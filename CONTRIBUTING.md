@@ -18,10 +18,9 @@ Thank you for contributing to RixBrowser. This project follows a **Spec-Driven, 
    - CI enforces a hard cap at **3,500 source lines** (excluding `Cargo.lock`, `docs/`, and test fixtures). If a feature is larger, split it into clean stacked PRs linked to the same tracking issue.
 5. **Run All Local Checks** before pushing:
    ```bash
-   cargo fmt --all -- --check
-   cargo clippy --workspace --all-targets -- -D warnings
-   cargo test --workspace
+   ./scripts/check.sh
    ```
+   (Which runs `#![deny(unsafe_code)]` verification, anti-hack/English-only checks, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`.)
 6. **Open a Pull Request** filling out `.github/pull_request_template.md`.
    - Automated checks (CI + CodeRabbit) will verify formatting, Clippy, tests, safety/hygiene rules, PR size, and spec compliance.
 
