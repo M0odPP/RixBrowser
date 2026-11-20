@@ -1,0 +1,25 @@
+name: Specification RFC
+description: Propose an architectural or specification change before writing code
+labels: ["type:rfc"]
+body:
+  - type: input
+    id: target_spec
+    attributes:
+      label: Affected Specification(s)
+      placeholder: docs/specs/04-css-and-layout.md
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Problem & Motivation
+      description: Why does the current spec need to evolve? Include benchmark or standards evidence.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Design
+      description: Data structures, invariants, safety impact, and migration path.
+    validations:
+      required: true

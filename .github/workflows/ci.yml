@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  pr-size-guard:
+    name: PR Size Guard
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR with base history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Enforce PR source-line limit (warn > 1500, fail > 3500)
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          TOTAL=$(git diff --numstat "$BASE_SHA" "$HEAD_SHA" -- \
+            ':!Cargo.lock' \
+            ':!docs/**' \
+            ':!.agents/**' \
+            ':!**/*.snap' \
+            ':!**/*.png' \
+            ':!**/*.webp' \
+            ':!**/fixtures/**' \
+            | awk '{ if ($1 ~ /^[0-9]+$/) add+=$1; if ($2 ~ /^[0-9]+$/) del+=$2 } END { print add + del + 0 }')
+
+          echo "Changed source lines (add + del, excluding lockfiles/docs/fixtures): $TOTAL"
+          if [ "$TOTAL" -gt 3500 ]; then
+            echo "::error::PR modifies $TOTAL source lines, exceeding the hard cap of 3500 lines. Split this work into smaller stacked PRs."
+            exit 1
+          elif [ "$TOTAL" -gt 1500 ]; then
+            echo "::warning::PR modifies $TOTAL source lines (recommended target is 400-1500 lines). Consider splitting if possible."
+          fi
+
+  safety-and-hygiene:
+    name: Safety & Anti-Hack Hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enforce #![deny(unsafe_code)] on core crates
+        run: |
+          ALLOWLIST="rix-jit rix-ipc"
+          FAILED=0
+          for lib in crates/*/src/lib.rs; do
+            crate=$(basename "$(dirname "$(dirname "$lib")")")
+            if echo " $ALLOWLIST " | grep -q " $crate "; then
+              if ! grep -q '#!\[deny(unsafe_op_in_unsafe_fn)\]' "$lib"; then
+                echo "::error::Allowlisted crate $crate must declare #![deny(unsafe_op_in_unsafe_fn)] in $lib"
+                FAILED=1
+              fi
+            else
+              if ! grep -q '#!\[deny(unsafe_code)\]' "$lib"; then
+                echo "::error::Core crate $crate is missing #![deny(unsafe_code)] in $lib"
+                FAILED=1
+              fi
+            fi
+          done
+          exit $FAILED
+
+      - name: Check zero site-specific hardcodes or placeholder stubs in crates/
+        run: |
+          if grep -rnE 'youtube\.com|youtu\.be|SOCS=|PENDING\+999|signature_cipher|youtube_hydrator' crates/; then
+            echo "::error::Site-specific hardcode detected in crates/ (violates AGENTS.md Section 2)."
+            exit 1
+          fi
+          if grep -rnE '\b(todo|unimplemented)!\(' crates/; then
+            echo "::error::Placeholder macro (todo!/unimplemented!) found in crates/ (violates AGENTS.md Section 2)."
+            exit 1
+          fi
+
+      - name: Check English-only repository files (zero Cyrillic in code/docs)
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+          cyrillic = re.compile(r"[\u0400-\u04FF]")
+          bad = []
+          for root in ("crates", "docs", ".github"):
+              p = pathlib.Path(root)
+              if not p.exists():
+                  continue
+              for f in p.rglob("*"):
+                  if not f.is_file():
+                      continue
+                  try:
+                      text = f.read_text(encoding="utf-8")
+                  except UnicodeDecodeError:
+                      continue
+                  if cyrillic.search(text):
+                      bad.append(str(f))
+          for top in ("README.md", "AGENTS.md", "CONTRIBUTING.md", ".coderabbit.yaml"):
+              f = pathlib.Path(top)
+              if f.exists() and cyrillic.search(f.read_text(encoding="utf-8")):
+                  bad.append(str(f))
+          if bad:
+              print("Cyrillic characters found in repository files:", bad)
+              sys.exit(1)
+          print("English-only check passed.")
+          PY
+
+  rust-checks:
+    name: Format, Clippy & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run unit & integration tests
+        run: cargo test --workspace

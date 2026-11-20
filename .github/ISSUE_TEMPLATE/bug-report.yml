@@ -1,0 +1,23 @@
+name: Bug Report
+description: Report a rendering, layout, JS, networking, or performance defect
+labels: ["type:bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Bug Description
+      description: Describe the observed behavior vs expected W3C/WHATWG/ECMA behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal Reproduction
+      description: Minimal HTML/CSS/JS snippet or test URL reproducing the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: F12 HUD / Log Diagnostics
+      description: Paste frame-time metrics, missing-feature telemetry, or console errors if available.

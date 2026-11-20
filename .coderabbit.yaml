@@ -1,0 +1,88 @@
+# CodeRabbit configuration for RixBrowser
+# Enforces pure-Rust safety, spec compliance, performance budgets, anti-hack discipline,
+# PR size hygiene, and unslop Chrome UI craft on every Pull Request.
+
+language: "en-US"
+early_access: false
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: true
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - "main"
+
+  path_filters:
+    - "!Cargo.lock"
+    - "!.agents/skills/unslop/**"
+    - "!target/**"
+
+  path_instructions:
+    - path: "crates/**/*.rs"
+      instructions: |
+        Review strictly against AGENTS.md and docs/ARCHITECTURE.md:
+        1. Pure Rust & Safety: Every crate except allowlisted low-level modules in `rix-jit` and `rix-ipc` MUST enforce `#![deny(unsafe_code)]`. Any `unsafe` block in allowlisted crates MUST live under `#![deny(unsafe_op_in_unsafe_fn)]` and have an explicit, sound `// SAFETY:` justification.
+        2. Zero Site-Specific Hacks: Reject any branching on specific hostnames/domains (e.g., youtube.com, google.com), fake consent cookies (SOCS, PREF, CONSENT), or magic per-site element IDs/classes.
+        3. Zero Stubs: Reject `todo!()`, `unimplemented!()`, or fake no-op Web API shims returning hardcoded success values.
+        4. No Hot-Path Regressions: Flag fixed-interval busy polling (`WaitUntil(1ms)`), `pollster::block_on` on UI/window threads, full DOM JSON serialization across IPC, `lightningcss` AST-to-string round-tripping, cloning `DisplayList` on scroll, `thread_local!` caches used across async thread pools, or `Box::into_raw` leaks.
+        5. Error Handling: Avoid `.unwrap()` / `.expect()` on untrusted web input or IPC frames in production code.
+        6. Language: All code, comments, identifiers, and error messages must be strictly in English.
+
+    - path: "crates/rix-ipc/**/*.rs"
+      instructions: |
+        Validate against docs/specs/01-ipc-and-processes.md:
+        - Enforce frame length caps before allocation (`MAX_CONTROL_FRAME_BYTES`).
+        - Verify `PROTOCOL_VERSION` checking and clean EOF / crash handling without panics.
+        - Verify shared memory sealing / atomic ordering (`Acquire`/`Release`) and FD leak prevention.
+
+    - path: "crates/rix-render/**/*.rs"
+      instructions: |
+        Validate against docs/specs/02-compositor-and-render.md:
+        - Verify hierarchical stacking contexts (never flat `sort_by_key(z_index)` across clip/layer boundaries).
+        - Verify `push_layer` uses finite element bounds (never `-1e6..1e6`).
+        - Verify viewport culling, VSync presentation (`AutoVsync`), and zero `DisplayList` cloning on scroll.
+
+    - path: "crates/rix-css/**/*.rs"
+      instructions: |
+        Validate against docs/specs/04-css-and-layout.md:
+        - Ensure parsed CSS properties remain typed (no `to_css_string` round-tripping).
+        - Flag heap `String` / `HashMap` allocations or full `ComputedStyle::clone()` in `layout_eq` or hot cascade loops.
+        - Verify per-document caches (no global single-slot `Mutex<Option<...>>` thrashed across tabs).
+
+    - path: "crates/rix-layout/**/*.rs"
+      instructions: |
+        Validate against docs/specs/04-css-and-layout.md:
+        - Ensure `Table`/`InlineBlock`/`ListItem` are not collapsed into `taffy::Display::Block`.
+        - Verify incremental reuse of layout/fragment caches and thread-safe shared text shaping cache.
+
+    - path: "crates/rix-js/**/*.rs"
+      instructions: |
+        Validate against docs/specs/05-js-vm-and-jit.md and docs/specs/06-web-platform-and-media.md:
+        - Verify Weak DOM wrapper lifetimes (no permanent strong-reference DOM leaks).
+        - Verify strict ECMAScript / WHATWG semantics and microtask checkpoint draining.
+        - Flag any polling timers in the JS event loop.
+
+    - path: "crates/rix-jit/**/*.rs"
+      instructions: |
+        Validate against docs/specs/05-js-vm-and-jit.md:
+        - Audit every `unsafe` block for ABI soundness, W^X (`PROT_READ | PROT_EXEC`) discipline, and `munmap` cleanup on drop (no executable memory leaks).
+        - Verify deoptimization / register preservation invariants across runtime helper calls.
+
+    - path: "crates/rix-chrome/assets/**"
+      instructions: |
+        Audit strictly against `.agents/skills/unslop/SKILL.md` and `docs/specs/07-chrome-ui-and-devtools.md`:
+        - Flag any AI slop tells: purple/neon gradients, glowing shadows, gradient text/logos, emoji labels/icons, decorative blobs, pulsing badges, or inconsistent non-4px-scale spacing.
+        - Verify quiet chrome, single restrained accent, nested border radii, visible keyboard focus rings, and both light and dark theme tokens.
+
+    - path: "docs/**"
+      instructions: |
+        Verify documentation is strictly in English, matches actual crate boundaries in docs/ARCHITECTURE.md, and keeps specs accurate and unambiguous.
+
+chat:
+  auto_reply: true

@@ -1,0 +1,13 @@
+/target
+/target-*/
+**/*.rs.bk
+*.redb
+*.redb.lock
+*.log
+*.pcap
+*.har
+.local/
+.DS_Store
+.idea/
+.vscode/
+unslop/

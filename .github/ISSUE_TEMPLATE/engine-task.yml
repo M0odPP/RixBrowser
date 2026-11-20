@@ -1,0 +1,38 @@
+name: Engine Task
+description: Scoped implementation task linked to a specification (target 400-2,000 LOC)
+labels: ["type:task"]
+body:
+  - type: input
+    id: spec
+    attributes:
+      label: Governing Specification
+      description: Link to the spec document and section under docs/specs/
+      placeholder: docs/specs/01-ipc-and-processes.md (Section 2)
+    validations:
+      required: true
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Development Phase
+      options:
+        - "phase:1-usable-browser"
+        - "phase:2-js-vm"
+        - "phase:3-jit-wasm"
+        - "phase:4-web-platform"
+        - "phase:5-media"
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope & Deliverables
+      description: Concrete modules, structs, and behaviors to implement. Must fit comfortably in one PR (< 3,500 source lines).
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria & Verification
+      description: Unit tests, benchmarks, WPT/Test262 subsets, and manual verification steps.
+    validations:
+      required: true
