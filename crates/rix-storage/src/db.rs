@@ -21,6 +21,8 @@ const TABLE_SECRET_METADATA: TableDefinition<&str, &[u8]> =
 const TABLE_BOOKMARKS: TableDefinition<u64, &[u8]> = TableDefinition::new("bookmarks");
 const TABLE_SESSION: TableDefinition<&str, &[u8]> = TableDefinition::new("session");
 const TABLE_LOCAL_STORAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("local_storage_v1");
+const TABLE_BYTECODE_CACHE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("js_bytecode_cache_v1");
 
 #[derive(Clone)]
 pub struct StorageEngine {
@@ -205,6 +207,7 @@ impl StorageEngine {
             let _ = write_txn.open_table(TABLE_BOOKMARKS)?;
             let _ = write_txn.open_table(TABLE_SESSION)?;
             let _ = write_txn.open_table(TABLE_LOCAL_STORAGE)?;
+            let _ = write_txn.open_table(TABLE_BYTECODE_CACHE)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -653,5 +656,48 @@ impl StorageEngine {
             }
         }
         Ok(map)
+    }
+
+    pub fn put_bytecode_cache(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(TABLE_BYTECODE_CACHE)?;
+            table.insert(key, bytes)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_bytecode_cache(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(TABLE_BYTECODE_CACHE)?;
+        Ok(table.get(key)?.map(|guard| guard.value().to_vec()))
+    }
+
+    pub fn remove_bytecode_cache(&self, key: &str) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(TABLE_BYTECODE_CACHE)?;
+            let _ = table.remove(key)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_bytecode_cache(&self) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(TABLE_BYTECODE_CACHE)?;
+            let keys: Vec<String> = table
+                .iter()?
+                .filter_map(|item| item.ok())
+                .map(|(k, _)| k.value().to_owned())
+                .collect();
+            for key in keys {
+                let _ = table.remove(key.as_str())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
     }
 }
