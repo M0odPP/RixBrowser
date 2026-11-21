@@ -52,6 +52,7 @@ rayon = "1.12"
 selectors = "0.40"
 cssparser = "0.37"
 precomputed-hash = "0.1"
+wuff = "0.2.10"
 
 [profile.dev]
 debug = 1
