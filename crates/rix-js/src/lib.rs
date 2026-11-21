@@ -4,6 +4,7 @@
 
 pub mod ast;
 pub mod bigint;
+pub mod builtins_collections;
 pub mod builtins_primitives;
 pub mod bytecode;
 pub mod cache;
