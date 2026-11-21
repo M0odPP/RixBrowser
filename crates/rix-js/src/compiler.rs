@@ -82,6 +82,7 @@ struct FunctionCompiler {
     loop_counter: u8,
     pending_label: Option<String>,
     chain_exits: Vec<Vec<(usize, u8)>>,
+    active_finalizers: Vec<Vec<Statement>>,
 }
 
 impl FunctionCompiler {
@@ -115,6 +116,7 @@ impl FunctionCompiler {
             loop_counter: 0,
             pending_label: None,
             chain_exits: Vec::new(),
+            active_finalizers: Vec::new(),
         }
     }
 
@@ -984,6 +986,17 @@ impl Compiler {
                     self.cur()
                         .emit(Instruction::abc(Opcode::LoadUndef, r, 0, 0));
                 }
+                if !self.cur().active_finalizers.is_empty() {
+                    let fins = std::mem::take(&mut self.cur().active_finalizers);
+                    for fin_body in fins.iter().rev() {
+                        self.cur().begin_scope();
+                        for s in fin_body {
+                            self.compile_stmt(s)?;
+                        }
+                        self.cur().end_scope();
+                    }
+                    self.cur().active_finalizers = fins;
+                }
                 self.cur().emit(Instruction::abc(Opcode::Return, r, 0, 0));
                 self.cur().free_to(saved);
             }
@@ -1000,6 +1013,9 @@ impl Compiler {
                 finalizer,
                 ..
             } => {
+                if let Some(fin_body) = finalizer {
+                    self.cur().active_finalizers.push(fin_body.clone());
+                }
                 let try_start = self.cur().code.len() as u32;
                 self.cur().begin_scope();
                 for s in block {
@@ -1031,6 +1047,10 @@ impl Compiler {
                     }
                     self.cur().end_scope();
                     catch_done_jump = Some(self.cur().emit_jump(Opcode::Jump, 0));
+                }
+
+                if finalizer.is_some() {
+                    self.cur().active_finalizers.pop();
                 }
 
                 let after_catch_pc = self.cur().code.len();
@@ -2386,6 +2406,21 @@ impl Compiler {
             optional: mem_opt,
         } = &callee.kind
         {
+            if matches!(object.kind, ExprKind::Super) {
+                self.cur()
+                    .emit(Instruction::abc(Opcode::LoadThis, recv_reg, 0, 0));
+                let saved = self.cur().next_reg;
+                let key_reg = self.cur().alloc_reg()?;
+                self.compile_member_prop_key(property, key_reg)?;
+                self.cur().emit(Instruction::abc(
+                    Opcode::GetSuperProp,
+                    callee_reg,
+                    key_reg,
+                    0,
+                ));
+                self.cur().free_to(saved);
+                return Ok(());
+            }
             self.compile_expr(object, recv_reg)?;
             if *mem_opt {
                 let j = self.cur().emit_jump(Opcode::JumpIfNullish, recv_reg);

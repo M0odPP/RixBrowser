@@ -586,6 +586,12 @@ impl GcHeap {
         self.interner.intern(s)
     }
 
+    #[inline]
+    #[must_use]
+    pub fn interner(&self) -> &StringInterner {
+        &self.interner
+    }
+
     #[must_use]
     pub fn resolve_key(&self, key: PropertyKey) -> Option<&str> {
         self.interner.get(key).map(|a| a.as_ref())
