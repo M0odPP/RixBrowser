@@ -10,8 +10,12 @@ rust-version.workspace = true
 [dependencies]
 rix-core = { path = "../rix-core" }
 rix-ipc = { path = "../rix-ipc" }
+rix-render = { path = "../rix-render" }
+rix-text = { path = "../rix-text" }
 tokio.workspace = true
 tracing.workspace = true
+winit.workspace = true
+pollster.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

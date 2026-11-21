@@ -13,5 +13,7 @@ pub use config::RixConfig;
 pub use error::{Result, RixError};
 pub use intern::{intern, intern_str, intern_string, InternedStr, InternedString};
 pub use logging::init_logging;
-pub use types::{NavigationState, NavigationTiming, Point, ProcessId, Rect, Size, TabId, WindowId};
+pub use types::{
+    NavigationState, NavigationTiming, Point, ProcessId, Rect, Size, TabId, Vec2, WindowId,
+};
 pub use url::{RixScheme, RixUrl};
