@@ -1,4 +1,4 @@
-pub use rix_core::{NavigationTiming, Point, ProcessId, Rect, Size, TabId, WindowId};
+pub use rix_core::{NavigationTiming, Point, ProcessId, Rect, Size, TabId, Vec2, WindowId};
 use serde::{Deserialize, Serialize};
 
 macro_rules! define_id {

@@ -1,0 +1,25 @@
+[package]
+name = "rix-render"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rix-core = { path = "../rix-core" }
+rix-text = { path = "../rix-text" }
+rix-ipc = { path = "../rix-ipc" }
+vello.workspace = true
+image.workspace = true
+smallvec.workspace = true
+svgtypes.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+pollster.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

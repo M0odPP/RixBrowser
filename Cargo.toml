@@ -8,6 +8,7 @@ members = [
     "crates/rix-html",
     "crates/rix-text",
     "crates/rix-ipc",
+    "crates/rix-render",
     "crates/rix-app",
 ]
 
@@ -35,6 +36,13 @@ bytes = "1.10"
 postcard = { version = "1.1", features = ["use-std"] }
 libc = "0.2"
 psl = "2"
+vello = "0.10"
+winit = "0.30"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+pollster = "1.0"
+smallvec = { version = "1.14", features = ["serde"] }
+svgtypes = "0.16"
+criterion = "0.5"
 
 [profile.dev]
 debug = 1

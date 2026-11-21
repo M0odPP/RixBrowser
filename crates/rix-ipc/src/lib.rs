@@ -25,7 +25,7 @@ pub use protocol::{
     HttpMethodKind, ImageId, KeyModifiers, LoadState, MissingFeatureKind, MouseButtonKind,
     NavigationId, NavigationTiming, NetworkToContent, PaintStats, PathResourceId, PipelineId,
     PixelFormat, Point, ProcessId, Rect, RequestId, RoutedInputEvent, ScrollId, ScrollNodeUpdate,
-    ScrollTreeUpdate, ShmemId, ShmemRef, Size, SpatialNodeId, StreamId, SurfaceId, TabId,
+    ScrollTreeUpdate, ShmemId, ShmemRef, Size, SpatialNodeId, StreamId, SurfaceId, TabId, Vec2,
     ViewportMetrics, WebSocketId, WindowId,
 };
 #[cfg(unix)]
