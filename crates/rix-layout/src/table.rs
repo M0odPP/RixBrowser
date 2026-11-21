@@ -267,7 +267,7 @@ pub fn layout_table(
             baseline: Some(bh),
             overflow_rect: Rect::new(0.0, 0.0, bw, bh),
             kind: FragmentKind::Box,
-            children: Vec::new(),
+            children: Arc::new(Vec::new()),
             is_float: ctx.tree.get(table_id).is_float,
             is_out_of_flow: ctx.tree.get(table_id).is_out_of_flow,
             collapsed_margin_top: metrics.margin.top,
@@ -396,7 +396,7 @@ pub fn layout_table(
                 _ => extra_v * 0.5, // CSS default vertical-align for table cells is middle
             };
             if shift_y > 0.0 {
-                for ch in &mut frag.children {
+                for ch in Arc::make_mut(&mut frag.children) {
                     ch.border_rect.origin.y += shift_y;
                 }
             }
@@ -427,7 +427,7 @@ pub fn layout_table(
             baseline: Some(row_heights[r_idx]),
             overflow_rect: Rect::new(0.0, 0.0, final_content_w, row_heights[r_idx]),
             kind: FragmentKind::Box,
-            children: std::mem::take(&mut row_children[r_idx]),
+            children: Arc::new(std::mem::take(&mut row_children[r_idx])),
             is_float: false,
             is_out_of_flow: false,
             collapsed_margin_top: 0.0,
@@ -457,7 +457,7 @@ pub fn layout_table(
         baseline: Some(border_h),
         overflow_rect: Rect::new(0.0, 0.0, border_w, border_h),
         kind: FragmentKind::Box,
-        children: placed_rows,
+        children: Arc::new(placed_rows),
         is_float: ctx.tree.get(table_id).is_float,
         is_out_of_flow: ctx.tree.get(table_id).is_out_of_flow,
         collapsed_margin_top: metrics.margin.top,

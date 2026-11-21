@@ -16,6 +16,7 @@ rix-ipc = { path = "../rix-ipc" }
 rix-render = { path = "../rix-render" }
 taffy = { workspace = true }
 image = { workspace = true }
+vello = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -24,4 +25,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 rix-html = { path = "../rix-html" }
 criterion = { workspace = true }
-vello = { workspace = true }
+
+[[bench]]
+name = "layout_bench"
+harness = false

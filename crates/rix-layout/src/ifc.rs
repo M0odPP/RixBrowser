@@ -158,7 +158,7 @@ pub fn measure_ifc_min_max_content(
                 is_space,
                 ..
             } => {
-                let font_id = resolve_font_for_style(ctx.font_db, ctx.web_fonts, style);
+                let font_id = ctx.resolve_font(style);
                 let font_size = style.text.font_size_px.max(1.0);
                 let w = measure_shaped_width(ctx, text, font_id, font_size, style);
                 if !is_space {
@@ -197,7 +197,7 @@ pub fn layout_ifc(
     let container_width = space.available_width.max(0.0);
     let eval = space.eval_context(container_style.text.font_size_px);
     let strut_line_h = resolve_line_height_px(&container_style, eval);
-    let strut_font_id = resolve_font_for_style(ctx.font_db, ctx.web_fonts, &container_style);
+    let strut_font_id = ctx.resolve_font(&container_style);
     let (strut_ascent, strut_descent) = font_ascent_descent(
         ctx.font_db,
         strut_font_id,
@@ -286,7 +286,7 @@ pub fn layout_ifc(
                     continue;
                 }
 
-                let font_id = resolve_font_for_style(ctx.font_db, ctx.web_fonts, &style);
+                let font_id = ctx.resolve_font(&style);
                 let font_size = style.text.font_size_px.max(1.0);
                 let (glyphs, width) = shape_word_glyphs(ctx, &text, font_id, font_size, &style);
                 let (asc, desc) = font_ascent_descent(ctx.font_db, font_id, font_size);
@@ -534,7 +534,7 @@ pub fn layout_ifc(
             kind: FragmentKind::LineBox {
                 baseline: line.baseline,
             },
-            children: line.children,
+            children: Arc::new(line.children),
             is_float: false,
             is_out_of_flow: false,
             collapsed_margin_top: 0.0,
@@ -561,7 +561,7 @@ struct FinishedLine {
 
 #[allow(clippy::too_many_arguments)]
 fn finish_line(
-    ctx: &LayoutContext<'_>,
+    ctx: &mut LayoutContext<'_>,
     pieces: &mut Vec<LinePiece>,
     band_left: f32,
     band_right: f32,
@@ -745,7 +745,7 @@ fn finish_line(
                     baseline: Some(local_baseline),
                     overflow_rect: Rect::new(0.0, 0.0, piece.width, piece.height),
                     kind: FragmentKind::TextRun(run),
-                    children: Vec::new(),
+                    children: Arc::new(Vec::new()),
                     is_float: false,
                     is_out_of_flow: false,
                     collapsed_margin_top: 0.0,
@@ -810,7 +810,7 @@ fn finish_line(
                 is_first,
                 is_last: false,
             },
-            children: Vec::new(),
+            children: Arc::new(Vec::new()),
             is_float: false,
             is_out_of_flow: false,
             collapsed_margin_top: 0.0,
@@ -854,12 +854,12 @@ fn mark_last_inline_fragments(lines: &mut [FinishedLine]) {
 }
 
 fn apply_ellipsis_truncation(
-    ctx: &LayoutContext<'_>,
+    ctx: &mut LayoutContext<'_>,
     pieces: &mut Vec<LinePiece>,
     max_width: f32,
     container_style: &Arc<ComputedStyle>,
 ) {
-    let ell_font = resolve_font_for_style(ctx.font_db, ctx.web_fonts, container_style);
+    let ell_font = ctx.resolve_font(container_style);
     let ell_size = container_style.text.font_size_px.max(1.0);
     let (ell_glyphs, ell_w) =
         shape_word_glyphs(ctx, "\u{2026}", ell_font, ell_size, container_style);

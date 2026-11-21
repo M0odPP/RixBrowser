@@ -310,7 +310,7 @@ pub struct Fragment {
     pub baseline: Option<f32>,
     pub overflow_rect: Rect,
     pub kind: FragmentKind,
-    pub children: Vec<Fragment>,
+    pub children: Arc<Vec<Fragment>>,
     pub is_float: bool,
     pub is_out_of_flow: bool,
     pub collapsed_margin_top: f32,
@@ -336,7 +336,7 @@ impl Fragment {
         let mut min_y = 0.0f32;
         let mut max_x = self.border_rect.size.width;
         let mut max_y = self.border_rect.size.height;
-        for child in &self.children {
+        for child in self.children.iter() {
             let cx = child.border_rect.origin.x;
             let cy = child.border_rect.origin.y;
             min_x = min_x.min(cx + child.overflow_rect.origin.x);
@@ -407,11 +407,13 @@ struct FragmentCacheKey {
     cb_h_bits: u32,
 }
 
-/// Per-document retained layout cache storing unchanged subtree fragments and
-/// retained per-container `taffy::TaffyTree` instances for Flex/Grid contexts.
+/// Per-document retained layout cache storing unchanged subtree fragments,
+/// font-match memo entries, and retained per-container `taffy::TaffyTree`
+/// instances for Flex/Grid contexts.
 #[derive(Default)]
 pub struct LayoutCache {
     fragments: FastMap<FragmentCacheKey, Arc<Fragment>>,
+    font_matches: FastMap<(usize, usize), FontId>,
     pub(crate) taffy_containers: HashMap<u64, RetainedTaffyContainer>,
     pub cache_hits: usize,
     pub cache_misses: usize,
@@ -430,9 +432,31 @@ impl LayoutCache {
 
     pub fn clear(&mut self) {
         self.fragments.clear();
+        self.font_matches.clear();
         self.taffy_containers.clear();
         self.cache_hits = 0;
         self.cache_misses = 0;
+    }
+
+    /// Resolves and caches the matched [`FontId`] for `style.text` in O(1) after first lookup.
+    pub fn resolve_font(
+        &mut self,
+        font_db: &FontDatabase,
+        web_fonts: Option<&FontFaceSet>,
+        style: &ComputedStyle,
+    ) -> FontId {
+        let text_ptr = Arc::as_ptr(&style.text) as usize;
+        let wf_count = web_fonts.map_or(0, |wf| wf.faces().len());
+        let key = (text_ptr, wf_count);
+        if let Some(&id) = self.font_matches.get(&key) {
+            return id;
+        }
+        let id = crate::ifc::resolve_font_for_style(font_db, web_fonts, style);
+        if self.font_matches.len() > 8192 {
+            self.font_matches.clear();
+        }
+        self.font_matches.insert(key, id);
+        id
     }
 
     fn make_key(
@@ -510,9 +534,10 @@ impl<'a> LayoutContext<'a> {
             cache,
         }
     }
+    pub fn resolve_font(&mut self, style: &ComputedStyle) -> FontId {
+        self.cache.resolve_font(self.font_db, self.web_fonts, style)
+    }
 }
-
-/// Lays out an entire [`BoxTree`] starting at its root inside `viewport`.
 pub fn layout_tree(
     tree: &BoxTree,
     viewport: Size,
@@ -591,9 +616,17 @@ pub fn measure_intrinsic_widths(
     let metrics = BoxMetrics::resolve(&b.style, &space);
     let pb_w = metrics.padding.horizontal() + metrics.border.horizontal();
 
-    if let Some(spec_w) = metrics.specified_width {
-        let total = metrics.clamp_content_width(spec_w) + pb_w;
-        return (total, total);
+    let is_percent_width = matches!(
+        b.style.box_model.width,
+        SizeValue::Length(
+            rix_css::LengthPercentage::Percent(_) | rix_css::LengthPercentage::Calc(_)
+        )
+    );
+    if !is_percent_width {
+        if let Some(spec_w) = metrics.specified_width {
+            let total = metrics.clamp_content_width(spec_w) + pb_w;
+            return (total, total);
+        }
     }
 
     match &b.kind {
@@ -642,11 +675,11 @@ pub fn measure_intrinsic_widths(
 }
 
 fn measure_text_intrinsic(
-    ctx: &LayoutContext<'_>,
+    ctx: &mut LayoutContext<'_>,
     text: &str,
     style: &ComputedStyle,
 ) -> (f32, f32) {
-    let font_id = crate::ifc::resolve_font_for_style(ctx.font_db, ctx.web_fonts, style);
+    let font_id = ctx.resolve_font(style);
     let font_size = style.text.font_size_px.max(1.0);
     let mut min_w = 0.0f32;
     for word in text.split_whitespace() {
@@ -779,7 +812,7 @@ pub fn layout_replaced(
         baseline,
         overflow_rect: Rect::new(0.0, 0.0, border_w, border_h),
         kind,
-        children: Vec::new(),
+        children: Arc::new(Vec::new()),
         is_float: b.is_float,
         is_out_of_flow: b.is_out_of_flow,
         collapsed_margin_top: metrics.margin.top,

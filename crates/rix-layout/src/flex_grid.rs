@@ -249,7 +249,7 @@ pub fn layout_flex_grid_container(
         baseline: Some(border_h),
         overflow_rect: Rect::new(0.0, 0.0, border_w, border_h),
         kind: FragmentKind::Box,
-        children: placed_children,
+        children: Arc::new(placed_children),
         is_float: ctx.tree.get(container_id).is_float,
         is_out_of_flow: ctx.tree.get(container_id).is_out_of_flow,
         collapsed_margin_top: metrics.margin.top,
@@ -382,11 +382,19 @@ fn to_taffy_container_style(
         _ => tp::Display::Flex,
     };
 
-    // Block-level flex/grid containers fill available width when width is `auto`.
+    // Block-level flex/grid containers fill available width when width is `auto`
+    // (border-box width = available_width - horizontal margins).
     if matches!(style.display, DisplayMode::Flex | DisplayMode::Grid)
         && matches!(style.box_model.width, SizeValue::Auto)
     {
-        ts.size.width = tp::Dimension::percent(1.0);
+        let metrics = BoxMetrics::resolve(style, space);
+        let pb_w = metrics.padding.horizontal() + metrics.border.horizontal();
+        let border_w = (space.available_width - metrics.margin.horizontal()).max(0.0);
+        let fill_w = match style.box_sizing {
+            BoxSizingMode::BorderBox => border_w,
+            BoxSizingMode::ContentBox => (border_w - pb_w).max(0.0),
+        };
+        ts.size.width = tp::length(fill_w);
     }
 
     let fg = style

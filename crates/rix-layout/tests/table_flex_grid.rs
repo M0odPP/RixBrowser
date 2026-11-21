@@ -49,7 +49,7 @@ fn find_abs_rect(doc: &Document, root: &Fragment, id: &str) -> Rect {
         if frag.dom_node == Some(target) {
             return Some(abs);
         }
-        for ch in &frag.children {
+        for ch in frag.children.iter() {
             if let Some(found) = walk(ch, target, abs.origin) {
                 return Some(found);
             }
