@@ -1,5 +1,8 @@
+use crate::state::{hash_ident, hash_ident_ascii_lower, DirtyFlags, ElementState};
 use indextree::NodeId;
 use markup5ever::{LocalName, Namespace, QualName};
+use rix_core::{intern_str, InternedStr};
+use smallvec::SmallVec;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +32,11 @@ pub struct ElementData {
     pub template_contents: Option<NodeId>,
     pub shadow_root: Option<NodeId>,
     pub content_document: Option<NodeId>,
+    pub dirty_flags: DirtyFlags,
+    pub pseudo_state: ElementState,
+    pub cached_id: Option<InternedStr>,
+    pub class_hashes: SmallVec<[u64; 4]>,
+    pub tag_hash: u64,
 }
 
 pub fn parse_non_negative_integer(input: &str) -> Option<u32> {
@@ -57,13 +65,65 @@ pub fn parse_non_negative_integer(input: &str) -> Option<u32> {
 
 impl ElementData {
     pub fn new(name: QualName) -> Self {
-        Self {
+        let tag_hash = hash_ident_ascii_lower(&name.local);
+        let mut elem = Self {
             name,
             attributes: Vec::new(),
             template_contents: None,
             shadow_root: None,
             content_document: None,
+            dirty_flags: DirtyFlags::SELF_STYLE_DIRTY
+                | DirtyFlags::SELF_LAYOUT_DIRTY
+                | DirtyFlags::PAINT_DIRTY,
+            pseudo_state: ElementState::empty(),
+            cached_id: None,
+            class_hashes: SmallVec::new(),
+            tag_hash,
+        };
+        elem.sync_intrinsic_state();
+        elem
+    }
+
+    pub fn sync_cached_attrs(&mut self) {
+        self.cached_id = self.id().filter(|id| !id.is_empty()).map(intern_str);
+        let mut hashes = SmallVec::new();
+        if let Some(classes) = self.get_attribute("class") {
+            for cls in classes.split_ascii_whitespace() {
+                let h = hash_ident(cls);
+                if !hashes.contains(&h) {
+                    hashes.push(h);
+                }
+            }
         }
+        self.class_hashes = hashes;
+        self.sync_intrinsic_state();
+    }
+
+    fn sync_intrinsic_state(&mut self) {
+        let local = self.name.local.as_str();
+        let is_link = matches!(local, "a" | "area") && self.has_attribute("href");
+        self.pseudo_state.set(ElementState::LINK, is_link);
+
+        let is_checked = self.has_attribute("checked");
+        self.pseudo_state.set(ElementState::CHECKED, is_checked);
+
+        let is_disableable = matches!(
+            local,
+            "button" | "input" | "select" | "textarea" | "fieldset" | "option" | "optgroup"
+        );
+        if is_disableable {
+            let disabled = self.has_attribute("disabled");
+            self.pseudo_state.set(ElementState::DISABLED, disabled);
+            self.pseudo_state.set(ElementState::ENABLED, !disabled);
+        } else {
+            self.pseudo_state
+                .remove(ElementState::DISABLED | ElementState::ENABLED);
+        }
+    }
+
+    #[inline]
+    pub fn has_class_hash(&self, hash: u64) -> bool {
+        self.class_hashes.contains(&hash)
     }
 
     pub fn new_html(local_name: &str) -> Self {
@@ -101,12 +161,19 @@ impl ElementData {
                     return;
                 }
                 *current = value.to_string();
+                self.dirty_flags |= DirtyFlags::SELF_STYLE_DIRTY
+                    | DirtyFlags::SELF_LAYOUT_DIRTY
+                    | DirtyFlags::PAINT_DIRTY;
+                self.sync_cached_attrs();
                 return;
             }
         }
 
         let qname = QualName::new(None, Namespace::from(""), LocalName::from(local_name));
         self.attributes.push((qname, value.to_string()));
+        self.dirty_flags |=
+            DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::SELF_LAYOUT_DIRTY | DirtyFlags::PAINT_DIRTY;
+        self.sync_cached_attrs();
     }
 
     pub fn remove_attribute(&mut self, local_name: &str) -> bool {
@@ -114,7 +181,14 @@ impl ElementData {
         self.attributes.retain(|(name, _)| {
             !name.ns.is_empty() || (!name.local.as_str().eq_ignore_ascii_case(local_name))
         });
-        self.attributes.len() < initial_len
+        let changed = self.attributes.len() < initial_len;
+        if changed {
+            self.dirty_flags |= DirtyFlags::SELF_STYLE_DIRTY
+                | DirtyFlags::SELF_LAYOUT_DIRTY
+                | DirtyFlags::PAINT_DIRTY;
+            self.sync_cached_attrs();
+        }
+        changed
     }
 
     pub fn get_attribute_ns(&self, namespace_uri: &str, local_name: &str) -> Option<&str> {
@@ -145,6 +219,10 @@ impl ElementData {
             let old_value = std::mem::replace(current, value.to_string());
             let old_prefix = name.prefix.as_ref().map(ToString::to_string);
             name.prefix = prefix.map(Into::into);
+            self.dirty_flags |= DirtyFlags::SELF_STYLE_DIRTY
+                | DirtyFlags::SELF_LAYOUT_DIRTY
+                | DirtyFlags::PAINT_DIRTY;
+            self.sync_cached_attrs();
             return Some((old_value, old_prefix));
         }
 
@@ -154,6 +232,9 @@ impl ElementData {
             LocalName::from(local_name),
         );
         self.attributes.push((name, value.to_string()));
+        self.dirty_flags |=
+            DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::SELF_LAYOUT_DIRTY | DirtyFlags::PAINT_DIRTY;
+        self.sync_cached_attrs();
         None
     }
 
@@ -162,7 +243,11 @@ impl ElementData {
             .attributes
             .iter()
             .position(|(name, _)| &*name.ns == namespace_uri && &*name.local == local_name)?;
-        Some(self.attributes.remove(index).1)
+        let removed = self.attributes.remove(index).1;
+        self.dirty_flags |=
+            DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::SELF_LAYOUT_DIRTY | DirtyFlags::PAINT_DIRTY;
+        self.sync_cached_attrs();
+        Some(removed)
     }
 
     pub fn id(&self) -> Option<&str> {

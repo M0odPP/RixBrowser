@@ -87,6 +87,7 @@ impl TreeSink for DomTreeSink {
                 .attributes
                 .push((attr.name, attr.value.to_string()));
         }
+        elem_data.sync_cached_attrs();
 
         if &*elem_data.name.local == "template" {
             let frag = self
@@ -198,11 +199,16 @@ impl TreeSink for DomTreeSink {
     fn add_attrs_if_missing(&self, target: &Self::Handle, attrs: Vec<Attribute>) {
         let mut doc = self.document.borrow_mut();
         if let Some(NodeData::Element(elem)) = doc.get_mut(*target) {
+            let mut changed = false;
             for attr in attrs {
                 let exists = elem.attributes.iter().any(|(qname, _)| qname == &attr.name);
                 if !exists {
                     elem.attributes.push((attr.name, attr.value.to_string()));
+                    changed = true;
                 }
+            }
+            if changed {
+                elem.sync_cached_attrs();
             }
         }
     }

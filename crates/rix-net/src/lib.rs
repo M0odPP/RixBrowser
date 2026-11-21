@@ -9,7 +9,10 @@ pub mod resource;
 pub mod timing;
 
 pub use cache::{CacheControlDirectives, HttpCache, HttpCacheEntry, HttpCacheMeta};
-pub use client::{parse_cookie_header, ConditionalRequest, H3Sender, HttpClient, HttpResponse};
+pub use client::{
+    parse_cookie_header, BodyStream, ConditionalRequest, H3Sender, HttpClient, HttpResponse,
+    RequestBodyStream, StreamingResponse,
+};
 pub use decompress::{
     decompress_body, decompress_body_for_header, encodings_from_header, ContentEncoding,
 };

@@ -1,5 +1,7 @@
 use crate::node::{ElementData, NodeData};
+use crate::state::{DirtyFlags, ElementState};
 use indextree::{Arena, NodeEdge, NodeId};
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -22,6 +24,7 @@ pub struct Document {
     text_selection: Option<(NodeId, usize, usize)>,
     dynamic_stylesheets: HashMap<NodeId, String>,
     adopted_stylesheets: HashMap<NodeId, Vec<String>>,
+    root_dirty_flags: DirtyFlags,
     id_cache: IdCache,
 }
 
@@ -54,6 +57,7 @@ impl Document {
             text_selection: None,
             dynamic_stylesheets: HashMap::new(),
             adopted_stylesheets: HashMap::new(),
+            root_dirty_flags: DirtyFlags::empty(),
             id_cache: Arc::new(RwLock::new(None)),
         }
     }
@@ -223,45 +227,255 @@ impl Document {
         self.style_revision = self.style_revision.wrapping_add(1);
     }
 
-    pub fn set_hovered(&mut self, node: Option<NodeId>) -> bool {
-        if self.hovered == node {
+    pub fn dirty_flags(&self, node: NodeId) -> DirtyFlags {
+        if node == self.root {
+            return self.root_dirty_flags;
+        }
+        match self.get(node) {
+            Some(NodeData::Element(elem)) => elem.dirty_flags,
+            _ => DirtyFlags::empty(),
+        }
+    }
+
+    pub fn mark_node_dirty(&mut self, node: NodeId, flags: DirtyFlags) {
+        if flags.is_empty() {
+            return;
+        }
+        if node == self.root {
+            self.root_dirty_flags |= flags;
+            return;
+        }
+        let target = if matches!(self.get(node), Some(NodeData::Text(_))) {
+            match self.parent(node) {
+                Some(p) => p,
+                None => return,
+            }
+        } else {
+            node
+        };
+        if let Some(NodeData::Element(elem)) = self.arena.get_mut(target).map(|n| n.get_mut()) {
+            elem.dirty_flags |= flags;
+        }
+
+        let mut descendant_flags = DirtyFlags::empty();
+        if flags.intersects(
+            DirtyFlags::SELF_STYLE_DIRTY
+                | DirtyFlags::DESCENDANT_STYLE_DIRTY
+                | DirtyFlags::SUBTREE_STYLE_DIRTY,
+        ) {
+            descendant_flags |= DirtyFlags::DESCENDANT_STYLE_DIRTY;
+        }
+        if flags.intersects(DirtyFlags::SELF_LAYOUT_DIRTY | DirtyFlags::DESCENDANT_LAYOUT_DIRTY) {
+            descendant_flags |= DirtyFlags::DESCENDANT_LAYOUT_DIRTY;
+        }
+        if descendant_flags.is_empty() {
+            return;
+        }
+
+        let mut cur = target;
+        for _ in 0..2048 {
+            let next = match self.parent(cur) {
+                Some(p) => p,
+                None => match self.get(cur) {
+                    Some(NodeData::ShadowRoot { host, .. }) => *host,
+                    _ => break,
+                },
+            };
+            if next == self.root {
+                self.root_dirty_flags |= descendant_flags;
+                break;
+            }
+            if let Some(NodeData::Element(elem)) = self.arena.get_mut(next).map(|n| n.get_mut()) {
+                if elem.dirty_flags.contains(descendant_flags) {
+                    break;
+                }
+                elem.dirty_flags |= descendant_flags;
+            }
+            cur = next;
+        }
+    }
+
+    pub fn clear_dirty_flags(&mut self, node: NodeId, flags: DirtyFlags) {
+        if node == self.root {
+            self.root_dirty_flags.remove(flags);
+            return;
+        }
+        if let Some(NodeData::Element(elem)) = self.arena.get_mut(node).map(|n| n.get_mut()) {
+            elem.dirty_flags.remove(flags);
+        }
+    }
+
+    pub fn clear_all_dirty_flags(&mut self) {
+        self.root_dirty_flags = DirtyFlags::empty();
+        let all_ids: Vec<NodeId> = self.root.descendants(&self.arena).collect();
+        for id in all_ids {
+            if let Some(NodeData::Element(elem)) = self.arena.get_mut(id).map(|n| n.get_mut()) {
+                elem.dirty_flags = DirtyFlags::empty();
+            }
+        }
+    }
+
+    pub fn element_state(&self, node: NodeId) -> ElementState {
+        match self.get(node) {
+            Some(NodeData::Element(elem)) => elem.pseudo_state,
+            _ => ElementState::empty(),
+        }
+    }
+
+    pub fn set_element_state(&mut self, node: NodeId, state: ElementState, enabled: bool) -> bool {
+        let Some(NodeData::Element(elem)) = self.arena.get_mut(node).map(|n| n.get_mut()) else {
             return false;
+        };
+        let was = elem.pseudo_state.contains(state);
+        if was == enabled {
+            return false;
+        }
+        elem.pseudo_state.set(state, enabled);
+        true
+    }
+
+    fn composed_element_ancestors(&self, start: Option<NodeId>) -> SmallVec<[NodeId; 16]> {
+        let mut chain = SmallVec::new();
+        let Some(mut cur) = start else {
+            return chain;
+        };
+        for _ in 0..2048 {
+            if matches!(self.get(cur), Some(NodeData::Element(_))) {
+                chain.push(cur);
+            }
+            cur = match self.parent(cur) {
+                Some(p) => p,
+                None => match self.get(cur) {
+                    Some(NodeData::ShadowRoot { host, .. }) => *host,
+                    _ => break,
+                },
+            };
+        }
+        chain
+    }
+
+    /// Updates `flag` along the symmetric ancestor difference between `old` and `new`,
+    /// marking ONLY changed elements dirty instead of invalidating `root`.
+    pub fn update_ancestor_state_diff(
+        &mut self,
+        old: Option<NodeId>,
+        new: Option<NodeId>,
+        flag: ElementState,
+    ) -> Vec<NodeId> {
+        let old_chain = self.composed_element_ancestors(old);
+        let new_chain = self.composed_element_ancestors(new);
+        let mut diff = Vec::with_capacity(old_chain.len().min(8) + new_chain.len().min(8));
+
+        for &id in &old_chain {
+            if !new_chain.contains(&id) && self.set_element_state(id, flag, false) {
+                self.mark_style(id);
+                self.mark_node_dirty(id, DirtyFlags::SELF_STYLE_DIRTY);
+                diff.push(id);
+            }
+        }
+        for &id in &new_chain {
+            if !old_chain.contains(&id) && self.set_element_state(id, flag, true) {
+                self.mark_style(id);
+                self.mark_node_dirty(id, DirtyFlags::SELF_STYLE_DIRTY);
+                diff.push(id);
+            }
+        }
+        diff
+    }
+
+    pub fn set_hovered_diff(&mut self, node: Option<NodeId>) -> Vec<NodeId> {
+        let prev = self.hovered;
+        if prev == node {
+            return Vec::new();
         }
         self.hovered = node;
         self.revision = self.revision.wrapping_add(1);
         self.style_revision = self.style_revision.wrapping_add(1);
-        self.mark_pseudo_class_state();
+        self.update_ancestor_state_diff(prev, node, ElementState::HOVER)
+    }
+
+    pub fn set_hovered(&mut self, node: Option<NodeId>) -> bool {
+        if self.hovered == node {
+            return false;
+        }
+        self.set_hovered_diff(node);
         true
+    }
+
+    pub fn set_active_diff(&mut self, node: Option<NodeId>) -> Vec<NodeId> {
+        let prev = self.active;
+        if prev == node {
+            return Vec::new();
+        }
+        self.active = node;
+        self.revision = self.revision.wrapping_add(1);
+        self.style_revision = self.style_revision.wrapping_add(1);
+        self.update_ancestor_state_diff(prev, node, ElementState::ACTIVE)
     }
 
     pub fn set_active(&mut self, node: Option<NodeId>) -> bool {
         if self.active == node {
             return false;
         }
-        self.active = node;
+        self.set_active_diff(node);
+        true
+    }
+
+    pub fn set_focused_diff(&mut self, node: Option<NodeId>, visible: bool) -> Vec<NodeId> {
+        let prev = self.focused;
+        let prev_vis = self.focus_visible;
+        if prev == node && prev_vis == visible {
+            return Vec::new();
+        }
+        self.focused = node;
+        self.focus_visible = visible;
         self.revision = self.revision.wrapping_add(1);
         self.style_revision = self.style_revision.wrapping_add(1);
-        self.mark_pseudo_class_state();
-        true
+
+        let mut affected = self.update_ancestor_state_diff(prev, node, ElementState::FOCUS_WITHIN);
+        if prev != node {
+            if let Some(old_id) = prev {
+                if self.set_element_state(
+                    old_id,
+                    ElementState::FOCUS | ElementState::FOCUS_VISIBLE,
+                    false,
+                ) {
+                    self.mark_style(old_id);
+                    self.mark_node_dirty(old_id, DirtyFlags::SELF_STYLE_DIRTY);
+                    if !affected.contains(&old_id) {
+                        affected.push(old_id);
+                    }
+                }
+            }
+            if let Some(new_id) = node {
+                let mut changed = self.set_element_state(new_id, ElementState::FOCUS, true);
+                changed |= self.set_element_state(new_id, ElementState::FOCUS_VISIBLE, visible);
+                if changed {
+                    self.mark_style(new_id);
+                    self.mark_node_dirty(new_id, DirtyFlags::SELF_STYLE_DIRTY);
+                    if !affected.contains(&new_id) {
+                        affected.push(new_id);
+                    }
+                }
+            }
+        } else if let Some(cur_id) = node {
+            if self.set_element_state(cur_id, ElementState::FOCUS_VISIBLE, visible) {
+                self.mark_style(cur_id);
+                self.mark_node_dirty(cur_id, DirtyFlags::SELF_STYLE_DIRTY);
+                if !affected.contains(&cur_id) {
+                    affected.push(cur_id);
+                }
+            }
+        }
+        affected
     }
 
     pub fn set_focused(&mut self, node: Option<NodeId>, visible: bool) -> bool {
         if self.focused == node && self.focus_visible == visible {
             return false;
         }
-        self.focused = node;
-        self.focus_visible = visible;
-        self.revision = self.revision.wrapping_add(1);
-        self.style_revision = self.style_revision.wrapping_add(1);
-        self.mark_pseudo_class_state();
+        self.set_focused_diff(node, visible);
         true
-    }
-
-    /// `:hover`/`:focus`/`:active` also match the ancestors of the targeted node, and there is no
-    /// rule revalidation set to narrow that down, so the whole tree is marked.
-    fn mark_pseudo_class_state(&mut self) {
-        let root = self.root;
-        self.mark_style(root);
     }
     pub fn focused_node(&self) -> Option<NodeId> {
         self.focused
@@ -365,6 +579,12 @@ impl Document {
             self.revision = self.revision.wrapping_add(1);
             self.style_revision = self.style_revision.wrapping_add(1);
             self.mark_style(parent);
+            self.mark_node_dirty(
+                child,
+                DirtyFlags::SELF_STYLE_DIRTY
+                    | DirtyFlags::SELF_LAYOUT_DIRTY
+                    | DirtyFlags::PAINT_DIRTY,
+            );
             if matches!(self.get(child), Some(NodeData::Element(e)) if e.name.local.as_str() == "script")
             {
                 self.script_revision = self.script_revision.wrapping_add(1);
@@ -380,6 +600,12 @@ impl Document {
             if let Some(parent) = self.parent(target) {
                 self.mark_style(parent);
             }
+            self.mark_node_dirty(
+                new_child,
+                DirtyFlags::SELF_STYLE_DIRTY
+                    | DirtyFlags::SELF_LAYOUT_DIRTY
+                    | DirtyFlags::PAINT_DIRTY,
+            );
             if matches!(self.get(new_child), Some(NodeData::Element(e)) if e.name.local.as_str() == "script")
             {
                 self.script_revision = self.script_revision.wrapping_add(1);
@@ -392,14 +618,27 @@ impl Document {
         let connected = self.is_connected(child);
         let parent = self.parent(child);
         if self.state_contains(self.hovered, child) {
+            let old = self.hovered;
             self.hovered = None;
+            self.update_ancestor_state_diff(old, None, ElementState::HOVER);
         }
         if self.state_contains(self.focused, child) {
+            let old = self.focused;
             self.focused = None;
             self.focus_visible = false;
+            self.update_ancestor_state_diff(old, None, ElementState::FOCUS_WITHIN);
+            if let Some(old_id) = old {
+                self.set_element_state(
+                    old_id,
+                    ElementState::FOCUS | ElementState::FOCUS_VISIBLE,
+                    false,
+                );
+            }
         }
         if self.state_contains(self.active, child) {
+            let old = self.active;
             self.active = None;
+            self.update_ancestor_state_diff(old, None, ElementState::ACTIVE);
         }
         if self.state_contains(self.text_selection.map(|selection| selection.0), child) {
             self.text_selection = None;
@@ -410,6 +649,10 @@ impl Document {
             self.style_revision = self.style_revision.wrapping_add(1);
             if let Some(parent) = parent {
                 self.mark_style(parent);
+                self.mark_node_dirty(
+                    parent,
+                    DirtyFlags::SELF_LAYOUT_DIRTY | DirtyFlags::PAINT_DIRTY,
+                );
             }
             if is_script {
                 self.script_revision = self.script_revision.wrapping_add(1);
@@ -435,6 +678,12 @@ impl Document {
             self.revision = self.revision.wrapping_add(1);
             self.style_revision = self.style_revision.wrapping_add(1);
             self.mark_style_dirty(id);
+            self.mark_node_dirty(
+                id,
+                DirtyFlags::SELF_STYLE_DIRTY
+                    | DirtyFlags::SELF_LAYOUT_DIRTY
+                    | DirtyFlags::PAINT_DIRTY,
+            );
         }
         self.arena.get_mut(id).map(|n| n.get_mut())
     }
