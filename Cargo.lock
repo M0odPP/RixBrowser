@@ -3798,6 +3798,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rix-js"
+version = "0.2.0-alpha.1"
+dependencies = [
+ "criterion",
+ "postcard",
+ "rix-core",
+ "rix-storage",
+ "serde",
+ "smallvec",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "rix-layout"
 version = "0.2.0-alpha.1"
 dependencies = [
