@@ -1,14 +1,22 @@
 use crate::error::{IpcError, Result};
 use crate::frame::{
-    decode_payload, encode_message, FrameDecoder, FLAG_NONE, MAX_CONTROL_FRAME_BYTES,
+    decode_payload, encode_message, FrameDecoder, FLAG_HAS_FDS, FLAG_NONE, MAX_CONTROL_FRAME_BYTES,
 };
+#[cfg(unix)]
+use crate::shmem::{recv_with_fds_raw, send_with_fds_raw};
 use bytes::BytesMut;
 use serde::{de::DeserializeOwned, Serialize};
+#[cfg(unix)]
+use std::collections::VecDeque;
 use std::marker::PhantomData;
+#[cfg(unix)]
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use tokio::io::Interest;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::{
@@ -18,6 +26,8 @@ use tokio::net::{
 
 const INITIAL_SEND_CAPACITY: usize = 8192;
 const COMPACT_SEND_THRESHOLD: usize = 256 * 1024;
+#[cfg(unix)]
+const FD_RECV_CHUNK_BYTES: usize = 8192;
 
 async fn write_frame<W, Tx>(
     writer: &mut W,
@@ -33,9 +43,74 @@ where
     let written = encode_message(msg, FLAG_NONE, max_frame_bytes, send_buf)?;
     writer.write_all(send_buf).await?;
     writer.flush().await?;
-    if send_buf.capacity() > COMPACT_SEND_THRESHOLD {
-        *send_buf = BytesMut::with_capacity(INITIAL_SEND_CAPACITY);
+    compact_send_buf(send_buf);
+    Ok(written)
+}
+
+#[cfg(unix)]
+trait UnixAsyncWrite: AsyncWrite + Unpin {
+    fn as_unix_stream(&self) -> &UnixStream;
+}
+
+#[cfg(unix)]
+impl UnixAsyncWrite for UnixStream {
+    fn as_unix_stream(&self) -> &UnixStream {
+        self
     }
+}
+
+#[cfg(unix)]
+impl UnixAsyncWrite for OwnedWriteHalf {
+    fn as_unix_stream(&self) -> &UnixStream {
+        self.as_ref()
+    }
+}
+
+#[cfg(unix)]
+async fn write_frame_with_fds<W, Tx>(
+    writer: &mut W,
+    send_buf: &mut BytesMut,
+    max_frame_bytes: usize,
+    msg: &Tx,
+    fds: &[BorrowedFd<'_>],
+) -> Result<usize>
+where
+    W: UnixAsyncWrite,
+    Tx: Serialize,
+{
+    if fds.is_empty() {
+        return write_frame(writer, send_buf, max_frame_bytes, msg).await;
+    }
+
+    send_buf.clear();
+    let written = encode_message(msg, FLAG_HAS_FDS, max_frame_bytes, send_buf)?;
+
+    let first_sent = {
+        let stream = writer.as_unix_stream();
+        loop {
+            stream.writable().await?;
+            match stream.try_io(Interest::WRITABLE, || {
+                send_with_fds_raw(stream.as_fd(), send_buf, fds)
+            }) {
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Ok(n) => break n,
+                Err(err) => {
+                    return Err(IpcError::FdPassingFailed(format!("sendmsg failed: {err}")))
+                }
+            }
+        }
+    };
+
+    if first_sent == 0 {
+        return Err(IpcError::FdPassingFailed(
+            "sendmsg wrote 0 bytes when sending SCM_RIGHTS".to_string(),
+        ));
+    }
+    if first_sent < send_buf.len() {
+        writer.write_all(&send_buf[first_sent..]).await?;
+    }
+    writer.flush().await?;
+    compact_send_buf(send_buf);
     Ok(written)
 }
 
@@ -45,7 +120,12 @@ where
     Rx: DeserializeOwned,
 {
     loop {
-        if let Some((_header, payload)) = decoder.try_decode()? {
+        if let Some((header, payload)) = decoder.try_decode()? {
+            if (header.flags & FLAG_HAS_FDS) != 0 {
+                return Err(IpcError::FdPassingFailed(
+                    "received frame with FLAG_HAS_FDS via non-FD recv()".to_string(),
+                ));
+            }
             let msg = decode_payload(&payload)?;
             return Ok(Some(msg));
         }
@@ -57,6 +137,62 @@ where
                 Ok(None)
             };
         }
+    }
+}
+
+#[cfg(unix)]
+async fn read_frame_with_fds<Rx>(
+    stream: &UnixStream,
+    decoder: &mut FrameDecoder,
+    pending_fd_batches: &mut VecDeque<Vec<OwnedFd>>,
+) -> Result<Option<(Rx, Vec<OwnedFd>)>>
+where
+    Rx: DeserializeOwned,
+{
+    loop {
+        if let Some((header, payload)) = decoder.try_decode()? {
+            let fds = if (header.flags & FLAG_HAS_FDS) != 0 {
+                pending_fd_batches.pop_front().ok_or_else(|| {
+                    IpcError::FdPassingFailed(
+                        "frame declared FLAG_HAS_FDS but no file descriptors arrived".to_string(),
+                    )
+                })?
+            } else {
+                Vec::new()
+            };
+            let msg = decode_payload(&payload)?;
+            return Ok(Some((msg, fds)));
+        }
+
+        let mut chunk = [0u8; FD_RECV_CHUNK_BYTES];
+        let bytes_read = loop {
+            stream.readable().await?;
+            match stream.try_io(Interest::READABLE, || {
+                recv_with_fds_raw(stream.as_fd(), &mut chunk)
+            }) {
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Ok((n, fds)) => {
+                    if !fds.is_empty() {
+                        pending_fd_batches.push_back(fds);
+                    }
+                    break n;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                    return Err(IpcError::FdPassingFailed(err.to_string()));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        };
+
+        if bytes_read > 0 {
+            decoder.buf_mut().extend_from_slice(&chunk[..bytes_read]);
+            continue;
+        }
+        return if decoder.has_partial_frame() {
+            Err(IpcError::UnexpectedEof)
+        } else {
+            Ok(None)
+        };
     }
 }
 
@@ -112,6 +248,8 @@ where
 pub struct FramedReceiver<R, Rx> {
     reader: R,
     decoder: FrameDecoder,
+    #[cfg(unix)]
+    pending_fd_batches: VecDeque<Vec<OwnedFd>>,
     _marker: PhantomData<fn() -> Rx>,
 }
 
@@ -124,6 +262,8 @@ impl<R, Rx> FramedReceiver<R, Rx> {
         Self {
             reader,
             decoder: FrameDecoder::with_max_frame_bytes(max_frame_bytes),
+            #[cfg(unix)]
+            pending_fd_batches: VecDeque::new(),
             _marker: PhantomData,
         }
     }
@@ -149,6 +289,8 @@ pub struct FramedChannel<S, Tx, Rx> {
     send_buf: BytesMut,
     decoder: FrameDecoder,
     max_frame_bytes: usize,
+    #[cfg(unix)]
+    pending_fd_batches: VecDeque<Vec<OwnedFd>>,
     _marker: PhantomData<fn(&Tx) -> Rx>,
 }
 
@@ -163,6 +305,8 @@ impl<S, Tx, Rx> FramedChannel<S, Tx, Rx> {
             send_buf: BytesMut::with_capacity(INITIAL_SEND_CAPACITY),
             decoder: FrameDecoder::with_max_frame_bytes(max_frame_bytes),
             max_frame_bytes,
+            #[cfg(unix)]
+            pending_fd_batches: VecDeque::new(),
             _marker: PhantomData,
         }
     }
@@ -218,9 +362,62 @@ impl<Tx, Rx> FramedChannel<UnixStream, Tx, Rx> {
         let receiver = FramedReceiver {
             reader: read_half,
             decoder: self.decoder,
+            pending_fd_batches: self.pending_fd_batches,
             _marker: PhantomData,
         };
         (sender, receiver)
+    }
+
+    pub async fn send_with_fds(&mut self, msg: &Tx, fds: &[BorrowedFd<'_>]) -> Result<usize>
+    where
+        Tx: Serialize,
+    {
+        write_frame_with_fds(
+            &mut self.stream,
+            &mut self.send_buf,
+            self.max_frame_bytes,
+            msg,
+            fds,
+        )
+        .await
+    }
+
+    pub async fn recv_with_fds(&mut self) -> Result<Option<(Rx, Vec<OwnedFd>)>>
+    where
+        Rx: DeserializeOwned,
+    {
+        read_frame_with_fds(
+            &self.stream,
+            &mut self.decoder,
+            &mut self.pending_fd_batches,
+        )
+        .await
+    }
+}
+
+#[cfg(unix)]
+impl<Tx: Serialize> UnixIpcSender<Tx> {
+    pub async fn send_with_fds(&mut self, msg: &Tx, fds: &[BorrowedFd<'_>]) -> Result<usize> {
+        write_frame_with_fds(
+            &mut self.writer,
+            &mut self.send_buf,
+            self.max_frame_bytes,
+            msg,
+            fds,
+        )
+        .await
+    }
+}
+
+#[cfg(unix)]
+impl<Rx: DeserializeOwned> UnixIpcReceiver<Rx> {
+    pub async fn recv_with_fds(&mut self) -> Result<Option<(Rx, Vec<OwnedFd>)>> {
+        read_frame_with_fds(
+            self.reader.as_ref(),
+            &mut self.decoder,
+            &mut self.pending_fd_batches,
+        )
+        .await
     }
 }
 
@@ -305,4 +502,10 @@ pub async fn connect_unix<Tx, Rx>(path: impl AsRef<Path>) -> Result<UnixIpcChann
 pub fn unix_pair<TxA, RxA>() -> Result<(UnixIpcChannel<TxA, RxA>, UnixIpcChannel<RxA, TxA>)> {
     let (a, b) = UnixStream::pair()?;
     Ok((FramedChannel::new(a), FramedChannel::new(b)))
+}
+
+fn compact_send_buf(buf: &mut BytesMut) {
+    if buf.capacity() > COMPACT_SEND_THRESHOLD {
+        *buf = BytesMut::with_capacity(INITIAL_SEND_CAPACITY);
+    }
 }

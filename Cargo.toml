@@ -32,6 +32,7 @@ redb = "2.3"
 tempfile = "3.17"
 bytes = "1.10"
 postcard = { version = "1.1", features = ["use-std"] }
+libc = "0.2"
 
 [profile.dev]
 debug = 1
