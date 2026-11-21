@@ -15,8 +15,12 @@ use rix_ipc::ImageId;
 use rix_text::{FontDatabase, FontFaceSet, FontId, TextShaper, TextShapingCache};
 
 use crate::bfc::layout_bfc_root;
-use crate::box_tree::{BoxId, BoxKind, BoxTree, FormControlKind, ReplacedKind, SvgPathEntry};
+use crate::box_tree::{
+    BoxId, BoxKind, BoxTree, FormControlKind, FormattingContextKind, ReplacedKind, SvgPathEntry,
+};
+use crate::flex_grid::{layout_flex_grid_container, RetainedTaffyContainer};
 use crate::ifc::{measure_ifc_min_max_content, resolve_line_height_px};
+use crate::table::layout_table;
 
 /// Four-sided resolved geometry insets (padding, border, or margin).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -403,10 +407,12 @@ struct FragmentCacheKey {
     cb_h_bits: u32,
 }
 
-/// Per-document retained layout cache storing unchanged subtree fragments.
+/// Per-document retained layout cache storing unchanged subtree fragments and
+/// retained per-container `taffy::TaffyTree` instances for Flex/Grid contexts.
 #[derive(Default)]
 pub struct LayoutCache {
     fragments: FastMap<FragmentCacheKey, Arc<Fragment>>,
+    pub(crate) taffy_containers: HashMap<u64, RetainedTaffyContainer>,
     pub cache_hits: usize,
     pub cache_misses: usize,
 }
@@ -424,6 +430,7 @@ impl LayoutCache {
 
     pub fn clear(&mut self) {
         self.fragments.clear();
+        self.taffy_containers.clear();
         self.cache_hits = 0;
         self.cache_misses = 0;
     }
@@ -551,6 +558,16 @@ pub fn layout_box(ctx: &mut LayoutContext<'_>, box_id: BoxId, space: ConstraintS
 
     let frag = match &b.kind {
         BoxKind::Replaced(replaced) => layout_replaced(b, replaced, space),
+        BoxKind::Table | BoxKind::AnonymousTable => layout_table(ctx, box_id, space),
+        BoxKind::Block {
+            formatting_context: FormattingContextKind::Flex | FormattingContextKind::Grid,
+        }
+        | BoxKind::InlineBlock {
+            formatting_context: FormattingContextKind::Flex | FormattingContextKind::Grid,
+        } => layout_flex_grid_container(ctx, box_id, space),
+        BoxKind::InlineBlock {
+            formatting_context: FormattingContextKind::Table,
+        } => layout_table(ctx, box_id, space),
         _ => layout_bfc_root(ctx, box_id, space),
     };
 
@@ -587,6 +604,9 @@ pub fn measure_intrinsic_widths(
         BoxKind::Text(text) => {
             let (min_w, max_w) = measure_text_intrinsic(ctx, text, &b.style);
             (min_w, max_w)
+        }
+        BoxKind::Table | BoxKind::AnonymousTable => {
+            crate::table::measure_table_intrinsic_widths(ctx, box_id, space)
         }
         _ => {
             if b.children.is_empty() {
