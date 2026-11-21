@@ -7,9 +7,12 @@ pub mod bigint;
 pub mod bytecode;
 pub mod cache;
 pub mod compiler;
+pub mod elements;
 pub mod heap;
+pub mod ic;
 pub mod lexer;
 pub mod parser;
+pub mod shape;
 pub mod string;
 pub mod value;
 
@@ -21,10 +24,16 @@ pub use bytecode::{
 };
 pub use cache::{BytecodeCache, CacheStatus};
 pub use compiler::{compile, compile_program, CompileError};
+pub use elements::{ElementsKind, ElementsStorage, SPARSE_GAP_THRESHOLD};
 pub use heap::{
-    GcCycleStats, GcHeap, Generation, HeapCell, JsObject, MajorGcPhase, RootStack, WeakHeapHandle,
-    WeakTable, DEFAULT_NURSERY_LIMIT, DEFAULT_OLD_GC_THRESHOLD,
+    BoundFunctionObject, ClosureObject, GcCycleStats, GcHeap, Generation, HeapCell, JsObject,
+    MajorGcPhase, ObjectKind, ProxyObject, RootStack, WeakHeapHandle, WeakTable,
+    DEFAULT_NURSERY_LIMIT, DEFAULT_OLD_GC_THRESHOLD,
 };
+pub use ic::{IcEntry, IcState, IcStats, IcTable, MegamorphicCache, POLYMORPHIC_MAX_ENTRIES};
 pub use parser::parse;
+pub use shape::{
+    DictProperty, PropertyAttrs, Shape, ShapeId, ShapeSlot, ShapeTable, DICTIONARY_TRANSITION_LIMIT,
+};
 pub use string::{JsString, PropertyKey, StringInterner};
 pub use value::{HeapHandle, JsValue, JsValueKind, SymbolId, CANONICAL_NAN_BITS};

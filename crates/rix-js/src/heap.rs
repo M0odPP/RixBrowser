@@ -9,6 +9,8 @@ use std::time::Instant;
 use smallvec::SmallVec;
 
 use crate::bigint::JsBigInt;
+use crate::elements::ElementsStorage;
+use crate::shape::{DictProperty, PropertyAttrs, ShapeId, ShapeTable, DICTIONARY_TRANSITION_LIMIT};
 use crate::string::{JsString, PropertyKey, StringInterner};
 use crate::value::{HeapHandle, JsValue, SymbolId};
 
@@ -35,28 +37,104 @@ pub enum MajorGcPhase {
     Marking,
 }
 
+/// Captured closure payload stored inside a function [`JsObject`].
+#[derive(Debug, Clone)]
+pub struct ClosureObject {
+    /// Compiled program identifier inside the VM.
+    pub program_id: u32,
+    /// Index into `CompiledProgram::functions`.
+    pub func_idx: u32,
+    /// Heap handles of [`JsObject`] upvalue cells (each holding its captured value in `slots[0]`).
+    pub upvalues: Vec<HeapHandle>,
+    /// Lexical `this` captured by arrow functions (`None` for ordinary functions).
+    pub bound_this: Option<JsValue>,
+    /// Class superclass constructor handle (if this function is a class constructor).
+    pub super_ctor: Option<HeapHandle>,
+    /// Optional instance field initializer `(program_id, func_idx)` for class constructors.
+    pub field_init: Option<(u32, u32)>,
+}
+
+/// Bound function created by `Function.prototype.bind`.
+#[derive(Debug, Clone)]
+pub struct BoundFunctionObject {
+    pub target: HeapHandle,
+    pub bound_this: JsValue,
+    pub bound_args: Vec<JsValue>,
+}
+
+/// ES6 `Proxy` wrapper (`new Proxy(target, handler)`).
+#[derive(Debug, Clone, Copy)]
+pub struct ProxyObject {
+    pub target: HeapHandle,
+    pub handler: HeapHandle,
+    pub revoked: bool,
+}
+
+/// Out-of-line RegExp pattern and flags payload.
+#[derive(Debug, Clone)]
+pub struct RegExpObject {
+    pub pattern: String,
+    pub flags: String,
+}
+
+/// Getter/setter handle pair for accessor properties.
+pub type AccessorPair = (Option<HeapHandle>, Option<HeapHandle>);
+
+/// Cold out-of-line object metadata (only allocated for dictionary-mode objects,
+/// accessors, or private fields so ordinary shaped objects stay compact in cache).
+#[derive(Debug, Clone, Default)]
+pub struct RareObjectData {
+    pub dict_props: HashMap<PropertyKey, DictProperty>,
+    pub dict_order: Vec<PropertyKey>,
+    pub accessors: HashMap<PropertyKey, AccessorPair>,
+    pub private_fields: HashMap<PropertyKey, JsValue>,
+}
+
+/// Specialized runtime tag for a [`JsObject`].
+#[derive(Debug, Clone, Default)]
+pub enum ObjectKind {
+    #[default]
+    Ordinary,
+    Array,
+    Closure(Box<ClosureObject>),
+    NativeFunction(u32),
+    BoundFunction(Box<BoundFunctionObject>),
+    Proxy(ProxyObject),
+    UpvalueCell,
+    RegExp(Box<RegExpObject>),
+    Host,
+}
+
 /// Mutable JS object backing storage inside the GC arena.
 #[derive(Debug, Clone)]
 pub struct JsObject {
     pub shape_id: u32,
+    pub transition_count: u16,
+    pub is_prototype: bool,
+    pub extensible: bool,
     pub prototype: Option<HeapHandle>,
     pub slots: Vec<JsValue>,
-    pub elements: Vec<JsValue>,
+    pub elements: ElementsStorage,
+    pub kind: ObjectKind,
+    pub rare: Option<Box<RareObjectData>>,
     pub extra_refs: SmallVec<[HeapHandle; 2]>,
     pub host_tag: Option<u64>,
-    pub extensible: bool,
 }
 
 impl Default for JsObject {
     fn default() -> Self {
         Self {
-            shape_id: 0,
+            shape_id: ShapeId::ROOT.0,
+            transition_count: 0,
+            is_prototype: false,
+            extensible: true,
             prototype: None,
             slots: Vec::new(),
-            elements: Vec::new(),
+            elements: ElementsStorage::default(),
+            kind: ObjectKind::Ordinary,
+            rare: None,
             extra_refs: SmallVec::new(),
             host_tag: None,
-            extensible: true,
         }
     }
 }
@@ -71,6 +149,77 @@ impl JsObject {
         }
     }
 
+    #[must_use]
+    pub fn with_kind(kind: ObjectKind, prototype: Option<HeapHandle>) -> Self {
+        Self {
+            kind,
+            prototype,
+            ..Self::default()
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn shape(&self) -> ShapeId {
+        ShapeId(self.shape_id)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_dictionary(&self) -> bool {
+        self.shape().is_dictionary()
+    }
+
+    #[inline]
+    pub fn rare_mut(&mut self) -> &mut RareObjectData {
+        self.rare.get_or_insert_with(Default::default)
+    }
+
+    /// Converts a shaped object into per-object dictionary mode preserving
+    /// insertion order, values, attributes, and accessor pairs.
+    pub fn to_dictionary_mode(&mut self, shapes: &ShapeTable) {
+        if self.is_dictionary() {
+            return;
+        }
+        let mut dict = HashMap::new();
+        let mut order = Vec::new();
+        if let Some(shape) = shapes.get(self.shape()) {
+            for &key in shape.keys() {
+                if let Some(slot) = shape.lookup(key) {
+                    let val = self
+                        .slots
+                        .get(slot.offset as usize)
+                        .copied()
+                        .unwrap_or(JsValue::UNDEFINED);
+                    let (getter, setter) = if slot.attrs.contains(PropertyAttrs::ACCESSOR) {
+                        self.rare
+                            .as_ref()
+                            .and_then(|r| r.accessors.get(&key).copied())
+                            .unwrap_or((None, None))
+                    } else {
+                        (None, None)
+                    };
+                    dict.insert(
+                        key,
+                        DictProperty {
+                            value: val,
+                            attrs: slot.attrs,
+                            getter,
+                            setter,
+                        },
+                    );
+                    order.push(key);
+                }
+            }
+        }
+        self.slots.clear();
+        let rare = self.rare_mut();
+        rare.accessors.clear();
+        rare.dict_props = dict;
+        rare.dict_order = order;
+        self.shape_id = ShapeId::DICTIONARY.0;
+    }
+
     pub fn trace_children(&self, mut visit: impl FnMut(HeapHandle)) {
         if let Some(proto) = self.prototype {
             visit(proto);
@@ -80,10 +229,66 @@ impl JsObject {
                 visit(h);
             }
         }
-        for &val in &self.elements {
-            if let Some(h) = val.as_heap_handle() {
-                visit(h);
+        self.elements.trace_children(&mut visit);
+        if let Some(rare) = &self.rare {
+            for prop in rare.dict_props.values() {
+                if let Some(h) = prop.value.as_heap_handle() {
+                    visit(h);
+                }
+                if let Some(g) = prop.getter {
+                    visit(g);
+                }
+                if let Some(s) = prop.setter {
+                    visit(s);
+                }
             }
+            for &(g, s) in rare.accessors.values() {
+                if let Some(h) = g {
+                    visit(h);
+                }
+                if let Some(h) = s {
+                    visit(h);
+                }
+            }
+            for &val in rare.private_fields.values() {
+                if let Some(h) = val.as_heap_handle() {
+                    visit(h);
+                }
+            }
+        }
+        match &self.kind {
+            ObjectKind::Closure(c) => {
+                for &uv in &c.upvalues {
+                    visit(uv);
+                }
+                if let Some(h) = c.bound_this.and_then(JsValue::as_heap_handle) {
+                    visit(h);
+                }
+                if let Some(sup) = c.super_ctor {
+                    visit(sup);
+                }
+            }
+            ObjectKind::BoundFunction(b) => {
+                visit(b.target);
+                if let Some(h) = b.bound_this.as_heap_handle() {
+                    visit(h);
+                }
+                for &arg in &b.bound_args {
+                    if let Some(h) = arg.as_heap_handle() {
+                        visit(h);
+                    }
+                }
+            }
+            ObjectKind::Proxy(p) => {
+                visit(p.target);
+                visit(p.handler);
+            }
+            ObjectKind::Ordinary
+            | ObjectKind::Array
+            | ObjectKind::NativeFunction(_)
+            | ObjectKind::UpvalueCell
+            | ObjectKind::RegExp(_)
+            | ObjectKind::Host => {}
         }
         for &extra in &self.extra_refs {
             visit(extra);
@@ -660,6 +865,303 @@ impl GcHeap {
         };
         obj.elements.push(value);
         self.write_barrier(owner, value);
+        true
+    }
+
+    /// Sets `owner.[[Prototype]] = proto`, marking `proto.is_prototype = true`,
+    /// bumping the prototype-chain epoch, and invoking the write barrier.
+    pub fn object_set_prototype(
+        &mut self,
+        owner: HeapHandle,
+        proto: Option<HeapHandle>,
+        shapes: &mut ShapeTable,
+    ) -> bool {
+        if let Some(p) = proto {
+            if let Some(proto_obj) = self.get_object_mut(p) {
+                proto_obj.is_prototype = true;
+            }
+        }
+        let Some(obj) = self.get_object_mut(owner) else {
+            return false;
+        };
+        obj.prototype = proto;
+        shapes.bump_prototype_epoch();
+        if let Some(p) = proto {
+            self.write_barrier(owner, JsValue::from_object(p));
+        }
+        true
+    }
+
+    /// Reads an own property value or descriptor from `owner` (shape or dictionary mode).
+    #[must_use]
+    pub fn object_get_own(
+        &self,
+        owner: HeapHandle,
+        key: PropertyKey,
+        shapes: &ShapeTable,
+    ) -> Option<DictProperty> {
+        let obj = self.get_object(owner)?;
+        if obj.is_dictionary() {
+            return obj.rare.as_ref()?.dict_props.get(&key).copied();
+        }
+        let slot = shapes.lookup(obj.shape(), key)?;
+        let value = obj
+            .slots
+            .get(slot.offset as usize)
+            .copied()
+            .unwrap_or(JsValue::UNDEFINED);
+        let (getter, setter) = if slot.attrs.contains(PropertyAttrs::ACCESSOR) {
+            obj.rare
+                .as_ref()
+                .and_then(|r| r.accessors.get(&key).copied())
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+        Some(DictProperty {
+            value,
+            attrs: slot.attrs,
+            getter,
+            setter,
+        })
+    }
+
+    /// Defines or updates an own data property on `owner`, advancing its Shape
+    /// transition tree or falling back automatically to dictionary mode when
+    /// `transition_count >= DICTIONARY_TRANSITION_LIMIT`.
+    ///
+    /// Returns `Some((prev_shape, new_shape, slot_offset))` when the object
+    /// remained in shaped mode (usable to populate an Inline Cache), or `None`
+    /// if stored in dictionary mode or rejected (`!extensible`).
+    pub fn object_define_data(
+        &mut self,
+        owner: HeapHandle,
+        key: PropertyKey,
+        value: JsValue,
+        attrs: PropertyAttrs,
+        shapes: &mut ShapeTable,
+    ) -> Option<(ShapeId, ShapeId, u32)> {
+        let is_proto = self.get_object(owner)?.is_prototype;
+        let cur_shape = self.get_object(owner)?.shape();
+        let extensible = self.get_object(owner)?.extensible;
+
+        if cur_shape.is_dictionary() {
+            let obj = self.get_object_mut(owner)?;
+            let rare = obj.rare_mut();
+            if let Some(entry) = rare.dict_props.get_mut(&key) {
+                entry.value = value;
+                entry.attrs = attrs;
+                entry.getter = None;
+                entry.setter = None;
+            } else {
+                if !extensible {
+                    return None;
+                }
+                rare.dict_props
+                    .insert(key, DictProperty::data(value, attrs));
+                rare.dict_order.push(key);
+            }
+            if is_proto {
+                shapes.bump_prototype_epoch();
+            }
+            self.write_barrier(owner, value);
+            return None;
+        }
+
+        // Existing shaped property update.
+        if let Some(existing) = shapes.lookup(cur_shape, key) {
+            let new_shape = if existing.attrs == attrs {
+                cur_shape
+            } else {
+                let (ns, _) = shapes.transition_add(cur_shape, key, attrs);
+                ns
+            };
+            let obj = self.get_object_mut(owner)?;
+            obj.shape_id = new_shape.0;
+            let idx = existing.offset as usize;
+            if idx >= obj.slots.len() {
+                obj.slots.resize(idx + 1, JsValue::UNDEFINED);
+            }
+            obj.slots[idx] = value;
+            if let Some(rare) = &mut obj.rare {
+                rare.accessors.remove(&key);
+            }
+            if is_proto {
+                shapes.bump_prototype_epoch();
+            }
+            self.write_barrier(owner, value);
+            return Some((cur_shape, new_shape, existing.offset));
+        }
+
+        // Adding a new own property.
+        if !extensible {
+            return None;
+        }
+        let tc = self.get_object(owner)?.transition_count;
+        if tc >= DICTIONARY_TRANSITION_LIMIT {
+            let obj = self.get_object_mut(owner)?;
+            obj.to_dictionary_mode(shapes);
+            let rare = obj.rare_mut();
+            rare.dict_props
+                .insert(key, DictProperty::data(value, attrs));
+            rare.dict_order.push(key);
+            if is_proto {
+                shapes.bump_prototype_epoch();
+            }
+            self.write_barrier(owner, value);
+            return None;
+        }
+
+        let (new_shape, offset) = shapes.transition_add(cur_shape, key, attrs);
+        let obj = self.get_object_mut(owner)?;
+        obj.shape_id = new_shape.0;
+        obj.transition_count = obj.transition_count.saturating_add(1);
+        let idx = offset as usize;
+        if idx >= obj.slots.len() {
+            obj.slots.resize(idx + 1, JsValue::UNDEFINED);
+        }
+        obj.slots[idx] = value;
+        if is_proto {
+            shapes.bump_prototype_epoch();
+        }
+        self.write_barrier(owner, value);
+        Some((cur_shape, new_shape, offset))
+    }
+
+    /// Defines an own getter and/or setter accessor property on `owner`.
+    pub fn object_define_accessor(
+        &mut self,
+        owner: HeapHandle,
+        key: PropertyKey,
+        getter: Option<HeapHandle>,
+        setter: Option<HeapHandle>,
+        attrs: PropertyAttrs,
+        shapes: &mut ShapeTable,
+    ) -> bool {
+        let Some(obj_ref) = self.get_object(owner) else {
+            return false;
+        };
+        let is_proto = obj_ref.is_prototype;
+        let cur_shape = obj_ref.shape();
+        let acc_attrs = attrs.union(PropertyAttrs::ACCESSOR);
+
+        if cur_shape.is_dictionary() {
+            let Some(obj) = self.get_object_mut(owner) else {
+                return false;
+            };
+            let rare = obj.rare_mut();
+            let entry = rare
+                .dict_props
+                .entry(key)
+                .or_insert_with(|| DictProperty::accessor(None, None, acc_attrs));
+            entry.attrs = acc_attrs;
+            if getter.is_some() {
+                entry.getter = getter;
+            }
+            if setter.is_some() {
+                entry.setter = setter;
+            }
+            if !rare.dict_order.contains(&key) {
+                rare.dict_order.push(key);
+            }
+        } else {
+            let (new_shape, offset) = shapes.transition_add(cur_shape, key, acc_attrs);
+            let Some(obj) = self.get_object_mut(owner) else {
+                return false;
+            };
+            obj.shape_id = new_shape.0;
+            let idx = offset as usize;
+            if idx >= obj.slots.len() {
+                obj.slots.resize(idx + 1, JsValue::UNDEFINED);
+            }
+            obj.slots[idx] = JsValue::UNDEFINED;
+            let rare = obj.rare_mut();
+            let pair = rare.accessors.entry(key).or_insert((None, None));
+            if getter.is_some() {
+                pair.0 = getter;
+            }
+            if setter.is_some() {
+                pair.1 = setter;
+            }
+        }
+
+        if is_proto {
+            shapes.bump_prototype_epoch();
+        }
+        if let Some(g) = getter {
+            self.write_barrier(owner, JsValue::from_object(g));
+        }
+        if let Some(s) = setter {
+            self.write_barrier(owner, JsValue::from_object(s));
+        }
+        true
+    }
+
+    /// Deletes own property `key` from `owner` (respecting `CONFIGURABLE`).
+    /// Uses fast tail rollback if deleting the last added property, or transitions
+    /// cleanly into dictionary mode otherwise.
+    pub fn object_delete_own(
+        &mut self,
+        owner: HeapHandle,
+        key: PropertyKey,
+        shapes: &mut ShapeTable,
+    ) -> bool {
+        let Some(obj_ref) = self.get_object(owner) else {
+            return true;
+        };
+        let is_proto = obj_ref.is_prototype;
+        let cur_shape = obj_ref.shape();
+
+        if cur_shape.is_dictionary() {
+            let Some(obj) = self.get_object_mut(owner) else {
+                return true;
+            };
+            if let Some(rare) = &mut obj.rare {
+                if let Some(prop) = rare.dict_props.get(&key) {
+                    if !prop.attrs.contains(PropertyAttrs::CONFIGURABLE) {
+                        return false;
+                    }
+                    rare.dict_props.remove(&key);
+                    rare.dict_order.retain(|&k| k != key);
+                    if is_proto {
+                        shapes.bump_prototype_epoch();
+                    }
+                }
+            }
+            return true;
+        }
+
+        let Some(slot) = shapes.lookup(cur_shape, key) else {
+            return true;
+        };
+        if !slot.attrs.contains(PropertyAttrs::CONFIGURABLE) {
+            return false;
+        }
+
+        if let Some((parent_shape, offset)) = shapes.try_tail_delete(cur_shape, key) {
+            if let Some(obj) = self.get_object_mut(owner) {
+                obj.shape_id = parent_shape.0;
+                obj.transition_count = obj.transition_count.saturating_add(1);
+                if (offset as usize) + 1 == obj.slots.len() {
+                    obj.slots.pop();
+                } else if (offset as usize) < obj.slots.len() {
+                    obj.slots[offset as usize] = JsValue::UNDEFINED;
+                }
+                if let Some(rare) = &mut obj.rare {
+                    rare.accessors.remove(&key);
+                }
+            }
+        } else if let Some(obj) = self.get_object_mut(owner) {
+            obj.to_dictionary_mode(shapes);
+            if let Some(rare) = &mut obj.rare {
+                rare.dict_props.remove(&key);
+                rare.dict_order.retain(|&k| k != key);
+            }
+        }
+
+        if is_proto {
+            shapes.bump_prototype_epoch();
+        }
         true
     }
 
