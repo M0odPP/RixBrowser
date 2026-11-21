@@ -1,0 +1,24 @@
+[package]
+name = "rix-css"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+rix-core = { path = "../rix-core" }
+rix-dom = { path = "../rix-dom" }
+lightningcss.workspace = true
+selectors.workspace = true
+cssparser.workspace = true
+precomputed-hash.workspace = true
+smallvec.workspace = true
+bitflags.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+rix-html = { path = "../rix-html" }
+criterion.workspace = true
