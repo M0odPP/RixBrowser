@@ -7,6 +7,7 @@ members = [
     "crates/rix-dom",
     "crates/rix-html",
     "crates/rix-text",
+    "crates/rix-ipc",
 ]
 
 [workspace.package]
@@ -29,6 +30,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio = { version = "1.43", features = ["full"] }
 redb = "2.3"
 tempfile = "3.17"
+bytes = "1.10"
+postcard = { version = "1.1", features = ["use-std"] }
 
 [profile.dev]
 debug = 1
