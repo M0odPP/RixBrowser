@@ -1279,7 +1279,11 @@ fn install_symbol(vm: &mut JsVm) {
         "toPrimitive",
         "species",
     ] {
-        let id = vm.heap.alloc_symbol(Some(format!("Symbol.{well_known}")));
+        let id = if well_known == "iterator" {
+            vm.sym_iterator
+        } else {
+            vm.heap.alloc_symbol(Some(format!("Symbol.{well_known}")))
+        };
         vm.symbol_descriptions
             .insert(id, format!("Symbol.{well_known}"));
         let k = vm.heap.intern_key(well_known);
@@ -1942,14 +1946,24 @@ fn array_from(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue
             vm.heap.object_push_element(out, v);
         }
     } else if let Some(h) = src.as_object() {
-        let len_val = vm.get_property_by_key(h, vm.key_length)?;
-        let len = vm.to_u32(len_val)?;
-        for i in 0..len {
-            let mut v = vm.get_elem(src, JsValue::from_i32(i as i32))?;
-            if let Some(cb) = map_fn {
-                v = vm.call_value(cb, JsValue::UNDEFINED, &[v, JsValue::from_i32(i as i32)])?;
+        let iter_m = vm.get_property_by_key(h, vm.key_symbol_iterator)?;
+        if !iter_m.is_undefined() && !iter_m.is_null() {
+            for (i, mut v) in vm.collect_iterable(src)?.into_iter().enumerate() {
+                if let Some(cb) = map_fn {
+                    v = vm.call_value(cb, JsValue::UNDEFINED, &[v, JsValue::from_i32(i as i32)])?;
+                }
+                vm.heap.object_push_element(out, v);
             }
-            vm.heap.object_push_element(out, v);
+        } else {
+            let len_val = vm.get_property_by_key(h, vm.key_length)?;
+            let len = vm.to_u32(len_val)?;
+            for i in 0..len {
+                let mut v = vm.get_elem(src, JsValue::from_i32(i as i32))?;
+                if let Some(cb) = map_fn {
+                    v = vm.call_value(cb, JsValue::UNDEFINED, &[v, JsValue::from_i32(i as i32)])?;
+                }
+                vm.heap.object_push_element(out, v);
+            }
         }
     }
     Ok(JsValue::from_object(out))

@@ -2,7 +2,7 @@
 //! write barriers, root stack discipline, and leak-free weak handle tables
 //! (`WeakHeapHandle` / `WeakTable`) ready for DOM wrappers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::time::Instant;
 
@@ -77,6 +77,79 @@ pub struct RegExpObject {
     pub flags: String,
 }
 
+/// Element type tag for ES6 TypedArrays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TypedArrayKind {
+    Int8 = 0,
+    Uint8 = 1,
+    Uint8Clamped = 2,
+    Int16 = 3,
+    Uint16 = 4,
+    Int32 = 5,
+    Uint32 = 6,
+    Float32 = 7,
+    Float64 = 8,
+}
+
+impl TypedArrayKind {
+    pub const ALL: [Self; 9] = [
+        Self::Int8,
+        Self::Uint8,
+        Self::Uint8Clamped,
+        Self::Int16,
+        Self::Uint16,
+        Self::Int32,
+        Self::Uint32,
+        Self::Float32,
+        Self::Float64,
+    ];
+
+    #[inline]
+    #[must_use]
+    pub const fn bytes_per_element(self) -> usize {
+        match self {
+            Self::Int8 | Self::Uint8 | Self::Uint8Clamped => 1,
+            Self::Int16 | Self::Uint16 => 2,
+            Self::Int32 | Self::Uint32 | Self::Float32 => 4,
+            Self::Float64 => 8,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Int8 => "Int8Array",
+            Self::Uint8 => "Uint8Array",
+            Self::Uint8Clamped => "Uint8ClampedArray",
+            Self::Int16 => "Int16Array",
+            Self::Uint16 => "Uint16Array",
+            Self::Int32 => "Int32Array",
+            Self::Uint32 => "Uint32Array",
+            Self::Float32 => "Float32Array",
+            Self::Float64 => "Float64Array",
+        }
+    }
+}
+
+/// `DataView` view over an [`ObjectKind::ArrayBuffer`].
+#[derive(Debug, Clone, Copy)]
+pub struct DataViewObject {
+    pub buffer: HeapHandle,
+    pub byte_offset: u32,
+    pub byte_length: u32,
+}
+
+/// `TypedArray` view over an [`ObjectKind::ArrayBuffer`].
+#[derive(Debug, Clone, Copy)]
+pub struct TypedArrayObject {
+    pub kind: TypedArrayKind,
+    pub buffer: HeapHandle,
+    pub byte_offset: u32,
+    pub length: u32,
+}
+
 /// Getter/setter handle pair for accessor properties.
 pub type AccessorPair = (Option<HeapHandle>, Option<HeapHandle>);
 
@@ -103,6 +176,14 @@ pub enum ObjectKind {
     UpvalueCell,
     RegExp(Box<RegExpObject>),
     Date(f64),
+    Map(Box<Vec<(JsValue, JsValue)>>),
+    Set(Box<Vec<JsValue>>),
+    WeakMap(Box<HashMap<HeapHandle, JsValue>>),
+    WeakSet(Box<HashSet<HeapHandle>>),
+    WeakRef(HeapHandle),
+    ArrayBuffer(Box<Vec<u8>>),
+    DataView(DataViewObject),
+    TypedArray(TypedArrayObject),
     Host,
 }
 
@@ -284,12 +365,41 @@ impl JsObject {
                 visit(p.target);
                 visit(p.handler);
             }
+            ObjectKind::Map(entries) => {
+                for &(k, v) in entries.iter() {
+                    if let Some(h) = k.as_heap_handle() {
+                        visit(h);
+                    }
+                    if let Some(h) = v.as_heap_handle() {
+                        visit(h);
+                    }
+                }
+            }
+            ObjectKind::Set(entries) => {
+                for &v in entries.iter() {
+                    if let Some(h) = v.as_heap_handle() {
+                        visit(h);
+                    }
+                }
+            }
+            ObjectKind::DataView(dv) => {
+                visit(dv.buffer);
+            }
+            ObjectKind::TypedArray(ta) => {
+                visit(ta.buffer);
+            }
+            // WeakMap, WeakSet, and WeakRef do NOT strongly trace weak keys or targets.
+            // WeakMap ephemeron values are traced during GC ephemeron resolution when keys are live.
             ObjectKind::Ordinary
             | ObjectKind::Array
             | ObjectKind::NativeFunction(_)
             | ObjectKind::UpvalueCell
             | ObjectKind::RegExp(_)
             | ObjectKind::Date(_)
+            | ObjectKind::WeakMap(_)
+            | ObjectKind::WeakSet(_)
+            | ObjectKind::WeakRef(_)
+            | ObjectKind::ArrayBuffer(_)
             | ObjectKind::Host => {}
         }
         for &extra in &self.extra_refs {
@@ -488,6 +598,7 @@ pub struct GcHeap {
     nursery: Vec<u32>,
     remembered_set: Vec<u32>,
     gray_worklist: Vec<u32>,
+    weak_collections: Vec<HeapHandle>,
     interner: StringInterner,
     interned_string_handles: HashMap<PropertyKey, HeapHandle>,
     symbols: Vec<Option<String>>,
@@ -523,6 +634,7 @@ impl GcHeap {
             nursery: Vec::with_capacity(nursery_limit.min(16_384)),
             remembered_set: Vec::new(),
             gray_worklist: Vec::new(),
+            weak_collections: Vec::new(),
             interner: StringInterner::new(),
             interned_string_handles: HashMap::new(),
             symbols: Vec::new(),
@@ -651,7 +763,12 @@ impl GcHeap {
     }
 
     pub fn alloc_object(&mut self, obj: JsObject) -> HeapHandle {
-        self.alloc_cell(HeapCell::Object(obj), Generation::Young)
+        let track_weak = matches!(obj.kind, ObjectKind::WeakMap(_) | ObjectKind::WeakSet(_));
+        let h = self.alloc_cell(HeapCell::Object(obj), Generation::Young);
+        if track_weak {
+            self.weak_collections.push(h);
+        }
+        h
     }
 
     pub fn alloc_empty_object(&mut self) -> HeapHandle {
@@ -1216,14 +1333,58 @@ impl GcHeap {
             }
         }
 
-        // 3. Trace transitive Young survivors.
-        while let Some(idx) = worklist.pop() {
-            scratch.clear();
-            if let Some(cell) = &self.slots[idx as usize].cell {
-                cell.trace_children(|h| scratch.push(h));
+        // 3. Trace transitive Young survivors + WeakMap ephemerons.
+        loop {
+            while let Some(idx) = worklist.pop() {
+                scratch.clear();
+                if let Some(cell) = &self.slots[idx as usize].cell {
+                    cell.trace_children(|h| scratch.push(h));
+                }
+                for &child in &scratch {
+                    self.mark_if_young(child, epoch, &mut worklist);
+                }
             }
-            for &child in &scratch {
-                self.mark_if_young(child, epoch, &mut worklist);
+            if self.weak_collections.is_empty() {
+                break;
+            }
+            let mut ephem_marked = false;
+            for wi in 0..self.weak_collections.len() {
+                let wh = self.weak_collections[wi];
+                let Some(s) = self.slots.get(wh.index as usize) else {
+                    continue;
+                };
+                if s.cell.is_none()
+                    || s.generation != wh.generation
+                    || (s.gen_space == Generation::Young && s.mark_epoch != epoch)
+                {
+                    continue;
+                }
+                let pairs: Vec<(HeapHandle, JsValue)> = match &s.cell {
+                    Some(HeapCell::Object(o)) => match &o.kind {
+                        ObjectKind::WeakMap(m) => m.iter().map(|(&k, &v)| (k, v)).collect(),
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                for (k, v) in pairs {
+                    let key_live = self.slots.get(k.index as usize).is_some_and(|ks| {
+                        ks.cell.is_some()
+                            && ks.generation == k.generation
+                            && (ks.gen_space == Generation::Old || ks.mark_epoch == epoch)
+                    });
+                    if key_live {
+                        if let Some(vh) = v.as_heap_handle() {
+                            let before = worklist.len();
+                            self.mark_if_young(vh, epoch, &mut worklist);
+                            if worklist.len() > before {
+                                ephem_marked = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !ephem_marked {
+                break;
             }
         }
 
@@ -1266,6 +1427,7 @@ impl GcHeap {
 
         self.nursery.truncate(write_pos);
         self.remembered_set = kept_remembered;
+        self.prune_dead_weak_collections();
         self.minor_collections += 1;
 
         GcCycleStats {
@@ -1353,6 +1515,46 @@ impl GcHeap {
         }
         while !self.step_major_marking(usize::MAX) {}
 
+        // Ephemeron fixed-point loop for live WeakMaps: if both the WeakMap and a key
+        // are marked live in this major epoch, mark the entry's value too.
+        while !self.weak_collections.is_empty() {
+            let mut ephem_marked = false;
+            for wi in 0..self.weak_collections.len() {
+                let wh = self.weak_collections[wi];
+                let Some(s) = self.slots.get(wh.index as usize) else {
+                    continue;
+                };
+                if s.cell.is_none() || s.generation != wh.generation || s.mark_epoch != epoch {
+                    continue;
+                }
+                let pairs: Vec<(HeapHandle, JsValue)> = match &s.cell {
+                    Some(HeapCell::Object(o)) => match &o.kind {
+                        ObjectKind::WeakMap(m) => m.iter().map(|(&k, &v)| (k, v)).collect(),
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                for (k, v) in pairs {
+                    let key_marked = self.slots.get(k.index as usize).is_some_and(|ks| {
+                        ks.cell.is_some() && ks.generation == k.generation && ks.mark_epoch == epoch
+                    });
+                    if key_marked {
+                        if let Some(vh) = v.as_heap_handle() {
+                            let before = self.gray_worklist.len();
+                            self.mark_any(vh, epoch);
+                            if self.gray_worklist.len() > before {
+                                ephem_marked = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !ephem_marked {
+                break;
+            }
+            while !self.step_major_marking(usize::MAX) {}
+        }
+
         let mut reclaimed = 0usize;
         let mut promoted = 0usize;
         let mut next_nursery = Vec::new();
@@ -1388,6 +1590,7 @@ impl GcHeap {
         }
         next_nursery.clear();
         self.nursery = next_nursery;
+        self.prune_dead_weak_collections();
         self.major_phase = MajorGcPhase::Idle;
         self.major_collections += 1;
         self.old_gc_threshold = (self.live_old * 2).max(DEFAULT_OLD_GC_THRESHOLD);
@@ -1408,6 +1611,48 @@ impl GcHeap {
         let mut stats = self.finish_major_sweep(&[]);
         stats.pause_us = start.elapsed().as_micros() as u64;
         stats
+    }
+
+    fn prune_dead_weak_collections(&mut self) {
+        if self.weak_collections.is_empty() {
+            return;
+        }
+        let handles = std::mem::take(&mut self.weak_collections);
+        let mut kept = Vec::with_capacity(handles.len());
+        for wh in handles {
+            if !self.is_alive(wh) {
+                continue;
+            }
+            kept.push(wh);
+            // Collect dead keys first to satisfy borrow checker.
+            let dead_keys: Vec<HeapHandle> = match self.get_object(wh).map(|o| &o.kind) {
+                Some(ObjectKind::WeakMap(m)) => {
+                    m.keys().copied().filter(|&k| !self.is_alive(k)).collect()
+                }
+                Some(ObjectKind::WeakSet(s)) => {
+                    s.iter().copied().filter(|&k| !self.is_alive(k)).collect()
+                }
+                _ => Vec::new(),
+            };
+            if !dead_keys.is_empty() {
+                if let Some(obj) = self.get_object_mut(wh) {
+                    match &mut obj.kind {
+                        ObjectKind::WeakMap(m) => {
+                            for k in dead_keys {
+                                m.remove(&k);
+                            }
+                        }
+                        ObjectKind::WeakSet(s) => {
+                            for k in dead_keys {
+                                s.remove(&k);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.weak_collections = kept;
     }
 
     fn mark_any(&mut self, h: HeapHandle, epoch: u32) {

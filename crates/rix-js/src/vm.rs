@@ -13,7 +13,9 @@ use crate::bytecode::{
     SerializableMethodKind, WIDE_IC_SENTINEL,
 };
 use crate::compiler::{compile, CompileError};
-use crate::heap::{ClosureObject, GcHeap, JsObject, ObjectKind, ProxyObject, RegExpObject};
+use crate::heap::{
+    ClosureObject, GcCycleStats, GcHeap, JsObject, ObjectKind, ProxyObject, RegExpObject,
+};
 use crate::ic::{IcEntry, IcStats, IcTable, MegamorphicCache};
 use crate::shape::{PropertyAttrs, ShapeId, ShapeTable};
 use crate::string::PropertyKey;
@@ -98,6 +100,17 @@ pub struct JsVm {
     pub boolean_proto: HeapHandle,
     pub regexp_proto: HeapHandle,
     pub date_proto: HeapHandle,
+    pub map_proto: HeapHandle,
+    pub set_proto: HeapHandle,
+    pub weakmap_proto: HeapHandle,
+    pub weakset_proto: HeapHandle,
+    pub weakref_proto: HeapHandle,
+    pub array_buffer_proto: HeapHandle,
+    pub data_view_proto: HeapHandle,
+    pub typed_array_proto: HeapHandle,
+    pub typed_array_protos: [HeapHandle; 9],
+    pub sym_iterator: SymbolId,
+    pub key_symbol_iterator: PropertyKey,
     pub symbol_registry: HashMap<String, SymbolId>,
     pub symbol_descriptions: HashMap<SymbolId, String>,
     pub rng_state: u64,
@@ -188,6 +201,26 @@ impl JsVm {
         heap.object_set_prototype(date_proto, Some(object_proto), &mut shapes);
         heap.get_object_mut(date_proto).unwrap().is_prototype = true;
 
+        let make_proto = |heap: &mut GcHeap, shapes: &mut ShapeTable, parent: HeapHandle| {
+            let p = heap.alloc_empty_object();
+            heap.object_set_prototype(p, Some(parent), shapes);
+            heap.get_object_mut(p).unwrap().is_prototype = true;
+            p
+        };
+        let map_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let set_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let weakmap_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let weakset_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let weakref_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let array_buffer_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let data_view_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let typed_array_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let typed_array_protos =
+            std::array::from_fn(|_| make_proto(&mut heap, &mut shapes, typed_array_proto));
+
+        let sym_iterator = heap.alloc_symbol(Some("Symbol.iterator".into()));
+        let key_symbol_iterator = heap.intern_key(&format!("Symbol({})", sym_iterator.0));
+
         let global = heap.alloc_empty_object();
         heap.object_set_prototype(global, Some(object_proto), &mut shapes);
 
@@ -226,6 +259,17 @@ impl JsVm {
             boolean_proto,
             regexp_proto,
             date_proto,
+            map_proto,
+            set_proto,
+            weakmap_proto,
+            weakset_proto,
+            weakref_proto,
+            array_buffer_proto,
+            data_view_proto,
+            typed_array_proto,
+            typed_array_protos,
+            sym_iterator,
+            key_symbol_iterator,
             symbol_registry: HashMap::new(),
             symbol_descriptions: HashMap::new(),
             rng_state: 0x9E37_79B9_7F4A_7C15,
@@ -265,7 +309,73 @@ impl JsVm {
         };
         crate::vm_builtins::install_core_intrinsics(&mut vm);
         crate::builtins_primitives::install_primitive_builtins(&mut vm);
+        crate::builtins_collections::install_collection_builtins(&mut vm);
         vm
+    }
+
+    /// Collects every active VM root into a flat vector for generational or major GC.
+    #[must_use]
+    pub fn collect_roots(&self) -> Vec<JsValue> {
+        let mut roots = Vec::with_capacity(
+            64 + self.registers.len() + self.frames.len() * 4 + self.open_upvalues.len(),
+        );
+        for h in [
+            self.global,
+            self.object_proto,
+            self.function_proto,
+            self.array_proto,
+            self.error_proto,
+            self.string_proto,
+            self.number_proto,
+            self.boolean_proto,
+            self.regexp_proto,
+            self.date_proto,
+            self.map_proto,
+            self.set_proto,
+            self.weakmap_proto,
+            self.weakset_proto,
+            self.weakref_proto,
+            self.array_buffer_proto,
+            self.data_view_proto,
+            self.typed_array_proto,
+        ] {
+            roots.push(JsValue::from_object(h));
+        }
+        for &h in &self.typed_array_protos {
+            roots.push(JsValue::from_object(h));
+        }
+        roots.extend_from_slice(&self.registers);
+        for f in &self.frames {
+            roots.push(f.this_val);
+            roots.push(JsValue::from_object(f.callee));
+            if let Some(c) = f.construct_obj {
+                roots.push(JsValue::from_object(c));
+            }
+            roots.push(f.new_target);
+        }
+        for &(_, uv) in &self.open_upvalues {
+            roots.push(JsValue::from_object(uv));
+        }
+        for &w in &self.with_stack {
+            roots.push(JsValue::from_object(w));
+        }
+        for (&iter_h, state) in &self.iterators {
+            roots.push(JsValue::from_object(iter_h));
+            match state {
+                IteratorState::Array { arr, .. } => roots.push(JsValue::from_object(*arr)),
+                IteratorState::Custom { iter_obj } => roots.push(JsValue::from_object(*iter_obj)),
+                IteratorState::String { .. } | IteratorState::Keys { .. } => {}
+            }
+        }
+        roots
+    }
+
+    /// Triggers a full stop-the-world Major GC across all live VM roots.
+    pub fn collect_garbage(&mut self) -> GcCycleStats {
+        let roots = self.collect_roots();
+        let stats = self.heap.collect_major(&roots);
+        self.iterators.retain(|&h, _| self.heap.is_alive(h));
+        stats
     }
 
     /// Allocates a `RegExp` object with `RegExp.prototype` and standard metadata properties.
@@ -2422,6 +2532,12 @@ impl JsVm {
             return self.proxy_get(p, k, obj_val);
         }
         if let Some(idx) = self.as_array_index(key_val) {
+            if let Some(ObjectKind::TypedArray(ta)) = self.heap.get_object(obj).map(|o| &o.kind) {
+                let ta = *ta;
+                return Ok(crate::builtins_collections::typed_array_read_element(
+                    self, ta, idx,
+                ));
+            }
             if let Some(val) = self.heap.get_object(obj).and_then(|o| o.elements.get(idx)) {
                 return Ok(val);
             }
@@ -2447,6 +2563,11 @@ impl JsVm {
             return Ok(());
         }
         if let Some(idx) = self.as_array_index(key_val) {
+            if let Some(ObjectKind::TypedArray(ta)) = self.heap.get_object(obj).map(|o| &o.kind) {
+                let ta = *ta;
+                crate::builtins_collections::typed_array_write_element(self, ta, idx, val)?;
+                return Ok(());
+            }
             if let Some(o) = self.heap.get_object_mut(obj) {
                 o.elements.set(idx, val);
             }
@@ -2696,6 +2817,17 @@ impl JsVm {
                 .insert(h, IteratorState::Array { arr: obj, index: 0 });
             return Ok(h);
         }
+        // Check `[Symbol.iterator]()` protocol (Map, Set, TypedArray, generators, user iterables).
+        let iter_method = self.get_property_by_key(obj, self.key_symbol_iterator)?;
+        if !iter_method.is_undefined() && !iter_method.is_null() {
+            let iter_res = self.call_value(iter_method, JsValue::from_object(obj), &[])?;
+            let Some(iter_obj) = iter_res.as_object() else {
+                return Err(self.type_error("Result of Symbol.iterator method is not an object"));
+            };
+            let h = self.alloc_ordinary_object();
+            self.iterators.insert(h, IteratorState::Custom { iter_obj });
+            return Ok(h);
+        }
         if self.has_property_by_key(obj, self.key_next)? {
             let h = self.alloc_ordinary_object();
             self.iterators
@@ -2764,7 +2896,7 @@ impl JsVm {
         }
     }
 
-    fn collect_iterable(&mut self, iterable: JsValue) -> Result<Vec<JsValue>, JsException> {
+    pub fn collect_iterable(&mut self, iterable: JsValue) -> Result<Vec<JsValue>, JsException> {
         let iter = self.create_iterator(iterable)?;
         let iter_val = JsValue::from_object(iter);
         let mut out = Vec::new();
@@ -3146,6 +3278,17 @@ impl JsVm {
                                     self.value_to_rust_string(v)
                                 }
                                 _ => String::new(),
+                            })
+                            .collect();
+                        return parts.join(",");
+                    }
+                    if let ObjectKind::TypedArray(ta) = o.kind {
+                        let parts: Vec<String> = (0..ta.length)
+                            .map(|i| {
+                                let v = crate::builtins_collections::typed_array_read_element(
+                                    self, ta, i,
+                                );
+                                self.value_to_rust_string(v)
                             })
                             .collect();
                         return parts.join(",");
