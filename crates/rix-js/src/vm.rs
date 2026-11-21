@@ -17,7 +17,7 @@ use crate::heap::{ClosureObject, GcHeap, JsObject, ObjectKind, ProxyObject, RegE
 use crate::ic::{IcEntry, IcStats, IcTable, MegamorphicCache};
 use crate::shape::{PropertyAttrs, ShapeId, ShapeTable};
 use crate::string::PropertyKey;
-use crate::value::{HeapHandle, JsValue, JsValueKind};
+use crate::value::{HeapHandle, JsValue, JsValueKind, SymbolId};
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
@@ -96,6 +96,11 @@ pub struct JsVm {
     pub string_proto: HeapHandle,
     pub number_proto: HeapHandle,
     pub boolean_proto: HeapHandle,
+    pub regexp_proto: HeapHandle,
+    pub date_proto: HeapHandle,
+    pub symbol_registry: HashMap<String, SymbolId>,
+    pub symbol_descriptions: HashMap<SymbolId, String>,
+    pub rng_state: u64,
     programs: Vec<CompiledProgram>,
     ic_tables: Vec<Vec<IcTable>>,
     const_keys: Vec<Vec<Vec<Option<PropertyKey>>>>,
@@ -175,6 +180,14 @@ impl JsVm {
         heap.object_set_prototype(boolean_proto, Some(object_proto), &mut shapes);
         heap.get_object_mut(boolean_proto).unwrap().is_prototype = true;
 
+        let regexp_proto = heap.alloc_empty_object();
+        heap.object_set_prototype(regexp_proto, Some(object_proto), &mut shapes);
+        heap.get_object_mut(regexp_proto).unwrap().is_prototype = true;
+
+        let date_proto = heap.alloc_empty_object();
+        heap.object_set_prototype(date_proto, Some(object_proto), &mut shapes);
+        heap.get_object_mut(date_proto).unwrap().is_prototype = true;
+
         let global = heap.alloc_empty_object();
         heap.object_set_prototype(global, Some(object_proto), &mut shapes);
 
@@ -211,6 +224,11 @@ impl JsVm {
             string_proto,
             number_proto,
             boolean_proto,
+            regexp_proto,
+            date_proto,
+            symbol_registry: HashMap::new(),
+            symbol_descriptions: HashMap::new(),
+            rng_state: 0x9E37_79B9_7F4A_7C15,
             programs: Vec::new(),
             ic_tables: Vec::new(),
             const_keys: Vec::new(),
@@ -246,7 +264,78 @@ impl JsVm {
             key_own_keys,
         };
         crate::vm_builtins::install_core_intrinsics(&mut vm);
+        crate::builtins_primitives::install_primitive_builtins(&mut vm);
         vm
+    }
+
+    /// Allocates a `RegExp` object with `RegExp.prototype` and standard metadata properties.
+    pub fn alloc_regexp(&mut self, pattern: String, flags: String) -> HeapHandle {
+        let re = self.heap.alloc_object(JsObject::with_kind(
+            ObjectKind::RegExp(Box::new(RegExpObject {
+                pattern: pattern.clone(),
+                flags: flags.clone(),
+            })),
+            Some(self.regexp_proto),
+        ));
+        let k_src = self.heap.intern_key("source");
+        let k_flags = self.heap.intern_key("flags");
+        let k_global = self.heap.intern_key("global");
+        let k_icase = self.heap.intern_key("ignoreCase");
+        let k_multi = self.heap.intern_key("multiline");
+        let k_last = self.heap.intern_key("lastIndex");
+        let src_v = JsValue::from_string(self.heap.alloc_string(pattern));
+        let flg_v = JsValue::from_string(self.heap.alloc_string(flags.clone()));
+        self.heap.object_define_data(
+            re,
+            k_src,
+            src_v,
+            PropertyAttrs::CONFIGURABLE,
+            &mut self.shapes,
+        );
+        self.heap.object_define_data(
+            re,
+            k_flags,
+            flg_v,
+            PropertyAttrs::CONFIGURABLE,
+            &mut self.shapes,
+        );
+        self.heap.object_define_data(
+            re,
+            k_global,
+            JsValue::from_bool(flags.contains('g')),
+            PropertyAttrs::CONFIGURABLE,
+            &mut self.shapes,
+        );
+        self.heap.object_define_data(
+            re,
+            k_icase,
+            JsValue::from_bool(flags.contains('i')),
+            PropertyAttrs::CONFIGURABLE,
+            &mut self.shapes,
+        );
+        self.heap.object_define_data(
+            re,
+            k_multi,
+            JsValue::from_bool(flags.contains('m')),
+            PropertyAttrs::CONFIGURABLE,
+            &mut self.shapes,
+        );
+        self.heap.object_define_data(
+            re,
+            k_last,
+            JsValue::from_i32(0),
+            PropertyAttrs::WRITABLE,
+            &mut self.shapes,
+        );
+        re
+    }
+
+    /// Allocates a `Date` object storing UTC milliseconds since Unix epoch.
+    pub fn alloc_date(&mut self, timestamp_ms: f64) -> HeapHandle {
+        self.heap.alloc_object(JsObject::with_kind(
+            ObjectKind::Date(timestamp_ms),
+            Some(self.date_proto),
+        ))
     }
 
     /// Registers a static native function and returns its callable [`HeapHandle`].
@@ -944,10 +1033,7 @@ impl JsVm {
                     }
                     _ => return Err(self.type_error("Expected RegExp constant")),
                 };
-                let re = self.heap.alloc_object(JsObject::with_kind(
-                    ObjectKind::RegExp(Box::new(RegExpObject { pattern, flags })),
-                    Some(self.object_proto),
-                ));
+                let re = self.alloc_regexp(pattern, flags);
                 self.registers[a] = JsValue::from_object(re);
             }
             Opcode::CreateClass => {
@@ -1649,6 +1735,8 @@ impl JsVm {
         roots.push(JsValue::from_object(self.string_proto));
         roots.push(JsValue::from_object(self.number_proto));
         roots.push(JsValue::from_object(self.boolean_proto));
+        roots.push(JsValue::from_object(self.regexp_proto));
+        roots.push(JsValue::from_object(self.date_proto));
         roots.extend_from_slice(&self.registers);
         for f in &self.frames {
             roots.push(f.this_val);
@@ -1734,11 +1822,7 @@ impl JsVm {
                 JsValue::from_bigint(self.heap.alloc_bigint(bi))
             }
             ConstantEntry::RegExp { pattern, flags } => {
-                let h = self.heap.alloc_object(JsObject::with_kind(
-                    ObjectKind::RegExp(Box::new(RegExpObject { pattern, flags })),
-                    Some(self.object_proto),
-                ));
-                JsValue::from_object(h)
+                JsValue::from_object(self.alloc_regexp(pattern, flags))
             }
             ConstantEntry::Function(_) | ConstantEntry::Class(_) => JsValue::UNDEFINED,
         })
