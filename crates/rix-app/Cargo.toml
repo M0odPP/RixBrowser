@@ -9,9 +9,17 @@ rust-version.workspace = true
 
 [dependencies]
 rix-core = { path = "../rix-core" }
+rix-dom = { path = "../rix-dom" }
+rix-html = { path = "../rix-html" }
+rix-css = { path = "../rix-css" }
+rix-layout = { path = "../rix-layout" }
+rix-chrome = { path = "../rix-chrome" }
+rix-net = { path = "../rix-net" }
 rix-ipc = { path = "../rix-ipc" }
 rix-render = { path = "../rix-render" }
 rix-text = { path = "../rix-text" }
+arboard.workspace = true
+url.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 winit.workspace = true
