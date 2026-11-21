@@ -1,13 +1,15 @@
 #![deny(unsafe_code)]
-//! CSS Box Tree, Fragment Tree, BFC/Floats, IFC, Table, and retained Taffy
-//! Flex/Grid layout engine for RixBrowser.
+//! CSS Box Tree, Fragment Tree, BFC/Floats, IFC, Table, retained Taffy
+//! Flex/Grid, and CSS 2.1 Appendix E DisplayList painter for RixBrowser.
 
 pub mod assets;
 pub mod bfc;
 pub mod box_tree;
+pub mod engine;
 pub mod flex_grid;
 pub mod fragment;
 pub mod ifc;
+pub mod paint;
 pub mod table;
 
 pub use assets::{
@@ -18,6 +20,7 @@ pub use box_tree::{
     BoxId, BoxKind, BoxTree, FormControlKind, FormattingContextKind, LayoutBox, ReplacedKind,
     SvgPathEntry,
 };
+pub use engine::{hit_test, LayoutEngine, LayoutFrame, LayoutMetrics};
 pub use flex_grid::layout_flex_grid_container;
 pub use fragment::{
     layout_box, layout_replaced, layout_tree, measure_intrinsic_widths, BoxMetrics,
@@ -27,4 +30,5 @@ pub use fragment::{
 pub use ifc::{
     layout_ifc, measure_ifc_min_max_content, resolve_font_for_style, resolve_line_height_px,
 };
+pub use paint::paint_fragment_tree;
 pub use table::{layout_table, measure_table_intrinsic_widths};

@@ -977,10 +977,19 @@ impl<'a> BoxTreeBuilder<'a> {
         let child_ids = self.tree.get(id).children.clone();
         let mut dirty = self.tree.get(id).subtree_dirty;
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        let style_ptr = Arc::as_ptr(&self.tree.get(id).style) as usize as u64;
-        hash = fnv_mix(hash, style_ptr);
         if let Some(dom) = self.tree.get(id).dom_node {
+            let style_ptr = Arc::as_ptr(&self.tree.get(id).style) as usize as u64;
+            hash = fnv_mix(hash, style_ptr);
             hash = fnv_mix(hash, usize::from(dom) as u64);
+        } else {
+            let kind_tag: u64 = match self.tree.get(id).kind {
+                BoxKind::AnonymousBlock => 1,
+                BoxKind::AnonymousTable => 2,
+                BoxKind::AnonymousTableRow => 3,
+                BoxKind::AnonymousTableCell => 4,
+                _ => 5,
+            };
+            hash = fnv_mix(hash, kind_tag);
         }
         match &self.tree.get(id).kind {
             BoxKind::Text(t) => {

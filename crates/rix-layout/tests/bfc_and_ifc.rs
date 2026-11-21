@@ -58,7 +58,7 @@ fn find_abs_rect_for_node(
     if frag.dom_node == Some(target) {
         return Some(abs);
     }
-    for ch in &frag.children {
+    for ch in frag.children.iter() {
         if let Some(found) = find_abs_rect_for_node(ch, target, abs.origin) {
             return Some(found);
         }
@@ -78,7 +78,7 @@ fn collect_inline_boxes_for_node(
             out.push((abs, is_first, is_last));
         }
     }
-    for ch in &frag.children {
+    for ch in frag.children.iter() {
         collect_inline_boxes_for_node(ch, target, abs.origin, out);
     }
 }
@@ -87,7 +87,7 @@ fn collect_text_runs(frag: &Fragment, out: &mut Vec<String>) {
     if let FragmentKind::TextRun(run) = &frag.kind {
         out.push(run.text.clone());
     }
-    for ch in &frag.children {
+    for ch in frag.children.iter() {
         collect_text_runs(ch, out);
     }
 }

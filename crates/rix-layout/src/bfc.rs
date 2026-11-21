@@ -518,7 +518,7 @@ pub fn layout_block_box(
         baseline: first_baseline.or(Some(border_h)),
         overflow_rect: Rect::new(0.0, 0.0, border_w, border_h),
         kind: FragmentKind::Box,
-        children: placed_children,
+        children: Arc::new(placed_children),
         is_float: ctx.tree.get(box_id).is_float,
         is_out_of_flow: ctx.tree.get(box_id).is_out_of_flow,
         collapsed_margin_top: collapsed_top,
