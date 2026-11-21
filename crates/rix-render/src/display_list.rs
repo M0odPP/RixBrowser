@@ -289,6 +289,14 @@ impl SpatialTree {
     }
 
     pub fn resolve_world_transform(&self, id: SpatialNodeId) -> Affine {
+        self.resolve_world_transform_with_override(id, None)
+    }
+
+    pub fn resolve_world_transform_with_override(
+        &self,
+        id: SpatialNodeId,
+        zero_scroll_node: Option<SpatialNodeId>,
+    ) -> Affine {
         let mut chain: SmallVec<[Affine; 8]> = SmallVec::new();
         let mut current = Some(id);
         let mut steps = 0usize;
@@ -301,7 +309,12 @@ impl SpatialTree {
             let Some(node) = self.get(node_id) else {
                 break;
             };
-            chain.push(self.local_transform(node));
+            let local = if zero_scroll_node == Some(node_id) {
+                Affine::IDENTITY
+            } else {
+                self.local_transform(node)
+            };
+            chain.push(local);
             current = node.parent;
         }
         let mut world = Affine::IDENTITY;

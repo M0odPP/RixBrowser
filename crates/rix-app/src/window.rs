@@ -1,8 +1,8 @@
 use rix_core::{Point, Rect, Size, Vec2};
-use rix_ipc::{FontResourceId, PipelineId, SpatialNodeId};
+use rix_ipc::{FontResourceId, PipelineId, ScrollId, SpatialNodeId};
 use rix_render::{
     smallvec, BlendMode, Color, ColorStop, Compositor, DisplayItem, DisplayList, GlyphInstance,
-    LayerRole, Rgba8, VelloRenderer,
+    LayerRole, Rgba8, SpatialNodeKind, VelloRenderer,
 };
 use rix_text::{FontDatabase, FontDescriptor, TextShaper};
 use std::path::Path;
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
@@ -34,6 +34,7 @@ pub struct BrowserShell {
     present_count: u64,
     demo_populated: bool,
     needs_present: bool,
+    cursor_pos: Point,
     _proxy: EventLoopProxy<AppWakeup>,
 }
 
@@ -46,6 +47,7 @@ impl BrowserShell {
             present_count: 0,
             demo_populated: false,
             needs_present: false,
+            cursor_pos: Point::new(640.0, 360.0),
             _proxy: proxy,
         }
     }
@@ -164,6 +166,23 @@ impl ApplicationHandler<AppWakeup> for BrowserShell {
                     self.request_redraw_if_needed();
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                let dpr = self.compositor.device_pixel_ratio();
+                self.cursor_pos = Point::new(position.x as f32 / dpr, position.y as f32 / dpr);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dpr = self.compositor.device_pixel_ratio();
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (-x * 48.0, -y * 48.0),
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        (-(pos.x as f32) / dpr, -(pos.y as f32) / dpr)
+                    }
+                };
+                if self.compositor.handle_wheel(self.cursor_pos, dx, dy) {
+                    let _ = self.compositor.drain_scroll_syncs();
+                    self.request_redraw_if_needed();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 // Idle guarantee: only compose when dirty, or re-present after swapchain resize.
                 if let Some(scene) = self.compositor.compose() {
@@ -275,10 +294,30 @@ pub fn populate_demo_layers(compositor: &mut Compositor, viewport: Size) {
     let h = viewport.height.max(240.0);
     let chrome_h = 84.0f32;
 
-    // 1. WebSurface retained layer (z = 10)
-    let mut web = DisplayList::new(Rect::new(0.0, chrome_h, w, (h - chrome_h).max(1.0)));
+    // 1. Scrollable 50-screen WebSurface retained layer (z = 10)
+    let vp_h = (h - chrome_h).max(1.0);
+    let content_h = (h * 50.0).max(4000.0);
+    let viewport_rect = Rect::new(0.0, chrome_h, w, vp_h);
+    let content_rect = Rect::new(0.0, chrome_h, w, content_h);
+    let mut web = DisplayList::new(content_rect);
+    let root_scroll = web.spatial_tree.add_node(
+        Some(SpatialNodeId(0)),
+        SpatialNodeKind::ScrollFrame {
+            content_rect,
+            viewport_rect,
+            external_scroll_id: ScrollId(1),
+            current_offset: Vec2::ZERO,
+        },
+    );
+    web.push(DisplayItem::PushStackingContext {
+        spatial: root_scroll,
+        bounds: content_rect,
+        opacity: 1.0,
+        mix_blend: BlendMode::Normal,
+        filters: smallvec![],
+    });
     web.push(DisplayItem::Rect {
-        bounds: Rect::new(0.0, chrome_h, w, (h - chrome_h).max(1.0)),
+        bounds: content_rect,
         color: Rgba8::new(22, 26, 35, 255),
         radii: [0.0; 4],
     });
@@ -332,7 +371,7 @@ pub fn populate_demo_layers(compositor: &mut Compositor, viewport: Size) {
     if let Some((font_id, bounds, glyphs)) = shape_line_glyphs(
         &font_db,
         compositor,
-        "Zero-polling winit loop | PresentMode::AutoVsync | Retained layer cache",
+        "Zero-polling winit loop | PresentMode::AutoVsync | APZ strip cache",
         15.0,
         Point::new(card_bounds.min_x() + 28.0, card_bounds.min_y() + 108.0),
     ) {
@@ -344,6 +383,27 @@ pub fn populate_demo_layers(compositor: &mut Compositor, viewport: Size) {
             &glyphs,
         );
     }
+    // Additional scrollable sections spanning all 50 screens for interactive wheel check.
+    for row in 0..140u32 {
+        let y = card_bounds.max_y() + 24.0 + (row as f32) * 240.0;
+        if y + 200.0 > content_rect.max_y() {
+            break;
+        }
+        let stripe = Rect::new(48.0, y, (w - 96.0).max(200.0), 180.0);
+        let shade = if row.is_multiple_of(2) { 30 } else { 36 };
+        web.push(DisplayItem::Rect {
+            bounds: stripe,
+            color: Rgba8::new(shade, shade + 6, shade + 18, 255),
+            radii: [10.0; 4],
+        });
+        web.push(DisplayItem::Border {
+            bounds: stripe,
+            widths: [1.0; 4],
+            colors: [Rgba8::new(54, 66, 88, 180); 4],
+            radii: [10.0; 4],
+        });
+    }
+    web.push(DisplayItem::PopStackingContext);
     compositor.submit_display_list(DEMO_WEB_PIPELINE, LayerRole::WebSurface, 1, web);
 
     // 2. Chrome retained layer (z = 100)
