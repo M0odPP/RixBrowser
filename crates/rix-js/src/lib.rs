@@ -16,6 +16,7 @@ pub mod shape;
 pub mod string;
 pub mod value;
 pub mod vm;
+pub mod vm_builtins;
 
 pub use ast::{Program, SourceType, Span, SyntaxError};
 pub use bigint::JsBigInt;
