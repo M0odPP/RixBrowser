@@ -5,6 +5,8 @@
 pub mod ast;
 pub mod bigint;
 pub mod bytecode;
+pub mod cache;
+pub mod compiler;
 pub mod heap;
 pub mod lexer;
 pub mod parser;
@@ -17,6 +19,8 @@ pub use bytecode::{
     CompiledProgram, ConstantEntry, ExceptionHandler, FunctionBytecode, IcKind, IcSlotDescriptor,
     Instruction, ModuleBlueprint, Opcode, UpvalueDescriptor, BYTECODE_VERSION,
 };
+pub use cache::{BytecodeCache, CacheStatus};
+pub use compiler::{compile, compile_program, CompileError};
 pub use heap::{
     GcCycleStats, GcHeap, Generation, HeapCell, JsObject, MajorGcPhase, RootStack, WeakHeapHandle,
     WeakTable, DEFAULT_NURSERY_LIMIT, DEFAULT_OLD_GC_THRESHOLD,
