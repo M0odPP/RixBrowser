@@ -43,6 +43,13 @@ pollster = "1.0"
 smallvec = { version = "1.14", features = ["serde"] }
 svgtypes = "0.16"
 criterion = "0.5"
+bitflags = "2.13"
+encoding_rs = "0.8"
+memchr = "2.8"
+lightningcss = "1.0.0-alpha.72"
+rayon = "1.12"
+selectors = "0.40"
+cssparser = "0.38"
 
 [profile.dev]
 debug = 1
