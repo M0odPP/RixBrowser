@@ -34,6 +34,12 @@ pub enum IpcError {
 
     #[error("File descriptor passing failed: {0}")]
     FdPassingFailed(String),
+
+    #[error("Process lifecycle error: {0}")]
+    Process(String),
+
+    #[error("Timed out waiting for child process: {0}")]
+    ProcessTimeout(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, IpcError>;
