@@ -13,13 +13,14 @@ use crate::properties::{
 };
 use crate::stylesheet::{CascadeOrigin, CompiledRule, LayerId, MediaContext};
 use crate::values::{
-    AlignValue, BackgroundLayerValue, BoxShadowValue, BoxSizingMode, ClearMode, ColorRgba,
-    CornerRadii, CssColor, CursorKind, DirectionMode, DisplayMode, EdgeValues, EvalContext,
-    FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
-    GridTrackSize, LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle,
-    OverflowMode, OverflowPair, OverflowWrapMode, PointerEventsMode, PositionMode, SizeValue,
-    TextAlignMode, TextDecorationLine, TextTransformMode, TransformOp, UserSelectMode,
-    VisibilityMode, WhiteSpaceMode, WordBreakMode, ZIndexValue,
+    AlignValue, BackgroundLayerValue, BorderCollapseMode, BoxShadowValue, BoxSizingMode, ClearMode,
+    ColorRgba, CornerRadii, CssColor, CursorKind, DirectionMode, DisplayMode, EdgeValues,
+    EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
+    GridAutoFlowMode, GridTrackSize, LengthPercentage, LengthPercentageAuto, LineHeightValue,
+    LineStyle, OverflowMode, OverflowPair, OverflowWrapMode, PointerEventsMode, PositionMode,
+    SizeValue, TableLayoutMode, TextAlignMode, TextDecorationLine, TextOverflowMode,
+    TextTransformMode, TransformOp, UserSelectMode, VerticalAlignMode, VisibilityMode,
+    WhiteSpaceMode, WordBreakMode, ZIndexValue,
 };
 
 const MAX_VAR_DEPTH: u8 = 32;
@@ -37,6 +38,13 @@ pub struct BoxModelStyle {
     pub padding: EdgeValues<LengthPercentage>,
     pub inset: EdgeValues<LengthPercentageAuto>,
     pub border_width: EdgeValues<f32>,
+    pub vertical_align: VerticalAlignMode,
+    pub text_overflow: TextOverflowMode,
+    pub border_collapse: BorderCollapseMode,
+    pub border_spacing_x: LengthPercentage,
+    pub border_spacing_y: LengthPercentage,
+    pub table_layout: TableLayoutMode,
+    pub content: Option<InternedStr>,
 }
 
 impl Default for BoxModelStyle {
@@ -52,6 +60,13 @@ impl Default for BoxModelStyle {
             padding: EdgeValues::all(LengthPercentage::Zero),
             inset: EdgeValues::all(LengthPercentageAuto::Auto),
             border_width: EdgeValues::all(0.0),
+            vertical_align: VerticalAlignMode::Baseline,
+            text_overflow: TextOverflowMode::Clip,
+            border_collapse: BorderCollapseMode::Separate,
+            border_spacing_x: LengthPercentage::Zero,
+            border_spacing_y: LengthPercentage::Zero,
+            table_layout: TableLayoutMode::Auto,
+            content: None,
         }
     }
 }
@@ -987,6 +1002,26 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::Filter, PropertyValue::Filter(v)) => {
             style.effects_mut().filter = v.clone();
+        }
+        (PropertyIdKind::VerticalAlign, PropertyValue::VerticalAlign(v)) => {
+            Arc::make_mut(&mut style.box_model).vertical_align = *v;
+        }
+        (PropertyIdKind::TextOverflow, PropertyValue::TextOverflow(v)) => {
+            Arc::make_mut(&mut style.box_model).text_overflow = *v;
+        }
+        (PropertyIdKind::BorderCollapse, PropertyValue::BorderCollapse(v)) => {
+            Arc::make_mut(&mut style.box_model).border_collapse = *v;
+        }
+        (PropertyIdKind::BorderSpacing, PropertyValue::BorderSpacing(x, y)) => {
+            let bm = Arc::make_mut(&mut style.box_model);
+            bm.border_spacing_x = x.clone();
+            bm.border_spacing_y = y.clone();
+        }
+        (PropertyIdKind::TableLayout, PropertyValue::TableLayout(v)) => {
+            Arc::make_mut(&mut style.box_model).table_layout = *v;
+        }
+        (PropertyIdKind::Content, PropertyValue::Content(v)) => {
+            Arc::make_mut(&mut style.box_model).content = v.clone();
         }
         _ => {}
     }

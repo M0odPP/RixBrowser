@@ -23,18 +23,19 @@ use crate::values::{
     convert_corner_radius, convert_cursor, convert_direction, convert_display, convert_filter,
     convert_flex_direction, convert_flex_wrap, convert_font_family_name, convert_font_size,
     convert_font_style, convert_font_weight, convert_grid_auto_flow, convert_justify_content,
-    convert_justify_items, convert_justify_self, convert_length_percentage,
+    convert_justify_items, convert_justify_self, convert_length, convert_length_percentage,
     convert_length_percentage_or_auto, convert_length_value, convert_line_height,
     convert_line_style, convert_max_size, convert_overflow, convert_overflow_wrap,
     convert_position, convert_size, convert_spacing, convert_text_align,
     convert_text_decoration_line, convert_text_transform, convert_track_size, convert_track_sizing,
     convert_transform, convert_user_select, convert_visibility, convert_white_space,
-    convert_word_break, convert_z_index, AlignValue, BackgroundLayerValue, BoxShadowValue,
-    BoxSizingMode, ClearMode, CornerRadius, CssColor, CursorKind, DirectionMode, DisplayMode,
-    FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
-    GridTrackSize, LengthPercentage, LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle,
-    OverflowMode, OverflowWrapMode, PointerEventsMode, PositionMode, SizeValue, TextAlignMode,
-    TextDecorationLine, TextTransformMode, TransformOp, UserSelectMode, VisibilityMode,
+    convert_word_break, convert_z_index, AlignValue, BackgroundLayerValue, BorderCollapseMode,
+    BoxShadowValue, BoxSizingMode, ClearMode, CornerRadius, CssColor, CursorKind, DirectionMode,
+    DisplayMode, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
+    GridAutoFlowMode, GridTrackSize, LengthPercentage, LengthPercentageAuto, LengthUnit,
+    LineHeightValue, LineStyle, OverflowMode, OverflowWrapMode, PointerEventsMode, PositionMode,
+    SizeValue, TableLayoutMode, TextAlignMode, TextDecorationLine, TextOverflowMode,
+    TextTransformMode, TransformOp, UserSelectMode, VerticalAlignMode, VisibilityMode,
     WhiteSpaceMode, WordBreakMode, ZIndexValue,
 };
 
@@ -386,6 +387,12 @@ pub enum PropertyIdKind {
     PlaceContent,
     PlaceItems,
     PlaceSelf,
+    VerticalAlign,
+    TextOverflow,
+    BorderCollapse,
+    BorderSpacing,
+    TableLayout,
+    Content,
     // Custom property (`--*`)
     Custom,
 }
@@ -515,6 +522,12 @@ impl PropertyIdKind {
             "place-content" => Self::PlaceContent,
             "place-items" => Self::PlaceItems,
             "place-self" => Self::PlaceSelf,
+            "vertical-align" => Self::VerticalAlign,
+            "text-overflow" => Self::TextOverflow,
+            "border-collapse" => Self::BorderCollapse,
+            "border-spacing" => Self::BorderSpacing,
+            "table-layout" => Self::TableLayout,
+            "content" => Self::Content,
             _ => return None,
         })
     }
@@ -640,6 +653,12 @@ impl PropertyIdKind {
             Self::PlaceContent => "place-content",
             Self::PlaceItems => "place-items",
             Self::PlaceSelf => "place-self",
+            Self::VerticalAlign => "vertical-align",
+            Self::TextOverflow => "text-overflow",
+            Self::BorderCollapse => "border-collapse",
+            Self::BorderSpacing => "border-spacing",
+            Self::TableLayout => "table-layout",
+            Self::Content => "content",
             Self::Custom => "--custom",
         }
     }
@@ -715,6 +734,12 @@ pub enum PropertyValue {
     BackgroundLayers(Vec<BackgroundLayerValue>),
     Transform(Vec<TransformOp>),
     Filter(Vec<FilterOp>),
+    VerticalAlign(VerticalAlignMode),
+    TextOverflow(TextOverflowMode),
+    BorderCollapse(BorderCollapseMode),
+    BorderSpacing(LengthPercentage, LengthPercentage),
+    TableLayout(TableLayoutMode),
+    Content(Option<InternedStr>),
 }
 
 /// A compiled single-property CSS declaration.
@@ -2253,6 +2278,57 @@ fn compile_property(
                 imp,
             );
         }
+        Property::TextOverflow(to, _) => {
+            let mode = match to {
+                lightningcss::properties::overflow::TextOverflow::Clip => TextOverflowMode::Clip,
+                lightningcss::properties::overflow::TextOverflow::Ellipsis => {
+                    TextOverflowMode::Ellipsis
+                }
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::TextOverflow,
+                PropertyValue::TextOverflow(mode),
+                imp,
+            );
+        }
+        Property::VerticalAlign(va) => {
+            use lightningcss::properties::font::{VerticalAlign as Lva, VerticalAlignKeyword};
+            let mode = match va {
+                Lva::Keyword(VerticalAlignKeyword::Baseline) => VerticalAlignMode::Baseline,
+                Lva::Keyword(VerticalAlignKeyword::Top) => VerticalAlignMode::Top,
+                Lva::Keyword(VerticalAlignKeyword::Middle) => VerticalAlignMode::Middle,
+                Lva::Keyword(VerticalAlignKeyword::Bottom) => VerticalAlignMode::Bottom,
+                Lva::Keyword(VerticalAlignKeyword::TextTop) => VerticalAlignMode::TextTop,
+                Lva::Keyword(VerticalAlignKeyword::TextBottom) => VerticalAlignMode::TextBottom,
+                Lva::Keyword(VerticalAlignKeyword::Sub) => VerticalAlignMode::Sub,
+                Lva::Keyword(VerticalAlignKeyword::Super) => VerticalAlignMode::Super,
+                Lva::Length(lp) => {
+                    let px = convert_length_percentage(lp)
+                        .resolve_px(16.0, &crate::values::EvalContext::default());
+                    VerticalAlignMode::LengthPx(px)
+                }
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::VerticalAlign,
+                PropertyValue::VerticalAlign(mode),
+                imp,
+            );
+        }
+        Property::BorderSpacing(bs) => {
+            let x = convert_length(&bs.0);
+            let y = convert_length(&bs.1);
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderSpacing,
+                PropertyValue::BorderSpacing(x, y),
+                imp,
+            );
+        }
         Property::Unparsed(u) => {
             let Some(kind) = PropertyIdKind::from_name(u.property_id.name()) else {
                 missing.push(MissingCssFeature::new(
@@ -2408,6 +2484,45 @@ fn compile_extra_standard_property(
                 ord,
                 PropertyIdKind::OutlineOffset,
                 PropertyValue::Length(len),
+                imp,
+            );
+        }
+        "border-collapse" => {
+            let mode = match first_ident.map(str::to_ascii_lowercase).as_deref() {
+                Some("collapse") => BorderCollapseMode::Collapse,
+                _ => BorderCollapseMode::Separate,
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderCollapse,
+                PropertyValue::BorderCollapse(mode),
+                imp,
+            );
+        }
+        "table-layout" => {
+            let mode = match first_ident.map(str::to_ascii_lowercase).as_deref() {
+                Some("fixed") => TableLayoutMode::Fixed,
+                _ => TableLayoutMode::Auto,
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::TableLayout,
+                PropertyValue::TableLayout(mode),
+                imp,
+            );
+        }
+        "content" => {
+            let value = owned.iter().find_map(|t| match t {
+                CssToken::String(s) => Some(s.clone()),
+                _ => None,
+            });
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::Content,
+                PropertyValue::Content(value),
                 imp,
             );
         }

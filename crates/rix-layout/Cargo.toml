@@ -1,0 +1,27 @@
+[package]
+name = "rix-layout"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rix-core = { path = "../rix-core" }
+rix-dom = { path = "../rix-dom" }
+rix-css = { path = "../rix-css" }
+rix-text = { path = "../rix-text" }
+rix-ipc = { path = "../rix-ipc" }
+rix-render = { path = "../rix-render" }
+taffy = { workspace = true }
+image = { workspace = true }
+smallvec = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rix-html = { path = "../rix-html" }
+criterion = { workspace = true }
+vello = { workspace = true }

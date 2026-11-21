@@ -661,6 +661,44 @@ pub enum GridAutoFlowMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum TextOverflowMode {
+    #[default]
+    Clip,
+    Ellipsis,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub enum VerticalAlignMode {
+    #[default]
+    Baseline,
+    Top,
+    Middle,
+    Bottom,
+    TextTop,
+    TextBottom,
+    Sub,
+    Super,
+    LengthPx(f32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum BorderCollapseMode {
+    #[default]
+    Separate,
+    Collapse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum TableLayoutMode {
+    #[default]
+    Auto,
+    Fixed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct EdgeValues<T> {
     pub top: T,
     pub right: T,

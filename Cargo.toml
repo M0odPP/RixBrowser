@@ -10,6 +10,7 @@ members = [
     "crates/rix-text",
     "crates/rix-ipc",
     "crates/rix-render",
+    "crates/rix-layout",
     "crates/rix-app",
 ]
 
@@ -53,6 +54,7 @@ selectors = "0.40"
 cssparser = "0.37"
 precomputed-hash = "0.1"
 wuff = "0.2.10"
+taffy = "0.14"
 
 [profile.dev]
 debug = 1
