@@ -61,6 +61,7 @@ taffy = "0.14"
 arboard = "3.6"
 unicode-ident = "1.0"
 sha2 = "0.10"
+regex = "1.13"
 
 [profile.dev]
 debug = 1

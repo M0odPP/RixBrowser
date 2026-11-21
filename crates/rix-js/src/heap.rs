@@ -102,6 +102,7 @@ pub enum ObjectKind {
     Proxy(ProxyObject),
     UpvalueCell,
     RegExp(Box<RegExpObject>),
+    Date(f64),
     Host,
 }
 
@@ -288,6 +289,7 @@ impl JsObject {
             | ObjectKind::NativeFunction(_)
             | ObjectKind::UpvalueCell
             | ObjectKind::RegExp(_)
+            | ObjectKind::Date(_)
             | ObjectKind::Host => {}
         }
         for &extra in &self.extra_refs {

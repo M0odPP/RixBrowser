@@ -18,6 +18,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 unicode-ident = { workspace = true }
 sha2 = { workspace = true }
+regex = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
