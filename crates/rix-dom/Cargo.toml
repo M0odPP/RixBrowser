@@ -10,7 +10,7 @@ rix-core = { path = "../rix-core" }
 indextree = "4.9"
 markup5ever = "0.40"
 selectors = "0.40"
-cssparser = "0.38"
+cssparser.workspace = true
 smallvec.workspace = true
 bitflags.workspace = true
 thiserror.workspace = true
