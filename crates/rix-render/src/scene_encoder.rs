@@ -3,15 +3,19 @@ use crate::resources::ResourceRegistry;
 use rix_core::Rect;
 use rix_ipc::{PipelineId, SpatialNodeId};
 use smallvec::SmallVec;
+use std::ops::Range;
 use vello::kurbo::{Affine, Rect as KurboRect, RoundedRect, RoundedRectRadii, Shape, Stroke};
 use vello::peniko::{Fill, Gradient, ImageBrush, InterpolationAlphaSpace};
 use vello::{Glyph, Scene};
+
+pub const DEFAULT_VIEWPORT_OVERSCAN_PX: f32 = 128.0;
 
 #[derive(Debug, Clone)]
 pub struct EncodeOptions {
     pub cull_rect: Option<Rect>,
     pub viewport_clip: Option<Rect>,
     pub base_transform: Affine,
+    pub override_scroll_zero: Option<SpatialNodeId>,
 }
 
 impl Default for EncodeOptions {
@@ -20,6 +24,7 @@ impl Default for EncodeOptions {
             cull_rect: None,
             viewport_clip: None,
             base_transform: Affine::IDENTITY,
+            override_scroll_zero: None,
         }
     }
 }
@@ -180,11 +185,40 @@ pub fn encode_display_list(
     options: &EncodeOptions,
     scene: &mut Scene,
 ) -> EncodeStats {
+    if list.items.is_empty() {
+        return EncodeStats::default();
+    }
+    let full = 0..list.items.len();
+    encode_display_list_ranges(
+        pipeline,
+        list,
+        std::slice::from_ref(&full),
+        resources,
+        options,
+        scene,
+    )
+}
+
+pub fn encode_display_list_ranges(
+    pipeline: PipelineId,
+    list: &DisplayList,
+    ranges: &[Range<usize>],
+    resources: &mut ResourceRegistry,
+    options: &EncodeOptions,
+    scene: &mut Scene,
+) -> EncodeStats {
+    if ranges.is_empty() || list.items.is_empty() {
+        return EncodeStats::default();
+    }
     let mut stats = EncodeStats::default();
     let mut spatial_transforms: Vec<Affine> = Vec::with_capacity(list.spatial_tree.nodes.len());
     for node in &list.spatial_tree.nodes {
-        spatial_transforms
-            .push(options.base_transform * list.spatial_tree.resolve_world_transform(node.id));
+        spatial_transforms.push(
+            options.base_transform
+                * list
+                    .spatial_tree
+                    .resolve_world_transform_with_override(node.id, options.override_scroll_zero),
+        );
     }
 
     let lookup_transform = |id: SpatialNodeId| -> Affine {
@@ -194,7 +228,10 @@ pub fn encode_display_list(
             .filter(|n| n.id == id)
             .and_then(|_| spatial_transforms.get(id.0 as usize).copied())
             .unwrap_or_else(|| {
-                options.base_transform * list.spatial_tree.resolve_world_transform(id)
+                options.base_transform
+                    * list
+                        .spatial_tree
+                        .resolve_world_transform_with_override(id, options.override_scroll_zero)
             })
     };
 
@@ -215,8 +252,24 @@ pub fn encode_display_list(
         }
     };
 
-    let mut idx = 0usize;
-    while idx < list.items.len() {
+    let mut range_idx = 0usize;
+    let mut idx = ranges[0].start;
+    loop {
+        while range_idx < ranges.len() {
+            let r_start = ranges[range_idx].start;
+            let r_end = ranges[range_idx].end.min(list.items.len());
+            if idx < r_start {
+                idx = r_start;
+            }
+            if idx < r_end {
+                break;
+            }
+            range_idx += 1;
+        }
+        if range_idx >= ranges.len() || idx >= list.items.len() {
+            break;
+        }
+
         stats.items_visited += 1;
         match &list.items[idx] {
             DisplayItem::PushStackingContext {
