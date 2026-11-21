@@ -1,35 +1,153 @@
 use crate::font_loader::{FontDatabase, FontId};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 use unicode_bidi::BidiInfo;
 use unicode_segmentation::UnicodeSegmentation;
 
-#[derive(Clone)]
-struct ShapeCacheEntry {
-    font_bytes_ptr: usize,
+const DEFAULT_SHAPING_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ShapeCacheKey {
+    font_key: u64,
     face_index: u32,
     font_size_bits: u32,
     text: String,
-    runs: Vec<ShapedRun>,
 }
 
-fn compute_shape_hash(
-    font_bytes_ptr: usize,
-    face_index: u32,
-    font_size_bits: u32,
-    text: &str,
-) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    font_bytes_ptr.hash(&mut hasher);
-    face_index.hash(&mut hasher);
-    font_size_bits.hash(&mut hasher);
-    text.hash(&mut hasher);
-    hasher.finish()
+struct ShapeCacheEntry {
+    runs: Arc<[ShapedRun]>,
+    approx_bytes: usize,
+    last_used: AtomicU64,
 }
 
-thread_local! {
-    static SHAPED_RUN_CACHE: std::cell::RefCell<std::collections::HashMap<u64, Vec<ShapeCacheEntry>>> =
-        std::cell::RefCell::new(std::collections::HashMap::with_capacity(4096));
+#[derive(Default)]
+struct ShapingCacheInner {
+    entries: HashMap<ShapeCacheKey, ShapeCacheEntry>,
+    used_bytes: usize,
+}
+
+/// Thread-safe shared text shaping cache with LRU memory budget eviction.
+pub struct TextShapingCache {
+    inner: RwLock<ShapingCacheInner>,
+    max_bytes: usize,
+    clock: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl TextShapingCache {
+    #[must_use]
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            inner: RwLock::new(ShapingCacheInner {
+                entries: HashMap::with_capacity(2048),
+                used_bytes: 0,
+            }),
+            max_bytes: max_bytes.max(1024),
+            clock: AtomicU64::new(1),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+
+    #[must_use]
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.read().map_or(0, |g| g.entries.len())
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[must_use]
+    pub fn used_bytes(&self) -> usize {
+        self.inner.read().map_or(0, |g| g.used_bytes)
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.entries.clear();
+            guard.used_bytes = 0;
+        }
+    }
+
+    fn get(&self, key: &ShapeCacheKey) -> Option<Arc<[ShapedRun]>> {
+        let guard = self.inner.read().ok()?;
+        let entry = guard.entries.get(key)?;
+        let tick = self.clock.fetch_add(1, Ordering::Relaxed);
+        entry.last_used.store(tick, Ordering::Relaxed);
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        Some(Arc::clone(&entry.runs))
+    }
+
+    fn insert(&self, key: ShapeCacheKey, runs: Vec<ShapedRun>) {
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        let approx_bytes = estimate_entry_bytes(&key.text, &runs);
+        if approx_bytes > self.max_bytes {
+            return;
+        }
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
+        if let Some(prev) = guard.entries.remove(&key) {
+            guard.used_bytes = guard.used_bytes.saturating_sub(prev.approx_bytes);
+        }
+        if guard.used_bytes + approx_bytes > self.max_bytes {
+            let target = (self.max_bytes * 3) / 4;
+            let mut victims: Vec<(u64, ShapeCacheKey)> = guard
+                .entries
+                .iter()
+                .map(|(k, v)| (v.last_used.load(Ordering::Relaxed), k.clone()))
+                .collect();
+            victims.sort_unstable_by_key(|(ts, _)| *ts);
+            for (_, victim_key) in victims {
+                if guard.used_bytes + approx_bytes <= target {
+                    break;
+                }
+                if let Some(removed) = guard.entries.remove(&victim_key) {
+                    guard.used_bytes = guard.used_bytes.saturating_sub(removed.approx_bytes);
+                }
+            }
+        }
+        let tick = self.clock.fetch_add(1, Ordering::Relaxed);
+        guard.used_bytes += approx_bytes;
+        guard.entries.insert(
+            key,
+            ShapeCacheEntry {
+                runs: Arc::from(runs),
+                approx_bytes,
+                last_used: AtomicU64::new(tick),
+            },
+        );
+    }
+}
+
+fn estimate_entry_bytes(text: &str, runs: &[ShapedRun]) -> usize {
+    let glyph_count: usize = runs.iter().map(|r| r.glyphs.len()).sum();
+    64 + text.len()
+        + std::mem::size_of_val(runs)
+        + glyph_count * std::mem::size_of::<GlyphPosition>()
+}
+
+/// Returns the process-wide shared thread-safe [`TextShapingCache`].
+#[must_use]
+pub fn shared_shaping_cache() -> Arc<TextShapingCache> {
+    static CACHE: OnceLock<Arc<TextShapingCache>> = OnceLock::new();
+    Arc::clone(
+        CACHE.get_or_init(|| Arc::new(TextShapingCache::new(DEFAULT_SHAPING_CACHE_MAX_BYTES))),
+    )
 }
 
 pub fn contains_rtl_runs(text: &str) -> bool {
@@ -68,11 +186,26 @@ pub struct ShapedRun {
 
 pub struct TextShaper<'a> {
     db: &'a FontDatabase,
+    cache: Arc<TextShapingCache>,
 }
 
 impl<'a> TextShaper<'a> {
+    #[must_use]
     pub fn new(db: &'a FontDatabase) -> Self {
-        Self { db }
+        Self {
+            db,
+            cache: shared_shaping_cache(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_cache(db: &'a FontDatabase, cache: Arc<TextShapingCache>) -> Self {
+        Self { db, cache }
+    }
+
+    #[must_use]
+    pub fn cache(&self) -> &Arc<TextShapingCache> {
+        &self.cache
     }
 
     pub fn shape_text(&self, text: &str, font_id: FontId, font_size: f32) -> Vec<ShapedRun> {
@@ -84,29 +217,17 @@ impl<'a> TextShaper<'a> {
         };
 
         let can_cache = text.len() <= 512;
-        let (font_bytes_ptr, face_index, font_size_bits) = (
-            Arc::as_ptr(&font.bytes) as usize,
-            font.face_index,
-            font_size.to_bits(),
-        );
-        let hash = if can_cache {
-            let h = compute_shape_hash(font_bytes_ptr, face_index, font_size_bits, text);
-            if let Ok(Some(cached)) = SHAPED_RUN_CACHE.try_with(|c| {
-                c.borrow().get(&h).and_then(|entries| {
-                    entries
-                        .iter()
-                        .find(|e| {
-                            e.font_bytes_ptr == font_bytes_ptr
-                                && e.face_index == face_index
-                                && e.font_size_bits == font_size_bits
-                                && e.text == text
-                        })
-                        .map(|e| e.runs.clone())
-                })
-            }) {
-                return cached;
+        let cache_key = if can_cache {
+            let key = ShapeCacheKey {
+                font_key: font.cache_identity(),
+                face_index: font.face_index,
+                font_size_bits: font_size.to_bits(),
+                text: text.to_string(),
+            };
+            if let Some(cached) = self.cache.get(&key) {
+                return cached.to_vec();
             }
-            Some(h)
+            Some(key)
         } else {
             None
         };
@@ -153,23 +274,8 @@ impl<'a> TextShaper<'a> {
             }
         }
 
-        if let Some(h) = hash {
-            let _ = SHAPED_RUN_CACHE.try_with(|c| {
-                let mut guard = c.borrow_mut();
-                if guard.len() >= 16384 {
-                    guard.clear();
-                }
-                let entries = guard.entry(h).or_default();
-                if entries.len() < 4 {
-                    entries.push(ShapeCacheEntry {
-                        font_bytes_ptr,
-                        face_index,
-                        font_size_bits,
-                        text: text.to_string(),
-                        runs: visual_runs.clone(),
-                    });
-                }
-            });
+        if let Some(key) = cache_key {
+            self.cache.insert(key, visual_runs.clone());
         }
 
         visual_runs
@@ -356,13 +462,16 @@ mod tests {
         let Some(font_id) = db.default_sans_serif else {
             return;
         };
-        let shaper = TextShaper::new(&db);
-        let runs1 = shaper.shape_text("Hello YouTube world!", font_id, 16.0);
+        let cache = Arc::new(TextShapingCache::new(4 * 1024 * 1024));
+        let shaper = TextShaper::with_cache(&db, Arc::clone(&cache));
+        let runs1 = shaper.shape_text("Hello world shaping test!", font_id, 16.0);
         assert!(!runs1.is_empty(), "First shaping run must return glyphs");
-        let runs2 = shaper.shape_text("Hello YouTube world!", font_id, 16.0);
+        assert_eq!(cache.misses(), 1);
+        let runs2 = shaper.shape_text("Hello world shaping test!", font_id, 16.0);
         assert_eq!(
             runs1, runs2,
             "Second shaping run must match cached run exactly"
         );
+        assert_eq!(cache.hits(), 1);
     }
 }

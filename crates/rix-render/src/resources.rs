@@ -101,11 +101,12 @@ impl ResourceRegistry {
     }
 
     pub fn register_rix_font(&mut self, font: &rix_text::FontData) -> FontResourceId {
-        let id = Self::font_resource_id(&font.bytes, font.face_index);
+        let bytes = font.bytes();
+        let id = Self::font_resource_id(&bytes, font.face_index);
         self.fonts.entry(id).or_insert_with(|| RegisteredFont {
             font: PenikoFontData::new(font.blob().clone(), font.face_index),
             normalized_coords: font.normalized_coords.clone(),
-            byte_len: font.bytes.len(),
+            byte_len: bytes.len(),
         });
         id
     }
