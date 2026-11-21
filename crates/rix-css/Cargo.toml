@@ -22,3 +22,7 @@ serde.workspace = true
 [dev-dependencies]
 rix-html = { path = "../rix-html" }
 criterion.workspace = true
+
+[[bench]]
+name = "cascade_bench"
+harness = false
