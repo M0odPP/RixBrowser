@@ -22,6 +22,18 @@ pub enum IpcError {
 
     #[error("Invalid IPC endpoint: {0}")]
     InvalidEndpoint(String),
+
+    #[error("Invalid shared memory size {size} bytes (allowed 1..={max} bytes)")]
+    ShmemInvalidSize { size: usize, max: usize },
+
+    #[error("Shared memory FD is missing required seal: {0}")]
+    ShmemSealMissing(&'static str),
+
+    #[error("Corrupt shared memory header: {0}")]
+    ShmemCorruptHeader(&'static str),
+
+    #[error("File descriptor passing failed: {0}")]
+    FdPassingFailed(String),
 }
 
 pub type Result<T> = std::result::Result<T, IpcError>;

@@ -2086,6 +2086,7 @@ name = "rix-ipc"
 version = "0.2.0-alpha.1"
 dependencies = [
  "bytes",
+ "libc",
  "postcard",
  "rix-core",
  "serde",

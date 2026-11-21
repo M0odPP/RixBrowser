@@ -4,6 +4,9 @@
 pub mod error;
 pub mod frame;
 pub mod protocol;
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub mod shmem;
 pub mod transport;
 
 pub use error::{IpcError, Result};
@@ -20,6 +23,11 @@ pub use protocol::{
     PixelFormat, Point, ProcessId, Rect, RequestId, RoutedInputEvent, ScrollId, ScrollNodeUpdate,
     ScrollTreeUpdate, ShmemId, ShmemRef, Size, SpatialNodeId, StreamId, SurfaceId, TabId,
     ViewportMetrics, WebSocketId, WindowId,
+};
+#[cfg(unix)]
+pub use shmem::{
+    SealedShmemBlob, TripleBufferConsumer, TripleBufferProducer, TripleBufferShmem,
+    MAX_FDS_PER_MESSAGE, MAX_SHMEM_BLOB_BYTES, MAX_TRIPLE_BUFFER_SLOT_BYTES,
 };
 #[cfg(unix)]
 pub use transport::{
