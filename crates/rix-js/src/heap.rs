@@ -16,7 +16,7 @@ use crate::value::{HeapHandle, JsValue, SymbolId};
 const PROMOTE_AGE: u8 = 2;
 
 /// Default nursery object budget before automatic minor collection.
-pub const DEFAULT_NURSERY_LIMIT: usize = 8_192;
+pub const DEFAULT_NURSERY_LIMIT: usize = 4_096;
 
 /// Default old-generation object growth threshold before major collection.
 pub const DEFAULT_OLD_GC_THRESHOLD: usize = 32_768;
@@ -717,13 +717,14 @@ impl GcHeap {
             }
         }
 
-        // 4. Sweep ONLY the nursery: promote aged survivors to Old, reclaim dead Young slots.
-        let nursery = std::mem::take(&mut self.nursery);
-        let mut next_nursery = Vec::with_capacity(nursery.len() / 4);
+        // 4. Sweep ONLY the nursery in-place (zero allocation): promote aged survivors, reclaim dead slots.
+        let mut write_pos = 0usize;
+        let nursery_len = self.nursery.len();
         let mut reclaimed = 0usize;
         let mut promoted = 0usize;
 
-        for idx in nursery {
+        for read_pos in 0..nursery_len {
+            let idx = self.nursery[read_pos];
             let slot = &mut self.slots[idx as usize];
             if slot.cell.is_none() || slot.gen_space != Generation::Young {
                 continue;
@@ -739,7 +740,8 @@ impl GcHeap {
                     slot.remembered = true;
                     kept_remembered.push(idx);
                 } else {
-                    next_nursery.push(idx);
+                    self.nursery[write_pos] = idx;
+                    write_pos += 1;
                 }
             } else {
                 slot.cell = None;
@@ -752,7 +754,7 @@ impl GcHeap {
             }
         }
 
-        self.nursery = next_nursery;
+        self.nursery.truncate(write_pos);
         self.remembered_set = kept_remembered;
         self.minor_collections += 1;
 

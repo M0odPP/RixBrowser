@@ -2,11 +2,14 @@
 //! Custom pure-Rust NaN-boxed JavaScript value representation, arena heap,
 //! generational tri-color mark-sweep GC, and weak handle tables for RixBrowser.
 
+pub mod ast;
 pub mod bigint;
 pub mod heap;
+pub mod lexer;
 pub mod string;
 pub mod value;
 
+pub use ast::{Program, SourceType, Span, SyntaxError};
 pub use bigint::JsBigInt;
 pub use heap::{
     GcCycleStats, GcHeap, Generation, HeapCell, JsObject, MajorGcPhase, RootStack, WeakHeapHandle,
