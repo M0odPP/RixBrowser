@@ -1,17 +1,5 @@
-use serde::{Deserialize, Serialize};
+pub use rix_core::NavigationTiming;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct NavigationTiming {
-    pub time_origin_ms: f64,
-    pub fetch_start_ms: f64,
-    pub request_start_ms: f64,
-    pub response_start_ms: f64,
-    pub response_end_ms: f64,
-    pub redirect_start_ms: Option<f64>,
-    pub redirect_end_ms: Option<f64>,
-    pub redirect_count: u32,
-}
 
 #[derive(Clone, Copy)]
 pub(crate) struct FetchClock {

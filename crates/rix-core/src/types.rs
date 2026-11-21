@@ -117,3 +117,15 @@ pub enum NavigationState {
     Complete,
     Failed,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NavigationTiming {
+    pub time_origin_ms: f64,
+    pub fetch_start_ms: f64,
+    pub request_start_ms: f64,
+    pub response_start_ms: f64,
+    pub response_end_ms: f64,
+    pub redirect_start_ms: Option<f64>,
+    pub redirect_end_ms: Option<f64>,
+    pub redirect_count: u32,
+}
