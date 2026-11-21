@@ -1,0 +1,32 @@
+[[cases]]
+name = "css2-collapsing-sibling-margins"
+html = "<html><body><div id='a'></div><div id='b'></div></body></html>"
+css = "body { margin: 0; } #a { height: 20px; margin-bottom: 30px; } #b { height: 20px; margin-top: 15px; }"
+[[cases.checks]]
+id = "b"
+expected_y = 50.0
+expected_height = 20.0
+
+[[cases]]
+name = "css2-float-right-and-clear-both"
+html = "<html><body><div id='box'><div id='f'></div><div id='c'></div></div></body></html>"
+css = "body { margin: 0; } #box { width: 400px; display: flow-root; } #f { float: right; width: 100px; height: 60px; } #c { clear: both; height: 20px; }"
+[[cases.checks]]
+id = "f"
+expected_x = 300.0
+expected_y = 0.0
+[[cases.checks]]
+id = "c"
+expected_y = 60.0
+
+[[cases]]
+name = "css2-table-colspan-rowspan"
+html = "<html><body><table id='t'><tr><td id='c0' colspan='2'>A</td><td id='c1' rowspan='2'>B</td></tr><tr><td id='c2'>C</td><td id='c3'>D</td></tr></table></body></html>"
+css = "body { margin: 0; } #t { width: 300px; table-layout: fixed; border-collapse: collapse; } td { height: 30px; }"
+[[cases.checks]]
+id = "c0"
+expected_width = 200.0
+[[cases.checks]]
+id = "c1"
+expected_x = 200.0
+expected_height = 60.0

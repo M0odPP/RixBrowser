@@ -1,0 +1,8 @@
+{
+  "subsets": {
+    "css2": 3,
+    "flexbox": 2,
+    "grid": 1,
+    "selectors": 2
+  }
+}

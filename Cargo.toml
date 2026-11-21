@@ -13,6 +13,7 @@ members = [
     "crates/rix-layout",
     "crates/rix-chrome",
     "crates/rix-app",
+    "xtask",
 ]
 
 [workspace.package]

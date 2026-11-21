@@ -1,0 +1,22 @@
+[[cases]]
+name = "flexbox-grow-and-gap"
+html = "<html><body><div id='f'><div id='a'></div><div id='b'></div></div></body></html>"
+css = "body { margin: 0; } #f { display: flex; width: 320px; gap: 20px; } #a { flex-grow: 1; height: 40px; } #b { flex-grow: 2; height: 40px; }"
+[[cases.checks]]
+id = "a"
+expected_width = 100.0
+[[cases.checks]]
+id = "b"
+expected_x = 120.0
+expected_width = 200.0
+
+[[cases]]
+name = "flexbox-justify-space-between"
+html = "<html><body><div id='f'><div id='a'></div><div id='b'></div></div></body></html>"
+css = "body { margin: 0; } #f { display: flex; width: 300px; justify-content: space-between; } #a, #b { width: 50px; height: 30px; }"
+[[cases.checks]]
+id = "a"
+expected_x = 0.0
+[[cases.checks]]
+id = "b"
+expected_x = 250.0

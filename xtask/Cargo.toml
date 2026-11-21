@@ -1,0 +1,24 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rix-core = { path = "../crates/rix-core" }
+rix-dom = { path = "../crates/rix-dom" }
+rix-html = { path = "../crates/rix-html" }
+rix-css = { path = "../crates/rix-css" }
+rix-layout = { path = "../crates/rix-layout" }
+rix-text = { path = "../crates/rix-text" }
+rix-ipc = { path = "../crates/rix-ipc" }
+rix-render = { path = "../crates/rix-render" }
+vello = { workspace = true }
+image = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
