@@ -11,6 +11,7 @@ rust-version.workspace = true
 rix-core = { path = "../rix-core" }
 bytes.workspace = true
 postcard.workspace = true
+psl.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

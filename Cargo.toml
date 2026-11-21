@@ -8,6 +8,7 @@ members = [
     "crates/rix-html",
     "crates/rix-text",
     "crates/rix-ipc",
+    "crates/rix-app",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ tempfile = "3.17"
 bytes = "1.10"
 postcard = { version = "1.1", features = ["use-std"] }
 libc = "0.2"
+psl = "2"
 
 [profile.dev]
 debug = 1

@@ -2040,6 +2040,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rix-app"
+version = "0.2.0-alpha.1"
+dependencies = [
+ "rix-core",
+ "rix-ipc",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rix-core"
 version = "0.2.0-alpha.1"
 dependencies = [
@@ -2088,6 +2099,7 @@ dependencies = [
  "bytes",
  "libc",
  "postcard",
+ "psl",
  "rix-core",
  "serde",
  "tempfile",

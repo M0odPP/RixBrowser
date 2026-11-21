@@ -6,7 +6,11 @@ pub mod frame;
 pub mod protocol;
 #[cfg(unix)]
 #[allow(unsafe_code)]
+pub mod sandbox;
+#[cfg(unix)]
+#[allow(unsafe_code)]
 pub mod shmem;
+pub mod supervisor;
 pub mod transport;
 
 pub use error::{IpcError, Result};
@@ -25,9 +29,16 @@ pub use protocol::{
     ViewportMetrics, WebSocketId, WindowId,
 };
 #[cfg(unix)]
+pub use sandbox::{apply_sandbox, probe_landlock_abi, SandboxConfig, SandboxRole, SandboxStatus};
+#[cfg(unix)]
 pub use shmem::{
     SealedShmemBlob, TripleBufferConsumer, TripleBufferProducer, TripleBufferShmem,
     MAX_FDS_PER_MESSAGE, MAX_SHMEM_BLOB_BYTES, MAX_TRIPLE_BUFFER_SLOT_BYTES,
+};
+#[cfg(unix)]
+pub use supervisor::ProcessSupervisor;
+pub use supervisor::{
+    parse_process_args, ChildLaunchArgs, PipelineHealth, ProcessRole, SiteKey, SupervisorEvent,
 };
 #[cfg(unix)]
 pub use transport::{
