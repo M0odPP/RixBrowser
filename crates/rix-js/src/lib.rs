@@ -15,6 +15,7 @@ pub mod parser;
 pub mod shape;
 pub mod string;
 pub mod value;
+pub mod vm;
 
 pub use ast::{Program, SourceType, Span, SyntaxError};
 pub use bigint::JsBigInt;
@@ -37,3 +38,4 @@ pub use shape::{
 };
 pub use string::{JsString, PropertyKey, StringInterner};
 pub use value::{HeapHandle, JsValue, JsValueKind, SymbolId, CANONICAL_NAN_BITS};
+pub use vm::{EvalError, JsException, JsVm, NativeFnPtr};

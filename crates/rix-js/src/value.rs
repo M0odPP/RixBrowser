@@ -351,6 +351,12 @@ impl JsValue {
 
     #[inline]
     #[must_use]
+    pub const fn as_object(self) -> Option<HeapHandle> {
+        self.as_object_handle()
+    }
+
+    #[inline]
+    #[must_use]
     pub const fn as_string_handle(self) -> Option<HeapHandle> {
         if self.is_string() {
             Some(HeapHandle::from_u48(self.0 & PAYLOAD_48_MASK))
@@ -361,12 +367,30 @@ impl JsValue {
 
     #[inline]
     #[must_use]
+    pub const fn as_string(self) -> Option<HeapHandle> {
+        self.as_string_handle()
+    }
+
+    #[inline]
+    #[must_use]
     pub const fn as_bigint_handle(self) -> Option<HeapHandle> {
         if self.is_bigint() {
             Some(HeapHandle::from_u48(self.0 & PAYLOAD_48_MASK))
         } else {
             None
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn as_bigint(self) -> Option<HeapHandle> {
+        self.as_bigint_handle()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn as_number(self) -> Option<f64> {
+        self.to_number_f64()
     }
 
     #[inline]
