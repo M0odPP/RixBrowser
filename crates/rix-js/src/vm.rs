@@ -198,7 +198,7 @@ impl JsVm {
         let key_set_prototype_of = heap.intern_key("setPrototypeOf");
         let key_own_keys = heap.intern_key("ownKeys");
 
-        Self {
+        let mut vm = Self {
             heap,
             shapes,
             mega_ic: MegamorphicCache::new(),
@@ -244,7 +244,9 @@ impl JsVm {
             key_get_prototype_of,
             key_set_prototype_of,
             key_own_keys,
-        }
+        };
+        crate::vm_builtins::install_core_intrinsics(&mut vm);
+        vm
     }
 
     /// Registers a static native function and returns its callable [`HeapHandle`].
