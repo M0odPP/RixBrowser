@@ -2,12 +2,16 @@
 //! Typed CSS stylesheet compiler, Selectors Level 4 integration, and compact
 //! `Arc`-grouped `ComputedStyle` for RixBrowser.
 
+pub mod cascade;
 pub mod computed;
 pub mod properties;
+pub mod rule_index;
 pub mod selector;
 pub mod stylesheet;
+pub mod ua;
 pub mod values;
 
+pub use cascade::{RestyleReport, StyleContext, StyleMemo};
 pub use computed::{
     apply_declaration, resolve_element_style, resolve_var_tokens, BoxModelStyle, ComputedStyle,
     CustomPropertyMap, EffectsStyle, FlexGridStyle, InheritedTextStyle, VisualStyle,
@@ -17,6 +21,7 @@ pub use properties::{
     GlobalKeyword, MissingCssFeature, MissingCssKind, PropertyIdKind, PropertyValue,
     SpecifiedDeclaration,
 };
+pub use rule_index::{InvalidationMap, InvalidationScope, RuleBucketEntry, RuleIndex};
 pub use selector::{
     compile_lightning_selector_list, matches_selector_list_for_element, matches_single_selector,
     parse_selector_list, CssAtom, CssLocalName, DomElement, RixPseudoClass, RixPseudoElement,
@@ -26,6 +31,7 @@ pub use stylesheet::{
     evaluate_supports, CascadeOrigin, CompiledRule, FontFaceRule, FontFaceSource, KeyframeStep,
     KeyframesRule, LayerId, MediaContext, MediaTypeKind, Stylesheet,
 };
+pub use ua::{default_ua_stylesheet, UA_CSS};
 pub use values::{
     AlignValue, BackgroundLayerValue, BorderEdge, BoxShadowValue, BoxSizingMode, CalcExpr,
     ClearMode, ColorRgba, CornerRadii, CornerRadius, CssColor, CursorKind, DirectionMode,
