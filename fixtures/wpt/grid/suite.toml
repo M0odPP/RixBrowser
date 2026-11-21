@@ -1,0 +1,15 @@
+[[cases]]
+name = "grid-fr-and-fixed-columns"
+html = "<html><body><div id='g'><div id='a'></div><div id='b'></div><div id='c'></div></div></body></html>"
+css = "body { margin: 0; } #g { display: grid; width: 420px; grid-template-columns: 100px 1fr 2fr; column-gap: 10px; } #a, #b, #c { height: 25px; }"
+[[cases.checks]]
+id = "a"
+expected_width = 100.0
+[[cases.checks]]
+id = "b"
+expected_x = 110.0
+expected_width = 100.0
+[[cases.checks]]
+id = "c"
+expected_x = 220.0
+expected_width = 200.0

@@ -1,0 +1,15 @@
+[[cases]]
+name = "selectors-l4-is-where-has-cascade-layers"
+html = "<html><body><div class='wrap'><p id='target' class='hit'><span>ok</span></p></div></body></html>"
+css = "@layer base, theme; @layer theme { .wrap:has(span) :is(p, div).hit { color: #16a34a; } } @layer base { #target { color: #dc2626; } }"
+[[cases.checks]]
+id = "target"
+expected_color_rgb = [22, 163, 74]
+
+[[cases]]
+name = "selectors-l4-not-selector-list"
+html = "<html><body><div id='keep'>Keep</div><div id='skip' class='no'>Skip</div></body></html>"
+css = "div:not(.no, .other) { color: #2563eb; }"
+[[cases.checks]]
+id = "keep"
+expected_color_rgb = [37, 99, 235]
