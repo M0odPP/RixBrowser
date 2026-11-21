@@ -3801,6 +3801,7 @@ dependencies = [
 name = "rix-js"
 version = "0.2.0-alpha.1"
 dependencies = [
+ "bitflags 2.13.2",
  "criterion",
  "postcard",
  "rix-core",
