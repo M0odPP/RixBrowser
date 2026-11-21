@@ -11,6 +11,7 @@ members = [
     "crates/rix-ipc",
     "crates/rix-render",
     "crates/rix-layout",
+    "crates/rix-chrome",
     "crates/rix-app",
 ]
 

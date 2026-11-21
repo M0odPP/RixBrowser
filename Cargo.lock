@@ -3604,6 +3604,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rix-chrome"
+version = "0.2.0-alpha.1"
+dependencies = [
+ "image",
+ "rix-core",
+ "rix-css",
+ "rix-dom",
+ "rix-html",
+ "rix-ipc",
+ "rix-layout",
+ "rix-net",
+ "rix-render",
+ "rix-text",
+ "serde",
+ "tracing",
+ "url",
+ "vello",
+]
+
+[[package]]
 name = "rix-core"
 version = "0.2.0-alpha.1"
 dependencies = [
