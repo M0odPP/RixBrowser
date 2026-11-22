@@ -67,6 +67,9 @@ pub struct DomPrototypes {
     pub html_element_proto: HeapHandle,
     pub html_canvas_element_proto: HeapHandle,
     pub html_iframe_element_proto: HeapHandle,
+    pub html_media_element_proto: HeapHandle,
+    pub html_video_element_proto: HeapHandle,
+    pub html_audio_element_proto: HeapHandle,
     pub document_proto: HeapHandle,
     pub shadow_root_proto: HeapHandle,
     pub text_proto: HeapHandle,
@@ -82,6 +85,9 @@ impl DomPrototypes {
             self.html_element_proto,
             self.html_canvas_element_proto,
             self.html_iframe_element_proto,
+            self.html_media_element_proto,
+            self.html_video_element_proto,
+            self.html_audio_element_proto,
             self.document_proto,
             self.shadow_root_proto,
             self.text_proto,
@@ -395,6 +401,10 @@ pub fn wrap_node(vm: &mut JsVm, host: &SharedHost, node_id: NodeId) -> JsValue {
                         h.prototypes.html_canvas_element_proto
                     } else if el.name.local.as_str().eq_ignore_ascii_case("iframe") {
                         h.prototypes.html_iframe_element_proto
+                    } else if el.name.local.as_str().eq_ignore_ascii_case("video") {
+                        h.prototypes.html_video_element_proto
+                    } else if el.name.local.as_str().eq_ignore_ascii_case("audio") {
+                        h.prototypes.html_audio_element_proto
                     } else {
                         h.prototypes.html_element_proto
                     }
@@ -444,6 +454,9 @@ pub fn install_dom_bridge(
     let html_element_proto = make_proto(vm, element_proto);
     let html_canvas_element_proto = make_proto(vm, html_element_proto);
     let html_iframe_element_proto = make_proto(vm, html_element_proto);
+    let html_media_element_proto = make_proto(vm, html_element_proto);
+    let html_video_element_proto = make_proto(vm, html_media_element_proto);
+    let html_audio_element_proto = make_proto(vm, html_media_element_proto);
     let document_proto = make_proto(vm, node_proto);
     let shadow_root_proto = make_proto(vm, node_proto);
     let text_proto = make_proto(vm, node_proto);
@@ -456,6 +469,9 @@ pub fn install_dom_bridge(
         html_element_proto,
         html_canvas_element_proto,
         html_iframe_element_proto,
+        html_media_element_proto,
+        html_video_element_proto,
+        html_audio_element_proto,
         document_proto,
         shadow_root_proto,
         text_proto,
