@@ -15,6 +15,13 @@ rix-css = { path = "../rix-css" }
 rix-layout = { path = "../rix-layout" }
 rix-text = { path = "../rix-text" }
 rix-js = { path = "../rix-js" }
+rix-net = { path = "../rix-net" }
+rix-storage = { path = "../rix-storage" }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
+encoding_rs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
