@@ -6,19 +6,30 @@ use crate::stylesheet::{CascadeOrigin, MediaContext, Stylesheet};
 
 /// Standard HTML5 User-Agent stylesheet rules.
 pub const UA_CSS: &str = r#"
-head, title, meta, link, style, script, template, [hidden] {
+head, title, meta, link, style, script, template, noscript, [hidden] {
     display: none;
 }
 html, body, div, p, section, article, main, header, footer, nav, aside,
 figure, figcaption, blockquote, pre, form, fieldset, legend, hr,
-ul, ol, dl, dt, dd, h1, h2, h3, h4, h5, h6, address {
+ul, ol, dl, dt, dd, h1, h2, h3, h4, h5, h6, address,
+center, details, summary, dialog, hgroup, search, menu, dir, caption {
     display: block;
+}
+center {
+    text-align: center;
+}
+center > table {
+    margin-left: auto;
+    margin-right: auto;
 }
 li {
     display: list-item;
 }
 table {
     display: table;
+    border-collapse: separate;
+    box-sizing: border-box;
+    text-align: left;
 }
 tr {
     display: table-row;
@@ -93,9 +104,20 @@ a:visited {
     text-decoration: underline;
     cursor: pointer;
 }
+input[type="hidden"] {
+    display: none;
+}
 button, input, select, textarea {
     display: inline-block;
     box-sizing: border-box;
+    border: 1px solid #a0a6b2;
+    border-radius: 4px;
+}
+input, textarea, select {
+    background-color: #ffffff;
+}
+button, input[type="submit"], input[type="button"], input[type="reset"] {
+    background-color: #eceef2;
 }
 img, svg, canvas, video {
     display: inline-block;

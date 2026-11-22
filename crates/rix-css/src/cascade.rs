@@ -14,7 +14,7 @@ use selectors::context::SelectorCaches;
 use selectors::Element as _;
 use smallvec::SmallVec;
 
-use crate::computed::{resolve_element_style, ComputedStyle};
+use crate::computed::{resolve_element_style, resolve_element_style_with_hints, ComputedStyle};
 use crate::properties::{parse_inline_style, MissingCssFeature, SpecifiedDeclaration};
 use crate::rule_index::{InvalidationMap, InvalidationScope, RuleIndex};
 use crate::selector::{matches_single_selector, DomElement, RixPseudoElement};
@@ -921,8 +921,9 @@ fn compute_single_element_style(
         .iter()
         .find(|(q, _)| q.local.eq_str_ignore_ascii_case("style"))
         .map(|(_, v)| v.as_str());
+    let has_pres_hints = has_presentational_hint_attrs(elem);
 
-    if inline_attr.is_none() {
+    if inline_attr.is_none() && !has_pres_hints {
         if let Some(cached) = memo.lookup(parent_ptr, &matched_indices) {
             if let Some(p_node) = sibling_parent {
                 memo.insert_sibling(p_node, elem, Arc::clone(&cached));
@@ -930,6 +931,12 @@ fn compute_single_element_style(
             return (cached, true);
         }
     }
+
+    let pres_decls = if has_pres_hints {
+        collect_presentational_hint_decls(elem, missing_out)
+    } else {
+        Vec::new()
+    };
 
     let inline_decls: Vec<SpecifiedDeclaration> = match inline_attr {
         Some(attr) if !attr.trim().is_empty() => parse_inline_style(attr, missing_out),
@@ -941,21 +948,154 @@ fn compute_single_element_style(
         .map(|&idx| &rule_index.rules[idx as usize])
         .collect();
 
-    let resolved = Arc::new(resolve_element_style(
+    let resolved = Arc::new(resolve_element_style_with_hints(
         &matched_refs,
+        &pres_decls,
         &inline_decls,
         parent_style.map(Arc::as_ref),
         root_font_size,
         media,
     ));
 
-    if inline_attr.is_none() {
+    if inline_attr.is_none() && !has_pres_hints {
         memo.insert(parent_ptr, &matched_indices, Arc::clone(&resolved));
         if let Some(p_node) = sibling_parent {
             memo.insert_sibling(p_node, elem, Arc::clone(&resolved));
         }
     }
     (resolved, false)
+}
+
+fn has_presentational_hint_attrs(elem: &ElementData) -> bool {
+    elem.attributes.iter().any(|(q, _)| {
+        let k: &str = q.local.as_ref();
+        k.eq_ignore_ascii_case("bgcolor")
+            || k.eq_ignore_ascii_case("width")
+            || k.eq_ignore_ascii_case("height")
+            || k.eq_ignore_ascii_case("align")
+            || k.eq_ignore_ascii_case("cellspacing")
+            || k.eq_ignore_ascii_case("color")
+    })
+}
+
+/// Translates HTML5 §15.3 presentational attributes (`bgcolor`, `width`, `height`, `align`,
+/// `cellspacing`, `<font color>`) into zero-specificity CSS declarations overridden by author CSS.
+fn collect_presentational_hint_decls(
+    elem: &ElementData,
+    missing_out: &mut Vec<MissingCssFeature>,
+) -> Vec<SpecifiedDeclaration> {
+    let tag: &str = elem.name.local.as_ref();
+    let mut css = String::new();
+
+    for (q, val) in &elem.attributes {
+        let attr: &str = q.local.as_ref();
+        let trimmed = val.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if attr.eq_ignore_ascii_case("bgcolor")
+            && (tag.eq_ignore_ascii_case("body")
+                || tag.eq_ignore_ascii_case("table")
+                || tag.eq_ignore_ascii_case("tr")
+                || tag.eq_ignore_ascii_case("td")
+                || tag.eq_ignore_ascii_case("th"))
+        {
+            let norm = normalize_legacy_color(trimmed);
+            css.push_str("background-color:");
+            css.push_str(&norm);
+            css.push(';');
+        } else if attr.eq_ignore_ascii_case("color") && tag.eq_ignore_ascii_case("font") {
+            let norm = normalize_legacy_color(trimmed);
+            css.push_str("color:");
+            css.push_str(&norm);
+            css.push(';');
+        } else if attr.eq_ignore_ascii_case("width")
+            && (tag.eq_ignore_ascii_case("table")
+                || tag.eq_ignore_ascii_case("td")
+                || tag.eq_ignore_ascii_case("th")
+                || tag.eq_ignore_ascii_case("img")
+                || tag.eq_ignore_ascii_case("svg")
+                || tag.eq_ignore_ascii_case("canvas")
+                || tag.eq_ignore_ascii_case("iframe")
+                || tag.eq_ignore_ascii_case("hr"))
+        {
+            if let Some(dim) = normalize_html_dimension(trimmed) {
+                css.push_str("width:");
+                css.push_str(&dim);
+                css.push(';');
+            }
+        } else if attr.eq_ignore_ascii_case("height")
+            && (tag.eq_ignore_ascii_case("table")
+                || tag.eq_ignore_ascii_case("td")
+                || tag.eq_ignore_ascii_case("th")
+                || tag.eq_ignore_ascii_case("img")
+                || tag.eq_ignore_ascii_case("svg")
+                || tag.eq_ignore_ascii_case("canvas")
+                || tag.eq_ignore_ascii_case("iframe"))
+        {
+            if let Some(dim) = normalize_html_dimension(trimmed) {
+                css.push_str("height:");
+                css.push_str(&dim);
+                css.push(';');
+            }
+        } else if attr.eq_ignore_ascii_case("align") {
+            let lower = trimmed.to_ascii_lowercase();
+            if tag.eq_ignore_ascii_case("table") && lower == "center" {
+                css.push_str("margin-left:auto;margin-right:auto;");
+            } else if matches!(lower.as_str(), "left" | "center" | "right" | "justify") {
+                css.push_str("text-align:");
+                css.push_str(&lower);
+                css.push(';');
+            }
+        } else if attr.eq_ignore_ascii_case("cellspacing") && tag.eq_ignore_ascii_case("table") {
+            if let Some(dim) = normalize_html_dimension(trimmed) {
+                css.push_str("border-spacing:");
+                css.push_str(&dim);
+                css.push(';');
+            }
+        }
+    }
+
+    if css.is_empty() {
+        Vec::new()
+    } else {
+        parse_inline_style(&css, missing_out)
+    }
+}
+
+fn normalize_legacy_color(raw: &str) -> String {
+    if raw.len() == 6 && raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        format!("#{raw}")
+    } else {
+        raw.to_string()
+    }
+}
+
+fn normalize_html_dimension(raw: &str) -> Option<String> {
+    if let Some(stripped) = raw.strip_suffix('%') {
+        let num = stripped.trim();
+        if num
+            .parse::<f32>()
+            .ok()
+            .is_some_and(|v| v.is_finite() && v >= 0.0)
+        {
+            return Some(format!("{num}%"));
+        }
+        return None;
+    }
+    let stripped = raw
+        .strip_suffix("px")
+        .or_else(|| raw.strip_suffix("PX"))
+        .unwrap_or(raw)
+        .trim();
+    if stripped
+        .parse::<f32>()
+        .ok()
+        .is_some_and(|v| v.is_finite() && v >= 0.0)
+    {
+        return Some(format!("{stripped}px"));
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]

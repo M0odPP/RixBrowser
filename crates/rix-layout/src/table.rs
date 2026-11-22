@@ -440,6 +440,30 @@ pub fn layout_table(
     let border_w = final_content_w + pb_w;
     let border_h = final_content_h + pb_h;
 
+    let (resolved_ml, resolved_mr) = if metrics.margin_left_auto || metrics.margin_right_auto {
+        let remaining = (space.available_width - border_w).max(0.0);
+        match (metrics.margin_left_auto, metrics.margin_right_auto) {
+            (true, true) => (remaining * 0.5, remaining * 0.5),
+            (true, false) => (
+                (remaining - metrics.margin.right).max(0.0),
+                metrics.margin.right,
+            ),
+            (false, true) => (
+                metrics.margin.left,
+                (remaining - metrics.margin.left).max(0.0),
+            ),
+            (false, false) => (metrics.margin.left, metrics.margin.right),
+        }
+    } else {
+        (metrics.margin.left, metrics.margin.right)
+    };
+    let resolved_margin = EdgeInsets {
+        top: metrics.margin.top,
+        right: resolved_mr,
+        bottom: metrics.margin.bottom,
+        left: resolved_ml,
+    };
+
     let mut table_frag = Fragment {
         box_id: table_id,
         dom_node: ctx.tree.get(table_id).dom_node,
@@ -447,7 +471,7 @@ pub fn layout_table(
         border_rect: Rect::new(0.0, 0.0, border_w, border_h),
         padding: metrics.padding,
         border: metrics.border,
-        margin: metrics.margin,
+        margin: resolved_margin,
         content_rect: Rect::new(
             content_origin_x,
             content_origin_y,

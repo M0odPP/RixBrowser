@@ -911,6 +911,12 @@ impl<'a> BoxTreeBuilder<'a> {
         parent_style: &Arc<ComputedStyle>,
         children: Vec<BoxId>,
     ) -> Vec<BoxId> {
+        // CSS 2.1 §9.2.1.1: Split any `BoxKind::Inline` box containing block-level descendants
+        // (e.g. `<a href="..."><div>Card</div></a>` or `<span><table>...</table></span>`) so
+        // block/table/flex/grid boxes participate directly in the enclosing BFC instead of being
+        // dropped by IFC!
+        let children = self.split_inline_containing_blocks(children);
+
         let has_block = children
             .iter()
             .any(|&cid| self.tree.get(cid).is_block_level());
@@ -948,6 +954,90 @@ impl<'a> BoxTreeBuilder<'a> {
                     inline_run,
                     false,
                 ));
+            }
+        }
+        out
+    }
+
+    fn inline_contains_block_descendant(&self, id: BoxId) -> bool {
+        let b = self.tree.get(id);
+        if b.is_block_level() {
+            return true;
+        }
+        if !matches!(b.kind, BoxKind::Inline) {
+            return false;
+        }
+        b.children
+            .iter()
+            .any(|&cid| self.inline_contains_block_descendant(cid))
+    }
+
+    fn split_inline_containing_blocks(&mut self, children: Vec<BoxId>) -> Vec<BoxId> {
+        let needs_split = children.iter().any(|&cid| {
+            matches!(self.tree.get(cid).kind, BoxKind::Inline)
+                && self.inline_contains_block_descendant(cid)
+        });
+        if !needs_split {
+            return children;
+        }
+        let mut out = Vec::with_capacity(children.len() + 2);
+        for cid in children {
+            if matches!(self.tree.get(cid).kind, BoxKind::Inline)
+                && self.inline_contains_block_descendant(cid)
+            {
+                let (dom_node, style, subtree_dirty, raw_kids) = {
+                    let b = self.tree.get(cid);
+                    (
+                        b.dom_node,
+                        Arc::clone(&b.style),
+                        b.subtree_dirty,
+                        b.children.clone(),
+                    )
+                };
+                let flattened = self.split_inline_containing_blocks(raw_kids);
+                let mut inline_seg = Vec::new();
+                for sub in flattened {
+                    let is_blk = {
+                        let sb = self.tree.get(sub);
+                        sb.is_block_level() || sb.is_out_of_flow || sb.is_float
+                    };
+                    if is_blk {
+                        if !inline_seg.is_empty() {
+                            let seg = std::mem::take(&mut inline_seg);
+                            out.push(self.alloc_box(LayoutBox {
+                                id: BoxId(0),
+                                dom_node,
+                                kind: BoxKind::Inline,
+                                style: Arc::clone(&style),
+                                children: seg,
+                                is_out_of_flow: false,
+                                is_float: false,
+                                establishes_bfc: false,
+                                subtree_dirty,
+                                subtree_hash: 0,
+                            }));
+                        }
+                        out.push(sub);
+                    } else {
+                        inline_seg.push(sub);
+                    }
+                }
+                if !inline_seg.is_empty() {
+                    out.push(self.alloc_box(LayoutBox {
+                        id: BoxId(0),
+                        dom_node,
+                        kind: BoxKind::Inline,
+                        style,
+                        children: inline_seg,
+                        is_out_of_flow: false,
+                        is_float: false,
+                        establishes_bfc: false,
+                        subtree_dirty,
+                        subtree_hash: 0,
+                    }));
+                }
+            } else {
+                out.push(cid);
             }
         }
         out

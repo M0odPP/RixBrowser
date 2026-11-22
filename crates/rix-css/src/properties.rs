@@ -37,11 +37,12 @@ use crate::values::{
     AnimationSpec, BackgroundImageValue, BackgroundLayerValue, BorderCollapseMode, BoxShadowValue,
     BoxSizingMode, ClearMode, ClipPathValue, CornerRadius, CssColor, CursorKind, DirectionMode,
     DisplayMode, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
-    GridAutoFlowMode, GridTrackSize, LengthPercentage, LengthPercentageAuto, LengthUnit,
-    LineHeightValue, LineStyle, MixBlendMode, OverflowMode, OverflowWrapMode, PointerEventsMode,
-    PositionMode, SizeValue, TableLayoutMode, TextAlignMode, TextDecorationLine, TextOverflowMode,
-    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionSpec,
-    UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, ZIndexValue,
+    GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize, LengthPercentage,
+    LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
+    OverflowWrapMode, PointerEventsMode, PositionMode, SizeValue, TableLayoutMode, TextAlignMode,
+    TextDecorationLine, TextOverflowMode, TextTransformMode, TimingFunction, TransformOp,
+    TransformOrigin, TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode,
+    WhiteSpaceMode, WordBreakMode, ZIndexValue,
 };
 
 /// Category of an unsupported CSS feature recorded during compilation.
@@ -378,6 +379,7 @@ pub enum PropertyIdKind {
     ColumnGap,
     GridTemplateColumns,
     GridTemplateRows,
+    GridTemplateAreas,
     GridAutoColumns,
     GridAutoRows,
     GridAutoFlow,
@@ -414,6 +416,7 @@ pub enum PropertyIdKind {
     BorderCollapse,
     BorderSpacing,
     TableLayout,
+    ColorScheme,
     Content,
     // Custom property (`--*`)
     Custom,
@@ -531,6 +534,7 @@ impl PropertyIdKind {
             "column-gap" => Self::ColumnGap,
             "grid-template-columns" => Self::GridTemplateColumns,
             "grid-template-rows" => Self::GridTemplateRows,
+            "grid-template-areas" => Self::GridTemplateAreas,
             "grid-auto-columns" => Self::GridAutoColumns,
             "grid-auto-rows" => Self::GridAutoRows,
             "grid-auto-flow" => Self::GridAutoFlow,
@@ -566,6 +570,7 @@ impl PropertyIdKind {
             "border-collapse" => Self::BorderCollapse,
             "border-spacing" => Self::BorderSpacing,
             "table-layout" => Self::TableLayout,
+            "color-scheme" => Self::ColorScheme,
             "content" => Self::Content,
             _ => return None,
         })
@@ -679,6 +684,7 @@ impl PropertyIdKind {
             Self::ColumnGap => "column-gap",
             Self::GridTemplateColumns => "grid-template-columns",
             Self::GridTemplateRows => "grid-template-rows",
+            Self::GridTemplateAreas => "grid-template-areas",
             Self::GridAutoColumns => "grid-auto-columns",
             Self::GridAutoRows => "grid-auto-rows",
             Self::GridAutoFlow => "grid-auto-flow",
@@ -714,6 +720,7 @@ impl PropertyIdKind {
             Self::BorderCollapse => "border-collapse",
             Self::BorderSpacing => "border-spacing",
             Self::TableLayout => "table-layout",
+            Self::ColorScheme => "color-scheme",
             Self::Content => "content",
             Self::Custom => "--custom",
         }
@@ -724,6 +731,7 @@ impl PropertyIdKind {
         matches!(
             self,
             Self::Color
+                | Self::ColorScheme
                 | Self::Visibility
                 | Self::PointerEvents
                 | Self::Cursor
@@ -786,6 +794,8 @@ pub enum PropertyValue {
     GridAutoFlow(GridAutoFlowMode),
     GridTracks(Vec<GridTrackSize>),
     GridLine(Option<i32>, Option<i32>),
+    GridPlacement(GridPlacementValue),
+    GridTemplateAreas(GridTemplateAreasValue),
     BoxShadow(Vec<BoxShadowValue>),
     BackgroundLayers(Vec<BackgroundLayerValue>),
     Transform(Vec<TransformOp>),
@@ -2315,6 +2325,126 @@ fn compile_property(
             PropertyValue::GridTracks(convert_track_sizing(ts)),
             imp,
         ),
+        Property::GridTemplateAreas(areas) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::GridTemplateAreas,
+            PropertyValue::GridTemplateAreas(convert_grid_template_areas(areas)),
+            imp,
+        ),
+        Property::GridTemplate(gt) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::GridTemplateRows,
+                PropertyValue::GridTracks(convert_track_sizing(&gt.rows)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::GridTemplateColumns,
+                PropertyValue::GridTracks(convert_track_sizing(&gt.columns)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::GridTemplateAreas,
+                PropertyValue::GridTemplateAreas(convert_grid_template_areas(&gt.areas)),
+                imp,
+            );
+        }
+        Property::GridRowStart(line) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::GridRowStart,
+            PropertyValue::GridPlacement(convert_grid_line(line)),
+            imp,
+        ),
+        Property::GridRowEnd(line) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::GridRowEnd,
+            PropertyValue::GridPlacement(convert_grid_line(line)),
+            imp,
+        ),
+        Property::GridRow(row) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::GridRowStart,
+                PropertyValue::GridPlacement(convert_grid_line(&row.start)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::GridRowEnd,
+                PropertyValue::GridPlacement(convert_grid_line(&row.end)),
+                imp,
+            );
+        }
+        Property::GridColumnStart(line) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::GridColumnStart,
+            PropertyValue::GridPlacement(convert_grid_line(line)),
+            imp,
+        ),
+        Property::GridColumnEnd(line) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::GridColumnEnd,
+            PropertyValue::GridPlacement(convert_grid_line(line)),
+            imp,
+        ),
+        Property::GridColumn(col) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::GridColumnStart,
+                PropertyValue::GridPlacement(convert_grid_line(&col.start)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::GridColumnEnd,
+                PropertyValue::GridPlacement(convert_grid_line(&col.end)),
+                imp,
+            );
+        }
+        Property::GridArea(area) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::GridRowStart,
+                PropertyValue::GridPlacement(convert_grid_line(&area.row_start)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::GridColumnStart,
+                PropertyValue::GridPlacement(convert_grid_line(&area.column_start)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::GridRowEnd,
+                PropertyValue::GridPlacement(convert_grid_line(&area.row_end)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::GridColumnEnd,
+                PropertyValue::GridPlacement(convert_grid_line(&area.column_end)),
+                imp,
+            );
+        }
         Property::GridAutoColumns(tsl) => push_decl(
             out,
             ord,
@@ -2336,6 +2466,16 @@ fn compile_property(
             PropertyValue::GridAutoFlow(convert_grid_auto_flow(f)),
             imp,
         ),
+        Property::ColorScheme(cs) => {
+            let supports_dark = cs.contains(lightningcss::properties::ui::ColorScheme::Dark);
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::ColorScheme,
+                PropertyValue::Number(if supports_dark { 1.0 } else { 0.0 }),
+                imp,
+            );
+        }
         Property::BoxShadow(bs, _) => {
             let shadows = bs.iter().map(convert_box_shadow).collect();
             push_decl(
@@ -2661,6 +2801,40 @@ fn convert_gap_value(gap: &lightningcss::properties::align::GapValue) -> LengthP
     }
 }
 
+fn convert_grid_template_areas(
+    areas: &lightningcss::properties::grid::GridTemplateAreas,
+) -> GridTemplateAreasValue {
+    match areas {
+        lightningcss::properties::grid::GridTemplateAreas::None => {
+            GridTemplateAreasValue::default()
+        }
+        lightningcss::properties::grid::GridTemplateAreas::Areas { columns, areas } => {
+            GridTemplateAreasValue {
+                columns: *columns,
+                areas: areas
+                    .iter()
+                    .map(|opt| opt.as_deref().map(intern_str))
+                    .collect(),
+            }
+        }
+    }
+}
+
+fn convert_grid_line(line: &lightningcss::properties::grid::GridLine<'_>) -> GridPlacementValue {
+    match line {
+        lightningcss::properties::grid::GridLine::Auto => GridPlacementValue::Auto,
+        lightningcss::properties::grid::GridLine::Area { name } => {
+            GridPlacementValue::Area(intern_str(name.0.as_ref()))
+        }
+        lightningcss::properties::grid::GridLine::Line { index, .. } => {
+            GridPlacementValue::Line((*index).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16)
+        }
+        lightningcss::properties::grid::GridLine::Span { index, .. } => {
+            GridPlacementValue::Span((*index).clamp(1, i32::from(u16::MAX)) as u16)
+        }
+    }
+}
+
 fn compile_extra_standard_property(
     name: &str,
     tokens: &TokenList<'_>,
@@ -2770,6 +2944,18 @@ fn compile_extra_standard_property(
                 ord,
                 PropertyIdKind::TableLayout,
                 PropertyValue::TableLayout(mode),
+                imp,
+            );
+        }
+        "color-scheme" => {
+            let supports_dark = owned.iter().any(
+                |t| matches!(t, CssToken::Ident(id) if id.as_str().eq_ignore_ascii_case("dark")),
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::ColorScheme,
+                PropertyValue::Number(if supports_dark { 1.0 } else { 0.0 }),
                 imp,
             );
         }

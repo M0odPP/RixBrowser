@@ -676,6 +676,62 @@ pub enum GridAutoFlowMode {
     ColumnDense,
 }
 
+/// Typed CSS Grid line / span / named area placement (`grid-row-*`, `grid-column-*`, `grid-area`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum GridPlacementValue {
+    #[default]
+    Auto,
+    Line(i16),
+    Span(u16),
+    Area(InternedStr),
+}
+
+/// Typed CSS `grid-template-areas` matrix (`columns` wide, `None` for `.` unnamed cells).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GridTemplateAreasValue {
+    pub columns: u32,
+    pub areas: Vec<Option<InternedStr>>,
+}
+
+impl GridTemplateAreasValue {
+    /// Looks up the bounding `(row_start, row_end, col_start, col_end)` in 1-based CSS grid lines
+    /// for named area `name`.
+    #[must_use]
+    pub fn find_area_lines(&self, name: &str) -> Option<(i16, i16, i16, i16)> {
+        let cols = self.columns as usize;
+        if cols == 0 || self.areas.is_empty() {
+            return None;
+        }
+        let mut min_r = usize::MAX;
+        let mut max_r = 0usize;
+        let mut min_c = usize::MAX;
+        let mut max_c = 0usize;
+        let mut found = false;
+        for (idx, cell) in self.areas.iter().enumerate() {
+            if let Some(a) = cell {
+                if a.as_str() == name {
+                    let r = idx / cols;
+                    let c = idx % cols;
+                    min_r = min_r.min(r);
+                    max_r = max_r.max(r);
+                    min_c = min_c.min(c);
+                    max_c = max_c.max(c);
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            return None;
+        }
+        Some((
+            (min_r + 1) as i16,
+            (max_r + 2) as i16,
+            (min_c + 1) as i16,
+            (max_c + 2) as i16,
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum TextOverflowMode {
