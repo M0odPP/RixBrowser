@@ -1,0 +1,57 @@
+# WPT subset: Workers, BroadcastChannel, EventSource, CacheStorage & ServiceWorker APIs
+
+[[script_cases]]
+name = "url_create_and_revoke_object_url"
+script = """
+var b = new Blob(["hello"], { type: "text/plain" });
+var u = URL.createObjectURL(b);
+URL.revokeObjectURL(u);
+var __pass = typeof u === "string" && u.indexOf("blob:") === 0;
+"""
+assert_expr = "__pass"
+expected = "true"
+
+[[script_cases]]
+name = "broadcast_channel_name_and_closed_invalid_state_error"
+script = """
+var bc = new BroadcastChannel("sync-room");
+var nameOk = bc.name === "sync-room";
+bc.close();
+var errName = "";
+try { bc.postMessage("after-close"); } catch (e) { errName = e.name; }
+var __pass = nameOk && errName === "InvalidStateError";
+"""
+assert_expr = "__pass"
+expected = "true"
+
+[[script_cases]]
+name = "cache_storage_open_put_match_and_delete"
+advance_ms = 10
+script = """
+var out = "";
+caches.open("wpt-v1").then(function(c) {
+    return c.put("/item", new Response("cached-value", { status: 200 }));
+}).then(function() {
+    return caches.match("/item");
+}).then(function(r) {
+    return r.text();
+}).then(function(txt) {
+    return caches.delete("wpt-v1").then(function(del) {
+        out = txt + "|" + del;
+    });
+});
+"""
+assert_expr = "out"
+expected = "cached-value|true"
+
+[[script_cases]]
+name = "service_worker_rejects_cross_origin_script_with_security_error"
+advance_ms = 10
+script = """
+var errName = "";
+navigator.serviceWorker.register("https://cross-origin.invalid/sw.js").catch(function(e) {
+    errName = e.name;
+});
+"""
+assert_expr = "errName"
+expected = "SecurityError"

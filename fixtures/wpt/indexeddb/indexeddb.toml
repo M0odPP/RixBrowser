@@ -1,0 +1,160 @@
+# WPT subset: IndexedDB (IDBFactory, IDBKeyRange, IDBObjectStore, IDBIndex, IDBCursor, ACID rollback)
+
+[[script_cases]]
+name = "idb_key_ordering_and_cmp"
+script = """
+var ok = indexedDB.cmp(1, 2) === -1
+    && indexedDB.cmp(2, 2) === 0
+    && indexedDB.cmp(10, "a") === -1
+    && indexedDB.cmp(new Date(1000), "a") === -1
+    && indexedDB.cmp("z", [1]) === -1
+    && indexedDB.cmp([1, "a"], [1, "b"]) === -1;
+var badErr = "";
+try { indexedDB.cmp(NaN, 1); } catch (e) { badErr = e.name; }
+var __pass = ok && badErr === "DataError";
+"""
+assert_expr = "__pass"
+expected = "true"
+
+[[script_cases]]
+name = "idb_key_range_bounds_and_includes"
+script = """
+var rOnly = IDBKeyRange.only(5);
+var rBound = IDBKeyRange.bound(1, 5, true, false);
+var rLow = IDBKeyRange.lowerBound("b", false);
+var rUp = IDBKeyRange.upperBound("d", true);
+var badRange = "";
+try { IDBKeyRange.bound(5, 1); } catch (e) { badRange = e.name; }
+var __pass = rOnly.includes(5) && !rOnly.includes(4)
+    && !rBound.includes(1) && rBound.includes(2) && rBound.includes(5) && !rBound.includes(6)
+    && rLow.includes("b") && !rLow.includes("a")
+    && rUp.includes("c") && !rUp.includes("d")
+    && badRange === "DataError";
+"""
+assert_expr = "__pass"
+expected = "true"
+
+[[script_cases]]
+name = "idb_object_store_crud_and_autoincrement"
+advance_ms = 20
+script = """
+var result = "";
+var req = indexedDB.open("wpt-crud", 1);
+req.onupgradeneeded = function() {
+    req.result.createObjectStore("items", { keyPath: "id", autoIncrement: true });
+};
+req.onsuccess = function() {
+    var db = req.result;
+    var tx = db.transaction("items", "readwrite");
+    var s = tx.objectStore("items");
+    s.add({ name: "first" });
+    s.add({ name: "second" });
+    s.put({ id: 2, name: "second-updated" });
+    tx.oncomplete = function() {
+        var rtx = db.transaction("items", "readonly");
+        var all = rtx.objectStore("items").getAll();
+        all.onsuccess = function() {
+            result = all.result.map(function(x) { return x.id + ":" + x.name; }).join("|");
+        };
+    };
+};
+"""
+assert_expr = "result"
+expected = "1:first|2:second-updated"
+
+[[script_cases]]
+name = "idb_unique_and_multientry_indexes"
+advance_ms = 20
+script = """
+var out = "";
+var req = indexedDB.open("wpt-idx", 1);
+req.onupgradeneeded = function() {
+    var s = req.result.createObjectStore("docs", { keyPath: "id" });
+    s.createIndex("by_slug", "slug", { unique: true });
+    s.createIndex("by_tag", "tags", { multiEntry: true });
+};
+req.onsuccess = function() {
+    var db = req.result;
+    var tx = db.transaction("docs", "readwrite");
+    var s = tx.objectStore("docs");
+    s.add({ id: 1, slug: "intro", tags: ["web", "idb"] });
+    s.add({ id: 2, slug: "guide", tags: ["idb", "storage"] });
+    var dup = s.add({ id: 3, slug: "intro", tags: ["dup"] });
+    var dupErr = "";
+    dup.onerror = function(e) { dupErr = dup.error.name; e.preventDefault(); };
+    tx.oncomplete = function() {
+        var rtx = db.transaction("docs", "readonly");
+        var r = rtx.objectStore("docs").index("by_tag").getAllKeys("idb");
+        r.onsuccess = function() { out = dupErr + ":" + r.result.join(","); };
+    };
+};
+"""
+assert_expr = "out"
+expected = "ConstraintError:1,2"
+
+[[script_cases]]
+name = "idb_cursor_directions_and_mutations"
+advance_ms = 20
+script = """
+var out = "";
+var req = indexedDB.open("wpt-cursor", 1);
+req.onupgradeneeded = function() {
+    var s = req.result.createObjectStore("nums", { keyPath: "k" });
+    s.put({ k: 10, v: "a" });
+    s.put({ k: 20, v: "b" });
+    s.put({ k: 30, v: "c" });
+};
+req.onsuccess = function() {
+    var db = req.result;
+    var tx = db.transaction("nums", "readwrite");
+    var seen = [];
+    var cReq = tx.objectStore("nums").openCursor(null, "prev");
+    cReq.onsuccess = function() {
+        var c = cReq.result;
+        if (c) {
+            seen.push(c.key + c.value.v);
+            if (c.key === 20) c.delete();
+            c.continue();
+        }
+    };
+    tx.oncomplete = function() {
+        var rtx = db.transaction("nums", "readonly");
+        var cnt = rtx.objectStore("nums").count();
+        cnt.onsuccess = function() { out = seen.join(",") + "|" + cnt.result; };
+    };
+};
+"""
+assert_expr = "out"
+expected = "30c,20b,10a|2"
+
+[[script_cases]]
+name = "idb_transaction_abort_rollback"
+advance_ms = 20
+script = """
+var out = "";
+var req = indexedDB.open("wpt-abort", 1);
+req.onupgradeneeded = function() {
+    req.result.createObjectStore("kv");
+};
+req.onsuccess = function() {
+    var db = req.result;
+    var tx1 = db.transaction("kv", "readwrite");
+    tx1.objectStore("kv").put("v1", "k1");
+    tx1.oncomplete = function() {
+        var tx2 = db.transaction("kv", "readwrite");
+        tx2.objectStore("kv").put("v2-aborted", "k2");
+        tx2.objectStore("kv").delete("k1");
+        tx2.abort();
+        tx2.onabort = function() {
+            var tx3 = db.transaction("kv", "readonly");
+            var g1 = tx3.objectStore("kv").get("k1");
+            var g2 = tx3.objectStore("kv").get("k2");
+            tx3.oncomplete = function() {
+                out = g1.result + "|" + String(g2.result);
+            };
+        };
+    };
+};
+"""
+assert_expr = "out"
+expected = "v1|undefined"
