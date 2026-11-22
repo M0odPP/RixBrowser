@@ -23,6 +23,7 @@ tracing.workspace = true
 pollster.workspace = true
 
 [dev-dependencies]
+rix-media = { path = "../rix-media" }
 tempfile.workspace = true
 criterion.workspace = true
 

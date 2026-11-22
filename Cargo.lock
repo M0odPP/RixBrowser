@@ -5249,6 +5249,7 @@ name = "rix-media"
 version = "0.2.0-alpha.1"
 dependencies = [
  "opus-decoder",
+ "rix-ipc",
  "rusty_av1d",
  "rusty_av1e",
  "rusty_h264",
@@ -5306,6 +5307,7 @@ dependencies = [
  "postcard",
  "rix-core",
  "rix-ipc",
+ "rix-media",
  "rix-text",
  "serde",
  "smallvec",

@@ -12,6 +12,7 @@ pub mod scene_encoder;
 pub mod strip_cache;
 pub mod webgl_constants;
 pub mod webgl_glsl;
+pub mod yuv_video;
 
 pub use animations::{
     AnimDirection, AnimFillMode, AnimationSample, AnimationTarget, CompositorAnimation,
@@ -54,4 +55,7 @@ pub use vello::Scene;
 pub use webgl_glsl::{
     compile_webgl_program, CompiledWebGlProgram, GlAttribReflection, GlSamplerReflection,
     GlUniformReflection, GlUniformType,
+};
+pub use yuv_video::{
+    YuvColorMatrix, YuvColorRange, YuvFrameUpload, YuvPixelFormat, YuvVideoRenderer,
 };

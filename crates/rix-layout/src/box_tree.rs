@@ -470,7 +470,7 @@ impl<'a> BoxTreeBuilder<'a> {
         match elem.name.local.as_str() {
             "br" => Some(ReplacedKind::LineBreak),
             "hr" => Some(ReplacedKind::HorizontalRule),
-            "canvas" | "iframe" => {
+            "canvas" | "iframe" | "video" => {
                 let iw = elem
                     .get_attribute("width")
                     .and_then(parse_html_dimension_attr)
