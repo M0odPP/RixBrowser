@@ -74,6 +74,12 @@ pub struct DevHudState {
     pub network: Vec<NetworkEntry>,
     pub missing_features: Vec<MissingFeatureEntry>,
     pub console: Vec<ConsoleEntry>,
+    /// Active video layer presentation FPS (0 when no video is playing).
+    pub video_fps: f32,
+    /// Absolute A/V synchronization jitter in milliseconds (`< 15 ms` target).
+    pub av_sync_jitter_ms: f32,
+    /// Cumulative `DisplayList` rebuild count during active video playback (`0` target per video frame).
+    pub video_display_list_rebuilds: u64,
 }
 
 impl Default for DevHudState {
@@ -95,6 +101,9 @@ impl DevHudState {
             network: Vec::new(),
             missing_features: Vec::new(),
             console: Vec::new(),
+            video_fps: 0.0,
+            av_sync_jitter_ms: 0.0,
+            video_display_list_rebuilds: 0,
         }
     }
 
@@ -161,6 +170,18 @@ impl DevHudState {
         if self.network.len() > 128 {
             self.network.remove(0);
         }
+    }
+
+    /// Updates live video playback FPS, A/V clock sync jitter (ms), and DisplayList rebuild telemetry.
+    pub fn record_media_telemetry(
+        &mut self,
+        video_fps: f32,
+        av_sync_jitter_ms: f32,
+        video_display_list_rebuilds: u64,
+    ) {
+        self.video_fps = video_fps.max(0.0);
+        self.av_sync_jitter_ms = av_sync_jitter_ms.abs();
+        self.video_display_list_rebuilds = video_display_list_rebuilds;
     }
 
     pub fn record_missing_feature(&mut self, category: &str, name: &str) {

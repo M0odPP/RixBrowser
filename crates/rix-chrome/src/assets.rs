@@ -429,6 +429,9 @@ fn render_hud_fragment(hud: &DevHudState, now: Instant) -> String {
     <span>Paint {paint:.2}</span>
     <span>IPC {ipc:.2}</span>
     <span>GPU {gpu:.2}</span>
+    <span>Video {vfps:.1} fps</span>
+    <span>A/V {jitter:.1} ms</span>
+    <span>DL {dl_rebuilds}</span>
   </div>"#,
         total = latest.total_ms,
         rss = hud.content_rss_mb,
@@ -437,6 +440,9 @@ fn render_hud_fragment(hud: &DevHudState, now: Instant) -> String {
         paint = latest.paint_ms,
         ipc = latest.ipc_ms,
         gpu = latest.gpu_ms,
+        vfps = hud.video_fps,
+        jitter = hud.av_sync_jitter_ms,
+        dl_rebuilds = hud.video_display_list_rebuilds,
     );
 
     // Rolling frame-time bar graph (last 64 samples, single neutral + accent highlight for spikes > 16ms)

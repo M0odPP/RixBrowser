@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rix-ipc = { path = "../rix-ipc" }
 thiserror.workspace = true
 tracing.workspace = true
 sha2.workspace = true
