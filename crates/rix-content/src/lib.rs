@@ -14,11 +14,13 @@ pub mod fetch_ws;
 pub mod frames;
 pub mod indexeddb;
 pub mod indexeddb_engine;
+pub mod media_elements;
 pub mod media_source;
 pub mod observers;
 pub mod service_worker;
 pub mod streams;
 pub mod web_apis;
+pub mod webaudio;
 pub mod webgl2;
 pub mod webgpu;
 pub mod webgpu_types;
@@ -63,6 +65,10 @@ pub use fetch_ws::{
     NetworkBridge, SharedNetBridge,
 };
 pub use indexeddb::{install_indexeddb, IndexedDbSystem, SharedIndexedDb};
+pub use media_elements::{
+    install_media_elements, MediaElementSystem, MediaPlaybackTelemetry, MediaPlayerState,
+    SharedMediaElements,
+};
 pub use media_source::{install_media_source, MediaSourceSystem, SharedMediaSource};
 pub use observers::{
     deliver_layout_observers, deliver_mutation_observers, install_observers, ObserverSystem,
@@ -76,6 +82,7 @@ pub use streams::{
     create_readable_stream_from_bytes, install_streams, SharedStreams, StreamSystem,
 };
 pub use web_apis::{install_web_apis, SharedWebApis, WebApiState, DEFAULT_DOCUMENT_URL};
+pub use webaudio::{install_webaudio, SharedWebAudio, WebAudioSystem};
 pub use webgl2::{install_webgl2, SharedWebGl2, WebGl2System};
 pub use webgpu::{install_webgpu, SharedWebGpu, WebGpuSystem};
 pub use workers::{
@@ -101,6 +108,8 @@ pub struct ContentRuntime {
     pub service_workers: SharedServiceWorkers,
     pub indexeddb: SharedIndexedDb,
     pub media_source: SharedMediaSource,
+    pub media_elements: SharedMediaElements,
+    pub webaudio: SharedWebAudio,
     pub webgpu: SharedWebGpu,
     pub webgl2: SharedWebGl2,
     pub jit: Rc<rix_jit::TieredJit>,
@@ -170,6 +179,15 @@ impl ContentRuntime {
             install_service_worker_and_cache_apis(&mut vm, &host, &web_apis, &streams, &net);
         let indexeddb = install_indexeddb(&mut vm, &host, &events, &event_loop, &web_apis);
         let media_source = install_media_source(&mut vm, &host, &events, &event_loop, &web_apis);
+        let media_elements = install_media_elements(
+            &mut vm,
+            &host,
+            &events,
+            &event_loop,
+            &web_apis,
+            &media_source,
+        );
+        let webaudio = install_webaudio(&mut vm, &host, &media_elements);
         let webgpu = install_webgpu(&mut vm, &host, &canvas2d);
         let webgl2 = install_webgl2(&mut vm, &host, &canvas2d);
         Self {
@@ -187,6 +205,8 @@ impl ContentRuntime {
             service_workers,
             indexeddb,
             media_source,
+            media_elements,
+            webaudio,
             webgpu,
             webgl2,
             jit,
@@ -547,15 +567,16 @@ impl ContentRuntime {
     }
 
     /// Attaches a compositor-owned [`rix_render::SharedGpuDevice`] so WebGPU/WebGL2 canvases
-    /// share the same `wgpu::Device` as `VelloRenderer` for zero-copy GPU-to-GPU presentation.
+    /// and `<video>` YUV->RGBA shader layers share the same `wgpu::Device` as `VelloRenderer`.
     pub fn attach_shared_gpu(&mut self, shared: rix_render::SharedGpuDevice) {
         self.webgpu.borrow_mut().attach_shared_gpu(shared.clone());
-        self.webgl2.borrow_mut().attach_shared_gpu(shared);
+        self.webgl2.borrow_mut().attach_shared_gpu(shared.clone());
+        self.media_elements.borrow_mut().attach_shared_gpu(shared);
     }
 
     /// Synchronizes any dirty page `DisplayList` (only when DOM/CSS changed!) AND
-    /// presents all dirty GPU-backed `Canvas2D` / `WebGPU` / `WebGL2` external surfaces into `compositor`.
-    /// Returns `(display_list_rebuilt, canvases_presented)`.
+    /// presents all dirty GPU-backed `Canvas2D` / `WebGPU` / `WebGL2` / `<video>` external surfaces
+    /// into `compositor`. Returns `(display_list_rebuilt, surfaces_presented)`.
     pub fn sync_frame_to_compositor(
         &mut self,
         pipeline: PipelineId,
@@ -584,12 +605,17 @@ impl ContentRuntime {
         let canvases_gl = self
             .webgl2
             .borrow_mut()
+            .present_dirty_to_compositor(compositor, gpu.as_deref_mut());
+        let videos = self
+            .media_elements
+            .borrow_mut()
             .present_dirty_to_compositor(compositor, gpu);
-        (dl_rebuilt, canvases2d + canvases_gpu + canvases_gl)
+        (dl_rebuilt, canvases2d + canvases_gpu + canvases_gl + videos)
     }
 
     /// Runs a full Major GC across VM roots, event loop callbacks, listeners, observers,
-    /// Web APIs, Streams, Canvas2D, WebGPU, WebGL2, active network handles, and host-pinned DOM wrappers.
+    /// Web APIs, Streams, Canvas2D, WebGPU, WebGL2, WebAudio, MediaSource, active network handles,
+    /// and host-pinned DOM wrappers.
     pub fn collect_garbage(&mut self) -> GcCycleStats {
         let mut roots = self.vm.collect_roots();
         self.event_loop.borrow().collect_roots(&mut roots);
@@ -606,6 +632,7 @@ impl ContentRuntime {
         self.service_workers.borrow().collect_roots(&mut roots);
         self.indexeddb.borrow().collect_roots(&mut roots);
         self.media_source.borrow().collect_roots(&mut roots);
+        self.webaudio.borrow().collect_roots(&mut roots);
         self.host.borrow().collect_roots(&mut roots);
         let stats = self.vm.heap.collect_major(&roots);
         self.events.borrow_mut().sweep_dead(&self.vm.heap);
@@ -620,6 +647,7 @@ impl ContentRuntime {
         self.service_workers.borrow_mut().sweep_dead(&self.vm.heap);
         self.indexeddb.borrow_mut().sweep_dead(&self.vm.heap);
         self.media_source.borrow_mut().sweep_dead(&self.vm.heap);
+        self.webaudio.borrow_mut().sweep_dead(&self.vm.heap);
         self.host.borrow_mut().sweep_dead_wrappers(&self.vm.heap);
         stats
     }
