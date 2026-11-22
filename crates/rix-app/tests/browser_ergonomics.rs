@@ -5,12 +5,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rix_app::{BrowserController, BrowserKey, KeyModifiers};
-use rix_chrome::{ThemeMode, URL_NEWTAB};
+use rix_chrome::{
+    FrameStageSample, NetworkEntry, SearchEngine, SettingsSection, TabLayoutMode, ThemeMode,
+    URL_BOOKMARKS, URL_HISTORY, URL_NEWTAB, URL_SETTINGS,
+};
 use rix_core::{Point, RixUrl, Size};
+use rix_dom::NodeData;
 use rix_ipc::{
     BrowserToContent, ContentToBrowser, PipelineId, ProcessSupervisor, SiteKey, SupervisorEvent,
     TabId, ViewportMetrics,
 };
+use rix_layout::Fragment;
+use rix_render::VelloRenderer;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -325,4 +331,250 @@ fn chrome_input_latency_remains_under_2ms_while_content_cpu_is_busy() {
     // Also verify right-click context menu & hover link preview do not panic.
     assert!(ctrl.handle_right_click(Point::new(300.0, 220.0)));
     assert!(ctrl.chrome.context_menu.visible);
+}
+
+fn find_fragment_center_by_id(
+    doc: &rix_dom::Document,
+    frag: &Fragment,
+    parent_origin: Point,
+    target_id: &str,
+) -> Option<Point> {
+    let abs = frag.absolute_border_rect(parent_origin);
+    if let Some(node) = frag.dom_node {
+        if let Some(NodeData::Element(e)) = doc.get(node) {
+            if e.id() == Some(target_id) {
+                return Some(Point::new(
+                    abs.min_x() + abs.size.width * 0.5,
+                    abs.min_y() + abs.size.height * 0.5,
+                ));
+            }
+        }
+    }
+    for ch in frag.children.iter() {
+        if let Some(pt) = find_fragment_center_by_id(doc, ch, abs.origin, target_id) {
+            return Some(pt);
+        }
+    }
+    None
+}
+
+fn click_web_element_by_id(ctrl: &mut BrowserController, id: &str) {
+    let web_rect = ctrl.web_viewport_rect();
+    let local_pt = {
+        let tab_doc = ctrl.active_tab_doc().expect("active tab doc");
+        let root = tab_doc.fragment_tree.root.as_ref().expect("fragment root");
+        find_fragment_center_by_id(&tab_doc.doc, root, Point::ZERO, id)
+            .unwrap_or_else(|| panic!("element #{id} not found in fragment tree"))
+    };
+    let screen_pt = Point::new(web_rect.min_x() + local_pt.x, web_rect.min_y() + local_pt.y);
+    assert!(
+        ctrl.handle_left_click(screen_pt),
+        "click on #{id} at ({:.1}, {:.1}) was not handled",
+        screen_pt.x,
+        screen_pt.y
+    );
+}
+
+fn maybe_dump_scene(ctrl: &mut BrowserController, name: &str) {
+    let Ok(dir) = std::env::var("RIX_DUMP_UI_DIR") else {
+        return;
+    };
+    let path = std::path::Path::new(&dir).join(format!("{name}.png"));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    ctrl.invalidate_all_layers();
+    ctrl.sync_layers();
+    let clear = ctrl.clear_color();
+    let vp = ctrl.compositor.viewport_size();
+    let scene = ctrl.compositor.compose_force();
+    VelloRenderer::render_scene_to_png(scene, vp.width as u32, vp.height as u32, clear, &path)
+        .unwrap_or_else(|e| panic!("failed rendering {name}.png: {e}"));
+}
+
+#[test]
+fn settings_bookmarks_history_find_persistence_and_visual_suite() {
+    let tmp = TempDir::new().expect("tempdir");
+    let settings_file = tmp.path().join("settings.json");
+
+    let mut ctrl = BrowserController::with_settings_path(
+        Size::new(1280.0, 800.0),
+        1.0,
+        Some(settings_file.clone()),
+    );
+
+    // Prepare realistic multi-tab state for visual audit.
+    ctrl.chrome
+        .new_tab("https://en.wikipedia.org/wiki/Rust_(programming_language)");
+    ctrl.chrome.new_tab("https://doc.rust-lang.org/std/");
+    ctrl.chrome.switch_to_tab(0);
+    ctrl.sync_layers();
+
+    // 01 & 02: New Tab in Dark & Light modes
+    maybe_dump_scene(&mut ctrl, "01_newtab_dark");
+    ctrl.set_theme(ThemeMode::Light);
+    maybe_dump_scene(&mut ctrl, "02_newtab_light");
+    ctrl.set_theme(ThemeMode::Dark);
+
+    // Open Settings via Ctrl+, shortcut
+    assert!(ctrl.handle_key(
+        KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::default()
+        },
+        BrowserKey::Char(','),
+    ));
+    assert_eq!(ctrl.chrome.active().url, URL_SETTINGS);
+    assert_eq!(ctrl.chrome.settings_section, SettingsSection::Appearance);
+    maybe_dump_scene(&mut ctrl, "03_settings_appearance_dark");
+
+    // Click real Settings UI controls: Search section -> switch to Kagi -> verify persistence.
+    click_web_element_by_id(&mut ctrl, "settings-sec-search");
+    assert_eq!(ctrl.chrome.settings_section, SettingsSection::Search);
+    click_web_element_by_id(&mut ctrl, "set-engine-kagi");
+    assert_eq!(ctrl.chrome.settings.search_engine, SearchEngine::Kagi);
+    maybe_dump_scene(&mut ctrl, "04_settings_search_dark");
+
+    // Privacy section
+    click_web_element_by_id(&mut ctrl, "settings-sec-privacy");
+    assert_eq!(ctrl.chrome.settings_section, SettingsSection::Privacy);
+    maybe_dump_scene(&mut ctrl, "05_settings_privacy_dark");
+
+    // Performance section
+    click_web_element_by_id(&mut ctrl, "settings-sec-performance");
+    assert_eq!(ctrl.chrome.settings_section, SettingsSection::Performance);
+    maybe_dump_scene(&mut ctrl, "06_settings_performance_dark");
+
+    // About & shortcuts section
+    click_web_element_by_id(&mut ctrl, "settings-sec-about");
+    assert_eq!(ctrl.chrome.settings_section, SettingsSection::About);
+    maybe_dump_scene(&mut ctrl, "07_settings_about_dark");
+
+    // Back to Appearance -> toggle Light theme via real click -> verify reload from disk!
+    click_web_element_by_id(&mut ctrl, "settings-sec-appearance");
+    click_web_element_by_id(&mut ctrl, "set-theme-light");
+    assert_eq!(ctrl.chrome.theme, ThemeMode::Light);
+    click_web_element_by_id(&mut ctrl, "set-zoom-in");
+    assert_eq!(ctrl.chrome.settings.default_zoom_pct, 110);
+    maybe_dump_scene(&mut ctrl, "08_settings_appearance_light");
+
+    // Reload a fresh BrowserController from disk and confirm persisted settings match!
+    let persisted = BrowserController::with_settings_path(
+        Size::new(1280.0, 800.0),
+        1.0,
+        Some(settings_file.clone()),
+    );
+    assert_eq!(persisted.chrome.theme, ThemeMode::Light);
+    assert_eq!(persisted.chrome.settings.search_engine, SearchEngine::Kagi);
+    assert_eq!(persisted.chrome.settings.default_zoom_pct, 110);
+
+    // Switch back to Dark, toggle Vertical Tabs + open Bookmarks
+    click_web_element_by_id(&mut ctrl, "set-theme-dark");
+    click_web_element_by_id(&mut ctrl, "set-tabs-vertical");
+    assert_eq!(ctrl.chrome.tab_layout, TabLayoutMode::Vertical);
+    click_web_element_by_id(&mut ctrl, "nav-open-bookmarks");
+    assert_eq!(ctrl.chrome.active().url, URL_BOOKMARKS);
+    maybe_dump_scene(&mut ctrl, "09_vertical_tabs_bookmarks_dark");
+
+    // Back to horizontal tabs, open History via Ctrl+H, open Find-in-page via Ctrl+F
+    ctrl.chrome.set_tab_layout(TabLayoutMode::Horizontal);
+    ctrl.chrome.zoom_reset();
+    assert!(ctrl.handle_key(
+        KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::default()
+        },
+        BrowserKey::Char('h'),
+    ));
+    assert_eq!(ctrl.chrome.active().url, URL_HISTORY);
+    assert!(ctrl.handle_key(
+        KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::default()
+        },
+        BrowserKey::Char('f'),
+    ));
+    assert!(ctrl.chrome.find_bar.open);
+    assert!(ctrl.handle_text_input("rust"));
+    assert!(ctrl.chrome.find_bar.total_matches >= 2);
+    maybe_dump_scene(&mut ctrl, "10_history_find_dark");
+
+    // Close Find bar with Escape
+    ctrl.handle_key(KeyModifiers::default(), BrowserKey::Escape);
+    assert!(!ctrl.chrome.find_bar.open);
+
+    // 11: Omnibox dropdown + HTTPS loading hairline + F12 Developer HUD
+    ctrl.navigate_active(URL_NEWTAB);
+    ctrl.chrome.active_mut().url =
+        "https://en.wikipedia.org/wiki/Rust_(programming_language)".to_string();
+    ctrl.chrome.active_mut().title = "Rust (programming language) - Wikipedia".to_string();
+    ctrl.chrome.active_mut().is_loading = true;
+    ctrl.chrome.active_mut().load_progress = 0.64;
+    ctrl.chrome.omnibox.set_text("rust");
+    ctrl.chrome.omnibox.focus_and_select_all();
+    ctrl.chrome.omnibox.selected_suggestion = Some(0);
+    let now = Instant::now();
+    for i in 0..32 {
+        ctrl.hud.record_frame_at(
+            FrameStageSample {
+                style_ms: 0.42,
+                layout_ms: 1.18,
+                paint_ms: 0.56,
+                ipc_ms: 0.19,
+                gpu_ms: 1.74,
+                total_ms: if i == 14 || i == 25 { 18.2 } else { 4.1 },
+            },
+            now + Duration::from_millis(i * 16),
+        );
+    }
+    ctrl.hud.record_media_telemetry(60.0, 2.4, 0);
+    ctrl.hud.record_network(NetworkEntry {
+        url: "https://en.wikipedia.org/wiki/Rust".to_string(),
+        method: "GET".to_string(),
+        protocol: "H2".to_string(),
+        status: 200,
+        mime: "text/html".to_string(),
+        bytes: 48_200,
+        cache_hit: false,
+        ttfb_ms: 18.4,
+        total_ms: 36.2,
+    });
+    ctrl.chrome.hud_open = true;
+    ctrl.sync_layers();
+    maybe_dump_scene(&mut ctrl, "11_omnibox_dropdown_hud_dark");
+
+    // 12: App Menu popover + hover link preview pill
+    ctrl.chrome.omnibox.blur();
+    ctrl.chrome.hud_open = false;
+    ctrl.chrome.active_mut().is_loading = false;
+    ctrl.chrome
+        .omnibox
+        .set_text("https://en.wikipedia.org/wiki/Rust_(programming_language)");
+    ctrl.chrome.toggle_app_menu();
+    ctrl.chrome.hovered_link =
+        Some("https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html".to_string());
+    ctrl.sync_layers();
+    maybe_dump_scene(&mut ctrl, "12_app_menu_hover_dark");
+
+    // 13: Crashed tab page (Dark)
+    ctrl.chrome.app_menu_open = false;
+    ctrl.chrome.hovered_link = None;
+    let active_id = ctrl.chrome.active().id;
+    ctrl.handle_content_process_crash(active_id, Some(4242), "SIGKILL received");
+    maybe_dump_scene(&mut ctrl, "13_crashed_dark");
+
+    // 14: Connection error page (Light)
+    ctrl.set_theme(ThemeMode::Light);
+    let err_html = rix_chrome::render_error_html(
+        ThemeMode::Light,
+        "https://unreachable.example.invalid/docs",
+        "DNS lookup failed for host unreachable.example.invalid",
+    );
+    ctrl.load_html_into_tab(active_id, rix_chrome::URL_ERROR, &err_html, true);
+    ctrl.chrome.active_mut().url = "https://unreachable.example.invalid/docs".to_string();
+    ctrl.chrome
+        .omnibox
+        .set_text("https://unreachable.example.invalid/docs");
+    ctrl.sync_layers();
+    maybe_dump_scene(&mut ctrl, "14_error_light");
 }

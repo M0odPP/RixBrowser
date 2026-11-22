@@ -2,10 +2,13 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rix_chrome::{
-    chrome_asset_provider, chrome_stylesheet, palette_for, render_browser_chrome_html,
-    render_crashed_html, render_error_html, render_hud_html, render_newtab_html,
-    resolve_omnibox_input, ChromeHitTarget, ChromeRenderer, ChromeState, DevHudState,
-    FrameStageSample, HudTab, NetworkEntry, SecurityState, TabLayoutMode, ThemeMode,
+    chrome_asset_provider, chrome_stylesheet, palette_for, parse_chrome_hit_id,
+    render_bookmarks_html, render_browser_chrome_html, render_crashed_html, render_error_html,
+    render_history_html, render_hud_html, render_newtab_html, render_overlay_html,
+    render_settings_html, resolve_omnibox_input, resolve_omnibox_input_with_settings,
+    BrowserSettings, ChromeHitTarget, ChromeRenderer, ChromeState, CookiePolicy, DevHudState,
+    FrameStageSample, HudTab, JitMode, NetworkEntry, SearchEngine, SecurityState, SettingsSection,
+    TabLayoutMode, ThemeMode, URL_BOOKMARKS, URL_HISTORY, URL_NEWTAB, URL_SETTINGS,
 };
 use rix_core::{Point, Size};
 use rix_ipc::PipelineId;
@@ -53,9 +56,58 @@ fn render_layer_rgba(
         .expect("headless Vello render succeeds")
 }
 
+fn parse_hex_rgb(hex: &str) -> (f64, f64, f64) {
+    let clean = hex.trim_start_matches('#');
+    let r = u8::from_str_radix(&clean[0..2], 16).expect("valid hex r");
+    let g = u8::from_str_radix(&clean[2..4], 16).expect("valid hex g");
+    let b = u8::from_str_radix(&clean[4..6], 16).expect("valid hex b");
+    (
+        f64::from(r) / 255.0,
+        f64::from(g) / 255.0,
+        f64::from(b) / 255.0,
+    )
+}
+
+fn relative_luminance(hex: &str) -> f64 {
+    let linear = |c: f64| {
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let (r, g, b) = parse_hex_rgb(hex);
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+}
+
+fn wcag_contrast_ratio(fg: &str, bg: &str) -> f64 {
+    let l1 = relative_luminance(fg);
+    let l2 = relative_luminance(bg);
+    let (hi, lo) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Strips HTML tags so copy audits inspect visible user-facing text only.
+fn strip_html_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Automated `unslop` audit across CSS tokens and rendered HTML documents.
 fn assert_zero_unslop_violations(doc_name: &str, html: &str, css: &str) {
-    // 1. Zero purple/indigo/pink AI gradients or gradient text.
+    // 1. Zero purple/indigo/pink AI gradients, glows, pulse rings, or uppercase micro-labels.
     for forbidden in [
         "linear-gradient",
         "radial-gradient",
@@ -83,15 +135,21 @@ fn assert_zero_unslop_violations(doc_name: &str, html: &str, css: &str) {
         );
     }
 
-    // 3. Zero hype words or exclamation marks in UI copy.
-    let lower = html.to_ascii_lowercase();
+    // 3. Zero hype words or exclamation marks in visible UI copy.
+    let visible = strip_html_tags(html);
+    assert!(
+        !visible.contains('!'),
+        "[{doc_name}] unslop violation: exclamation mark in visible UI copy: {visible}"
+    );
+    let lower = visible.to_ascii_lowercase();
     for hype in [
         "supercharge",
         "seamless",
         "unlock",
         "magic",
         "revolutionize",
-        "!!",
+        "blazing fast",
+        "next-gen",
     ] {
         assert!(
             !lower.contains(hype),
@@ -104,6 +162,31 @@ fn assert_zero_unslop_violations(doc_name: &str, html: &str, css: &str) {
         !css.contains("font-weight: 800") && !css.contains("font-weight: 900"),
         "[{doc_name}] unslop violation: excessive heading weight 800/900"
     );
+}
+
+#[test]
+fn wcag_contrast_ratios_pass_aa_across_all_dark_and_light_roles() {
+    for theme in [ThemeMode::Dark, ThemeMode::Light] {
+        let p = palette_for(theme);
+        for (bg_name, bg) in [("bg_toolbar", p.bg_toolbar), ("bg_card", p.bg_card)] {
+            for (fg_name, fg) in [
+                ("text_primary", p.text_primary),
+                ("text_secondary", p.text_secondary),
+                ("text_muted", p.text_muted),
+            ] {
+                let ratio = wcag_contrast_ratio(fg, bg);
+                assert!(
+                    ratio >= 4.5,
+                    "[{theme:?}] WCAG AA contrast failure: {fg_name} ({fg}) on {bg_name} ({bg}) = {ratio:.2}:1 (< 4.5:1)"
+                );
+            }
+        }
+        let btn_ratio = wcag_contrast_ratio(p.accent_fg, p.accent_solid);
+        assert!(
+            btn_ratio >= 4.5,
+            "[{theme:?}] WCAG AA contrast failure on primary button: {btn_ratio:.2}:1"
+        );
+    }
 }
 
 #[test]
@@ -143,32 +226,49 @@ fn unslop_audit_and_headless_gpu_render_dark_and_light_screens() {
     });
 
     let mut chrome_renderer = ChromeRenderer::new();
-    let viewport = Size::new(1280.0, 720.0);
+    let viewport = Size::new(1280.0, 800.0);
 
     for theme in [ThemeMode::Dark, ThemeMode::Light] {
-        state.theme = theme;
+        state.set_theme(theme);
         let css = chrome_stylesheet(theme);
         let clear = palette_for(theme).clear_rgba;
 
         let browser_html = render_browser_chrome_html(&state);
         let newtab_html = render_newtab_html(&state);
+        let bookmarks_html = render_bookmarks_html(&state);
+        let history_html = render_history_html(&state);
         let error_html =
             render_error_html(theme, "https://example.invalid", "DNS resolution failed");
         let crashed_html =
             render_crashed_html(theme, "https://example.com", Some(4242), "SIGKILL received");
         let hud_html = render_hud_html(&state, &hud, base + Duration::from_millis(400));
+        let overlay_html = render_overlay_html(&state, &hud, base + Duration::from_millis(400));
 
         // Verify 16px SVG stroke icons, keycaps, and focus rings are present.
         assert!(browser_html.contains(r#"<svg width="16" height="16""#));
         assert!(browser_html.contains(r#"class="keycap">Ctrl+L"#));
         assert!(browser_html.contains(r#"class="omnibox focused""#));
 
-        // Run strict anti-slop audit on every Chrome screen.
+        // Run strict anti-slop audit on every Chrome screen and every Settings section.
         assert_zero_unslop_violations("browser.html", &browser_html, &css);
         assert_zero_unslop_violations("newtab.html", &newtab_html, &css);
+        assert_zero_unslop_violations("bookmarks.html", &bookmarks_html, &css);
+        assert_zero_unslop_violations("history.html", &history_html, &css);
         assert_zero_unslop_violations("error.html", &error_html, &css);
         assert_zero_unslop_violations("crashed.html", &crashed_html, &css);
         assert_zero_unslop_violations("hud.html", &hud_html, &css);
+        assert_zero_unslop_violations("overlay", &overlay_html, &css);
+
+        for section in SettingsSection::ALL {
+            state.settings_section = section;
+            let settings_html = render_settings_html(&state);
+            assert_zero_unslop_violations(
+                &format!("settings.html ({})", section.id()),
+                &settings_html,
+                &css,
+            );
+        }
+        state.settings_section = SettingsSection::Appearance;
 
         // Render every screen headlessly on the GPU via Vello and confirm non-empty raster output.
         let mut resources = ResourceRegistry::default();
@@ -181,14 +281,32 @@ fn unslop_audit_and_headless_gpu_render_dark_and_light_screens() {
             p,
             &mut resources,
             1280,
-            120,
+            128,
             clear,
         );
         assert!(chrome_px.as_chunks::<4>().0.iter().any(|px| *px != clear));
 
-        // Hit-testing finds the omnibox in the toolbar region (y ~ 60, x ~ 500).
+        // Hit-testing finds the omnibox in the toolbar region (y ~ 62, x ~ 500).
         let hit = chrome_layer.hit_test_target(Point::new(500.0, 62.0));
         assert_eq!(hit, Some(ChromeHitTarget::Omnibox));
+
+        // Hit-testing finds left-side nav buttons now that nested flex sizing sums accurately!
+        assert_eq!(
+            chrome_layer.hit_test_target(Point::new(24.0, 62.0)),
+            Some(ChromeHitTarget::Back)
+        );
+        assert_eq!(
+            chrome_layer.hit_test_target(Point::new(60.0, 62.0)),
+            Some(ChromeHitTarget::Forward)
+        );
+        assert_eq!(
+            chrome_layer.hit_test_target(Point::new(96.0, 62.0)),
+            Some(ChromeHitTarget::Reload)
+        );
+        assert_eq!(
+            chrome_layer.hit_test_target(Point::new(132.0, 62.0)),
+            Some(ChromeHitTarget::Home)
+        );
 
         let newtab_layer =
             chrome_renderer.render_newtab(&state, viewport, shared_fonts(), p, &mut resources);
@@ -201,6 +319,46 @@ fn unslop_audit_and_headless_gpu_render_dark_and_light_screens() {
             clear,
         );
         assert!(newtab_px.as_chunks::<4>().0.iter().any(|px| *px != clear));
+
+        let settings_layer =
+            chrome_renderer.render_settings(&state, viewport, shared_fonts(), p, &mut resources);
+        let settings_px = render_layer_rgba(
+            &settings_layer.display_list,
+            p,
+            &mut resources,
+            1280,
+            720,
+            clear,
+        );
+        assert!(settings_px.as_chunks::<4>().0.iter().any(|px| *px != clear));
+
+        let bookmarks_layer =
+            chrome_renderer.render_bookmarks(&state, viewport, shared_fonts(), p, &mut resources);
+        let bookmarks_px = render_layer_rgba(
+            &bookmarks_layer.display_list,
+            p,
+            &mut resources,
+            960,
+            540,
+            clear,
+        );
+        assert!(bookmarks_px
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|px| *px != clear));
+
+        let history_layer =
+            chrome_renderer.render_history(&state, viewport, shared_fonts(), p, &mut resources);
+        let history_px = render_layer_rgba(
+            &history_layer.display_list,
+            p,
+            &mut resources,
+            960,
+            540,
+            clear,
+        );
+        assert!(history_px.as_chunks::<4>().0.iter().any(|px| *px != clear));
 
         let crashed_layer = chrome_renderer.render_crashed(
             theme,
@@ -226,12 +384,12 @@ fn unslop_audit_and_headless_gpu_render_dark_and_light_screens() {
             &state,
             &hud,
             base + Duration::from_millis(400),
-            Size::new(480.0, 460.0),
+            Size::new(480.0, 480.0),
             shared_fonts(),
             p,
             &mut resources,
         );
-        let hud_px = render_layer_rgba(&hud_layer.display_list, p, &mut resources, 480, 460, clear);
+        let hud_px = render_layer_rgba(&hud_layer.display_list, p, &mut resources, 480, 480, clear);
         assert!(hud_px.as_chunks::<4>().0.iter().any(|px| *px != clear));
     }
 }
@@ -244,6 +402,9 @@ fn chrome_asset_provider_integrates_with_resource_manager() {
         "tokens-light.css",
         "browser.html",
         "newtab.html",
+        "settings.html",
+        "bookmarks.html",
+        "history.html",
         "error.html",
         "crashed.html",
         "hud.html",
@@ -253,9 +414,79 @@ fn chrome_asset_provider_integrates_with_resource_manager() {
         assert!(mime.starts_with("text/"));
     }
 
-    // Verify ResourceManager accepts the provider cleanly without circular crate dependencies.
     let client = HttpClient::new(None).expect("http client");
     let _rm = ResourceManager::new(client).with_chrome_asset_provider(provider);
+}
+
+#[test]
+fn settings_persistence_bookmarks_find_and_hit_ids_work() {
+    let mut settings = BrowserSettings {
+        theme: ThemeMode::Light,
+        tab_layout: TabLayoutMode::Vertical,
+        show_bookmarks_bar: false,
+        compact_toolbar: true,
+        search_engine: SearchEngine::Kagi,
+        cookie_policy: CookiePolicy::BlockAll,
+        jit_mode: JitMode::BaselineOnly,
+        ..BrowserSettings::default()
+    };
+    settings.step_zoom(2);
+    assert_eq!(settings.default_zoom_pct, 125);
+    settings.step_font_size(2);
+    assert_eq!(settings.base_font_size_px, 16);
+
+    let tmp_path = std::env::temp_dir().join(format!(
+        "rix_chrome_settings_test_{}.json",
+        std::process::id()
+    ));
+    settings
+        .save_to_file(&tmp_path)
+        .expect("settings save succeeds");
+    let reloaded = BrowserSettings::load_from_file(&tmp_path).expect("settings load succeeds");
+    let _ = std::fs::remove_file(&tmp_path);
+    assert_eq!(settings, reloaded);
+
+    // Search engine & internal shorthand URL resolution.
+    assert_eq!(resolve_omnibox_input("rix://settings"), URL_SETTINGS);
+    assert_eq!(resolve_omnibox_input("rix://bookmarks"), URL_BOOKMARKS);
+    assert_eq!(resolve_omnibox_input("rix://history"), URL_HISTORY);
+    assert_eq!(resolve_omnibox_input("rix://newtab"), URL_NEWTAB);
+    assert!(
+        resolve_omnibox_input_with_settings("rust cranelift", &settings)
+            .starts_with("https://kagi.com/search?q=")
+    );
+
+    // Verify all new ChromeHitTarget ID mappings.
+    assert_eq!(
+        parse_chrome_hit_id("settings-sec-privacy"),
+        Some(ChromeHitTarget::SettingsSelectSection(
+            SettingsSection::Privacy
+        ))
+    );
+    assert_eq!(
+        parse_chrome_hit_id("set-engine-google"),
+        Some(ChromeHitTarget::SettingsSetSearchEngine(
+            SearchEngine::Google
+        ))
+    );
+    assert_eq!(
+        parse_chrome_hit_id("set-cookie-block-all"),
+        Some(ChromeHitTarget::SettingsSetCookiePolicy(
+            CookiePolicy::BlockAll
+        ))
+    );
+    assert_eq!(
+        parse_chrome_hit_id("set-jit-baseline"),
+        Some(ChromeHitTarget::SettingsSetJitMode(JitMode::BaselineOnly))
+    );
+    assert_eq!(
+        parse_chrome_hit_id("btn-bookmark-star"),
+        Some(ChromeHitTarget::ToggleBookmarkStar)
+    );
+    assert_eq!(
+        parse_chrome_hit_id("bm-del-2"),
+        Some(ChromeHitTarget::DeleteBookmark(2))
+    );
 }
 
 #[test]
@@ -277,9 +508,15 @@ fn chrome_state_tabs_omnibox_editing_autocomplete_and_hud_idle() {
     assert_eq!(state.tabs.len(), 2);
     assert_eq!(state.active().id, t2);
     assert_eq!(state.active().security_state(), SecurityState::SecureHttps);
+    assert!(state.is_bookmarked("https://doc.rust-lang.org/std/"));
 
     state.navigate_active("http://localhost:3000/form");
     assert_eq!(state.active().security_state(), SecurityState::InsecureHttp);
+    assert!(state.toggle_bookmark_active());
+    assert!(state.is_bookmarked("http://localhost:3000/form"));
+    assert!(!state.toggle_bookmark_active());
+    assert!(!state.is_bookmarked("http://localhost:3000/form"));
+
     assert!(state.active().can_go_back());
     assert_eq!(
         state.go_back().as_deref(),
@@ -300,7 +537,7 @@ fn chrome_state_tabs_omnibox_editing_autocomplete_and_hud_idle() {
 
     state.toggle_tab_layout();
     assert_eq!(state.tab_layout, TabLayoutMode::Vertical);
-    assert!(state.sidebar_width() > 200.0);
+    assert!(state.sidebar_width() >= 240.0);
 
     // Omnibox editing + selection + autocomplete.
     state.omnibox.focus_and_select_all();

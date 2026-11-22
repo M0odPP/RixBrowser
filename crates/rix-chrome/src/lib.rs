@@ -10,8 +10,9 @@ pub mod state;
 pub mod tokens;
 
 pub use assets::{
-    chrome_asset_provider, escape_html, render_browser_chrome_html, render_crashed_html,
-    render_error_html, render_hud_html, render_newtab_html, render_overlay_html,
+    chrome_asset_provider, escape_html, render_bookmarks_html, render_browser_chrome_html,
+    render_crashed_html, render_error_html, render_history_html, render_hud_html,
+    render_newtab_html, render_overlay_html, render_settings_html,
 };
 pub use hud::{
     ConsoleEntry, DevHudState, FrameStageSample, HudTab, MissingFeatureEntry, NetworkEntry,

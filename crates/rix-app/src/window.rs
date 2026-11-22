@@ -40,7 +40,11 @@ pub struct BrowserShell {
 impl BrowserShell {
     pub fn new(proxy: EventLoopProxy<AppWakeup>) -> Self {
         Self {
-            controller: BrowserController::new(Size::new(1280.0, 720.0), 1.0),
+            controller: BrowserController::with_settings_path(
+                Size::new(1280.0, 720.0),
+                1.0,
+                rix_chrome::BrowserSettings::default_config_path(),
+            ),
             renderer: VelloRenderer::new(),
             window: None,
             present_count: 0,
