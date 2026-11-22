@@ -1,8 +1,11 @@
 {
   "subsets": {
     "css2": 3,
+    "dom-events": 4,
+    "dom-nodes": 4,
     "flexbox": 2,
     "grid": 1,
+    "html-webappapis-timers": 4,
     "selectors": 2
   }
 }

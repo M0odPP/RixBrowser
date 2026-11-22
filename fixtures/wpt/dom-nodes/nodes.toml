@@ -1,0 +1,64 @@
+[[script_cases]]
+name = "node_tree_mutation_and_fragment"
+html = "<!doctype html><html><body><ul id='list'></ul></body></html>"
+script = """
+const list = document.getElementById("list");
+const frag = document.createDocumentFragment();
+for (const label of ["one", "two", "three"]) {
+    const li = document.createElement("li");
+    li.textContent = label;
+    frag.appendChild(li);
+}
+list.appendChild(frag);
+const zero = document.createElement("li");
+zero.textContent = "zero";
+list.insertBefore(zero, list.firstChild);
+list.removeChild(list.lastChild);
+var text = list.children.map(el => el.textContent).join(",");
+"""
+assert_expr = "text"
+expected = "zero,one,two"
+
+[[script_cases]]
+name = "inner_html_clone_and_contains"
+html = "<!doctype html><html><body><div id='root'></div></body></html>"
+script = """
+const root = document.getElementById("root");
+root.innerHTML = "<section class='a b'><p id='p1'>hello</p></section>";
+const p = root.querySelector("#p1");
+const cloned = root.firstElementChild.cloneNode(true);
+var ok = root.contains(p) && p.closest("section").classList.contains("b") && cloned.textContent === "hello";
+"""
+assert_expr = "ok"
+expected = "true"
+
+[[script_cases]]
+name = "mutation_observer_microtask_delivery"
+html = "<!doctype html><html><body><div id='box'></div></body></html>"
+script = """
+var kinds = [];
+const box = document.getElementById("box");
+const mo = new MutationObserver(recs => {
+    for (const r of recs) kinds.push(r.type);
+});
+mo.observe(box, { childList: true, attributes: true });
+box.setAttribute("data-x", "1");
+box.appendChild(document.createElement("span"));
+"""
+assert_expr = "kinds.join(',')"
+expected = "attributes,childList"
+
+[[script_cases]]
+name = "document_write_and_custom_elements"
+html = "<!doctype html><html><body><script>document.write('<div id=\"dw\">ok</div>');</script></body></html>"
+script = """
+var called = false;
+class XWidget extends HTMLElement {
+    connectedCallback() { called = true; }
+}
+customElements.define("x-widget", XWidget);
+document.body.appendChild(document.createElement("x-widget"));
+var dw = document.getElementById("dw").textContent;
+"""
+assert_expr = "dw + '|' + called"
+expected = "ok|true"

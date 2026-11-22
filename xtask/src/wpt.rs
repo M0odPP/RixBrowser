@@ -1,12 +1,16 @@
 //! Web Platform Tests (WPT) subset runner & baseline scorecard guard
 //! (`cargo xtask wpt --subset <name>`).
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use rix_content::ContentRuntime;
 use rix_core::{Point, Rect, Size};
 use rix_css::{CascadeOrigin, MediaContext, StyleContext, Stylesheet};
 use rix_dom::Document;
@@ -22,10 +26,39 @@ pub struct WptBaseline {
     pub subsets: BTreeMap<String, usize>,
 }
 
-/// Declarative layout/style assertion case inside a WPT subset TOML manifest.
+/// Declarative layout/style and JS/DOM/Event/Timer assertion cases inside a WPT subset TOML manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WptAssertionManifest {
+    #[serde(default)]
     pub cases: Vec<WptAssertionCase>,
+    #[serde(default)]
+    pub script_cases: Vec<WptScriptCase>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WptScriptCase {
+    pub name: String,
+    #[serde(default = "default_script_html")]
+    pub html: String,
+    pub script: String,
+    #[serde(default)]
+    pub advance_ms: u64,
+    #[serde(default)]
+    pub vsync_frames: u32,
+    #[serde(default = "default_assert_expr")]
+    pub assert_expr: String,
+    #[serde(default = "default_expected_str")]
+    pub expected: String,
+}
+
+fn default_script_html() -> String {
+    "<!doctype html><html><body></body></html>".to_string()
+}
+fn default_assert_expr() -> String {
+    "__pass".to_string()
+}
+fn default_expected_str() -> String {
+    "true".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +173,14 @@ pub fn run_wpt_suite(
                             failed_names.push(case.name.clone());
                         }
                     }
+                    for case in &manifest.script_cases {
+                        total += 1;
+                        if run_script_case(case) {
+                            passed += 1;
+                        } else {
+                            failed_names.push(case.name.clone());
+                        }
+                    }
                 } else if fname.ends_with(".html") && !fname.ends_with("-ref.html") {
                     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                     let ref_path = sub_dir.join(format!("{stem}-ref.html"));
@@ -189,6 +230,38 @@ pub fn run_wpt_suite(
     }
 
     Ok(report)
+}
+
+fn run_script_case(case: &WptScriptCase) -> bool {
+    static FONT_DB: std::sync::OnceLock<Arc<rix_text::FontDatabase>> = std::sync::OnceLock::new();
+    let font_db = Arc::clone(FONT_DB.get_or_init(|| Arc::new(rix_text::FontDatabase::new())));
+    let doc = Rc::new(RefCell::new(Document::new()));
+    let mut rt = ContentRuntime::new(doc, Size::new(800.0, 600.0), font_db);
+    rt.event_loop.borrow_mut().enable_virtual_clock();
+    if rt.load_html_with_scripts(&case.html).is_err() {
+        return false;
+    }
+    if rt.eval_script(&case.script).is_err() {
+        return false;
+    }
+    if case.advance_ms > 0 {
+        // Step in small virtual ticks so nested/interval timers fire in exact chronological order.
+        let mut remaining = case.advance_ms;
+        while remaining > 0 {
+            let step = remaining.min(5);
+            rt.advance_and_drain(Duration::from_millis(step));
+            remaining -= step;
+        }
+    } else {
+        rt.advance_and_drain(Duration::ZERO);
+    }
+    for i in 1..=case.vsync_frames {
+        rt.fire_vsync(f64::from(i) * 16.6);
+    }
+    match rt.eval_script(&case.assert_expr) {
+        Ok(val) => rt.vm.value_to_rust_string(val) == case.expected,
+        Err(_) => false,
+    }
 }
 
 fn run_assertion_case(case: &WptAssertionCase) -> bool {

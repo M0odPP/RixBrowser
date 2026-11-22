@@ -1,0 +1,71 @@
+[[script_cases]]
+name = "capture_target_bubble_order"
+html = "<!doctype html><html><body><div id='a'><div id='b'><button id='c'>go</button></div></div></body></html>"
+script = """
+var out = [];
+const a = document.getElementById("a");
+const b = document.getElementById("b");
+const c = document.getElementById("c");
+a.addEventListener("click", () => out.push("a:cap"), true);
+b.addEventListener("click", () => out.push("b:cap"), true);
+c.addEventListener("click", () => out.push("c:tgt"));
+b.addEventListener("click", () => out.push("b:bub"));
+a.addEventListener("click", () => out.push("a:bub"));
+c.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+"""
+assert_expr = "out.join(',')"
+expected = "a:cap,b:cap,c:tgt,b:bub,a:bub"
+
+[[script_cases]]
+name = "stop_propagation_and_prevent_default"
+html = "<!doctype html><html><body><div id='p'><span id='c'></span></div></body></html>"
+script = """
+var out = [];
+const p = document.getElementById("p");
+const c = document.getElementById("c");
+p.addEventListener("hit", () => out.push("parent"));
+c.addEventListener("hit", e => { out.push("child"); e.stopPropagation(); e.preventDefault(); });
+const ev = new Event("hit", { bubbles: true, cancelable: true });
+var ret = c.dispatchEvent(ev);
+var prevented = ev.defaultPrevented;
+"""
+assert_expr = "out.join(',') + '|' + ret + '|' + prevented"
+expected = "child|false|true"
+
+[[script_cases]]
+name = "shadow_dom_composed_and_retargeting"
+html = "<!doctype html><html><body><div id='outer'><div id='host'></div></div></body></html>"
+script = """
+var seen = [];
+const outer = document.getElementById("outer");
+const host = document.getElementById("host");
+const sr = host.attachShadow({ mode: "open" });
+sr.innerHTML = "<span id='inner'></span>";
+const inner = sr.getElementById("inner");
+outer.addEventListener("ev", e => seen.push("outer:" + e.target.id));
+inner.addEventListener("ev", e => seen.push("inner:" + e.target.id));
+inner.dispatchEvent(new CustomEvent("ev", { bubbles: true, composed: false }));
+inner.dispatchEvent(new CustomEvent("ev", { bubbles: true, composed: true }));
+"""
+assert_expr = "seen.join('|')"
+expected = "inner:inner|inner:inner|outer:host"
+
+[[script_cases]]
+name = "once_passive_and_immediate_stop"
+script = """
+const et = new EventTarget();
+var count = 0;
+et.addEventListener("x", () => count++, { once: true });
+et.dispatchEvent(new Event("x"));
+et.dispatchEvent(new Event("x"));
+
+et.addEventListener("p", e => e.preventDefault(), { passive: true });
+var passiveOk = et.dispatchEvent(new Event("p", { cancelable: true }));
+
+var imm = 0;
+et.addEventListener("i", e => { imm += 1; e.stopImmediatePropagation(); });
+et.addEventListener("i", () => { imm += 10; });
+et.dispatchEvent(new Event("i"));
+"""
+assert_expr = "count + '|' + passiveOk + '|' + imm"
+expected = "1|true|1"
