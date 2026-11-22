@@ -90,7 +90,9 @@ pub struct WebApiState {
     pub(crate) location_url: Url,
     history: Vec<HistoryItem>,
     history_index: usize,
-    storage: StorageEngine,
+    pub(crate) storage: StorageEngine,
+    pub(crate) object_urls: HashMap<String, Vec<u8>>,
+    next_object_url_id: u64,
     session_storage: HashMap<String, Vec<(String, String)>>,
     perf_entries: Vec<PerfEntry>,
     pub(crate) protos: WebApiPrototypes,
@@ -115,6 +117,8 @@ impl WebApiState {
             history_index: 0,
             location_url: parsed,
             storage,
+            object_urls: HashMap::new(),
+            next_object_url_id: 1,
             session_storage: HashMap::new(),
             perf_entries: Vec::new(),
             protos: WebApiPrototypes::default(),
@@ -1155,6 +1159,32 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
         };
         Ok(JsValue::from_bool(ok))
     });
+    {
+        let wa_c = Rc::clone(web_apis);
+        define_host_method(vm, url_ctor, "createObjectURL", move |vm, _, args| {
+            let Some(bh) = arg(args, 0).as_object() else {
+                return Err(vm.type_error("URL.createObjectURL requires a Blob argument"));
+            };
+            let mut st = wa_c.borrow_mut();
+            let Some(bytes) = st.blobs.get(&bh).map(|b| b.bytes.clone()) else {
+                return Err(vm.type_error("URL.createObjectURL argument must be a Blob"));
+            };
+            let id = st.next_object_url_id;
+            st.next_object_url_id = st.next_object_url_id.wrapping_add(1).max(1);
+            let origin = origin_of_url(&st.location_url);
+            let url = format!("blob:{origin}/{id}");
+            st.object_urls.insert(url.clone(), bytes);
+            Ok(JsValue::from_string(vm.heap.alloc_string(&url)))
+        });
+    }
+    {
+        let wa_r = Rc::clone(web_apis);
+        define_host_method(vm, url_ctor, "revokeObjectURL", move |vm, _, args| {
+            let url = vm.value_to_rust_string(arg(args, 0));
+            wa_r.borrow_mut().object_urls.remove(&url);
+            Ok(JsValue::UNDEFINED)
+        });
+    }
     bind_ctor_proto(vm, url_ctor, up);
     define_global(vm, "URL", JsValue::from_object(url_ctor));
 }
