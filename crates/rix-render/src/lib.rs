@@ -5,6 +5,7 @@ pub mod apz;
 pub mod canvas2d;
 pub mod compositor;
 pub mod display_list;
+pub mod gpu_context;
 pub mod renderer;
 pub mod resources;
 pub mod scene_encoder;
@@ -28,6 +29,11 @@ pub use display_list::{
     AnimationId, BlendMode, ClipPathShape, ColorStop, DisplayItem, DisplayList, FilterOp,
     GlyphInstance, ImageSampling, Rgba8, SpatialNode, SpatialNodeKind, SpatialTree, StickyMargins,
 };
+pub use gpu_context::{
+    create_headless_gpu_device, create_wgpu_instance, readback_wgpu_buffer_range,
+    readback_wgpu_texture_rgba, request_device_from_adapter, request_headless_adapter,
+    wait_for_gpu_idle, write_wgpu_buffer_mapped, SharedGpuDevice,
+};
 pub use renderer::{RenderError, VelloRenderer};
 pub use resources::{ResourceRegistry, DEFAULT_IMAGE_CACHE_BUDGET_BYTES};
 pub use scene_encoder::{
@@ -40,4 +46,6 @@ pub use strip_cache::{
     DEFAULT_STRIP_HEIGHT_PX,
 };
 pub use vello::peniko::Color;
+pub use vello::peniko::ImageData as PenikoImageData;
+pub use vello::wgpu;
 pub use vello::Scene;

@@ -10,8 +10,9 @@ use crate::strip_cache::{StripCacheStats, StripSceneCache, DEFAULT_STRIP_HEIGHT_
 use rix_core::{Point, Rect, Size};
 use rix_ipc::{CompositorToContent, PipelineId, SpatialNodeId, SurfaceId};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use vello::kurbo::{Affine, Circle, Line, Rect as KRect, RoundedRect, RoundedRectRadii, Stroke};
-use vello::peniko::{Color, Fill};
+use vello::peniko::{Blob, Color, Fill, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
 use vello::Scene;
 
 const MAX_EXTERNAL_SURFACE_DEPTH: usize = 16;
@@ -31,8 +32,15 @@ struct LiveExternalSurface {
 }
 
 enum ExternalSurfaceBinding {
-    /// GPU-backed vector/texture scene (e.g. Canvas2D, WebGPU, Video).
+    /// GPU-backed vector/texture scene (e.g. Canvas2D).
     Scene(Box<LiveExternalSurface>),
+    /// GPU-resident `wgpu::Texture` (registered via `VelloRenderer::register_external_gpu_texture`)
+    /// or RGBA frame backing WebGPU, WebGL2, and GPU Video external surfaces.
+    Image {
+        image: ImageData,
+        width: u32,
+        height: u32,
+    },
     /// Out-of-process or nested child `<iframe>` pipeline composited directly into the slot.
     ChildPipeline {
         pipeline: PipelineId,
@@ -151,6 +159,44 @@ impl Compositor {
             })),
         );
         self.dirty = true;
+    }
+
+    /// Presents a GPU-registered `ImageData` (zero-copy `wgpu::Texture` override from
+    /// [`crate::VelloRenderer::register_external_gpu_texture`]) or RGBA image into an
+    /// `ExternalSurface` slot WITHOUT rebuilding any `DisplayList` or re-encoding any layer.
+    pub fn present_external_surface_image(&mut self, surface_id: SurfaceId, image: ImageData) {
+        let width = image.width.max(1);
+        let height = image.height.max(1);
+        self.external_bindings.insert(
+            surface_id,
+            ExternalSurfaceBinding::Image {
+                image,
+                width,
+                height,
+            },
+        );
+        self.dirty = true;
+    }
+
+    /// Presents tightly packed RGBA8 pixels into an `ExternalSurface` slot WITHOUT
+    /// rebuilding any `DisplayList` or re-encoding any `RetainedLayer`.
+    pub fn present_external_surface_rgba(
+        &mut self,
+        surface_id: SurfaceId,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) {
+        let w = width.max(1);
+        let h = height.max(1);
+        let image = ImageData {
+            data: Blob::new(Arc::new(rgba)),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: w,
+            height: h,
+        };
+        self.present_external_surface_image(surface_id, image);
     }
 
     /// Binds an out-of-process or nested child `<iframe>` pipeline to an `ExternalSurface`
@@ -671,6 +717,21 @@ impl Compositor {
                         ))
                         * Affine::scale_non_uniform(sx, sy);
                     target.append(&ext.scene, Some(content_tf));
+                }
+                ExternalSurfaceBinding::Image {
+                    image,
+                    width,
+                    height,
+                } => {
+                    let sx = f64::from(slot.bounds.size.width) / f64::from(*width);
+                    let sy = f64::from(slot.bounds.size.height) / f64::from(*height);
+                    let content_tf = world_tf
+                        * Affine::translate((
+                            f64::from(slot.bounds.min_x()),
+                            f64::from(slot.bounds.min_y()),
+                        ))
+                        * Affine::scale_non_uniform(sx, sy);
+                    target.draw_image(&ImageBrush::new(image.clone()), content_tf);
                 }
                 ExternalSurfaceBinding::ChildPipeline { pipeline, .. } => {
                     if let Some(child_layer) = self.layer(*pipeline) {
