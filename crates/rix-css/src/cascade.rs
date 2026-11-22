@@ -279,6 +279,41 @@ impl StyleContext {
         self.media = media;
     }
 
+    /// Looks up the latest `@keyframes <name>` rule across author & UA stylesheets.
+    #[must_use]
+    pub fn keyframes(&self, name: &str) -> Option<&crate::stylesheet::KeyframesRule> {
+        for sheet in self.author_sheets.iter().rev() {
+            if let Some(kf) = sheet
+                .keyframes
+                .iter()
+                .rev()
+                .find(|k| k.name.as_str() == name)
+            {
+                return Some(kf);
+            }
+        }
+        self.ua_sheet
+            .keyframes
+            .iter()
+            .rev()
+            .find(|k| k.name.as_str() == name)
+    }
+
+    /// Returns all compiled `@keyframes` rules across attached stylesheets.
+    #[must_use]
+    pub fn all_keyframes(&self) -> Vec<&crate::stylesheet::KeyframesRule> {
+        let mut out = Vec::new();
+        for kf in &self.ua_sheet.keyframes {
+            out.push(kf);
+        }
+        for sheet in &self.author_sheets {
+            for kf in &sheet.keyframes {
+                out.push(kf);
+            }
+        }
+        out
+    }
+
     /// Ensures the bucketed [`RuleIndex`] and [`InvalidationMap`] are up to date.
     pub fn ensure_index(&mut self) {
         if self.index_dirty {

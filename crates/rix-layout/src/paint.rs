@@ -180,17 +180,26 @@ impl<'a> Painter<'a> {
             }
         }
 
-        // 2. Transform spatial node (`transform: ...`)
+        // 2. Transform spatial node (`transform: ...` + `transform-origin: ...`)
         let has_transform = style
             .effects
             .as_ref()
             .is_some_and(|e| !e.transform.is_empty());
         if has_transform {
             if let Some(effects) = &style.effects {
+                let eval = EvalContext::default();
                 let matrix = compose_transform_matrix(&effects.transform, abs_rect);
                 let origin = Point::new(
-                    abs_rect.min_x() + abs_rect.size.width * 0.5,
-                    abs_rect.min_y() + abs_rect.size.height * 0.5,
+                    abs_rect.min_x()
+                        + effects
+                            .transform_origin
+                            .x
+                            .resolve_px(abs_rect.size.width, &eval),
+                    abs_rect.min_y()
+                        + effects
+                            .transform_origin
+                            .y
+                            .resolve_px(abs_rect.size.height, &eval),
                 );
                 active_spatial = self.list.spatial_tree.add_node(
                     Some(active_spatial),
@@ -955,31 +964,230 @@ fn resolve_radii(style: &ComputedStyle, rect: Rect) -> [f32; 4] {
     ]
 }
 
-fn compose_transform_matrix(ops: &[TransformOp], rect: Rect) -> [f32; 6] {
+/// Multiplies two column-major 4x4 homogeneous transform matrices `a * b`.
+fn mat4_mul(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
+    let mut out = [0.0f64; 16];
+    for col in 0..4 {
+        for row in 0..4 {
+            let mut sum = 0.0;
+            for k in 0..4 {
+                sum += a[k * 4 + row] * b[col * 4 + k];
+            }
+            out[col * 4 + row] = sum;
+        }
+    }
+    out
+}
+
+const MAT4_IDENTITY: [f64; 16] = [
+    1.0, 0.0, 0.0, 0.0, // col 0
+    0.0, 1.0, 0.0, 0.0, // col 1
+    0.0, 0.0, 1.0, 0.0, // col 2
+    0.0, 0.0, 0.0, 1.0, // col 3
+];
+
+/// Composes a full CSS 2D/3D `transform` operation list in column-major 4x4
+/// homogeneous space and projects the resulting plane transform to a 2D affine
+/// matrix `[a, b, c, d, e, f]` suitable for Vello/Kurbo composition.
+pub(crate) fn compose_transform_matrix(ops: &[TransformOp], rect: Rect) -> [f32; 6] {
     let eval = EvalContext::default();
-    let mut m = Affine::IDENTITY;
+    let mut m = MAT4_IDENTITY;
     for op in ops {
         let next = match op {
-            TransformOp::Translate(tx, ty) => Affine::translate((
-                f64::from(tx.resolve_px(rect.size.width, &eval)),
-                f64::from(ty.resolve_px(rect.size.height, &eval)),
-            )),
-            TransformOp::Scale(sx, sy) => Affine::scale_non_uniform(f64::from(*sx), f64::from(*sy)),
-            TransformOp::RotateDeg(deg) => Affine::rotate(f64::from(deg.to_radians())),
-            TransformOp::SkewDeg(ax, ay) => Affine::new([
+            TransformOp::Translate(tx, ty) => {
+                let x = f64::from(tx.resolve_px(rect.size.width, &eval));
+                let y = f64::from(ty.resolve_px(rect.size.height, &eval));
+                [
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, x, y, 0.0, 1.0,
+                ]
+            }
+            TransformOp::Translate3d(tx, ty, tz) => {
+                let x = f64::from(tx.resolve_px(rect.size.width, &eval));
+                let y = f64::from(ty.resolve_px(rect.size.height, &eval));
+                let z = f64::from(*tz);
+                [
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, x, y, z, 1.0,
+                ]
+            }
+            TransformOp::TranslateZ(tz) => [
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                f64::from(*tz),
+                1.0,
+            ],
+            TransformOp::Scale(sx, sy) => [
+                f64::from(*sx),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                f64::from(*sy),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ],
+            TransformOp::Scale3d(sx, sy, sz) => [
+                f64::from(*sx),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                f64::from(*sy),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                f64::from(*sz),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ],
+            TransformOp::ScaleZ(sz) => [
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                f64::from(*sz),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ],
+            TransformOp::RotateDeg(deg) => {
+                let (s, c) = f64::from(deg.to_radians()).sin_cos();
+                [
+                    c, s, 0.0, 0.0, -s, c, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                ]
+            }
+            TransformOp::RotateXDeg(deg) => {
+                let (s, c) = f64::from(deg.to_radians()).sin_cos();
+                [
+                    1.0, 0.0, 0.0, 0.0, 0.0, c, s, 0.0, 0.0, -s, c, 0.0, 0.0, 0.0, 0.0, 1.0,
+                ]
+            }
+            TransformOp::RotateYDeg(deg) => {
+                let (s, c) = f64::from(deg.to_radians()).sin_cos();
+                [
+                    c, 0.0, -s, 0.0, 0.0, 1.0, 0.0, 0.0, s, 0.0, c, 0.0, 0.0, 0.0, 0.0, 1.0,
+                ]
+            }
+            TransformOp::Rotate3d(rx, ry, rz, deg) => {
+                let len =
+                    (f64::from(*rx).powi(2) + f64::from(*ry).powi(2) + f64::from(*rz).powi(2))
+                        .sqrt();
+                if len < 1e-6 {
+                    MAT4_IDENTITY
+                } else {
+                    let (ux, uy, uz) = (
+                        f64::from(*rx) / len,
+                        f64::from(*ry) / len,
+                        f64::from(*rz) / len,
+                    );
+                    let (s, c) = f64::from(deg.to_radians()).sin_cos();
+                    let t = 1.0 - c;
+                    [
+                        t * ux * ux + c,
+                        t * ux * uy + uz * s,
+                        t * ux * uz - uy * s,
+                        0.0,
+                        t * ux * uy - uz * s,
+                        t * uy * uy + c,
+                        t * uy * uz + ux * s,
+                        0.0,
+                        t * ux * uz + uy * s,
+                        t * uy * uz - ux * s,
+                        t * uz * uz + c,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ]
+                }
+            }
+            TransformOp::SkewDeg(ax, ay) => [
                 1.0,
                 f64::from(ay.to_radians().tan()),
+                0.0,
+                0.0,
                 f64::from(ax.to_radians().tan()),
                 1.0,
                 0.0,
                 0.0,
-            ]),
-            TransformOp::Matrix(arr) => Affine::new(arr.map(f64::from)),
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ],
+            TransformOp::Perspective(d) => {
+                let inv = if *d > 1e-3 { -1.0 / f64::from(*d) } else { 0.0 };
+                [
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, inv, 0.0, 0.0, 0.0, 1.0,
+                ]
+            }
+            TransformOp::Matrix(arr) => [
+                f64::from(arr[0]),
+                f64::from(arr[1]),
+                0.0,
+                0.0,
+                f64::from(arr[2]),
+                f64::from(arr[3]),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                f64::from(arr[4]),
+                f64::from(arr[5]),
+                0.0,
+                1.0,
+            ],
+            TransformOp::Matrix3d(arr) => arr.map(f64::from),
         };
-        m *= next;
+        m = mat4_mul(&m, &next);
     }
-    let coeffs = m.as_coeffs();
-    coeffs.map(|v| v as f32)
+    let w = if m[15].abs() > 1e-6 { m[15] } else { 1.0 };
+    [
+        (m[0] / w) as f32,
+        (m[1] / w) as f32,
+        (m[4] / w) as f32,
+        (m[5] / w) as f32,
+        (m[12] / w) as f32,
+        (m[13] / w) as f32,
+    ]
 }
 
 fn extract_render_filters(style: &ComputedStyle) -> SmallVec<[RenderFilterOp; 2]> {
