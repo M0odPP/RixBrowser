@@ -46,6 +46,15 @@ pub enum NetError {
 
     #[error("Response exceeds the {0} byte limit")]
     ResponseTooLarge(usize),
+
+    #[error("CORS policy blocked request: {0}")]
+    Cors(String),
+
+    #[error("Request was aborted")]
+    Aborted,
+
+    #[error("WebSocket error: {0}")]
+    WebSocket(String),
 }
 
 pub type Result<T> = std::result::Result<T, NetError>;
