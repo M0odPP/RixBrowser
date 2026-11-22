@@ -1,6 +1,8 @@
-//! Unified container detection and demuxing entry points.
+//! Unified container detection and demuxing entry points for MP4/fMP4, WebM/Matroska, Ogg, WAV, MP3, and FLAC.
 
 pub mod mp4;
+pub mod symphonia_demux;
+pub mod webm;
 
 use crate::types::{ContainerFormat, DemuxedMedia, MediaError};
 
@@ -47,6 +49,18 @@ pub fn demux_bytes(
 
     match container {
         ContainerFormat::Mp4 => mp4::demux_mp4(bytes),
-        _ => Err(MediaError::UnsupportedContainer),
+        ContainerFormat::WebM => webm::demux_webm(bytes),
+        ContainerFormat::Ogg => {
+            symphonia_demux::demux_with_symphonia(bytes, container, Some("ogg"))
+        }
+        ContainerFormat::Wav => {
+            symphonia_demux::demux_with_symphonia(bytes, container, Some("wav"))
+        }
+        ContainerFormat::Mp3 => {
+            symphonia_demux::demux_with_symphonia(bytes, container, Some("mp3"))
+        }
+        ContainerFormat::Flac => {
+            symphonia_demux::demux_with_symphonia(bytes, container, Some("flac"))
+        }
     }
 }
