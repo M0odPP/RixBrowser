@@ -18,6 +18,7 @@ pub mod observers;
 pub mod service_worker;
 pub mod streams;
 pub mod web_apis;
+pub mod webgl2;
 pub mod webgpu;
 pub mod webgpu_types;
 pub mod workers;
@@ -73,6 +74,7 @@ pub use streams::{
     create_readable_stream_from_bytes, install_streams, SharedStreams, StreamSystem,
 };
 pub use web_apis::{install_web_apis, SharedWebApis, WebApiState, DEFAULT_DOCUMENT_URL};
+pub use webgl2::{install_webgl2, SharedWebGl2, WebGl2System};
 pub use webgpu::{install_webgpu, SharedWebGpu, WebGpuSystem};
 pub use workers::{
     deliver_async_worker_event, install_worker_and_sse_apis, AsyncWorkerEvent, SharedWorkers,
@@ -97,6 +99,7 @@ pub struct ContentRuntime {
     pub service_workers: SharedServiceWorkers,
     pub indexeddb: SharedIndexedDb,
     pub webgpu: SharedWebGpu,
+    pub webgl2: SharedWebGl2,
     pub jit: Rc<rix_jit::TieredJit>,
     pub wasm: rix_jit::SharedWasmHost,
 }
@@ -164,6 +167,7 @@ impl ContentRuntime {
             install_service_worker_and_cache_apis(&mut vm, &host, &web_apis, &streams, &net);
         let indexeddb = install_indexeddb(&mut vm, &host, &events, &event_loop, &web_apis);
         let webgpu = install_webgpu(&mut vm, &host, &canvas2d);
+        let webgl2 = install_webgl2(&mut vm, &host, &canvas2d);
         Self {
             vm,
             host,
@@ -179,6 +183,7 @@ impl ContentRuntime {
             service_workers,
             indexeddb,
             webgpu,
+            webgl2,
             jit,
             wasm,
         }
@@ -539,11 +544,12 @@ impl ContentRuntime {
     /// Attaches a compositor-owned [`rix_render::SharedGpuDevice`] so WebGPU/WebGL2 canvases
     /// share the same `wgpu::Device` as `VelloRenderer` for zero-copy GPU-to-GPU presentation.
     pub fn attach_shared_gpu(&mut self, shared: rix_render::SharedGpuDevice) {
-        self.webgpu.borrow_mut().attach_shared_gpu(shared);
+        self.webgpu.borrow_mut().attach_shared_gpu(shared.clone());
+        self.webgl2.borrow_mut().attach_shared_gpu(shared);
     }
 
     /// Synchronizes any dirty page `DisplayList` (only when DOM/CSS changed!) AND
-    /// presents all dirty GPU-backed `Canvas2D` / `WebGPU` external surfaces into `compositor`.
+    /// presents all dirty GPU-backed `Canvas2D` / `WebGPU` / `WebGL2` external surfaces into `compositor`.
     /// Returns `(display_list_rebuilt, canvases_presented)`.
     pub fn sync_frame_to_compositor(
         &mut self,
@@ -569,12 +575,16 @@ impl ContentRuntime {
         let canvases_gpu = self
             .webgpu
             .borrow_mut()
+            .present_dirty_to_compositor(compositor, gpu.as_deref_mut());
+        let canvases_gl = self
+            .webgl2
+            .borrow_mut()
             .present_dirty_to_compositor(compositor, gpu);
-        (dl_rebuilt, canvases2d + canvases_gpu)
+        (dl_rebuilt, canvases2d + canvases_gpu + canvases_gl)
     }
 
     /// Runs a full Major GC across VM roots, event loop callbacks, listeners, observers,
-    /// Web APIs, Streams, Canvas2D, WebGPU, active network handles, and host-pinned DOM wrappers.
+    /// Web APIs, Streams, Canvas2D, WebGPU, WebGL2, active network handles, and host-pinned DOM wrappers.
     pub fn collect_garbage(&mut self) -> GcCycleStats {
         let mut roots = self.vm.collect_roots();
         self.event_loop.borrow().collect_roots(&mut roots);
@@ -585,6 +595,7 @@ impl ContentRuntime {
         self.net.borrow().collect_roots(&mut roots);
         self.canvas2d.borrow().collect_roots(&mut roots);
         self.webgpu.borrow().collect_roots(&mut roots);
+        self.webgl2.borrow().collect_roots(&mut roots);
         self.frames.borrow().collect_roots(&mut roots);
         self.workers.borrow().collect_roots(&mut roots);
         self.service_workers.borrow().collect_roots(&mut roots);
@@ -597,6 +608,7 @@ impl ContentRuntime {
         self.net.borrow_mut().sweep_dead(&self.vm.heap);
         self.canvas2d.borrow_mut().sweep_dead(&self.vm.heap);
         self.webgpu.borrow_mut().sweep_dead(&self.vm.heap);
+        self.webgl2.borrow_mut().sweep_dead(&self.vm.heap);
         self.frames.borrow_mut().sweep_dead(&self.vm.heap);
         self.workers.borrow_mut().sweep_dead(&self.vm.heap);
         self.service_workers.borrow_mut().sweep_dead(&self.vm.heap);
