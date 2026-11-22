@@ -22,11 +22,11 @@ pub use frame::{
 pub use protocol::{
     BrowserToContent, CompositorToContent, ContentToBrowser, ContentToCompositor, ContentToNetwork,
     CredentialsMode, CursorIcon, FetchMode, FontResourceId, FrameId, FrameTelemetry,
-    HttpMethodKind, ImageId, KeyModifiers, LoadState, MissingFeatureKind, MouseButtonKind,
-    NavigationId, NavigationTiming, NetworkToContent, PaintStats, PathResourceId, PipelineId,
-    PixelFormat, Point, ProcessId, Rect, RequestId, RoutedInputEvent, ScrollId, ScrollNodeUpdate,
-    ScrollTreeUpdate, ShmemId, ShmemRef, Size, SpatialNodeId, StreamId, SurfaceId, TabId, Vec2,
-    ViewportMetrics, WebSocketId, WindowId,
+    HttpMethodKind, ImageId, KeyModifiers, LoadState, MessagePortId, MissingFeatureKind,
+    MouseButtonKind, NavigationId, NavigationTiming, NetworkToContent, PaintStats, PathResourceId,
+    PipelineId, PixelFormat, Point, ProcessId, Rect, RequestId, RoutedInputEvent, ScrollId,
+    ScrollNodeUpdate, ScrollTreeUpdate, ShmemId, ShmemRef, Size, SpatialNodeId, StreamId,
+    SurfaceId, TabId, Vec2, ViewportMetrics, WebSocketId, WindowId,
 };
 #[cfg(unix)]
 pub use sandbox::{apply_sandbox, probe_landlock_abi, SandboxConfig, SandboxRole, SandboxStatus};

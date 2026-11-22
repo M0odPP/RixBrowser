@@ -23,6 +23,7 @@ define_id!(SurfaceId, u64);
 define_id!(ScrollId, u64);
 define_id!(SpatialNodeId, u32);
 define_id!(ShmemId, u64);
+define_id!(MessagePortId, u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShmemRef {
@@ -239,6 +240,48 @@ pub enum BrowserToContent {
         frame_seq: u64,
         vsync_ns: u64,
     },
+    LoadDocument {
+        pipeline: PipelineId,
+        url: String,
+        html: String,
+        sandbox: Option<String>,
+    },
+    EvalScript {
+        pipeline: PipelineId,
+        seq: u64,
+        source: String,
+    },
+    DeliverPostMessage {
+        target_pipeline: PipelineId,
+        source_pipeline: PipelineId,
+        data_json: String,
+        origin: String,
+        transfer_ports: Vec<MessagePortId>,
+    },
+    DeliverPortMessage {
+        target_pipeline: PipelineId,
+        port_id: MessagePortId,
+        data_json: String,
+        transfer_ports: Vec<MessagePortId>,
+    },
+    ChildFrameBound {
+        parent_pipeline: PipelineId,
+        frame_node_id: u64,
+        child_pipeline: PipelineId,
+        surface_id: SurfaceId,
+        origin: String,
+        is_cross_origin: bool,
+    },
+    ChildFrameCrashed {
+        parent_pipeline: PipelineId,
+        frame_node_id: u64,
+        child_pipeline: PipelineId,
+        surface_id: SurfaceId,
+    },
+    RequestDisplayList {
+        pipeline: PipelineId,
+        epoch: u64,
+    },
     ThemeChanged {
         dark: bool,
     },
@@ -292,6 +335,55 @@ pub enum ContentToBrowser {
         pipeline: PipelineId,
         kind: MissingFeatureKind,
         name: String,
+    },
+    CreateChildFrame {
+        parent_pipeline: PipelineId,
+        frame_node_id: u64,
+        surface_id: SurfaceId,
+        url: String,
+        srcdoc: Option<String>,
+        sandbox: Option<String>,
+        width: u32,
+        height: u32,
+    },
+    NavigateChildFrame {
+        parent_pipeline: PipelineId,
+        frame_node_id: u64,
+        url: String,
+        srcdoc: Option<String>,
+        sandbox: Option<String>,
+    },
+    RemoveChildFrame {
+        parent_pipeline: PipelineId,
+        frame_node_id: u64,
+    },
+    PostMessageToFrame {
+        source_pipeline: PipelineId,
+        target_pipeline: PipelineId,
+        data_json: String,
+        source_origin: String,
+        target_origin: String,
+        transfer_ports: Vec<MessagePortId>,
+    },
+    MessagePortSend {
+        source_pipeline: PipelineId,
+        port_id: MessagePortId,
+        data_json: String,
+        transfer_ports: Vec<MessagePortId>,
+    },
+    MessagePortClose {
+        port_id: MessagePortId,
+    },
+    ScriptResult {
+        pipeline: PipelineId,
+        seq: u64,
+        ok: bool,
+        value: String,
+    },
+    DisplayListReady {
+        pipeline: PipelineId,
+        epoch: u64,
+        bytes: Vec<u8>,
     },
     Pong {
         seq: u64,
@@ -509,6 +601,31 @@ mod tests {
         roundtrip(&CompositorToContent::FrameAck {
             pipeline: PipelineId(1),
             epoch: 42,
+        });
+        roundtrip(&BrowserToContent::DeliverPostMessage {
+            target_pipeline: PipelineId(2),
+            source_pipeline: PipelineId(1),
+            data_json: r#"{"hello":"oopif"}"#.to_string(),
+            origin: "https://parent.example.org".to_string(),
+            transfer_ports: vec![MessagePortId(7)],
+        });
+        roundtrip(&ContentToBrowser::CreateChildFrame {
+            parent_pipeline: PipelineId(1),
+            frame_node_id: 42,
+            surface_id: SurfaceId(99),
+            url: "https://child.example.com/embed".to_string(),
+            srcdoc: None,
+            sandbox: Some("allow-scripts".to_string()),
+            width: 300,
+            height: 150,
+        });
+        roundtrip(&ContentToBrowser::PostMessageToFrame {
+            source_pipeline: PipelineId(1),
+            target_pipeline: PipelineId(2),
+            data_json: r#""ping""#.to_string(),
+            source_origin: "https://parent.example.org".to_string(),
+            target_origin: "https://child.example.com".to_string(),
+            transfer_ports: vec![MessagePortId(11)],
         });
     }
 }

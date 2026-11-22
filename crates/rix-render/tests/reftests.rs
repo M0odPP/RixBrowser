@@ -475,3 +475,107 @@ fn disjoint_nested_clip_subtree_is_culled() {
     assert!(stats.subtrees_culled >= 1);
     assert_eq!(stats.items_encoded, 2); // Only outer PushClip + PopClip.
 }
+
+#[test]
+fn oopif_subframe_compositing_and_inline_crash_fallback() {
+    let parent_pipe = PipelineId(10);
+    let child_pipe = PipelineId(20);
+    let iframe_surface = SurfaceId(777);
+
+    // Parent page: solid blue backdrop with an embedded 120x80 OOPIF at (40, 30).
+    let mut parent_dl = DisplayList::new(Rect::new(0.0, 0.0, 200.0, 140.0));
+    parent_dl.push(DisplayItem::Rect {
+        bounds: Rect::new(0.0, 0.0, 200.0, 140.0),
+        color: Rgba8::new(20, 60, 200, 255),
+        radii: [0.0; 4],
+    });
+    parent_dl.push(DisplayItem::ExternalSurface {
+        bounds: Rect::new(40.0, 30.0, 120.0, 80.0),
+        surface_id: iframe_surface,
+        radii: [0.0; 4],
+    });
+
+    // Child OOPIF: bright emerald green document that deliberately overflows beyond 120x80
+    // to prove the compositor clips the child strictly to the parent's ExternalSurface bounds.
+    let mut child_dl = DisplayList::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+    child_dl.push(DisplayItem::Rect {
+        bounds: Rect::new(0.0, 0.0, 200.0, 200.0),
+        color: Rgba8::new(16, 200, 90, 255),
+        radii: [0.0; 4],
+    });
+
+    let mut compositor = Compositor::new(Size::new(200.0, 140.0), 1.0);
+    compositor.submit_display_list(parent_pipe, LayerRole::WebSurface, 1, parent_dl);
+    compositor.submit_display_list(child_pipe, LayerRole::Subframe, 1, child_dl);
+    compositor.bind_external_surface_pipeline(iframe_surface, child_pipe, 120, 80);
+
+    let scene1 = compositor.compose().expect("initial OOPIF frame");
+    let rgba1 = render_rgba(scene1, 200, 140, BG_COLOR);
+    assert_eq!(
+        compositor.layer(parent_pipe).unwrap().encode_generation(),
+        1
+    );
+    assert_eq!(compositor.layer(child_pipe).unwrap().encode_generation(), 1);
+
+    // Outside iframe remains parent blue; inside iframe is child green.
+    let outside = pixel_at(&rgba1, 200, 10, 10);
+    let inside = pixel_at(&rgba1, 200, 100, 70);
+    let past_right = pixel_at(&rgba1, 200, 180, 70);
+    assert!(
+        outside[2] > 180 && outside[1] < 90,
+        "parent bg: {outside:?}"
+    );
+    assert!(
+        inside[1] > 180 && inside[0] < 40,
+        "child iframe: {inside:?}"
+    );
+    assert!(
+        past_right[2] > 180 && past_right[1] < 90,
+        "child must be clipped strictly to iframe bounds: {past_right:?}"
+    );
+
+    // Repainting ONLY the child OOPIF must NOT re-encode the parent layer.
+    let mut child_dl2 = DisplayList::new(Rect::new(0.0, 0.0, 120.0, 80.0));
+    child_dl2.push(DisplayItem::Rect {
+        bounds: Rect::new(0.0, 0.0, 120.0, 80.0),
+        color: Rgba8::new(240, 210, 30, 255),
+        radii: [0.0; 4],
+    });
+    compositor.submit_display_list(child_pipe, LayerRole::Subframe, 2, child_dl2);
+    let scene2 = compositor.compose().expect("child repaint frame");
+    let rgba2 = render_rgba(scene2, 200, 140, BG_COLOR);
+    assert_eq!(
+        compositor.layer(parent_pipe).unwrap().encode_generation(),
+        1,
+        "parent must NOT re-encode when only child OOPIF repaints"
+    );
+    let inside2 = pixel_at(&rgba2, 200, 100, 70);
+    assert!(
+        inside2[0] > 210 && inside2[1] > 180 && inside2[2] < 60,
+        "updated child yellow pixel: {inside2:?}"
+    );
+
+    // Crash the child OOPIF pipeline: parent stays untouched, iframe shows inline crashed UI.
+    let crashed = compositor.mark_pipeline_crashed(child_pipe, "Child process crashed");
+    assert_eq!(crashed, vec![iframe_surface]);
+    assert!(compositor.external_surface_is_crashed(iframe_surface));
+    assert!(compositor.layer(child_pipe).is_none());
+
+    let scene3 = compositor.compose().expect("crashed fallback frame");
+    let rgba3 = render_rgba(scene3, 200, 140, BG_COLOR);
+    let outside3 = pixel_at(&rgba3, 200, 10, 10);
+    let crash_bg = pixel_at(&rgba3, 200, 50, 40);
+    let crash_badge = pixel_at(&rgba3, 200, 100, 70);
+    assert!(
+        outside3[2] > 180 && outside3[1] < 90,
+        "parent must remain intact after child crash: {outside3:?}"
+    );
+    assert!(
+        crash_bg[0] < 50 && crash_bg[1] < 55 && crash_bg[2] < 70,
+        "inline crashed frame slate backdrop expected: {crash_bg:?}"
+    );
+    assert!(
+        crash_badge[0] > 180,
+        "inline crashed frame alert badge expected at center: {crash_badge:?}"
+    );
+}
