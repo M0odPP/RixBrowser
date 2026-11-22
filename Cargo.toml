@@ -95,6 +95,7 @@ rusty_vp9 = "0.3.0"
 vp8-decoder = "0.1.2"
 rusty_av1e = { version = "0.8.1", default-features = false }
 vp8-encoder = "0.1.2"
+cpal = "0.18.2"
 
 [profile.dev]
 debug = 1
