@@ -1,0 +1,16 @@
+[package]
+name = "rix-media"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+symphonia.workspace = true
+symphonia-opus.workspace = true
+opus-decoder.workspace = true
