@@ -19,8 +19,51 @@ pub const JIT_EXCEPTION_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 /// Cannot collide with any valid `JsValue` (whose high 16 bits are strictly `<= 0xFFFE`).
 pub const JIT_MISS_SENTINEL: u64 = 0xFFFF_FFFE_0000_0000;
 
-/// High-16-bit tag marking a deoptimization return (`0xFFFF_0000_0000_0000 | resume_pc`).
+/// High-16-bit tag marking a deoptimization return:
+/// `0xFFFF_0000_0000_0000 | ((reason_code & 0xFFFF) << 32) | (resume_pc & 0xFFFF_FFFF)`.
 pub const JIT_DEOPT_TAG: u64 = 0xFFFF_0000_0000_0000;
+
+/// Speculative guard failure categories encoded in Tier-3 deoptimization return words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum DeoptReason {
+    ShapeGuard = 1,
+    PrototypeEpoch = 2,
+    Int32Type = 3,
+    Int32Overflow = 4,
+    ArrayGuard = 5,
+    ArrayBounds = 6,
+    CalleeGuard = 7,
+}
+
+impl DeoptReason {
+    #[inline]
+    #[must_use]
+    pub const fn encode_deopt(self, resume_pc: u32) -> u64 {
+        JIT_DEOPT_TAG | ((self as u64) << 32) | (resume_pc as u64)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> Option<(Self, usize)> {
+        if (raw & 0xFFFF_0000_0000_0000) != JIT_DEOPT_TAG || raw == JIT_EXCEPTION_SENTINEL {
+            return None;
+        }
+        let code = ((raw >> 32) & 0xFFFF) as u16;
+        let pc = (raw & 0xFFFF_FFFF) as usize;
+        let reason = match code {
+            1 => Self::ShapeGuard,
+            2 => Self::PrototypeEpoch,
+            3 => Self::Int32Type,
+            4 => Self::Int32Overflow,
+            5 => Self::ArrayGuard,
+            6 => Self::ArrayBounds,
+            7 => Self::CalleeGuard,
+            _ => return None,
+        };
+        Some((reason, pc))
+    }
+}
 
 /// Helper storing a thrown `JsException` onto `vm` and returning [`JIT_EXCEPTION_SENTINEL`].
 #[inline]
@@ -406,4 +449,155 @@ pub unsafe extern "C" fn rt_throw(vm: *mut JsVm, val_bits: u64, pc: u32) -> u64 
         },
         pc,
     )
+}
+
+/// Tier-3 hoisted shape guard: verifies `obj` has `expected_shape` (`!Proxy`, `slots.len() >= min_slots`,
+/// and not a prototype when `for_write != 0`), returning a raw pointer to `obj.slots[0]`, or null on fail.
+///
+/// # Safety
+/// `vm` must be a valid pointer to the active [`JsVm`]. The returned pointer remains valid only
+/// while the object stays rooted and no operation reallocates `obj.slots`.
+pub unsafe extern "C" fn rt_guard_object_slots(
+    vm: *mut JsVm,
+    obj_bits: u64,
+    expected_shape: u32,
+    min_slots: u32,
+    for_write: u32,
+) -> *mut u64 {
+    // SAFETY: Valid active `JsVm` pointer passed from Tier-3 JIT code.
+    let vm = unsafe { &mut *vm };
+    match vm.jit_guard_object_slots(
+        JsValue::from_raw(obj_bits),
+        expected_shape,
+        min_slots as usize,
+        for_write != 0,
+    ) {
+        Some(slice) => slice.as_mut_ptr().cast::<u64>(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Tier-3 prototype-chain guard: verifies `shapes.prototype_epoch() == expected_epoch` and
+/// receiver `shape_id == expected_shape`, returning the holder slot value or [`JIT_MISS_SENTINEL`].
+///
+/// # Safety
+/// `vm` must be a valid pointer to the active [`JsVm`].
+pub unsafe extern "C" fn rt_guard_proto_prop(
+    vm: *mut JsVm,
+    obj_bits: u64,
+    expected_shape: u32,
+    holder_bits: u64,
+    offset: u32,
+    expected_epoch: u64,
+) -> u64 {
+    // SAFETY: Valid active `JsVm` pointer passed from Tier-3 JIT code.
+    let vm = unsafe { &*vm };
+    match vm.jit_guard_proto_prop(
+        JsValue::from_raw(obj_bits),
+        expected_shape,
+        JsValue::from_raw(holder_bits),
+        offset as usize,
+        expected_epoch,
+    ) {
+        Some(v) => v.to_raw(),
+        None => JIT_MISS_SENTINEL,
+    }
+}
+
+/// Tier-3 hoisted packed array guard: verifies `obj` is an `Array` with `expected_kind`
+/// (`0 = PackedInt32`, `1 = PackedFloat64`, `2 = PackedValues`), writes its length to `*out_len`,
+/// and returns its raw data buffer pointer, or null on guard failure.
+///
+/// # Safety
+/// `vm` must be a valid pointer to the active [`JsVm`]; `out_len` must be a valid writable `*mut u32`.
+pub unsafe extern "C" fn rt_guard_packed_array(
+    vm: *mut JsVm,
+    obj_bits: u64,
+    expected_kind: u32,
+    out_len: *mut u32,
+) -> *mut u8 {
+    // SAFETY: Valid active `JsVm` pointer and stack-allocated `out_len` slot passed from Tier-3 JIT.
+    let vm = unsafe { &mut *vm };
+    let val = JsValue::from_raw(obj_bits);
+    let (ptr, len) = match expected_kind {
+        0 => match vm.jit_guard_packed_i32(val) {
+            Some(s) => (s.as_mut_ptr().cast::<u8>(), s.len() as u32),
+            None => return std::ptr::null_mut(),
+        },
+        1 => match vm.jit_guard_packed_f64(val) {
+            Some(s) => (s.as_mut_ptr().cast::<u8>(), s.len() as u32),
+            None => return std::ptr::null_mut(),
+        },
+        2 => match vm.jit_guard_packed_values(val) {
+            Some(s) => (s.as_mut_ptr().cast::<u8>(), s.len() as u32),
+            None => return std::ptr::null_mut(),
+        },
+        _ => return std::ptr::null_mut(),
+    };
+    // SAFETY: Caller passed a valid stack-slot pointer for `out_len`.
+    unsafe {
+        *out_len = len;
+    }
+    ptr
+}
+
+/// Tier-3 cold generational write barrier called when storing a heap-tagged value into a raw slot.
+///
+/// # Safety
+/// `vm` must be a valid pointer to the active [`JsVm`].
+pub unsafe extern "C" fn rt_write_barrier(vm: *mut JsVm, owner_bits: u64, val_bits: u64) -> u64 {
+    // SAFETY: Valid active `JsVm` pointer passed from Tier-3 JIT code.
+    let vm = unsafe { &mut *vm };
+    vm.jit_write_barrier(JsValue::from_raw(owner_bits), JsValue::from_raw(val_bits));
+    0
+}
+
+/// Zero-flush monomorphic `GetGlobal` fast path.
+/// Returns the global value raw `u64`, or [`JIT_MISS_SENTINEL`] on miss.
+///
+/// # Safety
+/// `vm` must be a valid pointer to the active [`JsVm`].
+pub unsafe extern "C" fn rt_get_global_ic_fast(
+    vm: *mut JsVm,
+    prog_id: u32,
+    func_idx: u32,
+    ic_idx: u32,
+) -> u64 {
+    // SAFETY: Valid active `JsVm` pointer; read-only monomorphic hit never runs JS or GC.
+    let vm = unsafe { &mut *vm };
+    match vm.jit_get_global_ic_fast(prog_id, func_idx, ic_idx as usize) {
+        Some(v) => v.to_raw(),
+        None => JIT_MISS_SENTINEL,
+    }
+}
+
+/// Fast zero-Vec-allocation direct call trampoline for 0..=2 argument `Opcode::Call` sites.
+///
+/// # Safety
+/// `vm` must be a valid pointer to the active [`JsVm`], and live SSA registers must have
+/// been flushed before invocation.
+pub unsafe extern "C" fn rt_call_fast2(
+    vm: *mut JsVm,
+    callee_bits: u64,
+    a0: u64,
+    a1: u64,
+    packed_meta: u64,
+    pc: u32,
+) -> u64 {
+    // SAFETY: Valid active `JsVm` pointer with flushed frame registers.
+    let vm = unsafe { &mut *vm };
+    let prog_id = (packed_meta >> 32) as u32;
+    let func_idx = ((packed_meta >> 8) & 0x00FF_FFFF) as u32;
+    let argc = (packed_meta & 0xFF) as usize;
+    let args = [JsValue::from_raw(a0), JsValue::from_raw(a1)];
+    match vm.jit_call_fast(
+        prog_id,
+        func_idx,
+        pc as usize,
+        JsValue::from_raw(callee_bits),
+        &args[..argc.min(2)],
+    ) {
+        Ok(v) => v.to_raw(),
+        Err(e) => record_exc(vm, e, pc),
+    }
 }

@@ -388,6 +388,11 @@ pub fn compile_baseline_function(
 
         match op {
             Opcode::Nop | Opcode::ExtraArg | Opcode::Debugger => {}
+            Opcode::CloseUpvalues => {
+                if has_closures {
+                    emitter.emit_generic_step(pc as u32);
+                }
+            }
             Opcode::Move => {
                 let v = emitter.read_reg(b);
                 emitter.write_reg(a, v);

@@ -102,6 +102,19 @@ pub enum JitOutcome {
     Fallback,
 }
 
+/// Monomorphic/polymorphic callee feedback collected at `Opcode::Call` sites for Tier-3 inlining.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CallSiteFeedback {
+    #[default]
+    Uninitialized,
+    Monomorphic {
+        callee: HeapHandle,
+        program_id: u32,
+        func_idx: u32,
+    },
+    Polymorphic,
+}
+
 /// Pluggable JIT compilation & execution backend attached to [`JsVm`]
 /// (implemented in `rix-jit` while keeping `rix-js` 100% `#![deny(unsafe_code)]`).
 pub trait JitEngine {
@@ -210,6 +223,10 @@ pub struct JsVm {
     pub back_edge_counts: Vec<Vec<u32>>,
     /// Optional attached Tier-2 / Tier-3 Cranelift JIT backend.
     jit: Option<Rc<dyn JitEngine>>,
+    /// Per-call-site `(prog_id, func_idx, pc)` monomorphic callee feedback for Tier-3 inlining.
+    call_feedback: HashMap<(u32, u32, usize), CallSiteFeedback>,
+    /// Per-element-site `(prog_id, func_idx, pc)` observed array `ElementsKind` for Tier-3.
+    elem_feedback: HashMap<(u32, u32, usize), crate::elements::ElementsKind>,
     /// Stashed JS exception raised inside an `extern "C"` JIT trampoline.
     pub pending_jit_exception: Option<JsException>,
     /// Frequently interned well-known property keys.
@@ -375,6 +392,8 @@ impl JsVm {
             call_counts: Vec::new(),
             back_edge_counts: Vec::new(),
             jit: None,
+            call_feedback: HashMap::new(),
+            elem_feedback: HashMap::new(),
             pending_jit_exception: None,
             key_length,
             key_prototype,
@@ -1100,6 +1119,7 @@ impl JsVm {
 
     /// Core register-window interpreter loop supporting `await`, `yield`, and JIT/OSR tier-up.
     pub(crate) fn run_suspendable(&mut self, stop_depth: usize) -> Result<RunOutcome, JsException> {
+        let mut skip_jit_once = false;
         loop {
             if self.frames.len() <= stop_depth {
                 return Ok(RunOutcome::Completed(JsValue::UNDEFINED));
@@ -1111,7 +1131,7 @@ impl JsVm {
             };
 
             // Tier-2/3 JIT function entry hook when pc == 0 and function call count reached threshold.
-            if pc == 0 {
+            if pc == 0 && !skip_jit_once {
                 if let Some(jit) = self.jit.clone() {
                     let call_cnt = self
                         .call_counts
@@ -1146,6 +1166,7 @@ impl JsVm {
                             }
                             JitOutcome::Deopt { resume_pc } => {
                                 self.frames[frame_idx].pc = resume_pc;
+                                skip_jit_once = true;
                                 continue;
                             }
                             JitOutcome::Fallback => {}
@@ -1153,6 +1174,7 @@ impl JsVm {
                     }
                 }
             }
+            skip_jit_once = false;
 
             let pc = self.frames[frame_idx].pc;
             let inst = match self.programs[prog_id].functions[func_idx].code.get(pc) {
@@ -1530,6 +1552,19 @@ impl JsVm {
             Opcode::GetElem => {
                 let obj_val = self.registers[base + usize::from(inst.b())];
                 let key_val = self.registers[base + usize::from(inst.c())];
+                if self.jit.is_some() {
+                    if let Some(obj) = obj_val.as_object() {
+                        if let Some(o) = self.heap.get_object(obj) {
+                            if matches!(o.kind, ObjectKind::Array) {
+                                let epc = self.frames[frame_idx].pc.saturating_sub(1);
+                                self.elem_feedback.insert(
+                                    (prog_id as u32, func_idx as u32, epc),
+                                    o.elements.kind(),
+                                );
+                            }
+                        }
+                    }
+                }
                 let val = self.get_elem(obj_val, key_val)?;
                 self.registers[a] = val;
             }
@@ -1537,6 +1572,19 @@ impl JsVm {
                 let obj_val = self.registers[a];
                 let key_val = self.registers[base + usize::from(inst.b())];
                 let val = self.registers[base + usize::from(inst.c())];
+                if self.jit.is_some() {
+                    if let Some(obj) = obj_val.as_object() {
+                        if let Some(o) = self.heap.get_object(obj) {
+                            if matches!(o.kind, ObjectKind::Array) {
+                                let epc = self.frames[frame_idx].pc.saturating_sub(1);
+                                self.elem_feedback.insert(
+                                    (prog_id as u32, func_idx as u32, epc),
+                                    o.elements.kind(),
+                                );
+                            }
+                        }
+                    }
+                }
                 self.set_elem(obj_val, key_val, val)?;
             }
             Opcode::DeleteProp | Opcode::DeleteElem => {
@@ -1650,10 +1698,22 @@ impl JsVm {
                 let call_base = base + usize::from(inst.b());
                 let argc = usize::from(inst.c());
                 let callee = self.registers[call_base];
-                let args: Vec<JsValue> = (0..argc)
-                    .map(|i| self.registers[call_base + 1 + i])
-                    .collect();
-                let res = self.call_value(callee, JsValue::UNDEFINED, &args)?;
+                if self.jit.is_some() {
+                    let call_pc = self.frames[frame_idx].pc.saturating_sub(1);
+                    self.record_call_feedback(prog_id as u32, func_idx as u32, call_pc, callee);
+                }
+                let res = if argc <= 4 {
+                    let mut buf = [JsValue::UNDEFINED; 4];
+                    for (i, slot) in buf.iter_mut().take(argc).enumerate() {
+                        *slot = self.registers[call_base + 1 + i];
+                    }
+                    self.call_value(callee, JsValue::UNDEFINED, &buf[..argc])?
+                } else {
+                    let args: Vec<JsValue> = (0..argc)
+                        .map(|i| self.registers[call_base + 1 + i])
+                        .collect();
+                    self.call_value(callee, JsValue::UNDEFINED, &args)?
+                };
                 self.registers[a] = res;
             }
             Opcode::CallMethod => {
@@ -3904,16 +3964,21 @@ impl JsVm {
         }
         let cached_offset = entry.offset as usize;
         let mut wrote = false;
+        let mut is_proto = false;
         if let Some(o) = self.heap.get_object_mut(obj) {
             if !matches!(o.kind, ObjectKind::Proxy(_))
                 && ShapeId(o.shape_id) == entry.shape
                 && cached_offset < o.slots.len()
             {
                 o.slots[cached_offset] = val;
+                is_proto = o.is_prototype;
                 wrote = true;
             }
         }
         if wrote {
+            if is_proto {
+                self.shapes.bump_prototype_epoch();
+            }
             self.heap.write_barrier(obj, val);
             self.ic_stats.monomorphic_hits += 1;
         }
@@ -4022,16 +4087,21 @@ impl JsVm {
             if entry.holder.is_none() && !entry.is_accessor && entry.target_shape == entry.shape {
                 let cached_offset = entry.offset as usize;
                 let mut wrote = false;
+                let mut is_proto = false;
                 if let Some(o) = self.heap.get_object_mut(obj) {
                     if !matches!(o.kind, ObjectKind::Proxy(_))
                         && ShapeId(o.shape_id) == entry.shape
                         && cached_offset < o.slots.len()
                     {
                         o.slots[cached_offset] = val;
+                        is_proto = o.is_prototype;
                         wrote = true;
                     }
                 }
                 if wrote {
+                    if is_proto {
+                        self.shapes.bump_prototype_epoch();
+                    }
                     self.heap.write_barrier(obj, val);
                     self.ic_stats.monomorphic_hits += 1;
                     return Ok(());
@@ -4148,6 +4218,217 @@ impl JsVm {
         let stop_depth = self.frames.len();
         let _ = self.dispatch_op(op, inst, p, f, base, frame_idx, stop_depth)?;
         Ok(self.frames[frame_idx].pc)
+    }
+
+    /// Records monomorphic/polymorphic JS closure target feedback at `Opcode::Call`.
+    #[inline]
+    fn record_call_feedback(&mut self, prog_id: u32, func_idx: u32, pc: usize, callee: JsValue) {
+        let key = (prog_id, func_idx, pc);
+        let cur = self.call_feedback.get(&key).copied().unwrap_or_default();
+        if matches!(cur, CallSiteFeedback::Polymorphic) {
+            return;
+        }
+        let next = match callee.as_object().and_then(|h| {
+            self.heap.get_object(h).and_then(|o| match &o.kind {
+                ObjectKind::Closure(cl) if cl.upvalues.is_empty() => {
+                    Some((h, cl.program_id, cl.func_idx))
+                }
+                _ => None,
+            })
+        }) {
+            Some((h, cp, cf)) => match cur {
+                CallSiteFeedback::Uninitialized => CallSiteFeedback::Monomorphic {
+                    callee: h,
+                    program_id: cp,
+                    func_idx: cf,
+                },
+                CallSiteFeedback::Monomorphic {
+                    callee: prev_h,
+                    program_id: prev_p,
+                    func_idx: prev_f,
+                } if prev_h == h && prev_p == cp && prev_f == cf => cur,
+                _ => CallSiteFeedback::Polymorphic,
+            },
+            None => CallSiteFeedback::Polymorphic,
+        };
+        self.call_feedback.insert(key, next);
+    }
+
+    /// Returns recorded Tier-3 call-site feedback for `(prog_id, func_idx, pc)`.
+    #[must_use]
+    pub fn jit_call_feedback(&self, prog_id: u32, func_idx: u32, pc: usize) -> CallSiteFeedback {
+        self.call_feedback
+            .get(&(prog_id, func_idx, pc))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Returns recorded Tier-3 array `ElementsKind` feedback for `(prog_id, func_idx, pc)`.
+    #[must_use]
+    pub fn jit_elem_feedback(
+        &self,
+        prog_id: u32,
+        func_idx: u32,
+        pc: usize,
+    ) -> Option<crate::elements::ElementsKind> {
+        self.elem_feedback.get(&(prog_id, func_idx, pc)).copied()
+    }
+
+    /// Snapshots all IC slot states for `(prog_id, func_idx)` for Tier-3 speculative compilation.
+    #[must_use]
+    pub fn jit_ic_snapshot(&self, prog_id: u32, func_idx: u32) -> Vec<crate::ic::IcState> {
+        let Some(table) = self
+            .ic_tables
+            .get(prog_id as usize)
+            .and_then(|v| v.get(func_idx as usize))
+        else {
+            return Vec::new();
+        };
+        (0..table.len()).map(|i| table.state(i)).collect()
+    }
+
+    /// Validates an object's `ShapeId` and returns a direct mutable slice over its dense own
+    /// property slots for hoisted Tier-3 shape guards.
+    ///
+    /// Returns `None` (triggering Tier-3 deoptimization) if `obj_val` is not an ordinary object,
+    /// is a `Proxy`, has a mismatched shape, has fewer than `min_slots`, or is a prototype object
+    /// when `for_write` is true.
+    #[inline]
+    pub fn jit_guard_object_slots(
+        &mut self,
+        obj_val: JsValue,
+        expected_shape: u32,
+        min_slots: usize,
+        for_write: bool,
+    ) -> Option<&mut [JsValue]> {
+        let obj = obj_val.as_object()?;
+        let o = self.heap.get_object_mut(obj)?;
+        if matches!(o.kind, ObjectKind::Proxy(_))
+            || o.shape_id != expected_shape
+            || o.slots.len() < min_slots
+            || (for_write && o.is_prototype)
+        {
+            return None;
+        }
+        Some(o.slots.as_mut_slice())
+    }
+
+    /// Validates a prototype-chain load guard (`prototype_epoch` + receiver `ShapeId`) and reads
+    /// the cached holder's slot directly. Returns `None` (deopt) if the prototype chain mutated
+    /// or the receiver shape changed.
+    #[inline]
+    pub fn jit_guard_proto_prop(
+        &self,
+        obj_val: JsValue,
+        expected_shape: u32,
+        holder_val: JsValue,
+        offset: usize,
+        expected_epoch: u64,
+    ) -> Option<JsValue> {
+        if self.shapes.prototype_epoch() != expected_epoch {
+            return None;
+        }
+        let obj = obj_val.as_object()?;
+        let o = self.heap.get_object(obj)?;
+        if matches!(o.kind, ObjectKind::Proxy(_)) || o.shape_id != expected_shape {
+            return None;
+        }
+        let holder = holder_val.as_object()?;
+        let ho = self.heap.get_object(holder)?;
+        ho.slots.get(offset).copied()
+    }
+
+    /// Validates that `obj_val` is an `Array` backed by `ElementsStorage::PackedInt32` and returns
+    /// direct slice access for Tier-3 unboxed array loops.
+    #[inline]
+    pub fn jit_guard_packed_i32(&mut self, obj_val: JsValue) -> Option<&mut [i32]> {
+        let obj = obj_val.as_object()?;
+        let o = self.heap.get_object_mut(obj)?;
+        if !matches!(o.kind, ObjectKind::Array) {
+            return None;
+        }
+        match &mut o.elements {
+            crate::elements::ElementsStorage::PackedInt32(v) => Some(v.as_mut_slice()),
+            _ => None,
+        }
+    }
+
+    /// Validates that `obj_val` is an `Array` backed by `ElementsStorage::PackedFloat64`.
+    #[inline]
+    pub fn jit_guard_packed_f64(&mut self, obj_val: JsValue) -> Option<&mut [f64]> {
+        let obj = obj_val.as_object()?;
+        let o = self.heap.get_object_mut(obj)?;
+        if !matches!(o.kind, ObjectKind::Array) {
+            return None;
+        }
+        match &mut o.elements {
+            crate::elements::ElementsStorage::PackedFloat64(v) => Some(v.as_mut_slice()),
+            _ => None,
+        }
+    }
+
+    /// Validates that `obj_val` is an `Array` backed by `ElementsStorage::PackedValues`.
+    #[inline]
+    pub fn jit_guard_packed_values(&mut self, obj_val: JsValue) -> Option<&mut [JsValue]> {
+        let obj = obj_val.as_object()?;
+        let o = self.heap.get_object_mut(obj)?;
+        if !matches!(o.kind, ObjectKind::Array) {
+            return None;
+        }
+        match &mut o.elements {
+            crate::elements::ElementsStorage::PackedValues(v) => Some(v.as_mut_slice()),
+            _ => None,
+        }
+    }
+
+    /// Zero-allocation monomorphic own-slot `GetGlobal` fast path for JIT code.
+    #[inline]
+    pub fn jit_get_global_ic_fast(
+        &mut self,
+        prog_id: u32,
+        func_idx: u32,
+        ic_idx: usize,
+    ) -> Option<JsValue> {
+        let crate::ic::IcState::Monomorphic(entry) = self
+            .ic_tables
+            .get(prog_id as usize)?
+            .get(func_idx as usize)?
+            .state(ic_idx)
+        else {
+            return None;
+        };
+        if entry.holder.is_some() || entry.is_accessor {
+            return None;
+        }
+        let cached_offset = entry.offset as usize;
+        let g = self.heap.get_object(self.global)?;
+        if ShapeId(g.shape_id) == entry.shape && cached_offset < g.slots.len() {
+            self.ic_stats.monomorphic_hits += 1;
+            return Some(g.slots[cached_offset]);
+        }
+        None
+    }
+
+    /// Zero-Vec-allocation fast call helper for JIT call sites.
+    #[inline]
+    pub fn jit_call_fast(
+        &mut self,
+        prog_id: u32,
+        func_idx: u32,
+        pc: usize,
+        callee: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JsException> {
+        self.record_call_feedback(prog_id, func_idx, pc, callee);
+        self.call_value(callee, JsValue::UNDEFINED, args)
+    }
+
+    /// Generational write barrier invoked on cold heap-reference stores from Tier-3 JIT code.
+    #[inline]
+    pub fn jit_write_barrier(&mut self, owner_val: JsValue, val: JsValue) {
+        if let Some(owner) = owner_val.as_object() {
+            self.heap.write_barrier(owner, val);
+        }
     }
 
     /// Cooperative interrupt + minor-GC safepoint executed at JIT loop back-edges.
