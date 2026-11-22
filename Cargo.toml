@@ -12,6 +12,7 @@ members = [
     "crates/rix-render",
     "crates/rix-layout",
     "crates/rix-js",
+    "crates/rix-content",
     "crates/rix-chrome",
     "crates/rix-app",
     "xtask",

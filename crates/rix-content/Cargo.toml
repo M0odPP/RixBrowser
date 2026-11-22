@@ -1,0 +1,20 @@
+[package]
+name = "rix-content"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rix-core = { path = "../rix-core" }
+rix-dom = { path = "../rix-dom" }
+rix-html = { path = "../rix-html" }
+rix-css = { path = "../rix-css" }
+rix-layout = { path = "../rix-layout" }
+rix-text = { path = "../rix-text" }
+rix-js = { path = "../rix-js" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
