@@ -17,6 +17,7 @@ rix-text = { path = "../rix-text" }
 rix-ipc = { path = "../rix-ipc" }
 rix-render = { path = "../rix-render" }
 rix-js = { path = "../rix-js" }
+rix-jit = { path = "../rix-jit" }
 rix-net = { path = "../rix-net" }
 rix-storage = { path = "../rix-storage" }
 tokio = { workspace = true }
@@ -27,3 +28,4 @@ encoding_rs = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+wat = "1"

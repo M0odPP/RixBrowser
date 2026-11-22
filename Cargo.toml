@@ -67,6 +67,7 @@ regex = "1.13"
 cranelift-codegen = "0.137"
 cranelift-frontend = "0.137"
 cranelift-native = "0.137"
+wasmtime = { version = "50", default-features = false, features = ["cranelift", "runtime", "std"] }
 
 [profile.dev]
 debug = 1

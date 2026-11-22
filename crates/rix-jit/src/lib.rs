@@ -16,6 +16,7 @@ pub mod memory;
 pub mod opt_analysis;
 pub mod optimizer;
 pub mod trampolines;
+pub mod wasm;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -35,6 +36,7 @@ pub use crate::memory::{
 pub use crate::optimizer::{
     compile_optimizing_function, CompiledOptimized, DeoptMetadata, OptHints,
 };
+pub use crate::wasm::{install_webassembly, SharedWasmHost, WasmHost};
 
 /// Maximum Tier-3 speculative deoptimizations per function before the deopt-loop circuit
 /// breaker permanently demotes that function to Tier-2 Baseline.
