@@ -1,5 +1,5 @@
 {
-  "engine_status": "phase2-rix-js-tier1",
-  "total_discovered": 62,
-  "passed": 62
+  "engine_status": "phase4-rix-js-intl402",
+  "total_discovered": 70,
+  "passed": 70
 }

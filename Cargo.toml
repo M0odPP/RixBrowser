@@ -68,6 +68,10 @@ cranelift-codegen = "0.137"
 cranelift-frontend = "0.137"
 cranelift-native = "0.137"
 wasmtime = { version = "50", default-features = false, features = ["cranelift", "runtime", "std"] }
+icu = { version = "2.4", features = ["compiled_data", "unstable"] }
+fixed_decimal = { version = "0.7", features = ["ryu"] }
+writeable = "0.6"
+jiff = { version = "1.0", features = ["tzdb-bundle-always"] }
 
 [profile.dev]
 debug = 1

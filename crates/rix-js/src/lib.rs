@@ -12,6 +12,7 @@ pub mod compiler;
 pub mod elements;
 pub mod heap;
 pub mod ic;
+pub mod intl;
 pub mod lexer;
 pub mod modules;
 pub mod parser;

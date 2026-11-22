@@ -419,6 +419,7 @@ impl JsVm {
         crate::builtins_primitives::install_primitive_builtins(&mut vm);
         crate::builtins_collections::install_collection_builtins(&mut vm);
         crate::promise::install_promise_and_async(&mut vm);
+        crate::intl::install_intl(&mut vm);
         vm
     }
 
