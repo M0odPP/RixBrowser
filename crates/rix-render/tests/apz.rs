@@ -202,6 +202,7 @@ fn viewport_culling_skips_offscreen_items_and_subtrees_on_10k_display_list() {
         viewport_clip: Some(viewport),
         base_transform: vello::kurbo::Affine::IDENTITY,
         override_scroll_zero: None,
+        ..EncodeOptions::default()
     };
     let mut scene = Scene::new();
     let stats = encode_display_list(PipelineId(1), &dl, &mut resources, &opts, &mut scene);
@@ -298,6 +299,7 @@ fn headless_gpu_strip_cache_matches_direct_render_pixel_equivalent() {
             viewport_clip: Some(viewport_rect),
             base_transform: vello::kurbo::Affine::IDENTITY,
             override_scroll_zero: None,
+            ..EncodeOptions::default()
         },
         &mut direct_scene,
     );

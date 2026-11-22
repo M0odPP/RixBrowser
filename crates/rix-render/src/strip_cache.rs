@@ -137,7 +137,7 @@ impl StripIndex {
                     let is_passthrough = *opacity >= 0.9999
                         && *mix_blend == BlendMode::Normal
                         && filters.is_empty()
-                        && bounds.size.height > strip_height * 1.5
+                        && (*spatial == root_scroll_id || bounds.size.height > strip_height * 1.5)
                         && matches!(rel, NodeRelation::RootScrolled | NodeRelation::RootFixed);
                     if is_passthrough {
                         wrappers.push(OpenWrapper {
@@ -206,6 +206,13 @@ impl StripIndex {
                         );
                         idx = end;
                     }
+                }
+                DisplayItem::PushClipPath { spatial, shape } => {
+                    let rel = lookup_relation(*spatial);
+                    let end = find_balanced_end(&list.items, idx, false);
+                    let world = transform_aabb(shape.bounding_rect(), lookup_transform(*spatial));
+                    index.record_range(rel, &mut wrappers, idx..end, world.min_y(), world.max_y());
+                    idx = end;
                 }
                 DisplayItem::PopClip => {
                     if let Some(w) = wrappers.pop() {
@@ -429,6 +436,7 @@ impl StripSceneCache {
                     viewport_clip: Some(band_rect),
                     base_transform: Affine::IDENTITY,
                     override_scroll_zero: Some(self.index.root_scroll_id),
+                    ..EncodeOptions::default()
                 };
                 let stats = encode_display_list_ranges(
                     pipeline,
@@ -468,6 +476,7 @@ impl StripSceneCache {
                 viewport_clip: Some(effective_vp),
                 base_transform: Affine::IDENTITY,
                 override_scroll_zero: None,
+                ..EncodeOptions::default()
             };
             let dyn_stats = encode_display_list_ranges(
                 pipeline,
@@ -489,6 +498,7 @@ impl StripSceneCache {
                     viewport_clip: base_viewport,
                     base_transform: Affine::IDENTITY,
                     override_scroll_zero: None,
+                    ..EncodeOptions::default()
                 };
                 encode_display_list_ranges(
                     pipeline,
@@ -573,7 +583,9 @@ fn find_balanced_end(items: &[DisplayItem], start: usize, stacking: bool) -> usi
                     return idx + 1;
                 }
             }
-            DisplayItem::PushClip { .. } if !stacking => depth += 1,
+            DisplayItem::PushClip { .. } | DisplayItem::PushClipPath { .. } if !stacking => {
+                depth += 1
+            }
             DisplayItem::PopClip if !stacking => {
                 depth -= 1;
                 if depth == 0 {
@@ -604,6 +616,7 @@ fn item_local_bounds(item: &DisplayItem) -> Option<Rect> {
     match item {
         DisplayItem::Rect { bounds, .. }
         | DisplayItem::LinearGradient { bounds, .. }
+        | DisplayItem::RadialGradient { bounds, .. }
         | DisplayItem::Border { bounds, .. }
         | DisplayItem::GlyphRun { bounds, .. }
         | DisplayItem::Image { bounds, .. }
@@ -627,6 +640,7 @@ fn item_local_bounds(item: &DisplayItem) -> Option<Rect> {
         DisplayItem::PushStackingContext { .. }
         | DisplayItem::PopStackingContext
         | DisplayItem::PushClip { .. }
+        | DisplayItem::PushClipPath { .. }
         | DisplayItem::PopClip => None,
     }
 }

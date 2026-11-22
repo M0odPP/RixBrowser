@@ -1,10 +1,14 @@
-use crate::display_list::{DisplayItem, DisplayList, FilterOp, Rgba8};
+use crate::display_list::{AnimationId, ClipPathShape, DisplayItem, DisplayList, FilterOp, Rgba8};
 use crate::resources::ResourceRegistry;
 use rix_core::Rect;
 use rix_ipc::{PipelineId, SpatialNodeId};
 use smallvec::SmallVec;
+use std::collections::HashMap;
 use std::ops::Range;
-use vello::kurbo::{Affine, Rect as KurboRect, RoundedRect, RoundedRectRadii, Shape, Stroke};
+use vello::kurbo::{
+    Affine, BezPath, Circle, Ellipse, Rect as KurboRect, RoundedRect, RoundedRectRadii, Shape,
+    Stroke,
+};
 use vello::peniko::{Fill, Gradient, ImageBrush, InterpolationAlphaSpace};
 use vello::{Glyph, Scene};
 
@@ -16,6 +20,7 @@ pub struct EncodeOptions {
     pub viewport_clip: Option<Rect>,
     pub base_transform: Affine,
     pub override_scroll_zero: Option<SpatialNodeId>,
+    pub opacity_overrides: HashMap<AnimationId, f32>,
 }
 
 impl Default for EncodeOptions {
@@ -25,7 +30,91 @@ impl Default for EncodeOptions {
             viewport_clip: None,
             base_transform: Affine::IDENTITY,
             override_scroll_zero: None,
+            opacity_overrides: HashMap::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveFilterFrame {
+    brightness: f32,
+    contrast: f32,
+    grayscale: f32,
+    blur_radius: f32,
+}
+
+impl Default for ActiveFilterFrame {
+    fn default() -> Self {
+        Self {
+            brightness: 1.0,
+            contrast: 1.0,
+            grayscale: 0.0,
+            blur_radius: 0.0,
+        }
+    }
+}
+
+impl ActiveFilterFrame {
+    fn is_identity_color(&self) -> bool {
+        (self.brightness - 1.0).abs() < 1e-4
+            && (self.contrast - 1.0).abs() < 1e-4
+            && self.grayscale.abs() < 1e-4
+    }
+
+    fn apply_color(&self, c: Rgba8) -> Rgba8 {
+        if self.is_identity_color() {
+            return c;
+        }
+        let mut r = f32::from(c.r) / 255.0;
+        let mut g = f32::from(c.g) / 255.0;
+        let mut b = f32::from(c.b) / 255.0;
+        // W3C Filter Effects Level 1 sRGB matrices:
+        // 1. brightness(k): c' = c * k
+        if (self.brightness - 1.0).abs() >= 1e-4 {
+            let k = self.brightness.max(0.0);
+            r *= k;
+            g *= k;
+            b *= k;
+        }
+        // 2. contrast(k): c' = (c - 0.5) * k + 0.5
+        if (self.contrast - 1.0).abs() >= 1e-4 {
+            let k = self.contrast.max(0.0);
+            r = (r - 0.5) * k + 0.5;
+            g = (g - 0.5) * k + 0.5;
+            b = (b - 0.5) * k + 0.5;
+        }
+        // 3. grayscale(amount): lerp towards Rec.709 luminance
+        if self.grayscale > 1e-4 {
+            let amt = self.grayscale.clamp(0.0, 1.0);
+            let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            r = r + (lum - r) * amt;
+            g = g + (lum - g) * amt;
+            b = b + (lum - b) * amt;
+        }
+        Rgba8::new(
+            (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+            c.a,
+        )
+    }
+
+    fn combine(parent: Self, ops: &[FilterOp]) -> Self {
+        let mut next = parent;
+        for op in ops {
+            match *op {
+                FilterOp::Brightness(b) => next.brightness *= b.max(0.0),
+                FilterOp::Contrast(c) => next.contrast *= c.max(0.0),
+                FilterOp::Grayscale(g) => {
+                    next.grayscale = (next.grayscale + g.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+                }
+                FilterOp::Blur(r) => next.blur_radius += r.max(0.0),
+                FilterOp::Opacity(_)
+                | FilterOp::DropShadow { .. }
+                | FilterOp::AnimatedOpacity(_) => {}
+            }
+        }
+        next
     }
 }
 
@@ -164,7 +253,7 @@ fn skip_balanced_clip_subtree(items: &[DisplayItem], start: usize) -> usize {
     let mut idx = start + 1;
     while idx < items.len() {
         match &items[idx] {
-            DisplayItem::PushClip { .. } => depth += 1,
+            DisplayItem::PushClip { .. } | DisplayItem::PushClipPath { .. } => depth += 1,
             DisplayItem::PopClip => {
                 depth -= 1;
                 if depth == 0 {
@@ -239,6 +328,8 @@ pub fn encode_display_list_ranges(
     let mut current_transform = lookup_transform(current_spatial);
     let mut layer_stack: SmallVec<[LayerFrame; 8]> = SmallVec::new();
     let mut world_clip_stack: SmallVec<[Rect; 8]> = SmallVec::new();
+    let mut filter_stack: SmallVec<[ActiveFilterFrame; 8]> =
+        smallvec::smallvec![ActiveFilterFrame::default()];
     if let Some(vp) = options.viewport_clip {
         world_clip_stack.push(vp);
     }
@@ -281,12 +372,36 @@ pub fn encode_display_list_ranges(
             } => {
                 let next_transform = lookup_transform(*spatial);
                 let mut effective_alpha = opacity.clamp(0.0, 1.0);
+                let mut extra_blur_inflate = 0.0f32;
                 for op in filters {
-                    if let FilterOp::Opacity(a) = op {
-                        effective_alpha *= a.clamp(0.0, 1.0);
+                    match *op {
+                        FilterOp::Opacity(a) => effective_alpha *= a.clamp(0.0, 1.0),
+                        FilterOp::AnimatedOpacity(anim_id) => {
+                            if let Some(&ov) = options.opacity_overrides.get(&anim_id) {
+                                effective_alpha = ov.clamp(0.0, 1.0);
+                            }
+                        }
+                        FilterOp::Blur(r) => extra_blur_inflate += r.max(0.0) * 2.5,
+                        FilterOp::DropShadow {
+                            offset,
+                            blur_radius,
+                            ..
+                        } => {
+                            extra_blur_inflate = extra_blur_inflate.max(
+                                blur_radius.max(0.0) * 2.5 + offset.x.abs().max(offset.y.abs()),
+                            );
+                        }
+                        FilterOp::Brightness(_)
+                        | FilterOp::Contrast(_)
+                        | FilterOp::Grayscale(_) => {}
                     }
                 }
-                let world_bounds = transform_aabb(*bounds, next_transform);
+                let expanded_bounds = if extra_blur_inflate > 0.0 {
+                    bounds.inflate(extra_blur_inflate)
+                } else {
+                    *bounds
+                };
+                let world_bounds = transform_aabb(expanded_bounds, next_transform);
                 let clipped_world = match world_clip_stack.last() {
                     Some(c) => world_bounds.intersect(c).unwrap_or(Rect::ZERO),
                     None => world_bounds,
@@ -302,6 +417,30 @@ pub fn encode_display_list_ranges(
                     continue;
                 }
 
+                // Render CSS `filter: drop-shadow(...)` behind the stacking context via Vello GPU blur.
+                let parent_filter = *filter_stack.last().unwrap_or(&ActiveFilterFrame::default());
+                for op in filters {
+                    if let FilterOp::DropShadow {
+                        offset,
+                        blur_radius,
+                        color,
+                    } = *op
+                    {
+                        if !color.is_transparent() {
+                            let shadow_color = parent_filter.apply_color(color);
+                            let shadow_rect = to_kurbo_rect(bounds.translate(offset));
+                            let std_dev = (f64::from(blur_radius.max(0.0)) * 0.5).max(0.5);
+                            scene.draw_blurred_rounded_rect(
+                                next_transform,
+                                shadow_rect,
+                                shadow_color.to_vello_color(),
+                                0.0,
+                                std_dev,
+                            );
+                        }
+                    }
+                }
+
                 // Always pass real finite bounds intersected with viewport/active clips (Spec 02 §2.2).
                 let finite_layer_clip = to_kurbo_rect(layer_clip);
                 scene.push_layer(
@@ -315,6 +454,7 @@ pub fn encode_display_list_ranges(
                     prev_spatial: current_spatial,
                 });
                 world_clip_stack.push(clipped_world);
+                filter_stack.push(ActiveFilterFrame::combine(parent_filter, filters));
                 current_spatial = *spatial;
                 current_transform = next_transform;
                 stats.items_encoded += 1;
@@ -323,10 +463,82 @@ pub fn encode_display_list_ranges(
                 if let Some(LayerFrame::Stacking { prev_spatial }) = layer_stack.pop() {
                     scene.pop_layer();
                     world_clip_stack.pop();
+                    if filter_stack.len() > 1 {
+                        filter_stack.pop();
+                    }
                     current_spatial = prev_spatial;
                     current_transform = lookup_transform(prev_spatial);
                     stats.items_encoded += 1;
                 }
+            }
+            DisplayItem::PushClipPath { spatial, shape } => {
+                let next_transform = lookup_transform(*spatial);
+                let local_bb = shape.bounding_rect();
+                let world_bounds = transform_aabb(local_bb, next_transform);
+                let clipped_world = match world_clip_stack.last() {
+                    Some(c) => world_bounds.intersect(c).unwrap_or(Rect::ZERO),
+                    None => world_bounds,
+                };
+                let visible_after_cull = options
+                    .cull_rect
+                    .map(|c| clipped_world.intersects(&c))
+                    .unwrap_or(true);
+
+                if local_bb.is_empty() || clipped_world.is_empty() || !visible_after_cull {
+                    stats.subtrees_culled += 1;
+                    idx = skip_balanced_clip_subtree(&list.items, idx);
+                    continue;
+                }
+
+                match shape {
+                    ClipPathShape::Inset { rect, radii } => {
+                        if radii.iter().any(|&r| r > 0.0) {
+                            let clip_shape = rounded_rect(*rect, *radii);
+                            scene.push_clip_layer(Fill::NonZero, next_transform, &clip_shape);
+                        } else {
+                            let clip_shape = to_kurbo_rect(*rect);
+                            scene.push_clip_layer(Fill::NonZero, next_transform, &clip_shape);
+                        }
+                    }
+                    ClipPathShape::Circle { center, radius } => {
+                        let c = Circle::new(
+                            (f64::from(center.x), f64::from(center.y)),
+                            f64::from(radius.max(0.0)),
+                        );
+                        scene.push_clip_layer(Fill::NonZero, next_transform, &c);
+                    }
+                    ClipPathShape::Ellipse { center, rx, ry } => {
+                        let e = Ellipse::new(
+                            (f64::from(center.x), f64::from(center.y)),
+                            (f64::from(rx.max(0.0)), f64::from(ry.max(0.0))),
+                            0.0,
+                        );
+                        scene.push_clip_layer(Fill::NonZero, next_transform, &e);
+                    }
+                    ClipPathShape::Polygon { fill_odd, points } => {
+                        let mut path = BezPath::new();
+                        if let Some(first) = points.first() {
+                            path.move_to((f64::from(first.x), f64::from(first.y)));
+                            for p in points.iter().skip(1) {
+                                path.line_to((f64::from(p.x), f64::from(p.y)));
+                            }
+                            path.close_path();
+                        }
+                        let fill = if *fill_odd {
+                            Fill::EvenOdd
+                        } else {
+                            Fill::NonZero
+                        };
+                        scene.push_clip_layer(fill, next_transform, &path);
+                    }
+                }
+                layer_stack.push(LayerFrame::Clip {
+                    prev_spatial: current_spatial,
+                });
+                world_clip_stack.push(clipped_world);
+                current_spatial = *spatial;
+                current_transform = next_transform;
+                stats.items_encoded += 1;
             }
             DisplayItem::PushClip {
                 spatial,
@@ -383,8 +595,14 @@ pub fn encode_display_list_ranges(
                     idx += 1;
                     continue;
                 }
+                let af = *filter_stack.last().unwrap_or(&ActiveFilterFrame::default());
+                let cull_bounds = if af.blur_radius > 0.0 {
+                    bounds.inflate(af.blur_radius * 2.5)
+                } else {
+                    *bounds
+                };
                 if is_culled(
-                    *bounds,
+                    cull_bounds,
                     current_transform,
                     effective_world_cull(&world_clip_stack),
                 ) {
@@ -392,13 +610,25 @@ pub fn encode_display_list_ranges(
                     idx += 1;
                     continue;
                 }
-                fill_shape(
-                    scene,
-                    current_transform,
-                    color.to_vello_color(),
-                    *bounds,
-                    *radii,
-                );
+                let filtered = af.apply_color(*color);
+                if af.blur_radius > 0.05 {
+                    let avg_r = f64::from(radii.iter().copied().sum::<f32>() * 0.25);
+                    scene.draw_blurred_rounded_rect(
+                        current_transform,
+                        to_kurbo_rect(*bounds),
+                        filtered.to_vello_color(),
+                        avg_r,
+                        f64::from(af.blur_radius),
+                    );
+                } else {
+                    fill_shape(
+                        scene,
+                        current_transform,
+                        filtered.to_vello_color(),
+                        *bounds,
+                        *radii,
+                    );
+                }
                 stats.items_encoded += 1;
             }
             DisplayItem::LinearGradient {
@@ -421,13 +651,54 @@ pub fn encode_display_list_ranges(
                     idx += 1;
                     continue;
                 }
+                let af = *filter_stack.last().unwrap_or(&ActiveFilterFrame::default());
                 let peniko_stops: SmallVec<[(f32, vello::peniko::Color); 4]> = stops
                     .iter()
-                    .map(|s| (s.offset, s.color.to_vello_color()))
+                    .map(|s| (s.offset, af.apply_color(s.color).to_vello_color()))
                     .collect();
                 let brush = Gradient::new_linear(
                     (f64::from(start.x), f64::from(start.y)),
                     (f64::from(end.x), f64::from(end.y)),
+                )
+                .with_interpolation_alpha_space(InterpolationAlphaSpace::Premultiplied)
+                .with_stops(peniko_stops.as_slice());
+                if radii.iter().any(|&r| r > 0.0) {
+                    let shape = rounded_rect(*bounds, *radii);
+                    scene.fill(Fill::NonZero, current_transform, &brush, None, &shape);
+                } else {
+                    let shape = to_kurbo_rect(*bounds);
+                    scene.fill(Fill::NonZero, current_transform, &brush, None, &shape);
+                }
+                stats.items_encoded += 1;
+            }
+            DisplayItem::RadialGradient {
+                bounds,
+                center,
+                radius,
+                stops,
+                radii,
+            } => {
+                if bounds.is_empty() || stops.is_empty() || *radius <= 0.0 {
+                    idx += 1;
+                    continue;
+                }
+                if is_culled(
+                    *bounds,
+                    current_transform,
+                    effective_world_cull(&world_clip_stack),
+                ) {
+                    stats.items_culled += 1;
+                    idx += 1;
+                    continue;
+                }
+                let af = *filter_stack.last().unwrap_or(&ActiveFilterFrame::default());
+                let peniko_stops: SmallVec<[(f32, vello::peniko::Color); 4]> = stops
+                    .iter()
+                    .map(|s| (s.offset, af.apply_color(s.color).to_vello_color()))
+                    .collect();
+                let brush = Gradient::new_radial(
+                    (f64::from(center.x), f64::from(center.y)),
+                    radius.max(0.5),
                 )
                 .with_interpolation_alpha_space(InterpolationAlphaSpace::Premultiplied)
                 .with_stops(peniko_stops.as_slice());
@@ -459,7 +730,16 @@ pub fn encode_display_list_ranges(
                     idx += 1;
                     continue;
                 }
-                encode_border(scene, current_transform, *bounds, *widths, *colors, *radii);
+                let af = *filter_stack.last().unwrap_or(&ActiveFilterFrame::default());
+                let filtered_colors = colors.map(|c| af.apply_color(c));
+                encode_border(
+                    scene,
+                    current_transform,
+                    *bounds,
+                    *widths,
+                    filtered_colors,
+                    *radii,
+                );
                 stats.items_encoded += 1;
             }
             DisplayItem::BoxShadow {
@@ -486,6 +766,7 @@ pub fn encode_display_list_ranges(
                     idx += 1;
                     continue;
                 }
+                let af = *filter_stack.last().unwrap_or(&ActiveFilterFrame::default());
                 encode_box_shadow(
                     scene,
                     current_transform,
@@ -493,7 +774,7 @@ pub fn encode_display_list_ranges(
                     *offset,
                     *blur_radius,
                     *spread_radius,
-                    *color,
+                    af.apply_color(*color),
                     *radii,
                     *inset,
                 );
@@ -525,6 +806,8 @@ pub fn encode_display_list_ranges(
                     idx += 1;
                     continue;
                 }
+                let af = *filter_stack.last().unwrap_or(&ActiveFilterFrame::default());
+                let glyph_color = af.apply_color(*color);
                 if let Some(font) = resources.get_font(*font_id) {
                     scene
                         .draw_glyphs(&font.font)
@@ -532,7 +815,7 @@ pub fn encode_display_list_ranges(
                         .normalized_coords(&font.normalized_coords)
                         .hint(true)
                         .transform(current_transform)
-                        .brush(color.to_vello_color())
+                        .brush(glyph_color.to_vello_color())
                         .draw(
                             Fill::NonZero,
                             list.glyphs[start..end].iter().map(|g| Glyph {

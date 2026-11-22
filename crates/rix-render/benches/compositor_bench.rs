@@ -67,6 +67,7 @@ fn bench_encode_10k_culled(c: &mut Criterion) {
         viewport_clip: Some(viewport),
         base_transform: vello::kurbo::Affine::IDENTITY,
         override_scroll_zero: None,
+        ..EncodeOptions::default()
     };
     let mut scene = Scene::new();
 

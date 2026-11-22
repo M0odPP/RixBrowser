@@ -13,16 +13,23 @@
 
 use std::collections::HashSet;
 
-use rix_core::{Point, Rect, Vec2};
+use rix_core::{Point, Rect, Size, Vec2};
 use rix_css::{
-    ColorRgba, ComputedStyle, EvalContext, FilterOp as CssFilterOp, LengthPercentageAuto,
-    LineStyle, OverflowMode, PositionMode, TextDecorationLine, TransformOp, VisibilityMode,
-    ZIndexValue,
+    AnimationDirectionMode, AnimationFillModeKind, AnimationPlayStateMode, BackgroundImageValue,
+    ClipPathValue, ClipRadius, ColorRgba, ComputedStyle, CssGradientStop, EvalContext,
+    FilterOp as CssFilterOp, KeyframesRule, LengthPercentageAuto, LineStyle, MixBlendMode,
+    OverflowMode, PositionMode, PropertyIdKind, PropertyValue, TextDecorationLine, TimingFunction,
+    TransformOp, VisibilityMode, ZIndexValue,
 };
 use rix_ipc::{FontResourceId, ImageId, PathResourceId, PipelineId, ScrollId, SpatialNodeId};
+use rix_render::animations::{
+    AnimDirection, AnimFillMode, AnimationTarget, CompositorAnimation, OpacityKeyframe,
+    TimingCurve, TransformKeyframe,
+};
 use rix_render::display_list::{
-    BlendMode, DisplayItem, DisplayList, FilterOp as RenderFilterOp, GlyphInstance, ImageSampling,
-    Rgba8, SpatialNodeKind, StickyMargins,
+    AnimationId, BlendMode, ClipPathShape, ColorStop, DisplayItem, DisplayList,
+    FilterOp as RenderFilterOp, GlyphInstance, ImageSampling, Rgba8, SpatialNodeKind,
+    StickyMargins,
 };
 use rix_render::resources::parse_svg_path;
 use rix_render::ResourceRegistry;
@@ -45,44 +52,137 @@ pub fn paint_fragment_tree(
     resources: &mut ResourceRegistry,
     dark_mode: bool,
 ) -> DisplayList {
+    paint_fragment_tree_with_keyframes(
+        tree,
+        font_db,
+        assets,
+        &[],
+        tree.content_bounds.size,
+        pipeline,
+        resources,
+        dark_mode,
+    )
+}
+
+/// Paints a [`FragmentTree`] with `@keyframes` compositor animation extraction and
+/// viewport-aware root [`SpatialNodeKind::ScrollFrame`] creation for `position: sticky`.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_fragment_tree_with_keyframes(
+    tree: &FragmentTree,
+    font_db: &FontDatabase,
+    assets: &AssetRegistry,
+    keyframes: &[&KeyframesRule],
+    viewport: Size,
+    pipeline: PipelineId,
+    resources: &mut ResourceRegistry,
+    dark_mode: bool,
+) -> DisplayList {
     let mut list = DisplayList::new(tree.content_bounds);
     let Some(root) = &tree.root else {
         return list;
     };
 
+    let needs_root_scroll = tree.content_bounds.size.height > viewport.height + 1.0
+        || tree.content_bounds.size.width > viewport.width + 1.0
+        || fragment_has_sticky_descendant(root);
+    let (root_spatial, root_scroll_parent, next_scroll_id) = if needs_root_scroll {
+        let vp_w = if viewport.width > 0.0 {
+            viewport.width
+        } else {
+            tree.content_bounds.size.width
+        };
+        let vp_h = if viewport.height > 0.0 {
+            viewport.height
+        } else {
+            tree.content_bounds.size.height
+        };
+        let scroll_node = list.spatial_tree.add_node(
+            Some(SpatialNodeId(0)),
+            SpatialNodeKind::ScrollFrame {
+                external_scroll_id: ScrollId(1),
+                content_rect: Rect::new(
+                    0.0,
+                    0.0,
+                    tree.content_bounds.size.width.max(vp_w),
+                    tree.content_bounds.size.height.max(vp_h),
+                ),
+                viewport_rect: Rect::new(0.0, 0.0, vp_w, vp_h),
+                current_offset: Vec2::ZERO,
+            },
+        );
+        (scroll_node, Some(scroll_node), 2)
+    } else {
+        (SpatialNodeId(0), None, 1)
+    };
+
+    if needs_root_scroll {
+        list.push(DisplayItem::PushStackingContext {
+            spatial: root_spatial,
+            bounds: Rect::new(
+                0.0,
+                0.0,
+                tree.content_bounds.size.width.max(viewport.width),
+                tree.content_bounds.size.height.max(viewport.height),
+            ),
+            opacity: 1.0,
+            mix_blend: BlendMode::Normal,
+            filters: SmallVec::new(),
+        });
+    }
+
     let mut painter = Painter {
         list: &mut list,
         font_db,
         assets,
+        keyframes,
         pipeline,
         resources,
         dark_mode,
         registered_fonts: Vec::new(),
         registered_images: HashSet::new(),
-        next_scroll_id: 1,
+        next_scroll_id,
+        next_animation_id: 1,
     };
 
-    let root_spatial = SpatialNodeId(0);
-    painter.paint_stacking_context(root, Point::ZERO, root_spatial, None);
+    painter.paint_stacking_context(
+        root,
+        Point::ZERO,
+        tree.content_bounds,
+        root_spatial,
+        root_scroll_parent,
+    );
+    if needs_root_scroll {
+        list.push(DisplayItem::PopStackingContext);
+    }
     list
+}
+
+fn fragment_has_sticky_descendant(frag: &Fragment) -> bool {
+    if frag.style.position == PositionMode::Sticky {
+        return true;
+    }
+    frag.children.iter().any(fragment_has_sticky_descendant)
 }
 
 struct Painter<'a> {
     list: &'a mut DisplayList,
     font_db: &'a FontDatabase,
     assets: &'a AssetRegistry,
+    keyframes: &'a [&'a KeyframesRule],
     pipeline: PipelineId,
     resources: &'a mut ResourceRegistry,
     dark_mode: bool,
     registered_fonts: Vec<(FontId, FontResourceId)>,
     registered_images: HashSet<ImageId>,
     next_scroll_id: u64,
+    next_animation_id: u64,
 }
 
 #[derive(Clone, Copy)]
 struct CollectedStackingChild<'f> {
     frag: &'f Fragment,
     parent_origin: Point,
+    container_rect: Rect,
     z_index: i32,
     order: usize,
 }
@@ -127,6 +227,7 @@ impl<'a> Painter<'a> {
         &mut self,
         frag: &'f Fragment,
         parent_origin: Point,
+        container_rect: Rect,
         parent_spatial: SpatialNodeId,
         scroll_parent: Option<SpatialNodeId>,
     ) {
@@ -136,9 +237,10 @@ impl<'a> Painter<'a> {
         let mut active_spatial = parent_spatial;
         let mut active_scroll_parent = scroll_parent;
         let mut pushed_stacking_layer = false;
+        let mut pushed_clip_path = false;
         let mut pushed_clip = false;
 
-        // 1. Sticky spatial node (`position: sticky`)
+        // 1. Sticky spatial node (`position: sticky`) with true containing-block travel bounds.
         if style.position == PositionMode::Sticky {
             if let Some(sp) = active_scroll_parent {
                 let eval = EvalContext::default();
@@ -146,33 +248,40 @@ impl<'a> Painter<'a> {
                 let margins = StickyMargins {
                     top: match &inset.top {
                         LengthPercentageAuto::Value(lp) => {
-                            Some(lp.resolve_px(abs_rect.size.height, &eval))
+                            Some(lp.resolve_px(container_rect.size.height, &eval))
                         }
                         LengthPercentageAuto::Auto => None,
                     },
                     bottom: match &inset.bottom {
                         LengthPercentageAuto::Value(lp) => {
-                            Some(lp.resolve_px(abs_rect.size.height, &eval))
+                            Some(lp.resolve_px(container_rect.size.height, &eval))
                         }
                         LengthPercentageAuto::Auto => None,
                     },
                     left: match &inset.left {
                         LengthPercentageAuto::Value(lp) => {
-                            Some(lp.resolve_px(abs_rect.size.width, &eval))
+                            Some(lp.resolve_px(container_rect.size.width, &eval))
                         }
                         LengthPercentageAuto::Auto => None,
                     },
                     right: match &inset.right {
                         LengthPercentageAuto::Value(lp) => {
-                            Some(lp.resolve_px(abs_rect.size.width, &eval))
+                            Some(lp.resolve_px(container_rect.size.width, &eval))
                         }
                         LengthPercentageAuto::Auto => None,
                     },
                 };
+                let max_travel_x = (container_rect.max_x() - abs_rect.max_x()).max(0.0);
+                let max_travel_y = (container_rect.max_y() - abs_rect.max_y()).max(0.0);
                 active_spatial = self.list.spatial_tree.add_node(
                     Some(active_spatial),
                     SpatialNodeKind::StickyFrame {
-                        bounds: abs_rect,
+                        bounds: Rect::new(
+                            abs_rect.min_x(),
+                            abs_rect.min_y(),
+                            max_travel_x,
+                            max_travel_y,
+                        ),
                         margins,
                         scroll_parent: sp,
                     },
@@ -180,42 +289,119 @@ impl<'a> Painter<'a> {
             }
         }
 
-        // 2. Transform spatial node (`transform: ...` + `transform-origin: ...`)
-        let has_transform = style
-            .effects
-            .as_ref()
-            .is_some_and(|e| !e.transform.is_empty());
-        if has_transform {
-            if let Some(effects) = &style.effects {
-                let eval = EvalContext::default();
-                let matrix = compose_transform_matrix(&effects.transform, abs_rect);
-                let origin = Point::new(
-                    abs_rect.min_x()
-                        + effects
-                            .transform_origin
-                            .x
-                            .resolve_px(abs_rect.size.width, &eval),
-                    abs_rect.min_y()
-                        + effects
-                            .transform_origin
-                            .y
-                            .resolve_px(abs_rect.size.height, &eval),
-                );
+        // 2. Transform spatial node (`transform: ...` + `transform-origin: ...` + `@keyframes` transform tracks)
+        let mut animated_opacity_ids: SmallVec<[AnimationId; 2]> = SmallVec::new();
+        let mut has_transform_anim = false;
+        if let Some(effects) = &style.effects {
+            let eval = EvalContext::default();
+            let base_matrix = if effects.transform.is_empty() {
+                [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+            } else {
+                compose_transform_matrix(&effects.transform, abs_rect)
+            };
+            let origin = Point::new(
+                abs_rect.min_x()
+                    + effects
+                        .transform_origin
+                        .x
+                        .resolve_px(abs_rect.size.width, &eval),
+                abs_rect.min_y()
+                    + effects
+                        .transform_origin
+                        .y
+                        .resolve_px(abs_rect.size.height, &eval),
+            );
+
+            // Check if any CSS `@keyframes` animation on this element animates `transform` or `opacity`.
+            let mut transform_anim_tracks: Vec<(AnimationId, CompositorAnimation)> = Vec::new();
+            for spec in &effects.animations {
+                if spec.name.as_str().eq_ignore_ascii_case("none") {
+                    continue;
+                }
+                let Some(rule) = self
+                    .keyframes
+                    .iter()
+                    .rev()
+                    .find(|k| k.name.as_str() == spec.name.as_str())
+                else {
+                    continue;
+                };
+                let tf_kfs = extract_transform_keyframes(rule, abs_rect, base_matrix);
+                if !tf_kfs.is_empty() {
+                    let id = AnimationId(self.next_animation_id);
+                    self.next_animation_id += 1;
+                    transform_anim_tracks.push((
+                        id,
+                        CompositorAnimation {
+                            id,
+                            start_time_ms: None,
+                            duration_ms: spec.duration_ms,
+                            delay_ms: spec.delay_ms,
+                            iteration_count: spec.iteration_count,
+                            direction: to_anim_direction(spec.direction),
+                            fill_mode: to_anim_fill(spec.fill_mode),
+                            paused: spec.play_state == AnimationPlayStateMode::Paused,
+                            timing: to_timing_curve(spec.timing),
+                            target: AnimationTarget::Transform {
+                                spatial: SpatialNodeId(0), // patched right after node allocation
+                                keyframes: tf_kfs,
+                            },
+                        },
+                    ));
+                }
+                let op_kfs = extract_opacity_keyframes(rule, style.opacity);
+                if !op_kfs.is_empty() {
+                    let id = AnimationId(self.next_animation_id);
+                    self.next_animation_id += 1;
+                    animated_opacity_ids.push(id);
+                    self.list.animations.push(CompositorAnimation {
+                        id,
+                        start_time_ms: None,
+                        duration_ms: spec.duration_ms,
+                        delay_ms: spec.delay_ms,
+                        iteration_count: spec.iteration_count,
+                        direction: to_anim_direction(spec.direction),
+                        fill_mode: to_anim_fill(spec.fill_mode),
+                        paused: spec.play_state == AnimationPlayStateMode::Paused,
+                        timing: to_timing_curve(spec.timing),
+                        target: AnimationTarget::Opacity { keyframes: op_kfs },
+                    });
+                }
+            }
+
+            if !effects.transform.is_empty() || !transform_anim_tracks.is_empty() {
+                has_transform_anim = !transform_anim_tracks.is_empty();
+                let first_anim_id = transform_anim_tracks.first().map(|(id, _)| *id);
                 active_spatial = self.list.spatial_tree.add_node(
                     Some(active_spatial),
                     SpatialNodeKind::Transform {
-                        matrix,
+                        matrix: base_matrix,
                         origin,
-                        animation_id: None,
+                        animation_id: first_anim_id,
                     },
                 );
+                for (_, mut track) in transform_anim_tracks {
+                    if let AnimationTarget::Transform { spatial, .. } = &mut track.target {
+                        *spatial = active_spatial;
+                    }
+                    self.list.animations.push(track);
+                }
             }
         }
 
-        // 3. Finite stacking-context layer (`opacity < 1`, `filter`, or new spatial node).
-        let filters = extract_render_filters(style);
-        let needs_layer =
-            style.opacity < 0.999 || !filters.is_empty() || active_spatial != parent_spatial;
+        // 3. Finite stacking-context layer (`opacity < 1`, `filter`, `mix-blend-mode`, animation, or new spatial node).
+        let mut filters = extract_render_filters(style, abs_rect, self.dark_mode);
+        for anim_id in animated_opacity_ids {
+            filters.push(RenderFilterOp::AnimatedOpacity(anim_id));
+        }
+        let mix_blend = style.effects.as_ref().map_or(BlendMode::Normal, |e| {
+            to_render_blend_mode(e.mix_blend_mode)
+        });
+        let needs_layer = style.opacity < 0.999
+            || !filters.is_empty()
+            || mix_blend != BlendMode::Normal
+            || has_transform_anim
+            || active_spatial != parent_spatial;
         if needs_layer {
             let finite_bounds = Rect::new(
                 abs_rect.origin.x + frag.overflow_rect.origin.x,
@@ -228,10 +414,21 @@ impl<'a> Painter<'a> {
                     spatial: active_spatial,
                     bounds: finite_bounds,
                     opacity: style.opacity.clamp(0.0, 1.0),
-                    mix_blend: BlendMode::Normal,
+                    mix_blend,
                     filters,
                 });
                 pushed_stacking_layer = true;
+            }
+        }
+
+        // 3b. CSS `clip-path` (clips the element's own background, border, AND descendants).
+        if let Some(effects) = &style.effects {
+            if let Some(shape) = resolve_clip_path(&effects.clip_path, abs_rect) {
+                self.list.push(DisplayItem::PushClipPath {
+                    spatial: active_spatial,
+                    shape,
+                });
+                pushed_clip_path = true;
             }
         }
 
@@ -291,6 +488,7 @@ impl<'a> Painter<'a> {
         collect_stacking_children(
             frag,
             abs_rect.origin,
+            abs_rect,
             &mut neg_z,
             &mut zero_z,
             &mut pos_z,
@@ -303,6 +501,7 @@ impl<'a> Painter<'a> {
             self.paint_stacking_context(
                 child.frag,
                 child.parent_origin,
+                child.container_rect,
                 active_spatial,
                 active_scroll_parent,
             );
@@ -340,6 +539,7 @@ impl<'a> Painter<'a> {
             self.paint_stacking_context(
                 child.frag,
                 child.parent_origin,
+                child.container_rect,
                 active_spatial,
                 active_scroll_parent,
             );
@@ -351,12 +551,16 @@ impl<'a> Painter<'a> {
             self.paint_stacking_context(
                 child.frag,
                 child.parent_origin,
+                child.container_rect,
                 active_spatial,
                 active_scroll_parent,
             );
         }
 
         if pushed_clip {
+            self.list.push(DisplayItem::PopClip);
+        }
+        if pushed_clip_path {
             self.list.push(DisplayItem::PopClip);
         }
         if pushed_stacking_layer {
@@ -394,7 +598,13 @@ impl<'a> Painter<'a> {
                 FlowPhase::Floats => {
                     if child.is_float {
                         // A float paints itself as a pseudo-stacking context (blocks, floats, inlines inside).
-                        self.paint_stacking_context(child, parent_origin, spatial, scroll_parent);
+                        self.paint_stacking_context(
+                            child,
+                            parent_origin,
+                            child_abs,
+                            spatial,
+                            scroll_parent,
+                        );
                     } else if !is_inline_level_fragment(child) {
                         self.paint_flow_phase(
                             child,
@@ -496,6 +706,7 @@ impl<'a> Painter<'a> {
                         abs_rect.origin.x - frag.border_rect.origin.x,
                         abs_rect.origin.y - frag.border_rect.origin.y,
                     ),
+                    abs_rect,
                     spatial,
                     scroll_parent,
                 );
@@ -545,6 +756,99 @@ impl<'a> Painter<'a> {
                 color: to_rgba8(bg),
                 radii,
             });
+        }
+
+        // Multi-layer `background-image` (`url(...)`, `linear-gradient(...)`, `radial-gradient(...)`)
+        // painted bottom-to-top per CSS Backgrounds Level 3 (last listed layer paints first).
+        for layer in style.visual.background_layers.iter().rev() {
+            match &layer.image {
+                BackgroundImageValue::None => {}
+                BackgroundImageValue::LinearGradient { angle_deg, stops } => {
+                    let resolved = resolve_gradient_stops(stops, style.text.color, self.dark_mode);
+                    if resolved.len() >= 2 {
+                        let (start, end) = linear_gradient_endpoints(abs_rect, *angle_deg);
+                        self.list.push(DisplayItem::LinearGradient {
+                            bounds: abs_rect,
+                            start,
+                            end,
+                            stops: resolved,
+                            radii,
+                        });
+                    }
+                }
+                BackgroundImageValue::RadialGradient {
+                    shape_circle,
+                    cx,
+                    cy,
+                    stops,
+                } => {
+                    let resolved = resolve_gradient_stops(stops, style.text.color, self.dark_mode);
+                    if resolved.len() >= 2 {
+                        let center = Point::new(
+                            abs_rect.min_x() + cx.resolve_px(abs_rect.size.width, &eval),
+                            abs_rect.min_y() + cy.resolve_px(abs_rect.size.height, &eval),
+                        );
+                        let dx = (center.x - abs_rect.min_x())
+                            .abs()
+                            .max((abs_rect.max_x() - center.x).abs());
+                        let dy = (center.y - abs_rect.min_y())
+                            .abs()
+                            .max((abs_rect.max_y() - center.y).abs());
+                        let radius = if *shape_circle {
+                            (dx * dx + dy * dy).sqrt().max(1.0)
+                        } else {
+                            dx.max(dy).max(1.0)
+                        };
+                        self.list.push(DisplayItem::RadialGradient {
+                            bounds: abs_rect,
+                            center,
+                            radius,
+                            stops: resolved,
+                            radii,
+                        });
+                    }
+                }
+                BackgroundImageValue::Url(url) => {
+                    if let Some(decoded) = self.assets.get_by_src(url.as_str()) {
+                        let img_id = decoded.image_id;
+                        let iw = decoded.width.max(1) as f32;
+                        let ih = decoded.height.max(1) as f32;
+                        if self.ensure_image_registered(img_id) {
+                            let img_bounds = if layer.size_cover {
+                                let scale =
+                                    (abs_rect.size.width / iw).max(abs_rect.size.height / ih);
+                                let dw = iw * scale;
+                                let dh = ih * scale;
+                                Rect::new(
+                                    abs_rect.min_x() + (abs_rect.size.width - dw) * 0.5,
+                                    abs_rect.min_y() + (abs_rect.size.height - dh) * 0.5,
+                                    dw,
+                                    dh,
+                                )
+                            } else if layer.size_contain {
+                                let scale =
+                                    (abs_rect.size.width / iw).min(abs_rect.size.height / ih);
+                                let dw = iw * scale;
+                                let dh = ih * scale;
+                                Rect::new(
+                                    abs_rect.min_x() + (abs_rect.size.width - dw) * 0.5,
+                                    abs_rect.min_y() + (abs_rect.size.height - dh) * 0.5,
+                                    dw,
+                                    dh,
+                                )
+                            } else {
+                                abs_rect
+                            };
+                            self.list.push(DisplayItem::Image {
+                                bounds: img_bounds,
+                                image_id: img_id,
+                                sampling: ImageSampling::Bilinear,
+                                radii,
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         // Inset box shadows above background, below borders.
@@ -874,6 +1178,7 @@ enum FlowPhase {
 fn collect_stacking_children<'f>(
     parent: &'f Fragment,
     parent_origin: Point,
+    container_rect: Rect,
     neg_z: &mut Vec<CollectedStackingChild<'f>>,
     zero_z: &mut Vec<CollectedStackingChild<'f>>,
     pos_z: &mut Vec<CollectedStackingChild<'f>>,
@@ -889,6 +1194,7 @@ fn collect_stacking_children<'f>(
             let entry = CollectedStackingChild {
                 frag: child,
                 parent_origin,
+                container_rect,
                 z_index: z,
                 order: *order,
             };
@@ -903,7 +1209,15 @@ fn collect_stacking_children<'f>(
             // Do NOT descend past a child stacking context — its own descendants belong to it!
             continue;
         }
-        collect_stacking_children(child, child_abs.origin, neg_z, zero_z, pos_z, order);
+        collect_stacking_children(
+            child,
+            child_abs.origin,
+            child_abs,
+            neg_z,
+            zero_z,
+            pos_z,
+            order,
+        );
     }
 }
 
@@ -925,7 +1239,12 @@ fn creates_stacking_context(frag: &Fragment) -> bool {
         return true;
     }
     if let Some(effects) = &s.effects {
-        if !effects.transform.is_empty() || !effects.filter.is_empty() {
+        if !effects.transform.is_empty()
+            || !effects.filter.is_empty()
+            || !effects.animations.is_empty()
+            || effects.clip_path != ClipPathValue::None
+            || effects.mix_blend_mode != MixBlendMode::Normal
+        {
             return true;
         }
     }
@@ -1190,7 +1509,11 @@ pub(crate) fn compose_transform_matrix(ops: &[TransformOp], rect: Rect) -> [f32;
     ]
 }
 
-fn extract_render_filters(style: &ComputedStyle) -> SmallVec<[RenderFilterOp; 2]> {
+fn extract_render_filters(
+    style: &ComputedStyle,
+    rect: Rect,
+    dark_mode: bool,
+) -> SmallVec<[RenderFilterOp; 2]> {
     let mut out = SmallVec::new();
     let eval = EvalContext::default();
     if let Some(effects) = &style.effects {
@@ -1203,11 +1526,289 @@ fn extract_render_filters(style: &ComputedStyle) -> SmallVec<[RenderFilterOp; 2]
                 CssFilterOp::Brightness(b) => out.push(RenderFilterOp::Brightness(*b)),
                 CssFilterOp::Contrast(c) => out.push(RenderFilterOp::Contrast(*c)),
                 CssFilterOp::Grayscale(g) => out.push(RenderFilterOp::Grayscale(*g)),
+                CssFilterOp::DropShadow {
+                    offset_x,
+                    offset_y,
+                    blur,
+                    color,
+                } => {
+                    let c = color.resolve(style.text.color, dark_mode);
+                    out.push(RenderFilterOp::DropShadow {
+                        offset: Vec2::new(
+                            offset_x.resolve_px(rect.size.width, &eval),
+                            offset_y.resolve_px(rect.size.height, &eval),
+                        ),
+                        blur_radius: blur.resolve_px(rect.size.width, &eval).max(0.0),
+                        color: to_rgba8(c),
+                    });
+                }
                 _ => {}
             }
         }
     }
     out
+}
+
+fn to_render_blend_mode(m: MixBlendMode) -> BlendMode {
+    match m {
+        MixBlendMode::Normal => BlendMode::Normal,
+        MixBlendMode::Multiply => BlendMode::Multiply,
+        MixBlendMode::Screen => BlendMode::Screen,
+        MixBlendMode::Overlay => BlendMode::Overlay,
+        MixBlendMode::Darken => BlendMode::Darken,
+        MixBlendMode::Lighten => BlendMode::Lighten,
+        MixBlendMode::ColorDodge => BlendMode::ColorDodge,
+        MixBlendMode::ColorBurn => BlendMode::ColorBurn,
+        MixBlendMode::HardLight => BlendMode::HardLight,
+        MixBlendMode::SoftLight => BlendMode::SoftLight,
+        MixBlendMode::Difference => BlendMode::Difference,
+        MixBlendMode::Exclusion => BlendMode::Exclusion,
+        MixBlendMode::Hue => BlendMode::Hue,
+        MixBlendMode::Saturation => BlendMode::Saturation,
+        MixBlendMode::Color => BlendMode::Color,
+        MixBlendMode::Luminosity => BlendMode::Luminosity,
+    }
+}
+
+fn resolve_clip_radius(r: &ClipRadius, basis: f32, closest: f32, farthest: f32) -> f32 {
+    let eval = EvalContext::default();
+    match r {
+        ClipRadius::Length(lp) => lp.resolve_px(basis, &eval).max(0.0),
+        ClipRadius::ClosestSide => closest.max(0.0),
+        ClipRadius::FarthestSide => farthest.max(0.0),
+    }
+}
+
+fn resolve_clip_path(cp: &ClipPathValue, rect: Rect) -> Option<ClipPathShape> {
+    let eval = EvalContext::default();
+    match cp {
+        ClipPathValue::None => None,
+        ClipPathValue::Inset {
+            top,
+            right,
+            bottom,
+            left,
+            radii,
+        } => {
+            let t = top.resolve_px(rect.size.height, &eval);
+            let r = right.resolve_px(rect.size.width, &eval);
+            let b = bottom.resolve_px(rect.size.height, &eval);
+            let l = left.resolve_px(rect.size.width, &eval);
+            let w = (rect.size.width - l - r).max(0.0);
+            let h = (rect.size.height - t - b).max(0.0);
+            let basis = w.min(h);
+            let resolved_radii = [
+                radii[0].resolve_px(basis, &eval).max(0.0),
+                radii[1].resolve_px(basis, &eval).max(0.0),
+                radii[2].resolve_px(basis, &eval).max(0.0),
+                radii[3].resolve_px(basis, &eval).max(0.0),
+            ];
+            Some(ClipPathShape::Inset {
+                rect: Rect::new(rect.min_x() + l, rect.min_y() + t, w, h),
+                radii: resolved_radii,
+            })
+        }
+        ClipPathValue::Circle { radius, cx, cy } => {
+            let lx = cx.resolve_px(rect.size.width, &eval);
+            let ly = cy.resolve_px(rect.size.height, &eval);
+            let center = Point::new(rect.min_x() + lx, rect.min_y() + ly);
+            let dx_min = lx.abs().min((rect.size.width - lx).abs());
+            let dy_min = ly.abs().min((rect.size.height - ly).abs());
+            let dx_max = lx.abs().max((rect.size.width - lx).abs());
+            let dy_max = ly.abs().max((rect.size.height - ly).abs());
+            let basis = ((rect.size.width.powi(2) + rect.size.height.powi(2)) * 0.5).sqrt();
+            let rad = resolve_clip_radius(radius, basis, dx_min.min(dy_min), dx_max.max(dy_max));
+            Some(ClipPathShape::Circle {
+                center,
+                radius: rad,
+            })
+        }
+        ClipPathValue::Ellipse { rx, ry, cx, cy } => {
+            let lx = cx.resolve_px(rect.size.width, &eval);
+            let ly = cy.resolve_px(rect.size.height, &eval);
+            let center = Point::new(rect.min_x() + lx, rect.min_y() + ly);
+            let dx_min = lx.abs().min((rect.size.width - lx).abs());
+            let dy_min = ly.abs().min((rect.size.height - ly).abs());
+            let dx_max = lx.abs().max((rect.size.width - lx).abs());
+            let dy_max = ly.abs().max((rect.size.height - ly).abs());
+            Some(ClipPathShape::Ellipse {
+                center,
+                rx: resolve_clip_radius(rx, rect.size.width, dx_min, dx_max),
+                ry: resolve_clip_radius(ry, rect.size.height, dy_min, dy_max),
+            })
+        }
+        ClipPathValue::Polygon { fill_odd, points } => {
+            if points.len() < 3 {
+                return None;
+            }
+            let resolved = points
+                .iter()
+                .map(|(px, py)| {
+                    Point::new(
+                        rect.min_x() + px.resolve_px(rect.size.width, &eval),
+                        rect.min_y() + py.resolve_px(rect.size.height, &eval),
+                    )
+                })
+                .collect();
+            Some(ClipPathShape::Polygon {
+                fill_odd: *fill_odd,
+                points: resolved,
+            })
+        }
+    }
+}
+
+fn resolve_gradient_stops(
+    stops: &[CssGradientStop],
+    current_color: ColorRgba,
+    dark_mode: bool,
+) -> SmallVec<[ColorStop; 4]> {
+    if stops.is_empty() {
+        return SmallVec::new();
+    }
+    let eval = EvalContext::default();
+    let n = stops.len();
+    let mut out = SmallVec::with_capacity(n);
+    for (i, stop) in stops.iter().enumerate() {
+        let color = to_rgba8(stop.color.resolve(current_color, dark_mode));
+        let offset = match &stop.position {
+            Some(lp) => lp.resolve_px(1.0, &eval).clamp(0.0, 1.0),
+            None => {
+                if n <= 1 {
+                    0.0
+                } else {
+                    i as f32 / (n - 1) as f32
+                }
+            }
+        };
+        out.push(ColorStop { offset, color });
+    }
+    out
+}
+
+fn linear_gradient_endpoints(rect: Rect, angle_deg: f32) -> (Point, Point) {
+    let rad = angle_deg.to_radians();
+    let dx = rad.sin();
+    let dy = -rad.cos();
+    let half_len = (rect.size.width * dx.abs() + rect.size.height * dy.abs()) * 0.5;
+    let cx = rect.min_x() + rect.size.width * 0.5;
+    let cy = rect.min_y() + rect.size.height * 0.5;
+    (
+        Point::new(cx - dx * half_len, cy - dy * half_len),
+        Point::new(cx + dx * half_len, cy + dy * half_len),
+    )
+}
+
+fn to_timing_curve(t: TimingFunction) -> TimingCurve {
+    match t {
+        TimingFunction::Linear => TimingCurve::Linear,
+        TimingFunction::Ease => TimingCurve::Ease,
+        TimingFunction::EaseIn => TimingCurve::EaseIn,
+        TimingFunction::EaseOut => TimingCurve::EaseOut,
+        TimingFunction::EaseInOut => TimingCurve::EaseInOut,
+        TimingFunction::CubicBezier(x1, y1, x2, y2) => TimingCurve::CubicBezier(x1, y1, x2, y2),
+        TimingFunction::Steps(c, s) => TimingCurve::Steps(c, s),
+    }
+}
+
+fn to_anim_direction(d: AnimationDirectionMode) -> AnimDirection {
+    match d {
+        AnimationDirectionMode::Normal => AnimDirection::Normal,
+        AnimationDirectionMode::Reverse => AnimDirection::Reverse,
+        AnimationDirectionMode::Alternate => AnimDirection::Alternate,
+        AnimationDirectionMode::AlternateReverse => AnimDirection::AlternateReverse,
+    }
+}
+
+fn to_anim_fill(f: AnimationFillModeKind) -> AnimFillMode {
+    match f {
+        AnimationFillModeKind::None => AnimFillMode::None,
+        AnimationFillModeKind::Forwards => AnimFillMode::Forwards,
+        AnimationFillModeKind::Backwards => AnimFillMode::Backwards,
+        AnimationFillModeKind::Both => AnimFillMode::Both,
+    }
+}
+
+fn extract_transform_keyframes(
+    rule: &KeyframesRule,
+    rect: Rect,
+    base_matrix: [f32; 6],
+) -> Vec<TransformKeyframe> {
+    let mut kfs = Vec::new();
+    for step in &rule.steps {
+        for decl in &step.declarations {
+            if decl.property == PropertyIdKind::Transform {
+                if let PropertyValue::Transform(ops) = &decl.value {
+                    let matrix = compose_transform_matrix(ops, rect);
+                    for &off in &step.offsets {
+                        kfs.push(TransformKeyframe {
+                            offset: off.clamp(0.0, 1.0),
+                            matrix,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if kfs.is_empty() {
+        return kfs;
+    }
+    kfs.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+    if kfs.first().is_some_and(|k| k.offset > 1e-4) {
+        kfs.insert(
+            0,
+            TransformKeyframe {
+                offset: 0.0,
+                matrix: base_matrix,
+            },
+        );
+    }
+    if kfs.last().is_some_and(|k| k.offset < 1.0 - 1e-4) {
+        kfs.push(TransformKeyframe {
+            offset: 1.0,
+            matrix: base_matrix,
+        });
+    }
+    kfs
+}
+
+fn extract_opacity_keyframes(rule: &KeyframesRule, base_opacity: f32) -> Vec<OpacityKeyframe> {
+    let mut kfs = Vec::new();
+    for step in &rule.steps {
+        for decl in &step.declarations {
+            if decl.property == PropertyIdKind::Opacity {
+                if let PropertyValue::Number(n) = &decl.value {
+                    let opacity = n.clamp(0.0, 1.0);
+                    for &off in &step.offsets {
+                        kfs.push(OpacityKeyframe {
+                            offset: off.clamp(0.0, 1.0),
+                            opacity,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if kfs.is_empty() {
+        return kfs;
+    }
+    kfs.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+    if kfs.first().is_some_and(|k| k.offset > 1e-4) {
+        kfs.insert(
+            0,
+            OpacityKeyframe {
+                offset: 0.0,
+                opacity: base_opacity.clamp(0.0, 1.0),
+            },
+        );
+    }
+    if kfs.last().is_some_and(|k| k.offset < 1.0 - 1e-4) {
+        kfs.push(OpacityKeyframe {
+            offset: 1.0,
+            opacity: base_opacity.clamp(0.0, 1.0),
+        });
+    }
+    kfs
 }
 
 fn hash_svg_path_id(d: &str, w: f32, h: f32) -> PathResourceId {
