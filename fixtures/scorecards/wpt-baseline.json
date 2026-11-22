@@ -9,6 +9,8 @@
     "grid": 1,
     "html-webappapis-timers": 4,
     "selectors": 2,
-    "websockets": 3
+    "webmessaging": 6,
+    "websockets": 3,
+    "window-open": 6
   }
 }

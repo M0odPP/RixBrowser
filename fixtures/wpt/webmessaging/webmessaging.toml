@@ -1,0 +1,95 @@
+# WPT subset: webmessaging (postMessage, MessageEvent, MessageChannel, MessagePort)
+
+[[script_cases]]
+name = "message_event_constructor_defaults_and_init"
+script = """
+var ch = new MessageChannel();
+var ev = new MessageEvent("message", {
+    data: { k: 42 },
+    origin: "https://example.org",
+    lastEventId: "ev-7",
+    source: window,
+    ports: [ch.port1]
+});
+var def = new MessageEvent("ping");
+var __pass = ev.type === "message" && ev.data.k === 42 && ev.origin === "https://example.org"
+    && ev.lastEventId === "ev-7" && ev.source === window && ev.ports.length === 1
+    && ev.ports[0] === ch.port1 && def.data === null && def.origin === "" && def.ports.length === 0;
+"""
+assert_expr = "__pass"
+expected = "true"
+
+[[script_cases]]
+name = "window_post_message_is_async_and_checks_origin"
+advance_ms = 5
+script = """
+var log = [];
+window.addEventListener("message", function(e) {
+    log.push(e.data + ":" + (e.source === window) + ":" + (e.origin === window.origin));
+});
+window.postMessage("hello", "*");
+window.postMessage("self-slash", "/");
+window.postMessage("wrong-origin", "https://mismatch.invalid");
+log.push("sync");
+"""
+assert_expr = "log.join('|')"
+expected = "sync|hello:true:true|self-slash:true:true"
+
+[[script_cases]]
+name = "window_post_message_invalid_target_origin_throws_syntax_error"
+script = """
+var err = "";
+try { window.postMessage("x", ":::invalid"); } catch (e) { err = e.name; }
+var __pass = err === "SyntaxError";
+"""
+assert_expr = "__pass"
+expected = "true"
+
+[[script_cases]]
+name = "message_channel_fifo_and_onmessage_autostart"
+advance_ms = 5
+script = """
+var out = [];
+var ch = new MessageChannel();
+ch.port2.onmessage = function(e) { out.push(e.data); };
+ch.port1.postMessage("a");
+ch.port1.postMessage("b");
+ch.port1.postMessage("c");
+"""
+assert_expr = "out.join(',')"
+expected = "a,b,c"
+
+[[script_cases]]
+name = "message_port_transfer_and_array_buffer_detachment"
+advance_ms = 5
+script = """
+var result = "";
+var ch = new MessageChannel();
+var ab = new ArrayBuffer(8);
+new Uint8Array(ab)[3] = 99;
+window.addEventListener("message", function(e) {
+    var bytes = new Uint8Array(e.data.buf);
+    e.ports[0].onmessage = function(pe) {
+        result = bytes.length + ":" + bytes[3] + ":" + pe.data;
+    };
+});
+window.postMessage({ buf: ab }, { targetOrigin: "*", transfer: [ab, ch.port2] });
+var detached = ab.byteLength === 0;
+ch.port1.postMessage("transferred-ok");
+"""
+assert_expr = "detached + '|' + result"
+expected = "true|8:99:transferred-ok"
+
+[[script_cases]]
+name = "message_port_data_clone_errors_on_self_partner_and_duplicate_transfer"
+script = """
+var ch = new MessageChannel();
+var e1 = "", e2 = "", e3 = "";
+try { ch.port1.postMessage("x", [ch.port1]); } catch (e) { e1 = e.name; }
+try { ch.port1.postMessage("x", [ch.port2]); } catch (e) { e2 = e.name; }
+var ch2 = new MessageChannel();
+try { window.postMessage("x", "*", [ch2.port1, ch2.port1]); } catch (e) { e3 = e.name; }
+var __pass = e1 === "DataCloneError" && e2 === "DataCloneError" && e3 === "DataCloneError";
+"""
+assert_expr = "__pass"
+expected = "true"

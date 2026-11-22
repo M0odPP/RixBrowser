@@ -17,6 +17,7 @@ rix-chrome = { path = "../rix-chrome" }
 rix-net = { path = "../rix-net" }
 rix-ipc = { path = "../rix-ipc" }
 rix-render = { path = "../rix-render" }
+rix-content = { path = "../rix-content" }
 rix-text = { path = "../rix-text" }
 arboard.workspace = true
 url.workspace = true

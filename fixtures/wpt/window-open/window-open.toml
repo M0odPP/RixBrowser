@@ -1,0 +1,70 @@
+# WPT subset: html/browsers/the-window-object/window-open
+
+[[script_cases]]
+name = "window_open_default_blank_and_close"
+script = """
+var w = window.open();
+var ok = w !== null && w.opener === window && w.closed === false && w.name === "";
+w.close();
+var __pass = ok && w.closed === true;
+"""
+assert_expr = "__pass"
+expected = "true"
+
+[[script_cases]]
+name = "window_open_named_target_reuses_open_window"
+script = """
+var w1 = window.open("about:blank", "rix_named_win");
+var w2 = window.open("", "rix_named_win");
+var same = (w1 === w2) && w1.name === "rix_named_win";
+w1.close();
+var w3 = window.open("about:blank", "rix_named_win");
+var __pass = same && (w3 !== w1) && w3.closed === false;
+"""
+assert_expr = "__pass"
+expected = "true"
+
+[[script_cases]]
+name = "window_open_noopener_returns_null"
+script = """
+var w1 = window.open("about:blank", "_blank", "noopener");
+var w2 = window.open("about:blank", "_blank", "noopener=yes");
+var w3 = window.open("about:blank", "_blank", "width=400,noopener=1");
+var __pass = w1 === null && w2 === null && w3 === null;
+"""
+assert_expr = "__pass"
+expected = "true"
+
+[[script_cases]]
+name = "window_open_noreferrer_implies_noopener_and_returns_null"
+script = """
+var w1 = window.open("about:blank", "_blank", "noreferrer");
+var w2 = window.open("about:blank", "_blank", "noreferrer=yes");
+var __pass = w1 === null && w2 === null;
+"""
+assert_expr = "__pass"
+expected = "true"
+
+[[script_cases]]
+name = "window_open_special_targets_self_parent_top"
+script = """
+var ws = window.open("", "_self");
+var wp = window.open("", "_parent");
+var wt = window.open("", "_top");
+var __pass = ws === window && wp === window.parent && wt === window.top;
+"""
+assert_expr = "__pass"
+expected = "true"
+
+[[script_cases]]
+name = "window_open_cross_origin_blocks_document_access"
+script = """
+var w = window.open("https://cross-origin.invalid/page", "_blank");
+var errName = "";
+try { void w.document; } catch (e) { errName = e.name; }
+var closedBefore = w.closed;
+w.close();
+var __pass = errName === "SecurityError" && closedBefore === false && w.closed === true;
+"""
+assert_expr = "__pass"
+expected = "true"
