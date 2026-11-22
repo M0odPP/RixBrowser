@@ -27,6 +27,7 @@ pub mod webgpu_types;
 pub mod workers;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,11 +36,15 @@ use rix_core::Size;
 use rix_dom::{Document, NodeData, NodeId};
 use rix_html::{attach_declarative_shadow_roots, HtmlParserStream, ParserStreamStep};
 use rix_ipc::{ContentToBrowser, MessagePortId, PipelineId};
-use rix_js::{EvalError, GcCycleStats, JsValue, JsVm};
+use rix_js::{
+    BytecodeCache, EvalError, GcCycleStats, ImportMap, JsValue, JsVm, MemoryModuleProvider,
+    ModuleLoader, SourceType,
+};
 use rix_net::FetchEngine;
 use rix_render::{Compositor, DisplayList, LayerRole, ResourceRegistry, VelloRenderer};
 use rix_storage::StorageEngine;
 use rix_text::FontDatabase;
+use url::Url;
 
 pub use canvas2d::{install_canvas2d, Canvas2DSystem, SharedCanvas2D};
 pub use frames::{
@@ -58,7 +63,8 @@ pub use event_loop::{
     MacrotaskAction, MicrotaskCheckpointHook, SharedEventLoop, TaskPriority,
 };
 pub use events::{
-    fire_object_event, install_event_system, EventSystem, EventTargetKey, SharedEvents,
+    fire_dom_node_event, fire_object_event, install_event_system, EventSystem, EventTargetKey,
+    SharedEvents,
 };
 pub use fetch_ws::{
     deliver_async_net_event, install_fetch_and_websocket, AsyncNetEvent, FetchFailure,
@@ -367,6 +373,431 @@ impl ContentRuntime {
     pub fn build_display_list(&mut self, pipeline: PipelineId) -> DisplayList {
         let mut resources = ResourceRegistry::default();
         self.host.borrow_mut().paint_now(pipeline, &mut resources)
+    }
+
+    /// Parses `html` incrementally through [`HtmlParserStream`], executing classic inline and
+    /// external `<script>` elements in document order (using [`BytecodeCache`] backed by
+    /// `StorageEngine`), executing `defer` and `type="module"` scripts (including `<script
+    /// type="importmap">`) after parsing completes, firing `DOMContentLoaded` and `load`, and
+    /// draining microtasks/due timers.
+    ///
+    /// JavaScript compilation or runtime errors are recorded to `console.error` and returned
+    /// without aborting document parsing or subsequent scripts.
+    pub fn load_document_with_external_scripts(
+        &mut self,
+        html: &str,
+        external_scripts: &HashMap<String, String>,
+    ) -> Vec<String> {
+        struct PendingScript {
+            url: String,
+            code: String,
+            is_module: bool,
+        }
+
+        let doc_url = self.web_apis.borrow().location_url.clone();
+        let doc_rc = Rc::clone(&self.host.borrow().document);
+        let parser = Rc::new(RefCell::new(HtmlParserStream::with_document(doc_rc)));
+        parser.borrow_mut().feed(html);
+        self.host.borrow_mut().active_parser = Some(Rc::clone(&parser));
+        self.host.borrow_mut().ready_state = "loading".to_string();
+
+        let mut errors = Vec::new();
+        let mut deferred_scripts: Vec<PendingScript> = Vec::new();
+        let mut import_map = ImportMap {
+            base_url: doc_url.as_str().to_string(),
+            ..ImportMap::default()
+        };
+        let mut inline_module_idx: usize = 0;
+
+        loop {
+            let step = parser.borrow_mut().step();
+            match step {
+                ParserStreamStep::Script(script_id) => {
+                    let info = {
+                        let doc_cell = Rc::clone(&self.host.borrow().document);
+                        let doc = doc_cell.borrow();
+                        match doc.get(script_id) {
+                            Some(NodeData::Element(e)) => {
+                                let ty = e.get_attribute("type").unwrap_or("").trim().to_string();
+                                let src = e.get_attribute("src").map(|s| s.trim().to_string());
+                                let is_defer = e.has_attribute("defer");
+                                let text = doc.inner_text(script_id);
+                                Some((ty, src, is_defer, text))
+                            }
+                            _ => None,
+                        }
+                    };
+                    let Some((ty, src, is_defer, inline_text)) = info else {
+                        continue;
+                    };
+                    if ty.eq_ignore_ascii_case("importmap") {
+                        match ImportMap::from_json(&inline_text, doc_url.as_str()) {
+                            Ok(parsed) => import_map = parsed,
+                            Err(err) => {
+                                let msg = format!("ImportMap error: {err}");
+                                self.web_apis
+                                    .borrow_mut()
+                                    .record_console("error", msg.clone());
+                                errors.push(msg);
+                            }
+                        }
+                        continue;
+                    }
+                    let scripts_allowed = self.frames.borrow().sandbox.scripts_allowed();
+                    if !scripts_allowed {
+                        continue;
+                    }
+
+                    let is_module = ty.eq_ignore_ascii_case("module");
+                    let is_classic = ty.is_empty()
+                        || ty.eq_ignore_ascii_case("text/javascript")
+                        || ty.eq_ignore_ascii_case("application/javascript")
+                        || ty.eq_ignore_ascii_case("text/ecmascript")
+                        || ty.eq_ignore_ascii_case("application/ecmascript");
+                    if !is_module && !is_classic {
+                        continue;
+                    }
+
+                    let (script_url, code) = if let Some(ref raw_src) = src {
+                        let resolved = doc_url
+                            .join(raw_src)
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|_| raw_src.clone());
+                        let fetched = external_scripts
+                            .get(&resolved)
+                            .or_else(|| external_scripts.get(raw_src))
+                            .cloned();
+                        match fetched {
+                            Some(src_code) => (resolved, src_code),
+                            None => continue,
+                        }
+                    } else {
+                        inline_module_idx += 1;
+                        let synthetic =
+                            format!("{}#inline-script-{inline_module_idx}", doc_url.as_str());
+                        (synthetic, inline_text)
+                    };
+
+                    if code.trim().is_empty() {
+                        continue;
+                    }
+
+                    if is_module || (is_defer && src.is_some()) {
+                        deferred_scripts.push(PendingScript {
+                            url: script_url,
+                            code,
+                            is_module,
+                        });
+                    } else if let Err(err) = self.eval_script_cached(&code) {
+                        let msg = format!("{err:?}");
+                        self.web_apis
+                            .borrow_mut()
+                            .record_console("error", msg.clone());
+                        errors.push(msg);
+                    }
+                }
+                ParserStreamStep::Done => break,
+            }
+        }
+
+        parser.borrow_mut().finish();
+        {
+            let doc_cell = Rc::clone(&self.host.borrow().document);
+            let mut doc = doc_cell.borrow_mut();
+            attach_declarative_shadow_roots(&mut doc);
+        }
+        self.host.borrow_mut().active_parser = None;
+
+        // Execute deferred classic scripts and ES modules in document order before DOMContentLoaded.
+        let has_modules = deferred_scripts.iter().any(|s| s.is_module);
+        let module_loader = if has_modules {
+            let mut provider = MemoryModuleProvider::new();
+            for (k, v) in external_scripts {
+                provider.insert(k.clone(), v.clone());
+                if let Ok(resolved) = Url::parse(doc_url.as_str()).and_then(|b| b.join(k)) {
+                    provider.insert(resolved.to_string(), v.clone());
+                }
+            }
+            for s in &deferred_scripts {
+                if s.is_module {
+                    provider.insert(s.url.clone(), s.code.clone());
+                }
+            }
+            let loader = Rc::new(RefCell::new(ModuleLoader::new(
+                Box::new(provider),
+                import_map,
+            )));
+            ModuleLoader::install_on_vm(&loader, &mut self.vm);
+            Some(loader)
+        } else {
+            None
+        };
+
+        for script in deferred_scripts {
+            if script.is_module {
+                if let Some(ref loader) = module_loader {
+                    match ModuleLoader::load_and_evaluate(loader, &mut self.vm, &script.url) {
+                        Ok(_) => self.microtask_checkpoint(),
+                        Err(err) => {
+                            let msg = format!("Module error ({}): {err}", script.url);
+                            self.web_apis
+                                .borrow_mut()
+                                .record_console("error", msg.clone());
+                            errors.push(msg);
+                        }
+                    }
+                }
+            } else if let Err(err) = self.eval_script_cached(&script.code) {
+                let msg = format!("{err:?}");
+                self.web_apis
+                    .borrow_mut()
+                    .record_console("error", msg.clone());
+                errors.push(msg);
+            }
+        }
+
+        self.host.borrow_mut().ready_state = "interactive".to_string();
+        let doc_root = self.host.borrow().document.borrow().root();
+        let _ = self.dispatch_node_event(doc_root, "DOMContentLoaded", true, true, &[]);
+
+        sync_all_iframes_in_document(
+            &mut self.vm,
+            &self.host,
+            &self.events,
+            &self.event_loop,
+            &self.web_apis,
+            &self.net,
+            &self.frames,
+        );
+
+        self.host.borrow_mut().ready_state = "complete".to_string();
+        let global = self.vm.global;
+        fire_object_event(
+            &mut self.vm,
+            &self.host,
+            &self.events,
+            &self.event_loop,
+            global,
+            "load",
+            &[],
+        );
+
+        // Execute `<body onload="...">` attribute if present.
+        let body_onload = {
+            let doc_cell = Rc::clone(&self.host.borrow().document);
+            let doc = doc_cell.borrow();
+            let found = doc
+                .descendants(doc.root())
+                .find(|&n| {
+                    matches!(
+                        doc.get(n),
+                        Some(NodeData::Element(e)) if e.name.local.as_str().eq_ignore_ascii_case("body")
+                    )
+                })
+                .and_then(|body_id| match doc.get(body_id) {
+                    Some(NodeData::Element(e)) => e.get_attribute("onload").map(str::to_string),
+                    _ => None,
+                });
+            found
+        };
+        if let Some(code) = body_onload {
+            if !code.trim().is_empty() {
+                if let Err(err) = self.eval_script_cached(&code) {
+                    let msg = format!("onload error: {err:?}");
+                    self.web_apis
+                        .borrow_mut()
+                        .record_console("error", msg.clone());
+                    errors.push(msg);
+                }
+            }
+        }
+
+        self.microtask_checkpoint();
+        drain_ready_tasks(&self.event_loop, &mut self.vm);
+        errors
+    }
+
+    /// Evaluates a JavaScript script using the persistent `StorageEngine`-backed
+    /// [`BytecodeCache`] to bypass lexing, parsing, and bytecode compilation on warm loads.
+    pub fn eval_script_cached(&mut self, source: &str) -> Result<JsValue, EvalError> {
+        let compiled = {
+            let wa = self.web_apis.borrow();
+            let cache = BytecodeCache::new(&wa.storage);
+            cache.compile_or_load(source, SourceType::Script)
+        };
+        let (program, _status) = compiled.map_err(EvalError::Compile)?;
+        let val = self
+            .vm
+            .execute_program(program)
+            .map_err(EvalError::Runtime)?;
+        self.microtask_checkpoint();
+        Ok(val)
+    }
+
+    /// Dispatches a real DOM event (`click`, `input`, `change`, `submit`, `keydown`, etc.)
+    /// on `node`, invoking inline `on<type>` handlers, JS property handlers, and bubbling
+    /// `EventTarget` listeners. Returns `true` if `preventDefault()` was NOT called.
+    pub fn dispatch_node_event(
+        &mut self,
+        node: NodeId,
+        ev_type: &str,
+        bubbles: bool,
+        cancelable: bool,
+        props: &[(&str, JsValue)],
+    ) -> bool {
+        let res = fire_dom_node_event(
+            &mut self.vm,
+            &self.host,
+            &self.events,
+            &self.event_loop,
+            node,
+            ev_type,
+            bubbles,
+            cancelable,
+            props,
+        );
+        self.microtask_checkpoint();
+        match res {
+            Ok(not_prevented) => not_prevented,
+            Err(exc) => {
+                let msg = format!("Uncaught exception in '{ev_type}' handler: {exc:?}");
+                self.web_apis.borrow_mut().record_console("error", msg);
+                true
+            }
+        }
+    }
+
+    /// Configures the Cranelift multi-tier JIT engine attached to this runtime:
+    /// - `(true, true)`: full 3-tier JIT (Interpreter -> Tier-2 Baseline/OSR -> Tier-3 Optimizing)
+    /// - `(true, false)`: Tier-2 Baseline/OSR only (disables Tier-3 speculation)
+    /// - `(false, _)`: pure bytecode interpreter (JIT detached for strict security hardening)
+    pub fn configure_jit(&mut self, enable_baseline: bool, enable_opt: bool) {
+        if !enable_baseline {
+            self.vm.detach_jit();
+            return;
+        }
+        let jit = if enable_opt {
+            rix_jit::TieredJit::new()
+        } else {
+            rix_jit::TieredJit::with_tier_thresholds(
+                rix_js::BASELINE_THRESHOLD,
+                rix_js::OSR_THRESHOLD,
+                u32::MAX,
+            )
+        };
+        self.vm.attach_jit(jit.clone());
+        self.jit = jit;
+    }
+
+    /// Drains all captured JavaScript `console.*` messages (`(level, text)`) for DevHUD display.
+    pub fn drain_console_messages(&mut self) -> Vec<(String, String)> {
+        self.web_apis.borrow_mut().drain_console_messages()
+    }
+
+    /// Performs a non-blocking poll of pending async `fetch()`/WebSocket, Web Worker, and
+    /// Service Worker completions, plus any due timers and queued macrotasks.
+    /// Returns `true` if any task or event ran.
+    pub fn poll_async_and_timers(&mut self) -> bool {
+        let mut progressed = false;
+
+        let net_events: Vec<AsyncNetEvent> = {
+            let nb = self.net.borrow();
+            let mut slot = nb.async_rx.borrow_mut();
+            let mut out = Vec::new();
+            if let Some(rx) = slot.as_mut() {
+                while let Ok(ev) = rx.try_recv() {
+                    out.push(ev);
+                }
+            }
+            out
+        };
+        for ev in net_events {
+            deliver_async_net_event(
+                &mut self.vm,
+                &self.host,
+                &self.events,
+                &self.event_loop,
+                &self.web_apis,
+                &self.streams,
+                &self.net,
+                ev,
+            );
+            progressed = true;
+        }
+
+        let worker_events: Vec<AsyncWorkerEvent> = {
+            let ws = self.workers.borrow();
+            let mut slot = ws.async_rx.borrow_mut();
+            let mut out = Vec::new();
+            if let Some(rx) = slot.as_mut() {
+                while let Ok(ev) = rx.try_recv() {
+                    out.push(ev);
+                }
+            }
+            out
+        };
+        for ev in worker_events {
+            deliver_async_worker_event(
+                &mut self.vm,
+                &self.host,
+                &self.events,
+                &self.event_loop,
+                &self.frames,
+                &self.workers,
+                ev,
+            );
+            progressed = true;
+        }
+
+        let sw_events: Vec<AsyncSwEvent> = {
+            let sw = self.service_workers.borrow();
+            let mut slot = sw.async_rx.borrow_mut();
+            let mut out = Vec::new();
+            if let Some(rx) = slot.as_mut() {
+                while let Ok(ev) = rx.try_recv() {
+                    out.push(ev);
+                }
+            }
+            out
+        };
+        for ev in sw_events {
+            deliver_async_sw_event(
+                &mut self.vm,
+                &self.event_loop,
+                &self.web_apis,
+                &self.service_workers,
+                ev,
+            );
+            progressed = true;
+        }
+
+        let ran = drain_ready_tasks(&self.event_loop, &mut self.vm);
+        if ran > 0 {
+            progressed = true;
+        }
+        progressed
+    }
+
+    /// Returns the exact delay until this runtime next needs CPU time, or `None` when
+    /// completely idle (`IDLE 0 Hz` — zero timers, zero rAF callbacks, zero queued tasks,
+    /// and zero in-flight async `fetch()` / `WebSocket` I/O).
+    #[must_use]
+    pub fn next_wakeup_delay(&self) -> Option<Duration> {
+        if self.vm.has_pending_microtasks() || self.event_loop.borrow().has_queued_macrotasks() {
+            return Some(Duration::ZERO);
+        }
+        if self.event_loop.borrow().has_pending_raf() {
+            return Some(Duration::from_millis(16));
+        }
+        let timer_delay = self.event_loop.borrow_mut().time_until_next_timer();
+        if self.net.borrow().has_pending_io() {
+            let io_poll = Duration::from_millis(8);
+            return Some(match timer_delay {
+                Some(t) => t.min(io_poll),
+                None => io_poll,
+            });
+        }
+        timer_delay
     }
 
     /// Evaluates a JavaScript script and immediately executes a WHATWG microtask checkpoint.

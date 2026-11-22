@@ -13,7 +13,9 @@ pub mod paint;
 pub mod table;
 
 pub use assets::{
-    parse_html_dimension_attr, parse_svg_color, AssetError, AssetRegistry, DecodedImage,
+    collect_svg_paths_from_dom, decode_raster_batch_parallel, decode_single_raster,
+    extract_svg_from_document, parse_best_srcset_url, parse_html_dimension_attr, parse_svg_color,
+    AssetError, AssetRegistry, DecodedImage, DecodedRasterBytes, DecodedSvg,
 };
 pub use bfc::{collapse_margins, layout_bfc_root, layout_block_box, FloatBand, FloatContext};
 pub use box_tree::{

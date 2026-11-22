@@ -220,6 +220,28 @@ pub fn install_event_system(
     let events = Rc::new(RefCell::new(EventSystem::new()));
     let etp = host.borrow().prototypes.event_target_proto;
 
+    // HTMLElement.prototype.click() dispatches a real bubbling, cancelable MouseEvent.
+    let ep = host.borrow().prototypes.element_proto;
+    let h_click = Rc::clone(host);
+    let evs_click = Rc::clone(&events);
+    let el_click = Rc::clone(event_loop);
+    define_host_method(vm, ep, "click", move |vm, this_val, _| {
+        if let Some(nid) = h_click.borrow().node_for_value(vm, this_val) {
+            let _ = fire_dom_node_event(
+                vm,
+                &h_click,
+                &evs_click,
+                &el_click,
+                nid,
+                "click",
+                true,
+                true,
+                &[],
+            );
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
     // EventTarget.prototype.addEventListener(type, listener, options?)
     let h = Rc::clone(host);
     let evs = Rc::clone(&events);
@@ -859,6 +881,138 @@ fn invoke_listeners_at(
         )?;
     }
     Ok(())
+}
+
+/// Dispatches a full W3C bubbling/cancelable DOM event on `node` (executing capture listeners,
+/// target/bubble listeners, JS `el["on" + ev_type]` properties, and inline HTML `on<type>="..."`
+/// attributes). Returns `Ok(true)` if default action is NOT prevented, `Ok(false)` if `preventDefault()` ran.
+#[allow(clippy::too_many_arguments)]
+pub fn fire_dom_node_event(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    node: NodeId,
+    ev_type: &str,
+    bubbles: bool,
+    cancelable: bool,
+    props: &[(&str, JsValue)],
+) -> Result<bool, JsException> {
+    let proto = events.borrow().event_proto.unwrap_or(vm.object_proto);
+    let ev_h = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    let target_val = value_for_target_key(vm, host, EventTargetKey::Node(node));
+    events.borrow_mut().events.insert(
+        ev_h,
+        EventInternal {
+            event_type: ev_type.to_string(),
+            bubbles,
+            cancelable,
+            composed: true,
+            default_prevented: false,
+            propagation_stopped: false,
+            immediate_stopped: false,
+            in_passive_listener: false,
+            event_phase: 2,
+            target: target_val,
+            current_target: target_val,
+            composed_path: Vec::new(),
+        },
+    );
+    for &(name, val) in props {
+        let k = vm.heap.intern_key(name);
+        vm.heap
+            .object_define_data(ev_h, k, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    }
+
+    // Invoke inline HTML `on<type>="..."` attributes and JS `node.on<type>` handlers along the
+    // target -> ancestor path (respecting `bubbles`, `stopPropagation`, and `return false`).
+    let path = build_propagation_path(host, EventTargetKey::Node(node), true);
+    let attr_name = format!("on{ev_type}");
+    let prop_key = vm.heap.intern_key(&attr_name);
+    for (idx, entry) in path.iter().enumerate() {
+        if idx > 0 && !bubbles {
+            break;
+        }
+        if is_propagation_stopped(events, ev_h) {
+            break;
+        }
+        let cur_val = value_for_target_key(vm, host, entry.current);
+        let tgt_val = value_for_target_key(vm, host, entry.retargeted_target);
+        if let Some(ev) = events.borrow_mut().events.get_mut(&ev_h) {
+            ev.event_phase = if idx == 0 { 2 } else { 3 };
+            ev.current_target = cur_val;
+            ev.target = tgt_val;
+        }
+        // 1. JS `element.on<type>` property handler
+        if let Some(cur_h) = cur_val.as_object() {
+            if let Ok(handler_val) = vm.get_property_by_key(cur_h, prop_key) {
+                if let Some(fh) = handler_val
+                    .as_object()
+                    .filter(|&h| vm.is_callable_handle(h))
+                {
+                    if let Ok(ret) = vm.call_value(
+                        JsValue::from_object(fh),
+                        cur_val,
+                        &[JsValue::from_object(ev_h)],
+                    ) {
+                        if ret == JsValue::FALSE && cancelable {
+                            if let Some(ev) = events.borrow_mut().events.get_mut(&ev_h) {
+                                ev.default_prevented = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 2. Inline HTML `on<type>="..."` attribute
+        if let EventTargetKey::Node(nid) = entry.current {
+            let inline_code = {
+                let doc_rc = Rc::clone(&host.borrow().document);
+                let doc = doc_rc.borrow();
+                match doc.get(nid) {
+                    Some(NodeData::Element(e)) => e.get_attribute(&attr_name).map(str::to_string),
+                    _ => None,
+                }
+            };
+            if let Some(code) = inline_code {
+                if !code.trim().is_empty() {
+                    let wrapped = format!("(function(event){{\n{code}\n}})");
+                    if let Ok(fn_val) = vm.eval_script(&wrapped) {
+                        if let Ok(ret) =
+                            vm.call_value(fn_val, cur_val, &[JsValue::from_object(ev_h)])
+                        {
+                            if ret == JsValue::FALSE && cancelable {
+                                if let Some(ev) = events.borrow_mut().events.get_mut(&ev_h) {
+                                    ev.default_prevented = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if is_propagation_stopped(events, ev_h) {
+        let prevented = events
+            .borrow()
+            .events
+            .get(&ev_h)
+            .is_some_and(|ev| ev.default_prevented);
+        run_microtask_checkpoint(event_loop, vm);
+        return Ok(!prevented);
+    }
+
+    dispatch_event_internal(
+        vm,
+        host,
+        events,
+        event_loop,
+        EventTargetKey::Node(node),
+        ev_h,
+    )
 }
 
 /// Allocates a real `Event` instance with extra `props`, invokes `target["on" + ev_type]`

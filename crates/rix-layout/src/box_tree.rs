@@ -12,11 +12,9 @@ use std::sync::Arc;
 
 use rix_core::Size;
 use rix_css::{
-    ColorRgba, ComputedStyle, DisplayMode, FloatMode, PositionMode, RixPseudoElement, StyleContext,
+    ComputedStyle, DisplayMode, FloatMode, PositionMode, RixPseudoElement, StyleContext,
 };
-use rix_dom::{
-    svg_element_to_path_d, DirtyFlags, Document, ElementData, NodeData, NodeId, SvgViewBox,
-};
+use rix_dom::{DirtyFlags, Document, ElementData, NodeData, NodeId, SvgViewBox};
 use rix_ipc::{ImageId, SurfaceId};
 
 /// Deterministic GPU `ExternalSurface` identifier derived from a DOM `NodeId`
@@ -27,7 +25,11 @@ pub fn surface_id_for_node(node: NodeId) -> SurfaceId {
     SurfaceId((usize::from(node) as u64).wrapping_add(1))
 }
 
-use crate::assets::{parse_html_dimension_attr, parse_svg_color, AssetRegistry};
+pub use crate::assets::SvgPathEntry;
+use crate::assets::{
+    collect_svg_paths_from_dom, parse_best_srcset_url, parse_html_dimension_attr, parse_svg_color,
+    AssetRegistry,
+};
 
 /// Dense index identifying a [`LayoutBox`] in a [`BoxTree`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -53,14 +55,6 @@ pub enum FormControlKind {
     Radio,
     TextArea,
     Select,
-}
-
-/// Extracted vector primitive inside an inline `<svg>` element.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SvgPathEntry {
-    pub path_d: String,
-    pub fill: Option<ColorRgba>,
-    pub stroke: Option<(ColorRgba, f32)>,
 }
 
 /// Replaced element payload carried on [`BoxKind::Replaced`].
@@ -485,14 +479,47 @@ impl<'a> BoxTreeBuilder<'a> {
                 })
             }
             "img" => {
-                let src = elem.get_attribute("src").unwrap_or_default().to_string();
-                let decoded = self.assets.get_by_src(&src);
+                let raw_src = elem.get_attribute("src").unwrap_or_default().trim();
+                let srcset_pick = elem.get_attribute("srcset").and_then(parse_best_srcset_url);
+                let src = if !raw_src.is_empty() {
+                    raw_src.to_string()
+                } else {
+                    srcset_pick.clone().unwrap_or_default()
+                };
                 let attr_w = elem
                     .get_attribute("width")
                     .and_then(parse_html_dimension_attr);
                 let attr_h = elem
                     .get_attribute("height")
                     .and_then(parse_html_dimension_attr);
+
+                // Pure-Rust SVG-in-`<img>` support (`.svg` and `data:image/svg+xml`).
+                let svg_asset = self.assets.get_svg_by_src(&src).or_else(|| {
+                    srcset_pick
+                        .as_deref()
+                        .and_then(|s| self.assets.get_svg_by_src(s))
+                });
+                if let Some(svg) = svg_asset {
+                    let nat_w = svg.intrinsic_size.width.max(1.0);
+                    let nat_h = svg.intrinsic_size.height.max(1.0);
+                    let (iw, ih) = match (attr_w, attr_h) {
+                        (Some(w), Some(h)) => (w, h),
+                        (Some(w), None) => (w, (w * (nat_h / nat_w)).max(1.0)),
+                        (None, Some(h)) => ((h * (nat_w / nat_h)).max(1.0), h),
+                        (None, None) => (nat_w, nat_h),
+                    };
+                    return Some(ReplacedKind::Svg {
+                        view_box: svg.view_box,
+                        intrinsic_size: Size::new(iw, ih),
+                        paths: svg.paths.clone(),
+                    });
+                }
+
+                let decoded = self.assets.get_by_src(&src).or_else(|| {
+                    srcset_pick
+                        .as_deref()
+                        .and_then(|s| self.assets.get_by_src(s))
+                });
                 let (iw, ih) = match (decoded, attr_w, attr_h) {
                     (Some(_), Some(w), Some(h)) => (w, h),
                     (Some(img), Some(w), None) => {
@@ -540,7 +567,8 @@ impl<'a> BoxTreeBuilder<'a> {
                     .get_attribute("stroke-width")
                     .and_then(parse_html_dimension_attr)
                     .unwrap_or(1.5);
-                self.collect_svg_paths(
+                collect_svg_paths_from_dom(
+                    self.doc,
                     node,
                     style.text.color,
                     inherited_fill,
@@ -636,48 +664,6 @@ impl<'a> BoxTreeBuilder<'a> {
                 })
             }
             _ => None,
-        }
-    }
-
-    fn collect_svg_paths(
-        &self,
-        parent: NodeId,
-        current_color: ColorRgba,
-        inherited_fill: Option<Option<ColorRgba>>,
-        inherited_stroke: Option<ColorRgba>,
-        inherited_stroke_w: f32,
-        out: &mut Vec<SvgPathEntry>,
-    ) {
-        for child in self.doc.children(parent) {
-            let Some(NodeData::Element(elem)) = self.doc.get(child) else {
-                continue;
-            };
-            let fill = match elem.get_attribute("fill") {
-                Some(raw) => Some(parse_svg_color(raw, current_color)),
-                None => inherited_fill,
-            };
-            let stroke = match elem.get_attribute("stroke") {
-                Some(raw) => parse_svg_color(raw, current_color),
-                None => inherited_stroke,
-            };
-            let stroke_w = elem
-                .get_attribute("stroke-width")
-                .and_then(parse_html_dimension_attr)
-                .unwrap_or(inherited_stroke_w);
-
-            if let Some(d) = svg_element_to_path_d(elem) {
-                let resolved_fill = match fill {
-                    Some(opt) => opt,
-                    None if stroke.is_some() => None,
-                    None => Some(current_color),
-                };
-                out.push(SvgPathEntry {
-                    path_d: d,
-                    fill: resolved_fill,
-                    stroke: stroke.map(|c| (c, stroke_w)),
-                });
-            }
-            self.collect_svg_paths(child, current_color, fill, stroke, stroke_w, out);
         }
     }
 

@@ -2,7 +2,7 @@
 //! `@font-face`, `@keyframes`, and CSS Nesting flattening.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use lightningcss::media_query::{
     MediaCondition, MediaFeatureId, MediaFeatureName, MediaFeatureValue, MediaList, MediaQuery,
@@ -24,11 +24,11 @@ use selectors::context::QuirksMode;
 use selectors::parser::{AncestorHashes, Selector};
 
 use crate::properties::{
-    compile_declaration_block, MissingCssFeature, MissingCssKind, PropertyIdKind,
+    compile_declaration_block, MissingCssFeature, MissingCssKind, PropertyIdKind, PropertyValue,
     SpecifiedDeclaration,
 };
 use crate::selector::{compile_lightning_selector_list, parse_selector_list, RixSelectorImpl};
-use crate::values::{convert_font_family_name, convert_length, EvalContext};
+use crate::values::{convert_font_family_name, convert_length, BackgroundImageValue, EvalContext};
 
 /// CSS Cascade origin priority order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -375,7 +375,28 @@ pub struct Stylesheet {
     pub layers: Vec<InternedStr>,
     pub font_faces: Vec<FontFaceRule>,
     pub keyframes: Vec<KeyframesRule>,
+    pub imports: Vec<String>,
     pub missing_features: Vec<MissingCssFeature>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct StylesheetCacheKey {
+    hash: u64,
+    len: usize,
+    origin: u8,
+    viewport_w: u32,
+    viewport_h: u32,
+    dark_mode: bool,
+    reduced_motion: bool,
+}
+
+fn hash_css_bytes(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 impl Stylesheet {
@@ -392,6 +413,61 @@ impl Stylesheet {
         }
         compiler.finish()
     }
+
+    /// Parses a stylesheet through a process-wide shared compiled cache keyed by content hash
+    /// and active media environment, avoiding redundant CSS parsing across navigations & tabs.
+    #[must_use]
+    pub fn parse_cached(css: &str, origin: CascadeOrigin, media: &MediaContext) -> Arc<Self> {
+        static CACHE: OnceLock<RwLock<HashMap<StylesheetCacheKey, Arc<Stylesheet>>>> =
+            OnceLock::new();
+        let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+        let key = StylesheetCacheKey {
+            hash: hash_css_bytes(css.as_bytes()),
+            len: css.len(),
+            origin: origin as u8,
+            viewport_w: media.viewport_width.round().max(0.0) as u32,
+            viewport_h: media.viewport_height.round().max(0.0) as u32,
+            dark_mode: media.dark_mode,
+            reduced_motion: media.reduced_motion,
+        };
+        if let Ok(guard) = cache.read() {
+            if let Some(hit) = guard.get(&key) {
+                return Arc::clone(hit);
+            }
+        }
+        let compiled = Arc::new(Self::parse(css, origin, media));
+        if let Ok(mut guard) = cache.write() {
+            if guard.len() >= 256 {
+                guard.clear();
+            }
+            guard.insert(key, Arc::clone(&compiled));
+        }
+        compiled
+    }
+
+    /// Returns all unique `background-image: url(...)` references compiled in this stylesheet.
+    #[must_use]
+    pub fn referenced_image_urls(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for rule in &self.rules {
+            for decl in rule.declarations.iter() {
+                if decl.property == PropertyIdKind::BackgroundLayers {
+                    if let PropertyValue::BackgroundLayers(layers) = &decl.value {
+                        for layer in layers {
+                            if let BackgroundImageValue::Url(url) = &layer.image {
+                                let trimmed = url.as_str().trim();
+                                if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                                    out.push(trimmed.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 struct StylesheetCompiler {
@@ -403,6 +479,7 @@ struct StylesheetCompiler {
     anon_layer_counter: u32,
     font_faces: Vec<FontFaceRule>,
     keyframes: Vec<KeyframesRule>,
+    imports: Vec<String>,
     missing_seen: HashSet<MissingCssFeature>,
     missing_features: Vec<MissingCssFeature>,
     next_source_order: u32,
@@ -420,6 +497,7 @@ impl StylesheetCompiler {
             anon_layer_counter: 0,
             font_faces: Vec::new(),
             keyframes: Vec::new(),
+            imports: Vec::new(),
             missing_seen: HashSet::new(),
             missing_features: Vec::new(),
             next_source_order: 0,
@@ -524,7 +602,15 @@ impl StylesheetCompiler {
                 }
                 CssRule::FontFace(ff) => self.compile_font_face(ff),
                 CssRule::Keyframes(kf) => self.compile_keyframes(kf),
-                CssRule::Import(_) | CssRule::Namespace(_) | CssRule::Ignored => {}
+                CssRule::Import(imp) => {
+                    if self.media.matches_media_list(&imp.media) {
+                        let url = imp.url.as_ref().trim();
+                        if !url.is_empty() {
+                            self.imports.push(url.to_string());
+                        }
+                    }
+                }
+                CssRule::Namespace(_) | CssRule::Ignored => {}
                 CssRule::Container(_) => {
                     self.record_missing(MissingCssFeature::new(
                         MissingCssKind::AtRule,
@@ -734,6 +820,7 @@ impl StylesheetCompiler {
             layers: self.layers,
             font_faces: self.font_faces,
             keyframes: self.keyframes,
+            imports: self.imports,
             missing_features: self.missing_features,
         }
     }
