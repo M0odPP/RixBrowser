@@ -1,5 +1,6 @@
 use crate::cookie_crypto::{cookie_key, derive_profile_cookie_key, random, CookieCipher};
 use crate::error::Result;
+use crate::idb_cache::{TABLE_CACHE_STORAGE, TABLE_INDEXED_DB};
 use crate::models::{current_time_secs, Bookmark, Cookie, HistoryEntry, SessionState};
 use crate::secrets::{profile_key, SecretStoreError};
 use crate::StorageError;
@@ -26,7 +27,7 @@ const TABLE_BYTECODE_CACHE: TableDefinition<&str, &[u8]> =
 
 #[derive(Clone)]
 pub struct StorageEngine {
-    db: Arc<Database>,
+    pub(crate) db: Arc<Database>,
     pub(crate) profile_id: [u8; 16],
     cookies: Arc<CookieState>,
 }
@@ -208,6 +209,8 @@ impl StorageEngine {
             let _ = write_txn.open_table(TABLE_SESSION)?;
             let _ = write_txn.open_table(TABLE_LOCAL_STORAGE)?;
             let _ = write_txn.open_table(TABLE_BYTECODE_CACHE)?;
+            let _ = write_txn.open_table(TABLE_CACHE_STORAGE)?;
+            let _ = write_txn.open_table(TABLE_INDEXED_DB)?;
         }
         write_txn.commit()?;
         Ok(())
