@@ -34,6 +34,15 @@ struct CanvasPrototypes {
     image_data_proto: Option<HeapHandle>,
 }
 
+/// Hook invoked by `HTMLCanvasElement.prototype.getContext(kind, options)` for
+/// non-2D contexts such as `"webgpu"`, `"webgl2"`, and `"webgl"`.
+pub type CanvasContextHook =
+    Rc<dyn Fn(&mut JsVm, NodeId, &str, JsValue) -> Result<Option<JsValue>, JsException>>;
+/// Hook notified whenever `canvas.width` or `canvas.height` is reassigned.
+pub type CanvasResizeHook = Rc<dyn Fn(NodeId, u32, u32)>;
+/// Hook queried by `canvas.toDataURL()` / `canvas.toBlob()` for GPU-backed non-2D canvases.
+pub type CanvasReadbackHook = Rc<dyn Fn(NodeId) -> Option<(u32, u32, Vec<u8>)>>;
+
 /// Shared Canvas2D registry owned by [`crate::ContentRuntime`].
 /// Keeps all GPU vector scenes completely outside `rix-dom` nodes.
 pub struct Canvas2DSystem {
@@ -45,6 +54,9 @@ pub struct Canvas2DSystem {
     image_data: HashMap<HeapHandle, (u32, u32, HeapHandle)>,
     readback_renderer: Option<VelloRenderer>,
     protos: CanvasPrototypes,
+    context_hooks: Vec<CanvasContextHook>,
+    resize_hooks: Vec<CanvasResizeHook>,
+    readback_hooks: Vec<CanvasReadbackHook>,
 }
 
 /// Shared handle to [`Canvas2DSystem`].
@@ -68,7 +80,25 @@ impl Canvas2DSystem {
             image_data: HashMap::new(),
             readback_renderer: None,
             protos: CanvasPrototypes::default(),
+            context_hooks: Vec::new(),
+            resize_hooks: Vec::new(),
+            readback_hooks: Vec::new(),
         }
+    }
+
+    /// Registers a `getContext(kind, options)` hook for GPU contexts (`webgpu`, `webgl2`).
+    pub fn register_context_hook(&mut self, hook: CanvasContextHook) {
+        self.context_hooks.push(hook);
+    }
+
+    /// Registers a resize listener notified when `canvas.width` / `canvas.height` change.
+    pub fn register_resize_hook(&mut self, hook: CanvasResizeHook) {
+        self.resize_hooks.push(hook);
+    }
+
+    /// Registers an RGBA readback hook used by `toDataURL()` / `toBlob()` for GPU canvases.
+    pub fn register_readback_hook(&mut self, hook: CanvasReadbackHook) {
+        self.readback_hooks.push(hook);
     }
 
     /// Returns a reference to the backing [`Canvas2DContext`] for a `<canvas>` DOM node.
@@ -182,7 +212,7 @@ pub fn install_canvas2d(
     canvas_sys
 }
 
-fn canvas_attr_dim(host: &SharedHost, node: NodeId, attr: &str, default: u32) -> u32 {
+pub(crate) fn canvas_attr_dim(host: &SharedHost, node: NodeId, attr: &str, default: u32) -> u32 {
     let doc = host.borrow().document.borrow().get(node).cloned();
     if let Some(NodeData::Element(el)) = doc {
         if let Some(raw) = el.get_attribute(attr) {
@@ -459,18 +489,29 @@ fn install_html_canvas_element_proto(
                 if let Some(ctx) = cs_set.borrow_mut().contexts.get_mut(&nid) {
                     ctx.resize(new_w, new_h);
                 }
+                let hooks: Vec<CanvasResizeHook> = cs_set.borrow().resize_hooks.clone();
+                for hook in hooks {
+                    hook(nid, new_w, new_h);
+                }
                 Ok(JsValue::UNDEFINED)
             },
         );
     }
 
-    // getContext("2d")
+    // getContext("2d" | "webgpu" | "webgl2" | "webgl")
     let h = Rc::clone(host);
     let cs = Rc::clone(canvas_sys);
     define_host_method(vm, cp, "getContext", move |vm, this_val, args| {
         let nid = require_canvas_node(vm, &h, this_val)?;
         let kind = vm.value_to_rust_string(arg(args, 0));
         if !kind.eq_ignore_ascii_case("2d") {
+            let opts = arg(args, 1);
+            let hooks: Vec<CanvasContextHook> = cs.borrow().context_hooks.clone();
+            for hook in hooks {
+                if let Some(ctx_val) = hook(vm, nid, &kind, opts)? {
+                    return Ok(ctx_val);
+                }
+            }
             return Ok(JsValue::NULL);
         }
         ensure_context_for_node(&h, &cs, nid);
@@ -494,8 +535,15 @@ fn install_html_canvas_element_proto(
     let cs = Rc::clone(canvas_sys);
     define_host_method(vm, cp, "toDataURL", move |vm, this_val, _| {
         let nid = require_canvas_node(vm, &h, this_val)?;
-        ensure_context_for_node(&h, &cs, nid);
-        let Some((w, h_px, rgba)) = cs.borrow_mut().readback_node_rgba(nid) else {
+        let hooks: Vec<CanvasReadbackHook> = cs.borrow().readback_hooks.clone();
+        let hook_pixels = hooks.into_iter().find_map(|hook| hook(nid));
+        let pixels = if let Some(px) = hook_pixels {
+            Some(px)
+        } else {
+            ensure_context_for_node(&h, &cs, nid);
+            cs.borrow_mut().readback_node_rgba(nid)
+        };
+        let Some((w, h_px, rgba)) = pixels else {
             return Ok(JsValue::from_string(vm.heap.alloc_string("data:,")));
         };
         let url =
@@ -513,8 +561,15 @@ fn install_html_canvas_element_proto(
         if !cb.as_object().is_some_and(|ch| vm.is_callable_handle(ch)) {
             return Err(vm.type_error("HTMLCanvasElement.toBlob requires a callback function"));
         }
-        ensure_context_for_node(&h, &cs, nid);
-        let blob_val = match cs.borrow_mut().readback_node_rgba(nid) {
+        let hooks: Vec<CanvasReadbackHook> = cs.borrow().readback_hooks.clone();
+        let hook_pixels = hooks.into_iter().find_map(|hook| hook(nid));
+        let pixels = if let Some(px) = hook_pixels {
+            Some(px)
+        } else {
+            ensure_context_for_node(&h, &cs, nid);
+            cs.borrow_mut().readback_node_rgba(nid)
+        };
+        let blob_val = match pixels {
             Some((w, h_px, rgba)) => match encode_rgba_to_png(w, h_px, &rgba) {
                 Ok(png) => {
                     JsValue::from_object(create_blob_object(vm, &wa, png, "image/png".to_string()))

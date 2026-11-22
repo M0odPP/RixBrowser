@@ -1,20 +1,31 @@
 use rix_ipc::SurfaceId;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 use thiserror::Error;
-use vello::peniko::Color;
+use vello::peniko::{Color, ImageData};
 use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene};
 
 use crate::canvas2d::Canvas2DContext;
+use crate::gpu_context::SharedGpuDevice;
+
+static NEXT_RENDERER_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 struct OffscreenGpuSurface {
     texture: vello::wgpu::Texture,
     view: vello::wgpu::TextureView,
     width: u32,
     height: u32,
+}
+
+struct RegisteredExternalGpuTexture {
+    image: ImageData,
+    width: u32,
+    height: u32,
+    blit_target: Option<vello::wgpu::Texture>,
 }
 
 #[derive(Error, Debug)]
@@ -36,11 +47,14 @@ pub enum RenderError {
 }
 
 pub struct VelloRenderer {
+    renderer_token: u64,
     context: RenderContext,
     renderer: Option<Renderer>,
     renderer_device_id: Option<usize>,
     surface: Option<RenderSurface<'static>>,
     offscreen_surfaces: HashMap<SurfaceId, OffscreenGpuSurface>,
+    external_gpu_textures: HashMap<SurfaceId, RegisteredExternalGpuTexture>,
+    rgba_blitter: Option<vello::wgpu::util::TextureBlitter>,
     gpu_surface_allocations: u64,
     width: u32,
     height: u32,
@@ -55,14 +69,194 @@ impl Default for VelloRenderer {
 impl VelloRenderer {
     pub fn new() -> Self {
         Self {
+            renderer_token: NEXT_RENDERER_TOKEN.fetch_add(1, Ordering::Relaxed),
             context: RenderContext::new(),
             renderer: None,
             renderer_device_id: None,
             surface: None,
             offscreen_surfaces: HashMap::new(),
+            external_gpu_textures: HashMap::new(),
+            rgba_blitter: None,
             gpu_surface_allocations: 0,
             width: 0,
             height: 0,
+        }
+    }
+
+    /// Unique runtime token identifying this `VelloRenderer`'s `wgpu::Device` for
+    /// zero-copy GPU-to-GPU external texture registration.
+    #[must_use]
+    pub const fn renderer_token(&self) -> u64 {
+        self.renderer_token
+    }
+
+    /// Returns cloned `wgpu` handles (`Adapter`, `Device`, `Queue`) backed by this renderer's
+    /// active GPU device, initializing the headless device and Vello renderer if needed.
+    pub async fn ensure_shared_gpu_device(&mut self) -> Result<SharedGpuDevice, RenderError> {
+        let device_id = match self.renderer_device_id {
+            Some(id) => id,
+            None => match &self.surface {
+                Some(surface) => surface.dev_id,
+                None => self
+                    .context
+                    .device(None)
+                    .await
+                    .ok_or(RenderError::NoDevice)?,
+            },
+        };
+        let handle = self
+            .context
+            .devices
+            .get(device_id)
+            .ok_or(RenderError::NoDevice)?;
+        if self.renderer_device_id != Some(device_id) {
+            self.renderer = Some(
+                Renderer::new(&handle.device, RendererOptions::default())
+                    .map_err(|e| RenderError::Vello(format!("{e:?}")))?,
+            );
+            self.renderer_device_id = Some(device_id);
+        }
+        Ok(SharedGpuDevice {
+            adapter: handle.adapter().clone(),
+            device: handle.device.clone(),
+            queue: handle.queue.clone(),
+            renderer_token: self.renderer_token,
+        })
+    }
+
+    /// Blocking convenience wrapper around [`Self::ensure_shared_gpu_device`].
+    pub fn ensure_shared_gpu_device_blocking(&mut self) -> Result<SharedGpuDevice, RenderError> {
+        pollster::block_on(self.ensure_shared_gpu_device())
+    }
+
+    /// Returns the active [`SharedGpuDevice`] if the GPU device is already initialized.
+    #[must_use]
+    pub fn shared_gpu_device(&self) -> Option<SharedGpuDevice> {
+        let id = self.renderer_device_id?;
+        let handle = self.context.devices.get(id)?;
+        Some(SharedGpuDevice {
+            adapter: handle.adapter().clone(),
+            device: handle.device.clone(),
+            queue: handle.queue.clone(),
+            renderer_token: self.renderer_token,
+        })
+    }
+
+    /// Registers or updates a GPU-resident `wgpu::Texture` (owned by this renderer's device)
+    /// as a zero-copy Vello external image for `surface_id`, returning an [`ImageData`] handle
+    /// that can be passed directly to [`crate::Compositor::present_external_surface_image`].
+    ///
+    /// If `texture` is `Rgba8Unorm` with `COPY_SRC`, it is registered directly without any
+    /// intermediate blit or CPU readback. Other renderable formats (such as `Bgra8Unorm`) are
+    /// converted GPU-to-GPU via `wgpu::util::TextureBlitter`.
+    pub fn register_external_gpu_texture(
+        &mut self,
+        surface_id: SurfaceId,
+        texture: vello::wgpu::Texture,
+    ) -> Result<ImageData, RenderError> {
+        let device_id = self.renderer_device_id.ok_or(RenderError::NoDevice)?;
+        let width = texture.width();
+        let height = texture.height();
+        if width == 0 || height == 0 {
+            return Err(RenderError::BadSize(width, height));
+        }
+
+        let direct_compatible = texture.format() == vello::wgpu::TextureFormat::Rgba8Unorm
+            && texture
+                .usage()
+                .contains(vello::wgpu::TextureUsages::COPY_SRC);
+
+        let (final_texture, new_blit_target) = if direct_compatible {
+            (texture, None)
+        } else {
+            let handle = self
+                .context
+                .devices
+                .get(device_id)
+                .ok_or(RenderError::NoDevice)?;
+            let device = &handle.device;
+            let queue = &handle.queue;
+            let reuse_blit = self
+                .external_gpu_textures
+                .get(&surface_id)
+                .and_then(|entry| entry.blit_target.as_ref())
+                .filter(|t| t.width() == width && t.height() == height)
+                .cloned();
+            let dst = reuse_blit.unwrap_or_else(|| {
+                device.create_texture(&vello::wgpu::TextureDescriptor {
+                    label: Some("rix-external-gpu-rgba-blit"),
+                    size: vello::wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: vello::wgpu::TextureDimension::D2,
+                    format: vello::wgpu::TextureFormat::Rgba8Unorm,
+                    usage: vello::wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | vello::wgpu::TextureUsages::COPY_SRC
+                        | vello::wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+            });
+            let blitter = self.rgba_blitter.get_or_insert_with(|| {
+                vello::wgpu::util::TextureBlitter::new(
+                    device,
+                    vello::wgpu::TextureFormat::Rgba8Unorm,
+                )
+            });
+            let src_view = texture.create_view(&vello::wgpu::TextureViewDescriptor::default());
+            let dst_view = dst.create_view(&vello::wgpu::TextureViewDescriptor::default());
+            let mut encoder =
+                device.create_command_encoder(&vello::wgpu::CommandEncoderDescriptor {
+                    label: Some("rix-external-gpu-rgba-blit-enc"),
+                });
+            blitter.copy(device, &mut encoder, &src_view, &dst_view);
+            queue.submit([encoder.finish()]);
+            (dst.clone(), Some(dst))
+        };
+
+        let renderer = self.renderer.as_mut().ok_or(RenderError::NoDevice)?;
+        if let Some(existing) = self.external_gpu_textures.get_mut(&surface_id) {
+            if existing.width == width && existing.height == height {
+                let copy_base = vello::wgpu::TexelCopyTextureInfoBase {
+                    texture: final_texture,
+                    mip_level: 0,
+                    origin: vello::wgpu::Origin3d::ZERO,
+                    aspect: vello::wgpu::TextureAspect::All,
+                };
+                renderer.override_image(&existing.image, Some(copy_base));
+                existing.blit_target = new_blit_target;
+                return Ok(existing.image.clone());
+            }
+        }
+        if let Some(old) = self.external_gpu_textures.remove(&surface_id) {
+            renderer.unregister_texture(old.image);
+        }
+        let image = renderer.register_texture(final_texture);
+        self.external_gpu_textures.insert(
+            surface_id,
+            RegisteredExternalGpuTexture {
+                image: image.clone(),
+                width,
+                height,
+                blit_target: new_blit_target,
+            },
+        );
+        self.gpu_surface_allocations += 1;
+        Ok(image)
+    }
+
+    /// Unregisters a previously registered external GPU texture for `surface_id`.
+    pub fn unregister_external_gpu_texture(&mut self, surface_id: SurfaceId) -> bool {
+        if let Some(old) = self.external_gpu_textures.remove(&surface_id) {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.unregister_texture(old.image);
+            }
+            true
+        } else {
+            false
         }
     }
 

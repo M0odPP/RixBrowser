@@ -18,6 +18,7 @@ pub mod observers;
 pub mod service_worker;
 pub mod streams;
 pub mod web_apis;
+pub mod webgpu_types;
 pub mod workers;
 
 use std::cell::RefCell;
