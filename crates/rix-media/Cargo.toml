@@ -14,3 +14,11 @@ sha2.workspace = true
 symphonia.workspace = true
 symphonia-opus.workspace = true
 opus-decoder.workspace = true
+rusty_av1d.workspace = true
+rusty_h264.workspace = true
+rusty_vp9.workspace = true
+vp8-decoder.workspace = true
+
+[dev-dependencies]
+rusty_av1e.workspace = true
+vp8-encoder.workspace = true
