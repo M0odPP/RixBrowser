@@ -22,6 +22,7 @@ pub mod string;
 pub mod value;
 pub mod vm;
 pub mod vm_builtins;
+pub mod webcrypto;
 
 pub use ast::{Program, SourceType, Span, SyntaxError};
 pub use bigint::JsBigInt;

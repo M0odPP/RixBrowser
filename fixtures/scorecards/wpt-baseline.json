@@ -1,5 +1,6 @@
 {
   "subsets": {
+    "WebCryptoAPI": 6,
     "cors": 4,
     "css2": 3,
     "dom-events": 4,

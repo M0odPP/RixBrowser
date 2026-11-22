@@ -420,6 +420,7 @@ impl JsVm {
         crate::builtins_collections::install_collection_builtins(&mut vm);
         crate::promise::install_promise_and_async(&mut vm);
         crate::intl::install_intl(&mut vm);
+        crate::webcrypto::install_webcrypto(&mut vm);
         vm
     }
 
