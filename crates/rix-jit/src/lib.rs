@@ -13,6 +13,7 @@
 
 pub mod baseline;
 pub mod memory;
+pub mod opt_analysis;
 pub mod trampolines;
 
 use std::cell::RefCell;

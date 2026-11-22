@@ -49,6 +49,6 @@ pub use shape::{
 pub use string::{JsString, PropertyKey, StringInterner};
 pub use value::{HeapHandle, JsValue, JsValueKind, SymbolId, CANONICAL_NAN_BITS};
 pub use vm::{
-    EvalError, JitEngine, JitOutcome, JsException, JsVm, NativeFnPtr, BASELINE_THRESHOLD,
-    OPT_THRESHOLD, OSR_THRESHOLD,
+    CallSiteFeedback, EvalError, JitEngine, JitOutcome, JsException, JsVm, NativeFnPtr,
+    BASELINE_THRESHOLD, OPT_THRESHOLD, OSR_THRESHOLD,
 };
