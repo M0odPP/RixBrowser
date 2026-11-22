@@ -12,6 +12,7 @@ pub mod event_loop;
 pub mod events;
 pub mod fetch_ws;
 pub mod frames;
+pub mod indexeddb_engine;
 pub mod observers;
 pub mod service_worker;
 pub mod streams;
