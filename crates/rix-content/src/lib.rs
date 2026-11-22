@@ -11,6 +11,7 @@ pub mod dom_bridge;
 pub mod event_loop;
 pub mod events;
 pub mod fetch_ws;
+pub mod frames;
 pub mod observers;
 pub mod streams;
 pub mod web_apis;
@@ -21,16 +22,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rix_core::Size;
-use rix_dom::{Document, NodeData};
+use rix_dom::{Document, NodeData, NodeId};
 use rix_html::{attach_declarative_shadow_roots, HtmlParserStream, ParserStreamStep};
-use rix_ipc::PipelineId;
+use rix_ipc::{ContentToBrowser, MessagePortId, PipelineId};
 use rix_js::{EvalError, GcCycleStats, JsValue, JsVm};
 use rix_net::FetchEngine;
-use rix_render::{Compositor, LayerRole, VelloRenderer};
+use rix_render::{Compositor, DisplayList, LayerRole, ResourceRegistry, VelloRenderer};
 use rix_storage::StorageEngine;
 use rix_text::FontDatabase;
 
 pub use canvas2d::{install_canvas2d, Canvas2DSystem, SharedCanvas2D};
+pub use frames::{
+    bind_child_frame, deliver_ipc_port_message, deliver_ipc_post_message,
+    install_frame_and_messaging_apis, mark_child_frame_crashed, sync_all_iframes_in_document,
+    FrameSystem, SandboxFlags, SharedFrames,
+};
 
 pub use dom_bridge::{
     install_dom_bridge, wrap_node, CustomElementDef, DomMutation, DomPrototypes, HostState,
@@ -70,6 +76,7 @@ pub struct ContentRuntime {
     pub streams: SharedStreams,
     pub net: SharedNetBridge,
     pub canvas2d: SharedCanvas2D,
+    pub frames: SharedFrames,
     pub jit: Rc<rix_jit::TieredJit>,
     pub wasm: rix_jit::SharedWasmHost,
 }
@@ -122,6 +129,8 @@ impl ContentRuntime {
         let streams = install_streams(&mut vm, &web_apis);
         let net = install_fetch_and_websocket(&mut vm, &host, &web_apis, &streams, fetch_engine);
         let canvas2d = install_canvas2d(&mut vm, &host, &web_apis);
+        let frames =
+            install_frame_and_messaging_apis(&mut vm, &host, &events, &event_loop, &web_apis, &net);
         Self {
             vm,
             host,
@@ -132,6 +141,7 @@ impl ContentRuntime {
             streams,
             net,
             canvas2d,
+            frames,
             jit,
             wasm,
         }
@@ -183,7 +193,8 @@ impl ContentRuntime {
                         let text = doc.inner_text(script_id);
                         (classic, text)
                     };
-                    if is_classic && !code.trim().is_empty() {
+                    let scripts_allowed = self.frames.borrow().sandbox.scripts_allowed();
+                    if scripts_allowed && is_classic && !code.trim().is_empty() {
                         self.eval_script(&code)?;
                     }
                 }
@@ -199,8 +210,96 @@ impl ContentRuntime {
         }
         self.host.borrow_mut().active_parser = None;
         self.host.borrow_mut().ready_state = "complete".to_string();
+        sync_all_iframes_in_document(
+            &mut self.vm,
+            &self.host,
+            &self.events,
+            &self.event_loop,
+            &self.web_apis,
+            &self.net,
+            &self.frames,
+        );
         self.microtask_checkpoint();
         Ok(())
+    }
+
+    /// Sets the `PipelineId` owned by this `ContentRuntime` (used for OOPIF IPC routing).
+    pub fn set_pipeline_id(&mut self, pipeline: PipelineId) {
+        self.frames.borrow_mut().pipeline_id = pipeline;
+    }
+
+    /// Applies an HTML `<iframe sandbox="...">` attribute policy to this runtime.
+    pub fn set_sandbox_attr(&mut self, sandbox: Option<&str>) {
+        self.frames.borrow_mut().sandbox = SandboxFlags::parse(sandbox);
+    }
+
+    /// Drains all outbound OOPIF / cross-process messaging IPC events emitted by this runtime.
+    pub fn drain_outbound_ipc(&mut self) -> Vec<ContentToBrowser> {
+        self.frames.borrow_mut().drain_outbound_ipc()
+    }
+
+    /// Binds a spawned cross-origin OOPIF child `PipelineId` to an `<iframe>` node.
+    pub fn bind_child_frame(
+        &mut self,
+        frame_node_id: u64,
+        child_pipeline: PipelineId,
+        origin: String,
+    ) {
+        bind_child_frame(&self.frames, frame_node_id, child_pipeline, origin);
+    }
+
+    /// Marks a bound cross-origin OOPIF pipeline as crashed inside this parent runtime.
+    pub fn mark_child_frame_crashed(&mut self, child_pipeline: PipelineId) -> Vec<NodeId> {
+        mark_child_frame_crashed(&self.frames, child_pipeline)
+    }
+
+    /// Delivers an inbound cross-process `window.postMessage` IPC payload into this runtime.
+    pub fn deliver_ipc_post_message(
+        &mut self,
+        source_pipeline: PipelineId,
+        data_json: &str,
+        origin: &str,
+        transfer_ports: &[MessagePortId],
+    ) {
+        deliver_ipc_post_message(
+            &mut self.vm,
+            &self.host,
+            &self.events,
+            &self.event_loop,
+            &self.web_apis,
+            &self.frames,
+            source_pipeline,
+            data_json,
+            origin,
+            transfer_ports,
+        );
+    }
+
+    /// Delivers an inbound cross-process `MessagePort` IPC payload into this runtime.
+    pub fn deliver_ipc_port_message(
+        &mut self,
+        source_pipeline: PipelineId,
+        port_id: MessagePortId,
+        data_json: &str,
+        transfer_ports: &[MessagePortId],
+    ) {
+        deliver_ipc_port_message(
+            &mut self.vm,
+            &self.host,
+            &self.events,
+            &self.event_loop,
+            &self.frames,
+            source_pipeline,
+            port_id,
+            data_json,
+            transfer_ports,
+        );
+    }
+
+    /// Builds and returns the current `DisplayList` for `pipeline`.
+    pub fn build_display_list(&mut self, pipeline: PipelineId) -> DisplayList {
+        let mut resources = ResourceRegistry::default();
+        self.host.borrow_mut().paint_now(pipeline, &mut resources)
     }
 
     /// Evaluates a JavaScript script and immediately executes a WHATWG microtask checkpoint.
@@ -351,6 +450,7 @@ impl ContentRuntime {
         self.streams.borrow().collect_roots(&mut roots);
         self.net.borrow().collect_roots(&mut roots);
         self.canvas2d.borrow().collect_roots(&mut roots);
+        self.frames.borrow().collect_roots(&mut roots);
         self.host.borrow().collect_roots(&mut roots);
         let stats = self.vm.heap.collect_major(&roots);
         self.events.borrow_mut().sweep_dead(&self.vm.heap);
@@ -358,6 +458,7 @@ impl ContentRuntime {
         self.streams.borrow_mut().sweep_dead(&self.vm.heap);
         self.net.borrow_mut().sweep_dead(&self.vm.heap);
         self.canvas2d.borrow_mut().sweep_dead(&self.vm.heap);
+        self.frames.borrow_mut().sweep_dead(&self.vm.heap);
         self.host.borrow_mut().sweep_dead_wrappers(&self.vm.heap);
         stats
     }
