@@ -1,0 +1,54 @@
+[[network_cases]]
+name = "websocket-text-echo"
+origin_mode = "same"
+script = """
+var ws = new WebSocket(__WPT_WS__);
+ws.onopen = function() {
+    ws.send("hello-wpt-ws");
+};
+ws.onmessage = function(ev) {
+    __pass = ev.data === "hello-wpt-ws" && ws.readyState === WebSocket.OPEN;
+    ws.close(1000, "ok");
+};
+ws.onclose = function() {
+    __done = true;
+};
+"""
+
+[[network_cases]]
+name = "websocket-binary-arraybuffer-echo"
+origin_mode = "same"
+script = """
+var ws = new WebSocket(__WPT_WS__);
+ws.binaryType = "arraybuffer";
+ws.onopen = function() {
+    ws.send(new Uint8Array([11, 22, 33, 44]));
+};
+ws.onmessage = function(ev) {
+    var u8 = new Uint8Array(ev.data);
+    __pass = u8.length === 4 && u8[0] === 11 && u8[3] === 44;
+    ws.close(1000);
+};
+ws.onclose = function() {
+    __done = true;
+};
+"""
+
+[[network_cases]]
+name = "websocket-clean-close-state-transitions"
+origin_mode = "same"
+script = """
+var states = [];
+var ws = new WebSocket(__WPT_WS__);
+states.push(ws.readyState);
+ws.onopen = function() {
+    states.push(ws.readyState);
+    ws.close(1000, "bye");
+    states.push(ws.readyState);
+};
+ws.onclose = function(ev) {
+    states.push(ws.readyState);
+    __pass = states.join(",") === "0,1,2,3" && ev.code === 1000 && ev.wasClean === true;
+    __done = true;
+};
+"""

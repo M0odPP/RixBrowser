@@ -1,0 +1,57 @@
+[[network_cases]]
+name = "cors-simple-wildcard-allowed"
+origin_mode = "cross"
+script = """
+(async function() {
+    var r = await fetch(__WPT_BASE__ + "/cors-open");
+    var txt = await r.text();
+    __pass = r.ok && r.status === 200 && r.type === "cors" && txt === "open-ok";
+    __done = true;
+})();
+"""
+
+[[network_cases]]
+name = "cors-preflight-and-expose-headers"
+origin_mode = "cross"
+script = """
+(async function() {
+    var r = await fetch(__WPT_BASE__ + "/cors-preflight", {
+        method: "PUT",
+        headers: { "X-Wpt-Header": "1", "Content-Type": "application/json" },
+        body: "{}"
+    });
+    var j = await r.json();
+    __pass = r.status === 200
+        && r.type === "cors"
+        && r.headers.get("X-Exposed") === "yes"
+        && r.headers.get("X-Internal") === null
+        && j.cors === "ok";
+    __done = true;
+})();
+"""
+
+[[network_cases]]
+name = "cors-missing-acao-rejects"
+origin_mode = "cross"
+script = """
+(async function() {
+    try {
+        await fetch(__WPT_BASE__ + "/cors-denied");
+        __pass = false;
+    } catch (e) {
+        __pass = true;
+    }
+    __done = true;
+})();
+"""
+
+[[network_cases]]
+name = "cors-no-cors-opaque-response"
+origin_mode = "cross"
+script = """
+(async function() {
+    var r = await fetch(__WPT_BASE__ + "/cors-denied", { mode: "no-cors" });
+    __pass = r.type === "opaque" && r.status === 0 && r.ok === false;
+    __done = true;
+})();
+"""

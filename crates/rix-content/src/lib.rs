@@ -2,14 +2,16 @@
 //! Content-process runtime integrating `rix-js`, `rix-dom`, `rix-html`,
 //! `rix-css`, `rix-layout`, `rix-net`, and `rix-storage` with a reactive
 //! WHATWG Event Loop, zero-leak Weak DOM Bridge (`WeakTable<NodeId>`),
-//! and core WHATWG Web Platform APIs.
+//! Fetch CORS/preflight, RFC 6455 WebSocket, Streams, and Web Storage.
 //!
 //! Reference: Spec 05 §2.2, Spec 06 §1–§3, Issues #16 & #17.
 
 pub mod dom_bridge;
 pub mod event_loop;
 pub mod events;
+pub mod fetch_ws;
 pub mod observers;
+pub mod streams;
 pub mod web_apis;
 
 use std::cell::RefCell;
@@ -21,6 +23,7 @@ use rix_core::Size;
 use rix_dom::{Document, NodeData};
 use rix_html::{attach_declarative_shadow_roots, HtmlParserStream, ParserStreamStep};
 use rix_js::{EvalError, GcCycleStats, JsValue, JsVm};
+use rix_net::FetchEngine;
 use rix_storage::StorageEngine;
 use rix_text::FontDatabase;
 
@@ -36,15 +39,22 @@ pub use event_loop::{
 pub use events::{
     fire_object_event, install_event_system, EventSystem, EventTargetKey, SharedEvents,
 };
+pub use fetch_ws::{
+    deliver_async_net_event, install_fetch_and_websocket, AsyncNetEvent, FetchFailure,
+    NetworkBridge, SharedNetBridge,
+};
 pub use observers::{
     deliver_layout_observers, deliver_mutation_observers, install_observers, ObserverSystem,
     SharedObservers,
+};
+pub use streams::{
+    create_readable_stream_from_bytes, install_streams, SharedStreams, StreamSystem,
 };
 pub use web_apis::{install_web_apis, SharedWebApis, WebApiState, DEFAULT_DOCUMENT_URL};
 
 /// Complete single-origin Content Process execution context owning a `JsVm`,
 /// Weak DOM Bridge (`HostState`), Event System, Observers, Core Web APIs,
-/// and WHATWG `EventLoopState`.
+/// WHATWG Streams, reactive Fetch/WebSocket `NetworkBridge`, and `EventLoopState`.
 pub struct ContentRuntime {
     pub vm: JsVm,
     pub host: SharedHost,
@@ -52,6 +62,8 @@ pub struct ContentRuntime {
     pub events: SharedEvents,
     pub observers: SharedObservers,
     pub web_apis: SharedWebApis,
+    pub streams: SharedStreams,
+    pub net: SharedNetBridge,
 }
 
 impl ContentRuntime {
@@ -76,6 +88,20 @@ impl ContentRuntime {
         origin_url: &str,
         storage: StorageEngine,
     ) -> Self {
+        Self::with_full_config(document, viewport, font_db, origin_url, storage, None)
+    }
+
+    /// Creates a runtime configured with an explicit origin URL, [`StorageEngine`],
+    /// and optional shared [`FetchEngine`].
+    #[must_use]
+    pub fn with_full_config(
+        document: Rc<RefCell<Document>>,
+        viewport: Size,
+        font_db: Arc<FontDatabase>,
+        origin_url: &str,
+        storage: StorageEngine,
+        fetch_engine: Option<Arc<FetchEngine>>,
+    ) -> Self {
         let mut vm = JsVm::new();
         let event_loop = Rc::new(RefCell::new(EventLoopState::new()));
         install_event_loop_globals(&mut vm, &event_loop);
@@ -83,6 +109,8 @@ impl ContentRuntime {
         let events = install_event_system(&mut vm, &host, &event_loop);
         let observers = install_observers(&mut vm, &host, &event_loop);
         let web_apis = install_web_apis(&mut vm, &host, &events, &event_loop, origin_url, storage);
+        let streams = install_streams(&mut vm, &web_apis);
+        let net = install_fetch_and_websocket(&mut vm, &host, &web_apis, &streams, fetch_engine);
         Self {
             vm,
             host,
@@ -90,6 +118,8 @@ impl ContentRuntime {
             events,
             observers,
             web_apis,
+            streams,
+            net,
         }
     }
 
@@ -101,7 +131,8 @@ impl ContentRuntime {
         Self::new(doc, Size::new(800.0, 600.0), font_db)
     }
 
-    /// Updates the current document URL used by `location`, `history`, and `localStorage`.
+    /// Updates the current document URL used by `location`, `history`, `localStorage`,
+    /// `fetch()` CORS origin checks, and `WebSocket` `Origin` headers.
     pub fn set_document_url(&mut self, url: &str) {
         self.web_apis.borrow_mut().set_document_url(url);
     }
@@ -196,18 +227,94 @@ impl ContentRuntime {
         self.microtask_checkpoint();
     }
 
+    /// Reactively drives pending async network/WebSocket events, timers, and microtasks
+    /// using `tokio::select!` (ZERO polling timers!) until `done(self)` returns `true`
+    /// or `timeout` expires.
+    pub async fn drive_async_until(
+        &mut self,
+        timeout: Duration,
+        mut done: impl FnMut(&mut Self) -> bool,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut rx = {
+            let nb = self.net.borrow();
+            let mut slot = nb.async_rx.borrow_mut();
+            slot.take()
+        };
+        let Some(mut net_rx) = rx.take() else {
+            return done(self);
+        };
+
+        let result = loop {
+            drain_ready_tasks(&self.event_loop, &mut self.vm);
+            while let Ok(ev) = net_rx.try_recv() {
+                deliver_async_net_event(
+                    &mut self.vm,
+                    &self.host,
+                    &self.events,
+                    &self.event_loop,
+                    &self.web_apis,
+                    &self.streams,
+                    &self.net,
+                    ev,
+                );
+                drain_ready_tasks(&self.event_loop, &mut self.vm);
+            }
+            if done(self) {
+                break true;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break false;
+            }
+            let next_wake = match self.event_loop.borrow_mut().time_until_next_timer() {
+                Some(dur) => (now + dur).min(deadline),
+                None => deadline,
+            };
+            tokio::select! {
+                biased;
+                maybe_ev = net_rx.recv() => {
+                    if let Some(ev) = maybe_ev {
+                        deliver_async_net_event(
+                            &mut self.vm,
+                            &self.host,
+                            &self.events,
+                            &self.event_loop,
+                            &self.web_apis,
+                            &self.streams,
+                            &self.net,
+                            ev,
+                        );
+                    } else {
+                        break done(self);
+                    }
+                }
+                () = tokio::time::sleep_until(next_wake) => {}
+            }
+        };
+
+        let nb = self.net.borrow();
+        let mut slot = nb.async_rx.borrow_mut();
+        *slot = Some(net_rx);
+        result
+    }
+
     /// Runs a full Major GC across VM roots, event loop callbacks, listeners, observers,
-    /// Web APIs, and host-pinned DOM wrappers, then sweeps all dead unpinned handles cleanly.
+    /// Web APIs, Streams, active network handles, and host-pinned DOM wrappers.
     pub fn collect_garbage(&mut self) -> GcCycleStats {
         let mut roots = self.vm.collect_roots();
         self.event_loop.borrow().collect_roots(&mut roots);
         self.events.borrow().collect_roots(&mut roots);
         self.observers.borrow().collect_roots(&mut roots);
         self.web_apis.borrow().collect_roots(&mut roots);
+        self.streams.borrow().collect_roots(&mut roots);
+        self.net.borrow().collect_roots(&mut roots);
         self.host.borrow().collect_roots(&mut roots);
         let stats = self.vm.heap.collect_major(&roots);
         self.events.borrow_mut().sweep_dead(&self.vm.heap);
         self.web_apis.borrow_mut().sweep_dead(&self.vm.heap);
+        self.streams.borrow_mut().sweep_dead(&self.vm.heap);
+        self.net.borrow_mut().sweep_dead(&self.vm.heap);
         self.host.borrow_mut().sweep_dead_wrappers(&self.vm.heap);
         stats
     }

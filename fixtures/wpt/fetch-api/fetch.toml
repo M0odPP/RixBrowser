@@ -1,0 +1,62 @@
+[[network_cases]]
+name = "fetch-same-origin-json-and-headers"
+origin_mode = "same"
+script = """
+(async function() {
+    var r = await fetch(__WPT_BASE__ + "/json");
+    var data = await r.json();
+    __pass = r.ok && r.status === 200 && r.type === "basic"
+        && r.headers.get("content-type") === "application/json"
+        && data.status === "ok" && data.value === 42;
+    __done = true;
+})();
+"""
+
+[[network_cases]]
+name = "fetch-post-body-echo"
+origin_mode = "same"
+script = """
+(async function() {
+    var req = new Request(__WPT_BASE__ + "/echo", {
+        method: "POST",
+        headers: new Headers([["Content-Type", "text/plain"]]),
+        body: "rix-fetch-payload"
+    });
+    var r = await fetch(req);
+    var txt = await r.text();
+    __pass = r.status === 200 && txt === "rix-fetch-payload";
+    __done = true;
+})();
+"""
+
+[[network_cases]]
+name = "fetch-response-body-readable-stream"
+origin_mode = "same"
+script = """
+(async function() {
+    var r = await fetch(__WPT_BASE__ + "/json");
+    var reader = r.body.getReader();
+    var c1 = await reader.read();
+    var c2 = await reader.read();
+    var decoded = new TextDecoder().decode(c1.value);
+    __pass = !c1.done && c2.done && JSON.parse(decoded).value === 42;
+    __done = true;
+})();
+"""
+
+[[network_cases]]
+name = "fetch-abort-signal-rejects-abort-error"
+origin_mode = "same"
+script = """
+(async function() {
+    var ac = new AbortController();
+    ac.abort();
+    try {
+        await fetch(__WPT_BASE__ + "/json", { signal: ac.signal });
+        __pass = false;
+    } catch (e) {
+        __pass = e.name === "AbortError";
+    }
+    __done = true;
+})();
+"""
