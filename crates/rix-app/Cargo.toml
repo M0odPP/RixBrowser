@@ -18,8 +18,11 @@ rix-net = { path = "../rix-net" }
 rix-ipc = { path = "../rix-ipc" }
 rix-render = { path = "../rix-render" }
 rix-content = { path = "../rix-content" }
+rix-js = { path = "../rix-js" }
+rix-storage = { path = "../rix-storage" }
 rix-text = { path = "../rix-text" }
 arboard.workspace = true
+rayon.workspace = true
 url.workspace = true
 tokio.workspace = true
 tracing.workspace = true

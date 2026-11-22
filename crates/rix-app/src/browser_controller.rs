@@ -1,33 +1,43 @@
 //! Parent-process [`BrowserController`] coordinating isolated Chrome UI (`z = 100`),
 //! active web tab surfaces (`z = 10`), transient overlays & `F12` Developer HUD (`z = 200`),
-//! real HTTP/HTTPS GET & POST navigation via `rix-net`, in-page form interaction,
-//! OS clipboard, and Content Process crash recovery.
+//! real HTTP/HTTPS GET & POST navigation via `rix-net`, full parallel subresource loading
+//! (external CSS + `@import`, `@font-face`, `<img>`/`srcset`/SVG/`background-image`, external &
+//! inline ES/classic scripts via `ContentRuntime` + Cranelift 3-tier JIT), in-page DOM events &
+//! form interaction, OS clipboard, and Content Process crash recovery.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rix_chrome::{
     chrome_asset_provider, chrome_stylesheet, find_link_href, palette_for, render_bookmarks_html,
     render_crashed_html, render_error_html, render_history_html, render_newtab_html,
     render_settings_html, BrowserSettings, ChromeHitTarget, ChromeRenderer, ChromeState,
-    DevHudState, FrameStageSample, NetworkEntry, RenderedChromeLayer, ThemeMode, URL_BOOKMARKS,
-    URL_CRASHED, URL_ERROR, URL_HISTORY, URL_NEWTAB, URL_SETTINGS,
+    CookiePolicy, DevHudState, FrameStageSample, JitMode, NetworkEntry, RenderedChromeLayer,
+    ThemeMode, URL_BOOKMARKS, URL_CRASHED, URL_ERROR, URL_HISTORY, URL_NEWTAB, URL_SETTINGS,
 };
+use rix_content::ContentRuntime;
 use rix_core::{Point, Rect, RixUrl, Size, TabId, Vec2};
 use rix_css::{CascadeOrigin, MediaContext, StyleContext, Stylesheet};
 use rix_dom::{Document, NodeData};
 use rix_html::parse_html;
 use rix_ipc::{PipelineId, ScrollId, SpatialNodeId};
 use rix_layout::{hit_test, FragmentTree, LayoutEngine};
-use rix_net::{HttpClient, ResourceManager};
-use rix_render::{Color, Compositor, DisplayItem, DisplayList, LayerRole, SpatialNodeKind};
-use rix_text::FontDatabase;
+use rix_net::cache::now_secs;
+use rix_net::{FetchEngine, HttpCache, HttpClient, ResourceManager};
+use rix_render::{Color, Compositor, DisplayItem, DisplayList, LayerRole, Rgba8, SpatialNodeKind};
+use rix_storage::StorageEngine;
+use rix_text::{FontDatabase, FontFaceSet};
 
 use crate::forms::{
     collect_element_text, resolve_relative_url, ClipboardBridge, FormMethod, FormSubmission,
     InPageInteractionState, PageClickOutcome,
+};
+use crate::page_loader::{
+    load_page_subresources, DecodedAssetCache, PageLoadStats, SpeculativePreconnector,
 };
 
 pub const WEB_PIPELINE: PipelineId = PipelineId(1);
@@ -58,7 +68,8 @@ pub enum BrowserKey {
     F12,
 }
 
-/// Per-tab web document, style context, layout engine, and form interaction state.
+/// Per-tab web document, style context, layout engine, live JS/DOM [`ContentRuntime`],
+/// and form interaction state.
 pub struct TabDocumentState {
     pub doc: Document,
     pub styles: StyleContext,
@@ -68,6 +79,10 @@ pub struct TabDocumentState {
     pub raw_html: String,
     pub page_css: Vec<String>,
     pub scroll_id: ScrollId,
+    pub is_chrome_page: bool,
+    pub runtime: Option<ContentRuntime>,
+    pub last_load_stats: PageLoadStats,
+    doc_snapshot_revision: u64,
 }
 
 impl TabDocumentState {
@@ -87,21 +102,72 @@ impl TabDocumentState {
             raw_html: String::new(),
             page_css: Vec::new(),
             scroll_id: ScrollId(100 + tab_id.0),
+            is_chrome_page: true,
+            runtime: None,
+            last_load_stats: PageLoadStats::default(),
+            doc_snapshot_revision: 0,
         }
+    }
+
+    /// Synchronizes `self.doc` snapshot from the live `ContentRuntime` document when modified.
+    fn sync_snapshot_from_runtime(&mut self) {
+        let Some(ref rt) = self.runtime else {
+            return;
+        };
+        let doc_rc = Rc::clone(&rt.host.borrow().document);
+        let live_doc = doc_rc.borrow();
+        let rev = live_doc.revision();
+        if rev != self.doc_snapshot_revision {
+            self.doc = live_doc.clone();
+            self.doc_snapshot_revision = rev;
+        }
+    }
+
+    /// Hit-tests `doc_pt` against the live runtime fragment tree (for web tabs) or the
+    /// static chrome fragment tree (for internal chrome pages) with zero fragment-tree copying.
+    #[must_use]
+    pub fn hit_test_point(&self, doc_pt: Point) -> Option<rix_dom::NodeId> {
+        if let Some(ref rt) = self.runtime {
+            return rt
+                .host
+                .borrow()
+                .cached_fragment_tree()
+                .and_then(|ft| hit_test(ft, doc_pt));
+        }
+        hit_test(&self.fragment_tree, doc_pt)
+    }
+
+    /// Computes the CSS Backgrounds & Borders Level 3 §2.11.2 canvas background color
+    /// propagated from `<html>` or `<body>` (defaulting to `#ffffff` for unthemed web pages).
+    fn page_canvas_background(&self) -> Option<Rgba8> {
+        if self.is_chrome_page {
+            return None;
+        }
+        if let Some(ref rt) = self.runtime {
+            let host = rt.host.borrow();
+            let doc = host.document.borrow();
+            return Some(resolve_canvas_bg(&doc, host.style_context()));
+        }
+        Some(resolve_canvas_bg(&self.doc, &self.styles))
     }
 }
 
-/// Complete parent-process browser controller driving `rix-chrome`, `rix-layout`,
-/// `rix-net`, and `rix-render::Compositor`.
+/// Complete parent-process browser controller driving `rix-chrome`, `rix-content`, `rix-layout`,
+/// `rix-net`, `rix-storage`, and `rix-render::Compositor`.
 pub struct BrowserController {
     pub chrome: ChromeState,
     pub hud: DevHudState,
     pub clipboard: ClipboardBridge,
     pub compositor: Compositor,
     chrome_renderer: ChromeRenderer,
-    font_db: FontDatabase,
+    base_font_db: Arc<FontDatabase>,
+    storage: StorageEngine,
+    http_cache: Arc<HttpCache>,
     http_client: HttpClient,
+    fetch_engine: Arc<FetchEngine>,
     resource_manager: ResourceManager,
+    asset_cache: DecodedAssetCache,
+    preconnector: SpeculativePreconnector,
     runtime: tokio::runtime::Runtime,
     tabs_doc: HashMap<TabId, TabDocumentState>,
     last_chrome_layer: Option<RenderedChromeLayer>,
@@ -124,21 +190,59 @@ impl BrowserController {
     pub fn with_settings_path(viewport: Size, dpr: f32, settings_path: Option<PathBuf>) -> Self {
         let mut font_db = FontDatabase::new();
         font_db.scan_system_fonts();
-
-        let http_client = HttpClient::new(None).expect("default HTTP client initializes");
-        let resource_manager = ResourceManager::new(http_client.clone())
-            .with_chrome_asset_provider(chrome_asset_provider());
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("browser network runtime initializes");
+        let base_font_db = Arc::new(font_db);
 
         let loaded_settings = settings_path
             .as_deref()
             .and_then(|p| BrowserSettings::load_from_file(p).ok())
             .unwrap_or_default();
         let chrome = ChromeState::with_settings(loaded_settings);
+
+        let data_dir = settings_path
+            .as_deref()
+            .and_then(|p| p.parent())
+            .map(PathBuf::from);
+        let storage = data_dir
+            .as_ref()
+            .and_then(|dir| StorageEngine::open_persistent(&dir.join("profile.redb")).ok())
+            .unwrap_or_else(|| {
+                StorageEngine::in_memory().expect("in-memory StorageEngine initializes")
+            });
+        let http_cache = Arc::new(HttpCache::new(
+            data_dir.as_ref().map(|dir| dir.join("http_cache")),
+        ));
+
+        let storage_for_http = if chrome.settings.cookie_policy == CookiePolicy::BlockAll {
+            None
+        } else {
+            Some(storage.clone())
+        };
+        let mut http_client = HttpClient::new(storage_for_http)
+            .expect("default HTTP client initializes")
+            .with_http_cache(Some(Arc::clone(&http_cache)));
+        http_client.set_preferred_color_scheme(if chrome.theme.is_dark() {
+            "dark"
+        } else {
+            "light"
+        });
+        let fetch_engine = Arc::new(FetchEngine::new(http_client.clone()));
+        let mut resource_manager = ResourceManager::new(http_client.clone())
+            .with_concurrency(16)
+            .with_chrome_asset_provider(chrome_asset_provider());
+        if let Some(ref dir) = data_dir {
+            if let Ok(rm) = resource_manager
+                .clone()
+                .with_disk_cache(dir.join("resource_cache"))
+            {
+                resource_manager = rm;
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("browser network runtime initializes");
+
         let initial_tab_id = chrome.active().id;
         let mut tabs_doc = HashMap::new();
         tabs_doc.insert(
@@ -152,9 +256,14 @@ impl BrowserController {
             clipboard: ClipboardBridge::new(),
             compositor: Compositor::new(viewport, dpr),
             chrome_renderer: ChromeRenderer::new(),
-            font_db,
+            base_font_db,
+            storage,
+            http_cache,
             http_client,
+            fetch_engine,
             resource_manager,
+            asset_cache: DecodedAssetCache::new(),
+            preconnector: SpeculativePreconnector::new(),
             runtime,
             tabs_doc,
             last_chrome_layer: None,
@@ -194,6 +303,132 @@ impl BrowserController {
         &self.resource_manager
     }
 
+    #[must_use]
+    pub fn asset_cache(&self) -> &DecodedAssetCache {
+        &self.asset_cache
+    }
+
+    #[must_use]
+    pub fn http_cache(&self) -> &Arc<HttpCache> {
+        &self.http_cache
+    }
+
+    /// Returns the active zoom scale factor (`1.0` for Chrome internal pages, `default_zoom_pct / 100` for web tabs).
+    #[must_use]
+    pub fn active_page_zoom(&self) -> f32 {
+        let active_id = self.chrome.active().id;
+        let is_chrome = self
+            .tabs_doc
+            .get(&active_id)
+            .is_none_or(|t| t.is_chrome_page);
+        if is_chrome {
+            1.0
+        } else {
+            (f32::from(self.chrome.settings.default_zoom_pct) / 100.0).clamp(0.5, 2.5)
+        }
+    }
+
+    /// Evaluates JavaScript directly inside the active web tab's `ContentRuntime` and syncs dirty layers.
+    pub fn eval_js_on_active_tab(&mut self, source: &str) -> Result<String, String> {
+        let active_id = self.chrome.active().id;
+        let active_url = self.chrome.active().url.clone();
+        let (result, console_msgs) = {
+            let Some(tab_doc) = self.tabs_doc.get_mut(&active_id) else {
+                return Err("no active tab".to_string());
+            };
+            let Some(ref mut rt) = tab_doc.runtime else {
+                return Err("active tab is an internal chrome page without JS runtime".to_string());
+            };
+            let _rt_guard = self.runtime.enter();
+            let res = rt
+                .eval_script_cached(source)
+                .map(|v| rt.vm.value_to_rust_string(v))
+                .map_err(|e| format!("{e:?}"));
+            let msgs = rt.drain_console_messages();
+            (res, msgs)
+        };
+        for (lvl, msg) in console_msgs {
+            self.hud.record_console(lvl, msg, active_url.clone());
+        }
+        self.web_dirty = true;
+        self.sync_layers();
+        result
+    }
+
+    /// Steps pending async `fetch()`/WebSocket responses, Web Workers, timers, and
+    /// `requestAnimationFrame` callbacks on the active web tab.
+    ///
+    /// Returns the exact delay until the next wakeup is needed, or `None` when the tab is
+    /// completely idle (`IDLE 0 Hz` — allowing the window event loop to sleep in `ControlFlow::Wait`).
+    pub fn tick_active_tab(&mut self) -> Option<Duration> {
+        let active_id = self.chrome.active().id;
+        let active_url = self.chrome.active().url.clone();
+        let (progressed, next_delay, console_msgs, surfaces_updated) = {
+            let tab_doc = self.tabs_doc.get_mut(&active_id)?;
+            let rt = tab_doc.runtime.as_mut()?;
+            let _rt_guard = self.runtime.enter();
+            let mut ran = rt.poll_async_and_timers();
+            if rt.event_loop.borrow().has_pending_raf() {
+                let now_ms = rt.event_loop.borrow().now_ms();
+                if rt.fire_vsync(now_ms) > 0 {
+                    ran = true;
+                }
+            }
+            let c2d = rt
+                .canvas2d
+                .borrow_mut()
+                .present_dirty_to_compositor(&mut self.compositor, None);
+            let wgpu = rt
+                .webgpu
+                .borrow_mut()
+                .present_dirty_to_compositor(&mut self.compositor, None);
+            let wgl = rt
+                .webgl2
+                .borrow_mut()
+                .present_dirty_to_compositor(&mut self.compositor, None);
+            let vid = rt
+                .media_elements
+                .borrow_mut()
+                .present_dirty_to_compositor(&mut self.compositor, None);
+            let surfaces = c2d + wgpu + wgl + vid;
+            let msgs = rt.drain_console_messages();
+            let delay = rt.next_wakeup_delay();
+            (ran, delay, msgs, surfaces)
+        };
+
+        for (lvl, msg) in console_msgs {
+            self.hud.record_console(lvl, msg, active_url.clone());
+            if self.chrome.hud_open {
+                self.overlay_dirty = true;
+            }
+        }
+        if progressed || surfaces_updated > 0 {
+            self.sync_layers();
+        }
+        next_delay
+    }
+
+    fn apply_settings_to_engine(&mut self) {
+        self.http_client
+            .set_preferred_color_scheme(if self.chrome.theme.is_dark() {
+                "dark"
+            } else {
+                "light"
+            });
+        let storage_for_http = if self.chrome.settings.cookie_policy == CookiePolicy::BlockAll {
+            None
+        } else {
+            Some(self.storage.clone())
+        };
+        self.http_client.set_storage(storage_for_http);
+        let jit_mode = self.chrome.settings.jit_mode;
+        for tab_doc in self.tabs_doc.values_mut() {
+            if let Some(ref mut rt) = tab_doc.runtime {
+                configure_runtime_jit(rt, jit_mode);
+            }
+        }
+    }
+
     /// Marks Chrome, Web, and Overlay layers dirty so direct state mutations repaint on next sync.
     pub fn invalidate_all_layers(&mut self) {
         self.chrome_dirty = true;
@@ -217,24 +452,122 @@ impl BrowserController {
     /// into [`Compositor`], keeping Chrome UI updates independent from Web content layers.
     pub fn sync_layers(&mut self) {
         let vp = self.compositor.viewport_size();
+        let dpr = self.compositor.device_pixel_ratio();
         let mut style_ms = 0.0f32;
         let mut layout_ms = 0.0f32;
         let mut paint_ms = 0.0f32;
         let total_start = Instant::now();
 
-        if self.web_dirty {
-            let web_rect = self.web_viewport_rect();
-            let active_id = self.chrome.active().id;
-            let dark_mode = self.chrome.theme.is_dark();
-            let scroll_y = self.chrome.active().scroll_y;
+        let web_rect = self.web_viewport_rect();
+        let active_id = self.chrome.active().id;
+        let active_url = self.chrome.active().url.clone();
+        let dark_mode = self.chrome.theme.is_dark();
+        let scroll_y = self.chrome.active().scroll_y;
+        let page_zoom = self.active_page_zoom();
+        let logical_web_size = Size::new(
+            (web_rect.size.width / page_zoom).max(64.0),
+            (web_rect.size.height / page_zoom).max(64.0),
+        );
+
+        let has_runtime = self
+            .tabs_doc
+            .get(&active_id)
+            .is_some_and(|t| t.runtime.is_some());
+
+        if has_runtime {
+            let mut runtime_console = Vec::new();
+            let mut updated_title: Option<String> = None;
+            let seq = self.frame_seq;
+            self.frame_seq = self.frame_seq.wrapping_add(1);
+
+            if let Some(tab_doc) = self.tabs_doc.get_mut(&active_id) {
+                if let Some(ref mut rt) = tab_doc.runtime {
+                    {
+                        let mut host = rt.host.borrow_mut();
+                        host.set_viewport(logical_web_size);
+                        host.set_dark_mode(dark_mode);
+                        host.device_pixel_ratio = dpr;
+                        host.scroll_offset.y = scroll_y;
+                        if self.web_dirty {
+                            host.invalidate_paint();
+                        }
+                    }
+
+                    let painted = rt
+                        .host
+                        .borrow_mut()
+                        .paint_if_dirty_with_metrics(WEB_PIPELINE, &mut self.compositor.resources);
+
+                    let c2d = rt
+                        .canvas2d
+                        .borrow_mut()
+                        .present_dirty_to_compositor(&mut self.compositor, None);
+                    let wgpu = rt
+                        .webgpu
+                        .borrow_mut()
+                        .present_dirty_to_compositor(&mut self.compositor, None);
+                    let wgl = rt
+                        .webgl2
+                        .borrow_mut()
+                        .present_dirty_to_compositor(&mut self.compositor, None);
+                    let vid = rt
+                        .media_elements
+                        .borrow_mut()
+                        .present_dirty_to_compositor(&mut self.compositor, None);
+                    let _ = c2d + wgpu + wgl + vid;
+
+                    runtime_console = rt.drain_console_messages();
+
+                    if let Some((dl, s_ms, l_ms, p_ms)) = painted {
+                        style_ms += s_ms;
+                        layout_ms += l_ms;
+                        paint_ms += p_ms;
+
+                        self.hud
+                            .ingest_css_missing_features(rt.host.borrow().missing_css_features());
+                        let canvas_bg = tab_doc.page_canvas_background();
+                        let wrapped = wrap_web_display_list(
+                            dl,
+                            web_rect,
+                            page_zoom,
+                            tab_doc.scroll_id,
+                            scroll_y,
+                            canvas_bg,
+                        );
+                        self.compositor.submit_display_list(
+                            WEB_PIPELINE,
+                            LayerRole::WebSurface,
+                            seq,
+                            wrapped,
+                        );
+                    }
+                    tab_doc.sync_snapshot_from_runtime();
+                    updated_title = extract_document_title(&tab_doc.doc);
+                }
+            }
+
+            if let Some(title) = updated_title {
+                if self.chrome.active().title != title {
+                    self.chrome.active_mut().title = title;
+                    self.chrome_dirty = true;
+                }
+            }
+            for (lvl, msg) in runtime_console {
+                self.hud.record_console(lvl, msg, active_url.clone());
+                if self.chrome.hud_open {
+                    self.overlay_dirty = true;
+                }
+            }
+            self.web_dirty = false;
+        } else if self.web_dirty {
             let seq = self.frame_seq;
             self.frame_seq = self.frame_seq.wrapping_add(1);
 
             if let Some(tab_doc) = self.tabs_doc.get_mut(&active_id) {
                 let t_style = Instant::now();
                 let media = MediaContext {
-                    viewport_width: web_rect.size.width,
-                    viewport_height: web_rect.size.height,
+                    viewport_width: logical_web_size.width,
+                    viewport_height: logical_web_size.height,
                     dark_mode,
                     ..MediaContext::default()
                 };
@@ -246,8 +579,8 @@ impl BrowserController {
                 let frame = tab_doc.layout.layout_and_paint(
                     &tab_doc.doc,
                     &tab_doc.styles,
-                    web_rect.size,
-                    &self.font_db,
+                    logical_web_size,
+                    &self.base_font_db,
                     WEB_PIPELINE,
                     &mut self.compositor.resources,
                 );
@@ -255,11 +588,14 @@ impl BrowserController {
                 paint_ms += frame.metrics.paint_ms;
                 tab_doc.fragment_tree = frame.fragment_tree;
 
+                let canvas_bg = tab_doc.page_canvas_background();
                 let wrapped = wrap_web_display_list(
                     frame.display_list,
                     web_rect,
+                    page_zoom,
                     tab_doc.scroll_id,
                     scroll_y,
+                    canvas_bg,
                 );
                 self.compositor.submit_display_list(
                     WEB_PIPELINE,
@@ -279,7 +615,7 @@ impl BrowserController {
             let layer = self.chrome_renderer.render_chrome(
                 &self.chrome,
                 vp,
-                &self.font_db,
+                &self.base_font_db,
                 CHROME_PIPELINE,
                 &mut self.compositor.resources,
             );
@@ -302,7 +638,7 @@ impl BrowserController {
                 &self.hud,
                 now,
                 vp,
-                &self.font_db,
+                &self.base_font_db,
                 OVERLAY_PIPELINE,
                 &mut self.compositor.resources,
             );
@@ -329,8 +665,14 @@ impl BrowserController {
         }
     }
 
-    /// Loads HTML into the given tab, compiles `<style>` tags (and chrome theme CSS for internal
-    /// pages), performs full style cascade, and marks the web surface dirty.
+    /// Loads HTML into the given tab.
+    ///
+    /// - Internal `rix://chrome/*` pages (`is_chrome_page == true`) use the lightweight zero-JS
+    ///   chrome pipeline with isolated chrome theme stylesheets.
+    /// - Real web pages (`is_chrome_page == false`) execute the full engine pipeline: parallel
+    ///   subresource fetching (`PreloadScanner` + `ResourceManager` concurrency 16), cached CSS
+    ///   compilation + `@import`, `@font-face` web font decoding, parallel `rayon` image/SVG
+    ///   decoding, and live [`ContentRuntime`] JavaScript + Cranelift 3-tier JIT execution.
     pub fn load_html_into_tab(
         &mut self,
         tab_id: TabId,
@@ -340,29 +682,137 @@ impl BrowserController {
     ) {
         let web_rect = self.web_viewport_rect();
         let dark_mode = self.chrome.theme.is_dark();
+        let dpr = self.compositor.device_pixel_ratio();
+        let zoom = if is_chrome_page {
+            1.0
+        } else {
+            (f32::from(self.chrome.settings.default_zoom_pct) / 100.0).clamp(0.5, 2.5)
+        };
+        let logical_size = Size::new(
+            (web_rect.size.width / zoom).max(64.0),
+            (web_rect.size.height / zoom).max(64.0),
+        );
         let media = MediaContext {
-            viewport_width: web_rect.size.width,
-            viewport_height: web_rect.size.height,
+            viewport_width: logical_size.width,
+            viewport_height: logical_size.height,
             dark_mode,
             ..MediaContext::default()
         };
 
-        let mut doc = parse_html(html);
-        let page_title = extract_document_title(&doc);
-        let inline_styles = extract_style_elements(&doc);
-
-        let mut styles = StyleContext::new(media);
         if is_chrome_page {
+            let mut doc = parse_html(html);
+            let page_title = extract_document_title(&doc);
+            let inline_styles = extract_style_elements(&doc);
+
+            let mut styles = StyleContext::new(media);
             styles.add_stylesheet(self.chrome_renderer.stylesheet_for(self.chrome.theme));
+            for css in &inline_styles {
+                styles.add_stylesheet(Stylesheet::parse_cached(css, CascadeOrigin::Author, &media));
+            }
+            styles.cascade_full(&mut doc);
+
+            if let Some(tab) = self.chrome.tabs.iter_mut().find(|t| t.id == tab_id) {
+                if let Some(title) = page_title {
+                    tab.title = title;
+                }
+                tab.is_loading = false;
+                tab.load_progress = 1.0;
+                tab.scroll_y = 0.0;
+            }
+            self.chrome.record_history(
+                url,
+                &self
+                    .chrome
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == tab_id)
+                    .map_or_else(String::new, |t| t.title.clone()),
+            );
+
+            let entry = self
+                .tabs_doc
+                .entry(tab_id)
+                .or_insert_with(|| TabDocumentState::new(tab_id, logical_size, dark_mode));
+            entry.doc = doc;
+            entry.styles = styles;
+            entry.layout.clear_caches();
+            entry.interaction.clear();
+            entry.raw_html = html.to_string();
+            entry.page_css = inline_styles;
+            entry.is_chrome_page = true;
+            entry.runtime = None;
+            entry.last_load_stats = PageLoadStats::default();
+            entry.doc_snapshot_revision = 0;
+
+            self.hud.clear_page_telemetry();
+            self.hud
+                .ingest_css_missing_features(entry.styles.missing_features());
+            self.web_dirty = true;
+            self.chrome_dirty = true;
+            if self.chrome.hud_open {
+                self.overlay_dirty = true;
+            }
+            return;
         }
-        for css in &inline_styles {
-            styles.add_stylesheet(Arc::new(Stylesheet::parse(
-                css,
-                CascadeOrigin::Author,
-                &media,
-            )));
+
+        // Full real-web engine pipeline: parallel subresources + ContentRuntime + JIT + Canvas/Media.
+        self.hud.clear_page_telemetry();
+        let loaded = load_page_subresources(
+            url,
+            html,
+            &media,
+            &self.resource_manager,
+            &self.runtime,
+            &self.asset_cache,
+        );
+        for net_entry in &loaded.network_entries {
+            self.hud.record_network(net_entry.clone());
         }
-        styles.cascade_full(&mut doc);
+
+        let mut web_fonts = FontFaceSet::new();
+        let tab_font_db = if loaded.web_fonts.is_empty() {
+            Arc::clone(&self.base_font_db)
+        } else {
+            let mut cloned_db = (*self.base_font_db).clone();
+            loaded.register_web_fonts(&mut cloned_db, &mut web_fonts);
+            Arc::new(cloned_db)
+        };
+
+        let doc_rc = Rc::new(RefCell::new(Document::new()));
+        let mut rt = ContentRuntime::with_full_config(
+            Rc::clone(&doc_rc),
+            logical_size,
+            tab_font_db,
+            url,
+            self.storage.clone(),
+            Some(Arc::clone(&self.fetch_engine)),
+        );
+        configure_runtime_jit(&mut rt, self.chrome.settings.jit_mode);
+        {
+            let mut host = rt.host.borrow_mut();
+            host.set_dark_mode(dark_mode);
+            host.device_pixel_ratio = dpr;
+            loaded.register_into_assets(&mut host.layout_engine.assets);
+            host.layout_engine.web_fonts = web_fonts;
+            host.set_external_stylesheets(loaded.external_stylesheets.clone());
+        }
+
+        let script_errors = {
+            let _rt_guard = self.runtime.enter();
+            rt.load_document_with_external_scripts(html, &loaded.external_scripts)
+        };
+        let console_msgs = rt.drain_console_messages();
+        for (lvl, msg) in console_msgs {
+            self.hud.record_console(lvl, msg, url.to_string());
+        }
+        if !script_errors.is_empty() && self.chrome.hud_open {
+            self.overlay_dirty = true;
+        }
+
+        let snapshot_doc = doc_rc.borrow().clone();
+        let snapshot_rev = snapshot_doc.revision();
+        let page_title = extract_document_title(&snapshot_doc);
+        let inline_styles = extract_style_elements(&snapshot_doc);
 
         if let Some(tab) = self.chrome.tabs.iter_mut().find(|t| t.id == tab_id) {
             if let Some(title) = page_title {
@@ -385,17 +835,16 @@ impl BrowserController {
         let entry = self
             .tabs_doc
             .entry(tab_id)
-            .or_insert_with(|| TabDocumentState::new(tab_id, web_rect.size, dark_mode));
-        entry.doc = doc;
-        entry.styles = styles;
-        entry.layout.clear_caches();
+            .or_insert_with(|| TabDocumentState::new(tab_id, logical_size, dark_mode));
+        entry.doc = snapshot_doc;
+        entry.doc_snapshot_revision = snapshot_rev;
         entry.interaction.clear();
         entry.raw_html = html.to_string();
         entry.page_css = inline_styles;
+        entry.is_chrome_page = false;
+        entry.last_load_stats = loaded.stats;
+        entry.runtime = Some(rt);
 
-        self.hud.clear_page_telemetry();
-        self.hud
-            .ingest_css_missing_features(entry.styles.missing_features());
         self.web_dirty = true;
         self.chrome_dirty = true;
         if self.chrome.hud_open {
@@ -609,8 +1058,14 @@ impl BrowserController {
             return;
         }
 
+        let effective_url = if self.chrome.settings.https_only {
+            maybe_upgrade_https_only(url)
+        } else {
+            url.to_string()
+        };
+
         let start = Instant::now();
-        let Ok(parsed_url) = RixUrl::parse(url) else {
+        let Ok(parsed_url) = RixUrl::parse(&effective_url) else {
             let html = render_error_html(self.chrome.theme, url, "Malformed URL");
             self.load_html_into_tab(tab_id, URL_ERROR, &html, true);
             self.sync_layers();
@@ -621,20 +1076,58 @@ impl BrowserController {
         if let Some(ct) = content_type {
             headers.insert("Content-Type".to_string(), ct.to_string());
         }
+        if self.chrome.settings.send_dnt {
+            headers.insert("DNT".to_string(), "1".to_string());
+        }
         let method_str = match method {
             FormMethod::Get => "GET",
             FormMethod::Post => "POST",
         };
-        let resp_res = self.runtime.block_on(self.http_client.request(
-            &parsed_url,
-            method_str,
-            &headers,
-            body,
-        ));
+        let (resp_res, cache_hit) = if method == FormMethod::Get && body.is_empty() {
+            let now = now_secs();
+            if let Some(entry) = self.http_cache.get(parsed_url.as_str()) {
+                if entry.is_fresh(now) {
+                    (Ok(self.http_cache.to_http_response(&entry, now)), true)
+                } else {
+                    (
+                        self.runtime.block_on(self.http_client.request(
+                            &parsed_url,
+                            method_str,
+                            &headers,
+                            body,
+                        )),
+                        false,
+                    )
+                }
+            } else {
+                (
+                    self.runtime.block_on(self.http_client.request(
+                        &parsed_url,
+                        method_str,
+                        &headers,
+                        body,
+                    )),
+                    false,
+                )
+            }
+        } else {
+            (
+                self.runtime.block_on(self.http_client.request(
+                    &parsed_url,
+                    method_str,
+                    &headers,
+                    body,
+                )),
+                false,
+            )
+        };
         let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
 
         match resp_res {
             Ok(resp) => {
+                if method == FormMethod::Get && !cache_hit && (200..300).contains(&resp.status) {
+                    self.http_client.cache_response(parsed_url.as_str(), &resp);
+                }
                 let final_url_str = resp.final_url.as_str().to_string();
                 let mime = if resp.content_type.is_empty() {
                     "text/html".to_string()
@@ -645,11 +1138,15 @@ impl BrowserController {
                 self.hud.record_network(NetworkEntry {
                     url: final_url_str.clone(),
                     method: method_str.to_string(),
-                    protocol: format!("{:?}", resp.protocol),
+                    protocol: if cache_hit {
+                        "cache".to_string()
+                    } else {
+                        format!("{:?}", resp.protocol)
+                    },
                     status: resp.status,
                     mime,
                     bytes: resp.body.len(),
-                    cache_hit: false,
+                    cache_hit,
                     ttfb_ms: elapsed_ms,
                     total_ms: elapsed_ms,
                 });
@@ -657,7 +1154,7 @@ impl BrowserController {
             }
             Err(err) => {
                 self.hud.record_network(NetworkEntry {
-                    url: url.to_string(),
+                    url: effective_url,
                     method: method_str.to_string(),
                     protocol: "net".to_string(),
                     status: 0,
@@ -716,15 +1213,16 @@ impl BrowserController {
         let active_id = self.chrome.active().id;
         let base_url = self.chrome.active().url.clone();
         let scroll_y = self.chrome.active().scroll_y;
+        let page_zoom = self.active_page_zoom();
         let doc_pt = Point::new(
-            point.x - web_rect.min_x(),
-            point.y - web_rect.min_y() + scroll_y,
+            (point.x - web_rect.min_x()) / page_zoom,
+            (point.y - web_rect.min_y()) / page_zoom + scroll_y,
         );
 
         let hit_node = self
             .tabs_doc
             .get(&active_id)
-            .and_then(|t| hit_test(&t.fragment_tree, doc_pt));
+            .and_then(|t| t.hit_test_point(doc_pt));
         let Some(node) = hit_node else {
             self.sync_layers();
             return false;
@@ -748,8 +1246,51 @@ impl BrowserController {
             return self.activate_chrome_target(target);
         }
 
+        // Dispatch real DOM `click` event into `ContentRuntime` on web pages (honoring preventDefault!).
+        let mut js_handled_dom_change = false;
+        let mut default_allowed = true;
+        let mut click_console = Vec::new();
+        if let Some(t) = self.tabs_doc.get_mut(&active_id) {
+            if let Some(ref mut rt) = t.runtime {
+                let prev_rev = rt.host.borrow().document.borrow().revision();
+                let _rt_guard = self.runtime.enter();
+                default_allowed = rt.dispatch_node_event(node, "click", true, true, &[]);
+                let _ = rt.poll_async_and_timers();
+                let next_rev = rt.host.borrow().document.borrow().revision();
+                js_handled_dom_change = next_rev != prev_rev;
+                click_console = rt.drain_console_messages();
+            }
+        }
+        for (lvl, msg) in click_console {
+            self.hud.record_console(lvl, msg, base_url.clone());
+            if self.chrome.hud_open {
+                self.overlay_dirty = true;
+            }
+        }
+        if !default_allowed {
+            self.web_dirty = true;
+            self.sync_layers();
+            return true;
+        }
+
         let outcome = match self.tabs_doc.get_mut(&active_id) {
-            Some(t) => t.interaction.handle_click(&mut t.doc, node, &base_url),
+            Some(t) => {
+                if let Some(ref mut rt) = t.runtime {
+                    let doc_rc = Rc::clone(&rt.host.borrow().document);
+                    let out = {
+                        let mut live_doc = doc_rc.borrow_mut();
+                        t.interaction.handle_click(&mut live_doc, node, &base_url)
+                    };
+                    if matches!(out, PageClickOutcome::ControlUpdated) {
+                        let _rt_guard = self.runtime.enter();
+                        let _ = rt.dispatch_node_event(node, "input", true, false, &[]);
+                        let _ = rt.dispatch_node_event(node, "change", true, false, &[]);
+                    }
+                    out
+                } else {
+                    t.interaction.handle_click(&mut t.doc, node, &base_url)
+                }
+            }
             None => PageClickOutcome::None,
         };
         match outcome {
@@ -758,7 +1299,20 @@ impl BrowserController {
                 true
             }
             PageClickOutcome::SubmitForm(sub) => {
-                self.submit_form(sub);
+                let submit_allowed = self
+                    .tabs_doc
+                    .get_mut(&active_id)
+                    .and_then(|t| t.runtime.as_mut())
+                    .is_none_or(|rt| {
+                        let _rt_guard = self.runtime.enter();
+                        rt.dispatch_node_event(node, "submit", true, true, &[])
+                    });
+                if submit_allowed {
+                    self.submit_form(sub);
+                } else {
+                    self.web_dirty = true;
+                    self.sync_layers();
+                }
                 true
             }
             PageClickOutcome::ControlUpdated => {
@@ -767,12 +1321,21 @@ impl BrowserController {
                 true
             }
             PageClickOutcome::SelectedText(_) => {
+                if js_handled_dom_change {
+                    self.web_dirty = true;
+                }
                 self.sync_layers();
                 true
             }
             PageClickOutcome::None => {
-                self.sync_layers();
-                false
+                if js_handled_dom_change {
+                    self.web_dirty = true;
+                    self.sync_layers();
+                    true
+                } else {
+                    self.sync_layers();
+                    false
+                }
             }
         }
     }
@@ -798,13 +1361,14 @@ impl BrowserController {
             let active_id = self.chrome.active().id;
             let base_url = self.chrome.active().url.clone();
             let scroll_y = self.chrome.active().scroll_y;
+            let page_zoom = self.active_page_zoom();
             let doc_pt = Point::new(
-                point.x - web_rect.min_x(),
-                point.y - web_rect.min_y() + scroll_y,
+                (point.x - web_rect.min_x()) / page_zoom,
+                (point.y - web_rect.min_y()) / page_zoom + scroll_y,
             );
             if let Some(t) = self.tabs_doc.get(&active_id) {
                 has_selection = !t.interaction.selected_text.is_empty();
-                if let Some(hit) = hit_test(&t.fragment_tree, doc_pt) {
+                if let Some(hit) = t.hit_test_point(doc_pt) {
                     if let Some(href) = find_link_href(&t.doc, hit) {
                         link_url = resolve_relative_url(&base_url, &href);
                     }
@@ -821,19 +1385,21 @@ impl BrowserController {
         true
     }
 
-    /// Updates bottom-left hover URL preview pill when pointer moves over `<a href>` links.
+    /// Updates bottom-left hover URL preview pill when pointer moves over `<a href>` links
+    /// and speculatively warms TCP+TLS/QUIC connections to hovered external origins.
     pub fn handle_hover(&mut self, point: Point) -> bool {
         let web_rect = self.web_viewport_rect();
         let next_hover = if web_rect.contains(point) {
             let active_id = self.chrome.active().id;
             let base_url = self.chrome.active().url.clone();
             let scroll_y = self.chrome.active().scroll_y;
+            let page_zoom = self.active_page_zoom();
             let doc_pt = Point::new(
-                point.x - web_rect.min_x(),
-                point.y - web_rect.min_y() + scroll_y,
+                (point.x - web_rect.min_x()) / page_zoom,
+                (point.y - web_rect.min_y()) / page_zoom + scroll_y,
             );
             self.tabs_doc.get(&active_id).and_then(|t| {
-                let hit = hit_test(&t.fragment_tree, doc_pt)?;
+                let hit = t.hit_test_point(doc_pt)?;
                 let href = find_link_href(&t.doc, hit)?;
                 resolve_relative_url(&base_url, &href)
             })
@@ -841,6 +1407,11 @@ impl BrowserController {
             None
         };
         if next_hover != self.chrome.hovered_link {
+            if let Some(ref url) = next_hover {
+                let _ = self
+                    .preconnector
+                    .maybe_preconnect(url, &self.http_client, &self.runtime);
+            }
             self.chrome.hovered_link = next_hover;
             self.overlay_dirty = true;
             self.sync_layers();
@@ -1037,6 +1608,7 @@ impl BrowserController {
                     self.persist_settings();
                     self.refresh_active_internal_page();
                     self.chrome_dirty = true;
+                    self.web_dirty = true;
                     self.overlay_dirty = true;
                     self.sync_layers();
                     return true;
@@ -1046,6 +1618,7 @@ impl BrowserController {
                     self.persist_settings();
                     self.refresh_active_internal_page();
                     self.chrome_dirty = true;
+                    self.web_dirty = true;
                     self.overlay_dirty = true;
                     self.sync_layers();
                     return true;
@@ -1055,6 +1628,7 @@ impl BrowserController {
                     self.persist_settings();
                     self.refresh_active_internal_page();
                     self.chrome_dirty = true;
+                    self.web_dirty = true;
                     self.overlay_dirty = true;
                     self.sync_layers();
                     return true;
@@ -1163,29 +1737,74 @@ impl BrowserController {
                 _ => {}
             }
         } else {
-            // Forward Backspace / Enter to focused in-page form controls.
+            // Forward Backspace / Enter to focused in-page form controls (dispatching live DOM events).
             let active_id = self.chrome.active().id;
             let base_url = self.chrome.active().url.clone();
             match key {
                 BrowserKey::Backspace => {
-                    if let Some(t) = self.tabs_doc.get_mut(&active_id) {
-                        if t.interaction.backspace(&mut t.doc) {
-                            self.web_dirty = true;
-                            self.sync_layers();
-                            return true;
+                    let updated = if let Some(t) = self.tabs_doc.get_mut(&active_id) {
+                        let focused = t.interaction.focused_control;
+                        if let Some(ref mut rt) = t.runtime {
+                            let doc_rc = Rc::clone(&rt.host.borrow().document);
+                            let changed = {
+                                let mut live_doc = doc_rc.borrow_mut();
+                                t.interaction.backspace(&mut live_doc)
+                            };
+                            if changed {
+                                if let Some(node) = focused {
+                                    let _rt_guard = self.runtime.enter();
+                                    let _ = rt.dispatch_node_event(node, "input", true, false, &[]);
+                                }
+                            }
+                            changed
+                        } else {
+                            t.interaction.backspace(&mut t.doc)
                         }
+                    } else {
+                        false
+                    };
+                    if updated {
+                        self.web_dirty = true;
+                        self.sync_layers();
+                        return true;
                     }
                 }
                 BrowserKey::Enter => {
-                    let outcome = self
+                    let focused = self
                         .tabs_doc
-                        .get_mut(&active_id)
-                        .map_or(PageClickOutcome::None, |t| {
-                            t.interaction.press_enter(&mut t.doc, &base_url)
-                        });
+                        .get(&active_id)
+                        .and_then(|t| t.interaction.focused_control);
+                    let outcome =
+                        self.tabs_doc
+                            .get_mut(&active_id)
+                            .map_or(PageClickOutcome::None, |t| {
+                                if let Some(ref mut rt) = t.runtime {
+                                    let doc_rc = Rc::clone(&rt.host.borrow().document);
+                                    let mut live_doc = doc_rc.borrow_mut();
+                                    t.interaction.press_enter(&mut live_doc, &base_url)
+                                } else {
+                                    t.interaction.press_enter(&mut t.doc, &base_url)
+                                }
+                            });
                     match outcome {
                         PageClickOutcome::SubmitForm(sub) => {
-                            self.submit_form(sub);
+                            let submit_allowed = focused
+                                .and_then(|node| {
+                                    self.tabs_doc
+                                        .get_mut(&active_id)
+                                        .and_then(|t| t.runtime.as_mut())
+                                        .map(|rt| {
+                                            let _rt_guard = self.runtime.enter();
+                                            rt.dispatch_node_event(node, "submit", true, true, &[])
+                                        })
+                                })
+                                .unwrap_or(true);
+                            if submit_allowed {
+                                self.submit_form(sub);
+                            } else {
+                                self.web_dirty = true;
+                                self.sync_layers();
+                            }
                             return true;
                         }
                         PageClickOutcome::ControlUpdated => {
@@ -1220,12 +1839,31 @@ impl BrowserController {
             return true;
         }
         let active_id = self.chrome.active().id;
-        if let Some(t) = self.tabs_doc.get_mut(&active_id) {
-            if t.interaction.insert_text(&mut t.doc, text) {
-                self.web_dirty = true;
-                self.sync_layers();
-                return true;
+        let updated = if let Some(t) = self.tabs_doc.get_mut(&active_id) {
+            let focused = t.interaction.focused_control;
+            if let Some(ref mut rt) = t.runtime {
+                let doc_rc = Rc::clone(&rt.host.borrow().document);
+                let changed = {
+                    let mut live_doc = doc_rc.borrow_mut();
+                    t.interaction.insert_text(&mut live_doc, text)
+                };
+                if changed {
+                    if let Some(node) = focused {
+                        let _rt_guard = self.runtime.enter();
+                        let _ = rt.dispatch_node_event(node, "input", true, false, &[]);
+                    }
+                }
+                changed
+            } else {
+                t.interaction.insert_text(&mut t.doc, text)
             }
+        } else {
+            false
+        };
+        if updated {
+            self.web_dirty = true;
+            self.sync_layers();
+            return true;
         }
         false
     }
@@ -1298,6 +1936,7 @@ impl BrowserController {
                 self.persist_settings();
                 self.refresh_active_internal_page();
                 self.chrome_dirty = true;
+                self.web_dirty = true;
                 self.overlay_dirty = true;
                 self.sync_layers();
                 true
@@ -1316,6 +1955,7 @@ impl BrowserController {
             ChromeHitTarget::ToggleTheme => {
                 self.chrome.toggle_theme();
                 self.chrome.app_menu_open = false;
+                self.apply_settings_to_engine();
                 self.persist_settings();
                 self.refresh_active_internal_page();
                 self.chrome_dirty = true;
@@ -1468,6 +2108,7 @@ impl BrowserController {
             }
             ChromeHitTarget::SettingsSetTheme(theme) => {
                 self.chrome.set_theme(theme);
+                self.apply_settings_to_engine();
                 self.persist_settings();
                 self.refresh_active_internal_page();
                 self.chrome_dirty = true;
@@ -1511,6 +2152,7 @@ impl BrowserController {
                 self.persist_settings();
                 self.refresh_active_internal_page();
                 self.chrome_dirty = true;
+                self.web_dirty = true;
                 self.overlay_dirty = true;
                 self.sync_layers();
                 true
@@ -1520,6 +2162,7 @@ impl BrowserController {
                 self.persist_settings();
                 self.refresh_active_internal_page();
                 self.chrome_dirty = true;
+                self.web_dirty = true;
                 self.overlay_dirty = true;
                 self.sync_layers();
                 true
@@ -1571,6 +2214,7 @@ impl BrowserController {
             }
             ChromeHitTarget::SettingsSetCookiePolicy(policy) => {
                 self.chrome.set_cookie_policy(policy);
+                self.apply_settings_to_engine();
                 self.persist_settings();
                 self.refresh_active_internal_page();
                 self.sync_layers();
@@ -1592,6 +2236,7 @@ impl BrowserController {
             }
             ChromeHitTarget::SettingsResetDefaults => {
                 self.chrome.reset_settings();
+                self.apply_settings_to_engine();
                 self.persist_settings();
                 self.refresh_active_internal_page();
                 self.chrome_dirty = true;
@@ -1602,6 +2247,7 @@ impl BrowserController {
             }
             ChromeHitTarget::SettingsSetJitMode(mode) => {
                 self.chrome.set_jit_mode(mode);
+                self.apply_settings_to_engine();
                 self.persist_settings();
                 self.refresh_active_internal_page();
                 self.sync_layers();
@@ -1657,6 +2303,7 @@ impl BrowserController {
     pub fn set_theme(&mut self, theme: ThemeMode) {
         if self.chrome.theme != theme {
             self.chrome.set_theme(theme);
+            self.apply_settings_to_engine();
             self.persist_settings();
             self.refresh_active_internal_page();
             self.chrome_dirty = true;
@@ -1667,13 +2314,19 @@ impl BrowserController {
     }
 }
 
-/// Wraps a document `DisplayList` into a clipped APZ scroll frame positioned at `web_rect`.
+/// Wraps a document `DisplayList` into a clipped, zoom-scaled APZ scroll frame positioned at
+/// `web_rect`, painting a full-viewport canvas backdrop when `canvas_bg` is provided.
 fn wrap_web_display_list(
     inner: DisplayList,
     web_rect: Rect,
+    zoom: f32,
     scroll_id: ScrollId,
     scroll_y: f32,
+    canvas_bg: Option<Rgba8>,
 ) -> DisplayList {
+    let zoom = zoom.clamp(0.5, 2.5);
+    let logical_w = (web_rect.size.width / zoom).max(1.0);
+    let logical_h = (web_rect.size.height / zoom).max(1.0);
     let mut out = DisplayList::new(Rect::new(0.0, 0.0, web_rect.max_x(), web_rect.max_y()));
     let translate_node = out.spatial_tree.add_node(
         Some(SpatialNodeId(0)),
@@ -1683,14 +2336,26 @@ fn wrap_web_display_list(
             animation_id: None,
         },
     );
-    let content_h = inner.content_bounds.size.height.max(web_rect.size.height);
-    let content_w = inner.content_bounds.size.width.max(web_rect.size.width);
+    let content_parent = if (zoom - 1.0).abs() > 1e-4 {
+        out.spatial_tree.add_node(
+            Some(translate_node),
+            SpatialNodeKind::Transform {
+                matrix: [zoom, 0.0, 0.0, zoom, 0.0, 0.0],
+                origin: Point::ZERO,
+                animation_id: None,
+            },
+        )
+    } else {
+        translate_node
+    };
+    let content_h = inner.content_bounds.size.height.max(logical_h);
+    let content_w = inner.content_bounds.size.width.max(logical_w);
     let scroll_node = out.spatial_tree.add_node(
-        Some(translate_node),
+        Some(content_parent),
         SpatialNodeKind::ScrollFrame {
             external_scroll_id: scroll_id,
             content_rect: Rect::new(0.0, 0.0, content_w, content_h),
-            viewport_rect: Rect::new(0.0, 0.0, web_rect.size.width, web_rect.size.height),
+            viewport_rect: Rect::new(0.0, 0.0, logical_w, logical_h),
             current_offset: Vec2::new(0.0, scroll_y),
         },
     );
@@ -1711,6 +2376,21 @@ fn wrap_web_display_list(
         rect: Rect::new(0.0, 0.0, web_rect.size.width, web_rect.size.height),
         radii: [0.0; 4],
     });
+    if let Some(bg) = canvas_bg {
+        out.push(DisplayItem::PushStackingContext {
+            spatial: translate_node,
+            bounds: Rect::new(0.0, 0.0, web_rect.size.width, web_rect.size.height),
+            opacity: 1.0,
+            mix_blend: rix_render::BlendMode::Normal,
+            filters: rix_render::smallvec![],
+        });
+        out.push(DisplayItem::Rect {
+            bounds: Rect::new(0.0, 0.0, web_rect.size.width, web_rect.size.height),
+            color: bg,
+            radii: [0.0; 4],
+        });
+        out.push(DisplayItem::PopStackingContext);
+    }
     out.push(DisplayItem::PushStackingContext {
         spatial: scroll_node,
         bounds: Rect::new(0.0, 0.0, content_w, content_h),
@@ -1737,6 +2417,60 @@ fn wrap_web_display_list(
     out.push(DisplayItem::PopStackingContext);
     out.push(DisplayItem::PopClip);
     out
+}
+
+fn configure_runtime_jit(rt: &mut ContentRuntime, mode: JitMode) {
+    match mode {
+        JitMode::FullThreeTier => rt.configure_jit(true, true),
+        JitMode::BaselineOnly => rt.configure_jit(true, false),
+        JitMode::InterpreterOnly => rt.configure_jit(false, false),
+    }
+}
+
+/// Upgrades `http://` navigations to `https://` when HTTPS-Only mode is active,
+/// exempting loopback addresses (`localhost`, `127.0.0.1`, `[::1]`) for local dev servers.
+fn maybe_upgrade_https_only(url: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    if parsed.scheme() != "http" {
+        return url.to_string();
+    }
+    let is_loopback = matches!(
+        parsed.host_str(),
+        Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+    );
+    if !is_loopback {
+        let _ = parsed.set_scheme("https");
+    }
+    parsed.to_string()
+}
+
+/// Implements W3C CSS Backgrounds & Borders Level 3 §2.11.2 Canvas Background Propagation:
+/// prefers `<html>` background if non-transparent, else `<body>` background if non-transparent,
+/// else crisp white (`#ffffff`) so unthemed web pages stay readable even in Dark Chrome mode.
+fn resolve_canvas_bg(doc: &Document, styles: &StyleContext) -> Rgba8 {
+    let mut html_node = None;
+    let mut body_node = None;
+    for n in doc.descendants(doc.root()) {
+        if let Some(NodeData::Element(e)) = doc.get(n) {
+            if html_node.is_none() && e.name.local.eq_str_ignore_ascii_case("html") {
+                html_node = Some(n);
+            } else if body_node.is_none() && e.name.local.eq_str_ignore_ascii_case("body") {
+                body_node = Some(n);
+                break;
+            }
+        }
+    }
+    for candidate in [html_node, body_node].into_iter().flatten() {
+        if let Some(st) = styles.style_for(candidate) {
+            let bg = st.visual.background_color;
+            if bg.a > 0 {
+                return Rgba8::new(bg.r, bg.g, bg.b, bg.a);
+            }
+        }
+    }
+    Rgba8::new(255, 255, 255, 255)
 }
 
 fn extract_document_title(doc: &Document) -> Option<String> {

@@ -1,10 +1,69 @@
 #![deny(unsafe_code)]
 
-use rix_app::{render_headless_demo, run_content_process, run_network_process, run_window_shell};
+use rix_app::{
+    render_headless_demo, render_url_to_png, run_content_process, run_network_process,
+    run_window_shell,
+};
+use rix_chrome::ThemeMode;
 use rix_core::logging::{init_logging, init_logging_to_stderr};
 use rix_ipc::{parse_process_args, ProcessRole};
 use std::process::ExitCode;
 use tracing::{error, info};
+
+struct RenderUrlCli {
+    url: String,
+    out_path: String,
+    width: u32,
+    height: u32,
+    theme: ThemeMode,
+}
+
+fn parse_render_url_args(args: &[String]) -> Option<RenderUrlCli> {
+    let mut url = None;
+    let mut out_path = "rix-page.png".to_string();
+    let mut width = 1280u32;
+    let mut height = 800u32;
+    let mut theme = ThemeMode::Dark;
+
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if let Some(v) = arg.strip_prefix("--render-url=") {
+            url = Some(v.to_string());
+        } else if arg == "--render-url" {
+            url = args.get(idx + 1).cloned();
+            idx += 1;
+        } else if let Some(v) = arg.strip_prefix("--out=") {
+            out_path = v.to_string();
+        } else if arg == "--out" {
+            if let Some(v) = args.get(idx + 1) {
+                out_path = v.clone();
+                idx += 1;
+            }
+        } else if let Some(v) = arg.strip_prefix("--width=") {
+            if let Ok(w) = v.parse::<u32>() {
+                width = w.max(64);
+            }
+        } else if let Some(v) = arg.strip_prefix("--height=") {
+            if let Ok(h) = v.parse::<u32>() {
+                height = h.max(64);
+            }
+        } else if arg == "--light" {
+            theme = ThemeMode::Light;
+        } else if arg == "--dark" {
+            theme = ThemeMode::Dark;
+        }
+        idx += 1;
+    }
+
+    url.map(|url| RenderUrlCli {
+        url,
+        out_path,
+        width,
+        height,
+        theme,
+    })
+}
 
 fn build_child_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
@@ -58,6 +117,16 @@ fn main() -> ExitCode {
         }
         Ok(None) => {
             init_logging("info");
+            if let Some(cli) = parse_render_url_args(&raw_args) {
+                info!(url = %cli.url, path = %cli.out_path, width = cli.width, height = cli.height, "rendering URL headlessly");
+                if let Err(err) =
+                    render_url_to_png(&cli.url, &cli.out_path, cli.width, cli.height, cli.theme)
+                {
+                    error!(%err, "headless URL render failed");
+                    return ExitCode::FAILURE;
+                }
+                return ExitCode::SUCCESS;
+            }
             if let Some(out_path) = parse_headless_demo_path(&raw_args) {
                 info!(path = %out_path, "rendering headless Vello compositor demo");
                 if let Err(err) = render_headless_demo(&out_path, 1280, 720) {
