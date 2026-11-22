@@ -4009,6 +4009,7 @@ dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-native",
+ "criterion",
  "libc",
  "rix-js",
  "thiserror 2.0.21",
