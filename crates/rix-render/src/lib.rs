@@ -10,6 +10,8 @@ pub mod renderer;
 pub mod resources;
 pub mod scene_encoder;
 pub mod strip_cache;
+pub mod webgl_constants;
+pub mod webgl_glsl;
 
 pub use animations::{
     AnimDirection, AnimFillMode, AnimationSample, AnimationTarget, CompositorAnimation,
@@ -49,3 +51,7 @@ pub use vello::peniko::Color;
 pub use vello::peniko::ImageData as PenikoImageData;
 pub use vello::wgpu;
 pub use vello::Scene;
+pub use webgl_glsl::{
+    compile_webgl_program, CompiledWebGlProgram, GlAttribReflection, GlSamplerReflection,
+    GlUniformReflection, GlUniformType,
+};

@@ -44,6 +44,7 @@ postcard = { version = "1.1", features = ["use-std"] }
 libc = "0.2"
 psl = "2"
 vello = "0.10"
+naga = { version = "29.0.4", features = ["glsl-in", "wgsl-out"] }
 winit = "0.30"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 pollster = "1.0"

@@ -12,6 +12,7 @@ rix-core = { path = "../rix-core" }
 rix-text = { path = "../rix-text" }
 rix-ipc = { path = "../rix-ipc" }
 vello.workspace = true
+naga.workspace = true
 image.workspace = true
 smallvec.workspace = true
 svgtypes.workspace = true
