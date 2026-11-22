@@ -14,6 +14,7 @@ pub mod fetch_ws;
 pub mod frames;
 pub mod indexeddb;
 pub mod indexeddb_engine;
+pub mod media_source;
 pub mod observers;
 pub mod service_worker;
 pub mod streams;
@@ -62,6 +63,7 @@ pub use fetch_ws::{
     NetworkBridge, SharedNetBridge,
 };
 pub use indexeddb::{install_indexeddb, IndexedDbSystem, SharedIndexedDb};
+pub use media_source::{install_media_source, MediaSourceSystem, SharedMediaSource};
 pub use observers::{
     deliver_layout_observers, deliver_mutation_observers, install_observers, ObserverSystem,
     SharedObservers,
@@ -98,6 +100,7 @@ pub struct ContentRuntime {
     pub workers: SharedWorkers,
     pub service_workers: SharedServiceWorkers,
     pub indexeddb: SharedIndexedDb,
+    pub media_source: SharedMediaSource,
     pub webgpu: SharedWebGpu,
     pub webgl2: SharedWebGl2,
     pub jit: Rc<rix_jit::TieredJit>,
@@ -166,6 +169,7 @@ impl ContentRuntime {
         let service_workers =
             install_service_worker_and_cache_apis(&mut vm, &host, &web_apis, &streams, &net);
         let indexeddb = install_indexeddb(&mut vm, &host, &events, &event_loop, &web_apis);
+        let media_source = install_media_source(&mut vm, &host, &events, &event_loop, &web_apis);
         let webgpu = install_webgpu(&mut vm, &host, &canvas2d);
         let webgl2 = install_webgl2(&mut vm, &host, &canvas2d);
         Self {
@@ -182,6 +186,7 @@ impl ContentRuntime {
             workers,
             service_workers,
             indexeddb,
+            media_source,
             webgpu,
             webgl2,
             jit,
@@ -600,6 +605,7 @@ impl ContentRuntime {
         self.workers.borrow().collect_roots(&mut roots);
         self.service_workers.borrow().collect_roots(&mut roots);
         self.indexeddb.borrow().collect_roots(&mut roots);
+        self.media_source.borrow().collect_roots(&mut roots);
         self.host.borrow().collect_roots(&mut roots);
         let stats = self.vm.heap.collect_major(&roots);
         self.events.borrow_mut().sweep_dead(&self.vm.heap);
@@ -613,6 +619,7 @@ impl ContentRuntime {
         self.workers.borrow_mut().sweep_dead(&self.vm.heap);
         self.service_workers.borrow_mut().sweep_dead(&self.vm.heap);
         self.indexeddb.borrow_mut().sweep_dead(&self.vm.heap);
+        self.media_source.borrow_mut().sweep_dead(&self.vm.heap);
         self.host.borrow_mut().sweep_dead_wrappers(&self.vm.heap);
         stats
     }

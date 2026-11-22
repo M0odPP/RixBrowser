@@ -1,0 +1,259 @@
+# WPT subset: media-source (MediaSource, SourceBuffer, SourceBufferList, TimeRanges, buffered range merging, remove, endOfStream, changeType, abort)
+
+[[script_cases]]
+name = "mediasource_is_type_supported"
+script = """
+var __pass =
+    MediaSource.isTypeSupported('video/mp4; codecs="avc1.640028"') === true &&
+    MediaSource.isTypeSupported('video/mp4; codecs="av01.0.04M.08"') === true &&
+    MediaSource.isTypeSupported('video/mp4; codecs="vp09.00.10.08"') === true &&
+    MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"') === true &&
+    MediaSource.isTypeSupported('audio/mp4; codecs="opus"') === true &&
+    MediaSource.isTypeSupported('video/webm; codecs="vp8"') === true &&
+    MediaSource.isTypeSupported('video/webm; codecs="vp9, opus"') === true &&
+    MediaSource.isTypeSupported('video/webm; codecs="av01.0.04M.08, opus"') === true &&
+    MediaSource.isTypeSupported('audio/webm; codecs="opus"') === true &&
+    MediaSource.isTypeSupported('audio/webm; codecs="vorbis"') === true &&
+    MediaSource.isTypeSupported('') === false &&
+    MediaSource.isTypeSupported('video/mp4; codecs="bogus"') === false &&
+    MediaSource.isTypeSupported('audio/mp4; codecs="avc1.640028"') === false &&
+    MediaSource.isTypeSupported('video/webm; codecs="avc1.640028"') === false &&
+    MediaSource.isTypeSupported('text/plain') === false;
+"""
+assert_expr = "__pass"
+expected = "true"
+
+[[script_cases]]
+name = "mediasource_closed_state_and_open_via_video_object_url"
+advance_ms = 5
+script = """
+var ms = new MediaSource();
+var closedErr = "";
+try { ms.addSourceBuffer('video/mp4; codecs="avc1.640028"'); } catch (e) { closedErr = e.name; }
+var initState = ms.readyState + "|" + Number.isNaN(ms.duration) + "|" + closedErr;
+var url = URL.createObjectURL(ms);
+var video = document.createElement("video");
+var openResult = "";
+ms.addEventListener("sourceopen", function() {
+    var sb = ms.addSourceBuffer('video/mp4; codecs="avc1.640028"');
+    openResult = initState + "|" + url.startsWith("blob:") + "|" + ms.readyState
+        + "|" + ms.sourceBuffers.length + "|" + (ms.sourceBuffers[0] === sb)
+        + "|" + (sb.mode === "segments") + "|" + (sb.buffered.length === 0);
+});
+video.src = url;
+"""
+assert_expr = "openResult"
+expected = "closed|true|InvalidStateError|true|open|1|true|true|true"
+
+[[script_cases]]
+name = "sourcebuffer_append_fmp4_merges_and_preserves_disjoint_ranges"
+advance_ms = 10
+script = """
+function u32be(v) { return [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]; }
+function box(type, body) {
+    var out = u32be(8 + body.length);
+    for (var i = 0; i < 4; i++) out.push(type.charCodeAt(i));
+    for (var j = 0; j < body.length; j++) out.push(body[j]);
+    return out;
+}
+function fbox(type, ver, flags, body) {
+    var p = [ver, (flags >>> 16) & 255, (flags >>> 8) & 255, flags & 255].concat(body);
+    return box(type, p);
+}
+function makeInit() {
+    var ftyp = box("ftyp", [105,115,111,109, 0,0,2,0, 105,115,111,109, 109,112,52,49]);
+    var mvhd = fbox("mvhd", 0, 0, new Array(92).fill(0));
+    mvhd[20] = 0; mvhd[21] = 0; mvhd[22] = 3; mvhd[23] = 232; // timescale=1000
+    var tkhdP = new Array(80).fill(0); tkhdP[11] = 1;
+    var tkhd = fbox("tkhd", 0, 3, tkhdP);
+    var mdhdP = new Array(20).fill(0);
+    mdhdP[8] = 0; mdhdP[9] = 0; mdhdP[10] = 3; mdhdP[11] = 232; // timescale=1000
+    var mdhd = fbox("mdhd", 0, 0, mdhdP);
+    var hdlrP = new Array(21).fill(0);
+    hdlrP[4] = 118; hdlrP[5] = 105; hdlrP[6] = 100; hdlrP[7] = 101;
+    var hdlr = fbox("hdlr", 0, 0, hdlrP);
+    var avc1 = box("avc1", new Array(78).fill(0));
+    var stsd = fbox("stsd", 0, 0, u32be(1).concat(avc1));
+    var stbl = box("stbl", stsd.concat(fbox("stts",0,0,u32be(0)), fbox("stsc",0,0,u32be(0)), fbox("stsz",0,0,u32be(0).concat(u32be(0))), fbox("stco",0,0,u32be(0))));
+    var trak = box("trak", tkhd.concat(box("mdia", mdhd.concat(hdlr, box("minf", stbl)))));
+    var trex = fbox("trex", 0, 0, u32be(1).concat(u32be(1), u32be(0), u32be(0), u32be(0)));
+    var moov = box("moov", mvhd.concat(trak, box("mvex", trex)));
+    return new Uint8Array(ftyp.concat(moov));
+}
+function makeSeg(seq, baseMs, durMs) {
+    var payload = [0, 0, 0, 2, 0x65, 0x88];
+    var mfhd = fbox("mfhd", 0, 0, u32be(seq));
+    var tfhd = fbox("tfhd", 0, 0x020000, u32be(1));
+    var tfdt = fbox("tfdt", 0, 0, u32be(baseMs));
+    var buildTrun = function(off) {
+        return fbox("trun", 0, 0x000701, u32be(1).concat(u32be(off), u32be(durMs), u32be(payload.length), u32be(0x02000000)));
+    };
+    var probeTraf = box("traf", tfhd.concat(tfdt, buildTrun(0)));
+    var moofLen = 8 + mfhd.length + probeTraf.length;
+    var traf = box("traf", tfhd.concat(tfdt, buildTrun(moofLen + 8)));
+    return new Uint8Array(box("moof", mfhd.concat(traf)).concat(box("mdat", payload)));
+}
+var ms = new MediaSource();
+var video = document.createElement("video");
+var result = "";
+var evLog = [];
+ms.onsourceopen = function() {
+    var sb = ms.addSourceBuffer('video/mp4; codecs="avc1.640028"');
+    var step = 0;
+    sb.addEventListener("updatestart", function() { evLog.push("s"); });
+    sb.addEventListener("update", function() { evLog.push("u"); });
+    sb.addEventListener("updateend", function() {
+        evLog.push("e");
+        step++;
+        if (step === 1) {
+            sb.appendBuffer(makeSeg(1, 0, 100));
+        } else if (step === 2) {
+            sb.appendBuffer(makeSeg(2, 100, 100));
+        } else if (step === 3) {
+            // Contiguous [0, 0.1] + [0.1, 0.2] must coalesce to [0, 0.2].
+            var mergedOk = sb.buffered.length === 1 && sb.buffered.start(0) === 0 && Math.abs(sb.buffered.end(0) - 0.2) < 0.001;
+            sb.appendBuffer(makeSeg(3, 500, 100));
+            result = mergedOk + "|";
+        } else if (step === 4) {
+            // Disjoint segment at [0.5, 0.6] yields 2 ranges and out-of-bounds throws IndexSizeError.
+            var oob = "";
+            try { sb.buffered.start(2); } catch (e) { oob = e.name; }
+            result += (sb.buffered.length === 2) + "|" + Math.abs(sb.buffered.start(1) - 0.5) + "|" + oob + "|" + (evLog.join("") === "suesuesuesue");
+        }
+    });
+    sb.appendBuffer(makeInit());
+};
+video.srcObject = ms;
+"""
+assert_expr = "result"
+expected = "true|true|0|IndexSizeError|true"
+
+[[script_cases]]
+name = "sourcebuffer_timestamp_offset_and_remove_split"
+advance_ms = 10
+script = """
+function u32be(v) { return [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]; }
+function box(type, body) {
+    var out = u32be(8 + body.length);
+    for (var i = 0; i < 4; i++) out.push(type.charCodeAt(i));
+    for (var j = 0; j < body.length; j++) out.push(body[j]);
+    return out;
+}
+function fbox(type, ver, flags, body) {
+    return box(type, [ver, (flags >>> 16) & 255, (flags >>> 8) & 255, flags & 255].concat(body));
+}
+function makeInit() {
+    var ftyp = box("ftyp", [105,115,111,109, 0,0,2,0, 105,115,111,109, 109,112,52,49]);
+    var mvhd = fbox("mvhd", 0, 0, new Array(92).fill(0));
+    mvhd[22] = 3; mvhd[23] = 232;
+    var tkhdP = new Array(80).fill(0); tkhdP[11] = 1;
+    var mdhdP = new Array(20).fill(0); mdhdP[10] = 3; mdhdP[11] = 232;
+    var hdlrP = new Array(21).fill(0); hdlrP[4] = 118; hdlrP[5] = 105; hdlrP[6] = 100; hdlrP[7] = 101;
+    var stsd = fbox("stsd", 0, 0, u32be(1).concat(box("avc1", new Array(78).fill(0))));
+    var stbl = box("stbl", stsd.concat(fbox("stts",0,0,u32be(0)), fbox("stsc",0,0,u32be(0)), fbox("stsz",0,0,u32be(0).concat(u32be(0))), fbox("stco",0,0,u32be(0))));
+    var trak = box("trak", fbox("tkhd",0,3,tkhdP).concat(box("mdia", fbox("mdhd",0,0,mdhdP).concat(fbox("hdlr",0,0,hdlrP), box("minf", stbl)))));
+    var moov = box("moov", mvhd.concat(trak, box("mvex", fbox("trex",0,0,u32be(1).concat(u32be(1),u32be(0),u32be(0),u32be(0))))));
+    return new Uint8Array(ftyp.concat(moov));
+}
+function make3Samples(baseMs) {
+    var p = [0,0,0,2,0x65,0x88];
+    var mfhd = fbox("mfhd", 0, 0, u32be(1));
+    var tfhd = fbox("tfhd", 0, 0x020000, u32be(1));
+    var tfdt = fbox("tfdt", 0, 0, u32be(baseMs));
+    var buildTrun = function(off) {
+        var b = u32be(3).concat(u32be(off));
+        for (var i = 0; i < 3; i++) b = b.concat(u32be(100), u32be(p.length), u32be(0x02000000));
+        return fbox("trun", 0, 0x000701, b);
+    };
+    var moofLen = 8 + mfhd.length + box("traf", tfhd.concat(tfdt, buildTrun(0))).length;
+    var traf = box("traf", tfhd.concat(tfdt, buildTrun(moofLen + 8)));
+    return new Uint8Array(box("moof", mfhd.concat(traf)).concat(box("mdat", p.concat(p, p))));
+}
+var ms = new MediaSource();
+var video = document.createElement("video");
+var out = "";
+ms.onsourceopen = function() {
+    var sb = ms.addSourceBuffer('video/mp4; codecs="avc1.640028"');
+    var step = 0;
+    sb.onupdateend = function() {
+        step++;
+        if (step === 1) {
+            sb.timestampOffset = 1.0;
+            sb.appendBuffer(make3Samples(0)); // buffers [1.0, 1.3]
+        } else if (step === 2) {
+            sb.remove(1.09, 1.19); // removes middle frame [1.1, 1.2], leaving [1.0, 1.1] & [1.2, 1.3]
+        } else if (step === 3) {
+            out = sb.buffered.length + "|" + sb.buffered.start(0).toFixed(1) + "|" + sb.buffered.end(0).toFixed(1)
+                + "|" + sb.buffered.start(1).toFixed(1) + "|" + sb.buffered.end(1).toFixed(1);
+        }
+    };
+    sb.appendBuffer(makeInit());
+};
+video.srcObject = ms;
+"""
+assert_expr = "out"
+expected = "2|1.0|1.1|1.2|1.3"
+
+[[script_cases]]
+name = "mediasource_end_of_stream_and_duration"
+advance_ms = 10
+script = """
+var ms = new MediaSource();
+var video = document.createElement("video");
+var out = "";
+var endedFired = false;
+ms.addEventListener("sourceended", function() {
+    endedFired = true;
+    out = ms.readyState + "|" + ms.duration + "|" + endedFired + "|" + video.duration;
+});
+ms.addEventListener("sourceopen", function() {
+    ms.duration = 42.5;
+    ms.endOfStream();
+});
+video.srcObject = ms;
+"""
+assert_expr = "out"
+expected = "ended|42.5|true|42.5"
+
+[[script_cases]]
+name = "sourcebuffer_change_type_and_abort_resets_window"
+advance_ms = 10
+script = """
+var ms = new MediaSource();
+var video = document.createElement("video");
+var out = "";
+ms.addEventListener("sourceopen", function() {
+    var sb = ms.addSourceBuffer('video/mp4; codecs="avc1.640028"');
+    sb.appendWindowStart = 1.5;
+    sb.appendWindowEnd = 10.0;
+    sb.abort();
+    var resetOk = sb.appendWindowStart === 0 && sb.appendWindowEnd === Infinity;
+    sb.changeType('video/webm; codecs="vp9"');
+    var badErr = "";
+    try { sb.changeType('video/bogus'); } catch (e) { badErr = e.name; }
+    out = resetOk + "|" + badErr + "|" + ms.sourceBuffers.length;
+});
+video.srcObject = ms;
+"""
+assert_expr = "out"
+expected = "true|NotSupportedError|1"
+
+[[script_cases]]
+name = "mediasource_remove_source_buffer_and_detach_closes"
+advance_ms = 10
+script = """
+var ms = new MediaSource();
+var video = document.createElement("video");
+var events = [];
+ms.addEventListener("sourceclose", function() { events.push("close:" + ms.readyState + ":" + ms.sourceBuffers.length); });
+ms.addEventListener("sourceopen", function() {
+    var sb = ms.addSourceBuffer('audio/webm; codecs="opus"');
+    events.push("added:" + ms.sourceBuffers.length);
+    ms.removeSourceBuffer(sb);
+    events.push("removed:" + ms.sourceBuffers.length);
+    video.srcObject = null;
+});
+video.srcObject = ms;
+"""
+assert_expr = "events.join('|')"
+expected = "added:1|removed:0|close:closed:0"

@@ -5074,6 +5074,7 @@ dependencies = [
  "rix-jit",
  "rix-js",
  "rix-layout",
+ "rix-media",
  "rix-net",
  "rix-render",
  "rix-storage",

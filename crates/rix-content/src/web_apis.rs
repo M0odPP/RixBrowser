@@ -92,6 +92,8 @@ pub struct WebApiState {
     history_index: usize,
     pub(crate) storage: StorageEngine,
     pub(crate) object_urls: HashMap<String, Vec<u8>>,
+    pub(crate) object_url_objects: HashMap<String, HeapHandle>,
+    object_url_validators: Vec<Rc<dyn Fn(HeapHandle) -> bool>>,
     next_object_url_id: u64,
     session_storage: HashMap<String, Vec<(String, String)>>,
     perf_entries: Vec<PerfEntry>,
@@ -118,6 +120,8 @@ impl WebApiState {
             location_url: parsed,
             storage,
             object_urls: HashMap::new(),
+            object_url_objects: HashMap::new(),
+            object_url_validators: Vec::new(),
             next_object_url_id: 1,
             session_storage: HashMap::new(),
             perf_entries: Vec::new(),
@@ -152,6 +156,14 @@ impl WebApiState {
         self.storage = storage;
     }
 
+    /// Registers a predicate recognizing host objects (e.g., `MediaSource`) accepted by `URL.createObjectURL`.
+    pub(crate) fn register_object_url_validator(
+        &mut self,
+        validator: impl Fn(HeapHandle) -> bool + 'static,
+    ) {
+        self.object_url_validators.push(Rc::new(validator));
+    }
+
     /// Collects all GC roots retained by Web API objects and internal queues.
     pub fn collect_roots(&self, out: &mut Vec<JsValue>) {
         for p in [
@@ -172,6 +184,9 @@ impl WebApiState {
         for u in self.url_objects.values() {
             out.push(JsValue::from_object(u.search_params));
         }
+        for &h in self.object_url_objects.values() {
+            out.push(JsValue::from_object(h));
+        }
         for item in &self.history {
             out.push(item.state);
         }
@@ -183,6 +198,7 @@ impl WebApiState {
         self.abort_signals.retain(|&h, _| heap.is_alive(h));
         self.url_objects.retain(|&h, _| heap.is_alive(h));
         self.search_params.retain(|&h, _| heap.is_alive(h));
+        self.object_url_objects.retain(|_, &mut h| heap.is_alive(h));
     }
 }
 
@@ -1163,17 +1179,33 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
         let wa_c = Rc::clone(web_apis);
         define_host_method(vm, url_ctor, "createObjectURL", move |vm, _, args| {
             let Some(bh) = arg(args, 0).as_object() else {
-                return Err(vm.type_error("URL.createObjectURL requires a Blob argument"));
+                return Err(
+                    vm.type_error("URL.createObjectURL requires a Blob or MediaSource argument")
+                );
             };
+            let (blob_bytes, validators) = {
+                let st = wa_c.borrow();
+                (
+                    st.blobs.get(&bh).map(|b| b.bytes.clone()),
+                    st.object_url_validators.clone(),
+                )
+            };
+            let is_valid_obj = blob_bytes.is_none() && validators.iter().any(|v| v(bh));
+            if blob_bytes.is_none() && !is_valid_obj {
+                return Err(
+                    vm.type_error("URL.createObjectURL argument must be a Blob or MediaSource")
+                );
+            }
             let mut st = wa_c.borrow_mut();
-            let Some(bytes) = st.blobs.get(&bh).map(|b| b.bytes.clone()) else {
-                return Err(vm.type_error("URL.createObjectURL argument must be a Blob"));
-            };
             let id = st.next_object_url_id;
             st.next_object_url_id = st.next_object_url_id.wrapping_add(1).max(1);
             let origin = origin_of_url(&st.location_url);
             let url = format!("blob:{origin}/{id}");
-            st.object_urls.insert(url.clone(), bytes);
+            if let Some(bytes) = blob_bytes {
+                st.object_urls.insert(url.clone(), bytes);
+            } else {
+                st.object_url_objects.insert(url.clone(), bh);
+            }
             Ok(JsValue::from_string(vm.heap.alloc_string(&url)))
         });
     }
@@ -1181,7 +1213,9 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
         let wa_r = Rc::clone(web_apis);
         define_host_method(vm, url_ctor, "revokeObjectURL", move |vm, _, args| {
             let url = vm.value_to_rust_string(arg(args, 0));
-            wa_r.borrow_mut().object_urls.remove(&url);
+            let mut st = wa_r.borrow_mut();
+            st.object_urls.remove(&url);
+            st.object_url_objects.remove(&url);
             Ok(JsValue::UNDEFINED)
         });
     }

@@ -18,6 +18,7 @@ rix-ipc = { path = "../rix-ipc" }
 rix-render = { path = "../rix-render" }
 rix-js = { path = "../rix-js" }
 rix-jit = { path = "../rix-jit" }
+rix-media = { path = "../rix-media" }
 rix-net = { path = "../rix-net" }
 rix-storage = { path = "../rix-storage" }
 tokio = { workspace = true }

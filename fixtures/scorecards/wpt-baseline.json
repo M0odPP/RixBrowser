@@ -10,6 +10,7 @@
     "grid": 1,
     "html-webappapis-timers": 4,
     "indexeddb": 6,
+    "media-source": 7,
     "selectors": 2,
     "webmessaging": 6,
     "websockets": 3,
