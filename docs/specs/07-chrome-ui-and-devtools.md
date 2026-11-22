@@ -57,10 +57,14 @@ To allow comfortable **manual day-to-day testing from Phase 1**, Chrome UI ships
    - Text selection & OS clipboard copy,
    - Native HTML `<input>`, `<textarea>`, `<button>`, `<select>` interaction and GET/POST `<form>` submission,
    - Context menu (Back, Forward, Reload, Copy Link, Open Link in New Tab, Inspect / Toggle HUD).
-4. **Built-In Utility Pages (`rix://chrome/*`):**
-   - `rix://chrome/newtab.html` — Calm, focused start page (quiet search/URL entry + recent bookmarks/history grid, zero clutter).
-   - `rix://chrome/error.html` — Clear network/TLS/DNS diagnostics with retry button.
-   - `rix://chrome/crashed.html` — Tab crash recovery page showing exit reason + **Reload Tab** button.
+4. **Built-In Utility & Preferences Pages (`rix://chrome/*`):**
+   - `rix://chrome/newtab.html` (`rix://newtab`) — Calm, centered start page with active search-engine selector, 4-column pinned shortcuts grid, recent pages list, and single-row keyboard shortcut hints.
+   - `rix://chrome/settings.html` (`rix://settings`, `Ctrl+,`) — Complete preferences workspace (`248px` left navigation rail + fluid `720px` content pane) covering **Appearance** (Dark/Light polarity, Horizontal/Vertical tabs, bookmarks bar toggle, compact density, zoom/font steppers), **Search & address bar** (DuckDuckGo/Google/Startpage/Kagi, autocomplete, full URL toggle), **Privacy & security** (HTTPS-Only, cookie policy, Do Not Track, Site Isolation status, local history wipe, reset defaults), **Performance & media** (Cranelift JIT tiers, Vello GPU toggle, pure-Rust codec stack telemetry, startup HUD toggle), and **About & shortcuts**, persisted atomically as JSON via `BrowserSettings`.
+   - `rix://chrome/bookmarks.html` (`rix://bookmarks`) & `rix://chrome/history.html` (`rix://history`, `Ctrl+H`) — Unified library managers with live item removal and navigation.
+   - `rix://chrome/error.html` — Clear network/TLS/DNS diagnostics with Retry & Go back actions.
+   - `rix://chrome/crashed.html` — Isolated tab crash recovery page showing Content PID, exit reason, and **Reload tab** action.
+5. **Bookmarks Bar, App Menu & Find-in-Page (`Ctrl+F`):**
+   - Optional `32px` Bookmarks Bar (`Ctrl+B`), address-bar bookmark star (`Ctrl+D`), zoom indicator & steppers (`Ctrl+=`/`-`/`0`), floating App Menu popover, and live `Ctrl+F` Find-in-page bar with match counts.
 
 ---
 

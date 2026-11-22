@@ -4,14 +4,16 @@
 //! OS clipboard, and Content Process crash recovery.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use rix_chrome::{
-    chrome_asset_provider, chrome_stylesheet, find_link_href, palette_for, render_crashed_html,
-    render_error_html, render_newtab_html, ChromeHitTarget, ChromeRenderer, ChromeState,
-    DevHudState, FrameStageSample, NetworkEntry, RenderedChromeLayer, ThemeMode, URL_CRASHED,
-    URL_ERROR, URL_NEWTAB,
+    chrome_asset_provider, chrome_stylesheet, find_link_href, palette_for, render_bookmarks_html,
+    render_crashed_html, render_error_html, render_history_html, render_newtab_html,
+    render_settings_html, BrowserSettings, ChromeHitTarget, ChromeRenderer, ChromeState,
+    DevHudState, FrameStageSample, NetworkEntry, RenderedChromeLayer, ThemeMode, URL_BOOKMARKS,
+    URL_CRASHED, URL_ERROR, URL_HISTORY, URL_NEWTAB, URL_SETTINGS,
 };
 use rix_core::{Point, Rect, RixUrl, Size, TabId, Vec2};
 use rix_css::{CascadeOrigin, MediaContext, StyleContext, Stylesheet};
@@ -104,6 +106,7 @@ pub struct BrowserController {
     tabs_doc: HashMap<TabId, TabDocumentState>,
     last_chrome_layer: Option<RenderedChromeLayer>,
     last_overlay_layer: Option<RenderedChromeLayer>,
+    settings_path: Option<PathBuf>,
     chrome_dirty: bool,
     overlay_dirty: bool,
     web_dirty: bool,
@@ -113,6 +116,12 @@ pub struct BrowserController {
 impl BrowserController {
     #[must_use]
     pub fn new(viewport: Size, dpr: f32) -> Self {
+        Self::with_settings_path(viewport, dpr, None)
+    }
+
+    /// Creates a controller that loads and persists [`BrowserSettings`] at `settings_path`.
+    #[must_use]
+    pub fn with_settings_path(viewport: Size, dpr: f32, settings_path: Option<PathBuf>) -> Self {
         let mut font_db = FontDatabase::new();
         font_db.scan_system_fonts();
 
@@ -125,7 +134,11 @@ impl BrowserController {
             .build()
             .expect("browser network runtime initializes");
 
-        let chrome = ChromeState::new();
+        let loaded_settings = settings_path
+            .as_deref()
+            .and_then(|p| BrowserSettings::load_from_file(p).ok())
+            .unwrap_or_default();
+        let chrome = ChromeState::with_settings(loaded_settings);
         let initial_tab_id = chrome.active().id;
         let mut tabs_doc = HashMap::new();
         tabs_doc.insert(
@@ -146,6 +159,7 @@ impl BrowserController {
             tabs_doc,
             last_chrome_layer: None,
             last_overlay_layer: None,
+            settings_path,
             chrome_dirty: true,
             overlay_dirty: true,
             web_dirty: true,
@@ -178,6 +192,13 @@ impl BrowserController {
     #[must_use]
     pub fn resource_manager(&self) -> &ResourceManager {
         &self.resource_manager
+    }
+
+    /// Marks Chrome, Web, and Overlay layers dirty so direct state mutations repaint on next sync.
+    pub fn invalidate_all_layers(&mut self) {
+        self.chrome_dirty = true;
+        self.web_dirty = true;
+        self.overlay_dirty = true;
     }
 
     pub fn set_viewport(&mut self, logical: Size, dpr: f32) -> bool {
@@ -387,6 +408,57 @@ impl BrowserController {
         self.load_html_into_tab(tab_id, URL_NEWTAB, &html, true);
     }
 
+    fn load_internal_settings(&mut self, tab_id: TabId) {
+        let html = render_settings_html(&self.chrome);
+        self.load_html_into_tab(tab_id, URL_SETTINGS, &html, true);
+    }
+
+    fn load_internal_bookmarks(&mut self, tab_id: TabId) {
+        let html = render_bookmarks_html(&self.chrome);
+        self.load_html_into_tab(tab_id, URL_BOOKMARKS, &html, true);
+    }
+
+    fn load_internal_history(&mut self, tab_id: TabId) {
+        let html = render_history_html(&self.chrome);
+        self.load_html_into_tab(tab_id, URL_HISTORY, &html, true);
+    }
+
+    fn refresh_active_internal_page(&mut self) {
+        let id = self.chrome.active().id;
+        match self.chrome.active().url.as_str() {
+            URL_NEWTAB => self.load_internal_newtab(id),
+            URL_SETTINGS => self.load_internal_settings(id),
+            URL_BOOKMARKS => self.load_internal_bookmarks(id),
+            URL_HISTORY => self.load_internal_history(id),
+            _ => {}
+        }
+    }
+
+    fn persist_settings(&self) {
+        if let Some(path) = &self.settings_path {
+            let _ = self.chrome.settings.save_to_file(path);
+        }
+    }
+
+    fn update_find_match_count(&mut self) {
+        let query = self.chrome.find_bar.query.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            self.chrome.find_bar.total_matches = 0;
+            self.chrome.find_bar.match_index = 0;
+            return;
+        }
+        let active_id = self.chrome.active().id;
+        let count = self.tabs_doc.get(&active_id).map_or(0, |t| {
+            let root = t.doc.root();
+            let text = collect_element_text(&t.doc, root).to_ascii_lowercase();
+            text.matches(&query).count()
+        });
+        self.chrome.find_bar.total_matches = count;
+        if count == 0 || self.chrome.find_bar.match_index >= count {
+            self.chrome.find_bar.match_index = 0;
+        }
+    }
+
     /// Navigates the active tab to a URL (HTTP/HTTPS, `rix://chrome/*`, `file://`, or search).
     pub fn navigate_active(&mut self, raw_input: &str) {
         let target_url = self.chrome.navigate_active(raw_input);
@@ -458,6 +530,21 @@ impl BrowserController {
     ) {
         if url == URL_NEWTAB {
             self.load_internal_newtab(tab_id);
+            self.sync_layers();
+            return;
+        }
+        if url == URL_SETTINGS {
+            self.load_internal_settings(tab_id);
+            self.sync_layers();
+            return;
+        }
+        if url == URL_BOOKMARKS {
+            self.load_internal_bookmarks(tab_id);
+            self.sync_layers();
+            return;
+        }
+        if url == URL_HISTORY {
+            self.load_internal_history(tab_id);
             self.sync_layers();
             return;
         }
@@ -598,9 +685,11 @@ impl BrowserController {
             return self.activate_chrome_target(target);
         }
 
-        // Dismiss open context menu if click landed elsewhere.
-        if self.chrome.context_menu.visible {
+        // Dismiss open menus if click landed elsewhere.
+        if self.chrome.context_menu.visible || self.chrome.app_menu_open {
             self.chrome.context_menu.visible = false;
+            self.chrome.app_menu_open = false;
+            self.chrome_dirty = true;
             self.overlay_dirty = true;
         }
 
@@ -908,6 +997,68 @@ impl BrowserController {
                         return self.handle_text_input(&pasted);
                     }
                 }
+                BrowserKey::Char(',') => {
+                    self.navigate_active(URL_SETTINGS);
+                    return true;
+                }
+                BrowserKey::Char('f' | 'F') => {
+                    self.chrome.find_bar.open_and_focus();
+                    self.chrome.omnibox.blur();
+                    self.chrome.app_menu_open = false;
+                    self.update_find_match_count();
+                    self.chrome_dirty = true;
+                    self.overlay_dirty = true;
+                    self.sync_layers();
+                    return true;
+                }
+                BrowserKey::Char('d' | 'D') => {
+                    self.chrome.toggle_bookmark_active();
+                    self.refresh_active_internal_page();
+                    self.chrome_dirty = true;
+                    self.sync_layers();
+                    return true;
+                }
+                BrowserKey::Char('b' | 'B') => {
+                    self.chrome.toggle_bookmarks_bar();
+                    self.persist_settings();
+                    self.refresh_active_internal_page();
+                    self.chrome_dirty = true;
+                    self.web_dirty = true;
+                    self.overlay_dirty = true;
+                    self.sync_layers();
+                    return true;
+                }
+                BrowserKey::Char('h' | 'H') => {
+                    self.navigate_active(URL_HISTORY);
+                    return true;
+                }
+                BrowserKey::Char('=' | '+') => {
+                    self.chrome.zoom_in();
+                    self.persist_settings();
+                    self.refresh_active_internal_page();
+                    self.chrome_dirty = true;
+                    self.overlay_dirty = true;
+                    self.sync_layers();
+                    return true;
+                }
+                BrowserKey::Char('-') => {
+                    self.chrome.zoom_out();
+                    self.persist_settings();
+                    self.refresh_active_internal_page();
+                    self.chrome_dirty = true;
+                    self.overlay_dirty = true;
+                    self.sync_layers();
+                    return true;
+                }
+                BrowserKey::Char('0') => {
+                    self.chrome.zoom_reset();
+                    self.persist_settings();
+                    self.refresh_active_internal_page();
+                    self.chrome_dirty = true;
+                    self.overlay_dirty = true;
+                    self.sync_layers();
+                    return true;
+                }
                 _ => {}
             }
         }
@@ -915,10 +1066,31 @@ impl BrowserController {
         if key == BrowserKey::Escape {
             self.chrome.omnibox.blur();
             self.chrome.context_menu.visible = false;
+            self.chrome.app_menu_open = false;
+            self.chrome.find_bar.close();
             self.chrome_dirty = true;
             self.overlay_dirty = true;
             self.sync_layers();
             return true;
+        }
+
+        if self.chrome.find_bar.open && !self.chrome.omnibox.focused {
+            match key {
+                BrowserKey::Backspace => {
+                    self.chrome.find_bar.backspace();
+                    self.update_find_match_count();
+                    self.overlay_dirty = true;
+                    self.sync_layers();
+                    return true;
+                }
+                BrowserKey::Enter => {
+                    self.chrome.find_bar.step_match(!mods.shift);
+                    self.overlay_dirty = true;
+                    self.sync_layers();
+                    return true;
+                }
+                _ => {}
+            }
         }
 
         if self.chrome.omnibox.focused {
@@ -1031,11 +1203,18 @@ impl BrowserController {
         false
     }
 
-    /// Routes typed characters into the focused omnibox or focused in-page `<input>`/`<textarea>`.
+    /// Routes typed characters into the focused omnibox, find bar, or in-page `<input>`/`<textarea>`.
     pub fn handle_text_input(&mut self, text: &str) -> bool {
         if self.chrome.omnibox.focused {
             self.chrome.omnibox.insert_str(text);
             self.chrome_dirty = true;
+            self.overlay_dirty = true;
+            self.sync_layers();
+            return true;
+        }
+        if self.chrome.find_bar.open {
+            self.chrome.find_bar.insert_str(text);
+            self.update_find_match_count();
             self.overlay_dirty = true;
             self.sync_layers();
             return true;
@@ -1094,8 +1273,30 @@ impl BrowserController {
                 self.reload_active_tab();
                 true
             }
+            ChromeHitTarget::Home => {
+                let home = self.chrome.settings.home_url.clone();
+                self.navigate_active(&home);
+                true
+            }
             ChromeHitTarget::Omnibox => {
                 self.chrome.omnibox.focus_and_select_all();
+                self.chrome.app_menu_open = false;
+                self.chrome_dirty = true;
+                self.overlay_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::ToggleBookmarkStar => {
+                self.chrome.toggle_bookmark_active();
+                self.refresh_active_internal_page();
+                self.chrome_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::ResetZoom => {
+                self.chrome.zoom_reset();
+                self.persist_settings();
+                self.refresh_active_internal_page();
                 self.chrome_dirty = true;
                 self.overlay_dirty = true;
                 self.sync_layers();
@@ -1103,6 +1304,9 @@ impl BrowserController {
             }
             ChromeHitTarget::ToggleSidebar => {
                 self.chrome.toggle_tab_layout();
+                self.chrome.app_menu_open = false;
+                self.persist_settings();
+                self.refresh_active_internal_page();
                 self.chrome_dirty = true;
                 self.web_dirty = true;
                 self.overlay_dirty = true;
@@ -1111,11 +1315,9 @@ impl BrowserController {
             }
             ChromeHitTarget::ToggleTheme => {
                 self.chrome.toggle_theme();
-                let is_newtab = self.chrome.active().url == URL_NEWTAB;
-                let id = self.chrome.active().id;
-                if is_newtab {
-                    self.load_internal_newtab(id);
-                }
+                self.chrome.app_menu_open = false;
+                self.persist_settings();
+                self.refresh_active_internal_page();
                 self.chrome_dirty = true;
                 self.web_dirty = true;
                 self.overlay_dirty = true;
@@ -1124,8 +1326,63 @@ impl BrowserController {
             }
             ChromeHitTarget::ToggleHud | ChromeHitTarget::ContextToggleHud => {
                 self.chrome.context_menu.visible = false;
+                self.chrome.app_menu_open = false;
                 self.chrome.toggle_hud();
                 self.chrome_dirty = true;
+                self.overlay_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::OpenSettings => {
+                self.chrome.app_menu_open = false;
+                self.navigate_active(URL_SETTINGS);
+                true
+            }
+            ChromeHitTarget::OpenBookmarks => {
+                self.chrome.app_menu_open = false;
+                self.navigate_active(URL_BOOKMARKS);
+                true
+            }
+            ChromeHitTarget::OpenHistory => {
+                self.chrome.app_menu_open = false;
+                self.navigate_active(URL_HISTORY);
+                true
+            }
+            ChromeHitTarget::OpenNewTabPage => {
+                self.chrome.app_menu_open = false;
+                self.navigate_active(URL_NEWTAB);
+                true
+            }
+            ChromeHitTarget::ToggleAppMenu => {
+                self.chrome.toggle_app_menu();
+                self.chrome_dirty = true;
+                self.overlay_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::OpenFindBar => {
+                self.chrome.app_menu_open = false;
+                self.chrome.find_bar.open_and_focus();
+                self.update_find_match_count();
+                self.chrome_dirty = true;
+                self.overlay_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::FindPrev => {
+                self.chrome.find_bar.step_match(false);
+                self.overlay_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::FindNext => {
+                self.chrome.find_bar.step_match(true);
+                self.overlay_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::FindClose => {
+                self.chrome.find_bar.close();
                 self.overlay_dirty = true;
                 self.sync_layers();
                 true
@@ -1135,6 +1392,28 @@ impl BrowserController {
                 if let Some(item) = suggestions.get(idx) {
                     let url = item.url.clone();
                     self.navigate_active(&url);
+                }
+                true
+            }
+            ChromeHitTarget::BookmarkBarItem(idx) => {
+                if let Some(bm) = self.chrome.bookmarks.get(idx) {
+                    let url = bm.url.clone();
+                    self.navigate_active(&url);
+                }
+                true
+            }
+            ChromeHitTarget::DeleteBookmark(idx) => {
+                if self.chrome.remove_bookmark(idx) {
+                    self.refresh_active_internal_page();
+                    self.chrome_dirty = true;
+                    self.sync_layers();
+                }
+                true
+            }
+            ChromeHitTarget::DeleteHistory(idx) => {
+                if self.chrome.remove_history(idx) {
+                    self.refresh_active_internal_page();
+                    self.sync_layers();
                 }
                 true
             }
@@ -1181,6 +1460,169 @@ impl BrowserController {
                 }
                 true
             }
+            ChromeHitTarget::SettingsSelectSection(section) => {
+                self.chrome.settings_section = section;
+                self.refresh_active_internal_page();
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsSetTheme(theme) => {
+                self.chrome.set_theme(theme);
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.chrome_dirty = true;
+                self.web_dirty = true;
+                self.overlay_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsSetTabLayout(layout) => {
+                self.chrome.set_tab_layout(layout);
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.chrome_dirty = true;
+                self.web_dirty = true;
+                self.overlay_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsToggleBookmarksBar => {
+                self.chrome.toggle_bookmarks_bar();
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.chrome_dirty = true;
+                self.web_dirty = true;
+                self.overlay_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsToggleCompactToolbar => {
+                self.chrome.toggle_compact_toolbar();
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.chrome_dirty = true;
+                self.web_dirty = true;
+                self.overlay_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsZoomIn => {
+                self.chrome.zoom_in();
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.chrome_dirty = true;
+                self.overlay_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsZoomOut => {
+                self.chrome.zoom_out();
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.chrome_dirty = true;
+                self.overlay_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsFontInc => {
+                self.chrome.settings.step_font_size(1);
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsFontDec => {
+                self.chrome.settings.step_font_size(-1);
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsSetSearchEngine(engine) => {
+                self.chrome.set_search_engine(engine);
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsToggleAutocomplete => {
+                self.chrome.settings.autocomplete_enabled =
+                    !self.chrome.settings.autocomplete_enabled;
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.overlay_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsToggleFullUrl => {
+                self.chrome.settings.show_full_url = !self.chrome.settings.show_full_url;
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.chrome_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsToggleHttpsOnly => {
+                self.chrome.settings.https_only = !self.chrome.settings.https_only;
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsSetCookiePolicy(policy) => {
+                self.chrome.set_cookie_policy(policy);
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsToggleDnt => {
+                self.chrome.settings.send_dnt = !self.chrome.settings.send_dnt;
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsClearHistory => {
+                self.chrome.clear_history();
+                self.refresh_active_internal_page();
+                self.overlay_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsResetDefaults => {
+                self.chrome.reset_settings();
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.chrome_dirty = true;
+                self.web_dirty = true;
+                self.overlay_dirty = true;
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsSetJitMode(mode) => {
+                self.chrome.set_jit_mode(mode);
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsToggleGpu => {
+                self.chrome.settings.hardware_compositing =
+                    !self.chrome.settings.hardware_compositing;
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.sync_layers();
+                true
+            }
+            ChromeHitTarget::SettingsToggleHudOnStartup => {
+                self.chrome.settings.open_hud_on_startup =
+                    !self.chrome.settings.open_hud_on_startup;
+                self.persist_settings();
+                self.refresh_active_internal_page();
+                self.sync_layers();
+                true
+            }
         }
     }
 
@@ -1214,11 +1656,9 @@ impl BrowserController {
     /// Re-themes active chrome & internal pages (useful for headless dark/light screenshot renders).
     pub fn set_theme(&mut self, theme: ThemeMode) {
         if self.chrome.theme != theme {
-            self.chrome.theme = theme;
-            let id = self.chrome.active().id;
-            if self.chrome.active().url == URL_NEWTAB {
-                self.load_internal_newtab(id);
-            }
+            self.chrome.set_theme(theme);
+            self.persist_settings();
+            self.refresh_active_internal_page();
             self.chrome_dirty = true;
             self.web_dirty = true;
             self.overlay_dirty = true;

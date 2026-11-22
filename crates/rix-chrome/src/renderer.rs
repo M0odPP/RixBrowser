@@ -19,11 +19,13 @@ use rix_render::ResourceRegistry;
 use rix_text::FontDatabase;
 
 use crate::assets::{
-    render_browser_chrome_html, render_crashed_html, render_error_html, render_hud_html,
-    render_newtab_html, render_overlay_html,
+    render_bookmarks_html, render_browser_chrome_html, render_crashed_html, render_error_html,
+    render_history_html, render_hud_html, render_newtab_html, render_overlay_html,
+    render_settings_html,
 };
 use crate::hud::{DevHudState, HudTab};
-use crate::state::ChromeState;
+use crate::settings::{CookiePolicy, JitMode, SearchEngine, SettingsSection};
+use crate::state::{ChromeState, TabLayoutMode};
 use crate::tokens::{chrome_stylesheet, ThemeMode};
 
 /// Semantic interactive Chrome UI element resolved from pointer coordinates.
@@ -35,11 +37,26 @@ pub enum ChromeHitTarget {
     Back,
     Forward,
     Reload,
+    Home,
     Omnibox,
+    ToggleBookmarkStar,
+    ResetZoom,
     ToggleSidebar,
     ToggleTheme,
     ToggleHud,
+    OpenSettings,
+    OpenBookmarks,
+    OpenHistory,
+    OpenNewTabPage,
+    ToggleAppMenu,
+    OpenFindBar,
+    FindPrev,
+    FindNext,
+    FindClose,
     Suggestion(usize),
+    BookmarkBarItem(usize),
+    DeleteBookmark(usize),
+    DeleteHistory(usize),
     HudTab(HudTab),
     ContextBack,
     ContextForward,
@@ -52,6 +69,27 @@ pub enum ChromeHitTarget {
     OpenNewTabFromCrashed,
     RetryError,
     HistoryLink(usize),
+    // Settings page interactive controls
+    SettingsSelectSection(SettingsSection),
+    SettingsSetTheme(ThemeMode),
+    SettingsSetTabLayout(TabLayoutMode),
+    SettingsToggleBookmarksBar,
+    SettingsToggleCompactToolbar,
+    SettingsZoomIn,
+    SettingsZoomOut,
+    SettingsFontInc,
+    SettingsFontDec,
+    SettingsSetSearchEngine(SearchEngine),
+    SettingsToggleAutocomplete,
+    SettingsToggleFullUrl,
+    SettingsToggleHttpsOnly,
+    SettingsSetCookiePolicy(CookiePolicy),
+    SettingsToggleDnt,
+    SettingsClearHistory,
+    SettingsResetDefaults,
+    SettingsSetJitMode(JitMode),
+    SettingsToggleGpu,
+    SettingsToggleHudOnStartup,
 }
 
 /// Cached rendered Chrome / Overlay frame along with its DOM + FragmentTree for hit-testing.
@@ -155,8 +193,8 @@ impl ChromeRenderer {
         )
     }
 
-    /// Renders transient overlays (`z = 200`): omnibox dropdown, context menu,
-    /// hover URL preview pill, and `F12` Developer HUD.
+    /// Renders transient overlays (`z = 200`): omnibox dropdown, app menu, find bar,
+    /// context menu, hover URL preview pill, and `F12` Developer HUD.
     #[allow(clippy::too_many_arguments)]
     pub fn render_overlay(
         &mut self,
@@ -183,7 +221,7 @@ impl ChromeRenderer {
         )
     }
 
-    /// Renders a built-in internal page (`newtab.html`, `error.html`, `crashed.html`, `hud.html`).
+    /// Renders a built-in internal page (`newtab`, `settings`, `bookmarks`, `history`, `error`, `crashed`, `hud`).
     pub fn render_internal_document(
         &mut self,
         html: &str,
@@ -218,6 +256,45 @@ impl ChromeRenderer {
         resources: &mut ResourceRegistry,
     ) -> RenderedChromeLayer {
         let html = render_newtab_html(state);
+        self.render_internal_document(&html, state.theme, viewport, font_db, pipeline, resources)
+    }
+
+    /// Convenience helper rendering `settings.html` for the active theme and section.
+    pub fn render_settings(
+        &mut self,
+        state: &ChromeState,
+        viewport: Size,
+        font_db: &FontDatabase,
+        pipeline: PipelineId,
+        resources: &mut ResourceRegistry,
+    ) -> RenderedChromeLayer {
+        let html = render_settings_html(state);
+        self.render_internal_document(&html, state.theme, viewport, font_db, pipeline, resources)
+    }
+
+    /// Convenience helper rendering `bookmarks.html`.
+    pub fn render_bookmarks(
+        &mut self,
+        state: &ChromeState,
+        viewport: Size,
+        font_db: &FontDatabase,
+        pipeline: PipelineId,
+        resources: &mut ResourceRegistry,
+    ) -> RenderedChromeLayer {
+        let html = render_bookmarks_html(state);
+        self.render_internal_document(&html, state.theme, viewport, font_db, pipeline, resources)
+    }
+
+    /// Convenience helper rendering `history.html`.
+    pub fn render_history(
+        &mut self,
+        state: &ChromeState,
+        viewport: Size,
+        font_db: &FontDatabase,
+        pipeline: PipelineId,
+        resources: &mut ResourceRegistry,
+    ) -> RenderedChromeLayer {
+        let html = render_history_html(state);
         self.render_internal_document(&html, state.theme, viewport, font_db, pipeline, resources)
     }
 
@@ -316,15 +393,69 @@ pub fn parse_chrome_hit_id(id: &str) -> Option<ChromeHitTarget> {
     if let Some(rest) = id.strip_prefix("history-") {
         return rest.parse::<usize>().ok().map(ChromeHitTarget::HistoryLink);
     }
+    if let Some(rest) = id.strip_prefix("bm-bar-") {
+        return rest
+            .parse::<usize>()
+            .ok()
+            .map(ChromeHitTarget::BookmarkBarItem);
+    }
+    if let Some(rest) = id.strip_prefix("bookmark-") {
+        return rest
+            .parse::<usize>()
+            .ok()
+            .map(ChromeHitTarget::BookmarkBarItem);
+    }
+    if let Some(rest) = id.strip_prefix("bm-del-") {
+        return rest
+            .parse::<usize>()
+            .ok()
+            .map(ChromeHitTarget::DeleteBookmark);
+    }
+    if let Some(rest) = id.strip_prefix("hist-del-") {
+        return rest
+            .parse::<usize>()
+            .ok()
+            .map(ChromeHitTarget::DeleteHistory);
+    }
+    if let Some(rest) = id.strip_prefix("settings-sec-") {
+        return SettingsSection::from_id(rest).map(ChromeHitTarget::SettingsSelectSection);
+    }
+    if let Some(rest) = id.strip_prefix("set-engine-") {
+        return SearchEngine::from_id(rest).map(ChromeHitTarget::SettingsSetSearchEngine);
+    }
+    if let Some(rest) = id.strip_prefix("set-cookie-") {
+        return CookiePolicy::from_id(rest).map(ChromeHitTarget::SettingsSetCookiePolicy);
+    }
+    if let Some(rest) = id.strip_prefix("set-jit-") {
+        return JitMode::from_id(rest).map(ChromeHitTarget::SettingsSetJitMode);
+    }
     match id {
-        "btn-new-tab" => Some(ChromeHitTarget::NewTab),
+        "btn-new-tab" | "menu-new-tab" => Some(ChromeHitTarget::NewTab),
         "btn-back" => Some(ChromeHitTarget::Back),
         "btn-forward" => Some(ChromeHitTarget::Forward),
         "btn-reload" => Some(ChromeHitTarget::Reload),
+        "btn-home" => Some(ChromeHitTarget::Home),
         "omnibox" => Some(ChromeHitTarget::Omnibox),
-        "btn-sidebar" => Some(ChromeHitTarget::ToggleSidebar),
-        "btn-theme" => Some(ChromeHitTarget::ToggleTheme),
-        "btn-hud" => Some(ChromeHitTarget::ToggleHud),
+        "btn-bookmark-star" => Some(ChromeHitTarget::ToggleBookmarkStar),
+        "btn-zoom-reset" => Some(ChromeHitTarget::ResetZoom),
+        "btn-sidebar" | "menu-tabs" => Some(ChromeHitTarget::ToggleSidebar),
+        "btn-theme" | "menu-theme" => Some(ChromeHitTarget::ToggleTheme),
+        "btn-hud" | "menu-hud" => Some(ChromeHitTarget::ToggleHud),
+        "btn-settings" | "nav-open-settings" | "menu-settings" => {
+            Some(ChromeHitTarget::OpenSettings)
+        }
+        "bm-open-bookmarks" | "nav-open-bookmarks" | "menu-bookmarks" => {
+            Some(ChromeHitTarget::OpenBookmarks)
+        }
+        "bm-open-history" | "nav-open-history" | "menu-history" => {
+            Some(ChromeHitTarget::OpenHistory)
+        }
+        "nav-open-newtab" => Some(ChromeHitTarget::OpenNewTabPage),
+        "btn-menu" => Some(ChromeHitTarget::ToggleAppMenu),
+        "menu-find" => Some(ChromeHitTarget::OpenFindBar),
+        "find-prev" => Some(ChromeHitTarget::FindPrev),
+        "find-next" => Some(ChromeHitTarget::FindNext),
+        "find-close" => Some(ChromeHitTarget::FindClose),
         "hud-tab-perf" => Some(ChromeHitTarget::HudTab(HudTab::Performance)),
         "hud-tab-net" => Some(ChromeHitTarget::HudTab(HudTab::Network)),
         "hud-tab-missing" => Some(ChromeHitTarget::HudTab(HudTab::MissingFeatures)),
@@ -339,6 +470,28 @@ pub fn parse_chrome_hit_id(id: &str) -> Option<ChromeHitTarget> {
         "btn-reload-crashed" => Some(ChromeHitTarget::ReloadCrashedTab),
         "btn-newtab-crashed" => Some(ChromeHitTarget::OpenNewTabFromCrashed),
         "btn-retry" => Some(ChromeHitTarget::RetryError),
+        "set-theme-dark" => Some(ChromeHitTarget::SettingsSetTheme(ThemeMode::Dark)),
+        "set-theme-light" => Some(ChromeHitTarget::SettingsSetTheme(ThemeMode::Light)),
+        "set-tabs-horizontal" => Some(ChromeHitTarget::SettingsSetTabLayout(
+            TabLayoutMode::Horizontal,
+        )),
+        "set-tabs-vertical" => Some(ChromeHitTarget::SettingsSetTabLayout(
+            TabLayoutMode::Vertical,
+        )),
+        "set-toggle-bookmarks-bar" => Some(ChromeHitTarget::SettingsToggleBookmarksBar),
+        "set-toggle-compact" => Some(ChromeHitTarget::SettingsToggleCompactToolbar),
+        "set-zoom-in" => Some(ChromeHitTarget::SettingsZoomIn),
+        "set-zoom-out" => Some(ChromeHitTarget::SettingsZoomOut),
+        "set-font-inc" => Some(ChromeHitTarget::SettingsFontInc),
+        "set-font-dec" => Some(ChromeHitTarget::SettingsFontDec),
+        "set-toggle-autocomplete" => Some(ChromeHitTarget::SettingsToggleAutocomplete),
+        "set-toggle-full-url" => Some(ChromeHitTarget::SettingsToggleFullUrl),
+        "set-toggle-https-only" => Some(ChromeHitTarget::SettingsToggleHttpsOnly),
+        "set-toggle-dnt" => Some(ChromeHitTarget::SettingsToggleDnt),
+        "set-clear-history" => Some(ChromeHitTarget::SettingsClearHistory),
+        "set-reset-defaults" => Some(ChromeHitTarget::SettingsResetDefaults),
+        "set-toggle-gpu" => Some(ChromeHitTarget::SettingsToggleGpu),
+        "set-toggle-hud-startup" => Some(ChromeHitTarget::SettingsToggleHudOnStartup),
         _ => None,
     }
 }
