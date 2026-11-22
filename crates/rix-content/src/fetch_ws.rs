@@ -219,6 +219,12 @@ pub struct NetworkBridge {
 pub type SharedNetBridge = Rc<RefCell<NetworkBridge>>;
 
 impl NetworkBridge {
+    /// Returns `true` when at least one async `fetch()` request or live `WebSocket` is active.
+    #[must_use]
+    pub fn has_pending_io(&self) -> bool {
+        !self.pending_fetches.is_empty() || !self.websockets.is_empty()
+    }
+
     pub(crate) fn new(fetch_engine: Arc<FetchEngine>) -> Self {
         let (async_tx, async_rx) = mpsc::unbounded_channel();
         Self {

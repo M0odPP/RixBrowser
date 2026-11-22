@@ -97,6 +97,7 @@ pub struct WebApiState {
     next_object_url_id: u64,
     session_storage: HashMap<String, Vec<(String, String)>>,
     perf_entries: Vec<PerfEntry>,
+    pub console_messages: Vec<(String, String)>,
     pub(crate) protos: WebApiPrototypes,
 }
 
@@ -125,8 +126,22 @@ impl WebApiState {
             next_object_url_id: 1,
             session_storage: HashMap::new(),
             perf_entries: Vec::new(),
+            console_messages: Vec::new(),
             protos: WebApiPrototypes::default(),
         }
+    }
+
+    /// Records a console message (`log`, `info`, `warn`, `error`, `debug`) for Developer HUD display.
+    pub fn record_console(&mut self, level: impl Into<String>, message: impl Into<String>) {
+        self.console_messages.push((level.into(), message.into()));
+        if self.console_messages.len() > 256 {
+            self.console_messages.remove(0);
+        }
+    }
+
+    /// Drains all buffered JS console entries since the last drain.
+    pub fn drain_console_messages(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.console_messages)
     }
 
     /// Updates the current document URL (affecting `location`, `history`, `localStorage`, and CORS origin).
@@ -437,6 +452,8 @@ pub fn install_web_apis(
     install_location_and_history(vm, &web_apis);
     install_web_storage(vm, &web_apis);
     install_performance(vm, event_loop, &web_apis);
+    install_console(vm, &web_apis);
+    install_window_and_navigator(vm, host, event_loop);
     web_apis
 }
 
@@ -2711,4 +2728,278 @@ fn install_performance(vm: &mut JsVm, event_loop: &SharedEventLoop, web_apis: &S
     });
 
     define_global(vm, "performance", JsValue::from_object(perf));
+}
+
+// ---------------------------------------------------------------------------
+// Console, Window Viewport/Scroll, matchMedia, requestIdleCallback, Navigator
+// ---------------------------------------------------------------------------
+
+fn install_console(vm: &mut JsVm, web_apis: &SharedWebApis) {
+    let console_obj = vm.alloc_ordinary_object();
+    for level in ["log", "info", "warn", "error", "debug", "dir", "table"] {
+        let wa = Rc::clone(web_apis);
+        let lvl = level.to_string();
+        define_host_method(vm, console_obj, level, move |vm, _, args| {
+            let formatted: Vec<String> = args.iter().map(|&v| vm.value_to_rust_string(v)).collect();
+            wa.borrow_mut()
+                .record_console(lvl.clone(), formatted.join(" "));
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+    let wa_assert = Rc::clone(web_apis);
+    define_host_method(vm, console_obj, "assert", move |vm, _, args| {
+        let ok = args.first().copied().is_some_and(|v| vm.to_boolean(v));
+        if !ok {
+            let msg: Vec<String> = args
+                .iter()
+                .skip(1)
+                .map(|&v| vm.value_to_rust_string(v))
+                .collect();
+            let text = if msg.is_empty() {
+                "Assertion failed".to_string()
+            } else {
+                format!("Assertion failed: {}", msg.join(" "))
+            };
+            wa_assert.borrow_mut().record_console("error", text);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_method(vm, console_obj, "clear", |_, _, _| Ok(JsValue::UNDEFINED));
+    define_host_method(vm, console_obj, "group", |_, _, _| Ok(JsValue::UNDEFINED));
+    define_host_method(vm, console_obj, "groupEnd", |_, _, _| {
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_method(vm, console_obj, "time", |_, _, _| Ok(JsValue::UNDEFINED));
+    define_host_method(vm, console_obj, "timeEnd", |_, _, _| Ok(JsValue::UNDEFINED));
+    define_global(vm, "console", JsValue::from_object(console_obj));
+}
+
+fn install_window_and_navigator(vm: &mut JsVm, host: &SharedHost, event_loop: &SharedEventLoop) {
+    let global = vm.global;
+
+    // Live viewport & scroll getters on `window` / `globalThis`.
+    let h = Rc::clone(host);
+    define_host_getter(vm, global, "innerWidth", move |_, _, _| {
+        Ok(JsValue::from_number(f64::from(h.borrow().viewport.width)))
+    });
+
+    let h = Rc::clone(host);
+    define_host_getter(vm, global, "innerHeight", move |_, _, _| {
+        Ok(JsValue::from_number(f64::from(h.borrow().viewport.height)))
+    });
+
+    let h = Rc::clone(host);
+    define_host_getter(vm, global, "devicePixelRatio", move |_, _, _| {
+        Ok(JsValue::from_number(f64::from(
+            h.borrow().device_pixel_ratio,
+        )))
+    });
+
+    let h = Rc::clone(host);
+    define_host_getter(vm, global, "scrollX", move |_, _, _| {
+        Ok(JsValue::from_number(f64::from(h.borrow().scroll_offset.x)))
+    });
+
+    let h = Rc::clone(host);
+    define_host_getter(vm, global, "pageXOffset", move |_, _, _| {
+        Ok(JsValue::from_number(f64::from(h.borrow().scroll_offset.x)))
+    });
+
+    let h = Rc::clone(host);
+    define_host_getter(vm, global, "scrollY", move |_, _, _| {
+        Ok(JsValue::from_number(f64::from(h.borrow().scroll_offset.y)))
+    });
+
+    let h = Rc::clone(host);
+    define_host_getter(vm, global, "pageYOffset", move |_, _, _| {
+        Ok(JsValue::from_number(f64::from(h.borrow().scroll_offset.y)))
+    });
+
+    let h = Rc::clone(host);
+    define_host_method(vm, global, "scrollTo", move |vm, _, args| {
+        let first = arg(args, 0);
+        if let Some(obj) = first.as_object() {
+            let k_top = vm.heap.intern_key("top");
+            let k_left = vm.heap.intern_key("left");
+            if let Ok(v) = vm.get_property_by_key(obj, k_left) {
+                if !v.is_undefined() {
+                    let x = vm.to_number(v)?;
+                    if x.is_finite() {
+                        h.borrow_mut().scroll_offset.x = (x as f32).max(0.0);
+                    }
+                }
+            }
+            if let Ok(v) = vm.get_property_by_key(obj, k_top) {
+                if !v.is_undefined() {
+                    let y = vm.to_number(v)?;
+                    if y.is_finite() {
+                        h.borrow_mut().scroll_offset.y = (y as f32).max(0.0);
+                    }
+                }
+            }
+        } else {
+            let x = vm.to_number(first)?;
+            let y = vm.to_number(arg(args, 1))?;
+            if x.is_finite() {
+                h.borrow_mut().scroll_offset.x = (x as f32).max(0.0);
+            }
+            if y.is_finite() {
+                h.borrow_mut().scroll_offset.y = (y as f32).max(0.0);
+            }
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    let h = Rc::clone(host);
+    define_host_method(vm, global, "scrollBy", move |vm, _, args| {
+        let dx = vm.to_number(arg(args, 0))?;
+        let dy = vm.to_number(arg(args, 1))?;
+        let mut hs = h.borrow_mut();
+        if dx.is_finite() {
+            hs.scroll_offset.x = (hs.scroll_offset.x + dx as f32).max(0.0);
+        }
+        if dy.is_finite() {
+            hs.scroll_offset.y = (hs.scroll_offset.y + dy as f32).max(0.0);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    // window.matchMedia(query)
+    let h = Rc::clone(host);
+    define_host_method(vm, global, "matchMedia", move |vm, _, args| {
+        let query = vm.value_to_rust_string(arg(args, 0));
+        let (vp, dark) = {
+            let hs = h.borrow();
+            (hs.viewport, hs.dark_mode)
+        };
+        let matches = evaluate_simple_media_query(&query, vp.width, vp.height, dark);
+        let mql = vm.alloc_ordinary_object();
+        let k_matches = vm.heap.intern_key("matches");
+        let k_media = vm.heap.intern_key("media");
+        let media_s = JsValue::from_string(vm.heap.alloc_string(&query));
+        vm.heap.object_define_data(
+            mql,
+            k_matches,
+            JsValue::from_bool(matches),
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+        vm.heap.object_define_data(
+            mql,
+            k_media,
+            media_s,
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+        define_host_method(vm, mql, "addEventListener", |_, _, _| {
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_method(vm, mql, "removeEventListener", |_, _, _| {
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_method(vm, mql, "addListener", |_, _, _| Ok(JsValue::UNDEFINED));
+        define_host_method(vm, mql, "removeListener", |_, _, _| Ok(JsValue::UNDEFINED));
+        Ok(JsValue::from_object(mql))
+    });
+
+    // window.requestIdleCallback / cancelIdleCallback
+    let el = Rc::clone(event_loop);
+    define_host_method(vm, global, "requestIdleCallback", move |vm, _, args| {
+        let Some(cb) = arg(args, 0)
+            .as_object()
+            .filter(|&h| vm.is_callable_handle(h))
+        else {
+            return Ok(JsValue::from_i32(0));
+        };
+        let deadline = vm.alloc_ordinary_object();
+        let k_did = vm.heap.intern_key("didTimeout");
+        vm.heap.object_define_data(
+            deadline,
+            k_did,
+            JsValue::FALSE,
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+        define_host_method(vm, deadline, "timeRemaining", |_, _, _| {
+            Ok(JsValue::from_number(12.0))
+        });
+        let id =
+            el.borrow_mut()
+                .schedule_timer(cb, 1.0, vec![JsValue::from_object(deadline)], false);
+        Ok(JsValue::from_i32(id as i32))
+    });
+    let el = Rc::clone(event_loop);
+    define_host_method(vm, global, "cancelIdleCallback", move |vm, _, args| {
+        let id = vm.to_number(arg(args, 0))? as u32;
+        el.borrow_mut().clear_timer(id);
+        Ok(JsValue::UNDEFINED)
+    });
+
+    // navigator object (preserved & extended by service_worker.rs and webgpu.rs).
+    let nav = vm.alloc_ordinary_object();
+    let ua = JsValue::from_string(
+        vm.heap
+            .alloc_string("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) RixBrowser/0.2.0 Safari/537.36"),
+    );
+    let lang = JsValue::from_string(vm.heap.alloc_string("en-US"));
+    let langs = vm.alloc_array();
+    vm.heap.object_push_element(langs, lang);
+    let plat = JsValue::from_string(vm.heap.alloc_string("Linux x86_64"));
+    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get) as f64;
+    for (k, v) in [
+        ("userAgent", ua),
+        ("language", lang),
+        ("languages", JsValue::from_object(langs)),
+        ("platform", plat),
+        ("hardwareConcurrency", JsValue::from_number(cores)),
+        ("onLine", JsValue::TRUE),
+        ("cookieEnabled", JsValue::TRUE),
+    ] {
+        let key = vm.heap.intern_key(k);
+        vm.heap
+            .object_define_data(nav, key, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    }
+    define_global(vm, "navigator", JsValue::from_object(nav));
+}
+
+fn evaluate_simple_media_query(query: &str, vw: f32, vh: f32, dark_mode: bool) -> bool {
+    let lower = query.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower == "all" || lower == "screen" {
+        return true;
+    }
+    if lower == "print" {
+        return false;
+    }
+    if lower.contains("prefers-color-scheme: dark") || lower.contains("prefers-color-scheme:dark") {
+        return dark_mode;
+    }
+    if lower.contains("prefers-color-scheme: light") || lower.contains("prefers-color-scheme:light")
+    {
+        return !dark_mode;
+    }
+    if lower.contains("prefers-reduced-motion: reduce") {
+        return false;
+    }
+    if let Some(px) = extract_media_px(&lower, "min-width:") {
+        return vw >= px;
+    }
+    if let Some(px) = extract_media_px(&lower, "max-width:") {
+        return vw <= px;
+    }
+    if let Some(px) = extract_media_px(&lower, "min-height:") {
+        return vh >= px;
+    }
+    if let Some(px) = extract_media_px(&lower, "max-height:") {
+        return vh <= px;
+    }
+    true
+}
+
+fn extract_media_px(haystack: &str, key: &str) -> Option<f32> {
+    let idx = haystack.find(key)?;
+    let rest = haystack[idx + key.len()..].trim_start();
+    let num_end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(rest.len());
+    rest[..num_end].parse::<f32>().ok()
 }

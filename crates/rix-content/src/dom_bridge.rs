@@ -109,9 +109,15 @@ pub struct HostState {
     pub active_parser: Option<Rc<RefCell<HtmlParserStream>>>,
     pub ready_state: String,
     pub viewport: Size,
+    pub scroll_offset: Point,
+    pub device_pixel_ratio: f32,
+    pub dark_mode: bool,
     pub font_db: Arc<FontDatabase>,
     pub layout_engine: LayoutEngine,
     style_ctx: StyleContext,
+    external_stylesheets: Vec<Arc<Stylesheet>>,
+    sheets_dirty: bool,
+    last_inline_style_hash: u64,
     last_style_revs: Option<(u64, u64)>,
     last_layout_revs: Option<(u64, u64)>,
     last_paint_revs: Option<(u64, u64)>,
@@ -150,9 +156,15 @@ impl HostState {
             active_parser: None,
             ready_state: "complete".to_string(),
             viewport,
+            scroll_offset: Point::ZERO,
+            device_pixel_ratio: 1.0,
+            dark_mode: false,
             font_db,
             layout_engine: LayoutEngine::new(),
             style_ctx: StyleContext::new(media),
+            external_stylesheets: Vec::new(),
+            sheets_dirty: true,
+            last_inline_style_hash: 0,
             last_style_revs: None,
             last_layout_revs: None,
             last_paint_revs: None,
@@ -220,29 +232,84 @@ impl HostState {
         removed
     }
 
-    /// Recomputes CSS cascade ONLY when document structure or style revision changed.
+    /// Installs pre-parsed external `<link rel="stylesheet">` stylesheets and triggers a style refresh.
+    pub fn set_external_stylesheets(&mut self, sheets: Vec<Arc<Stylesheet>>) {
+        self.external_stylesheets = sheets;
+        self.sheets_dirty = true;
+        self.last_style_revs = None;
+        self.last_layout_revs = None;
+        self.last_paint_revs = None;
+    }
+
+    /// Updates viewport dimensions and marks styles/layout dirty when size changed.
+    pub fn set_viewport(&mut self, viewport: Size) {
+        if (self.viewport.width - viewport.width).abs() > 0.5
+            || (self.viewport.height - viewport.height).abs() > 0.5
+        {
+            self.viewport = viewport;
+            self.sheets_dirty = true;
+            self.last_style_revs = None;
+            self.last_layout_revs = None;
+            self.last_paint_revs = None;
+        }
+    }
+
+    /// Updates `prefers-color-scheme` dark mode state for CSS `@media` queries and painting.
+    pub fn set_dark_mode(&mut self, dark_mode: bool) {
+        if self.dark_mode != dark_mode {
+            self.dark_mode = dark_mode;
+            self.layout_engine.dark_mode = dark_mode;
+            self.sheets_dirty = true;
+            self.last_style_revs = None;
+            self.last_layout_revs = None;
+            self.last_paint_revs = None;
+        }
+    }
+
+    /// Forces the next `paint_if_dirty*` call to repaint even if DOM revisions did not change
+    /// (for example after async images or web fonts finish loading).
+    pub fn invalidate_paint(&mut self) {
+        self.last_layout_revs = None;
+        self.last_paint_revs = None;
+    }
+
+    #[must_use]
+    pub fn style_context(&self) -> &StyleContext {
+        &self.style_ctx
+    }
+
+    #[must_use]
+    pub fn cached_fragment_tree(&self) -> Option<&FragmentTree> {
+        self.cached_fragment_tree.as_ref()
+    }
+
+    #[must_use]
+    pub fn missing_css_features(&self) -> &[rix_css::MissingCssFeature] {
+        self.style_ctx.missing_features()
+    }
+
+    /// Recomputes CSS cascade ONLY when document structure, style revision, or stylesheets changed.
+    /// Uses fast incremental `restyle_dirty` when only DOM nodes/attributes mutated and cached
+    /// `Stylesheet::parse_cached` when rebuilding the stylesheet list.
     pub fn ensure_styles(&mut self) -> &StyleContext {
         let revs = {
             let doc = self.document.borrow();
             (doc.revision(), doc.style_revision())
         };
-        if self.last_style_revs == Some(revs) {
+        if !self.sheets_dirty && self.last_style_revs == Some(revs) {
             return &self.style_ctx;
         }
-        let media = MediaContext {
-            viewport_width: self.viewport.width,
-            viewport_height: self.viewport.height,
-            ..MediaContext::default()
-        };
-        let mut ctx = StyleContext::new(media);
-        let sheets: Vec<String> = {
+
+        let (inline_hash, maybe_sheets) = {
             let doc = self.document.borrow();
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
             let mut css_blocks = Vec::new();
             for node in doc.descendants_with_shadow_roots(doc.root()) {
                 if let Some(NodeData::Element(el)) = doc.get(node) {
                     if el.name.local.as_str().eq_ignore_ascii_case("style") {
                         let text = doc.inner_text(node);
                         if !text.trim().is_empty() {
+                            h = fnv_mix(h, text.as_bytes());
                             css_blocks.push(text);
                         }
                     }
@@ -250,14 +317,47 @@ impl HostState {
             }
             for sheet in doc.all_dynamic_stylesheets().values() {
                 if !sheet.trim().is_empty() {
+                    h = fnv_mix(h, sheet.as_bytes());
                     css_blocks.push(sheet.clone());
                 }
             }
-            css_blocks
+            (h, css_blocks)
         };
-        for css in sheets {
-            let parsed = Stylesheet::parse(&css, CascadeOrigin::Author, &media);
-            ctx.add_stylesheet(Arc::new(parsed));
+
+        if !self.sheets_dirty
+            && self.last_style_revs.is_some()
+            && inline_hash == self.last_inline_style_hash
+        {
+            // Fast path: stylesheets unchanged — run targeted incremental `restyle_dirty` only!
+            {
+                let mut doc = self.document.borrow_mut();
+                let _ = self.style_ctx.restyle_dirty(&mut doc);
+            }
+            let post_revs = {
+                let doc = self.document.borrow();
+                (doc.revision(), doc.style_revision())
+            };
+            self.last_style_revs = Some(post_revs);
+            self.style_recalc_count += 1;
+            return &self.style_ctx;
+        }
+
+        let media = MediaContext {
+            viewport_width: self.viewport.width,
+            viewport_height: self.viewport.height,
+            dark_mode: self.dark_mode,
+            ..MediaContext::default()
+        };
+        let mut ctx = StyleContext::new(media);
+        for ext in &self.external_stylesheets {
+            ctx.add_stylesheet(Arc::clone(ext));
+        }
+        for css in maybe_sheets {
+            ctx.add_stylesheet(Stylesheet::parse_cached(
+                &css,
+                CascadeOrigin::Author,
+                &media,
+            ));
         }
         {
             let mut doc = self.document.borrow_mut();
@@ -268,6 +368,8 @@ impl HostState {
             (doc.revision(), doc.style_revision())
         };
         self.style_ctx = ctx;
+        self.sheets_dirty = false;
+        self.last_inline_style_hash = inline_hash;
         self.last_style_revs = Some(post_revs);
         self.style_recalc_count += 1;
         &self.style_ctx
@@ -309,6 +411,51 @@ impl HostState {
         ctx.style_for(node).cloned()
     }
 
+    /// Rebuilds the page [`rix_render::DisplayList`] ONLY when the DOM or CSS revisions changed,
+    /// returning `(DisplayList, style_ms, layout_ms, paint_ms)` for live telemetry.
+    pub fn paint_if_dirty_with_metrics(
+        &mut self,
+        pipeline: rix_ipc::PipelineId,
+        resources: &mut rix_render::ResourceRegistry,
+    ) -> Option<(rix_render::DisplayList, f32, f32, f32)> {
+        let revs = {
+            let doc = self.document.borrow();
+            (doc.revision(), doc.style_revision())
+        };
+        if !self.sheets_dirty && self.last_paint_revs == Some(revs) {
+            return None;
+        }
+        let t_style = std::time::Instant::now();
+        let _ = self.ensure_styles();
+        let style_ms = t_style.elapsed().as_secs_f32() * 1000.0;
+
+        let t_layout = std::time::Instant::now();
+        let _ = self.ensure_layout();
+        let layout_ms = t_layout.elapsed().as_secs_f32() * 1000.0;
+
+        let post_revs = {
+            let doc = self.document.borrow();
+            (doc.revision(), doc.style_revision())
+        };
+        let tree = self.cached_fragment_tree.as_ref()?;
+        let t_paint = std::time::Instant::now();
+        let keyframes = self.style_ctx.all_keyframes();
+        let dl = rix_layout::paint_fragment_tree_with_keyframes(
+            tree,
+            &self.font_db,
+            &self.layout_engine.assets,
+            &keyframes,
+            self.viewport,
+            pipeline,
+            resources,
+            self.layout_engine.dark_mode,
+        );
+        let paint_ms = t_paint.elapsed().as_secs_f32() * 1000.0;
+        self.last_paint_revs = Some(post_revs);
+        self.display_list_build_count += 1;
+        Some((dl, style_ms, layout_ms, paint_ms))
+    }
+
     /// Rebuilds the page [`rix_render::DisplayList`] ONLY when the DOM or CSS revisions changed.
     /// During 60 FPS Canvas2D animations this returns `None` (zero DisplayList rebuilds!).
     pub fn paint_if_dirty(
@@ -316,30 +463,8 @@ impl HostState {
         pipeline: rix_ipc::PipelineId,
         resources: &mut rix_render::ResourceRegistry,
     ) -> Option<rix_render::DisplayList> {
-        let revs = {
-            let doc = self.document.borrow();
-            (doc.revision(), doc.style_revision())
-        };
-        if self.last_paint_revs == Some(revs) {
-            return None;
-        }
-        let _ = self.ensure_layout();
-        let post_revs = {
-            let doc = self.document.borrow();
-            (doc.revision(), doc.style_revision())
-        };
-        let tree = self.cached_fragment_tree.as_ref()?;
-        let dl = rix_layout::paint_fragment_tree(
-            tree,
-            &self.font_db,
-            &self.layout_engine.assets,
-            pipeline,
-            resources,
-            self.layout_engine.dark_mode,
-        );
-        self.last_paint_revs = Some(post_revs);
-        self.display_list_build_count += 1;
-        Some(dl)
+        self.paint_if_dirty_with_metrics(pipeline, resources)
+            .map(|(dl, _, _, _)| dl)
     }
 
     /// Forces a fresh layout + paint of the current document into a [`rix_render::DisplayList`].
@@ -1039,6 +1164,39 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
             get_attr_string(&h, nid, &name).is_some(),
         ))
     });
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "toggleAttribute", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let name = vm.value_to_rust_string(arg(args, 0));
+        let has = get_attr_string(&h, nid, &name).is_some();
+        let force = args.get(1).copied();
+        let want = match force {
+            Some(v) if !v.is_undefined() => vm.to_boolean(v),
+            _ => !has,
+        };
+        if want {
+            if !has {
+                set_element_attr(vm, &h, nid, &name, "");
+            }
+            Ok(JsValue::TRUE)
+        } else {
+            if has {
+                remove_element_attr(vm, &h, nid, &name);
+            }
+            Ok(JsValue::FALSE)
+        }
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "insertAdjacentHTML", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let pos = vm.value_to_rust_string(arg(args, 0)).to_ascii_lowercase();
+        let html = vm.value_to_rust_string(arg(args, 1));
+        insert_adjacent_html(vm, &h, nid, &pos, &html);
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_method(vm, ep, "focus", |_, _, _| Ok(JsValue::UNDEFINED));
+    define_host_method(vm, ep, "blur", |_, _, _| Ok(JsValue::UNDEFINED));
+    define_host_method(vm, ep, "scrollIntoView", |_, _, _| Ok(JsValue::UNDEFINED));
 
     // Element traversal getters
     let h = Rc::clone(host);
@@ -1406,6 +1564,93 @@ fn set_inner_html(vm: &mut JsVm, host: &SharedHost, nid: NodeId, html: &str) {
     }
 }
 
+fn insert_adjacent_html(vm: &mut JsVm, host: &SharedHost, nid: NodeId, pos: &str, html: &str) {
+    let ctx_name = match host.borrow().document.borrow().get(nid) {
+        Some(NodeData::Element(e)) => Some(e.name.clone()),
+        _ => None,
+    };
+    let (frag_doc, frag_roots) = parse_html_fragment(html, ctx_name.as_ref());
+    if frag_roots.is_empty() {
+        return;
+    }
+    let (parent_target, added, is_conn) = {
+        let _doc_rc = Rc::clone(&host.borrow().document);
+        let mut doc = _doc_rc.borrow_mut();
+        let mut added = Vec::with_capacity(frag_roots.len());
+        match pos {
+            "afterbegin" => {
+                let first = doc.first_child(nid);
+                for src_root in frag_roots {
+                    let cloned = doc.clone_subtree_from(&frag_doc, src_root);
+                    if let Some(ref_node) = first {
+                        doc.insert_before(ref_node, cloned);
+                    } else {
+                        doc.append_child(nid, cloned);
+                    }
+                    added.push(cloned);
+                }
+                (nid, added, doc.is_connected(nid))
+            }
+            "beforeend" => {
+                for src_root in frag_roots {
+                    let cloned = doc.clone_subtree_from(&frag_doc, src_root);
+                    doc.append_child(nid, cloned);
+                    added.push(cloned);
+                }
+                (nid, added, doc.is_connected(nid))
+            }
+            "beforebegin" => {
+                let Some(parent) = doc.parent(nid) else {
+                    return;
+                };
+                for src_root in frag_roots {
+                    let cloned = doc.clone_subtree_from(&frag_doc, src_root);
+                    doc.insert_before(nid, cloned);
+                    added.push(cloned);
+                }
+                (parent, added, doc.is_connected(parent))
+            }
+            "afterend" => {
+                let Some(parent) = doc.parent(nid) else {
+                    return;
+                };
+                let next_sib = doc.next_sibling(nid);
+                for src_root in frag_roots {
+                    let cloned = doc.clone_subtree_from(&frag_doc, src_root);
+                    if let Some(ref_node) = next_sib {
+                        doc.insert_before(ref_node, cloned);
+                    } else {
+                        doc.append_child(parent, cloned);
+                    }
+                    added.push(cloned);
+                }
+                (parent, added, doc.is_connected(parent))
+            }
+            _ => return,
+        }
+    };
+    host.borrow().emit_mutation(DomMutation::ChildList {
+        target: parent_target,
+        added: added.clone(),
+        removed: Vec::new(),
+        previous_sibling: None,
+        next_sibling: None,
+    });
+    if is_conn {
+        for n in added {
+            notify_custom_element_subtree(vm, host, n, true);
+        }
+    }
+}
+
+fn fnv_mix(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h ^ 0xff
+}
+
 // ---------------------------------------------------------------------------
 // Document.prototype & ShadowRoot.prototype
 // ---------------------------------------------------------------------------
@@ -1470,10 +1715,73 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
     });
     define_host_accessor(vm, dp, "readyState", Some(g), None);
 
+    // document.title getter/setter
+    let h_get = Rc::clone(host);
+    let g = vm.alloc_host_fn("get title", move |vm, _, _| {
+        let title = {
+            let doc_rc = Rc::clone(&h_get.borrow().document);
+            let doc = doc_rc.borrow();
+            let found = doc
+                .descendants(doc.root())
+                .find(|&n| {
+                    matches!(
+                        doc.get(n),
+                        Some(NodeData::Element(e)) if e.name.local.as_str().eq_ignore_ascii_case("title")
+                    )
+                })
+                .map(|n| doc.inner_text(n).trim().to_string())
+                .unwrap_or_default();
+            found
+        };
+        Ok(JsValue::from_string(vm.heap.alloc_string(title)))
+    });
+    let h_set = Rc::clone(host);
+    let s = vm.alloc_host_fn("set title", move |vm, _, args| {
+        let next = vm.value_to_rust_string(arg(args, 0));
+        let doc_rc = Rc::clone(&h_set.borrow().document);
+        let mut doc = doc_rc.borrow_mut();
+        let existing = doc.descendants(doc.root()).find(|&n| {
+            matches!(
+                doc.get(n),
+                Some(NodeData::Element(e)) if e.name.local.as_str().eq_ignore_ascii_case("title")
+            )
+        });
+        let head = doc.descendants(doc.root()).find(|&n| {
+            matches!(
+                doc.get(n),
+                Some(NodeData::Element(e)) if e.name.local.as_str().eq_ignore_ascii_case("head")
+            )
+        });
+        if let Some(tn) = existing {
+            let kids: Vec<NodeId> = doc.children(tn).collect();
+            for k in kids {
+                doc.remove_child(k);
+            }
+            let text_node = doc.create_text(&next);
+            doc.append_child(tn, text_node);
+        } else if let Some(head) = head {
+            let tn = doc.create_element("title");
+            let text_node = doc.create_text(&next);
+            doc.append_child(tn, text_node);
+            doc.append_child(head, tn);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_accessor(vm, dp, "title", Some(g), Some(s));
+
     // Node factory methods
     let h = Rc::clone(host);
     define_host_method(vm, dp, "createElement", move |vm, _, args| {
         let raw_tag = vm.value_to_rust_string(arg(args, 0));
+        let tag = raw_tag.to_ascii_lowercase();
+        let nid = h.borrow().document.borrow_mut().create_element(&tag);
+        let wrapper = wrap_node(vm, &h, nid);
+        upgrade_if_custom_element(vm, &h, nid, &tag);
+        Ok(wrapper)
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, dp, "createElementNS", move |vm, _, args| {
+        let raw_tag = vm.value_to_rust_string(arg(args, 1));
         let tag = raw_tag.to_ascii_lowercase();
         let nid = h.borrow().document.borrow_mut().create_element(&tag);
         let wrapper = wrap_node(vm, &h, nid);

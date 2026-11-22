@@ -16,6 +16,7 @@ rix-ipc = { path = "../rix-ipc" }
 rix-render = { path = "../rix-render" }
 taffy = { workspace = true }
 image = { workspace = true }
+rayon = { workspace = true }
 vello = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true }
