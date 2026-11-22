@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 pub mod apz;
+pub mod canvas2d;
 pub mod compositor;
 pub mod display_list;
 pub mod renderer;
@@ -11,6 +12,11 @@ pub mod strip_cache;
 pub use apz::{
     apply_scroll_wheel, clamp_scroll_offset, hit_test_scroll_chain, ScrollDelta, ScrollOutcome,
     ScrollSyncQueue,
+};
+pub use canvas2d::{
+    encode_rgba_to_png, encode_rgba_to_png_data_url, parse_css_color, Canvas2DContext,
+    CanvasFillRule, CanvasGradient, CanvasGradientKind, CanvasPaint, CanvasPattern,
+    CanvasPatternRepeat, CanvasState, CanvasTextAlign, CanvasTextBaseline, CanvasTextMetrics,
 };
 pub use compositor::{Compositor, LayerRole, RetainedLayer};
 pub use display_list::{

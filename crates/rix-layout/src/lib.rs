@@ -17,8 +17,8 @@ pub use assets::{
 };
 pub use bfc::{collapse_margins, layout_bfc_root, layout_block_box, FloatBand, FloatContext};
 pub use box_tree::{
-    BoxId, BoxKind, BoxTree, FormControlKind, FormattingContextKind, LayoutBox, ReplacedKind,
-    SvgPathEntry,
+    surface_id_for_node, BoxId, BoxKind, BoxTree, FormControlKind, FormattingContextKind,
+    LayoutBox, ReplacedKind, SvgPathEntry,
 };
 pub use engine::{hit_test, LayoutEngine, LayoutFrame, LayoutMetrics};
 pub use flex_grid::layout_flex_grid_container;
