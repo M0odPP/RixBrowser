@@ -860,3 +860,65 @@ fn invoke_listeners_at(
     }
     Ok(())
 }
+
+/// Allocates a real `Event` instance with extra `props`, invokes `target["on" + ev_type]`
+/// if set, and dispatches through `EventTarget` listeners on `target`.
+pub fn fire_object_event(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    target: HeapHandle,
+    ev_type: &str,
+    props: &[(&str, JsValue)],
+) {
+    let ep = events.borrow().event_proto.unwrap_or(vm.object_proto);
+    let ev_h = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(ep)));
+    events.borrow_mut().events.insert(
+        ev_h,
+        EventInternal {
+            event_type: ev_type.to_string(),
+            bubbles: false,
+            cancelable: false,
+            composed: false,
+            default_prevented: false,
+            propagation_stopped: false,
+            immediate_stopped: false,
+            in_passive_listener: false,
+            event_phase: 2,
+            target: JsValue::from_object(target),
+            current_target: JsValue::from_object(target),
+            composed_path: vec![JsValue::from_object(target)],
+        },
+    );
+    for &(name, val) in props {
+        let k = vm.heap.intern_key(name);
+        vm.heap
+            .object_define_data(ev_h, k, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    }
+
+    let handler_key = vm.heap.intern_key(&format!("on{ev_type}"));
+    if let Ok(handler_val) = vm.get_property_by_key(target, handler_key) {
+        if let Some(h) = handler_val
+            .as_object()
+            .filter(|&fh| vm.is_callable_handle(fh))
+        {
+            let _ = vm.call_value(
+                JsValue::from_object(h),
+                JsValue::from_object(target),
+                &[JsValue::from_object(ev_h)],
+            );
+        }
+    }
+
+    let _ = dispatch_event_internal(
+        vm,
+        host,
+        events,
+        event_loop,
+        EventTargetKey::Object(target),
+        ev_h,
+    );
+}

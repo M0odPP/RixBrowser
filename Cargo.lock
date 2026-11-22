@@ -3719,16 +3719,21 @@ dependencies = [
 name = "rix-content"
 version = "0.2.0-alpha.1"
 dependencies = [
+ "encoding_rs",
  "rix-core",
  "rix-css",
  "rix-dom",
  "rix-html",
  "rix-js",
  "rix-layout",
+ "rix-net",
+ "rix-storage",
  "rix-text",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

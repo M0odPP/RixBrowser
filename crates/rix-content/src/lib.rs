@@ -1,14 +1,16 @@
 #![deny(unsafe_code)]
 //! Content-process runtime integrating `rix-js`, `rix-dom`, `rix-html`,
-//! `rix-css`, and `rix-layout` with a reactive WHATWG Event Loop and a
-//! zero-leak Weak DOM Bridge (`WeakTable<NodeId>`).
+//! `rix-css`, `rix-layout`, `rix-net`, and `rix-storage` with a reactive
+//! WHATWG Event Loop, zero-leak Weak DOM Bridge (`WeakTable<NodeId>`),
+//! and core WHATWG Web Platform APIs.
 //!
-//! Reference: Spec 05 §2.2, Spec 06 §1 & §3, Issue #16.
+//! Reference: Spec 05 §2.2, Spec 06 §1–§3, Issues #16 & #17.
 
 pub mod dom_bridge;
 pub mod event_loop;
 pub mod events;
 pub mod observers;
+pub mod web_apis;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -19,6 +21,7 @@ use rix_core::Size;
 use rix_dom::{Document, NodeData};
 use rix_html::{attach_declarative_shadow_roots, HtmlParserStream, ParserStreamStep};
 use rix_js::{EvalError, GcCycleStats, JsValue, JsVm};
+use rix_storage::StorageEngine;
 use rix_text::FontDatabase;
 
 pub use dom_bridge::{
@@ -30,29 +33,48 @@ pub use event_loop::{
     step_event_loop_once, wait_for_next_event_or_timer, EventLoopState, ExternalEvent,
     MacrotaskAction, MicrotaskCheckpointHook, SharedEventLoop, TaskPriority,
 };
-pub use events::{install_event_system, EventSystem, EventTargetKey, SharedEvents};
+pub use events::{
+    fire_object_event, install_event_system, EventSystem, EventTargetKey, SharedEvents,
+};
 pub use observers::{
     deliver_layout_observers, deliver_mutation_observers, install_observers, ObserverSystem,
     SharedObservers,
 };
+pub use web_apis::{install_web_apis, SharedWebApis, WebApiState, DEFAULT_DOCUMENT_URL};
 
 /// Complete single-origin Content Process execution context owning a `JsVm`,
-/// Weak DOM Bridge (`HostState`), Event System, Observers, and WHATWG `EventLoopState`.
+/// Weak DOM Bridge (`HostState`), Event System, Observers, Core Web APIs,
+/// and WHATWG `EventLoopState`.
 pub struct ContentRuntime {
     pub vm: JsVm,
     pub host: SharedHost,
     pub event_loop: SharedEventLoop,
     pub events: SharedEvents,
     pub observers: SharedObservers,
+    pub web_apis: SharedWebApis,
 }
 
 impl ContentRuntime {
-    /// Creates a fresh runtime over `document` with the given `viewport` and `font_db`.
+    /// Creates a fresh runtime over `document` with default origin and in-memory storage.
     #[must_use]
     pub fn new(
         document: Rc<RefCell<Document>>,
         viewport: Size,
         font_db: Arc<FontDatabase>,
+    ) -> Self {
+        let storage = StorageEngine::in_memory().expect("in-memory StorageEngine");
+        Self::with_origin_and_storage(document, viewport, font_db, DEFAULT_DOCUMENT_URL, storage)
+    }
+
+    /// Creates a runtime configured with an explicit document origin URL and persistent or
+    /// in-memory [`StorageEngine`].
+    #[must_use]
+    pub fn with_origin_and_storage(
+        document: Rc<RefCell<Document>>,
+        viewport: Size,
+        font_db: Arc<FontDatabase>,
+        origin_url: &str,
+        storage: StorageEngine,
     ) -> Self {
         let mut vm = JsVm::new();
         let event_loop = Rc::new(RefCell::new(EventLoopState::new()));
@@ -60,12 +82,14 @@ impl ContentRuntime {
         let host = install_dom_bridge(&mut vm, document, viewport, font_db);
         let events = install_event_system(&mut vm, &host, &event_loop);
         let observers = install_observers(&mut vm, &host, &event_loop);
+        let web_apis = install_web_apis(&mut vm, &host, &events, &event_loop, origin_url, storage);
         Self {
             vm,
             host,
             event_loop,
             events,
             observers,
+            web_apis,
         }
     }
 
@@ -75,6 +99,11 @@ impl ContentRuntime {
         let doc = Rc::new(RefCell::new(Document::new()));
         let font_db = Arc::new(FontDatabase::new());
         Self::new(doc, Size::new(800.0, 600.0), font_db)
+    }
+
+    /// Updates the current document URL used by `location`, `history`, and `localStorage`.
+    pub fn set_document_url(&mut self, url: &str) {
+        self.web_apis.borrow_mut().set_document_url(url);
     }
 
     /// Parses `html` incrementally through [`HtmlParserStream`], pausing on every classic
@@ -168,15 +197,17 @@ impl ContentRuntime {
     }
 
     /// Runs a full Major GC across VM roots, event loop callbacks, listeners, observers,
-    /// and host-pinned DOM wrappers, then sweeps all dead unpinned weak DOM wrappers cleanly.
+    /// Web APIs, and host-pinned DOM wrappers, then sweeps all dead unpinned handles cleanly.
     pub fn collect_garbage(&mut self) -> GcCycleStats {
         let mut roots = self.vm.collect_roots();
         self.event_loop.borrow().collect_roots(&mut roots);
         self.events.borrow().collect_roots(&mut roots);
         self.observers.borrow().collect_roots(&mut roots);
+        self.web_apis.borrow().collect_roots(&mut roots);
         self.host.borrow().collect_roots(&mut roots);
         let stats = self.vm.heap.collect_major(&roots);
         self.events.borrow_mut().sweep_dead(&self.vm.heap);
+        self.web_apis.borrow_mut().sweep_dead(&self.vm.heap);
         self.host.borrow_mut().sweep_dead_wrappers(&self.vm.heap);
         stats
     }
