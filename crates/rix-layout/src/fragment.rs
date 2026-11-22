@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use rix_core::{Point, Rect, Size};
 use rix_css::{
-    BoxSizingMode, ColorRgba, ComputedStyle, EvalContext, LengthPercentageAuto, LineHeightValue,
-    SizeValue, TextDecorationLine,
+    BoxSizingMode, ColorRgba, ComputedStyle, EvalContext, FlexDirectionMode, FlexWrapMode,
+    LengthPercentageAuto, LineHeightValue, SizeValue, TextDecorationLine,
 };
 use rix_dom::NodeId;
 use rix_ipc::{ImageId, SurfaceId};
@@ -650,25 +650,75 @@ pub fn measure_intrinsic_widths(
                 let w = metrics.clamp_content_width(0.0) + pb_w;
                 return (w, w);
             }
-            let has_block = b
-                .children
-                .iter()
-                .any(|&c| ctx.tree.get(c).is_block_level() || ctx.tree.get(c).is_float);
-            let (content_min, content_max) = if has_block {
+            let fc = b.formatting_context();
+            let (content_min, content_max) = if fc == FormattingContextKind::Flex {
+                let fg = b.style.flex_grid.as_deref();
+                let is_row = fg.is_none_or(|f| {
+                    matches!(
+                        f.flex_direction,
+                        FlexDirectionMode::Row | FlexDirectionMode::RowReverse
+                    )
+                });
+                let is_nowrap = fg.is_none_or(|f| f.flex_wrap == FlexWrapMode::NoWrap);
+                let col_gap = fg.map_or(0.0, |f| {
+                    f.column_gap.resolve_px(
+                        space.available_width,
+                        &space.eval_context(b.style.text.font_size_px),
+                    )
+                });
                 let mut min_w = 0.0f32;
                 let mut max_w = 0.0f32;
+                let mut count = 0usize;
                 for &cid in &b.children {
                     if ctx.tree.get(cid).is_out_of_flow {
                         continue;
                     }
                     let cm = BoxMetrics::resolve(&ctx.tree.get(cid).style, &space);
                     let (cmin, cmax) = measure_intrinsic_widths(ctx, cid, space);
-                    min_w = min_w.max(cmin + cm.margin.horizontal());
-                    max_w = max_w.max(cmax + cm.margin.horizontal());
+                    let item_min = cmin + cm.margin.horizontal();
+                    let item_max = cmax + cm.margin.horizontal();
+                    if is_row {
+                        max_w += item_max;
+                        if is_nowrap {
+                            min_w += item_min;
+                        } else {
+                            min_w = min_w.max(item_min);
+                        }
+                    } else {
+                        min_w = min_w.max(item_min);
+                        max_w = max_w.max(item_max);
+                    }
+                    count += 1;
                 }
-                (min_w, max_w)
+                if is_row && count > 1 {
+                    let gaps = col_gap * (count - 1) as f32;
+                    max_w += gaps;
+                    if is_nowrap {
+                        min_w += gaps;
+                    }
+                }
+                (min_w, max_w.max(min_w))
             } else {
-                measure_ifc_min_max_content(ctx, box_id, space)
+                let has_block = b
+                    .children
+                    .iter()
+                    .any(|&c| ctx.tree.get(c).is_block_level() || ctx.tree.get(c).is_float);
+                if has_block {
+                    let mut min_w = 0.0f32;
+                    let mut max_w = 0.0f32;
+                    for &cid in &b.children {
+                        if ctx.tree.get(cid).is_out_of_flow {
+                            continue;
+                        }
+                        let cm = BoxMetrics::resolve(&ctx.tree.get(cid).style, &space);
+                        let (cmin, cmax) = measure_intrinsic_widths(ctx, cid, space);
+                        min_w = min_w.max(cmin + cm.margin.horizontal());
+                        max_w = max_w.max(cmax + cm.margin.horizontal());
+                    }
+                    (min_w, max_w)
+                } else {
+                    measure_ifc_min_max_content(ctx, box_id, space)
+                }
             };
             (
                 metrics.clamp_content_width(content_min) + pb_w,
@@ -685,7 +735,15 @@ fn measure_text_intrinsic(
 ) -> (f32, f32) {
     let font_id = ctx.resolve_font(style);
     let font_size = style.text.font_size_px.max(1.0);
+    let space_w: f32 = ctx
+        .shaper
+        .shape_text(" ", font_id, font_size)
+        .iter()
+        .map(|r| r.width)
+        .sum();
     let mut min_w = 0.0f32;
+    let mut words_sum = 0.0f32;
+    let mut word_count = 0usize;
     for word in text.split_whitespace() {
         let w: f32 = ctx
             .shaper
@@ -694,15 +752,22 @@ fn measure_text_intrinsic(
             .map(|r| r.width)
             .sum();
         min_w = min_w.max(w);
+        words_sum += w;
+        word_count += 1;
+    }
+    if word_count > 1 {
+        words_sum += space_w * (word_count - 1) as f32;
     }
     let normalized: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let max_w: f32 = ctx
+    let joined_w: f32 = ctx
         .shaper
         .shape_text(&normalized, font_id, font_size)
         .iter()
         .map(|r| r.width)
         .sum();
-    (min_w, max_w.max(min_w))
+    let min_ceil = min_w.ceil();
+    let max_ceil = joined_w.max(words_sum).max(min_w).ceil();
+    (min_ceil, max_ceil)
 }
 
 /// Lays out a replaced element (`<img>`, `<svg>`, form controls, `<br>`, `<hr>`).

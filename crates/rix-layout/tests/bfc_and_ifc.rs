@@ -248,3 +248,106 @@ fn incremental_layout_cache_reuses_unchanged_subtrees() {
     let r0 = find_abs_rect_by_id(&doc, ft2.root.as_ref().unwrap(), "s0").unwrap();
     assert!((r0.size.width - 516.0).abs() < 1.5);
 }
+
+#[test]
+fn max_width_auto_margins_nested_row_flex_and_text_run_outline_regression() {
+    let html = r#"<!DOCTYPE html><html><head><style>
+        * { box-sizing: border-box; }
+        body { margin: 0; }
+        .bar { display: flex; align-items: center; gap: 8px; padding: 0 8px; height: 44px; }
+        .grp { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+        .btn { width: 32px; height: 32px; flex-shrink: 0; }
+        .fill { flex-grow: 1; height: 32px; }
+        .centered { max-width: 600px; margin: 0 auto; height: 40px; }
+        .outlined { display: flex; outline: 2px solid #3b82f6; outline-offset: 2px; }
+    </style></head><body>
+        <div class="bar">
+            <div id="left-grp" class="grp">
+                <div id="b1" class="btn"></div>
+                <div id="b2" class="btn"></div>
+                <div id="b3" class="btn"></div>
+            </div>
+            <div id="mid" class="fill"></div>
+        </div>
+        <div id="centered" class="centered"></div>
+        <div id="outlined" class="outlined">Reload tab</div>
+    </body></html>"#;
+
+    let viewport = Size::new(1000.0, 400.0);
+    let mut doc = parse_html(html);
+    let media = MediaContext {
+        viewport_width: viewport.width,
+        viewport_height: viewport.height,
+        ..MediaContext::default()
+    };
+    let mut styles = StyleContext::new(media);
+    let css = {
+        let mut s = String::new();
+        for node in doc.descendants(doc.root()) {
+            if let Some(NodeData::Element(e)) = doc.get(node) {
+                if e.name.local.eq_str_ignore_ascii_case("style") {
+                    for ch in doc.children(node) {
+                        if let Some(NodeData::Text(t)) = doc.get(ch) {
+                            s.push_str(t);
+                        }
+                    }
+                }
+            }
+        }
+        s
+    };
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        &css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut font_db = FontDatabase::new();
+    font_db.scan_system_fonts();
+    let mut engine = rix_layout::LayoutEngine::new();
+    let mut resources = rix_render::ResourceRegistry::default();
+    let frame = engine.layout_and_paint(
+        &doc,
+        &styles,
+        viewport,
+        &font_db,
+        rix_ipc::PipelineId(1),
+        &mut resources,
+    );
+    let root = frame.fragment_tree.root.as_ref().unwrap();
+
+    // 1. Nested row flex `.grp` sums 3x32px + 2x4px gaps = 104px instead of collapsing to 32px.
+    let grp = find_abs_rect_by_id(&doc, root, "left-grp").unwrap();
+    assert!(
+        (grp.size.width - 104.0).abs() < 1.0,
+        "expected nested row flex width 104px, got {:.1}",
+        grp.size.width
+    );
+    let mid = find_abs_rect_by_id(&doc, root, "mid").unwrap();
+    assert!(
+        mid.min_x() >= 119.0,
+        "fill sibling must not overlap left-grp"
+    );
+
+    // 2. `max-width: 600px; margin: 0 auto` centers horizontally at x = 200px in 1000px viewport.
+    let centered = find_abs_rect_by_id(&doc, root, "centered").unwrap();
+    assert!((centered.size.width - 600.0).abs() < 1.0);
+    assert!(
+        (centered.min_x() - 200.0).abs() < 1.0,
+        "expected centered x=200px, got {:.1}",
+        centered.min_x()
+    );
+
+    // 3. `outline` on parent box paints exactly 1 Border DisplayItem, never duplicated per TextRun.
+    let border_count = frame
+        .display_list
+        .items
+        .iter()
+        .filter(|i| matches!(i, rix_render::DisplayItem::Border { .. }))
+        .count();
+    assert_eq!(
+        border_count, 1,
+        "parent outline must paint once, not per TextRun word"
+    );
+}

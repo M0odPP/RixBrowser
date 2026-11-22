@@ -689,8 +689,12 @@ impl<'a> Painter<'a> {
             FragmentKind::InlineBox { .. } => {
                 self.paint_box_decorations(frag, abs_rect);
             }
-            FragmentKind::TextRun(_)
-            | FragmentKind::Image { .. }
+            FragmentKind::TextRun(_) => {
+                // Text runs inherit their parent element's computed style for typography only;
+                // never re-paint box backgrounds, borders, shadows, or outlines per text run.
+                self.paint_leaf_content(frag, abs_rect);
+            }
+            FragmentKind::Image { .. }
             | FragmentKind::Svg { .. }
             | FragmentKind::FormControl { .. }
             | FragmentKind::ExternalSurface { .. } => {
@@ -1139,7 +1143,7 @@ impl<'a> Painter<'a> {
         let text_w: f32 = runs.iter().map(|r| r.width).sum();
         let start_x = match kind {
             FormControlKind::Button => {
-                content_abs.min_x() + ((content_abs.size.width - text_w) * 0.5).max(4.0)
+                content_abs.min_x() + ((content_abs.size.width - text_w) * 0.5).max(0.0)
             }
             _ => content_abs.min_x() + 6.0,
         };

@@ -5181,6 +5181,7 @@ dependencies = [
  "rix-render",
  "rix-text",
  "serde",
+ "serde_json",
  "tracing",
  "url",
  "vello",

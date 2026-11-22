@@ -250,11 +250,25 @@ pub fn layout_block_box(
             )
         } else {
             let avail_c = (space.available_width - metrics.margin.horizontal() - pb_w).max(0.0);
-            (
-                metrics.clamp_content_width(avail_c),
-                metrics.margin.left,
-                metrics.margin.right,
-            )
+            let cw = metrics.clamp_content_width(avail_c);
+            let (ml, mr) = if metrics.margin_left_auto || metrics.margin_right_auto {
+                let remaining = (space.available_width - cw - pb_w).max(0.0);
+                match (metrics.margin_left_auto, metrics.margin_right_auto) {
+                    (true, true) => (remaining * 0.5, remaining * 0.5),
+                    (true, false) => (
+                        (remaining - metrics.margin.right).max(0.0),
+                        metrics.margin.right,
+                    ),
+                    (false, true) => (
+                        metrics.margin.left,
+                        (remaining - metrics.margin.left).max(0.0),
+                    ),
+                    (false, false) => (metrics.margin.left, metrics.margin.right),
+                }
+            } else {
+                (metrics.margin.left, metrics.margin.right)
+            };
+            (cw, ml, mr)
         };
 
     let resolved_margin = EdgeInsets {

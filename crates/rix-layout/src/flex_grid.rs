@@ -12,7 +12,7 @@ use rix_core::{Point, Rect};
 use rix_css::{
     AlignValue, BoxSizingMode, ComputedStyle, DisplayMode, EvalContext, FlexDirectionMode,
     FlexGridStyle, FlexWrapMode, GridAutoFlowMode, GridTrackSize, LengthPercentage,
-    LengthPercentageAuto, PositionMode, SizeValue,
+    LengthPercentageAuto, OverflowMode, PositionMode, SizeValue,
 };
 use taffy::prelude as tp;
 use taffy::{AvailableSpace, LayoutInput, LayoutOutput, NodeId as TaffyNodeId, TaffyTree};
@@ -463,6 +463,10 @@ fn to_taffy_item_style(
             BoxSizingMode::BorderBox => tp::BoxSizing::BorderBox,
             BoxSizingMode::ContentBox => tp::BoxSizing::ContentBox,
         },
+        overflow: taffy::Point {
+            x: map_overflow(style.overflow.x),
+            y: map_overflow(style.overflow.y),
+        },
         size: tp::Size {
             width: size_to_dimension(&bm.width, eval),
             height: size_to_dimension(&bm.height, eval),
@@ -540,6 +544,15 @@ fn size_to_lpa(size: &SizeValue, eval: &EvalContext) -> tp::LengthPercentageAuto
     match size {
         SizeValue::Length(lp) => lp_to_taffy(lp, eval).into(),
         _ => tp::auto(),
+    }
+}
+
+fn map_overflow(mode: OverflowMode) -> taffy::Overflow {
+    match mode {
+        OverflowMode::Visible => taffy::Overflow::Visible,
+        OverflowMode::Hidden => taffy::Overflow::Hidden,
+        OverflowMode::Clip => taffy::Overflow::Clip,
+        OverflowMode::Scroll | OverflowMode::Auto => taffy::Overflow::Scroll,
     }
 }
 

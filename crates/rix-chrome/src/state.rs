@@ -1,16 +1,23 @@
 //! Parent-process Browser Chrome state machine: tabs, omnibox editing,
-//! smart URL/search resolution, history autocomplete, security origin badge,
-//! hover URL preview, and context menu.
+//! smart URL/search resolution, history autocomplete, bookmarks, find-in-page,
+//! persistent settings, security origin badge, hover URL preview, and menus.
 
 use rix_core::TabId;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::settings::{
+    BookmarkItem, BrowserSettings, CookiePolicy, FindInPageState, JitMode, SearchEngine,
+    SettingsSection,
+};
 use crate::tokens::ThemeMode;
 
 /// Built-in RixBrowser internal chrome page URLs.
 pub const URL_NEWTAB: &str = "rix://chrome/newtab.html";
 pub const URL_BROWSER: &str = "rix://chrome/browser.html";
+pub const URL_SETTINGS: &str = "rix://chrome/settings.html";
+pub const URL_BOOKMARKS: &str = "rix://chrome/bookmarks.html";
+pub const URL_HISTORY: &str = "rix://chrome/history.html";
 pub const URL_ERROR: &str = "rix://chrome/error.html";
 pub const URL_CRASHED: &str = "rix://chrome/crashed.html";
 
@@ -20,6 +27,16 @@ pub enum TabLayoutMode {
     #[default]
     Horizontal,
     Vertical,
+}
+
+impl TabLayoutMode {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Horizontal => "Horizontal",
+            Self::Vertical => "Vertical",
+        }
+    }
 }
 
 /// Security classification shown in the omnibox origin badge.
@@ -47,7 +64,7 @@ impl SecurityState {
     #[must_use]
     pub const fn badge_label(self) -> &'static str {
         match self {
-            Self::Internal => "Internal",
+            Self::Internal => "Rix",
             Self::SecureHttps => "HTTPS",
             Self::InsecureHttp => "HTTP",
         }
@@ -129,7 +146,7 @@ impl TabEntry {
     }
 }
 
-/// Saved browsing history record used for omnibox autocomplete and `newtab.html`.
+/// Saved browsing history record used for omnibox autocomplete, `newtab.html`, and `history.html`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub url: String,
@@ -307,13 +324,18 @@ pub struct ClosedTabSnapshot {
 pub struct ChromeState {
     pub theme: ThemeMode,
     pub tab_layout: TabLayoutMode,
+    pub settings: BrowserSettings,
+    pub settings_section: SettingsSection,
     pub tabs: Vec<TabEntry>,
     pub active_tab: usize,
     pub closed_tabs: Vec<ClosedTabSnapshot>,
     pub omnibox: OmniboxState,
+    pub bookmarks: Vec<BookmarkItem>,
     pub history: Vec<HistoryEntry>,
     pub hovered_link: Option<String>,
     pub context_menu: ContextMenuState,
+    pub app_menu_open: bool,
+    pub find_bar: FindInPageState,
     pub hud_open: bool,
     pub focused_control: Option<String>,
     next_tab_id: u64,
@@ -328,16 +350,52 @@ impl Default for ChromeState {
 impl ChromeState {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_settings(BrowserSettings::default())
+    }
+
+    #[must_use]
+    pub fn with_settings(settings: BrowserSettings) -> Self {
         let first = TabEntry::new(TabId::new(1), URL_NEWTAB);
         let mut omnibox = OmniboxState::default();
         omnibox.set_text(URL_NEWTAB);
+        let theme = settings.theme;
+        let tab_layout = settings.tab_layout;
+        let hud_open = settings.open_hud_on_startup;
         Self {
-            theme: ThemeMode::Dark,
-            tab_layout: TabLayoutMode::Horizontal,
+            theme,
+            tab_layout,
+            settings,
+            settings_section: SettingsSection::Appearance,
             tabs: vec![first],
             active_tab: 0,
             closed_tabs: Vec::new(),
             omnibox,
+            bookmarks: vec![
+                BookmarkItem::new(
+                    "https://doc.rust-lang.org/std/",
+                    "Rust Standard Library",
+                    "Rust Docs",
+                    true,
+                ),
+                BookmarkItem::new(
+                    "https://developer.mozilla.org/en-US/docs/Web",
+                    "MDN Web Docs",
+                    "MDN",
+                    true,
+                ),
+                BookmarkItem::new(
+                    "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+                    "Rust - Wikipedia",
+                    "Wikipedia",
+                    true,
+                ),
+                BookmarkItem::new(
+                    "https://news.ycombinator.com/",
+                    "Hacker News",
+                    "Hacker News",
+                    true,
+                ),
+            ],
             history: vec![
                 HistoryEntry {
                     url: "https://en.wikipedia.org/wiki/Rust_(programming_language)".to_string(),
@@ -362,10 +420,23 @@ impl ChromeState {
             ],
             hovered_link: None,
             context_menu: ContextMenuState::default(),
-            hud_open: false,
+            app_menu_open: false,
+            find_bar: FindInPageState::default(),
+            hud_open,
             focused_control: None,
             next_tab_id: 2,
         }
+    }
+
+    /// Applies an updated [`BrowserSettings`] snapshot and synchronizes top-level fields.
+    pub fn apply_settings(&mut self, settings: BrowserSettings) {
+        self.theme = settings.theme;
+        self.tab_layout = settings.tab_layout;
+        self.settings = settings;
+    }
+
+    pub fn reset_settings(&mut self) {
+        self.apply_settings(BrowserSettings::default());
     }
 
     #[must_use]
@@ -387,6 +458,7 @@ impl ChromeState {
         self.active_tab = self.tabs.len() - 1;
         self.omnibox.set_text(url_str);
         self.context_menu.visible = false;
+        self.app_menu_open = false;
         id
     }
 
@@ -413,6 +485,7 @@ impl ChromeState {
             self.omnibox.set_text(active_url);
         }
         self.context_menu.visible = false;
+        self.app_menu_open = false;
         Some(removed.id)
     }
 
@@ -434,6 +507,7 @@ impl ChromeState {
         self.omnibox.set_text(url);
         self.omnibox.blur();
         self.context_menu.visible = false;
+        self.app_menu_open = false;
         true
     }
 
@@ -454,29 +528,130 @@ impl ChromeState {
         self.switch_to_tab(next)
     }
 
+    /// Sets horizontal or vertical tab layout and keeps `settings.tab_layout` in sync.
+    pub fn set_tab_layout(&mut self, layout: TabLayoutMode) {
+        self.tab_layout = layout;
+        self.settings.tab_layout = layout;
+    }
+
     /// Toggles between horizontal top tab bar and vertical left tab sidebar.
     pub fn toggle_tab_layout(&mut self) {
-        self.tab_layout = match self.tab_layout {
+        let next = match self.tab_layout {
             TabLayoutMode::Horizontal => TabLayoutMode::Vertical,
             TabLayoutMode::Vertical => TabLayoutMode::Horizontal,
         };
+        self.set_tab_layout(next);
+    }
+
+    /// Sets theme polarity and keeps `settings.theme` in sync.
+    pub fn set_theme(&mut self, theme: ThemeMode) {
+        self.theme = theme;
+        self.settings.theme = theme;
     }
 
     pub fn toggle_theme(&mut self) {
-        self.theme = self.theme.toggled();
+        self.set_theme(self.theme.toggled());
+    }
+
+    pub fn toggle_bookmarks_bar(&mut self) {
+        self.settings.show_bookmarks_bar = !self.settings.show_bookmarks_bar;
+    }
+
+    pub fn toggle_compact_toolbar(&mut self) {
+        self.settings.compact_toolbar = !self.settings.compact_toolbar;
+    }
+
+    pub fn toggle_app_menu(&mut self) {
+        self.app_menu_open = !self.app_menu_open;
+        if self.app_menu_open {
+            self.context_menu.visible = false;
+            self.omnibox.blur();
+        }
     }
 
     pub fn toggle_hud(&mut self) {
         self.hud_open = !self.hud_open;
     }
 
+    pub fn set_search_engine(&mut self, engine: SearchEngine) {
+        self.settings.search_engine = engine;
+    }
+
+    pub fn set_cookie_policy(&mut self, policy: CookiePolicy) {
+        self.settings.cookie_policy = policy;
+    }
+
+    pub fn set_jit_mode(&mut self, mode: JitMode) {
+        self.settings.jit_mode = mode;
+    }
+
+    pub fn zoom_in(&mut self) {
+        self.settings.step_zoom(1);
+    }
+
+    pub fn zoom_out(&mut self) {
+        self.settings.step_zoom(-1);
+    }
+
+    pub fn zoom_reset(&mut self) {
+        self.settings.reset_zoom();
+    }
+
+    /// Returns `true` when `url` is currently saved in bookmarks.
+    #[must_use]
+    pub fn is_bookmarked(&self, url: &str) -> bool {
+        self.bookmarks.iter().any(|b| b.url == url)
+    }
+
+    /// Adds or removes the active tab URL from bookmarks; returns `true` if now bookmarked.
+    pub fn toggle_bookmark_active(&mut self) -> bool {
+        let url = self.active().url.clone();
+        if url.starts_with("rix://") {
+            return false;
+        }
+        if let Some(pos) = self.bookmarks.iter().position(|b| b.url == url) {
+            self.bookmarks.remove(pos);
+            false
+        } else {
+            let title = self.active().title.clone();
+            let short = short_label_for_bookmark(&title, &url);
+            self.bookmarks
+                .push(BookmarkItem::new(url, title, short, true));
+            true
+        }
+    }
+
+    pub fn remove_bookmark(&mut self, index: usize) -> bool {
+        if index < self.bookmarks.len() {
+            self.bookmarks.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remove_history(&mut self, index: usize) -> bool {
+        if index < self.history.len() {
+            self.history.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+        self.closed_tabs.clear();
+    }
+
     /// Navigates the active tab to a raw omnibox string (auto-resolving URL vs search).
     pub fn navigate_active(&mut self, raw_input: &str) -> String {
-        let resolved = resolve_omnibox_input(raw_input);
+        let resolved = resolve_omnibox_input_with_settings(raw_input, &self.settings);
         self.active_mut().navigate_to(resolved.clone());
         self.omnibox.set_text(resolved.clone());
         self.omnibox.blur();
         self.context_menu.visible = false;
+        self.app_menu_open = false;
         self.record_history(&resolved, &default_title_for_url(&resolved));
         resolved
     }
@@ -523,7 +698,7 @@ impl ChromeState {
     }
 
     pub fn record_history(&mut self, url: &str, title: &str) {
-        if url.starts_with("rix://chrome/") {
+        if url.starts_with("rix://") {
             return;
         }
         if let Some(entry) = self.history.iter_mut().find(|h| h.url == url) {
@@ -547,14 +722,39 @@ impl ChromeState {
     /// Returns ranked omnibox autocomplete suggestions matching the current omnibox input.
     #[must_use]
     pub fn autocomplete_suggestions(&self, limit: usize) -> Vec<AutocompleteItem> {
+        if !self.settings.autocomplete_enabled {
+            return Vec::new();
+        }
         let query = self.omnibox.text.trim();
         let lower = query.to_ascii_lowercase();
         let mut out = Vec::new();
+
+        // Include internal chrome shortcuts when typing "rix" or "set" / "book" / "hist".
+        for (url, title) in [
+            (URL_SETTINGS, "Settings"),
+            (URL_BOOKMARKS, "Bookmarks"),
+            (URL_HISTORY, "History"),
+        ] {
+            if !lower.is_empty()
+                && (url.contains(&lower) || title.to_ascii_lowercase().contains(&lower))
+                && out.len() < limit.saturating_sub(1).max(1)
+            {
+                out.push(AutocompleteItem {
+                    url: url.to_string(),
+                    title: format!("RixBrowser {title}"),
+                    is_search: false,
+                });
+            }
+        }
+
         for entry in &self.history {
             if lower.is_empty()
                 || entry.url.to_ascii_lowercase().contains(&lower)
                 || entry.title.to_ascii_lowercase().contains(&lower)
             {
+                if out.iter().any(|existing| existing.url == entry.url) {
+                    continue;
+                }
                 out.push(AutocompleteItem {
                     url: entry.url.clone(),
                     title: entry.title.clone(),
@@ -567,8 +767,8 @@ impl ChromeState {
         }
         if !query.is_empty() && !looks_like_url(query) && out.len() < limit {
             out.push(AutocompleteItem {
-                url: resolve_omnibox_input(query),
-                title: format!("Search for {query}"),
+                url: self.settings.search_engine.search_url(query),
+                title: format!("Search {} for {query}", self.settings.search_engine.label()),
                 is_search: true,
             });
         }
@@ -578,10 +778,22 @@ impl ChromeState {
     /// Height in logical pixels consumed by top Chrome UI bars.
     #[must_use]
     pub const fn top_chrome_height(&self) -> f32 {
-        match self.tab_layout {
-            TabLayoutMode::Horizontal => 85.0,
-            TabLayoutMode::Vertical => 45.0,
-        }
+        let tab_h = match (self.tab_layout, self.settings.compact_toolbar) {
+            (TabLayoutMode::Horizontal, false) => 40.0,
+            (TabLayoutMode::Horizontal, true) => 36.0,
+            (TabLayoutMode::Vertical, _) => 0.0,
+        };
+        let bar_h = if self.settings.compact_toolbar {
+            40.0
+        } else {
+            44.0
+        };
+        let bm_h = if self.settings.show_bookmarks_bar {
+            32.0
+        } else {
+            0.0
+        };
+        tab_h + bar_h + bm_h + 1.0
     }
 
     /// Width in logical pixels consumed by vertical tab sidebar (0 in horizontal mode).
@@ -589,17 +801,35 @@ impl ChromeState {
     pub const fn sidebar_width(&self) -> f32 {
         match self.tab_layout {
             TabLayoutMode::Horizontal => 0.0,
-            TabLayoutMode::Vertical => 224.0,
+            TabLayoutMode::Vertical => 240.0,
         }
     }
 }
 
-/// Resolves raw omnibox text into a concrete navigable URL or search query URL.
+/// Resolves raw omnibox text into a concrete navigable URL or search query URL
+/// using default browser settings.
 #[must_use]
 pub fn resolve_omnibox_input(raw: &str) -> String {
+    resolve_omnibox_input_with_settings(raw, &BrowserSettings::default())
+}
+
+/// Resolves raw omnibox text using active [`BrowserSettings`] (search engine and
+/// internal `rix://` shorthands).
+#[must_use]
+pub fn resolve_omnibox_input_with_settings(raw: &str, settings: &BrowserSettings) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return URL_NEWTAB.to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "rix://newtab" | "rix://chrome/newtab" | "about:newtab" => return URL_NEWTAB.to_string(),
+        "rix://settings" | "rix://chrome/settings" | "about:preferences" => {
+            return URL_SETTINGS.to_string()
+        }
+        "rix://bookmarks" | "rix://chrome/bookmarks" => return URL_BOOKMARKS.to_string(),
+        "rix://history" | "rix://chrome/history" => return URL_HISTORY.to_string(),
+        _ => {}
     }
     if trimmed.starts_with("rix://")
         || trimmed.starts_with("http://")
@@ -620,8 +850,7 @@ pub fn resolve_omnibox_input(raw: &str) -> String {
             return format!("https://{trimmed}");
         }
     }
-    let encoded = percent_encode_query(trimmed);
-    format!("https://duckduckgo.com/?q={encoded}")
+    settings.search_engine.search_url(trimmed)
 }
 
 #[must_use]
@@ -651,6 +880,9 @@ pub fn looks_like_url(input: &str) -> bool {
 pub fn default_title_for_url(url: &str) -> String {
     match url {
         URL_NEWTAB => "New tab".to_string(),
+        URL_SETTINGS => "Settings".to_string(),
+        URL_BOOKMARKS => "Bookmarks".to_string(),
+        URL_HISTORY => "History".to_string(),
         URL_CRASHED => "Tab crashed".to_string(),
         URL_ERROR => "Connection error".to_string(),
         other => Url::parse(other)
@@ -660,7 +892,44 @@ pub fn default_title_for_url(url: &str) -> String {
     }
 }
 
-fn percent_encode_query(input: &str) -> String {
+/// Returns a crisp 1-character uppercase monogram for a URL/title tile.
+#[must_use]
+pub fn domain_monogram(url: &str, title: &str) -> String {
+    if let Some(ch) = title.chars().find(|c| c.is_ascii_alphanumeric()) {
+        return ch.to_ascii_uppercase().to_string();
+    }
+    if let Ok(parsed) = Url::parse(url) {
+        if let Some(host) = parsed.host_str() {
+            let clean = host.strip_prefix("www.").unwrap_or(host);
+            let first = clean.chars().next().unwrap_or('R').to_ascii_uppercase();
+            return first.to_string();
+        }
+    }
+    "R".to_string()
+}
+
+/// Extracts a concise display hostname (stripping `www.`) from a URL.
+#[must_use]
+pub fn display_host(url: &str) -> String {
+    Url::parse(url)
+        .ok()
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| h.strip_prefix("www.").unwrap_or(h).to_string())
+        })
+        .unwrap_or_else(|| url.to_string())
+}
+
+fn short_label_for_bookmark(title: &str, url: &str) -> String {
+    let trimmed = title.trim();
+    if !trimmed.is_empty() && trimmed.chars().count() <= 16 {
+        return trimmed.to_string();
+    }
+    let host = display_host(url);
+    host.chars().take(16).collect()
+}
+
+pub(crate) fn percent_encode_query(input: &str) -> String {
     let mut out = String::with_capacity(input.len() * 2);
     for b in input.bytes() {
         match b {
