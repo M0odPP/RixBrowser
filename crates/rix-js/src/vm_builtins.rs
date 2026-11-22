@@ -97,6 +97,8 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
         "ReferenceError",
         "RangeError",
         "SyntaxError",
+        "URIError",
+        "EvalError",
     ] {
         let name_owned = err_name.to_owned();
         let ctor = vm.alloc_host_fn(err_name, move |vm, _this, args| {

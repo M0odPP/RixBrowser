@@ -378,9 +378,10 @@ impl Compiler {
         root.completion_reg = Some(comp_reg);
         self.frames.push(root);
 
-        // Pre-pass: register module imports and hoist `var` & `function` declarations.
+        // Pre-pass: register module imports/exports and hoist `var` & `function` declarations.
         if is_module {
             self.collect_module_imports(&program.body);
+            self.collect_module_exports(&program.body);
         }
         self.hoist_declarations(&program.body, true)?;
 
@@ -623,12 +624,14 @@ impl Compiler {
 
     fn emit_store_var(&mut self, name: &str, src: u8) -> Result<(), CompileError> {
         let frame_idx = self.frames.len() - 1;
-        match self.resolve_var(frame_idx, name)? {
+        let res = self.resolve_var(frame_idx, name)?;
+        match &res {
             VarResolution::Local {
                 reg,
                 is_const,
                 is_tdz,
             } => {
+                let (reg, is_const, is_tdz) = (*reg, *is_const, *is_tdz);
                 if is_tdz {
                     let c = self.cur().add_string_const(name)?;
                     self.cur().emit_abx_wide(Opcode::CheckTdz, reg, c);
@@ -646,6 +649,7 @@ impl Compiler {
                 }
             }
             VarResolution::Upvalue { index, is_const } => {
+                let (index, is_const) = (*index, *is_const);
                 if is_const {
                     let msg = self
                         .cur()
@@ -669,14 +673,18 @@ impl Compiler {
                 self.cur().free_to(tmp);
             }
             VarResolution::Global(g) => {
-                let c = self.cur().add_string_const(&g)?;
+                let g_name = g.clone();
+                let c = self.cur().add_string_const(&g_name)?;
                 let ic = self.cur().add_ic_slot(IcKind::SetGlobal, c, 0)?;
                 self.cur().emit_abx_wide(Opcode::SetGlobal, src, ic);
             }
         }
-        // Propagate live module export binding update if exported at top-level.
-        if self.frames.len() == 1 {
-            if let Some(&export_idx) = self.module_exports.get(name) {
+        // Propagate live module export binding update when writing a module-root binding
+        // either directly at top-level or via an upvalue from an inner module function.
+        if let Some(&export_idx) = self.module_exports.get(name) {
+            let writes_root =
+                self.frames.len() == 1 || matches!(res, VarResolution::Upvalue { .. });
+            if writes_root {
                 self.cur()
                     .emit(Instruction::abx(Opcode::SetModuleExport, src, export_idx));
             }
@@ -823,10 +831,15 @@ impl Compiler {
                 ..
             } => {
                 self.cur().begin_scope();
+                let mut per_iter_close_reg: Option<u8> = None;
                 if let Some(init) = init {
                     match init {
                         ForInit::VarDecl { kind, decls, .. } => {
+                            let start_reg = self.cur().next_reg;
                             self.compile_var_decl(*kind, decls)?;
+                            if matches!(kind, VarKind::Let | VarKind::Const) {
+                                per_iter_close_reg = Some(start_reg);
+                            }
                         }
                         ForInit::Expr(e) => {
                             let saved = self.cur().next_reg;
@@ -858,6 +871,10 @@ impl Compiler {
 
                 self.compile_stmt(body)?;
                 let update_pc = self.cur().code.len();
+                if let Some(close_reg) = per_iter_close_reg {
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::CloseUpvalues, close_reg, 0, 0));
+                }
                 if let Some(upd) = update {
                     let saved = self.cur().next_reg;
                     let r = self.cur().alloc_reg()?;
@@ -1246,6 +1263,54 @@ impl Compiler {
         Ok(())
     }
 
+    fn collect_module_exports(&mut self, stmts: &[Statement]) {
+        for stmt in stmts {
+            let Statement::ExportDecl(export) = stmt else {
+                continue;
+            };
+            match &export.kind {
+                ExportKind::Declaration(inner) => {
+                    let mut names = Vec::new();
+                    match inner.as_ref() {
+                        Statement::VarDecl { decls, .. } => {
+                            for d in decls {
+                                d.id.collect_bound_names(&mut names);
+                            }
+                        }
+                        Statement::FunctionDecl(f) => {
+                            if let Some(ref n) = f.name {
+                                names.push((n.clone(), f.span));
+                            }
+                        }
+                        Statement::ClassDecl(c) => {
+                            if let Some(ref n) = c.name {
+                                names.push((n.clone(), c.span));
+                            }
+                        }
+                        _ => {}
+                    }
+                    for (name, _) in names {
+                        self.register_module_export(Some(name.clone()), name, None, false);
+                    }
+                }
+                ExportKind::Named {
+                    specifiers,
+                    source: None,
+                } => {
+                    for spec in specifiers {
+                        self.register_module_export(
+                            Some(spec.local.clone()),
+                            spec.exported.clone(),
+                            None,
+                            false,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn register_module_export(
         &mut self,
         local_name: Option<String>,
@@ -1256,6 +1321,18 @@ impl Compiler {
         let Some(ref mut module) = self.module else {
             return 0;
         };
+        if reexport_from.is_none() && !is_star {
+            if let Some(pos) = module
+                .exports
+                .iter()
+                .position(|e| e.reexport_from.is_none() && e.exported_name == exported_name)
+            {
+                if let Some(ref local) = local_name {
+                    self.module_exports.insert(local.clone(), pos as u16);
+                }
+                return pos as u16;
+            }
+        }
         let idx = module.exports.len() as u16;
         if let Some(ref local) = local_name {
             self.module_exports.insert(local.clone(), idx);

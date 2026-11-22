@@ -5955,6 +5955,7 @@ dependencies = [
  "rix-dom",
  "rix-html",
  "rix-ipc",
+ "rix-js",
  "rix-layout",
  "rix-render",
  "rix-text",

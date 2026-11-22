@@ -69,7 +69,13 @@ fn test262_frontmatter_parser_and_suite_baseline_check() {
         false,
     )
     .expect("test262 runs");
-    assert_eq!(report.total, 2);
-    assert_eq!(report.metadata_valid, 2);
+    assert!(report.total >= 60, "expected >= 60 test262 fixtures");
+    assert_eq!(report.metadata_valid, report.total);
+    assert!(
+        report.pass_rate_pct() >= 85.0,
+        "Test262 pass rate {:.1}% below 85% gate: {:?}",
+        report.pass_rate_pct(),
+        report.failures
+    );
     assert!(!report.regressed);
 }
