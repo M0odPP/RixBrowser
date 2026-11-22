@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use rix_chrome::ThemeMode;
 use rix_core::{Point, Size};
 use rix_render::{Compositor, VelloRenderer};
 use tracing::{error, info, warn};
@@ -250,6 +252,17 @@ impl ApplicationHandler<AppWakeup> for BrowserShell {
             }
         }
     }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(delay) = self.controller.tick_active_tab() {
+            self.request_redraw_if_needed();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + delay));
+        } else {
+            self.request_redraw_if_needed();
+            // Zero active timers, zero rAF callbacks, zero in-flight async I/O -> IDLE 0 Hz!
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+    }
 }
 
 fn map_winit_key(key: &Key) -> Option<BrowserKey> {
@@ -300,6 +313,43 @@ pub fn render_headless_demo(
     let width = width.max(1);
     let height = height.max(1);
     let mut controller = BrowserController::new(Size::new(width as f32, height as f32), 1.0);
+    let clear = controller.clear_color();
+    let scene = controller.compositor.compose_force();
+    VelloRenderer::render_scene_to_png(scene, width, height, clear, out_path)?;
+    Ok(())
+}
+
+/// Navigates a headless [`BrowserController`] to `url` (executing external CSS, images, SVGs,
+/// `@font-face` web fonts, JavaScript, Canvas2D, and initial async `fetch()`/timers) and renders
+/// the full composed frame to a PNG file via Vello GPU.
+pub fn render_url_to_png(
+    url: &str,
+    out_path: impl AsRef<Path>,
+    width: u32,
+    height: u32,
+    theme: ThemeMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let width = width.max(1);
+    let height = height.max(1);
+    let mut controller = BrowserController::new(Size::new(width as f32, height as f32), 1.0);
+    controller.set_theme(theme);
+    controller.navigate_active(url);
+
+    // Allow initial async `fetch()` / short timers / first rAF frame to settle cleanly (bounded).
+    let settle_deadline = Instant::now() + Duration::from_millis(250);
+    for _ in 0..32 {
+        let Some(delay) = controller.tick_active_tab() else {
+            break;
+        };
+        if Instant::now() >= settle_deadline {
+            break;
+        }
+        let sleep_for = delay.min(Duration::from_millis(10));
+        if !sleep_for.is_zero() {
+            std::thread::sleep(sleep_for);
+        }
+    }
+    controller.sync_layers();
     let clear = controller.clear_color();
     let scene = controller.compositor.compose_force();
     VelloRenderer::render_scene_to_png(scene, width, height, clear, out_path)?;
