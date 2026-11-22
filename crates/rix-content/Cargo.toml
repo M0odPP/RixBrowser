@@ -14,6 +14,8 @@ rix-html = { path = "../rix-html" }
 rix-css = { path = "../rix-css" }
 rix-layout = { path = "../rix-layout" }
 rix-text = { path = "../rix-text" }
+rix-ipc = { path = "../rix-ipc" }
+rix-render = { path = "../rix-render" }
 rix-js = { path = "../rix-js" }
 rix-net = { path = "../rix-net" }
 rix-storage = { path = "../rix-storage" }

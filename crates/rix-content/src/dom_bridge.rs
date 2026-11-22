@@ -65,6 +65,7 @@ pub struct DomPrototypes {
     pub node_proto: HeapHandle,
     pub element_proto: HeapHandle,
     pub html_element_proto: HeapHandle,
+    pub html_canvas_element_proto: HeapHandle,
     pub document_proto: HeapHandle,
     pub shadow_root_proto: HeapHandle,
     pub text_proto: HeapHandle,
@@ -78,6 +79,7 @@ impl DomPrototypes {
             self.node_proto,
             self.element_proto,
             self.html_element_proto,
+            self.html_canvas_element_proto,
             self.document_proto,
             self.shadow_root_proto,
             self.text_proto,
@@ -104,9 +106,11 @@ pub struct HostState {
     style_ctx: StyleContext,
     last_style_revs: Option<(u64, u64)>,
     last_layout_revs: Option<(u64, u64)>,
+    last_paint_revs: Option<(u64, u64)>,
     cached_fragment_tree: Option<FragmentTree>,
     pub style_recalc_count: u64,
     pub layout_count: u64,
+    pub display_list_build_count: u64,
     pub custom_elements: HashMap<String, CustomElementDef>,
     pub when_defined_waiters: HashMap<String, Vec<HeapHandle>>,
     pub mutation_sinks: Vec<MutationSink>,
@@ -143,9 +147,11 @@ impl HostState {
             style_ctx: StyleContext::new(media),
             last_style_revs: None,
             last_layout_revs: None,
+            last_paint_revs: None,
             cached_fragment_tree: None,
             style_recalc_count: 0,
             layout_count: 0,
+            display_list_build_count: 0,
             custom_elements: HashMap::new(),
             when_defined_waiters: HashMap::new(),
             mutation_sinks: Vec::new(),
@@ -294,6 +300,39 @@ impl HostState {
         let ctx = self.ensure_styles();
         ctx.style_for(node).cloned()
     }
+
+    /// Rebuilds the page [`rix_render::DisplayList`] ONLY when the DOM or CSS revisions changed.
+    /// During 60 FPS Canvas2D animations this returns `None` (zero DisplayList rebuilds!).
+    pub fn paint_if_dirty(
+        &mut self,
+        pipeline: rix_ipc::PipelineId,
+        resources: &mut rix_render::ResourceRegistry,
+    ) -> Option<rix_render::DisplayList> {
+        let revs = {
+            let doc = self.document.borrow();
+            (doc.revision(), doc.style_revision())
+        };
+        if self.last_paint_revs == Some(revs) {
+            return None;
+        }
+        let _ = self.ensure_layout();
+        let post_revs = {
+            let doc = self.document.borrow();
+            (doc.revision(), doc.style_revision())
+        };
+        let tree = self.cached_fragment_tree.as_ref()?;
+        let dl = rix_layout::paint_fragment_tree(
+            tree,
+            &self.font_db,
+            &self.layout_engine.assets,
+            pipeline,
+            resources,
+            self.layout_engine.dark_mode,
+        );
+        self.last_paint_revs = Some(post_revs);
+        self.display_list_build_count += 1;
+        Some(dl)
+    }
 }
 
 fn find_fragment_rects(
@@ -332,7 +371,13 @@ pub fn wrap_node(vm: &mut JsVm, host: &SharedHost, node_id: NodeId) -> JsValue {
             match doc.get(node_id) {
                 Some(NodeData::Document) => h.prototypes.document_proto,
                 Some(NodeData::ShadowRoot { .. }) => h.prototypes.shadow_root_proto,
-                Some(NodeData::Element(_)) => h.prototypes.html_element_proto,
+                Some(NodeData::Element(el)) => {
+                    if el.name.local.as_str().eq_ignore_ascii_case("canvas") {
+                        h.prototypes.html_canvas_element_proto
+                    } else {
+                        h.prototypes.html_element_proto
+                    }
+                }
                 Some(NodeData::Text(_) | NodeData::Comment(_)) => h.prototypes.text_proto,
                 Some(NodeData::DocumentFragment) => h.prototypes.fragment_proto,
                 _ => h.prototypes.node_proto,
@@ -376,6 +421,7 @@ pub fn install_dom_bridge(
     let node_proto = make_proto(vm, event_target_proto);
     let element_proto = make_proto(vm, node_proto);
     let html_element_proto = make_proto(vm, element_proto);
+    let html_canvas_element_proto = make_proto(vm, html_element_proto);
     let document_proto = make_proto(vm, node_proto);
     let shadow_root_proto = make_proto(vm, node_proto);
     let text_proto = make_proto(vm, node_proto);
@@ -386,6 +432,7 @@ pub fn install_dom_bridge(
         node_proto,
         element_proto,
         html_element_proto,
+        html_canvas_element_proto,
         document_proto,
         shadow_root_proto,
         text_proto,
@@ -1775,7 +1822,13 @@ fn get_attr_string(host: &SharedHost, nid: NodeId, name: &str) -> Option<String>
     }
 }
 
-fn set_element_attr(vm: &mut JsVm, host: &SharedHost, nid: NodeId, name: &str, val: &str) {
+pub(crate) fn set_element_attr(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    nid: NodeId,
+    name: &str,
+    val: &str,
+) {
     let (old_val, tag_lower) = {
         let _doc_rc = Rc::clone(&host.borrow().document);
         let mut doc = _doc_rc.borrow_mut();

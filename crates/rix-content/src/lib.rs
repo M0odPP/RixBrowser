@@ -6,6 +6,7 @@
 //!
 //! Reference: Spec 05 §2.2, Spec 06 §1–§3, Issues #16 & #17.
 
+pub mod canvas2d;
 pub mod dom_bridge;
 pub mod event_loop;
 pub mod events;
@@ -22,10 +23,14 @@ use std::time::Duration;
 use rix_core::Size;
 use rix_dom::{Document, NodeData};
 use rix_html::{attach_declarative_shadow_roots, HtmlParserStream, ParserStreamStep};
+use rix_ipc::PipelineId;
 use rix_js::{EvalError, GcCycleStats, JsValue, JsVm};
 use rix_net::FetchEngine;
+use rix_render::{Compositor, LayerRole, VelloRenderer};
 use rix_storage::StorageEngine;
 use rix_text::FontDatabase;
+
+pub use canvas2d::{install_canvas2d, Canvas2DSystem, SharedCanvas2D};
 
 pub use dom_bridge::{
     install_dom_bridge, wrap_node, CustomElementDef, DomMutation, DomPrototypes, HostState,
@@ -64,6 +69,7 @@ pub struct ContentRuntime {
     pub web_apis: SharedWebApis,
     pub streams: SharedStreams,
     pub net: SharedNetBridge,
+    pub canvas2d: SharedCanvas2D,
 }
 
 impl ContentRuntime {
@@ -111,6 +117,7 @@ impl ContentRuntime {
         let web_apis = install_web_apis(&mut vm, &host, &events, &event_loop, origin_url, storage);
         let streams = install_streams(&mut vm, &web_apis);
         let net = install_fetch_and_websocket(&mut vm, &host, &web_apis, &streams, fetch_engine);
+        let canvas2d = install_canvas2d(&mut vm, &host, &web_apis);
         Self {
             vm,
             host,
@@ -120,6 +127,7 @@ impl ContentRuntime {
             web_apis,
             streams,
             net,
+            canvas2d,
         }
     }
 
@@ -299,8 +307,35 @@ impl ContentRuntime {
         result
     }
 
+    /// Synchronizes any dirty page `DisplayList` (only when DOM/CSS changed!) AND
+    /// presents all dirty GPU-backed `Canvas2D` external surfaces into `compositor`.
+    /// Returns `(display_list_rebuilt, canvases_presented)`.
+    pub fn sync_frame_to_compositor(
+        &mut self,
+        pipeline: PipelineId,
+        epoch: u64,
+        compositor: &mut Compositor,
+        gpu: Option<&mut VelloRenderer>,
+    ) -> (bool, usize) {
+        let dl_rebuilt = if let Some(dl) = self
+            .host
+            .borrow_mut()
+            .paint_if_dirty(pipeline, &mut compositor.resources)
+        {
+            compositor.submit_display_list(pipeline, LayerRole::WebSurface, epoch, dl);
+            true
+        } else {
+            false
+        };
+        let canvases = self
+            .canvas2d
+            .borrow_mut()
+            .present_dirty_to_compositor(compositor, gpu);
+        (dl_rebuilt, canvases)
+    }
+
     /// Runs a full Major GC across VM roots, event loop callbacks, listeners, observers,
-    /// Web APIs, Streams, active network handles, and host-pinned DOM wrappers.
+    /// Web APIs, Streams, Canvas2D, active network handles, and host-pinned DOM wrappers.
     pub fn collect_garbage(&mut self) -> GcCycleStats {
         let mut roots = self.vm.collect_roots();
         self.event_loop.borrow().collect_roots(&mut roots);
@@ -309,12 +344,14 @@ impl ContentRuntime {
         self.web_apis.borrow().collect_roots(&mut roots);
         self.streams.borrow().collect_roots(&mut roots);
         self.net.borrow().collect_roots(&mut roots);
+        self.canvas2d.borrow().collect_roots(&mut roots);
         self.host.borrow().collect_roots(&mut roots);
         let stats = self.vm.heap.collect_major(&roots);
         self.events.borrow_mut().sweep_dead(&self.vm.heap);
         self.web_apis.borrow_mut().sweep_dead(&self.vm.heap);
         self.streams.borrow_mut().sweep_dead(&self.vm.heap);
         self.net.borrow_mut().sweep_dead(&self.vm.heap);
+        self.canvas2d.borrow_mut().sweep_dead(&self.vm.heap);
         self.host.borrow_mut().sweep_dead_wrappers(&self.vm.heap);
         stats
     }
