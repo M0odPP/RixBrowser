@@ -49,6 +49,13 @@ pub async fn run_content_process(site_id: u64, ipc_socket: &Path) -> Result<()> 
             | BrowserToContent::InputEvent { .. }
             | BrowserToContent::ScrollOffsetSync { .. }
             | BrowserToContent::BeginFrame { .. }
+            | BrowserToContent::LoadDocument { .. }
+            | BrowserToContent::EvalScript { .. }
+            | BrowserToContent::DeliverPostMessage { .. }
+            | BrowserToContent::DeliverPortMessage { .. }
+            | BrowserToContent::ChildFrameBound { .. }
+            | BrowserToContent::ChildFrameCrashed { .. }
+            | BrowserToContent::RequestDisplayList { .. }
             | BrowserToContent::ThemeChanged { .. } => {}
             BrowserToContent::Shutdown => {
                 let _ = channel.shutdown().await;
