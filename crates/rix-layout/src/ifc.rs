@@ -993,7 +993,12 @@ fn collect_inline_recursive(
         BoxKind::Replaced(ReplacedKind::LineBreak) => {
             out.push(InlineItem::HardBreak);
         }
-        BoxKind::InlineBlock { .. } | BoxKind::Replaced(_) => {
+        BoxKind::InlineBlock { .. }
+        | BoxKind::Replaced(_)
+        | BoxKind::Block { .. }
+        | BoxKind::Table
+        | BoxKind::AnonymousTable
+        | BoxKind::AnonymousBlock => {
             out.push(InlineItem::Atomic {
                 box_id,
                 style: Arc::clone(&b.style),
@@ -1180,9 +1185,11 @@ fn shape_word_glyphs(
     let mut glyphs = Vec::new();
     let mut pen_x = 0.0f32;
     for run in runs {
+        let run_font_id = run.font_id;
         for g in run.glyphs {
             let adv = (g.x_advance + letter_sp + word_sp).max(0.0);
             glyphs.push(PositionedGlyph {
+                font_id: run_font_id,
                 glyph_id: g.glyph_id,
                 x: pen_x + g.x_offset,
                 y: -g.y_offset,

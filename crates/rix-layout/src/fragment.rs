@@ -248,6 +248,7 @@ fn is_percent_dep(lp: &rix_css::LengthPercentage) -> bool {
 /// Positioned shaped glyph within a [`ShapedTextFragment`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PositionedGlyph {
+    pub font_id: FontId,
     pub glyph_id: u32,
     pub x: f32,
     pub y: f32,
@@ -519,6 +520,10 @@ pub struct LayoutContext<'a> {
     pub web_fonts: Option<&'a FontFaceSet>,
     pub shaper: TextShaper<'a>,
     pub cache: &'a mut LayoutCache,
+    /// Per-pass memo for `measure_intrinsic_widths` eliminating exponential recursion in nested Flex/Grid/Tables.
+    pub(crate) pass_intrinsic_memo: HashMap<(BoxId, u32), (f32, f32)>,
+    /// Per-pass memo for `layout_box` keyed by `(box_id, avail_w_q, avail_h_q)` (active even on initial dirty passes!).
+    pub(crate) pass_fragment_memo: HashMap<(BoxId, u32, u32), Fragment>,
 }
 
 impl<'a> LayoutContext<'a> {
@@ -536,10 +541,29 @@ impl<'a> LayoutContext<'a> {
             web_fonts,
             shaper: TextShaper::with_cache(font_db, shaping_cache),
             cache,
+            pass_intrinsic_memo: HashMap::with_capacity(256),
+            pass_fragment_memo: HashMap::with_capacity(256),
         }
     }
     pub fn resolve_font(&mut self, style: &ComputedStyle) -> FontId {
         self.cache.resolve_font(self.font_db, self.web_fonts, style)
+    }
+
+    #[inline]
+    pub(crate) fn quantize_px(v: f32) -> u32 {
+        if !v.is_finite() {
+            u32::MAX - 1
+        } else {
+            (v.max(0.0) * 4.0).round() as u32
+        }
+    }
+
+    #[inline]
+    pub(crate) fn quantize_opt_px(v: Option<f32>) -> u32 {
+        match v {
+            None => u32::MAX,
+            Some(x) => Self::quantize_px(x),
+        }
     }
 }
 pub fn layout_tree(
@@ -573,13 +597,21 @@ pub fn layout_tree(
 }
 
 /// Lays out any [`LayoutBox`] by dispatching to its formatting context, checking
-/// [`LayoutCache`] first when the subtree is clean.
+/// per-pass memoization and [`LayoutCache`] first to keep nested Flex/Grid/Table passes strictly linear.
 pub fn layout_box(ctx: &mut LayoutContext<'_>, box_id: BoxId, space: ConstraintSpace) -> Fragment {
     let b = ctx.tree.get(box_id);
     // Only reuse cached fragments for boxes that establish an independent formatting context
     // or have no incoming external floats (BFC roots, Flex, Grid, Table, Replaced).
     let cacheable = b.establishes_bfc || matches!(b.kind, BoxKind::Block { .. } | BoxKind::Table);
+    let pass_key = (
+        box_id,
+        LayoutContext::quantize_px(space.available_width),
+        LayoutContext::quantize_opt_px(space.available_height),
+    );
     if cacheable {
+        if let Some(hit) = ctx.pass_fragment_memo.get(&pass_key) {
+            return hit.clone();
+        }
         if let Some(cached) = ctx.cache.get_fragment(b, &space) {
             return cached;
         }
@@ -601,6 +633,9 @@ pub fn layout_box(ctx: &mut LayoutContext<'_>, box_id: BoxId, space: ConstraintS
     };
 
     if cacheable {
+        if ctx.pass_fragment_memo.len() < 16_384 {
+            ctx.pass_fragment_memo.insert(pass_key, frag.clone());
+        }
         ctx.cache
             .store_fragment(ctx.tree.get(box_id), &space, &frag);
     }
@@ -610,8 +645,24 @@ pub fn layout_box(ctx: &mut LayoutContext<'_>, box_id: BoxId, space: ConstraintS
 /// Computes `(min_content_width, max_content_width)` border-box sizes for any box.
 ///
 /// Used by Table column sizing, shrink-to-fit Floats/`inline-block`, and Taffy
-/// Flex/Grid leaf measurement callbacks.
+/// Flex/Grid leaf measurement callbacks. Memoized per layout pass in `O(1)`.
 pub fn measure_intrinsic_widths(
+    ctx: &mut LayoutContext<'_>,
+    box_id: BoxId,
+    space: ConstraintSpace,
+) -> (f32, f32) {
+    let memo_key = (box_id, LayoutContext::quantize_px(space.available_width));
+    if let Some(&hit) = ctx.pass_intrinsic_memo.get(&memo_key) {
+        return hit;
+    }
+    let result = measure_intrinsic_widths_uncached(ctx, box_id, space);
+    if ctx.pass_intrinsic_memo.len() < 32_768 {
+        ctx.pass_intrinsic_memo.insert(memo_key, result);
+    }
+    result
+}
+
+fn measure_intrinsic_widths_uncached(
     ctx: &mut LayoutContext<'_>,
     box_id: BoxId,
     space: ConstraintSpace,

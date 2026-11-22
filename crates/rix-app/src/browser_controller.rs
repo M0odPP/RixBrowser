@@ -139,16 +139,16 @@ impl TabDocumentState {
 
     /// Computes the CSS Backgrounds & Borders Level 3 §2.11.2 canvas background color
     /// propagated from `<html>` or `<body>` (defaulting to `#ffffff` for unthemed web pages).
-    fn page_canvas_background(&self) -> Option<Rgba8> {
+    fn page_canvas_background(&self, dark_mode: bool) -> Option<Rgba8> {
         if self.is_chrome_page {
             return None;
         }
         if let Some(ref rt) = self.runtime {
             let host = rt.host.borrow();
             let doc = host.document.borrow();
-            return Some(resolve_canvas_bg(&doc, host.style_context()));
+            return Some(resolve_canvas_bg(&doc, host.style_context(), dark_mode));
         }
-        Some(resolve_canvas_bg(&self.doc, &self.styles))
+        Some(resolve_canvas_bg(&self.doc, &self.styles, dark_mode))
     }
 }
 
@@ -212,14 +212,24 @@ impl BrowserController {
             data_dir.as_ref().map(|dir| dir.join("http_cache")),
         ));
 
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("browser network runtime initializes");
+
         let storage_for_http = if chrome.settings.cookie_policy == CookiePolicy::BlockAll {
             None
         } else {
             Some(storage.clone())
         };
-        let mut http_client = HttpClient::new(storage_for_http)
-            .expect("default HTTP client initializes")
-            .with_http_cache(Some(Arc::clone(&http_cache)));
+        let mut http_client = {
+            let _rt_guard = runtime.enter();
+            HttpClient::new(storage_for_http)
+                .expect("default HTTP client initializes")
+                .with_timeout(Duration::from_secs(8))
+                .with_http_cache(Some(Arc::clone(&http_cache)))
+        };
         http_client.set_preferred_color_scheme(if chrome.theme.is_dark() {
             "dark"
         } else {
@@ -237,11 +247,6 @@ impl BrowserController {
                 resource_manager = rm;
             }
         }
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("browser network runtime initializes");
 
         let initial_tab_id = chrome.active().id;
         let mut tabs_doc = HashMap::new();
@@ -525,7 +530,7 @@ impl BrowserController {
 
                         self.hud
                             .ingest_css_missing_features(rt.host.borrow().missing_css_features());
-                        let canvas_bg = tab_doc.page_canvas_background();
+                        let canvas_bg = tab_doc.page_canvas_background(dark_mode);
                         let wrapped = wrap_web_display_list(
                             dl,
                             web_rect,
@@ -588,7 +593,7 @@ impl BrowserController {
                 paint_ms += frame.metrics.paint_ms;
                 tab_doc.fragment_tree = frame.fragment_tree;
 
-                let canvas_bg = tab_doc.page_canvas_background();
+                let canvas_bg = tab_doc.page_canvas_background(dark_mode);
                 let wrapped = wrap_web_display_list(
                     frame.display_list,
                     web_rect,
@@ -756,6 +761,7 @@ impl BrowserController {
         }
 
         // Full real-web engine pipeline: parallel subresources + ContentRuntime + JIT + Canvas/Media.
+        let t_load_start = Instant::now();
         self.hud.clear_page_telemetry();
         let loaded = load_page_subresources(
             url,
@@ -765,6 +771,7 @@ impl BrowserController {
             &self.runtime,
             &self.asset_cache,
         );
+        let subres_ms = t_load_start.elapsed().as_secs_f32() * 1000.0;
         for net_entry in &loaded.network_entries {
             self.hud.record_network(net_entry.clone());
         }
@@ -797,10 +804,25 @@ impl BrowserController {
             host.set_external_stylesheets(loaded.external_stylesheets.clone());
         }
 
+        let t_js = Instant::now();
         let script_errors = {
             let _rt_guard = self.runtime.enter();
             rt.load_document_with_external_scripts(html, &loaded.external_scripts)
         };
+        let js_ms = t_js.elapsed().as_secs_f32() * 1000.0;
+        tracing::info!(
+            url = %url,
+            subresources = loaded.stats.subresources_fetched,
+            cache_hits = loaded.stats.network_cache_hits + loaded.stats.decoded_asset_cache_hits,
+            subres_ms = format_args!("{subres_ms:.1}"),
+            wave1_ms = format_args!("{:.1}", loaded.stats.wave1_ms),
+            wave2_ms = format_args!("{:.1}", loaded.stats.wave2_ms),
+            css_ms = format_args!("{:.1}", loaded.stats.css_parse_ms),
+            img_decode_ms = format_args!("{:.1}", loaded.stats.image_decode_ms),
+            js_ms = format_args!("{js_ms:.1}"),
+            js_errors = script_errors.len(),
+            "committed real-web document"
+        );
         let console_msgs = rt.drain_console_messages();
         for (lvl, msg) in console_msgs {
             self.hud.record_console(lvl, msg, url.to_string());
@@ -2449,7 +2471,7 @@ fn maybe_upgrade_https_only(url: &str) -> String {
 /// Implements W3C CSS Backgrounds & Borders Level 3 §2.11.2 Canvas Background Propagation:
 /// prefers `<html>` background if non-transparent, else `<body>` background if non-transparent,
 /// else crisp white (`#ffffff`) so unthemed web pages stay readable even in Dark Chrome mode.
-fn resolve_canvas_bg(doc: &Document, styles: &StyleContext) -> Rgba8 {
+fn resolve_canvas_bg(doc: &Document, styles: &StyleContext, dark_mode: bool) -> Rgba8 {
     let mut html_node = None;
     let mut body_node = None;
     for n in doc.descendants(doc.root()) {
@@ -2467,6 +2489,13 @@ fn resolve_canvas_bg(doc: &Document, styles: &StyleContext) -> Rgba8 {
             let bg = st.visual.background_color;
             if bg.a > 0 {
                 return Rgba8::new(bg.r, bg.g, bg.b, bg.a);
+            }
+        }
+    }
+    if let Some(html_id) = html_node {
+        if let Some(st) = styles.style_for(html_id) {
+            if st.color_scheme_dark && dark_mode {
+                return Rgba8::new(18, 18, 22, 255);
             }
         }
     }

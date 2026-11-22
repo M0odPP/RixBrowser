@@ -17,12 +17,12 @@ use crate::values::{
     AnimationSpec, BackgroundLayerValue, BorderCollapseMode, BoxShadowValue, BoxSizingMode,
     ClearMode, ClipPathValue, ColorRgba, CornerRadii, CssColor, CursorKind, DirectionMode,
     DisplayMode, EdgeValues, EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode,
-    FontStyleMode, GridAutoFlowMode, GridTrackSize, LengthPercentage, LengthPercentageAuto,
-    LineHeightValue, LineStyle, MixBlendMode, OverflowMode, OverflowPair, OverflowWrapMode,
-    PointerEventsMode, PositionMode, SizeValue, TableLayoutMode, TextAlignMode, TextDecorationLine,
-    TextOverflowMode, TextTransformMode, TimingFunction, TransformOp, TransformOrigin,
-    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
-    WordBreakMode, ZIndexValue,
+    FontStyleMode, GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
+    LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
+    OverflowPair, OverflowWrapMode, PointerEventsMode, PositionMode, SizeValue, TableLayoutMode,
+    TextAlignMode, TextDecorationLine, TextOverflowMode, TextTransformMode, TimingFunction,
+    TransformOp, TransformOrigin, TransitionSpec, UserSelectMode, VerticalAlignMode,
+    VisibilityMode, WhiteSpaceMode, WordBreakMode, ZIndexValue,
 };
 
 const MAX_VAR_DEPTH: u8 = 32;
@@ -188,9 +188,14 @@ pub struct FlexGridStyle {
     pub column_gap: LengthPercentage,
     pub grid_template_columns: Vec<GridTrackSize>,
     pub grid_template_rows: Vec<GridTrackSize>,
+    pub grid_template_areas: GridTemplateAreasValue,
     pub grid_auto_columns: Vec<GridTrackSize>,
     pub grid_auto_rows: Vec<GridTrackSize>,
     pub grid_auto_flow: GridAutoFlowMode,
+    pub grid_row_start: GridPlacementValue,
+    pub grid_row_end: GridPlacementValue,
+    pub grid_column_start: GridPlacementValue,
+    pub grid_column_end: GridPlacementValue,
 }
 
 impl Default for FlexGridStyle {
@@ -212,9 +217,14 @@ impl Default for FlexGridStyle {
             column_gap: LengthPercentage::Zero,
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
+            grid_template_areas: GridTemplateAreasValue::default(),
             grid_auto_columns: Vec::new(),
             grid_auto_rows: Vec::new(),
             grid_auto_flow: GridAutoFlowMode::Row,
+            grid_row_start: GridPlacementValue::Auto,
+            grid_row_end: GridPlacementValue::Auto,
+            grid_column_start: GridPlacementValue::Auto,
+            grid_column_end: GridPlacementValue::Auto,
         }
     }
 }
@@ -289,6 +299,7 @@ pub struct ComputedStyle {
     pub cursor: CursorKind,
     pub z_index: ZIndexValue,
     pub opacity: f32,
+    pub color_scheme_dark: bool,
     pub box_model: Arc<BoxModelStyle>,
     pub visual: Arc<VisualStyle>,
     pub text: Arc<InheritedTextStyle>,
@@ -311,6 +322,7 @@ impl Default for ComputedStyle {
             cursor: CursorKind::Auto,
             z_index: ZIndexValue::Auto,
             opacity: 1.0,
+            color_scheme_dark: false,
             box_model: Arc::clone(default_box_model()),
             visual: Arc::clone(default_visual()),
             text: Arc::clone(default_text()),
@@ -337,6 +349,7 @@ impl ComputedStyle {
             cursor: parent.cursor,
             z_index: ZIndexValue::Auto,
             opacity: 1.0,
+            color_scheme_dark: parent.color_scheme_dark,
             box_model: Arc::clone(default_box_model()),
             visual: Arc::clone(default_visual()),
             text: Arc::clone(&parent.text),
@@ -511,13 +524,48 @@ pub fn resolve_element_style(
     root_font_size_px: f32,
     media: &MediaContext,
 ) -> ComputedStyle {
+    resolve_element_style_with_hints(
+        matched_rules,
+        &[],
+        inline_decls,
+        parent_style,
+        root_font_size_px,
+        media,
+    )
+}
+
+/// Resolves an element's [`ComputedStyle`] including zero-specificity HTML5 §15.3
+/// presentational hint declarations (`bgcolor`, `width`, `height`, `align`, `cellspacing`, etc.).
+#[must_use]
+pub fn resolve_element_style_with_hints(
+    matched_rules: &[&CompiledRule],
+    pres_hint_decls: &[SpecifiedDeclaration],
+    inline_decls: &[SpecifiedDeclaration],
+    parent_style: Option<&ComputedStyle>,
+    root_font_size_px: f32,
+    media: &MediaContext,
+) -> ComputedStyle {
     let mut style = match parent_style {
         Some(p) => ComputedStyle::inherit_from(p),
         None => ComputedStyle::default(),
     };
 
     let mut candidates: Vec<CandidateDecl<'_>> =
-        Vec::with_capacity(matched_rules.len() * 4 + inline_decls.len());
+        Vec::with_capacity(matched_rules.len() * 4 + pres_hint_decls.len() + inline_decls.len());
+    for decl in pres_hint_decls {
+        // HTML5 §15.3 Presentational Hints: override UA stylesheet (band 0) while losing
+        // to every Author rule (even 0-specificity or layered author rules).
+        candidates.push(CandidateDecl {
+            key: CascadeKey {
+                band: 1,
+                layer_rank: 0,
+                specificity: 0,
+                rule_order: 0,
+                decl_order: decl.order,
+            },
+            decl,
+        });
+    }
     for (rule_idx, rule) in matched_rules.iter().enumerate() {
         let r_order = (rule.source_order).max(rule_idx as u32);
         for decl in rule.declarations.iter() {
@@ -649,18 +697,36 @@ pub fn resolve_element_style(
         }
     }
 
-    // Pass 2b: Resolve `color` next so `currentColor` on borders/backgrounds matches.
+    // Pass 2b: Resolve `color-scheme` and `color` next so CanvasText & `currentColor` match.
     let eval_ctx = media.eval_context(style.text.font_size_px, root_font_size_px);
-    if let Some(stack) = per_prop.get_mut(&PropertyIdKind::Color) {
+    if let Some(stack) = per_prop.get_mut(&PropertyIdKind::ColorScheme) {
         stack.sort_by_key(|(k, _)| *k);
         if let Some(winner) = select_winning_candidate(stack) {
             apply_declaration(&mut style, winner, parent_style, &eval_ctx, media.dark_mode);
         }
     }
+    let mut explicit_color = false;
+    if let Some(stack) = per_prop.get_mut(&PropertyIdKind::Color) {
+        stack.sort_by_key(|(k, _)| *k);
+        if let Some(winner) = select_winning_candidate(stack) {
+            apply_declaration(&mut style, winner, parent_style, &eval_ctx, media.dark_mode);
+            explicit_color = true;
+        }
+    }
+    if !explicit_color
+        && media.dark_mode
+        && style.color_scheme_dark
+        && parent_style.is_none_or(|p| !p.color_scheme_dark)
+    {
+        Arc::make_mut(&mut style.text).color = ColorRgba::rgb(241, 245, 249);
+    }
 
     // Pass 2c: Resolve all remaining properties.
     for (&prop, stack) in &mut per_prop {
-        if matches!(prop, PropertyIdKind::FontSize | PropertyIdKind::Color) {
+        if matches!(
+            prop,
+            PropertyIdKind::FontSize | PropertyIdKind::Color | PropertyIdKind::ColorScheme
+        ) {
             continue;
         }
         stack.sort_by_key(|(k, _)| *k);
@@ -749,6 +815,9 @@ pub fn apply_declaration(
         (PropertyIdKind::Cursor, PropertyValue::Cursor(v)) => style.cursor = *v,
         (PropertyIdKind::ZIndex, PropertyValue::ZIndex(v)) => style.z_index = *v,
         (PropertyIdKind::Opacity, PropertyValue::Number(v)) => style.opacity = v.clamp(0.0, 1.0),
+        (PropertyIdKind::ColorScheme, PropertyValue::Number(v)) => {
+            style.color_scheme_dark = *v > 0.5;
+        }
 
         // Box model
         (PropertyIdKind::Width, PropertyValue::Size(v)) => {
@@ -991,6 +1060,9 @@ pub fn apply_declaration(
         (PropertyIdKind::GridTemplateRows, PropertyValue::GridTracks(v)) => {
             style.flex_grid_mut().grid_template_rows = v.clone();
         }
+        (PropertyIdKind::GridTemplateAreas, PropertyValue::GridTemplateAreas(v)) => {
+            style.flex_grid_mut().grid_template_areas = v.clone();
+        }
         (PropertyIdKind::GridAutoColumns, PropertyValue::GridTracks(v)) => {
             style.flex_grid_mut().grid_auto_columns = v.clone();
         }
@@ -999,6 +1071,18 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::GridAutoFlow, PropertyValue::GridAutoFlow(v)) => {
             style.flex_grid_mut().grid_auto_flow = *v;
+        }
+        (PropertyIdKind::GridRowStart, PropertyValue::GridPlacement(v)) => {
+            style.flex_grid_mut().grid_row_start = v.clone();
+        }
+        (PropertyIdKind::GridRowEnd, PropertyValue::GridPlacement(v)) => {
+            style.flex_grid_mut().grid_row_end = v.clone();
+        }
+        (PropertyIdKind::GridColumnStart, PropertyValue::GridPlacement(v)) => {
+            style.flex_grid_mut().grid_column_start = v.clone();
+        }
+        (PropertyIdKind::GridColumnEnd, PropertyValue::GridPlacement(v)) => {
+            style.flex_grid_mut().grid_column_end = v.clone();
         }
 
         // Effects (allocated lazily)

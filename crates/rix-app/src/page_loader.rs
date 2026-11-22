@@ -24,7 +24,10 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 use rix_chrome::NetworkEntry;
 use rix_core::RixUrl;
-use rix_css::{CascadeOrigin, ColorRgba, FontFaceSource, MediaContext, Stylesheet};
+use rix_css::{
+    BackgroundImageValue, CascadeOrigin, ColorRgba, FontFaceSource, MediaContext, StyleContext,
+    Stylesheet,
+};
 use rix_dom::{Document, NodeData};
 use rix_html::{parse_html, PreloadKind, PreloadScanner};
 use rix_layout::{
@@ -241,6 +244,7 @@ enum SubresourceRole {
 }
 
 struct DiscoveredRefs {
+    doc: Document,
     effective_base: Option<Url>,
     stylesheets: Vec<(String, String)>, // (raw_href, resolved_url)
     scripts: Vec<(String, String)>,     // (raw_src, resolved_url)
@@ -552,16 +556,62 @@ pub fn load_page_subresources(
     }
     out.stats.css_parse_ms = t_css.elapsed().as_secs_f32() * 1000.0;
 
-    // Wave 2 Discovery: CSS `background-image: url(...)` and `@font-face` URLs.
+    // Wave 2 Discovery (Used-Only!): resolve styles on the parsed DOM (~2 ms) so we ONLY fetch
+    // `background-image: url(...)` and `@font-face` families ACTUALLY matched by visible DOM
+    // elements instead of downloading hundreds of unused framework CSS sprites & banners!
     let mut wave2_queue: Vec<(String, ResourcePriority, SubresourceRole)> = Vec::new();
     let mut seen_wave2: HashSet<String> = seen_wave1;
     let mut pending_font_specs: Vec<(String, String, (u16, u16), bool)> = Vec::new(); // (url, family, weight_range, italic)
 
+    let mut used_bg_urls: HashSet<String> = HashSet::new();
+    let mut used_font_families: HashSet<String> = HashSet::new();
+    {
+        let mut probe_doc = discovered.doc;
+        let mut probe_styles = StyleContext::new(*media);
+        for (_, sheet) in &all_sheets_with_base {
+            probe_styles.add_stylesheet(Arc::clone(sheet));
+        }
+        probe_styles.cascade_full(&mut probe_doc);
+        for node in probe_doc.descendants(probe_doc.root()) {
+            let Some(st) = probe_styles.style_for(node) else {
+                continue;
+            };
+            if st.display == rix_css::DisplayMode::None {
+                continue;
+            }
+            for layer in &st.visual.background_layers {
+                if let BackgroundImageValue::Url(u) = &layer.image {
+                    let trimmed = u.as_str().trim();
+                    if !trimmed.is_empty() {
+                        used_bg_urls.insert(trimmed.to_string());
+                    }
+                }
+            }
+            for fam in &st.text.font_family {
+                let lower = fam
+                    .as_str()
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_ascii_lowercase();
+                if !lower.is_empty() {
+                    used_font_families.insert(lower);
+                }
+            }
+        }
+    }
+
     for (base_url, sheet) in &all_sheets_with_base {
         for raw_img in sheet.referenced_image_urls() {
+            if !used_bg_urls.contains(&raw_img) {
+                continue;
+            }
             let Some(resolved) = resolve_url(base_url, &raw_img) else {
                 continue;
             };
+            if is_non_image_media_url(&resolved) {
+                continue;
+            }
             let aliases = image_aliases.entry(resolved.clone()).or_default();
             if !aliases.contains(&raw_img) {
                 aliases.push(raw_img.clone());
@@ -596,6 +646,15 @@ pub fn load_page_subresources(
             let Some(ref family) = ff.family else {
                 continue;
             };
+            let fam_lower = family
+                .as_str()
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_ascii_lowercase();
+            if !used_font_families.contains(&fam_lower) {
+                continue;
+            }
             let Some(raw_font_url) = pick_best_font_face_url(&ff.sources) else {
                 continue;
             };
@@ -784,7 +843,9 @@ fn discover_wave1_refs(document_url: &str, html: &str) -> DiscoveredRefs {
             if let Some(srcset) = el.get_attribute("srcset") {
                 if let Some(best) = parse_best_srcset_url(srcset) {
                     if let Some(resolved) = resolve_url(base_str, &best) {
-                        if seen_img.insert((best.clone(), resolved.clone())) {
+                        if !is_non_image_media_url(&resolved)
+                            && seen_img.insert((best.clone(), resolved.clone()))
+                        {
                             images.push((best, resolved));
                         }
                     }
@@ -793,18 +854,31 @@ fn discover_wave1_refs(document_url: &str, html: &str) -> DiscoveredRefs {
             if let Some(src) = el.get_attribute("src").map(str::trim) {
                 if !src.is_empty() {
                     if let Some(resolved) = resolve_url(base_str, src) {
-                        if seen_img.insert((src.to_string(), resolved.clone())) {
+                        if !is_non_image_media_url(&resolved)
+                            && seen_img.insert((src.to_string(), resolved.clone()))
+                        {
                             images.push((src.to_string(), resolved));
                         }
                     }
                 }
             }
         } else if tag.eq_ignore_ascii_case("source") {
-            if let Some(srcset) = el.get_attribute("srcset") {
-                if let Some(best) = parse_best_srcset_url(srcset) {
-                    if let Some(resolved) = resolve_url(base_str, &best) {
-                        if seen_img.insert((best.clone(), resolved.clone())) {
-                            images.push((best, resolved));
+            // Only fetch `<source srcset>` when inside `<picture>` (NEVER `<video>`/`<audio>` streams!).
+            let in_picture = doc.parent(node).is_some_and(|p| {
+                matches!(
+                    doc.get(p),
+                    Some(NodeData::Element(pe)) if pe.name.local.eq_str_ignore_ascii_case("picture")
+                )
+            });
+            if in_picture {
+                if let Some(srcset) = el.get_attribute("srcset") {
+                    if let Some(best) = parse_best_srcset_url(srcset) {
+                        if let Some(resolved) = resolve_url(base_str, &best) {
+                            if !is_non_image_media_url(&resolved)
+                                && seen_img.insert((best.clone(), resolved.clone()))
+                            {
+                                images.push((best, resolved));
+                            }
                         }
                     }
                 }
@@ -822,29 +896,30 @@ fn discover_wave1_refs(document_url: &str, html: &str) -> DiscoveredRefs {
         }
     }
 
-    // Incorporate any additional `<link rel="preload">` hints discovered by PreloadScanner.
+    // Incorporate any additional `<link rel="preload">` hints from PreloadScanner (decoding `&amp;`
+    // entities and skipping non-image media streams like `.webm`/`.mp4`).
     for hint in hints {
+        let clean_url = hint.url.replace("&amp;", "&");
         match hint.kind {
             PreloadKind::Image => {
-                if seen_img.insert((hint.url.clone(), hint.url.clone())) {
-                    images.push((hint.url.clone(), hint.url));
+                if !is_non_image_media_url(&clean_url)
+                    && seen_img.insert((clean_url.clone(), clean_url.clone()))
+                {
+                    images.push((clean_url.clone(), clean_url));
                 }
             }
             PreloadKind::Style => {
-                if seen_css.insert(hint.url.clone()) {
-                    stylesheets.push((hint.url.clone(), hint.url));
+                if seen_css.insert(clean_url.clone()) {
+                    stylesheets.push((clean_url.clone(), clean_url));
                 }
             }
-            PreloadKind::Script | PreloadKind::Module => {
-                if seen_js.insert((hint.url.clone(), hint.url.clone())) {
-                    scripts.push((hint.url.clone(), hint.url));
-                }
-            }
+            PreloadKind::Script | PreloadKind::Module => {}
             PreloadKind::Font => {}
         }
     }
 
     DiscoveredRefs {
+        doc,
         effective_base,
         stylesheets,
         scripts,
@@ -910,7 +985,38 @@ fn fetch_batch(
 
     if !net_reqs.is_empty() {
         let start = Instant::now();
-        let fetched = runtime.block_on(resource_manager.load_all_with_priorities(&net_reqs));
+        // Run all subresources concurrently with a PER-REQUEST 4s timeout so a single lagging CDN
+        // host NEVER discards already-completed stylesheets, scripts, or images!
+        let fetched = runtime.block_on(async {
+            let sem = Arc::new(tokio::sync::Semaphore::new(16));
+            let mut handles = Vec::with_capacity(net_reqs.len());
+            for (url, prio) in net_reqs {
+                let rm = resource_manager.clone();
+                let sem = Arc::clone(&sem);
+                handles.push(tokio::spawn(async move {
+                    let _permit = sem.acquire_owned().await.ok();
+                    match tokio::time::timeout(
+                        Duration::from_secs(4),
+                        rm.load_prioritized(&url, prio),
+                    )
+                    .await
+                    {
+                        Ok(res) => res,
+                        Err(_) => Err(rix_net::NetError::Timeout(Duration::from_secs(4))),
+                    }
+                }));
+            }
+            let mut out = Vec::with_capacity(handles.len());
+            for h in handles {
+                match h.await {
+                    Ok(res) => out.push(res),
+                    Err(_) => out.push(Err(rix_net::NetError::Http(
+                        "subresource task cancelled".into(),
+                    ))),
+                }
+            }
+            out
+        });
         let batch_ms = start.elapsed().as_secs_f32() * 1000.0;
         for (slot_idx, res) in net_indices.into_iter().zip(fetched) {
             let url_str = &queue[slot_idx].0;
@@ -985,6 +1091,22 @@ fn is_fetchable_url(url: &str, allow_file_scheme: bool) -> bool {
         || url.starts_with("https://")
         || url.starts_with("data:")
         || (allow_file_scheme && url.starts_with("file://"))
+}
+
+fn is_non_image_media_url(url: &str) -> bool {
+    let clean = url.split(['?', '#']).next().unwrap_or(url);
+    let lower = clean.to_ascii_lowercase();
+    lower.ends_with(".webm")
+        || lower.ends_with(".mp4")
+        || lower.ends_with(".m4v")
+        || lower.ends_with(".mov")
+        || lower.ends_with(".ogv")
+        || lower.ends_with(".ogg")
+        || lower.ends_with(".mp3")
+        || lower.ends_with(".wav")
+        || lower.ends_with(".flac")
+        || lower.ends_with(".m3u8")
+        || lower.ends_with(".mpd")
 }
 
 fn pick_best_font_face_url(sources: &[FontFaceSource]) -> Option<&str> {

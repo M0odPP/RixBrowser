@@ -955,22 +955,37 @@ impl<'a> Painter<'a> {
                 if run.glyphs.is_empty() || run.color.a == 0 {
                     return;
                 }
-                let Some(font_res_id) = self.register_font(run.font_id) else {
-                    return;
-                };
                 let baseline_y = abs_rect.min_y() + run.baseline_y;
-                let instances: Vec<GlyphInstance> = run
-                    .glyphs
-                    .iter()
-                    .map(|g| GlyphInstance {
-                        glyph_id: g.glyph_id,
-                        x: abs_rect.min_x() + g.x,
-                        y: baseline_y + g.y,
-                    })
-                    .collect();
                 let color = to_rgba8(run.color);
-                self.list
-                    .push_glyph_run(abs_rect, font_res_id, run.font_size, color, &instances);
+
+                // Emit glyphs grouped by each glyph's true fallback `font_id` so multi-script runs
+                // (Latin + Arabic + CJK + Emoji) ALWAYS use the exact font whose glyph IDs were shaped!
+                let mut span_start = 0usize;
+                while span_start < run.glyphs.len() {
+                    let span_font = run.glyphs[span_start].font_id;
+                    let mut span_end = span_start + 1;
+                    while span_end < run.glyphs.len() && run.glyphs[span_end].font_id == span_font {
+                        span_end += 1;
+                    }
+                    if let Some(font_res_id) = self.register_font(span_font) {
+                        let instances: Vec<GlyphInstance> = run.glyphs[span_start..span_end]
+                            .iter()
+                            .map(|g| GlyphInstance {
+                                glyph_id: g.glyph_id,
+                                x: abs_rect.min_x() + g.x,
+                                y: baseline_y + g.y,
+                            })
+                            .collect();
+                        self.list.push_glyph_run(
+                            abs_rect,
+                            font_res_id,
+                            run.font_size,
+                            color,
+                            &instances,
+                        );
+                    }
+                    span_start = span_end;
+                }
 
                 // Paint `text-decoration` lines (underline, overline, line-through).
                 if !run.decoration.is_empty() && run.width > 0.0 {
@@ -1109,26 +1124,9 @@ impl<'a> Painter<'a> {
         if abs_rect.is_empty() {
             return;
         }
-        // Provide clean fallback chrome if the author did not set explicit background/border.
-        if frag.style.visual.background_color.a == 0 {
-            let default_bg = match kind {
-                FormControlKind::Button => Rgba8::new(236, 238, 242, 255),
-                _ => Rgba8::new(255, 255, 255, 255),
-            };
-            self.list.push(DisplayItem::Rect {
-                bounds: abs_rect,
-                color: default_bg,
-                radii: [4.0; 4],
-            });
-        }
-        if frag.border.horizontal() == 0.0 && frag.border.vertical() == 0.0 {
-            self.list.push(DisplayItem::Border {
-                bounds: abs_rect,
-                widths: [1.0; 4],
-                colors: [Rgba8::new(160, 166, 178, 255); 4],
-                radii: [4.0; 4],
-            });
-        }
+        // Background and border are already painted from `ComputedStyle` (including `UA_CSS`
+        // defaults) in `paint_box_decorations`, so author rules like `background: transparent;
+        // border: 0;` are respected faithfully instead of painting a hardcoded white box!
         let display_text = if !text.is_empty() { text } else { placeholder };
         if display_text.is_empty() {
             return;

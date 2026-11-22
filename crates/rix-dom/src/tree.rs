@@ -574,6 +574,12 @@ impl Document {
     }
 
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
+        if parent == child || parent.ancestors(&self.arena).any(|a| a == child) {
+            return;
+        }
+        if child.ancestors(&self.arena).nth(1).is_some() {
+            child.detach(&mut self.arena);
+        }
         parent.append(child, &mut self.arena);
         if self.is_connected(parent) {
             self.revision = self.revision.wrapping_add(1);
@@ -593,6 +599,15 @@ impl Document {
     }
 
     pub fn insert_before(&mut self, target: NodeId, new_child: NodeId) {
+        if target == new_child
+            || self.parent(target).is_none()
+            || target.ancestors(&self.arena).any(|a| a == new_child)
+        {
+            return;
+        }
+        if new_child.ancestors(&self.arena).nth(1).is_some() {
+            new_child.detach(&mut self.arena);
+        }
         target.insert_before(new_child, &mut self.arena);
         if self.is_connected(target) {
             self.revision = self.revision.wrapping_add(1);

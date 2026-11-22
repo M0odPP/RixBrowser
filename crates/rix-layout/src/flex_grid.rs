@@ -11,8 +11,8 @@ use std::sync::Arc;
 use rix_core::{Point, Rect};
 use rix_css::{
     AlignValue, BoxSizingMode, ComputedStyle, DisplayMode, EvalContext, FlexDirectionMode,
-    FlexGridStyle, FlexWrapMode, GridAutoFlowMode, GridTrackSize, LengthPercentage,
-    LengthPercentageAuto, OverflowMode, PositionMode, SizeValue,
+    FlexGridStyle, FlexWrapMode, GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue,
+    GridTrackSize, LengthPercentage, LengthPercentageAuto, OverflowMode, PositionMode, SizeValue,
 };
 use taffy::prelude as tp;
 use taffy::{AvailableSpace, LayoutInput, LayoutOutput, NodeId as TaffyNodeId, TaffyTree};
@@ -110,6 +110,12 @@ pub fn layout_flex_grid_container(
         .remove(&container_key)
         .unwrap_or_else(|| RetainedTaffyContainer::new(root_taffy_style.clone()));
 
+    let parent_areas = container_style
+        .flex_grid
+        .as_deref()
+        .map(|fg| &fg.grid_template_areas)
+        .filter(|a| a.columns > 0 && !a.areas.is_empty());
+
     reconcile_retained_tree(
         &mut retained,
         ctx.tree,
@@ -117,6 +123,7 @@ pub fn layout_flex_grid_container(
         root_taffy_style,
         root_style_hash,
         &space,
+        parent_areas,
     );
 
     let taffy_avail = tp::Size {
@@ -169,8 +176,25 @@ pub fn layout_flex_grid_container(
     for (cid, item_layout) in item_layouts {
         let item_w = item_layout.size.width.max(0.0);
         let item_h = item_layout.size.height.max(0.0);
-        let item_space = space.with_available(item_w, Some(item_h));
-        let mut frag = layout_box(ctx, cid, item_space);
+        let probe_key = (cid, LayoutContext::quantize_px(item_w), u32::MAX);
+        let reused_frag = if !has_percent_height_direct_child(ctx.tree, cid) {
+            ctx.pass_fragment_memo.get(&probe_key).and_then(|f| {
+                if (f.border_rect.size.height - item_h).abs() < 0.75 {
+                    Some(f.clone())
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        let mut frag = match reused_frag {
+            Some(f) => f,
+            None => {
+                let item_space = space.with_available(item_w, Some(item_h));
+                layout_box(ctx, cid, item_space)
+            }
+        };
         // Pin border-box to Taffy's exact solved Flex/Grid item geometry.
         let i_pb_w = frag.padding.horizontal() + frag.border.horizontal();
         let i_pb_h = frag.padding.vertical() + frag.border.vertical();
@@ -266,8 +290,10 @@ fn reconcile_retained_tree(
     root_style: tp::Style,
     root_hash: u64,
     space: &ConstraintSpace,
+    parent_areas: Option<&GridTemplateAreasValue>,
 ) {
-    if retained.root_hash != root_hash {
+    let root_changed = retained.root_hash != root_hash;
+    if root_changed {
         let _ = retained.taffy.set_style(retained.root, root_style);
         retained.root_hash = root_hash;
     }
@@ -289,9 +315,12 @@ fn reconcile_retained_tree(
             if let Some(leaf_ctx) = retained.taffy.get_node_context_mut(entry.taffy_node) {
                 leaf_ctx.box_id = cid;
             }
-            if child_box.subtree_dirty || entry.subtree_hash != child_box.subtree_hash {
+            if root_changed
+                || child_box.subtree_dirty
+                || entry.subtree_hash != child_box.subtree_hash
+            {
                 let eval = space.eval_context(child_box.style.text.font_size_px);
-                let item_style = to_taffy_item_style(&child_box.style, space, &eval);
+                let item_style = to_taffy_item_style(&child_box.style, space, &eval, parent_areas);
                 let _ = retained.taffy.set_style(entry.taffy_node, item_style);
                 let _ = retained.taffy.mark_dirty(entry.taffy_node);
                 entry.subtree_hash = child_box.subtree_hash;
@@ -308,7 +337,7 @@ fn reconcile_retained_tree(
     for &cid in ordered_items {
         let child_box = tree.get(cid);
         let eval = space.eval_context(child_box.style.text.font_size_px);
-        let item_style = to_taffy_item_style(&child_box.style, space, &eval);
+        let item_style = to_taffy_item_style(&child_box.style, space, &eval, parent_areas);
         let node = retained
             .taffy
             .new_leaf_with_context(item_style, TaffyLeafCtx { box_id: cid })
@@ -357,6 +386,7 @@ fn measure_taffy_leaf(
 
     let resolved_h = match input.known_dimensions.height {
         Some(h) => h.max(0.0),
+        None if matches!(input.axis, taffy::RequestedAxis::Horizontal) => 0.0,
         None => {
             let sub_space = container_space.with_available(resolved_w, None);
             let frag = layout_box(ctx, box_id, sub_space);
@@ -370,13 +400,24 @@ fn measure_taffy_leaf(
     })
 }
 
+fn has_percent_height_direct_child(tree: &crate::box_tree::BoxTree, container_id: BoxId) -> bool {
+    let b = tree.get(container_id);
+    b.children.iter().any(|&cid| {
+        let h = &tree.get(cid).style.box_model.height;
+        matches!(
+            h,
+            SizeValue::Length(LengthPercentage::Percent(_) | LengthPercentage::Calc(_))
+        )
+    })
+}
+
 fn to_taffy_container_style(
     style: &ComputedStyle,
     fc: FormattingContextKind,
     space: &ConstraintSpace,
     eval: &EvalContext,
 ) -> tp::Style {
-    let mut ts = to_taffy_item_style(style, space, eval);
+    let mut ts = to_taffy_item_style(style, space, eval, None);
     ts.display = match fc {
         FormattingContextKind::Grid => tp::Display::Grid,
         _ => tp::Display::Flex,
@@ -455,6 +496,7 @@ fn to_taffy_item_style(
     style: &ComputedStyle,
     space: &ConstraintSpace,
     eval: &EvalContext,
+    parent_areas: Option<&GridTemplateAreasValue>,
 ) -> tp::Style {
     let bm = &style.box_model;
     let metrics = BoxMetrics::resolve(style, space);
@@ -506,8 +548,83 @@ fn to_taffy_item_style(
         ts.flex_basis = lpa_to_dimension(&fg.flex_basis, eval);
         ts.align_self = map_align_items(fg.align_self);
         ts.justify_self = map_align_items(fg.justify_self);
+
+        let (row_start, row_end) =
+            resolve_grid_axis(&fg.grid_row_start, &fg.grid_row_end, parent_areas, true);
+        let (col_start, col_end) = resolve_grid_axis(
+            &fg.grid_column_start,
+            &fg.grid_column_end,
+            parent_areas,
+            false,
+        );
+        ts.grid_row = tp::Line {
+            start: row_start,
+            end: row_end,
+        };
+        ts.grid_column = tp::Line {
+            start: col_start,
+            end: col_end,
+        };
     }
     ts
+}
+
+fn resolve_grid_axis(
+    start: &GridPlacementValue,
+    end: &GridPlacementValue,
+    parent_areas: Option<&GridTemplateAreasValue>,
+    is_row: bool,
+) -> (tp::GridPlacement, tp::GridPlacement) {
+    // Handle `grid-area: <ident>` (lightningcss expands `grid-area: foo` into
+    // `row_start = Area("foo"), col_start = Area("foo"), row_end = Area("foo"), col_end = Area("foo")`).
+    if let GridPlacementValue::Area(name) = start {
+        if let Some((rs, re, cs, ce)) = parent_areas.and_then(|a| a.find_area_lines(name.as_str()))
+        {
+            return if is_row {
+                (
+                    tp::GridPlacement::Line(rs.into()),
+                    tp::GridPlacement::Line(re.into()),
+                )
+            } else {
+                (
+                    tp::GridPlacement::Line(cs.into()),
+                    tp::GridPlacement::Line(ce.into()),
+                )
+            };
+        }
+    }
+    (
+        placement_to_taffy(start, parent_areas, is_row, true),
+        placement_to_taffy(end, parent_areas, is_row, false),
+    )
+}
+
+fn placement_to_taffy(
+    p: &GridPlacementValue,
+    parent_areas: Option<&GridTemplateAreasValue>,
+    is_row: bool,
+    is_start: bool,
+) -> tp::GridPlacement {
+    match p {
+        GridPlacementValue::Auto => tp::GridPlacement::Auto,
+        GridPlacementValue::Line(n) => tp::GridPlacement::Line((*n).into()),
+        GridPlacementValue::Span(n) => tp::GridPlacement::Span(*n),
+        GridPlacementValue::Area(name) => {
+            if let Some((rs, re, cs, ce)) =
+                parent_areas.and_then(|a| a.find_area_lines(name.as_str()))
+            {
+                let line = match (is_row, is_start) {
+                    (true, true) => rs,
+                    (true, false) => re,
+                    (false, true) => cs,
+                    (false, false) => ce,
+                };
+                tp::GridPlacement::Line(line.into())
+            } else {
+                tp::GridPlacement::Auto
+            }
+        }
+    }
 }
 
 fn lp_to_taffy(lp: &LengthPercentage, eval: &EvalContext) -> tp::LengthPercentage {
