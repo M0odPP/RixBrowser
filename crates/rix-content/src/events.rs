@@ -940,6 +940,67 @@ pub(crate) fn fire_object_event_with_proto(
     let _ = dispatch_event_internal(vm, host, events, event_loop, target_key, ev_h);
 }
 
+/// Fires a cancelable event on `target` and returns `true` if a listener called `preventDefault()`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fire_cancelable_object_event(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    target: HeapHandle,
+    ev_type: &str,
+    proto: HeapHandle,
+) -> bool {
+    let ev_h = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    events.borrow_mut().events.insert(
+        ev_h,
+        EventInternal {
+            event_type: ev_type.to_string(),
+            bubbles: true,
+            cancelable: true,
+            composed: false,
+            default_prevented: false,
+            propagation_stopped: false,
+            immediate_stopped: false,
+            in_passive_listener: false,
+            event_phase: 2,
+            target: JsValue::from_object(target),
+            current_target: JsValue::from_object(target),
+            composed_path: vec![JsValue::from_object(target)],
+        },
+    );
+
+    let handler_key = vm.heap.intern_key(&format!("on{ev_type}"));
+    if let Ok(handler_val) = vm.get_property_by_key(target, handler_key) {
+        if let Some(h) = handler_val
+            .as_object()
+            .filter(|&fh| vm.is_callable_handle(fh))
+        {
+            let _ = vm.call_value(
+                JsValue::from_object(h),
+                JsValue::from_object(target),
+                &[JsValue::from_object(ev_h)],
+            );
+        }
+    }
+
+    let target_key = if target == vm.global {
+        EventTargetKey::Window
+    } else if let Some(nid) = host.borrow().node_for_handle(vm, target) {
+        EventTargetKey::Node(nid)
+    } else {
+        EventTargetKey::Object(target)
+    };
+    let _ = dispatch_event_internal(vm, host, events, event_loop, target_key, ev_h);
+    events
+        .borrow()
+        .events
+        .get(&ev_h)
+        .is_some_and(|e| e.default_prevented)
+}
+
 /// Registers an externally constructed `Event` subclass instance (such as `MessageEvent`)
 /// in `EventSystem` so `event.type`, `preventDefault()`, and `dispatchEvent()` work seamlessly.
 pub(crate) fn register_constructed_event(

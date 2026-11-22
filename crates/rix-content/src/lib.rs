@@ -12,6 +12,7 @@ pub mod event_loop;
 pub mod events;
 pub mod fetch_ws;
 pub mod frames;
+pub mod indexeddb;
 pub mod indexeddb_engine;
 pub mod observers;
 pub mod service_worker;
@@ -57,6 +58,7 @@ pub use fetch_ws::{
     deliver_async_net_event, install_fetch_and_websocket, AsyncNetEvent, FetchFailure,
     NetworkBridge, SharedNetBridge,
 };
+pub use indexeddb::{install_indexeddb, IndexedDbSystem, SharedIndexedDb};
 pub use observers::{
     deliver_layout_observers, deliver_mutation_observers, install_observers, ObserverSystem,
     SharedObservers,
@@ -90,6 +92,7 @@ pub struct ContentRuntime {
     pub frames: SharedFrames,
     pub workers: SharedWorkers,
     pub service_workers: SharedServiceWorkers,
+    pub indexeddb: SharedIndexedDb,
     pub jit: Rc<rix_jit::TieredJit>,
     pub wasm: rix_jit::SharedWasmHost,
 }
@@ -155,6 +158,7 @@ impl ContentRuntime {
         );
         let service_workers =
             install_service_worker_and_cache_apis(&mut vm, &host, &web_apis, &streams, &net);
+        let indexeddb = install_indexeddb(&mut vm, &host, &events, &event_loop, &web_apis);
         Self {
             vm,
             host,
@@ -168,6 +172,7 @@ impl ContentRuntime {
             frames,
             workers,
             service_workers,
+            indexeddb,
             jit,
             wasm,
         }
@@ -566,6 +571,7 @@ impl ContentRuntime {
         self.frames.borrow().collect_roots(&mut roots);
         self.workers.borrow().collect_roots(&mut roots);
         self.service_workers.borrow().collect_roots(&mut roots);
+        self.indexeddb.borrow().collect_roots(&mut roots);
         self.host.borrow().collect_roots(&mut roots);
         let stats = self.vm.heap.collect_major(&roots);
         self.events.borrow_mut().sweep_dead(&self.vm.heap);
@@ -576,6 +582,7 @@ impl ContentRuntime {
         self.frames.borrow_mut().sweep_dead(&self.vm.heap);
         self.workers.borrow_mut().sweep_dead(&self.vm.heap);
         self.service_workers.borrow_mut().sweep_dead(&self.vm.heap);
+        self.indexeddb.borrow_mut().sweep_dead(&self.vm.heap);
         self.host.borrow_mut().sweep_dead_wrappers(&self.vm.heap);
         stats
     }

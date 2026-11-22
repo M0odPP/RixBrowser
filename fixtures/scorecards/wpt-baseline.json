@@ -8,9 +8,11 @@
     "flexbox": 2,
     "grid": 1,
     "html-webappapis-timers": 4,
+    "indexeddb": 6,
     "selectors": 2,
     "webmessaging": 6,
     "websockets": 3,
-    "window-open": 6
+    "window-open": 6,
+    "workers": 4
   }
 }
