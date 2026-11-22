@@ -187,9 +187,22 @@ struct NetPrototypes {
     websocket_proto: Option<HeapHandle>,
 }
 
+/// Async `ServiceWorker` fetch interception hook invoked before network fetch.
+/// Returns `Some(rx)` when an active ServiceWorker matches the request scope;
+/// receiving `Some(result)` short-circuits `fetch()`, while `None` falls through to network.
+pub(crate) type AsyncFetchInterceptor = Arc<
+    dyn Fn(
+            &FetchRequest,
+        )
+            -> Option<tokio::sync::oneshot::Receiver<Option<Result<FetchResponse, FetchFailure>>>>
+        + Send
+        + Sync,
+>;
+
 /// Shared network bridge between `ContentRuntime`'s JS VM and `rix-net`.
 pub struct NetworkBridge {
     pub(crate) fetch_engine: Arc<FetchEngine>,
+    pub(crate) fetch_interceptor: Option<AsyncFetchInterceptor>,
     async_tx: mpsc::UnboundedSender<AsyncNetEvent>,
     pub(crate) async_rx: RefCell<Option<mpsc::UnboundedReceiver<AsyncNetEvent>>>,
     next_id: u64,
@@ -210,6 +223,7 @@ impl NetworkBridge {
         let (async_tx, async_rx) = mpsc::unbounded_channel();
         Self {
             fetch_engine,
+            fetch_interceptor: None,
             async_tx,
             async_rx: RefCell::new(Some(async_rx)),
             next_id: 1,
@@ -1056,7 +1070,7 @@ fn consume_request_body(
 // Response & fetch()
 // ---------------------------------------------------------------------------
 
-fn alloc_response_from_fetch(
+pub(crate) fn alloc_response_from_fetch(
     vm: &mut JsVm,
     streams: &SharedStreams,
     net: &SharedNetBridge,
@@ -1092,6 +1106,94 @@ fn alloc_response_from_fetch(
             body: resp.body,
             body_stream: stream_h,
             body_used: false,
+        },
+    );
+    obj
+}
+
+/// Extracts a serializable snapshot of a JS `Response` object for `CacheStorage` / `ServiceWorker`.
+pub(crate) fn extract_response_snapshot(
+    net: &SharedNetBridge,
+    val: JsValue,
+) -> Option<rix_storage::CachedHttpResponse> {
+    let h = val.as_object()?;
+    let st = net.borrow();
+    let entry = st.responses.get(&h)?;
+    let headers = st
+        .headers
+        .get(&entry.headers_h)
+        .map(|h| h.pairs.clone())
+        .unwrap_or_default();
+    Some(rix_storage::CachedHttpResponse {
+        url: entry.url.clone(),
+        status: entry.status,
+        status_text: entry.status_text.clone(),
+        headers,
+        body: entry.body.clone(),
+    })
+}
+
+/// Allocates a JS `Response` from a persisted [`rix_storage::CachedHttpResponse`].
+pub(crate) fn alloc_response_from_cached(
+    vm: &mut JsVm,
+    streams: &SharedStreams,
+    net: &SharedNetBridge,
+    cached: rix_storage::CachedHttpResponse,
+) -> HeapHandle {
+    let headers_map = HeadersEntry {
+        pairs: cached.headers,
+    }
+    .to_map();
+    alloc_response_from_fetch(
+        vm,
+        streams,
+        net,
+        FetchResponse {
+            url: cached.url,
+            status: cached.status,
+            status_text: cached.status_text,
+            headers: headers_map,
+            body: cached.body,
+            response_type: FetchResponseType::Basic,
+            redirected: false,
+        },
+    )
+}
+
+/// Resolves a JS `RequestInfo` (`string`, `URL`, or `Request`) to `(url, method)`.
+pub(crate) fn extract_request_url_and_method(
+    vm: &mut JsVm,
+    web_apis: &SharedWebApis,
+    net: &SharedNetBridge,
+    val: JsValue,
+) -> Result<(String, String), JsException> {
+    let entry = build_request_entry(vm, web_apis, net, val, JsValue::UNDEFINED)?;
+    Ok((entry.url, entry.method))
+}
+
+/// Allocates a JS `Request` object for a cached URL (used by `Cache.prototype.keys()`).
+pub(crate) fn alloc_request_from_url(
+    vm: &mut JsVm,
+    net: &SharedNetBridge,
+    url: String,
+) -> HeapHandle {
+    let hdr_h = alloc_headers_from_entry(vm, net, HeadersEntry { pairs: Vec::new() });
+    let proto = net.borrow().protos.request_proto.unwrap_or(vm.object_proto);
+    let obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    net.borrow_mut().requests.insert(
+        obj,
+        RequestEntry {
+            url,
+            method: "GET".to_string(),
+            headers_h: hdr_h,
+            body: Vec::new(),
+            body_used: false,
+            mode: FetchMode::Cors,
+            credentials: FetchCredentials::SameOrigin,
+            redirect: FetchRedirect::Follow,
+            signal_val: JsValue::UNDEFINED,
         },
     );
     obj
@@ -1481,7 +1583,7 @@ fn install_fetch_fn(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBrid
             abort_signal,
         };
 
-        let (id, engine, tx) = {
+        let (id, engine, tx, interceptor) = {
             let mut st = nb.borrow_mut();
             let id = st.alloc_id();
             st.pending_fetches.insert(
@@ -1491,11 +1593,28 @@ fn install_fetch_fn(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBrid
                     abort_reason,
                 },
             );
-            (id, Arc::clone(&st.fetch_engine), st.async_tx.clone())
+            (
+                id,
+                Arc::clone(&st.fetch_engine),
+                st.async_tx.clone(),
+                st.fetch_interceptor.clone(),
+            )
         };
 
-        // Spawn reactive async network task (zero polling!).
+        // Spawn reactive async network task (zero polling!), giving any active
+        // ServiceWorker covering the request scope first opportunity to intercept.
         tokio::spawn(async move {
+            if let Some(intercept_fn) = interceptor {
+                if let Some(rx) = intercept_fn(&fetch_req) {
+                    if let Ok(Some(sw_result)) = rx.await {
+                        let _ = tx.send(AsyncNetEvent::FetchDone {
+                            id,
+                            result: sw_result,
+                        });
+                        return;
+                    }
+                }
+            }
             let result = match engine.fetch(fetch_req).await {
                 Ok(resp) => Ok(resp),
                 Err(NetError::Aborted) => Err(FetchFailure::Aborted),

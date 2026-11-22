@@ -13,6 +13,7 @@ pub mod events;
 pub mod fetch_ws;
 pub mod frames;
 pub mod observers;
+pub mod service_worker;
 pub mod streams;
 pub mod web_apis;
 pub mod workers;
@@ -59,6 +60,10 @@ pub use observers::{
     deliver_layout_observers, deliver_mutation_observers, install_observers, ObserverSystem,
     SharedObservers,
 };
+pub use service_worker::{
+    deliver_async_sw_event, install_cache_storage, install_service_worker_and_cache_apis,
+    AsyncSwEvent, ServiceWorkerSystem, SharedServiceWorkers,
+};
 pub use streams::{
     create_readable_stream_from_bytes, install_streams, SharedStreams, StreamSystem,
 };
@@ -83,6 +88,7 @@ pub struct ContentRuntime {
     pub canvas2d: SharedCanvas2D,
     pub frames: SharedFrames,
     pub workers: SharedWorkers,
+    pub service_workers: SharedServiceWorkers,
     pub jit: Rc<rix_jit::TieredJit>,
     pub wasm: rix_jit::SharedWasmHost,
 }
@@ -146,6 +152,8 @@ impl ContentRuntime {
             &net,
             &frames,
         );
+        let service_workers =
+            install_service_worker_and_cache_apis(&mut vm, &host, &web_apis, &streams, &net);
         Self {
             vm,
             host,
@@ -158,6 +166,7 @@ impl ContentRuntime {
             canvas2d,
             frames,
             workers,
+            service_workers,
             jit,
             wasm,
         }
@@ -385,6 +394,22 @@ impl ContentRuntime {
             }
             return done(self);
         };
+        let mut swrx = {
+            let sw = self.service_workers.borrow();
+            let mut slot = sw.async_rx.borrow_mut();
+            slot.take()
+        };
+        let Some(mut sw_rx) = swrx.take() else {
+            {
+                let nb = self.net.borrow();
+                *nb.async_rx.borrow_mut() = Some(net_rx);
+            }
+            {
+                let ws = self.workers.borrow();
+                *ws.async_rx.borrow_mut() = Some(worker_rx);
+            }
+            return done(self);
+        };
 
         let result = loop {
             drain_ready_tasks(&self.event_loop, &mut self.vm);
@@ -409,6 +434,16 @@ impl ContentRuntime {
                     &self.event_loop,
                     &self.frames,
                     &self.workers,
+                    ev,
+                );
+                drain_ready_tasks(&self.event_loop, &mut self.vm);
+            }
+            while let Ok(ev) = sw_rx.try_recv() {
+                deliver_async_sw_event(
+                    &mut self.vm,
+                    &self.event_loop,
+                    &self.web_apis,
+                    &self.service_workers,
                     ev,
                 );
                 drain_ready_tasks(&self.event_loop, &mut self.vm);
@@ -457,6 +492,19 @@ impl ContentRuntime {
                         break done(self);
                     }
                 }
+                maybe_swev = sw_rx.recv() => {
+                    if let Some(ev) = maybe_swev {
+                        deliver_async_sw_event(
+                            &mut self.vm,
+                            &self.event_loop,
+                            &self.web_apis,
+                            &self.service_workers,
+                            ev,
+                        );
+                    } else {
+                        break done(self);
+                    }
+                }
                 () = tokio::time::sleep_until(next_wake) => {}
             }
         };
@@ -468,6 +516,10 @@ impl ContentRuntime {
         {
             let ws = self.workers.borrow();
             *ws.async_rx.borrow_mut() = Some(worker_rx);
+        }
+        {
+            let sw = self.service_workers.borrow();
+            *sw.async_rx.borrow_mut() = Some(sw_rx);
         }
         result
     }
@@ -512,6 +564,7 @@ impl ContentRuntime {
         self.canvas2d.borrow().collect_roots(&mut roots);
         self.frames.borrow().collect_roots(&mut roots);
         self.workers.borrow().collect_roots(&mut roots);
+        self.service_workers.borrow().collect_roots(&mut roots);
         self.host.borrow().collect_roots(&mut roots);
         let stats = self.vm.heap.collect_major(&roots);
         self.events.borrow_mut().sweep_dead(&self.vm.heap);
@@ -521,6 +574,7 @@ impl ContentRuntime {
         self.canvas2d.borrow_mut().sweep_dead(&self.vm.heap);
         self.frames.borrow_mut().sweep_dead(&self.vm.heap);
         self.workers.borrow_mut().sweep_dead(&self.vm.heap);
+        self.service_workers.borrow_mut().sweep_dead(&self.vm.heap);
         self.host.borrow_mut().sweep_dead_wrappers(&self.vm.heap);
         stats
     }
