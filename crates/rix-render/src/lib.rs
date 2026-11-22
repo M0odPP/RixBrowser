@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+pub mod animations;
 pub mod apz;
 pub mod canvas2d;
 pub mod compositor;
@@ -9,6 +10,10 @@ pub mod resources;
 pub mod scene_encoder;
 pub mod strip_cache;
 
+pub use animations::{
+    AnimDirection, AnimFillMode, AnimationSample, AnimationTarget, CompositorAnimation,
+    OpacityKeyframe, TimingCurve, TransformKeyframe,
+};
 pub use apz::{
     apply_scroll_wheel, clamp_scroll_offset, hit_test_scroll_chain, ScrollDelta, ScrollOutcome,
     ScrollSyncQueue,
@@ -20,8 +25,8 @@ pub use canvas2d::{
 };
 pub use compositor::{Compositor, LayerRole, RetainedLayer};
 pub use display_list::{
-    AnimationId, BlendMode, ColorStop, DisplayItem, DisplayList, FilterOp, GlyphInstance,
-    ImageSampling, Rgba8, SpatialNode, SpatialNodeKind, SpatialTree, StickyMargins,
+    AnimationId, BlendMode, ClipPathShape, ColorStop, DisplayItem, DisplayList, FilterOp,
+    GlyphInstance, ImageSampling, Rgba8, SpatialNode, SpatialNodeKind, SpatialTree, StickyMargins,
 };
 pub use renderer::{RenderError, VelloRenderer};
 pub use resources::{ResourceRegistry, DEFAULT_IMAGE_CACHE_BUDGET_BYTES};

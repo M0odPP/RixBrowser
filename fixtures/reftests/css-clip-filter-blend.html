@@ -1,0 +1,38 @@
+<!DOCTYPE html><html><head><style>
+body { margin: 0; background: #ffffff; }
+.clipped {
+  position: absolute;
+  left: 10px;
+  top: 10px;
+  width: 100px;
+  height: 100px;
+  background: #ff0000;
+  clip-path: inset(20px);
+}
+.dimmed {
+  position: absolute;
+  left: 130px;
+  top: 20px;
+  width: 60px;
+  height: 60px;
+  background: #80c040;
+  filter: brightness(0.5);
+}
+.base {
+  position: absolute;
+  left: 210px;
+  top: 20px;
+  width: 60px;
+  height: 60px;
+  background: #ffff00;
+}
+.blend {
+  position: absolute;
+  left: 210px;
+  top: 20px;
+  width: 60px;
+  height: 60px;
+  background: #00ffff;
+  mix-blend-mode: multiply;
+}
+</style></head><body><div class="clipped"></div><div class="dimmed"></div><div class="base"></div><div class="blend"></div></body></html>

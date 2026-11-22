@@ -1,5 +1,6 @@
+use crate::animations::{AnimationSample, CompositorAnimation};
 use crate::apz::{apply_scroll_wheel, ScrollDelta, ScrollSyncQueue};
-use crate::display_list::{DisplayItem, DisplayList, SpatialNodeKind};
+use crate::display_list::{AnimationId, DisplayItem, DisplayList, SpatialNodeKind};
 use crate::resources::ResourceRegistry;
 use crate::scene_encoder::{
     encode_display_list, scale_corner_radii, transform_aabb, EncodeOptions, EncodeStats,
@@ -74,6 +75,7 @@ pub struct RetainedLayer {
     cached_scene: Option<Scene>,
     strip_cache: Option<StripSceneCache>,
     external_placements: Vec<ExternalSurfacePlacement>,
+    animated_opacities: HashMap<AnimationId, f32>,
     encode_generation: u64,
     last_encode_stats: EncodeStats,
     dirty: bool,
@@ -324,6 +326,7 @@ impl Compositor {
                 existing.display_list = display_list;
                 existing.strip_cache = None;
                 existing.external_placements = external_placements;
+                existing.animated_opacities.clear();
                 existing.dirty = true;
                 existing.strip_recompose_needed = false;
             }
@@ -339,6 +342,7 @@ impl Compositor {
                         cached_scene: None,
                         strip_cache: None,
                         external_placements,
+                        animated_opacities: HashMap::new(),
                         encode_generation: 0,
                         last_encode_stats: EncodeStats::default(),
                         dirty: true,
@@ -417,6 +421,82 @@ impl Compositor {
         false
     }
 
+    /// Adds a compositor-driven animation or CSS `transition` track directly onto
+    /// `pipeline`'s retained `DisplayList` (runs at 60–120 Hz without waking layout).
+    pub fn add_animation(&mut self, pipeline: PipelineId, anim: CompositorAnimation) -> bool {
+        let Some(&z) = self.pipeline_z.get(&pipeline) else {
+            return false;
+        };
+        let Some(layer) = self.layers.get_mut(&(z, pipeline)) else {
+            return false;
+        };
+        layer.display_list.animations.retain(|a| a.id != anim.id);
+        layer.display_list.animations.push(anim);
+        layer.strip_cache = None;
+        layer.dirty = true;
+        self.dirty = true;
+        true
+    }
+
+    /// Evaluates all compositor-driven `transform` and `opacity` animations across all
+    /// retained layers at VSync timestamp `now_ms`.
+    ///
+    /// Returns the number of still-running animations. Once all finite animations finish,
+    /// this returns `0` and leaves `self.dirty == false` so the compositor stays 0 Hz idle.
+    pub fn tick_animations(&mut self, now_ms: f64) -> usize {
+        let mut active_count = 0usize;
+        for layer in self.layers.values_mut() {
+            if layer.display_list.animations.is_empty() {
+                continue;
+            }
+            let mut layer_changed = false;
+            let mut samples = Vec::new();
+            for anim in &mut layer.display_list.animations {
+                let (sample, still_active) = anim.tick(now_ms);
+                if still_active {
+                    active_count += 1;
+                }
+                if let Some(s) = sample {
+                    samples.push(s);
+                }
+            }
+            for sample in samples {
+                match sample {
+                    AnimationSample::Transform { spatial, matrix } => {
+                        if let Some(node) = layer.display_list.spatial_tree.get_mut(spatial) {
+                            if let SpatialNodeKind::Transform { matrix: cur, .. } = &mut node.kind {
+                                if cur
+                                    .iter()
+                                    .zip(matrix.iter())
+                                    .any(|(a, b)| (a - b).abs() > 1e-4)
+                                {
+                                    *cur = matrix;
+                                    layer_changed = true;
+                                }
+                            }
+                        }
+                    }
+                    AnimationSample::Opacity {
+                        animation_id,
+                        opacity,
+                    } => {
+                        let prev = layer.animated_opacities.get(&animation_id).copied();
+                        if prev.is_none_or(|p| (p - opacity).abs() > 1e-4) {
+                            layer.animated_opacities.insert(animation_id, opacity);
+                            layer_changed = true;
+                        }
+                    }
+                }
+            }
+            if layer_changed {
+                layer.strip_cache = None;
+                layer.dirty = true;
+                self.dirty = true;
+            }
+        }
+        active_count
+    }
+
     /// Re-encodes only dirty layers and composes the final scene. Returns `None` when idle.
     pub fn compose(&mut self) -> Option<&Scene> {
         if !self.dirty {
@@ -470,12 +550,18 @@ impl Compositor {
                 viewport_clip: layer_vp,
                 base_transform: Affine::IDENTITY,
                 override_scroll_zero: None,
+                opacity_overrides: layer.animated_opacities.clone(),
             };
             if layer.dirty || layer.cached_scene.is_none() {
                 let mut scene = layer.cached_scene.take().unwrap_or_default();
                 scene.reset();
-                layer.strip_cache =
-                    StripSceneCache::try_new(&layer.display_list, self.strip_height_px);
+                let use_strips =
+                    layer.display_list.animations.is_empty() && layer.animated_opacities.is_empty();
+                layer.strip_cache = if use_strips {
+                    StripSceneCache::try_new(&layer.display_list, self.strip_height_px)
+                } else {
+                    None
+                };
                 let stats = if let Some(strip_cache) = layer.strip_cache.as_mut() {
                     strip_cache.compose_visible(
                         layer.pipeline,
@@ -671,7 +757,8 @@ fn extract_external_surface_placements(list: &DisplayList) -> Vec<ExternalSurfac
     for item in &list.items {
         match item {
             DisplayItem::PushStackingContext { spatial, .. }
-            | DisplayItem::PushClip { spatial, .. } => {
+            | DisplayItem::PushClip { spatial, .. }
+            | DisplayItem::PushClipPath { spatial, .. } => {
                 spatial_stack.push(*spatial);
             }
             DisplayItem::PopStackingContext | DisplayItem::PopClip => {

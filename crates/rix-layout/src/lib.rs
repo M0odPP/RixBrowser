@@ -30,5 +30,5 @@ pub use fragment::{
 pub use ifc::{
     layout_ifc, measure_ifc_min_max_content, resolve_font_for_style, resolve_line_height_px,
 };
-pub use paint::paint_fragment_tree;
+pub use paint::{paint_fragment_tree, paint_fragment_tree_with_keyframes};
 pub use table::{layout_table, measure_table_intrinsic_widths};

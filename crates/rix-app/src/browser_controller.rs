@@ -1282,7 +1282,8 @@ fn wrap_web_display_list(
     for mut item in inner.items {
         match &mut item {
             DisplayItem::PushStackingContext { spatial, .. }
-            | DisplayItem::PushClip { spatial, .. } => {
+            | DisplayItem::PushClip { spatial, .. }
+            | DisplayItem::PushClipPath { spatial, .. } => {
                 *spatial = if spatial.0 == 0 {
                     scroll_node
                 } else {

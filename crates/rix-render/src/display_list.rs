@@ -133,6 +133,59 @@ pub enum FilterOp {
     Brightness(f32),
     Contrast(f32),
     Grayscale(f32),
+    DropShadow {
+        offset: Vec2,
+        blur_radius: f32,
+        color: Rgba8,
+    },
+    /// Compositor-driven opacity animation track evaluated at VSync without rebuilding DisplayLists.
+    AnimatedOpacity(AnimationId),
+}
+
+/// Geometry shape used by [`DisplayItem::PushClipPath`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ClipPathShape {
+    Inset { rect: Rect, radii: [f32; 4] },
+    Circle { center: Point, radius: f32 },
+    Ellipse { center: Point, rx: f32, ry: f32 },
+    Polygon { fill_odd: bool, points: Vec<Point> },
+}
+
+impl ClipPathShape {
+    #[must_use]
+    pub fn bounding_rect(&self) -> Rect {
+        match self {
+            Self::Inset { rect, .. } => *rect,
+            Self::Circle { center, radius } => {
+                let r = radius.max(0.0);
+                Rect::new(center.x - r, center.y - r, r * 2.0, r * 2.0)
+            }
+            Self::Ellipse { center, rx, ry } => {
+                let rx = rx.max(0.0);
+                let ry = ry.max(0.0);
+                Rect::new(center.x - rx, center.y - ry, rx * 2.0, ry * 2.0)
+            }
+            Self::Polygon { points, .. } => {
+                let Some(first) = points.first() else {
+                    return Rect::ZERO;
+                };
+                let (mut min_x, mut min_y, mut max_x, mut max_y) =
+                    (first.x, first.y, first.x, first.y);
+                for p in points.iter().skip(1) {
+                    min_x = min_x.min(p.x);
+                    min_y = min_y.min(p.y);
+                    max_x = max_x.max(p.x);
+                    max_y = max_y.max(p.y);
+                }
+                Rect::new(
+                    min_x,
+                    min_y,
+                    (max_x - min_x).max(0.0),
+                    (max_y - min_y).max(0.0),
+                )
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -347,6 +400,10 @@ pub enum DisplayItem {
         rect: Rect,
         radii: [f32; 4],
     },
+    PushClipPath {
+        spatial: SpatialNodeId,
+        shape: ClipPathShape,
+    },
     PopClip,
     Rect {
         bounds: Rect,
@@ -357,6 +414,13 @@ pub enum DisplayItem {
         bounds: Rect,
         start: Point,
         end: Point,
+        stops: SmallVec<[ColorStop; 4]>,
+        radii: [f32; 4],
+    },
+    RadialGradient {
+        bounds: Rect,
+        center: Point,
+        radius: f32,
         stops: SmallVec<[ColorStop; 4]>,
         radii: [f32; 4],
     },
@@ -407,6 +471,8 @@ pub struct DisplayList {
     pub items: Vec<DisplayItem>,
     pub glyphs: Vec<GlyphInstance>,
     pub content_bounds: Rect,
+    #[serde(default)]
+    pub animations: Vec<crate::animations::CompositorAnimation>,
 }
 
 impl Default for DisplayList {
@@ -422,6 +488,7 @@ impl DisplayList {
             items: Vec::new(),
             glyphs: Vec::new(),
             content_bounds,
+            animations: Vec::new(),
         }
     }
 

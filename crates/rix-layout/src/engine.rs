@@ -15,7 +15,7 @@ use rix_text::{shared_shaping_cache, FontDatabase, FontFaceSet, TextShapingCache
 use crate::assets::AssetRegistry;
 use crate::box_tree::BoxTree;
 use crate::fragment::{layout_tree, Fragment, FragmentTree, LayoutCache};
-use crate::paint::paint_fragment_tree;
+use crate::paint::paint_fragment_tree_with_keyframes;
 
 /// Timing and cache telemetry emitted by [`LayoutEngine::layout_and_paint`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -110,10 +110,13 @@ impl LayoutEngine {
     ) -> LayoutFrame {
         let (fragment_tree, mut metrics) = self.layout_only(doc, styles, viewport, font_db);
         let t_paint = Instant::now();
-        let display_list = paint_fragment_tree(
+        let keyframes = styles.all_keyframes();
+        let display_list = paint_fragment_tree_with_keyframes(
             &fragment_tree,
             font_db,
             &self.assets,
+            &keyframes,
+            viewport,
             pipeline,
             resources,
             self.dark_mode,
