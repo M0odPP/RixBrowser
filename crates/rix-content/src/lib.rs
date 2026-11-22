@@ -7,6 +7,8 @@
 
 pub mod dom_bridge;
 pub mod event_loop;
+pub mod events;
+pub mod observers;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -28,13 +30,20 @@ pub use event_loop::{
     step_event_loop_once, wait_for_next_event_or_timer, EventLoopState, ExternalEvent,
     MacrotaskAction, MicrotaskCheckpointHook, SharedEventLoop, TaskPriority,
 };
+pub use events::{install_event_system, EventSystem, EventTargetKey, SharedEvents};
+pub use observers::{
+    deliver_layout_observers, deliver_mutation_observers, install_observers, ObserverSystem,
+    SharedObservers,
+};
 
 /// Complete single-origin Content Process execution context owning a `JsVm`,
-/// Weak DOM Bridge (`HostState`), and prioritized WHATWG `EventLoopState`.
+/// Weak DOM Bridge (`HostState`), Event System, Observers, and WHATWG `EventLoopState`.
 pub struct ContentRuntime {
     pub vm: JsVm,
     pub host: SharedHost,
     pub event_loop: SharedEventLoop,
+    pub events: SharedEvents,
+    pub observers: SharedObservers,
 }
 
 impl ContentRuntime {
@@ -49,10 +58,14 @@ impl ContentRuntime {
         let event_loop = Rc::new(RefCell::new(EventLoopState::new()));
         install_event_loop_globals(&mut vm, &event_loop);
         let host = install_dom_bridge(&mut vm, document, viewport, font_db);
+        let events = install_event_system(&mut vm, &host, &event_loop);
+        let observers = install_observers(&mut vm, &host, &event_loop);
         Self {
             vm,
             host,
             event_loop,
+            events,
+            observers,
         }
     }
 
@@ -139,18 +152,31 @@ impl ContentRuntime {
         drain_ready_tasks(&self.event_loop, &mut self.vm)
     }
 
-    /// Fires a compositor VSync frame signal at `timestamp_ms`.
+    /// Fires a compositor VSync frame signal at `timestamp_ms`, executing rAF callbacks
+    /// followed by `ResizeObserver` and `IntersectionObserver` layout observations.
     pub fn fire_vsync(&mut self, timestamp_ms: f64) -> usize {
-        fire_vsync(&self.event_loop, &mut self.vm, timestamp_ms)
+        let ran = fire_vsync(&self.event_loop, &mut self.vm, timestamp_ms);
+        self.flush_layout_observers(timestamp_ms);
+        ran
     }
 
-    /// Runs a full Major GC across VM roots, event loop callback roots, and host-pinned
-    /// DOM wrappers, then sweeps all dead unpinned weak DOM wrappers cleanly.
+    /// Evaluates `ResizeObserver` and `IntersectionObserver` entries against current layout
+    /// geometry and runs a strict WHATWG microtask checkpoint.
+    pub fn flush_layout_observers(&mut self, timestamp_ms: f64) {
+        deliver_layout_observers(&mut self.vm, &self.host, &self.observers, timestamp_ms);
+        self.microtask_checkpoint();
+    }
+
+    /// Runs a full Major GC across VM roots, event loop callbacks, listeners, observers,
+    /// and host-pinned DOM wrappers, then sweeps all dead unpinned weak DOM wrappers cleanly.
     pub fn collect_garbage(&mut self) -> GcCycleStats {
         let mut roots = self.vm.collect_roots();
         self.event_loop.borrow().collect_roots(&mut roots);
+        self.events.borrow().collect_roots(&mut roots);
+        self.observers.borrow().collect_roots(&mut roots);
         self.host.borrow().collect_roots(&mut roots);
         let stats = self.vm.heap.collect_major(&roots);
+        self.events.borrow_mut().sweep_dead(&self.vm.heap);
         self.host.borrow_mut().sweep_dead_wrappers(&self.vm.heap);
         stats
     }

@@ -1,0 +1,59 @@
+[[script_cases]]
+name = "set_timeout_ordering_args_and_clear"
+script = """
+var seq = [];
+const dropped = setTimeout(() => seq.push("drop"), 5);
+clearTimeout(dropped);
+setTimeout((a, b) => seq.push("second:" + (a + b)), 20, 10, 5);
+setTimeout(() => {
+    seq.push("first");
+    Promise.resolve().then(() => seq.push("first:micro"));
+}, 10);
+"""
+advance_ms = 25
+assert_expr = "seq.join('|')"
+expected = "first|first:micro|second:15"
+
+[[script_cases]]
+name = "set_interval_and_clear_interval"
+script = """
+var count = 0;
+const id = setInterval(() => {
+    count++;
+    if (count === 3) clearInterval(id);
+}, 10);
+"""
+advance_ms = 50
+assert_expr = "count"
+expected = "3"
+
+[[script_cases]]
+name = "nested_timer_4ms_clamping"
+script = """
+var depths = [];
+function nest(d) {
+    depths.push(d + "@" + Math.round(performance.now()));
+    if (d < 7) {
+        setTimeout(() => nest(d + 1), 0);
+    }
+}
+setTimeout(() => nest(1), 0);
+"""
+advance_ms = 20
+assert_expr = "depths.length === 7 && performance.now() >= 8"
+expected = "true"
+
+[[script_cases]]
+name = "request_animation_frame_vsync_batching"
+script = """
+var frames = [];
+const dropId = requestAnimationFrame(() => frames.push("dropped"));
+cancelAnimationFrame(dropId);
+requestAnimationFrame(() => {
+    frames.push("f1");
+    requestAnimationFrame(() => frames.push("f2"));
+});
+"""
+vsync_frames = 2
+assert_expr = "frames.join(',')"
+expected = "f1,f2"
