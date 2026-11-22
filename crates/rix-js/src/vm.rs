@@ -15,12 +15,15 @@ use crate::bytecode::{
 use crate::compiler::{compile, CompileError};
 use crate::heap::{
     ClosureObject, GcCycleStats, GcHeap, JsObject, ObjectKind, ProxyObject, RegExpObject,
+    SuspendedFrame,
 };
 use crate::ic::{IcEntry, IcStats, IcTable, MegamorphicCache};
+use crate::modules::ModuleEnv;
+use crate::promise::MicrotaskJob;
 use crate::shape::{PropertyAttrs, ShapeId, ShapeTable};
 use crate::string::PropertyKey;
 use crate::value::{HeapHandle, JsValue, JsValueKind, SymbolId};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,6 +59,27 @@ pub type NativeFnPtr = fn(&mut JsVm, JsValue, &[JsValue]) -> Result<JsValue, JsE
 
 /// Shared closure-backed host callback.
 pub type NativeClosure = Rc<dyn Fn(&mut JsVm, JsValue, &[JsValue]) -> Result<JsValue, JsException>>;
+
+/// Dynamic `import(specifier)` handler callback `(vm, referrer_url, specifier) -> promise_handle`.
+pub type DynamicImportHandler = Rc<dyn Fn(&mut JsVm, Option<String>, String) -> HeapHandle>;
+
+/// Outcome of running a potentially suspendable (`async` / generator) bytecode frame.
+#[derive(Debug, Clone)]
+pub enum RunOutcome {
+    Completed(JsValue),
+    SuspendedAwait {
+        frame: SuspendedFrame,
+        awaited: JsValue,
+    },
+    SuspendedYield {
+        frame: SuspendedFrame,
+        yielded: JsValue,
+    },
+    SuspendedYieldStar {
+        frame: SuspendedFrame,
+        iterable: JsValue,
+    },
+}
 
 /// Native callable backing stored in [`JsVm::native_fns`].
 pub enum NativeCallable {
@@ -109,11 +133,16 @@ pub struct JsVm {
     pub data_view_proto: HeapHandle,
     pub typed_array_proto: HeapHandle,
     pub typed_array_protos: [HeapHandle; 9],
+    pub promise_proto: HeapHandle,
+    pub generator_proto: HeapHandle,
     pub sym_iterator: SymbolId,
     pub key_symbol_iterator: PropertyKey,
     pub symbol_registry: HashMap<String, SymbolId>,
     pub symbol_descriptions: HashMap<SymbolId, String>,
     pub rng_state: u64,
+    microtasks: VecDeque<MicrotaskJob>,
+    module_envs: HashMap<u32, ModuleEnv>,
+    dynamic_import_handler: Option<DynamicImportHandler>,
     programs: Vec<CompiledProgram>,
     ic_tables: Vec<Vec<IcTable>>,
     const_keys: Vec<Vec<Vec<Option<PropertyKey>>>>,
@@ -217,6 +246,8 @@ impl JsVm {
         let typed_array_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let typed_array_protos =
             std::array::from_fn(|_| make_proto(&mut heap, &mut shapes, typed_array_proto));
+        let promise_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let generator_proto = make_proto(&mut heap, &mut shapes, object_proto);
 
         let sym_iterator = heap.alloc_symbol(Some("Symbol.iterator".into()));
         let key_symbol_iterator = heap.intern_key(&format!("Symbol({})", sym_iterator.0));
@@ -268,11 +299,16 @@ impl JsVm {
             data_view_proto,
             typed_array_proto,
             typed_array_protos,
+            promise_proto,
+            generator_proto,
             sym_iterator,
             key_symbol_iterator,
             symbol_registry: HashMap::new(),
             symbol_descriptions: HashMap::new(),
             rng_state: 0x9E37_79B9_7F4A_7C15,
+            microtasks: VecDeque::new(),
+            module_envs: HashMap::new(),
+            dynamic_import_handler: None,
             programs: Vec::new(),
             ic_tables: Vec::new(),
             const_keys: Vec::new(),
@@ -310,7 +346,48 @@ impl JsVm {
         crate::vm_builtins::install_core_intrinsics(&mut vm);
         crate::builtins_primitives::install_primitive_builtins(&mut vm);
         crate::builtins_collections::install_collection_builtins(&mut vm);
+        crate::promise::install_promise_and_async(&mut vm);
         vm
+    }
+
+    /// Enqueues an ECMAScript microtask job in FIFO order.
+    pub fn enqueue_microtask(&mut self, job: MicrotaskJob) {
+        self.microtasks.push_back(job);
+    }
+
+    /// Pops the next queued microtask job.
+    pub fn pop_microtask(&mut self) -> Option<MicrotaskJob> {
+        self.microtasks.pop_front()
+    }
+
+    /// Returns `true` if any microtasks are waiting to run.
+    #[must_use]
+    pub fn has_pending_microtasks(&self) -> bool {
+        !self.microtasks.is_empty()
+    }
+
+    /// Drains all queued microtasks FIFO (Promise reactions, `queueMicrotask`, `async`/`await`).
+    pub fn drain_microtasks(&mut self) {
+        crate::promise::drain_microtasks(self);
+    }
+
+    /// Registers a runtime [`ModuleEnv`] for compiled program `program_id`.
+    pub fn register_module_env(&mut self, program_id: u32, env: ModuleEnv) {
+        self.module_envs.insert(program_id, env);
+    }
+
+    #[must_use]
+    pub fn module_env(&self, program_id: u32) -> Option<&ModuleEnv> {
+        self.module_envs.get(&program_id)
+    }
+
+    pub fn module_env_mut(&mut self, program_id: u32) -> Option<&mut ModuleEnv> {
+        self.module_envs.get_mut(&program_id)
+    }
+
+    /// Installs the dynamic `import(specifier)` callback used by `Opcode::DynamicImport`.
+    pub fn set_dynamic_import_handler(&mut self, handler: DynamicImportHandler) {
+        self.dynamic_import_handler = Some(handler);
     }
 
     /// Collects every active VM root into a flat vector for generational or major GC.
@@ -338,11 +415,19 @@ impl JsVm {
             self.array_buffer_proto,
             self.data_view_proto,
             self.typed_array_proto,
+            self.promise_proto,
+            self.generator_proto,
         ] {
             roots.push(JsValue::from_object(h));
         }
         for &h in &self.typed_array_protos {
             roots.push(JsValue::from_object(h));
+        }
+        for job in &self.microtasks {
+            job.trace_roots(&mut roots);
+        }
+        for env in self.module_envs.values() {
+            env.trace_roots(&mut roots);
         }
         roots.extend_from_slice(&self.registers);
         for f in &self.frames {
@@ -725,17 +810,41 @@ impl JsVm {
                 self.call_handle(p.target, this_val, args, construct_obj, new_target)
             }
             ObjectKind::Closure(closure) => {
-                let entry_depth = self.frames.len();
+                let (is_strict, is_async, is_generator) = {
+                    let f = &self.programs[closure.program_id as usize].functions
+                        [closure.func_idx as usize];
+                    (f.is_strict, f.is_async, f.is_generator)
+                };
                 let effective_this = closure.bound_this.unwrap_or_else(|| {
-                    let is_strict = self.programs[closure.program_id as usize].functions
-                        [closure.func_idx as usize]
-                        .is_strict;
                     if !is_strict && (this_val.is_undefined() || this_val.is_null()) {
                         JsValue::from_object(self.global)
                     } else {
                         this_val
                     }
                 });
+                if is_generator {
+                    let gen_h = crate::promise::create_generator(
+                        self,
+                        callee,
+                        closure.program_id,
+                        closure.func_idx,
+                        effective_this,
+                        args,
+                    );
+                    return Ok(JsValue::from_object(gen_h));
+                }
+                if is_async {
+                    let prom_h = crate::promise::start_async_call(
+                        self,
+                        callee,
+                        closure.program_id,
+                        closure.func_idx,
+                        effective_this,
+                        args,
+                    );
+                    return Ok(JsValue::from_object(prom_h));
+                }
+                let entry_depth = self.frames.len();
                 self.push_closure_frame(
                     callee,
                     closure.program_id,
@@ -753,7 +862,7 @@ impl JsVm {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn push_closure_frame(
+    pub(crate) fn push_closure_frame(
         &mut self,
         callee: HeapHandle,
         program_id: u32,
@@ -808,11 +917,129 @@ impl JsVm {
         Ok(())
     }
 
-    /// Core register-window bytecode interpreter dispatch loop.
+    pub(crate) fn frame_depth(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub(crate) fn restore_suspended_frame(&mut self, frame: &SuspendedFrame) -> usize {
+        let base_reg = self.registers.len();
+        self.registers.extend_from_slice(&frame.saved_regs);
+        // Re-attach suspended open upvalue cells and sync any mutations made while suspended.
+        for &(rel_reg, cell) in &frame.saved_upvalues {
+            let abs_reg = base_reg + rel_reg;
+            if let Some(val) = self
+                .heap
+                .get_object(cell)
+                .and_then(|o| o.slots.first().copied())
+            {
+                if abs_reg < self.registers.len() {
+                    self.registers[abs_reg] = val;
+                }
+            }
+            self.open_upvalues.push((abs_reg, cell));
+        }
+        self.frames.push(CallFrame {
+            program_id: frame.program_id,
+            func_idx: frame.func_idx,
+            base_reg,
+            pc: frame.pc,
+            this_val: frame.this_val,
+            callee: frame.callee,
+            ret_dst: None,
+            construct_obj: None,
+            new_target: JsValue::UNDEFINED,
+        });
+        base_reg
+    }
+
+    pub(crate) fn write_register(&mut self, abs_reg: usize, val: JsValue) {
+        if abs_reg < self.registers.len() {
+            self.registers[abs_reg] = val;
+        }
+    }
+
+    pub(crate) fn discard_frames_to(&mut self, depth: usize) {
+        while self.frames.len() > depth {
+            if let Some(popped) = self.frames.pop() {
+                self.close_upvalues_from(popped.base_reg);
+                self.registers.truncate(popped.base_reg);
+            }
+        }
+    }
+
+    pub(crate) fn unwind_into_frame(&mut self, stop_depth: usize, exc: JsException) -> bool {
+        self.handle_exception(exc, stop_depth).is_ok()
+    }
+
+    pub(crate) fn format_exception_public(&self, val: JsValue) -> String {
+        self.format_exception_value(val)
+    }
+
+    pub(crate) fn create_iterator_public(
+        &mut self,
+        iterable: JsValue,
+    ) -> Result<HeapHandle, JsException> {
+        self.create_iterator(iterable)
+    }
+
+    pub(crate) fn step_iterator_public(
+        &mut self,
+        iter_val: JsValue,
+    ) -> Result<(JsValue, bool), JsException> {
+        self.step_iterator(iter_val)
+    }
+
+    fn suspend_top_frame(&mut self, resume_dst: u8) -> SuspendedFrame {
+        let top = self.frames.pop().expect("active frame to suspend");
+        // Snapshot open upvalues in this frame so closures see current values while suspended
+        // and re-attach seamlessly when the frame resumes.
+        let mut saved_upvalues = Vec::new();
+        let mut i = 0;
+        while i < self.open_upvalues.len() {
+            let (abs_reg, cell) = self.open_upvalues[i];
+            if abs_reg >= top.base_reg {
+                let val = self
+                    .registers
+                    .get(abs_reg)
+                    .copied()
+                    .unwrap_or(JsValue::UNDEFINED);
+                self.heap.object_set_slot(cell, 0, val);
+                saved_upvalues.push((abs_reg - top.base_reg, cell));
+                self.open_upvalues.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        let saved_regs = self.registers.split_off(top.base_reg);
+        SuspendedFrame {
+            program_id: top.program_id,
+            func_idx: top.func_idx,
+            pc: top.pc,
+            this_val: top.this_val,
+            callee: top.callee,
+            saved_regs,
+            saved_upvalues,
+            resume_dst,
+        }
+    }
+
+    /// Core register-window bytecode interpreter dispatch loop (synchronous entry).
     fn run_loop(&mut self, stop_depth: usize) -> Result<JsValue, JsException> {
+        match self.run_suspendable(stop_depth)? {
+            RunOutcome::Completed(val) => Ok(val),
+            RunOutcome::SuspendedAwait { .. }
+            | RunOutcome::SuspendedYield { .. }
+            | RunOutcome::SuspendedYieldStar { .. } => {
+                Err(self.type_error("Unexpected suspension outside async or generator context"))
+            }
+        }
+    }
+
+    /// Core register-window interpreter loop supporting `await` and `yield` suspension.
+    pub(crate) fn run_suspendable(&mut self, stop_depth: usize) -> Result<RunOutcome, JsException> {
         loop {
             if self.frames.len() <= stop_depth {
-                return Ok(JsValue::UNDEFINED);
+                return Ok(RunOutcome::Completed(JsValue::UNDEFINED));
             }
             let frame_idx = self.frames.len() - 1;
             let (prog_id, func_idx, base, pc) = {
@@ -824,7 +1051,7 @@ impl JsVm {
                 None => {
                     // Implicit return undefined.
                     if let Some(ret) = self.pop_frame_with_value(JsValue::UNDEFINED, stop_depth) {
-                        return Ok(ret);
+                        return Ok(RunOutcome::Completed(ret));
                     }
                     continue;
                 }
@@ -841,7 +1068,19 @@ impl JsVm {
                 self.dispatch_op(op, inst, prog_id, func_idx, base, frame_idx, stop_depth);
             match step_res {
                 Ok(StepOutcome::Continue) => {}
-                Ok(StepOutcome::ReturnTop(val)) => return Ok(val),
+                Ok(StepOutcome::ReturnTop(val)) => return Ok(RunOutcome::Completed(val)),
+                Ok(StepOutcome::SuspendAwait { dst, awaited }) => {
+                    let frame = self.suspend_top_frame(dst);
+                    return Ok(RunOutcome::SuspendedAwait { frame, awaited });
+                }
+                Ok(StepOutcome::SuspendYield { dst, yielded }) => {
+                    let frame = self.suspend_top_frame(dst);
+                    return Ok(RunOutcome::SuspendedYield { frame, yielded });
+                }
+                Ok(StepOutcome::SuspendYieldStar { dst, iterable }) => {
+                    let frame = self.suspend_top_frame(dst);
+                    return Ok(RunOutcome::SuspendedYieldStar { frame, iterable });
+                }
                 Err(exc) => {
                     self.handle_exception(exc, stop_depth)?;
                 }
@@ -1687,15 +1926,56 @@ impl JsVm {
             Opcode::PopWith => {
                 self.with_stack.pop();
             }
-            // Async / Generators / Module runtime hooks (expanded in Issue #15)
-            Opcode::Await | Opcode::Yield | Opcode::YieldStar | Opcode::DynamicImport => {
-                let src = self.registers[base + usize::from(inst.b())];
-                self.registers[a] = src;
+            // Async / Generators / Module runtime hooks
+            Opcode::Await => {
+                let awaited = self.registers[base + usize::from(inst.b())];
+                return Ok(StepOutcome::SuspendAwait {
+                    dst: inst.a(),
+                    awaited,
+                });
+            }
+            Opcode::Yield => {
+                let yielded = self.registers[base + usize::from(inst.b())];
+                return Ok(StepOutcome::SuspendYield {
+                    dst: inst.a(),
+                    yielded,
+                });
+            }
+            Opcode::YieldStar => {
+                let iterable = self.registers[base + usize::from(inst.b())];
+                return Ok(StepOutcome::SuspendYieldStar {
+                    dst: inst.a(),
+                    iterable,
+                });
+            }
+            Opcode::DynamicImport => {
+                let spec_val = self.registers[base + usize::from(inst.b())];
+                let specifier = self.value_to_rust_string(spec_val);
+                let referrer = self
+                    .module_envs
+                    .get(&(prog_id as u32))
+                    .map(|e| e.url.clone());
+                let promise_h = if let Some(handler) = self.dynamic_import_handler.clone() {
+                    handler(self, referrer, specifier)
+                } else {
+                    let p = crate::promise::alloc_promise(self);
+                    let err =
+                        self.type_error("Dynamic import() requires a registered ModuleLoader");
+                    crate::promise::reject_promise(self, p, err.value);
+                    p
+                };
+                self.registers[a] = JsValue::from_object(promise_h);
             }
             Opcode::GetModuleImport => {
-                self.registers[a] = JsValue::UNDEFINED;
+                let import_idx = inst.bx();
+                let val = crate::modules::vm_get_module_import(self, prog_id as u32, import_idx)?;
+                self.registers[a] = val;
             }
-            Opcode::SetModuleExport => {}
+            Opcode::SetModuleExport => {
+                let export_idx = inst.bx();
+                let val = self.registers[a];
+                crate::modules::vm_set_module_export(self, prog_id as u32, export_idx, val);
+            }
         }
         Ok(StepOutcome::Continue)
     }
@@ -3369,6 +3649,9 @@ impl JsVm {
 enum StepOutcome {
     Continue,
     ReturnTop(JsValue),
+    SuspendAwait { dst: u8, awaited: JsValue },
+    SuspendYield { dst: u8, yielded: JsValue },
+    SuspendYieldStar { dst: u8, iterable: JsValue },
 }
 
 enum NativeInv {

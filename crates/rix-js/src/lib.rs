@@ -13,7 +13,9 @@ pub mod elements;
 pub mod heap;
 pub mod ic;
 pub mod lexer;
+pub mod modules;
 pub mod parser;
+pub mod promise;
 pub mod shape;
 pub mod string;
 pub mod value;
@@ -30,12 +32,17 @@ pub use cache::{BytecodeCache, CacheStatus};
 pub use compiler::{compile, compile_program, CompileError};
 pub use elements::{ElementsKind, ElementsStorage, SPARSE_GAP_THRESHOLD};
 pub use heap::{
-    BoundFunctionObject, ClosureObject, GcCycleStats, GcHeap, Generation, HeapCell, JsObject,
-    MajorGcPhase, ObjectKind, ProxyObject, RootStack, WeakHeapHandle, WeakTable,
+    BoundFunctionObject, ClosureObject, GcCycleStats, GcHeap, Generation, GeneratorObject,
+    GeneratorState, HeapCell, JsObject, MajorGcPhase, ObjectKind, PromiseObject, PromiseReaction,
+    PromiseState, ProxyObject, RootStack, SuspendedFrame, WeakHeapHandle, WeakTable,
     DEFAULT_NURSERY_LIMIT, DEFAULT_OLD_GC_THRESHOLD,
 };
 pub use ic::{IcEntry, IcState, IcStats, IcTable, MegamorphicCache, POLYMORPHIC_MAX_ENTRIES};
+pub use modules::{
+    ImportMap, MemoryModuleProvider, ModuleEnv, ModuleError, ModuleLoader, ModuleSourceProvider,
+};
 pub use parser::parse;
+pub use promise::MicrotaskJob;
 pub use shape::{
     DictProperty, PropertyAttrs, Shape, ShapeId, ShapeSlot, ShapeTable, DICTIONARY_TRANSITION_LIMIT,
 };

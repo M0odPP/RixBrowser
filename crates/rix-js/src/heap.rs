@@ -150,6 +150,90 @@ pub struct TypedArrayObject {
     pub length: u32,
 }
 
+/// Suspended register-window execution frame for `async` functions, generators,
+/// and top-level-`await` ES modules.
+#[derive(Debug, Clone)]
+pub struct SuspendedFrame {
+    pub program_id: u32,
+    pub func_idx: u32,
+    pub pc: usize,
+    pub this_val: JsValue,
+    pub callee: HeapHandle,
+    pub saved_regs: Vec<JsValue>,
+    /// Open upvalue cells `(relative_reg_offset, cell_handle)` detached on suspend
+    /// and re-attached on resume so closures stay live across `await`/`yield`.
+    pub saved_upvalues: Vec<(usize, HeapHandle)>,
+    pub resume_dst: u8,
+}
+
+impl SuspendedFrame {
+    pub fn trace_children(&self, mut visit: impl FnMut(HeapHandle)) {
+        if let Some(h) = self.this_val.as_heap_handle() {
+            visit(h);
+        }
+        visit(self.callee);
+        for &v in &self.saved_regs {
+            if let Some(h) = v.as_heap_handle() {
+                visit(h);
+            }
+        }
+        for &(_, cell) in &self.saved_upvalues {
+            visit(cell);
+        }
+    }
+}
+
+/// Resolution state of an ECMAScript `Promise`.
+#[derive(Debug, Clone, Copy)]
+pub enum PromiseState {
+    Pending,
+    Fulfilled(JsValue),
+    Rejected(JsValue),
+}
+
+/// Reaction record queued on a pending [`PromiseObject`].
+#[derive(Debug, Clone, Copy)]
+pub struct PromiseReaction {
+    pub on_fulfilled: Option<HeapHandle>,
+    pub on_rejected: Option<HeapHandle>,
+    pub result_promise: Option<HeapHandle>,
+}
+
+/// Backing storage for an ECMAScript `Promise` object.
+#[derive(Debug, Clone)]
+pub struct PromiseObject {
+    pub state: PromiseState,
+    pub reactions: Vec<PromiseReaction>,
+    pub handled: bool,
+}
+
+impl Default for PromiseObject {
+    fn default() -> Self {
+        Self {
+            state: PromiseState::Pending,
+            reactions: Vec::new(),
+            handled: false,
+        }
+    }
+}
+
+/// Lifecycle state of an ECMAScript `Generator`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratorState {
+    SuspendedStart,
+    SuspendedYield,
+    Executing,
+    Completed,
+}
+
+/// Backing storage for an ECMAScript `Generator` object (`function*`).
+#[derive(Debug, Clone)]
+pub struct GeneratorObject {
+    pub state: GeneratorState,
+    pub frame: Option<SuspendedFrame>,
+    pub delegate_iter: Option<HeapHandle>,
+}
+
 /// Getter/setter handle pair for accessor properties.
 pub type AccessorPair = (Option<HeapHandle>, Option<HeapHandle>);
 
@@ -184,6 +268,8 @@ pub enum ObjectKind {
     ArrayBuffer(Box<Vec<u8>>),
     DataView(DataViewObject),
     TypedArray(TypedArrayObject),
+    Promise(Box<PromiseObject>),
+    Generator(Box<GeneratorObject>),
     Host,
 }
 
@@ -387,6 +473,35 @@ impl JsObject {
             }
             ObjectKind::TypedArray(ta) => {
                 visit(ta.buffer);
+            }
+            ObjectKind::Promise(p) => {
+                match p.state {
+                    PromiseState::Fulfilled(v) | PromiseState::Rejected(v) => {
+                        if let Some(h) = v.as_heap_handle() {
+                            visit(h);
+                        }
+                    }
+                    PromiseState::Pending => {}
+                }
+                for r in &p.reactions {
+                    if let Some(h) = r.on_fulfilled {
+                        visit(h);
+                    }
+                    if let Some(h) = r.on_rejected {
+                        visit(h);
+                    }
+                    if let Some(h) = r.result_promise {
+                        visit(h);
+                    }
+                }
+            }
+            ObjectKind::Generator(g) => {
+                if let Some(ref f) = g.frame {
+                    f.trace_children(&mut visit);
+                }
+                if let Some(d) = g.delegate_iter {
+                    visit(d);
+                }
             }
             // WeakMap, WeakSet, and WeakRef do NOT strongly trace weak keys or targets.
             // WeakMap ephemeron values are traced during GC ephemeron resolution when keys are live.

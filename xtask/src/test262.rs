@@ -1,12 +1,55 @@
-//! ECMAScript Test262 harness (`cargo xtask test262`) with YAML frontmatter
-//! parsing (`/*--- ... ---*/`) and committed conformance baseline tracking
-//! ready for Phase 2/3 JS VM (`rix-js`) integration.
+//! ECMAScript Test262 harness (`cargo xtask test262`) executing real `.js`
+//! conformance tests on `rix-js` with YAML frontmatter parsing (`/*--- ... ---*/`),
+//! strict/non-strict/module/async modes, negative phase/type checks, and committed
+//! baseline ratchet tracking.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use rix_js::{EvalError, JsVm, ModuleLoader, ObjectKind, PromiseState, PropertyAttrs};
 use serde::{Deserialize, Serialize};
+
+/// Standard Test262 assertion harness injected before each test case.
+const TEST262_HARNESS_PRELUDE: &str = r#"
+function Test262Error(message) {
+    this.name = "Test262Error";
+    this.message = message || "";
+}
+Test262Error.prototype = Object.create(Error.prototype);
+Test262Error.prototype.constructor = Test262Error;
+
+function assert(mustBeTrue, message) {
+    if (mustBeTrue === true) return;
+    throw new Test262Error(message || "Expected true but got " + mustBeTrue);
+}
+assert.sameValue = function(actual, expected, message) {
+    if (Object.is(actual, expected)) return;
+    throw new Test262Error((message ? message + ": " : "") + "Expected " + expected + " but got " + actual);
+};
+assert.notSameValue = function(actual, unexpected, message) {
+    if (!Object.is(actual, unexpected)) return;
+    throw new Test262Error((message ? message + ": " : "") + "Expected value different from " + unexpected);
+};
+assert.throws = function(expectedErrorConstructor, func, message) {
+    let threw = false;
+    try {
+        func();
+    } catch (err) {
+        threw = true;
+        if (expectedErrorConstructor) {
+            const expName = expectedErrorConstructor.name;
+            const errName = err && err.name ? err.name : "";
+            if (!(err instanceof expectedErrorConstructor) && errName !== expName) {
+                throw new Test262Error((message ? message + ": " : "") + "Expected " + expName + " but got " + errName);
+            }
+        }
+    }
+    if (!threw) {
+        throw new Test262Error((message ? message + ": " : "") + "Expected exception to be thrown");
+    }
+};
+"#;
 
 /// Parsed Test262 YAML metadata header (`/*--- ... ---*/`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -26,15 +69,35 @@ pub struct Test262Baseline {
     pub passed: usize,
 }
 
+/// Individual failure record reported when a Test262 test fails.
+#[derive(Debug, Clone)]
+pub struct Test262Failure {
+    pub path: String,
+    pub reason: String,
+}
+
 /// Summary report emitted by `cargo xtask test262`.
 #[derive(Debug, Clone, Default)]
 pub struct Test262Report {
     pub total: usize,
     pub metadata_valid: usize,
     pub passed: usize,
+    pub failed: usize,
     pub pending_vm: usize,
     pub baseline_passed: usize,
     pub regressed: bool,
+    pub failures: Vec<Test262Failure>,
+}
+
+impl Test262Report {
+    #[must_use]
+    pub fn pass_rate_pct(&self) -> f64 {
+        if self.total == 0 {
+            100.0
+        } else {
+            (self.passed as f64 / self.total as f64) * 100.0
+        }
+    }
 }
 
 /// Parses Test262 `/*--- ... ---*/` metadata block from a `.js` test file.
@@ -98,8 +161,158 @@ fn collect_js_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Discovers Test262 fixtures, validates metadata, runs available JS execution
-/// checks, and verifies pass count does not regress below `baseline_path`.
+fn run_single_test262(source: &str, meta: &Test262Metadata) -> std::result::Result<(), String> {
+    let is_module = meta.flags.iter().any(|f| f == "module");
+    let is_async = meta.flags.iter().any(|f| f == "async");
+    let only_strict = meta.flags.iter().any(|f| f == "onlyStrict");
+    let no_strict = meta.flags.iter().any(|f| f == "noStrict");
+
+    let mut modes = Vec::new();
+    if is_module || only_strict {
+        modes.push(true);
+    } else if no_strict {
+        modes.push(false);
+    } else if meta.negative_phase.is_some() {
+        // Test262 negative tests without explicit strictness flags pass if strict mode rejects.
+        modes.push(true);
+    } else {
+        modes.push(false);
+    }
+
+    for strict in modes {
+        run_single_mode(source, meta, strict, is_module, is_async)?;
+    }
+    Ok(())
+}
+
+fn run_single_mode(
+    source: &str,
+    meta: &Test262Metadata,
+    strict: bool,
+    is_module: bool,
+    is_async: bool,
+) -> std::result::Result<(), String> {
+    let mut vm = JsVm::new();
+    vm.max_loop_iterations = Some(500_000);
+    vm.eval_script(TEST262_HARNESS_PRELUDE)
+        .map_err(|e| format!("harness prelude failed: {e}"))?;
+
+    let done_state = std::rc::Rc::new(std::cell::RefCell::new(None::<Option<String>>));
+    if is_async {
+        let ds = std::rc::Rc::clone(&done_state);
+        let done_fn = vm.alloc_host_fn("$DONE", move |vm, _this, args| {
+            let err_arg = args.first().copied().unwrap_or(rix_js::JsValue::UNDEFINED);
+            if err_arg.is_undefined() || err_arg.is_null() {
+                *ds.borrow_mut() = Some(None);
+            } else {
+                *ds.borrow_mut() = Some(Some(vm.value_to_rust_string(err_arg)));
+            }
+            Ok(rix_js::JsValue::UNDEFINED)
+        });
+        let k_done = vm.heap.intern_key("$DONE");
+        let g = vm.global;
+        vm.heap.object_define_data(
+            g,
+            k_done,
+            rix_js::JsValue::from_object(done_fn),
+            PropertyAttrs::METHOD,
+            &mut vm.shapes,
+        );
+    }
+
+    let exec_source = if strict && !is_module {
+        format!("\"use strict\";\n{source}")
+    } else {
+        source.to_string()
+    };
+
+    let outcome: std::result::Result<(), (String, String)> = if is_module {
+        match ModuleLoader::eval_single_module(
+            &mut vm,
+            "https://test262.local/test.mjs",
+            &exec_source,
+        ) {
+            Ok(prom_h) => {
+                vm.drain_microtasks();
+                match vm.heap.get_object(prom_h).map(|o| &o.kind) {
+                    Some(ObjectKind::Promise(p)) => match p.state {
+                        PromiseState::Fulfilled(_) => Ok(()),
+                        PromiseState::Rejected(r) => {
+                            Err(("runtime".into(), error_type_name(&vm, r)))
+                        }
+                        PromiseState::Pending => {
+                            Err(("runtime".into(), "ModulePromisePending".into()))
+                        }
+                    },
+                    _ => Ok(()),
+                }
+            }
+            Err(e) => Err(("parse".into(), format!("SyntaxError: {e}"))),
+        }
+    } else {
+        match vm.eval_script(&exec_source) {
+            Ok(_) => {
+                vm.drain_microtasks();
+                Ok(())
+            }
+            Err(EvalError::Compile(e)) => Err(("parse".into(), format!("SyntaxError: {e}"))),
+            Err(EvalError::Runtime(e)) => Err(("runtime".into(), error_type_name(&vm, e.value))),
+        }
+    };
+
+    match (&meta.negative_phase, &meta.negative_type) {
+        (Some(exp_phase), Some(exp_type)) => match outcome {
+            Ok(()) => Err(format!(
+                "expected negative {exp_phase}/{exp_type}, but test succeeded"
+            )),
+            Err((actual_phase, actual_err)) => {
+                let phase_ok = exp_phase == &actual_phase
+                    || (exp_phase == "early" && actual_phase == "parse")
+                    || (exp_phase == "resolution" && actual_phase == "parse");
+                let type_ok = actual_err.contains(exp_type.as_str());
+                if phase_ok && type_ok {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "expected negative {exp_phase}/{exp_type}, got {actual_phase}/{actual_err}"
+                    ))
+                }
+            }
+        },
+        _ => {
+            if let Err((phase, err)) = outcome {
+                return Err(format!("unexpected {phase} error: {err}"));
+            }
+            if is_async {
+                match done_state.borrow().as_ref() {
+                    Some(None) => Ok(()),
+                    Some(Some(err)) => Err(format!("async test called $DONE with error: {err}")),
+                    None => Err("async test never invoked $DONE()".into()),
+                }
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+fn error_type_name(vm: &JsVm, val: rix_js::JsValue) -> String {
+    if let Some(h) = val.as_object() {
+        if let Some(p) = vm.heap.object_get_own(h, vm.key_name, &vm.shapes) {
+            let n = vm.value_to_rust_string(p.value);
+            let m = vm
+                .heap
+                .object_get_own(h, vm.key_message, &vm.shapes)
+                .map(|mp| vm.value_to_rust_string(mp.value))
+                .unwrap_or_default();
+            return format!("{n}: {m}");
+        }
+    }
+    vm.value_to_rust_string(val)
+}
+
+/// Discovers Test262 fixtures, validates metadata, executes each case on `rix-js`,
+/// and verifies pass count does not regress below `baseline_path`.
 pub fn run_test262_suite(
     test262_dir: &Path,
     baseline_path: &Path,
@@ -124,16 +337,30 @@ pub fn run_test262_suite(
 
     for path in &files {
         let src = fs::read_to_string(path)?;
-        if parse_test262_frontmatter(&src).is_some() {
-            report.metadata_valid += 1;
-            // Phase 2/3 (`rix-js`) will plug execution directly here and ratchet `passed`.
-            report.pending_vm += 1;
+        let Some(meta) = parse_test262_frontmatter(&src) else {
+            report.failed += 1;
+            report.failures.push(Test262Failure {
+                path: path.display().to_string(),
+                reason: "missing Test262 YAML frontmatter".into(),
+            });
+            continue;
+        };
+        report.metadata_valid += 1;
+        match run_single_test262(&src, &meta) {
+            Ok(()) => report.passed += 1,
+            Err(reason) => {
+                report.failed += 1;
+                report.failures.push(Test262Failure {
+                    path: path.display().to_string(),
+                    reason,
+                });
+            }
         }
     }
 
     if update_baseline {
         let updated = Test262Baseline {
-            engine_status: "phase1-harness-ready".to_string(),
+            engine_status: "phase2-rix-js-tier1".to_string(),
             total_discovered: report.total,
             passed: report.passed,
         };
@@ -152,13 +379,18 @@ pub fn run_test262_suite(
 }
 
 pub fn print_report(report: &Test262Report) {
-    println!("=== Test262 Conformance Harness ===");
+    println!("=== Test262 Conformance Harness (rix-js Tier-1) ===");
     println!(
-        "  Discovered: {} | Valid frontmatter: {} | Passed: {} (baseline: {}) | Pending JS VM: {}",
+        "  Discovered: {} | Valid frontmatter: {} | Passed: {} / {} ({:.1}%) | Baseline: {} | Failed: {}",
         report.total,
         report.metadata_valid,
         report.passed,
+        report.total,
+        report.pass_rate_pct(),
         report.baseline_passed,
-        report.pending_vm
+        report.failed,
     );
+    for f in &report.failures {
+        println!("    FAIL {}: {}", f.path, f.reason);
+    }
 }
