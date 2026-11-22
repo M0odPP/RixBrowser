@@ -572,12 +572,30 @@ impl Canvas2DContext {
         }
     }
 
+    #[must_use]
+    pub fn line_cap_str(&self) -> &'static str {
+        match self.state.line_cap {
+            Cap::Round => "round",
+            Cap::Square => "square",
+            _ => "butt",
+        }
+    }
+
     pub fn set_line_join(&mut self, join: &str) {
         match join.trim().to_ascii_lowercase().as_str() {
             "miter" => self.state.line_join = Join::Miter,
             "round" => self.state.line_join = Join::Round,
             "bevel" => self.state.line_join = Join::Bevel,
             _ => {}
+        }
+    }
+
+    #[must_use]
+    pub fn line_join_str(&self) -> &'static str {
+        match self.state.line_join {
+            Join::Round => "round",
+            Join::Bevel => "bevel",
+            _ => "miter",
         }
     }
 
