@@ -1,0 +1,141 @@
+# WPT subset: WebCryptoAPI (getRandomValues, randomUUID, SubtleCrypto digest/HMAC/AES/HKDF/PBKDF2/Ed25519/ECDSA/ECDH/RSA)
+
+[[script_cases]]
+name = "crypto_get_random_values_and_random_uuid"
+script = """
+var buf = new Uint8Array(16);
+var ret = crypto.getRandomValues(buf);
+var u1 = crypto.randomUUID();
+var u2 = crypto.randomUUID();
+var re = new RegExp("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$");
+var floatErr = "", quotaErr = "";
+try { crypto.getRandomValues(new Float64Array(2)); } catch (e) { floatErr = e.name; }
+try { crypto.getRandomValues(new Uint8Array(65537)); } catch (e) { quotaErr = e.name; }
+var __pass = ret === buf && re.test(u1) && re.test(u2) && u1 !== u2
+    && floatErr === "TypeMismatchError" && quotaErr === "QuotaExceededError";
+"""
+assert_expr = "__pass"
+expected = "true"
+
+[[script_cases]]
+name = "subtle_digest_nist_sha256_sha384_sha512"
+advance_ms = 5
+script = """
+var out = "";
+function hex(b) {
+    return Array.from(new Uint8Array(b)).map(function(x) { return x.toString(16).padStart(2, "0"); }).join("");
+}
+var msg = new TextEncoder().encode("abc");
+Promise.all([
+    crypto.subtle.digest("SHA-256", msg),
+    crypto.subtle.digest("SHA-384", msg),
+    crypto.subtle.digest("SHA-512", msg)
+]).then(function(arr) {
+    out = (hex(arr[0]) === "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        + "|" + (arr[1].byteLength === 48)
+        + "|" + (arr[2].byteLength === 64);
+});
+"""
+assert_expr = "out"
+expected = "true|true|true"
+
+[[script_cases]]
+name = "subtle_aes_gcm_encrypt_decrypt_and_tamper_rejection"
+advance_ms = 5
+script = """
+var out = "";
+(async function() {
+    var key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    var iv = crypto.getRandomValues(new Uint8Array(12));
+    var aad = new TextEncoder().encode("aad");
+    var pt = new TextEncoder().encode("rix-webcrypto");
+    var ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv, additionalData: aad }, key, pt);
+    var dec = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv, additionalData: aad }, key, ct);
+    var tampered = "";
+    try {
+        await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv, additionalData: new TextEncoder().encode("bad") }, key, ct);
+    } catch (e) { tampered = e.name; }
+    var nonExt = "";
+    try { await crypto.subtle.exportKey("raw", key); } catch (e) { nonExt = e.name; }
+    out = new TextDecoder().decode(dec) + "|" + tampered + "|" + nonExt;
+})();
+"""
+assert_expr = "out"
+expected = "rix-webcrypto|OperationError|InvalidAccessError"
+
+[[script_cases]]
+name = "subtle_hmac_hkdf_and_pbkdf2_vectors"
+advance_ms = 5
+script = """
+var out = "";
+function hex(b) {
+    return Array.from(new Uint8Array(b)).map(function(x) { return x.toString(16).padStart(2, "0"); }).join("");
+}
+(async function() {
+    var k = await crypto.subtle.importKey("raw", new TextEncoder().encode("Jefe"), { name: "HMAC", hash: "SHA-256" }, true, ["sign", "verify"]);
+    var sig = await crypto.subtle.sign("HMAC", k, new TextEncoder().encode("what do ya want for nothing?"));
+    var ok = await crypto.subtle.verify("HMAC", k, sig, new TextEncoder().encode("what do ya want for nothing?"));
+    var pw = await crypto.subtle.importKey("raw", new TextEncoder().encode("password"), "PBKDF2", false, ["deriveBits"]);
+    var bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: new TextEncoder().encode("salt"), iterations: 1 }, pw, 256);
+    out = ok + "|" + (hex(sig) === "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+        + "|" + (hex(bits) === "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+})();
+"""
+assert_expr = "out"
+expected = "true|true|true"
+
+[[script_cases]]
+name = "subtle_ed25519_ecdsa_and_ecdh_roundtrip"
+advance_ms = 5
+script = """
+var out = "";
+function hex(b) {
+    return Array.from(new Uint8Array(b)).map(function(x) { return x.toString(16).padStart(2, "0"); }).join("");
+}
+(async function() {
+    var ed = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+    var data = new TextEncoder().encode("sign-me");
+    var edSig = await crypto.subtle.sign("Ed25519", ed.privateKey, data);
+    var edOk = await crypto.subtle.verify("Ed25519", ed.publicKey, edSig, data);
+
+    var ec = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+    var ecSig = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, ec.privateKey, data);
+    var ecOk = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, ec.publicKey, ecSig, data);
+
+    var a = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+    var b = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+    var s1 = hex(await crypto.subtle.deriveBits({ name: "ECDH", public: b.publicKey }, a.privateKey, 256));
+    var s2 = hex(await crypto.subtle.deriveBits({ name: "ECDH", public: a.publicKey }, b.privateKey, 256));
+    out = edOk + "|" + ecOk + "|" + (s1.length === 64 && s1 === s2);
+})();
+"""
+assert_expr = "out"
+expected = "true|true|true"
+
+[[script_cases]]
+name = "subtle_rsa_oaep_and_pss_roundtrip"
+advance_ms = 5
+script = """
+var out = "";
+(async function() {
+    var oaep = await crypto.subtle.generateKey(
+        { name: "RSA-OAEP", modulusLength: 1024, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+        true,
+        ["encrypt", "decrypt"]
+    );
+    var ct = await crypto.subtle.encrypt({ name: "RSA-OAEP" }, oaep.publicKey, new TextEncoder().encode("rsa-msg"));
+    var pt = await crypto.subtle.decrypt({ name: "RSA-OAEP" }, oaep.privateKey, ct);
+
+    var pss = await crypto.subtle.generateKey(
+        { name: "RSA-PSS", modulusLength: 1024, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+        true,
+        ["sign", "verify"]
+    );
+    var msg = new TextEncoder().encode("verify-pss");
+    var sig = await crypto.subtle.sign({ name: "RSA-PSS", saltLength: 32 }, pss.privateKey, msg);
+    var ok = await crypto.subtle.verify({ name: "RSA-PSS", saltLength: 32 }, pss.publicKey, sig, msg);
+    out = new TextDecoder().decode(pt) + "|" + ok;
+})();
+"""
+assert_expr = "out"
+expected = "rsa-msg|true"
