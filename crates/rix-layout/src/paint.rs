@@ -473,7 +473,8 @@ impl<'a> Painter<'a> {
             FragmentKind::TextRun(_)
             | FragmentKind::Image { .. }
             | FragmentKind::Svg { .. }
-            | FragmentKind::FormControl { .. } => {
+            | FragmentKind::FormControl { .. }
+            | FragmentKind::ExternalSurface { .. } => {
                 self.paint_box_decorations(frag, abs_rect);
                 self.paint_leaf_content(frag, abs_rect);
             }
@@ -715,6 +716,16 @@ impl<'a> Painter<'a> {
                     }
                 }
             }
+            FragmentKind::ExternalSurface { surface_id, .. } => {
+                if content_abs.is_empty() {
+                    return;
+                }
+                self.list.push(DisplayItem::ExternalSurface {
+                    bounds: content_abs,
+                    surface_id: *surface_id,
+                    radii: resolve_radii(&frag.style, content_abs),
+                });
+            }
             FragmentKind::Svg { view_box, paths } => {
                 if content_abs.is_empty() || paths.is_empty() {
                     return;
@@ -922,6 +933,7 @@ fn is_inline_level_fragment(frag: &Fragment) -> bool {
             | FragmentKind::Image { .. }
             | FragmentKind::Svg { .. }
             | FragmentKind::FormControl { .. }
+            | FragmentKind::ExternalSurface { .. }
     )
 }
 

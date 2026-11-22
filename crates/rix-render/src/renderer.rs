@@ -1,3 +1,5 @@
+use rix_ipc::SurfaceId;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -5,6 +7,15 @@ use thiserror::Error;
 use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene};
+
+use crate::canvas2d::Canvas2DContext;
+
+struct OffscreenGpuSurface {
+    texture: vello::wgpu::Texture,
+    view: vello::wgpu::TextureView,
+    width: u32,
+    height: u32,
+}
 
 #[derive(Error, Debug)]
 pub enum RenderError {
@@ -29,6 +40,8 @@ pub struct VelloRenderer {
     renderer: Option<Renderer>,
     renderer_device_id: Option<usize>,
     surface: Option<RenderSurface<'static>>,
+    offscreen_surfaces: HashMap<SurfaceId, OffscreenGpuSurface>,
+    gpu_surface_allocations: u64,
     width: u32,
     height: u32,
 }
@@ -46,9 +59,20 @@ impl VelloRenderer {
             renderer: None,
             renderer_device_id: None,
             surface: None,
+            offscreen_surfaces: HashMap::new(),
+            gpu_surface_allocations: 0,
             width: 0,
             height: 0,
         }
+    }
+
+    #[must_use]
+    pub const fn gpu_surface_allocations(&self) -> u64 {
+        self.gpu_surface_allocations
+    }
+
+    pub fn release_gpu_surface(&mut self, surface_id: SurfaceId) -> bool {
+        self.offscreen_surfaces.remove(&surface_id).is_some()
     }
 
     pub fn has_surface(&self) -> bool {
@@ -296,6 +320,183 @@ impl VelloRenderer {
         base_color: Color,
     ) -> Result<Vec<u8>, RenderError> {
         pollster::block_on(self.render_to_rgba(scene, width, height, base_color))
+    }
+
+    /// Renders a GPU-backed [`Canvas2DContext`] via Vello directly into a persistent
+    /// off-screen GPU `wgpu::Texture` keyed by `canvas.surface_id()` (reallocated ONLY on resize!).
+    pub async fn render_canvas_to_gpu_surface(
+        &mut self,
+        canvas: &Canvas2DContext,
+    ) -> Result<(), RenderError> {
+        let width = canvas.width().max(1);
+        let height = canvas.height().max(1);
+        let surface_id = canvas.surface_id();
+        let device_id = match self.renderer_device_id {
+            Some(id) => id,
+            None => self
+                .context
+                .device(None)
+                .await
+                .ok_or(RenderError::NoDevice)?,
+        };
+        let handle = &self.context.devices[device_id];
+        let limits = handle.device.limits();
+        if width > limits.max_texture_dimension_2d || height > limits.max_texture_dimension_2d {
+            return Err(RenderError::BadSize(width, height));
+        }
+        if self.renderer_device_id != Some(device_id) {
+            self.renderer = Some(
+                Renderer::new(&handle.device, RendererOptions::default())
+                    .map_err(|e| RenderError::Vello(format!("{e:?}")))?,
+            );
+            self.renderer_device_id = Some(device_id);
+        }
+
+        let device = &handle.device;
+        let queue = &handle.queue;
+        let needs_alloc = self
+            .offscreen_surfaces
+            .get(&surface_id)
+            .is_none_or(|s| s.width != width || s.height != height);
+        if needs_alloc {
+            let texture = device.create_texture(&vello::wgpu::TextureDescriptor {
+                label: Some("rix-canvas2d-gpu-surface"),
+                size: vello::wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: vello::wgpu::TextureDimension::D2,
+                format: vello::wgpu::TextureFormat::Rgba8Unorm,
+                usage: vello::wgpu::TextureUsages::STORAGE_BINDING
+                    | vello::wgpu::TextureUsages::TEXTURE_BINDING
+                    | vello::wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            self.offscreen_surfaces.insert(
+                surface_id,
+                OffscreenGpuSurface {
+                    texture,
+                    view,
+                    width,
+                    height,
+                },
+            );
+            self.gpu_surface_allocations += 1;
+        }
+
+        let scene = canvas.snapshot_scene();
+        let target = self
+            .offscreen_surfaces
+            .get(&surface_id)
+            .ok_or(RenderError::NoSurface)?;
+        self.renderer
+            .as_mut()
+            .ok_or(RenderError::NoDevice)?
+            .render_to_texture(
+                device,
+                queue,
+                &scene,
+                &target.view,
+                &render_params(width, height, Color::TRANSPARENT),
+            )
+            .map_err(|e| RenderError::Vello(format!("{e:?}")))?;
+        Ok(())
+    }
+
+    pub fn render_canvas_to_gpu_surface_blocking(
+        &mut self,
+        canvas: &Canvas2DContext,
+    ) -> Result<(), RenderError> {
+        pollster::block_on(self.render_canvas_to_gpu_surface(canvas))
+    }
+
+    /// Reads back RGBA8 pixels on demand from a GPU-resident `ExternalSurface` texture
+    /// (called ONLY when JS invokes `getImageData`/`toDataURL`/`toBlob` or visual reftests).
+    pub async fn readback_gpu_surface_rgba(
+        &mut self,
+        surface_id: SurfaceId,
+    ) -> Result<(u32, u32, Vec<u8>), RenderError> {
+        let device_id = self.renderer_device_id.ok_or(RenderError::NoDevice)?;
+        let handle = &self.context.devices[device_id];
+        let target = self
+            .offscreen_surfaces
+            .get(&surface_id)
+            .ok_or(RenderError::NoSurface)?;
+        let (width, height) = (target.width, target.height);
+        let row_bytes = width
+            .checked_mul(4)
+            .ok_or(RenderError::BadSize(width, height))?;
+        let padded_row_bytes = row_bytes
+            .checked_add(255)
+            .map(|b| b / 256 * 256)
+            .ok_or(RenderError::BadSize(width, height))?;
+        let buffer_size = u64::from(padded_row_bytes) * u64::from(height);
+        let device = &handle.device;
+        let queue = &handle.queue;
+        let buffer = device.create_buffer(&vello::wgpu::BufferDescriptor {
+            label: Some("rix-canvas2d-readback"),
+            size: buffer_size,
+            usage: vello::wgpu::BufferUsages::COPY_DST | vello::wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            vello::wgpu::TexelCopyTextureInfo {
+                texture: &target.texture,
+                mip_level: 0,
+                origin: vello::wgpu::Origin3d::ZERO,
+                aspect: vello::wgpu::TextureAspect::All,
+            },
+            vello::wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: vello::wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(height),
+                },
+            },
+            vello::wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = queue.submit([encoder.finish()]);
+        let slice = buffer.slice(..);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(vello::wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        let timeout = Duration::from_secs(30);
+        device
+            .poll(vello::wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(timeout),
+            })
+            .map_err(|e| RenderError::Readback(e.to_string()))?;
+        rx.recv_timeout(timeout)
+            .map_err(|e| RenderError::Readback(e.to_string()))?
+            .map_err(|e| RenderError::Readback(e.to_string()))?;
+
+        let mapped = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity(row_bytes as usize * height as usize);
+        for row in mapped.chunks_exact(padded_row_bytes as usize) {
+            pixels.extend_from_slice(&row[..row_bytes as usize]);
+        }
+        drop(mapped);
+        buffer.unmap();
+        Ok((width, height, pixels))
+    }
+
+    pub fn readback_gpu_surface_rgba_blocking(
+        &mut self,
+        surface_id: SurfaceId,
+    ) -> Result<(u32, u32, Vec<u8>), RenderError> {
+        pollster::block_on(self.readback_gpu_surface_rgba(surface_id))
     }
 
     pub fn save_rgba_png(

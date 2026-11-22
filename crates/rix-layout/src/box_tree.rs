@@ -17,7 +17,15 @@ use rix_css::{
 use rix_dom::{
     svg_element_to_path_d, DirtyFlags, Document, ElementData, NodeData, NodeId, SvgViewBox,
 };
-use rix_ipc::ImageId;
+use rix_ipc::{ImageId, SurfaceId};
+
+/// Deterministic GPU `ExternalSurface` identifier derived from a DOM `NodeId`
+/// (zero pixel arrays or graphics state stored inside DOM nodes!).
+#[inline]
+#[must_use]
+pub fn surface_id_for_node(node: NodeId) -> SurfaceId {
+    SurfaceId((usize::from(node) as u64).wrapping_add(1))
+}
 
 use crate::assets::{parse_html_dimension_attr, parse_svg_color, AssetRegistry};
 
@@ -72,6 +80,10 @@ pub enum ReplacedKind {
         kind: FormControlKind,
         text: String,
         placeholder: String,
+        intrinsic_size: Size,
+    },
+    ExternalSurface {
+        surface_id: SurfaceId,
         intrinsic_size: Size,
     },
     LineBreak,
@@ -150,6 +162,7 @@ impl LayoutBox {
                     ReplacedKind::Image { .. }
                         | ReplacedKind::Svg { .. }
                         | ReplacedKind::FormControl { .. }
+                        | ReplacedKind::ExternalSurface { .. }
                         | ReplacedKind::LineBreak
                 )
         )
@@ -457,6 +470,20 @@ impl<'a> BoxTreeBuilder<'a> {
         match elem.name.local.as_str() {
             "br" => Some(ReplacedKind::LineBreak),
             "hr" => Some(ReplacedKind::HorizontalRule),
+            "canvas" => {
+                let iw = elem
+                    .get_attribute("width")
+                    .and_then(parse_html_dimension_attr)
+                    .unwrap_or(300.0);
+                let ih = elem
+                    .get_attribute("height")
+                    .and_then(parse_html_dimension_attr)
+                    .unwrap_or(150.0);
+                Some(ReplacedKind::ExternalSurface {
+                    surface_id: surface_id_for_node(node),
+                    intrinsic_size: Size::new(iw, ih),
+                })
+            }
             "img" => {
                 let src = elem.get_attribute("src").unwrap_or_default().to_string();
                 let decoded = self.assets.get_by_src(&src);
@@ -1007,6 +1034,17 @@ impl<'a> BoxTreeBuilder<'a> {
                 ..
             }) => {
                 hash = fnv_mix(hash, image_id.map_or(0, |i| i.0));
+                hash = fnv_mix(
+                    hash,
+                    (u64::from(intrinsic_size.width.to_bits()) << 32)
+                        | u64::from(intrinsic_size.height.to_bits()),
+                );
+            }
+            BoxKind::Replaced(ReplacedKind::ExternalSurface {
+                surface_id,
+                intrinsic_size,
+            }) => {
+                hash = fnv_mix(hash, surface_id.0);
                 hash = fnv_mix(
                     hash,
                     (u64::from(intrinsic_size.width.to_bits()) << 32)

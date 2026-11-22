@@ -11,7 +11,7 @@ use rix_css::{
     SizeValue, TextDecorationLine,
 };
 use rix_dom::NodeId;
-use rix_ipc::ImageId;
+use rix_ipc::{ImageId, SurfaceId};
 use rix_text::{FontDatabase, FontFaceSet, FontId, TextShaper, TextShapingCache};
 
 use crate::bfc::layout_bfc_root;
@@ -291,6 +291,10 @@ pub enum FragmentKind {
         kind: FormControlKind,
         text: String,
         placeholder: String,
+    },
+    ExternalSurface {
+        surface_id: SurfaceId,
+        intrinsic_size: Size,
     },
 }
 
@@ -740,6 +744,20 @@ pub fn layout_replaced(
                 h,
                 FragmentKind::Image {
                     image_id: *image_id,
+                    intrinsic_size: *intrinsic_size,
+                },
+            )
+        }
+        ReplacedKind::ExternalSurface {
+            surface_id,
+            intrinsic_size,
+        } => {
+            let (w, h) = resolve_replaced_size(*intrinsic_size, &metrics);
+            (
+                w,
+                h,
+                FragmentKind::ExternalSurface {
+                    surface_id: *surface_id,
                     intrinsic_size: *intrinsic_size,
                 },
             )

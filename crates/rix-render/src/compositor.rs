@@ -1,15 +1,31 @@
 use crate::apz::{apply_scroll_wheel, ScrollDelta, ScrollSyncQueue};
-use crate::display_list::{DisplayList, SpatialNodeKind};
+use crate::display_list::{DisplayItem, DisplayList, SpatialNodeKind};
 use crate::resources::ResourceRegistry;
 use crate::scene_encoder::{
-    encode_display_list, transform_aabb, EncodeOptions, EncodeStats, DEFAULT_VIEWPORT_OVERSCAN_PX,
+    encode_display_list, scale_corner_radii, transform_aabb, EncodeOptions, EncodeStats,
+    DEFAULT_VIEWPORT_OVERSCAN_PX,
 };
 use crate::strip_cache::{StripCacheStats, StripSceneCache, DEFAULT_STRIP_HEIGHT_PX};
 use rix_core::{Point, Rect, Size};
-use rix_ipc::{CompositorToContent, PipelineId};
-use std::collections::BTreeMap;
-use vello::kurbo::Affine;
+use rix_ipc::{CompositorToContent, PipelineId, SpatialNodeId, SurfaceId};
+use std::collections::{BTreeMap, HashMap};
+use vello::kurbo::{Affine, RoundedRect, RoundedRectRadii};
+use vello::peniko::Fill;
 use vello::Scene;
+
+#[derive(Debug, Clone, Copy)]
+struct ExternalSurfacePlacement {
+    surface_id: SurfaceId,
+    spatial_id: SpatialNodeId,
+    bounds: Rect,
+    radii: [f32; 4],
+}
+
+struct LiveExternalSurface {
+    width: u32,
+    height: u32,
+    scene: Scene,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LayerRole {
@@ -36,6 +52,7 @@ pub struct RetainedLayer {
     pub display_list: DisplayList,
     cached_scene: Option<Scene>,
     strip_cache: Option<StripSceneCache>,
+    external_placements: Vec<ExternalSurfacePlacement>,
     encode_generation: u64,
     last_encode_stats: EncodeStats,
     dirty: bool,
@@ -60,6 +77,7 @@ pub struct Compositor {
     layers: BTreeMap<(i32, PipelineId), RetainedLayer>,
     pipeline_z: BTreeMap<PipelineId, i32>,
     pub resources: ResourceRegistry,
+    external_scenes: HashMap<SurfaceId, LiveExternalSurface>,
     viewport_size: Size,
     device_pixel_ratio: f32,
     strip_height_px: f32,
@@ -81,6 +99,7 @@ impl Compositor {
             layers: BTreeMap::new(),
             pipeline_z: BTreeMap::new(),
             resources: ResourceRegistry::default(),
+            external_scenes: HashMap::new(),
             viewport_size,
             device_pixel_ratio: device_pixel_ratio.max(0.5),
             strip_height_px: DEFAULT_STRIP_HEIGHT_PX,
@@ -89,6 +108,35 @@ impl Compositor {
             frames_rendered: 0,
             composed_scene: Scene::new(),
         }
+    }
+
+    /// Presents a new frame for a GPU-backed `ExternalSurface` (e.g. Canvas2D) WITHOUT
+    /// rebuilding any `DisplayList` or re-encoding any `RetainedLayer`.
+    pub fn present_external_surface_scene(
+        &mut self,
+        surface_id: SurfaceId,
+        width: u32,
+        height: u32,
+        scene: Scene,
+    ) {
+        self.external_scenes.insert(
+            surface_id,
+            LiveExternalSurface {
+                width: width.max(1),
+                height: height.max(1),
+                scene,
+            },
+        );
+        self.dirty = true;
+    }
+
+    /// Removes a live external surface scene when its owning canvas is destroyed.
+    pub fn remove_external_surface_scene(&mut self, surface_id: SurfaceId) -> bool {
+        let removed = self.external_scenes.remove(&surface_id).is_some();
+        if removed {
+            self.dirty = true;
+        }
+        removed
     }
 
     pub fn viewport_size(&self) -> Size {
@@ -167,12 +215,14 @@ impl Compositor {
             }
         }
         let key = (z_order, pipeline);
+        let external_placements = extract_external_surface_placements(&display_list);
         match self.layers.get_mut(&key) {
             Some(existing) => {
                 existing.role = role;
                 existing.epoch = epoch;
                 existing.display_list = display_list;
                 existing.strip_cache = None;
+                existing.external_placements = external_placements;
                 existing.dirty = true;
                 existing.strip_recompose_needed = false;
             }
@@ -187,6 +237,7 @@ impl Compositor {
                         display_list,
                         cached_scene: None,
                         strip_cache: None,
+                        external_placements,
                         encode_generation: 0,
                         last_encode_stats: EncodeStats::default(),
                         dirty: true,
@@ -344,11 +395,77 @@ impl Compositor {
             if let Some(layer_scene) = layer.cached_scene.as_ref() {
                 self.composed_scene.append(layer_scene, Some(dpr_scale));
             }
+            for slot in &layer.external_placements {
+                if let Some(ext) = self.external_scenes.get(&slot.surface_id) {
+                    if slot.bounds.is_empty() {
+                        continue;
+                    }
+                    let world_tf = dpr_scale
+                        * layer
+                            .display_list
+                            .spatial_tree
+                            .resolve_world_transform(slot.spatial_id);
+                    let sx = f64::from(slot.bounds.size.width) / f64::from(ext.width);
+                    let sy = f64::from(slot.bounds.size.height) / f64::from(ext.height);
+                    let content_tf = world_tf
+                        * Affine::translate((
+                            f64::from(slot.bounds.min_x()),
+                            f64::from(slot.bounds.min_y()),
+                        ))
+                        * Affine::scale_non_uniform(sx, sy);
+                    let [tl, tr, br, bl] = scale_corner_radii(
+                        f64::from(slot.bounds.size.width),
+                        f64::from(slot.bounds.size.height),
+                        slot.radii,
+                    );
+                    let clip_rr = RoundedRect::new(
+                        f64::from(slot.bounds.min_x()),
+                        f64::from(slot.bounds.min_y()),
+                        f64::from(slot.bounds.max_x()),
+                        f64::from(slot.bounds.max_y()),
+                        RoundedRectRadii::new(tl, tr, br, bl),
+                    );
+                    self.composed_scene
+                        .push_clip_layer(Fill::NonZero, world_tf, &clip_rr);
+                    self.composed_scene.append(&ext.scene, Some(content_tf));
+                    self.composed_scene.pop_layer();
+                }
+            }
         }
 
         self.dirty = false;
         self.frames_rendered += 1;
     }
+}
+
+fn extract_external_surface_placements(list: &DisplayList) -> Vec<ExternalSurfacePlacement> {
+    let mut out = Vec::new();
+    let mut spatial_stack = vec![SpatialNodeId(0)];
+    for item in &list.items {
+        match item {
+            DisplayItem::PushStackingContext { spatial, .. }
+            | DisplayItem::PushClip { spatial, .. } => {
+                spatial_stack.push(*spatial);
+            }
+            DisplayItem::PopStackingContext | DisplayItem::PopClip => {
+                if spatial_stack.len() > 1 {
+                    spatial_stack.pop();
+                }
+            }
+            DisplayItem::ExternalSurface {
+                bounds,
+                surface_id,
+                radii,
+            } => out.push(ExternalSurfacePlacement {
+                surface_id: *surface_id,
+                spatial_id: *spatial_stack.last().unwrap_or(&SpatialNodeId(0)),
+                bounds: *bounds,
+                radii: *radii,
+            }),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn nested_scroll_content_y_span(
