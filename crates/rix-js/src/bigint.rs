@@ -202,14 +202,22 @@ impl JsBigInt {
     /// Formats the BigInt in base 10 without the trailing `n`.
     #[must_use]
     pub fn to_decimal_string(&self) -> String {
+        self.to_radix_string(10)
+    }
+
+    /// Formats the BigInt in the given radix (`2..=36`) without the trailing `n`.
+    #[must_use]
+    pub fn to_radix_string(&self, radix: u32) -> String {
+        debug_assert!((2..=36).contains(&radix));
         if self.is_zero() {
             return "0".to_string();
         }
+        const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
         let mut work = self.limbs.clone();
         let mut digits = Vec::new();
         while !work.is_empty() {
-            let rem = div_rem_limb(&mut work, 10);
-            digits.push(char::from(b'0' + rem as u8));
+            let rem = div_rem_limb(&mut work, radix);
+            digits.push(char::from(DIGITS[rem as usize]));
             while work.last() == Some(&0) {
                 work.pop();
             }

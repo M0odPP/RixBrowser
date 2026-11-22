@@ -743,7 +743,6 @@ fn num_to_string(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let n = vm.to_number(this_val)?;
     let radix = args
         .first()
         .filter(|v| !v.is_undefined())
@@ -753,6 +752,14 @@ fn num_to_string(
     if !(2..=36).contains(&radix) {
         return Err(vm.range_error("toString() radix must be between 2 and 36"));
     }
+    if let Some(bh) = this_val.as_bigint() {
+        let s = vm
+            .heap
+            .get_bigint(bh)
+            .map_or_else(|| "0".to_string(), |bi| bi.to_radix_string(radix as u32));
+        return Ok(JsValue::from_string(vm.heap.alloc_string(s)));
+    }
+    let n = vm.to_number(this_val)?;
     if radix == 10 || !n.is_finite() {
         return Ok(JsValue::from_string(
             vm.heap
@@ -783,6 +790,9 @@ fn num_value_of(
     this_val: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, JsException> {
+    if this_val.is_bigint() {
+        return Ok(this_val);
+    }
     Ok(JsValue::from_f64(vm.to_number(this_val)?))
 }
 

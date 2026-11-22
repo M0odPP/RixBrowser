@@ -70,6 +70,8 @@ pub struct ContentRuntime {
     pub streams: SharedStreams,
     pub net: SharedNetBridge,
     pub canvas2d: SharedCanvas2D,
+    pub jit: Rc<rix_jit::TieredJit>,
+    pub wasm: rix_jit::SharedWasmHost,
 }
 
 impl ContentRuntime {
@@ -109,6 +111,8 @@ impl ContentRuntime {
         fetch_engine: Option<Arc<FetchEngine>>,
     ) -> Self {
         let mut vm = JsVm::new();
+        let jit = rix_jit::TieredJit::attach_to(&mut vm);
+        let wasm = rix_jit::install_webassembly(&mut vm);
         let event_loop = Rc::new(RefCell::new(EventLoopState::new()));
         install_event_loop_globals(&mut vm, &event_loop);
         let host = install_dom_bridge(&mut vm, document, viewport, font_db);
@@ -128,6 +132,8 @@ impl ContentRuntime {
             streams,
             net,
             canvas2d,
+            jit,
+            wasm,
         }
     }
 
