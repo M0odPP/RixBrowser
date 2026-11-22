@@ -66,6 +66,7 @@ pub struct DomPrototypes {
     pub element_proto: HeapHandle,
     pub html_element_proto: HeapHandle,
     pub html_canvas_element_proto: HeapHandle,
+    pub html_iframe_element_proto: HeapHandle,
     pub document_proto: HeapHandle,
     pub shadow_root_proto: HeapHandle,
     pub text_proto: HeapHandle,
@@ -80,6 +81,7 @@ impl DomPrototypes {
             self.element_proto,
             self.html_element_proto,
             self.html_canvas_element_proto,
+            self.html_iframe_element_proto,
             self.document_proto,
             self.shadow_root_proto,
             self.text_proto,
@@ -333,6 +335,23 @@ impl HostState {
         self.display_list_build_count += 1;
         Some(dl)
     }
+
+    /// Forces a fresh layout + paint of the current document into a [`rix_render::DisplayList`].
+    pub fn paint_now(
+        &mut self,
+        pipeline: rix_ipc::PipelineId,
+        resources: &mut rix_render::ResourceRegistry,
+    ) -> rix_render::DisplayList {
+        self.last_paint_revs = None;
+        self.paint_if_dirty(pipeline, resources).unwrap_or_else(|| {
+            rix_render::DisplayList::new(Rect::new(
+                0.0,
+                0.0,
+                self.viewport.width,
+                self.viewport.height,
+            ))
+        })
+    }
 }
 
 fn find_fragment_rects(
@@ -374,6 +393,8 @@ pub fn wrap_node(vm: &mut JsVm, host: &SharedHost, node_id: NodeId) -> JsValue {
                 Some(NodeData::Element(el)) => {
                     if el.name.local.as_str().eq_ignore_ascii_case("canvas") {
                         h.prototypes.html_canvas_element_proto
+                    } else if el.name.local.as_str().eq_ignore_ascii_case("iframe") {
+                        h.prototypes.html_iframe_element_proto
                     } else {
                         h.prototypes.html_element_proto
                     }
@@ -422,6 +443,7 @@ pub fn install_dom_bridge(
     let element_proto = make_proto(vm, node_proto);
     let html_element_proto = make_proto(vm, element_proto);
     let html_canvas_element_proto = make_proto(vm, html_element_proto);
+    let html_iframe_element_proto = make_proto(vm, html_element_proto);
     let document_proto = make_proto(vm, node_proto);
     let shadow_root_proto = make_proto(vm, node_proto);
     let text_proto = make_proto(vm, node_proto);
@@ -433,6 +455,7 @@ pub fn install_dom_bridge(
         element_proto,
         html_element_proto,
         html_canvas_element_proto,
+        html_iframe_element_proto,
         document_proto,
         shadow_root_proto,
         text_proto,
@@ -1623,6 +1646,7 @@ fn install_window_and_cssom(vm: &mut JsVm, host: &SharedHost) {
         ("Node", protos.node_proto),
         ("Element", protos.element_proto),
         ("HTMLElement", protos.html_element_proto),
+        ("HTMLIFrameElement", protos.html_iframe_element_proto),
         ("Document", protos.document_proto),
         ("ShadowRoot", protos.shadow_root_proto),
     ] {

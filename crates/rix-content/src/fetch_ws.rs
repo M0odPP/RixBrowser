@@ -189,7 +189,7 @@ struct NetPrototypes {
 
 /// Shared network bridge between `ContentRuntime`'s JS VM and `rix-net`.
 pub struct NetworkBridge {
-    fetch_engine: Arc<FetchEngine>,
+    pub(crate) fetch_engine: Arc<FetchEngine>,
     async_tx: mpsc::UnboundedSender<AsyncNetEvent>,
     pub(crate) async_rx: RefCell<Option<mpsc::UnboundedReceiver<AsyncNetEvent>>>,
     next_id: u64,

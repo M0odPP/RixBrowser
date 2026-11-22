@@ -107,6 +107,10 @@ impl Drop for VmPtrGuard<'_> {
 pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
     let mut config = Config::new();
     config.cranelift_opt_level(wasmtime::OptLevel::Speed);
+    // Keep Wasm virtual address reservations compact so sandboxed Content Processes
+    // with strict `RLIMIT_AS` budgets (2 GiB) instantiate Wasm modules cleanly.
+    config.memory_reservation(64 * 1024 * 1024);
+    config.memory_guard_size(64 * 1024);
     let engine = Engine::new(&config).expect("initialize wasmtime Cranelift engine");
     let memories = Arc::new(Mutex::new(Vec::new()));
     let store = Store::new(

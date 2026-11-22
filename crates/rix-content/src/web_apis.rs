@@ -1598,7 +1598,7 @@ fn install_structured_clone(vm: &mut JsVm, web_apis: &SharedWebApis) {
     define_global(vm, "structuredClone", JsValue::from_object(sc_fn));
 }
 
-fn structured_clone_inner(
+pub(crate) fn structured_clone_inner(
     vm: &mut JsVm,
     web_apis: &SharedWebApis,
     val: JsValue,

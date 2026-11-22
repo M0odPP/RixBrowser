@@ -873,9 +873,25 @@ pub fn fire_object_event(
     props: &[(&str, JsValue)],
 ) {
     let ep = events.borrow().event_proto.unwrap_or(vm.object_proto);
+    fire_object_event_with_proto(vm, host, events, event_loop, target, ev_type, ep, props);
+}
+
+/// Allocates an `Event` inheriting from `proto` with extra `props`, invokes
+/// `target["on" + ev_type]` if set, and dispatches through `EventTarget` listeners.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fire_object_event_with_proto(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    target: HeapHandle,
+    ev_type: &str,
+    proto: HeapHandle,
+    props: &[(&str, JsValue)],
+) {
     let ev_h = vm
         .heap
-        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(ep)));
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
     events.borrow_mut().events.insert(
         ev_h,
         EventInternal {
@@ -913,12 +929,42 @@ pub fn fire_object_event(
         }
     }
 
-    let _ = dispatch_event_internal(
-        vm,
-        host,
-        events,
-        event_loop,
-        EventTargetKey::Object(target),
+    let target_key = if target == vm.global {
+        EventTargetKey::Window
+    } else if let Some(nid) = host.borrow().node_for_handle(vm, target) {
+        EventTargetKey::Node(nid)
+    } else {
+        EventTargetKey::Object(target)
+    };
+
+    let _ = dispatch_event_internal(vm, host, events, event_loop, target_key, ev_h);
+}
+
+/// Registers an externally constructed `Event` subclass instance (such as `MessageEvent`)
+/// in `EventSystem` so `event.type`, `preventDefault()`, and `dispatchEvent()` work seamlessly.
+pub(crate) fn register_constructed_event(
+    events: &SharedEvents,
+    ev_h: HeapHandle,
+    event_type: String,
+    bubbles: bool,
+    cancelable: bool,
+    composed: bool,
+) {
+    events.borrow_mut().events.insert(
         ev_h,
+        EventInternal {
+            event_type,
+            bubbles,
+            cancelable,
+            composed,
+            default_prevented: false,
+            propagation_stopped: false,
+            immediate_stopped: false,
+            in_passive_listener: false,
+            event_phase: 0,
+            target: JsValue::NULL,
+            current_target: JsValue::NULL,
+            composed_path: Vec::new(),
+        },
     );
 }
