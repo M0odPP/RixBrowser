@@ -26,13 +26,31 @@ pub struct WptBaseline {
     pub subsets: BTreeMap<String, usize>,
 }
 
-/// Declarative layout/style and JS/DOM/Event/Timer assertion cases inside a WPT subset TOML manifest.
+/// Declarative layout/style, JS/DOM/Event/Timer, and live-server Fetch/CORS/WS cases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WptAssertionManifest {
     #[serde(default)]
     pub cases: Vec<WptAssertionCase>,
     #[serde(default)]
     pub script_cases: Vec<WptScriptCase>,
+    #[serde(default)]
+    pub network_cases: Vec<WptNetworkCase>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WptNetworkCase {
+    pub name: String,
+    #[serde(default = "default_net_origin")]
+    pub origin_mode: String,
+    pub script: String,
+    #[serde(default = "default_assert_expr")]
+    pub assert_expr: String,
+    #[serde(default = "default_expected_str")]
+    pub expected: String,
+}
+
+fn default_net_origin() -> String {
+    "same".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +199,14 @@ pub fn run_wpt_suite(
                             failed_names.push(case.name.clone());
                         }
                     }
+                    for case in &manifest.network_cases {
+                        total += 1;
+                        if run_network_case(case) {
+                            passed += 1;
+                        } else {
+                            failed_names.push(case.name.clone());
+                        }
+                    }
                 } else if fname.ends_with(".html") && !fname.ends_with("-ref.html") {
                     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                     let ref_path = sub_dir.join(format!("{stem}-ref.html"));
@@ -257,6 +283,210 @@ fn run_script_case(case: &WptScriptCase) -> bool {
     }
     for i in 1..=case.vsync_frames {
         rt.fire_vsync(f64::from(i) * 16.6);
+    }
+    match rt.eval_script(&case.assert_expr) {
+        Ok(val) => rt.vm.value_to_rust_string(val) == case.expected,
+        Err(_) => false,
+    }
+}
+
+fn run_network_case(case: &WptNetworkCase) -> bool {
+    let Ok(rt_tokio) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+    rt_tokio.block_on(async move { run_network_case_async(case).await })
+}
+
+async fn run_network_case_async(case: &WptNetworkCase) -> bool {
+    use rix_net::{compute_ws_accept_key, encode_server_frame};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+        return false;
+    };
+    let Ok(addr) = listener.local_addr() else {
+        return false;
+    };
+    let port = addr.port();
+
+    let server_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let Ok(n) = sock.read(&mut buf).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let first = req.lines().next().unwrap_or("");
+                let mut parts = first.split_whitespace();
+                let method = parts.next().unwrap_or("GET");
+                let path = parts.next().unwrap_or("/");
+                let header_val = |name: &str| -> Option<String> {
+                    req.lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+                    })
+                };
+
+                // RFC 6455 WebSocket upgrade endpoint (`/ws`)
+                if path == "/ws" {
+                    if let Some(ws_key) = header_val("sec-websocket-key") {
+                        let accept = compute_ws_accept_key(&ws_key);
+                        let handshake = format!(
+                            "HTTP/1.1 101 Switching Protocols\r\n\
+                             Upgrade: websocket\r\n\
+                             Connection: Upgrade\r\n\
+                             Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                        );
+                        let _ = sock.write_all(handshake.as_bytes()).await;
+                        let mut acc = Vec::new();
+                        let mut tmp = [0u8; 2048];
+                        while let Ok(m) = sock.read(&mut tmp).await {
+                            if m == 0 {
+                                break;
+                            }
+                            acc.extend_from_slice(&tmp[..m]);
+                            while acc.len() >= 6 {
+                                let op = acc[0] & 0x0F;
+                                let len = (acc[1] & 0x7F) as usize;
+                                let frame_len = 6 + len;
+                                if acc.len() < frame_len {
+                                    break;
+                                }
+                                let mask = [acc[2], acc[3], acc[4], acc[5]];
+                                let mut payload = acc[6..frame_len].to_vec();
+                                for (i, b) in payload.iter_mut().enumerate() {
+                                    *b ^= mask[i & 3];
+                                }
+                                acc.drain(..frame_len);
+                                match op {
+                                    0x1 | 0x2 => {
+                                        let _ = sock
+                                            .write_all(&encode_server_frame(op, &payload))
+                                            .await;
+                                    }
+                                    0x8 => {
+                                        let _ = sock
+                                            .write_all(&encode_server_frame(0x8, &payload))
+                                            .await;
+                                        return;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                let origin = header_val("origin").unwrap_or_else(|| "*".to_string());
+                let resp = match (method, path) {
+                    ("OPTIONS", "/cors-preflight") => format!(
+                        "HTTP/1.1 204 No Content\r\n\
+                         Access-Control-Allow-Origin: {origin}\r\n\
+                         Access-Control-Allow-Methods: GET, POST, PUT, DELETE\r\n\
+                         Access-Control-Allow-Headers: X-Wpt-Header, Content-Type\r\n\
+                         Access-Control-Max-Age: 60\r\n\
+                         Content-Length: 0\r\n\
+                         Connection: close\r\n\r\n"
+                    ),
+                    (_, "/cors-preflight") => {
+                        let body = r#"{"cors":"ok"}"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Access-Control-Allow-Origin: {origin}\r\n\
+                             Access-Control-Expose-Headers: X-Exposed\r\n\
+                             X-Exposed: yes\r\n\
+                             X-Internal: no\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    (_, "/cors-open") => {
+                        let body = "open-ok";
+                        format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    (_, "/cors-denied") => {
+                        let body = "denied";
+                        format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    ("POST", "/echo") => {
+                        let body = req.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+                        format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: text/plain\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    (_, "/json") => {
+                        let body = r#"{"status":"ok","value":42}"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    _ => "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                        .to_string(),
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    let ws_url = format!("ws://127.0.0.1:{port}/ws");
+    let doc_url = if case.origin_mode == "cross" {
+        "http://wpt-origin.local:9999/".to_string()
+    } else {
+        format!("{base_url}/")
+    };
+
+    let mut rt = ContentRuntime::with_empty_document();
+    rt.set_document_url(&doc_url);
+    let prelude = format!(
+        r#"var __WPT_BASE__ = "{base_url}"; var __WPT_WS__ = "{ws_url}"; var __done = false; var __pass = false;"#
+    );
+    if rt.eval_script(&prelude).is_err() || rt.eval_script(&case.script).is_err() {
+        server_task.abort();
+        return false;
+    }
+    let completed = rt
+        .drive_async_until(Duration::from_secs(3), |rt| {
+            rt.eval_script("__done")
+                .is_ok_and(|v| v.as_bool() == Some(true))
+        })
+        .await;
+    server_task.abort();
+    if !completed {
+        return false;
     }
     match rt.eval_script(&case.assert_expr) {
         Ok(val) => rt.vm.value_to_rust_string(val) == case.expected,

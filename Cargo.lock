@@ -5979,10 +5979,12 @@ dependencies = [
  "rix-ipc",
  "rix-js",
  "rix-layout",
+ "rix-net",
  "rix-render",
  "rix-text",
  "serde",
  "serde_json",
+ "tokio",
  "toml",
  "vello",
 ]
