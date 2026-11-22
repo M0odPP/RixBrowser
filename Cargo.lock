@@ -5191,6 +5191,7 @@ name = "rix-content"
 version = "0.2.0-alpha.1"
 dependencies = [
  "encoding_rs",
+ "rix-chrome",
  "rix-core",
  "rix-css",
  "rix-dom",
@@ -5204,6 +5205,7 @@ dependencies = [
  "rix-render",
  "rix-storage",
  "rix-text",
+ "rusty_h264",
  "serde",
  "serde_json",
  "tempfile",
