@@ -213,6 +213,12 @@ impl FetchEngine {
         }
     }
 
+    /// Returns a reference to the underlying [`HttpClient`].
+    #[must_use]
+    pub fn client(&self) -> &HttpClient {
+        &self.client
+    }
+
     /// Executes a WHATWG Fetch request with full CORS preflight, header filtering,
     /// opaque `no-cors` handling, and instant zero-polling `AbortHandle` cancellation.
     pub async fn fetch(&self, req: FetchRequest) -> Result<FetchResponse> {
