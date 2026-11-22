@@ -33,12 +33,15 @@ pub use stylesheet::{
 };
 pub use ua::{default_ua_stylesheet, UA_CSS};
 pub use values::{
-    AlignValue, BackgroundLayerValue, BorderCollapseMode, BorderEdge, BoxShadowValue,
-    BoxSizingMode, CalcExpr, ClearMode, ColorRgba, CornerRadii, CornerRadius, CssColor, CursorKind,
-    DirectionMode, DisplayMode, EdgeValues, EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode,
-    FloatMode, FontStyleMode, GridAutoFlowMode, GridTrackSize, LengthPercentage,
-    LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, OverflowMode, OverflowPair,
-    OverflowWrapMode, PointerEventsMode, PositionMode, SizeValue, TableLayoutMode, TextAlignMode,
-    TextDecorationLine, TextOverflowMode, TextTransformMode, TransformOp, UserSelectMode,
-    VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, ZIndexValue,
+    AlignValue, AnimationDirectionMode, AnimationFillModeKind, AnimationPlayStateMode,
+    AnimationSpec, BackgroundImageValue, BackgroundLayerValue, BorderCollapseMode, BorderEdge,
+    BoxShadowValue, BoxSizingMode, CalcExpr, ClearMode, ClipPathValue, ClipRadius, ColorRgba,
+    CornerRadii, CornerRadius, CssColor, CssGradientStop, CursorKind, DirectionMode, DisplayMode,
+    EdgeValues, EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
+    GridAutoFlowMode, GridTrackSize, LengthPercentage, LengthPercentageAuto, LengthUnit,
+    LineHeightValue, LineStyle, MixBlendMode, OverflowMode, OverflowPair, OverflowWrapMode,
+    PointerEventsMode, PositionMode, SizeValue, TableLayoutMode, TextAlignMode, TextDecorationLine,
+    TextOverflowMode, TextTransformMode, TimingFunction, TransformOp, TransformOrigin,
+    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
+    WordBreakMode, ZIndexValue,
 };

@@ -19,24 +19,29 @@ use smallvec::SmallVec;
 
 use crate::values::{
     angle_to_deg, convert_align_content, convert_align_items, convert_align_self, convert_alpha,
-    convert_background_layer, convert_border_width, convert_box_shadow, convert_color,
-    convert_corner_radius, convert_cursor, convert_direction, convert_display, convert_filter,
-    convert_flex_direction, convert_flex_wrap, convert_font_family_name, convert_font_size,
-    convert_font_style, convert_font_weight, convert_grid_auto_flow, convert_justify_content,
-    convert_justify_items, convert_justify_self, convert_length, convert_length_percentage,
+    convert_animation, convert_animation_direction, convert_animation_fill,
+    convert_animation_iteration, convert_animation_name, convert_animation_play_state,
+    convert_background_layer, convert_blend_mode, convert_border_width, convert_box_shadow,
+    convert_clip_path, convert_color, convert_corner_radius, convert_cursor, convert_direction,
+    convert_display, convert_easing, convert_filter, convert_flex_direction, convert_flex_wrap,
+    convert_font_family_name, convert_font_size, convert_font_style, convert_font_weight,
+    convert_grid_auto_flow, convert_image, convert_justify_content, convert_justify_items,
+    convert_justify_self, convert_length, convert_length_percentage,
     convert_length_percentage_or_auto, convert_length_value, convert_line_height,
     convert_line_style, convert_max_size, convert_overflow, convert_overflow_wrap,
     convert_position, convert_size, convert_spacing, convert_text_align,
     convert_text_decoration_line, convert_text_transform, convert_track_size, convert_track_sizing,
-    convert_transform, convert_user_select, convert_visibility, convert_white_space,
-    convert_word_break, convert_z_index, AlignValue, BackgroundLayerValue, BorderCollapseMode,
-    BoxShadowValue, BoxSizingMode, ClearMode, CornerRadius, CssColor, CursorKind, DirectionMode,
+    convert_transform, convert_transform_origin, convert_transition, convert_user_select,
+    convert_visibility, convert_white_space, convert_word_break, convert_z_index, time_to_ms,
+    AlignValue, AnimationDirectionMode, AnimationFillModeKind, AnimationPlayStateMode,
+    AnimationSpec, BackgroundImageValue, BackgroundLayerValue, BorderCollapseMode, BoxShadowValue,
+    BoxSizingMode, ClearMode, ClipPathValue, CornerRadius, CssColor, CursorKind, DirectionMode,
     DisplayMode, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
     GridAutoFlowMode, GridTrackSize, LengthPercentage, LengthPercentageAuto, LengthUnit,
-    LineHeightValue, LineStyle, OverflowMode, OverflowWrapMode, PointerEventsMode, PositionMode,
-    SizeValue, TableLayoutMode, TextAlignMode, TextDecorationLine, TextOverflowMode,
-    TextTransformMode, TransformOp, UserSelectMode, VerticalAlignMode, VisibilityMode,
-    WhiteSpaceMode, WordBreakMode, ZIndexValue,
+    LineHeightValue, LineStyle, MixBlendMode, OverflowMode, OverflowWrapMode, PointerEventsMode,
+    PositionMode, SizeValue, TableLayoutMode, TextAlignMode, TextDecorationLine, TextOverflowMode,
+    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionSpec,
+    UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, ZIndexValue,
 };
 
 /// Category of an unsupported CSS feature recorded during compilation.
@@ -321,7 +326,24 @@ pub enum PropertyIdKind {
     BackgroundLayers,
     BoxShadow,
     Transform,
+    TransformOrigin,
     Filter,
+    ClipPath,
+    MixBlendMode,
+    Transition,
+    TransitionProperty,
+    TransitionDuration,
+    TransitionDelay,
+    TransitionTimingFunction,
+    Animation,
+    AnimationName,
+    AnimationDuration,
+    AnimationDelay,
+    AnimationTimingFunction,
+    AnimationIterationCount,
+    AnimationDirection,
+    AnimationFillMode,
+    AnimationPlayState,
     // Typography
     FontSize,
     FontWeight,
@@ -459,7 +481,24 @@ impl PropertyIdKind {
             "background-image" => Self::BackgroundLayers,
             "box-shadow" => Self::BoxShadow,
             "transform" => Self::Transform,
+            "transform-origin" => Self::TransformOrigin,
             "filter" => Self::Filter,
+            "clip-path" => Self::ClipPath,
+            "mix-blend-mode" => Self::MixBlendMode,
+            "transition" => Self::Transition,
+            "transition-property" => Self::TransitionProperty,
+            "transition-duration" => Self::TransitionDuration,
+            "transition-delay" => Self::TransitionDelay,
+            "transition-timing-function" => Self::TransitionTimingFunction,
+            "animation" => Self::Animation,
+            "animation-name" => Self::AnimationName,
+            "animation-duration" => Self::AnimationDuration,
+            "animation-delay" => Self::AnimationDelay,
+            "animation-timing-function" => Self::AnimationTimingFunction,
+            "animation-iteration-count" => Self::AnimationIterationCount,
+            "animation-direction" => Self::AnimationDirection,
+            "animation-fill-mode" => Self::AnimationFillMode,
+            "animation-play-state" => Self::AnimationPlayState,
             "font-size" => Self::FontSize,
             "font-weight" => Self::FontWeight,
             "font-style" => Self::FontStyle,
@@ -590,7 +629,24 @@ impl PropertyIdKind {
             Self::BackgroundLayers => "background-image",
             Self::BoxShadow => "box-shadow",
             Self::Transform => "transform",
+            Self::TransformOrigin => "transform-origin",
             Self::Filter => "filter",
+            Self::ClipPath => "clip-path",
+            Self::MixBlendMode => "mix-blend-mode",
+            Self::Transition => "transition",
+            Self::TransitionProperty => "transition-property",
+            Self::TransitionDuration => "transition-duration",
+            Self::TransitionDelay => "transition-delay",
+            Self::TransitionTimingFunction => "transition-timing-function",
+            Self::Animation => "animation",
+            Self::AnimationName => "animation-name",
+            Self::AnimationDuration => "animation-duration",
+            Self::AnimationDelay => "animation-delay",
+            Self::AnimationTimingFunction => "animation-timing-function",
+            Self::AnimationIterationCount => "animation-iteration-count",
+            Self::AnimationDirection => "animation-direction",
+            Self::AnimationFillMode => "animation-fill-mode",
+            Self::AnimationPlayState => "animation-play-state",
             Self::FontSize => "font-size",
             Self::FontWeight => "font-weight",
             Self::FontStyle => "font-style",
@@ -733,7 +789,18 @@ pub enum PropertyValue {
     BoxShadow(Vec<BoxShadowValue>),
     BackgroundLayers(Vec<BackgroundLayerValue>),
     Transform(Vec<TransformOp>),
+    TransformOrigin(TransformOrigin),
     Filter(Vec<FilterOp>),
+    ClipPath(ClipPathValue),
+    MixBlendMode(MixBlendMode),
+    Transitions(Vec<TransitionSpec>),
+    Animations(Vec<AnimationSpec>),
+    NameList(Vec<InternedStr>),
+    DurationList(Vec<f32>),
+    TimingList(Vec<TimingFunction>),
+    DirectionList(Vec<AnimationDirectionMode>),
+    FillModeList(Vec<AnimationFillModeKind>),
+    PlayStateList(Vec<AnimationPlayStateMode>),
     VerticalAlign(VerticalAlignMode),
     TextOverflow(TextOverflowMode),
     BorderCollapse(BorderCollapseMode),
@@ -1057,6 +1124,32 @@ fn compile_property(
                 }
             }
             let layers = bgs.iter().map(convert_background_layer).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BackgroundLayers,
+                PropertyValue::BackgroundLayers(layers),
+                imp,
+            );
+        }
+        Property::BackgroundImage(imgs) => {
+            let layers = imgs
+                .iter()
+                .map(|img| {
+                    let image = convert_image(img);
+                    let image_url = match &image {
+                        BackgroundImageValue::Url(u) => Some(u.clone()),
+                        _ => None,
+                    };
+                    BackgroundLayerValue {
+                        image_url,
+                        image,
+                        repeat_x: true,
+                        repeat_y: true,
+                        ..BackgroundLayerValue::default()
+                    }
+                })
+                .collect();
             push_decl(
                 out,
                 ord,
@@ -2263,6 +2356,15 @@ fn compile_property(
                 imp,
             );
         }
+        Property::TransformOrigin(pos, _) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::TransformOrigin,
+                PropertyValue::TransformOrigin(convert_transform_origin(pos)),
+                imp,
+            );
+        }
         Property::Filter(fl, _) => {
             let ops = match fl {
                 lightningcss::properties::effects::FilterList::None => Vec::new(),
@@ -2275,6 +2377,164 @@ fn compile_property(
                 ord,
                 PropertyIdKind::Filter,
                 PropertyValue::Filter(ops),
+                imp,
+            );
+        }
+        Property::ClipPath(cp, _) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::ClipPath,
+                PropertyValue::ClipPath(convert_clip_path(cp)),
+                imp,
+            );
+        }
+        Property::MixBlendMode(bm) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::MixBlendMode,
+                PropertyValue::MixBlendMode(convert_blend_mode(bm)),
+                imp,
+            );
+        }
+        Property::Transition(list, _) => {
+            let specs = list.iter().map(convert_transition).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::Transition,
+                PropertyValue::Transitions(specs),
+                imp,
+            );
+        }
+        Property::TransitionProperty(props, _) => {
+            let names = props.iter().map(|p| intern_str(p.name())).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::TransitionProperty,
+                PropertyValue::NameList(names),
+                imp,
+            );
+        }
+        Property::TransitionDuration(times, _) => {
+            let ms = times.iter().map(|t| time_to_ms(t).max(0.0)).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::TransitionDuration,
+                PropertyValue::DurationList(ms),
+                imp,
+            );
+        }
+        Property::TransitionDelay(times, _) => {
+            let ms = times.iter().map(time_to_ms).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::TransitionDelay,
+                PropertyValue::DurationList(ms),
+                imp,
+            );
+        }
+        Property::TransitionTimingFunction(fns, _) => {
+            let timings = fns.iter().map(convert_easing).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::TransitionTimingFunction,
+                PropertyValue::TimingList(timings),
+                imp,
+            );
+        }
+        Property::Animation(list, _) => {
+            let specs = list.iter().map(convert_animation).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::Animation,
+                PropertyValue::Animations(specs),
+                imp,
+            );
+        }
+        Property::AnimationName(list, _) => {
+            let names = list.iter().map(convert_animation_name).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::AnimationName,
+                PropertyValue::NameList(names),
+                imp,
+            );
+        }
+        Property::AnimationDuration(times, _) => {
+            let ms = times.iter().map(|t| time_to_ms(t).max(0.0)).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::AnimationDuration,
+                PropertyValue::DurationList(ms),
+                imp,
+            );
+        }
+        Property::AnimationDelay(times, _) => {
+            let ms = times.iter().map(time_to_ms).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::AnimationDelay,
+                PropertyValue::DurationList(ms),
+                imp,
+            );
+        }
+        Property::AnimationTimingFunction(fns, _) => {
+            let timings = fns.iter().map(convert_easing).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::AnimationTimingFunction,
+                PropertyValue::TimingList(timings),
+                imp,
+            );
+        }
+        Property::AnimationIterationCount(counts, _) => {
+            let vals = counts.iter().map(convert_animation_iteration).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::AnimationIterationCount,
+                PropertyValue::DurationList(vals),
+                imp,
+            );
+        }
+        Property::AnimationDirection(dirs, _) => {
+            let vals = dirs.iter().map(convert_animation_direction).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::AnimationDirection,
+                PropertyValue::DirectionList(vals),
+                imp,
+            );
+        }
+        Property::AnimationFillMode(fills, _) => {
+            let vals = fills.iter().map(convert_animation_fill).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::AnimationFillMode,
+                PropertyValue::FillModeList(vals),
+                imp,
+            );
+        }
+        Property::AnimationPlayState(states, _) => {
+            let vals = states.iter().map(convert_animation_play_state).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::AnimationPlayState,
+                PropertyValue::PlayStateList(vals),
                 imp,
             );
         }

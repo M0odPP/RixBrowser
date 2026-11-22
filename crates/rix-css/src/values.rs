@@ -3,22 +3,29 @@
 //! All converters consume `lightningcss` parsed values directly without
 //! serializing intermediate CSS strings.
 
+use lightningcss::printer::PrinterOptions;
 use lightningcss::properties::{
     align::{
         AlignContent, AlignItems, AlignSelf, ContentDistribution, ContentPosition, JustifyContent,
         JustifyItems, JustifySelf, SelfPosition,
     },
+    animation::{
+        Animation as LightningAnimation, AnimationDirection as LightningAnimDirection,
+        AnimationFillMode as LightningAnimFill, AnimationIterationCount as LightningAnimIter,
+        AnimationName as LightningAnimName, AnimationPlayState as LightningAnimPlay,
+    },
     background::{Background, BackgroundRepeatKeyword, BackgroundSize},
     border::{BorderSideWidth, LineStyle as LightningLineStyle},
     box_shadow::BoxShadow,
     display::{Display, DisplayInside, DisplayKeyword, DisplayOutside, Visibility},
-    effects::Filter,
+    effects::{BlendMode as LightningBlendMode, Filter},
     flex::{FlexDirection, FlexWrap},
     font::{
         AbsoluteFontSize, AbsoluteFontWeight, FontFamily, FontSize, FontStyle, FontWeight,
         GenericFontFamily, LineHeight, RelativeFontSize,
     },
     grid::{GridAutoFlow, RepeatCount, TrackBreadth, TrackListItem, TrackSize, TrackSizing},
+    masking::ClipPath as LightningClipPath,
     overflow::OverflowKeyword,
     position::{Position, ZIndex},
     size::{MaxSize, Size},
@@ -27,18 +34,27 @@ use lightningcss::properties::{
         TextTransform, TextTransformCase, WhiteSpace, WordBreak,
     },
     transform::Transform,
+    transition::Transition as LightningTransition,
     ui::{Cursor, CursorKeyword, UserSelect},
 };
+use lightningcss::traits::ToCss;
 use lightningcss::values::{
     alpha::AlphaValue,
     angle::Angle,
     calc::{Calc, MathFunction},
     color::CssColor as LightningCssColor,
+    easing::{EasingFunction, StepPosition},
+    gradient::{EndingShape, Gradient, GradientItem, LineDirection},
     image::Image,
     length::{Length, LengthPercentage as LightningLp, LengthPercentageOrAuto, LengthValue},
     percentage::{DimensionPercentage, NumberOrPercentage},
-    position::{HorizontalPosition, VerticalPosition},
+    position::{
+        HorizontalPosition, HorizontalPositionKeyword, Position as LightningPosition,
+        VerticalPosition, VerticalPositionKeyword,
+    },
+    shape::{BasicShape, FillRule, ShapeRadius},
     size::Size2D,
+    time::Time,
 };
 use rix_core::{intern_str, InternedStr};
 use serde::{Deserialize, Serialize};
@@ -749,9 +765,33 @@ pub struct BoxShadowValue {
     pub inset: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CssGradientStop {
+    pub color: CssColor,
+    pub position: Option<LengthPercentage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum BackgroundImageValue {
+    #[default]
+    None,
+    Url(InternedStr),
+    LinearGradient {
+        angle_deg: f32,
+        stops: Vec<CssGradientStop>,
+    },
+    RadialGradient {
+        shape_circle: bool,
+        cx: LengthPercentage,
+        cy: LengthPercentage,
+        stops: Vec<CssGradientStop>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BackgroundLayerValue {
     pub image_url: Option<InternedStr>,
+    pub image: BackgroundImageValue,
     pub repeat_x: bool,
     pub repeat_y: bool,
     pub pos_x: LengthPercentage,
@@ -761,12 +801,38 @@ pub struct BackgroundLayerValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TransformOrigin {
+    pub x: LengthPercentage,
+    pub y: LengthPercentage,
+    pub z: f32,
+}
+
+impl Default for TransformOrigin {
+    fn default() -> Self {
+        Self {
+            x: LengthPercentage::Percent(0.5),
+            y: LengthPercentage::Percent(0.5),
+            z: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TransformOp {
     Translate(LengthPercentage, LengthPercentage),
+    Translate3d(LengthPercentage, LengthPercentage, f32),
+    TranslateZ(f32),
     Scale(f32, f32),
+    Scale3d(f32, f32, f32),
+    ScaleZ(f32),
     RotateDeg(f32),
+    RotateXDeg(f32),
+    RotateYDeg(f32),
+    Rotate3d(f32, f32, f32, f32),
     SkewDeg(f32, f32),
+    Perspective(f32),
     Matrix([f32; 6]),
+    Matrix3d([f32; 16]),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -780,6 +846,188 @@ pub enum FilterOp {
     Invert(f32),
     Sepia(f32),
     HueRotateDeg(f32),
+    DropShadow {
+        offset_x: LengthPercentage,
+        offset_y: LengthPercentage,
+        blur: LengthPercentage,
+        color: CssColor,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum MixBlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ClipRadius {
+    Length(LengthPercentage),
+    ClosestSide,
+    FarthestSide,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub enum ClipPathValue {
+    #[default]
+    None,
+    Inset {
+        top: LengthPercentage,
+        right: LengthPercentage,
+        bottom: LengthPercentage,
+        left: LengthPercentage,
+        radii: [LengthPercentage; 4],
+    },
+    Circle {
+        radius: ClipRadius,
+        cx: LengthPercentage,
+        cy: LengthPercentage,
+    },
+    Ellipse {
+        rx: ClipRadius,
+        ry: ClipRadius,
+        cx: LengthPercentage,
+        cy: LengthPercentage,
+    },
+    Polygon {
+        fill_odd: bool,
+        points: Vec<(LengthPercentage, LengthPercentage)>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub enum TimingFunction {
+    Linear,
+    #[default]
+    Ease,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+    CubicBezier(f32, f32, f32, f32),
+    Steps(u32, bool),
+}
+
+impl TimingFunction {
+    /// Evaluates the CSS easing curve at normalized progress `t` in `[0.0, 1.0]`.
+    #[must_use]
+    pub fn evaluate(self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        match self {
+            Self::Linear => t,
+            Self::Ease => eval_cubic_bezier(0.25, 0.1, 0.25, 1.0, t),
+            Self::EaseIn => eval_cubic_bezier(0.42, 0.0, 1.0, 1.0, t),
+            Self::EaseOut => eval_cubic_bezier(0.0, 0.0, 0.58, 1.0, t),
+            Self::EaseInOut => eval_cubic_bezier(0.42, 0.0, 0.58, 1.0, t),
+            Self::CubicBezier(x1, y1, x2, y2) => eval_cubic_bezier(x1, y1, x2, y2, t),
+            Self::Steps(count, jump_start) => {
+                let n = count.max(1) as f32;
+                if jump_start {
+                    ((t * n).floor() + 1.0).min(n) / n
+                } else {
+                    (t * n).floor() / n
+                }
+            }
+        }
+    }
+}
+
+fn eval_cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let sample_x = |u: f32| {
+        let inv = 1.0 - u;
+        3.0 * inv * inv * u * x1 + 3.0 * inv * u * u * x2 + u * u * u
+    };
+    let sample_dx = |u: f32| {
+        let inv = 1.0 - u;
+        3.0 * inv * inv * x1 + 6.0 * inv * u * (x2 - x1) + 3.0 * u * u * (1.0 - x2)
+    };
+    let sample_y = |u: f32| {
+        let inv = 1.0 - u;
+        3.0 * inv * inv * u * y1 + 3.0 * inv * u * u * y2 + u * u * u
+    };
+    let mut u = x;
+    for _ in 0..6 {
+        let err = sample_x(u) - x;
+        if err.abs() < 1e-5 {
+            break;
+        }
+        let d = sample_dx(u);
+        if d.abs() < 1e-6 {
+            break;
+        }
+        u = (u - err / d).clamp(0.0, 1.0);
+    }
+    sample_y(u)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransitionSpec {
+    pub property: InternedStr,
+    pub duration_ms: f32,
+    pub delay_ms: f32,
+    pub timing: TimingFunction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum AnimationDirectionMode {
+    #[default]
+    Normal,
+    Reverse,
+    Alternate,
+    AlternateReverse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum AnimationFillModeKind {
+    #[default]
+    None,
+    Forwards,
+    Backwards,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum AnimationPlayStateMode {
+    #[default]
+    Running,
+    Paused,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnimationSpec {
+    pub name: InternedStr,
+    pub duration_ms: f32,
+    pub delay_ms: f32,
+    pub timing: TimingFunction,
+    /// `f32::INFINITY` represents CSS `infinite`.
+    pub iteration_count: f32,
+    pub direction: AnimationDirectionMode,
+    pub fill_mode: AnimationFillModeKind,
+    pub play_state: AnimationPlayStateMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1399,36 +1647,105 @@ pub fn convert_box_shadow(shadow: &BoxShadow) -> BoxShadowValue {
     }
 }
 
-#[must_use]
-pub fn convert_background_layer(bg: &Background<'_>) -> BackgroundLayerValue {
-    let image_url = match &bg.image {
-        Image::Url(u) => Some(intern_str(u.url.as_ref())),
-        _ => None,
-    };
-    let pos_x = match &bg.position.x {
+fn convert_hv_axes(
+    hx: &HorizontalPosition,
+    vy: &VerticalPosition,
+) -> (LengthPercentage, LengthPercentage) {
+    let x = match hx {
         HorizontalPosition::Length(lp) => convert_length_percentage(lp),
-        HorizontalPosition::Side { side, .. } => {
-            use lightningcss::values::position::HorizontalPositionKeyword;
-            match side {
-                HorizontalPositionKeyword::Left => LengthPercentage::Percent(0.0),
-                HorizontalPositionKeyword::Right => LengthPercentage::Percent(1.0),
-            }
-        }
+        HorizontalPosition::Side { side, .. } => match side {
+            HorizontalPositionKeyword::Left => LengthPercentage::Percent(0.0),
+            HorizontalPositionKeyword::Right => LengthPercentage::Percent(1.0),
+        },
         HorizontalPosition::Center => LengthPercentage::Percent(0.5),
     };
-    let pos_y = match &bg.position.y {
+    let y = match vy {
         VerticalPosition::Length(lp) => convert_length_percentage(lp),
-        VerticalPosition::Side { side, .. } => {
-            use lightningcss::values::position::VerticalPositionKeyword;
-            match side {
-                VerticalPositionKeyword::Top => LengthPercentage::Percent(0.0),
-                VerticalPositionKeyword::Bottom => LengthPercentage::Percent(1.0),
-            }
-        }
+        VerticalPosition::Side { side, .. } => match side {
+            VerticalPositionKeyword::Top => LengthPercentage::Percent(0.0),
+            VerticalPositionKeyword::Bottom => LengthPercentage::Percent(1.0),
+        },
         VerticalPosition::Center => LengthPercentage::Percent(0.5),
     };
+    (x, y)
+}
+
+fn convert_position_axes(pos: &LightningPosition) -> (LengthPercentage, LengthPercentage) {
+    convert_hv_axes(&pos.x, &pos.y)
+}
+
+fn convert_gradient_stops(items: &[GradientItem<LightningLp>]) -> Vec<CssGradientStop> {
+    let mut stops = Vec::new();
+    for item in items {
+        if let GradientItem::ColorStop(cs) = item {
+            if let Some(color) = convert_color(&cs.color) {
+                stops.push(CssGradientStop {
+                    color,
+                    position: cs.position.as_ref().map(convert_length_percentage),
+                });
+            }
+        }
+    }
+    stops
+}
+
+#[must_use]
+pub fn convert_image(img: &Image<'_>) -> BackgroundImageValue {
+    match img {
+        Image::None => BackgroundImageValue::None,
+        Image::Url(u) => BackgroundImageValue::Url(intern_str(u.url.as_ref())),
+        Image::Gradient(grad) => match grad.as_ref() {
+            Gradient::Linear(lg) | Gradient::RepeatingLinear(lg) => {
+                let angle_deg = match &lg.direction {
+                    LineDirection::Angle(a) => angle_to_deg(a),
+                    LineDirection::Horizontal(HorizontalPositionKeyword::Right) => 90.0,
+                    LineDirection::Horizontal(HorizontalPositionKeyword::Left) => 270.0,
+                    LineDirection::Vertical(VerticalPositionKeyword::Top) => 0.0,
+                    LineDirection::Vertical(VerticalPositionKeyword::Bottom) => 180.0,
+                    LineDirection::Corner {
+                        horizontal,
+                        vertical,
+                    } => match (horizontal, vertical) {
+                        (HorizontalPositionKeyword::Right, VerticalPositionKeyword::Top) => 45.0,
+                        (HorizontalPositionKeyword::Right, VerticalPositionKeyword::Bottom) => {
+                            135.0
+                        }
+                        (HorizontalPositionKeyword::Left, VerticalPositionKeyword::Bottom) => 225.0,
+                        (HorizontalPositionKeyword::Left, VerticalPositionKeyword::Top) => 315.0,
+                    },
+                };
+                BackgroundImageValue::LinearGradient {
+                    angle_deg,
+                    stops: convert_gradient_stops(&lg.items),
+                }
+            }
+            Gradient::Radial(rg) | Gradient::RepeatingRadial(rg) => {
+                let shape_circle = matches!(rg.shape, EndingShape::Circle(_));
+                let (cx, cy) = convert_position_axes(&rg.position);
+                BackgroundImageValue::RadialGradient {
+                    shape_circle,
+                    cx,
+                    cy,
+                    stops: convert_gradient_stops(&rg.items),
+                }
+            }
+            _ => BackgroundImageValue::None,
+        },
+        _ => BackgroundImageValue::None,
+    }
+}
+
+#[must_use]
+pub fn convert_background_layer(bg: &Background<'_>) -> BackgroundLayerValue {
+    let image = convert_image(&bg.image);
+    let image_url = match &image {
+        BackgroundImageValue::Url(u) => Some(u.clone()),
+        _ => None,
+    };
+    let (pos_x, pos_y) = convert_hv_axes(&bg.position.x, &bg.position.y);
     BackgroundLayerValue {
         image_url,
+        image,
         repeat_x: !matches!(bg.repeat.x, BackgroundRepeatKeyword::NoRepeat),
         repeat_y: !matches!(bg.repeat.y, BackgroundRepeatKeyword::NoRepeat),
         pos_x,
@@ -1456,7 +1773,14 @@ pub fn angle_to_deg(angle: &Angle) -> f32 {
 }
 
 #[must_use]
+pub fn convert_transform_origin(pos: &LightningPosition) -> TransformOrigin {
+    let (x, y) = convert_position_axes(pos);
+    TransformOrigin { x, y, z: 0.0 }
+}
+
+#[must_use]
 pub fn convert_transform(tf: &Transform) -> Option<TransformOp> {
+    let eval = EvalContext::default();
     match tf {
         Transform::Translate(x, y) => Some(TransformOp::Translate(
             convert_length_percentage(x),
@@ -1470,22 +1794,40 @@ pub fn convert_transform(tf: &Transform) -> Option<TransformOp> {
             LengthPercentage::Zero,
             convert_length_percentage(y),
         )),
-        Transform::Translate3d(x, y, _) => Some(TransformOp::Translate(
+        Transform::TranslateZ(z) => Some(TransformOp::TranslateZ(
+            convert_length(z).resolve_px(0.0, &eval),
+        )),
+        Transform::Translate3d(x, y, z) => Some(TransformOp::Translate3d(
             convert_length_percentage(x),
             convert_length_percentage(y),
+            convert_length(z).resolve_px(0.0, &eval),
         )),
         Transform::Scale(x, y) => Some(TransformOp::Scale(num_or_pct(x), num_or_pct(y))),
         Transform::ScaleX(x) => Some(TransformOp::Scale(num_or_pct(x), 1.0)),
         Transform::ScaleY(y) => Some(TransformOp::Scale(1.0, num_or_pct(y))),
-        Transform::Scale3d(x, y, _) => Some(TransformOp::Scale(num_or_pct(x), num_or_pct(y))),
+        Transform::ScaleZ(z) => Some(TransformOp::ScaleZ(num_or_pct(z))),
+        Transform::Scale3d(x, y, z) => Some(TransformOp::Scale3d(
+            num_or_pct(x),
+            num_or_pct(y),
+            num_or_pct(z),
+        )),
         Transform::Rotate(a) | Transform::RotateZ(a) => {
             Some(TransformOp::RotateDeg(angle_to_deg(a)))
         }
+        Transform::RotateX(a) => Some(TransformOp::RotateXDeg(angle_to_deg(a))),
+        Transform::RotateY(a) => Some(TransformOp::RotateYDeg(angle_to_deg(a))),
+        Transform::Rotate3d(x, y, z, a) => Some(TransformOp::Rotate3d(*x, *y, *z, angle_to_deg(a))),
         Transform::Skew(ax, ay) => Some(TransformOp::SkewDeg(angle_to_deg(ax), angle_to_deg(ay))),
         Transform::SkewX(ax) => Some(TransformOp::SkewDeg(angle_to_deg(ax), 0.0)),
         Transform::SkewY(ay) => Some(TransformOp::SkewDeg(0.0, angle_to_deg(ay))),
+        Transform::Perspective(len) => Some(TransformOp::Perspective(
+            convert_length(len).resolve_px(0.0, &eval),
+        )),
         Transform::Matrix(m) => Some(TransformOp::Matrix([m.a, m.b, m.c, m.d, m.e, m.f])),
-        _ => None,
+        Transform::Matrix3d(m) => Some(TransformOp::Matrix3d([
+            m.m11, m.m12, m.m13, m.m14, m.m21, m.m22, m.m23, m.m24, m.m31, m.m32, m.m33, m.m34,
+            m.m41, m.m42, m.m43, m.m44,
+        ])),
     }
 }
 
@@ -1501,7 +1843,208 @@ pub fn convert_filter(filter: &Filter<'_>) -> Option<FilterOp> {
         Filter::Invert(v) => Some(FilterOp::Invert(num_or_pct(v))),
         Filter::Sepia(v) => Some(FilterOp::Sepia(num_or_pct(v))),
         Filter::HueRotate(a) => Some(FilterOp::HueRotateDeg(angle_to_deg(a))),
-        Filter::DropShadow(_) | Filter::Url(_) => None,
+        Filter::DropShadow(ds) => Some(FilterOp::DropShadow {
+            offset_x: convert_length(&ds.x_offset),
+            offset_y: convert_length(&ds.y_offset),
+            blur: convert_length(&ds.blur),
+            color: convert_color(&ds.color).unwrap_or(CssColor::CurrentColor),
+        }),
+        Filter::Url(_) => None,
+    }
+}
+
+#[must_use]
+pub fn convert_blend_mode(bm: &LightningBlendMode) -> MixBlendMode {
+    match bm {
+        LightningBlendMode::Normal => MixBlendMode::Normal,
+        LightningBlendMode::Multiply => MixBlendMode::Multiply,
+        LightningBlendMode::Screen => MixBlendMode::Screen,
+        LightningBlendMode::Overlay => MixBlendMode::Overlay,
+        LightningBlendMode::Darken => MixBlendMode::Darken,
+        LightningBlendMode::Lighten => MixBlendMode::Lighten,
+        LightningBlendMode::ColorDodge => MixBlendMode::ColorDodge,
+        LightningBlendMode::ColorBurn => MixBlendMode::ColorBurn,
+        LightningBlendMode::HardLight => MixBlendMode::HardLight,
+        LightningBlendMode::SoftLight => MixBlendMode::SoftLight,
+        LightningBlendMode::Difference => MixBlendMode::Difference,
+        LightningBlendMode::Exclusion => MixBlendMode::Exclusion,
+        LightningBlendMode::Hue => MixBlendMode::Hue,
+        LightningBlendMode::Saturation => MixBlendMode::Saturation,
+        LightningBlendMode::Color => MixBlendMode::Color,
+        LightningBlendMode::Luminosity => MixBlendMode::Luminosity,
+        LightningBlendMode::PlusDarker => MixBlendMode::Darken,
+        LightningBlendMode::PlusLighter => MixBlendMode::Lighten,
+    }
+}
+
+fn convert_shape_radius(r: &ShapeRadius) -> ClipRadius {
+    match r {
+        ShapeRadius::LengthPercentage(lp) => ClipRadius::Length(convert_length_percentage(lp)),
+        ShapeRadius::ClosestSide => ClipRadius::ClosestSide,
+        ShapeRadius::FarthestSide => ClipRadius::FarthestSide,
+    }
+}
+
+fn parse_simple_lp(token: &str) -> LengthPercentage {
+    let t = token.trim();
+    if let Some(p) = t.strip_suffix('%') {
+        if let Ok(v) = p.parse::<f32>() {
+            return LengthPercentage::Percent(v / 100.0);
+        }
+    }
+    if let Some(p) = t.strip_suffix("px") {
+        if let Ok(v) = p.parse::<f32>() {
+            return LengthPercentage::px(v);
+        }
+    }
+    if let Ok(v) = t.parse::<f32>() {
+        return LengthPercentage::px(v);
+    }
+    LengthPercentage::Zero
+}
+
+#[must_use]
+pub fn convert_clip_path(cp: &LightningClipPath<'_>) -> ClipPathValue {
+    match cp {
+        LightningClipPath::None | LightningClipPath::Url(_) | LightningClipPath::Box(_) => {
+            ClipPathValue::None
+        }
+        LightningClipPath::Shape { shape, .. } => match shape.as_ref() {
+            BasicShape::Inset(ins) => ClipPathValue::Inset {
+                top: convert_length_percentage(&ins.rect.0),
+                right: convert_length_percentage(&ins.rect.1),
+                bottom: convert_length_percentage(&ins.rect.2),
+                left: convert_length_percentage(&ins.rect.3),
+                radii: [
+                    convert_length_percentage(&ins.radius.top_left.0),
+                    convert_length_percentage(&ins.radius.top_right.0),
+                    convert_length_percentage(&ins.radius.bottom_right.0),
+                    convert_length_percentage(&ins.radius.bottom_left.0),
+                ],
+            },
+            BasicShape::Circle(c) => {
+                let (cx, cy) = convert_position_axes(&c.position);
+                ClipPathValue::Circle {
+                    radius: convert_shape_radius(&c.radius),
+                    cx,
+                    cy,
+                }
+            }
+            BasicShape::Ellipse(e) => {
+                let (cx, cy) = convert_position_axes(&e.position);
+                ClipPathValue::Ellipse {
+                    rx: convert_shape_radius(&e.radius_x),
+                    ry: convert_shape_radius(&e.radius_y),
+                    cx,
+                    cy,
+                }
+            }
+            BasicShape::Polygon(poly) => {
+                let fill_odd = matches!(poly.fill_rule, FillRule::Evenodd);
+                let mut points = Vec::with_capacity(poly.points.len());
+                for pt in &poly.points {
+                    if let Ok(s) = pt.to_css_string(PrinterOptions::default()) {
+                        let mut parts = s.split_ascii_whitespace();
+                        if let (Some(xs), Some(ys)) = (parts.next(), parts.next()) {
+                            points.push((parse_simple_lp(xs), parse_simple_lp(ys)));
+                        }
+                    }
+                }
+                ClipPathValue::Polygon { fill_odd, points }
+            }
+        },
+    }
+}
+
+#[must_use]
+pub fn convert_easing(ef: &EasingFunction) -> TimingFunction {
+    match ef {
+        EasingFunction::Linear => TimingFunction::Linear,
+        EasingFunction::Ease => TimingFunction::Ease,
+        EasingFunction::EaseIn => TimingFunction::EaseIn,
+        EasingFunction::EaseOut => TimingFunction::EaseOut,
+        EasingFunction::EaseInOut => TimingFunction::EaseInOut,
+        EasingFunction::CubicBezier { x1, y1, x2, y2 } => {
+            TimingFunction::CubicBezier(*x1, *y1, *x2, *y2)
+        }
+        EasingFunction::Steps { count, position } => TimingFunction::Steps(
+            (*count).max(1) as u32,
+            matches!(position, StepPosition::Start | StepPosition::JumpBoth),
+        ),
+    }
+}
+
+#[must_use]
+pub fn time_to_ms(t: &Time) -> f32 {
+    t.to_ms()
+}
+
+#[must_use]
+pub fn convert_transition(tr: &LightningTransition<'_>) -> TransitionSpec {
+    TransitionSpec {
+        property: intern_str(tr.property.name()),
+        duration_ms: tr.duration.to_ms().max(0.0),
+        delay_ms: tr.delay.to_ms(),
+        timing: convert_easing(&tr.timing_function),
+    }
+}
+
+#[must_use]
+pub fn convert_animation_direction(d: &LightningAnimDirection) -> AnimationDirectionMode {
+    match d {
+        LightningAnimDirection::Normal => AnimationDirectionMode::Normal,
+        LightningAnimDirection::Reverse => AnimationDirectionMode::Reverse,
+        LightningAnimDirection::Alternate => AnimationDirectionMode::Alternate,
+        LightningAnimDirection::AlternateReverse => AnimationDirectionMode::AlternateReverse,
+    }
+}
+
+#[must_use]
+pub fn convert_animation_fill(f: &LightningAnimFill) -> AnimationFillModeKind {
+    match f {
+        LightningAnimFill::None => AnimationFillModeKind::None,
+        LightningAnimFill::Forwards => AnimationFillModeKind::Forwards,
+        LightningAnimFill::Backwards => AnimationFillModeKind::Backwards,
+        LightningAnimFill::Both => AnimationFillModeKind::Both,
+    }
+}
+
+#[must_use]
+pub fn convert_animation_play_state(p: &LightningAnimPlay) -> AnimationPlayStateMode {
+    match p {
+        LightningAnimPlay::Running => AnimationPlayStateMode::Running,
+        LightningAnimPlay::Paused => AnimationPlayStateMode::Paused,
+    }
+}
+
+#[must_use]
+pub fn convert_animation_iteration(c: &LightningAnimIter) -> f32 {
+    match c {
+        LightningAnimIter::Number(n) => n.max(0.0),
+        LightningAnimIter::Infinite => f32::INFINITY,
+    }
+}
+
+#[must_use]
+pub fn convert_animation_name(n: &LightningAnimName<'_>) -> InternedStr {
+    match n {
+        LightningAnimName::None => intern_str("none"),
+        LightningAnimName::Ident(id) => intern_str(id.as_ref()),
+        LightningAnimName::String(s) => intern_str(s.as_ref()),
+    }
+}
+
+#[must_use]
+pub fn convert_animation(anim: &LightningAnimation<'_>) -> AnimationSpec {
+    AnimationSpec {
+        name: convert_animation_name(&anim.name),
+        duration_ms: anim.duration.to_ms().max(0.0),
+        delay_ms: anim.delay.to_ms(),
+        timing: convert_easing(&anim.timing_function),
+        iteration_count: convert_animation_iteration(&anim.iteration_count),
+        direction: convert_animation_direction(&anim.direction),
+        fill_mode: convert_animation_fill(&anim.fill_mode),
+        play_state: convert_animation_play_state(&anim.play_state),
     }
 }
 
