@@ -81,6 +81,53 @@ pub enum RunOutcome {
     },
 }
 
+/// Tier-2 Baseline Cranelift JIT invocation threshold (Spec 05 §4.3).
+pub const BASELINE_THRESHOLD: u32 = 32;
+/// Tier-2 On-Stack Replacement (OSR) loop back-edge threshold (Spec 05 §4.3).
+pub const OSR_THRESHOLD: u32 = 256;
+/// Tier-3 Speculative Optimizing JIT invocation threshold (Spec 05 §4.4).
+pub const OPT_THRESHOLD: u32 = 1_000;
+
+/// Result returned from a native JIT entry invocation back to [`JsVm`].
+#[derive(Debug, Clone)]
+pub enum JitOutcome {
+    /// Compiled frame completed normally and produced `val`.
+    Returned(JsValue),
+    /// Compiled frame raised a JavaScript exception to be unwound by `JsVm`.
+    Threw(JsException),
+    /// Compiled frame deoptimized cleanly back to interpreter at `resume_pc`
+    /// with the live register window already materialized.
+    Deopt { resume_pc: usize },
+    /// Function/entry is not JIT-compiled — continue execution in Tier-1 interpreter.
+    Fallback,
+}
+
+/// Pluggable JIT compilation & execution backend attached to [`JsVm`]
+/// (implemented in `rix-jit` while keeping `rix-js` 100% `#![deny(unsafe_code)]`).
+pub trait JitEngine {
+    /// Minimum call count before attempting Tier-2 function-entry JIT compilation.
+    fn baseline_threshold(&self) -> u32 {
+        BASELINE_THRESHOLD
+    }
+
+    /// Minimum loop back-edge count before attempting Tier-2 OSR compilation.
+    fn osr_threshold(&self) -> u32 {
+        OSR_THRESHOLD
+    }
+
+    /// Attempts to compile (if hot) and execute `(program_id, func_idx)` starting at
+    /// `entry_pc` (`0` for normal function entry, loop-header PC for OSR).
+    fn try_enter(
+        &self,
+        vm: &mut JsVm,
+        program_id: u32,
+        func_idx: u32,
+        entry_pc: usize,
+        call_count: u32,
+        back_edge_count: u32,
+    ) -> JitOutcome;
+}
+
 /// Native callable backing stored in [`JsVm::native_fns`].
 pub enum NativeCallable {
     Static(NativeFnPtr),
@@ -161,6 +208,10 @@ pub struct JsVm {
     pub call_counts: Vec<Vec<u32>>,
     /// Per-function loop back-edge counters (used for Tier-2 OSR in Phase 3).
     pub back_edge_counts: Vec<Vec<u32>>,
+    /// Optional attached Tier-2 / Tier-3 Cranelift JIT backend.
+    jit: Option<Rc<dyn JitEngine>>,
+    /// Stashed JS exception raised inside an `extern "C"` JIT trampoline.
+    pub pending_jit_exception: Option<JsException>,
     /// Frequently interned well-known property keys.
     pub key_length: PropertyKey,
     pub key_prototype: PropertyKey,
@@ -323,6 +374,8 @@ impl JsVm {
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             call_counts: Vec::new(),
             back_edge_counts: Vec::new(),
+            jit: None,
+            pending_jit_exception: None,
             key_length,
             key_prototype,
             key_constructor,
@@ -1035,7 +1088,17 @@ impl JsVm {
         }
     }
 
-    /// Core register-window interpreter loop supporting `await` and `yield` suspension.
+    /// Attaches a Tier-2/Tier-3 [`JitEngine`] to this VM realm.
+    pub fn attach_jit(&mut self, jit: Rc<dyn JitEngine>) {
+        self.jit = Some(jit);
+    }
+
+    /// Detaches any active [`JitEngine`], returning to pure Tier-1 interpreter mode.
+    pub fn detach_jit(&mut self) {
+        self.jit = None;
+    }
+
+    /// Core register-window interpreter loop supporting `await`, `yield`, and JIT/OSR tier-up.
     pub(crate) fn run_suspendable(&mut self, stop_depth: usize) -> Result<RunOutcome, JsException> {
         loop {
             if self.frames.len() <= stop_depth {
@@ -1046,6 +1109,52 @@ impl JsVm {
                 let f = &self.frames[frame_idx];
                 (f.program_id as usize, f.func_idx as usize, f.base_reg, f.pc)
             };
+
+            // Tier-2/3 JIT function entry hook when pc == 0 and function call count reached threshold.
+            if pc == 0 {
+                if let Some(jit) = self.jit.clone() {
+                    let call_cnt = self
+                        .call_counts
+                        .get(prog_id)
+                        .and_then(|v| v.get(func_idx))
+                        .copied()
+                        .unwrap_or(0);
+                    let back_cnt = self
+                        .back_edge_counts
+                        .get(prog_id)
+                        .and_then(|v| v.get(func_idx))
+                        .copied()
+                        .unwrap_or(0);
+                    if call_cnt >= jit.baseline_threshold() || back_cnt >= jit.osr_threshold() {
+                        match jit.try_enter(
+                            self,
+                            prog_id as u32,
+                            func_idx as u32,
+                            0,
+                            call_cnt,
+                            back_cnt,
+                        ) {
+                            JitOutcome::Returned(val) => {
+                                if let Some(top_ret) = self.pop_frame_with_value(val, stop_depth) {
+                                    return Ok(RunOutcome::Completed(top_ret));
+                                }
+                                continue;
+                            }
+                            JitOutcome::Threw(exc) => {
+                                self.handle_exception(exc, stop_depth)?;
+                                continue;
+                            }
+                            JitOutcome::Deopt { resume_pc } => {
+                                self.frames[frame_idx].pc = resume_pc;
+                                continue;
+                            }
+                            JitOutcome::Fallback => {}
+                        }
+                    }
+                }
+            }
+
+            let pc = self.frames[frame_idx].pc;
             let inst = match self.programs[prog_id].functions[func_idx].code.get(pc) {
                 Some(&i) => i,
                 None => {
@@ -1856,7 +1965,45 @@ impl JsVm {
                     self.collect_minor_gc();
                 }
                 let cur_pc = self.frames[frame_idx].pc as isize;
-                self.frames[frame_idx].pc = (cur_pc + isize::from(inst.sbx())) as usize;
+                let target_pc = (cur_pc + isize::from(inst.sbx())) as usize;
+                self.frames[frame_idx].pc = target_pc;
+
+                // Tier-2 On-Stack Replacement (OSR) at hot loop back-edges.
+                if let Some(jit) = self.jit.clone() {
+                    let back_cnt = self
+                        .back_edge_counts
+                        .get(prog_id)
+                        .and_then(|v| v.get(func_idx))
+                        .copied()
+                        .unwrap_or(0);
+                    if back_cnt >= jit.osr_threshold() {
+                        let call_cnt = self
+                            .call_counts
+                            .get(prog_id)
+                            .and_then(|v| v.get(func_idx))
+                            .copied()
+                            .unwrap_or(0);
+                        match jit.try_enter(
+                            self,
+                            prog_id as u32,
+                            func_idx as u32,
+                            target_pc,
+                            call_cnt,
+                            back_cnt,
+                        ) {
+                            JitOutcome::Returned(val) => {
+                                if let Some(top_ret) = self.pop_frame_with_value(val, stop_depth) {
+                                    return Ok(StepOutcome::ReturnTop(top_ret));
+                                }
+                            }
+                            JitOutcome::Threw(exc) => return Err(exc),
+                            JitOutcome::Deopt { resume_pc } => {
+                                self.frames[frame_idx].pc = resume_pc;
+                            }
+                            JitOutcome::Fallback => {}
+                        }
+                    }
+                }
             }
             Opcode::Return => {
                 let val = self.registers[a];
@@ -3643,6 +3790,385 @@ impl JsVm {
             .get(prog_id as usize)?
             .functions
             .get(func_idx as usize)
+    }
+
+    /// Returns the base register offset of the active top call frame.
+    #[must_use]
+    pub fn jit_current_frame_base(&self) -> usize {
+        self.frames.last().map_or(0, |f| f.base_reg)
+    }
+
+    /// Returns `this` of the active top call frame.
+    #[must_use]
+    pub fn jit_current_frame_this(&self) -> JsValue {
+        self.frames
+            .last()
+            .map_or(JsValue::UNDEFINED, |f| f.this_val)
+    }
+
+    /// Updates `pc` on the active top call frame (used before throwing slow paths for exact unwinding).
+    pub fn jit_set_current_frame_pc(&mut self, pc: usize) {
+        if let Some(f) = self.frames.last_mut() {
+            f.pc = pc;
+        }
+    }
+
+    /// Mutable access to the flat register window slice starting at `base`.
+    pub fn jit_registers_from_mut(&mut self, base: usize) -> &mut [JsValue] {
+        &mut self.registers[base..]
+    }
+
+    /// Inspects an IC slot state for Tier-2/Tier-3 type & shape feedback.
+    #[must_use]
+    pub fn jit_ic_state(&self, prog_id: u32, func_idx: u32, ic_idx: usize) -> crate::ic::IcState {
+        self.ic_tables
+            .get(prog_id as usize)
+            .and_then(|v| v.get(func_idx as usize))
+            .map_or(crate::ic::IcState::Uninitialized, |t| t.state(ic_idx))
+    }
+
+    /// Returns the interned `PropertyKey` associated with an IC slot.
+    #[must_use]
+    pub fn jit_ic_key(&mut self, prog_id: u32, func_idx: u32, ic_idx: usize) -> PropertyKey {
+        self.ic_key(prog_id as usize, func_idx as usize, ic_idx)
+    }
+
+    /// Materializes a constant pool entry into a `JsValue` (safe for JIT constant loading).
+    pub fn jit_materialize_const(
+        &mut self,
+        prog_id: u32,
+        func_idx: u32,
+        idx: usize,
+    ) -> Result<JsValue, JsException> {
+        self.materialize_constant(prog_id as usize, func_idx as usize, idx)
+    }
+
+    /// Pure zero-allocation, zero-JS-reentry monomorphic own-slot `GetProp` fast path.
+    /// Returns `Some(val)` on an own-data-property shape hit, or `None` if slow path is required.
+    #[inline]
+    pub fn jit_get_prop_ic_fast(
+        &mut self,
+        prog_id: u32,
+        func_idx: u32,
+        ic_idx: usize,
+        obj_val: JsValue,
+    ) -> Option<JsValue> {
+        let obj = obj_val.as_object()?;
+        let crate::ic::IcState::Monomorphic(entry) = self
+            .ic_tables
+            .get(prog_id as usize)?
+            .get(func_idx as usize)?
+            .state(ic_idx)
+        else {
+            return None;
+        };
+        if entry.holder.is_some() || entry.is_accessor {
+            return None;
+        }
+        let cached_offset = entry.offset as usize;
+        let o = self.heap.get_object(obj)?;
+        if !matches!(o.kind, ObjectKind::Proxy(_))
+            && ShapeId(o.shape_id) == entry.shape
+            && cached_offset < o.slots.len()
+        {
+            self.ic_stats.monomorphic_hits += 1;
+            return Some(o.slots[cached_offset]);
+        }
+        None
+    }
+
+    /// Pure zero-allocation, zero-JS-reentry monomorphic in-place `SetProp` fast path.
+    /// Returns `true` on an own-data-property in-place write hit, or `false` if slow path is required.
+    #[inline]
+    pub fn jit_set_prop_ic_fast(
+        &mut self,
+        prog_id: u32,
+        func_idx: u32,
+        ic_idx: usize,
+        obj_val: JsValue,
+        val: JsValue,
+    ) -> bool {
+        let Some(obj) = obj_val.as_object() else {
+            return false;
+        };
+        let Some(crate::ic::IcState::Monomorphic(entry)) = self
+            .ic_tables
+            .get(prog_id as usize)
+            .and_then(|v| v.get(func_idx as usize))
+            .map(|t| t.state(ic_idx))
+        else {
+            return false;
+        };
+        if entry.holder.is_some() || entry.is_accessor || entry.target_shape != entry.shape {
+            return false;
+        }
+        let cached_offset = entry.offset as usize;
+        let mut wrote = false;
+        if let Some(o) = self.heap.get_object_mut(obj) {
+            if !matches!(o.kind, ObjectKind::Proxy(_))
+                && ShapeId(o.shape_id) == entry.shape
+                && cached_offset < o.slots.len()
+            {
+                o.slots[cached_offset] = val;
+                wrote = true;
+            }
+        }
+        if wrote {
+            self.heap.write_barrier(obj, val);
+            self.ic_stats.monomorphic_hits += 1;
+        }
+        wrote
+    }
+
+    /// Pure zero-JS-reentry dense array element read fast path.
+    #[inline]
+    pub fn jit_get_elem_fast(&self, obj_val: JsValue, key_val: JsValue) -> Option<JsValue> {
+        let obj = obj_val.as_object()?;
+        let idx = key_val.as_i32()?;
+        if idx < 0 {
+            return None;
+        }
+        let o = self.heap.get_object(obj)?;
+        if matches!(o.kind, ObjectKind::Array) {
+            return o.elements.get(idx as u32);
+        }
+        None
+    }
+
+    /// Pure zero-JS-reentry dense array in-bounds element write fast path.
+    #[inline]
+    pub fn jit_set_elem_fast(&mut self, obj_val: JsValue, key_val: JsValue, val: JsValue) -> bool {
+        let Some(obj) = obj_val.as_object() else {
+            return false;
+        };
+        let Some(idx) = key_val.as_i32() else {
+            return false;
+        };
+        if idx < 0 {
+            return false;
+        }
+        let mut wrote = false;
+        if let Some(o) = self.heap.get_object_mut(obj) {
+            if matches!(o.kind, ObjectKind::Array) && (idx as u32) < o.elements.len() {
+                o.elements.set(idx as u32, val);
+                wrote = true;
+            }
+        }
+        if wrote {
+            self.heap.write_barrier(obj, val);
+        }
+        wrote
+    }
+
+    /// Fast safe `GetProp` via the VM's Monomorphic/Polymorphic/Megamorphic IC table.
+    #[inline]
+    pub fn jit_get_prop_ic(
+        &mut self,
+        prog_id: u32,
+        func_idx: u32,
+        ic_idx: usize,
+        obj_val: JsValue,
+    ) -> Result<JsValue, JsException> {
+        let p = prog_id as usize;
+        let f = func_idx as usize;
+        // Ultra-fast monomorphic direct own-slot hit before touching key lookup.
+        if let Some(obj) = obj_val.as_object() {
+            if let Some(crate::ic::IcState::Monomorphic(entry)) = self
+                .ic_tables
+                .get(p)
+                .and_then(|v| v.get(f))
+                .map(|t| t.state(ic_idx))
+            {
+                if entry.holder.is_none() && !entry.is_accessor {
+                    let cached_offset = entry.offset as usize;
+                    if let Some(o) = self.heap.get_object(obj) {
+                        if !matches!(o.kind, ObjectKind::Proxy(_))
+                            && ShapeId(o.shape_id) == entry.shape
+                            && cached_offset < o.slots.len()
+                        {
+                            self.ic_stats.monomorphic_hits += 1;
+                            return Ok(o.slots[cached_offset]);
+                        }
+                    }
+                }
+            }
+        }
+        let key = self.ic_key(p, f, ic_idx);
+        self.get_prop_cached(obj_val, p, f, ic_idx, key)
+    }
+
+    /// Fast safe `SetProp` via the VM's Monomorphic/Polymorphic/Megamorphic IC table.
+    #[inline]
+    pub fn jit_set_prop_ic(
+        &mut self,
+        prog_id: u32,
+        func_idx: u32,
+        ic_idx: usize,
+        obj_val: JsValue,
+        val: JsValue,
+    ) -> Result<(), JsException> {
+        let p = prog_id as usize;
+        let f = func_idx as usize;
+        let Some(obj) = obj_val.as_object() else {
+            return Err(self.type_error("Cannot set property on non-object"));
+        };
+        // Ultra-fast monomorphic in-place slot write when shape already matches!
+        if let Some(crate::ic::IcState::Monomorphic(entry)) = self
+            .ic_tables
+            .get(p)
+            .and_then(|v| v.get(f))
+            .map(|t| t.state(ic_idx))
+        {
+            if entry.holder.is_none() && !entry.is_accessor && entry.target_shape == entry.shape {
+                let cached_offset = entry.offset as usize;
+                let mut wrote = false;
+                if let Some(o) = self.heap.get_object_mut(obj) {
+                    if !matches!(o.kind, ObjectKind::Proxy(_))
+                        && ShapeId(o.shape_id) == entry.shape
+                        && cached_offset < o.slots.len()
+                    {
+                        o.slots[cached_offset] = val;
+                        wrote = true;
+                    }
+                }
+                if wrote {
+                    self.heap.write_barrier(obj, val);
+                    self.ic_stats.monomorphic_hits += 1;
+                    return Ok(());
+                }
+            }
+        }
+        let key = self.ic_key(p, f, ic_idx);
+        self.set_prop_cached(obj, p, f, ic_idx, key, val)
+    }
+
+    /// Fast safe dense array / object element load (`obj[key]`).
+    #[inline]
+    pub fn jit_get_elem(
+        &mut self,
+        obj_val: JsValue,
+        key_val: JsValue,
+    ) -> Result<JsValue, JsException> {
+        if let (Some(obj), Some(idx)) = (obj_val.as_object(), key_val.as_i32()) {
+            if idx >= 0 {
+                if let Some(o) = self.heap.get_object(obj) {
+                    if matches!(o.kind, ObjectKind::Array) {
+                        if let Some(v) = o.elements.get(idx as u32) {
+                            return Ok(v);
+                        }
+                    }
+                }
+            }
+        }
+        self.get_elem(obj_val, key_val)
+    }
+
+    /// Fast safe dense array / object element store (`obj[key] = val`).
+    #[inline]
+    pub fn jit_set_elem(
+        &mut self,
+        obj_val: JsValue,
+        key_val: JsValue,
+        val: JsValue,
+    ) -> Result<(), JsException> {
+        if let (Some(obj), Some(idx)) = (obj_val.as_object(), key_val.as_i32()) {
+            if idx >= 0 {
+                let mut wrote = false;
+                if let Some(o) = self.heap.get_object_mut(obj) {
+                    if matches!(o.kind, ObjectKind::Array) && (idx as u32) < o.elements.len() {
+                        o.elements.set(idx as u32, val);
+                        wrote = true;
+                    }
+                }
+                if wrote {
+                    self.heap.write_barrier(obj, val);
+                    return Ok(());
+                }
+            }
+        }
+        self.set_elem(obj_val, key_val, val)
+    }
+
+    /// Arithmetic & comparison slow paths delegating to exact ES2024 VM semantics.
+    pub fn jit_add(&mut self, a: JsValue, b: JsValue) -> Result<JsValue, JsException> {
+        self.op_add(a, b)
+    }
+    pub fn jit_sub(&mut self, a: JsValue, b: JsValue) -> Result<JsValue, JsException> {
+        self.op_sub(a, b)
+    }
+    pub fn jit_mul(&mut self, a: JsValue, b: JsValue) -> Result<JsValue, JsException> {
+        self.op_mul(a, b)
+    }
+    pub fn jit_div(&mut self, a: JsValue, b: JsValue) -> Result<JsValue, JsException> {
+        Ok(JsValue::from_number(
+            self.to_number(a)? / self.to_number(b)?,
+        ))
+    }
+    pub fn jit_rem(&mut self, a: JsValue, b: JsValue) -> Result<JsValue, JsException> {
+        Ok(JsValue::from_number(
+            self.to_number(a)? % self.to_number(b)?,
+        ))
+    }
+    pub fn jit_lt(&mut self, a: JsValue, b: JsValue) -> Result<JsValue, JsException> {
+        Ok(JsValue::from_bool(self.op_lt(a, b)?))
+    }
+    pub fn jit_le(&mut self, a: JsValue, b: JsValue) -> Result<JsValue, JsException> {
+        Ok(JsValue::from_bool(self.op_lteq(a, b)?))
+    }
+    pub fn jit_gt(&mut self, a: JsValue, b: JsValue) -> Result<JsValue, JsException> {
+        Ok(JsValue::from_bool(self.op_lt(b, a)?))
+    }
+    pub fn jit_ge(&mut self, a: JsValue, b: JsValue) -> Result<JsValue, JsException> {
+        Ok(JsValue::from_bool(self.op_lteq(b, a)?))
+    }
+    pub fn jit_eq(&mut self, a: JsValue, b: JsValue) -> Result<JsValue, JsException> {
+        Ok(JsValue::from_bool(self.abstract_eq(a, b)?))
+    }
+    pub fn jit_strict_eq(&self, a: JsValue, b: JsValue) -> JsValue {
+        JsValue::from_bool(self.strict_eq(a, b))
+    }
+
+    /// Executes a single generic non-branch bytecode instruction at `pc` directly on the
+    /// active top frame's live register window, returning the advanced `pc`.
+    pub fn jit_step_generic(
+        &mut self,
+        prog_id: u32,
+        func_idx: u32,
+        pc: usize,
+    ) -> Result<usize, JsException> {
+        let frame_idx = self.frames.len() - 1;
+        let base = self.frames[frame_idx].base_reg;
+        let p = prog_id as usize;
+        let f = func_idx as usize;
+        let inst = self.programs[p].functions[f].code[pc];
+        self.frames[frame_idx].pc = pc + 1;
+        let Some(op) = inst.opcode() else {
+            return Err(self.type_error("Invalid bytecode opcode"));
+        };
+        let stop_depth = self.frames.len();
+        let _ = self.dispatch_op(op, inst, p, f, base, frame_idx, stop_depth)?;
+        Ok(self.frames[frame_idx].pc)
+    }
+
+    /// Cooperative interrupt + minor-GC safepoint executed at JIT loop back-edges.
+    pub fn jit_loop_safepoint(&mut self, prog_id: u32, func_idx: u32) -> Result<(), JsException> {
+        self.loop_iterations = self.loop_iterations.saturating_add(1);
+        if let Some(edges) = self.back_edge_counts.get_mut(prog_id as usize) {
+            if let Some(cnt) = edges.get_mut(func_idx as usize) {
+                *cnt = cnt.saturating_add(1);
+            }
+        }
+        if self.interrupt_flag.load(Ordering::Relaxed)
+            || self
+                .max_loop_iterations
+                .is_some_and(|limit| self.loop_iterations > limit)
+        {
+            return Err(self.range_error("Execution interrupted: loop budget exceeded"));
+        }
+        if self.heap.should_collect_minor() {
+            self.collect_minor_gc();
+        }
+        Ok(())
     }
 }
 

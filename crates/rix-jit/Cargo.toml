@@ -1,0 +1,16 @@
+[package]
+name = "rix-jit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Tier-2 Baseline & Tier-3 Speculative Cranelift JIT and WebAssembly engine for RixBrowser"
+
+[dependencies]
+rix-js = { path = "../rix-js" }
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-native.workspace = true
+libc = "0.2"
+thiserror.workspace = true
+tracing.workspace = true

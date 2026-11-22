@@ -12,6 +12,7 @@ members = [
     "crates/rix-render",
     "crates/rix-layout",
     "crates/rix-js",
+    "crates/rix-jit",
     "crates/rix-content",
     "crates/rix-chrome",
     "crates/rix-app",
@@ -63,6 +64,9 @@ arboard = "3.6"
 unicode-ident = "1.0"
 sha2 = "0.10"
 regex = "1.13"
+cranelift-codegen = "0.137"
+cranelift-frontend = "0.137"
+cranelift-native = "0.137"
 
 [profile.dev]
 debug = 1
