@@ -18,6 +18,7 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
     define_global(vm, "globalThis", g);
     let eval_fn = vm.alloc_native_fn("eval", global_eval_fn);
     vm.set_fn_length(eval_fn, 1);
+    vm.eval_fn = Some(eval_fn);
     define_global(vm, "eval", JsValue::from_object(eval_fn));
 
     // Function.prototype.{call, apply, bind, toString} + Function constructor
@@ -133,6 +134,7 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
         PropertyAttrs::METHOD,
         &mut vm.shapes,
     );
+    vm.default_array_iter_fn = Some(array_values_fn);
     define_method(vm, arr_proto, "keys", array_keys);
     define_method(vm, arr_proto, "entries", array_entries);
 
@@ -326,8 +328,16 @@ fn global_eval_fn(
         return Ok(first);
     };
     let src = vm.heap.materialize_string(str_h).unwrap_or_default();
-    vm.eval_script(&src)
-        .map_err(|e| eval_error_to_exception(vm, e))
+    let prog = crate::parser::parse(&src, crate::ast::SourceType::Script)
+        .map_err(|e| vm.make_error("SyntaxError", e.to_string()))?;
+    let mode = if prog.strict {
+        crate::compiler::EvalScopeMode::LocalAll
+    } else {
+        crate::compiler::EvalScopeMode::GlobalVars
+    };
+    let compiled = crate::compiler::compile_eval_program(&prog, mode)
+        .map_err(|e| vm.make_error("SyntaxError", e.to_string()))?;
+    vm.execute_program(compiled)
 }
 
 fn function_ctor_fn(
@@ -585,6 +595,44 @@ fn object_ctor_fn(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsV
         if first.is_object() {
             return Ok(first);
         }
+        if !first.is_null() && !first.is_undefined() {
+            let proto = if first.is_string() {
+                vm.string_proto
+            } else if first.is_bool() {
+                vm.boolean_proto
+            } else if first.is_bigint() {
+                vm.bigint_proto
+            } else if first.is_symbol() {
+                vm.symbol_proto
+            } else {
+                vm.number_proto
+            };
+            let h = vm
+                .heap
+                .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+            if let Some(o) = vm.heap.get_object_mut(h) {
+                o.rare_mut().boxed_value = Some(first);
+                if let Some(sh) = first.as_string() {
+                    let s = vm.heap.materialize_string(sh).unwrap_or_default();
+                    let len = s.encode_utf16().count() as f64;
+                    for (i, ch) in s.chars().enumerate() {
+                        let cv = JsValue::from_string(vm.heap.alloc_string(ch.to_string()));
+                        if let Some(obj_mut) = vm.heap.get_object_mut(h) {
+                            obj_mut.elements.set(i as u32, cv);
+                        }
+                    }
+                    vm.heap.object_define_data(
+                        h,
+                        vm.key_length,
+                        JsValue::from_f64(len),
+                        PropertyAttrs::empty(),
+                        &mut vm.shapes,
+                    );
+                }
+            }
+            vm.heap.write_barrier(h, first);
+            return Ok(JsValue::from_object(h));
+        }
     }
     Ok(JsValue::from_object(vm.alloc_ordinary_object()))
 }
@@ -612,25 +660,87 @@ fn obj_to_string(
     this_val: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let tag = if this_val.is_undefined() {
-        "[object Undefined]"
+    let builtin_tag = if this_val.is_undefined() {
+        return Ok(JsValue::from_string(
+            vm.heap.alloc_string("[object Undefined]"),
+        ));
     } else if this_val.is_null() {
-        "[object Null]"
+        return Ok(JsValue::from_string(vm.heap.alloc_string("[object Null]")));
+    } else if this_val.is_bool() {
+        "Boolean"
+    } else if this_val.is_number() {
+        "Number"
+    } else if this_val.is_string() {
+        "String"
+    } else if this_val.is_bigint() {
+        "BigInt"
+    } else if this_val.is_symbol() {
+        "Symbol"
     } else if let Some(h) = this_val.as_object() {
-        match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::Array) => "[object Array]",
-            Some(
-                ObjectKind::Closure(_)
-                | ObjectKind::NativeFunction(_)
-                | ObjectKind::BoundFunction(_),
-            ) => "[object Function]",
-            Some(ObjectKind::RegExp(_)) => "[object RegExp]",
-            _ => "[object Object]",
+        // Check `Symbol.toStringTag` first on objects (ECMA-262 §20.1.3.6).
+        let k_sym = vm.heap.intern_key("Symbol");
+        if let Ok(sym_ctor) = vm.get_property_by_key(vm.global, k_sym) {
+            if let Some(sc_h) = sym_ctor.as_object() {
+                let k_tst = vm.heap.intern_key("toStringTag");
+                if let Ok(tag_sym) = vm.get_property_by_key(sc_h, k_tst) {
+                    if tag_sym.is_symbol() {
+                        let tag_key_s = vm.value_to_rust_string(tag_sym);
+                        let tag_key = vm.heap.intern_key(&tag_key_s);
+                        let tag_val = vm.get_property_by_key(h, tag_key)?;
+                        if let Some(sh) = tag_val.as_string() {
+                            let s = vm.heap.materialize_string(sh).unwrap_or_default();
+                            return Ok(JsValue::from_string(
+                                vm.heap.alloc_string(format!("[object {s}]")),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(bv) = vm
+            .heap
+            .get_object(h)
+            .and_then(|o| o.rare.as_ref())
+            .and_then(|r| r.boxed_value)
+        {
+            if bv.is_string() {
+                "String"
+            } else if bv.is_number() {
+                "Number"
+            } else if bv.is_bool() {
+                "Boolean"
+            } else if bv.is_bigint() {
+                "BigInt"
+            } else if bv.is_symbol() {
+                "Symbol"
+            } else {
+                "Object"
+            }
+        } else {
+            match vm.heap.get_object(h).map(|o| &o.kind) {
+                Some(ObjectKind::Array) => "Array",
+                Some(
+                    ObjectKind::Closure(_)
+                    | ObjectKind::NativeFunction(_)
+                    | ObjectKind::BoundFunction(_),
+                ) => "Function",
+                Some(ObjectKind::RegExp(_)) => "RegExp",
+                Some(ObjectKind::Date(_)) => "Date",
+                Some(ObjectKind::Map(_)) => "Map",
+                Some(ObjectKind::Set(_)) => "Set",
+                Some(ObjectKind::Promise(_)) => "Promise",
+                Some(ObjectKind::ArrayBuffer(_)) => "ArrayBuffer",
+                Some(ObjectKind::DataView(_)) => "DataView",
+                Some(ObjectKind::TypedArray(ta)) => ta.kind.name(),
+                _ => "Object",
+            }
         }
     } else {
-        "[object Object]"
+        "Object"
     };
-    Ok(JsValue::from_string(vm.heap.alloc_string(tag)))
+    Ok(JsValue::from_string(
+        vm.heap.alloc_string(format!("[object {builtin_tag}]")),
+    ))
 }
 
 fn object_create(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {

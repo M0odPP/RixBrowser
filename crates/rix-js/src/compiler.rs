@@ -2,8 +2,19 @@
 
 use crate::ast::*;
 use crate::bytecode::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
+
+/// Scoping mode when compiling `eval(...)` source code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalScopeMode {
+    /// Normal Script or ES Module (not `eval`).
+    None,
+    /// Sloppy-mode top-level `eval`: `var`/`function` go to global, `let`/`const`/`class` stay local.
+    GlobalVars,
+    /// Strict-mode or function-nested `eval`: all declarations stay in `eval`'s local frame.
+    LocalAll,
+}
 
 /// Failure returned when parsing or compiling ECMAScript source into bytecode.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -20,10 +31,36 @@ pub fn compile_program(program: &Program) -> Result<CompiledProgram, CompileErro
     compiler.compile_root(program)
 }
 
+/// Compiles a parsed `eval` [`Program`] with explicit `eval` declaration scoping.
+pub fn compile_eval_program(
+    program: &Program,
+    eval_mode: EvalScopeMode,
+) -> Result<CompiledProgram, CompileError> {
+    let mut compiler = Compiler::new(program.source_type);
+    compiler.eval_mode = eval_mode;
+    compiler.compile_root(program)
+}
+
 /// Parses and compiles ECMAScript source directly into [`CompiledProgram`].
 pub fn compile(source: &str, source_type: SourceType) -> Result<CompiledProgram, CompileError> {
     let program = crate::parser::parse(source, source_type)?;
     compile_program(&program)
+}
+
+/// Collects ECMA-262 `VarDeclaredNames` (top-level `var` and top-level `FunctionDeclaration`).
+pub fn collect_eval_var_declared_names(stmts: &[Statement]) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_hoisted_vars(stmts, &mut out);
+    for stmt in stmts {
+        if let Statement::FunctionDecl(f) = stmt {
+            if let Some(ref name) = f.name {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +71,7 @@ struct LocalVar {
     is_const: bool,
     is_captured: bool,
     is_tdz: bool,
+    is_lex: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +123,11 @@ struct FunctionCompiler {
     pending_label: Option<String>,
     chain_exits: Vec<Vec<(usize, u8)>>,
     active_finalizers: Vec<Vec<Statement>>,
+    annex_b_hoisted: HashSet<String>,
+    param_names: Vec<String>,
+    in_param_init: bool,
+    in_class_field_or_static: bool,
+    in_class_body: bool,
 }
 
 impl FunctionCompiler {
@@ -121,6 +164,11 @@ impl FunctionCompiler {
             pending_label: None,
             chain_exits: Vec::new(),
             active_finalizers: Vec::new(),
+            annex_b_hoisted: HashSet::new(),
+            param_names: Vec::new(),
+            in_param_init: false,
+            in_class_field_or_static: false,
+            in_class_body: false,
         }
     }
 
@@ -293,6 +341,7 @@ impl FunctionCompiler {
             is_const,
             is_captured: false,
             is_tdz,
+            is_lex: is_tdz || is_const,
         });
         Ok(reg)
     }
@@ -345,6 +394,7 @@ impl FunctionCompiler {
 
 struct Compiler {
     source_type: SourceType,
+    eval_mode: EvalScopeMode,
     functions: Vec<FunctionBytecode>,
     frames: Vec<FunctionCompiler>,
     module: Option<ModuleBlueprint>,
@@ -356,6 +406,7 @@ impl Compiler {
     fn new(source_type: SourceType) -> Self {
         Self {
             source_type,
+            eval_mode: EvalScopeMode::None,
             functions: Vec::new(),
             frames: Vec::new(),
             module: (source_type == SourceType::Module).then(ModuleBlueprint::default),
@@ -371,8 +422,15 @@ impl Compiler {
 
     fn compile_root(&mut self, program: &Program) -> Result<CompiledProgram, CompileError> {
         let is_module = program.source_type == SourceType::Module;
+        let root_name = if is_module {
+            "<module>"
+        } else if self.eval_mode != EvalScopeMode::None {
+            "<eval>"
+        } else {
+            "<script>"
+        };
         let mut root = FunctionCompiler::new(
-            Some(if is_module { "<module>" } else { "<script>" }.into()),
+            Some(root_name.into()),
             0,
             program.strict,
             is_module, // modules can execute top-level await
@@ -422,6 +480,7 @@ impl Compiler {
                         specifier: decl.source.clone(),
                         imported_name: ModuleImportKind::SideEffectOnly,
                         local_name: String::new(),
+                        import_type: decl.import_type.clone(),
                     });
                     continue;
                 }
@@ -439,6 +498,7 @@ impl Compiler {
                         specifier: decl.source.clone(),
                         imported_name: kind,
                         local_name: local,
+                        import_type: decl.import_type.clone(),
                     });
                 }
             }
@@ -452,41 +512,95 @@ impl Compiler {
     ) -> Result<(), CompileError> {
         let mut var_names = Vec::new();
         let mut func_decls = Vec::new();
+        let mut top_lex_set = HashSet::new();
         collect_hoisted_vars(stmts, &mut var_names);
         for stmt in stmts {
-            match stmt {
-                Statement::FunctionDecl(f) => func_decls.push(f),
+            let inner = match stmt {
                 Statement::ExportDecl(ExportDecl {
-                    kind: ExportKind::Declaration(inner),
+                    kind: ExportKind::Declaration(d),
                     ..
-                }) => {
-                    if let Statement::FunctionDecl(f) = inner.as_ref() {
-                        func_decls.push(f);
+                }) => d.as_ref(),
+                other => other,
+            };
+            match unwrap_labeled_func_decl(inner) {
+                Some(f) => func_decls.push(f),
+                None => match inner {
+                    Statement::VarDecl {
+                        kind: VarKind::Let | VarKind::Const,
+                        decls,
+                        ..
+                    } => {
+                        for d in decls {
+                            let mut names = Vec::new();
+                            d.id.collect_bound_names(&mut names);
+                            for (n, _) in names {
+                                top_lex_set.insert(n);
+                            }
+                        }
                     }
-                }
-                _ => {}
+                    Statement::ClassDecl(cls) => {
+                        if let Some(ref name) = cls.name {
+                            top_lex_set.insert(name.clone());
+                        }
+                    }
+                    _ => {}
+                },
             }
         }
 
-        let is_script_global = is_root && self.source_type == SourceType::Script;
-        for name in var_names {
-            if is_script_global {
-                let c = self.cur().add_string_const(&name)?;
+        let is_var_global = is_root
+            && self.source_type == SourceType::Script
+            && self.eval_mode != EvalScopeMode::LocalAll;
+        let is_lex_global = is_root
+            && self.source_type == SourceType::Script
+            && self.eval_mode == EvalScopeMode::None;
+
+        for name in &var_names {
+            if is_var_global {
+                let c = self.cur().add_string_const(name)?;
                 let tmp = self.cur().alloc_reg()?;
+                // Empty sentinel instructs DeclareGlobal to initialize `undefined` only if absent.
                 self.cur()
-                    .emit(Instruction::abc(Opcode::LoadUndef, tmp, 0, 0));
+                    .emit(Instruction::abc(Opcode::LoadTdz, tmp, 0, 0));
                 self.cur().emit_abx_wide(Opcode::DeclareGlobal, tmp, c);
                 self.cur().free_to(tmp);
-            } else if self.cur().find_local(&name).is_none() {
-                let reg = self.cur().declare_local(&name, false, false)?;
+            } else if self.cur().find_local(name).is_none() {
+                let reg = self.cur().declare_local(name, false, false)?;
                 self.cur()
                     .emit(Instruction::abc(Opcode::LoadUndef, reg, 0, 0));
             }
         }
 
+        // Annex B §B.3.3: hoist sloppy-mode block-level plain FunctionDeclarations to `undefined`.
+        if !self.cur().is_strict && (self.source_type == SourceType::Script || !is_root) {
+            let mut annex_b_names = Vec::new();
+            collect_annex_b_block_funcs(stmts, &top_lex_set, false, &mut annex_b_names);
+            for name in &annex_b_names {
+                self.cur().annex_b_hoisted.insert(name.clone());
+                if is_var_global {
+                    if !var_names.contains(name)
+                        && !func_decls
+                            .iter()
+                            .any(|f| f.name.as_deref() == Some(name.as_str()))
+                    {
+                        let c = self.cur().add_string_const(name)?;
+                        let tmp = self.cur().alloc_reg()?;
+                        self.cur()
+                            .emit(Instruction::abc(Opcode::LoadTdz, tmp, 0, 0));
+                        self.cur().emit_abx_wide(Opcode::DeclareGlobal, tmp, c);
+                        self.cur().free_to(tmp);
+                    }
+                } else if self.cur().find_local(name).is_none() {
+                    let reg = self.cur().declare_local(name, false, false)?;
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::LoadUndef, reg, 0, 0));
+                }
+            }
+        }
+
         // Pre-declare lexical (`let`/`const`/`class`) bindings in this scope as TDZ
         // BEFORE compiling hoisted functions so inner closures can capture them.
-        if !is_script_global {
+        if !is_lex_global {
             for stmt in stmts {
                 let inner = match stmt {
                     Statement::ExportDecl(ExportDecl {
@@ -528,7 +642,7 @@ impl Compiler {
         // Pre-declare ALL hoisted function names in non-script-global scopes BEFORE
         // compiling any of their bodies so sibling functions can call each other
         // (mutual recursion & forward references, ECMA-262 §10.2.11).
-        if !is_script_global {
+        if !is_var_global {
             for func in &func_decls {
                 if let Some(ref name) = func.name {
                     if self.cur().find_local(name).is_none() {
@@ -544,7 +658,7 @@ impl Compiler {
             let func_idx = self.compile_function_body(func, false)?;
             let const_idx = self.cur().add_const(ConstantEntry::Function(func_idx))?;
             if let Some(ref name) = func.name {
-                if is_script_global {
+                if is_var_global {
                     let tmp = self.cur().alloc_reg()?;
                     self.cur().emit_abx_wide(Opcode::NewClosure, tmp, const_idx);
                     let name_c = self.cur().add_string_const(name)?;
@@ -597,6 +711,11 @@ impl Compiler {
                 Statement::FunctionDecl(f) => {
                     func_decls.push(f);
                 }
+                Statement::Labeled { .. } => {
+                    if let Some(f) = unwrap_labeled_func_decl(stmt) {
+                        func_decls.push(f);
+                    }
+                }
                 _ => {}
             }
         }
@@ -608,7 +727,14 @@ impl Compiler {
                     .iter()
                     .any(|l| l.depth == cur_depth && l.name == *name);
                 if !already {
+                    let is_strict_or_special =
+                        self.cur().is_strict || func.is_async || func.is_generator;
                     let reg = self.cur().declare_local(name, false, false)?;
+                    if is_strict_or_special {
+                        if let Some(last) = self.cur().locals.last_mut() {
+                            last.is_lex = true;
+                        }
+                    }
                     self.cur()
                         .emit(Instruction::abc(Opcode::LoadUndef, reg, 0, 0));
                 }
@@ -864,6 +990,10 @@ impl Compiler {
                 }
             }
             Statement::While { test, body, .. } => {
+                if let Some(comp) = self.cur().completion_reg {
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::LoadUndef, comp, 0, 0));
+                }
                 let loop_start = self.cur().code.len();
                 self.cur().loops.push(LoopControl {
                     label,
@@ -890,6 +1020,10 @@ impl Compiler {
                 }
             }
             Statement::DoWhile { body, test, .. } => {
+                if let Some(comp) = self.cur().completion_reg {
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::LoadUndef, comp, 0, 0));
+                }
                 let loop_start = self.cur().code.len();
                 self.cur().loops.push(LoopControl {
                     label,
@@ -925,6 +1059,10 @@ impl Compiler {
                 body,
                 ..
             } => {
+                if let Some(comp) = self.cur().completion_reg {
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::LoadUndef, comp, 0, 0));
+                }
                 self.cur().begin_scope();
                 let mut per_iter_close_reg: Option<u8> = None;
                 if let Some(init) = init {
@@ -994,6 +1132,10 @@ impl Compiler {
             Statement::ForIn {
                 left, right, body, ..
             } => {
+                if let Some(comp) = self.cur().completion_reg {
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::LoadUndef, comp, 0, 0));
+                }
                 self.compile_for_each(label, left, right, body, ForEachKind::In)?;
             }
             Statement::ForOf {
@@ -1003,6 +1145,10 @@ impl Compiler {
                 body,
                 ..
             } => {
+                if let Some(comp) = self.cur().completion_reg {
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::LoadUndef, comp, 0, 0));
+                }
                 let kind = if *is_await {
                     if self.frames.len() == 1 {
                         if let Some(ref mut m) = self.module {
@@ -1023,6 +1169,11 @@ impl Compiler {
                 self.cur().begin_scope();
                 let disc_reg = self.cur().alloc_reg()?;
                 self.compile_expr(discriminant, disc_reg)?;
+                let mut case_stmts = Vec::new();
+                for c in cases {
+                    case_stmts.extend(c.consequent.iter().cloned());
+                }
+                self.hoist_block_declarations(&case_stmts)?;
                 self.cur().loops.push(LoopControl {
                     label,
                     continue_target: None,
@@ -1153,6 +1304,12 @@ impl Compiler {
                     });
                     if let Some(ref pat) = catch.param {
                         self.declare_pattern_locals(pat, VarKind::Let)?;
+                        // Annex B §B.3.5: simple catch parameter does not block outer var/Annex-B.
+                        if matches!(pat, Pattern::Ident { .. }) {
+                            if let Some(last) = self.cur().locals.last_mut() {
+                                last.is_lex = false;
+                            }
+                        }
                         self.compile_pattern_bind(pat, err_reg)?;
                     }
                     self.hoist_block_declarations(&catch.body)?;
@@ -1221,13 +1378,62 @@ impl Compiler {
                 self.cur().pending_label = Some(label.clone());
                 self.compile_stmt(body)?;
             }
-            Statement::FunctionDecl(_) => {
-                // Already hoisted and bound in `hoist_declarations`.
+            Statement::FunctionDecl(func) => {
+                // Annex B §B.3.3: copy the block-local function binding's current value to the
+                // enclosing non-strict function/script var binding at statement evaluation time.
+                let cur_depth = self.cur().scope_depth;
+                if cur_depth > 0 && !self.cur().is_strict && !func.is_async && !func.is_generator {
+                    if let Some(ref name) = func.name {
+                        if self.cur().annex_b_hoisted.contains(name) {
+                            let blocked_by_lex = self.cur().locals.iter().any(|l| {
+                                l.depth > 0 && l.depth < cur_depth && l.name == *name && l.is_lex
+                            });
+                            if !blocked_by_lex {
+                                if let Some(block_reg) = self
+                                    .cur()
+                                    .locals
+                                    .iter()
+                                    .rev()
+                                    .find(|l| l.depth == cur_depth && l.name == *name)
+                                    .map(|l| l.reg)
+                                {
+                                    if let Some(outer_reg) = self
+                                        .cur()
+                                        .locals
+                                        .iter()
+                                        .find(|l| l.depth == 0 && l.name == *name)
+                                        .map(|l| l.reg)
+                                    {
+                                        if outer_reg != block_reg {
+                                            self.cur().emit(Instruction::abc(
+                                                Opcode::Move,
+                                                outer_reg,
+                                                block_reg,
+                                                0,
+                                            ));
+                                        }
+                                    } else if self.frames.len() == 1
+                                        && self.source_type == SourceType::Script
+                                        && self.eval_mode != EvalScopeMode::LocalAll
+                                    {
+                                        let c = self.cur().add_string_const(name)?;
+                                        self.cur().emit_abx_wide(
+                                            Opcode::DeclareGlobal,
+                                            block_reg,
+                                            c,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             Statement::ClassDecl(cls) => {
                 let name = cls.name.clone().unwrap_or_default();
                 let dst = if self.frames.len() == 1
                     && self.source_type == SourceType::Script
+                    && self.eval_mode == EvalScopeMode::None
                     && self.cur().scope_depth == 0
                 {
                     let r = self.cur().alloc_reg()?;
@@ -1530,6 +1736,7 @@ impl Compiler {
             ));
         }
         let jmp_done = self.cur().emit_jump(Opcode::JumpIfTrue, done_reg);
+        let body_try_start = self.cur().code.len() as u32;
 
         match left {
             ForEachLeft::VarDecl { id, .. } => {
@@ -1541,6 +1748,7 @@ impl Compiler {
         }
 
         self.compile_stmt(body)?;
+        let body_try_end = self.cur().code.len() as u32;
         self.cur().emit_loop_back(loop_start)?;
 
         let end_pc = self.cur().code.len();
@@ -1552,6 +1760,23 @@ impl Compiler {
         if kind != ForEachKind::In {
             self.cur()
                 .emit(Instruction::abc(Opcode::IteratorClose, iter_reg, 0, 0));
+            let jmp_after_abrupt = self.cur().emit_jump(Opcode::Jump, 0);
+            let handler_pc = self.cur().code.len() as u32;
+            let exc_reg = self.cur().alloc_reg()?;
+            self.cur().exception_handlers.push(ExceptionHandler {
+                try_start: body_try_start,
+                try_end: body_try_end,
+                handler_pc,
+                catch_reg: exc_reg,
+                is_finally: true,
+            });
+            self.cur()
+                .emit(Instruction::abc(Opcode::IteratorClose, iter_reg, 1, 0));
+            self.cur()
+                .emit(Instruction::abc(Opcode::Throw, exc_reg, 0, 0));
+            self.cur().free_to(exc_reg);
+            let after_abrupt = self.cur().code.len();
+            self.cur().patch_jump(jmp_after_abrupt, after_abrupt)?;
         }
         self.cur().end_scope();
         Ok(())
@@ -1562,11 +1787,12 @@ impl Compiler {
         kind: VarKind,
         decls: &[VarDeclarator],
     ) -> Result<(), CompileError> {
-        let is_script_global = self.frames.len() == 1
+        let is_lex_global = self.frames.len() == 1
             && self.source_type == SourceType::Script
+            && self.eval_mode == EvalScopeMode::None
             && self.cur().scope_depth == 0;
 
-        if kind != VarKind::Var && !is_script_global {
+        if kind != VarKind::Var && !is_lex_global {
             for d in decls {
                 self.declare_pattern_locals(&d.id, kind)?;
             }
@@ -1617,7 +1843,9 @@ impl Compiler {
                 // Clear TDZ flag on local binding initialization and store value directly.
                 let is_script_global = self.frames.len() == 1
                     && self.source_type == SourceType::Script
-                    && self.cur().scope_depth == 0;
+                    && self.eval_mode != EvalScopeMode::LocalAll
+                    && self.cur().scope_depth == 0
+                    && self.cur().find_local(name).is_none();
                 if is_script_global {
                     let c = self.cur().add_string_const(name)?;
                     self.cur().emit_abx_wide(Opcode::DeclareGlobal, val_reg, c);
@@ -1655,6 +1883,7 @@ impl Compiler {
                 let done_reg = self.cur().alloc_reg()?;
                 self.cur()
                     .emit(Instruction::abc(Opcode::GetIterator, iter_reg, val_reg, 0));
+                let try_start = self.cur().code.len() as u32;
                 for elem in elements {
                     self.cur().emit(Instruction::abc(
                         Opcode::IteratorNext,
@@ -1685,12 +1914,35 @@ impl Compiler {
                     self.cur().patch_jump(jmp_done, end_pc)?;
                     self.compile_pattern_bind(rest_pat, rest_arr)?;
                 }
+                let try_end = self.cur().code.len() as u32;
                 self.cur()
                     .emit(Instruction::abc(Opcode::IteratorClose, iter_reg, 0, 0));
+                let jmp_after = self.cur().emit_jump(Opcode::Jump, 0);
+                let handler_pc = self.cur().code.len() as u32;
+                let exc_reg = self.cur().alloc_reg()?;
+                self.cur().exception_handlers.push(ExceptionHandler {
+                    try_start,
+                    try_end,
+                    handler_pc,
+                    catch_reg: exc_reg,
+                    is_finally: true,
+                });
+                self.cur()
+                    .emit(Instruction::abc(Opcode::IteratorClose, iter_reg, 1, 0));
+                self.cur()
+                    .emit(Instruction::abc(Opcode::Throw, exc_reg, 0, 0));
+                let after = self.cur().code.len();
+                self.cur().patch_jump(jmp_after, after)?;
                 self.cur().free_to(saved);
             }
             Pattern::Object { props, rest, .. } => {
                 let saved = self.cur().next_reg;
+                self.cur().emit(Instruction::abc(
+                    Opcode::RequireObjectCoercible,
+                    val_reg,
+                    0,
+                    0,
+                ));
                 let prop_val = self.cur().alloc_reg()?;
                 let excluded_arr = if rest.is_some() {
                     let arr = self.cur().alloc_reg()?;
@@ -1721,6 +1973,13 @@ impl Compiler {
                             let ic = self.cur().add_ic_slot(IcKind::GetProp, c, 0)?;
                             self.cur()
                                 .emit_ic_abc(Opcode::GetProp, prop_val, val_reg, ic);
+                            if let Some(excl) = excluded_arr {
+                                let k = self.cur().alloc_reg()?;
+                                self.cur().emit_abx_wide(Opcode::LoadConst, k, c);
+                                self.cur()
+                                    .emit(Instruction::abc(Opcode::ArrayPush, excl, k, 0));
+                                self.cur().free_to(k);
+                            }
                         }
                         PropKey::Computed(key_expr) => {
                             let k = self.cur().alloc_reg()?;
@@ -1814,6 +2073,12 @@ impl Compiler {
             .iter()
             .take_while(|p| !matches!(p, Pattern::Assign { .. }))
             .count() as u16;
+        let parent_in_class_field = is_arrow
+            && self
+                .frames
+                .last()
+                .is_some_and(|f| f.in_class_field_or_static);
+        let parent_in_class_body = self.frames.last().is_some_and(|f| f.in_class_body);
         let mut frame = FunctionCompiler::new(
             resolved_name,
             func.params.len() as u16,
@@ -1824,56 +2089,98 @@ impl Compiler {
         );
         frame.length = expected_len;
         frame.is_method = is_method;
+        frame.in_class_field_or_static = parent_in_class_field;
+        frame.in_class_body = parent_in_class_body;
         self.frames.push(frame);
 
         // Bind positional parameter registers (`0..params.len()`).
-        let mut complex_params = Vec::new();
+        let has_complex_params = func
+            .params
+            .iter()
+            .any(|p| !matches!(p, Pattern::Ident { .. }))
+            || func.rest_param.is_some();
         let mut param_binds_arguments = false;
+        let mut all_param_names = Vec::new();
         for pat in &func.params {
             let mut bound = Vec::new();
             pat.collect_bound_names(&mut bound);
-            if bound.iter().any(|(n, _)| n == "arguments") {
-                param_binds_arguments = true;
-            }
-            match pat {
-                Pattern::Ident { name, .. } => {
-                    let _ = self.cur().declare_local(name, false, false)?;
+            for (n, _) in bound {
+                if n == "arguments" {
+                    param_binds_arguments = true;
                 }
-                other => {
-                    let raw_reg = self.cur().alloc_reg()?;
-                    complex_params.push((raw_reg, other));
+                if !all_param_names.contains(&n) {
+                    all_param_names.push(n);
                 }
             }
         }
         if let Some(ref rest_pat) = func.rest_param {
             let mut bound = Vec::new();
             rest_pat.collect_bound_names(&mut bound);
-            if bound.iter().any(|(n, _)| n == "arguments") {
-                param_binds_arguments = true;
+            for (n, _) in bound {
+                if n == "arguments" {
+                    param_binds_arguments = true;
+                }
+                if !all_param_names.contains(&n) {
+                    all_param_names.push(n);
+                }
             }
         }
-        // Materialize `arguments` binding for non-arrow functions that reference it
-        // (or contain direct `eval`), before evaluating default parameter expressions.
-        if !is_arrow && !param_binds_arguments && function_uses_arguments(func) {
-            let args_reg = self.cur().declare_local("arguments", false, false)?;
+        self.cur().param_names = all_param_names;
+        if !has_complex_params {
+            for pat in &func.params {
+                if let Pattern::Ident { name, .. } = pat {
+                    let _ = self.cur().declare_local(name, false, false)?;
+                }
+            }
+            if !is_arrow && !param_binds_arguments && function_uses_arguments(func) {
+                let args_reg = self.cur().declare_local("arguments", false, false)?;
+                self.cur()
+                    .emit(Instruction::abc(Opcode::LoadArguments, args_reg, 0, 0));
+            }
+        } else {
+            // Reserve incoming argument registers `0..params.len()`, materialize `arguments`
+            // if referenced, pre-declare all parameter bindings in TDZ, then bind left-to-right.
+            let mut raw_regs = Vec::with_capacity(func.params.len());
+            for _ in &func.params {
+                raw_regs.push(self.cur().alloc_reg()?);
+            }
+            if !is_arrow && !param_binds_arguments && function_uses_arguments(func) {
+                let args_reg = self.cur().declare_local("arguments", false, false)?;
+                self.cur()
+                    .emit(Instruction::abc(Opcode::LoadArguments, args_reg, 0, 0));
+            }
+            for pat in &func.params {
+                self.declare_pattern_locals(pat, VarKind::Let)?;
+            }
+            if let Some(ref rest_pat) = func.rest_param {
+                self.declare_pattern_locals(rest_pat, VarKind::Let)?;
+            }
+            self.cur().in_param_init = true;
+            for (raw_reg, pat) in raw_regs.into_iter().zip(&func.params) {
+                self.compile_pattern_bind(pat, raw_reg)?;
+            }
+            if let Some(ref rest_pat) = func.rest_param {
+                let rest_reg = self.cur().alloc_reg()?;
+                let first_rest = func.params.len().min(255) as u8;
+                self.cur().emit(Instruction::abc(
+                    Opcode::CollectRestArgs,
+                    rest_reg,
+                    first_rest,
+                    0,
+                ));
+                self.compile_pattern_bind(rest_pat, rest_reg)?;
+            }
+            self.cur().in_param_init = false;
+            // Parameter bindings are not body lexical declarations for later body `var`s.
+            for l in &mut self.cur().locals {
+                l.is_lex = false;
+            }
+        }
+
+        // Generators & async generators suspend here (after synchronous parameter initialization).
+        if func.is_generator {
             self.cur()
-                .emit(Instruction::abc(Opcode::LoadArguments, args_reg, 0, 0));
-        }
-        for (raw_reg, pat) in complex_params {
-            self.declare_pattern_locals(pat, VarKind::Let)?;
-            self.compile_pattern_bind(pat, raw_reg)?;
-        }
-        if let Some(ref rest_pat) = func.rest_param {
-            let rest_reg = self.cur().alloc_reg()?;
-            let first_rest = func.params.len().min(255) as u8;
-            self.cur().emit(Instruction::abc(
-                Opcode::CollectRestArgs,
-                rest_reg,
-                first_rest,
-                0,
-            ));
-            self.declare_pattern_locals(rest_pat, VarKind::Let)?;
-            self.compile_pattern_bind(rest_pat, rest_reg)?;
+                .emit(Instruction::abc(Opcode::GeneratorStart, 0, 0, 0));
         }
 
         self.hoist_declarations(&func.body, false)?;
@@ -1913,6 +2220,7 @@ impl Compiler {
 
         let mut constructor_idx = None;
         let mut methods = Vec::new();
+        let mut computed_methods: Vec<(&Expr, MethodKind, bool, u32)> = Vec::new();
         let mut instance_fields = Vec::new();
         let mut static_inits = Vec::new();
 
@@ -1933,12 +2241,15 @@ impl Compiler {
                             cls.name.as_deref().or(inferred_name),
                         )?;
                         constructor_idx = Some(fn_idx);
+                    } else if let PropKey::Computed(key_expr) = key {
+                        let fn_idx = self.compile_function_body_ex(function, false, true, None)?;
+                        computed_methods.push((key_expr, *kind, *is_static, fn_idx));
                     } else {
                         let (name, is_private) = match key {
                             PropKey::Ident(n) | PropKey::String(n) => (n.clone(), false),
                             PropKey::Private(n) => (n.clone(), true),
                             PropKey::Number(n) => (n.to_string(), false),
-                            PropKey::Computed(_) => ("<computed>".into(), false),
+                            PropKey::Computed(_) => unreachable!(),
                         };
                         let disp_name = match kind {
                             MethodKind::Get => {
@@ -2003,6 +2314,7 @@ impl Compiler {
             None
         };
 
+        let defer_static_init = !computed_methods.is_empty() && static_init_idx.is_some();
         let blueprint = ClassBlueprint {
             name: cls
                 .name
@@ -2012,11 +2324,52 @@ impl Compiler {
             constructor_idx,
             methods,
             instance_field_init_idx,
-            static_init_idx,
+            static_init_idx: if defer_static_init {
+                None
+            } else {
+                static_init_idx
+            },
         };
         let c = self.cur().add_const(ConstantEntry::Class(blueprint))?;
         self.cur()
             .emit_ic_abc(Opcode::CreateClass, dst, super_reg, c);
+
+        if !computed_methods.is_empty() {
+            let proto_reg = self.cur().alloc_reg()?;
+            let c_proto = self.cur().add_string_const("prototype")?;
+            let ic_proto = self.cur().add_ic_slot(IcKind::GetProp, c_proto, 0)?;
+            self.cur()
+                .emit_ic_abc(Opcode::GetProp, proto_reg, dst, ic_proto);
+            let key_reg = self.cur().alloc_reg()?;
+            let fn_reg = self.cur().alloc_reg()?;
+            for (key_expr, kind, is_static, fn_idx) in computed_methods {
+                self.compile_expr(key_expr, key_reg)?;
+                let fc = self.cur().add_const(ConstantEntry::Function(fn_idx))?;
+                self.cur().emit_abx_wide(Opcode::NewClosure, fn_reg, fc);
+                let target_reg = if is_static { dst } else { proto_reg };
+                let def_op = match kind {
+                    MethodKind::Get => Opcode::DefineClassGetter,
+                    MethodKind::Set => Opcode::DefineClassSetter,
+                    _ => Opcode::DefineClassMethod,
+                };
+                self.cur()
+                    .emit(Instruction::abc(def_op, target_reg, key_reg, fn_reg));
+            }
+            if let Some(si_idx) = static_init_idx.filter(|_| defer_static_init) {
+                let call_base = self.cur().alloc_reg()?;
+                let this_slot = self.cur().alloc_reg()?;
+                let fc = self.cur().add_const(ConstantEntry::Function(si_idx))?;
+                self.cur().emit_abx_wide(Opcode::NewClosure, call_base, fc);
+                self.cur()
+                    .emit(Instruction::abc(Opcode::Move, this_slot, dst, 0));
+                self.cur().emit(Instruction::abc(
+                    Opcode::CallWithThis,
+                    key_reg,
+                    call_base,
+                    0,
+                ));
+            }
+        }
         self.cur().free_to(saved);
         Ok(())
     }
@@ -2025,8 +2378,10 @@ impl Compiler {
         &mut self,
         fields: &[(&PropKey, Option<&Expr>)],
     ) -> Result<u32, CompileError> {
-        let frame =
+        let mut frame =
             FunctionCompiler::new(Some("<field_init>".into()), 0, true, false, false, false);
+        frame.in_class_field_or_static = true;
+        frame.in_class_body = true;
         self.frames.push(frame);
         let this_reg = self.cur().alloc_reg()?;
         let val_reg = self.cur().alloc_reg()?;
@@ -2055,8 +2410,10 @@ impl Compiler {
         &mut self,
         items: &[StaticInitItem<'_>],
     ) -> Result<u32, CompileError> {
-        let frame =
+        let mut frame =
             FunctionCompiler::new(Some("<static_init>".into()), 0, true, false, false, false);
+        frame.in_class_field_or_static = true;
+        frame.in_class_body = true;
         self.frames.push(frame);
         let this_reg = self.cur().alloc_reg()?;
         let val_reg = self.cur().alloc_reg()?;
@@ -2075,6 +2432,7 @@ impl Compiler {
                 }
                 StaticInitItem::Block(stmts) => {
                     self.cur().begin_scope();
+                    self.hoist_block_declarations(stmts)?;
                     for s in *stmts {
                         self.compile_stmt(s)?;
                     }
@@ -2219,6 +2577,39 @@ impl Compiler {
                 Ok(())
             }
             ExprKind::Object(props) => {
+                // Early Error checks (ECMA-262 §13.2.5.1):
+                // 1) Unconverted CoverInitializedName (`{ a = 1 }`) outside destructuring.
+                // 2) Duplicate non-computed `__proto__: expr` data properties.
+                let mut proto_data_count = 0u32;
+                for prop in props {
+                    if let ObjectProp::KeyValue {
+                        key,
+                        value,
+                        shorthand,
+                        span,
+                    } = prop
+                    {
+                        if *shorthand && matches!(value.kind, ExprKind::Assign { .. }) {
+                            return Err(CompileError::Syntax(SyntaxError::new(
+                                "Invalid shorthand property initializer",
+                                *span,
+                            )));
+                        }
+                        if !*shorthand {
+                            if let PropKey::Ident(n) | PropKey::String(n) = key {
+                                if n == "__proto__" {
+                                    proto_data_count += 1;
+                                    if proto_data_count > 1 {
+                                        return Err(CompileError::Syntax(SyntaxError::new(
+                                            "Duplicate __proto__ fields are not allowed in object literals",
+                                            *span,
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 self.cur().emit(Instruction::abc(
                     Opcode::NewObject,
                     dst,
@@ -2684,7 +3075,8 @@ impl Compiler {
             return Ok(());
         }
 
-        // Ordinary function call `f(a, b)`.
+        // Ordinary function call `f(a, b)` — check syntactic direct `eval(...)` call.
+        let is_direct_eval = !optional && matches!(&callee.kind, ExprKind::Ident(n) if n == "eval");
         let base = self.cur().alloc_regs((1 + args.len()) as u8)?;
         self.compile_expr(callee, base)?;
         if optional {
@@ -2696,6 +3088,45 @@ impl Compiler {
         for (i, a) in args.iter().enumerate() {
             if let CallArg::Expr(e) = a {
                 self.compile_expr(e, base + 1 + i as u8)?;
+            }
+        }
+        if is_direct_eval {
+            let mut forbidden_vars = Vec::new();
+            for l in &self.cur().locals {
+                if l.is_lex && !forbidden_vars.contains(&l.name) {
+                    forbidden_vars.push(l.name.clone());
+                }
+            }
+            if self.cur().in_param_init {
+                let pnames = self.cur().param_names.clone();
+                for p in pnames {
+                    if !forbidden_vars.contains(&p) {
+                        forbidden_vars.push(p);
+                    }
+                }
+                if !self.cur().is_arrow && !forbidden_vars.iter().any(|n| n == "arguments") {
+                    forbidden_vars.push("arguments".into());
+                }
+            }
+            let in_function = self.frames.len() > 1;
+            let meta = DirectEvalMeta {
+                argc: args.len() as u8,
+                is_strict: self.cur().is_strict,
+                in_function,
+                in_class_field_or_static: self.cur().in_class_field_or_static,
+                in_class_body: self.cur().in_class_body,
+                forbidden_vars,
+            };
+            let meta_c = self.cur().add_const(ConstantEntry::DirectEval(meta))?;
+            if meta_c <= 255 {
+                self.cur().emit(Instruction::abc(
+                    Opcode::DirectEval,
+                    dst,
+                    base,
+                    meta_c as u8,
+                ));
+                self.cur().free_to(saved);
+                return Ok(());
             }
         }
         self.cur()
@@ -3538,5 +3969,185 @@ fn expr_uses_arguments(expr: &Expr) -> bool {
         | ExprKind::Super
         | ExprKind::NewTarget
         | ExprKind::ImportMeta => false,
+    }
+}
+
+fn unwrap_labeled_func_decl(mut stmt: &Statement) -> Option<&Function> {
+    while let Statement::Labeled { body, .. } = stmt {
+        stmt = body.as_ref();
+    }
+    match stmt {
+        Statement::FunctionDecl(f) => Some(f),
+        _ => None,
+    }
+}
+
+fn collect_direct_lex_names(stmts: &[Statement], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            Statement::VarDecl {
+                kind: VarKind::Let | VarKind::Const,
+                decls,
+                ..
+            } => {
+                for d in decls {
+                    let mut names = Vec::new();
+                    d.id.collect_bound_names(&mut names);
+                    for (n, _) in names {
+                        out.insert(n);
+                    }
+                }
+            }
+            Statement::ClassDecl(cls) => {
+                if let Some(ref n) = cls.name {
+                    out.insert(n.clone());
+                }
+            }
+            Statement::FunctionDecl(f) if f.is_async || f.is_generator => {
+                if let Some(ref n) = f.name {
+                    out.insert(n.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Annex B §B.3.3: collects eligible sloppy-mode block-level plain `FunctionDeclaration` names
+/// not shadowed by any enclosing lexical declaration.
+fn collect_annex_b_block_funcs(
+    stmts: &[Statement],
+    blocked: &HashSet<String>,
+    in_block: bool,
+    out: &mut Vec<String>,
+) {
+    let mut local_blocked = blocked.clone();
+    if in_block {
+        collect_direct_lex_names(stmts, &mut local_blocked);
+    }
+    for stmt in stmts {
+        match stmt {
+            Statement::FunctionDecl(f) => {
+                if in_block && !f.is_async && !f.is_generator {
+                    if let Some(ref name) = f.name {
+                        if !local_blocked.contains(name) && !out.contains(name) {
+                            out.push(name.clone());
+                        }
+                    }
+                }
+            }
+            Statement::Block { body, .. } => {
+                collect_annex_b_block_funcs(body, &local_blocked, true, out);
+            }
+            Statement::If {
+                consequent,
+                alternate,
+                ..
+            } => {
+                collect_annex_b_block_funcs(
+                    std::slice::from_ref(consequent.as_ref()),
+                    &local_blocked,
+                    true,
+                    out,
+                );
+                if let Some(alt) = alternate {
+                    collect_annex_b_block_funcs(
+                        std::slice::from_ref(alt.as_ref()),
+                        &local_blocked,
+                        true,
+                        out,
+                    );
+                }
+            }
+            Statement::Switch { cases, .. } => {
+                let mut sw_blocked = local_blocked.clone();
+                for c in cases {
+                    collect_direct_lex_names(&c.consequent, &mut sw_blocked);
+                }
+                for c in cases {
+                    collect_annex_b_block_funcs(&c.consequent, &sw_blocked, true, out);
+                }
+            }
+            Statement::Try {
+                block,
+                handler,
+                finalizer,
+                ..
+            } => {
+                collect_annex_b_block_funcs(block, &local_blocked, true, out);
+                if let Some(h) = handler {
+                    let mut catch_blocked = local_blocked.clone();
+                    if let Some(ref p) = h.param {
+                        if !matches!(p, Pattern::Ident { .. }) {
+                            let mut names = Vec::new();
+                            p.collect_bound_names(&mut names);
+                            for (n, _) in names {
+                                catch_blocked.insert(n);
+                            }
+                        }
+                    }
+                    collect_annex_b_block_funcs(&h.body, &catch_blocked, true, out);
+                }
+                if let Some(fin) = finalizer {
+                    collect_annex_b_block_funcs(fin, &local_blocked, true, out);
+                }
+            }
+            Statement::While { body, .. }
+            | Statement::DoWhile { body, .. }
+            | Statement::With { body, .. }
+            | Statement::Labeled { body, .. } => {
+                collect_annex_b_block_funcs(
+                    std::slice::from_ref(body.as_ref()),
+                    &local_blocked,
+                    in_block,
+                    out,
+                );
+            }
+            Statement::For { init, body, .. } => {
+                let mut for_blocked = local_blocked.clone();
+                if let Some(ForInit::VarDecl {
+                    kind: VarKind::Let | VarKind::Const,
+                    decls,
+                    ..
+                }) = init
+                {
+                    for d in decls {
+                        let mut names = Vec::new();
+                        d.id.collect_bound_names(&mut names);
+                        for (n, _) in names {
+                            for_blocked.insert(n);
+                        }
+                    }
+                }
+                collect_annex_b_block_funcs(
+                    std::slice::from_ref(body.as_ref()),
+                    &for_blocked,
+                    true,
+                    out,
+                );
+            }
+            Statement::ForIn { left, body, .. } | Statement::ForOf { left, body, .. } => {
+                let mut for_blocked = local_blocked.clone();
+                if let ForEachLeft::VarDecl {
+                    kind: VarKind::Let | VarKind::Const,
+                    id,
+                    ..
+                } = left
+                {
+                    let mut names = Vec::new();
+                    id.collect_bound_names(&mut names);
+                    for (n, _) in names {
+                        for_blocked.insert(n);
+                    }
+                }
+                collect_annex_b_block_funcs(
+                    std::slice::from_ref(body.as_ref()),
+                    &for_blocked,
+                    true,
+                    out,
+                );
+            }
+            _ => {}
+        }
     }
 }

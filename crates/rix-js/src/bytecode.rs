@@ -224,6 +224,18 @@ pub enum Opcode {
     UnpackIterResult = 107,
     /// Defines a new private field on object `a` with value `b` and IC slot `c` (`PrivateFieldAdd`).
     DefinePrivate = 108,
+    /// Throws `TypeError` if `regs[a]` is `null` or `undefined` (`RequireObjectCoercible`).
+    RequireObjectCoercible = 109,
+    /// Initial suspend boundary for generators/async generators after synchronous parameter initialization.
+    GeneratorStart = 110,
+    /// Defines a non-enumerable class method on `regs[a]` with computed key `regs[b]` and closure `regs[c]`.
+    DefineClassMethod = 111,
+    /// Defines a non-enumerable class getter on `regs[a]` with computed key `regs[b]` and closure `regs[c]`.
+    DefineClassGetter = 112,
+    /// Defines a non-enumerable class setter on `regs[a]` with computed key `regs[b]` and closure `regs[c]`.
+    DefineClassSetter = 113,
+    /// Direct `eval(...)` call site (`A = dst`, `B = base`, `C = DirectEvalMeta const index`).
+    DirectEval = 114,
 }
 
 impl Opcode {
@@ -338,6 +350,12 @@ impl Opcode {
             106 => Some(Self::AsyncIteratorNext),
             107 => Some(Self::UnpackIterResult),
             108 => Some(Self::DefinePrivate),
+            109 => Some(Self::RequireObjectCoercible),
+            110 => Some(Self::GeneratorStart),
+            111 => Some(Self::DefineClassMethod),
+            112 => Some(Self::DefineClassGetter),
+            113 => Some(Self::DefineClassSetter),
+            114 => Some(Self::DirectEval),
             _ => None,
         }
     }
@@ -427,6 +445,17 @@ pub struct ClassBlueprint {
     pub static_init_idx: Option<u32>,
 }
 
+/// Metadata for a syntactic direct `eval(...)` call site (ECMA-262 §19.2.1.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectEvalMeta {
+    pub argc: u8,
+    pub is_strict: bool,
+    pub in_function: bool,
+    pub in_class_field_or_static: bool,
+    pub in_class_body: bool,
+    pub forbidden_vars: Vec<String>,
+}
+
 /// Serializable constant pool entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConstantEntry {
@@ -437,6 +466,7 @@ pub enum ConstantEntry {
     RegExp { pattern: String, flags: String },
     Function(u32),
     Class(ClassBlueprint),
+    DirectEval(DirectEvalMeta),
 }
 
 /// Compiled register bytecode for a single JS function, script, or module body.
@@ -466,6 +496,8 @@ pub struct ModuleImportEntry {
     pub specifier: String,
     pub imported_name: ModuleImportKind,
     pub local_name: String,
+    #[serde(default)]
+    pub import_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

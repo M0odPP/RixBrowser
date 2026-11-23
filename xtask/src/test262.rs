@@ -12,7 +12,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rix_jit::TieredJit;
-use rix_js::{EvalError, JsVm, ModuleLoader, ObjectKind, PromiseState, PropertyAttrs};
+use rix_js::{
+    EvalError, ImportMap, JsVm, ModuleLoader, ModuleSourceProvider, ObjectKind, PromiseState,
+    PropertyAttrs,
+};
 use serde::{Deserialize, Serialize};
 
 /// Fallback Test262 assertion prelude when running standalone fixtures without a `harness/` folder.
@@ -300,7 +303,114 @@ fn load_harness_cache(test262_dir: &Path) -> HashMap<String, String> {
     cache
 }
 
+struct FsModuleProvider {
+    root_dir: PathBuf,
+    entry_url: String,
+    entry_source: String,
+}
+
+impl ModuleSourceProvider for FsModuleProvider {
+    fn load_source(&self, url: &str) -> std::result::Result<String, String> {
+        if url == self.entry_url {
+            return Ok(self.entry_source.clone());
+        }
+        let rel = url
+            .strip_prefix("https://test262.local/")
+            .ok_or_else(|| format!("unsupported module url: {url}"))?;
+        let path = self.root_dir.join(rel);
+        fs::read_to_string(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))
+    }
+}
+
+fn install_test262_host(vm: &mut JsVm) {
+    let host = vm.alloc_ordinary_object();
+    let g_val = rix_js::JsValue::from_object(vm.global);
+    let k_global = vm.heap.intern_key("global");
+    vm.heap.object_define_data(
+        host,
+        k_global,
+        g_val,
+        PropertyAttrs::DEFAULT,
+        &mut vm.shapes,
+    );
+
+    let eval_script_fn = vm.alloc_native_fn("evalScript", |vm, _this, args| {
+        let code =
+            vm.value_to_rust_string(args.first().copied().unwrap_or(rix_js::JsValue::UNDEFINED));
+        match vm.eval_script(&code) {
+            Ok(v) => Ok(v),
+            Err(EvalError::Compile(ce)) => Err(vm.make_error("SyntaxError", ce.to_string())),
+            Err(EvalError::Runtime(exc)) => Err(exc),
+        }
+    });
+    let k_eval = vm.heap.intern_key("evalScript");
+    vm.heap.object_define_data(
+        host,
+        k_eval,
+        rix_js::JsValue::from_object(eval_script_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+
+    let gc_fn = vm.alloc_native_fn("gc", |vm, _this, _args| {
+        let _ = vm.collect_garbage();
+        Ok(rix_js::JsValue::UNDEFINED)
+    });
+    let k_gc = vm.heap.intern_key("gc");
+    vm.heap.object_define_data(
+        host,
+        k_gc,
+        rix_js::JsValue::from_object(gc_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+
+    let detach_fn = vm.alloc_native_fn("detachArrayBuffer", |vm, _this, args| {
+        if let Some(h) = args.first().and_then(|v| v.as_object()) {
+            if let Some(ObjectKind::ArrayBuffer(buf)) =
+                vm.heap.get_object_mut(h).map(|o| &mut o.kind)
+            {
+                buf.clear();
+            }
+        }
+        Ok(rix_js::JsValue::UNDEFINED)
+    });
+    let k_detach = vm.heap.intern_key("detachArrayBuffer");
+    vm.heap.object_define_data(
+        host,
+        k_detach,
+        rix_js::JsValue::from_object(detach_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+
+    let create_realm_fn = vm.alloc_native_fn("createRealm", |vm, _this, _args| {
+        let k_262 = vm.heap.intern_key("$262");
+        vm.get_property_by_key(vm.global, k_262)
+    });
+    let k_cr = vm.heap.intern_key("createRealm");
+    vm.heap.object_define_data(
+        host,
+        k_cr,
+        rix_js::JsValue::from_object(create_realm_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+
+    let k_262 = vm.heap.intern_key("$262");
+    let g = vm.global;
+    vm.heap.object_define_data(
+        g,
+        k_262,
+        rix_js::JsValue::from_object(host),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+}
+
 fn run_single_test262(
+    test262_dir: &Path,
+    test_path: &Path,
     source: &str,
     meta: &Test262Metadata,
     harness: &HashMap<String, String>,
@@ -327,7 +437,16 @@ fn run_single_test262(
 
     for strict in modes {
         run_single_mode(
-            source, meta, harness, strict, is_module, is_async, is_raw, always_jit,
+            test262_dir,
+            test_path,
+            source,
+            meta,
+            harness,
+            strict,
+            is_module,
+            is_async,
+            is_raw,
+            always_jit,
         )?;
     }
     Ok(())
@@ -335,6 +454,8 @@ fn run_single_test262(
 
 #[allow(clippy::too_many_arguments)]
 fn run_single_mode(
+    test262_dir: &Path,
+    test_path: &Path,
     source: &str,
     meta: &Test262Metadata,
     harness: &HashMap<String, String>,
@@ -349,6 +470,7 @@ fn run_single_mode(
     if always_jit {
         vm.attach_jit(TieredJit::with_tier_thresholds(1, 1, 2));
     }
+    install_test262_host(&mut vm);
 
     if !is_raw {
         if let (Some(sta), Some(assert_js)) = (harness.get("sta.js"), harness.get("assert.js")) {
@@ -400,12 +522,29 @@ fn run_single_mode(
         source.to_string()
     };
 
+    let rel_url = test_path
+        .strip_prefix(test262_dir)
+        .unwrap_or(test_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let entry_url = format!("https://test262.local/{rel_url}");
+    let provider = FsModuleProvider {
+        root_dir: test262_dir.to_path_buf(),
+        entry_url: entry_url.clone(),
+        entry_source: exec_source.clone(),
+    };
+    let import_map = ImportMap {
+        base_url: entry_url.clone(),
+        ..ImportMap::default()
+    };
+    let loader = std::rc::Rc::new(std::cell::RefCell::new(ModuleLoader::new(
+        Box::new(provider),
+        import_map,
+    )));
+    ModuleLoader::install_on_vm(&loader, &mut vm);
+
     let outcome: std::result::Result<(), (String, String)> = if is_module {
-        match ModuleLoader::eval_single_module(
-            &mut vm,
-            "https://test262.local/test.mjs",
-            &exec_source,
-        ) {
+        match ModuleLoader::load_and_evaluate(&loader, &mut vm, &entry_url) {
             Ok(prom_h) => {
                 vm.drain_microtasks();
                 match vm.heap.get_object(prom_h).map(|o| &o.kind) {
@@ -572,7 +711,7 @@ pub fn run_test262_suite_with_options(
                 };
                 let h = Arc::clone(&harness);
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_single_test262(&src, &meta, &h, always_jit)
+                    run_single_test262(test262_dir, path, &src, &meta, &h, always_jit)
                 }));
                 match res {
                     Ok(Ok(())) => (path.clone(), Outcome::Pass),
