@@ -1109,9 +1109,15 @@ fn str_html(
 
 fn install_number(vm: &mut JsVm) {
     let np = vm.number_proto;
-    define_method(vm, np, "toFixed", num_to_fixed);
-    define_method(vm, np, "toString", num_to_string);
-    define_method(vm, np, "valueOf", num_value_of);
+    if let Some(o) = vm.heap.get_object_mut(np) {
+        o.rare_mut().boxed_value = Some(JsValue::from_i32(0));
+    }
+    define_method_len(vm, np, "toFixed", 1, num_to_fixed);
+    define_method_len(vm, np, "toExponential", 1, num_to_exponential);
+    define_method_len(vm, np, "toPrecision", 1, num_to_precision);
+    define_method_len(vm, np, "toString", 1, num_to_string);
+    define_method_len(vm, np, "valueOf", 0, num_value_of);
+    define_method_len(vm, np, "toLocaleString", 0, num_to_string);
 
     let ctor = vm.alloc_native_fn("Number", number_ctor);
     vm.heap.object_define_data(
@@ -1122,12 +1128,18 @@ fn install_number(vm: &mut JsVm) {
         &mut vm.shapes,
     );
     link_ctor_meta(vm, ctor, np, 1, true);
-    define_method(vm, ctor, "isNaN", num_is_nan);
-    define_method(vm, ctor, "isFinite", num_is_finite);
-    define_method(vm, ctor, "isInteger", num_is_integer);
-    define_method(vm, ctor, "isSafeInteger", num_is_safe_integer);
-    define_method(vm, ctor, "parseInt", global_parse_int);
-    define_method(vm, ctor, "parseFloat", global_parse_float);
+    define_method_len(vm, ctor, "isNaN", 1, num_is_nan);
+    define_method_len(vm, ctor, "isFinite", 1, num_is_finite);
+    define_method_len(vm, ctor, "isInteger", 1, num_is_integer);
+    define_method_len(vm, ctor, "isSafeInteger", 1, num_is_safe_integer);
+    // ECMA-262 §21.1.2.12–13: `Number.parseInt === globalThis.parseInt` and `Number.parseFloat === globalThis.parseFloat`.
+    for name in ["parseInt", "parseFloat"] {
+        let k = vm.heap.intern_key(name);
+        if let Ok(gfn) = vm.get_property_by_key(vm.global, k) {
+            vm.heap
+                .object_define_data(ctor, k, gfn, PropertyAttrs::METHOD, &mut vm.shapes);
+        }
+    }
 
     let consts = [
         ("EPSILON", f64::EPSILON),
@@ -1155,19 +1167,24 @@ fn install_number(vm: &mut JsVm) {
 fn number_ctor(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let n = match args.first() {
         Some(&v) => {
-            if let Some(bh) = v.as_bigint() {
-                vm.heap
-                    .get_bigint(bh)
-                    .map_or(0.0, |b| b.to_i64_lossy() as f64)
+            let prim = if v.is_object() {
+                vm.to_primitive(v, crate::vm::PrimHint::Number)?
             } else {
-                vm.to_number(v)?
+                v
+            };
+            if let Some(bh) = prim.as_bigint() {
+                vm.heap.get_bigint(bh).map_or(0.0, |b| {
+                    b.to_radix_string(10).parse::<f64>().unwrap_or(f64::NAN)
+                })
+            } else {
+                vm.to_number(prim)?
             }
         }
         None => 0.0,
     };
     let nv = JsValue::from_f64(n);
-    if let Some(h) = this_val.as_object() {
-        if vm.heap.get_object(h).and_then(|o| o.prototype) == Some(vm.number_proto) {
+    if !vm.native_new_target.is_undefined() {
+        if let Some(h) = this_val.as_object() {
             if let Some(o) = vm.heap.get_object_mut(h) {
                 o.rare_mut().boxed_value = Some(nv);
             }
@@ -1177,24 +1194,135 @@ fn number_ctor(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsV
     Ok(nv)
 }
 
+fn require_number_this(vm: &mut JsVm, this_val: JsValue, method: &str) -> Result<f64, JsException> {
+    unbox_prim(vm, this_val).as_number().ok_or_else(|| {
+        vm.type_error(format!(
+            "Number.prototype.{method} requires that 'this' be a Number"
+        ))
+    })
+}
+
+fn format_exp_js(s: String) -> String {
+    if let Some((mant, exp)) = s.split_once('e') {
+        if exp.starts_with('-') || exp.starts_with('+') {
+            format!("{mant}e{exp}")
+        } else {
+            format!("{mant}e+{exp}")
+        }
+    } else {
+        s
+    }
+}
+
 fn num_to_fixed(
     vm: &mut JsVm,
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let n = vm.to_number(this_val)?;
-    let digits = args
-        .first()
-        .map(|&v| vm.to_i32(v))
-        .transpose()?
-        .unwrap_or(0);
-    if !(0..=100).contains(&digits) {
+    let n = require_number_this(vm, this_val, "toFixed")?;
+    let f = vm.to_integer_or_infinity(arg0(args))?;
+    if !(0.0..=100.0).contains(&f) {
         return Err(vm.range_error("toFixed() digits argument must be between 0 and 100"));
     }
-    let out = if !n.is_finite() {
+    let out = if !n.is_finite() || n.abs() >= 1e21 {
         vm.value_to_rust_string(JsValue::from_f64(n))
     } else {
-        format!("{n:.prec$}", prec = digits as usize)
+        let mut s = format!("{n:.prec$}", prec = f as usize);
+        if n == 0.0 && s.starts_with('-') {
+            s.remove(0);
+        }
+        s
+    };
+    Ok(JsValue::from_string(vm.heap.alloc_string(out)))
+}
+
+fn num_to_exponential(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let n = require_number_this(vm, this_val, "toExponential")?;
+    let fd = arg0(args);
+    let f = vm.to_integer_or_infinity(fd)?;
+    if !n.is_finite() {
+        return Ok(JsValue::from_string(
+            vm.heap
+                .alloc_string(vm.value_to_rust_string(JsValue::from_f64(n))),
+        ));
+    }
+    if !(0.0..=100.0).contains(&f) {
+        return Err(vm.range_error("toExponential() argument must be between 0 and 100"));
+    }
+    let n_clean = if n == 0.0 { 0.0 } else { n };
+    let out = if fd.is_undefined() {
+        format_exp_js(format!("{n_clean:e}"))
+    } else {
+        format_exp_js(format!("{n_clean:.prec$e}", prec = f as usize))
+    };
+    Ok(JsValue::from_string(vm.heap.alloc_string(out)))
+}
+
+fn num_to_precision(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let n = require_number_this(vm, this_val, "toPrecision")?;
+    let p_arg = arg0(args);
+    if p_arg.is_undefined() {
+        return Ok(JsValue::from_string(
+            vm.heap
+                .alloc_string(vm.value_to_rust_string(JsValue::from_f64(n))),
+        ));
+    }
+    let p = vm.to_integer_or_infinity(p_arg)?;
+    if !n.is_finite() {
+        return Ok(JsValue::from_string(
+            vm.heap
+                .alloc_string(vm.value_to_rust_string(JsValue::from_f64(n))),
+        ));
+    }
+    if !(1.0..=100.0).contains(&p) {
+        return Err(vm.range_error("toPrecision() argument must be between 1 and 100"));
+    }
+    let prec = p as usize;
+    let n_clean = if n == 0.0 { 0.0 } else { n };
+    let sci = format_exp_js(format!("{n_clean:.d$e}", d = prec - 1));
+    let out = if let Some((mant, exp_str)) = sci.split_once('e') {
+        let exp: i32 = exp_str.parse().unwrap_or(0);
+        if exp < -6 || exp >= prec as i32 {
+            sci
+        } else {
+            let neg = mant.starts_with('-');
+            let digits: String = mant.chars().filter(|c| c.is_ascii_digit()).collect();
+            let mut res = if neg {
+                String::from("-")
+            } else {
+                String::new()
+            };
+            if exp < 0 {
+                res.push_str("0.");
+                for _ in 0..((-exp - 1) as usize) {
+                    res.push('0');
+                }
+                res.push_str(&digits);
+            } else {
+                let split = (exp + 1) as usize;
+                if split >= digits.len() {
+                    res.push_str(&digits);
+                    for _ in 0..(split - digits.len()) {
+                        res.push('0');
+                    }
+                } else {
+                    res.push_str(&digits[..split]);
+                    res.push('.');
+                    res.push_str(&digits[split..]);
+                }
+            }
+            res
+        }
+    } else {
+        sci
     };
     Ok(JsValue::from_string(vm.heap.alloc_string(out)))
 }
@@ -1549,61 +1677,86 @@ fn install_boolean(vm: &mut JsVm) {
 // BigInt
 // ---------------------------------------------------------------------------
 
-fn bigint_as_n(vm: &mut JsVm, args: &[JsValue], signed: bool) -> Result<JsValue, JsException> {
-    let bits_f = vm.to_number(arg0(args))?;
-    if !bits_f.is_finite() || bits_f < 0.0 {
-        return Err(vm.range_error("Invalid index for BigInt clamp"));
-    }
-    let bits = bits_f.trunc() as u32;
-    let Some(h) = args.get(1).and_then(|v| v.as_bigint()) else {
-        return Err(vm.type_error("BigInt clamp requires a BigInt"));
+fn to_bigint_val(vm: &mut JsVm, val: JsValue) -> Result<JsBigInt, JsException> {
+    let prim = if val.is_object() {
+        vm.to_primitive(val, crate::vm::PrimHint::Number)?
+    } else {
+        val
     };
-    let raw = vm.heap.get_bigint(h).map_or(0i64, JsBigInt::to_i64_lossy);
+    match prim.kind() {
+        JsValueKind::BigInt(h) => Ok(vm
+            .heap
+            .get_bigint(h)
+            .cloned()
+            .unwrap_or_else(|| JsBigInt::from_i64(0))),
+        JsValueKind::Bool(b) => Ok(JsBigInt::from_i64(i64::from(b))),
+        JsValueKind::String(h) => {
+            let s = vm.heap.materialize_string(h).unwrap_or_default();
+            JsBigInt::parse_str(&s).ok_or_else(|| {
+                vm.make_error("SyntaxError", format!("Cannot convert {s} to a BigInt"))
+            })
+        }
+        _ => Err(vm.type_error("Cannot convert value to a BigInt")),
+    }
+}
+
+fn bigint_as_n(vm: &mut JsVm, args: &[JsValue], signed: bool) -> Result<JsValue, JsException> {
+    let bits_idx = crate::builtins_atomics::to_index(vm, arg0(args))?;
+    let bi_val = to_bigint_val(vm, args.get(1).copied().unwrap_or(JsValue::UNDEFINED))?;
+    let raw = bi_val.to_i64_lossy();
     let bi = if signed {
-        let out = if bits == 0 {
+        let out = if bits_idx == 0 {
             0i64
-        } else if bits >= 64 {
+        } else if bits_idx >= 64 {
             raw
         } else {
-            (raw << (64 - bits)) >> (64 - bits)
+            let shift = 64 - bits_idx as u32;
+            (raw << shift) >> shift
         };
         JsBigInt::from_i64(out)
     } else {
         let u = raw as u64;
-        let out = if bits == 0 {
+        let out = if bits_idx == 0 {
             0u64
-        } else if bits >= 64 {
+        } else if bits_idx >= 64 {
             u
         } else {
-            u & ((1u64 << bits) - 1)
+            u & ((1u64 << (bits_idx as u32)) - 1)
         };
         JsBigInt::from_i128(i128::from(out))
     };
     Ok(JsValue::from_bigint(vm.heap.alloc_bigint(bi)))
 }
 
+fn bigint_to_string(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let Some(h) = unbox_prim(vm, this_val).as_bigint() else {
+        return Err(vm.type_error("BigInt.prototype.toString requires a BigInt"));
+    };
+    let radix = args
+        .first()
+        .filter(|v| !v.is_undefined())
+        .map(|&v| vm.to_integer_or_infinity(v))
+        .transpose()?
+        .unwrap_or(10.0);
+    if !(2.0..=36.0).contains(&radix) {
+        return Err(vm.range_error("toString() radix must be between 2 and 36"));
+    }
+    let s = vm
+        .heap
+        .get_bigint(h)
+        .map_or_else(|| "0".to_owned(), |bi| bi.to_radix_string(radix as u32));
+    Ok(JsValue::from_string(vm.heap.alloc_string(s)))
+}
+
 fn install_bigint(vm: &mut JsVm) {
     let bi_proto = vm.bigint_proto;
-    define_method(vm, bi_proto, "toString", |vm, this_val, args| {
-        let Some(h) = unbox_prim(vm, this_val).as_bigint() else {
-            return Err(vm.type_error("BigInt.prototype.toString requires a BigInt"));
-        };
-        let radix = args
-            .first()
-            .filter(|v| !v.is_undefined())
-            .map(|&v| vm.to_i32(v))
-            .transpose()?
-            .unwrap_or(10);
-        if !(2..=36).contains(&radix) {
-            return Err(vm.range_error("toString() radix must be between 2 and 36"));
-        }
-        let s = vm
-            .heap
-            .get_bigint(h)
-            .map_or_else(|| "0".to_owned(), |bi| bi.to_radix_string(radix as u32));
-        Ok(JsValue::from_string(vm.heap.alloc_string(s)))
-    });
-    define_method(vm, bi_proto, "valueOf", |vm, this_val, _| {
+    define_method_len(vm, bi_proto, "toString", 0, bigint_to_string);
+    define_method_len(vm, bi_proto, "toLocaleString", 0, bigint_to_string);
+    define_method_len(vm, bi_proto, "valueOf", 0, |vm, this_val, _| {
         let prim = unbox_prim(vm, this_val);
         if prim.as_bigint().is_some() {
             Ok(prim)
@@ -1611,11 +1764,28 @@ fn install_bigint(vm: &mut JsVm) {
             Err(vm.type_error("BigInt.prototype.valueOf requires a BigInt"))
         }
     });
+    let tag = JsValue::from_string(vm.heap.alloc_string("BigInt"));
+    let k_tag = vm.key_symbol_to_string_tag;
+    vm.heap.object_define_data(
+        bi_proto,
+        k_tag,
+        tag,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+
     // Note: `BigInt` is NOT a constructor (`new BigInt(1)` throws TypeError per ECMA-262 §21.2.1.1).
     let ctor = vm.alloc_native_fn("BigInt", |vm, _this, args| {
-        let v = arg0(args);
-        let bi = match v.kind() {
-            JsValueKind::BigInt(_) => return Ok(v),
+        let prim = {
+            let v = arg0(args);
+            if v.is_object() {
+                vm.to_primitive(v, crate::vm::PrimHint::Number)?
+            } else {
+                v
+            }
+        };
+        let bi = match prim.kind() {
+            JsValueKind::BigInt(_) => return Ok(prim),
             JsValueKind::Bool(b) => JsBigInt::from_i64(i64::from(b)),
             JsValueKind::Int32(i) => JsBigInt::from_i64(i64::from(i)),
             JsValueKind::Float(f) if f.is_finite() && f.fract() == 0.0 => {
@@ -1624,8 +1794,8 @@ fn install_bigint(vm: &mut JsVm) {
             JsValueKind::Float(_) => {
                 return Err(vm.range_error("Cannot convert non-integer number to BigInt"))
             }
-            JsValueKind::String(_) | JsValueKind::Object(_) => {
-                let s = vm.value_to_rust_string(v);
+            JsValueKind::String(h) => {
+                let s = vm.heap.materialize_string(h).unwrap_or_default();
                 JsBigInt::parse_str(&s).ok_or_else(|| {
                     vm.make_error("SyntaxError", format!("Cannot convert {s} to a BigInt"))
                 })?
@@ -1650,8 +1820,109 @@ fn install_bigint(vm: &mut JsVm) {
 }
 
 // ---------------------------------------------------------------------------
-// Math
+// Math (ECMA-262 §21.3 + ES2025 `f16round` & `sumPrecise`)
 // ---------------------------------------------------------------------------
+
+/// Shewchuk exact adaptive floating-point expansion sum (`Math.sumPrecise`).
+fn math_sum_precise(
+    vm: &mut JsVm,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let iter = vm.create_iterator_public(arg0(args))?;
+    let mut partials: Vec<f64> = Vec::new();
+    let mut has_pos_inf = false;
+    let mut has_neg_inf = false;
+    let mut has_nan = false;
+    let mut minus_zero = true;
+    loop {
+        let (val, done) = vm.step_iterator_public(JsValue::from_object(iter))?;
+        if done {
+            break;
+        }
+        let Some(mut x) = val.as_number() else {
+            let _ = vm.iterator_close_handle(iter, true);
+            return Err(vm.type_error("Math.sumPrecise requires number values"));
+        };
+        if x.is_nan() {
+            has_nan = true;
+            continue;
+        }
+        if x.is_infinite() {
+            if x.is_sign_positive() {
+                has_pos_inf = true;
+            } else {
+                has_neg_inf = true;
+            }
+            continue;
+        }
+        if x == 0.0 {
+            if x.is_sign_positive() {
+                minus_zero = false;
+            }
+            continue;
+        }
+        minus_zero = false;
+        // Shewchuk Grow-Expansion (Two-Sum)
+        let mut write = 0usize;
+        for read in 0..partials.len() {
+            let mut y = partials[read];
+            if x.abs() < y.abs() {
+                std::mem::swap(&mut x, &mut y);
+            }
+            let hi = x + y;
+            let lo = y - (hi - x);
+            if lo != 0.0 {
+                partials[write] = lo;
+                write += 1;
+            }
+            x = hi;
+        }
+        partials.truncate(write);
+        if x != 0.0 {
+            partials.push(x);
+        }
+    }
+    if has_nan || (has_pos_inf && has_neg_inf) {
+        return Ok(JsValue::NAN);
+    }
+    if has_pos_inf {
+        return Ok(JsValue::from_f64(f64::INFINITY));
+    }
+    if has_neg_inf {
+        return Ok(JsValue::from_f64(f64::NEG_INFINITY));
+    }
+    if minus_zero {
+        return Ok(JsValue::from_f64(-0.0));
+    }
+    // Exact final rounding of non-overlapping expansion (Python `math.fsum` finalization).
+    let mut n = partials.len();
+    let mut hi = 0.0f64;
+    if n > 0 {
+        n -= 1;
+        hi = partials[n];
+        while n > 0 {
+            n -= 1;
+            let x = hi;
+            let y = partials[n];
+            hi = x + y;
+            let lo = y - (hi - x);
+            if lo != 0.0 {
+                if n > 0
+                    && ((lo < 0.0 && partials[n - 1] < 0.0) || (lo > 0.0 && partials[n - 1] > 0.0))
+                {
+                    let y2 = lo * 2.0;
+                    let x2 = hi + y2;
+                    if y2 == x2 - hi {
+                        hi = x2;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    Ok(JsValue::from_f64(if hi == 0.0 { 0.0 } else { hi }))
+}
 
 fn install_math(vm: &mut JsVm) {
     let math = vm.alloc_ordinary_object();
@@ -1675,143 +1946,231 @@ fn install_math(vm: &mut JsVm) {
             &mut vm.shapes,
         );
     }
+    let mtag = JsValue::from_string(vm.heap.alloc_string("Math"));
+    let k_tag = vm.key_symbol_to_string_tag;
+    vm.heap.object_define_data(
+        math,
+        k_tag,
+        mtag,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
 
-    define_method(vm, math, "abs", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.abs()))
-    });
-    define_method(vm, math, "floor", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.floor()))
-    });
-    define_method(vm, math, "ceil", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.ceil()))
-    });
-    define_method(vm, math, "trunc", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.trunc()))
-    });
-    define_method(vm, math, "round", |vm, _, a| {
-        let n = vm.to_number(arg0(a))?;
-        let r = if !n.is_finite() || n == 0.0 {
-            n
-        } else {
-            (n + 0.5).floor()
-        };
-        Ok(JsValue::from_f64(r))
-    });
-    define_method(vm, math, "sign", |vm, _, a| {
-        let n = vm.to_number(arg0(a))?;
-        Ok(JsValue::from_f64(if n.is_nan() || n == 0.0 {
-            n
-        } else if n > 0.0 {
-            1.0
-        } else {
-            -1.0
-        }))
-    });
-    define_method(vm, math, "min", |vm, _, args| {
-        let mut res = f64::INFINITY;
-        for &v in args {
-            let n = vm.to_number(v)?;
-            if n.is_nan() {
+    let fns: &[(&str, u32, crate::vm::NativeFnPtr)] = &[
+        ("abs", 1, |vm, _, a| {
+            Ok(JsValue::from_f64(vm.to_number(arg0(a))?.abs()))
+        }),
+        ("acos", 1, |vm, _, a| {
+            Ok(JsValue::from_f64(vm.to_number(arg0(a))?.acos()))
+        }),
+        ("acosh", 1, |vm, _, a| {
+            Ok(JsValue::from_f64(vm.to_number(arg0(a))?.acosh()))
+        }),
+        ("asin", 1, |vm, _, a| {
+            Ok(JsValue::from_f64(vm.to_number(arg0(a))?.asin()))
+        }),
+        ("asinh", 1, |vm, _, a| {
+            let x = vm.to_number(arg0(a))?;
+            Ok(JsValue::from_f64(if x == 0.0 { x } else { x.asinh() }))
+        }),
+        ("atan", 1, |vm, _, a| {
+            let x = vm.to_number(arg0(a))?;
+            Ok(JsValue::from_f64(if x == 0.0 { x } else { x.atan() }))
+        }),
+        ("atanh", 1, |vm, _, a| {
+            let x = vm.to_number(arg0(a))?;
+            Ok(JsValue::from_f64(if x == 0.0 { x } else { x.atanh() }))
+        }),
+        ("atan2", 2, |vm, _, a| {
+            let y = vm.to_number(arg0(a))?;
+            let x = vm.to_number(a.get(1).copied().unwrap_or(JsValue::UNDEFINED))?;
+            Ok(JsValue::from_f64(y.atan2(x)))
+        }),
+        ("cbrt", 1, |vm, _, a| {
+            let x = vm.to_number(arg0(a))?;
+            Ok(JsValue::from_f64(if x == 0.0 { x } else { x.cbrt() }))
+        }),
+        ("ceil", 1, |vm, _, a| {
+            Ok(JsValue::from_f64(vm.to_number(arg0(a))?.ceil()))
+        }),
+        ("clz32", 1, |vm, _, a| {
+            let x = vm.to_u32(arg0(a))?;
+            Ok(JsValue::from_i32(x.leading_zeros() as i32))
+        }),
+        ("cos", 1, |vm, _, a| {
+            Ok(JsValue::from_f64(vm.to_number(arg0(a))?.cos()))
+        }),
+        ("cosh", 1, |vm, _, a| {
+            Ok(JsValue::from_f64(vm.to_number(arg0(a))?.cosh()))
+        }),
+        ("exp", 1, |vm, _, a| {
+            Ok(JsValue::from_f64(vm.to_number(arg0(a))?.exp()))
+        }),
+        ("expm1", 1, |vm, _, a| {
+            let x = vm.to_number(arg0(a))?;
+            Ok(JsValue::from_f64(if x == 0.0 { x } else { x.exp_m1() }))
+        }),
+        ("floor", 1, |vm, _, a| {
+            Ok(JsValue::from_f64(vm.to_number(arg0(a))?.floor()))
+        }),
+        ("fround", 1, |vm, _, a| {
+            let x = vm.to_number(arg0(a))?;
+            Ok(JsValue::from_f64(f64::from(x as f32)))
+        }),
+        ("f16round", 1, |vm, _, a| {
+            let x = vm.to_number(arg0(a))?;
+            let bits = crate::builtins_collections::f64_to_f16(x);
+            Ok(JsValue::from_f64(crate::builtins_collections::f16_to_f64(
+                bits,
+            )))
+        }),
+        ("hypot", 2, |vm, _, args| {
+            let mut vals = Vec::with_capacity(args.len());
+            for &v in args {
+                vals.push(vm.to_number(v)?);
+            }
+            let mut has_nan = false;
+            let mut max_abs = 0.0f64;
+            for x in vals.iter().copied() {
+                if x.is_infinite() {
+                    return Ok(JsValue::from_f64(f64::INFINITY));
+                }
+                if x.is_nan() {
+                    has_nan = true;
+                } else {
+                    max_abs = max_abs.max(x.abs());
+                }
+            }
+            if has_nan {
                 return Ok(JsValue::NAN);
             }
-            if n < res || (n == 0.0 && res == 0.0 && n.is_sign_negative()) {
-                res = n;
+            if max_abs == 0.0 {
+                return Ok(JsValue::from_f64(0.0));
             }
-        }
-        Ok(JsValue::from_f64(res))
-    });
-    define_method(vm, math, "max", |vm, _, args| {
-        let mut res = f64::NEG_INFINITY;
-        for &v in args {
-            let n = vm.to_number(v)?;
-            if n.is_nan() {
-                return Ok(JsValue::NAN);
+            let mut sum = 0.0f64;
+            for x in vals {
+                let s = x / max_abs;
+                sum += s * s;
             }
-            if n > res || (n == 0.0 && res == 0.0 && n.is_sign_positive()) {
-                res = n;
+            Ok(JsValue::from_f64(max_abs * sum.sqrt()))
+        }),
+        ("imul", 2, |vm, _, a| {
+            let x = vm.to_i32(arg0(a))?;
+            let y = vm.to_i32(a.get(1).copied().unwrap_or(JsValue::UNDEFINED))?;
+            Ok(JsValue::from_i32(x.wrapping_mul(y)))
+        }),
+        ("log", 1, |vm, _, a| {
+            Ok(JsValue::from_f64(vm.to_number(arg0(a))?.ln()))
+        }),
+        ("log1p", 1, |vm, _, a| {
+            let x = vm.to_number(arg0(a))?;
+            Ok(JsValue::from_f64(if x == 0.0 { x } else { x.ln_1p() }))
+        }),
+        ("log2", 1, |vm, _, a| {
+            Ok(JsValue::from_f64(vm.to_number(arg0(a))?.log2()))
+        }),
+        ("log10", 1, |vm, _, a| {
+            Ok(JsValue::from_f64(vm.to_number(arg0(a))?.log10()))
+        }),
+        ("max", 2, |vm, _, args| {
+            let mut res = f64::NEG_INFINITY;
+            let mut nan = false;
+            for &v in args {
+                let n = vm.to_number(v)?;
+                if n.is_nan() {
+                    nan = true;
+                } else if !nan && (n > res || (n == 0.0 && res == 0.0 && n.is_sign_positive())) {
+                    res = n;
+                }
             }
-        }
-        Ok(JsValue::from_f64(res))
-    });
-    define_method(vm, math, "pow", |vm, _, a| {
-        let x = vm.to_number(arg0(a))?;
-        let y = vm.to_number(a.get(1).copied().unwrap_or(JsValue::UNDEFINED))?;
-        Ok(JsValue::from_f64(x.powf(y)))
-    });
-    define_method(vm, math, "sqrt", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.sqrt()))
-    });
-    define_method(vm, math, "cbrt", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.cbrt()))
-    });
-    define_method(vm, math, "hypot", |vm, _, args| {
-        let mut sum = 0.0f64;
-        for &v in args {
-            let n = vm.to_number(v)?;
-            sum += n * n;
-        }
-        Ok(JsValue::from_f64(sum.sqrt()))
-    });
-    define_method(vm, math, "sin", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.sin()))
-    });
-    define_method(vm, math, "cos", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.cos()))
-    });
-    define_method(vm, math, "tan", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.tan()))
-    });
-    define_method(vm, math, "asin", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.asin()))
-    });
-    define_method(vm, math, "acos", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.acos()))
-    });
-    define_method(vm, math, "atan", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.atan()))
-    });
-    define_method(vm, math, "atan2", |vm, _, a| {
-        let y = vm.to_number(arg0(a))?;
-        let x = vm.to_number(a.get(1).copied().unwrap_or(JsValue::UNDEFINED))?;
-        Ok(JsValue::from_f64(y.atan2(x)))
-    });
-    define_method(vm, math, "exp", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.exp()))
-    });
-    define_method(vm, math, "log", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.ln()))
-    });
-    define_method(vm, math, "log2", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.log2()))
-    });
-    define_method(vm, math, "log10", |vm, _, a| {
-        Ok(JsValue::from_f64(vm.to_number(arg0(a))?.log10()))
-    });
-    define_method(vm, math, "imul", |vm, _, a| {
-        let x = vm.to_i32(arg0(a))?;
-        let y = vm.to_i32(a.get(1).copied().unwrap_or(JsValue::UNDEFINED))?;
-        Ok(JsValue::from_i32(x.wrapping_mul(y)))
-    });
-    define_method(vm, math, "clz32", |vm, _, a| {
-        let x = vm.to_u32(arg0(a))?;
-        Ok(JsValue::from_i32(x.leading_zeros() as i32))
-    });
-    define_method(vm, math, "fround", |vm, _, a| {
-        let x = vm.to_number(arg0(a))?;
-        Ok(JsValue::from_f64(f64::from(x as f32)))
-    });
-    define_method(vm, math, "random", |vm, _, _| {
-        // xorshift64* producing uniform [0, 1) f64
-        let mut x = vm.rng_state;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        vm.rng_state = x;
-        let bits = x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11;
-        Ok(JsValue::from_f64(
-            (bits as f64) * (1.0 / ((1u64 << 53) as f64)),
-        ))
-    });
+            Ok(JsValue::from_f64(if nan { f64::NAN } else { res }))
+        }),
+        ("min", 2, |vm, _, args| {
+            let mut res = f64::INFINITY;
+            let mut nan = false;
+            for &v in args {
+                let n = vm.to_number(v)?;
+                if n.is_nan() {
+                    nan = true;
+                } else if !nan && (n < res || (n == 0.0 && res == 0.0 && n.is_sign_negative())) {
+                    res = n;
+                }
+            }
+            Ok(JsValue::from_f64(if nan { f64::NAN } else { res }))
+        }),
+        ("pow", 2, |vm, _, a| {
+            let x = vm.to_number(arg0(a))?;
+            let y = vm.to_number(a.get(1).copied().unwrap_or(JsValue::UNDEFINED))?;
+            let out = if y.is_nan() {
+                f64::NAN
+            } else if y == 0.0 {
+                1.0
+            } else if x.abs() == 1.0 && y.is_infinite() {
+                f64::NAN
+            } else {
+                x.powf(y)
+            };
+            Ok(JsValue::from_f64(out))
+        }),
+        ("random", 0, |vm, _, _| {
+            let mut x = vm.rng_state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            vm.rng_state = x;
+            let bits = x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11;
+            Ok(JsValue::from_f64(
+                (bits as f64) * (1.0 / ((1u64 << 53) as f64)),
+            ))
+        }),
+        ("round", 1, |vm, _, a| {
+            let n = vm.to_number(arg0(a))?;
+            let r = if !n.is_finite() || n == 0.0 {
+                n
+            } else if (-0.5..0.0).contains(&n) {
+                -0.0
+            } else {
+                (n + 0.5).floor()
+            };
+            Ok(JsValue::from_f64(r))
+        }),
+        ("sign", 1, |vm, _, a| {
+            let n = vm.to_number(arg0(a))?;
+            Ok(JsValue::from_f64(if n.is_nan() || n == 0.0 {
+                n
+            } else if n > 0.0 {
+                1.0
+            } else {
+                -1.0
+            }))
+        }),
+        ("sin", 1, |vm, _, a| {
+            let x = vm.to_number(arg0(a))?;
+            Ok(JsValue::from_f64(if x == 0.0 { x } else { x.sin() }))
+        }),
+        ("sinh", 1, |vm, _, a| {
+            let x = vm.to_number(arg0(a))?;
+            Ok(JsValue::from_f64(if x == 0.0 { x } else { x.sinh() }))
+        }),
+        ("sqrt", 1, |vm, _, a| {
+            Ok(JsValue::from_f64(vm.to_number(arg0(a))?.sqrt()))
+        }),
+        ("sumPrecise", 1, math_sum_precise),
+        ("tan", 1, |vm, _, a| {
+            let x = vm.to_number(arg0(a))?;
+            Ok(JsValue::from_f64(if x == 0.0 { x } else { x.tan() }))
+        }),
+        ("tanh", 1, |vm, _, a| {
+            let x = vm.to_number(arg0(a))?;
+            Ok(JsValue::from_f64(if x == 0.0 { x } else { x.tanh() }))
+        }),
+        ("trunc", 1, |vm, _, a| {
+            Ok(JsValue::from_f64(vm.to_number(arg0(a))?.trunc()))
+        }),
+    ];
+    for &(name, len, f) in fns {
+        define_method_len(vm, math, name, len, f);
+    }
 
     define_global(vm, "Math", JsValue::from_object(math));
 }
@@ -1827,7 +2186,7 @@ fn arg0(args: &[JsValue]) -> JsValue {
 
 fn install_symbol(vm: &mut JsVm) {
     let sym_proto = vm.symbol_proto;
-    define_method(vm, sym_proto, "valueOf", |vm, this_val, _| {
+    define_method_len(vm, sym_proto, "valueOf", 0, |vm, this_val, _| {
         let prim = unbox_prim(vm, this_val);
         if prim.is_symbol() {
             Ok(prim)
@@ -1835,7 +2194,7 @@ fn install_symbol(vm: &mut JsVm) {
             Err(vm.type_error("Symbol.prototype.valueOf requires a Symbol"))
         }
     });
-    define_method(vm, sym_proto, "toString", |vm, this_val, _| {
+    define_method_len(vm, sym_proto, "toString", 0, |vm, this_val, _| {
         let Some(id) = unbox_prim(vm, this_val).as_symbol() else {
             return Err(vm.type_error("Symbol.prototype.toString requires a Symbol"));
         };
@@ -1844,6 +2203,32 @@ fn install_symbol(vm: &mut JsVm) {
             vm.heap.alloc_string(format!("Symbol({desc})")),
         ))
     });
+    let to_prim = vm.alloc_native_fn("[Symbol.toPrimitive]", |vm, this_val, _| {
+        let prim = unbox_prim(vm, this_val);
+        if prim.is_symbol() {
+            Ok(prim)
+        } else {
+            Err(vm.type_error("Symbol.prototype[Symbol.toPrimitive] requires a Symbol"))
+        }
+    });
+    vm.set_fn_length(to_prim, 1);
+    let k_tp = vm.key_symbol_to_primitive;
+    vm.heap.object_define_data(
+        sym_proto,
+        k_tp,
+        JsValue::from_object(to_prim),
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+    let stag = JsValue::from_string(vm.heap.alloc_string("Symbol"));
+    let k_tag = vm.key_symbol_to_string_tag;
+    vm.heap.object_define_data(
+        sym_proto,
+        k_tag,
+        stag,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
     let desc_getter = vm.alloc_native_fn("get description", |vm, this_val, _| {
         let Some(id) = unbox_prim(vm, this_val).as_symbol() else {
             return Err(vm.type_error("Symbol.prototype.description requires a Symbol"));
@@ -1853,6 +2238,7 @@ fn install_symbol(vm: &mut JsVm) {
             None => JsValue::UNDEFINED,
         })
     });
+    vm.set_fn_length(desc_getter, 0);
     let k_desc = vm.heap.intern_key("description");
     vm.heap.object_define_accessor(
         sym_proto,
@@ -1882,8 +2268,8 @@ fn install_symbol(vm: &mut JsVm) {
         &mut vm.shapes,
     );
     link_ctor_meta(vm, ctor, sym_proto, 0, false);
-    define_method(vm, ctor, "for", |vm, _this, args| {
-        let key = vm.value_to_rust_string(arg0(args));
+    define_method_len(vm, ctor, "for", 1, |vm, _this, args| {
+        let key = vm.to_js_string(arg0(args))?;
         if let Some(&id) = vm.symbol_registry.get(&key) {
             return Ok(JsValue::from_symbol(id));
         }
@@ -1892,7 +2278,7 @@ fn install_symbol(vm: &mut JsVm) {
         vm.symbol_descriptions.insert(id, key);
         Ok(JsValue::from_symbol(id))
     });
-    define_method(vm, ctor, "keyFor", |vm, _this, args| {
+    define_method_len(vm, ctor, "keyFor", 1, |vm, _this, args| {
         let Some(sym) = arg0(args).as_symbol() else {
             return Err(vm.type_error("Symbol.keyFor requires a Symbol"));
         };
@@ -1937,18 +2323,81 @@ fn install_symbol(vm: &mut JsVm) {
 }
 
 // ---------------------------------------------------------------------------
-// JSON (`JSON.parse` / `JSON.stringify` with cycle detection & reviver/space)
+// JSON (ECMA-262 §25.5 + ES2025 `rawJSON` / `isRawJSON` / reviver `context`)
 // ---------------------------------------------------------------------------
 
 fn install_json(vm: &mut JsVm) {
     let json = vm.alloc_ordinary_object();
-    define_method(vm, json, "parse", json_parse);
-    define_method(vm, json, "stringify", json_stringify);
+    define_method_len(vm, json, "parse", 2, json_parse);
+    define_method_len(vm, json, "stringify", 3, json_stringify);
+    define_method_len(vm, json, "rawJSON", 1, json_raw_json);
+    define_method_len(vm, json, "isRawJSON", 1, json_is_raw_json);
+    let jtag = JsValue::from_string(vm.heap.alloc_string("JSON"));
+    let k_tag = vm.key_symbol_to_string_tag;
+    vm.heap.object_define_data(
+        json,
+        k_tag,
+        jtag,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
     define_global(vm, "JSON", JsValue::from_object(json));
 }
 
+fn is_json_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+fn json_raw_json(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
+    let text = vm.to_js_string(arg0(args))?;
+    let bytes = text.as_bytes();
+    if bytes.is_empty()
+        || is_json_ws(bytes[0])
+        || is_json_ws(bytes[bytes.len() - 1])
+        || matches!(bytes[0], b'{' | b'[')
+    {
+        return Err(vm.make_error(
+            "SyntaxError",
+            "JSON.rawJSON requires a valid JSON primitive",
+        ));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| vm.make_error("SyntaxError", format!("JSON.rawJSON: {e}")))?;
+    if matches!(
+        parsed,
+        serde_json::Value::Array(_) | serde_json::Value::Object(_)
+    ) {
+        return Err(vm.make_error("SyntaxError", "JSON.rawJSON cannot wrap an object or array"));
+    }
+    let obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, None));
+    let k_raw = vm.heap.intern_key("rawJSON");
+    let tv = JsValue::from_string(vm.heap.alloc_string(text));
+    vm.heap
+        .object_define_data(obj, k_raw, tv, PropertyAttrs::ENUMERABLE, &mut vm.shapes);
+    if let Some(o) = vm.heap.get_object_mut(obj) {
+        o.extensible = false;
+        o.rare_mut().is_raw_json = true;
+    }
+    Ok(JsValue::from_object(obj))
+}
+
+fn json_is_raw_json(
+    vm: &mut JsVm,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let is_raw = arg0(args)
+        .as_object()
+        .and_then(|h| vm.heap.get_object(h))
+        .and_then(|o| o.rare.as_ref())
+        .is_some_and(|r| r.is_raw_json);
+    Ok(JsValue::from_bool(is_raw))
+}
+
 fn json_parse(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let text = vm.value_to_rust_string(arg0(args));
+    let text = vm.to_js_string(arg0(args))?;
     let parsed: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| vm.make_error("SyntaxError", format!("JSON.parse: {e}")))?;
     let val = serde_to_js(vm, &parsed);
@@ -1961,7 +2410,12 @@ fn json_parse(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue
         let empty_k = vm.heap.intern_key("");
         vm.heap
             .object_define_data(holder, empty_k, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
-        return json_revive(vm, holder, "", reviver);
+        let root_src = if !val.is_object() {
+            Some(text.trim().to_string())
+        } else {
+            None
+        };
+        return json_revive(vm, holder, "", reviver, root_src.as_deref());
     }
     Ok(val)
 }
@@ -2004,34 +2458,28 @@ fn json_revive(
     holder: HeapHandle,
     name: &str,
     reviver: JsValue,
+    prim_source: Option<&str>,
 ) -> Result<JsValue, JsException> {
     let name_v = JsValue::from_string(vm.heap.alloc_string(name));
     let val = vm.get_elem(JsValue::from_object(holder), name_v)?;
+    let ctx = vm.alloc_ordinary_object();
     if let Some(obj) = val.as_object() {
-        if matches!(
-            vm.heap.get_object(obj).map(|o| &o.kind),
-            Some(ObjectKind::Array)
-        ) {
-            let len = vm.heap.get_object(obj).map_or(0, |o| o.elements.len());
+        let is_arr = vm.is_array_value(val).unwrap_or(false);
+        if is_arr {
+            let len = vm.array_get_len(obj)?;
             for i in 0..len {
                 let idx_s = i.to_string();
-                let new_v = json_revive(vm, obj, &idx_s, reviver)?;
+                let new_v = json_revive(vm, obj, &idx_s, reviver, None)?;
                 if new_v.is_undefined() {
-                    if let Some(o) = vm.heap.get_object_mut(obj) {
-                        o.elements.delete(i);
-                    }
+                    let _ = vm.array_delete_index_strict(obj, i);
                 } else {
-                    vm.set_elem(
-                        JsValue::from_object(obj),
-                        JsValue::from_i32(i as i32),
-                        new_v,
-                    )?;
+                    let _ = vm.array_create_data_prop(obj, i, new_v);
                 }
             }
         } else {
             let keys = vm.own_enumerable_keys_including_elements(obj);
             for k in keys {
-                let new_v = json_revive(vm, obj, &k, reviver)?;
+                let new_v = json_revive(vm, obj, &k, reviver, None)?;
                 let pk = vm.heap.intern_key(&k);
                 if new_v.is_undefined() {
                     vm.heap.object_delete_own(obj, pk, &mut vm.shapes);
@@ -2046,47 +2494,182 @@ fn json_revive(
                 }
             }
         }
+    } else {
+        let src_str = prim_source
+            .map(str::to_string)
+            .unwrap_or_else(|| match val.kind() {
+                JsValueKind::Null => "null".into(),
+                JsValueKind::Bool(b) => if b { "true" } else { "false" }.into(),
+                JsValueKind::Int32(i) => i.to_string(),
+                JsValueKind::Float(f) => vm.value_to_rust_string(JsValue::from_f64(f)),
+                JsValueKind::String(sh) => {
+                    let s = vm.heap.materialize_string(sh).unwrap_or_default();
+                    serde_json::to_string(&s).unwrap_or_else(|_| "\"\"".into())
+                }
+                _ => String::new(),
+            });
+        if !src_str.is_empty() {
+            let k_src = vm.heap.intern_key("source");
+            let sv = JsValue::from_string(vm.heap.alloc_string(src_str));
+            vm.heap
+                .object_define_data(ctx, k_src, sv, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        }
     }
     let name_v = JsValue::from_string(vm.heap.alloc_string(name));
-    vm.call_value(reviver, JsValue::from_object(holder), &[name_v, val])
+    vm.call_value(
+        reviver,
+        JsValue::from_object(holder),
+        &[name_v, val, JsValue::from_object(ctx)],
+    )
+}
+
+enum JsonReplacer {
+    None,
+    Fn(JsValue),
+    List(Vec<String>),
 }
 
 fn json_stringify(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let val = arg0(args);
-    let indent = match args.get(2).copied() {
-        Some(v) if v.is_number() => {
-            let n = vm.to_i32(v)?.clamp(0, 10) as usize;
-            " ".repeat(n)
+    let rep_arg = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
+    let replacer = if let Some(rh) = rep_arg.as_object() {
+        if vm.is_callable_handle(rh) {
+            JsonReplacer::Fn(rep_arg)
+        } else if vm
+            .is_array_value(rep_arg)
+            .map_err(|_| vm.type_error("Proxy has been revoked"))?
+        {
+            let len = vm.array_get_len(rh)?;
+            let mut list = Vec::new();
+            for i in 0..len {
+                let v = vm.array_get_index(rh, i)?;
+                let item = match v.kind() {
+                    JsValueKind::String(sh) => vm.heap.materialize_string(sh),
+                    JsValueKind::Int32(_) | JsValueKind::Float(_) => Some(vm.to_js_string(v)?),
+                    JsValueKind::Object(oh) => {
+                        let boxed = vm
+                            .heap
+                            .get_object(oh)
+                            .and_then(|o| o.rare.as_ref())
+                            .and_then(|r| r.boxed_value);
+                        if boxed.is_some_and(|b| b.is_string() || b.is_number()) {
+                            Some(vm.to_js_string(v)?)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(s) = item {
+                    if !list.contains(&s) {
+                        list.push(s);
+                    }
+                }
+            }
+            JsonReplacer::List(list)
+        } else {
+            JsonReplacer::None
         }
-        Some(v) if v.is_string() => {
-            let s = vm.value_to_rust_string(v);
-            s.chars().take(10).collect()
+    } else {
+        JsonReplacer::None
+    };
+
+    let space_arg = args.get(2).copied().unwrap_or(JsValue::UNDEFINED);
+    let space_unboxed = if let Some(sh) = space_arg.as_object() {
+        let boxed = vm
+            .heap
+            .get_object(sh)
+            .and_then(|o| o.rare.as_ref())
+            .and_then(|r| r.boxed_value);
+        match boxed {
+            Some(b) if b.is_number() => JsValue::from_f64(vm.to_number(space_arg)?),
+            Some(b) if b.is_string() => {
+                let s = vm.to_js_string(space_arg)?;
+                JsValue::from_string(vm.heap.alloc_string(s))
+            }
+            _ => space_arg,
+        }
+    } else {
+        space_arg
+    };
+    let indent = match space_unboxed.kind() {
+        JsValueKind::Int32(_) | JsValueKind::Float(_) => {
+            let n = vm.to_integer_or_infinity(space_unboxed)?;
+            let clamped = if n < 1.0 { 0 } else { n.min(10.0) as usize };
+            " ".repeat(clamped)
+        }
+        JsValueKind::String(sh) => {
+            let s = vm.heap.materialize_string(sh).unwrap_or_default();
+            let u16s: Vec<u16> = s.encode_utf16().take(10).collect();
+            String::from_utf16_lossy(&u16s)
         }
         _ => String::new(),
     };
+
+    let wrapper = vm.alloc_ordinary_object();
+    let empty_k = vm.heap.intern_key("");
+    vm.heap.object_define_data(
+        wrapper,
+        empty_k,
+        val,
+        PropertyAttrs::DEFAULT,
+        &mut vm.shapes,
+    );
     let mut stack = Vec::new();
-    match stringify_value(vm, val, &indent, 0, &mut stack)? {
+    match stringify_prop(vm, wrapper, "", val, &replacer, &indent, 0, &mut stack)? {
         Some(s) => Ok(JsValue::from_string(vm.heap.alloc_string(s))),
         None => Ok(JsValue::UNDEFINED),
     }
 }
 
-fn stringify_value(
+#[allow(clippy::too_many_arguments)]
+fn stringify_prop(
     vm: &mut JsVm,
+    holder: HeapHandle,
+    key: &str,
     mut val: JsValue,
+    replacer: &JsonReplacer,
     indent: &str,
     depth: usize,
     stack: &mut Vec<HeapHandle>,
 ) -> Result<Option<String>, JsException> {
-    // Honor `.toJSON()` hook on objects (e.g. `Date.prototype.toJSON` / custom objects).
-    if let Some(h) = val.as_object() {
+    // §25.5.2.1 step 2: invoke `.toJSON(key)` on objects AND BigInt primitives.
+    if val.is_object() || val.is_bigint() {
+        let lookup_h = if let Some(h) = val.as_object() {
+            h
+        } else {
+            vm.bigint_proto
+        };
         let k_to_json = vm.heap.intern_key("toJSON");
-        let to_json = vm.get_property_by_key(h, k_to_json)?;
+        let to_json = vm.get_property_by_key(lookup_h, k_to_json)?;
         if to_json
             .as_object()
             .is_some_and(|fh| vm.is_callable_handle(fh))
         {
-            val = vm.call_value(to_json, val, &[])?;
+            let kv = JsValue::from_string(vm.heap.alloc_string(key));
+            val = vm.call_value(to_json, val, &[kv])?;
+        }
+    }
+    if let JsonReplacer::Fn(rep_fn) = replacer {
+        let kv = JsValue::from_string(vm.heap.alloc_string(key));
+        val = vm.call_value(*rep_fn, JsValue::from_object(holder), &[kv, val])?;
+    }
+    // Unbox Number / String / Boolean / BigInt wrapper objects per §25.5.2.1 step 4.
+    if let Some(h) = val.as_object() {
+        let boxed = vm
+            .heap
+            .get_object(h)
+            .and_then(|o| o.rare.as_ref())
+            .and_then(|r| r.boxed_value);
+        if let Some(b) = boxed {
+            if b.is_number() {
+                val = JsValue::from_f64(vm.to_number(val)?);
+            } else if b.is_string() {
+                let s = vm.to_js_string(val)?;
+                val = JsValue::from_string(vm.heap.alloc_string(s));
+            } else if b.is_bool() || b.is_bigint() {
+                val = b;
+            }
         }
     }
 
@@ -2097,7 +2680,7 @@ fn stringify_value(
         JsValueKind::Int32(i) => Ok(Some(i.to_string())),
         JsValueKind::Float(f) => {
             if f.is_finite() {
-                Ok(Some(if f == 0.0 { "0".into() } else { f.to_string() }))
+                Ok(Some(vm.value_to_rust_string(JsValue::from_f64(f))))
             } else {
                 Ok(Some("null".into()))
             }
@@ -2112,32 +2695,39 @@ fn stringify_value(
             ))
         }
         JsValueKind::Object(h) => {
+            if vm
+                .heap
+                .get_object(h)
+                .and_then(|o| o.rare.as_ref())
+                .is_some_and(|r| r.is_raw_json)
+            {
+                let k_raw = vm.heap.intern_key("rawJSON");
+                let raw_v = vm.get_property_by_key(h, k_raw)?;
+                return Ok(Some(vm.value_to_rust_string(raw_v)));
+            }
             if vm.is_callable_handle(h) {
                 return Ok(None);
             }
             if stack.contains(&h) {
                 return Err(vm.type_error("Converting circular structure to JSON"));
             }
+            let is_array = vm
+                .is_array_value(val)
+                .map_err(|_| vm.type_error("Proxy has been revoked"))?;
             stack.push(h);
-            let is_array = matches!(
-                vm.heap.get_object(h).map(|o| &o.kind),
-                Some(ObjectKind::Array)
-            );
-            let out = if is_array {
-                let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
+            let res = if is_array {
+                let len = vm.array_get_len(h)?;
                 if len > 4_000_000 {
                     stack.pop();
                     return Err(vm.range_error("Invalid string length"));
                 }
                 let mut items = Vec::with_capacity((len as usize).min(16_384));
                 for i in 0..len {
-                    let elem = vm
-                        .heap
-                        .get_object(h)
-                        .and_then(|o| o.elements.get(i))
-                        .unwrap_or(JsValue::UNDEFINED);
-                    let rendered = stringify_value(vm, elem, indent, depth + 1, stack)?
-                        .unwrap_or_else(|| "null".into());
+                    let elem = vm.array_get_index(h, i)?;
+                    let idx_s = i.to_string();
+                    let rendered =
+                        stringify_prop(vm, h, &idx_s, elem, replacer, indent, depth + 1, stack)?
+                            .unwrap_or_else(|| "null".into());
                     items.push(rendered);
                 }
                 if items.is_empty() {
@@ -2150,12 +2740,17 @@ fn stringify_value(
                     format!("[\n{pad}{}\n{close}]", items.join(&format!(",\n{pad}")))
                 }
             } else {
-                let keys = vm.own_enumerable_keys_including_elements(h);
+                let keys: Vec<String> = match replacer {
+                    JsonReplacer::List(list) => list.clone(),
+                    _ => vm.own_enumerable_keys_including_elements(h),
+                };
                 let mut pairs = Vec::new();
                 for k in keys {
                     let kv = JsValue::from_string(vm.heap.alloc_string(k.as_str()));
                     let pv = vm.get_elem(JsValue::from_object(h), kv)?;
-                    if let Some(sv) = stringify_value(vm, pv, indent, depth + 1, stack)? {
+                    if let Some(sv) =
+                        stringify_prop(vm, h, &k, pv, replacer, indent, depth + 1, stack)?
+                    {
                         let jk = serde_json::to_string(&k).unwrap_or_else(|_| "\"\"".into());
                         if indent.is_empty() {
                             pairs.push(format!("{jk}:{sv}"));
@@ -2175,7 +2770,7 @@ fn stringify_value(
                 }
             };
             stack.pop();
-            Ok(Some(out))
+            Ok(Some(res))
         }
     }
 }

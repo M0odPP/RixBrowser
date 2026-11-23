@@ -25,6 +25,7 @@ pub fn install_collection_builtins(vm: &mut JsVm) {
     install_weak_map(vm);
     install_weak_set(vm);
     install_weak_ref(vm);
+    install_finalization_registry(vm);
     install_array_buffer(vm);
     install_shared_array_buffer(vm);
     install_data_view(vm);
@@ -311,6 +312,47 @@ fn map_set_entry(vm: &mut JsVm, map_h: HeapHandle, key: JsValue, val: JsValue) {
     vm.heap.write_barrier(map_h, val);
 }
 
+fn proto_from_new_target_or(
+    vm: &mut JsVm,
+    default_proto: HeapHandle,
+) -> Result<HeapHandle, JsException> {
+    if let Some(nth) = vm.native_new_target.as_object() {
+        let p = vm.get_property_by_key(nth, vm.key_prototype)?;
+        if let Some(ph) = p.as_object() {
+            return Ok(ph);
+        }
+    }
+    Ok(default_proto)
+}
+
+fn can_be_held_weakly(vm: &JsVm, val: JsValue) -> bool {
+    if val.is_object() {
+        return true;
+    }
+    if let Some(sym) = val.as_symbol() {
+        return !vm.symbol_registry.values().any(|&s| s == sym);
+    }
+    false
+}
+
+fn norm_zero(v: JsValue) -> JsValue {
+    if v.as_number() == Some(0.0) {
+        JsValue::from_i32(0)
+    } else {
+        v
+    }
+}
+
+fn map_find(vm: &JsVm, map_h: HeapHandle, key: JsValue) -> Option<JsValue> {
+    match vm.heap.get_object(map_h).map(|o| &o.kind) {
+        Some(ObjectKind::Map(e)) => e
+            .iter()
+            .find(|(k, _)| same_value_zero(vm, *k, key))
+            .map(|(_, v)| *v),
+        _ => None,
+    }
+}
+
 fn install_map(vm: &mut JsVm) {
     let mp = vm.map_proto;
     define_getter(vm, mp, "size", |vm, this_val, _| {
@@ -321,33 +363,46 @@ fn install_map(vm: &mut JsVm) {
         };
         Ok(JsValue::from_f64(len))
     });
-    define_method(vm, mp, "get", |vm, this_val, args| {
+    define_method_len(vm, mp, "get", 1, |vm, this_val, args| {
         let h = require_map(vm, this_val)?;
-        let key = arg(args, 0);
-        let found = match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::Map(e)) => e
-                .iter()
-                .find(|(k, _)| same_value_zero(vm, *k, key))
-                .map(|(_, v)| *v),
-            _ => None,
-        };
-        Ok(found.unwrap_or(JsValue::UNDEFINED))
+        Ok(map_find(vm, h, arg(args, 0)).unwrap_or(JsValue::UNDEFINED))
     });
-    define_method(vm, mp, "has", |vm, this_val, args| {
+    define_method_len(vm, mp, "has", 1, |vm, this_val, args| {
         let h = require_map(vm, this_val)?;
-        let key = arg(args, 0);
-        let found = match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::Map(e)) => e.iter().any(|(k, _)| same_value_zero(vm, *k, key)),
-            _ => false,
-        };
-        Ok(JsValue::from_bool(found))
+        Ok(JsValue::from_bool(map_find(vm, h, arg(args, 0)).is_some()))
     });
-    define_method(vm, mp, "set", |vm, this_val, args| {
+    define_method_len(vm, mp, "set", 2, |vm, this_val, args| {
         let h = require_map(vm, this_val)?;
         map_set_entry(vm, h, arg(args, 0), arg(args, 1));
         Ok(this_val)
     });
-    define_method(vm, mp, "delete", |vm, this_val, args| {
+    define_method_len(vm, mp, "getOrInsert", 2, |vm, this_val, args| {
+        let h = require_map(vm, this_val)?;
+        let key = norm_zero(arg(args, 0));
+        if let Some(existing) = map_find(vm, h, key) {
+            return Ok(existing);
+        }
+        let default_val = arg(args, 1);
+        map_set_entry(vm, h, key, default_val);
+        Ok(default_val)
+    });
+    define_method_len(vm, mp, "getOrInsertComputed", 2, |vm, this_val, args| {
+        let h = require_map(vm, this_val)?;
+        let cb = arg(args, 1);
+        if !cb.as_object().is_some_and(|ch| vm.is_callable_handle(ch)) {
+            return Err(
+                vm.type_error("Map.prototype.getOrInsertComputed callback is not a function")
+            );
+        }
+        let key = norm_zero(arg(args, 0));
+        if let Some(existing) = map_find(vm, h, key) {
+            return Ok(existing);
+        }
+        let val = vm.call_value(cb, JsValue::UNDEFINED, &[key])?;
+        map_set_entry(vm, h, key, val);
+        Ok(val)
+    });
+    define_method_len(vm, mp, "delete", 1, |vm, this_val, args| {
         let h = require_map(vm, this_val)?;
         let key = arg(args, 0);
         let pos = match vm.heap.get_object(h).map(|o| &o.kind) {
@@ -363,16 +418,19 @@ fn install_map(vm: &mut JsVm) {
             Ok(JsValue::FALSE)
         }
     });
-    define_method(vm, mp, "clear", |vm, this_val, _| {
+    define_method_len(vm, mp, "clear", 0, |vm, this_val, _| {
         let h = require_map(vm, this_val)?;
         if let Some(ObjectKind::Map(e)) = vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
             e.clear();
         }
         Ok(JsValue::UNDEFINED)
     });
-    define_method(vm, mp, "forEach", |vm, this_val, args| {
+    define_method_len(vm, mp, "forEach", 1, |vm, this_val, args| {
         let h = require_map(vm, this_val)?;
         let cb = arg(args, 0);
+        if !cb.as_object().is_some_and(|ch| vm.is_callable_handle(ch)) {
+            return Err(vm.type_error("Map.prototype.forEach callback is not a function"));
+        }
         let this_arg = arg(args, 1);
         let snapshot: Vec<(JsValue, JsValue)> = match vm.heap.get_object(h).map(|o| &o.kind) {
             Some(ObjectKind::Map(e)) => (**e).clone(),
@@ -383,7 +441,7 @@ fn install_map(vm: &mut JsVm) {
         }
         Ok(JsValue::UNDEFINED)
     });
-    define_method(vm, mp, "keys", |vm, this_val, _| {
+    define_method_len(vm, mp, "keys", 0, |vm, this_val, _| {
         let h = require_map(vm, this_val)?;
         let items: Vec<JsValue> = match vm.heap.get_object(h).map(|o| &o.kind) {
             Some(ObjectKind::Map(e)) => e.iter().map(|(k, _)| *k).collect(),
@@ -391,7 +449,7 @@ fn install_map(vm: &mut JsVm) {
         };
         Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
     });
-    define_method(vm, mp, "values", |vm, this_val, _| {
+    define_method_len(vm, mp, "values", 0, |vm, this_val, _| {
         let h = require_map(vm, this_val)?;
         let items: Vec<JsValue> = match vm.heap.get_object(h).map(|o| &o.kind) {
             Some(ObjectKind::Map(e)) => e.iter().map(|(_, v)| *v).collect(),
@@ -399,45 +457,96 @@ fn install_map(vm: &mut JsVm) {
         };
         Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
     });
-    define_method(vm, mp, "entries", map_entries_fn);
-    define_symbol_iterator(vm, mp, map_entries_fn);
+    let entries_fn = vm.alloc_native_fn("entries", map_entries_fn);
+    vm.set_fn_length(entries_fn, 0);
+    let k_entries = vm.heap.intern_key("entries");
+    vm.heap.object_define_data(
+        mp,
+        k_entries,
+        JsValue::from_object(entries_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    let k_sym_iter = vm.key_symbol_iterator;
+    vm.heap.object_define_data(
+        mp,
+        k_sym_iter,
+        JsValue::from_object(entries_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    define_to_string_tag(vm, mp, "Map");
 
     let ctor = vm.alloc_native_fn("Map", |vm, _this, args| {
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("Constructor Map requires 'new'"));
+        }
+        let proto = proto_from_new_target_or(vm, vm.map_proto)?;
         let map_h = vm.heap.alloc_object(JsObject::with_kind(
             ObjectKind::Map(Box::default()),
-            Some(vm.map_proto),
+            Some(proto),
         ));
         let iterable = arg(args, 0);
         if !iterable.is_undefined() && !iterable.is_null() {
-            let items = vm.collect_iterable(iterable)?;
-            for item in items {
+            let k_set = vm.heap.intern_key("set");
+            let adder = vm.get_property_by_key(map_h, k_set)?;
+            if !adder.as_object().is_some_and(|h| vm.is_callable_handle(h)) {
+                return Err(vm.type_error("Map.prototype.set is not a function"));
+            }
+            let iter = vm.create_iterator_public(iterable)?;
+            loop {
+                let (item, done) = vm.step_iterator_public(JsValue::from_object(iter))?;
+                if done {
+                    break;
+                }
                 if !item.is_object() {
+                    let _ = vm.iterator_close_handle(iter, true);
                     return Err(vm.type_error("Iterator value is not an entry object"));
                 }
-                let k = vm.get_elem(item, JsValue::from_i32(0))?;
-                let v = vm.get_elem(item, JsValue::from_i32(1))?;
-                map_set_entry(vm, map_h, k, v);
+                let res = (|| -> Result<(), JsException> {
+                    let k = vm.get_elem(item, JsValue::from_i32(0))?;
+                    let v = vm.get_elem(item, JsValue::from_i32(1))?;
+                    vm.call_value(adder, JsValue::from_object(map_h), &[k, v])?;
+                    Ok(())
+                })();
+                if let Err(e) = res {
+                    let _ = vm.iterator_close_handle(iter, true);
+                    return Err(e);
+                }
             }
         }
         Ok(JsValue::from_object(map_h))
     });
-    define_method(vm, ctor, "groupBy", |vm, _this, args| {
-        let items = vm.collect_iterable(arg(args, 0))?;
+    vm.set_fn_length(ctor, 0);
+    define_species_getter(vm, ctor);
+    define_method_len(vm, ctor, "groupBy", 2, |vm, _this, args| {
         let cb = arg(args, 1);
+        if !cb.as_object().is_some_and(|h| vm.is_callable_handle(h)) {
+            return Err(vm.type_error("Map.groupBy callback is not a function"));
+        }
+        let iter = vm.create_iterator_public(arg(args, 0))?;
         let map_h = vm.heap.alloc_object(JsObject::with_kind(
             ObjectKind::Map(Box::default()),
             Some(vm.map_proto),
         ));
-        for (i, item) in items.into_iter().enumerate() {
-            let group_key =
-                vm.call_value(cb, JsValue::UNDEFINED, &[item, JsValue::from_f64(i as f64)])?;
-            let existing = match vm.heap.get_object(map_h).map(|o| &o.kind) {
-                Some(ObjectKind::Map(e)) => e
-                    .iter()
-                    .find(|(k, _)| same_value_zero(vm, *k, group_key))
-                    .and_then(|(_, v)| v.as_object()),
-                _ => None,
+        let mut idx = 0u64;
+        loop {
+            let (item, done) = vm.step_iterator_public(JsValue::from_object(iter))?;
+            if done {
+                break;
+            }
+            let group_key = match vm.call_value(
+                cb,
+                JsValue::UNDEFINED,
+                &[item, JsValue::from_f64(idx as f64)],
+            ) {
+                Ok(k) => norm_zero(k),
+                Err(e) => {
+                    let _ = vm.iterator_close_handle(iter, true);
+                    return Err(e);
+                }
             };
+            let existing = map_find(vm, map_h, group_key).and_then(|v| v.as_object());
             let arr = if let Some(a) = existing {
                 a
             } else {
@@ -446,6 +555,7 @@ fn install_map(vm: &mut JsVm) {
                 a
             };
             vm.heap.object_push_element(arr, item);
+            idx += 1;
         }
         Ok(JsValue::from_object(map_h))
     });
@@ -474,7 +584,7 @@ fn map_entries_fn(
 }
 
 // ---------------------------------------------------------------------------
-// Set (including ES2024 set operations)
+// Set (ECMA-262 §24.2 + ES2025 Set Methods with GetSetRecord)
 // ---------------------------------------------------------------------------
 
 fn require_set(vm: &mut JsVm, this_val: JsValue) -> Result<HeapHandle, JsException> {
@@ -492,11 +602,7 @@ fn require_set(vm: &mut JsVm, this_val: JsValue) -> Result<HeapHandle, JsExcepti
 }
 
 fn set_add_entry(vm: &mut JsVm, set_h: HeapHandle, val: JsValue) {
-    let norm = if val.as_number() == Some(0.0) {
-        JsValue::from_i32(0)
-    } else {
-        val
-    };
+    let norm = norm_zero(val);
     let exists = match vm.heap.get_object(set_h).map(|o| &o.kind) {
         Some(ObjectKind::Set(e)) => e.iter().any(|v| same_value_zero(vm, *v, norm)),
         _ => false,
@@ -509,6 +615,35 @@ fn set_add_entry(vm: &mut JsVm, set_h: HeapHandle, val: JsValue) {
     }
 }
 
+fn set_has_entry(vm: &JsVm, set_h: HeapHandle, val: JsValue) -> bool {
+    match vm.heap.get_object(set_h).map(|o| &o.kind) {
+        Some(ObjectKind::Set(e)) => e.iter().any(|v| same_value_zero(vm, *v, val)),
+        _ => false,
+    }
+}
+
+fn set_delete_entry(vm: &mut JsVm, set_h: HeapHandle, val: JsValue) -> bool {
+    let pos = match vm.heap.get_object(set_h).map(|o| &o.kind) {
+        Some(ObjectKind::Set(e)) => e.iter().position(|v| same_value_zero(vm, *v, val)),
+        _ => None,
+    };
+    if let Some(i) = pos {
+        if let Some(ObjectKind::Set(e)) = vm.heap.get_object_mut(set_h).map(|o| &mut o.kind) {
+            e.remove(i);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+fn set_len(vm: &JsVm, set_h: HeapHandle) -> usize {
+    match vm.heap.get_object(set_h).map(|o| &o.kind) {
+        Some(ObjectKind::Set(e)) => e.len(),
+        _ => 0,
+    }
+}
+
 fn set_snapshot(vm: &JsVm, h: HeapHandle) -> Vec<JsValue> {
     match vm.heap.get_object(h).map(|o| &o.kind) {
         Some(ObjectKind::Set(e)) => (**e).clone(),
@@ -516,78 +651,142 @@ fn set_snapshot(vm: &JsVm, h: HeapHandle) -> Vec<JsValue> {
     }
 }
 
-fn set_like_items(vm: &mut JsVm, other: JsValue) -> Result<Vec<JsValue>, JsException> {
-    if let Some(oh) = other.as_object() {
-        if matches!(
-            vm.heap.get_object(oh).map(|o| &o.kind),
-            Some(ObjectKind::Set(_))
-        ) {
-            return Ok(set_snapshot(vm, oh));
-        }
+struct SetRecord {
+    obj: JsValue,
+    size: f64,
+    has_fn: JsValue,
+    keys_fn: JsValue,
+}
+
+/// ECMA-262 §24.2.1.2 `GetSetRecord(obj)`.
+fn get_set_record(vm: &mut JsVm, obj: JsValue) -> Result<SetRecord, JsException> {
+    let Some(oh) = obj.as_object() else {
+        return Err(vm.type_error("Set operation argument must be an object"));
+    };
+    let k_size = vm.heap.intern_key("size");
+    let raw_size = vm.get_property_by_key(oh, k_size)?;
+    let num_size = vm.to_number(raw_size)?;
+    if num_size.is_nan() {
+        return Err(vm.type_error("Set-like size must not be NaN"));
     }
-    vm.collect_iterable(other)
+    let int_size = if num_size.is_infinite() {
+        num_size
+    } else {
+        num_size.trunc()
+    };
+    if int_size < 0.0 {
+        return Err(vm.range_error("Set-like size must be non-negative"));
+    }
+    let k_has = vm.heap.intern_key("has");
+    let has_fn = vm.get_property_by_key(oh, k_has)?;
+    if !has_fn.as_object().is_some_and(|h| vm.is_callable_handle(h)) {
+        return Err(vm.type_error("Set-like object has no callable 'has' method"));
+    }
+    let k_keys = vm.heap.intern_key("keys");
+    let keys_fn = vm.get_property_by_key(oh, k_keys)?;
+    if !keys_fn
+        .as_object()
+        .is_some_and(|h| vm.is_callable_handle(h))
+    {
+        return Err(vm.type_error("Set-like object has no callable 'keys' method"));
+    }
+    Ok(SetRecord {
+        obj,
+        size: int_size,
+        has_fn,
+        keys_fn,
+    })
+}
+
+fn open_set_keys_iter(
+    vm: &mut JsVm,
+    rec: &SetRecord,
+) -> Result<(HeapHandle, JsValue), JsException> {
+    let iter = vm.call_value(rec.keys_fn, rec.obj, &[])?;
+    let Some(ih) = iter.as_object() else {
+        return Err(vm.type_error("Set-like keys() did not return an object"));
+    };
+    let next_m = vm.get_property_by_key(ih, vm.key_next)?;
+    Ok((ih, next_m))
+}
+
+fn step_set_keys_iter(
+    vm: &mut JsVm,
+    ih: HeapHandle,
+    next_m: JsValue,
+) -> Result<Option<JsValue>, JsException> {
+    let res = vm.call_value(next_m, JsValue::from_object(ih), &[])?;
+    let Some(rh) = res.as_object() else {
+        return Err(vm.type_error("Iterator result is not an object"));
+    };
+    let done = vm.get_property_by_key(rh, vm.key_done)?;
+    if vm.to_boolean(done) {
+        return Ok(None);
+    }
+    let val = vm.get_property_by_key(rh, vm.key_value)?;
+    Ok(Some(val))
 }
 
 fn install_set(vm: &mut JsVm) {
     let sp = vm.set_proto;
     define_getter(vm, sp, "size", |vm, this_val, _| {
         let h = require_set(vm, this_val)?;
-        let len = match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::Set(e)) => e.len() as f64,
-            _ => 0.0,
-        };
-        Ok(JsValue::from_f64(len))
+        Ok(JsValue::from_f64(set_len(vm, h) as f64))
     });
-    define_method(vm, sp, "add", |vm, this_val, args| {
+    define_method_len(vm, sp, "add", 1, |vm, this_val, args| {
         let h = require_set(vm, this_val)?;
         set_add_entry(vm, h, arg(args, 0));
         Ok(this_val)
     });
-    define_method(vm, sp, "has", |vm, this_val, args| {
+    define_method_len(vm, sp, "has", 1, |vm, this_val, args| {
         let h = require_set(vm, this_val)?;
-        let val = arg(args, 0);
-        let found = match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::Set(e)) => e.iter().any(|v| same_value_zero(vm, *v, val)),
-            _ => false,
-        };
-        Ok(JsValue::from_bool(found))
+        Ok(JsValue::from_bool(set_has_entry(vm, h, arg(args, 0))))
     });
-    define_method(vm, sp, "delete", |vm, this_val, args| {
+    define_method_len(vm, sp, "delete", 1, |vm, this_val, args| {
         let h = require_set(vm, this_val)?;
-        let val = arg(args, 0);
-        let pos = match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::Set(e)) => e.iter().position(|v| same_value_zero(vm, *v, val)),
-            _ => None,
-        };
-        if let Some(i) = pos {
-            if let Some(ObjectKind::Set(e)) = vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
-                e.remove(i);
-            }
-            Ok(JsValue::TRUE)
-        } else {
-            Ok(JsValue::FALSE)
-        }
+        Ok(JsValue::from_bool(set_delete_entry(vm, h, arg(args, 0))))
     });
-    define_method(vm, sp, "clear", |vm, this_val, _| {
+    define_method_len(vm, sp, "clear", 0, |vm, this_val, _| {
         let h = require_set(vm, this_val)?;
         if let Some(ObjectKind::Set(e)) = vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
             e.clear();
         }
         Ok(JsValue::UNDEFINED)
     });
-    define_method(vm, sp, "forEach", |vm, this_val, args| {
+    define_method_len(vm, sp, "forEach", 1, |vm, this_val, args| {
         let h = require_set(vm, this_val)?;
         let cb = arg(args, 0);
+        if !cb.as_object().is_some_and(|ch| vm.is_callable_handle(ch)) {
+            return Err(vm.type_error("Set.prototype.forEach callback is not a function"));
+        }
         let this_arg = arg(args, 1);
         for v in set_snapshot(vm, h) {
             vm.call_value(cb, this_arg, &[v, v, this_val])?;
         }
         Ok(JsValue::UNDEFINED)
     });
-    define_method(vm, sp, "values", set_values_fn);
-    define_method(vm, sp, "keys", set_values_fn);
-    define_symbol_iterator(vm, sp, set_values_fn);
-    define_method(vm, sp, "entries", |vm, this_val, _| {
+    // `Set.prototype.keys === Set.prototype.values === Set.prototype[Symbol.iterator]`
+    let vals_fn = vm.alloc_native_fn("values", set_values_fn);
+    vm.set_fn_length(vals_fn, 0);
+    for kname in ["values", "keys"] {
+        let k = vm.heap.intern_key(kname);
+        vm.heap.object_define_data(
+            sp,
+            k,
+            JsValue::from_object(vals_fn),
+            PropertyAttrs::METHOD,
+            &mut vm.shapes,
+        );
+    }
+    let k_sym_iter = vm.key_symbol_iterator;
+    vm.heap.object_define_data(
+        sp,
+        k_sym_iter,
+        JsValue::from_object(vals_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    define_method_len(vm, sp, "entries", 0, |vm, this_val, _| {
         let h = require_set(vm, this_val)?;
         let mut pairs = Vec::new();
         for v in set_snapshot(vm, h) {
@@ -598,108 +797,187 @@ fn install_set(vm: &mut JsVm) {
         }
         Ok(JsValue::from_object(alloc_values_iterator(vm, pairs)))
     });
-    // ES2024 Set mathematical methods.
-    define_method(vm, sp, "union", |vm, this_val, args| {
+    define_to_string_tag(vm, sp, "Set");
+
+    // ES2025 Set mathematical methods using `GetSetRecord`
+    define_method_len(vm, sp, "union", 1, |vm, this_val, args| {
         let h = require_set(vm, this_val)?;
-        let a = set_snapshot(vm, h);
-        let b = set_like_items(vm, arg(args, 0))?;
+        let rec = get_set_record(vm, arg(args, 0))?;
+        let (ih, next_m) = open_set_keys_iter(vm, &rec)?;
         let out = vm.heap.alloc_object(JsObject::with_kind(
             ObjectKind::Set(Box::default()),
             Some(vm.set_proto),
         ));
-        for v in a.into_iter().chain(b) {
+        for v in set_snapshot(vm, h) {
+            set_add_entry(vm, out, v);
+        }
+        while let Some(v) = step_set_keys_iter(vm, ih, next_m)? {
             set_add_entry(vm, out, v);
         }
         Ok(JsValue::from_object(out))
     });
-    define_method(vm, sp, "intersection", |vm, this_val, args| {
+    define_method_len(vm, sp, "intersection", 1, |vm, this_val, args| {
         let h = require_set(vm, this_val)?;
-        let a = set_snapshot(vm, h);
-        let b = set_like_items(vm, arg(args, 0))?;
+        let rec = get_set_record(vm, arg(args, 0))?;
         let out = vm.heap.alloc_object(JsObject::with_kind(
             ObjectKind::Set(Box::default()),
             Some(vm.set_proto),
         ));
-        for v in a {
-            if b.iter().any(|bv| same_value_zero(vm, v, *bv)) {
-                set_add_entry(vm, out, v);
+        if (set_len(vm, h) as f64) <= rec.size {
+            let mut idx = 0usize;
+            loop {
+                let item = match vm.heap.get_object(h).map(|o| &o.kind) {
+                    Some(ObjectKind::Set(e)) => e.get(idx).copied(),
+                    _ => None,
+                };
+                let Some(e) = item else { break };
+                idx += 1;
+                let in_other = vm.call_value(rec.has_fn, rec.obj, &[e])?;
+                if vm.to_boolean(in_other) && set_has_entry(vm, h, e) {
+                    set_add_entry(vm, out, e);
+                }
+            }
+        } else {
+            let (ih, next_m) = open_set_keys_iter(vm, &rec)?;
+            while let Some(e) = step_set_keys_iter(vm, ih, next_m)? {
+                if set_has_entry(vm, h, e) {
+                    set_add_entry(vm, out, e);
+                }
             }
         }
         Ok(JsValue::from_object(out))
     });
-    define_method(vm, sp, "difference", |vm, this_val, args| {
+    define_method_len(vm, sp, "difference", 1, |vm, this_val, args| {
         let h = require_set(vm, this_val)?;
-        let a = set_snapshot(vm, h);
-        let b = set_like_items(vm, arg(args, 0))?;
+        let rec = get_set_record(vm, arg(args, 0))?;
         let out = vm.heap.alloc_object(JsObject::with_kind(
             ObjectKind::Set(Box::default()),
             Some(vm.set_proto),
         ));
-        for v in a {
-            if !b.iter().any(|bv| same_value_zero(vm, v, *bv)) {
-                set_add_entry(vm, out, v);
+        for v in set_snapshot(vm, h) {
+            set_add_entry(vm, out, v);
+        }
+        if (set_len(vm, h) as f64) <= rec.size {
+            for e in set_snapshot(vm, out) {
+                let in_other = vm.call_value(rec.has_fn, rec.obj, &[e])?;
+                if vm.to_boolean(in_other) {
+                    set_delete_entry(vm, out, e);
+                }
+            }
+        } else {
+            let (ih, next_m) = open_set_keys_iter(vm, &rec)?;
+            while let Some(e) = step_set_keys_iter(vm, ih, next_m)? {
+                set_delete_entry(vm, out, e);
             }
         }
         Ok(JsValue::from_object(out))
     });
-    define_method(vm, sp, "symmetricDifference", |vm, this_val, args| {
+    define_method_len(vm, sp, "symmetricDifference", 1, |vm, this_val, args| {
         let h = require_set(vm, this_val)?;
-        let a = set_snapshot(vm, h);
-        let b = set_like_items(vm, arg(args, 0))?;
+        let rec = get_set_record(vm, arg(args, 0))?;
+        let (ih, next_m) = open_set_keys_iter(vm, &rec)?;
         let out = vm.heap.alloc_object(JsObject::with_kind(
             ObjectKind::Set(Box::default()),
             Some(vm.set_proto),
         ));
-        for &v in &a {
-            if !b.iter().any(|bv| same_value_zero(vm, v, *bv)) {
-                set_add_entry(vm, out, v);
-            }
+        for v in set_snapshot(vm, h) {
+            set_add_entry(vm, out, v);
         }
-        for &v in &b {
-            if !a.iter().any(|av| same_value_zero(vm, v, *av)) {
-                set_add_entry(vm, out, v);
+        while let Some(e) = step_set_keys_iter(vm, ih, next_m)? {
+            let in_result = set_has_entry(vm, out, e);
+            if set_has_entry(vm, h, e) {
+                if in_result {
+                    set_delete_entry(vm, out, e);
+                }
+            } else if !in_result {
+                set_add_entry(vm, out, e);
             }
         }
         Ok(JsValue::from_object(out))
     });
-    define_method(vm, sp, "isSubsetOf", |vm, this_val, args| {
+    define_method_len(vm, sp, "isSubsetOf", 1, |vm, this_val, args| {
         let h = require_set(vm, this_val)?;
-        let a = set_snapshot(vm, h);
-        let b = set_like_items(vm, arg(args, 0))?;
-        Ok(JsValue::from_bool(a.iter().all(|av| {
-            b.iter().any(|bv| same_value_zero(vm, *av, *bv))
-        })))
+        let rec = get_set_record(vm, arg(args, 0))?;
+        if (set_len(vm, h) as f64) > rec.size {
+            return Ok(JsValue::FALSE);
+        }
+        for e in set_snapshot(vm, h) {
+            let in_other = vm.call_value(rec.has_fn, rec.obj, &[e])?;
+            if !vm.to_boolean(in_other) {
+                return Ok(JsValue::FALSE);
+            }
+        }
+        Ok(JsValue::TRUE)
     });
-    define_method(vm, sp, "isSupersetOf", |vm, this_val, args| {
+    define_method_len(vm, sp, "isSupersetOf", 1, |vm, this_val, args| {
         let h = require_set(vm, this_val)?;
-        let a = set_snapshot(vm, h);
-        let b = set_like_items(vm, arg(args, 0))?;
-        Ok(JsValue::from_bool(b.iter().all(|bv| {
-            a.iter().any(|av| same_value_zero(vm, *av, *bv))
-        })))
+        let rec = get_set_record(vm, arg(args, 0))?;
+        if (set_len(vm, h) as f64) < rec.size {
+            return Ok(JsValue::FALSE);
+        }
+        let (ih, next_m) = open_set_keys_iter(vm, &rec)?;
+        while let Some(e) = step_set_keys_iter(vm, ih, next_m)? {
+            if !set_has_entry(vm, h, e) {
+                vm.iterator_close_obj(ih, false)?;
+                return Ok(JsValue::FALSE);
+            }
+        }
+        Ok(JsValue::TRUE)
     });
-    define_method(vm, sp, "isDisjointFrom", |vm, this_val, args| {
+    define_method_len(vm, sp, "isDisjointFrom", 1, |vm, this_val, args| {
         let h = require_set(vm, this_val)?;
-        let a = set_snapshot(vm, h);
-        let b = set_like_items(vm, arg(args, 0))?;
-        Ok(JsValue::from_bool(!a.iter().any(|av| {
-            b.iter().any(|bv| same_value_zero(vm, *av, *bv))
-        })))
+        let rec = get_set_record(vm, arg(args, 0))?;
+        if (set_len(vm, h) as f64) <= rec.size {
+            for e in set_snapshot(vm, h) {
+                let in_other = vm.call_value(rec.has_fn, rec.obj, &[e])?;
+                if vm.to_boolean(in_other) {
+                    return Ok(JsValue::FALSE);
+                }
+            }
+        } else {
+            let (ih, next_m) = open_set_keys_iter(vm, &rec)?;
+            while let Some(e) = step_set_keys_iter(vm, ih, next_m)? {
+                if set_has_entry(vm, h, e) {
+                    vm.iterator_close_obj(ih, false)?;
+                    return Ok(JsValue::FALSE);
+                }
+            }
+        }
+        Ok(JsValue::TRUE)
     });
 
     let ctor = vm.alloc_native_fn("Set", |vm, _this, args| {
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("Constructor Set requires 'new'"));
+        }
+        let proto = proto_from_new_target_or(vm, vm.set_proto)?;
         let set_h = vm.heap.alloc_object(JsObject::with_kind(
             ObjectKind::Set(Box::default()),
-            Some(vm.set_proto),
+            Some(proto),
         ));
         let iterable = arg(args, 0);
         if !iterable.is_undefined() && !iterable.is_null() {
-            for item in vm.collect_iterable(iterable)? {
-                set_add_entry(vm, set_h, item);
+            let k_add = vm.heap.intern_key("add");
+            let adder = vm.get_property_by_key(set_h, k_add)?;
+            if !adder.as_object().is_some_and(|h| vm.is_callable_handle(h)) {
+                return Err(vm.type_error("Set.prototype.add is not a function"));
+            }
+            let iter = vm.create_iterator_public(iterable)?;
+            loop {
+                let (item, done) = vm.step_iterator_public(JsValue::from_object(iter))?;
+                if done {
+                    break;
+                }
+                if let Err(e) = vm.call_value(adder, JsValue::from_object(set_h), &[item]) {
+                    let _ = vm.iterator_close_handle(iter, true);
+                    return Err(e);
+                }
             }
         }
         Ok(JsValue::from_object(set_h))
     });
+    vm.set_fn_length(ctor, 0);
+    define_species_getter(vm, ctor);
     bind_ctor_proto(vm, ctor, sp);
     define_global(vm, "Set", JsValue::from_object(ctor));
 }
@@ -715,7 +993,7 @@ fn set_values_fn(
 }
 
 // ---------------------------------------------------------------------------
-// WeakMap, WeakSet, WeakRef (true GC-integrated weak references)
+// WeakMap, WeakSet, WeakRef, FinalizationRegistry (incl. ES2023 Symbol keys)
 // ---------------------------------------------------------------------------
 
 fn require_weakmap(vm: &mut JsVm, this_val: JsValue) -> Result<HeapHandle, JsException> {
@@ -732,81 +1010,164 @@ fn require_weakmap(vm: &mut JsVm, this_val: JsValue) -> Result<HeapHandle, JsExc
     }
 }
 
-fn install_weak_map(vm: &mut JsVm) {
-    let wp = vm.weakmap_proto;
-    define_method(vm, wp, "get", |vm, this_val, args| {
-        let h = require_weakmap(vm, this_val)?;
-        let Some(k) = arg(args, 0).as_object() else {
-            return Ok(JsValue::UNDEFINED);
-        };
+fn weakmap_get_entry(vm: &JsVm, wm_h: HeapHandle, key: JsValue) -> Option<JsValue> {
+    if !can_be_held_weakly(vm, key) {
+        return None;
+    }
+    if let Some(k) = key.as_object() {
         if !vm.heap.is_alive(k) {
-            return Ok(JsValue::UNDEFINED);
+            return None;
         }
-        let res = match vm.heap.get_object(h).map(|o| &o.kind) {
+        return match vm.heap.get_object(wm_h).map(|o| &o.kind) {
             Some(ObjectKind::WeakMap(m)) => m.get(&k).copied(),
             _ => None,
         };
-        Ok(res.unwrap_or(JsValue::UNDEFINED))
-    });
-    define_method(vm, wp, "has", |vm, this_val, args| {
-        let h = require_weakmap(vm, this_val)?;
-        let Some(k) = arg(args, 0).as_object() else {
-            return Ok(JsValue::FALSE);
-        };
-        let found = vm.heap.is_alive(k)
-            && match vm.heap.get_object(h).map(|o| &o.kind) {
-                Some(ObjectKind::WeakMap(m)) => m.contains_key(&k),
-                _ => false,
-            };
-        Ok(JsValue::from_bool(found))
-    });
-    define_method(vm, wp, "set", |vm, this_val, args| {
-        let h = require_weakmap(vm, this_val)?;
-        let Some(k) = arg(args, 0).as_object() else {
-            return Err(vm.type_error("Invalid value used as WeakMap key"));
-        };
-        let v = arg(args, 1);
-        if let Some(ObjectKind::WeakMap(m)) = vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
-            m.insert(k, v);
+    }
+    if let Some(sym) = key.as_symbol() {
+        return vm
+            .heap
+            .get_object(wm_h)
+            .and_then(|o| o.rare.as_ref())
+            .and_then(|r| r.weak_sym_map.get(&sym).copied());
+    }
+    None
+}
+
+fn weakmap_set_entry(
+    vm: &mut JsVm,
+    wm_h: HeapHandle,
+    key: JsValue,
+    val: JsValue,
+) -> Result<(), JsException> {
+    if !can_be_held_weakly(vm, key) {
+        return Err(vm.type_error("Invalid value used as WeakMap key"));
+    }
+    if let Some(k) = key.as_object() {
+        if let Some(ObjectKind::WeakMap(m)) = vm.heap.get_object_mut(wm_h).map(|o| &mut o.kind) {
+            m.insert(k, val);
         }
-        vm.heap.write_barrier(h, v);
+    } else if let Some(sym) = key.as_symbol() {
+        if let Some(o) = vm.heap.get_object_mut(wm_h) {
+            o.rare_mut().weak_sym_map.insert(sym, val);
+        }
+    }
+    vm.heap.write_barrier(wm_h, val);
+    Ok(())
+}
+
+fn install_weak_map(vm: &mut JsVm) {
+    let wp = vm.weakmap_proto;
+    define_method_len(vm, wp, "get", 1, |vm, this_val, args| {
+        let h = require_weakmap(vm, this_val)?;
+        Ok(weakmap_get_entry(vm, h, arg(args, 0)).unwrap_or(JsValue::UNDEFINED))
+    });
+    define_method_len(vm, wp, "has", 1, |vm, this_val, args| {
+        let h = require_weakmap(vm, this_val)?;
+        Ok(JsValue::from_bool(
+            weakmap_get_entry(vm, h, arg(args, 0)).is_some(),
+        ))
+    });
+    define_method_len(vm, wp, "set", 2, |vm, this_val, args| {
+        let h = require_weakmap(vm, this_val)?;
+        weakmap_set_entry(vm, h, arg(args, 0), arg(args, 1))?;
         Ok(this_val)
     });
-    define_method(vm, wp, "delete", |vm, this_val, args| {
+    define_method_len(vm, wp, "getOrInsert", 2, |vm, this_val, args| {
         let h = require_weakmap(vm, this_val)?;
-        let Some(k) = arg(args, 0).as_object() else {
+        let key = arg(args, 0);
+        if !can_be_held_weakly(vm, key) {
+            return Err(vm.type_error("Invalid value used as WeakMap key"));
+        }
+        if let Some(v) = weakmap_get_entry(vm, h, key) {
+            return Ok(v);
+        }
+        let default_v = arg(args, 1);
+        weakmap_set_entry(vm, h, key, default_v)?;
+        Ok(default_v)
+    });
+    define_method_len(vm, wp, "getOrInsertComputed", 2, |vm, this_val, args| {
+        let h = require_weakmap(vm, this_val)?;
+        let key = arg(args, 0);
+        let cb = arg(args, 1);
+        if !can_be_held_weakly(vm, key) {
+            return Err(vm.type_error("Invalid value used as WeakMap key"));
+        }
+        if !cb.as_object().is_some_and(|ch| vm.is_callable_handle(ch)) {
+            return Err(
+                vm.type_error("WeakMap.prototype.getOrInsertComputed callback is not a function")
+            );
+        }
+        if let Some(v) = weakmap_get_entry(vm, h, key) {
+            return Ok(v);
+        }
+        let val = vm.call_value(cb, JsValue::UNDEFINED, &[key])?;
+        weakmap_set_entry(vm, h, key, val)?;
+        Ok(val)
+    });
+    define_method_len(vm, wp, "delete", 1, |vm, this_val, args| {
+        let h = require_weakmap(vm, this_val)?;
+        let key = arg(args, 0);
+        if !can_be_held_weakly(vm, key) {
             return Ok(JsValue::FALSE);
-        };
-        let removed = match vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
-            Some(ObjectKind::WeakMap(m)) => m.remove(&k).is_some(),
-            _ => false,
+        }
+        let removed = if let Some(k) = key.as_object() {
+            match vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
+                Some(ObjectKind::WeakMap(m)) => m.remove(&k).is_some(),
+                _ => false,
+            }
+        } else if let Some(sym) = key.as_symbol() {
+            vm.heap
+                .get_object_mut(h)
+                .and_then(|o| o.rare.as_mut())
+                .is_some_and(|r| r.weak_sym_map.remove(&sym).is_some())
+        } else {
+            false
         };
         Ok(JsValue::from_bool(removed))
     });
+    define_to_string_tag(vm, wp, "WeakMap");
 
     let ctor = vm.alloc_native_fn("WeakMap", |vm, _this, args| {
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("Constructor WeakMap requires 'new'"));
+        }
+        let proto = proto_from_new_target_or(vm, vm.weakmap_proto)?;
         let wm = vm.heap.alloc_object(JsObject::with_kind(
             ObjectKind::WeakMap(Box::default()),
-            Some(vm.weakmap_proto),
+            Some(proto),
         ));
         let iterable = arg(args, 0);
         if !iterable.is_undefined() && !iterable.is_null() {
-            for item in vm.collect_iterable(iterable)? {
-                let k = vm.get_elem(item, JsValue::from_i32(0))?;
-                let Some(kh) = k.as_object() else {
-                    return Err(vm.type_error("Invalid value used as WeakMap key"));
-                };
-                let v = vm.get_elem(item, JsValue::from_i32(1))?;
-                if let Some(ObjectKind::WeakMap(m)) =
-                    vm.heap.get_object_mut(wm).map(|o| &mut o.kind)
-                {
-                    m.insert(kh, v);
+            let k_set = vm.heap.intern_key("set");
+            let adder = vm.get_property_by_key(wm, k_set)?;
+            if !adder.as_object().is_some_and(|h| vm.is_callable_handle(h)) {
+                return Err(vm.type_error("WeakMap.prototype.set is not a function"));
+            }
+            let iter = vm.create_iterator_public(iterable)?;
+            loop {
+                let (item, done) = vm.step_iterator_public(JsValue::from_object(iter))?;
+                if done {
+                    break;
                 }
-                vm.heap.write_barrier(wm, v);
+                if !item.is_object() {
+                    let _ = vm.iterator_close_handle(iter, true);
+                    return Err(vm.type_error("Iterator value is not an entry object"));
+                }
+                let res = (|| -> Result<(), JsException> {
+                    let k = vm.get_elem(item, JsValue::from_i32(0))?;
+                    let v = vm.get_elem(item, JsValue::from_i32(1))?;
+                    vm.call_value(adder, JsValue::from_object(wm), &[k, v])?;
+                    Ok(())
+                })();
+                if let Err(e) = res {
+                    let _ = vm.iterator_close_handle(iter, true);
+                    return Err(e);
+                }
             }
         }
         Ok(JsValue::from_object(wm))
     });
+    vm.set_fn_length(ctor, 0);
     bind_ctor_proto(vm, ctor, wp);
     define_global(vm, "WeakMap", JsValue::from_object(ctor));
 }
@@ -827,70 +1188,117 @@ fn require_weakset(vm: &mut JsVm, this_val: JsValue) -> Result<HeapHandle, JsExc
 
 fn install_weak_set(vm: &mut JsVm) {
     let wp = vm.weakset_proto;
-    define_method(vm, wp, "add", |vm, this_val, args| {
+    define_method_len(vm, wp, "add", 1, |vm, this_val, args| {
         let h = require_weakset(vm, this_val)?;
-        let Some(k) = arg(args, 0).as_object() else {
+        let val = arg(args, 0);
+        if !can_be_held_weakly(vm, val) {
             return Err(vm.type_error("Invalid value used in WeakSet"));
-        };
-        if let Some(ObjectKind::WeakSet(s)) = vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
-            s.insert(k);
+        }
+        if let Some(k) = val.as_object() {
+            if let Some(ObjectKind::WeakSet(s)) = vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
+                s.insert(k);
+            }
+        } else if let Some(sym) = val.as_symbol() {
+            if let Some(o) = vm.heap.get_object_mut(h) {
+                o.rare_mut().weak_sym_set.insert(sym);
+            }
         }
         Ok(this_val)
     });
-    define_method(vm, wp, "has", |vm, this_val, args| {
+    define_method_len(vm, wp, "has", 1, |vm, this_val, args| {
         let h = require_weakset(vm, this_val)?;
-        let Some(k) = arg(args, 0).as_object() else {
+        let val = arg(args, 0);
+        if !can_be_held_weakly(vm, val) {
             return Ok(JsValue::FALSE);
+        }
+        let found = if let Some(k) = val.as_object() {
+            vm.heap.is_alive(k)
+                && match vm.heap.get_object(h).map(|o| &o.kind) {
+                    Some(ObjectKind::WeakSet(s)) => s.contains(&k),
+                    _ => false,
+                }
+        } else if let Some(sym) = val.as_symbol() {
+            vm.heap
+                .get_object(h)
+                .and_then(|o| o.rare.as_ref())
+                .is_some_and(|r| r.weak_sym_set.contains(&sym))
+        } else {
+            false
         };
-        let found = vm.heap.is_alive(k)
-            && match vm.heap.get_object(h).map(|o| &o.kind) {
-                Some(ObjectKind::WeakSet(s)) => s.contains(&k),
-                _ => false,
-            };
         Ok(JsValue::from_bool(found))
     });
-    define_method(vm, wp, "delete", |vm, this_val, args| {
+    define_method_len(vm, wp, "delete", 1, |vm, this_val, args| {
         let h = require_weakset(vm, this_val)?;
-        let Some(k) = arg(args, 0).as_object() else {
+        let val = arg(args, 0);
+        if !can_be_held_weakly(vm, val) {
             return Ok(JsValue::FALSE);
-        };
-        let removed = match vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
-            Some(ObjectKind::WeakSet(s)) => s.remove(&k),
-            _ => false,
+        }
+        let removed = if let Some(k) = val.as_object() {
+            match vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
+                Some(ObjectKind::WeakSet(s)) => s.remove(&k),
+                _ => false,
+            }
+        } else if let Some(sym) = val.as_symbol() {
+            vm.heap
+                .get_object_mut(h)
+                .and_then(|o| o.rare.as_mut())
+                .is_some_and(|r| r.weak_sym_set.remove(&sym))
+        } else {
+            false
         };
         Ok(JsValue::from_bool(removed))
     });
+    define_to_string_tag(vm, wp, "WeakSet");
 
     let ctor = vm.alloc_native_fn("WeakSet", |vm, _this, args| {
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("Constructor WeakSet requires 'new'"));
+        }
+        let proto = proto_from_new_target_or(vm, vm.weakset_proto)?;
         let ws = vm.heap.alloc_object(JsObject::with_kind(
             ObjectKind::WeakSet(Box::default()),
-            Some(vm.weakset_proto),
+            Some(proto),
         ));
         let iterable = arg(args, 0);
         if !iterable.is_undefined() && !iterable.is_null() {
-            for item in vm.collect_iterable(iterable)? {
-                let Some(kh) = item.as_object() else {
-                    return Err(vm.type_error("Invalid value used in WeakSet"));
-                };
-                if let Some(ObjectKind::WeakSet(s)) =
-                    vm.heap.get_object_mut(ws).map(|o| &mut o.kind)
-                {
-                    s.insert(kh);
+            let k_add = vm.heap.intern_key("add");
+            let adder = vm.get_property_by_key(ws, k_add)?;
+            if !adder.as_object().is_some_and(|h| vm.is_callable_handle(h)) {
+                return Err(vm.type_error("WeakSet.prototype.add is not a function"));
+            }
+            let iter = vm.create_iterator_public(iterable)?;
+            loop {
+                let (item, done) = vm.step_iterator_public(JsValue::from_object(iter))?;
+                if done {
+                    break;
+                }
+                if let Err(e) = vm.call_value(adder, JsValue::from_object(ws), &[item]) {
+                    let _ = vm.iterator_close_handle(iter, true);
+                    return Err(e);
                 }
             }
         }
         Ok(JsValue::from_object(ws))
     });
+    vm.set_fn_length(ctor, 0);
     bind_ctor_proto(vm, ctor, wp);
     define_global(vm, "WeakSet", JsValue::from_object(ctor));
 }
 
 fn install_weak_ref(vm: &mut JsVm) {
     let rp = vm.weakref_proto;
-    define_method(vm, rp, "deref", |vm, this_val, _| {
+    define_method_len(vm, rp, "deref", 0, |vm, this_val, _| {
         let Some(h) = this_val.as_object() else {
             return Err(vm.type_error("Incompatible WeakRef receiver"));
         };
+        if let Some(sym) = vm
+            .heap
+            .get_object(h)
+            .and_then(|o| o.rare.as_ref())
+            .and_then(|r| r.weak_ref_sym)
+        {
+            return Ok(JsValue::from_symbol(sym));
+        }
         let target = match vm.heap.get_object(h).map(|o| &o.kind) {
             Some(ObjectKind::WeakRef(t)) => *t,
             _ => return Err(vm.type_error("Incompatible WeakRef receiver")),
@@ -901,19 +1309,149 @@ fn install_weak_ref(vm: &mut JsVm) {
             Ok(JsValue::UNDEFINED)
         }
     });
+    define_to_string_tag(vm, rp, "WeakRef");
 
     let ctor = vm.alloc_native_fn("WeakRef", |vm, _this, args| {
-        let Some(target) = arg(args, 0).as_object() else {
-            return Err(vm.type_error("WeakRef target must be an object"));
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("Constructor WeakRef requires 'new'"));
+        }
+        let target_v = arg(args, 0);
+        if !can_be_held_weakly(vm, target_v) {
+            return Err(vm.type_error("WeakRef target must be an object or non-registered symbol"));
+        }
+        let proto = proto_from_new_target_or(vm, vm.weakref_proto)?;
+        let wr = if let Some(target) = target_v.as_object() {
+            vm.heap.alloc_object(JsObject::with_kind(
+                ObjectKind::WeakRef(target),
+                Some(proto),
+            ))
+        } else {
+            let h = vm
+                .heap
+                .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+            if let Some(o) = vm.heap.get_object_mut(h) {
+                o.rare_mut().weak_ref_sym = target_v.as_symbol();
+            }
+            h
         };
-        let wr = vm.heap.alloc_object(JsObject::with_kind(
-            ObjectKind::WeakRef(target),
-            Some(vm.weakref_proto),
-        ));
         Ok(JsValue::from_object(wr))
     });
+    vm.set_fn_length(ctor, 1);
     bind_ctor_proto(vm, ctor, rp);
     define_global(vm, "WeakRef", JsValue::from_object(ctor));
+}
+
+/// ECMA-262 §26.2 `FinalizationRegistry`.
+fn install_finalization_registry(vm: &mut JsVm) {
+    type RegistryCells = std::rc::Rc<
+        std::cell::RefCell<
+            std::collections::HashMap<HeapHandle, Vec<(JsValue, JsValue, Option<JsValue>)>>,
+        >,
+    >;
+    let registries: RegistryCells = Default::default();
+    let proto = vm.finalization_registry_proto;
+
+    {
+        let regs = std::rc::Rc::clone(&registries);
+        let reg_fn = vm.alloc_host_fn("register", move |vm, this_val, args| {
+            let Some(h) = this_val.as_object() else {
+                return Err(vm.type_error("Incompatible FinalizationRegistry receiver"));
+            };
+            if !regs.borrow().contains_key(&h) {
+                return Err(vm.type_error("Incompatible FinalizationRegistry receiver"));
+            }
+            let target = arg(args, 0);
+            if !can_be_held_weakly(vm, target) {
+                return Err(vm.type_error("FinalizationRegistry target cannot be held weakly"));
+            }
+            let held = arg(args, 1);
+            if vm.strict_eq(target, held) {
+                return Err(
+                    vm.type_error("FinalizationRegistry target and heldValue cannot be identical")
+                );
+            }
+            let token_v = arg(args, 2);
+            let token = if token_v.is_undefined() {
+                None
+            } else if can_be_held_weakly(vm, token_v) {
+                Some(token_v)
+            } else {
+                return Err(
+                    vm.type_error("FinalizationRegistry unregisterToken cannot be held weakly")
+                );
+            };
+            if let Some(cells) = regs.borrow_mut().get_mut(&h) {
+                cells.push((target, held, token));
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+        vm.set_fn_length(reg_fn, 2);
+        let k_reg = vm.heap.intern_key("register");
+        vm.heap.object_define_data(
+            proto,
+            k_reg,
+            JsValue::from_object(reg_fn),
+            PropertyAttrs::METHOD,
+            &mut vm.shapes,
+        );
+    }
+    {
+        let regs = std::rc::Rc::clone(&registries);
+        let unreg_fn = vm.alloc_host_fn("unregister", move |vm, this_val, args| {
+            let Some(h) = this_val.as_object() else {
+                return Err(vm.type_error("Incompatible FinalizationRegistry receiver"));
+            };
+            if !regs.borrow().contains_key(&h) {
+                return Err(vm.type_error("Incompatible FinalizationRegistry receiver"));
+            }
+            let token = arg(args, 0);
+            if !can_be_held_weakly(vm, token) {
+                return Err(
+                    vm.type_error("FinalizationRegistry unregisterToken cannot be held weakly")
+                );
+            }
+            let mut removed = false;
+            if let Some(cells) = regs.borrow_mut().get_mut(&h) {
+                let before = cells.len();
+                cells.retain(|(_, _, t)| !t.is_some_and(|tv| vm.strict_eq(tv, token)));
+                removed = cells.len() < before;
+            }
+            Ok(JsValue::from_bool(removed))
+        });
+        vm.set_fn_length(unreg_fn, 1);
+        let k_unreg = vm.heap.intern_key("unregister");
+        vm.heap.object_define_data(
+            proto,
+            k_unreg,
+            JsValue::from_object(unreg_fn),
+            PropertyAttrs::METHOD,
+            &mut vm.shapes,
+        );
+    }
+    define_to_string_tag(vm, proto, "FinalizationRegistry");
+
+    let regs = registries;
+    let ctor = vm.alloc_host_fn("FinalizationRegistry", move |vm, _this, args| {
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("Constructor FinalizationRegistry requires 'new'"));
+        }
+        let cb = arg(args, 0);
+        let Some(cb_h) = cb.as_object().filter(|&x| vm.is_callable_handle(x)) else {
+            return Err(vm.type_error("FinalizationRegistry cleanupCallback must be a function"));
+        };
+        let obj_proto = proto_from_new_target_or(vm, vm.finalization_registry_proto)?;
+        let h = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(obj_proto)));
+        if let Some(o) = vm.heap.get_object_mut(h) {
+            o.extra_refs.push(cb_h);
+        }
+        regs.borrow_mut().insert(h, Vec::new());
+        Ok(JsValue::from_object(h))
+    });
+    vm.set_fn_length(ctor, 1);
+    bind_ctor_proto(vm, ctor, proto);
+    define_global(vm, "FinalizationRegistry", JsValue::from_object(ctor));
 }
 
 // ---------------------------------------------------------------------------
@@ -1510,7 +2048,7 @@ fn install_data_view(vm: &mut JsVm) {
 // TypedArray (all 9 numeric views)
 // ---------------------------------------------------------------------------
 
-fn f16_to_f64(bits: u16) -> f64 {
+pub(crate) fn f16_to_f64(bits: u16) -> f64 {
     let (s, e, m) = (
         u32::from(bits >> 15) << 31,
         u32::from((bits >> 10) & 0x1F),
@@ -1529,7 +2067,7 @@ fn f16_to_f64(bits: u16) -> f64 {
 }
 
 /// Exact IEEE-754 binary64 -> binary16 (round-to-nearest-even without f32 double-rounding).
-fn f64_to_f16(val: f64) -> u16 {
+pub(crate) fn f64_to_f16(val: f64) -> u16 {
     let bits = val.to_bits();
     let sign = ((bits >> 48) & 0x8000) as u16;
     let exp = ((bits >> 52) & 0x7FF) as i32;

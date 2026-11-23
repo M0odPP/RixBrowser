@@ -221,6 +221,7 @@ pub struct JsVm {
     pub weakmap_proto: HeapHandle,
     pub weakset_proto: HeapHandle,
     pub weakref_proto: HeapHandle,
+    pub finalization_registry_proto: HeapHandle,
     pub array_buffer_proto: HeapHandle,
     pub shared_array_buffer_proto: HeapHandle,
     pub data_view_proto: HeapHandle,
@@ -422,6 +423,7 @@ impl JsVm {
         let weakmap_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let weakset_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let weakref_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let finalization_registry_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let array_buffer_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let shared_array_buffer_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let data_view_proto = make_proto(&mut heap, &mut shapes, object_proto);
@@ -520,6 +522,7 @@ impl JsVm {
             weakmap_proto,
             weakset_proto,
             weakref_proto,
+            finalization_registry_proto,
             array_buffer_proto,
             shared_array_buffer_proto,
             data_view_proto,
@@ -703,6 +706,7 @@ impl JsVm {
             self.weakmap_proto,
             self.weakset_proto,
             self.weakref_proto,
+            self.finalization_registry_proto,
             self.array_buffer_proto,
             self.shared_array_buffer_proto,
             self.data_view_proto,
@@ -3901,7 +3905,16 @@ impl JsVm {
             return self.get_property_with_receiver(self.string_proto, k, obj_val);
         }
         let Some(obj) = obj_val.as_object() else {
-            return Ok(JsValue::UNDEFINED);
+            let proto = match obj_val.kind() {
+                JsValueKind::Int32(_) | JsValueKind::Float(_) => self.number_proto,
+                JsValueKind::Bool(_) => self.boolean_proto,
+                JsValueKind::BigInt(_) => self.bigint_proto,
+                JsValueKind::Symbol(_) => self.symbol_proto,
+                _ => return Ok(JsValue::UNDEFINED),
+            };
+            let ks = self.to_property_key(key_val)?;
+            let k = self.heap.intern_key(&ks);
+            return self.get_property_with_receiver(proto, k, obj_val);
         };
         if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
             let ks = self.to_property_key(key_val)?;
@@ -5921,6 +5934,9 @@ impl JsVm {
         let err_obj = self
             .heap
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+        if let Some(o) = self.heap.get_object_mut(err_obj) {
+            o.rare_mut().is_error_data = true;
+        }
         let is_known_builtin = matches!(
             name,
             "Error"

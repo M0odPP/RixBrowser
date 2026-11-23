@@ -60,6 +60,9 @@ pub(crate) fn alloc_suppressed_error(
         ObjectKind::Ordinary,
         Some(vm.suppressed_error_proto),
     ));
+    if let Some(o) = vm.heap.get_object_mut(obj) {
+        o.rare_mut().is_error_data = true;
+    }
     if let Some(msg) = message {
         let mv = JsValue::from_string(vm.heap.alloc_string(msg));
         vm.heap.object_define_data(
@@ -114,6 +117,9 @@ fn install_suppressed_error(vm: &mut JsVm) {
         let err_obj = vm
             .heap
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(obj_proto)));
+        if let Some(o) = vm.heap.get_object_mut(err_obj) {
+            o.rare_mut().is_error_data = true;
+        }
         let error_v = arg(args, 0);
         let suppressed_v = arg(args, 1);
         let msg_v = arg(args, 2);

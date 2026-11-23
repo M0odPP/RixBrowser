@@ -468,6 +468,16 @@ pub struct RareObjectData {
     pub view_auto_length: bool,
     /// Explicit Resource Management stack slot (`[[DisposableState]]` / `[[DisposeCapability]]`).
     pub disposable_stack: Option<Box<DisposableStackData>>,
+    /// `[[ErrorData]]` internal brand for `Error.isError`.
+    pub is_error_data: bool,
+    /// `[[IsRawJSON]]` internal brand for `JSON.rawJSON` / `JSON.isRawJSON`.
+    pub is_raw_json: bool,
+    /// Non-registered Symbol keys stored weakly in `WeakMap` (ECMA-262 ES2023).
+    pub weak_sym_map: HashMap<crate::value::SymbolId, JsValue>,
+    /// Non-registered Symbol entries stored weakly in `WeakSet` (ECMA-262 ES2023).
+    pub weak_sym_set: HashSet<crate::value::SymbolId>,
+    /// Non-registered Symbol target held by a `WeakRef` (ECMA-262 ES2023).
+    pub weak_ref_sym: Option<crate::value::SymbolId>,
 }
 
 /// Specialized runtime tag for a [`JsObject`].
@@ -682,6 +692,11 @@ impl JsObject {
                     if let Some(m) = entry.method {
                         visit(m);
                     }
+                }
+            }
+            for &val in rare.weak_sym_map.values() {
+                if let Some(h) = val.as_heap_handle() {
+                    visit(h);
                 }
             }
         }
