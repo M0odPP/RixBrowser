@@ -2,7 +2,7 @@
 //! write barriers, root stack discipline, and leak-free weak handle tables
 //! (`WeakHeapHandle` / `WeakTable`) ready for DOM wrappers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::time::Instant;
 
@@ -160,6 +160,8 @@ pub struct SuspendedFrame {
     pub this_val: JsValue,
     pub callee: HeapHandle,
     pub saved_regs: Vec<JsValue>,
+    /// Original invocation arguments preserved for lazy `arguments` materialization.
+    pub call_args: Vec<JsValue>,
     /// Open upvalue cells `(relative_reg_offset, cell_handle)` detached on suspend
     /// and re-attached on resume so closures stay live across `await`/`yield`.
     pub saved_upvalues: Vec<(usize, HeapHandle)>,
@@ -173,6 +175,11 @@ impl SuspendedFrame {
         }
         visit(self.callee);
         for &v in &self.saved_regs {
+            if let Some(h) = v.as_heap_handle() {
+                visit(h);
+            }
+        }
+        for &v in &self.call_args {
             if let Some(h) = v.as_heap_handle() {
                 visit(h);
             }
@@ -226,25 +233,60 @@ pub enum GeneratorState {
     Completed,
 }
 
-/// Backing storage for an ECMAScript `Generator` object (`function*`).
+/// Queued request kind for an ECMAScript `AsyncGenerator` (`async function*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncGeneratorRequestKind {
+    Next,
+    Return,
+    Throw,
+}
+
+/// Queued step request waiting on an executing `AsyncGenerator`.
+#[derive(Debug, Clone, Copy)]
+pub struct AsyncGeneratorRequest {
+    pub kind: AsyncGeneratorRequestKind,
+    pub value: JsValue,
+    pub promise: HeapHandle,
+}
+
+/// Backing storage for an ECMAScript `Generator` or `AsyncGenerator` object.
 #[derive(Debug, Clone)]
 pub struct GeneratorObject {
     pub state: GeneratorState,
     pub frame: Option<SuspendedFrame>,
     pub delegate_iter: Option<HeapHandle>,
+    pub is_async: bool,
+    pub pending_requests: VecDeque<AsyncGeneratorRequest>,
 }
 
 /// Getter/setter handle pair for accessor properties.
 pub type AccessorPair = (Option<HeapHandle>, Option<HeapHandle>);
 
+/// Private class element storage entry (ECMA-262 §7.3.26–7.3.30).
+#[derive(Debug, Clone, Copy)]
+pub enum PrivateEntry {
+    Field(JsValue),
+    Method(HeapHandle),
+    Accessor(Option<HeapHandle>, Option<HeapHandle>),
+}
+
+/// Metadata attached to a class constructor for `InitializeInstanceElements`.
+#[derive(Debug, Clone, Copy)]
+pub struct ClassInstanceInit {
+    pub proto: HeapHandle,
+    pub field_init_fn: Option<HeapHandle>,
+    pub is_derived: bool,
+}
+
 /// Cold out-of-line object metadata (only allocated for dictionary-mode objects,
-/// accessors, or private fields so ordinary shaped objects stay compact in cache).
+/// accessors, class constructors, or private fields so ordinary shaped objects stay compact in cache).
 #[derive(Debug, Clone, Default)]
 pub struct RareObjectData {
     pub dict_props: HashMap<PropertyKey, DictProperty>,
     pub dict_order: Vec<PropertyKey>,
     pub accessors: HashMap<PropertyKey, AccessorPair>,
-    pub private_fields: HashMap<PropertyKey, JsValue>,
+    pub private_fields: HashMap<PropertyKey, PrivateEntry>,
+    pub class_instance_init: Option<ClassInstanceInit>,
 }
 
 /// Specialized runtime tag for a [`JsObject`].
@@ -418,9 +460,28 @@ impl JsObject {
                     visit(h);
                 }
             }
-            for &val in rare.private_fields.values() {
-                if let Some(h) = val.as_heap_handle() {
-                    visit(h);
+            for entry in rare.private_fields.values() {
+                match *entry {
+                    PrivateEntry::Field(val) => {
+                        if let Some(h) = val.as_heap_handle() {
+                            visit(h);
+                        }
+                    }
+                    PrivateEntry::Method(h) => visit(h),
+                    PrivateEntry::Accessor(g, s) => {
+                        if let Some(h) = g {
+                            visit(h);
+                        }
+                        if let Some(h) = s {
+                            visit(h);
+                        }
+                    }
+                }
+            }
+            if let Some(init) = rare.class_instance_init {
+                visit(init.proto);
+                if let Some(f) = init.field_init_fn {
+                    visit(f);
                 }
             }
         }
@@ -501,6 +562,12 @@ impl JsObject {
                 }
                 if let Some(d) = g.delegate_iter {
                     visit(d);
+                }
+                for req in &g.pending_requests {
+                    if let Some(h) = req.value.as_heap_handle() {
+                        visit(h);
+                    }
+                    visit(req.promise);
                 }
             }
             // WeakMap, WeakSet, and WeakRef do NOT strongly trace weak keys or targets.

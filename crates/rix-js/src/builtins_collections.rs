@@ -1450,6 +1450,13 @@ fn construct_typed_array(
 
 fn install_typed_arrays(vm: &mut JsVm) {
     let tap = vm.typed_array_proto;
+    // Shared `%TypedArray%` intrinsic constructor (ECMA-262 §23.2.1):
+    // `Object.getPrototypeOf(Int8Array) === %TypedArray%` and `%TypedArray%.prototype === tap`.
+    let typed_array_ctor = vm.alloc_native_fn("TypedArray", |vm, _, _| {
+        Err(vm.type_error("Abstract class TypedArray not directly constructable"))
+    });
+    bind_ctor_proto(vm, typed_array_ctor, tap);
+
     define_getter(vm, tap, "buffer", |vm, t, _| {
         let ta = require_typed_array(vm, t)?;
         Ok(JsValue::from_object(ta.buffer))
@@ -1842,6 +1849,8 @@ fn install_typed_arrays(vm: &mut JsVm) {
             &mut vm.shapes,
         );
         bind_ctor_proto(vm, ctor, proto);
+        vm.heap
+            .object_set_prototype(ctor, Some(typed_array_ctor), &mut vm.shapes);
         define_global(vm, kind.name(), JsValue::from_object(ctor));
     }
 }

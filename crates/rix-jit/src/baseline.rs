@@ -237,6 +237,7 @@ pub fn compile_baseline_function(
             | Opcode::DefineProp
             | Opcode::GetPrivate
             | Opcode::SetPrivate
+            | Opcode::DefinePrivate
             | Opcode::InPrivate
             | Opcode::CreateClass
             | Opcode::CallMethod => resolve_wide(func, scan_pc, false).1,
@@ -850,6 +851,7 @@ fn advance_pc(func: &FunctionBytecode, pc: usize, op: Opcode) -> usize {
         | Opcode::DefineProp
         | Opcode::GetPrivate
         | Opcode::SetPrivate
+        | Opcode::DefinePrivate
         | Opcode::InPrivate
         | Opcode::CreateClass
         | Opcode::CallMethod => resolve_wide(func, pc, false).1,

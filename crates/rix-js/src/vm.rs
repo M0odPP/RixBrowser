@@ -14,8 +14,8 @@ use crate::bytecode::{
 };
 use crate::compiler::{compile, CompileError};
 use crate::heap::{
-    ClosureObject, GcCycleStats, GcHeap, JsObject, ObjectKind, ProxyObject, RegExpObject,
-    SuspendedFrame,
+    ClassInstanceInit, ClosureObject, GcCycleStats, GcHeap, JsObject, ObjectKind, PrivateEntry,
+    ProxyObject, RegExpObject, SuspendedFrame,
 };
 use crate::ic::{IcEntry, IcStats, IcTable, MegamorphicCache};
 use crate::modules::ModuleEnv;
@@ -158,6 +158,8 @@ struct CallFrame {
     ret_dst: Option<usize>,
     construct_obj: Option<HeapHandle>,
     new_target: JsValue,
+    call_args: Vec<JsValue>,
+    arguments_obj: Option<HeapHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +168,7 @@ enum IteratorState {
     String { chars: Vec<char>, index: usize },
     Keys { keys: Vec<String>, index: usize },
     Custom { iter_obj: HeapHandle },
+    AsyncCustom { iter_obj: HeapHandle },
 }
 
 /// Core pure-Rust Register Bytecode Virtual Machine (`#![deny(unsafe_code)]`).
@@ -195,8 +198,11 @@ pub struct JsVm {
     pub typed_array_protos: [HeapHandle; 9],
     pub promise_proto: HeapHandle,
     pub generator_proto: HeapHandle,
+    pub async_generator_proto: HeapHandle,
     pub sym_iterator: SymbolId,
     pub key_symbol_iterator: PropertyKey,
+    pub sym_async_iterator: SymbolId,
+    pub key_symbol_async_iterator: PropertyKey,
     pub symbol_registry: HashMap<String, SymbolId>,
     pub symbol_descriptions: HashMap<SymbolId, String>,
     pub rng_state: u64,
@@ -317,9 +323,13 @@ impl JsVm {
             std::array::from_fn(|_| make_proto(&mut heap, &mut shapes, typed_array_proto));
         let promise_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let generator_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let async_generator_proto = make_proto(&mut heap, &mut shapes, object_proto);
 
         let sym_iterator = heap.alloc_symbol(Some("Symbol.iterator".into()));
         let key_symbol_iterator = heap.intern_key(&format!("Symbol({})", sym_iterator.0));
+        let sym_async_iterator = heap.alloc_symbol(Some("Symbol.asyncIterator".into()));
+        let key_symbol_async_iterator =
+            heap.intern_key(&format!("Symbol({})", sym_async_iterator.0));
 
         let global = heap.alloc_empty_object();
         heap.object_set_prototype(global, Some(object_proto), &mut shapes);
@@ -370,8 +380,11 @@ impl JsVm {
             typed_array_protos,
             promise_proto,
             generator_proto,
+            async_generator_proto,
             sym_iterator,
             key_symbol_iterator,
+            sym_async_iterator,
+            key_symbol_async_iterator,
             symbol_registry: HashMap::new(),
             symbol_descriptions: HashMap::new(),
             rng_state: 0x9E37_79B9_7F4A_7C15,
@@ -493,6 +506,7 @@ impl JsVm {
             self.typed_array_proto,
             self.promise_proto,
             self.generator_proto,
+            self.async_generator_proto,
         ] {
             roots.push(JsValue::from_object(h));
         }
@@ -513,6 +527,10 @@ impl JsVm {
                 roots.push(JsValue::from_object(c));
             }
             roots.push(f.new_target);
+            roots.extend_from_slice(&f.call_args);
+            if let Some(a) = f.arguments_obj {
+                roots.push(JsValue::from_object(a));
+            }
         }
         for &(_, uv) in &self.open_upvalues {
             roots.push(JsValue::from_object(uv));
@@ -524,7 +542,9 @@ impl JsVm {
             roots.push(JsValue::from_object(iter_h));
             match state {
                 IteratorState::Array { arr, .. } => roots.push(JsValue::from_object(*arr)),
-                IteratorState::Custom { iter_obj } => roots.push(JsValue::from_object(*iter_obj)),
+                IteratorState::Custom { iter_obj } | IteratorState::AsyncCustom { iter_obj } => {
+                    roots.push(JsValue::from_object(*iter_obj))
+                }
                 IteratorState::String { .. } | IteratorState::Keys { .. } => {}
             }
         }
@@ -786,30 +806,6 @@ impl JsVm {
             p_obj.is_prototype = true;
         }
 
-        // Run instance class field initializer if attached to constructor.
-        if let Some(ObjectKind::Closure(c)) = self.heap.get_object(callee).map(|o| o.kind.clone()) {
-            if let Some((prog_id, field_fn)) = c.field_init {
-                let init_fn = self.heap.alloc_object(JsObject::with_kind(
-                    ObjectKind::Closure(Box::new(ClosureObject {
-                        program_id: prog_id,
-                        func_idx: field_fn,
-                        upvalues: Vec::new(),
-                        bound_this: None,
-                        super_ctor: None,
-                        field_init: None,
-                    })),
-                    Some(self.function_proto),
-                ));
-                self.call_handle(
-                    init_fn,
-                    JsValue::from_object(instance),
-                    &[],
-                    None,
-                    JsValue::UNDEFINED,
-                )?;
-            }
-        }
-
         let res = self.call_handle(
             callee,
             JsValue::from_object(instance),
@@ -850,11 +846,25 @@ impl JsVm {
         construct_obj: Option<HeapHandle>,
         new_target: JsValue,
     ) -> Result<JsValue, JsException> {
-        let kind = self
+        let (kind, class_init) = self
             .heap
             .get_object(callee)
-            .map(|o| o.kind.clone())
+            .map(|o| {
+                (
+                    o.kind.clone(),
+                    o.rare.as_ref().and_then(|r| r.class_instance_init),
+                )
+            })
             .ok_or_else(|| self.type_error("Attempted to call dead object handle"))?;
+
+        if let Some(init) = class_init {
+            let Some(inst_h) = construct_obj else {
+                return Err(self.type_error("Class constructor cannot be invoked without 'new'"));
+            };
+            if !init.is_derived {
+                self.init_class_instance(callee, inst_h)?;
+            }
+        }
 
         match kind {
             ObjectKind::NativeFunction(id) => {
@@ -916,6 +926,17 @@ impl JsVm {
                         this_val
                     }
                 });
+                if is_generator && is_async {
+                    let gen_h = crate::promise::create_async_generator(
+                        self,
+                        callee,
+                        closure.program_id,
+                        closure.func_idx,
+                        effective_this,
+                        args,
+                    );
+                    return Ok(JsValue::from_object(gen_h));
+                }
                 if is_generator {
                     let gen_h = crate::promise::create_generator(
                         self,
@@ -1007,6 +1028,8 @@ impl JsVm {
             ret_dst,
             construct_obj,
             new_target,
+            call_args: args.to_vec(),
+            arguments_obj: None,
         });
         Ok(())
     }
@@ -1042,6 +1065,8 @@ impl JsVm {
             ret_dst: None,
             construct_obj: None,
             new_target: JsValue::UNDEFINED,
+            call_args: frame.call_args.clone(),
+            arguments_obj: None,
         });
         base_reg
     }
@@ -1083,6 +1108,20 @@ impl JsVm {
         self.step_iterator(iter_val)
     }
 
+    pub(crate) fn create_async_iterator_public(
+        &mut self,
+        iterable: JsValue,
+    ) -> Result<HeapHandle, JsException> {
+        self.create_async_iterator(iterable)
+    }
+
+    pub(crate) fn step_async_iterator_public(
+        &mut self,
+        iter_val: JsValue,
+    ) -> Result<JsValue, JsException> {
+        self.step_async_iterator(iter_val)
+    }
+
     fn suspend_top_frame(&mut self, resume_dst: u8) -> SuspendedFrame {
         let top = self.frames.pop().expect("active frame to suspend");
         // Snapshot open upvalues in this frame so closures see current values while suspended
@@ -1112,6 +1151,7 @@ impl JsVm {
             this_val: top.this_val,
             callee: top.callee,
             saved_regs,
+            call_args: top.call_args,
             saved_upvalues,
             resume_dst,
         }
@@ -1541,7 +1581,8 @@ impl JsVm {
             Opcode::CreateClass => {
                 let super_val = self.registers[base + usize::from(inst.b())];
                 let const_idx = self.resolve_ic_idx(inst, prog_id, func_idx, frame_idx);
-                let cls_obj = self.instantiate_class(prog_id, func_idx, const_idx, super_val)?;
+                let cls_obj = self
+                    .instantiate_class(prog_id, func_idx, const_idx, super_val, frame_idx, base)?;
                 self.registers[a] = JsValue::from_object(cls_obj);
             }
             Opcode::GetProp => {
@@ -1644,7 +1685,7 @@ impl JsVm {
                 let Some(obj) = obj_val.as_object() else {
                     return Err(self.type_error("Cannot read private member from non-object"));
                 };
-                let val = self
+                let entry = self
                     .heap
                     .get_object(obj)
                     .and_then(|o| o.rare.as_ref())
@@ -1652,6 +1693,18 @@ impl JsVm {
                     .ok_or_else(|| {
                         self.type_error("Cannot read private member from object without it")
                     })?;
+                let val = match entry {
+                    PrivateEntry::Field(v) => v,
+                    PrivateEntry::Method(h) => JsValue::from_object(h),
+                    PrivateEntry::Accessor(Some(g), _) => {
+                        self.call_value(JsValue::from_object(g), obj_val, &[])?
+                    }
+                    PrivateEntry::Accessor(None, _) => {
+                        return Err(
+                            self.type_error("Cannot read private accessor without a getter")
+                        );
+                    }
+                };
                 self.registers[a] = val;
             }
             Opcode::SetPrivate => {
@@ -1662,8 +1715,56 @@ impl JsVm {
                 let Some(obj) = obj_val.as_object() else {
                     return Err(self.type_error("Cannot write private member on non-object"));
                 };
+                let entry = self
+                    .heap
+                    .get_object(obj)
+                    .and_then(|o| o.rare.as_ref())
+                    .and_then(|r| r.private_fields.get(&key).copied())
+                    .ok_or_else(|| {
+                        self.type_error("Cannot write private member to object without it")
+                    })?;
+                match entry {
+                    PrivateEntry::Field(_) => {
+                        if let Some(o) = self.heap.get_object_mut(obj) {
+                            o.rare_mut()
+                                .private_fields
+                                .insert(key, PrivateEntry::Field(val));
+                        }
+                        self.heap.write_barrier(obj, val);
+                    }
+                    PrivateEntry::Method(_) => {
+                        return Err(self.type_error("Private method is not writable"));
+                    }
+                    PrivateEntry::Accessor(_, Some(s)) => {
+                        self.call_value(JsValue::from_object(s), obj_val, &[val])?;
+                    }
+                    PrivateEntry::Accessor(_, None) => {
+                        return Err(self.type_error("Private accessor has no setter"));
+                    }
+                }
+            }
+            Opcode::DefinePrivate => {
+                let obj_val = self.registers[a];
+                let val = self.registers[base + usize::from(inst.b())];
+                let ic_idx = self.resolve_ic_idx(inst, prog_id, func_idx, frame_idx);
+                let key = self.ic_key(prog_id, func_idx, ic_idx);
+                let Some(obj) = obj_val.as_object() else {
+                    return Err(self.type_error("Cannot define private field on non-object"));
+                };
+                let already = self
+                    .heap
+                    .get_object(obj)
+                    .and_then(|o| o.rare.as_ref())
+                    .is_some_and(|r| r.private_fields.contains_key(&key));
+                if already {
+                    return Err(
+                        self.type_error("Cannot initialize private field twice on the same object")
+                    );
+                }
                 if let Some(o) = self.heap.get_object_mut(obj) {
-                    o.rare_mut().private_fields.insert(key, val);
+                    o.rare_mut()
+                        .private_fields
+                        .insert(key, PrivateEntry::Field(val));
                 }
                 self.heap.write_barrier(obj, val);
             }
@@ -1797,14 +1898,25 @@ impl JsVm {
                     .collect();
                 let callee_h = self.frames[frame_idx].callee;
                 let this_val = self.frames[frame_idx].this_val;
+                let new_target = self.frames[frame_idx].new_target;
                 let super_ctor = match self.heap.get_object(callee_h).map(|o| &o.kind) {
                     Some(ObjectKind::Closure(c)) => c.super_ctor,
                     _ => None,
                 };
+                let mut actual_this = this_val;
                 if let Some(sup) = super_ctor {
-                    self.call_handle(sup, this_val, &args, this_val.as_object(), this_val)?;
+                    let sup_res =
+                        self.call_handle(sup, this_val, &args, this_val.as_object(), new_target)?;
+                    if sup_res.is_object() {
+                        actual_this = sup_res;
+                        self.frames[frame_idx].this_val = actual_this;
+                        self.frames[frame_idx].construct_obj = actual_this.as_object();
+                    }
                 }
-                self.registers[a] = this_val;
+                if let Some(actual_obj) = actual_this.as_object() {
+                    self.init_class_instance(callee_h, actual_obj)?;
+                }
+                self.registers[a] = actual_this;
             }
             Opcode::CollectRestArgs => {
                 let first_idx = usize::from(inst.b());
@@ -1824,6 +1936,42 @@ impl JsVm {
                 }
                 let _ = first_idx;
                 self.registers[a] = JsValue::from_object(arr);
+            }
+            Opcode::LoadArguments => {
+                let args_obj = if let Some(cached) = self.frames[frame_idx].arguments_obj {
+                    cached
+                } else {
+                    let call_args = self.frames[frame_idx].call_args.clone();
+                    let obj = self.alloc_ordinary_object();
+                    for (i, &val) in call_args.iter().enumerate() {
+                        if let Some(o) = self.heap.get_object_mut(obj) {
+                            o.elements.set(i as u32, val);
+                        }
+                        self.heap.write_barrier(obj, val);
+                    }
+                    self.heap.object_define_data(
+                        obj,
+                        self.key_length,
+                        JsValue::from_i32(call_args.len() as i32),
+                        PropertyAttrs::WRITABLE | PropertyAttrs::CONFIGURABLE,
+                        &mut self.shapes,
+                    );
+                    let sym_iter_key = self.key_symbol_iterator;
+                    if let Ok(arr_iter) = self.get_property_by_key(self.array_proto, sym_iter_key) {
+                        if !arr_iter.is_undefined() {
+                            self.heap.object_define_data(
+                                obj,
+                                sym_iter_key,
+                                arr_iter,
+                                PropertyAttrs::METHOD,
+                                &mut self.shapes,
+                            );
+                        }
+                    }
+                    self.frames[frame_idx].arguments_obj = Some(obj);
+                    obj
+                };
+                self.registers[a] = JsValue::from_object(args_obj);
             }
             // Binary arithmetic & bitwise ops
             Opcode::Add => {
@@ -2102,10 +2250,32 @@ impl JsVm {
                 });
             }
             // Iterators
-            Opcode::GetIterator | Opcode::GetAsyncIterator => {
+            Opcode::GetIterator => {
                 let iterable = self.registers[base + usize::from(inst.b())];
                 let iter_h = self.create_iterator(iterable)?;
                 self.registers[a] = JsValue::from_object(iter_h);
+            }
+            Opcode::GetAsyncIterator => {
+                let iterable = self.registers[base + usize::from(inst.b())];
+                let iter_h = self.create_async_iterator(iterable)?;
+                self.registers[a] = JsValue::from_object(iter_h);
+            }
+            Opcode::AsyncIteratorNext => {
+                let iter_val = self.registers[base + usize::from(inst.b())];
+                let res = self.step_async_iterator(iter_val)?;
+                self.registers[a] = res;
+            }
+            Opcode::UnpackIterResult => {
+                let res_val = self.registers[base + usize::from(inst.b())];
+                let done_reg = base + usize::from(inst.c());
+                let Some(res_h) = res_val.as_object() else {
+                    return Err(self.type_error("Async iterator result is not an object"));
+                };
+                let done_val = self.get_property_by_key(res_h, self.key_done)?;
+                let done = self.to_boolean(done_val);
+                let val = self.get_property_by_key(res_h, self.key_value)?;
+                self.registers[a] = val;
+                self.registers[done_reg] = JsValue::from_bool(done);
             }
             Opcode::ForInKeys => {
                 let obj_val = self.registers[base + usize::from(inst.b())];
@@ -2345,40 +2515,7 @@ impl JsVm {
 
     /// Collects all live VM roots and runs a sub-millisecond generational minor GC.
     pub fn collect_minor_gc(&mut self) {
-        let mut roots = Vec::with_capacity(self.registers.len() + self.frames.len() * 3 + 16);
-        roots.push(JsValue::from_object(self.global));
-        roots.push(JsValue::from_object(self.object_proto));
-        roots.push(JsValue::from_object(self.function_proto));
-        roots.push(JsValue::from_object(self.array_proto));
-        roots.push(JsValue::from_object(self.error_proto));
-        roots.push(JsValue::from_object(self.string_proto));
-        roots.push(JsValue::from_object(self.number_proto));
-        roots.push(JsValue::from_object(self.boolean_proto));
-        roots.push(JsValue::from_object(self.regexp_proto));
-        roots.push(JsValue::from_object(self.date_proto));
-        roots.extend_from_slice(&self.registers);
-        for f in &self.frames {
-            roots.push(f.this_val);
-            roots.push(JsValue::from_object(f.callee));
-            roots.push(f.new_target);
-            if let Some(c) = f.construct_obj {
-                roots.push(JsValue::from_object(c));
-            }
-        }
-        for &(_, cell) in &self.open_upvalues {
-            roots.push(JsValue::from_object(cell));
-        }
-        for &w in &self.with_stack {
-            roots.push(JsValue::from_object(w));
-        }
-        for (&h, state) in &self.iterators {
-            roots.push(JsValue::from_object(h));
-            match state {
-                IteratorState::Array { arr, .. } => roots.push(JsValue::from_object(*arr)),
-                IteratorState::Custom { iter_obj } => roots.push(JsValue::from_object(*iter_obj)),
-                IteratorState::String { .. } | IteratorState::Keys { .. } => {}
-            }
-        }
+        let roots = self.collect_roots();
         let _ = self.heap.collect_minor(&roots);
     }
 
@@ -3123,12 +3260,102 @@ impl JsVm {
         }
     }
 
+    fn capture_function_upvalues(
+        &mut self,
+        prog_id: usize,
+        child_fn_idx: u32,
+        frame_idx: usize,
+        base: usize,
+    ) -> Result<Vec<HeapHandle>, JsException> {
+        let uv_descs = self.programs[prog_id].functions[child_fn_idx as usize]
+            .upvalues
+            .clone();
+        let mut captured = Vec::with_capacity(uv_descs.len());
+        for desc in uv_descs {
+            if desc.is_local {
+                let abs_reg = base + usize::from(desc.index);
+                let cell = self.capture_open_upvalue(abs_reg);
+                captured.push(cell);
+            } else {
+                let parent_cell = self.frame_upvalue(frame_idx, usize::from(desc.index))?;
+                captured.push(parent_cell);
+            }
+        }
+        Ok(captured)
+    }
+
+    fn init_class_instance(
+        &mut self,
+        ctor_handle: HeapHandle,
+        instance: HeapHandle,
+    ) -> Result<(), JsException> {
+        let Some(init) = self
+            .heap
+            .get_object(ctor_handle)
+            .and_then(|o| o.rare.as_ref())
+            .and_then(|r| r.class_instance_init)
+        else {
+            return Ok(());
+        };
+        // Copy private methods & private accessors defined on the class prototype onto the instance.
+        let proto_privates: Vec<(PropertyKey, PrivateEntry)> = self
+            .heap
+            .get_object(init.proto)
+            .and_then(|o| o.rare.as_ref())
+            .map(|r| r.private_fields.iter().map(|(&k, &v)| (k, v)).collect())
+            .unwrap_or_default();
+        if !proto_privates.is_empty() {
+            for (key, entry) in proto_privates {
+                let already = self
+                    .heap
+                    .get_object(instance)
+                    .and_then(|o| o.rare.as_ref())
+                    .is_some_and(|r| r.private_fields.contains_key(&key));
+                if already {
+                    return Err(self.type_error(
+                        "Cannot initialize private elements twice on the same object",
+                    ));
+                }
+                if let Some(o) = self.heap.get_object_mut(instance) {
+                    o.rare_mut().private_fields.insert(key, entry);
+                }
+                match entry {
+                    PrivateEntry::Field(v) => self.heap.write_barrier(instance, v),
+                    PrivateEntry::Method(h) => {
+                        self.heap.write_barrier(instance, JsValue::from_object(h))
+                    }
+                    PrivateEntry::Accessor(g, s) => {
+                        if let Some(h) = g {
+                            self.heap.write_barrier(instance, JsValue::from_object(h));
+                        }
+                        if let Some(h) = s {
+                            self.heap.write_barrier(instance, JsValue::from_object(h));
+                        }
+                    }
+                }
+            }
+        }
+        // Run instance field initializer closure (with already-captured upvalues).
+        if let Some(field_init_fn) = init.field_init_fn {
+            self.call_handle(
+                field_init_fn,
+                JsValue::from_object(instance),
+                &[],
+                None,
+                JsValue::UNDEFINED,
+            )?;
+        }
+        Ok(())
+    }
+
     fn instantiate_class(
         &mut self,
         prog_id: usize,
         func_idx: usize,
         const_idx: usize,
         super_val: JsValue,
+        frame_idx: usize,
+        base: usize,
     ) -> Result<HeapHandle, JsException> {
         let bp = match self.programs[prog_id].functions[func_idx]
             .constants
@@ -3164,38 +3391,87 @@ impl JsVm {
         ));
         self.heap.get_object_mut(class_proto).unwrap().is_prototype = true;
 
+        // Pre-instantiate instance field initializer closure so any upvalues from the enclosing
+        // lexical scope are captured at class definition time.
+        let field_init_fn = if let Some(fi_idx) = bp.instance_field_init_idx {
+            let upvalues = self.capture_function_upvalues(prog_id, fi_idx, frame_idx, base)?;
+            let fn_h = self.heap.alloc_object(JsObject::with_kind(
+                ObjectKind::Closure(Box::new(ClosureObject {
+                    program_id: prog_id as u32,
+                    func_idx: fi_idx,
+                    upvalues,
+                    bound_this: None,
+                    super_ctor,
+                    field_init: None,
+                })),
+                Some(self.function_proto),
+            ));
+            Some(fn_h)
+        } else {
+            None
+        };
+
         let ctor_handle = if let Some(ctor_idx) = bp.constructor_idx {
+            let upvalues = self.capture_function_upvalues(prog_id, ctor_idx, frame_idx, base)?;
             self.heap.alloc_object(JsObject::with_kind(
                 ObjectKind::Closure(Box::new(ClosureObject {
                     program_id: prog_id as u32,
                     func_idx: ctor_idx,
-                    upvalues: Vec::new(),
+                    upvalues,
                     bound_this: None,
                     super_ctor,
-                    field_init: bp.instance_field_init_idx.map(|f| (prog_id as u32, f)),
+                    field_init: None,
                 })),
                 Some(super_ctor.unwrap_or(self.function_proto)),
             ))
         } else {
-            // Synthesize default constructor invoking `super` if derived.
+            // Synthesize default constructor invoking `super` + instance element init if derived.
             let sup_copy = super_ctor;
-            let field_init = bp.instance_field_init_idx.map(|f| (prog_id as u32, f));
+            let ctor_cell = Rc::new(std::cell::Cell::new(None::<HeapHandle>));
+            let ctor_cell_clone = Rc::clone(&ctor_cell);
             let h = self.alloc_host_fn(
                 bp.name.as_deref().unwrap_or(""),
                 move |vm, this_val, args| {
                     if let Some(sup) = sup_copy {
-                        vm.call_handle(sup, this_val, args, this_val.as_object(), this_val)?;
+                        let sup_res =
+                            vm.call_handle(sup, this_val, args, this_val.as_object(), this_val)?;
+                        let actual_this = if sup_res.is_object() {
+                            sup_res
+                        } else {
+                            this_val
+                        };
+                        if let (Some(c_h), Some(actual_obj)) =
+                            (ctor_cell_clone.get(), actual_this.as_object())
+                        {
+                            vm.init_class_instance(c_h, actual_obj)?;
+                        }
+                        return Ok(actual_this);
                     }
-                    let _ = field_init;
                     Ok(this_val)
                 },
             );
+            ctor_cell.set(Some(h));
             if let Some(sup) = super_ctor {
                 self.heap
                     .object_set_prototype(h, Some(sup), &mut self.shapes);
             }
             h
         };
+
+        // Attach class instance initialization metadata to constructor (traced by GC).
+        if let Some(o) = self.heap.get_object_mut(ctor_handle) {
+            o.rare_mut().class_instance_init = Some(ClassInstanceInit {
+                proto: class_proto,
+                field_init_fn,
+                is_derived: super_ctor.is_some(),
+            });
+        }
+        self.heap
+            .write_barrier(ctor_handle, JsValue::from_object(class_proto));
+        if let Some(fi_h) = field_init_fn {
+            self.heap
+                .write_barrier(ctor_handle, JsValue::from_object(fi_h));
+        }
 
         if let Some(ref cls_name) = bp.name {
             let nv = JsValue::from_string(self.heap.alloc_string(cls_name.as_str()));
@@ -3223,11 +3499,12 @@ impl JsVm {
         );
 
         for m in bp.methods {
+            let upvalues = self.capture_function_upvalues(prog_id, m.func_idx, frame_idx, base)?;
             let method_fn = self.heap.alloc_object(JsObject::with_kind(
                 ObjectKind::Closure(Box::new(ClosureObject {
                     program_id: prog_id as u32,
                     func_idx: m.func_idx,
-                    upvalues: Vec::new(),
+                    upvalues,
                     bound_this: None,
                     super_ctor,
                     field_init: None,
@@ -3240,6 +3517,33 @@ impl JsVm {
                 class_proto
             };
             let key = self.heap.intern_key(&m.name);
+            if m.is_private {
+                if let Some(o) = self.heap.get_object_mut(target) {
+                    let map = &mut o.rare_mut().private_fields;
+                    match m.kind {
+                        SerializableMethodKind::Get => {
+                            let existing_set = match map.get(&key) {
+                                Some(PrivateEntry::Accessor(_, s)) => *s,
+                                _ => None,
+                            };
+                            map.insert(key, PrivateEntry::Accessor(Some(method_fn), existing_set));
+                        }
+                        SerializableMethodKind::Set => {
+                            let existing_get = match map.get(&key) {
+                                Some(PrivateEntry::Accessor(g, _)) => *g,
+                                _ => None,
+                            };
+                            map.insert(key, PrivateEntry::Accessor(existing_get, Some(method_fn)));
+                        }
+                        SerializableMethodKind::Method | SerializableMethodKind::Constructor => {
+                            map.insert(key, PrivateEntry::Method(method_fn));
+                        }
+                    }
+                }
+                self.heap
+                    .write_barrier(target, JsValue::from_object(method_fn));
+                continue;
+            }
             match m.kind {
                 SerializableMethodKind::Get => {
                     self.heap.object_define_accessor(
@@ -3274,11 +3578,13 @@ impl JsVm {
         }
 
         if let Some(static_fn_idx) = bp.static_init_idx {
+            let upvalues =
+                self.capture_function_upvalues(prog_id, static_fn_idx, frame_idx, base)?;
             let init_fn = self.heap.alloc_object(JsObject::with_kind(
                 ObjectKind::Closure(Box::new(ClosureObject {
                     program_id: prog_id as u32,
                     func_idx: static_fn_idx,
-                    upvalues: Vec::new(),
+                    upvalues,
                     bound_this: None,
                     super_ctor,
                     field_init: None,
@@ -3390,7 +3696,8 @@ impl JsVm {
                 }
                 Ok((JsValue::from_string(self.heap.alloc_string(k)), false))
             }
-            Some(IteratorState::Custom { iter_obj }) => {
+            Some(IteratorState::Custom { iter_obj })
+            | Some(IteratorState::AsyncCustom { iter_obj }) => {
                 let next_fn = self.get_property_by_key(iter_obj, self.key_next)?;
                 let res = self.call_value(next_fn, JsValue::from_object(iter_obj), &[])?;
                 let Some(res_h) = res.as_object() else {
@@ -3403,6 +3710,49 @@ impl JsVm {
             }
             None => Ok((JsValue::UNDEFINED, true)),
         }
+    }
+
+    fn create_async_iterator(&mut self, iterable: JsValue) -> Result<HeapHandle, JsException> {
+        if let Some(obj) = iterable.as_object() {
+            let async_method = self.get_property_by_key(obj, self.key_symbol_async_iterator)?;
+            if !async_method.is_undefined() && !async_method.is_null() {
+                let iter_res = self.call_value(async_method, JsValue::from_object(obj), &[])?;
+                let Some(iter_obj) = iter_res.as_object() else {
+                    return Err(
+                        self.type_error("Result of Symbol.asyncIterator method is not an object")
+                    );
+                };
+                let h = self.alloc_ordinary_object();
+                self.iterators
+                    .insert(h, IteratorState::AsyncCustom { iter_obj });
+                return Ok(h);
+            }
+        }
+        // ECMA-262 §7.4.1 GetIterator(obj, async): fall back to sync iterator if no Symbol.asyncIterator.
+        self.create_iterator(iterable)
+    }
+
+    fn step_async_iterator(&mut self, iter_val: JsValue) -> Result<JsValue, JsException> {
+        let Some(h) = iter_val.as_object() else {
+            return Ok(crate::promise::make_iter_result(
+                self,
+                JsValue::UNDEFINED,
+                true,
+            ));
+        };
+        if let Some(IteratorState::AsyncCustom { iter_obj }) = self.iterators.get(&h).cloned() {
+            let next_fn = self.get_property_by_key(iter_obj, self.key_next)?;
+            return self.call_value(next_fn, JsValue::from_object(iter_obj), &[]);
+        }
+        // Async-from-Sync Iterator adapter (ECMA-262 §27.1.4.2.1): unwrap awaited value into `{ value, done }`.
+        let (val, done) = self.step_iterator(iter_val)?;
+        let p = crate::promise::promise_resolve_value(self, val);
+        let on_ful = self.alloc_host_fn("async_from_sync_next", move |vm, _this, args| {
+            let v = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+            Ok(crate::promise::make_iter_result(vm, v, done))
+        });
+        let res_p = crate::promise::promise_then(self, p, Some(on_ful), None);
+        Ok(JsValue::from_object(res_p))
     }
 
     pub fn collect_iterable(&mut self, iterable: JsValue) -> Result<Vec<JsValue>, JsException> {
@@ -3831,18 +4181,46 @@ impl JsVm {
         }
     }
 
+    pub fn format_exception(&self, val: JsValue) -> String {
+        self.format_exception_value(val)
+    }
+
     fn format_exception_value(&self, val: JsValue) -> String {
         if let Some(h) = val.as_object() {
-            let name = self
-                .heap
-                .object_get_own(h, self.key_name, &self.shapes)
-                .map(|p| self.value_to_rust_string(p.value));
-            let msg = self
-                .heap
-                .object_get_own(h, self.key_message, &self.shapes)
-                .map(|p| self.value_to_rust_string(p.value));
-            if let (Some(n), Some(m)) = (name, msg) {
-                return format!("{n}: {m}");
+            let mut cur = Some(h);
+            let mut name = None;
+            let mut msg = None;
+            let mut hops = 0u32;
+            while let Some(obj_h) = cur {
+                if hops > 64 {
+                    break;
+                }
+                hops += 1;
+                if name.is_none() {
+                    name = self
+                        .heap
+                        .object_get_own(obj_h, self.key_name, &self.shapes)
+                        .filter(|p| !p.value.is_undefined())
+                        .map(|p| self.value_to_rust_string(p.value));
+                }
+                if msg.is_none() {
+                    msg = self
+                        .heap
+                        .object_get_own(obj_h, self.key_message, &self.shapes)
+                        .filter(|p| !p.value.is_undefined())
+                        .map(|p| self.value_to_rust_string(p.value));
+                }
+                if name.is_some() && msg.is_some() {
+                    break;
+                }
+                cur = self.heap.get_object(obj_h).and_then(|o| o.prototype);
+            }
+            if let Some(m) = msg {
+                let n = name.unwrap_or_else(|| "Error".to_string());
+                return if m.is_empty() { n } else { format!("{n}: {m}") };
+            }
+            if let Some(n) = name {
+                return n;
             }
         }
         self.value_to_rust_string(val)

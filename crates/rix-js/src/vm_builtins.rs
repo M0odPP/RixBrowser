@@ -10,18 +10,36 @@ use crate::value::{HeapHandle, JsValue};
 use crate::vm::{JsException, JsVm, NativeFnPtr};
 
 pub fn install_core_intrinsics(vm: &mut JsVm) {
-    // Global constants
+    // Global constants & core global functions
     define_global(vm, "undefined", JsValue::UNDEFINED);
     define_global(vm, "NaN", JsValue::NAN);
     define_global(vm, "Infinity", JsValue::from_f64(f64::INFINITY));
     let g = JsValue::from_object(vm.global);
     define_global(vm, "globalThis", g);
+    let eval_fn = vm.alloc_native_fn("eval", global_eval_fn);
+    define_global(vm, "eval", JsValue::from_object(eval_fn));
 
-    // Function.prototype.{call, apply, bind}
+    // Function.prototype.{call, apply, bind} + Function constructor
     let fn_proto = vm.function_proto;
     define_method(vm, fn_proto, "call", fn_call);
     define_method(vm, fn_proto, "apply", fn_apply);
     define_method(vm, fn_proto, "bind", fn_bind);
+    let function_ctor = vm.alloc_native_fn("Function", function_ctor_fn);
+    vm.heap.object_define_data(
+        function_ctor,
+        vm.key_prototype,
+        JsValue::from_object(fn_proto),
+        PropertyAttrs::empty(),
+        &mut vm.shapes,
+    );
+    vm.heap.object_define_data(
+        fn_proto,
+        vm.key_constructor,
+        JsValue::from_object(function_ctor),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    define_global(vm, "Function", JsValue::from_object(function_ctor));
 
     // Object.prototype.{hasOwnProperty, toString}
     let obj_proto = vm.object_proto;
@@ -35,6 +53,13 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
         vm.key_prototype,
         JsValue::from_object(obj_proto),
         PropertyAttrs::empty(),
+        &mut vm.shapes,
+    );
+    vm.heap.object_define_data(
+        obj_proto,
+        vm.key_constructor,
+        JsValue::from_object(object_ctor),
+        PropertyAttrs::METHOD,
         &mut vm.shapes,
     );
     define_method(vm, object_ctor, "create", object_create);
@@ -61,6 +86,25 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
     define_method(vm, arr_proto, "slice", array_slice);
     define_method(vm, arr_proto, "indexOf", array_index_of);
     define_method(vm, arr_proto, "includes", array_includes);
+    let array_values_fn = vm.alloc_native_fn("values", array_values);
+    let k_values = vm.heap.intern_key("values");
+    vm.heap.object_define_data(
+        arr_proto,
+        k_values,
+        JsValue::from_object(array_values_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    let sym_iter_key = vm.key_symbol_iterator;
+    vm.heap.object_define_data(
+        arr_proto,
+        sym_iter_key,
+        JsValue::from_object(array_values_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    define_method(vm, arr_proto, "keys", array_keys);
+    define_method(vm, arr_proto, "entries", array_entries);
 
     let array_ctor = vm.alloc_native_fn("Array", array_ctor_fn);
     vm.heap.object_define_data(
@@ -68,6 +112,13 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
         vm.key_prototype,
         JsValue::from_object(arr_proto),
         PropertyAttrs::empty(),
+        &mut vm.shapes,
+    );
+    vm.heap.object_define_data(
+        arr_proto,
+        vm.key_constructor,
+        JsValue::from_object(array_ctor),
+        PropertyAttrs::METHOD,
         &mut vm.shapes,
     );
     define_method(vm, array_ctor, "isArray", array_is_array);
@@ -145,6 +196,59 @@ pub fn define_method(vm: &mut JsVm, target: HeapHandle, name: &str, f: NativeFnP
 }
 
 // ---------------------------------------------------------------------------
+// Global eval & Function constructor
+// ---------------------------------------------------------------------------
+
+fn eval_error_to_exception(vm: &mut JsVm, err: crate::vm::EvalError) -> JsException {
+    match err {
+        crate::vm::EvalError::Compile(ce) => vm.make_error("SyntaxError", ce.to_string()),
+        crate::vm::EvalError::Runtime(exc) => exc,
+    }
+}
+
+fn global_eval_fn(
+    vm: &mut JsVm,
+    _this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let first = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+    let Some(str_h) = first.as_string() else {
+        // ECMA-262 §19.2.1.1 step 2: if x is not a String, return x unchanged.
+        return Ok(first);
+    };
+    let src = vm.heap.materialize_string(str_h).unwrap_or_default();
+    vm.eval_script(&src)
+        .map_err(|e| eval_error_to_exception(vm, e))
+}
+
+fn function_ctor_fn(
+    vm: &mut JsVm,
+    _this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let (params_str, body_str) = if args.is_empty() {
+        (String::new(), String::new())
+    } else if args.len() == 1 {
+        (String::new(), vm.value_to_rust_string(args[0]))
+    } else {
+        let mut params = Vec::with_capacity(args.len() - 1);
+        for &a in &args[..args.len() - 1] {
+            params.push(vm.value_to_rust_string(a));
+        }
+        let body = vm.value_to_rust_string(args[args.len() - 1]);
+        (params.join(","), body)
+    };
+    // Validate parameter list independently so syntax like `Function("a) { } (", "")` cannot escape.
+    let param_check = format!("(function anonymous({params_str}\n) {{\n}})");
+    if let Err(e) = crate::parser::parse(&param_check, crate::ast::SourceType::Script) {
+        return Err(vm.make_error("SyntaxError", format!("Invalid Function parameters: {e}")));
+    }
+    let full_src = format!("(function anonymous({params_str}\n) {{\n{body_str}\n}})");
+    vm.eval_script(&full_src)
+        .map_err(|e| eval_error_to_exception(vm, e))
+}
+
+// ---------------------------------------------------------------------------
 // Function.prototype
 // ---------------------------------------------------------------------------
 
@@ -157,19 +261,46 @@ fn fn_call(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue
 fn fn_apply(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let bound_this = args.first().copied().unwrap_or(JsValue::UNDEFINED);
     let mut call_args = Vec::new();
-    if let Some(arr_h) = args.get(1).and_then(|v| v.as_object()) {
-        let len = vm.heap.get_object(arr_h).map_or(0, |o| o.elements.len());
+    let arg_array = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
+    if !arg_array.is_undefined() && !arg_array.is_null() {
+        let Some(arr_h) = arg_array.as_object() else {
+            return Err(vm.type_error("CreateListFromArrayLike called on non-object"));
+        };
+        let is_dense_array = matches!(
+            vm.heap.get_object(arr_h).map(|o| &o.kind),
+            Some(ObjectKind::Array)
+        );
+        let len: u32 = if is_dense_array {
+            vm.heap.get_object(arr_h).map_or(0, |o| o.elements.len())
+        } else {
+            let lv = vm.get_property_by_key(arr_h, vm.key_length)?;
+            let n = vm.to_number(lv)?;
+            if !n.is_finite() || n <= 0.0 {
+                0
+            } else if n > 1_000_000.0 {
+                return Err(vm.range_error("Maximum call stack size exceeded"));
+            } else {
+                n.trunc() as u32
+            }
+        };
         if len > 1_000_000 {
             return Err(vm.range_error("Maximum call stack size exceeded"));
         }
         call_args.reserve(len as usize);
-        for i in 0..len {
-            let v = vm
-                .heap
-                .get_object(arr_h)
-                .and_then(|o| o.elements.get(i))
-                .unwrap_or(JsValue::UNDEFINED);
-            call_args.push(v);
+        if is_dense_array {
+            for i in 0..len {
+                let v = vm
+                    .heap
+                    .get_object(arr_h)
+                    .and_then(|o| o.elements.get(i))
+                    .unwrap_or(JsValue::UNDEFINED);
+                call_args.push(v);
+            }
+        } else {
+            for i in 0..len {
+                let v = vm.get_elem(arg_array, JsValue::from_i32(i as i32))?;
+                call_args.push(v);
+            }
         }
     }
     vm.call_value(this_val, bound_this, &call_args)
@@ -763,6 +894,115 @@ fn array_includes(
 ) -> Result<JsValue, JsException> {
     let idx = array_index_of(vm, this_val, args)?;
     Ok(JsValue::from_bool(idx.as_i32() != Some(-1)))
+}
+
+#[derive(Clone, Copy)]
+enum ArrayIterKind {
+    Values,
+    Keys,
+    Entries,
+}
+
+fn alloc_array_iterator(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    kind: ArrayIterKind,
+) -> Result<JsValue, JsException> {
+    if this_val.is_null() || this_val.is_undefined() {
+        return Err(vm.type_error("Cannot convert undefined or null to object"));
+    }
+    let Some(target) = this_val.as_object() else {
+        return Err(vm.type_error("Array iterator requires an object"));
+    };
+    let iter_obj = vm.alloc_ordinary_object();
+    let idx_cell = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let done_cell = std::rc::Rc::new(std::cell::Cell::new(false));
+    let next_fn = vm.alloc_host_fn("next", move |vm, _this, _args| {
+        if done_cell.get() {
+            return Ok(crate::promise::make_iter_result(
+                vm,
+                JsValue::UNDEFINED,
+                true,
+            ));
+        }
+        let len: u32 = if matches!(
+            vm.heap.get_object(target).map(|o| &o.kind),
+            Some(ObjectKind::Array)
+        ) {
+            vm.heap.get_object(target).map_or(0, |o| o.elements.len())
+        } else {
+            let lv = vm.get_property_by_key(target, vm.key_length)?;
+            let n = vm.to_number(lv)?;
+            if !n.is_finite() || n <= 0.0 {
+                0
+            } else {
+                n.trunc().min(f64::from(u32::MAX)) as u32
+            }
+        };
+        let i = idx_cell.get();
+        if i >= len {
+            done_cell.set(true);
+            return Ok(crate::promise::make_iter_result(
+                vm,
+                JsValue::UNDEFINED,
+                true,
+            ));
+        }
+        idx_cell.set(i + 1);
+        let item = match kind {
+            ArrayIterKind::Keys => JsValue::from_f64(f64::from(i)),
+            ArrayIterKind::Values => vm.get_elem(this_val, JsValue::from_f64(f64::from(i)))?,
+            ArrayIterKind::Entries => {
+                let val = vm.get_elem(this_val, JsValue::from_f64(f64::from(i)))?;
+                let pair = vm.alloc_array();
+                vm.heap
+                    .object_push_element(pair, JsValue::from_f64(f64::from(i)));
+                vm.heap.object_push_element(pair, val);
+                JsValue::from_object(pair)
+            }
+        };
+        Ok(crate::promise::make_iter_result(vm, item, false))
+    });
+    vm.heap.object_define_data(
+        iter_obj,
+        vm.key_next,
+        JsValue::from_object(next_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    let self_iter = vm.alloc_native_fn("[Symbol.iterator]", |_vm, t, _| Ok(t));
+    let sym_key = vm.key_symbol_iterator;
+    vm.heap.object_define_data(
+        iter_obj,
+        sym_key,
+        JsValue::from_object(self_iter),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    if let Some(o) = vm.heap.get_object_mut(iter_obj) {
+        o.extra_refs.push(target);
+    }
+    Ok(JsValue::from_object(iter_obj))
+}
+
+fn array_values(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    alloc_array_iterator(vm, this_val, ArrayIterKind::Values)
+}
+
+fn array_keys(vm: &mut JsVm, this_val: JsValue, _args: &[JsValue]) -> Result<JsValue, JsException> {
+    alloc_array_iterator(vm, this_val, ArrayIterKind::Keys)
+}
+
+fn array_entries(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    alloc_array_iterator(vm, this_val, ArrayIterKind::Entries)
 }
 
 // ---------------------------------------------------------------------------

@@ -4,11 +4,12 @@
 //! Reference: Spec 05 §6 & Issue #15.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use crate::heap::{
-    GeneratorObject, GeneratorState, JsObject, ObjectKind, PromiseReaction, PromiseState,
-    SuspendedFrame,
+    AsyncGeneratorRequest, AsyncGeneratorRequestKind, GeneratorObject, GeneratorState, JsObject,
+    ObjectKind, PromiseReaction, PromiseState, SuspendedFrame,
 };
 use crate::shape::PropertyAttrs;
 use crate::value::{HeapHandle, JsValue};
@@ -112,6 +113,7 @@ pub fn install_promise_and_async(vm: &mut JsVm) {
     install_aggregate_error(vm);
     install_promise(vm);
     install_generator_proto(vm);
+    install_async_generator_proto(vm);
 
     let qm = vm.alloc_native_fn("queueMicrotask", |vm, _this, args| {
         let Some(func) = arg(args, 0).as_object() else {
@@ -977,6 +979,30 @@ pub fn create_generator(
     this_val: JsValue,
     args: &[JsValue],
 ) -> HeapHandle {
+    create_generator_inner(vm, callee, program_id, func_idx, this_val, args, false)
+}
+
+/// Creates a new suspended `AsyncGenerator` object for an `async function*` invocation.
+pub fn create_async_generator(
+    vm: &mut JsVm,
+    callee: HeapHandle,
+    program_id: u32,
+    func_idx: u32,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> HeapHandle {
+    create_generator_inner(vm, callee, program_id, func_idx, this_val, args, true)
+}
+
+fn create_generator_inner(
+    vm: &mut JsVm,
+    callee: HeapHandle,
+    program_id: u32,
+    func_idx: u32,
+    this_val: JsValue,
+    args: &[JsValue],
+    is_async: bool,
+) -> HeapHandle {
     let (reg_count, param_count) = {
         let f = vm.function_bytecode(program_id, func_idx).unwrap();
         (f.register_count as usize, f.param_count as usize)
@@ -995,20 +1021,28 @@ pub fn create_generator(
         this_val,
         callee,
         saved_regs,
+        call_args: args.to_vec(),
         saved_upvalues: Vec::new(),
         resume_dst: 0,
+    };
+    let proto = if is_async {
+        vm.async_generator_proto
+    } else {
+        vm.generator_proto
     };
     vm.heap.alloc_object(JsObject::with_kind(
         ObjectKind::Generator(Box::new(GeneratorObject {
             state: GeneratorState::SuspendedStart,
             frame: Some(frame),
             delegate_iter: None,
+            is_async,
+            pending_requests: VecDeque::new(),
         })),
-        Some(vm.generator_proto),
+        Some(proto),
     ))
 }
 
-fn make_iter_result(vm: &mut JsVm, value: JsValue, done: bool) -> JsValue {
+pub fn make_iter_result(vm: &mut JsVm, value: JsValue, done: bool) -> JsValue {
     let obj = vm.alloc_ordinary_object();
     vm.heap.object_define_data(
         obj,
@@ -1264,6 +1298,583 @@ fn install_generator_proto(vm: &mut JsVm) {
     let sym_fn = vm.alloc_native_fn("[Symbol.iterator]", |_vm, this_val, _| Ok(this_val));
     vm.heap.object_define_data(
         gp,
+        sym_key,
+        JsValue::from_object(sym_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AsyncGenerator (`async function*`, ECMA-262 §27.6)
+// ---------------------------------------------------------------------------
+
+fn enqueue_async_generator_request(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    kind: AsyncGeneratorRequestKind,
+    value: JsValue,
+) -> HeapHandle {
+    let out_p = alloc_promise(vm);
+    let Some(gen_h) = this_val.as_object() else {
+        let err = vm.type_error("Incompatible AsyncGenerator receiver");
+        reject_promise(vm, out_p, err.value);
+        return out_p;
+    };
+    let (is_valid_async_gen, state) = match vm.heap.get_object(gen_h).map(|o| &o.kind) {
+        Some(ObjectKind::Generator(g)) if g.is_async => (true, g.state),
+        _ => (false, GeneratorState::Completed),
+    };
+    if !is_valid_async_gen {
+        let err = vm.type_error("Incompatible AsyncGenerator receiver");
+        reject_promise(vm, out_p, err.value);
+        return out_p;
+    }
+    let req = AsyncGeneratorRequest {
+        kind,
+        value,
+        promise: out_p,
+    };
+    if state == GeneratorState::Executing {
+        if let Some(ObjectKind::Generator(g)) = vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind) {
+            g.pending_requests.push_back(req);
+        }
+        vm.heap.write_barrier(gen_h, value);
+        vm.heap.write_barrier(gen_h, JsValue::from_object(out_p));
+        return out_p;
+    }
+    start_async_generator_request(vm, gen_h, req);
+    out_p
+}
+
+fn drain_next_async_generator_request(vm: &mut JsVm, gen_h: HeapHandle) {
+    let next_req = match vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind) {
+        Some(ObjectKind::Generator(g)) => g.pending_requests.pop_front(),
+        _ => None,
+    };
+    if let Some(req) = next_req {
+        start_async_generator_request(vm, gen_h, req);
+    }
+}
+
+fn finish_async_generator_step_resolve(
+    vm: &mut JsVm,
+    gen_h: HeapHandle,
+    step_p: HeapHandle,
+    value: JsValue,
+    done: bool,
+) {
+    let res = make_iter_result(vm, value, done);
+    resolve_promise(vm, step_p, res);
+    drain_next_async_generator_request(vm, gen_h);
+}
+
+fn finish_async_generator_step_reject(
+    vm: &mut JsVm,
+    gen_h: HeapHandle,
+    step_p: HeapHandle,
+    reason: JsValue,
+) {
+    reject_promise(vm, step_p, reason);
+    drain_next_async_generator_request(vm, gen_h);
+}
+
+fn start_async_generator_request(vm: &mut JsVm, gen_h: HeapHandle, req: AsyncGeneratorRequest) {
+    let (state, mut frame_opt, delegate_opt) =
+        match vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind) {
+            Some(ObjectKind::Generator(g)) => (g.state, g.frame.take(), g.delegate_iter),
+            _ => {
+                let err = vm.type_error("Incompatible AsyncGenerator receiver");
+                reject_promise(vm, req.promise, err.value);
+                return;
+            }
+        };
+
+    if state == GeneratorState::Completed {
+        match req.kind {
+            AsyncGeneratorRequestKind::Next => {
+                finish_async_generator_step_resolve(
+                    vm,
+                    gen_h,
+                    req.promise,
+                    JsValue::UNDEFINED,
+                    true,
+                );
+            }
+            AsyncGeneratorRequestKind::Return => {
+                let p = promise_resolve_value(vm, req.value);
+                let step_p = req.promise;
+                let on_ok = vm.alloc_host_fn("agen_ret_ok", move |vm, _this, args| {
+                    finish_async_generator_step_resolve(vm, gen_h, step_p, arg(args, 0), true);
+                    Ok(JsValue::UNDEFINED)
+                });
+                let on_err = vm.alloc_host_fn("agen_ret_err", move |vm, _this, args| {
+                    finish_async_generator_step_reject(vm, gen_h, step_p, arg(args, 0));
+                    Ok(JsValue::UNDEFINED)
+                });
+                attach_promise_reaction(
+                    vm,
+                    p,
+                    PromiseReaction {
+                        on_fulfilled: Some(on_ok),
+                        on_rejected: Some(on_err),
+                        result_promise: None,
+                    },
+                );
+            }
+            AsyncGeneratorRequestKind::Throw => {
+                finish_async_generator_step_reject(vm, gen_h, req.promise, req.value);
+            }
+        }
+        return;
+    }
+
+    // Active `yield*` delegation inside an async generator.
+    if let Some(iter_h) = delegate_opt {
+        if req.kind == AsyncGeneratorRequestKind::Next {
+            let next_res_p = match vm.step_async_iterator_public(JsValue::from_object(iter_h)) {
+                Ok(v) => promise_resolve_value(vm, v),
+                Err(e) => {
+                    if let Some(ObjectKind::Generator(g)) =
+                        vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind)
+                    {
+                        g.delegate_iter = None;
+                        g.state = GeneratorState::Completed;
+                    }
+                    finish_async_generator_step_reject(vm, gen_h, req.promise, e.value);
+                    return;
+                }
+            };
+            if let Some(ObjectKind::Generator(g)) =
+                vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind)
+            {
+                g.state = GeneratorState::Executing;
+                g.frame = frame_opt;
+            }
+            let step_p = req.promise;
+            let on_ok = vm.alloc_host_fn("agen_del_ok", move |vm, _this, args| {
+                let res_val = arg(args, 0);
+                let Some(res_h) = res_val.as_object() else {
+                    if let Some(ObjectKind::Generator(g)) =
+                        vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind)
+                    {
+                        g.delegate_iter = None;
+                        g.state = GeneratorState::Completed;
+                        g.frame = None;
+                    }
+                    let err = vm.type_error("Async iterator result is not an object");
+                    finish_async_generator_step_reject(vm, gen_h, step_p, err.value);
+                    return Ok(JsValue::UNDEFINED);
+                };
+                let done_val = match vm.get_property_by_key(res_h, vm.key_done) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        finish_async_generator_step_reject(vm, gen_h, step_p, e.value);
+                        return Ok(JsValue::UNDEFINED);
+                    }
+                };
+                let done = vm.to_boolean(done_val);
+                let val = match vm.get_property_by_key(res_h, vm.key_value) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        finish_async_generator_step_reject(vm, gen_h, step_p, e.value);
+                        return Ok(JsValue::UNDEFINED);
+                    }
+                };
+                if !done {
+                    if let Some(ObjectKind::Generator(g)) =
+                        vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind)
+                    {
+                        g.state = GeneratorState::SuspendedYield;
+                    }
+                    finish_async_generator_step_resolve(vm, gen_h, step_p, val, false);
+                } else {
+                    let frame = match vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind) {
+                        Some(ObjectKind::Generator(g)) => {
+                            g.delegate_iter = None;
+                            g.frame.take()
+                        }
+                        _ => None,
+                    };
+                    resume_async_generator_frame(
+                        vm,
+                        gen_h,
+                        frame,
+                        AsyncGeneratorRequest {
+                            kind: AsyncGeneratorRequestKind::Next,
+                            value: val,
+                            promise: step_p,
+                        },
+                    );
+                }
+                Ok(JsValue::UNDEFINED)
+            });
+            let on_err = vm.alloc_host_fn("agen_del_err", move |vm, _this, args| {
+                let frame = match vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind) {
+                    Some(ObjectKind::Generator(g)) => {
+                        g.delegate_iter = None;
+                        g.frame.take()
+                    }
+                    _ => None,
+                };
+                resume_async_generator_frame(
+                    vm,
+                    gen_h,
+                    frame,
+                    AsyncGeneratorRequest {
+                        kind: AsyncGeneratorRequestKind::Throw,
+                        value: arg(args, 0),
+                        promise: step_p,
+                    },
+                );
+                Ok(JsValue::UNDEFINED)
+            });
+            attach_promise_reaction(
+                vm,
+                next_res_p,
+                PromiseReaction {
+                    on_fulfilled: Some(on_ok),
+                    on_rejected: Some(on_err),
+                    result_promise: None,
+                },
+            );
+            return;
+        }
+        if let Some(ObjectKind::Generator(g)) = vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind) {
+            g.delegate_iter = None;
+        }
+    }
+
+    if state == GeneratorState::SuspendedStart {
+        match req.kind {
+            AsyncGeneratorRequestKind::Return => {
+                if let Some(ObjectKind::Generator(g)) =
+                    vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind)
+                {
+                    g.state = GeneratorState::Completed;
+                }
+                let p = promise_resolve_value(vm, req.value);
+                let step_p = req.promise;
+                let on_ok = vm.alloc_host_fn("agen_start_ret_ok", move |vm, _this, args| {
+                    finish_async_generator_step_resolve(vm, gen_h, step_p, arg(args, 0), true);
+                    Ok(JsValue::UNDEFINED)
+                });
+                let on_err = vm.alloc_host_fn("agen_start_ret_err", move |vm, _this, args| {
+                    finish_async_generator_step_reject(vm, gen_h, step_p, arg(args, 0));
+                    Ok(JsValue::UNDEFINED)
+                });
+                attach_promise_reaction(
+                    vm,
+                    p,
+                    PromiseReaction {
+                        on_fulfilled: Some(on_ok),
+                        on_rejected: Some(on_err),
+                        result_promise: None,
+                    },
+                );
+                return;
+            }
+            AsyncGeneratorRequestKind::Throw => {
+                if let Some(ObjectKind::Generator(g)) =
+                    vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind)
+                {
+                    g.state = GeneratorState::Completed;
+                }
+                finish_async_generator_step_reject(vm, gen_h, req.promise, req.value);
+                return;
+            }
+            AsyncGeneratorRequestKind::Next => {
+                resume_async_generator_frame(
+                    vm,
+                    gen_h,
+                    frame_opt.take(),
+                    AsyncGeneratorRequest {
+                        kind: AsyncGeneratorRequestKind::Next,
+                        value: JsValue::UNDEFINED,
+                        promise: req.promise,
+                    },
+                );
+                return;
+            }
+        }
+    }
+
+    resume_async_generator_frame(vm, gen_h, frame_opt, req);
+}
+
+fn resume_async_generator_frame(
+    vm: &mut JsVm,
+    gen_h: HeapHandle,
+    frame_opt: Option<SuspendedFrame>,
+    req: AsyncGeneratorRequest,
+) {
+    let Some(frame) = frame_opt else {
+        if let Some(ObjectKind::Generator(g)) = vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind) {
+            g.state = GeneratorState::Completed;
+        }
+        finish_async_generator_step_resolve(vm, gen_h, req.promise, JsValue::UNDEFINED, true);
+        return;
+    };
+    if let Some(ObjectKind::Generator(g)) = vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind) {
+        g.state = GeneratorState::Executing;
+    }
+    let entry_depth = vm.frame_depth();
+    let base = vm.restore_suspended_frame(&frame);
+    match req.kind {
+        AsyncGeneratorRequestKind::Next => {
+            if frame.pc > 0 {
+                vm.write_register(base + usize::from(frame.resume_dst), req.value);
+            }
+        }
+        AsyncGeneratorRequestKind::Return => {
+            vm.discard_frames_to(entry_depth);
+            if let Some(ObjectKind::Generator(g)) =
+                vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind)
+            {
+                g.state = GeneratorState::Completed;
+                g.frame = None;
+            }
+            let p = promise_resolve_value(vm, req.value);
+            let step_p = req.promise;
+            let on_ok = vm.alloc_host_fn("agen_mid_ret_ok", move |vm, _this, args| {
+                finish_async_generator_step_resolve(vm, gen_h, step_p, arg(args, 0), true);
+                Ok(JsValue::UNDEFINED)
+            });
+            let on_err = vm.alloc_host_fn("agen_mid_ret_err", move |vm, _this, args| {
+                finish_async_generator_step_reject(vm, gen_h, step_p, arg(args, 0));
+                Ok(JsValue::UNDEFINED)
+            });
+            attach_promise_reaction(
+                vm,
+                p,
+                PromiseReaction {
+                    on_fulfilled: Some(on_ok),
+                    on_rejected: Some(on_err),
+                    result_promise: None,
+                },
+            );
+            return;
+        }
+        AsyncGeneratorRequestKind::Throw => {
+            let msg = vm.format_exception_public(req.value);
+            let exc = JsException {
+                value: req.value,
+                message: msg,
+            };
+            if !vm.unwind_into_frame(entry_depth, exc) {
+                if let Some(ObjectKind::Generator(g)) =
+                    vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind)
+                {
+                    g.state = GeneratorState::Completed;
+                    g.frame = None;
+                }
+                finish_async_generator_step_reject(vm, gen_h, req.promise, req.value);
+                return;
+            }
+        }
+    }
+    drive_async_generator_exec(vm, gen_h, entry_depth, req.promise);
+}
+
+fn drive_async_generator_exec(
+    vm: &mut JsVm,
+    gen_h: HeapHandle,
+    entry_depth: usize,
+    step_p: HeapHandle,
+) {
+    match vm.run_suspendable(entry_depth) {
+        Ok(RunOutcome::Completed(val)) => {
+            if let Some(ObjectKind::Generator(g)) =
+                vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind)
+            {
+                g.state = GeneratorState::Completed;
+                g.frame = None;
+            }
+            // ECMA-262 §27.6.3.3: return value of async generator is awaited before settling.
+            let p = promise_resolve_value(vm, val);
+            let on_ok = vm.alloc_host_fn("agen_done_ok", move |vm, _this, args| {
+                finish_async_generator_step_resolve(vm, gen_h, step_p, arg(args, 0), true);
+                Ok(JsValue::UNDEFINED)
+            });
+            let on_err = vm.alloc_host_fn("agen_done_err", move |vm, _this, args| {
+                finish_async_generator_step_reject(vm, gen_h, step_p, arg(args, 0));
+                Ok(JsValue::UNDEFINED)
+            });
+            attach_promise_reaction(
+                vm,
+                p,
+                PromiseReaction {
+                    on_fulfilled: Some(on_ok),
+                    on_rejected: Some(on_err),
+                    result_promise: None,
+                },
+            );
+        }
+        Ok(RunOutcome::SuspendedYield { frame, yielded }) => {
+            // ECMA-262 §27.6.3.6 AsyncGeneratorYield: await `yielded` before resolving step_p.
+            let awaited_p = promise_resolve_value(vm, yielded);
+            let frame_rc = Rc::new(std::cell::RefCell::new(Some(frame)));
+            let f_ok = Rc::clone(&frame_rc);
+            let on_ok = vm.alloc_host_fn("agen_yield_ok", move |vm, _this, args| {
+                if let Some(f) = f_ok.borrow_mut().take() {
+                    if let Some(ObjectKind::Generator(g)) =
+                        vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind)
+                    {
+                        g.state = GeneratorState::SuspendedYield;
+                        g.frame = Some(f);
+                    }
+                    finish_async_generator_step_resolve(vm, gen_h, step_p, arg(args, 0), false);
+                }
+                Ok(JsValue::UNDEFINED)
+            });
+            let f_err = frame_rc;
+            let on_err = vm.alloc_host_fn("agen_yield_err", move |vm, _this, args| {
+                if let Some(f) = f_err.borrow_mut().take() {
+                    resume_async_generator_frame(
+                        vm,
+                        gen_h,
+                        Some(f),
+                        AsyncGeneratorRequest {
+                            kind: AsyncGeneratorRequestKind::Throw,
+                            value: arg(args, 0),
+                            promise: step_p,
+                        },
+                    );
+                }
+                Ok(JsValue::UNDEFINED)
+            });
+            attach_promise_reaction(
+                vm,
+                awaited_p,
+                PromiseReaction {
+                    on_fulfilled: Some(on_ok),
+                    on_rejected: Some(on_err),
+                    result_promise: None,
+                },
+            );
+        }
+        Ok(RunOutcome::SuspendedAwait { frame, awaited }) => {
+            let awaited_p = promise_resolve_value(vm, awaited);
+            let frame_rc = Rc::new(std::cell::RefCell::new(Some(frame)));
+            let f_ok = Rc::clone(&frame_rc);
+            let on_ok = vm.alloc_host_fn("agen_await_ok", move |vm, _this, args| {
+                if let Some(f) = f_ok.borrow_mut().take() {
+                    resume_async_generator_frame(
+                        vm,
+                        gen_h,
+                        Some(f),
+                        AsyncGeneratorRequest {
+                            kind: AsyncGeneratorRequestKind::Next,
+                            value: arg(args, 0),
+                            promise: step_p,
+                        },
+                    );
+                }
+                Ok(JsValue::UNDEFINED)
+            });
+            let f_err = frame_rc;
+            let on_err = vm.alloc_host_fn("agen_await_err", move |vm, _this, args| {
+                if let Some(f) = f_err.borrow_mut().take() {
+                    resume_async_generator_frame(
+                        vm,
+                        gen_h,
+                        Some(f),
+                        AsyncGeneratorRequest {
+                            kind: AsyncGeneratorRequestKind::Throw,
+                            value: arg(args, 0),
+                            promise: step_p,
+                        },
+                    );
+                }
+                Ok(JsValue::UNDEFINED)
+            });
+            attach_promise_reaction(
+                vm,
+                awaited_p,
+                PromiseReaction {
+                    on_fulfilled: Some(on_ok),
+                    on_rejected: Some(on_err),
+                    result_promise: None,
+                },
+            );
+        }
+        Ok(RunOutcome::SuspendedYieldStar { frame, iterable }) => {
+            match vm.create_async_iterator_public(iterable) {
+                Ok(iter_h) => {
+                    if let Some(ObjectKind::Generator(g)) =
+                        vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind)
+                    {
+                        g.state = GeneratorState::SuspendedYield;
+                        g.frame = Some(frame);
+                        g.delegate_iter = Some(iter_h);
+                    }
+                    vm.heap.write_barrier(gen_h, JsValue::from_object(iter_h));
+                    start_async_generator_request(
+                        vm,
+                        gen_h,
+                        AsyncGeneratorRequest {
+                            kind: AsyncGeneratorRequestKind::Next,
+                            value: JsValue::UNDEFINED,
+                            promise: step_p,
+                        },
+                    );
+                }
+                Err(e) => {
+                    if let Some(ObjectKind::Generator(g)) =
+                        vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind)
+                    {
+                        g.state = GeneratorState::Completed;
+                        g.frame = None;
+                    }
+                    finish_async_generator_step_reject(vm, gen_h, step_p, e.value);
+                }
+            }
+        }
+        Err(e) => {
+            if let Some(ObjectKind::Generator(g)) =
+                vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind)
+            {
+                g.state = GeneratorState::Completed;
+                g.frame = None;
+            }
+            finish_async_generator_step_reject(vm, gen_h, step_p, e.value);
+        }
+    }
+}
+
+fn install_async_generator_proto(vm: &mut JsVm) {
+    let agp = vm.async_generator_proto;
+    define_method(vm, agp, "next", |vm, this_val, args| {
+        let p = enqueue_async_generator_request(
+            vm,
+            this_val,
+            AsyncGeneratorRequestKind::Next,
+            arg(args, 0),
+        );
+        Ok(JsValue::from_object(p))
+    });
+    define_method(vm, agp, "return", |vm, this_val, args| {
+        let p = enqueue_async_generator_request(
+            vm,
+            this_val,
+            AsyncGeneratorRequestKind::Return,
+            arg(args, 0),
+        );
+        Ok(JsValue::from_object(p))
+    });
+    define_method(vm, agp, "throw", |vm, this_val, args| {
+        let p = enqueue_async_generator_request(
+            vm,
+            this_val,
+            AsyncGeneratorRequestKind::Throw,
+            arg(args, 0),
+        );
+        Ok(JsValue::from_object(p))
+    });
+    let sym_key = vm.key_symbol_async_iterator;
+    let sym_fn = vm.alloc_native_fn("[Symbol.asyncIterator]", |_vm, this_val, _| Ok(this_val));
+    vm.heap.object_define_data(
+        agp,
         sym_key,
         JsValue::from_object(sym_fn),
         PropertyAttrs::METHOD,

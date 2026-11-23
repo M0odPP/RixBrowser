@@ -216,6 +216,14 @@ pub enum Opcode {
     Debugger = 103,
     /// Collects remaining arguments `[first_idx..]` into a rest Array stored in `dst`.
     CollectRestArgs = 104,
+    /// Materializes the ECMAScript `arguments` object for the current non-arrow call frame into `dst`.
+    LoadArguments = 105,
+    /// Invokes `next()` on an async iterator (or async-from-sync iterator) and stores the resulting Promise/result in `dst`.
+    AsyncIteratorNext = 106,
+    /// Unpacks an awaited `{ value, done }` iterator result object in `b` into `a` (value) and `c` (done boolean).
+    UnpackIterResult = 107,
+    /// Defines a new private field on object `a` with value `b` and IC slot `c` (`PrivateFieldAdd`).
+    DefinePrivate = 108,
 }
 
 impl Opcode {
@@ -326,6 +334,10 @@ impl Opcode {
             102 => Some(Self::PopWith),
             103 => Some(Self::Debugger),
             104 => Some(Self::CollectRestArgs),
+            105 => Some(Self::LoadArguments),
+            106 => Some(Self::AsyncIteratorNext),
+            107 => Some(Self::UnpackIterResult),
+            108 => Some(Self::DefinePrivate),
             _ => None,
         }
     }

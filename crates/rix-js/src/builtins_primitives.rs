@@ -1298,6 +1298,8 @@ fn install_symbol(vm: &mut JsVm) {
     ] {
         let id = if well_known == "iterator" {
             vm.sym_iterator
+        } else if well_known == "asyncIterator" {
+            vm.sym_async_iterator
         } else {
             vm.heap.alloc_symbol(Some(format!("Symbol.{well_known}")))
         };
