@@ -222,6 +222,14 @@ pub struct JsVm {
     pub weakset_proto: HeapHandle,
     pub weakref_proto: HeapHandle,
     pub finalization_registry_proto: HeapHandle,
+    pub temporal_instant_proto: HeapHandle,
+    pub temporal_duration_proto: HeapHandle,
+    pub temporal_plain_date_proto: HeapHandle,
+    pub temporal_plain_time_proto: HeapHandle,
+    pub temporal_plain_date_time_proto: HeapHandle,
+    pub temporal_plain_year_month_proto: HeapHandle,
+    pub temporal_plain_month_day_proto: HeapHandle,
+    pub temporal_zoned_date_time_proto: HeapHandle,
     pub array_buffer_proto: HeapHandle,
     pub shared_array_buffer_proto: HeapHandle,
     pub data_view_proto: HeapHandle,
@@ -424,6 +432,14 @@ impl JsVm {
         let weakset_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let weakref_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let finalization_registry_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let temporal_instant_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let temporal_duration_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let temporal_plain_date_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let temporal_plain_time_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let temporal_plain_date_time_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let temporal_plain_year_month_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let temporal_plain_month_day_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let temporal_zoned_date_time_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let array_buffer_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let shared_array_buffer_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let data_view_proto = make_proto(&mut heap, &mut shapes, object_proto);
@@ -523,6 +539,14 @@ impl JsVm {
             weakset_proto,
             weakref_proto,
             finalization_registry_proto,
+            temporal_instant_proto,
+            temporal_duration_proto,
+            temporal_plain_date_proto,
+            temporal_plain_time_proto,
+            temporal_plain_date_time_proto,
+            temporal_plain_year_month_proto,
+            temporal_plain_month_day_proto,
+            temporal_zoned_date_time_proto,
             array_buffer_proto,
             shared_array_buffer_proto,
             data_view_proto,
@@ -628,6 +652,7 @@ impl JsVm {
         crate::promise::install_promise_and_async(&mut vm);
         crate::builtins_disposable::install_disposable(&mut vm);
         crate::intl::install_intl(&mut vm);
+        crate::temporal::install_temporal(&mut vm);
         crate::webcrypto::install_webcrypto(&mut vm);
         vm
     }
@@ -707,6 +732,14 @@ impl JsVm {
             self.weakset_proto,
             self.weakref_proto,
             self.finalization_registry_proto,
+            self.temporal_instant_proto,
+            self.temporal_duration_proto,
+            self.temporal_plain_date_proto,
+            self.temporal_plain_time_proto,
+            self.temporal_plain_date_time_proto,
+            self.temporal_plain_year_month_proto,
+            self.temporal_plain_month_day_proto,
+            self.temporal_zoned_date_time_proto,
             self.array_buffer_proto,
             self.shared_array_buffer_proto,
             self.data_view_proto,

@@ -118,6 +118,30 @@ impl JsBigInt {
     }
 
     #[must_use]
+    pub fn to_i128_checked(&self) -> Option<i128> {
+        if self.limbs.len() > 4 {
+            return None;
+        }
+        let mut mag = 0u128;
+        for (i, &limb) in self.limbs.iter().enumerate() {
+            mag |= u128::from(limb) << (i * 32);
+        }
+        if self.negative {
+            if mag == (i128::MAX as u128) + 1 {
+                Some(i128::MIN)
+            } else if mag <= i128::MAX as u128 {
+                Some(-(mag as i128))
+            } else {
+                None
+            }
+        } else if mag <= i128::MAX as u128 {
+            Some(mag as i128)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
     pub fn to_f64(&self) -> f64 {
         let mut acc = 0.0f64;
         for &limb in self.limbs.iter().rev() {

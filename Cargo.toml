@@ -87,6 +87,7 @@ icu = { version = "2.4", features = ["compiled_data", "unstable"] }
 fixed_decimal = { version = "0.7", features = ["ryu"] }
 writeable = "0.6"
 jiff = { version = "1.0", features = ["tzdb-bundle-always"] }
+temporal_rs = { version = "0.2.6", features = ["float64_representable_durations"] }
 symphonia = { version = "0.6.1", features = ["all", "exp-video-codecs"] }
 symphonia-opus = "0.1.3"
 opus-decoder = "0.1.1"
