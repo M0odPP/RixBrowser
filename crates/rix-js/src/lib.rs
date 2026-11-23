@@ -7,6 +7,8 @@ pub mod bigint;
 pub mod builtins_atomics;
 pub mod builtins_collections;
 pub mod builtins_date;
+pub mod builtins_disposable;
+pub mod builtins_iterator;
 pub mod builtins_primitives;
 pub mod builtins_regexp;
 pub mod bytecode;
