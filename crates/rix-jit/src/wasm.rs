@@ -331,6 +331,7 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
         JsValue::from_object(mod_ctor),
         PropertyAttrs::METHOD,
     );
+    vm.mark_constructor(mod_ctor);
 
     // `WebAssembly.Instance` constructor.
     let inst_ctor = {
@@ -363,6 +364,7 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
         JsValue::from_object(inst_ctor),
         PropertyAttrs::METHOD,
     );
+    vm.mark_constructor(inst_ctor);
 
     // `WebAssembly.Memory` constructor.
     let mem_ctor = {
@@ -425,6 +427,7 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
         JsValue::from_object(mem_ctor),
         PropertyAttrs::METHOD,
     );
+    vm.mark_constructor(mem_ctor);
 
     // `WebAssembly.Table` constructor.
     let table_ctor = {
@@ -500,6 +503,7 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
         JsValue::from_object(table_ctor),
         PropertyAttrs::METHOD,
     );
+    vm.mark_constructor(table_ctor);
 
     // `WebAssembly.Global` constructor.
     let global_ctor = {
@@ -573,6 +577,7 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
         JsValue::from_object(global_ctor),
         PropertyAttrs::METHOD,
     );
+    vm.mark_constructor(global_ctor);
 
     // `WebAssembly.validate(bytes)`
     let validate_fn = {
@@ -1809,6 +1814,7 @@ fn make_wasm_error_ctor(vm: &mut JsVm, name: &'static str, proto: HeapHandle) ->
         define_prop(vm, obj, "message", m, PropertyAttrs::METHOD);
         Ok(JsValue::from_object(obj))
     });
+    vm.mark_constructor(ctor);
     define_prop(
         vm,
         ctor,

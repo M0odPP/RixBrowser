@@ -133,16 +133,20 @@ pub fn install_promise_and_async(vm: &mut JsVm) {
 }
 
 fn install_aggregate_error(vm: &mut JsVm) {
-    let ep = vm.error_proto;
-    let agg_proto = vm.heap.alloc_empty_object();
-    vm.heap
-        .object_set_prototype(agg_proto, Some(ep), &mut vm.shapes);
-    vm.heap.get_object_mut(agg_proto).unwrap().is_prototype = true;
+    let agg_proto = vm.aggregate_error_proto;
     let nv = JsValue::from_string(vm.heap.alloc_string("AggregateError"));
+    let empty_m = JsValue::from_string(vm.heap.alloc_string(""));
     vm.heap.object_define_data(
         agg_proto,
         vm.key_name,
         nv,
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    vm.heap.object_define_data(
+        agg_proto,
+        vm.key_message,
+        empty_m,
         PropertyAttrs::METHOD,
         &mut vm.shapes,
     );
@@ -153,10 +157,8 @@ fn install_aggregate_error(vm: &mut JsVm) {
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(agg_proto)));
         let errors_arr = vm.alloc_array();
         let iterable = arg(args, 0);
-        if !iterable.is_undefined() && !iterable.is_null() {
-            for item in vm.collect_iterable(iterable)? {
-                vm.heap.object_push_element(errors_arr, item);
-            }
+        for item in vm.collect_iterable(iterable)? {
+            vm.heap.object_push_element(errors_arr, item);
         }
         let k_errors = vm.heap.intern_key("errors");
         vm.heap.object_define_data(
@@ -166,24 +168,47 @@ fn install_aggregate_error(vm: &mut JsVm) {
             PropertyAttrs::METHOD,
             &mut vm.shapes,
         );
-        let msg = if arg(args, 1).is_undefined() {
-            String::new()
-        } else {
-            vm.value_to_rust_string(arg(args, 1))
-        };
-        let mv = JsValue::from_string(vm.heap.alloc_string(msg));
-        vm.heap.object_define_data(
-            err,
-            vm.key_message,
-            mv,
-            PropertyAttrs::METHOD,
-            &mut vm.shapes,
-        );
-        let nm = JsValue::from_string(vm.heap.alloc_string("AggregateError"));
-        vm.heap
-            .object_define_data(err, vm.key_name, nm, PropertyAttrs::METHOD, &mut vm.shapes);
+        if !arg(args, 1).is_undefined() {
+            let msg = vm.value_to_rust_string(arg(args, 1));
+            let mv = JsValue::from_string(vm.heap.alloc_string(msg));
+            vm.heap.object_define_data(
+                err,
+                vm.key_message,
+                mv,
+                PropertyAttrs::METHOD,
+                &mut vm.shapes,
+            );
+        }
+        if let Some(opts) = args.get(2).and_then(|v| v.as_object()) {
+            let k_cause = vm.heap.intern_key("cause");
+            if vm.has_property_by_key(opts, k_cause)? {
+                let cause = vm.get_property_by_key(opts, k_cause)?;
+                vm.heap.object_define_data(
+                    err,
+                    k_cause,
+                    cause,
+                    PropertyAttrs::METHOD,
+                    &mut vm.shapes,
+                );
+            }
+        }
         Ok(JsValue::from_object(err))
     });
+    vm.mark_constructor(ctor);
+    vm.set_fn_length(ctor, 2);
+    let k_error = vm.heap.intern_key("Error");
+    if let Ok(err_ctor) = vm.get_property_by_key(vm.global, k_error) {
+        if let Some(ec) = err_ctor.as_object() {
+            vm.heap.object_set_prototype(ctor, Some(ec), &mut vm.shapes);
+        }
+    }
+    vm.heap.object_define_data(
+        agg_proto,
+        vm.key_constructor,
+        JsValue::from_object(ctor),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
     vm.heap.object_define_data(
         ctor,
         vm.key_prototype,
@@ -637,6 +662,8 @@ fn install_promise(vm: &mut JsVm) {
         }
         Ok(JsValue::from_object(p))
     });
+    vm.mark_constructor(ctor);
+    vm.set_fn_length(ctor, 1);
     define_method(vm, ctor, "resolve", |vm, _this, args| {
         Ok(JsValue::from_object(promise_resolve_value(
             vm,

@@ -198,10 +198,18 @@ fn inline_cache_transitions_mono_poly_mega_and_invalidates_prototype_epoch() {
     for _ in 0..1_000 {
         let epoch = shapes.prototype_epoch();
         if ic
-            .probe_load(0, shape0, key_val, epoch, &mega, &mut mono_stats)
+            .probe_load(
+                0,
+                shape0,
+                Some(proto),
+                key_val,
+                epoch,
+                &mega,
+                &mut mono_stats,
+            )
             .is_none()
         {
-            let entry = IcEntry::proto(shape0, proto, proto_off, epoch);
+            let entry = IcEntry::proto(shape0, Some(proto), proto, proto_off, epoch);
             ic.update(0, key_val, entry, false, &mut mega);
         }
     }
@@ -222,6 +230,7 @@ fn inline_cache_transitions_mono_poly_mega_and_invalidates_prototype_epoch() {
         ic.probe_load(
             0,
             shape0,
+            Some(proto),
             key_val,
             shapes.prototype_epoch(),
             &mega,
@@ -236,12 +245,12 @@ fn inline_cache_transitions_mono_poly_mega_and_invalidates_prototype_epoch() {
         let s = heap.get_object(obj).unwrap().shape();
         let epoch = shapes.prototype_epoch();
         assert!(ic
-            .probe_load(1, s, key_val, epoch, &mega, &mut stats)
+            .probe_load(1, s, Some(proto), key_val, epoch, &mega, &mut stats)
             .is_none());
         ic.update(
             1,
             key_val,
-            IcEntry::proto(s, proto, proto_off, epoch),
+            IcEntry::proto(s, Some(proto), proto, proto_off, epoch),
             false,
             &mut mega,
         );
@@ -260,7 +269,15 @@ fn inline_cache_transitions_mono_poly_mega_and_invalidates_prototype_epoch() {
     for &obj in &objs {
         let s = heap.get_object(obj).unwrap().shape();
         let hit = ic
-            .probe_load(1, s, key_val, shapes.prototype_epoch(), &mega, &mut stats)
+            .probe_load(
+                1,
+                s,
+                Some(proto),
+                key_val,
+                shapes.prototype_epoch(),
+                &mega,
+                &mut stats,
+            )
             .expect("megamorphic hit");
         assert_eq!(hit.holder, Some(proto));
         assert_eq!(hit.offset, proto_off);

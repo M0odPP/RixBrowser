@@ -271,6 +271,7 @@ fn def_host_getter(
 }
 
 fn bind_ctor_proto(vm: &mut JsVm, ctor: HeapHandle, proto: HeapHandle) {
+    vm.mark_constructor(ctor);
     def_data(
         vm,
         ctor,
@@ -2674,7 +2675,10 @@ pub fn install_webcrypto(vm: &mut JsVm) {
         };
         let (buf_h, start, byte_len) = match vm.heap.get_object(h).map(|o| &o.kind) {
             Some(ObjectKind::TypedArray(ta))
-                if !matches!(ta.kind, TypedArrayKind::Float32 | TypedArrayKind::Float64) =>
+                if !matches!(
+                    ta.kind,
+                    TypedArrayKind::Float16 | TypedArrayKind::Float32 | TypedArrayKind::Float64
+                ) =>
             {
                 let start = ta.byte_offset as usize;
                 let byte_len = (ta.length as usize).saturating_mul(ta.kind.bytes_per_element());

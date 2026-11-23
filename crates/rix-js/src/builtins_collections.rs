@@ -3,20 +3,23 @@
 //!
 //! Reference: Spec 05 §6 & Issue #15.
 
+use crate::bigint::JsBigInt;
 use crate::heap::{DataViewObject, JsObject, ObjectKind, TypedArrayKind, TypedArrayObject};
 use crate::shape::PropertyAttrs;
 use crate::value::{HeapHandle, JsValue};
 use crate::vm::{JsException, JsVm, NativeFnPtr};
 
-/// Installs `Map`, `Set`, `WeakMap`, `WeakSet`, `WeakRef`, `ArrayBuffer`,
-/// `DataView`, and all 9 `TypedArray` constructors on the VM global object.
+/// Installs `Map`, `Set`, `WeakMap`, `WeakSet`, `WeakRef`, `ArrayBuffer`, `SharedArrayBuffer`,
+/// `DataView`, all 12 `TypedArray` constructors, and ES2025 `Iterator` helpers.
 pub fn install_collection_builtins(vm: &mut JsVm) {
+    install_iterator(vm);
     install_map(vm);
     install_set(vm);
     install_weak_map(vm);
     install_weak_set(vm);
     install_weak_ref(vm);
     install_array_buffer(vm);
+    install_shared_array_buffer(vm);
     install_data_view(vm);
     install_typed_arrays(vm);
 }
@@ -66,6 +69,7 @@ fn define_global(vm: &mut JsVm, name: &str, val: JsValue) {
 }
 
 fn bind_ctor_proto(vm: &mut JsVm, ctor: HeapHandle, proto: HeapHandle) {
+    vm.mark_constructor(ctor);
     vm.heap.object_define_data(
         ctor,
         vm.key_prototype,
@@ -101,7 +105,10 @@ pub fn same_value_zero(vm: &JsVm, a: JsValue, b: JsValue) -> bool {
 
 /// Creates a JS iterable iterator object over a snapshot of `JsValue` items.
 pub fn alloc_values_iterator(vm: &mut JsVm, items: Vec<JsValue>) -> HeapHandle {
-    let iter_obj = vm.alloc_ordinary_object();
+    let iter_obj = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Ordinary,
+        Some(vm.iterator_proto),
+    ));
     let arr = vm.alloc_array();
     for item in items {
         vm.heap.object_push_element(arr, item);
@@ -1189,60 +1196,157 @@ fn install_data_view(vm: &mut JsVm) {
 // TypedArray (all 9 numeric views)
 // ---------------------------------------------------------------------------
 
-/// Reads element `index` from a `TypedArray` backing `ArrayBuffer`.
-#[must_use]
-pub fn typed_array_read_element(vm: &JsVm, ta: TypedArrayObject, index: u32) -> JsValue {
-    if index >= ta.length {
-        return JsValue::UNDEFINED;
-    }
-    let Some(ObjectKind::ArrayBuffer(buf)) = vm.heap.get_object(ta.buffer).map(|o| &o.kind) else {
-        return JsValue::UNDEFINED;
+fn f16_to_f64(bits: u16) -> f64 {
+    let (s, e, m) = (
+        u32::from(bits >> 15) << 31,
+        u32::from((bits >> 10) & 0x1F),
+        u32::from(bits & 0x3FF),
+    );
+    let f32_bits = match e {
+        0 if m == 0 => s,
+        0 => {
+            let shift = m.leading_zeros() - 21;
+            s | ((113 - shift) << 23) | (((m << shift) & 0x3FF) << 13)
+        }
+        0x1F => s | (0xFF << 23) | (m << 13),
+        _ => s | ((e + 112) << 23) | (m << 13),
     };
+    f64::from(f32::from_bits(f32_bits))
+}
+
+fn f64_to_f16(val: f64) -> u16 {
+    let bits = (val as f32).to_bits();
+    let (s, exp, frac) = (
+        ((bits >> 16) & 0x8000) as u16,
+        ((bits >> 23) & 0xFF) as i32,
+        bits & 0x007F_FFFF,
+    );
+    if exp == 0xFF {
+        return s | if frac != 0 { 0x7E00 } else { 0x7C00 };
+    }
+    let u = exp - 127;
+    if u > 15 {
+        return s | 0x7C00;
+    }
+    if u < -24 {
+        return s;
+    }
+    if u < -14 {
+        let (mant, sh) = (0x0080_0000 | frac, (-14 - u) + 13);
+        let (mut r, rem, half) = (mant >> sh, mant & ((1u32 << sh) - 1), 1u32 << (sh - 1));
+        if rem > half || (rem == half && (r & 1) == 1) {
+            r += 1;
+        }
+        return s | (r as u16);
+    }
+    let (h_exp, mut h_frac, rem) = ((u + 15) as u32, frac >> 13, frac & 0x1FFF);
+    if rem > 0x1000 || (rem == 0x1000 && (h_frac & 1) == 1) {
+        h_frac += 1;
+        if h_frac == 0x400 {
+            return if h_exp + 1 >= 0x1F {
+                s | 0x7C00
+            } else {
+                s | (((h_exp + 1) as u16) << 10)
+            };
+        }
+    }
+    s | ((h_exp as u16) << 10) | (h_frac as u16)
+}
+
+fn typed_array_bytes(vm: &JsVm, ta: TypedArrayObject, index: u32) -> Option<[u8; 8]> {
+    if index >= ta.length {
+        return None;
+    }
     let bpe = ta.kind.bytes_per_element();
     let off = ta.byte_offset as usize + (index as usize) * bpe;
+    let Some(ObjectKind::ArrayBuffer(buf)) = vm.heap.get_object(ta.buffer).map(|o| &o.kind) else {
+        return None;
+    };
     if off + bpe > buf.len() {
-        return JsValue::UNDEFINED;
+        return None;
     }
+    let mut tmp = [0u8; 8];
+    tmp[..bpe].copy_from_slice(&buf[off..off + bpe]);
+    Some(tmp)
+}
+
+/// Formats element `index` of a `TypedArray` as a Rust string without mutating the heap.
+#[must_use]
+pub fn typed_array_read_element_string(vm: &JsVm, ta: TypedArrayObject, index: u32) -> String {
+    let Some(b) = typed_array_bytes(vm, ta, index) else {
+        return String::new();
+    };
     match ta.kind {
-        TypedArrayKind::Int8 => JsValue::from_i32(i32::from(buf[off] as i8)),
-        TypedArrayKind::Uint8 | TypedArrayKind::Uint8Clamped => {
-            JsValue::from_i32(i32::from(buf[off]))
+        TypedArrayKind::BigInt64 => i64::from_ne_bytes(b).to_string(),
+        TypedArrayKind::BigUint64 => u64::from_ne_bytes(b).to_string(),
+        TypedArrayKind::Float16 => {
+            vm.value_to_rust_string(JsValue::from_f64(f16_to_f64(u16::from_ne_bytes([
+                b[0], b[1],
+            ]))))
         }
-        TypedArrayKind::Int16 => {
-            JsValue::from_i32(i32::from(i16::from_ne_bytes([buf[off], buf[off + 1]])))
+        TypedArrayKind::Int8 => (b[0] as i8).to_string(),
+        TypedArrayKind::Uint8 | TypedArrayKind::Uint8Clamped => b[0].to_string(),
+        TypedArrayKind::Int16 => i16::from_ne_bytes([b[0], b[1]]).to_string(),
+        TypedArrayKind::Uint16 => u16::from_ne_bytes([b[0], b[1]]).to_string(),
+        TypedArrayKind::Int32 => i32::from_ne_bytes([b[0], b[1], b[2], b[3]]).to_string(),
+        TypedArrayKind::Uint32 => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]).to_string(),
+        TypedArrayKind::Float32 => {
+            vm.value_to_rust_string(JsValue::from_f64(f64::from(f32::from_ne_bytes([
+                b[0], b[1], b[2], b[3],
+            ]))))
         }
-        TypedArrayKind::Uint16 => {
-            JsValue::from_i32(i32::from(u16::from_ne_bytes([buf[off], buf[off + 1]])))
+        TypedArrayKind::Float64 => {
+            vm.value_to_rust_string(JsValue::from_f64(f64::from_ne_bytes(b)))
         }
-        TypedArrayKind::Int32 => JsValue::from_i32(i32::from_ne_bytes([
-            buf[off],
-            buf[off + 1],
-            buf[off + 2],
-            buf[off + 3],
-        ])),
-        TypedArrayKind::Uint32 => JsValue::from_f64(f64::from(u32::from_ne_bytes([
-            buf[off],
-            buf[off + 1],
-            buf[off + 2],
-            buf[off + 3],
-        ]))),
-        TypedArrayKind::Float32 => JsValue::from_f64(f64::from(f32::from_ne_bytes([
-            buf[off],
-            buf[off + 1],
-            buf[off + 2],
-            buf[off + 3],
-        ]))),
-        TypedArrayKind::Float64 => JsValue::from_f64(f64::from_ne_bytes([
-            buf[off],
-            buf[off + 1],
-            buf[off + 2],
-            buf[off + 3],
-            buf[off + 4],
-            buf[off + 5],
-            buf[off + 6],
-            buf[off + 7],
-        ])),
     }
+}
+
+/// Reads element `index` from a `TypedArray` backing `ArrayBuffer`.
+#[must_use]
+pub fn typed_array_read_element(vm: &mut JsVm, ta: TypedArrayObject, index: u32) -> JsValue {
+    let Some(b) = typed_array_bytes(vm, ta, index) else {
+        return JsValue::UNDEFINED;
+    };
+    match ta.kind {
+        TypedArrayKind::Int8 => JsValue::from_i32(i32::from(b[0] as i8)),
+        TypedArrayKind::Uint8 | TypedArrayKind::Uint8Clamped => JsValue::from_i32(i32::from(b[0])),
+        TypedArrayKind::Int16 => JsValue::from_i32(i32::from(i16::from_ne_bytes([b[0], b[1]]))),
+        TypedArrayKind::Uint16 => JsValue::from_i32(i32::from(u16::from_ne_bytes([b[0], b[1]]))),
+        TypedArrayKind::Float16 => JsValue::from_f64(f16_to_f64(u16::from_ne_bytes([b[0], b[1]]))),
+        TypedArrayKind::Int32 => JsValue::from_i32(i32::from_ne_bytes([b[0], b[1], b[2], b[3]])),
+        TypedArrayKind::Uint32 => {
+            JsValue::from_f64(f64::from(u32::from_ne_bytes([b[0], b[1], b[2], b[3]])))
+        }
+        TypedArrayKind::Float32 => {
+            JsValue::from_f64(f64::from(f32::from_ne_bytes([b[0], b[1], b[2], b[3]])))
+        }
+        TypedArrayKind::Float64 => JsValue::from_f64(f64::from_ne_bytes(b)),
+        TypedArrayKind::BigInt64 => JsValue::from_bigint(
+            vm.heap
+                .alloc_bigint(JsBigInt::from_i64(i64::from_ne_bytes(b))),
+        ),
+        TypedArrayKind::BigUint64 => JsValue::from_bigint(
+            vm.heap
+                .alloc_bigint(JsBigInt::from_i128(i128::from(u64::from_ne_bytes(b)))),
+        ),
+    }
+}
+
+fn to_bigint_bits(vm: &mut JsVm, val: JsValue) -> Result<i64, JsException> {
+    if let Some(h) = val.as_bigint() {
+        return Ok(vm.heap.get_bigint(h).map_or(0, JsBigInt::to_i64_lossy));
+    }
+    if let Some(b) = val.as_bool() {
+        return Ok(i64::from(b));
+    }
+    if let Some(sh) = val.as_string() {
+        let s = vm.heap.materialize_string(sh).unwrap_or_default();
+        let bi = JsBigInt::parse_str(&s).ok_or_else(|| {
+            vm.make_error("SyntaxError", format!("Cannot convert {s} to a BigInt"))
+        })?;
+        return Ok(bi.to_i64_lossy());
+    }
+    Err(vm.type_error("Cannot convert value to a BigInt"))
 }
 
 /// Writes `val` coerced to `ta.kind` at element `index` in the backing `ArrayBuffer`.
@@ -1255,9 +1359,22 @@ pub fn typed_array_write_element(
     if index >= ta.length {
         return Ok(());
     }
-    let num = vm.to_number(val)?;
     let bpe = ta.kind.bytes_per_element();
     let off = ta.byte_offset as usize + (index as usize) * bpe;
+    if ta.kind.is_bigint() {
+        let bits = to_bigint_bits(vm, val)?;
+        let Some(ObjectKind::ArrayBuffer(buf)) =
+            vm.heap.get_object_mut(ta.buffer).map(|o| &mut o.kind)
+        else {
+            return Ok(());
+        };
+        if off + bpe > buf.len() {
+            return Ok(());
+        }
+        buf[off..off + 8].copy_from_slice(&bits.to_ne_bytes());
+        return Ok(());
+    }
+    let num = vm.to_number(val)?;
     let Some(ObjectKind::ArrayBuffer(buf)) = vm.heap.get_object_mut(ta.buffer).map(|o| &mut o.kind)
     else {
         return Ok(());
@@ -1281,6 +1398,9 @@ pub fn typed_array_write_element(
         TypedArrayKind::Uint16 => {
             buf[off..off + 2].copy_from_slice(&(to_int32_bits(num) as u16).to_ne_bytes());
         }
+        TypedArrayKind::Float16 => {
+            buf[off..off + 2].copy_from_slice(&f64_to_f16(num).to_ne_bytes());
+        }
         TypedArrayKind::Int32 => {
             buf[off..off + 4].copy_from_slice(&to_int32_bits(num).to_ne_bytes());
         }
@@ -1293,6 +1413,7 @@ pub fn typed_array_write_element(
         TypedArrayKind::Float64 => {
             buf[off..off + 8].copy_from_slice(&num.to_ne_bytes());
         }
+        TypedArrayKind::BigInt64 | TypedArrayKind::BigUint64 => unreachable!(),
     }
     Ok(())
 }
@@ -1350,6 +1471,45 @@ pub fn alloc_typed_array(vm: &mut JsVm, kind: TypedArrayKind, length: u32) -> He
         }),
         Some(proto),
     ))
+}
+
+fn alloc_typed_array_pair(
+    vm: &mut JsVm,
+    kind: TypedArrayKind,
+    length: u32,
+) -> (HeapHandle, TypedArrayObject) {
+    let h = alloc_typed_array(vm, kind, length);
+    let ta = match vm.heap.get_object(h).map(|o| &o.kind) {
+        Some(ObjectKind::TypedArray(x)) => *x,
+        _ => unreachable!(),
+    };
+    (h, ta)
+}
+
+fn ta_find_last(
+    vm: &mut JsVm,
+    t: JsValue,
+    args: &[JsValue],
+    return_index: bool,
+) -> Result<JsValue, JsException> {
+    let ta = require_typed_array(vm, t)?;
+    let (cb, this_arg) = (arg(args, 0), arg(args, 1));
+    for i in (0..ta.length).rev() {
+        let v = typed_array_read_element(vm, ta, i);
+        let r = vm.call_value(cb, this_arg, &[v, JsValue::from_f64(f64::from(i)), t])?;
+        if vm.to_boolean(r) {
+            return Ok(if return_index {
+                JsValue::from_f64(f64::from(i))
+            } else {
+                v
+            });
+        }
+    }
+    Ok(if return_index {
+        JsValue::from_i32(-1)
+    } else {
+        JsValue::UNDEFINED
+    })
 }
 
 fn construct_typed_array(
@@ -1418,11 +1578,16 @@ fn construct_typed_array(
             _ => None,
         };
         let src_vals = if let Some(src) = src_ta {
-            (0..src.length)
-                .map(|i| typed_array_read_element(vm, src, i))
-                .collect::<Vec<_>>()
+            if src.kind.is_bigint() != kind.is_bigint() {
+                return Err(vm.type_error("Cannot mix BigInt and other TypedArray types"));
+            }
+            let mut vals = Vec::with_capacity(src.length as usize);
+            for i in 0..src.length {
+                vals.push(typed_array_read_element(vm, src, i));
+            }
+            vals
         } else {
-            vm.collect_iterable(first)?
+            collect_iterable_or_array_like(vm, first)?
         };
         let handle = alloc_typed_array(vm, kind, src_vals.len() as u32);
         let ta = match vm.heap.get_object(handle).map(|o| &o.kind) {
@@ -1547,11 +1712,16 @@ fn install_typed_arrays(vm: &mut JsVm) {
                 _ => None,
             };
             if let Some(sta) = sta_opt {
-                (0..sta.length)
-                    .map(|i| typed_array_read_element(vm, sta, i))
-                    .collect::<Vec<_>>()
+                if sta.kind.is_bigint() != ta.kind.is_bigint() {
+                    return Err(vm.type_error("Cannot mix BigInt and other TypedArray types"));
+                }
+                let mut v = Vec::with_capacity(sta.length as usize);
+                for i in 0..sta.length {
+                    v.push(typed_array_read_element(vm, sta, i));
+                }
+                v
             } else {
-                vm.collect_iterable(src)?
+                collect_array_like_only(vm, src)?
             }
         } else {
             return Err(vm.type_error("TypedArray.prototype.set source must be an object"));
@@ -1716,11 +1886,21 @@ fn install_typed_arrays(vm: &mut JsVm) {
     define_method(vm, tap, "sort", |vm, t, args| {
         let ta = require_typed_array(vm, t)?;
         let cmp = arg(args, 0);
-        let mut vals: Vec<JsValue> = (0..ta.length)
-            .map(|i| typed_array_read_element(vm, ta, i))
-            .collect();
+        let mut vals = Vec::with_capacity(ta.length as usize);
+        for i in 0..ta.length {
+            vals.push(typed_array_read_element(vm, ta, i));
+        }
         if cmp.is_undefined() {
             vals.sort_by(|a, b| {
+                if let (Some(ha), Some(hb)) = (a.as_bigint(), b.as_bigint()) {
+                    let ba = vm.heap.get_bigint(ha).map_or(0, JsBigInt::to_i64_lossy);
+                    let bb = vm.heap.get_bigint(hb).map_or(0, JsBigInt::to_i64_lossy);
+                    return if ta.kind == TypedArrayKind::BigUint64 {
+                        (ba as u64).cmp(&(bb as u64))
+                    } else {
+                        ba.cmp(&bb)
+                    };
+                }
                 let fa = a.as_number().unwrap_or(f64::NAN);
                 let fb = b.as_number().unwrap_or(f64::NAN);
                 fa.total_cmp(&fb)
@@ -1752,14 +1932,14 @@ fn install_typed_arrays(vm: &mut JsVm) {
             vm.value_to_rust_string(arg(args, 0))
         };
         let parts: Vec<String> = (0..ta.length)
-            .map(|i| vm.value_to_rust_string(typed_array_read_element(vm, ta, i)))
+            .map(|i| typed_array_read_element_string(vm, ta, i))
             .collect();
         Ok(JsValue::from_string(vm.heap.alloc_string(parts.join(&sep))))
     });
     define_method(vm, tap, "toString", |vm, t, _| {
         let ta = require_typed_array(vm, t)?;
         let parts: Vec<String> = (0..ta.length)
-            .map(|i| vm.value_to_rust_string(typed_array_read_element(vm, ta, i)))
+            .map(|i| typed_array_read_element_string(vm, ta, i))
             .collect();
         Ok(JsValue::from_string(vm.heap.alloc_string(parts.join(","))))
     });
@@ -1776,14 +1956,140 @@ fn install_typed_arrays(vm: &mut JsVm) {
         let ta = require_typed_array(vm, t)?;
         let mut pairs = Vec::with_capacity(ta.length as usize);
         for i in 0..ta.length {
+            let elem = typed_array_read_element(vm, ta, i);
             let p = vm.alloc_array();
             vm.heap
                 .object_push_element(p, JsValue::from_f64(f64::from(i)));
-            vm.heap
-                .object_push_element(p, typed_array_read_element(vm, ta, i));
+            vm.heap.object_push_element(p, elem);
             pairs.push(JsValue::from_object(p));
         }
         Ok(JsValue::from_object(alloc_values_iterator(vm, pairs)))
+    });
+    define_method(vm, tap, "toReversed", |vm, t, _| {
+        let ta = require_typed_array(vm, t)?;
+        let (out_h, out_ta) = alloc_typed_array_pair(vm, ta.kind, ta.length);
+        for i in 0..ta.length {
+            let v = typed_array_read_element(vm, ta, ta.length - 1 - i);
+            typed_array_write_element(vm, out_ta, i, v)?;
+        }
+        Ok(JsValue::from_object(out_h))
+    });
+    define_method(vm, tap, "toSorted", |vm, t, args| {
+        let ta = require_typed_array(vm, t)?;
+        let (out_h, out_ta) = alloc_typed_array_pair(vm, ta.kind, ta.length);
+        for i in 0..ta.length {
+            let v = typed_array_read_element(vm, ta, i);
+            typed_array_write_element(vm, out_ta, i, v)?;
+        }
+        let sort_k = vm.heap.intern_key("sort");
+        let sort_fn = vm.get_property_by_key(out_h, sort_k)?;
+        vm.call_value(sort_fn, JsValue::from_object(out_h), args)
+    });
+    define_method(vm, tap, "with", |vm, t, args| {
+        let ta = require_typed_array(vm, t)?;
+        let len = i64::from(ta.length);
+        let idx_f = vm.to_number(arg(args, 0))?;
+        let idx = if idx_f.is_nan() {
+            0
+        } else {
+            idx_f.trunc() as i64
+        };
+        let actual = if idx < 0 { len + idx } else { idx };
+        if actual < 0 || actual >= len {
+            return Err(vm.range_error("Invalid index in TypedArray.prototype.with"));
+        }
+        let (out_h, out_ta) = alloc_typed_array_pair(vm, ta.kind, ta.length);
+        for i in 0..ta.length {
+            let v = if i == actual as u32 {
+                arg(args, 1)
+            } else {
+                typed_array_read_element(vm, ta, i)
+            };
+            typed_array_write_element(vm, out_ta, i, v)?;
+        }
+        Ok(JsValue::from_object(out_h))
+    });
+    define_method(vm, tap, "lastIndexOf", |vm, t, args| {
+        let ta = require_typed_array(vm, t)?;
+        let target = arg(args, 0);
+        if ta.length == 0 {
+            return Ok(JsValue::from_i32(-1));
+        }
+        let len = i64::from(ta.length);
+        let from = if args.len() > 1 {
+            let f = vm.to_number(arg(args, 1))?;
+            let i = if f.is_nan() { 0 } else { f.trunc() as i64 };
+            if i < 0 {
+                len + i
+            } else {
+                i.min(len - 1)
+            }
+        } else {
+            len - 1
+        };
+        if from < 0 {
+            return Ok(JsValue::from_i32(-1));
+        }
+        for i in (0..=from as u32).rev() {
+            let v = typed_array_read_element(vm, ta, i);
+            if vm.strict_eq(v, target) {
+                return Ok(JsValue::from_f64(f64::from(i)));
+            }
+        }
+        Ok(JsValue::from_i32(-1))
+    });
+    define_method(vm, tap, "findLast", |vm, t, args| {
+        ta_find_last(vm, t, args, false)
+    });
+    define_method(vm, tap, "findLastIndex", |vm, t, args| {
+        ta_find_last(vm, t, args, true)
+    });
+    define_method(vm, tap, "reduceRight", |vm, t, args| {
+        let ta = require_typed_array(vm, t)?;
+        let cb = arg(args, 0);
+        let mut acc = (args.len() > 1).then(|| arg(args, 1));
+        for i in (0..ta.length).rev() {
+            let v = typed_array_read_element(vm, ta, i);
+            acc = Some(if let Some(cur) = acc {
+                vm.call_value(
+                    cb,
+                    JsValue::UNDEFINED,
+                    &[cur, v, JsValue::from_f64(f64::from(i)), t],
+                )?
+            } else {
+                v
+            });
+        }
+        acc.ok_or_else(|| vm.type_error("Reduce of empty TypedArray with no initial value"))
+    });
+    define_method(vm, tap, "copyWithin", |vm, t, args| {
+        let ta = require_typed_array(vm, t)?;
+        let len = i64::from(ta.length);
+        let clamp = |v: f64| -> usize {
+            let n = if v.is_nan() { 0 } else { v.trunc() as i64 };
+            if n < 0 {
+                (len + n).max(0) as usize
+            } else {
+                n.min(len) as usize
+            }
+        };
+        let to = clamp(vm.to_number(arg(args, 0))?);
+        let from = clamp(vm.to_number(arg(args, 1))?);
+        let end = if arg(args, 2).is_undefined() {
+            len as usize
+        } else {
+            clamp(vm.to_number(arg(args, 2))?)
+        };
+        let count = end
+            .saturating_sub(from)
+            .min((len as usize).saturating_sub(to));
+        let tmp: Vec<_> = (0..count)
+            .map(|i| typed_array_read_element(vm, ta, (from + i) as u32))
+            .collect();
+        for (i, v) in tmp.into_iter().enumerate() {
+            typed_array_write_element(vm, ta, (to + i) as u32, v)?;
+        }
+        Ok(t)
     });
 
     // Install each concrete TypedArray constructor inheriting from `TypedArray.prototype`.
@@ -1801,10 +2107,11 @@ fn install_typed_arrays(vm: &mut JsVm) {
         let ctor = vm.alloc_host_fn(kind.name(), move |vm, _this, args| {
             construct_typed_array(vm, kind, args)
         });
+        vm.set_fn_length(ctor, 3);
         vm.heap
             .object_define_data(ctor, k_bpe, bpe_val, PropertyAttrs::empty(), &mut vm.shapes);
         let from_fn = vm.alloc_host_fn("from", move |vm, _this, args| {
-            let src = vm.collect_iterable(arg(args, 0))?;
+            let src = collect_iterable_or_array_like(vm, arg(args, 0))?;
             let map_fn = arg(args, 1);
             let out_h = alloc_typed_array(vm, kind, src.len() as u32);
             let out_ta = match vm.heap.get_object(out_h).map(|o| &o.kind) {
@@ -1821,6 +2128,7 @@ fn install_typed_arrays(vm: &mut JsVm) {
             }
             Ok(JsValue::from_object(out_h))
         });
+        vm.set_fn_length(from_fn, 1);
         let of_fn = vm.alloc_host_fn("of", move |vm, _this, args| {
             let out_h = alloc_typed_array(vm, kind, args.len() as u32);
             let out_ta = match vm.heap.get_object(out_h).map(|o| &o.kind) {
@@ -1855,14 +2163,454 @@ fn install_typed_arrays(vm: &mut JsVm) {
     }
 }
 
+fn collect_array_like_only(vm: &mut JsVm, src: JsValue) -> Result<Vec<JsValue>, JsException> {
+    if src.is_null() || src.is_undefined() {
+        return Err(vm.type_error("Cannot convert undefined or null to object"));
+    }
+    let Some(obj) = src.as_object() else {
+        return Ok(Vec::new());
+    };
+    let len_val = vm.get_property_by_key(obj, vm.key_length)?;
+    let n = vm.to_number(len_val)?;
+    if !n.is_finite() || n <= 0.0 {
+        return Ok(Vec::new());
+    }
+    let len = n.trunc().min(4_000_000.0) as u32;
+    let mut out = Vec::with_capacity((len as usize).min(16_384));
+    for i in 0..len {
+        out.push(vm.get_elem(src, JsValue::from_f64(f64::from(i)))?);
+    }
+    Ok(out)
+}
+
+fn collect_iterable_or_array_like(
+    vm: &mut JsVm,
+    src: JsValue,
+) -> Result<Vec<JsValue>, JsException> {
+    if src.is_null() || src.is_undefined() {
+        return Err(vm.type_error("Cannot convert undefined or null to object"));
+    }
+    if src.is_string() {
+        return vm.collect_iterable(src);
+    }
+    if let Some(obj) = src.as_object() {
+        if matches!(
+            vm.heap.get_object(obj).map(|o| &o.kind),
+            Some(ObjectKind::Array)
+        ) {
+            return vm.collect_iterable(src);
+        }
+        let iter_m = vm.get_property_by_key(obj, vm.key_symbol_iterator)?;
+        if !iter_m.is_undefined() && !iter_m.is_null() {
+            return vm.collect_iterable(src);
+        }
+        return collect_array_like_only(vm, src);
+    }
+    Ok(Vec::new())
+}
+
 fn typed_array_values_fn(
     vm: &mut JsVm,
     t: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, JsException> {
     let ta = require_typed_array(vm, t)?;
-    let items: Vec<JsValue> = (0..ta.length)
-        .map(|i| typed_array_read_element(vm, ta, i))
-        .collect();
+    let mut items = Vec::with_capacity(ta.length as usize);
+    for i in 0..ta.length {
+        items.push(typed_array_read_element(vm, ta, i));
+    }
     Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
+}
+
+// ---------------------------------------------------------------------------
+// SharedArrayBuffer (ECMA-262 §25.2)
+// ---------------------------------------------------------------------------
+
+fn require_sab(vm: &mut JsVm, t: JsValue) -> Result<(HeapHandle, usize), JsException> {
+    if let Some(h) = t.as_object() {
+        if let Some(ObjectKind::ArrayBuffer(b)) = vm.heap.get_object(h).map(|o| &o.kind) {
+            return Ok((h, b.len()));
+        }
+    }
+    Err(vm.type_error("SharedArrayBuffer incompatible receiver"))
+}
+
+fn install_shared_array_buffer(vm: &mut JsVm) {
+    let sab_proto = vm.alloc_ordinary_object();
+    vm.heap.get_object_mut(sab_proto).unwrap().is_prototype = true;
+    define_getter(vm, sab_proto, "byteLength", |vm, t, _| {
+        Ok(JsValue::from_f64(require_sab(vm, t)?.1 as f64))
+    });
+    define_getter(vm, sab_proto, "growable", |_, _, _| Ok(JsValue::FALSE));
+    define_method(vm, sab_proto, "slice", |vm, t, args| {
+        let (h, len) = require_sab(vm, t)?;
+        let s = if arg(args, 0).is_undefined() {
+            0
+        } else {
+            clamp_slice_index(vm.to_number(arg(args, 0))?.trunc() as i64, len)
+        };
+        let e = if arg(args, 1).is_undefined() {
+            len
+        } else {
+            clamp_slice_index(vm.to_number(arg(args, 1))?.trunc() as i64, len)
+        };
+        let sliced = match vm.heap.get_object(h).map(|o| &o.kind) {
+            Some(ObjectKind::ArrayBuffer(b)) if e > s => b[s..e].to_vec(),
+            _ => Vec::new(),
+        };
+        let proto = vm.heap.get_object(h).and_then(|o| o.prototype);
+        let out = vm.heap.alloc_object(JsObject::with_kind(
+            ObjectKind::ArrayBuffer(Box::new(sliced)),
+            proto,
+        ));
+        Ok(JsValue::from_object(out))
+    });
+
+    let ctor = vm.alloc_host_fn("SharedArrayBuffer", move |vm, _this, args| {
+        let byte_len_f = if arg(args, 0).is_undefined() {
+            0.0
+        } else {
+            vm.to_number(arg(args, 0))?
+        };
+        if !byte_len_f.is_finite() || byte_len_f < 0.0 || byte_len_f > 64.0 * 1024.0 * 1024.0 {
+            return Err(vm.range_error("Invalid SharedArrayBuffer length"));
+        }
+        let len = byte_len_f.trunc() as usize;
+        let out = vm.heap.alloc_object(JsObject::with_kind(
+            ObjectKind::ArrayBuffer(Box::new(vec![0u8; len])),
+            Some(sab_proto),
+        ));
+        Ok(JsValue::from_object(out))
+    });
+    vm.set_fn_length(ctor, 1);
+    bind_ctor_proto(vm, ctor, sab_proto);
+    define_global(vm, "SharedArrayBuffer", JsValue::from_object(ctor));
+}
+
+// ---------------------------------------------------------------------------
+// ES2025 Iterator & Iterator Helpers (ECMA-262 §27.1.3)
+// ---------------------------------------------------------------------------
+
+fn step_js_iterator(vm: &mut JsVm, iter_h: HeapHandle) -> Result<Option<JsValue>, JsException> {
+    vm.loop_iterations = vm.loop_iterations.saturating_add(1);
+    if let Some(limit) = vm.max_loop_iterations {
+        if vm.loop_iterations > limit {
+            return Err(vm.range_error("Script execution iteration limit exceeded"));
+        }
+    }
+    let next_fn = vm.get_property_by_key(iter_h, vm.key_next)?;
+    let res = vm.call_value(next_fn, JsValue::from_object(iter_h), &[])?;
+    let Some(res_h) = res.as_object() else {
+        return Err(vm.type_error("Iterator result is not an object"));
+    };
+    let done_val = vm.get_property_by_key(res_h, vm.key_done)?;
+    if vm.to_boolean(done_val) {
+        return Ok(None);
+    }
+    let val = vm.get_property_by_key(res_h, vm.key_value)?;
+    Ok(Some(val))
+}
+
+fn iter_done(vm: &mut JsVm) -> JsValue {
+    crate::promise::make_iter_result(vm, JsValue::UNDEFINED, true)
+}
+
+fn iter_val(vm: &mut JsVm, val: JsValue) -> JsValue {
+    crate::promise::make_iter_result(vm, val, false)
+}
+
+fn alloc_helper_iterator(
+    vm: &mut JsVm,
+    parent: HeapHandle,
+    extra: Option<HeapHandle>,
+    next_impl: impl Fn(&mut JsVm, JsValue, &[JsValue]) -> Result<JsValue, JsException> + 'static,
+) -> HeapHandle {
+    let iter_obj = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Ordinary,
+        Some(vm.iterator_proto),
+    ));
+    let next_fn = vm.alloc_host_fn("next", next_impl);
+    vm.heap.object_define_data(
+        iter_obj,
+        vm.key_next,
+        JsValue::from_object(next_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    if let Some(o) = vm.heap.get_object_mut(iter_obj) {
+        o.extra_refs.push(parent);
+        if let Some(e) = extra {
+            o.extra_refs.push(e);
+        }
+    }
+    iter_obj
+}
+
+fn wrap_next_iter(vm: &mut JsVm, ih: HeapHandle) -> HeapHandle {
+    alloc_helper_iterator(vm, ih, None, move |vm, _this, _| {
+        let next_fn = vm.get_property_by_key(ih, vm.key_next)?;
+        vm.call_value(next_fn, JsValue::from_object(ih), &[])
+    })
+}
+
+fn require_iter_and_cb(
+    vm: &mut JsVm,
+    t: JsValue,
+    args: &[JsValue],
+    name: &str,
+) -> Result<(HeapHandle, JsValue), JsException> {
+    let Some(src_h) = t.as_object() else {
+        return Err(vm.type_error(format!("Iterator.prototype.{name} called on non-object")));
+    };
+    let cb = arg(args, 0);
+    if !cb.as_object().is_some_and(|h| vm.is_callable_handle(h)) {
+        return Err(vm.type_error(format!("Iterator.prototype.{name} requires a function")));
+    }
+    Ok((src_h, cb))
+}
+
+fn require_iter_limit(
+    vm: &mut JsVm,
+    t: JsValue,
+    args: &[JsValue],
+    name: &str,
+) -> Result<(HeapHandle, u64), JsException> {
+    let Some(src_h) = t.as_object() else {
+        return Err(vm.type_error(format!("Iterator.prototype.{name} called on non-object")));
+    };
+    let n = vm.to_number(arg(args, 0))?;
+    if n.is_nan() || n < 0.0 {
+        return Err(vm.range_error(format!(
+            "Iterator.prototype.{name} limit must be non-negative"
+        )));
+    }
+    Ok((
+        src_h,
+        if n.is_infinite() {
+            u64::MAX
+        } else {
+            n.trunc() as u64
+        },
+    ))
+}
+
+fn iter_predicate_scan(
+    vm: &mut JsVm,
+    t: JsValue,
+    args: &[JsValue],
+    mode: u8,
+) -> Result<JsValue, JsException> {
+    let name = match mode {
+        0 => "some",
+        1 => "every",
+        _ => "find",
+    };
+    let (src_h, cb) = require_iter_and_cb(vm, t, args, name)?;
+    let mut idx = 0u64;
+    while let Some(v) = step_js_iterator(vm, src_h)? {
+        let r = vm.call_value(cb, JsValue::UNDEFINED, &[v, JsValue::from_f64(idx as f64)])?;
+        let hit = vm.to_boolean(r);
+        match mode {
+            0 if hit => return Ok(JsValue::TRUE),
+            1 if !hit => return Ok(JsValue::FALSE),
+            2 if hit => return Ok(v),
+            _ => {}
+        }
+        idx += 1;
+    }
+    Ok(match mode {
+        0 => JsValue::FALSE,
+        1 => JsValue::TRUE,
+        _ => JsValue::UNDEFINED,
+    })
+}
+
+fn install_iterator(vm: &mut JsVm) {
+    let ip = vm.iterator_proto;
+    define_symbol_iterator(vm, ip, |_vm, this_val, _| Ok(this_val));
+    let def_iter = |vm: &mut JsVm, name: &str, len: u32, f: NativeFnPtr| {
+        crate::vm_builtins::define_method_len(vm, ip, name, len, f);
+    };
+    def_iter(vm, "map", 1, |vm, t, args| {
+        let (src_h, mapper) = require_iter_and_cb(vm, t, args, "map")?;
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let h = alloc_helper_iterator(vm, src_h, mapper.as_object(), move |vm, _, _| {
+            let Some(val) = step_js_iterator(vm, src_h)? else {
+                return Ok(iter_done(vm));
+            };
+            let idx = counter.replace(counter.get() + 1);
+            let m = vm.call_value(
+                mapper,
+                JsValue::UNDEFINED,
+                &[val, JsValue::from_f64(idx as f64)],
+            )?;
+            Ok(iter_val(vm, m))
+        });
+        Ok(JsValue::from_object(h))
+    });
+    def_iter(vm, "filter", 1, |vm, t, args| {
+        let (src_h, pred) = require_iter_and_cb(vm, t, args, "filter")?;
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let h = alloc_helper_iterator(vm, src_h, pred.as_object(), move |vm, _, _| loop {
+            let Some(val) = step_js_iterator(vm, src_h)? else {
+                return Ok(iter_done(vm));
+            };
+            let idx = counter.replace(counter.get() + 1);
+            let keep = vm.call_value(
+                pred,
+                JsValue::UNDEFINED,
+                &[val, JsValue::from_f64(idx as f64)],
+            )?;
+            if vm.to_boolean(keep) {
+                return Ok(iter_val(vm, val));
+            }
+        });
+        Ok(JsValue::from_object(h))
+    });
+    def_iter(vm, "take", 1, |vm, t, args| {
+        let (src_h, lim) = require_iter_limit(vm, t, args, "take")?;
+        let rem = std::rc::Rc::new(std::cell::Cell::new(lim));
+        let h = alloc_helper_iterator(vm, src_h, None, move |vm, _, _| {
+            if rem.get() == 0 {
+                return Ok(iter_done(vm));
+            }
+            rem.set(rem.get() - 1);
+            match step_js_iterator(vm, src_h)? {
+                Some(val) => Ok(iter_val(vm, val)),
+                None => {
+                    rem.set(0);
+                    Ok(iter_done(vm))
+                }
+            }
+        });
+        Ok(JsValue::from_object(h))
+    });
+    def_iter(vm, "drop", 1, |vm, t, args| {
+        let (src_h, lim) = require_iter_limit(vm, t, args, "drop")?;
+        let to_drop = std::rc::Rc::new(std::cell::Cell::new(lim));
+        let h = alloc_helper_iterator(vm, src_h, None, move |vm, _, _| {
+            while to_drop.get() > 0 {
+                to_drop.set(to_drop.get() - 1);
+                if step_js_iterator(vm, src_h)?.is_none() {
+                    to_drop.set(0);
+                    return Ok(iter_done(vm));
+                }
+            }
+            match step_js_iterator(vm, src_h)? {
+                Some(val) => Ok(iter_val(vm, val)),
+                None => Ok(iter_done(vm)),
+            }
+        });
+        Ok(JsValue::from_object(h))
+    });
+    def_iter(vm, "flatMap", 1, |vm, t, args| {
+        let (src_h, mapper) = require_iter_and_cb(vm, t, args, "flatMap")?;
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let buf = std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new()));
+        let h = alloc_helper_iterator(vm, src_h, mapper.as_object(), move |vm, _, _| loop {
+            if let Some(v) = buf.borrow_mut().pop_front() {
+                return Ok(iter_val(vm, v));
+            }
+            let Some(val) = step_js_iterator(vm, src_h)? else {
+                return Ok(iter_done(vm));
+            };
+            let idx = counter.replace(counter.get() + 1);
+            let mapped = vm.call_value(
+                mapper,
+                JsValue::UNDEFINED,
+                &[val, JsValue::from_f64(idx as f64)],
+            )?;
+            buf.borrow_mut().extend(vm.collect_iterable(mapped)?);
+        });
+        Ok(JsValue::from_object(h))
+    });
+    def_iter(vm, "toArray", 0, |vm, t, _| {
+        let Some(src_h) = t.as_object() else {
+            return Err(vm.type_error("Iterator.prototype.toArray called on non-object"));
+        };
+        let out = vm.alloc_array();
+        while let Some(v) = step_js_iterator(vm, src_h)? {
+            vm.heap.object_push_element(out, v);
+        }
+        Ok(JsValue::from_object(out))
+    });
+    def_iter(vm, "forEach", 1, |vm, t, args| {
+        let (src_h, cb) = require_iter_and_cb(vm, t, args, "forEach")?;
+        let mut idx = 0u64;
+        while let Some(v) = step_js_iterator(vm, src_h)? {
+            vm.call_value(cb, JsValue::UNDEFINED, &[v, JsValue::from_f64(idx as f64)])?;
+            idx += 1;
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    def_iter(vm, "reduce", 1, |vm, t, args| {
+        let (src_h, cb) = require_iter_and_cb(vm, t, args, "reduce")?;
+        let mut idx = 0u64;
+        let mut acc = if args.len() > 1 {
+            arg(args, 1)
+        } else {
+            let Some(first) = step_js_iterator(vm, src_h)? else {
+                return Err(vm.type_error("Reduce of empty iterator with no initial value"));
+            };
+            idx = 1;
+            first
+        };
+        while let Some(v) = step_js_iterator(vm, src_h)? {
+            acc = vm.call_value(
+                cb,
+                JsValue::UNDEFINED,
+                &[acc, v, JsValue::from_f64(idx as f64)],
+            )?;
+            idx += 1;
+        }
+        Ok(acc)
+    });
+    def_iter(vm, "some", 1, |vm, t, args| {
+        iter_predicate_scan(vm, t, args, 0)
+    });
+    def_iter(vm, "every", 1, |vm, t, args| {
+        iter_predicate_scan(vm, t, args, 1)
+    });
+    def_iter(vm, "find", 1, |vm, t, args| {
+        iter_predicate_scan(vm, t, args, 2)
+    });
+
+    let ctor = vm.alloc_native_fn("Iterator", |vm, this_val, _| {
+        // Abstract base constructor: subclasses may invoke `super()`, direct `new Iterator()` throws TypeError.
+        if let Some(h) = this_val.as_object() {
+            if vm.heap.get_object(h).and_then(|o| o.prototype) == Some(vm.iterator_proto) {
+                return Err(vm.type_error("Abstract class Iterator not directly constructable"));
+            }
+            return Ok(this_val);
+        }
+        Err(vm.type_error("Iterator constructor requires 'new'"))
+    });
+    define_method(vm, ctor, "from", |vm, _this, args| {
+        let obj = arg(args, 0);
+        if let Some(h) = obj.as_object() {
+            let iter_m = vm.get_property_by_key(h, vm.key_symbol_iterator)?;
+            if !iter_m.is_undefined() && !iter_m.is_null() {
+                let it = vm.call_value(iter_m, obj, &[])?;
+                if let Some(ih) = it.as_object() {
+                    if vm.heap.get_object(ih).and_then(|o| o.prototype) == Some(vm.iterator_proto) {
+                        return Ok(it);
+                    }
+                    return Ok(JsValue::from_object(wrap_next_iter(vm, ih)));
+                }
+            }
+            if vm.has_property_by_key(h, vm.key_next)? {
+                return Ok(JsValue::from_object(wrap_next_iter(vm, h)));
+            }
+        } else if obj.is_string() {
+            let chars: Vec<JsValue> = vm
+                .value_to_rust_string(obj)
+                .chars()
+                .map(|c| JsValue::from_string(vm.heap.alloc_string(c.to_string())))
+                .collect();
+            return Ok(JsValue::from_object(alloc_values_iterator(vm, chars)));
+        }
+        Err(vm.type_error("Iterator.from called on non-iterable"))
+    });
+    bind_ctor_proto(vm, ctor, ip);
+    define_global(vm, "Iterator", JsValue::from_object(ctor));
 }

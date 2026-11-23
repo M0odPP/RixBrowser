@@ -440,7 +440,7 @@ pub unsafe extern "C" fn rt_throw(vm: *mut JsVm, val_bits: u64, pc: u32) -> u64 
     // SAFETY: Valid active `JsVm` pointer passed from JIT frame.
     let vm = unsafe { &mut *vm };
     let val = JsValue::from_raw(val_bits);
-    let msg = vm.value_to_rust_string(val);
+    let msg = vm.format_exception(val);
     record_exc(
         vm,
         rix_js::JsException {

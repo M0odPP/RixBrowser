@@ -733,6 +733,7 @@ fn install_mutation_observer(vm: &mut JsVm, host: &SharedHost, observers: &Share
         PropertyAttrs::empty(),
         &mut vm.shapes,
     );
+    vm.mark_constructor(ctor);
     define_global(vm, "MutationObserver", JsValue::from_object(ctor));
 }
 
@@ -814,6 +815,7 @@ fn install_resize_observer(vm: &mut JsVm, host: &SharedHost, observers: &SharedO
         PropertyAttrs::empty(),
         &mut vm.shapes,
     );
+    vm.mark_constructor(ctor);
     define_global(vm, "ResizeObserver", JsValue::from_object(ctor));
 }
 
@@ -949,5 +951,6 @@ fn install_intersection_observer(vm: &mut JsVm, host: &SharedHost, observers: &S
         PropertyAttrs::empty(),
         &mut vm.shapes,
     );
+    vm.mark_constructor(ctor);
     define_global(vm, "IntersectionObserver", JsValue::from_object(ctor));
 }

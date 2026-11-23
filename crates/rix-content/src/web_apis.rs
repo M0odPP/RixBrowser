@@ -296,6 +296,7 @@ pub(crate) fn define_host_accessor(
 }
 
 pub(crate) fn bind_ctor_proto(vm: &mut JsVm, ctor: HeapHandle, proto: HeapHandle) {
+    vm.mark_constructor(ctor);
     vm.heap.object_define_data(
         ctor,
         vm.key_prototype,

@@ -182,6 +182,13 @@ pub struct JsVm {
     pub function_proto: HeapHandle,
     pub array_proto: HeapHandle,
     pub error_proto: HeapHandle,
+    pub type_error_proto: HeapHandle,
+    pub reference_error_proto: HeapHandle,
+    pub range_error_proto: HeapHandle,
+    pub syntax_error_proto: HeapHandle,
+    pub uri_error_proto: HeapHandle,
+    pub eval_error_proto: HeapHandle,
+    pub aggregate_error_proto: HeapHandle,
     pub string_proto: HeapHandle,
     pub number_proto: HeapHandle,
     pub boolean_proto: HeapHandle,
@@ -195,8 +202,9 @@ pub struct JsVm {
     pub array_buffer_proto: HeapHandle,
     pub data_view_proto: HeapHandle,
     pub typed_array_proto: HeapHandle,
-    pub typed_array_protos: [HeapHandle; 9],
+    pub typed_array_protos: [HeapHandle; 12],
     pub promise_proto: HeapHandle,
+    pub iterator_proto: HeapHandle,
     pub generator_proto: HeapHandle,
     pub async_generator_proto: HeapHandle,
     pub sym_iterator: SymbolId,
@@ -311,6 +319,13 @@ impl JsVm {
             heap.get_object_mut(p).unwrap().is_prototype = true;
             p
         };
+        let type_error_proto = make_proto(&mut heap, &mut shapes, error_proto);
+        let reference_error_proto = make_proto(&mut heap, &mut shapes, error_proto);
+        let range_error_proto = make_proto(&mut heap, &mut shapes, error_proto);
+        let syntax_error_proto = make_proto(&mut heap, &mut shapes, error_proto);
+        let uri_error_proto = make_proto(&mut heap, &mut shapes, error_proto);
+        let eval_error_proto = make_proto(&mut heap, &mut shapes, error_proto);
+        let aggregate_error_proto = make_proto(&mut heap, &mut shapes, error_proto);
         let map_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let set_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let weakmap_proto = make_proto(&mut heap, &mut shapes, object_proto);
@@ -322,7 +337,8 @@ impl JsVm {
         let typed_array_protos =
             std::array::from_fn(|_| make_proto(&mut heap, &mut shapes, typed_array_proto));
         let promise_proto = make_proto(&mut heap, &mut shapes, object_proto);
-        let generator_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let iterator_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let generator_proto = make_proto(&mut heap, &mut shapes, iterator_proto);
         let async_generator_proto = make_proto(&mut heap, &mut shapes, object_proto);
 
         let sym_iterator = heap.alloc_symbol(Some("Symbol.iterator".into()));
@@ -333,6 +349,7 @@ impl JsVm {
 
         let global = heap.alloc_empty_object();
         heap.object_set_prototype(global, Some(object_proto), &mut shapes);
+        heap.get_object_mut(global).unwrap().is_global = true;
 
         let key_length = heap.intern_key("length");
         let key_prototype = heap.intern_key("prototype");
@@ -364,6 +381,13 @@ impl JsVm {
             function_proto,
             array_proto,
             error_proto,
+            type_error_proto,
+            reference_error_proto,
+            range_error_proto,
+            syntax_error_proto,
+            uri_error_proto,
+            eval_error_proto,
+            aggregate_error_proto,
             string_proto,
             number_proto,
             boolean_proto,
@@ -379,6 +403,7 @@ impl JsVm {
             typed_array_proto,
             typed_array_protos,
             promise_proto,
+            iterator_proto,
             generator_proto,
             async_generator_proto,
             sym_iterator,
@@ -491,6 +516,13 @@ impl JsVm {
             self.function_proto,
             self.array_proto,
             self.error_proto,
+            self.type_error_proto,
+            self.reference_error_proto,
+            self.range_error_proto,
+            self.syntax_error_proto,
+            self.uri_error_proto,
+            self.eval_error_proto,
+            self.aggregate_error_proto,
             self.string_proto,
             self.number_proto,
             self.boolean_proto,
@@ -505,6 +537,7 @@ impl JsVm {
             self.data_view_proto,
             self.typed_array_proto,
             self.promise_proto,
+            self.iterator_proto,
             self.generator_proto,
             self.async_generator_proto,
         ] {
@@ -629,6 +662,45 @@ impl JsVm {
         ))
     }
 
+    /// Marks a callable handle as constructable (`[[Construct]]` internal method present).
+    pub fn mark_constructor(&mut self, handle: HeapHandle) {
+        if let Some(o) = self.heap.get_object_mut(handle) {
+            o.is_constructor = true;
+        }
+    }
+
+    /// Sets a function object's own `length` property (`{ writable: false, enumerable: false, configurable: true }`).
+    pub fn set_fn_length(&mut self, handle: HeapHandle, len: u32) {
+        self.heap.object_define_data(
+            handle,
+            self.key_length,
+            JsValue::from_i32(len as i32),
+            PropertyAttrs::CONFIGURABLE,
+            &mut self.shapes,
+        );
+    }
+
+    /// Returns `true` if `handle` implements ECMAScript `IsConstructor(handle)`.
+    pub fn is_constructor_handle(&self, handle: HeapHandle) -> bool {
+        let mut cur = handle;
+        for _ in 0..32 {
+            let Some(obj) = self.heap.get_object(cur) else {
+                return false;
+            };
+            match &obj.kind {
+                ObjectKind::BoundFunction(b) => cur = b.target,
+                ObjectKind::Proxy(p) => {
+                    if p.revoked {
+                        return false;
+                    }
+                    cur = p.target;
+                }
+                _ => return obj.is_constructor,
+            }
+        }
+        false
+    }
+
     /// Registers a static native function and returns its callable [`HeapHandle`].
     pub fn alloc_native_fn(&mut self, name: &str, f: NativeFnPtr) -> HeapHandle {
         let id = self.native_fns.len() as u32;
@@ -637,6 +709,13 @@ impl JsVm {
             ObjectKind::NativeFunction(id),
             Some(self.function_proto),
         ));
+        self.heap.object_define_data(
+            obj,
+            self.key_length,
+            JsValue::from_i32(0),
+            PropertyAttrs::CONFIGURABLE,
+            &mut self.shapes,
+        );
         let name_val = JsValue::from_string(self.heap.alloc_string(name));
         self.heap.object_define_data(
             obj,
@@ -660,6 +739,13 @@ impl JsVm {
             ObjectKind::NativeFunction(id),
             Some(self.function_proto),
         ));
+        self.heap.object_define_data(
+            obj,
+            self.key_length,
+            JsValue::from_i32(0),
+            PropertyAttrs::CONFIGURABLE,
+            &mut self.shapes,
+        );
         let name_val = JsValue::from_string(self.heap.alloc_string(name));
         self.heap.object_define_data(
             obj,
@@ -768,6 +854,18 @@ impl JsVm {
         let Some(callee) = callee_val.as_object() else {
             return Err(self.type_error("Target is not a constructor"));
         };
+        if !self.is_constructor_handle(callee) {
+            return Err(self.type_error("Target is not a constructor"));
+        }
+        let nt_handle = match new_target.as_object() {
+            Some(nt) => {
+                if !self.is_constructor_handle(nt) {
+                    return Err(self.type_error("newTarget is not a constructor"));
+                }
+                nt
+            }
+            None => return Err(self.type_error("newTarget is not a constructor")),
+        };
         if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(callee).map(|o| o.kind.clone()) {
             if p.revoked {
                 return Err(self.type_error("Cannot perform 'construct' on a revoked Proxy"));
@@ -795,9 +893,16 @@ impl JsVm {
             return self.construct_value(JsValue::from_object(p.target), args, new_target);
         }
 
-        // Determine instance `[[Prototype]]` from `callee.prototype`.
-        let proto_val = self.get_property_by_key(callee, self.key_prototype)?;
-        let proto_handle = proto_val.as_object().unwrap_or(self.object_proto);
+        // Determine instance `[[Prototype]]` from `newTarget.prototype` (fallback `callee.prototype`).
+        let proto_val = self.get_property_by_key(nt_handle, self.key_prototype)?;
+        let proto_handle = proto_val
+            .as_object()
+            .or_else(|| {
+                self.get_property_by_key(callee, self.key_prototype)
+                    .ok()
+                    .and_then(|v| v.as_object())
+            })
+            .unwrap_or(self.object_proto);
         let instance = self.heap.alloc_object(JsObject::with_kind(
             ObjectKind::Ordinary,
             Some(proto_handle),
@@ -1448,23 +1553,22 @@ impl JsVm {
                     Some(ConstantEntry::Function(idx)) => *idx,
                     _ => return Err(self.type_error("Expected Function constant")),
                 };
-                let uv_descs = self.programs[prog_id].functions[child_fn_idx as usize]
-                    .upvalues
-                    .clone();
-                let is_arrow = self.programs[prog_id].functions[child_fn_idx as usize].is_arrow;
-                let mut captured = Vec::with_capacity(uv_descs.len());
-                for desc in uv_descs {
-                    if desc.is_local {
-                        let abs_reg = base + usize::from(desc.index);
-                        let cell = self.capture_open_upvalue(abs_reg);
-                        captured.push(cell);
-                    } else {
-                        let parent_cell = self.frame_upvalue(frame_idx, usize::from(desc.index))?;
-                        captured.push(parent_cell);
-                    }
-                }
+                let (is_arrow, is_async, is_generator, is_method, fn_length, fn_name) = {
+                    let f = &self.programs[prog_id].functions[child_fn_idx as usize];
+                    (
+                        f.is_arrow,
+                        f.is_async,
+                        f.is_generator,
+                        f.is_method,
+                        f.length,
+                        f.name.clone().unwrap_or_default(),
+                    )
+                };
+                let captured =
+                    self.capture_function_upvalues(prog_id, child_fn_idx, frame_idx, base)?;
                 let bound_this = is_arrow.then_some(self.frames[frame_idx].this_val);
-                let closure_obj = self.heap.alloc_object(JsObject::with_kind(
+                let is_ctor = !is_arrow && !is_async && !is_generator && !is_method;
+                let mut js_obj = JsObject::with_kind(
                     ObjectKind::Closure(Box::new(ClosureObject {
                         program_id: prog_id as u32,
                         func_idx: child_fn_idx,
@@ -1474,8 +1578,25 @@ impl JsVm {
                         field_init: None,
                     })),
                     Some(self.function_proto),
-                ));
-                if !is_arrow {
+                );
+                js_obj.is_constructor = is_ctor;
+                let closure_obj = self.heap.alloc_object(js_obj);
+                self.heap.object_define_data(
+                    closure_obj,
+                    self.key_length,
+                    JsValue::from_i32(i32::from(fn_length)),
+                    PropertyAttrs::CONFIGURABLE,
+                    &mut self.shapes,
+                );
+                let name_val = JsValue::from_string(self.heap.alloc_string(fn_name));
+                self.heap.object_define_data(
+                    closure_obj,
+                    self.key_name,
+                    name_val,
+                    PropertyAttrs::CONFIGURABLE,
+                    &mut self.shapes,
+                );
+                if is_ctor {
                     let proto_obj = self.alloc_ordinary_object();
                     self.heap.get_object_mut(proto_obj).unwrap().is_prototype = true;
                     self.heap.object_define_data(
@@ -1485,6 +1606,23 @@ impl JsVm {
                         PropertyAttrs::METHOD,
                         &mut self.shapes,
                     );
+                    self.heap.object_define_data(
+                        closure_obj,
+                        self.key_prototype,
+                        JsValue::from_object(proto_obj),
+                        PropertyAttrs::WRITABLE,
+                        &mut self.shapes,
+                    );
+                } else if is_generator {
+                    let parent_gp = if is_async {
+                        self.async_generator_proto
+                    } else {
+                        self.generator_proto
+                    };
+                    let proto_obj = self
+                        .heap
+                        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(parent_gp)));
+                    self.heap.get_object_mut(proto_obj).unwrap().is_prototype = true;
                     self.heap.object_define_data(
                         closure_obj,
                         self.key_prototype,
@@ -1597,8 +1735,12 @@ impl JsVm {
                 let val = self.registers[base + usize::from(inst.b())];
                 let ic_idx = self.resolve_ic_idx(inst, prog_id, func_idx, frame_idx);
                 let key = self.ic_key(prog_id, func_idx, ic_idx);
+                let is_strict = self.programs[prog_id].functions[func_idx].is_strict;
                 let Some(obj) = obj_val.as_object() else {
-                    return Err(self.type_error("Cannot set property on non-object"));
+                    if obj_val.is_null() || obj_val.is_undefined() || is_strict {
+                        return Err(self.type_error("Cannot set property on non-object"));
+                    }
+                    return Ok(StepOutcome::Continue);
                 };
                 self.set_prop_cached(obj, prog_id, func_idx, ic_idx, key, val)?;
             }
@@ -1635,6 +1777,7 @@ impl JsVm {
                 let obj_val = self.registers[a];
                 let key_val = self.registers[base + usize::from(inst.b())];
                 let val = self.registers[base + usize::from(inst.c())];
+                let is_strict = self.programs[prog_id].functions[func_idx].is_strict;
                 if self.jit.is_some() {
                     if let Some(obj) = obj_val.as_object() {
                         if let Some(o) = self.heap.get_object(obj) {
@@ -1648,12 +1791,33 @@ impl JsVm {
                         }
                     }
                 }
-                self.set_elem(obj_val, key_val, val)?;
+                if obj_val.is_null() || obj_val.is_undefined() {
+                    return Err(self.type_error("Cannot set element on null or undefined"));
+                }
+                if !obj_val.is_object() {
+                    if is_strict {
+                        return Err(self.type_error("Cannot set property on primitive value"));
+                    }
+                    return Ok(StepOutcome::Continue);
+                }
+                let ok = self.set_elem_checked(obj_val, key_val, val)?;
+                if !ok && is_strict {
+                    return Err(
+                        self.type_error("Cannot assign to read-only or non-extensible property")
+                    );
+                }
             }
             Opcode::DeleteProp | Opcode::DeleteElem => {
                 let obj_val = self.registers[base + usize::from(inst.b())];
                 let key_val = self.registers[base + usize::from(inst.c())];
+                if obj_val.is_null() || obj_val.is_undefined() {
+                    return Err(self.type_error("Cannot delete property of null or undefined"));
+                }
                 let deleted = self.delete_elem(obj_val, key_val)?;
+                let is_strict = self.programs[prog_id].functions[func_idx].is_strict;
+                if !deleted && is_strict {
+                    return Err(self.type_error("Cannot delete non-configurable property"));
+                }
                 self.registers[a] = JsValue::from_bool(deleted);
             }
             Opcode::DefineGetter | Opcode::DefineSetter => {
@@ -2107,6 +2271,15 @@ impl JsVm {
                 let v = self.registers[base + usize::from(inst.b())];
                 self.registers[a] = match v.kind() {
                     JsValueKind::Int32(i) if i != 0 && i != i32::MIN => JsValue::from_i32(-i),
+                    JsValueKind::BigInt(h) => {
+                        let bi = self
+                            .heap
+                            .get_bigint(h)
+                            .cloned()
+                            .unwrap_or_default()
+                            .negate();
+                        JsValue::from_bigint(self.heap.alloc_bigint(bi))
+                    }
                     _ => JsValue::from_f64(-self.to_number(v)?),
                 };
             }
@@ -2125,8 +2298,19 @@ impl JsVm {
                 self.registers[a] = JsValue::from_bool(!self.to_boolean(v));
             }
             Opcode::BitNot => {
-                let v = self.to_i32(self.registers[base + usize::from(inst.b())])?;
-                self.registers[a] = JsValue::from_i32(!v);
+                let raw = self.registers[base + usize::from(inst.b())];
+                self.registers[a] = if let Some(h) = raw.as_bigint() {
+                    let bi = self
+                        .heap
+                        .get_bigint(h)
+                        .cloned()
+                        .unwrap_or_default()
+                        .negate()
+                        .sub(&JsBigInt::from_i64(1));
+                    JsValue::from_bigint(self.heap.alloc_bigint(bi))
+                } else {
+                    JsValue::from_i32(!self.to_i32(raw)?)
+                };
             }
             Opcode::TypeOf => {
                 let v = self.registers[base + usize::from(inst.b())];
@@ -2137,6 +2321,15 @@ impl JsVm {
                 let v = self.registers[base + usize::from(inst.b())];
                 self.registers[a] = match v.kind() {
                     JsValueKind::Int32(i) => JsValue::add_i32_overflow(i, 1),
+                    JsValueKind::BigInt(h) => {
+                        let bi = self
+                            .heap
+                            .get_bigint(h)
+                            .cloned()
+                            .unwrap_or_default()
+                            .add(&JsBigInt::from_i64(1));
+                        JsValue::from_bigint(self.heap.alloc_bigint(bi))
+                    }
                     _ => JsValue::from_f64(self.to_number(v)? + 1.0),
                 };
             }
@@ -2144,6 +2337,15 @@ impl JsVm {
                 let v = self.registers[base + usize::from(inst.b())];
                 self.registers[a] = match v.kind() {
                     JsValueKind::Int32(i) => JsValue::sub_i32_overflow(i, 1),
+                    JsValueKind::BigInt(h) => {
+                        let bi = self
+                            .heap
+                            .get_bigint(h)
+                            .cloned()
+                            .unwrap_or_default()
+                            .sub(&JsBigInt::from_i64(1));
+                        JsValue::from_bigint(self.heap.alloc_bigint(bi))
+                    }
                     _ => JsValue::from_f64(self.to_number(v)? - 1.0),
                 };
             }
@@ -2592,11 +2794,15 @@ impl JsVm {
         key: PropertyKey,
         name: &str,
     ) -> Result<JsValue, JsException> {
-        let shape = self.heap.get_object(self.global).unwrap().shape();
+        let (shape, global_proto) = {
+            let g = self.heap.get_object(self.global).unwrap();
+            (g.shape(), g.prototype)
+        };
         let epoch = self.shapes.prototype_epoch();
         if let Some(entry) = self.ic_tables[prog_id][func_idx].probe_load(
             ic_idx,
             shape,
+            global_proto,
             key,
             epoch,
             &self.mega_ic,
@@ -2652,14 +2858,17 @@ impl JsVm {
             return self.get_property_with_receiver(proto, key, obj_val);
         };
 
-        let Some((is_array, is_proxy, arr_len, shape)) = self.heap.get_object(obj).map(|o| {
-            (
-                matches!(o.kind, ObjectKind::Array),
-                matches!(o.kind, ObjectKind::Proxy(_)),
-                o.elements.len(),
-                o.shape(),
-            )
-        }) else {
+        let Some((is_array, is_proxy, arr_len, shape, receiver_proto)) =
+            self.heap.get_object(obj).map(|o| {
+                (
+                    matches!(o.kind, ObjectKind::Array),
+                    matches!(o.kind, ObjectKind::Proxy(_)),
+                    o.elements.len(),
+                    o.shape(),
+                    o.prototype,
+                )
+            })
+        else {
             return Err(self.type_error("Dead object handle"));
         };
 
@@ -2674,6 +2883,7 @@ impl JsVm {
             if let Some(entry) = self.ic_tables[prog_id][func_idx].probe_load(
                 ic_idx,
                 shape,
+                receiver_proto,
                 key,
                 epoch,
                 &self.mega_ic,
@@ -2705,10 +2915,10 @@ impl JsVm {
         if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
             return self.proxy_get(p, key, receiver);
         }
-        let receiver_shape = self
+        let (receiver_shape, receiver_proto) = self
             .heap
             .get_object(obj)
-            .map_or(ShapeId::DICTIONARY, |o| o.shape());
+            .map_or((ShapeId::DICTIONARY, None), |o| (o.shape(), o.prototype));
         let epoch = self.shapes.prototype_epoch();
 
         let mut cur = Some(obj);
@@ -2727,7 +2937,13 @@ impl JsVm {
                             let entry = if holder == obj {
                                 IcEntry::own(receiver_shape, slot.offset)
                             } else {
-                                IcEntry::proto(receiver_shape, holder, slot.offset, epoch)
+                                IcEntry::proto(
+                                    receiver_shape,
+                                    receiver_proto,
+                                    holder,
+                                    slot.offset,
+                                    epoch,
+                                )
                             };
                             self.ic_tables[prog_id][func_idx].update(
                                 ic_idx,
@@ -2755,14 +2971,17 @@ impl JsVm {
         key: PropertyKey,
         val: JsValue,
     ) -> Result<(), JsException> {
-        let Some((is_array, is_proxy, shape, is_proto)) = self.heap.get_object(obj).map(|o| {
-            (
-                matches!(o.kind, ObjectKind::Array),
-                matches!(o.kind, ObjectKind::Proxy(_)),
-                o.shape(),
-                o.is_prototype,
-            )
-        }) else {
+        let Some((is_array, is_proxy, shape, is_proto, extensible)) =
+            self.heap.get_object(obj).map(|o| {
+                (
+                    matches!(o.kind, ObjectKind::Array),
+                    matches!(o.kind, ObjectKind::Proxy(_)),
+                    o.shape(),
+                    o.is_prototype,
+                    o.extensible,
+                )
+            })
+        else {
             return Err(self.type_error("Dead object handle"));
         };
 
@@ -2782,21 +3001,23 @@ impl JsVm {
                 &self.mega_ic,
                 &mut self.ic_stats,
             ) {
-                let target_idx = entry.offset as usize;
-                let obj_mut = self.heap.get_object_mut(obj).unwrap();
-                if entry.target_shape != entry.shape {
-                    obj_mut.shape_id = entry.target_shape.0;
-                    obj_mut.transition_count = obj_mut.transition_count.saturating_add(1);
+                if entry.target_shape == entry.shape || extensible {
+                    let target_idx = entry.offset as usize;
+                    let obj_mut = self.heap.get_object_mut(obj).unwrap();
+                    if entry.target_shape != entry.shape {
+                        obj_mut.shape_id = entry.target_shape.0;
+                        obj_mut.transition_count = obj_mut.transition_count.saturating_add(1);
+                    }
+                    if target_idx >= obj_mut.slots.len() {
+                        obj_mut.slots.resize(target_idx + 1, JsValue::UNDEFINED);
+                    }
+                    obj_mut.slots[target_idx] = val;
+                    if is_proto {
+                        self.shapes.bump_prototype_epoch();
+                    }
+                    self.heap.write_barrier(obj, val);
+                    return Ok(());
                 }
-                if target_idx >= obj_mut.slots.len() {
-                    obj_mut.slots.resize(target_idx + 1, JsValue::UNDEFINED);
-                }
-                obj_mut.slots[target_idx] = val;
-                if is_proto {
-                    self.shapes.bump_prototype_epoch();
-                }
-                self.heap.write_barrier(obj, val);
-                return Ok(());
             }
         }
 
@@ -2812,8 +3033,12 @@ impl JsVm {
         key: PropertyKey,
         val: JsValue,
     ) -> Result<(), JsException> {
+        let is_strict = self.programs[prog_id].functions[func_idx].is_strict;
         if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
-            self.proxy_set(p, key, val, JsValue::from_object(obj))?;
+            let ok = self.proxy_set(p, key, val, JsValue::from_object(obj))?;
+            if !ok && is_strict {
+                return Err(self.type_error("'set' on proxy returned falsy"));
+            }
             return Ok(());
         }
 
@@ -2828,10 +3053,17 @@ impl JsVm {
                             JsValue::from_object(obj),
                             &[val],
                         )?;
+                        return Ok(());
+                    }
+                    if is_strict {
+                        return Err(self.type_error("Cannot set property with only a getter"));
                     }
                     return Ok(());
                 }
                 if !prop.attrs.contains(PropertyAttrs::WRITABLE) {
+                    if is_strict {
+                        return Err(self.type_error("Cannot assign to read-only property"));
+                    }
                     return Ok(());
                 }
                 if holder == obj {
@@ -2852,6 +3084,13 @@ impl JsVm {
                 break;
             }
             cur = self.heap.get_object(holder).and_then(|o| o.prototype);
+        }
+
+        if !self.heap.get_object(obj).is_some_and(|o| o.extensible) {
+            if is_strict {
+                return Err(self.type_error("Cannot add property, object is not extensible"));
+            }
+            return Ok(());
         }
 
         if let Some((from_s, to_s, off)) =
@@ -3009,6 +3248,9 @@ impl JsVm {
             }
             cur = self.heap.get_object(holder).and_then(|o| o.prototype);
         }
+        if !self.heap.get_object(obj).is_some_and(|o| o.extensible) {
+            return Ok(false);
+        }
         self.heap
             .object_define_data(obj, key, val, PropertyAttrs::DEFAULT, &mut self.shapes);
         Ok(true)
@@ -3092,6 +3334,18 @@ impl JsVm {
                 return Ok(self.to_boolean(r));
             }
             return self.delete_property_by_key(p.target, key);
+        }
+        if let Some(prop) = self.heap.object_get_own(obj, key, &self.shapes) {
+            if !prop.attrs.contains(PropertyAttrs::CONFIGURABLE) {
+                return Ok(false);
+            }
+        }
+        if matches!(
+            self.heap.get_object(obj).map(|o| &o.kind),
+            Some(ObjectKind::Array)
+        ) && key == self.key_length
+        {
+            return Ok(false);
         }
         Ok(self.heap.object_delete_own(obj, key, &mut self.shapes))
     }
@@ -3199,31 +3453,47 @@ impl JsVm {
         key_val: JsValue,
         val: JsValue,
     ) -> Result<(), JsException> {
+        let _ = self.set_elem_checked(obj_val, key_val, val)?;
+        Ok(())
+    }
+
+    pub fn set_elem_checked(
+        &mut self,
+        obj_val: JsValue,
+        key_val: JsValue,
+        val: JsValue,
+    ) -> Result<bool, JsException> {
         let Some(obj) = obj_val.as_object() else {
             return Err(self.type_error("Cannot set element on non-object"));
         };
         if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
             let ks = self.value_to_rust_string(key_val);
             let k = self.heap.intern_key(&ks);
-            self.proxy_set(p, k, val, obj_val)?;
-            return Ok(());
+            return self.proxy_set(p, k, val, obj_val);
         }
         if let Some(idx) = self.as_array_index(key_val) {
             if let Some(ObjectKind::TypedArray(ta)) = self.heap.get_object(obj).map(|o| &o.kind) {
                 let ta = *ta;
                 crate::builtins_collections::typed_array_write_element(self, ta, idx, val)?;
-                return Ok(());
+                return Ok(true);
+            }
+            let extensible = self.heap.get_object(obj).is_some_and(|o| o.extensible);
+            let exists = self
+                .heap
+                .get_object(obj)
+                .is_some_and(|o| o.elements.has(idx));
+            if !exists && !extensible {
+                return Ok(false);
             }
             if let Some(o) = self.heap.get_object_mut(obj) {
                 o.elements.set(idx, val);
             }
             self.heap.write_barrier(obj, val);
-            return Ok(());
+            return Ok(true);
         }
         let ks = self.value_to_rust_string(key_val);
         let key = self.heap.intern_key(&ks);
-        self.set_property_by_key(obj, key, val)?;
-        Ok(())
+        self.set_property_by_key(obj, key, val)
     }
 
     fn delete_elem(&mut self, obj_val: JsValue, key_val: JsValue) -> Result<bool, JsException> {
@@ -3411,9 +3681,12 @@ impl JsVm {
             None
         };
 
+        let ctor_length = bp
+            .constructor_idx
+            .map_or(0, |ci| self.programs[prog_id].functions[ci as usize].length);
         let ctor_handle = if let Some(ctor_idx) = bp.constructor_idx {
             let upvalues = self.capture_function_upvalues(prog_id, ctor_idx, frame_idx, base)?;
-            self.heap.alloc_object(JsObject::with_kind(
+            let mut obj = JsObject::with_kind(
                 ObjectKind::Closure(Box::new(ClosureObject {
                     program_id: prog_id as u32,
                     func_idx: ctor_idx,
@@ -3423,7 +3696,9 @@ impl JsVm {
                     field_init: None,
                 })),
                 Some(super_ctor.unwrap_or(self.function_proto)),
-            ))
+            );
+            obj.is_constructor = true;
+            self.heap.alloc_object(obj)
         } else {
             // Synthesize default constructor invoking `super` + instance element init if derived.
             let sup_copy = super_ctor;
@@ -3450,6 +3725,7 @@ impl JsVm {
                     Ok(this_val)
                 },
             );
+            self.mark_constructor(h);
             ctor_cell.set(Some(h));
             if let Some(sup) = super_ctor {
                 self.heap
@@ -3473,16 +3749,22 @@ impl JsVm {
                 .write_barrier(ctor_handle, JsValue::from_object(fi_h));
         }
 
-        if let Some(ref cls_name) = bp.name {
-            let nv = JsValue::from_string(self.heap.alloc_string(cls_name.as_str()));
-            self.heap.object_define_data(
-                ctor_handle,
-                self.key_name,
-                nv,
-                PropertyAttrs::CONFIGURABLE,
-                &mut self.shapes,
-            );
-        }
+        self.heap.object_define_data(
+            ctor_handle,
+            self.key_length,
+            JsValue::from_i32(i32::from(ctor_length)),
+            PropertyAttrs::CONFIGURABLE,
+            &mut self.shapes,
+        );
+        let cls_name_str = bp.name.as_deref().unwrap_or("");
+        let nv = JsValue::from_string(self.heap.alloc_string(cls_name_str));
+        self.heap.object_define_data(
+            ctor_handle,
+            self.key_name,
+            nv,
+            PropertyAttrs::CONFIGURABLE,
+            &mut self.shapes,
+        );
         self.heap.object_define_data(
             ctor_handle,
             self.key_prototype,
@@ -3499,6 +3781,10 @@ impl JsVm {
         );
 
         for m in bp.methods {
+            let (m_len, m_name) = {
+                let f = &self.programs[prog_id].functions[m.func_idx as usize];
+                (f.length, f.name.clone().unwrap_or_else(|| m.name.clone()))
+            };
             let upvalues = self.capture_function_upvalues(prog_id, m.func_idx, frame_idx, base)?;
             let method_fn = self.heap.alloc_object(JsObject::with_kind(
                 ObjectKind::Closure(Box::new(ClosureObject {
@@ -3511,6 +3797,21 @@ impl JsVm {
                 })),
                 Some(self.function_proto),
             ));
+            self.heap.object_define_data(
+                method_fn,
+                self.key_length,
+                JsValue::from_i32(i32::from(m_len)),
+                PropertyAttrs::CONFIGURABLE,
+                &mut self.shapes,
+            );
+            let mnv = JsValue::from_string(self.heap.alloc_string(m_name));
+            self.heap.object_define_data(
+                method_fn,
+                self.key_name,
+                mnv,
+                PropertyAttrs::CONFIGURABLE,
+                &mut self.shapes,
+            );
             let target = if m.is_static {
                 ctor_handle
             } else {
@@ -4167,10 +4468,9 @@ impl JsVm {
                         let len = ta.length.min(65_536);
                         let parts: Vec<String> = (0..len)
                             .map(|i| {
-                                let v = crate::builtins_collections::typed_array_read_element(
+                                crate::builtins_collections::typed_array_read_element_string(
                                     self, ta, i,
-                                );
-                                self.value_to_rust_string(v)
+                                )
                             })
                             .collect();
                         return parts.join(",");
@@ -4226,31 +4526,64 @@ impl JsVm {
         self.value_to_rust_string(val)
     }
 
+    pub fn error_proto_for_name(&self, name: &str) -> HeapHandle {
+        match name {
+            "TypeError" => self.type_error_proto,
+            "ReferenceError" => self.reference_error_proto,
+            "RangeError" => self.range_error_proto,
+            "SyntaxError" => self.syntax_error_proto,
+            "URIError" => self.uri_error_proto,
+            "EvalError" => self.eval_error_proto,
+            "AggregateError" => self.aggregate_error_proto,
+            _ => self.error_proto,
+        }
+    }
+
     pub fn make_error(&mut self, name: &str, message: impl Into<String>) -> JsException {
         let msg = message.into();
-        let err_obj = self.heap.alloc_object(JsObject::with_kind(
-            ObjectKind::Ordinary,
-            Some(self.error_proto),
-        ));
-        let nv = JsValue::from_string(self.heap.alloc_string(name));
-        let mv = JsValue::from_string(self.heap.alloc_string(msg.as_str()));
-        self.heap.object_define_data(
-            err_obj,
-            self.key_name,
-            nv,
-            PropertyAttrs::METHOD,
-            &mut self.shapes,
+        let proto = self.error_proto_for_name(name);
+        let err_obj = self
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+        let is_known_builtin = matches!(
+            name,
+            "Error"
+                | "TypeError"
+                | "ReferenceError"
+                | "RangeError"
+                | "SyntaxError"
+                | "URIError"
+                | "EvalError"
+                | "AggregateError"
         );
-        self.heap.object_define_data(
-            err_obj,
-            self.key_message,
-            mv,
-            PropertyAttrs::METHOD,
-            &mut self.shapes,
-        );
+        if !is_known_builtin {
+            let nv = JsValue::from_string(self.heap.alloc_string(name));
+            self.heap.object_define_data(
+                err_obj,
+                self.key_name,
+                nv,
+                PropertyAttrs::METHOD,
+                &mut self.shapes,
+            );
+        }
+        if !msg.is_empty() {
+            let mv = JsValue::from_string(self.heap.alloc_string(msg.as_str()));
+            self.heap.object_define_data(
+                err_obj,
+                self.key_message,
+                mv,
+                PropertyAttrs::METHOD,
+                &mut self.shapes,
+            );
+        }
+        let formatted = if msg.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{name}: {msg}")
+        };
         JsException {
             value: JsValue::from_object(err_obj),
-            message: format!("{name}: {msg}"),
+            message: formatted,
         }
     }
 

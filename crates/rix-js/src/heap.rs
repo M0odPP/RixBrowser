@@ -77,7 +77,7 @@ pub struct RegExpObject {
     pub flags: String,
 }
 
-/// Element type tag for ES6 TypedArrays.
+/// Element type tag for ES6+ TypedArrays (including BigInt64, BigUint64, and Float16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TypedArrayKind {
@@ -90,10 +90,13 @@ pub enum TypedArrayKind {
     Uint32 = 6,
     Float32 = 7,
     Float64 = 8,
+    BigInt64 = 9,
+    BigUint64 = 10,
+    Float16 = 11,
 }
 
 impl TypedArrayKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 12] = [
         Self::Int8,
         Self::Uint8,
         Self::Uint8Clamped,
@@ -103,6 +106,9 @@ impl TypedArrayKind {
         Self::Uint32,
         Self::Float32,
         Self::Float64,
+        Self::BigInt64,
+        Self::BigUint64,
+        Self::Float16,
     ];
 
     #[inline]
@@ -110,10 +116,16 @@ impl TypedArrayKind {
     pub const fn bytes_per_element(self) -> usize {
         match self {
             Self::Int8 | Self::Uint8 | Self::Uint8Clamped => 1,
-            Self::Int16 | Self::Uint16 => 2,
+            Self::Int16 | Self::Uint16 | Self::Float16 => 2,
             Self::Int32 | Self::Uint32 | Self::Float32 => 4,
-            Self::Float64 => 8,
+            Self::Float64 | Self::BigInt64 | Self::BigUint64 => 8,
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_bigint(self) -> bool {
+        matches!(self, Self::BigInt64 | Self::BigUint64)
     }
 
     #[inline]
@@ -129,6 +141,9 @@ impl TypedArrayKind {
             Self::Uint32 => "Uint32Array",
             Self::Float32 => "Float32Array",
             Self::Float64 => "Float64Array",
+            Self::BigInt64 => "BigInt64Array",
+            Self::BigUint64 => "BigUint64Array",
+            Self::Float16 => "Float16Array",
         }
     }
 }
@@ -322,6 +337,8 @@ pub struct JsObject {
     pub transition_count: u16,
     pub is_prototype: bool,
     pub extensible: bool,
+    pub is_constructor: bool,
+    pub is_global: bool,
     pub prototype: Option<HeapHandle>,
     pub slots: Vec<JsValue>,
     pub elements: ElementsStorage,
@@ -338,6 +355,8 @@ impl Default for JsObject {
             transition_count: 0,
             is_prototype: false,
             extensible: true,
+            is_constructor: false,
+            is_global: false,
             prototype: None,
             slots: Vec::new(),
             elements: ElementsStorage::default(),
@@ -1304,8 +1323,16 @@ impl GcHeap {
         if !extensible {
             return None;
         }
-        let tc = self.get_object(owner)?.transition_count;
-        if tc >= DICTIONARY_TRANSITION_LIMIT {
+        let (tc, is_global) = {
+            let o = self.get_object(owner)?;
+            (o.transition_count, o.is_global)
+        };
+        let limit = if is_global {
+            1024
+        } else {
+            DICTIONARY_TRANSITION_LIMIT
+        };
+        if tc >= limit {
             let obj = self.get_object_mut(owner)?;
             obj.to_dictionary_mode(shapes);
             let rare = obj.rare_mut();

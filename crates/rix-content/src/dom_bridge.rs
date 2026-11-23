@@ -679,6 +679,7 @@ pub fn install_dom_bridge(
         PropertyAttrs::METHOD,
         &mut vm.shapes,
     );
+    vm.mark_constructor(dom_parser_ctor);
     define_global(vm, "DOMParser", JsValue::from_object(dom_parser_ctor));
 
     let xml_ser_proto = make_proto(vm, vm.object_proto);
@@ -707,6 +708,7 @@ pub fn install_dom_bridge(
         PropertyAttrs::METHOD,
         &mut vm.shapes,
     );
+    vm.mark_constructor(xml_ser_ctor);
     define_global(vm, "XMLSerializer", JsValue::from_object(xml_ser_ctor));
 
     host
@@ -2933,6 +2935,7 @@ fn install_window_and_cssom(vm: &mut JsVm, host: &SharedHost) {
             PropertyAttrs::METHOD,
             &mut vm.shapes,
         );
+        vm.mark_constructor(ctor);
         define_global(vm, name, JsValue::from_object(ctor));
     }
 
