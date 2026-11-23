@@ -222,6 +222,13 @@ pub struct PromiseReaction {
     pub result_promise: Option<HeapHandle>,
 }
 
+/// Backing storage for a suspended `async` function awaiting a `Promise` (GC-traced!).
+#[derive(Debug, Clone)]
+pub struct AsyncResumeObject {
+    pub frame: Option<SuspendedFrame>,
+    pub promise: HeapHandle,
+}
+
 /// Backing storage for an ECMAScript `Promise` object.
 #[derive(Debug, Clone)]
 pub struct PromiseObject {
@@ -517,6 +524,7 @@ pub enum ObjectKind {
     DataView(DataViewObject),
     TypedArray(TypedArrayObject),
     Promise(Box<PromiseObject>),
+    AsyncResume(Box<AsyncResumeObject>),
     Generator(Box<GeneratorObject>),
     Host,
 }
@@ -785,6 +793,12 @@ impl JsObject {
                         visit(h);
                     }
                 }
+            }
+            ObjectKind::AsyncResume(st) => {
+                if let Some(ref f) = st.frame {
+                    f.trace_children(&mut visit);
+                }
+                visit(st.promise);
             }
             ObjectKind::Generator(g) => {
                 if let Some(ref f) = g.frame {

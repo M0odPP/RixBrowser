@@ -298,6 +298,7 @@ pub struct JsVm {
     registers: Vec<JsValue>,
     frames: Vec<CallFrame>,
     open_upvalues: Vec<(usize, HeapHandle)>,
+    pub(crate) temp_roots: Vec<JsValue>,
     with_stack: Vec<(usize, HeapHandle)>,
     iterators: HashMap<HeapHandle, IteratorState>,
     /// Optional cooperative loop back-edge budget (`None` = unlimited).
@@ -617,6 +618,7 @@ impl JsVm {
             registers: Vec::with_capacity(1024),
             frames: Vec::with_capacity(64),
             open_upvalues: Vec::new(),
+            temp_roots: Vec::new(),
             with_stack: Vec::new(),
             iterators: HashMap::new(),
             max_loop_iterations: None,
@@ -793,6 +795,7 @@ impl JsVm {
         for &(_, w) in &self.with_stack {
             roots.push(JsValue::from_object(w));
         }
+        roots.extend_from_slice(&self.temp_roots);
         for (&iter_h, state) in &self.iterators {
             roots.push(JsValue::from_object(iter_h));
             match state {
