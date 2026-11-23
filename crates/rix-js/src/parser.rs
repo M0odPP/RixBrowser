@@ -1883,23 +1883,84 @@ impl<'a> Parser<'a> {
     }
 
     /// Scans matching `(...)` in O(tokens inside parens) to test if `)` is directly followed by `=>`.
+    /// Rejects non-parameter starts (like IIFEs `(function(){...})()`) in O(1) and never propagates
+    /// speculative lex errors (e.g. from regex/template literals inside non-arrow parenthesized exprs).
     fn paren_followed_by_arrow(&mut self) -> Result<bool, SyntaxError> {
         let cp = self.checkpoint();
-        let mut depth = 0u32;
+        // Fast O(1) rejection: an arrow parameter list after `(` can only start with `)`, `...`,
+        // an identifier (`yield`/`await` included), `{`, or `[`.
+        let first_ok = match self.peek_token() {
+            Ok(tok) => matches!(
+                tok.kind,
+                TokenKind::RParen
+                    | TokenKind::Ellipsis
+                    | TokenKind::Ident { .. }
+                    | TokenKind::LBrace
+                    | TokenKind::LBracket
+                    | TokenKind::Keyword(Keyword::Yield | Keyword::Await)
+            ),
+            Err(_) => false,
+        };
+        if !first_ok {
+            self.restore(cp);
+            return Ok(false);
+        }
+
+        let mut paren_depth = 0u32;
+        let mut brace_depth = 0u32;
+        let mut tpl_brace_stack: Vec<u32> = Vec::new();
         let result = loop {
             match self.cur.kind {
-                TokenKind::LParen => depth += 1,
+                TokenKind::LParen => paren_depth += 1,
                 TokenKind::RParen => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        let next = self.peek_token()?;
-                        break next.kind == TokenKind::Arrow && !next.line_terminator_before;
+                    paren_depth = paren_depth.saturating_sub(1);
+                    if paren_depth == 0 {
+                        let is_arrow = match self.peek_token() {
+                            Ok(next) => {
+                                next.kind == TokenKind::Arrow && !next.line_terminator_before
+                            }
+                            Err(_) => false,
+                        };
+                        break is_arrow;
+                    }
+                }
+                TokenKind::TemplateHead { .. } => {
+                    tpl_brace_stack.push(brace_depth);
+                    brace_depth += 1;
+                }
+                TokenKind::LBrace => brace_depth += 1,
+                TokenKind::RBrace => {
+                    brace_depth = brace_depth.saturating_sub(1);
+                    if tpl_brace_stack.last().copied() == Some(brace_depth) {
+                        let rbrace_end = self.cur.span.end as usize;
+                        self.peek = None;
+                        match self.lexer.lex_template_continuation(rbrace_end) {
+                            Ok(cont) => match cont.kind {
+                                TokenKind::TemplateMiddle { .. } => {
+                                    brace_depth += 1;
+                                }
+                                TokenKind::TemplateTail { .. } => {
+                                    tpl_brace_stack.pop();
+                                }
+                                _ => break false,
+                            },
+                            Err(_) => break false,
+                        }
+                        match self.lexer.next_token() {
+                            Ok(tok) => {
+                                self.cur = tok;
+                                continue;
+                            }
+                            Err(_) => break false,
+                        }
                     }
                 }
                 TokenKind::Eof => break false,
                 _ => {}
             }
-            self.advance()?;
+            if self.advance().is_err() {
+                break false;
+            }
         };
         self.restore(cp);
         Ok(result)

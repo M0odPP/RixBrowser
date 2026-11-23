@@ -269,13 +269,15 @@ fn collect_js_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 fn load_harness_cache(test262_dir: &Path) -> HashMap<String, String> {
     let mut cache = HashMap::new();
     let candidates = [
-        test262_dir.join("harness"),
         test262_dir
             .parent()
             .map_or_else(PathBuf::new, |p| p.join("harness")),
+        test262_dir.join("harness"),
     ];
     for hdir in candidates {
-        if !hdir.is_dir() {
+        // Distinguish the real Test262 `harness/` directory (which contains `sta.js` and `assert.js`)
+        // from `test/harness/` (which contains conformance tests for the harness itself).
+        if !hdir.join("sta.js").is_file() {
             continue;
         }
         if let Ok(entries) = fs::read_dir(&hdir) {
@@ -377,7 +379,7 @@ fn run_single_mode(
             if err_arg.is_undefined() || err_arg.is_null() {
                 *ds.borrow_mut() = Some(None);
             } else {
-                *ds.borrow_mut() = Some(Some(vm.value_to_rust_string(err_arg)));
+                *ds.borrow_mut() = Some(Some(vm.format_exception(err_arg)));
             }
             Ok(rix_js::JsValue::UNDEFINED)
         });
@@ -469,18 +471,7 @@ fn run_single_mode(
 }
 
 fn error_type_name(vm: &JsVm, val: rix_js::JsValue) -> String {
-    if let Some(h) = val.as_object() {
-        if let Some(p) = vm.heap.object_get_own(h, vm.key_name, &vm.shapes) {
-            let n = vm.value_to_rust_string(p.value);
-            let m = vm
-                .heap
-                .object_get_own(h, vm.key_message, &vm.shapes)
-                .map(|mp| vm.value_to_rust_string(mp.value))
-                .unwrap_or_default();
-            return format!("{n}: {m}");
-        }
-    }
-    vm.value_to_rust_string(val)
+    vm.format_exception(val)
 }
 
 fn category_key(base_dir: &Path, path: &Path) -> String {

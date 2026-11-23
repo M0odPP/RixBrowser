@@ -519,6 +519,21 @@ impl Compiler {
             }
         }
 
+        // Pre-declare ALL hoisted function names in non-script-global scopes BEFORE
+        // compiling any of their bodies so sibling functions can call each other
+        // (mutual recursion & forward references, ECMA-262 §10.2.11).
+        if !is_script_global {
+            for func in &func_decls {
+                if let Some(ref name) = func.name {
+                    if self.cur().find_local(name).is_none() {
+                        let reg = self.cur().declare_local(name, false, false)?;
+                        self.cur()
+                            .emit(Instruction::abc(Opcode::LoadUndef, reg, 0, 0));
+                    }
+                }
+            }
+        }
+
         for func in func_decls {
             let func_idx = self.compile_function_body(func, false)?;
             let const_idx = self.cur().add_const(ConstantEntry::Function(func_idx))?;
@@ -539,6 +554,78 @@ impl Compiler {
             }
         }
 
+        Ok(())
+    }
+
+    /// Implements ECMA-262 §14.2.3 `BlockDeclarationInstantiation`: pre-declares
+    /// block-scoped `let`/`const`/`class` TDZ bindings and hoists block-scoped
+    /// `FunctionDeclaration`s before compiling the block body.
+    fn hoist_block_declarations(&mut self, stmts: &[Statement]) -> Result<(), CompileError> {
+        let cur_depth = self.cur().scope_depth;
+        let mut func_decls = Vec::new();
+        for stmt in stmts {
+            match stmt {
+                Statement::VarDecl {
+                    kind: kind @ (VarKind::Let | VarKind::Const),
+                    decls,
+                    ..
+                } => {
+                    for d in decls {
+                        self.declare_pattern_locals(&d.id, *kind)?;
+                    }
+                }
+                Statement::ClassDecl(cls) => {
+                    if let Some(ref name) = cls.name {
+                        let already = self
+                            .cur()
+                            .locals
+                            .iter()
+                            .any(|l| l.depth == cur_depth && l.name == *name);
+                        if !already {
+                            let reg = self.cur().declare_local(name, false, true)?;
+                            self.cur()
+                                .emit(Instruction::abc(Opcode::LoadTdz, reg, 0, 0));
+                        }
+                    }
+                }
+                Statement::FunctionDecl(f) => {
+                    func_decls.push(f);
+                }
+                _ => {}
+            }
+        }
+        for func in &func_decls {
+            if let Some(ref name) = func.name {
+                let already = self
+                    .cur()
+                    .locals
+                    .iter()
+                    .any(|l| l.depth == cur_depth && l.name == *name);
+                if !already {
+                    let reg = self.cur().declare_local(name, false, false)?;
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::LoadUndef, reg, 0, 0));
+                }
+            }
+        }
+        for func in func_decls {
+            let func_idx = self.compile_function_body(func, false)?;
+            let const_idx = self.cur().add_const(ConstantEntry::Function(func_idx))?;
+            if let Some(ref name) = func.name {
+                let reg = self
+                    .cur()
+                    .locals
+                    .iter()
+                    .rev()
+                    .find(|l| l.depth == cur_depth && l.name == *name)
+                    .map(|l| l.reg);
+                let reg = match reg {
+                    Some(r) => r,
+                    None => self.cur().declare_local(name, false, false)?,
+                };
+                self.cur().emit_abx_wide(Opcode::NewClosure, reg, const_idx);
+            }
+        }
         Ok(())
     }
 
@@ -713,6 +800,7 @@ impl Compiler {
                         is_switch: true,
                     });
                     self.cur().begin_scope();
+                    self.hoist_block_declarations(body)?;
                     for s in body {
                         self.compile_stmt(s)?;
                     }
@@ -724,6 +812,7 @@ impl Compiler {
                     }
                 } else {
                     self.cur().begin_scope();
+                    self.hoist_block_declarations(body)?;
                     for s in body {
                         self.compile_stmt(s)?;
                     }
@@ -1035,6 +1124,7 @@ impl Compiler {
                 }
                 let try_start = self.cur().code.len() as u32;
                 self.cur().begin_scope();
+                self.hoist_block_declarations(block)?;
                 for s in block {
                     self.compile_stmt(s)?;
                 }
@@ -1059,6 +1149,7 @@ impl Compiler {
                         self.declare_pattern_locals(pat, VarKind::Let)?;
                         self.compile_pattern_bind(pat, err_reg)?;
                     }
+                    self.hoist_block_declarations(&catch.body)?;
                     for s in &catch.body {
                         self.compile_stmt(s)?;
                     }
@@ -1079,6 +1170,7 @@ impl Compiler {
                 if let Some(fin_body) = finalizer {
                     // Normal path runs finally inline; abnormal path catches, runs finally, rethrows.
                     self.cur().begin_scope();
+                    self.hoist_block_declarations(fin_body)?;
                     for s in fin_body {
                         self.compile_stmt(s)?;
                     }
@@ -1096,6 +1188,7 @@ impl Compiler {
                         is_finally: true,
                     });
                     self.cur().begin_scope();
+                    self.hoist_block_declarations(fin_body)?;
                     for s in fin_body {
                         self.compile_stmt(s)?;
                     }
@@ -1405,15 +1498,30 @@ impl Compiler {
             is_switch: false,
         });
 
-        self.cur().emit(Instruction::abc(
-            Opcode::IteratorNext,
-            val_reg,
-            iter_reg,
-            done_reg,
-        ));
         if kind == ForEachKind::AsyncOf {
+            let res_reg = self.cur().alloc_reg()?;
+            self.cur().emit(Instruction::abc(
+                Opcode::AsyncIteratorNext,
+                res_reg,
+                iter_reg,
+                0,
+            ));
             self.cur()
-                .emit(Instruction::abc(Opcode::Await, val_reg, val_reg, 0));
+                .emit(Instruction::abc(Opcode::Await, res_reg, res_reg, 0));
+            self.cur().emit(Instruction::abc(
+                Opcode::UnpackIterResult,
+                val_reg,
+                res_reg,
+                done_reg,
+            ));
+            self.cur().free_to(res_reg);
+        } else {
+            self.cur().emit(Instruction::abc(
+                Opcode::IteratorNext,
+                val_reg,
+                iter_reg,
+                done_reg,
+            ));
         }
         let jmp_done = self.cur().emit_jump(Opcode::JumpIfTrue, done_reg);
 
@@ -1685,7 +1793,13 @@ impl Compiler {
 
         // Bind positional parameter registers (`0..params.len()`).
         let mut complex_params = Vec::new();
+        let mut param_binds_arguments = false;
         for pat in &func.params {
+            let mut bound = Vec::new();
+            pat.collect_bound_names(&mut bound);
+            if bound.iter().any(|(n, _)| n == "arguments") {
+                param_binds_arguments = true;
+            }
             match pat {
                 Pattern::Ident { name, .. } => {
                     let _ = self.cur().declare_local(name, false, false)?;
@@ -1695,6 +1809,20 @@ impl Compiler {
                     complex_params.push((raw_reg, other));
                 }
             }
+        }
+        if let Some(ref rest_pat) = func.rest_param {
+            let mut bound = Vec::new();
+            rest_pat.collect_bound_names(&mut bound);
+            if bound.iter().any(|(n, _)| n == "arguments") {
+                param_binds_arguments = true;
+            }
+        }
+        // Materialize `arguments` binding for non-arrow functions that reference it
+        // (or contain direct `eval`), before evaluating default parameter expressions.
+        if !is_arrow && !param_binds_arguments && function_uses_arguments(func) {
+            let args_reg = self.cur().declare_local("arguments", false, false)?;
+            self.cur()
+                .emit(Instruction::abc(Opcode::LoadArguments, args_reg, 0, 0));
         }
         for (raw_reg, pat) in complex_params {
             self.declare_pattern_locals(pat, VarKind::Let)?;
@@ -2892,7 +3020,7 @@ impl Compiler {
                 let c = self.cur().add_string_const(name)?;
                 let ic = self.cur().add_ic_slot(IcKind::SetProp, c, 0)?;
                 self.cur()
-                    .emit_ic_abc(Opcode::SetPrivate, obj_reg, val_reg, ic);
+                    .emit_ic_abc(Opcode::DefinePrivate, obj_reg, val_reg, ic);
             }
             PropKey::Number(n) => {
                 let c = self.cur().add_string_const(&n.to_string())?;
@@ -3064,5 +3192,240 @@ fn collect_hoisted_vars(stmts: &[Statement], out: &mut Vec<String>) {
             }) => collect_hoisted_vars(std::slice::from_ref(inner.as_ref()), out),
             _ => {}
         }
+    }
+}
+
+/// Returns `true` if `func` (or any nested arrow function / direct `eval`)
+/// references the identifier `arguments` within this function's own scope.
+fn function_uses_arguments(func: &Function) -> bool {
+    func.params.iter().any(pattern_uses_arguments)
+        || func
+            .rest_param
+            .as_deref()
+            .is_some_and(pattern_uses_arguments)
+        || stmts_use_arguments(&func.body)
+}
+
+fn pattern_uses_arguments(pat: &Pattern) -> bool {
+    match pat {
+        Pattern::Ident { .. } => false,
+        Pattern::Array { elements, rest, .. } => {
+            elements.iter().flatten().any(pattern_uses_arguments)
+                || rest.as_deref().is_some_and(pattern_uses_arguments)
+        }
+        Pattern::Object { props, rest, .. } => {
+            props
+                .iter()
+                .any(|p| prop_key_uses_arguments(&p.key) || pattern_uses_arguments(&p.value))
+                || rest.as_deref().is_some_and(pattern_uses_arguments)
+        }
+        Pattern::Assign { left, right, .. } => {
+            pattern_uses_arguments(left) || expr_uses_arguments(right)
+        }
+    }
+}
+
+fn prop_key_uses_arguments(key: &PropKey) -> bool {
+    matches!(key, PropKey::Computed(e) if expr_uses_arguments(e))
+}
+
+fn target_uses_arguments(target: &AssignTarget) -> bool {
+    match target {
+        AssignTarget::Ident { name, .. } => name == "arguments",
+        AssignTarget::Member {
+            object, property, ..
+        } => {
+            expr_uses_arguments(object)
+                || matches!(property, MemberProp::Computed(e) if expr_uses_arguments(e))
+        }
+        AssignTarget::Pattern(p) => pattern_uses_arguments(p),
+    }
+}
+
+fn stmts_use_arguments(stmts: &[Statement]) -> bool {
+    stmts.iter().any(stmt_uses_arguments)
+}
+
+fn stmt_uses_arguments(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Block { body, .. } => stmts_use_arguments(body),
+        Statement::VarDecl { decls, .. } => decls.iter().any(|d| {
+            pattern_uses_arguments(&d.id) || d.init.as_ref().is_some_and(expr_uses_arguments)
+        }),
+        Statement::Expr { expr, .. } => expr_uses_arguments(expr),
+        Statement::If {
+            test,
+            consequent,
+            alternate,
+            ..
+        } => {
+            expr_uses_arguments(test)
+                || stmt_uses_arguments(consequent)
+                || alternate.as_deref().is_some_and(stmt_uses_arguments)
+        }
+        Statement::While { test, body, .. } | Statement::DoWhile { body, test, .. } => {
+            expr_uses_arguments(test) || stmt_uses_arguments(body)
+        }
+        Statement::For {
+            init,
+            test,
+            update,
+            body,
+            ..
+        } => {
+            init.as_ref().is_some_and(|i| match i {
+                ForInit::VarDecl { decls, .. } => decls.iter().any(|d| {
+                    pattern_uses_arguments(&d.id)
+                        || d.init.as_ref().is_some_and(expr_uses_arguments)
+                }),
+                ForInit::Expr(e) => expr_uses_arguments(e),
+            }) || test.as_ref().is_some_and(expr_uses_arguments)
+                || update.as_ref().is_some_and(expr_uses_arguments)
+                || stmt_uses_arguments(body)
+        }
+        Statement::ForIn {
+            left, right, body, ..
+        }
+        | Statement::ForOf {
+            left, right, body, ..
+        } => {
+            (match left {
+                ForEachLeft::VarDecl { id, .. } => pattern_uses_arguments(id),
+                ForEachLeft::Target(t) => target_uses_arguments(t),
+            }) || expr_uses_arguments(right)
+                || stmt_uses_arguments(body)
+        }
+        Statement::Switch {
+            discriminant,
+            cases,
+            ..
+        } => {
+            expr_uses_arguments(discriminant)
+                || cases.iter().any(|c| {
+                    c.test.as_ref().is_some_and(expr_uses_arguments)
+                        || stmts_use_arguments(&c.consequent)
+                })
+        }
+        Statement::Return { arg, .. } => arg.as_ref().is_some_and(expr_uses_arguments),
+        Statement::Throw { arg, .. } => expr_uses_arguments(arg),
+        Statement::Try {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
+            stmts_use_arguments(block)
+                || handler.as_ref().is_some_and(|h| {
+                    h.param.as_ref().is_some_and(pattern_uses_arguments)
+                        || stmts_use_arguments(&h.body)
+                })
+                || finalizer.as_deref().is_some_and(stmts_use_arguments)
+        }
+        Statement::With { object, body, .. } => {
+            expr_uses_arguments(object) || stmt_uses_arguments(body)
+        }
+        Statement::Labeled { body, .. } => stmt_uses_arguments(body),
+        Statement::ClassDecl(cls) => class_uses_arguments(cls),
+        // Non-arrow nested functions have their own `arguments` binding.
+        Statement::FunctionDecl(_)
+        | Statement::Empty { .. }
+        | Statement::Break { .. }
+        | Statement::Continue { .. }
+        | Statement::Debugger { .. }
+        | Statement::ImportDecl(_)
+        | Statement::ExportDecl(_) => false,
+    }
+}
+
+fn class_uses_arguments(cls: &Class) -> bool {
+    cls.super_class.as_deref().is_some_and(expr_uses_arguments)
+        || cls.elements.iter().any(|el| match el {
+            ClassElement::Method { key, .. } => prop_key_uses_arguments(key),
+            ClassElement::Field { key, value, .. } => {
+                prop_key_uses_arguments(key) || value.as_ref().is_some_and(expr_uses_arguments)
+            }
+            ClassElement::StaticBlock { .. } => false,
+        })
+}
+
+fn expr_uses_arguments(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Ident(n) => n == "arguments" || n == "eval",
+        ExprKind::Array(elems) => elems.iter().flatten().any(|e| match e {
+            ArrayElement::Expr(x) | ArrayElement::Spread(x) => expr_uses_arguments(x),
+        }),
+        ExprKind::Object(props) => props.iter().any(|p| match p {
+            ObjectProp::KeyValue { key, value, .. } => {
+                prop_key_uses_arguments(key) || expr_uses_arguments(value)
+            }
+            ObjectProp::Method { key, .. } => prop_key_uses_arguments(key),
+            ObjectProp::Spread { arg, .. } => expr_uses_arguments(arg),
+        }),
+        ExprKind::Template { exprs, .. } => exprs.iter().any(expr_uses_arguments),
+        ExprKind::TaggedTemplate { tag, exprs, .. } => {
+            expr_uses_arguments(tag) || exprs.iter().any(expr_uses_arguments)
+        }
+        // Arrow functions inherit the enclosing function's `arguments`!
+        ExprKind::Arrow {
+            params,
+            rest_param,
+            body,
+            ..
+        } => {
+            params.iter().any(pattern_uses_arguments)
+                || rest_param.as_deref().is_some_and(pattern_uses_arguments)
+                || match body {
+                    ArrowBody::Block { body, .. } => stmts_use_arguments(body),
+                    ArrowBody::Expr(e) => expr_uses_arguments(e),
+                }
+        }
+        ExprKind::Class(cls) => class_uses_arguments(cls),
+        ExprKind::Member {
+            object, property, ..
+        } => {
+            expr_uses_arguments(object)
+                || matches!(property, MemberProp::Computed(e) if expr_uses_arguments(e))
+        }
+        ExprKind::Call { callee, args, .. } | ExprKind::New { callee, args } => {
+            expr_uses_arguments(callee)
+                || args.iter().any(|a| match a {
+                    CallArg::Expr(x) | CallArg::Spread(x) => expr_uses_arguments(x),
+                })
+        }
+        ExprKind::ImportCall { source } => expr_uses_arguments(source),
+        ExprKind::Unary { arg, .. }
+        | ExprKind::Update { arg, .. }
+        | ExprKind::Await(arg)
+        | ExprKind::Chain(arg)
+        | ExprKind::Paren(arg) => expr_uses_arguments(arg),
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            expr_uses_arguments(left) || expr_uses_arguments(right)
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_uses_arguments(test)
+                || expr_uses_arguments(consequent)
+                || expr_uses_arguments(alternate)
+        }
+        ExprKind::Assign { left, right, .. } => {
+            target_uses_arguments(left) || expr_uses_arguments(right)
+        }
+        ExprKind::Sequence(list) => list.iter().any(expr_uses_arguments),
+        ExprKind::Yield { arg, .. } => arg.as_deref().is_some_and(expr_uses_arguments),
+        ExprKind::Function(_)
+        | ExprKind::Null
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::BigInt(_)
+        | ExprKind::String(_)
+        | ExprKind::RegExp { .. }
+        | ExprKind::PrivateIdent(_)
+        | ExprKind::This
+        | ExprKind::Super
+        | ExprKind::NewTarget
+        | ExprKind::ImportMeta => false,
     }
 }
