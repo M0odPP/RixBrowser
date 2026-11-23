@@ -78,6 +78,7 @@ p384 = { version = "0.14", features = ["ecdh", "ecdsa", "pkcs8"] }
 rsa = { version = "0.10", features = ["sha1", "pkcs1v15", "encoding", "getrandom"] }
 getrandom = { version = "0.4", features = ["sys_rng"] }
 regex = "1.13"
+regress = { version = "0.12", features = ["utf16", "prohibit-unsafe"] }
 cranelift-codegen = "0.137"
 cranelift-frontend = "0.137"
 cranelift-native = "0.137"

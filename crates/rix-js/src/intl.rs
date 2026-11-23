@@ -698,9 +698,12 @@ pub fn install_intl(vm: &mut JsVm) {
 
 fn install_intl_prototype_hooks(vm: &mut JsVm, intl_obj: HeapHandle) {
     let sp = vm.string_proto;
-    def_host_method(vm, sp, "localeCompare", move |vm, this_val, args| {
-        let a = vm.value_to_rust_string(this_val);
-        let b = vm.value_to_rust_string(arg(args, 0));
+    let lc_fn = vm.alloc_host_fn("localeCompare", move |vm, this_val, args| {
+        if this_val.is_null() || this_val.is_undefined() {
+            return Err(vm.type_error("Cannot convert undefined or null to object"));
+        }
+        let a = vm.to_js_string(this_val)?;
+        let b = vm.to_js_string(arg(args, 0))?;
         let ck = vm.heap.intern_key("Collator");
         let ctor = vm.get_property_by_key(intl_obj, ck)?;
         let coll = vm.call_value(ctor, JsValue::UNDEFINED, &[arg(args, 1), arg(args, 2)])?;
@@ -713,6 +716,15 @@ fn install_intl_prototype_hooks(vm: &mut JsVm, intl_obj: HeapHandle) {
         let bv = str_val(vm, &b);
         vm.call_value(cmp_fn, JsValue::UNDEFINED, &[av, bv])
     });
+    vm.set_fn_length(lc_fn, 1);
+    let k_lc = vm.heap.intern_key("localeCompare");
+    vm.heap.object_define_data(
+        sp,
+        k_lc,
+        JsValue::from_object(lc_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
 
     let np = vm.number_proto;
     def_host_method(vm, np, "toLocaleString", move |vm, this_val, args| {

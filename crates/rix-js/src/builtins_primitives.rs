@@ -2,12 +2,14 @@
 //! and extended Array/Object standard library built-ins.
 
 use crate::bigint::JsBigInt;
+use crate::builtins_regexp::{
+    get_substitution, install_regexp_and_annexb_globals, is_es_whitespace_or_lt, is_regexp,
+};
 use crate::heap::{JsObject, ObjectKind};
 use crate::shape::PropertyAttrs;
 use crate::value::{HeapHandle, JsValue, JsValueKind};
 use crate::vm::{JsException, JsVm};
 use crate::vm_builtins::{define_global, define_method, define_method_len};
-use regex::{Regex, RegexBuilder};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn install_primitive_builtins(vm: &mut JsVm) {
@@ -19,71 +21,148 @@ pub fn install_primitive_builtins(vm: &mut JsVm) {
     install_math(vm);
     install_symbol(vm);
     install_date(vm);
-    install_regexp(vm);
+    install_regexp_and_annexb_globals(vm);
     install_json(vm);
     install_extended_array_and_object(vm);
 }
 
 fn install_global_functions(vm: &mut JsVm) {
-    let parse_int_fn = vm.alloc_native_fn("parseInt", global_parse_int);
-    let parse_float_fn = vm.alloc_native_fn("parseFloat", global_parse_float);
-    let is_nan_fn = vm.alloc_native_fn("isNaN", global_is_nan);
-    let is_finite_fn = vm.alloc_native_fn("isFinite", global_is_finite);
-    let enc_uri = vm.alloc_native_fn("encodeURI", global_encode_uri);
-    let dec_uri = vm.alloc_native_fn("decodeURI", global_decode_uri);
-    let enc_comp = vm.alloc_native_fn("encodeURIComponent", global_encode_uri_component);
-    let dec_comp = vm.alloc_native_fn("decodeURIComponent", global_decode_uri_component);
-
-    define_global(vm, "parseInt", JsValue::from_object(parse_int_fn));
-    define_global(vm, "parseFloat", JsValue::from_object(parse_float_fn));
-    define_global(vm, "isNaN", JsValue::from_object(is_nan_fn));
-    define_global(vm, "isFinite", JsValue::from_object(is_finite_fn));
-    define_global(vm, "encodeURI", JsValue::from_object(enc_uri));
-    define_global(vm, "decodeURI", JsValue::from_object(dec_uri));
-    define_global(vm, "encodeURIComponent", JsValue::from_object(enc_comp));
-    define_global(vm, "decodeURIComponent", JsValue::from_object(dec_comp));
+    let globals: &[(&str, u32, crate::vm::NativeFnPtr)] = &[
+        ("parseInt", 2, global_parse_int),
+        ("parseFloat", 1, global_parse_float),
+        ("isNaN", 1, global_is_nan),
+        ("isFinite", 1, global_is_finite),
+        ("encodeURI", 1, global_encode_uri),
+        ("decodeURI", 1, global_decode_uri),
+        ("encodeURIComponent", 1, global_encode_uri_component),
+        ("decodeURIComponent", 1, global_decode_uri_component),
+    ];
+    for &(name, len, f) in globals {
+        let h = vm.alloc_native_fn(name, f);
+        vm.set_fn_length(h, len);
+        define_global(vm, name, JsValue::from_object(h));
+    }
 }
 
 // ---------------------------------------------------------------------------
-// String
+// String, %StringIteratorPrototype%, & Annex B String HTML methods
 // ---------------------------------------------------------------------------
 
 fn install_string(vm: &mut JsVm) {
+    // %StringIteratorPrototype%
+    let sip = vm.string_iter_proto;
+    define_method_len(vm, sip, "next", 0, str_iter_next);
+    let stag = JsValue::from_string(vm.heap.alloc_string("String Iterator"));
+    let k_tag = vm.key_symbol_to_string_tag;
+    vm.heap.object_define_data(
+        sip,
+        k_tag,
+        stag,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+
     let sp = vm.string_proto;
-    define_method(vm, sp, "charAt", str_char_at);
-    define_method(vm, sp, "charCodeAt", str_char_code_at);
-    define_method(vm, sp, "codePointAt", str_code_point_at);
-    define_method(vm, sp, "slice", str_slice);
-    define_method(vm, sp, "substring", str_substring);
-    define_method(vm, sp, "indexOf", str_index_of);
-    define_method(vm, sp, "lastIndexOf", str_last_index_of);
-    define_method(vm, sp, "includes", str_includes);
-    define_method(vm, sp, "startsWith", str_starts_with);
-    define_method(vm, sp, "endsWith", str_ends_with);
-    define_method(vm, sp, "split", str_split);
-    define_method(vm, sp, "trim", str_trim);
-    define_method(vm, sp, "trimStart", str_trim_start);
-    define_method(vm, sp, "trimEnd", str_trim_end);
-    define_method(vm, sp, "toLowerCase", str_to_lower);
-    define_method(vm, sp, "toUpperCase", str_to_upper);
-    define_method(vm, sp, "repeat", str_repeat);
-    define_method(vm, sp, "padStart", str_pad_start);
-    define_method(vm, sp, "padEnd", str_pad_end);
-    define_method(vm, sp, "replace", str_replace);
-    define_method(vm, sp, "replaceAll", str_replace_all);
-    define_method(vm, sp, "match", str_match);
-    define_method(vm, sp, "search", str_search);
-    define_method(vm, sp, "concat", str_concat);
-    define_method(vm, sp, "at", str_at);
-    define_method(vm, sp, "toString", str_to_string);
-    define_method(vm, sp, "valueOf", str_to_string);
+    let methods: &[(&str, u32, crate::vm::NativeFnPtr)] = &[
+        ("charAt", 1, str_char_at),
+        ("charCodeAt", 1, str_char_code_at),
+        ("codePointAt", 1, str_code_point_at),
+        ("slice", 2, str_slice),
+        ("substring", 2, str_substring),
+        ("substr", 2, str_substr),
+        ("indexOf", 1, str_index_of),
+        ("lastIndexOf", 1, str_last_index_of),
+        ("includes", 1, str_includes),
+        ("startsWith", 1, str_starts_with),
+        ("endsWith", 1, str_ends_with),
+        ("split", 2, str_split),
+        ("trim", 0, str_trim),
+        ("toLowerCase", 0, str_to_lower),
+        ("toUpperCase", 0, str_to_upper),
+        ("toLocaleLowerCase", 0, str_to_lower),
+        ("toLocaleUpperCase", 0, str_to_upper),
+        ("localeCompare", 1, str_locale_compare),
+        ("normalize", 0, str_normalize),
+        ("isWellFormed", 0, str_is_well_formed),
+        ("toWellFormed", 0, str_to_well_formed),
+        ("repeat", 1, str_repeat),
+        ("padStart", 1, str_pad_start),
+        ("padEnd", 1, str_pad_end),
+        ("replace", 2, str_replace),
+        ("replaceAll", 2, str_replace_all),
+        ("match", 1, str_match),
+        ("matchAll", 1, str_match_all),
+        ("search", 1, str_search),
+        ("concat", 1, str_concat),
+        ("at", 1, str_at),
+        ("toString", 0, str_to_string),
+        ("valueOf", 0, str_to_string),
+        ("anchor", 1, |vm, t, a| {
+            str_html(vm, t, "a", Some(("name", arg0(a))))
+        }),
+        ("big", 0, |vm, t, _| str_html(vm, t, "big", None)),
+        ("blink", 0, |vm, t, _| str_html(vm, t, "blink", None)),
+        ("bold", 0, |vm, t, _| str_html(vm, t, "b", None)),
+        ("fixed", 0, |vm, t, _| str_html(vm, t, "tt", None)),
+        ("fontcolor", 1, |vm, t, a| {
+            str_html(vm, t, "font", Some(("color", arg0(a))))
+        }),
+        ("fontsize", 1, |vm, t, a| {
+            str_html(vm, t, "font", Some(("size", arg0(a))))
+        }),
+        ("italics", 0, |vm, t, _| str_html(vm, t, "i", None)),
+        ("link", 1, |vm, t, a| {
+            str_html(vm, t, "a", Some(("href", arg0(a))))
+        }),
+        ("small", 0, |vm, t, _| str_html(vm, t, "small", None)),
+        ("strike", 0, |vm, t, _| str_html(vm, t, "strike", None)),
+        ("sub", 0, |vm, t, _| str_html(vm, t, "sub", None)),
+        ("sup", 0, |vm, t, _| str_html(vm, t, "sup", None)),
+    ];
+    for &(name, len, f) in methods {
+        define_method_len(vm, sp, name, len, f);
+    }
+    // Annex B §B.2.3.1: `trimLeft === trimStart` and `trimRight === trimEnd`.
+    let ts_fn = vm.alloc_native_fn("trimStart", str_trim_start);
+    vm.set_fn_length(ts_fn, 0);
+    for kname in ["trimStart", "trimLeft"] {
+        let k = vm.heap.intern_key(kname);
+        vm.heap.object_define_data(
+            sp,
+            k,
+            JsValue::from_object(ts_fn),
+            PropertyAttrs::METHOD,
+            &mut vm.shapes,
+        );
+    }
+    let te_fn = vm.alloc_native_fn("trimEnd", str_trim_end);
+    vm.set_fn_length(te_fn, 0);
+    for kname in ["trimEnd", "trimRight"] {
+        let k = vm.heap.intern_key(kname);
+        vm.heap.object_define_data(
+            sp,
+            k,
+            JsValue::from_object(te_fn),
+            PropertyAttrs::METHOD,
+            &mut vm.shapes,
+        );
+    }
+
     let str_iter_fn = vm.alloc_native_fn("[Symbol.iterator]", str_symbol_iterator);
+    vm.set_fn_length(str_iter_fn, 0);
     let sym_iter_key = vm.key_symbol_iterator;
     vm.heap.object_define_data(
         sp,
         sym_iter_key,
         JsValue::from_object(str_iter_fn),
         PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    vm.heap.object_define_data(
+        sp,
+        vm.key_length,
+        JsValue::from_i32(0),
+        PropertyAttrs::empty(),
         &mut vm.shapes,
     );
 
@@ -98,6 +177,7 @@ fn install_string(vm: &mut JsVm) {
     link_ctor_meta(vm, ctor, sp, 1, true);
     define_method_len(vm, ctor, "fromCharCode", 1, str_from_char_code);
     define_method_len(vm, ctor, "fromCodePoint", 1, str_from_code_point);
+    define_method_len(vm, ctor, "raw", 1, str_raw);
     define_global(vm, "String", JsValue::from_object(ctor));
 }
 
@@ -121,22 +201,111 @@ fn link_ctor_meta(
     );
 }
 
+fn require_coercible(vm: &mut JsVm, val: JsValue) -> Result<(), JsException> {
+    if val.is_null() || val.is_undefined() {
+        Err(vm.type_error("Cannot convert undefined or null to object"))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_string_this(vm: &mut JsVm, this_val: JsValue) -> Result<String, JsException> {
+    require_coercible(vm, this_val)?;
+    vm.to_js_string(this_val)
+}
+
+fn get_method_opt(
+    vm: &mut JsVm,
+    val: JsValue,
+    key: crate::PropertyKey,
+) -> Result<Option<JsValue>, JsException> {
+    let h = vm.to_object(val)?;
+    let func = vm.get_property_by_key(h, key)?;
+    if func.is_undefined() || func.is_null() {
+        return Ok(None);
+    }
+    if !func.as_object().is_some_and(|fh| vm.is_callable_handle(fh)) {
+        return Err(vm.type_error("Property is not a function"));
+    }
+    Ok(Some(func))
+}
+
+fn clamp_u16_idx(n: f64, len: usize) -> usize {
+    if n <= 0.0 || n.is_nan() {
+        0
+    } else if n >= len as f64 {
+        len
+    } else {
+        n as usize
+    }
+}
+
+fn find_u16_subslice(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(from.min(haystack.len()));
+    }
+    if from + needle.len() > haystack.len() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|rel| from + rel)
+}
+
 fn str_symbol_iterator(
     vm: &mut JsVm,
     this_val: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    if this_val.is_null() || this_val.is_undefined() {
-        return Err(vm.type_error("Cannot convert undefined or null to object"));
-    }
-    let items: Vec<JsValue> = vm
-        .value_to_rust_string(this_val)
-        .chars()
-        .map(|c| JsValue::from_string(vm.heap.alloc_string(c.to_string())))
-        .collect();
-    Ok(JsValue::from_object(
-        crate::builtins_collections::alloc_values_iterator(vm, items),
-    ))
+    let s = require_string_this(vm, this_val)?;
+    let iter = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Ordinary,
+        Some(vm.string_iter_proto),
+    ));
+    let chars: Vec<String> = s.chars().map(|c| c.to_string()).collect();
+    let idx = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let step = vm.alloc_host_fn("", move |vm, _t, _a| {
+        let i = idx.get();
+        if i >= chars.len() {
+            return Ok(crate::promise::make_iter_result(
+                vm,
+                JsValue::UNDEFINED,
+                true,
+            ));
+        }
+        idx.set(i + 1);
+        let v = JsValue::from_string(vm.heap.alloc_string(chars[i].as_str()));
+        Ok(crate::promise::make_iter_result(vm, v, false))
+    });
+    let k_step = vm.heap.intern_key("__str_iter_step");
+    vm.heap.object_define_data(
+        iter,
+        k_step,
+        JsValue::from_object(step),
+        PropertyAttrs::empty(),
+        &mut vm.shapes,
+    );
+    Ok(JsValue::from_object(iter))
+}
+
+fn str_iter_next(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let Some(h) = this_val.as_object() else {
+        return Err(vm.type_error("String Iterator.next called on incompatible receiver"));
+    };
+    let k_step = vm.heap.intern_key("__str_iter_step");
+    let Some(step) = vm
+        .heap
+        .object_get_own(h, k_step, &vm.shapes)
+        .map(|p| p.value)
+    else {
+        return Err(vm.type_error("String Iterator.next called on incompatible receiver"));
+    };
+    vm.call_value(step, JsValue::UNDEFINED, &[])
 }
 
 fn unbox_prim(vm: &JsVm, val: JsValue) -> JsValue {
@@ -154,8 +323,9 @@ fn unbox_prim(vm: &JsVm, val: JsValue) -> JsValue {
 }
 
 fn string_ctor(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
+    let is_construct = !vm.native_new_target.is_undefined();
     let s = if let Some(&v) = args.first() {
-        if v.is_symbol() && this_val.as_object().is_none() {
+        if !is_construct && v.is_symbol() {
             let desc = v
                 .as_symbol()
                 .and_then(|id| vm.symbol_descriptions.get(&id))
@@ -169,22 +339,25 @@ fn string_ctor(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsV
         String::new()
     };
     let sv = JsValue::from_string(vm.heap.alloc_string(s.clone()));
-    if let Some(h) = this_val.as_object() {
-        let is_new_str = vm.heap.get_object(h).and_then(|o| o.prototype) == Some(vm.string_proto);
-        if is_new_str {
+    if is_construct {
+        if let Some(h) = this_val.as_object() {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            let len = units.len() as f64;
             if let Some(o) = vm.heap.get_object_mut(h) {
                 o.rare_mut().boxed_value = Some(sv);
-                for (i, ch) in s.chars().enumerate() {
-                    let cv = JsValue::from_string(vm.heap.alloc_string(ch.to_string()));
-                    if let Some(obj_mut) = vm.heap.get_object_mut(h) {
-                        obj_mut.elements.set(i as u32, cv);
-                    }
-                }
+            }
+            for (i, u) in units.into_iter().enumerate() {
+                let ch = char::from_u32(u32::from(u))
+                    .map_or_else(|| "\u{FFFD}".to_string(), |c| c.to_string());
+                let cv = JsValue::from_string(vm.heap.alloc_string(ch));
+                let k = vm.heap.intern_key(&i.to_string());
+                vm.heap
+                    .object_define_data(h, k, cv, PropertyAttrs::ENUMERABLE, &mut vm.shapes);
             }
             vm.heap.object_define_data(
                 h,
                 vm.key_length,
-                JsValue::from_f64(s.encode_utf16().count() as f64),
+                JsValue::from_f64(len),
                 PropertyAttrs::empty(),
                 &mut vm.shapes,
             );
@@ -204,8 +377,9 @@ fn str_from_char_code(
     for &a in args {
         units.push((vm.to_u32(a)? & 0xFFFF) as u16);
     }
-    let s = String::from_utf16_lossy(&units);
-    Ok(JsValue::from_string(vm.heap.alloc_string(s)))
+    Ok(JsValue::from_string(
+        vm.heap.alloc_string(String::from_utf16_lossy(&units)),
+    ))
 }
 
 fn str_from_code_point(
@@ -228,7 +402,32 @@ fn str_from_code_point(
             units.push((0xDC00 + (adj & 0x3FF)) as u16);
         }
     }
-    let out = String::from_utf16_lossy(&units);
+    Ok(JsValue::from_string(
+        vm.heap.alloc_string(String::from_utf16_lossy(&units)),
+    ))
+}
+
+fn str_raw(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
+    let cooked = vm.to_object(arg0(args))?;
+    let k_raw = vm.heap.intern_key("raw");
+    let raw_v = vm.get_property_by_key(cooked, k_raw)?;
+    let raw = vm.to_object(raw_v)?;
+    let lit_count = vm.array_get_len(raw)?;
+    if lit_count == 0 {
+        return Ok(JsValue::from_string(vm.heap.alloc_string("")));
+    }
+    let mut out = String::new();
+    let num_subs = args.len().saturating_sub(1) as u64;
+    for next_idx in 0..lit_count {
+        let seg_v = vm.array_get_index(raw, next_idx)?;
+        out.push_str(&vm.to_js_string(seg_v)?);
+        if next_idx + 1 == lit_count {
+            break;
+        }
+        if next_idx < num_subs {
+            out.push_str(&vm.to_js_string(args[(next_idx + 1) as usize])?);
+        }
+    }
     Ok(JsValue::from_string(vm.heap.alloc_string(out)))
 }
 
@@ -245,21 +444,15 @@ fn str_to_string(
 }
 
 fn str_char_at(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let idx = args
-        .first()
-        .map(|&v| vm.to_i32(v))
-        .transpose()?
-        .unwrap_or(0);
-    let ch = if idx >= 0 {
-        s.chars()
-            .nth(idx as usize)
-            .map(|c| c.to_string())
-            .unwrap_or_default()
+    let s = require_string_this(vm, this_val)?;
+    let pos = vm.to_integer_or_infinity(arg0(args))?;
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let out = if pos >= 0.0 && pos < units.len() as f64 {
+        String::from_utf16_lossy(&units[pos as usize..pos as usize + 1])
     } else {
         String::new()
     };
-    Ok(JsValue::from_string(vm.heap.alloc_string(ch)))
+    Ok(JsValue::from_string(vm.heap.alloc_string(out)))
 }
 
 fn str_char_code_at(
@@ -267,19 +460,13 @@ fn str_char_code_at(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let idx = args
-        .first()
-        .map(|&v| vm.to_i32(v))
-        .transpose()?
-        .unwrap_or(0);
-    if idx < 0 {
+    let s = require_string_this(vm, this_val)?;
+    let pos = vm.to_integer_or_infinity(arg0(args))?;
+    let units: Vec<u16> = s.encode_utf16().collect();
+    if pos < 0.0 || pos >= units.len() as f64 {
         return Ok(JsValue::NAN);
     }
-    let units: Vec<u16> = s.encode_utf16().collect();
-    Ok(units
-        .get(idx as usize)
-        .map_or(JsValue::NAN, |&u| JsValue::from_i32(i32::from(u))))
+    Ok(JsValue::from_i32(i32::from(units[pos as usize])))
 }
 
 fn str_code_point_at(
@@ -287,48 +474,41 @@ fn str_code_point_at(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let idx = args
-        .first()
-        .map(|&v| vm.to_i32(v))
-        .transpose()?
-        .unwrap_or(0);
-    if idx < 0 {
+    let s = require_string_this(vm, this_val)?;
+    let pos = vm.to_integer_or_infinity(arg0(args))?;
+    let units: Vec<u16> = s.encode_utf16().collect();
+    if pos < 0.0 || pos >= units.len() as f64 {
         return Ok(JsValue::UNDEFINED);
     }
-    Ok(s.chars()
-        .nth(idx as usize)
-        .map_or(JsValue::UNDEFINED, |c| JsValue::from_i32(c as i32)))
+    let idx = pos as usize;
+    let first = units[idx];
+    let cp = if (0xD800..=0xDBFF).contains(&first) && idx + 1 < units.len() {
+        let second = units[idx + 1];
+        if (0xDC00..=0xDFFF).contains(&second) {
+            (((u32::from(first) - 0xD800) << 10) + (u32::from(second) - 0xDC00) + 0x10000) as i32
+        } else {
+            i32::from(first)
+        }
+    } else {
+        i32::from(first)
+    };
+    Ok(JsValue::from_i32(cp))
 }
 
 fn str_slice(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len() as i64;
-    let raw_start = args
-        .first()
-        .filter(|v| !v.is_undefined())
-        .map(|&v| vm.to_i32(v))
-        .transpose()?
-        .unwrap_or(0) as i64;
-    let raw_end = args
-        .get(1)
-        .filter(|v| !v.is_undefined())
-        .map(|&v| vm.to_i32(v))
-        .transpose()?
-        .map_or(len, i64::from);
-    let start = if raw_start < 0 {
-        (len + raw_start).max(0)
-    } else {
-        raw_start.min(len)
-    } as usize;
-    let end = if raw_end < 0 {
-        (len + raw_end).max(0)
-    } else {
-        raw_end.min(len)
-    } as usize;
-    let out: String = if start < end {
-        chars[start..end].iter().collect()
+    let s = require_string_this(vm, this_val)?;
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let len = units.len() as u64;
+    let start = match args.first().copied() {
+        Some(v) if !v.is_undefined() => clamp_rel_f64(vm.to_integer_or_infinity(v)?, len) as usize,
+        _ => 0,
+    };
+    let end = match args.get(1).copied() {
+        Some(v) if !v.is_undefined() => clamp_rel_f64(vm.to_integer_or_infinity(v)?, len) as usize,
+        _ => units.len(),
+    };
+    let out = if start < end {
+        String::from_utf16_lossy(&units[start..end])
     } else {
         String::new()
     };
@@ -340,31 +520,52 @@ fn str_substring(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len() as i64;
-    let a = args
-        .first()
-        .filter(|v| !v.is_undefined())
-        .map(|&v| vm.to_i32(v))
-        .transpose()?
-        .unwrap_or(0)
-        .max(0) as i64;
-    let b = args
-        .get(1)
-        .filter(|v| !v.is_undefined())
-        .map(|&v| vm.to_i32(v))
-        .transpose()?
-        .map_or(len, |v| i64::from(v.max(0)));
-    let start = a.min(len) as usize;
-    let end = b.min(len) as usize;
+    let s = require_string_this(vm, this_val)?;
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let len = units.len();
+    let start = match args.first().copied() {
+        Some(v) if !v.is_undefined() => clamp_u16_idx(vm.to_integer_or_infinity(v)?, len),
+        _ => 0,
+    };
+    let end = match args.get(1).copied() {
+        Some(v) if !v.is_undefined() => clamp_u16_idx(vm.to_integer_or_infinity(v)?, len),
+        _ => len,
+    };
     let (lo, hi) = if start <= end {
         (start, end)
     } else {
         (end, start)
     };
-    let out: String = chars[lo..hi].iter().collect();
-    Ok(JsValue::from_string(vm.heap.alloc_string(out)))
+    Ok(JsValue::from_string(
+        vm.heap
+            .alloc_string(String::from_utf16_lossy(&units[lo..hi])),
+    ))
+}
+
+fn str_substr(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
+    let s = require_string_this(vm, this_val)?;
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let len = units.len() as u64;
+    let start_f = vm.to_integer_or_infinity(arg0(args))?;
+    let start = if start_f == f64::INFINITY {
+        len as usize
+    } else {
+        clamp_rel_f64(start_f, len) as usize
+    };
+    let count = match args.get(1).copied() {
+        Some(v) if !v.is_undefined() => {
+            let l = vm.to_integer_or_infinity(v)?;
+            if l <= 0.0 {
+                0
+            } else {
+                l.min((units.len() - start) as f64) as usize
+            }
+        }
+        _ => units.len() - start,
+    };
+    Ok(JsValue::from_string(vm.heap.alloc_string(
+        String::from_utf16_lossy(&units[start..start + count]),
+    )))
 }
 
 fn str_index_of(
@@ -372,20 +573,17 @@ fn str_index_of(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let needle = vm.value_to_rust_string(args.first().copied().unwrap_or(JsValue::UNDEFINED));
-    let from = args
-        .get(1)
-        .filter(|v| !v.is_undefined())
-        .map(|&v| vm.to_i32(v))
-        .transpose()?
-        .unwrap_or(0)
-        .max(0) as usize;
-    let byte_off = s.char_indices().nth(from).map_or(s.len(), |(b, _)| b);
-    let found = s[byte_off..]
-        .find(&needle)
-        .map(|rel| s[..byte_off + rel].chars().count() as i32);
-    Ok(JsValue::from_i32(found.unwrap_or(-1)))
+    let s = require_string_this(vm, this_val)?;
+    let needle = vm.to_js_string(arg0(args))?;
+    let pos_f = match args.get(1).copied() {
+        Some(v) if !v.is_undefined() => vm.to_integer_or_infinity(v)?,
+        _ => 0.0,
+    };
+    let hay: Vec<u16> = s.encode_utf16().collect();
+    let ndl: Vec<u16> = needle.encode_utf16().collect();
+    let from = clamp_u16_idx(pos_f, hay.len());
+    let found = find_u16_subslice(&hay, &ndl, from).map_or(-1.0, |i| i as f64);
+    Ok(JsValue::from_f64(found))
 }
 
 fn str_last_index_of(
@@ -393,12 +591,32 @@ fn str_last_index_of(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let needle = vm.value_to_rust_string(args.first().copied().unwrap_or(JsValue::UNDEFINED));
-    let found = s
-        .rfind(&needle)
-        .map(|byte_idx| s[..byte_idx].chars().count() as i32);
-    Ok(JsValue::from_i32(found.unwrap_or(-1)))
+    let s = require_string_this(vm, this_val)?;
+    let needle = vm.to_js_string(arg0(args))?;
+    let num_pos = match args.get(1).copied() {
+        Some(v) => vm.to_number(v)?,
+        None => f64::NAN,
+    };
+    let hay: Vec<u16> = s.encode_utf16().collect();
+    let ndl: Vec<u16> = needle.encode_utf16().collect();
+    let start = if num_pos.is_nan() {
+        hay.len()
+    } else {
+        clamp_u16_idx(num_pos.trunc(), hay.len())
+    };
+    if ndl.is_empty() {
+        return Ok(JsValue::from_f64(start as f64));
+    }
+    if ndl.len() > hay.len() {
+        return Ok(JsValue::from_i32(-1));
+    }
+    let max_i = start.min(hay.len() - ndl.len());
+    for i in (0..=max_i).rev() {
+        if hay[i..i + ndl.len()] == ndl[..] {
+            return Ok(JsValue::from_f64(i as f64));
+        }
+    }
+    Ok(JsValue::from_i32(-1))
 }
 
 fn str_includes(
@@ -406,8 +624,24 @@ fn str_includes(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let idx = str_index_of(vm, this_val, args)?;
-    Ok(JsValue::from_bool(idx.as_i32() != Some(-1)))
+    let s = require_string_this(vm, this_val)?;
+    let search = arg0(args);
+    if is_regexp(vm, search)? {
+        return Err(vm.type_error(
+            "First argument to String.prototype.includes must not be a regular expression",
+        ));
+    }
+    let needle = vm.to_js_string(search)?;
+    let pos_f = match args.get(1).copied() {
+        Some(v) if !v.is_undefined() => vm.to_integer_or_infinity(v)?,
+        _ => 0.0,
+    };
+    let hay: Vec<u16> = s.encode_utf16().collect();
+    let ndl: Vec<u16> = needle.encode_utf16().collect();
+    let from = clamp_u16_idx(pos_f, hay.len());
+    Ok(JsValue::from_bool(
+        find_u16_subslice(&hay, &ndl, from).is_some(),
+    ))
 }
 
 fn str_starts_with(
@@ -415,17 +649,24 @@ fn str_starts_with(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let prefix = vm.value_to_rust_string(args.first().copied().unwrap_or(JsValue::UNDEFINED));
-    let pos = args
-        .get(1)
-        .filter(|v| !v.is_undefined())
-        .map(|&v| vm.to_i32(v))
-        .transpose()?
-        .unwrap_or(0)
-        .max(0) as usize;
-    let byte_off = s.char_indices().nth(pos).map_or(s.len(), |(b, _)| b);
-    Ok(JsValue::from_bool(s[byte_off..].starts_with(&prefix)))
+    let s = require_string_this(vm, this_val)?;
+    let search = arg0(args);
+    if is_regexp(vm, search)? {
+        return Err(vm.type_error(
+            "First argument to String.prototype.startsWith must not be a regular expression",
+        ));
+    }
+    let prefix = vm.to_js_string(search)?;
+    let pos_f = match args.get(1).copied() {
+        Some(v) if !v.is_undefined() => vm.to_integer_or_infinity(v)?,
+        _ => 0.0,
+    };
+    let hay: Vec<u16> = s.encode_utf16().collect();
+    let pfx: Vec<u16> = prefix.encode_utf16().collect();
+    let start = clamp_u16_idx(pos_f, hay.len());
+    Ok(JsValue::from_bool(
+        start + pfx.len() <= hay.len() && hay[start..start + pfx.len()] == pfx[..],
+    ))
 }
 
 fn str_ends_with(
@@ -433,66 +674,78 @@ fn str_ends_with(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let suffix = vm.value_to_rust_string(args.first().copied().unwrap_or(JsValue::UNDEFINED));
-    let end_chars = args
-        .get(1)
-        .filter(|v| !v.is_undefined())
-        .map(|&v| vm.to_i32(v))
-        .transpose()?
-        .map(|v| v.max(0) as usize);
-    let slice = match end_chars {
-        Some(n) => {
-            let byte_end = s.char_indices().nth(n).map_or(s.len(), |(b, _)| b);
-            &s[..byte_end]
-        }
-        None => s.as_str(),
+    let s = require_string_this(vm, this_val)?;
+    let search = arg0(args);
+    if is_regexp(vm, search)? {
+        return Err(vm.type_error(
+            "First argument to String.prototype.endsWith must not be a regular expression",
+        ));
+    }
+    let suffix = vm.to_js_string(search)?;
+    let hay: Vec<u16> = s.encode_utf16().collect();
+    let end = match args.get(1).copied() {
+        Some(v) if !v.is_undefined() => clamp_u16_idx(vm.to_integer_or_infinity(v)?, hay.len()),
+        _ => hay.len(),
     };
-    Ok(JsValue::from_bool(slice.ends_with(&suffix)))
+    let sfx: Vec<u16> = suffix.encode_utf16().collect();
+    Ok(JsValue::from_bool(
+        sfx.len() <= end && hay[end - sfx.len()..end] == sfx[..],
+    ))
 }
 
 fn str_split(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let arr = vm.alloc_array();
-    let sep = args.first().copied().unwrap_or(JsValue::UNDEFINED);
-    let limit = args
-        .get(1)
-        .filter(|v| !v.is_undefined())
-        .map(|&v| vm.to_u32(v))
-        .transpose()?
-        .unwrap_or(u32::MAX) as usize;
-    if sep.is_undefined() {
-        if limit > 0 {
-            let v = JsValue::from_string(vm.heap.alloc_string(s));
-            vm.heap.object_push_element(arr, v);
+    require_coercible(vm, this_val)?;
+    let sep = arg0(args);
+    let lim_arg = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
+    if !sep.is_null() && !sep.is_undefined() {
+        if let Some(splitter) = get_method_opt(vm, sep, vm.key_symbol_split)? {
+            return vm.call_value(splitter, sep, &[this_val, lim_arg]);
         }
-        return Ok(JsValue::from_object(arr));
     }
-    if let Some(re) = extract_compiled_regex(vm, sep)? {
-        for part in re.split(&s).take(limit) {
-            let v = JsValue::from_string(vm.heap.alloc_string(part));
-            vm.heap.object_push_element(arr, v);
-        }
-        return Ok(JsValue::from_object(arr));
-    }
-    let sep_str = vm.value_to_rust_string(sep);
-    if sep_str.is_empty() {
-        for ch in s.chars().take(limit) {
-            let v = JsValue::from_string(vm.heap.alloc_string(ch.to_string()));
-            vm.heap.object_push_element(arr, v);
-        }
+    let s = vm.to_js_string(this_val)?;
+    let lim = if lim_arg.is_undefined() {
+        u32::MAX
     } else {
-        for part in s.split(&sep_str).take(limit) {
-            let v = JsValue::from_string(vm.heap.alloc_string(part));
+        vm.to_u32(lim_arg)?
+    };
+    let sep_str = vm.to_js_string(sep)?;
+    let arr = vm.alloc_array();
+    if lim == 0 {
+        return Ok(JsValue::from_object(arr));
+    }
+    if sep.is_undefined() {
+        let v = JsValue::from_string(vm.heap.alloc_string(s));
+        vm.heap.object_push_element(arr, v);
+        return Ok(JsValue::from_object(arr));
+    }
+    let hay: Vec<u16> = s.encode_utf16().collect();
+    let ndl: Vec<u16> = sep_str.encode_utf16().collect();
+    if ndl.is_empty() {
+        for u in hay.iter().take(lim as usize) {
+            let v = JsValue::from_string(vm.heap.alloc_string(String::from_utf16_lossy(&[*u])));
             vm.heap.object_push_element(arr, v);
         }
+        return Ok(JsValue::from_object(arr));
     }
+    let (mut p, mut count) = (0usize, 0u32);
+    while let Some(pos) = find_u16_subslice(&hay, &ndl, p) {
+        let v = JsValue::from_string(vm.heap.alloc_string(String::from_utf16_lossy(&hay[p..pos])));
+        vm.heap.object_push_element(arr, v);
+        count += 1;
+        if count == lim {
+            return Ok(JsValue::from_object(arr));
+        }
+        p = pos + ndl.len();
+    }
+    let tail = JsValue::from_string(vm.heap.alloc_string(String::from_utf16_lossy(&hay[p..])));
+    vm.heap.object_push_element(arr, tail);
     Ok(JsValue::from_object(arr))
 }
 
 fn str_trim(vm: &mut JsVm, this_val: JsValue, _args: &[JsValue]) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    Ok(JsValue::from_string(vm.heap.alloc_string(s.trim())))
+    let s = require_string_this(vm, this_val)?;
+    let trimmed = s.trim_matches(is_es_whitespace_or_lt);
+    Ok(JsValue::from_string(vm.heap.alloc_string(trimmed)))
 }
 
 fn str_trim_start(
@@ -500,8 +753,9 @@ fn str_trim_start(
     this_val: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    Ok(JsValue::from_string(vm.heap.alloc_string(s.trim_start())))
+    let s = require_string_this(vm, this_val)?;
+    let trimmed = s.trim_start_matches(is_es_whitespace_or_lt);
+    Ok(JsValue::from_string(vm.heap.alloc_string(trimmed)))
 }
 
 fn str_trim_end(
@@ -509,8 +763,9 @@ fn str_trim_end(
     this_val: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    Ok(JsValue::from_string(vm.heap.alloc_string(s.trim_end())))
+    let s = require_string_this(vm, this_val)?;
+    let trimmed = s.trim_end_matches(is_es_whitespace_or_lt);
+    Ok(JsValue::from_string(vm.heap.alloc_string(trimmed)))
 }
 
 fn str_to_lower(
@@ -518,7 +773,7 @@ fn str_to_lower(
     this_val: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val).to_lowercase();
+    let s = require_string_this(vm, this_val)?.to_lowercase();
     Ok(JsValue::from_string(vm.heap.alloc_string(s)))
 }
 
@@ -527,27 +782,81 @@ fn str_to_upper(
     this_val: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val).to_uppercase();
+    let s = require_string_this(vm, this_val)?.to_uppercase();
+    Ok(JsValue::from_string(vm.heap.alloc_string(s)))
+}
+
+fn str_locale_compare(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let a = require_string_this(vm, this_val)?;
+    let b = vm.to_js_string(arg0(args))?;
+    let ord = match a.cmp(&b) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    Ok(JsValue::from_i32(ord))
+}
+
+fn str_normalize(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let s = require_string_this(vm, this_val)?;
+    let form = match args.first().copied() {
+        Some(v) if !v.is_undefined() => vm.to_js_string(v)?,
+        _ => "NFC".to_string(),
+    };
+    let out = match form.as_str() {
+        "NFC" => icu::normalizer::ComposingNormalizer::new_nfc().normalize(&s),
+        "NFD" => icu::normalizer::DecomposingNormalizer::new_nfd().normalize(&s),
+        "NFKC" => icu::normalizer::ComposingNormalizer::new_nfkc().normalize(&s),
+        "NFKD" => icu::normalizer::DecomposingNormalizer::new_nfkd().normalize(&s),
+        _ => {
+            return Err(vm.range_error(format!(
+                "The normalization form should be one of NFC, NFD, NFKC, NFKD (got '{form}')"
+            )))
+        }
+    };
+    Ok(JsValue::from_string(vm.heap.alloc_string(out)))
+}
+
+fn str_is_well_formed(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let _ = require_string_this(vm, this_val)?;
+    Ok(JsValue::TRUE)
+}
+
+fn str_to_well_formed(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let s = require_string_this(vm, this_val)?;
     Ok(JsValue::from_string(vm.heap.alloc_string(s)))
 }
 
 fn str_repeat(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let count = args
-        .first()
-        .map(|&v| vm.to_number(v))
-        .transpose()?
-        .unwrap_or(0.0);
-    if count < 0.0 || !count.is_finite() {
+    let s = require_string_this(vm, this_val)?;
+    let n = vm.to_integer_or_infinity(arg0(args))?;
+    if n < 0.0 || n.is_infinite() {
         return Err(vm.range_error("Invalid count value for String.prototype.repeat"));
     }
-    let count_usize = count.trunc() as usize;
-    if !s.is_empty() && s.len().saturating_mul(count_usize) > 32 * 1024 * 1024 {
+    let count = n as usize;
+    if count == 0 || s.is_empty() {
+        return Ok(JsValue::from_string(vm.heap.alloc_string("")));
+    }
+    if s.len().saturating_mul(count) > 32 * 1024 * 1024 {
         return Err(vm.range_error("Invalid string length"));
     }
-    Ok(JsValue::from_string(
-        vm.heap.alloc_string(s.repeat(count_usize)),
-    ))
+    Ok(JsValue::from_string(vm.heap.alloc_string(s.repeat(count))))
 }
 
 fn str_pad_start(
@@ -568,30 +877,27 @@ fn str_pad_impl(
     args: &[JsValue],
     start: bool,
 ) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let target_len = args
-        .first()
-        .map(|&v| vm.to_i32(v))
-        .transpose()?
-        .unwrap_or(0)
-        .max(0) as usize;
-    let cur_len = s.chars().count();
-    if target_len <= cur_len {
+    let s = require_string_this(vm, this_val)?;
+    let max_len = vm.to_length(arg0(args))?;
+    let fill = match args.get(1).copied() {
+        Some(v) if !v.is_undefined() => vm.to_js_string(v)?,
+        _ => " ".to_owned(),
+    };
+    let s_units: Vec<u16> = s.encode_utf16().collect();
+    if max_len <= s_units.len() as u64 || fill.is_empty() {
         return Ok(JsValue::from_string(vm.heap.alloc_string(s)));
     }
-    if target_len > 32 * 1024 * 1024 {
+    if max_len > 32 * 1024 * 1024 {
         return Err(vm.range_error("Invalid string length"));
     }
-    let fill = args
-        .get(1)
-        .filter(|v| !v.is_undefined())
-        .map(|&v| vm.value_to_rust_string(v))
-        .unwrap_or_else(|| " ".to_owned());
-    if fill.is_empty() {
-        return Ok(JsValue::from_string(vm.heap.alloc_string(s)));
+    let fill_units: Vec<u16> = fill.encode_utf16().collect();
+    let need = (max_len as usize) - s_units.len();
+    let mut pad_units = Vec::with_capacity(need);
+    while pad_units.len() < need {
+        let take = (need - pad_units.len()).min(fill_units.len());
+        pad_units.extend_from_slice(&fill_units[..take]);
     }
-    let need = target_len - cur_len;
-    let pad: String = fill.chars().cycle().take(need).collect();
+    let pad = String::from_utf16_lossy(&pad_units);
     let out = if start {
         format!("{pad}{s}")
     } else {
@@ -618,160 +924,184 @@ fn str_replace_impl(
     args: &[JsValue],
     force_all: bool,
 ) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let search = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+    require_coercible(vm, this_val)?;
+    let search = arg0(args);
     let repl_val = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
-    let repl_is_fn = repl_val
+    if !search.is_null() && !search.is_undefined() {
+        if force_all && is_regexp(vm, search)? {
+            let sh = search.as_object().unwrap();
+            let k_flg = vm.heap.intern_key("flags");
+            let flg_v = vm.get_property_by_key(sh, k_flg)?;
+            require_coercible(vm, flg_v)?;
+            if !vm.to_js_string(flg_v)?.contains('g') {
+                return Err(
+                    vm.type_error("String.prototype.replaceAll called with non-global RegExp")
+                );
+            }
+        }
+        if let Some(replacer) = get_method_opt(vm, search, vm.key_symbol_replace)? {
+            return vm.call_value(replacer, search, &[this_val, repl_val]);
+        }
+    }
+    let s = vm.to_js_string(this_val)?;
+    let needle = vm.to_js_string(search)?;
+    let functional = repl_val
         .as_object()
         .is_some_and(|h| vm.is_callable_handle(h));
-
-    if let Some((re, is_global)) = extract_compiled_regex_with_global(vm, search)? {
-        if force_all && !is_global {
-            return Err(vm.type_error("String.prototype.replaceAll called with non-global RegExp"));
-        }
-        let all = force_all || is_global;
-        if repl_is_fn {
-            let mut out = String::new();
-            let mut last = 0usize;
-            for caps in re.captures_iter(&s) {
-                let m = caps.get(0).unwrap();
-                out.push_str(&s[last..m.start()]);
-                let mut cb_args = Vec::with_capacity(caps.len() + 2);
-                for i in 0..caps.len() {
-                    cb_args.push(match caps.get(i) {
-                        Some(g) => JsValue::from_string(vm.heap.alloc_string(g.as_str())),
-                        None => JsValue::UNDEFINED,
-                    });
-                }
-                cb_args.push(JsValue::from_i32(m.start() as i32));
-                cb_args.push(JsValue::from_string(vm.heap.alloc_string(s.as_str())));
-                let rep = vm.call_value(repl_val, JsValue::UNDEFINED, &cb_args)?;
-                out.push_str(&vm.value_to_rust_string(rep));
-                last = m.end();
-                if !all {
+    let repl_str = if functional {
+        String::new()
+    } else {
+        vm.to_js_string(repl_val)?
+    };
+    let hay: Vec<u16> = s.encode_utf16().collect();
+    let ndl: Vec<u16> = needle.encode_utf16().collect();
+    let mut positions = Vec::new();
+    let advance = ndl.len().max(1);
+    if let Some(first) = find_u16_subslice(&hay, &ndl, 0) {
+        positions.push(first);
+        if force_all {
+            let mut cur = first + advance;
+            while cur <= hay.len() {
+                if let Some(pos) = find_u16_subslice(&hay, &ndl, cur) {
+                    positions.push(pos);
+                    cur = pos + advance;
+                } else {
                     break;
                 }
             }
-            out.push_str(&s[last..]);
-            return Ok(JsValue::from_string(vm.heap.alloc_string(out)));
         }
-        let repl_str = vm.value_to_rust_string(repl_val);
-        let out = if all {
-            re.replace_all(&s, repl_str.as_str()).into_owned()
-        } else {
-            re.replace(&s, repl_str.as_str()).into_owned()
-        };
-        return Ok(JsValue::from_string(vm.heap.alloc_string(out)));
     }
-
-    let needle = vm.value_to_rust_string(search);
-    if repl_is_fn {
-        let mut out = String::new();
-        let mut cursor = 0usize;
-        while let Some(rel) = s[cursor..].find(&needle) {
-            let pos = cursor + rel;
-            out.push_str(&s[cursor..pos]);
-            let m_val = JsValue::from_string(vm.heap.alloc_string(needle.as_str()));
-            let s_val = JsValue::from_string(vm.heap.alloc_string(s.as_str()));
-            let rep = vm.call_value(
+    let mut out = String::new();
+    let mut end_of_last = 0usize;
+    let sv = JsValue::from_string(vm.heap.alloc_string(s));
+    let mv = JsValue::from_string(vm.heap.alloc_string(needle.as_str()));
+    for pos in positions {
+        out.push_str(&String::from_utf16_lossy(&hay[end_of_last..pos]));
+        let rep = if functional {
+            let r = vm.call_value(
                 repl_val,
                 JsValue::UNDEFINED,
-                &[m_val, JsValue::from_i32(pos as i32), s_val],
+                &[mv, JsValue::from_f64(pos as f64), sv],
             )?;
-            out.push_str(&vm.value_to_rust_string(rep));
-            cursor = pos + needle.len().max(1);
-            if !force_all || needle.is_empty() {
-                break;
-            }
-        }
-        out.push_str(&s[cursor..]);
-        return Ok(JsValue::from_string(vm.heap.alloc_string(out)));
+            vm.to_js_string(r)?
+        } else {
+            get_substitution(vm, &needle, &hay, pos, &[], None, &repl_str)?
+        };
+        out.push_str(&rep);
+        end_of_last = pos + ndl.len();
     }
-    let repl_str = vm.value_to_rust_string(repl_val);
-    let out = if force_all {
-        s.replace(&needle, &repl_str)
-    } else {
-        s.replacen(&needle, &repl_str, 1)
-    };
+    out.push_str(&String::from_utf16_lossy(&hay[end_of_last..]));
     Ok(JsValue::from_string(vm.heap.alloc_string(out)))
 }
 
 fn str_match(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let arg = args.first().copied().unwrap_or(JsValue::UNDEFINED);
-    let (re, is_global) = match extract_compiled_regex_with_global(vm, arg)? {
-        Some(pair) => pair,
-        None => {
-            let pat = if arg.is_undefined() {
-                String::new()
-            } else {
-                vm.value_to_rust_string(arg)
-            };
-            (compile_js_regex(vm, &pat, "")?, false)
+    require_coercible(vm, this_val)?;
+    let rx_arg = arg0(args);
+    if !rx_arg.is_null() && !rx_arg.is_undefined() {
+        if let Some(matcher) = get_method_opt(vm, rx_arg, vm.key_symbol_match)? {
+            return vm.call_value(matcher, rx_arg, &[this_val]);
         }
-    };
-    if is_global {
-        let matches: Vec<&str> = re.find_iter(&s).map(|m| m.as_str()).collect();
-        if matches.is_empty() {
-            return Ok(JsValue::NULL);
-        }
-        let arr = vm.alloc_array();
-        for m in matches {
-            let v = JsValue::from_string(vm.heap.alloc_string(m));
-            vm.heap.object_push_element(arr, v);
-        }
-        return Ok(JsValue::from_object(arr));
     }
-    Ok(build_exec_array(vm, &re, &s, 0).unwrap_or(JsValue::NULL))
+    let s = vm.to_js_string(this_val)?;
+    let sv = JsValue::from_string(vm.heap.alloc_string(s));
+    let k_re = vm.heap.intern_key("RegExp");
+    let re_ctor = vm.get_property_by_key(vm.global, k_re)?;
+    let rx = vm.construct_value(re_ctor, &[rx_arg, JsValue::UNDEFINED], re_ctor)?;
+    let m = vm.get_property_by_key(rx.as_object().unwrap(), vm.key_symbol_match)?;
+    vm.call_value(m, rx, &[sv])
+}
+
+fn str_match_all(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    require_coercible(vm, this_val)?;
+    let rx_arg = arg0(args);
+    if !rx_arg.is_null() && !rx_arg.is_undefined() {
+        if is_regexp(vm, rx_arg)? {
+            let rh = rx_arg.as_object().unwrap();
+            let k_flg = vm.heap.intern_key("flags");
+            let flg_v = vm.get_property_by_key(rh, k_flg)?;
+            require_coercible(vm, flg_v)?;
+            if !vm.to_js_string(flg_v)?.contains('g') {
+                return Err(
+                    vm.type_error("String.prototype.matchAll called with non-global RegExp")
+                );
+            }
+        }
+        if let Some(matcher) = get_method_opt(vm, rx_arg, vm.key_symbol_match_all)? {
+            return vm.call_value(matcher, rx_arg, &[this_val]);
+        }
+    }
+    let s = vm.to_js_string(this_val)?;
+    let sv = JsValue::from_string(vm.heap.alloc_string(s));
+    let k_re = vm.heap.intern_key("RegExp");
+    let re_ctor = vm.get_property_by_key(vm.global, k_re)?;
+    let g_v = JsValue::from_string(vm.heap.alloc_string("g"));
+    let rx = vm.construct_value(re_ctor, &[rx_arg, g_v], re_ctor)?;
+    let m = vm.get_property_by_key(rx.as_object().unwrap(), vm.key_symbol_match_all)?;
+    vm.call_value(m, rx, &[sv])
 }
 
 fn str_search(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let arg = args.first().copied().unwrap_or(JsValue::UNDEFINED);
-    let re = match extract_compiled_regex(vm, arg)? {
-        Some(r) => r,
-        None => {
-            let pat = if arg.is_undefined() {
-                String::new()
-            } else {
-                vm.value_to_rust_string(arg)
-            };
-            compile_js_regex(vm, &pat, "")?
+    require_coercible(vm, this_val)?;
+    let rx_arg = arg0(args);
+    if !rx_arg.is_null() && !rx_arg.is_undefined() {
+        if let Some(searcher) = get_method_opt(vm, rx_arg, vm.key_symbol_search)? {
+            return vm.call_value(searcher, rx_arg, &[this_val]);
         }
-    };
-    let idx = re
-        .find(&s)
-        .map_or(-1, |m| s[..m.start()].chars().count() as i32);
-    Ok(JsValue::from_i32(idx))
+    }
+    let s = vm.to_js_string(this_val)?;
+    let sv = JsValue::from_string(vm.heap.alloc_string(s));
+    let k_re = vm.heap.intern_key("RegExp");
+    let re_ctor = vm.get_property_by_key(vm.global, k_re)?;
+    let rx = vm.construct_value(re_ctor, &[rx_arg, JsValue::UNDEFINED], re_ctor)?;
+    let m = vm.get_property_by_key(rx.as_object().unwrap(), vm.key_symbol_search)?;
+    vm.call_value(m, rx, &[sv])
 }
 
 fn str_concat(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let mut out = vm.value_to_rust_string(this_val);
+    let mut out = require_string_this(vm, this_val)?;
     for &a in args {
-        out.push_str(&vm.value_to_rust_string(a));
+        out.push_str(&vm.to_js_string(a)?);
     }
     Ok(JsValue::from_string(vm.heap.alloc_string(out)))
 }
 
 fn str_at(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    let chars: Vec<char> = s.chars().collect();
-    let idx = args
-        .first()
-        .map(|&v| vm.to_i32(v))
-        .transpose()?
-        .unwrap_or(0) as i64;
-    let pos = if idx < 0 {
-        chars.len() as i64 + idx
+    let s = require_string_this(vm, this_val)?;
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let rel = vm.to_integer_or_infinity(arg0(args))?;
+    let k = if rel >= 0.0 {
+        rel
     } else {
-        idx
+        units.len() as f64 + rel
     };
-    if pos < 0 || (pos as usize) >= chars.len() {
+    if k < 0.0 || k >= units.len() as f64 {
         return Ok(JsValue::UNDEFINED);
     }
-    Ok(JsValue::from_string(
-        vm.heap.alloc_string(chars[pos as usize].to_string()),
-    ))
+    let idx = k as usize;
+    Ok(JsValue::from_string(vm.heap.alloc_string(
+        String::from_utf16_lossy(&units[idx..idx + 1]),
+    )))
+}
+
+/// ECMA-262 Annex B §B.2.3.2.1 `CreateHTML(string, tag, attribute, value)`.
+fn str_html(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    tag: &str,
+    attr: Option<(&str, JsValue)>,
+) -> Result<JsValue, JsException> {
+    let s = require_string_this(vm, this_val)?;
+    let out = if let Some((attr_name, attr_val)) = attr {
+        let v = vm.to_js_string(attr_val)?.replace('"', "&quot;");
+        format!("<{tag} {attr_name}=\"{v}\">{s}</{tag}>")
+    } else {
+        format!("<{tag}>{s}</{tag}>")
+    };
+    Ok(JsValue::from_string(vm.heap.alloc_string(out)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1801,153 +2131,6 @@ fn parse_iso_date(s: &str) -> Option<f64> {
     }
     let days = days_from_civil(y, m, d);
     Some(((((days * 24 + h) * 60 + min) * 60 + sec) * 1000 + ms) as f64)
-}
-
-// ---------------------------------------------------------------------------
-// RegExp (backed by `regex`)
-// ---------------------------------------------------------------------------
-
-fn install_regexp(vm: &mut JsVm) {
-    let rp = vm.regexp_proto;
-    define_method(vm, rp, "test", regexp_test);
-    define_method(vm, rp, "exec", regexp_exec);
-    define_method(vm, rp, "toString", |vm, this_val, _| {
-        let Some(h) = this_val.as_object() else {
-            return Err(vm.type_error("RegExp.prototype.toString called on non-RegExp"));
-        };
-        let (p, f) = match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::RegExp(r)) => (r.pattern.clone(), r.flags.clone()),
-            _ => return Err(vm.type_error("RegExp.prototype.toString called on non-RegExp")),
-        };
-        Ok(JsValue::from_string(
-            vm.heap.alloc_string(format!("/{p}/{f}")),
-        ))
-    });
-
-    let ctor = vm.alloc_native_fn("RegExp", |vm, _this, args| {
-        let pat = args
-            .first()
-            .filter(|v| !v.is_undefined())
-            .map(|&v| vm.value_to_rust_string(v))
-            .unwrap_or_default();
-        let flags = args
-            .get(1)
-            .filter(|v| !v.is_undefined())
-            .map(|&v| vm.value_to_rust_string(v))
-            .unwrap_or_default();
-        let _ = compile_js_regex(vm, &pat, &flags)?;
-        Ok(JsValue::from_object(vm.alloc_regexp(pat, flags)))
-    });
-    vm.heap.object_define_data(
-        ctor,
-        vm.key_prototype,
-        JsValue::from_object(rp),
-        PropertyAttrs::empty(),
-        &mut vm.shapes,
-    );
-    link_ctor_meta(vm, ctor, rp, 2, true);
-    define_global(vm, "RegExp", JsValue::from_object(ctor));
-}
-
-fn compile_js_regex(vm: &mut JsVm, pattern: &str, flags: &str) -> Result<Regex, JsException> {
-    let mut builder = RegexBuilder::new(pattern);
-    builder.case_insensitive(flags.contains('i'));
-    builder.multi_line(flags.contains('m'));
-    builder.dot_matches_new_line(flags.contains('s'));
-    builder.build().map_err(|e| {
-        vm.make_error(
-            "SyntaxError",
-            format!("Invalid RegExp /{pattern}/{flags}: {e}"),
-        )
-    })
-}
-
-fn extract_compiled_regex(vm: &mut JsVm, val: JsValue) -> Result<Option<Regex>, JsException> {
-    Ok(extract_compiled_regex_with_global(vm, val)?.map(|(r, _)| r))
-}
-
-fn extract_compiled_regex_with_global(
-    vm: &mut JsVm,
-    val: JsValue,
-) -> Result<Option<(Regex, bool)>, JsException> {
-    let Some(h) = val.as_object() else {
-        return Ok(None);
-    };
-    let Some((pat, flags)) = vm.heap.get_object(h).and_then(|o| match &o.kind {
-        ObjectKind::RegExp(r) => Some((r.pattern.clone(), r.flags.clone())),
-        _ => None,
-    }) else {
-        return Ok(None);
-    };
-    let re = compile_js_regex(vm, &pat, &flags)?;
-    Ok(Some((re, flags.contains('g'))))
-}
-
-fn regexp_test(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let exec_res = regexp_exec(vm, this_val, args)?;
-    Ok(JsValue::from_bool(!exec_res.is_null()))
-}
-
-fn regexp_exec(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let Some(h) = this_val.as_object() else {
-        return Err(vm.type_error("RegExp.prototype.exec called on non-RegExp"));
-    };
-    let (re, is_global) = extract_compiled_regex_with_global(vm, this_val)?
-        .ok_or_else(|| vm.type_error("RegExp.prototype.exec called on non-RegExp"))?;
-    let input = vm.value_to_rust_string(arg0(args));
-    let k_last = vm.heap.intern_key("lastIndex");
-    let start_char = if is_global {
-        let li = vm.get_property_by_key(h, k_last)?;
-        vm.to_i32(li)?.max(0) as usize
-    } else {
-        0
-    };
-    let start_byte = input
-        .char_indices()
-        .nth(start_char)
-        .map_or(input.len(), |(b, _)| b);
-
-    if let Some(arr) = build_exec_array(vm, &re, &input, start_byte) {
-        if is_global {
-            if let Some(m) = re.find_at(&input, start_byte) {
-                let next_char = input[..m.end()].chars().count() as i32;
-                vm.set_property_by_key(h, k_last, JsValue::from_i32(next_char))?;
-            }
-        }
-        Ok(arr)
-    } else {
-        if is_global {
-            vm.set_property_by_key(h, k_last, JsValue::from_i32(0))?;
-        }
-        Ok(JsValue::NULL)
-    }
-}
-
-fn build_exec_array(vm: &mut JsVm, re: &Regex, input: &str, start_byte: usize) -> Option<JsValue> {
-    let caps = re.captures_at(input, start_byte)?;
-    let full = caps.get(0)?;
-    let arr = vm.alloc_array();
-    for i in 0..caps.len() {
-        let v = match caps.get(i) {
-            Some(g) => JsValue::from_string(vm.heap.alloc_string(g.as_str())),
-            None => JsValue::UNDEFINED,
-        };
-        vm.heap.object_push_element(arr, v);
-    }
-    let idx_chars = input[..full.start()].chars().count() as i32;
-    let k_index = vm.heap.intern_key("index");
-    let k_input = vm.heap.intern_key("input");
-    vm.heap.object_define_data(
-        arr,
-        k_index,
-        JsValue::from_i32(idx_chars),
-        PropertyAttrs::DEFAULT,
-        &mut vm.shapes,
-    );
-    let inp_v = JsValue::from_string(vm.heap.alloc_string(input));
-    vm.heap
-        .object_define_data(arr, k_input, inp_v, PropertyAttrs::DEFAULT, &mut vm.shapes);
-    Some(JsValue::from_object(arr))
 }
 
 // ---------------------------------------------------------------------------

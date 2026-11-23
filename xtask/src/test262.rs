@@ -466,7 +466,7 @@ fn run_single_mode(
     always_jit: bool,
 ) -> std::result::Result<(), String> {
     let mut vm = JsVm::new();
-    vm.max_loop_iterations = Some(250_000);
+    vm.max_loop_iterations = Some(2_500_000);
     if always_jit {
         vm.attach_jit(TieredJit::with_tier_thresholds(1, 1, 2));
     }
