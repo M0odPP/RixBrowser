@@ -745,7 +745,11 @@ fn install_intl_prototype_hooks(vm: &mut JsVm, intl_obj: HeapHandle) {
         ("toLocaleDateString", Some("short"), None),
         ("toLocaleTimeString", None, Some("medium")),
     ] {
-        def_host_method(vm, dp, method, move |vm, this_val, args| {
+        let fh = vm.alloc_host_fn(method, move |vm, this_val, args| {
+            let (_, tv) = crate::builtins_date::this_time_value(vm, this_val)?;
+            if !tv.is_finite() {
+                return Ok(str_val(vm, "Invalid Date"));
+            }
             let dk = vm.heap.intern_key("DateTimeFormat");
             let ctor = vm.get_property_by_key(intl_obj, dk)?;
             let opts = if arg(args, 1).is_undefined() {
@@ -773,6 +777,14 @@ fn install_intl_prototype_hooks(vm: &mut JsVm, intl_obj: HeapHandle) {
             let fmt_fn = vm.get_property_by_key(dh, fk)?;
             vm.call_value(fmt_fn, JsValue::UNDEFINED, &[this_val])
         });
+        vm.set_fn_length(fh, 0);
+        def_data(
+            vm,
+            dp,
+            method,
+            JsValue::from_object(fh),
+            PropertyAttrs::METHOD,
+        );
     }
 }
 

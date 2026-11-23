@@ -10,7 +10,6 @@ use crate::shape::PropertyAttrs;
 use crate::value::{HeapHandle, JsValue, JsValueKind};
 use crate::vm::{JsException, JsVm};
 use crate::vm_builtins::{define_global, define_method, define_method_len};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn install_primitive_builtins(vm: &mut JsVm) {
     install_global_functions(vm);
@@ -20,7 +19,7 @@ pub fn install_primitive_builtins(vm: &mut JsVm) {
     install_bigint(vm);
     install_math(vm);
     install_symbol(vm);
-    install_date(vm);
+    crate::builtins_date::install_date(vm);
     install_regexp_and_annexb_globals(vm);
     install_json(vm);
     install_extended_array_and_object(vm);
@@ -1936,204 +1935,6 @@ fn install_symbol(vm: &mut JsVm) {
 }
 
 // ---------------------------------------------------------------------------
-// Date (UTC calendar math)
-// ---------------------------------------------------------------------------
-
-fn install_date(vm: &mut JsVm) {
-    let dp = vm.date_proto;
-    define_method(vm, dp, "getTime", date_get_time);
-    define_method(vm, dp, "valueOf", date_get_time);
-    define_method(vm, dp, "toISOString", date_to_iso_string);
-    define_method(vm, dp, "toString", date_to_iso_string);
-    define_method(vm, dp, "getUTCFullYear", |vm, t, _| Ok(date_part(vm, t, 0)));
-    define_method(vm, dp, "getUTCMonth", |vm, t, _| Ok(date_part(vm, t, 1)));
-    define_method(vm, dp, "getUTCDate", |vm, t, _| Ok(date_part(vm, t, 2)));
-    define_method(vm, dp, "getUTCHours", |vm, t, _| Ok(date_part(vm, t, 3)));
-    define_method(vm, dp, "getUTCMinutes", |vm, t, _| Ok(date_part(vm, t, 4)));
-    define_method(vm, dp, "getUTCSeconds", |vm, t, _| Ok(date_part(vm, t, 5)));
-    define_method(vm, dp, "getUTCMilliseconds", |vm, t, _| {
-        Ok(date_part(vm, t, 6))
-    });
-
-    let ctor = vm.alloc_native_fn("Date", date_ctor);
-    vm.heap.object_define_data(
-        ctor,
-        vm.key_prototype,
-        JsValue::from_object(dp),
-        PropertyAttrs::empty(),
-        &mut vm.shapes,
-    );
-    link_ctor_meta(vm, ctor, dp, 7, true);
-    define_method(vm, ctor, "now", |_, _, _| Ok(JsValue::from_f64(now_ms())));
-    define_method(vm, ctor, "UTC", date_utc);
-    define_method(vm, ctor, "parse", |vm, _, args| {
-        let s = vm.value_to_rust_string(arg0(args));
-        Ok(JsValue::from_f64(parse_iso_date(&s).unwrap_or(f64::NAN)))
-    });
-    define_global(vm, "Date", JsValue::from_object(ctor));
-}
-
-fn now_ms() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_millis() as f64)
-}
-
-fn date_ctor(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let ms = if args.is_empty() {
-        now_ms()
-    } else if args.len() == 1 {
-        if args[0].is_string() {
-            let s = vm.value_to_rust_string(args[0]);
-            parse_iso_date(&s).unwrap_or(f64::NAN)
-        } else {
-            vm.to_number(args[0])?
-        }
-    } else {
-        let utc = date_utc(vm, JsValue::UNDEFINED, args)?;
-        utc.as_number().unwrap_or(f64::NAN)
-    };
-    Ok(JsValue::from_object(vm.alloc_date(ms)))
-}
-
-fn date_utc(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let year = vm.to_i32(arg0(args))? as i64;
-    let month = args.get(1).map(|&v| vm.to_i32(v)).transpose()?.unwrap_or(0) as i64;
-    let day = args.get(2).map(|&v| vm.to_i32(v)).transpose()?.unwrap_or(1) as i64;
-    let hour = args.get(3).map(|&v| vm.to_i32(v)).transpose()?.unwrap_or(0) as i64;
-    let min = args.get(4).map(|&v| vm.to_i32(v)).transpose()?.unwrap_or(0) as i64;
-    let sec = args.get(5).map(|&v| vm.to_i32(v)).transpose()?.unwrap_or(0) as i64;
-    let ms = args.get(6).map(|&v| vm.to_i32(v)).transpose()?.unwrap_or(0) as i64;
-    let full_year = if (0..=99).contains(&year) {
-        1900 + year
-    } else {
-        year
-    };
-    let days = days_from_civil(full_year, month + 1, day);
-    let total_ms = (((days * 24 + hour) * 60 + min) * 60 + sec) * 1000 + ms;
-    Ok(JsValue::from_f64(total_ms as f64))
-}
-
-fn date_get_time(
-    vm: &mut JsVm,
-    this_val: JsValue,
-    _args: &[JsValue],
-) -> Result<JsValue, JsException> {
-    let ms = this_val
-        .as_object()
-        .and_then(|h| vm.heap.get_object(h))
-        .and_then(|o| match o.kind {
-            ObjectKind::Date(ms) => Some(ms),
-            _ => None,
-        })
-        .ok_or_else(|| vm.type_error("Date method called on non-Date"))?;
-    Ok(JsValue::from_f64(ms))
-}
-
-fn date_to_iso_string(
-    vm: &mut JsVm,
-    this_val: JsValue,
-    _args: &[JsValue],
-) -> Result<JsValue, JsException> {
-    let ms = date_get_time(vm, this_val, &[])?
-        .as_number()
-        .unwrap_or(f64::NAN);
-    if !ms.is_finite() {
-        return Err(vm.range_error("Invalid time value"));
-    }
-    let (y, m, d, h, min, s, milli) = civil_from_ms(ms as i64);
-    let iso = format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}.{milli:03}Z");
-    Ok(JsValue::from_string(vm.heap.alloc_string(iso)))
-}
-
-fn date_part(vm: &JsVm, this_val: JsValue, field: u8) -> JsValue {
-    let Some(ms) = this_val
-        .as_object()
-        .and_then(|h| vm.heap.get_object(h))
-        .and_then(|o| match o.kind {
-            ObjectKind::Date(ms) if ms.is_finite() => Some(ms as i64),
-            _ => None,
-        })
-    else {
-        return JsValue::NAN;
-    };
-    let (y, m, d, h, min, s, milli) = civil_from_ms(ms);
-    let val = match field {
-        0 => y as i32,
-        1 => (m - 1) as i32,
-        2 => d as i32,
-        3 => h as i32,
-        4 => min as i32,
-        5 => s as i32,
-        _ => milli as i32,
-    };
-    JsValue::from_i32(val)
-}
-
-/// Howard Hinnant civil-to-days algorithm (exact proleptic Gregorian calendar).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = y - i64::from(m <= 2);
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-/// Howard Hinnant days-to-civil algorithm -> `(year, month 1..=12, day, h, m, s, ms)`.
-fn civil_from_ms(total_ms: i64) -> (i64, u32, u32, u32, u32, u32, u32) {
-    let ms_in_day = 86_400_000i64;
-    let days = total_ms.div_euclid(ms_in_day);
-    let rem = total_ms.rem_euclid(ms_in_day);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (mp + if mp < 10 { 3 } else { -9 }) as u32;
-    let year = y + i64::from(m <= 2);
-    let milli = (rem % 1000) as u32;
-    let secs = rem / 1000;
-    let s = (secs % 60) as u32;
-    let min = ((secs / 60) % 60) as u32;
-    let h = (secs / 3600) as u32;
-    (year, m, d, h, min, s, milli)
-}
-
-fn parse_iso_date(s: &str) -> Option<f64> {
-    // Supports ISO-8601 `YYYY-MM-DD` and `YYYY-MM-DDTHH:MM:SS(.sss)?Z`.
-    let trimmed = s.trim();
-    let (date_part, time_part) = match trimmed.split_once('T') {
-        Some((d, t)) => (d, Some(t.trim_end_matches('Z'))),
-        None => (trimmed, None),
-    };
-    let mut dp = date_part.split('-');
-    let y: i64 = dp.next()?.parse().ok()?;
-    let m: i64 = dp.next().unwrap_or("1").parse().ok()?;
-    let d: i64 = dp.next().unwrap_or("1").parse().ok()?;
-    let (mut h, mut min, mut sec, mut ms) = (0i64, 0i64, 0i64, 0i64);
-    if let Some(tp) = time_part {
-        let mut tparts = tp.split(':');
-        h = tparts.next().unwrap_or("0").parse().ok()?;
-        min = tparts.next().unwrap_or("0").parse().ok()?;
-        if let Some(sec_str) = tparts.next() {
-            if let Some((s_int, s_frac)) = sec_str.split_once('.') {
-                sec = s_int.parse().ok()?;
-                let padded = format!("{s_frac:0<3}");
-                ms = padded[..3].parse().ok()?;
-            } else {
-                sec = sec_str.parse().ok()?;
-            }
-        }
-    }
-    let days = days_from_civil(y, m, d);
-    Some(((((days * 24 + h) * 60 + min) * 60 + sec) * 1000 + ms) as f64)
-}
-
-// ---------------------------------------------------------------------------
 // JSON (`JSON.parse` / `JSON.stringify` with cycle detection & reviver/space)
 // ---------------------------------------------------------------------------
 
@@ -2277,20 +2078,13 @@ fn stringify_value(
 ) -> Result<Option<String>, JsException> {
     // Honor `.toJSON()` hook on objects (e.g. `Date.prototype.toJSON` / custom objects).
     if let Some(h) = val.as_object() {
-        if matches!(
-            vm.heap.get_object(h).map(|o| &o.kind),
-            Some(ObjectKind::Date(_))
-        ) {
-            val = date_to_iso_string(vm, val, &[])?;
-        } else {
-            let k_to_json = vm.heap.intern_key("toJSON");
-            let to_json = vm.get_property_by_key(h, k_to_json)?;
-            if to_json
-                .as_object()
-                .is_some_and(|fh| vm.is_callable_handle(fh))
-            {
-                val = vm.call_value(to_json, val, &[])?;
-            }
+        let k_to_json = vm.heap.intern_key("toJSON");
+        let to_json = vm.get_property_by_key(h, k_to_json)?;
+        if to_json
+            .as_object()
+            .is_some_and(|fh| vm.is_callable_handle(fh))
+        {
+            val = vm.call_value(to_json, val, &[])?;
         }
     }
 
