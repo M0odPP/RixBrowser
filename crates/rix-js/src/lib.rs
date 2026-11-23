@@ -4,6 +4,7 @@
 
 pub mod ast;
 pub mod bigint;
+pub mod builtins_atomics;
 pub mod builtins_collections;
 pub mod builtins_primitives;
 pub mod builtins_regexp;
