@@ -17,8 +17,11 @@ rix-text = { path = "../crates/rix-text" }
 rix-ipc = { path = "../crates/rix-ipc" }
 rix-render = { path = "../crates/rix-render" }
 rix-js = { path = "../crates/rix-js" }
+rix-jit = { path = "../crates/rix-jit" }
 rix-net = { path = "../crates/rix-net" }
 rix-content = { path = "../crates/rix-content" }
+markup5ever = "0.40"
+rayon = { workspace = true }
 tokio = { workspace = true }
 vello = { workspace = true }
 image = { workspace = true }

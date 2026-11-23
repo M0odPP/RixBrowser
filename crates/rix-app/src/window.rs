@@ -319,6 +319,52 @@ pub fn render_headless_demo(
     Ok(())
 }
 
+/// Machine-readable telemetry captured during a headless [`render_url_to_png_with_metrics`] run.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RenderUrlMetrics {
+    pub url: String,
+    pub final_url: String,
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+    pub web_viewport_x: u32,
+    pub web_viewport_y: u32,
+    pub web_viewport_width: u32,
+    pub web_viewport_height: u32,
+    pub startup_ms: f32,
+    pub navigate_ms: f32,
+    pub settle_ms: f32,
+    pub render_ms: f32,
+    pub total_ms: f32,
+    pub wave1_ms: f32,
+    pub wave2_ms: f32,
+    pub css_parse_ms: f32,
+    pub image_decode_ms: f32,
+    pub js_ms: f32,
+    pub subresources_fetched: usize,
+    pub cache_hits: usize,
+    pub js_error_count: usize,
+    pub js_errors: Vec<String>,
+    pub peak_rss_kib: u64,
+    pub current_rss_kib: u64,
+}
+
+fn read_proc_status_kib(key: &str) -> u64 {
+    let Ok(text) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(key) {
+            if let Some(num) = rest.split_whitespace().next() {
+                if let Ok(v) = num.parse::<u64>() {
+                    return v;
+                }
+            }
+        }
+    }
+    0
+}
+
 /// Navigates a headless [`BrowserController`] to `url` (executing external CSS, images, SVGs,
 /// `@font-face` web fonts, JavaScript, Canvas2D, and initial async `fetch()`/timers) and renders
 /// the full composed frame to a PNG file via Vello GPU.
@@ -329,14 +375,35 @@ pub fn render_url_to_png(
     height: u32,
     theme: ThemeMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = render_url_to_png_with_metrics(url, out_path, width, height, theme)?;
+    Ok(())
+}
+
+/// Same as [`render_url_to_png`], returning structured [`RenderUrlMetrics`] for conformance
+/// harnesses and Chrome/Firefox head-to-head benchmarks.
+pub fn render_url_to_png_with_metrics(
+    url: &str,
+    out_path: impl AsRef<Path>,
+    width: u32,
+    height: u32,
+    theme: ThemeMode,
+) -> Result<RenderUrlMetrics, Box<dyn std::error::Error>> {
+    let t_total = Instant::now();
     let width = width.max(1);
     let height = height.max(1);
+
+    let t_start = Instant::now();
     let mut controller = BrowserController::new(Size::new(width as f32, height as f32), 1.0);
     controller.set_theme(theme);
+    let startup_ms = t_start.elapsed().as_secs_f32() * 1000.0;
+
+    let t_nav = Instant::now();
     controller.navigate_active(url);
+    let navigate_ms = t_nav.elapsed().as_secs_f32() * 1000.0;
 
     // Allow initial async `fetch()` / short timers / first rAF frame to settle cleanly (bounded).
-    let settle_deadline = Instant::now() + Duration::from_millis(250);
+    let t_settle = Instant::now();
+    let settle_deadline = t_settle + Duration::from_millis(250);
     for _ in 0..32 {
         let Some(delay) = controller.tick_active_tab() else {
             break;
@@ -349,9 +416,48 @@ pub fn render_url_to_png(
             std::thread::sleep(sleep_for);
         }
     }
+    let settle_ms = t_settle.elapsed().as_secs_f32() * 1000.0;
+
+    let t_render = Instant::now();
     controller.sync_layers();
     let clear = controller.clear_color();
     let scene = controller.compositor.compose_force();
     VelloRenderer::render_scene_to_png(scene, width, height, clear, out_path)?;
-    Ok(())
+    let render_ms = t_render.elapsed().as_secs_f32() * 1000.0;
+    let total_ms = t_total.elapsed().as_secs_f32() * 1000.0;
+
+    let web_rect = controller.web_viewport_rect();
+    let active_tab = controller.chrome.active();
+    let (stats, js_errors) = controller
+        .active_tab_doc()
+        .map(|d| (d.last_load_stats, d.last_js_errors.clone()))
+        .unwrap_or_default();
+
+    Ok(RenderUrlMetrics {
+        url: url.to_string(),
+        final_url: active_tab.url.clone(),
+        title: active_tab.title.clone(),
+        width,
+        height,
+        web_viewport_x: web_rect.origin.x.max(0.0).round() as u32,
+        web_viewport_y: web_rect.origin.y.max(0.0).round() as u32,
+        web_viewport_width: web_rect.size.width.max(0.0).round() as u32,
+        web_viewport_height: web_rect.size.height.max(0.0).round() as u32,
+        startup_ms,
+        navigate_ms,
+        settle_ms,
+        render_ms,
+        total_ms,
+        wave1_ms: stats.wave1_ms,
+        wave2_ms: stats.wave2_ms,
+        css_parse_ms: stats.css_parse_ms,
+        image_decode_ms: stats.image_decode_ms,
+        js_ms: stats.js_ms,
+        subresources_fetched: stats.subresources_fetched,
+        cache_hits: stats.network_cache_hits + stats.decoded_asset_cache_hits,
+        js_error_count: stats.js_error_count,
+        js_errors,
+        peak_rss_kib: read_proc_status_kib("VmHWM:"),
+        current_rss_kib: read_proc_status_kib("VmRSS:"),
+    })
 }

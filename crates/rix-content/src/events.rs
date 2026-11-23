@@ -226,7 +226,8 @@ pub fn install_event_system(
     let evs_click = Rc::clone(&events);
     let el_click = Rc::clone(event_loop);
     define_host_method(vm, ep, "click", move |vm, this_val, _| {
-        if let Some(nid) = h_click.borrow().node_for_value(vm, this_val) {
+        let nid = h_click.borrow().node_for_value(vm, this_val);
+        if let Some(nid) = nid {
             let _ = fire_dom_node_event(
                 vm,
                 &h_click,

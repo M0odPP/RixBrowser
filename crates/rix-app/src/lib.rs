@@ -20,6 +20,7 @@ pub use page_loader::{
     PageLoadStats, SpeculativePreconnector,
 };
 pub use window::{
-    populate_demo_layers, render_headless_demo, render_url_to_png, run_window_shell, AppWakeup,
-    BrowserShell, DEMO_CHROME_PIPELINE, DEMO_OVERLAY_PIPELINE, DEMO_WEB_PIPELINE,
+    populate_demo_layers, render_headless_demo, render_url_to_png, render_url_to_png_with_metrics,
+    run_window_shell, AppWakeup, BrowserShell, RenderUrlMetrics, DEMO_CHROME_PIPELINE,
+    DEMO_OVERLAY_PIPELINE, DEMO_WEB_PIPELINE,
 };

@@ -26,6 +26,11 @@ if grep -rnE 'youtube\.com|youtu\.be|SOCS=|PENDING\+999|signature_cipher|youtube
   echo "ERROR: Site-specific hardcode detected in crates/."
   exit 1
 fi
+ENGINE_SRC_DIRS="crates/rix-html/src crates/rix-dom/src crates/rix-css/src crates/rix-text/src crates/rix-layout/src crates/rix-render/src crates/rix-js/src crates/rix-jit/src crates/rix-content/src crates/rix-media/src crates/rix-net/src crates/rix-storage/src"
+if grep -rnE '\b(google|github|wikipedia|reddit|twitter|facebook|instagram|amazon|netflix|tiktok|discord|telegram|ycombinator|stackoverflow|nytimes|bbc|twitch|spotify|linkedin)\.(com|org|tv)\b' $ENGINE_SRC_DIRS; then
+  echo "ERROR: Site-specific domain hardcode detected in core engine crates."
+  exit 1
+fi
 if grep -rnE '\b(todo|unimplemented)!\(' crates/; then
   echo "ERROR: Placeholder macro (todo!/unimplemented!) detected in crates/."
   exit 1

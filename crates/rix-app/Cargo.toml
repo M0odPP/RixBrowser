@@ -23,6 +23,8 @@ rix-storage = { path = "../rix-storage" }
 rix-text = { path = "../rix-text" }
 arboard.workspace = true
 rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 url.workspace = true
 tokio.workspace = true
 tracing.workspace = true

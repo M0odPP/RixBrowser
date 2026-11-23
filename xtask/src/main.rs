@@ -17,7 +17,10 @@ fn print_usage() {
         "Usage:\n  \
          cargo xtask reftest [--dir <path>] [--update-refs]\n  \
          cargo xtask wpt --subset <all|css2|flexbox|grid|selectors|html> [--wpt-dir <path>] [--update-baseline]\n  \
-         cargo xtask test262 [--test262-dir <path>] [--update-baseline]\n  \
+         cargo xtask wpt-official --suite <subpath> [--wpt-dir <path>] [--kind <all|testharness|reftest>] [--limit <n>] [--report-json <path>]\n  \
+         cargo xtask html5lib [--dir <path>] [--filter <substr>] [--report-json <path>]\n  \
+         cargo xtask test262 [--test262-dir <path>] [--official] [--filter <substr>] [--limit <n>] [--always-jit] [--report-json <path>] [--update-baseline]\n  \
+         cargo xtask compare-chrome --cohort <path> [--out-dir <path>] [--rix-bin <path>] [--chrome-bin <path>] [--limit <n>] [--report-json <path>]\n  \
          cargo xtask bench [--quick]"
     );
 }
@@ -93,9 +96,119 @@ fn dispatch(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        "wpt-official" => {
+            let mut wpt_dir = xtask::wpt_official::default_official_wpt_dir();
+            let mut suite = "dom".to_string();
+            let mut kind = xtask::wpt_official::OfficialWptKind::All;
+            let mut limit = None;
+            let mut report_json = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--wpt-dir" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --wpt-dir"))?;
+                        wpt_dir = PathBuf::from(val);
+                    }
+                    "--suite" => {
+                        i += 1;
+                        suite = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --suite"))?
+                            .clone();
+                    }
+                    "--kind" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --kind"))?;
+                        kind = match val.as_str() {
+                            "all" => xtask::wpt_official::OfficialWptKind::All,
+                            "testharness" => xtask::wpt_official::OfficialWptKind::Testharness,
+                            "reftest" => xtask::wpt_official::OfficialWptKind::Reftest,
+                            other => bail!("unknown --kind value: {other}"),
+                        };
+                    }
+                    "--limit" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --limit"))?;
+                        limit = Some(val.parse::<usize>()?);
+                    }
+                    "--report-json" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --report-json"))?;
+                        report_json = Some(PathBuf::from(val));
+                    }
+                    other => bail!("unknown wpt-official flag: {other}"),
+                }
+                i += 1;
+            }
+            let opts = xtask::wpt_official::OfficialWptOptions {
+                wpt_dir,
+                suite,
+                kind,
+                limit,
+                report_json,
+            };
+            let report = xtask::wpt_official::run_official_wpt_suite(&opts)?;
+            xtask::wpt_official::print_report(&report);
+            Ok(())
+        }
+        "html5lib" => {
+            let mut dir = xtask::html5lib::default_html5lib_dir();
+            let mut filter: Option<String> = None;
+            let mut report_json: Option<PathBuf> = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--dir" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --dir"))?;
+                        dir = PathBuf::from(val);
+                    }
+                    "--filter" => {
+                        i += 1;
+                        filter = Some(
+                            args.get(i)
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --filter"))?
+                                .clone(),
+                        );
+                    }
+                    "--report-json" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --report-json"))?;
+                        report_json = Some(PathBuf::from(val));
+                    }
+                    other => bail!("unknown html5lib flag: {other}"),
+                }
+                i += 1;
+            }
+            let report = xtask::html5lib::run_html5lib_suite(
+                &dir,
+                filter.as_deref(),
+                report_json.as_deref(),
+            )?;
+            xtask::html5lib::print_report(&report);
+            Ok(())
+        }
         "test262" => {
             let mut test262_dir = root.join("fixtures/test262");
             let mut update_baseline = false;
+            let mut official = false;
+            let mut opts = xtask::test262::Test262Options {
+                check_baseline: true,
+                ..xtask::test262::Test262Options::default()
+            };
             let baseline_path = root.join("fixtures/scorecards/test262-baseline.json");
             let mut i = 1;
             while i < args.len() {
@@ -106,14 +219,50 @@ fn dispatch(args: &[String]) -> Result<()> {
                             .get(i)
                             .ok_or_else(|| anyhow::anyhow!("missing value for --test262-dir"))?;
                         test262_dir = PathBuf::from(val);
+                        opts.check_baseline = false;
+                    }
+                    "--official" => {
+                        official = true;
+                        test262_dir = xtask::test262::default_official_test262_dir();
+                        opts.check_baseline = false;
+                    }
+                    "--filter" => {
+                        i += 1;
+                        opts.filter = Some(
+                            args.get(i)
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --filter"))?
+                                .clone(),
+                        );
+                        opts.check_baseline = false;
+                    }
+                    "--limit" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --limit"))?;
+                        opts.limit = Some(val.parse::<usize>()?);
+                        opts.check_baseline = false;
+                    }
+                    "--always-jit" => opts.always_jit = true,
+                    "--report-json" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --report-json"))?;
+                        opts.report_json = Some(PathBuf::from(val));
                     }
                     "--update-baseline" => update_baseline = true,
                     other => bail!("unknown test262 flag: {other}"),
                 }
                 i += 1;
             }
-            let report =
-                xtask::test262::run_test262_suite(&test262_dir, &baseline_path, update_baseline)?;
+            let _ = official;
+            let report = xtask::test262::run_test262_suite_with_options(
+                &test262_dir,
+                &baseline_path,
+                update_baseline,
+                &opts,
+            )?;
             xtask::test262::print_report(&report);
             if report.regressed {
                 bail!(
@@ -122,6 +271,77 @@ fn dispatch(args: &[String]) -> Result<()> {
                     report.baseline_passed
                 );
             }
+            Ok(())
+        }
+        "compare-chrome" => {
+            let mut cohort_path: Option<PathBuf> = None;
+            let mut out_dir = PathBuf::from("/tmp/rix-compare-chrome");
+            let mut rix_bin = root.join("target/release/rix-app");
+            let mut chrome_bin = PathBuf::from("/usr/bin/google-chrome-stable");
+            let mut limit = None;
+            let mut report_json = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--cohort" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --cohort"))?;
+                        cohort_path = Some(PathBuf::from(val));
+                    }
+                    "--out-dir" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --out-dir"))?;
+                        out_dir = PathBuf::from(val);
+                    }
+                    "--rix-bin" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --rix-bin"))?;
+                        rix_bin = PathBuf::from(val);
+                    }
+                    "--chrome-bin" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --chrome-bin"))?;
+                        chrome_bin = PathBuf::from(val);
+                    }
+                    "--limit" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --limit"))?;
+                        limit = Some(val.parse::<usize>()?);
+                    }
+                    "--report-json" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --report-json"))?;
+                        report_json = Some(PathBuf::from(val));
+                    }
+                    other => bail!("unknown compare-chrome flag: {other}"),
+                }
+                i += 1;
+            }
+            let Some(cohort_path) = cohort_path else {
+                bail!("missing required --cohort <path> argument");
+            };
+            let opts = xtask::compare_chrome::CompareChromeOptions {
+                cohort_path,
+                out_dir,
+                rix_bin,
+                chrome_bin,
+                limit,
+                report_json,
+            };
+            let report = xtask::compare_chrome::run_compare_chrome(&opts)?;
+            xtask::compare_chrome::print_report(&report);
             Ok(())
         }
         "bench" => {
