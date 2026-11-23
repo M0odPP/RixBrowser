@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use markup5ever::{LocalName, Namespace, QualName};
 use rayon::prelude::*;
 use rix_dom::{Document, NodeData, NodeId};
-use rix_html::{parse_html, parse_html_fragment};
+use rix_html::{parse_html_fragment_with_scripting, parse_html_with_scripting};
 use serde::Serialize;
 
 const HTML_NS: &str = "http://www.w3.org/1999/xhtml";
@@ -124,8 +124,14 @@ pub fn parse_dat_file(file_name: &str, content: &str) -> Vec<Html5libCase> {
                 }
                 "#document" => {
                     i += 1;
-                    while i < lines.len() && lines[i] != "#data" {
+                    while i < lines.len() && !is_section_header(lines[i]) {
                         expected_lines.push(lines[i]);
+                        i += 1;
+                    }
+                }
+                "#description" => {
+                    i += 1;
+                    while i < lines.len() && !is_section_header(lines[i]) {
                         i += 1;
                     }
                 }
@@ -165,6 +171,7 @@ fn is_section_header(line: &str) -> bool {
             | "#script-on"
             | "#script-off"
             | "#document"
+            | "#description"
     )
 }
 
@@ -228,6 +235,9 @@ fn serialize_node(doc: &Document, node: NodeId, depth: usize, out: &mut Vec<Stri
         NodeData::Comment(text) => {
             out.push(format!("| {indent}<!-- {text} -->"));
         }
+        NodeData::ProcessingInstruction { target, data } => {
+            out.push(format!("| {indent}<?{target} {data}?>"));
+        }
         NodeData::Element(elem) => {
             let prefix = match elem.name.ns.as_ref() {
                 SVG_NS => "svg ",
@@ -273,15 +283,34 @@ fn serialize_node(doc: &Document, node: NodeId, depth: usize, out: &mut Vec<Stri
 }
 
 fn evaluate_case(case: &Html5libCase) -> std::result::Result<(), String> {
-    let actual = if let Some(ref ctx_str) = case.fragment_context {
-        let ctx = parse_fragment_context(ctx_str);
-        let (doc, nodes) = parse_html_fragment(&case.data, Some(&ctx));
-        serialize_html5lib_tree(&doc, &nodes)
-    } else {
-        let doc = parse_html(&case.data);
-        let roots: Vec<NodeId> = doc.children(doc.root()).collect();
-        serialize_html5lib_tree(&doc, &roots)
-    };
+    let scripting = !case.script_off;
+    let actual =
+        if case.file.starts_with("scripted_") && case.fragment_context.is_none() && scripting {
+            static FONT_DB: std::sync::OnceLock<std::sync::Arc<rix_text::FontDatabase>> =
+                std::sync::OnceLock::new();
+            let font_db = std::sync::Arc::clone(
+                FONT_DB.get_or_init(|| std::sync::Arc::new(rix_text::FontDatabase::new())),
+            );
+            let doc_rc = std::rc::Rc::new(std::cell::RefCell::new(Document::new()));
+            let mut rt = rix_content::ContentRuntime::new(
+                std::rc::Rc::clone(&doc_rc),
+                rix_core::Size::new(800.0, 600.0),
+                font_db,
+            );
+            let _ = rt.load_html_with_scripts(&case.data);
+            let doc = doc_rc.borrow();
+            let roots: Vec<NodeId> = doc.children(doc.root()).collect();
+            serialize_html5lib_tree(&doc, &roots)
+        } else if let Some(ref ctx_str) = case.fragment_context {
+            let ctx = parse_fragment_context(ctx_str);
+            let (doc, nodes) =
+                parse_html_fragment_with_scripting(&case.data, Some(&ctx), scripting);
+            serialize_html5lib_tree(&doc, &nodes)
+        } else {
+            let doc = parse_html_with_scripting(&case.data, scripting);
+            let roots: Vec<NodeId> = doc.children(doc.root()).collect();
+            serialize_html5lib_tree(&doc, &roots)
+        };
 
     if actual == case.expected_tree {
         Ok(())
@@ -326,14 +355,10 @@ pub fn run_html5lib_suite(
         all_cases.extend(parse_dat_file(fname, &raw));
     }
 
-    // Evaluate all cases in parallel with panic isolation.
+    // Evaluate all cases (both #script-on and #script-off) in parallel with panic isolation.
     let outcomes: Vec<(&Html5libCase, Option<std::result::Result<(), String>>)> = all_cases
         .par_iter()
         .map(|case| {
-            // Skip `#script-off` cases until `scripting_enabled=false` mode is requested.
-            if case.script_off {
-                return (case, None);
-            }
             let res = std::panic::catch_unwind(|| evaluate_case(case))
                 .unwrap_or_else(|_| Err("<PANIC during parse_html>".to_string()));
             (case, Some(res))

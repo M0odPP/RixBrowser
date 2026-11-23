@@ -262,25 +262,67 @@ fn prescan_meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
     let scan_len = bytes.len().min(MAX_CHARSET_SNIFF_BYTES);
     let text = String::from_utf8_lossy(&bytes[..scan_len]);
     let lower = text.to_ascii_lowercase();
-    let mut idx = 0usize;
-    while let Some(rel) = lower[idx..].find("<meta") {
-        let tag_start = idx + rel;
-        let rel_end = lower[tag_start..].find('>')?;
-        let tag = &text[tag_start..=tag_start + rel_end];
-        let tag_lower = &lower[tag_start..=tag_start + rel_end];
-        if let Some(charset) = extract_attr_value(tag, tag_lower, "charset") {
-            if let Some(enc) = Encoding::for_label(charset.trim().as_bytes()) {
-                return Some(enc);
+    let lb = lower.as_bytes();
+    let len = lb.len();
+    let mut i = 0usize;
+
+    while i < len {
+        if lb[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        // WHATWG §13.2.3.2: skip HTML comments `<!-- ... -->`.
+        if lower[i..].starts_with("<!--") {
+            if let Some(rel) = lower[i + 4..].find("-->") {
+                i = i + 4 + rel + 3;
+                continue;
+            }
+            return None;
+        }
+        // Skip rawtext tags (`<script>`, `<style>`, `<title>`, `<xmp>`).
+        for raw_tag in ["<script", "<style", "<title", "<xmp"] {
+            if lower[i..].starts_with(raw_tag)
+                && lb
+                    .get(i + raw_tag.len())
+                    .is_some_and(|&b| b.is_ascii_whitespace() || b == b'>' || b == b'/')
+            {
+                let close = format!("</{}", &raw_tag[1..]);
+                if let Some(rel) = lower[i + raw_tag.len()..].find(&close) {
+                    i = i + raw_tag.len() + rel + close.len();
+                    if let Some(gt) = lower[i..].find('>') {
+                        i += gt + 1;
+                    }
+                    continue;
+                }
+                return None;
             }
         }
-        if tag_lower.contains("content-type") {
-            if let Some(content) = extract_attr_value(tag, tag_lower, "content") {
-                if let Some(enc) = parse_charset_from_header(content) {
+        if lower[i..].starts_with("<meta")
+            && lb
+                .get(i + 5)
+                .is_some_and(|&b| b.is_ascii_whitespace() || b == b'/')
+        {
+            let rel_end = lower[i..].find('>')?;
+            let tag = &text[i..=i + rel_end];
+            let tag_lower = &lower[i..=i + rel_end];
+            if let Some(charset) = extract_attr_value(tag, tag_lower, "charset") {
+                if let Some(enc) = Encoding::for_label(charset.trim().as_bytes()) {
                     return Some(enc);
                 }
             }
+            if extract_attr_value(tag, tag_lower, "http-equiv")
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("content-type"))
+            {
+                if let Some(content) = extract_attr_value(tag, tag_lower, "content") {
+                    if let Some(enc) = parse_charset_from_header(content) {
+                        return Some(enc);
+                    }
+                }
+            }
+            i += rel_end + 1;
+            continue;
         }
-        idx = tag_start + rel_end + 1;
+        i += 1;
     }
     None
 }
@@ -323,25 +365,61 @@ fn extract_attr_value<'a>(orig: &'a str, lower: &str, name: &str) -> Option<&'a 
     None
 }
 
+/// Detects the document character encoding from BOM or `<meta charset>` / `<meta http-equiv>`
+/// prescan per WHATWG HTML §13.2.3.2, mapping meta UTF-16 labels to `"UTF-8"`.
+pub fn detect_html_charset(bytes: &[u8]) -> &'static str {
+    if let Some((enc, _)) = Encoding::for_bom(bytes) {
+        return enc.name();
+    }
+    if let Some(enc) = prescan_meta_charset(bytes) {
+        // Per WHATWG HTML §13.2.3.2 step 8: UTF-16BE/UTF-16LE in `<meta>` maps to UTF-8.
+        if enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE {
+            return UTF_8.name();
+        }
+        return enc.name();
+    }
+    UTF_8.name()
+}
+
 pub fn parse_html(html: &str) -> Document {
-    let sink = DomTreeSink::new();
-    let opts = ParseOpts::default();
+    parse_html_with_scripting(html, true)
+}
+
+pub fn parse_html_with_scripting(html: &str, scripting_enabled: bool) -> Document {
+    let sink = DomTreeSink::with_source_pi_scan(html, scripting_enabled);
+    let opts = ParseOpts {
+        tree_builder: html5ever::tree_builder::TreeBuilderOpts {
+            scripting_enabled,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let mut doc = parse_document(sink, opts).one(html);
+    doc.set_character_set(detect_html_charset(html.as_bytes()));
     attach_declarative_shadow_roots(&mut doc);
     doc
 }
 
 pub fn parse_html_fragment(html: &str, context: Option<&QualName>) -> (Document, Vec<NodeId>) {
-    let sink = DomTreeSink::new();
-    let opts = ParseOpts::default();
+    parse_html_fragment_with_scripting(html, context, true)
+}
+
+pub fn parse_html_fragment_with_scripting(
+    html: &str,
+    context: Option<&QualName>,
+    scripting_enabled: bool,
+) -> (Document, Vec<NodeId>) {
+    let sink = DomTreeSink::with_source_pi_scan(html, scripting_enabled);
+    let opts = ParseOpts {
+        tree_builder: html5ever::tree_builder::TreeBuilderOpts {
+            scripting_enabled,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let context_name = match context {
-        Some(qname)
-            if !(&*qname.local == "html"
-                && (&*qname.ns == "http://www.w3.org/1999/xhtml" || qname.ns.is_empty())) =>
-        {
-            qname.clone()
-        }
-        _ => QualName::new(
+        Some(qname) => qname.clone(),
+        None => QualName::new(
             None,
             markup5ever::ns!(html),
             markup5ever::local_name!("body"),
@@ -349,19 +427,23 @@ pub fn parse_html_fragment(html: &str, context: Option<&QualName>) -> (Document,
     };
     let mut doc = parse_fragment(sink, opts, context_name, Vec::new(), true).one(html);
     attach_declarative_shadow_roots(&mut doc);
+    // Per html5ever `parse_fragment`, parsed fragment nodes live as children of the synthetic
+    // root `<html>` wrapper element (plus any trailing sibling nodes like comments after `</html>`).
     let mut fragment_nodes = Vec::new();
+    let mut found_html_wrapper = false;
     for child in doc.children(doc.root()) {
-        if let Some(NodeData::Element(elem)) = doc.get(child) {
-            if &*elem.name.local == "html" {
-                for node in doc.children(child) {
-                    fragment_nodes.push(node);
+        if !found_html_wrapper {
+            if let Some(NodeData::Element(elem)) = doc.get(child) {
+                if &*elem.name.local == "html" {
+                    found_html_wrapper = true;
+                    for node in doc.children(child) {
+                        fragment_nodes.push(node);
+                    }
+                    continue;
                 }
-                break;
             }
         }
-    }
-    if fragment_nodes.is_empty() {
-        fragment_nodes.extend(doc.children(doc.root()));
+        fragment_nodes.push(child);
     }
     (doc, fragment_nodes)
 }

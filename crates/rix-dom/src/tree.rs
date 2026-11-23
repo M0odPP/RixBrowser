@@ -26,6 +26,8 @@ pub struct Document {
     adopted_stylesheets: HashMap<NodeId, Vec<String>>,
     root_dirty_flags: DirtyFlags,
     id_cache: IdCache,
+    character_set: String,
+    quirks_mode: u8,
 }
 
 impl Default for Document {
@@ -59,7 +61,31 @@ impl Document {
             adopted_stylesheets: HashMap::new(),
             root_dirty_flags: DirtyFlags::empty(),
             id_cache: Arc::new(RwLock::new(None)),
+            character_set: "UTF-8".to_string(),
+            quirks_mode: 0,
         }
+    }
+
+    pub fn character_set(&self) -> &str {
+        &self.character_set
+    }
+
+    pub fn set_character_set(&mut self, charset: impl Into<String>) {
+        self.character_set = charset.into();
+    }
+
+    /// Returns `"BackCompat"` in quirks mode and `"CSS1Compat"` otherwise (WHATWG DOM §4.5).
+    pub fn compat_mode(&self) -> &'static str {
+        if self.quirks_mode == 2 {
+            "BackCompat"
+        } else {
+            "CSS1Compat"
+        }
+    }
+
+    /// Sets quirks mode (`0` = NoQuirks, `1` = LimitedQuirks, `2` = Quirks).
+    pub fn set_quirks_mode(&mut self, mode: u8) {
+        self.quirks_mode = mode;
     }
 
     pub fn root(&self) -> NodeId {
@@ -519,8 +545,12 @@ impl Document {
     }
 
     pub fn create_element(&mut self, local_name: &str) -> NodeId {
-        let data = NodeData::Element(ElementData::new_html(local_name));
-        self.arena.new_node(data)
+        let mut elem = ElementData::new_html(local_name);
+        if local_name == "template" {
+            let frag = self.arena.new_node(NodeData::DocumentFragment);
+            elem.template_contents = Some(frag);
+        }
+        self.arena.new_node(NodeData::Element(elem))
     }
 
     pub fn create_element_ns(
@@ -529,13 +559,16 @@ impl Document {
         prefix: Option<&str>,
         local_name: &str,
     ) -> NodeId {
-        self.new_node(NodeData::Element(crate::node::ElementData::new(
-            markup5ever::QualName::new(
-                prefix.map(markup5ever::Prefix::from),
-                markup5ever::Namespace::from(namespace),
-                markup5ever::LocalName::from(local_name),
-            ),
-        )))
+        let mut elem = crate::node::ElementData::new(markup5ever::QualName::new(
+            prefix.map(markup5ever::Prefix::from),
+            markup5ever::Namespace::from(namespace),
+            markup5ever::LocalName::from(local_name),
+        ));
+        if namespace == "http://www.w3.org/1999/xhtml" && local_name == "template" {
+            let frag = self.arena.new_node(NodeData::DocumentFragment);
+            elem.template_contents = Some(frag);
+        }
+        self.new_node(NodeData::Element(elem))
     }
 
     pub fn create_text(&mut self, text: &str) -> NodeId {
@@ -546,6 +579,13 @@ impl Document {
     pub fn create_comment(&mut self, comment: &str) -> NodeId {
         let data = NodeData::Comment(comment.to_string());
         self.arena.new_node(data)
+    }
+
+    pub fn create_processing_instruction(&mut self, target: &str, data: &str) -> NodeId {
+        self.arena.new_node(NodeData::ProcessingInstruction {
+            target: target.to_string(),
+            data: data.to_string(),
+        })
     }
 
     pub fn new_node(&mut self, data: NodeData) -> NodeId {
@@ -1121,6 +1161,13 @@ impl Document {
                             output.push_str("<!--");
                             output.push_str(comment);
                             output.push_str("-->");
+                        }
+                        Some(NodeData::ProcessingInstruction { target, data }) => {
+                            output.push_str("<?");
+                            output.push_str(target);
+                            output.push(' ');
+                            output.push_str(data);
+                            output.push_str("?>");
                         }
                         Some(NodeData::DocumentType { name, .. }) => {
                             output.push_str("<!DOCTYPE ");

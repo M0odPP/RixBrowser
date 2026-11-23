@@ -297,6 +297,15 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
             }
         );
     }
+    function generate_tests(fn, params) {
+        if (!Array.isArray(params)) return;
+        for (let i = 0; i < params.length; i++) {
+            const entry = params[i];
+            const name = entry[0];
+            const rest = entry.slice(1);
+            test(function() { fn.apply(this, rest); }, name);
+        }
+    }
     function setup(fnOrProps, maybeProps) {
         if (typeof fnOrProps === "function") {
             try { fnOrProps(); } catch (e) { harnessStatus = 1; harnessErrors.push(String(e)); }
@@ -309,6 +318,7 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
     global.test = test;
     global.async_test = async_test;
     global.promise_test = promise_test;
+    global.generate_tests = generate_tests;
     global.promise_rejects_js = promise_rejects_js;
     global.promise_rejects_dom = promise_rejects_dom;
     global.setup = setup;

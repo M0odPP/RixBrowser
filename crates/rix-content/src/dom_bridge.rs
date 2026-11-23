@@ -128,6 +128,10 @@ pub struct HostState {
     pub custom_elements: HashMap<String, CustomElementDef>,
     pub when_defined_waiters: HashMap<String, Vec<HeapHandle>>,
     pub mutation_sinks: Vec<MutationSink>,
+    pub current_script: Option<NodeId>,
+    pub custom_validity: HashMap<NodeId, String>,
+    pub dialog_return_values: HashMap<NodeId, String>,
+    pub open_popovers: Vec<NodeId>,
 }
 
 /// Shared handle to [`HostState`].
@@ -175,6 +179,10 @@ impl HostState {
             custom_elements: HashMap::new(),
             when_defined_waiters: HashMap::new(),
             mutation_sinks: Vec::new(),
+            current_script: None,
+            custom_validity: HashMap::new(),
+            dialog_return_values: HashMap::new(),
+            open_popovers: Vec::new(),
         }
     }
 
@@ -534,7 +542,11 @@ pub fn wrap_node(vm: &mut JsVm, host: &SharedHost, node_id: NodeId) -> JsValue {
                         h.prototypes.html_element_proto
                     }
                 }
-                Some(NodeData::Text(_) | NodeData::Comment(_)) => h.prototypes.text_proto,
+                Some(
+                    NodeData::Text(_)
+                    | NodeData::Comment(_)
+                    | NodeData::ProcessingInstruction { .. },
+                ) => h.prototypes.text_proto,
                 Some(NodeData::DocumentFragment) => h.prototypes.fragment_proto,
                 _ => h.prototypes.node_proto,
             }
@@ -628,6 +640,75 @@ pub fn install_dom_bridge(
     define_global(vm, "self", gv);
     define_global(vm, "globalThis", gv);
 
+    // Global `DOMParser` and `XMLSerializer` constructors (WHATWG HTML §8.4).
+    let dom_parser_proto = make_proto(vm, vm.object_proto);
+    let h_dp = Rc::clone(&host);
+    define_host_method(
+        vm,
+        dom_parser_proto,
+        "parseFromString",
+        move |vm, _, args| {
+            let markup = vm.value_to_rust_string(arg(args, 0));
+            let parsed = rix_html::parse_html(&markup);
+            let sub_root = {
+                let doc_rc = Rc::clone(&h_dp.borrow().document);
+                let mut doc = doc_rc.borrow_mut();
+                let r = doc.new_node(NodeData::Document);
+                let pr = parsed.root();
+                for child in parsed.children(pr) {
+                    let cloned = doc.clone_subtree_from(&parsed, child);
+                    doc.append_child(r, cloned);
+                }
+                r
+            };
+            Ok(wrap_node(vm, &h_dp, sub_root))
+        },
+    );
+    let dom_parser_ctor = vm.alloc_host_fn("DOMParser", move |vm, _, _| {
+        let inst = vm.heap.alloc_object(JsObject::with_kind(
+            ObjectKind::Ordinary,
+            Some(dom_parser_proto),
+        ));
+        Ok(JsValue::from_object(inst))
+    });
+    let k_proto = vm.key_prototype;
+    vm.heap.object_define_data(
+        dom_parser_ctor,
+        k_proto,
+        JsValue::from_object(dom_parser_proto),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    define_global(vm, "DOMParser", JsValue::from_object(dom_parser_ctor));
+
+    let xml_ser_proto = make_proto(vm, vm.object_proto);
+    let h_xs = Rc::clone(&host);
+    define_host_method(
+        vm,
+        xml_ser_proto,
+        "serializeToString",
+        move |vm, _, args| {
+            let nid = require_node(vm, &h_xs, arg(args, 0))?;
+            let html = h_xs.borrow().document.borrow().to_html_string(nid);
+            Ok(JsValue::from_string(vm.heap.alloc_string(html)))
+        },
+    );
+    let xml_ser_ctor = vm.alloc_host_fn("XMLSerializer", move |vm, _, _| {
+        let inst = vm.heap.alloc_object(JsObject::with_kind(
+            ObjectKind::Ordinary,
+            Some(xml_ser_proto),
+        ));
+        Ok(JsValue::from_object(inst))
+    });
+    vm.heap.object_define_data(
+        xml_ser_ctor,
+        k_proto,
+        JsValue::from_object(xml_ser_proto),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    define_global(vm, "XMLSerializer", JsValue::from_object(xml_ser_ctor));
+
     host
 }
 
@@ -706,6 +787,7 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
         let ty = match h.borrow().document.borrow().get(nid) {
             Some(NodeData::Element(_)) => 1,
             Some(NodeData::Text(_)) => 3,
+            Some(NodeData::ProcessingInstruction { .. }) => 7,
             Some(NodeData::Comment(_)) => 8,
             Some(NodeData::Document) => 9,
             Some(NodeData::DocumentType { .. }) => 10,
@@ -721,9 +803,16 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
     let g = vm.alloc_host_fn("get nodeName", move |vm, this_val, _| {
         let nid = require_node(vm, &h, this_val)?;
         let name = match h.borrow().document.borrow().get(nid) {
-            Some(NodeData::Element(e)) => e.name.local.as_str().to_ascii_uppercase(),
+            Some(NodeData::Element(e)) => {
+                if &*e.name.ns == "http://www.w3.org/1999/xhtml" {
+                    e.name.local.as_str().to_ascii_uppercase()
+                } else {
+                    e.name.local.as_str().to_string()
+                }
+            }
             Some(NodeData::Text(_)) => "#text".into(),
             Some(NodeData::Comment(_)) => "#comment".into(),
+            Some(NodeData::ProcessingInstruction { target, .. }) => target.clone(),
             Some(NodeData::Document) => "#document".into(),
             Some(NodeData::DocumentFragment | NodeData::ShadowRoot { .. }) => {
                 "#document-fragment".into()
@@ -837,16 +926,18 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
         };
         let is_text = matches!(
             h2.borrow().document.borrow().get(nid),
-            Some(NodeData::Text(_) | NodeData::Comment(_))
+            Some(NodeData::Text(_) | NodeData::Comment(_) | NodeData::ProcessingInstruction { .. })
         );
         if is_text {
             let old = {
                 let _doc_rc = Rc::clone(&h2.borrow().document);
                 let mut doc = _doc_rc.borrow_mut();
                 match doc.get_mut(nid) {
-                    Some(NodeData::Text(s) | NodeData::Comment(s)) => {
-                        std::mem::replace(s, new_text)
-                    }
+                    Some(
+                        NodeData::Text(s)
+                        | NodeData::Comment(s)
+                        | NodeData::ProcessingInstruction { data: s, .. },
+                    ) => std::mem::replace(s, new_text),
                     _ => String::new(),
                 }
             };
@@ -1130,6 +1221,58 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         Ok(create_dataset_proxy(vm, &h, nid))
     });
     define_host_accessor(vm, ep, "dataset", Some(g), None);
+
+    // namespaceURI / localName / prefix (WHATWG DOM §4.9)
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get namespaceURI", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let ns = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            match doc.get(nid) {
+                Some(NodeData::Element(e)) if !e.name.ns.is_empty() => Some(e.name.ns.to_string()),
+                _ => None,
+            }
+        };
+        Ok(match ns {
+            Some(s) => JsValue::from_string(vm.heap.alloc_string(s)),
+            None => JsValue::NULL,
+        })
+    });
+    define_host_accessor(vm, ep, "namespaceURI", Some(g), None);
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get localName", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let local = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            match doc.get(nid) {
+                Some(NodeData::Element(e)) => e.name.local.to_string(),
+                _ => String::new(),
+            }
+        };
+        Ok(JsValue::from_string(vm.heap.alloc_string(local)))
+    });
+    define_host_accessor(vm, ep, "localName", Some(g), None);
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get prefix", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let pref = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            match doc.get(nid) {
+                Some(NodeData::Element(e)) => e.name.prefix.as_ref().map(|p| p.to_string()),
+                _ => None,
+            }
+        };
+        Ok(match pref {
+            Some(s) => JsValue::from_string(vm.heap.alloc_string(s)),
+            None => JsValue::NULL,
+        })
+    });
+    define_host_accessor(vm, ep, "prefix", Some(g), None);
 
     // Attribute methods
     let h = Rc::clone(host);
@@ -1493,6 +1636,630 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         });
         define_host_accessor(vm, ep, prop, Some(g), None);
     }
+
+    install_html5_element_semantics(vm, host, ep);
+}
+
+/// Installs WHATWG HTML5 element semantics on `Element.prototype`:
+/// `<template>.content`, `<dialog>`, `<details>`, `<form>` / Constraint Validation API,
+/// `<select>`/`<option>`/`<label>`, Popover API, and standard boolean/string attribute reflections.
+fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHandle) {
+    // `<template>.content` -> inert `DocumentFragment`
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get content", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let frag = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            match doc.get(nid) {
+                Some(NodeData::Element(el)) => el.template_contents,
+                _ => None,
+            }
+        };
+        Ok(frag.map_or(JsValue::UNDEFINED, |f| wrap_node(vm, &h, f)))
+    });
+    define_host_accessor(vm, ep, "content", Some(g), None);
+
+    // Reflected boolean attributes (`open`, `hidden`, `disabled`, `required`, `readOnly`,
+    // `checked`, `multiple`, `noValidate`, `selected`).
+    for (prop, attr) in [
+        ("open", "open"),
+        ("hidden", "hidden"),
+        ("disabled", "disabled"),
+        ("required", "required"),
+        ("readOnly", "readonly"),
+        ("checked", "checked"),
+        ("multiple", "multiple"),
+        ("noValidate", "novalidate"),
+        ("selected", "selected"),
+    ] {
+        let h1 = Rc::clone(host);
+        let g =
+            vm.alloc_host_fn(prop, move |vm, t, _| {
+                let nid = require_node(vm, &h1, t)?;
+                let present =
+                    h1.borrow().document.borrow().get(nid).is_some_and(
+                        |d| matches!(d, NodeData::Element(e) if e.has_attribute(attr)),
+                    );
+                Ok(JsValue::from_bool(present))
+            });
+        let h2 = Rc::clone(host);
+        let s = vm.alloc_host_fn(prop, move |vm, t, args| {
+            let nid = require_node(vm, &h2, t)?;
+            let on = vm.to_boolean(arg(args, 0));
+            if on {
+                set_element_attr(vm, &h2, nid, attr, "");
+            } else {
+                remove_element_attr(vm, &h2, nid, attr);
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, ep, prop, Some(g), Some(s));
+    }
+
+    // Reflected string attributes (`name`, `placeholder`, `title`, `lang`, `dir`, `htmlFor`, `popover`).
+    for (prop, attr) in [
+        ("name", "name"),
+        ("placeholder", "placeholder"),
+        ("title", "title"),
+        ("lang", "lang"),
+        ("dir", "dir"),
+        ("htmlFor", "for"),
+    ] {
+        let h1 = Rc::clone(host);
+        let g = vm.alloc_host_fn(prop, move |vm, t, _| {
+            let nid = require_node(vm, &h1, t)?;
+            let val = h1
+                .borrow()
+                .document
+                .borrow()
+                .get(nid)
+                .and_then(|d| match d {
+                    NodeData::Element(e) => e.get_attribute(attr).map(str::to_string),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Ok(JsValue::from_string(vm.heap.alloc_string(val)))
+        });
+        let h2 = Rc::clone(host);
+        let s = vm.alloc_host_fn(prop, move |vm, t, args| {
+            let nid = require_node(vm, &h2, t)?;
+            let val = vm.value_to_rust_string(arg(args, 0));
+            set_element_attr(vm, &h2, nid, attr, &val);
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, ep, prop, Some(g), Some(s));
+    }
+
+    // `popover` enumerated attribute (HTML5 Popover API: "auto" | "manual" | null).
+    let h1 = Rc::clone(host);
+    let g = vm.alloc_host_fn("get popover", move |vm, t, _| {
+        let nid = require_node(vm, &h1, t)?;
+        let val = {
+            let doc_rc = Rc::clone(&h1.borrow().document);
+            let doc = doc_rc.borrow();
+            match doc.get(nid) {
+                Some(NodeData::Element(e)) => e.get_attribute("popover").map(|raw| {
+                    if raw.eq_ignore_ascii_case("manual") {
+                        "manual".to_string()
+                    } else {
+                        "auto".to_string()
+                    }
+                }),
+                _ => None,
+            }
+        };
+        Ok(match val {
+            Some(s) => JsValue::from_string(vm.heap.alloc_string(s)),
+            None => JsValue::NULL,
+        })
+    });
+    let h2 = Rc::clone(host);
+    let s = vm.alloc_host_fn("set popover", move |vm, t, args| {
+        let nid = require_node(vm, &h2, t)?;
+        let a = arg(args, 0);
+        if a.is_null() {
+            remove_element_attr(vm, &h2, nid, "popover");
+        } else {
+            let v = vm.value_to_rust_string(a);
+            set_element_attr(vm, &h2, nid, "popover", &v);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_accessor(vm, ep, "popover", Some(g), Some(s));
+
+    // `showPopover()`, `hidePopover()`, `togglePopover(force?)`
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "showPopover", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let is_popover = h
+            .borrow()
+            .document
+            .borrow()
+            .get(nid)
+            .is_some_and(|d| matches!(d, NodeData::Element(e) if e.has_attribute("popover")));
+        if !is_popover {
+            return Err(vm.make_error(
+                "NotSupportedError",
+                "Element does not have popover attribute",
+            ));
+        }
+        let mut hs = h.borrow_mut();
+        if !hs.open_popovers.contains(&nid) {
+            hs.open_popovers.push(nid);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "hidePopover", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        h.borrow_mut().open_popovers.retain(|&p| p != nid);
+        Ok(JsValue::UNDEFINED)
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "togglePopover", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let is_popover = h
+            .borrow()
+            .document
+            .borrow()
+            .get(nid)
+            .is_some_and(|d| matches!(d, NodeData::Element(e) if e.has_attribute("popover")));
+        if !is_popover {
+            return Err(vm.make_error(
+                "NotSupportedError",
+                "Element does not have popover attribute",
+            ));
+        }
+        let mut hs = h.borrow_mut();
+        let was_open = hs.open_popovers.contains(&nid);
+        let next = if args.first().is_some_and(|v| !v.is_undefined()) {
+            vm.to_boolean(args[0])
+        } else {
+            !was_open
+        };
+        if next && !was_open {
+            hs.open_popovers.push(nid);
+        } else if !next && was_open {
+            hs.open_popovers.retain(|&p| p != nid);
+        }
+        Ok(JsValue::from_bool(next))
+    });
+
+    // `tabIndex`
+    let h1 = Rc::clone(host);
+    let g = vm.alloc_host_fn("get tabIndex", move |vm, t, _| {
+        let nid = require_node(vm, &h1, t)?;
+        let idx = {
+            let doc_rc = Rc::clone(&h1.borrow().document);
+            let doc = doc_rc.borrow();
+            match doc.get(nid) {
+                Some(NodeData::Element(e)) => {
+                    if let Some(raw) = e.get_attribute("tabindex") {
+                        raw.trim().parse::<i32>().unwrap_or(-1)
+                    } else if matches!(
+                        e.name.local.as_ref(),
+                        "a" | "button" | "input" | "select" | "textarea" | "summary"
+                    ) {
+                        0
+                    } else {
+                        -1
+                    }
+                }
+                _ => -1,
+            }
+        };
+        Ok(JsValue::from_i32(idx))
+    });
+    let h2 = Rc::clone(host);
+    let s = vm.alloc_host_fn("set tabIndex", move |vm, t, args| {
+        let nid = require_node(vm, &h2, t)?;
+        let v = vm.to_i32(arg(args, 0))?;
+        set_element_attr(vm, &h2, nid, "tabindex", &v.to_string());
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_accessor(vm, ep, "tabIndex", Some(g), Some(s));
+
+    // `<input>` / `<button>` / `<select>` / `<textarea>` `type`, `value`, `defaultValue`
+    let h1 = Rc::clone(host);
+    let g = vm.alloc_host_fn("get type", move |vm, t, _| {
+        let nid = require_node(vm, &h1, t)?;
+        let ty = {
+            let doc_rc = Rc::clone(&h1.borrow().document);
+            let doc = doc_rc.borrow();
+            match doc.get(nid) {
+                Some(NodeData::Element(e)) => match e.name.local.as_ref() {
+                    "input" => e
+                        .get_attribute("type")
+                        .unwrap_or("text")
+                        .trim()
+                        .to_ascii_lowercase(),
+                    "button" => e
+                        .get_attribute("type")
+                        .unwrap_or("submit")
+                        .trim()
+                        .to_ascii_lowercase(),
+                    "textarea" => "textarea".to_string(),
+                    "select" => {
+                        if e.has_attribute("multiple") {
+                            "select-multiple".to_string()
+                        } else {
+                            "select-one".to_string()
+                        }
+                    }
+                    _ => e.get_attribute("type").unwrap_or("").to_string(),
+                },
+                _ => String::new(),
+            }
+        };
+        Ok(JsValue::from_string(vm.heap.alloc_string(ty)))
+    });
+    let h2 = Rc::clone(host);
+    let s = vm.alloc_host_fn("set type", move |vm, t, args| {
+        let nid = require_node(vm, &h2, t)?;
+        let v = vm.value_to_rust_string(arg(args, 0));
+        set_element_attr(vm, &h2, nid, "type", &v);
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_accessor(vm, ep, "type", Some(g), Some(s));
+
+    let h1 = Rc::clone(host);
+    let g = vm.alloc_host_fn("get value", move |vm, t, _| {
+        let nid = require_node(vm, &h1, t)?;
+        let val = {
+            let doc_rc = Rc::clone(&h1.borrow().document);
+            let doc = doc_rc.borrow();
+            match doc.get(nid) {
+                Some(NodeData::Element(e)) => match e.name.local.as_ref() {
+                    "textarea" => e
+                        .get_attribute("value")
+                        .map(str::to_string)
+                        .unwrap_or_else(|| doc.inner_text(nid)),
+                    "option" => e
+                        .get_attribute("value")
+                        .map(str::to_string)
+                        .unwrap_or_else(|| doc.inner_text(nid)),
+                    "select" => {
+                        let opts: Vec<NodeId> = doc
+                            .descendants(nid)
+                            .filter(|&n| {
+                                matches!(doc.get(n), Some(NodeData::Element(o)) if &*o.name.local == "option")
+                            })
+                            .collect();
+                        let chosen = opts
+                            .iter()
+                            .copied()
+                            .find(|&n| {
+                                matches!(doc.get(n), Some(NodeData::Element(o)) if o.has_attribute("selected"))
+                            })
+                            .or_else(|| opts.first().copied());
+                        chosen
+                            .and_then(|opt| match doc.get(opt) {
+                                Some(NodeData::Element(o)) => Some(
+                                    o.get_attribute("value")
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|| doc.inner_text(opt)),
+                                ),
+                                _ => None,
+                            })
+                            .unwrap_or_default()
+                    }
+                    _ => e.get_attribute("value").unwrap_or("").to_string(),
+                },
+                _ => String::new(),
+            }
+        };
+        Ok(JsValue::from_string(vm.heap.alloc_string(val)))
+    });
+    let h2 = Rc::clone(host);
+    let s = vm.alloc_host_fn("set value", move |vm, t, args| {
+        let nid = require_node(vm, &h2, t)?;
+        let val = vm.value_to_rust_string(arg(args, 0));
+        set_element_attr(vm, &h2, nid, "value", &val);
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_accessor(vm, ep, "value", Some(g), Some(s));
+
+    // `<dialog>` `returnValue`, `show()`, `showModal()`, `close(returnValue?)`
+    let h1 = Rc::clone(host);
+    let g = vm.alloc_host_fn("get returnValue", move |vm, t, _| {
+        let nid = require_node(vm, &h1, t)?;
+        let rv = h1
+            .borrow()
+            .dialog_return_values
+            .get(&nid)
+            .cloned()
+            .unwrap_or_default();
+        Ok(JsValue::from_string(vm.heap.alloc_string(rv)))
+    });
+    let h2 = Rc::clone(host);
+    let s = vm.alloc_host_fn("set returnValue", move |vm, t, args| {
+        let nid = require_node(vm, &h2, t)?;
+        let rv = vm.value_to_rust_string(arg(args, 0));
+        h2.borrow_mut().dialog_return_values.insert(nid, rv);
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_accessor(vm, ep, "returnValue", Some(g), Some(s));
+
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "show", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        set_element_attr(vm, &h, nid, "open", "");
+        Ok(JsValue::UNDEFINED)
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "showModal", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let is_open = h
+            .borrow()
+            .document
+            .borrow()
+            .get(nid)
+            .is_some_and(|d| matches!(d, NodeData::Element(e) if e.has_attribute("open")));
+        if is_open {
+            return Err(vm.make_error("InvalidStateError", "Dialog is already open"));
+        }
+        set_element_attr(vm, &h, nid, "open", "");
+        Ok(JsValue::UNDEFINED)
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "close", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        if let Some(&rv) = args.first() {
+            if !rv.is_undefined() {
+                let s = vm.value_to_rust_string(rv);
+                h.borrow_mut().dialog_return_values.insert(nid, s);
+            }
+        }
+        remove_element_attr(vm, &h, nid, "open");
+        Ok(JsValue::UNDEFINED)
+    });
+
+    // HTML5 Constraint Validation API (`validity`, `validationMessage`, `willValidate`,
+    // `setCustomValidity`, `checkValidity`, `reportValidity`) and `<form>` (`elements`, `reset`).
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "setCustomValidity", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let msg = vm.value_to_rust_string(arg(args, 0));
+        if msg.is_empty() {
+            h.borrow_mut().custom_validity.remove(&nid);
+        } else {
+            h.borrow_mut().custom_validity.insert(nid, msg);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get validity", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let (valid, value_missing, custom_error, _msg) = compute_element_validity(&h, nid);
+        let obj = vm.alloc_ordinary_object();
+        for (k, v) in [
+            ("valid", valid),
+            ("valueMissing", value_missing),
+            ("typeMismatch", false),
+            ("patternMismatch", false),
+            ("tooLong", false),
+            ("tooShort", false),
+            ("rangeUnderflow", false),
+            ("rangeOverflow", false),
+            ("stepMismatch", false),
+            ("badInput", false),
+            ("customError", custom_error),
+        ] {
+            let key = vm.heap.intern_key(k);
+            vm.heap.object_define_data(
+                obj,
+                key,
+                JsValue::from_bool(v),
+                PropertyAttrs::DEFAULT,
+                &mut vm.shapes,
+            );
+        }
+        Ok(JsValue::from_object(obj))
+    });
+    define_host_accessor(vm, ep, "validity", Some(g), None);
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get validationMessage", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let (_, _, _, msg) = compute_element_validity(&h, nid);
+        Ok(JsValue::from_string(vm.heap.alloc_string(msg)))
+    });
+    define_host_accessor(vm, ep, "validationMessage", Some(g), None);
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get willValidate", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let will = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            match doc.get(nid) {
+                Some(NodeData::Element(e)) => {
+                    let is_ctrl = matches!(
+                        e.name.local.as_ref(),
+                        "input" | "select" | "textarea" | "button"
+                    );
+                    let is_hidden_input = &*e.name.local == "input"
+                        && e.get_attribute("type")
+                            .is_some_and(|t| t.eq_ignore_ascii_case("hidden"));
+                    is_ctrl
+                        && !is_hidden_input
+                        && !e.has_attribute("disabled")
+                        && !e.has_attribute("readonly")
+                }
+                _ => false,
+            }
+        };
+        Ok(JsValue::from_bool(will))
+    });
+    define_host_accessor(vm, ep, "willValidate", Some(g), None);
+
+    for mname in ["checkValidity", "reportValidity"] {
+        let h = Rc::clone(host);
+        define_host_method(vm, ep, mname, move |vm, t, _| {
+            let nid = require_node(vm, &h, t)?;
+            let is_form = h
+                .borrow()
+                .document
+                .borrow()
+                .get(nid)
+                .is_some_and(|d| matches!(d, NodeData::Element(e) if &*e.name.local == "form"));
+            if is_form {
+                let controls: Vec<NodeId> = {
+                    let doc_rc = Rc::clone(&h.borrow().document);
+                    let doc = doc_rc.borrow();
+                    doc.descendants(nid)
+                        .filter(|&n| {
+                            matches!(
+                                doc.get(n),
+                                Some(NodeData::Element(e))
+                                    if matches!(e.name.local.as_ref(), "input" | "select" | "textarea")
+                            )
+                        })
+                        .collect()
+                };
+                for c in controls {
+                    if !compute_element_validity(&h, c).0 {
+                        return Ok(JsValue::FALSE);
+                    }
+                }
+                Ok(JsValue::TRUE)
+            } else {
+                Ok(JsValue::from_bool(compute_element_validity(&h, nid).0))
+            }
+        });
+    }
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get form", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let form_id = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            let mut cur = doc.parent(nid);
+            let mut found = None;
+            while let Some(p) = cur {
+                if matches!(doc.get(p), Some(NodeData::Element(e)) if &*e.name.local == "form") {
+                    found = Some(p);
+                    break;
+                }
+                cur = doc.parent(p);
+            }
+            found
+        };
+        Ok(form_id.map_or(JsValue::NULL, |id| wrap_node(vm, &h, id)))
+    });
+    define_host_accessor(vm, ep, "form", Some(g), None);
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get elements", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let list: Vec<NodeId> = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            doc.descendants(nid)
+                .filter(|&n| {
+                    n != nid
+                        && matches!(
+                            doc.get(n),
+                            Some(NodeData::Element(e))
+                                if matches!(
+                                    e.name.local.as_ref(),
+                                    "button" | "fieldset" | "input" | "object" | "output" | "select" | "textarea"
+                                )
+                        )
+                })
+                .collect()
+        };
+        Ok(wrap_node_list(vm, &h, list))
+    });
+    define_host_accessor(vm, ep, "elements", Some(g), None);
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get options", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let list: Vec<NodeId> = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            doc.descendants(nid)
+                .filter(|&n| {
+                    n != nid
+                        && matches!(doc.get(n), Some(NodeData::Element(e)) if &*e.name.local == "option")
+                })
+                .collect()
+        };
+        Ok(wrap_node_list(vm, &h, list))
+    });
+    define_host_accessor(vm, ep, "options", Some(g), None);
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get selectedIndex", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let idx = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            let opts: Vec<NodeId> = doc
+                .descendants(nid)
+                .filter(|&n| {
+                    matches!(doc.get(n), Some(NodeData::Element(e)) if &*e.name.local == "option")
+                })
+                .collect();
+            if opts.is_empty() {
+                -1
+            } else {
+                opts.iter()
+                    .position(|&n| {
+                        matches!(doc.get(n), Some(NodeData::Element(e)) if e.has_attribute("selected"))
+                    })
+                    .unwrap_or(0) as i32
+            }
+        };
+        Ok(JsValue::from_i32(idx))
+    });
+    define_host_accessor(vm, ep, "selectedIndex", Some(g), None);
+}
+
+fn compute_element_validity(host: &SharedHost, nid: NodeId) -> (bool, bool, bool, String) {
+    let custom = host
+        .borrow()
+        .custom_validity
+        .get(&nid)
+        .cloned()
+        .unwrap_or_default();
+    if !custom.is_empty() {
+        return (false, false, true, custom);
+    }
+    let doc_rc = Rc::clone(&host.borrow().document);
+    let doc = doc_rc.borrow();
+    if let Some(NodeData::Element(e)) = doc.get(nid) {
+        if !e.has_attribute("disabled") && e.has_attribute("required") {
+            let empty = match e.name.local.as_ref() {
+                "input" => {
+                    let ty = e.get_attribute("type").unwrap_or("text");
+                    if ty.eq_ignore_ascii_case("checkbox") || ty.eq_ignore_ascii_case("radio") {
+                        !e.has_attribute("checked")
+                    } else {
+                        e.get_attribute("value").unwrap_or("").is_empty()
+                    }
+                }
+                "textarea" => e
+                    .get_attribute("value")
+                    .map(|s| s.is_empty())
+                    .unwrap_or_else(|| doc.inner_text(nid).is_empty()),
+                _ => false,
+            };
+            if empty {
+                return (
+                    false,
+                    true,
+                    false,
+                    "Please fill out this field.".to_string(),
+                );
+            }
+        }
+    }
+    (true, false, false, String::new())
 }
 
 fn alloc_dom_rect(vm: &mut JsVm, rect: Rect) -> HeapHandle {
@@ -1715,6 +2482,100 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
     });
     define_host_accessor(vm, dp, "readyState", Some(g), None);
 
+    // document.characterSet / charset / inputEncoding / compatMode / currentScript / doctype / dir
+    for prop in ["characterSet", "charset", "inputEncoding"] {
+        let h = Rc::clone(host);
+        let g = vm.alloc_host_fn(prop, move |vm, _, _| {
+            let cs = h.borrow().document.borrow().character_set().to_string();
+            Ok(JsValue::from_string(vm.heap.alloc_string(cs)))
+        });
+        define_host_accessor(vm, dp, prop, Some(g), None);
+    }
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get compatMode", move |vm, _, _| {
+        let cm = h.borrow().document.borrow().compat_mode();
+        Ok(JsValue::from_string(vm.heap.alloc_string(cm.to_string())))
+    });
+    define_host_accessor(vm, dp, "compatMode", Some(g), None);
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get currentScript", move |vm, _, _| {
+        let cs = h.borrow().current_script;
+        Ok(cs.map_or(JsValue::NULL, |nid| wrap_node(vm, &h, nid)))
+    });
+    define_host_accessor(vm, dp, "currentScript", Some(g), None);
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get doctype", move |vm, _, _| {
+        let dt_id = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            let found = doc
+                .children(doc.root())
+                .find(|&n| matches!(doc.get(n), Some(NodeData::DocumentType { .. })));
+            found
+        };
+        let Some(dt_id) = dt_id else {
+            return Ok(JsValue::NULL);
+        };
+        let wrapper = wrap_node(vm, &h, dt_id);
+        if let Some(wh) = wrapper.as_object() {
+            let dt_fields = {
+                let doc_rc = Rc::clone(&h.borrow().document);
+                let doc = doc_rc.borrow();
+                match doc.get(dt_id) {
+                    Some(NodeData::DocumentType {
+                        name,
+                        public_id,
+                        system_id,
+                    }) => Some((name.clone(), public_id.clone(), system_id.clone())),
+                    _ => None,
+                }
+            };
+            if let Some((name, pub_id, sys_id)) = dt_fields {
+                for (k, v) in [("name", name), ("publicId", pub_id), ("systemId", sys_id)] {
+                    let key = vm.heap.intern_key(k);
+                    let s = vm.heap.alloc_string(v);
+                    vm.heap.object_define_data(
+                        wh,
+                        key,
+                        JsValue::from_string(s),
+                        PropertyAttrs::DEFAULT,
+                        &mut vm.shapes,
+                    );
+                }
+            }
+        }
+        Ok(wrapper)
+    });
+    define_host_accessor(vm, dp, "doctype", Some(g), None);
+
+    let h1 = Rc::clone(host);
+    let g = vm.alloc_host_fn("get dir", move |vm, _, _| {
+        let dir = {
+            let doc_rc = Rc::clone(&h1.borrow().document);
+            let doc = doc_rc.borrow();
+            doc.document_element()
+                .and_then(|de| match doc.get(de) {
+                    Some(NodeData::Element(e)) => e.get_attribute("dir").map(str::to_string),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        Ok(JsValue::from_string(vm.heap.alloc_string(dir)))
+    });
+    let h2 = Rc::clone(host);
+    let s = vm.alloc_host_fn("set dir", move |vm, _, args| {
+        let next = vm.value_to_rust_string(arg(args, 0));
+        let de = h2.borrow().document.borrow().document_element();
+        if let Some(de) = de {
+            set_element_attr(vm, &h2, de, "dir", &next);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_accessor(vm, dp, "dir", Some(g), Some(s));
+
     // document.title getter/setter
     let h_get = Rc::clone(host);
     let g = vm.alloc_host_fn("get title", move |vm, _, _| {
@@ -1781,11 +2642,26 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
     });
     let h = Rc::clone(host);
     define_host_method(vm, dp, "createElementNS", move |vm, _, args| {
-        let raw_tag = vm.value_to_rust_string(arg(args, 1));
-        let tag = raw_tag.to_ascii_lowercase();
-        let nid = h.borrow().document.borrow_mut().create_element(&tag);
+        let ns_arg = arg(args, 0);
+        let ns = if ns_arg.is_null() || ns_arg.is_undefined() {
+            String::new()
+        } else {
+            vm.value_to_rust_string(ns_arg)
+        };
+        let raw_qname = vm.value_to_rust_string(arg(args, 1));
+        let (prefix, local) = match raw_qname.split_once(':') {
+            Some((p, l)) => (Some(p), l),
+            None => (None, raw_qname.as_str()),
+        };
+        let nid = h
+            .borrow()
+            .document
+            .borrow_mut()
+            .create_element_ns(&ns, prefix, local);
         let wrapper = wrap_node(vm, &h, nid);
-        upgrade_if_custom_element(vm, &h, nid, &tag);
+        if ns == "http://www.w3.org/1999/xhtml" {
+            upgrade_if_custom_element(vm, &h, nid, local);
+        }
         Ok(wrapper)
     });
     let h = Rc::clone(host);
@@ -1801,6 +2677,23 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         Ok(wrap_node(vm, &h, nid))
     });
     let h = Rc::clone(host);
+    define_host_method(vm, dp, "createProcessingInstruction", move |vm, _, args| {
+        let target = vm.value_to_rust_string(arg(args, 0));
+        let data = vm.value_to_rust_string(arg(args, 1));
+        if data.contains("?>") {
+            return Err(vm.make_error(
+                "InvalidCharacterError",
+                "ProcessingInstruction data cannot contain '?>'",
+            ));
+        }
+        let nid = h
+            .borrow()
+            .document
+            .borrow_mut()
+            .create_processing_instruction(&target, &data);
+        Ok(wrap_node(vm, &h, nid))
+    });
+    let h = Rc::clone(host);
     define_host_method(vm, dp, "createDocumentFragment", move |vm, _, _| {
         let nid = h
             .borrow()
@@ -1809,6 +2702,57 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
             .new_node(NodeData::DocumentFragment);
         Ok(wrap_node(vm, &h, nid))
     });
+
+    // document.implementation (WHATWG DOM §4.5.1 DOMImplementation)
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get implementation", move |vm, _, _| {
+        let imp = vm.alloc_ordinary_object();
+        let h_html = Rc::clone(&h);
+        define_host_method(vm, imp, "createHTMLDocument", move |vm, _, args| {
+            let title = if args.first().is_some_and(|v| !v.is_undefined()) {
+                Some(vm.value_to_rust_string(args[0]))
+            } else {
+                None
+            };
+            let html = match title {
+                Some(t) => format!(
+                    "<!DOCTYPE html><html><head><title>{t}</title></head><body></body></html>"
+                ),
+                None => "<!DOCTYPE html><html><head></head><body></body></html>".to_string(),
+            };
+            let parsed = rix_html::parse_html(&html);
+            let sub_root = {
+                let doc_rc = Rc::clone(&h_html.borrow().document);
+                let mut doc = doc_rc.borrow_mut();
+                let r = doc.new_node(NodeData::Document);
+                let pr = parsed.root();
+                for child in parsed.children(pr) {
+                    let cloned = doc.clone_subtree_from(&parsed, child);
+                    doc.append_child(r, cloned);
+                }
+                r
+            };
+            Ok(wrap_node(vm, &h_html, sub_root))
+        });
+        let h_dt = Rc::clone(&h);
+        define_host_method(vm, imp, "createDocumentType", move |vm, _, args| {
+            let name = vm.value_to_rust_string(arg(args, 0));
+            let pub_id = vm.value_to_rust_string(arg(args, 1));
+            let sys_id = vm.value_to_rust_string(arg(args, 2));
+            let nid = h_dt
+                .borrow()
+                .document
+                .borrow_mut()
+                .new_node(NodeData::DocumentType {
+                    name,
+                    public_id: pub_id,
+                    system_id: sys_id,
+                });
+            Ok(wrap_node(vm, &h_dt, nid))
+        });
+        Ok(JsValue::from_object(imp))
+    });
+    define_host_accessor(vm, dp, "implementation", Some(g), None);
 
     // Document queries
     let h = Rc::clone(host);
@@ -2265,10 +3209,21 @@ fn find_elements_by_tag(host: &SharedHost, root: NodeId, tag: &str) -> Vec<NodeI
     let _doc_rc = Rc::clone(&host.borrow().document);
     let doc = _doc_rc.borrow();
     let wildcard = tag == "*";
+    let tag_lower = tag.to_ascii_lowercase();
     doc.descendants(root)
         .filter(|&n| {
             n != root
-                && matches!(doc.get(n), Some(NodeData::Element(e)) if wildcard || e.name.local.as_str().eq_ignore_ascii_case(tag))
+                && matches!(doc.get(n), Some(NodeData::Element(e)) if {
+                    if wildcard {
+                        true
+                    } else if &*e.name.ns == "http://www.w3.org/1999/xhtml" {
+                        // WHATWG DOM §4.2.6.1: HTML elements in HTML documents match ASCII-lowercased qualifiedName.
+                        e.name.local.as_str() == tag_lower
+                    } else {
+                        // Foreign elements (SVG, MathML, XML) match exact case-sensitive qualifiedName.
+                        e.name.local.as_str() == tag
+                    }
+                })
         })
         .collect()
 }

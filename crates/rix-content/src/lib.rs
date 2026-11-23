@@ -396,6 +396,9 @@ impl ContentRuntime {
 
         let doc_url = self.web_apis.borrow().location_url.clone();
         let doc_rc = Rc::clone(&self.host.borrow().document);
+        doc_rc
+            .borrow_mut()
+            .set_character_set(rix_html::detect_html_charset(html.as_bytes()));
         let parser = Rc::new(RefCell::new(HtmlParserStream::with_document(doc_rc)));
         parser.borrow_mut().feed(html);
         self.host.borrow_mut().active_parser = Some(Rc::clone(&parser));
@@ -488,12 +491,17 @@ impl ContentRuntime {
                             code,
                             is_module,
                         });
-                    } else if let Err(err) = self.eval_script_cached(&code) {
-                        let msg = format!("{err:?}");
-                        self.web_apis
-                            .borrow_mut()
-                            .record_console("error", msg.clone());
-                        errors.push(msg);
+                    } else {
+                        self.host.borrow_mut().current_script = Some(script_id);
+                        let res = self.eval_script_cached(&code);
+                        self.host.borrow_mut().current_script = None;
+                        if let Err(err) = res {
+                            let msg = format_eval_error(&self.vm, &err);
+                            self.web_apis
+                                .borrow_mut()
+                                .record_console("error", msg.clone());
+                            errors.push(msg);
+                        }
                     }
                 }
                 ParserStreamStep::Done => break,
@@ -548,7 +556,7 @@ impl ContentRuntime {
                     }
                 }
             } else if let Err(err) = self.eval_script_cached(&script.code) {
-                let msg = format!("{err:?}");
+                let msg = format_eval_error(&self.vm, &err);
                 self.web_apis
                     .borrow_mut()
                     .record_console("error", msg.clone());
@@ -1081,5 +1089,29 @@ impl ContentRuntime {
         self.webaudio.borrow_mut().sweep_dead(&self.vm.heap);
         self.host.borrow_mut().sweep_dead_wrappers(&self.vm.heap);
         stats
+    }
+}
+
+fn format_eval_error(vm: &JsVm, err: &EvalError) -> String {
+    match err {
+        EvalError::Compile(ce) => format!("SyntaxError: {ce}"),
+        EvalError::Runtime(exc) => {
+            if let Some(h) = exc.value.as_object() {
+                if let Some(np) = vm.heap.object_get_own(h, vm.key_name, &vm.shapes) {
+                    let name = vm.value_to_rust_string(np.value);
+                    let msg = vm
+                        .heap
+                        .object_get_own(h, vm.key_message, &vm.shapes)
+                        .map(|mp| vm.value_to_rust_string(mp.value))
+                        .unwrap_or_default();
+                    return if msg.is_empty() {
+                        name
+                    } else {
+                        format!("{name}: {msg}")
+                    };
+                }
+            }
+            vm.value_to_rust_string(exc.value)
+        }
     }
 }
