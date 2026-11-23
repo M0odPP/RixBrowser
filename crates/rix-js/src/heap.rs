@@ -1695,6 +1695,59 @@ impl GcHeap {
         true
     }
 
+    /// Replaces an accessor property's getter and setter verbatim (allowing `None` to clear).
+    pub fn object_replace_accessor(
+        &mut self,
+        owner: HeapHandle,
+        key: PropertyKey,
+        getter: Option<HeapHandle>,
+        setter: Option<HeapHandle>,
+        attrs: PropertyAttrs,
+        shapes: &mut ShapeTable,
+    ) -> bool {
+        let Some(obj_ref) = self.get_object(owner) else {
+            return false;
+        };
+        let is_proto = obj_ref.is_prototype;
+        let cur_shape = obj_ref.shape();
+        let acc_attrs = attrs.union(PropertyAttrs::ACCESSOR);
+
+        if cur_shape.is_dictionary() {
+            let Some(obj) = self.get_object_mut(owner) else {
+                return false;
+            };
+            let rare = obj.rare_mut();
+            let entry = rare
+                .dict_props
+                .entry(key)
+                .or_insert_with(|| DictProperty::accessor(None, None, acc_attrs));
+            entry.attrs = acc_attrs;
+            entry.getter = getter;
+            entry.setter = setter;
+            if !rare.dict_order.contains(&key) {
+                rare.dict_order.push(key);
+            }
+        } else {
+            let (new_shape, offset) = shapes.transition_add(cur_shape, key, acc_attrs);
+            let Some(obj) = self.get_object_mut(owner) else {
+                return false;
+            };
+            obj.shape_id = new_shape.0;
+            let idx = offset as usize;
+            if idx >= obj.slots.len() {
+                obj.slots.resize(idx + 1, JsValue::UNDEFINED);
+            }
+            obj.slots[idx] = JsValue::UNDEFINED;
+            let rare = obj.rare_mut();
+            rare.accessors.insert(key, (getter, setter));
+        }
+
+        if is_proto {
+            shapes.bump_prototype_epoch();
+        }
+        true
+    }
+
     /// Runs a fast generational **Minor GC** strictly over the Young nursery + remembered set.
     pub fn collect_minor(&mut self, roots: &[JsValue]) -> GcCycleStats {
         let start = Instant::now();

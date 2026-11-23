@@ -22,6 +22,7 @@ pub mod lexer;
 pub mod modules;
 pub mod parser;
 pub mod promise;
+pub mod proxy;
 pub mod shape;
 pub mod string;
 pub mod value;

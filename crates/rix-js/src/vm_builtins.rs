@@ -288,6 +288,15 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
         1,
         reflect_prevent_extensions,
     );
+    let reflect_tag = JsValue::from_string(vm.heap.alloc_string("Reflect"));
+    let k_tag = vm.key_symbol_to_string_tag;
+    vm.heap.object_define_data(
+        reflect,
+        k_tag,
+        reflect_tag,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
     define_global(vm, "Reflect", JsValue::from_object(reflect));
 
     // Error & NativeError constructors with distinct prototypes (ECMA-262 §20.5)
@@ -789,7 +798,7 @@ fn obj_is_prototype_of(
     };
     let target = vm.to_object(this_val)?;
     for _ in 0..1024 {
-        let Some(proto) = vm.heap.get_object(cur).and_then(|o| o.prototype) else {
+        let Some(proto) = crate::proxy::mop_get_prototype_of(vm, cur)? else {
             return Ok(JsValue::FALSE);
         };
         if proto == target {
@@ -808,22 +817,10 @@ fn obj_property_is_enumerable(
     let prop = vm.to_property_key(args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
     let h = vm.to_object(this_val)?;
     let key = vm.heap.intern_key(&prop);
-    if let Some(p) = vm.heap.object_get_own(h, key, &vm.shapes) {
-        return Ok(JsValue::from_bool(
-            p.attrs.contains(PropertyAttrs::ENUMERABLE),
-        ));
-    }
-    if let Ok(idx) = prop.parse::<u32>() {
-        if let Some(o) = vm.heap.get_object(h) {
-            if let ObjectKind::TypedArray(ta) = o.kind {
-                return Ok(JsValue::from_bool(idx < ta.length));
-            }
-            if o.elements.has(idx) {
-                return Ok(JsValue::TRUE);
-            }
-        }
-    }
-    Ok(JsValue::FALSE)
+    let desc = crate::proxy::mop_get_own_property(vm, h, key)?;
+    Ok(JsValue::from_bool(
+        desc.is_some_and(|d| d.enumerable == Some(true)),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -846,21 +843,7 @@ fn obj_has_own_property(
     let ks = vm.to_property_key(args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
     let h = vm.to_object(this_val)?;
     let key = vm.heap.intern_key(&ks);
-    let has = vm.heap.object_get_own(h, key, &vm.shapes).is_some()
-        || (ks == "length"
-            && matches!(
-                vm.heap.get_object(h).map(|o| &o.kind),
-                Some(ObjectKind::Array)
-            ))
-        || ks.parse::<u32>().ok().is_some_and(|i| {
-            vm.heap.get_object(h).is_some_and(|o| {
-                if let ObjectKind::TypedArray(ta) = o.kind {
-                    i < ta.length
-                } else {
-                    o.elements.has(i)
-                }
-            })
-        });
+    let has = crate::proxy::mop_get_own_property(vm, h, key)?.is_some();
     Ok(JsValue::from_bool(has))
 }
 
@@ -881,7 +864,7 @@ fn obj_get_proto_accessor(
     _args: &[JsValue],
 ) -> Result<JsValue, JsException> {
     let h = vm.to_object(this_val)?;
-    Ok(match vm.heap.get_object(h).and_then(|o| o.prototype) {
+    Ok(match crate::proxy::mop_get_prototype_of(vm, h)? {
         Some(p) => JsValue::from_object(p),
         None => JsValue::NULL,
     })
@@ -903,7 +886,7 @@ fn obj_set_proto_accessor(
         return Ok(JsValue::UNDEFINED);
     };
     let new_proto = proto_val.as_object();
-    if !ordinary_set_prototype_of(vm, h, new_proto) {
+    if !crate::proxy::mop_set_prototype_of(vm, h, new_proto)? {
         return Err(vm.type_error("Cyclic __proto__ value or non-extensible object"));
     }
     Ok(JsValue::UNDEFINED)
@@ -1027,7 +1010,11 @@ fn obj_to_string(
     } else if this_val.is_symbol() {
         "Symbol"
     } else if let Some(h) = this_val.as_object() {
-        // Check `Symbol.toStringTag` first on objects (ECMA-262 §20.1.3.6).
+        // Step 6: IsArray(O) MUST run before @@toStringTag (throws on revoked Proxy).
+        let is_arr = vm
+            .is_array_value(this_val)
+            .map_err(|_| vm.type_error("Cannot perform 'IsArray' on a revoked Proxy"))?;
+        // Check `Symbol.toStringTag` on objects (ECMA-262 §20.1.3.6).
         let tag_key = vm.key_symbol_to_string_tag;
         let tag_val = vm.get_property_by_key(h, tag_key)?;
         if let Some(sh) = tag_val.as_string() {
@@ -1036,7 +1023,9 @@ fn obj_to_string(
                 vm.heap.alloc_string(format!("[object {s}]")),
             ));
         }
-        if let Some(bv) = vm
+        if is_arr {
+            "Array"
+        } else if let Some(bv) = vm
             .heap
             .get_object(h)
             .and_then(|o| o.rare.as_ref())
@@ -1062,14 +1051,10 @@ fn obj_to_string(
             .is_some_and(|r| r.is_error_data)
         {
             "Error"
+        } else if vm.is_callable_handle(h) {
+            "Function"
         } else {
             match vm.heap.get_object(h).map(|o| &o.kind) {
-                Some(ObjectKind::Array) => "Array",
-                Some(
-                    ObjectKind::Closure(_)
-                    | ObjectKind::NativeFunction(_)
-                    | ObjectKind::BoundFunction(_),
-                ) => "Function",
                 Some(ObjectKind::RegExp(_)) => "RegExp",
                 Some(ObjectKind::Date(_)) => "Date",
                 Some(ObjectKind::Map(_)) => "Map",
@@ -1113,9 +1098,14 @@ fn object_create(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsVa
 fn object_keys(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let h = vm.to_object(args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
     let arr = vm.alloc_array();
-    for k in vm.own_enumerable_keys_including_elements(h) {
-        let s = JsValue::from_string(vm.heap.alloc_string(k));
-        vm.heap.object_push_element(arr, s);
+    let own = crate::proxy::mop_own_property_keys(vm, h)?;
+    for (kv, pk) in own {
+        if kv.is_string()
+            && crate::proxy::mop_get_own_property(vm, h, pk)?
+                .is_some_and(|d| d.enumerable == Some(true))
+        {
+            vm.heap.object_push_element(arr, kv);
+        }
     }
     Ok(JsValue::from_object(arr))
 }
@@ -1123,11 +1113,15 @@ fn object_keys(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValu
 fn object_values(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let h = vm.to_object(args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
     let arr = vm.alloc_array();
-    let keys = vm.own_enumerable_keys_including_elements(h);
-    for ks in keys {
-        let kv = JsValue::from_string(vm.heap.alloc_string(ks));
-        let val = vm.get_elem(JsValue::from_object(h), kv)?;
-        vm.heap.object_push_element(arr, val);
+    let own = crate::proxy::mop_own_property_keys(vm, h)?;
+    for (kv, pk) in own {
+        if kv.is_string()
+            && crate::proxy::mop_get_own_property(vm, h, pk)?
+                .is_some_and(|d| d.enumerable == Some(true))
+        {
+            let val = vm.get_property_by_key(h, pk)?;
+            vm.heap.object_push_element(arr, val);
+        }
     }
     Ok(JsValue::from_object(arr))
 }
@@ -1135,14 +1129,18 @@ fn object_values(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsVa
 fn object_entries(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let h = vm.to_object(args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
     let arr = vm.alloc_array();
-    let keys = vm.own_enumerable_keys_including_elements(h);
-    for ks in keys {
-        let kv = JsValue::from_string(vm.heap.alloc_string(ks));
-        let val = vm.get_elem(JsValue::from_object(h), kv)?;
-        let pair = vm.alloc_array();
-        vm.heap.object_push_element(pair, kv);
-        vm.heap.object_push_element(pair, val);
-        vm.heap.object_push_element(arr, JsValue::from_object(pair));
+    let own = crate::proxy::mop_own_property_keys(vm, h)?;
+    for (kv, pk) in own {
+        if kv.is_string()
+            && crate::proxy::mop_get_own_property(vm, h, pk)?
+                .is_some_and(|d| d.enumerable == Some(true))
+        {
+            let val = vm.get_property_by_key(h, pk)?;
+            let pair = vm.alloc_array();
+            vm.heap.object_push_element(pair, kv);
+            vm.heap.object_push_element(pair, val);
+            vm.heap.object_push_element(arr, JsValue::from_object(pair));
+        }
     }
     Ok(JsValue::from_object(arr))
 }
@@ -1155,31 +1153,20 @@ fn object_assign(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsVa
             continue;
         }
         let src = vm.to_object(src_val)?;
-        // Copy own enumerable string/index keys, then own enumerable Symbol keys (ECMA-262 §20.1.2.1).
-        let str_keys = vm.own_enumerable_keys_including_elements(src);
-        for ks in str_keys {
-            let kv = JsValue::from_string(vm.heap.alloc_string(ks));
-            let v = vm.get_elem(JsValue::from_object(src), kv)?;
-            let ok = vm.set_elem_checked(JsValue::from_object(target), kv, v)?;
-            if !ok {
-                return Err(vm.type_error("Cannot assign to read only property"));
-            }
-        }
-        let sym_keys: Vec<_> = vm
-            .own_enumerable_keys(src)
-            .into_iter()
-            .filter(|&k| {
-                vm.heap
-                    .interner()
-                    .get(k)
-                    .is_some_and(|s| crate::vm::is_symbol_key_str(s))
-            })
-            .collect();
-        for k in sym_keys {
-            let v = vm.get_property_by_key(src, k)?;
-            let ok = vm.set_property_by_key(target, k, v)?;
-            if !ok {
-                return Err(vm.type_error("Cannot assign to read only property"));
+        let own = crate::proxy::mop_own_property_keys(vm, src)?;
+        for (kv, pk) in own {
+            if crate::proxy::mop_get_own_property(vm, src, pk)?
+                .is_some_and(|d| d.enumerable == Some(true))
+            {
+                let v = vm.get_property_by_key(src, pk)?;
+                let ok = if kv.is_symbol() {
+                    vm.set_property_by_key(target, pk, v)?
+                } else {
+                    vm.set_elem_checked(JsValue::from_object(target), kv, v)?
+                };
+                if !ok {
+                    return Err(vm.type_error("Cannot assign to read only property"));
+                }
             }
         }
     }
@@ -1192,34 +1179,8 @@ fn object_get_prototype_of(
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
     let h = vm.to_object(args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
-    let proto = vm.heap.get_object(h).and_then(|o| o.prototype);
+    let proto = crate::proxy::mop_get_prototype_of(vm, h)?;
     Ok(proto.map_or(JsValue::NULL, JsValue::from_object))
-}
-
-/// ECMA-262 §10.1.2.1 `OrdinarySetPrototypeOf`: rejects non-extensible changes and prototype cycles.
-fn ordinary_set_prototype_of(vm: &mut JsVm, h: HeapHandle, proto: Option<HeapHandle>) -> bool {
-    let Some(obj) = vm.heap.get_object(h) else {
-        return false;
-    };
-    if obj.prototype == proto {
-        return true;
-    }
-    if !obj.extensible {
-        return false;
-    }
-    // Walk candidate prototype chain to prevent any cycle (including `p == h`).
-    let mut cur = proto;
-    let mut hops = 0usize;
-    while let Some(p) = cur {
-        if p == h || hops > 4096 {
-            return false;
-        }
-        cur = vm.heap.get_object(p).and_then(|o| o.prototype);
-        hops += 1;
-    }
-    vm.heap.object_set_prototype(h, proto, &mut vm.shapes);
-    vm.mega_ic.invalidate_prototypes();
-    true
 }
 
 fn object_set_prototype_of(
@@ -1243,7 +1204,7 @@ fn object_set_prototype_of(
         // Per ES spec §20.1.2.21 step 4: primitive targets return O unchanged after validating proto.
         return Ok(obj_val);
     };
-    if !ordinary_set_prototype_of(vm, h, proto) {
+    if !crate::proxy::mop_set_prototype_of(vm, h, proto)? {
         return Err(vm.type_error("Cyclic __proto__ value or non-extensible object"));
     }
     Ok(obj_val)
@@ -1258,7 +1219,9 @@ fn object_has_own(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsV
 fn object_freeze(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let target = args.first().copied().unwrap_or(JsValue::UNDEFINED);
     if let Some(h) = target.as_object() {
-        crate::builtins_primitives::set_object_integrity_level(vm, h, true);
+        if !crate::builtins_primitives::set_object_integrity_level(vm, h, true)? {
+            return Err(vm.type_error("Cannot freeze object"));
+        }
     }
     Ok(target)
 }
@@ -1731,21 +1694,28 @@ fn array_entries(
 // Proxy & Reflect
 // ---------------------------------------------------------------------------
 
-fn proxy_ctor_fn(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
+fn alloc_proxy_obj(vm: &mut JsVm, args: &[JsValue]) -> Result<HeapHandle, JsException> {
     let (Some(target), Some(handler)) = (
         args.first().and_then(|v| v.as_object()),
         args.get(1).and_then(|v| v.as_object()),
     ) else {
         return Err(vm.type_error("Cannot create proxy with a non-object as target or handler"));
     };
-    let proxy = vm.heap.alloc_object(JsObject::with_kind(
+    Ok(vm.heap.alloc_object(JsObject::with_kind(
         ObjectKind::Proxy(ProxyObject {
             target,
             handler,
             revoked: false,
         }),
         None,
-    ));
+    )))
+}
+
+fn proxy_ctor_fn(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
+    if vm.native_new_target.is_undefined() {
+        return Err(vm.type_error("Constructor Proxy requires 'new'"));
+    }
+    let proxy = alloc_proxy_obj(vm, args)?;
     Ok(JsValue::from_object(proxy))
 }
 
@@ -1754,9 +1724,9 @@ fn proxy_revocable(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let proxy_val = proxy_ctor_fn(vm, JsValue::UNDEFINED, args)?;
-    let proxy_h = proxy_val.as_object().unwrap();
-    let revoke_fn = vm.alloc_host_fn("revoke", move |vm, _this, _args| {
+    let proxy_h = alloc_proxy_obj(vm, args)?;
+    let proxy_val = JsValue::from_object(proxy_h);
+    let revoke_fn = vm.alloc_host_fn("", move |vm, _this, _args| {
         if let Some(o) = vm.heap.get_object_mut(proxy_h) {
             if let ObjectKind::Proxy(ref mut p) = o.kind {
                 p.revoked = true;
@@ -1783,12 +1753,13 @@ fn reflect_get(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValu
     let Some(target) = args.first().and_then(|v| v.as_object()) else {
         return Err(vm.type_error("Reflect.get called on non-object"));
     };
-    let prop_str = vm.value_to_rust_string(args.get(1).copied().unwrap_or(JsValue::UNDEFINED));
+    let prop_str = vm.to_property_key(args.get(1).copied().unwrap_or(JsValue::UNDEFINED))?;
     let key = vm.heap.intern_key(&prop_str);
-    let receiver = args
-        .get(2)
-        .copied()
-        .unwrap_or_else(|| JsValue::from_object(target));
+    let receiver = if args.len() >= 3 {
+        args[2]
+    } else {
+        JsValue::from_object(target)
+    };
     vm.get_property_with_receiver(target, key, receiver)
 }
 
@@ -1796,10 +1767,15 @@ fn reflect_set(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValu
     let Some(target) = args.first().and_then(|v| v.as_object()) else {
         return Err(vm.type_error("Reflect.set called on non-object"));
     };
-    let prop_str = vm.value_to_rust_string(args.get(1).copied().unwrap_or(JsValue::UNDEFINED));
+    let prop_str = vm.to_property_key(args.get(1).copied().unwrap_or(JsValue::UNDEFINED))?;
     let key = vm.heap.intern_key(&prop_str);
     let val = args.get(2).copied().unwrap_or(JsValue::UNDEFINED);
-    let ok = vm.set_property_by_key(target, key, val)?;
+    let receiver = if args.len() >= 4 {
+        args[3]
+    } else {
+        JsValue::from_object(target)
+    };
+    let ok = vm.set_property_with_receiver(target, key, val, receiver)?;
     Ok(JsValue::from_bool(ok))
 }
 
@@ -1807,7 +1783,7 @@ fn reflect_has(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValu
     let Some(target) = args.first().and_then(|v| v.as_object()) else {
         return Err(vm.type_error("Reflect.has called on non-object"));
     };
-    let prop_str = vm.value_to_rust_string(args.get(1).copied().unwrap_or(JsValue::UNDEFINED));
+    let prop_str = vm.to_property_key(args.get(1).copied().unwrap_or(JsValue::UNDEFINED))?;
     let key = vm.heap.intern_key(&prop_str);
     let has = vm.has_property_by_key(target, key)?;
     Ok(JsValue::from_bool(has))
@@ -1821,7 +1797,7 @@ fn reflect_delete_property(
     let Some(target) = args.first().and_then(|v| v.as_object()) else {
         return Err(vm.type_error("Reflect.deleteProperty called on non-object"));
     };
-    let prop_str = vm.value_to_rust_string(args.get(1).copied().unwrap_or(JsValue::UNDEFINED));
+    let prop_str = vm.to_property_key(args.get(1).copied().unwrap_or(JsValue::UNDEFINED))?;
     let key = vm.heap.intern_key(&prop_str);
     let del = vm.delete_property_by_key(target, key)?;
     Ok(JsValue::from_bool(del))
@@ -1829,9 +1805,13 @@ fn reflect_delete_property(
 
 fn reflect_apply(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let target = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+    if !target.as_object().is_some_and(|h| vm.is_callable_handle(h)) {
+        return Err(vm.type_error("Reflect.apply target is not callable"));
+    }
     let this_arg = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
     let arg_list = args.get(2).copied().unwrap_or(JsValue::UNDEFINED);
-    fn_apply(vm, target, &[this_arg, arg_list])
+    let call_args = create_list_from_array_like(vm, arg_list)?;
+    vm.call_value(target, this_arg, &call_args)
 }
 
 fn reflect_construct(
@@ -1866,8 +1846,7 @@ fn reflect_is_extensible(
     let Some(h) = args.first().and_then(|v| v.as_object()) else {
         return Err(vm.type_error("Reflect.isExtensible called on non-object"));
     };
-    let ext = vm.heap.get_object(h).is_some_and(|o| o.extensible);
-    Ok(JsValue::from_bool(ext))
+    Ok(JsValue::from_bool(crate::proxy::mop_is_extensible(vm, h)?))
 }
 
 fn reflect_prevent_extensions(
@@ -1878,18 +1857,21 @@ fn reflect_prevent_extensions(
     let Some(h) = args.first().and_then(|v| v.as_object()) else {
         return Err(vm.type_error("Reflect.preventExtensions called on non-object"));
     };
-    if let Some(o) = vm.heap.get_object_mut(h) {
-        o.extensible = false;
-    }
-    Ok(JsValue::TRUE)
+    Ok(JsValue::from_bool(crate::proxy::mop_prevent_extensions(
+        vm, h,
+    )?))
 }
 
 fn reflect_get_prototype_of(
     vm: &mut JsVm,
-    this: JsValue,
+    _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    object_get_prototype_of(vm, this, args)
+    let Some(h) = args.first().and_then(|v| v.as_object()) else {
+        return Err(vm.type_error("Reflect.getPrototypeOf called on non-object"));
+    };
+    let proto = crate::proxy::mop_get_prototype_of(vm, h)?;
+    Ok(proto.map_or(JsValue::NULL, JsValue::from_object))
 }
 
 fn reflect_set_prototype_of(
@@ -1900,7 +1882,7 @@ fn reflect_set_prototype_of(
     let Some(h) = args.first().and_then(|v| v.as_object()) else {
         return Err(vm.type_error("Reflect.setPrototypeOf called on non-object"));
     };
-    let proto_arg = args.get(1).copied().unwrap_or(JsValue::NULL);
+    let proto_arg = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
     let proto = if proto_arg.is_null() {
         None
     } else if let Some(p) = proto_arg.as_object() {
@@ -1908,13 +1890,23 @@ fn reflect_set_prototype_of(
     } else {
         return Err(vm.type_error("Object prototype may only be an Object or null"));
     };
-    Ok(JsValue::from_bool(ordinary_set_prototype_of(vm, h, proto)))
+    Ok(JsValue::from_bool(crate::proxy::mop_set_prototype_of(
+        vm, h, proto,
+    )?))
 }
 
 fn reflect_own_keys(
     vm: &mut JsVm,
-    this: JsValue,
+    _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    object_keys(vm, this, args)
+    let Some(h) = args.first().and_then(|v| v.as_object()) else {
+        return Err(vm.type_error("Reflect.ownKeys called on non-object"));
+    };
+    let keys = crate::proxy::mop_own_property_keys(vm, h)?;
+    let arr = vm.alloc_array();
+    for (kv, _) in keys {
+        vm.heap.object_push_element(arr, kv);
+    }
+    Ok(JsValue::from_object(arr))
 }
