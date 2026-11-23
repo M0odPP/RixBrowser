@@ -6,6 +6,8 @@
 pub mod duration;
 pub mod instant;
 pub mod options;
+pub mod plain_date;
+pub mod plain_time;
 
 use temporal_rs::error::ErrorKind;
 use temporal_rs::{Instant, PlainDate, PlainDateTime, PlainTime, TemporalError, ZonedDateTime};
@@ -305,6 +307,8 @@ pub fn install_temporal(vm: &mut JsVm) {
 
     instant::install_instant(vm, ns);
     duration::install_duration(vm, ns);
+    plain_date::install_plain_date_types(vm, ns);
+    plain_time::install_plain_time_types(vm, ns);
 
     // Date.prototype.toTemporalInstant
     let date_proto = vm.date_proto;

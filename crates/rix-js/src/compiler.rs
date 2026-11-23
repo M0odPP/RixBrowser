@@ -3001,6 +3001,18 @@ impl Compiler {
 
         // `super(args...)` constructor call.
         if matches!(callee.kind, ExprKind::Super) {
+            if has_spread {
+                let args_arr = self.cur().alloc_reg()?;
+                self.compile_spread_args_array(args, args_arr)?;
+                self.cur().emit(Instruction::abc(
+                    Opcode::SuperConstruct,
+                    dst,
+                    args_arr,
+                    u8::MAX,
+                ));
+                self.cur().free_to(saved);
+                return Ok(());
+            }
             let base = self.cur().alloc_regs((args.len() + 1) as u8)?;
             self.cur()
                 .emit(Instruction::abc(Opcode::LoadThis, base, 0, 0));
