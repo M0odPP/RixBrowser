@@ -52,6 +52,9 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
     }
     AssertionError.prototype = Object.create(Error.prototype);
     AssertionError.prototype.constructor = AssertionError;
+    AssertionError.prototype.toString = function() {
+        return this.name + ": " + this.message;
+    };
 
     function fail(msg) { throw new AssertionError(msg); }
 
@@ -161,6 +164,8 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
             threw = true;
             if (typeof type === "string" && e && e.name && e.name !== type && e.code !== type) {
                 fail((desc ? desc + ": " : "") + "expected DOMException " + type + " got " + e.name);
+            } else if (typeof type === "number" && e && e.code !== type) {
+                fail((desc ? desc + ": " : "") + "expected DOMException code " + type + " got " + (e.code !== undefined ? e.code : e.name));
             }
         }
         if (!threw) fail((desc ? desc + ": " : "") + "did not throw DOMException " + type);

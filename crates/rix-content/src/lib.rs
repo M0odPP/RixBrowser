@@ -7,6 +7,7 @@
 //! Reference: Spec 05 §2.2, Spec 06 §1–§3, Issues #16 & #17.
 
 pub mod canvas2d;
+pub mod cssom;
 pub mod dom_bridge;
 pub mod event_loop;
 pub mod events;
@@ -167,6 +168,7 @@ impl ContentRuntime {
         let events = install_event_system(&mut vm, &host, &event_loop);
         let observers = install_observers(&mut vm, &host, &event_loop);
         let web_apis = install_web_apis(&mut vm, &host, &events, &event_loop, origin_url, storage);
+        cssom::install_cssom(&mut vm, &host);
         let streams = install_streams(&mut vm, &web_apis);
         let net = install_fetch_and_websocket(&mut vm, &host, &web_apis, &streams, fetch_engine);
         let canvas2d = install_canvas2d(&mut vm, &host, &web_apis);
@@ -1148,24 +1150,51 @@ impl ContentRuntime {
     }
 }
 
+fn lookup_proto_data_prop(
+    vm: &JsVm,
+    start: rix_js::HeapHandle,
+    key: rix_js::PropertyKey,
+) -> Option<JsValue> {
+    let mut cur = Some(start);
+    let mut depth = 0u8;
+    while let Some(h) = cur {
+        if depth > 16 {
+            break;
+        }
+        depth += 1;
+        if let Some(p) = vm.heap.object_get_own(h, key, &vm.shapes) {
+            return Some(p.value);
+        }
+        cur = vm.heap.get_object(h).and_then(|o| o.prototype);
+    }
+    None
+}
+
 fn format_eval_error(vm: &JsVm, err: &EvalError) -> String {
     match err {
         EvalError::Compile(ce) => format!("SyntaxError: {ce}"),
         EvalError::Runtime(exc) => {
             if let Some(h) = exc.value.as_object() {
-                if let Some(np) = vm.heap.object_get_own(h, vm.key_name, &vm.shapes) {
-                    let name = vm.value_to_rust_string(np.value);
-                    let msg = vm
-                        .heap
-                        .object_get_own(h, vm.key_message, &vm.shapes)
-                        .map(|mp| vm.value_to_rust_string(mp.value))
-                        .unwrap_or_default();
+                let name = lookup_proto_data_prop(vm, h, vm.key_name)
+                    .filter(|v| !v.is_undefined())
+                    .map(|v| vm.value_to_rust_string(v));
+                let msg = lookup_proto_data_prop(vm, h, vm.key_message)
+                    .filter(|v| !v.is_undefined())
+                    .map(|v| vm.value_to_rust_string(v))
+                    .unwrap_or_default();
+                if let Some(n) = name {
                     return if msg.is_empty() {
-                        name
+                        n
                     } else {
-                        format!("{name}: {msg}")
+                        format!("{n}: {msg}")
                     };
                 }
+                if !msg.is_empty() {
+                    return msg;
+                }
+            }
+            if !exc.message.is_empty() {
+                return exc.message.clone();
             }
             vm.value_to_rust_string(exc.value)
         }

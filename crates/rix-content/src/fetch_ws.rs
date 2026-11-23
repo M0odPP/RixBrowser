@@ -1609,25 +1609,33 @@ fn install_fetch_fn(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBrid
 
         // Spawn reactive async network task (zero polling!), giving any active
         // ServiceWorker covering the request scope first opportunity to intercept.
-        tokio::spawn(async move {
-            if let Some(intercept_fn) = interceptor {
-                if let Some(rx) = intercept_fn(&fetch_req) {
-                    if let Ok(Some(sw_result)) = rx.await {
-                        let _ = tx.send(AsyncNetEvent::FetchDone {
-                            id,
-                            result: sw_result,
-                        });
-                        return;
+        // Guard with `Handle::try_current()` so synchronous/offline runtimes (e.g. WPT harness)
+        // cleanly reject the Promise instead of panicking with "no reactor running".
+        if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
+            rt_handle.spawn(async move {
+                if let Some(intercept_fn) = interceptor {
+                    if let Some(rx) = intercept_fn(&fetch_req) {
+                        if let Ok(Some(sw_result)) = rx.await {
+                            let _ = tx.send(AsyncNetEvent::FetchDone {
+                                id,
+                                result: sw_result,
+                            });
+                            return;
+                        }
                     }
                 }
-            }
-            let result = match engine.fetch(fetch_req).await {
-                Ok(resp) => Ok(resp),
-                Err(NetError::Aborted) => Err(FetchFailure::Aborted),
-                Err(e) => Err(FetchFailure::TypeError(e.to_string())),
-            };
-            let _ = tx.send(AsyncNetEvent::FetchDone { id, result });
-        });
+                let result = match engine.fetch(fetch_req).await {
+                    Ok(resp) => Ok(resp),
+                    Err(NetError::Aborted) => Err(FetchFailure::Aborted),
+                    Err(e) => Err(FetchFailure::TypeError(e.to_string())),
+                };
+                let _ = tx.send(AsyncNetEvent::FetchDone { id, result });
+            });
+        } else {
+            nb.borrow_mut().pending_fetches.remove(&id);
+            let err = vm.type_error("Network runtime unavailable");
+            reject_promise(vm, promise, err.value);
+        }
 
         Ok(JsValue::from_object(promise))
     });
@@ -1848,7 +1856,14 @@ fn install_websocket(
         };
 
         // Spawn reactive RFC 6455 WebSocket task (ZERO polling!).
-        tokio::spawn(async move {
+        let Ok(rt_handle) = tokio::runtime::Handle::try_current() else {
+            let _ = ev_tx.send(AsyncNetEvent::WsError {
+                id,
+                message: "Network runtime unavailable".to_string(),
+            });
+            return Ok(JsValue::from_object(obj));
+        };
+        rt_handle.spawn(async move {
             let mut conn = match WebSocketConnection::connect(
                 &raw_url,
                 Some(&origin),
