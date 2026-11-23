@@ -4,13 +4,21 @@
 //! Reference: Spec 05 §6 & Issue #15.
 
 use crate::bigint::JsBigInt;
-use crate::heap::{DataViewObject, JsObject, ObjectKind, TypedArrayKind, TypedArrayObject};
+use crate::builtins_atomics::{
+    ab_byte_len, ab_copy_slice, ab_is_detached, ab_is_immutable, ab_is_shared, ab_max_byte_length,
+    ab_read_bytes, ab_shared_backing, ab_write_bytes, dv_effective_byte_len, install_atomics,
+    ta_effective_len, to_bigint_i64, to_index,
+};
+use crate::heap::{
+    DataViewObject, JsObject, ObjectKind, SharedBufferBacking, TypedArrayKind, TypedArrayObject,
+};
 use crate::shape::PropertyAttrs;
 use crate::value::{HeapHandle, JsValue};
 use crate::vm::{JsException, JsVm, NativeFnPtr};
+use crate::vm_builtins::define_method_len;
 
 /// Installs `Map`, `Set`, `WeakMap`, `WeakSet`, `WeakRef`, `ArrayBuffer`, `SharedArrayBuffer`,
-/// `DataView`, all 12 `TypedArray` constructors, and ES2025 `Iterator` helpers.
+/// `DataView`, all 11 `TypedArray` constructors, `Atomics`, and ES2025 `Iterator` helpers.
 pub fn install_collection_builtins(vm: &mut JsVm) {
     install_iterator(vm);
     install_map(vm);
@@ -22,6 +30,7 @@ pub fn install_collection_builtins(vm: &mut JsVm) {
     install_shared_array_buffer(vm);
     install_data_view(vm);
     install_typed_arrays(vm);
+    install_atomics(vm);
 }
 
 fn define_method(vm: &mut JsVm, target: HeapHandle, name: &str, f: NativeFnPtr) {
@@ -38,7 +47,8 @@ fn define_method(vm: &mut JsVm, target: HeapHandle, name: &str, f: NativeFnPtr) 
 
 fn define_getter(vm: &mut JsVm, target: HeapHandle, name: &str, getter: NativeFnPtr) {
     let key = vm.heap.intern_key(name);
-    let g_fn = vm.alloc_native_fn(name, getter);
+    let g_fn = vm.alloc_native_fn(&format!("get {name}"), getter);
+    vm.set_fn_length(g_fn, 0);
     vm.heap.object_define_accessor(
         target,
         key,
@@ -47,6 +57,69 @@ fn define_getter(vm: &mut JsVm, target: HeapHandle, name: &str, getter: NativeFn
         PropertyAttrs::CONFIGURABLE,
         &mut vm.shapes,
     );
+}
+
+fn define_species_getter(vm: &mut JsVm, ctor: HeapHandle) {
+    let sp = vm.alloc_native_fn("get [Symbol.species]", |_vm, t, _| Ok(t));
+    vm.set_fn_length(sp, 0);
+    let k = vm.key_symbol_species;
+    vm.heap.object_define_accessor(
+        ctor,
+        k,
+        Some(sp),
+        None,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+}
+
+fn define_to_string_tag(vm: &mut JsVm, proto: HeapHandle, tag: &str) {
+    let v = JsValue::from_string(vm.heap.alloc_string(tag));
+    let k = vm.key_symbol_to_string_tag;
+    vm.heap
+        .object_define_data(proto, k, v, PropertyAttrs::CONFIGURABLE, &mut vm.shapes);
+}
+
+fn species_ctor_for(
+    vm: &mut JsVm,
+    obj: HeapHandle,
+    default_ctor: HeapHandle,
+) -> Result<JsValue, JsException> {
+    let c = vm.get_property_by_key(obj, vm.key_constructor)?;
+    if c.is_undefined() {
+        return Ok(JsValue::from_object(default_ctor));
+    }
+    let Some(ch) = c.as_object() else {
+        return Err(vm.type_error("constructor property is not an object"));
+    };
+    let s = vm.get_property_by_key(ch, vm.key_symbol_species)?;
+    if s.is_undefined() || s.is_null() {
+        return Ok(JsValue::from_object(default_ctor));
+    }
+    if s.as_object().is_some_and(|h| vm.is_constructor_handle(h)) {
+        return Ok(s);
+    }
+    Err(vm.type_error("Species is not a constructor"))
+}
+
+fn parse_max_byte_length_opt(
+    vm: &mut JsVm,
+    options: JsValue,
+    byte_len: usize,
+) -> Result<Option<usize>, JsException> {
+    let Some(opt_h) = options.as_object() else {
+        return Ok(None);
+    };
+    let k = vm.heap.intern_key("maxByteLength");
+    let mv = vm.get_property_by_key(opt_h, k)?;
+    if mv.is_undefined() {
+        return Ok(None);
+    }
+    let max_len = to_index(vm, mv)?;
+    if byte_len > max_len || max_len > 64 * 1024 * 1024 {
+        return Err(vm.range_error("Invalid maxByteLength"));
+    }
+    Ok(Some(max_len))
 }
 
 fn define_symbol_iterator(vm: &mut JsVm, target: HeapHandle, f: NativeFnPtr) {
@@ -845,12 +918,12 @@ fn install_weak_ref(vm: &mut JsVm) {
 }
 
 // ---------------------------------------------------------------------------
-// ArrayBuffer
+// ArrayBuffer (ECMA-262 §25.1, incl. Resizable ArrayBuffer & transfer)
 // ---------------------------------------------------------------------------
 
-fn require_array_buffer(vm: &mut JsVm, val: JsValue) -> Result<HeapHandle, JsException> {
+fn require_any_buffer(vm: &mut JsVm, val: JsValue) -> Result<HeapHandle, JsException> {
     let Some(h) = val.as_object() else {
-        return Err(vm.type_error("Expected ArrayBuffer"));
+        return Err(vm.type_error("Expected ArrayBuffer or SharedArrayBuffer"));
     };
     if matches!(
         vm.heap.get_object(h).map(|o| &o.kind),
@@ -858,74 +931,245 @@ fn require_array_buffer(vm: &mut JsVm, val: JsValue) -> Result<HeapHandle, JsExc
     ) {
         Ok(h)
     } else {
-        Err(vm.type_error("Expected ArrayBuffer"))
+        Err(vm.type_error("Expected ArrayBuffer or SharedArrayBuffer"))
     }
+}
+
+fn require_unshared_ab(vm: &mut JsVm, val: JsValue) -> Result<HeapHandle, JsException> {
+    let h = require_any_buffer(vm, val)?;
+    if ab_is_shared(vm, h) {
+        return Err(vm.type_error("Method called on incompatible SharedArrayBuffer"));
+    }
+    Ok(h)
 }
 
 pub fn alloc_array_buffer(vm: &mut JsVm, bytes: Vec<u8>) -> HeapHandle {
-    vm.heap.alloc_object(JsObject::with_kind(
-        ObjectKind::ArrayBuffer(Box::new(bytes)),
-        Some(vm.array_buffer_proto),
-    ))
+    alloc_array_buffer_ex(vm, bytes, None)
 }
 
-fn clamp_slice_index(idx: i64, len: usize) -> usize {
-    let len_i = len as i64;
-    if idx < 0 {
-        (len_i + idx).max(0) as usize
-    } else {
-        idx.min(len_i) as usize
+pub fn alloc_array_buffer_ex(
+    vm: &mut JsVm,
+    bytes: Vec<u8>,
+    max_byte_length: Option<usize>,
+) -> HeapHandle {
+    let h = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::ArrayBuffer(Box::new(bytes)),
+        Some(vm.array_buffer_proto),
+    ));
+    if let Some(max) = max_byte_length {
+        if let Some(o) = vm.heap.get_object_mut(h) {
+            o.rare_mut().ab_max_byte_length = Some(max);
+        }
     }
+    h
+}
+
+fn clamp_rel_usize(rel: f64, len: usize) -> usize {
+    if rel == f64::NEG_INFINITY {
+        0
+    } else if rel < 0.0 {
+        (len as f64 + rel).max(0.0) as usize
+    } else if rel >= len as f64 {
+        len
+    } else {
+        rel as usize
+    }
+}
+
+fn ab_transfer_impl(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+    preserve_resizable: bool,
+    make_immutable: bool,
+) -> Result<JsValue, JsException> {
+    let h = require_unshared_ab(vm, this_val)?;
+    let new_len_arg = arg(args, 0);
+    let new_len = if new_len_arg.is_undefined() {
+        ab_byte_len(vm, h)
+    } else {
+        to_index(vm, new_len_arg)?
+    };
+    if ab_is_detached(vm, h) || ab_is_immutable(vm, h) {
+        return Err(vm.type_error("Cannot transfer a detached or immutable ArrayBuffer"));
+    }
+    let old_max = ab_max_byte_length(vm, h);
+    let new_max = if preserve_resizable && !make_immutable {
+        old_max
+    } else {
+        None
+    };
+    if let Some(max) = new_max {
+        if new_len > max {
+            return Err(vm.range_error("Transfer byteLength exceeds maxByteLength"));
+        }
+    }
+    if new_len > 64 * 1024 * 1024 {
+        return Err(vm.range_error("Invalid ArrayBuffer byteLength"));
+    }
+    let cur_len = ab_byte_len(vm, h);
+    let copy_len = cur_len.min(new_len);
+    let mut new_bytes = vec![0u8; new_len];
+    if copy_len > 0 {
+        let src = ab_copy_slice(vm, h, 0, copy_len);
+        new_bytes[..src.len()].copy_from_slice(&src);
+    }
+    vm.detach_array_buffer(h)?;
+    let out_h = alloc_array_buffer_ex(vm, new_bytes, new_max);
+    if make_immutable {
+        if let Some(o) = vm.heap.get_object_mut(out_h) {
+            o.rare_mut().ab_immutable = true;
+        }
+    }
+    Ok(JsValue::from_object(out_h))
 }
 
 fn install_array_buffer(vm: &mut JsVm) {
     let abp = vm.array_buffer_proto;
     define_getter(vm, abp, "byteLength", |vm, this_val, _| {
-        let h = require_array_buffer(vm, this_val)?;
-        let len = match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::ArrayBuffer(b)) => b.len() as f64,
-            _ => 0.0,
-        };
-        Ok(JsValue::from_f64(len))
+        let h = require_unshared_ab(vm, this_val)?;
+        Ok(JsValue::from_f64(ab_byte_len(vm, h) as f64))
     });
-    define_method(vm, abp, "slice", |vm, this_val, args| {
-        let h = require_array_buffer(vm, this_val)?;
-        let len = match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::ArrayBuffer(b)) => b.len(),
-            _ => 0,
-        };
-        let start_n = if arg(args, 0).is_undefined() {
-            0
-        } else {
-            vm.to_number(arg(args, 0))?.trunc() as i64
-        };
-        let end_n = if arg(args, 1).is_undefined() {
-            len as i64
-        } else {
-            vm.to_number(arg(args, 1))?.trunc() as i64
-        };
-        let start = clamp_slice_index(start_n, len);
-        let end = clamp_slice_index(end_n, len).max(start);
-        let sliced = match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::ArrayBuffer(b)) => b[start..end].to_vec(),
-            _ => Vec::new(),
-        };
-        Ok(JsValue::from_object(alloc_array_buffer(vm, sliced)))
+    define_getter(vm, abp, "maxByteLength", |vm, this_val, _| {
+        let h = require_unshared_ab(vm, this_val)?;
+        if ab_is_detached(vm, h) {
+            return Ok(JsValue::from_i32(0));
+        }
+        let max = ab_max_byte_length(vm, h).unwrap_or_else(|| ab_byte_len(vm, h));
+        Ok(JsValue::from_f64(max as f64))
     });
+    define_getter(vm, abp, "resizable", |vm, this_val, _| {
+        let h = require_unshared_ab(vm, this_val)?;
+        Ok(JsValue::from_bool(ab_max_byte_length(vm, h).is_some()))
+    });
+    define_getter(vm, abp, "detached", |vm, this_val, _| {
+        let h = require_unshared_ab(vm, this_val)?;
+        Ok(JsValue::from_bool(ab_is_detached(vm, h)))
+    });
+    define_getter(vm, abp, "immutable", |vm, this_val, _| {
+        let h = require_unshared_ab(vm, this_val)?;
+        Ok(JsValue::from_bool(ab_is_immutable(vm, h)))
+    });
+    define_method_len(vm, abp, "resize", 1, |vm, this_val, args| {
+        let h = require_unshared_ab(vm, this_val)?;
+        let Some(max) = ab_max_byte_length(vm, h) else {
+            return Err(vm.type_error("ArrayBuffer is not resizable"));
+        };
+        let new_len = to_index(vm, arg(args, 0))?;
+        if ab_is_detached(vm, h) || ab_is_immutable(vm, h) {
+            return Err(vm.type_error("Cannot resize a detached or immutable ArrayBuffer"));
+        }
+        if new_len > max {
+            return Err(vm.range_error("New length exceeds maxByteLength"));
+        }
+        if let Some(ObjectKind::ArrayBuffer(buf)) = vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
+            buf.resize(new_len, 0);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    define_method_len(vm, abp, "transfer", 0, |vm, t, args| {
+        ab_transfer_impl(vm, t, args, true, false)
+    });
+    define_method_len(vm, abp, "transferToFixedLength", 0, |vm, t, args| {
+        ab_transfer_impl(vm, t, args, false, false)
+    });
+    define_method_len(vm, abp, "transferToImmutable", 0, |vm, t, args| {
+        ab_transfer_impl(vm, t, args, false, true)
+    });
+    define_method_len(vm, abp, "sliceToImmutable", 2, |vm, this_val, args| {
+        let h = require_unshared_ab(vm, this_val)?;
+        if ab_is_detached(vm, h) {
+            return Err(vm.type_error("Cannot slice a detached ArrayBuffer"));
+        }
+        let len = ab_byte_len(vm, h);
+        let first = clamp_rel_usize(vm.to_integer_or_infinity(arg(args, 0))?, len);
+        let fin = if arg(args, 1).is_undefined() {
+            len
+        } else {
+            clamp_rel_usize(vm.to_integer_or_infinity(arg(args, 1))?, len)
+        };
+        let new_len = fin.saturating_sub(first);
+        if ab_is_detached(vm, h) {
+            return Err(vm.type_error("Source ArrayBuffer was detached"));
+        }
+        let mut bytes = vec![0u8; new_len];
+        let avail = ab_byte_len(vm, h).saturating_sub(first).min(new_len);
+        if avail > 0 {
+            let copied = ab_copy_slice(vm, h, first, first + avail);
+            bytes[..copied.len()].copy_from_slice(&copied);
+        }
+        let out_h = alloc_array_buffer_ex(vm, bytes, None);
+        if let Some(o) = vm.heap.get_object_mut(out_h) {
+            o.rare_mut().ab_immutable = true;
+        }
+        Ok(JsValue::from_object(out_h))
+    });
+    define_method_len(vm, abp, "slice", 2, |vm, this_val, args| {
+        let h = require_unshared_ab(vm, this_val)?;
+        if ab_is_detached(vm, h) {
+            return Err(vm.type_error("Cannot slice a detached ArrayBuffer"));
+        }
+        let len = ab_byte_len(vm, h);
+        let rel_start = vm.to_integer_or_infinity(arg(args, 0))?;
+        let first = clamp_rel_usize(rel_start, len);
+        let fin = if arg(args, 1).is_undefined() {
+            len
+        } else {
+            clamp_rel_usize(vm.to_integer_or_infinity(arg(args, 1))?, len)
+        };
+        let new_len = fin.saturating_sub(first);
+        let k_ab = vm.heap.intern_key("ArrayBuffer");
+        let default_ctor = vm
+            .get_property_by_key(vm.global, k_ab)
+            .ok()
+            .and_then(|v| v.as_object())
+            .unwrap_or(vm.array_buffer_proto);
+        let ctor = species_ctor_for(vm, h, default_ctor)?;
+        let new_val = vm.construct_value(ctor, &[JsValue::from_f64(new_len as f64)], ctor)?;
+        let new_h = require_unshared_ab(vm, new_val)?;
+        if ab_is_detached(vm, new_h) {
+            return Err(vm.type_error("Species constructor returned a detached ArrayBuffer"));
+        }
+        if new_h == h {
+            return Err(vm.type_error("Species constructor returned the same ArrayBuffer"));
+        }
+        if ab_byte_len(vm, new_h) < new_len {
+            return Err(vm.type_error("Species constructor returned too-small ArrayBuffer"));
+        }
+        if ab_is_detached(vm, h) {
+            return Err(vm.type_error("Source ArrayBuffer was detached during slice"));
+        }
+        let available = ab_byte_len(vm, h).saturating_sub(first);
+        let copy_n = new_len.min(available);
+        if copy_n > 0 {
+            let copied = ab_copy_slice(vm, h, first, first + copy_n);
+            if let Some(ObjectKind::ArrayBuffer(dst)) =
+                vm.heap.get_object_mut(new_h).map(|o| &mut o.kind)
+            {
+                dst[..copied.len()].copy_from_slice(&copied);
+            }
+        }
+        Ok(new_val)
+    });
+    define_to_string_tag(vm, abp, "ArrayBuffer");
 
     let ctor = vm.alloc_native_fn("ArrayBuffer", |vm, _this, args| {
-        let raw_len = if arg(args, 0).is_undefined() {
-            0.0
-        } else {
-            vm.to_number(arg(args, 0))?
-        };
-        if !raw_len.is_finite() || raw_len < 0.0 || raw_len > 64.0 * 1024.0 * 1024.0 {
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("Constructor ArrayBuffer requires 'new'"));
+        }
+        let len = to_index(vm, arg(args, 0))?;
+        let max_len = parse_max_byte_length_opt(vm, arg(args, 1), len)?;
+        if len > 64 * 1024 * 1024 {
             return Err(vm.range_error("Invalid ArrayBuffer byteLength"));
         }
-        let len = raw_len.trunc() as usize;
-        Ok(JsValue::from_object(alloc_array_buffer(vm, vec![0u8; len])))
+        Ok(JsValue::from_object(alloc_array_buffer_ex(
+            vm,
+            vec![0u8; len],
+            max_len,
+        )))
     });
-    define_method(vm, ctor, "isView", |vm, _this, args| {
+    vm.set_fn_length(ctor, 1);
+    define_method_len(vm, ctor, "isView", 1, |vm, _this, args| {
         let is_view = arg(args, 0).as_object().is_some_and(|h| {
             matches!(
                 vm.heap.get_object(h).map(|o| &o.kind),
@@ -934,250 +1178,315 @@ fn install_array_buffer(vm: &mut JsVm) {
         });
         Ok(JsValue::from_bool(is_view))
     });
+    define_species_getter(vm, ctor);
     bind_ctor_proto(vm, ctor, abp);
     define_global(vm, "ArrayBuffer", JsValue::from_object(ctor));
 }
 
 // ---------------------------------------------------------------------------
-// DataView
+// DataView (ECMA-262 §25.3, all 11 element types + auto-length tracking)
 // ---------------------------------------------------------------------------
 
-fn require_data_view(vm: &mut JsVm, val: JsValue) -> Result<DataViewObject, JsException> {
+fn require_data_view(
+    vm: &mut JsVm,
+    val: JsValue,
+) -> Result<(HeapHandle, DataViewObject), JsException> {
     let Some(h) = val.as_object() else {
         return Err(vm.type_error("Incompatible DataView receiver"));
     };
     match vm.heap.get_object(h).map(|o| &o.kind) {
-        Some(ObjectKind::DataView(dv)) => Ok(*dv),
+        Some(ObjectKind::DataView(dv)) => Ok((h, *dv)),
         _ => Err(vm.type_error("Incompatible DataView receiver")),
     }
 }
 
-fn dv_read_bytes<const N: usize>(
+fn dv_get_bytes<const N: usize>(
     vm: &mut JsVm,
-    dv: DataViewObject,
-    offset_val: JsValue,
-) -> Result<[u8; N], JsException> {
-    let off_f = vm.to_number(offset_val)?;
-    if !off_f.is_finite() || off_f < 0.0 {
-        return Err(vm.range_error("Offset is outside the bounds of the DataView"));
-    }
-    let off = off_f.trunc() as usize;
-    if off.saturating_add(N) > dv.byte_length as usize {
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<([u8; N], bool), JsException> {
+    let (dv_h, dv) = require_data_view(vm, this_val)?;
+    let off = to_index(vm, arg(args, 0))?;
+    let le = vm.to_boolean(arg(args, 1));
+    let Some(view_len) = dv_effective_byte_len(vm, dv_h, dv) else {
+        return Err(vm.type_error("DataView buffer is detached or out of bounds"));
+    };
+    if off.checked_add(N).is_none_or(|end| end > view_len as usize) {
         return Err(vm.range_error("Offset is outside the bounds of the DataView"));
     }
     let abs = dv.byte_offset as usize + off;
-    let Some(ObjectKind::ArrayBuffer(buf)) = vm.heap.get_object(dv.buffer).map(|o| &o.kind) else {
-        return Err(vm.type_error("Detached ArrayBuffer"));
-    };
-    if abs + N > buf.len() {
-        return Err(vm.range_error("Offset is outside the bounds of the DataView"));
-    }
-    let mut out = [0u8; N];
-    out.copy_from_slice(&buf[abs..abs + N]);
-    Ok(out)
+    let bytes = ab_read_bytes::<N>(vm, dv.buffer, abs)
+        .ok_or_else(|| vm.range_error("Offset is outside the bounds of the DataView"))?;
+    Ok((bytes, le))
 }
 
-fn dv_write_bytes<const N: usize>(
+fn dv_set_num<const N: usize>(
     vm: &mut JsVm,
-    dv: DataViewObject,
-    offset_val: JsValue,
-    bytes: [u8; N],
-) -> Result<(), JsException> {
-    let off_f = vm.to_number(offset_val)?;
-    if !off_f.is_finite() || off_f < 0.0 {
-        return Err(vm.range_error("Offset is outside the bounds of the DataView"));
-    }
-    let off = off_f.trunc() as usize;
-    if off.saturating_add(N) > dv.byte_length as usize {
-        return Err(vm.range_error("Offset is outside the bounds of the DataView"));
-    }
-    let abs = dv.byte_offset as usize + off;
-    let Some(ObjectKind::ArrayBuffer(buf)) = vm.heap.get_object_mut(dv.buffer).map(|o| &mut o.kind)
-    else {
-        return Err(vm.type_error("Detached ArrayBuffer"));
+    this_val: JsValue,
+    args: &[JsValue],
+    encode: impl FnOnce(f64, bool) -> [u8; N],
+) -> Result<JsValue, JsException> {
+    let (dv_h, dv) = require_data_view(vm, this_val)?;
+    let off = to_index(vm, arg(args, 0))?;
+    let num = vm.to_number(arg(args, 1))?;
+    let le = vm.to_boolean(arg(args, 2));
+    let Some(view_len) = dv_effective_byte_len(vm, dv_h, dv) else {
+        return Err(vm.type_error("DataView buffer is detached or out of bounds"));
     };
-    if abs + N > buf.len() {
+    if off.checked_add(N).is_none_or(|end| end > view_len as usize) {
         return Err(vm.range_error("Offset is outside the bounds of the DataView"));
     }
-    buf[abs..abs + N].copy_from_slice(&bytes);
-    Ok(())
+    let bytes = encode(num, le);
+    if !ab_write_bytes(vm, dv.buffer, dv.byte_offset as usize + off, bytes) {
+        return Err(vm.type_error("DataView buffer is detached or out of bounds"));
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn dv_set_bigint(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let (dv_h, dv) = require_data_view(vm, this_val)?;
+    let off = to_index(vm, arg(args, 0))?;
+    let bits = to_bigint_i64(vm, arg(args, 1))?;
+    let le = vm.to_boolean(arg(args, 2));
+    let Some(view_len) = dv_effective_byte_len(vm, dv_h, dv) else {
+        return Err(vm.type_error("DataView buffer is detached or out of bounds"));
+    };
+    if off.checked_add(8).is_none_or(|end| end > view_len as usize) {
+        return Err(vm.range_error("Offset is outside the bounds of the DataView"));
+    }
+    let bytes = if le {
+        bits.to_le_bytes()
+    } else {
+        bits.to_be_bytes()
+    };
+    if !ab_write_bytes(vm, dv.buffer, dv.byte_offset as usize + off, bytes) {
+        return Err(vm.type_error("DataView buffer is detached or out of bounds"));
+    }
+    Ok(JsValue::UNDEFINED)
 }
 
 fn install_data_view(vm: &mut JsVm) {
     let dvp = vm.data_view_proto;
     define_getter(vm, dvp, "buffer", |vm, this_val, _| {
-        let dv = require_data_view(vm, this_val)?;
+        let (_, dv) = require_data_view(vm, this_val)?;
         Ok(JsValue::from_object(dv.buffer))
     });
     define_getter(vm, dvp, "byteOffset", |vm, this_val, _| {
-        let dv = require_data_view(vm, this_val)?;
+        let (dv_h, dv) = require_data_view(vm, this_val)?;
+        if dv_effective_byte_len(vm, dv_h, dv).is_none() {
+            return Err(vm.type_error("DataView buffer is detached or out of bounds"));
+        }
         Ok(JsValue::from_f64(f64::from(dv.byte_offset)))
     });
     define_getter(vm, dvp, "byteLength", |vm, this_val, _| {
-        let dv = require_data_view(vm, this_val)?;
-        Ok(JsValue::from_f64(f64::from(dv.byte_length)))
+        let (dv_h, dv) = require_data_view(vm, this_val)?;
+        let Some(len) = dv_effective_byte_len(vm, dv_h, dv) else {
+            return Err(vm.type_error("DataView buffer is detached or out of bounds"));
+        };
+        Ok(JsValue::from_f64(f64::from(len)))
     });
-    define_method(vm, dvp, "getInt8", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let [b] = dv_read_bytes::<1>(vm, dv, arg(args, 0))?;
+    define_method_len(vm, dvp, "getInt8", 1, |vm, t, args| {
+        let ([b], _) = dv_get_bytes::<1>(vm, t, args)?;
         Ok(JsValue::from_i32(i32::from(b as i8)))
     });
-    define_method(vm, dvp, "setInt8", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let v = vm.to_i32(arg(args, 1))? as i8 as u8;
-        dv_write_bytes(vm, dv, arg(args, 0), [v])?;
-        Ok(JsValue::UNDEFINED)
+    define_method_len(vm, dvp, "setInt8", 2, |vm, t, args| {
+        dv_set_num::<1>(vm, t, args, |n, _| [to_int32_bits(n) as i8 as u8])
     });
-    define_method(vm, dvp, "getUint8", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let [b] = dv_read_bytes::<1>(vm, dv, arg(args, 0))?;
+    define_method_len(vm, dvp, "getUint8", 1, |vm, t, args| {
+        let ([b], _) = dv_get_bytes::<1>(vm, t, args)?;
         Ok(JsValue::from_i32(i32::from(b)))
     });
-    define_method(vm, dvp, "setUint8", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let v = vm.to_u32(arg(args, 1))? as u8;
-        dv_write_bytes(vm, dv, arg(args, 0), [v])?;
-        Ok(JsValue::UNDEFINED)
+    define_method_len(vm, dvp, "setUint8", 2, |vm, t, args| {
+        dv_set_num::<1>(vm, t, args, |n, _| [to_int32_bits(n) as u8])
     });
-    define_method(vm, dvp, "getInt16", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let b = dv_read_bytes::<2>(vm, dv, arg(args, 0))?;
-        let le = vm.to_boolean(arg(args, 1));
-        let v = if le {
+    define_method_len(vm, dvp, "getInt16", 1, |vm, t, args| {
+        let (b, le) = dv_get_bytes::<2>(vm, t, args)?;
+        Ok(JsValue::from_i32(i32::from(if le {
             i16::from_le_bytes(b)
         } else {
             i16::from_be_bytes(b)
-        };
-        Ok(JsValue::from_i32(i32::from(v)))
+        })))
     });
-    define_method(vm, dvp, "setInt16", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let v = vm.to_i32(arg(args, 1))? as i16;
-        let le = vm.to_boolean(arg(args, 2));
-        let b = if le { v.to_le_bytes() } else { v.to_be_bytes() };
-        dv_write_bytes(vm, dv, arg(args, 0), b)?;
-        Ok(JsValue::UNDEFINED)
+    define_method_len(vm, dvp, "setInt16", 2, |vm, t, args| {
+        dv_set_num::<2>(vm, t, args, |n, le| {
+            let v = to_int32_bits(n) as i16;
+            if le {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            }
+        })
     });
-    define_method(vm, dvp, "getUint16", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let b = dv_read_bytes::<2>(vm, dv, arg(args, 0))?;
-        let le = vm.to_boolean(arg(args, 1));
-        let v = if le {
+    define_method_len(vm, dvp, "getUint16", 1, |vm, t, args| {
+        let (b, le) = dv_get_bytes::<2>(vm, t, args)?;
+        Ok(JsValue::from_i32(i32::from(if le {
+            u16::from_le_bytes(b)
+        } else {
+            u16::from_be_bytes(b)
+        })))
+    });
+    define_method_len(vm, dvp, "setUint16", 2, |vm, t, args| {
+        dv_set_num::<2>(vm, t, args, |n, le| {
+            let v = to_int32_bits(n) as u16;
+            if le {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            }
+        })
+    });
+    define_method_len(vm, dvp, "getInt32", 1, |vm, t, args| {
+        let (b, le) = dv_get_bytes::<4>(vm, t, args)?;
+        Ok(JsValue::from_i32(if le {
+            i32::from_le_bytes(b)
+        } else {
+            i32::from_be_bytes(b)
+        }))
+    });
+    define_method_len(vm, dvp, "setInt32", 2, |vm, t, args| {
+        dv_set_num::<4>(vm, t, args, |n, le| {
+            let v = to_int32_bits(n);
+            if le {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            }
+        })
+    });
+    define_method_len(vm, dvp, "getUint32", 1, |vm, t, args| {
+        let (b, le) = dv_get_bytes::<4>(vm, t, args)?;
+        Ok(JsValue::from_f64(f64::from(if le {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        })))
+    });
+    define_method_len(vm, dvp, "setUint32", 2, |vm, t, args| {
+        dv_set_num::<4>(vm, t, args, |n, le| {
+            let v = to_int32_bits(n) as u32;
+            if le {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            }
+        })
+    });
+    define_method_len(vm, dvp, "getFloat16", 1, |vm, t, args| {
+        let (b, le) = dv_get_bytes::<2>(vm, t, args)?;
+        let bits = if le {
             u16::from_le_bytes(b)
         } else {
             u16::from_be_bytes(b)
         };
-        Ok(JsValue::from_i32(i32::from(v)))
+        Ok(JsValue::from_f64(f16_to_f64(bits)))
     });
-    define_method(vm, dvp, "setUint16", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let v = vm.to_u32(arg(args, 1))? as u16;
-        let le = vm.to_boolean(arg(args, 2));
-        let b = if le { v.to_le_bytes() } else { v.to_be_bytes() };
-        dv_write_bytes(vm, dv, arg(args, 0), b)?;
-        Ok(JsValue::UNDEFINED)
+    define_method_len(vm, dvp, "setFloat16", 2, |vm, t, args| {
+        dv_set_num::<2>(vm, t, args, |n, le| {
+            let bits = f64_to_f16(n);
+            if le {
+                bits.to_le_bytes()
+            } else {
+                bits.to_be_bytes()
+            }
+        })
     });
-    define_method(vm, dvp, "getInt32", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let b = dv_read_bytes::<4>(vm, dv, arg(args, 0))?;
-        let le = vm.to_boolean(arg(args, 1));
-        let v = if le {
-            i32::from_le_bytes(b)
-        } else {
-            i32::from_be_bytes(b)
-        };
-        Ok(JsValue::from_i32(v))
-    });
-    define_method(vm, dvp, "setInt32", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let v = vm.to_i32(arg(args, 1))?;
-        let le = vm.to_boolean(arg(args, 2));
-        let b = if le { v.to_le_bytes() } else { v.to_be_bytes() };
-        dv_write_bytes(vm, dv, arg(args, 0), b)?;
-        Ok(JsValue::UNDEFINED)
-    });
-    define_method(vm, dvp, "getUint32", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let b = dv_read_bytes::<4>(vm, dv, arg(args, 0))?;
-        let le = vm.to_boolean(arg(args, 1));
-        let v = if le {
-            u32::from_le_bytes(b)
-        } else {
-            u32::from_be_bytes(b)
-        };
-        Ok(JsValue::from_f64(f64::from(v)))
-    });
-    define_method(vm, dvp, "setUint32", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let v = vm.to_u32(arg(args, 1))?;
-        let le = vm.to_boolean(arg(args, 2));
-        let b = if le { v.to_le_bytes() } else { v.to_be_bytes() };
-        dv_write_bytes(vm, dv, arg(args, 0), b)?;
-        Ok(JsValue::UNDEFINED)
-    });
-    define_method(vm, dvp, "getFloat32", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let b = dv_read_bytes::<4>(vm, dv, arg(args, 0))?;
-        let le = vm.to_boolean(arg(args, 1));
-        let v = if le {
+    define_method_len(vm, dvp, "getFloat32", 1, |vm, t, args| {
+        let (b, le) = dv_get_bytes::<4>(vm, t, args)?;
+        Ok(JsValue::from_f64(f64::from(if le {
             f32::from_le_bytes(b)
         } else {
             f32::from_be_bytes(b)
-        };
-        Ok(JsValue::from_f64(f64::from(v)))
+        })))
     });
-    define_method(vm, dvp, "setFloat32", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let v = vm.to_number(arg(args, 1))? as f32;
-        let le = vm.to_boolean(arg(args, 2));
-        let b = if le { v.to_le_bytes() } else { v.to_be_bytes() };
-        dv_write_bytes(vm, dv, arg(args, 0), b)?;
-        Ok(JsValue::UNDEFINED)
+    define_method_len(vm, dvp, "setFloat32", 2, |vm, t, args| {
+        dv_set_num::<4>(vm, t, args, |n, le| {
+            let v = n as f32;
+            if le {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            }
+        })
     });
-    define_method(vm, dvp, "getFloat64", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let b = dv_read_bytes::<8>(vm, dv, arg(args, 0))?;
-        let le = vm.to_boolean(arg(args, 1));
-        let v = if le {
+    define_method_len(vm, dvp, "getFloat64", 1, |vm, t, args| {
+        let (b, le) = dv_get_bytes::<8>(vm, t, args)?;
+        Ok(JsValue::from_f64(if le {
             f64::from_le_bytes(b)
         } else {
             f64::from_be_bytes(b)
+        }))
+    });
+    define_method_len(vm, dvp, "setFloat64", 2, |vm, t, args| {
+        dv_set_num::<8>(vm, t, args, |n, le| {
+            if le {
+                n.to_le_bytes()
+            } else {
+                n.to_be_bytes()
+            }
+        })
+    });
+    define_method_len(vm, dvp, "getBigInt64", 1, |vm, t, args| {
+        let (b, le) = dv_get_bytes::<8>(vm, t, args)?;
+        let v = if le {
+            i64::from_le_bytes(b)
+        } else {
+            i64::from_be_bytes(b)
         };
-        Ok(JsValue::from_f64(v))
+        Ok(JsValue::from_bigint(
+            vm.heap.alloc_bigint(JsBigInt::from_i64(v)),
+        ))
     });
-    define_method(vm, dvp, "setFloat64", |vm, t, args| {
-        let dv = require_data_view(vm, t)?;
-        let v = vm.to_number(arg(args, 1))?;
-        let le = vm.to_boolean(arg(args, 2));
-        let b = if le { v.to_le_bytes() } else { v.to_be_bytes() };
-        dv_write_bytes(vm, dv, arg(args, 0), b)?;
-        Ok(JsValue::UNDEFINED)
+    define_method_len(vm, dvp, "setBigInt64", 2, dv_set_bigint);
+    define_method_len(vm, dvp, "getBigUint64", 1, |vm, t, args| {
+        let (b, le) = dv_get_bytes::<8>(vm, t, args)?;
+        let v = if le {
+            u64::from_le_bytes(b)
+        } else {
+            u64::from_be_bytes(b)
+        };
+        Ok(JsValue::from_bigint(
+            vm.heap.alloc_bigint(JsBigInt::from_i128(i128::from(v))),
+        ))
     });
+    define_method_len(vm, dvp, "setBigUint64", 2, dv_set_bigint);
+    define_to_string_tag(vm, dvp, "DataView");
 
     let ctor = vm.alloc_native_fn("DataView", |vm, _this, args| {
-        let buf_h = require_array_buffer(vm, arg(args, 0))?;
-        let buf_len = match vm.heap.get_object(buf_h).map(|o| &o.kind) {
-            Some(ObjectKind::ArrayBuffer(b)) => b.len(),
-            _ => 0,
-        };
-        let off_f = if arg(args, 1).is_undefined() {
-            0.0
-        } else {
-            vm.to_number(arg(args, 1))?
-        };
-        if !off_f.is_finite() || off_f < 0.0 || (off_f.trunc() as usize) > buf_len {
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("Constructor DataView requires 'new'"));
+        }
+        let buf_h = require_any_buffer(vm, arg(args, 0))?;
+        let byte_offset = to_index(vm, arg(args, 1))?;
+        if ab_is_detached(vm, buf_h) {
+            return Err(vm.type_error("Cannot construct DataView on detached ArrayBuffer"));
+        }
+        let buf_len = ab_byte_len(vm, buf_h);
+        if byte_offset > buf_len {
             return Err(vm.range_error("Start offset is outside the bounds of the buffer"));
         }
-        let byte_offset = off_f.trunc() as usize;
-        let byte_length = if arg(args, 2).is_undefined() {
-            buf_len - byte_offset
+        let (byte_length, auto_len) = if arg(args, 2).is_undefined() {
+            (
+                buf_len - byte_offset,
+                ab_max_byte_length(vm, buf_h).is_some(),
+            )
         } else {
-            let l = vm.to_number(arg(args, 2))?;
-            if !l.is_finite() || l < 0.0 || byte_offset + (l.trunc() as usize) > buf_len {
+            let l = to_index(vm, arg(args, 2))?;
+            if byte_offset.checked_add(l).is_none_or(|end| end > buf_len) {
                 return Err(vm.range_error("Invalid DataView byteLength"));
             }
-            l.trunc() as usize
+            (l, false)
         };
+        if ab_is_detached(vm, buf_h) {
+            return Err(vm.type_error("Cannot construct DataView on detached ArrayBuffer"));
+        }
+        let cur_len = ab_byte_len(vm, buf_h);
+        if byte_offset > cur_len || (!auto_len && byte_offset + byte_length > cur_len) {
+            return Err(vm.range_error("Start offset is outside the bounds of the buffer"));
+        }
         let dv = vm.heap.alloc_object(JsObject::with_kind(
             ObjectKind::DataView(DataViewObject {
                 buffer: buf_h,
@@ -1186,8 +1495,14 @@ fn install_data_view(vm: &mut JsVm) {
             }),
             Some(vm.data_view_proto),
         ));
+        if auto_len {
+            if let Some(o) = vm.heap.get_object_mut(dv) {
+                o.rare_mut().view_auto_length = true;
+            }
+        }
         Ok(JsValue::from_object(dv))
     });
+    vm.set_fn_length(ctor, 1);
     bind_ctor_proto(vm, ctor, dvp);
     define_global(vm, "DataView", JsValue::from_object(ctor));
 }
@@ -1214,59 +1529,61 @@ fn f16_to_f64(bits: u16) -> f64 {
     f64::from(f32::from_bits(f32_bits))
 }
 
+/// Exact IEEE-754 binary64 -> binary16 (round-to-nearest-even without f32 double-rounding).
 fn f64_to_f16(val: f64) -> u16 {
-    let bits = (val as f32).to_bits();
-    let (s, exp, frac) = (
-        ((bits >> 16) & 0x8000) as u16,
-        ((bits >> 23) & 0xFF) as i32,
-        bits & 0x007F_FFFF,
-    );
-    if exp == 0xFF {
-        return s | if frac != 0 { 0x7E00 } else { 0x7C00 };
+    let bits = val.to_bits();
+    let sign = ((bits >> 48) & 0x8000) as u16;
+    let exp = ((bits >> 52) & 0x7FF) as i32;
+    let frac = bits & 0x000F_FFFF_FFFF_FFFF;
+    if exp == 0x7FF {
+        return sign | if frac != 0 { 0x7E00 } else { 0x7C00 };
     }
-    let u = exp - 127;
-    if u > 15 {
-        return s | 0x7C00;
+    let unbiased = exp - 1023;
+    if unbiased > 15 {
+        return sign | 0x7C00;
     }
-    if u < -24 {
-        return s;
+    if unbiased < -25 {
+        return sign;
     }
-    if u < -14 {
-        let (mant, sh) = (0x0080_0000 | frac, (-14 - u) + 13);
-        let (mut r, rem, half) = (mant >> sh, mant & ((1u32 << sh) - 1), 1u32 << (sh - 1));
+    if unbiased < -14 {
+        let mant = 0x0010_0000_0000_0000u64 | frac;
+        let shift = (-14 - unbiased) as u32 + 42;
+        let mut r = mant >> shift;
+        let half = 1u64 << (shift - 1);
+        let rem = mant & ((1u64 << shift) - 1);
         if rem > half || (rem == half && (r & 1) == 1) {
             r += 1;
         }
-        return s | (r as u16);
+        return sign | (r as u16);
     }
-    let (h_exp, mut h_frac, rem) = ((u + 15) as u32, frac >> 13, frac & 0x1FFF);
-    if rem > 0x1000 || (rem == 0x1000 && (h_frac & 1) == 1) {
+    let h_exp = (unbiased + 15) as u16;
+    let mut h_frac = (frac >> 42) as u16;
+    let rem = frac & ((1u64 << 42) - 1);
+    let half = 1u64 << 41;
+    if rem > half || (rem == half && (h_frac & 1) == 1) {
         h_frac += 1;
         if h_frac == 0x400 {
             return if h_exp + 1 >= 0x1F {
-                s | 0x7C00
+                sign | 0x7C00
             } else {
-                s | (((h_exp + 1) as u16) << 10)
+                sign | ((h_exp + 1) << 10)
             };
         }
     }
-    s | ((h_exp as u16) << 10) | (h_frac as u16)
+    sign | (h_exp << 10) | h_frac
 }
 
 fn typed_array_bytes(vm: &JsVm, ta: TypedArrayObject, index: u32) -> Option<[u8; 8]> {
-    if index >= ta.length {
-        return None;
-    }
     let bpe = ta.kind.bytes_per_element();
-    let off = ta.byte_offset as usize + (index as usize) * bpe;
-    let Some(ObjectKind::ArrayBuffer(buf)) = vm.heap.get_object(ta.buffer).map(|o| &o.kind) else {
-        return None;
-    };
-    if off + bpe > buf.len() {
-        return None;
-    }
+    let off = (ta.byte_offset as usize).checked_add((index as usize).checked_mul(bpe)?)?;
     let mut tmp = [0u8; 8];
-    tmp[..bpe].copy_from_slice(&buf[off..off + bpe]);
+    match bpe {
+        1 => tmp[..1].copy_from_slice(&ab_read_bytes::<1>(vm, ta.buffer, off)?),
+        2 => tmp[..2].copy_from_slice(&ab_read_bytes::<2>(vm, ta.buffer, off)?),
+        4 => tmp[..4].copy_from_slice(&ab_read_bytes::<4>(vm, ta.buffer, off)?),
+        8 => tmp.copy_from_slice(&ab_read_bytes::<8>(vm, ta.buffer, off)?),
+        _ => return None,
+    }
     Some(tmp)
 }
 
@@ -1301,7 +1618,7 @@ pub fn typed_array_read_element_string(vm: &JsVm, ta: TypedArrayObject, index: u
     }
 }
 
-/// Reads element `index` from a `TypedArray` backing `ArrayBuffer`.
+/// Reads element `index` from a `TypedArray` backing `ArrayBuffer` / `SharedArrayBuffer`.
 #[must_use]
 pub fn typed_array_read_element(vm: &mut JsVm, ta: TypedArrayObject, index: u32) -> JsValue {
     let Some(b) = typed_array_bytes(vm, ta, index) else {
@@ -1332,21 +1649,79 @@ pub fn typed_array_read_element(vm: &mut JsVm, ta: TypedArrayObject, index: u32)
     }
 }
 
-fn to_bigint_bits(vm: &mut JsVm, val: JsValue) -> Result<i64, JsException> {
-    if let Some(h) = val.as_bigint() {
-        return Ok(vm.heap.get_bigint(h).map_or(0, JsBigInt::to_i64_lossy));
+fn write_ta_raw_num(vm: &mut JsVm, ta: TypedArrayObject, off: usize, num: f64) {
+    match ta.kind {
+        TypedArrayKind::Int8 => {
+            ab_write_bytes(vm, ta.buffer, off, [to_int32_bits(num) as i8 as u8]);
+        }
+        TypedArrayKind::Uint8 => {
+            ab_write_bytes(vm, ta.buffer, off, [to_int32_bits(num) as u8]);
+        }
+        TypedArrayKind::Uint8Clamped => {
+            ab_write_bytes(vm, ta.buffer, off, [clamp_u8_round_even(num)]);
+        }
+        TypedArrayKind::Int16 => {
+            ab_write_bytes(
+                vm,
+                ta.buffer,
+                off,
+                (to_int32_bits(num) as i16).to_ne_bytes(),
+            );
+        }
+        TypedArrayKind::Uint16 => {
+            ab_write_bytes(
+                vm,
+                ta.buffer,
+                off,
+                (to_int32_bits(num) as u16).to_ne_bytes(),
+            );
+        }
+        TypedArrayKind::Float16 => {
+            ab_write_bytes(vm, ta.buffer, off, f64_to_f16(num).to_ne_bytes());
+        }
+        TypedArrayKind::Int32 => {
+            ab_write_bytes(vm, ta.buffer, off, to_int32_bits(num).to_ne_bytes());
+        }
+        TypedArrayKind::Uint32 => {
+            ab_write_bytes(
+                vm,
+                ta.buffer,
+                off,
+                (to_int32_bits(num) as u32).to_ne_bytes(),
+            );
+        }
+        TypedArrayKind::Float32 => {
+            ab_write_bytes(vm, ta.buffer, off, (num as f32).to_ne_bytes());
+        }
+        TypedArrayKind::Float64 => {
+            ab_write_bytes(vm, ta.buffer, off, num.to_ne_bytes());
+        }
+        TypedArrayKind::BigInt64 | TypedArrayKind::BigUint64 => unreachable!(),
     }
-    if let Some(b) = val.as_bool() {
-        return Ok(i64::from(b));
+}
+
+/// ECMA-262 §10.4.5.9 `IntegerIndexedElementSet` (coerces `val` BEFORE detached/OOB check).
+pub fn typed_array_write_element_checked(
+    vm: &mut JsVm,
+    ta_h: HeapHandle,
+    ta: TypedArrayObject,
+    index: u32,
+    val: JsValue,
+) -> Result<(), JsException> {
+    let bpe = ta.kind.bytes_per_element();
+    let off = ta.byte_offset as usize + (index as usize) * bpe;
+    if ta.kind.is_bigint() {
+        let bits = to_bigint_i64(vm, val)?;
+        if ta_effective_len(vm, ta_h, ta).is_some_and(|len| index < len) {
+            ab_write_bytes(vm, ta.buffer, off, bits.to_ne_bytes());
+        }
+        return Ok(());
     }
-    if let Some(sh) = val.as_string() {
-        let s = vm.heap.materialize_string(sh).unwrap_or_default();
-        let bi = JsBigInt::parse_str(&s).ok_or_else(|| {
-            vm.make_error("SyntaxError", format!("Cannot convert {s} to a BigInt"))
-        })?;
-        return Ok(bi.to_i64_lossy());
+    let num = vm.to_number(val)?;
+    if ta_effective_len(vm, ta_h, ta).is_some_and(|len| index < len) {
+        write_ta_raw_num(vm, ta, off, num);
     }
-    Err(vm.type_error("Cannot convert value to a BigInt"))
+    Ok(())
 }
 
 /// Writes `val` coerced to `ta.kind` at element `index` in the backing `ArrayBuffer`.
@@ -1356,65 +1731,15 @@ pub fn typed_array_write_element(
     index: u32,
     val: JsValue,
 ) -> Result<(), JsException> {
-    if index >= ta.length {
-        return Ok(());
-    }
     let bpe = ta.kind.bytes_per_element();
     let off = ta.byte_offset as usize + (index as usize) * bpe;
     if ta.kind.is_bigint() {
-        let bits = to_bigint_bits(vm, val)?;
-        let Some(ObjectKind::ArrayBuffer(buf)) =
-            vm.heap.get_object_mut(ta.buffer).map(|o| &mut o.kind)
-        else {
-            return Ok(());
-        };
-        if off + bpe > buf.len() {
-            return Ok(());
-        }
-        buf[off..off + 8].copy_from_slice(&bits.to_ne_bytes());
+        let bits = to_bigint_i64(vm, val)?;
+        ab_write_bytes(vm, ta.buffer, off, bits.to_ne_bytes());
         return Ok(());
     }
     let num = vm.to_number(val)?;
-    let Some(ObjectKind::ArrayBuffer(buf)) = vm.heap.get_object_mut(ta.buffer).map(|o| &mut o.kind)
-    else {
-        return Ok(());
-    };
-    if off + bpe > buf.len() {
-        return Ok(());
-    }
-    match ta.kind {
-        TypedArrayKind::Int8 => {
-            buf[off] = to_int32_bits(num) as i8 as u8;
-        }
-        TypedArrayKind::Uint8 => {
-            buf[off] = to_int32_bits(num) as u8;
-        }
-        TypedArrayKind::Uint8Clamped => {
-            buf[off] = clamp_u8_round_even(num);
-        }
-        TypedArrayKind::Int16 => {
-            buf[off..off + 2].copy_from_slice(&(to_int32_bits(num) as i16).to_ne_bytes());
-        }
-        TypedArrayKind::Uint16 => {
-            buf[off..off + 2].copy_from_slice(&(to_int32_bits(num) as u16).to_ne_bytes());
-        }
-        TypedArrayKind::Float16 => {
-            buf[off..off + 2].copy_from_slice(&f64_to_f16(num).to_ne_bytes());
-        }
-        TypedArrayKind::Int32 => {
-            buf[off..off + 4].copy_from_slice(&to_int32_bits(num).to_ne_bytes());
-        }
-        TypedArrayKind::Uint32 => {
-            buf[off..off + 4].copy_from_slice(&(to_int32_bits(num) as u32).to_ne_bytes());
-        }
-        TypedArrayKind::Float32 => {
-            buf[off..off + 4].copy_from_slice(&(num as f32).to_ne_bytes());
-        }
-        TypedArrayKind::Float64 => {
-            buf[off..off + 8].copy_from_slice(&num.to_ne_bytes());
-        }
-        TypedArrayKind::BigInt64 | TypedArrayKind::BigUint64 => unreachable!(),
-    }
+    write_ta_raw_num(vm, ta, off, num);
     Ok(())
 }
 
@@ -1448,14 +1773,66 @@ fn clamp_u8_round_even(n: f64) -> u8 {
     rounded as u8
 }
 
-fn require_typed_array(vm: &mut JsVm, val: JsValue) -> Result<TypedArrayObject, JsException> {
+fn require_typed_array_raw(
+    vm: &mut JsVm,
+    val: JsValue,
+) -> Result<(HeapHandle, TypedArrayObject), JsException> {
     let Some(h) = val.as_object() else {
         return Err(vm.type_error("Incompatible TypedArray receiver"));
     };
     match vm.heap.get_object(h).map(|o| &o.kind) {
-        Some(ObjectKind::TypedArray(ta)) => Ok(*ta),
+        Some(ObjectKind::TypedArray(ta)) => Ok((h, *ta)),
         _ => Err(vm.type_error("Incompatible TypedArray receiver")),
     }
+}
+
+fn require_valid_ta(
+    vm: &mut JsVm,
+    val: JsValue,
+) -> Result<(HeapHandle, TypedArrayObject, u32), JsException> {
+    let (h, ta) = require_typed_array_raw(vm, val)?;
+    let Some(len) = ta_effective_len(vm, h, ta) else {
+        return Err(vm.type_error("TypedArray buffer is detached or out of bounds"));
+    };
+    Ok((h, ta, len))
+}
+
+fn require_callable(vm: &mut JsVm, cb: JsValue) -> Result<(), JsException> {
+    if cb.as_object().is_some_and(|h| vm.is_callable_handle(h)) {
+        Ok(())
+    } else {
+        Err(vm.type_error("Callback is not a function"))
+    }
+}
+
+fn ta_default_ctor(vm: &mut JsVm, kind: TypedArrayKind) -> HeapHandle {
+    let k = vm.heap.intern_key(kind.name());
+    vm.get_property_by_key(vm.global, k)
+        .ok()
+        .and_then(|v| v.as_object())
+        .unwrap_or(vm.typed_array_proto)
+}
+
+fn ta_species_create(
+    vm: &mut JsVm,
+    ta_h: HeapHandle,
+    ta: TypedArrayObject,
+    ctor_args: &[JsValue],
+    min_len: Option<u32>,
+) -> Result<(HeapHandle, TypedArrayObject), JsException> {
+    let def_ctor = ta_default_ctor(vm, ta.kind);
+    let c = species_ctor_for(vm, ta_h, def_ctor)?;
+    let created = vm.construct_value(c, ctor_args, c)?;
+    let (out_h, out_ta, out_len) = require_valid_ta(vm, created)?;
+    if let Some(need) = min_len {
+        if out_len < need {
+            return Err(vm.type_error("Derived TypedArray constructor created too small array"));
+        }
+    }
+    if out_ta.kind.is_bigint() != ta.kind.is_bigint() {
+        return Err(vm.type_error("Cannot mix BigInt and other TypedArray types"));
+    }
+    Ok((out_h, out_ta))
 }
 
 pub fn alloc_typed_array(vm: &mut JsVm, kind: TypedArrayKind, length: u32) -> HeapHandle {
@@ -1486,16 +1863,23 @@ fn alloc_typed_array_pair(
     (h, ta)
 }
 
-fn ta_find_last(
+fn ta_find_impl(
     vm: &mut JsVm,
     t: JsValue,
     args: &[JsValue],
     return_index: bool,
+    reverse: bool,
 ) -> Result<JsValue, JsException> {
-    let ta = require_typed_array(vm, t)?;
+    let (ta_h, ta, len) = require_valid_ta(vm, t)?;
     let (cb, this_arg) = (arg(args, 0), arg(args, 1));
-    for i in (0..ta.length).rev() {
-        let v = typed_array_read_element(vm, ta, i);
+    require_callable(vm, cb)?;
+    for step in 0..len {
+        let i = if reverse { len - 1 - step } else { step };
+        let v = if ta_effective_len(vm, ta_h, ta).is_some_and(|l| i < l) {
+            typed_array_read_element(vm, ta, i)
+        } else {
+            JsValue::UNDEFINED
+        };
         let r = vm.call_value(cb, this_arg, &[v, JsValue::from_f64(f64::from(i)), t])?;
         if vm.to_boolean(r) {
             return Ok(if return_index {
@@ -1512,52 +1896,86 @@ fn ta_find_last(
     })
 }
 
+fn ta_quantifier(
+    vm: &mut JsVm,
+    t: JsValue,
+    args: &[JsValue],
+    stop_on: bool,
+) -> Result<JsValue, JsException> {
+    let (ta_h, ta, len) = require_valid_ta(vm, t)?;
+    let (cb, this_arg) = (arg(args, 0), arg(args, 1));
+    require_callable(vm, cb)?;
+    for i in 0..len {
+        let v = if ta_effective_len(vm, ta_h, ta).is_some_and(|l| i < l) {
+            typed_array_read_element(vm, ta, i)
+        } else {
+            JsValue::UNDEFINED
+        };
+        let r = vm.call_value(cb, this_arg, &[v, JsValue::from_f64(f64::from(i)), t])?;
+        if vm.to_boolean(r) == stop_on {
+            return Ok(JsValue::from_bool(stop_on));
+        }
+    }
+    Ok(JsValue::from_bool(!stop_on))
+}
+
 fn construct_typed_array(
     vm: &mut JsVm,
     kind: TypedArrayKind,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
+    if vm.native_new_target.is_undefined() {
+        return Err(vm.type_error(format!("Constructor {} requires 'new'", kind.name())));
+    }
     let bpe = kind.bytes_per_element();
     let first = arg(args, 0);
     if first.is_undefined() {
         return Ok(JsValue::from_object(alloc_typed_array(vm, kind, 0)));
     }
-    // 1. Over an existing ArrayBuffer (shared backing memory!).
+    // 1. Over an existing ArrayBuffer or SharedArrayBuffer (shared backing memory!).
     if let Some(buf_h) = first.as_object() {
-        if let Some(ObjectKind::ArrayBuffer(buf)) = vm.heap.get_object(buf_h).map(|o| &o.kind) {
-            let buf_len = buf.len();
-            let off_f = if arg(args, 1).is_undefined() {
-                0.0
-            } else {
-                vm.to_number(arg(args, 1))?
-            };
-            if !off_f.is_finite() || off_f < 0.0 || (off_f.trunc() as usize) > buf_len {
-                return Err(vm.range_error("TypedArray byteOffset out of range"));
-            }
-            let byte_offset = off_f.trunc() as usize;
+        if matches!(
+            vm.heap.get_object(buf_h).map(|o| &o.kind),
+            Some(ObjectKind::ArrayBuffer(_))
+        ) {
+            let byte_offset = to_index(vm, arg(args, 1))?;
             if !byte_offset.is_multiple_of(bpe) {
                 return Err(
                     vm.range_error("TypedArray byteOffset must be a multiple of element size")
                 );
             }
-            let length = if arg(args, 2).is_undefined() {
-                let rem = buf_len - byte_offset;
-                if !rem.is_multiple_of(bpe) {
-                    return Err(
-                        vm.range_error("ArrayBuffer byteLength not aligned to element size")
-                    );
-                }
-                rem / bpe
+            let len_arg = arg(args, 2);
+            let req_len = if len_arg.is_undefined() {
+                None
             } else {
-                let l = vm.to_number(arg(args, 2))?;
-                if !l.is_finite() || l < 0.0 {
-                    return Err(vm.range_error("Invalid TypedArray length"));
+                Some(to_index(vm, len_arg)?)
+            };
+            if ab_is_detached(vm, buf_h) {
+                return Err(vm.type_error("Cannot construct TypedArray on detached ArrayBuffer"));
+            }
+            let buf_len = ab_byte_len(vm, buf_h);
+            let (length, auto_len) = match req_len {
+                None => {
+                    let resizable = ab_max_byte_length(vm, buf_h).is_some();
+                    if !resizable && !buf_len.is_multiple_of(bpe) {
+                        return Err(
+                            vm.range_error("ArrayBuffer byteLength not aligned to element size")
+                        );
+                    }
+                    if byte_offset > buf_len {
+                        return Err(vm.range_error("TypedArray byteOffset out of range"));
+                    }
+                    ((buf_len - byte_offset) / bpe, resizable)
                 }
-                let count = l.trunc() as usize;
-                if byte_offset + count * bpe > buf_len {
-                    return Err(vm.range_error("TypedArray length exceeds ArrayBuffer bounds"));
+                Some(count) => {
+                    let end = count
+                        .checked_mul(bpe)
+                        .and_then(|n| byte_offset.checked_add(n));
+                    if end.is_none_or(|e| e > buf_len) {
+                        return Err(vm.range_error("TypedArray length exceeds ArrayBuffer bounds"));
+                    }
+                    (count, false)
                 }
-                count
             };
             let proto = vm.typed_array_protos[kind as usize];
             let ta = vm.heap.alloc_object(JsObject::with_kind(
@@ -1569,6 +1987,11 @@ fn construct_typed_array(
                 }),
                 Some(proto),
             ));
+            if auto_len {
+                if let Some(o) = vm.heap.get_object_mut(ta) {
+                    o.rare_mut().view_auto_length = true;
+                }
+            }
             return Ok(JsValue::from_object(ta));
         }
 
@@ -1578,11 +2001,14 @@ fn construct_typed_array(
             _ => None,
         };
         let src_vals = if let Some(src) = src_ta {
+            let Some(eff_len) = ta_effective_len(vm, buf_h, src) else {
+                return Err(vm.type_error("Source TypedArray buffer is detached or out of bounds"));
+            };
             if src.kind.is_bigint() != kind.is_bigint() {
                 return Err(vm.type_error("Cannot mix BigInt and other TypedArray types"));
             }
-            let mut vals = Vec::with_capacity(src.length as usize);
-            for i in 0..src.length {
+            let mut vals = Vec::with_capacity(eff_len as usize);
+            for i in 0..eff_len {
                 vals.push(typed_array_read_element(vm, src, i));
             }
             vals
@@ -1600,269 +2026,408 @@ fn construct_typed_array(
         return Ok(JsValue::from_object(handle));
     }
 
-    // 3. Length constructor.
-    let len_f = vm.to_number(first)?;
+    // 3. Length constructor (`ToIndex`).
+    let len = to_index(vm, first)?;
     let max_elems = (64 * 1024 * 1024) / bpe;
-    if !len_f.is_finite() || len_f < 0.0 || len_f > max_elems as f64 {
+    if len > max_elems {
         return Err(vm.range_error("Invalid TypedArray length"));
     }
     Ok(JsValue::from_object(alloc_typed_array(
-        vm,
-        kind,
-        len_f.trunc() as u32,
+        vm, kind, len as u32,
     )))
 }
 
 fn install_typed_arrays(vm: &mut JsVm) {
     let tap = vm.typed_array_proto;
     // Shared `%TypedArray%` intrinsic constructor (ECMA-262 §23.2.1):
-    // `Object.getPrototypeOf(Int8Array) === %TypedArray%` and `%TypedArray%.prototype === tap`.
     let typed_array_ctor = vm.alloc_native_fn("TypedArray", |vm, _, _| {
         Err(vm.type_error("Abstract class TypedArray not directly constructable"))
+    });
+    vm.set_fn_length(typed_array_ctor, 0);
+    define_species_getter(vm, typed_array_ctor);
+    define_method_len(vm, typed_array_ctor, "from", 1, |vm, this_val, args| {
+        if !this_val
+            .as_object()
+            .is_some_and(|h| vm.is_constructor_handle(h))
+        {
+            return Err(vm.type_error("%TypedArray%.from requires a constructor 'this'"));
+        }
+        let map_arg = arg(args, 1);
+        let mapping = !map_arg.is_undefined();
+        if mapping {
+            require_callable(vm, map_arg)?;
+        }
+        let this_arg = arg(args, 2);
+        let src = collect_iterable_or_array_like(vm, arg(args, 0))?;
+        let created =
+            vm.construct_value(this_val, &[JsValue::from_f64(src.len() as f64)], this_val)?;
+        let (out_h, out_ta, out_len) = require_valid_ta(vm, created)?;
+        if (out_len as usize) < src.len() {
+            return Err(vm.type_error("Derived TypedArray constructor created too small array"));
+        }
+        for (i, item) in src.into_iter().enumerate() {
+            let v = if mapping {
+                vm.call_value(map_arg, this_arg, &[item, JsValue::from_f64(i as f64)])?
+            } else {
+                item
+            };
+            typed_array_write_element_checked(vm, out_h, out_ta, i as u32, v)?;
+        }
+        Ok(created)
+    });
+    define_method_len(vm, typed_array_ctor, "of", 0, |vm, this_val, args| {
+        if !this_val
+            .as_object()
+            .is_some_and(|h| vm.is_constructor_handle(h))
+        {
+            return Err(vm.type_error("%TypedArray%.of requires a constructor 'this'"));
+        }
+        let created =
+            vm.construct_value(this_val, &[JsValue::from_f64(args.len() as f64)], this_val)?;
+        let (out_h, out_ta, out_len) = require_valid_ta(vm, created)?;
+        if (out_len as usize) < args.len() {
+            return Err(vm.type_error("Derived TypedArray constructor created too small array"));
+        }
+        for (i, &v) in args.iter().enumerate() {
+            typed_array_write_element_checked(vm, out_h, out_ta, i as u32, v)?;
+        }
+        Ok(created)
     });
     bind_ctor_proto(vm, typed_array_ctor, tap);
 
     define_getter(vm, tap, "buffer", |vm, t, _| {
-        let ta = require_typed_array(vm, t)?;
+        let (_, ta) = require_typed_array_raw(vm, t)?;
         Ok(JsValue::from_object(ta.buffer))
     });
     define_getter(vm, tap, "byteOffset", |vm, t, _| {
-        let ta = require_typed_array(vm, t)?;
+        let (h, ta) = require_typed_array_raw(vm, t)?;
+        if ta_effective_len(vm, h, ta).is_none() {
+            return Ok(JsValue::from_i32(0));
+        }
         Ok(JsValue::from_f64(f64::from(ta.byte_offset)))
     });
     define_getter(vm, tap, "byteLength", |vm, t, _| {
-        let ta = require_typed_array(vm, t)?;
+        let (h, ta) = require_typed_array_raw(vm, t)?;
+        let len = ta_effective_len(vm, h, ta).unwrap_or(0);
         Ok(JsValue::from_f64(
-            (ta.length as usize * ta.kind.bytes_per_element()) as f64,
+            (len as usize * ta.kind.bytes_per_element()) as f64,
         ))
     });
     define_getter(vm, tap, "length", |vm, t, _| {
-        let ta = require_typed_array(vm, t)?;
-        Ok(JsValue::from_f64(f64::from(ta.length)))
+        let (h, ta) = require_typed_array_raw(vm, t)?;
+        Ok(JsValue::from_f64(f64::from(
+            ta_effective_len(vm, h, ta).unwrap_or(0),
+        )))
     });
-    define_method(vm, tap, "subarray", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
-        let len = ta.length as usize;
-        let begin_n = if arg(args, 0).is_undefined() {
-            0
-        } else {
-            vm.to_number(arg(args, 0))?.trunc() as i64
+    let tag_getter = vm.alloc_native_fn("get [Symbol.toStringTag]", |vm, t, _| {
+        let Some(h) = t.as_object() else {
+            return Ok(JsValue::UNDEFINED);
         };
-        let end_n = if arg(args, 1).is_undefined() {
-            len as i64
-        } else {
-            vm.to_number(arg(args, 1))?.trunc() as i64
+        let Some(ObjectKind::TypedArray(ta)) = vm.heap.get_object(h).map(|o| &o.kind) else {
+            return Ok(JsValue::UNDEFINED);
         };
-        let begin = clamp_slice_index(begin_n, len);
-        let end = clamp_slice_index(end_n, len).max(begin);
+        Ok(JsValue::from_string(vm.heap.alloc_string(ta.kind.name())))
+    });
+    vm.set_fn_length(tag_getter, 0);
+    let k_tag = vm.key_symbol_to_string_tag;
+    vm.heap.object_define_accessor(
+        tap,
+        k_tag,
+        Some(tag_getter),
+        None,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+
+    define_method_len(vm, tap, "subarray", 2, |vm, t, args| {
+        let (ta_h, ta) = require_typed_array_raw(vm, t)?;
+        let src_len = ta_effective_len(vm, ta_h, ta).unwrap_or(0) as usize;
+        let begin_f = vm.to_integer_or_infinity(arg(args, 0))?;
+        let begin = clamp_rel_usize(begin_f, src_len);
         let new_off = ta.byte_offset as usize + begin * ta.kind.bytes_per_element();
-        let proto = vm.typed_array_protos[ta.kind as usize];
-        let sub = vm.heap.alloc_object(JsObject::with_kind(
-            ObjectKind::TypedArray(TypedArrayObject {
-                kind: ta.kind,
-                buffer: ta.buffer,
-                byte_offset: new_off as u32,
-                length: (end - begin) as u32,
-            }),
-            Some(proto),
-        ));
-        Ok(JsValue::from_object(sub))
+        let auto_src = vm
+            .heap
+            .get_object(ta_h)
+            .and_then(|o| o.rare.as_ref())
+            .is_some_and(|r| r.view_auto_length);
+        let ctor_args: Vec<JsValue> = if auto_src && arg(args, 1).is_undefined() {
+            vec![
+                JsValue::from_object(ta.buffer),
+                JsValue::from_f64(new_off as f64),
+            ]
+        } else {
+            let end = if arg(args, 1).is_undefined() {
+                src_len
+            } else {
+                clamp_rel_usize(vm.to_integer_or_infinity(arg(args, 1))?, src_len)
+            };
+            vec![
+                JsValue::from_object(ta.buffer),
+                JsValue::from_f64(new_off as f64),
+                JsValue::from_f64(end.saturating_sub(begin) as f64),
+            ]
+        };
+        let (out_h, _) = ta_species_create(vm, ta_h, ta, &ctor_args, None)?;
+        Ok(JsValue::from_object(out_h))
     });
-    define_method(vm, tap, "slice", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
-        let len = ta.length as usize;
-        let begin_n = if arg(args, 0).is_undefined() {
-            0
+    define_method_len(vm, tap, "slice", 2, |vm, t, args| {
+        let (ta_h, ta, src_len_u32) = require_valid_ta(vm, t)?;
+        let len = src_len_u32 as usize;
+        let begin = clamp_rel_usize(vm.to_integer_or_infinity(arg(args, 0))?, len);
+        let end = if arg(args, 1).is_undefined() {
+            len
         } else {
-            vm.to_number(arg(args, 0))?.trunc() as i64
+            clamp_rel_usize(vm.to_integer_or_infinity(arg(args, 1))?, len)
         };
-        let end_n = if arg(args, 1).is_undefined() {
-            len as i64
-        } else {
-            vm.to_number(arg(args, 1))?.trunc() as i64
-        };
-        let begin = clamp_slice_index(begin_n, len);
-        let end = clamp_slice_index(end_n, len).max(begin);
-        let out_h = alloc_typed_array(vm, ta.kind, (end - begin) as u32);
-        let out_ta = match vm.heap.get_object(out_h).map(|o| &o.kind) {
-            Some(ObjectKind::TypedArray(x)) => *x,
-            _ => unreachable!(),
-        };
-        for i in begin..end {
-            let v = typed_array_read_element(vm, ta, i as u32);
-            typed_array_write_element(vm, out_ta, (i - begin) as u32, v)?;
+        let count = end.saturating_sub(begin) as u32;
+        let (out_h, out_ta) = ta_species_create(
+            vm,
+            ta_h,
+            ta,
+            &[JsValue::from_f64(f64::from(count))],
+            Some(count),
+        )?;
+        if count > 0 {
+            let Some(cur_len) = ta_effective_len(vm, ta_h, ta) else {
+                return Err(vm.type_error("TypedArray buffer was detached during slice"));
+            };
+            let avail = (cur_len as usize).saturating_sub(begin).min(count as usize);
+            for i in 0..avail {
+                let v = typed_array_read_element(vm, ta, (begin + i) as u32);
+                typed_array_write_element_checked(vm, out_h, out_ta, i as u32, v)?;
+            }
         }
         Ok(JsValue::from_object(out_h))
     });
-    define_method(vm, tap, "set", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
+    define_method_len(vm, tap, "set", 1, |vm, t, args| {
+        let (ta_h, ta, target_len) = require_valid_ta(vm, t)?;
         let src = arg(args, 0);
-        let off_f = if arg(args, 1).is_undefined() {
-            0.0
-        } else {
-            vm.to_number(arg(args, 1))?
-        };
-        if !off_f.is_finite() || off_f < 0.0 {
+        let off_f = vm.to_integer_or_infinity(arg(args, 1))?;
+        if off_f < 0.0 {
             return Err(vm.range_error("Offset is out of bounds"));
         }
-        let off = off_f.trunc() as usize;
-        let vals = if let Some(sh) = src.as_object() {
-            let sta_opt = match vm.heap.get_object(sh).map(|o| &o.kind) {
-                Some(ObjectKind::TypedArray(sta)) => Some(*sta),
-                _ => None,
-            };
-            if let Some(sta) = sta_opt {
-                if sta.kind.is_bigint() != ta.kind.is_bigint() {
-                    return Err(vm.type_error("Cannot mix BigInt and other TypedArray types"));
-                }
-                let mut v = Vec::with_capacity(sta.length as usize);
-                for i in 0..sta.length {
-                    v.push(typed_array_read_element(vm, sta, i));
-                }
-                v
-            } else {
-                collect_array_like_only(vm, src)?
-            }
+        let off = if off_f.is_infinite() {
+            usize::MAX
         } else {
-            return Err(vm.type_error("TypedArray.prototype.set source must be an object"));
+            off_f as usize
         };
-        if off + vals.len() > ta.length as usize {
+        let src_ta_opt = src
+            .as_object()
+            .and_then(|sh| vm.heap.get_object(sh).map(|o| (sh, &o.kind)))
+            .and_then(|(sh, k)| match k {
+                ObjectKind::TypedArray(sta) => Some((sh, *sta)),
+                _ => None,
+            });
+        if let Some((sh, sta)) = src_ta_opt {
+            let Some(cur_target_len) = ta_effective_len(vm, ta_h, ta) else {
+                return Err(vm.type_error("Target TypedArray buffer is detached or out of bounds"));
+            };
+            let Some(src_len) = ta_effective_len(vm, sh, sta) else {
+                return Err(vm.type_error("Source TypedArray buffer is detached or out of bounds"));
+            };
+            if sta.kind.is_bigint() != ta.kind.is_bigint() {
+                return Err(vm.type_error("Cannot mix BigInt and other TypedArray types"));
+            }
+            if off
+                .checked_add(src_len as usize)
+                .is_none_or(|e| e > cur_target_len as usize)
+            {
+                return Err(vm.range_error("Source is too large for TypedArray"));
+            }
+            let mut snapshot = Vec::with_capacity(src_len as usize);
+            for i in 0..src_len {
+                snapshot.push(typed_array_read_element(vm, sta, i));
+            }
+            for (i, v) in snapshot.into_iter().enumerate() {
+                typed_array_write_element_checked(vm, ta_h, ta, (off + i) as u32, v)?;
+            }
+            return Ok(JsValue::UNDEFINED);
+        }
+        let src_h = vm.to_object(src)?;
+        let src_len = vm.array_get_len(src_h)?;
+        if ta_effective_len(vm, ta_h, ta).is_none() {
+            return Err(vm.type_error("Target TypedArray buffer is detached or out of bounds"));
+        }
+        if (off as u64)
+            .checked_add(src_len)
+            .is_none_or(|e| e > u64::from(target_len))
+        {
             return Err(vm.range_error("Source is too large for TypedArray"));
         }
-        for (i, v) in vals.into_iter().enumerate() {
-            typed_array_write_element(vm, ta, (off + i) as u32, v)?;
+        for i in 0..src_len {
+            let v = vm.array_get_index(src_h, i)?;
+            typed_array_write_element_checked(vm, ta_h, ta, (off as u64 + i) as u32, v)?;
         }
         Ok(JsValue::UNDEFINED)
     });
-    define_method(vm, tap, "fill", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
-        let val = arg(args, 0);
-        let len = ta.length as usize;
-        let start = if arg(args, 1).is_undefined() {
-            0
+    define_method_len(vm, tap, "fill", 1, |vm, t, args| {
+        let (ta_h, ta, len_u32) = require_valid_ta(vm, t)?;
+        let len = len_u32 as usize;
+        let coerced_val = if ta.kind.is_bigint() {
+            let bits = to_bigint_i64(vm, arg(args, 0))?;
+            JsValue::from_bigint(vm.heap.alloc_bigint(JsBigInt::from_i64(bits)))
         } else {
-            clamp_slice_index(vm.to_number(arg(args, 1))?.trunc() as i64, len)
+            JsValue::from_f64(vm.to_number(arg(args, 0))?)
         };
+        let start = clamp_rel_usize(vm.to_integer_or_infinity(arg(args, 1))?, len);
         let end = if arg(args, 2).is_undefined() {
             len
         } else {
-            clamp_slice_index(vm.to_number(arg(args, 2))?.trunc() as i64, len)
+            clamp_rel_usize(vm.to_integer_or_infinity(arg(args, 2))?, len)
         };
+        let Some(cur_len) = ta_effective_len(vm, ta_h, ta) else {
+            return Err(vm.type_error("TypedArray buffer was detached during fill"));
+        };
+        let end = end.min(cur_len as usize);
         for i in start..end {
-            typed_array_write_element(vm, ta, i as u32, val)?;
+            typed_array_write_element_checked(vm, ta_h, ta, i as u32, coerced_val)?;
         }
         Ok(t)
     });
-    define_method(vm, tap, "at", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
-        let idx_f = vm.to_number(arg(args, 0))?.trunc() as i64;
-        let len = ta.length as i64;
-        let actual = if idx_f < 0 { len + idx_f } else { idx_f };
-        if actual < 0 || actual >= len {
-            Ok(JsValue::UNDEFINED)
+    define_method_len(vm, tap, "at", 1, |vm, t, args| {
+        let (ta_h, ta, len_u32) = require_valid_ta(vm, t)?;
+        let len = len_u32 as f64;
+        let rel = vm.to_integer_or_infinity(arg(args, 0))?;
+        let k = if rel >= 0.0 { rel } else { len + rel };
+        if k < 0.0 || k >= len {
+            return Ok(JsValue::UNDEFINED);
+        }
+        let idx = k as u32;
+        if ta_effective_len(vm, ta_h, ta).is_some_and(|l| idx < l) {
+            Ok(typed_array_read_element(vm, ta, idx))
         } else {
-            Ok(typed_array_read_element(vm, ta, actual as u32))
+            Ok(JsValue::UNDEFINED)
         }
     });
-    define_method(vm, tap, "indexOf", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
+    define_method_len(vm, tap, "indexOf", 1, |vm, t, args| {
+        let (ta_h, ta, len_u32) = require_valid_ta(vm, t)?;
+        let len = len_u32 as usize;
+        if len == 0 {
+            return Ok(JsValue::from_i32(-1));
+        }
         let target = arg(args, 0);
-        let from = if arg(args, 1).is_undefined() {
-            0
-        } else {
-            clamp_slice_index(
-                vm.to_number(arg(args, 1))?.trunc() as i64,
-                ta.length as usize,
-            )
-        };
-        for i in from..ta.length as usize {
-            let v = typed_array_read_element(vm, ta, i as u32);
-            if vm.strict_eq(v, target) {
-                return Ok(JsValue::from_i32(i as i32));
+        let n = vm.to_integer_or_infinity(arg(args, 1))?;
+        if n == f64::INFINITY {
+            return Ok(JsValue::from_i32(-1));
+        }
+        let from = clamp_rel_usize(n, len);
+        for i in from..len {
+            if ta_effective_len(vm, ta_h, ta).is_some_and(|l| (i as u32) < l) {
+                let v = typed_array_read_element(vm, ta, i as u32);
+                if vm.strict_eq(v, target) {
+                    return Ok(JsValue::from_f64(i as f64));
+                }
             }
         }
         Ok(JsValue::from_i32(-1))
     });
-    define_method(vm, tap, "includes", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
+    define_method_len(vm, tap, "includes", 1, |vm, t, args| {
+        let (ta_h, ta, len_u32) = require_valid_ta(vm, t)?;
+        let len = len_u32 as usize;
+        if len == 0 {
+            return Ok(JsValue::FALSE);
+        }
         let target = arg(args, 0);
-        let from = if arg(args, 1).is_undefined() {
-            0
-        } else {
-            clamp_slice_index(
-                vm.to_number(arg(args, 1))?.trunc() as i64,
-                ta.length as usize,
-            )
-        };
-        for i in from..ta.length as usize {
-            let v = typed_array_read_element(vm, ta, i as u32);
+        let n = vm.to_integer_or_infinity(arg(args, 1))?;
+        if n == f64::INFINITY {
+            return Ok(JsValue::FALSE);
+        }
+        let from = clamp_rel_usize(n, len);
+        for i in from..len {
+            let v = if ta_effective_len(vm, ta_h, ta).is_some_and(|l| (i as u32) < l) {
+                typed_array_read_element(vm, ta, i as u32)
+            } else {
+                JsValue::UNDEFINED
+            };
             if same_value_zero(vm, v, target) {
                 return Ok(JsValue::TRUE);
             }
         }
         Ok(JsValue::FALSE)
     });
-    define_method(vm, tap, "forEach", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
-        let cb = arg(args, 0);
-        let this_arg = arg(args, 1);
-        for i in 0..ta.length {
-            let v = typed_array_read_element(vm, ta, i);
+    define_method_len(vm, tap, "forEach", 1, |vm, t, args| {
+        let (ta_h, ta, len) = require_valid_ta(vm, t)?;
+        let (cb, this_arg) = (arg(args, 0), arg(args, 1));
+        require_callable(vm, cb)?;
+        for i in 0..len {
+            let v = if ta_effective_len(vm, ta_h, ta).is_some_and(|l| i < l) {
+                typed_array_read_element(vm, ta, i)
+            } else {
+                JsValue::UNDEFINED
+            };
             vm.call_value(cb, this_arg, &[v, JsValue::from_f64(f64::from(i)), t])?;
         }
         Ok(JsValue::UNDEFINED)
     });
-    define_method(vm, tap, "map", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
-        let cb = arg(args, 0);
-        let this_arg = arg(args, 1);
-        let out_h = alloc_typed_array(vm, ta.kind, ta.length);
-        let out_ta = match vm.heap.get_object(out_h).map(|o| &o.kind) {
-            Some(ObjectKind::TypedArray(x)) => *x,
-            _ => unreachable!(),
-        };
-        for i in 0..ta.length {
-            let v = typed_array_read_element(vm, ta, i);
+    define_method_len(vm, tap, "map", 1, |vm, t, args| {
+        let (ta_h, ta, len) = require_valid_ta(vm, t)?;
+        let (cb, this_arg) = (arg(args, 0), arg(args, 1));
+        require_callable(vm, cb)?;
+        let (out_h, out_ta) = ta_species_create(
+            vm,
+            ta_h,
+            ta,
+            &[JsValue::from_f64(f64::from(len))],
+            Some(len),
+        )?;
+        for i in 0..len {
+            let v = if ta_effective_len(vm, ta_h, ta).is_some_and(|l| i < l) {
+                typed_array_read_element(vm, ta, i)
+            } else {
+                JsValue::UNDEFINED
+            };
             let mapped = vm.call_value(cb, this_arg, &[v, JsValue::from_f64(f64::from(i)), t])?;
-            typed_array_write_element(vm, out_ta, i, mapped)?;
+            typed_array_write_element_checked(vm, out_h, out_ta, i, mapped)?;
         }
         Ok(JsValue::from_object(out_h))
     });
-    define_method(vm, tap, "filter", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
-        let cb = arg(args, 0);
-        let this_arg = arg(args, 1);
+    define_method_len(vm, tap, "filter", 1, |vm, t, args| {
+        let (ta_h, ta, len) = require_valid_ta(vm, t)?;
+        let (cb, this_arg) = (arg(args, 0), arg(args, 1));
+        require_callable(vm, cb)?;
         let mut kept = Vec::new();
-        for i in 0..ta.length {
-            let v = typed_array_read_element(vm, ta, i);
+        for i in 0..len {
+            let v = if ta_effective_len(vm, ta_h, ta).is_some_and(|l| i < l) {
+                typed_array_read_element(vm, ta, i)
+            } else {
+                JsValue::UNDEFINED
+            };
             let keep = vm.call_value(cb, this_arg, &[v, JsValue::from_f64(f64::from(i)), t])?;
             if vm.to_boolean(keep) {
                 kept.push(v);
             }
         }
-        let out_h = alloc_typed_array(vm, ta.kind, kept.len() as u32);
-        let out_ta = match vm.heap.get_object(out_h).map(|o| &o.kind) {
-            Some(ObjectKind::TypedArray(x)) => *x,
-            _ => unreachable!(),
-        };
+        let cnt = kept.len() as u32;
+        let (out_h, out_ta) = ta_species_create(
+            vm,
+            ta_h,
+            ta,
+            &[JsValue::from_f64(f64::from(cnt))],
+            Some(cnt),
+        )?;
         for (i, v) in kept.into_iter().enumerate() {
-            typed_array_write_element(vm, out_ta, i as u32, v)?;
+            typed_array_write_element_checked(vm, out_h, out_ta, i as u32, v)?;
         }
         Ok(JsValue::from_object(out_h))
     });
-    define_method(vm, tap, "reduce", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
+    define_method_len(vm, tap, "reduce", 1, |vm, t, args| {
+        let (ta_h, ta, len) = require_valid_ta(vm, t)?;
         let cb = arg(args, 0);
+        require_callable(vm, cb)?;
         let (mut acc, start) = if args.len() >= 2 {
             (args[1], 0u32)
         } else {
-            if ta.length == 0 {
+            if len == 0 {
                 return Err(vm.type_error("Reduce of empty TypedArray with no initial value"));
             }
             (typed_array_read_element(vm, ta, 0), 1u32)
         };
-        for i in start..ta.length {
-            let v = typed_array_read_element(vm, ta, i);
+        for i in start..len {
+            let v = if ta_effective_len(vm, ta_h, ta).is_some_and(|l| i < l) {
+                typed_array_read_element(vm, ta, i)
+            } else {
+                JsValue::UNDEFINED
+            };
             acc = vm.call_value(
                 cb,
                 JsValue::UNDEFINED,
@@ -1871,23 +2436,43 @@ fn install_typed_arrays(vm: &mut JsVm) {
         }
         Ok(acc)
     });
-    define_method(vm, tap, "reverse", |vm, t, _| {
-        let ta = require_typed_array(vm, t)?;
-        let len = ta.length;
+    define_method_len(vm, tap, "find", 1, |vm, t, args| {
+        ta_find_impl(vm, t, args, false, false)
+    });
+    define_method_len(vm, tap, "findIndex", 1, |vm, t, args| {
+        ta_find_impl(vm, t, args, true, false)
+    });
+    define_method_len(vm, tap, "findLast", 1, |vm, t, args| {
+        ta_find_impl(vm, t, args, false, true)
+    });
+    define_method_len(vm, tap, "findLastIndex", 1, |vm, t, args| {
+        ta_find_impl(vm, t, args, true, true)
+    });
+    define_method_len(vm, tap, "some", 1, |vm, t, args| {
+        ta_quantifier(vm, t, args, true)
+    });
+    define_method_len(vm, tap, "every", 1, |vm, t, args| {
+        ta_quantifier(vm, t, args, false)
+    });
+    define_method_len(vm, tap, "reverse", 0, |vm, t, _| {
+        let (ta_h, ta, len) = require_valid_ta(vm, t)?;
         for i in 0..(len / 2) {
             let j = len - 1 - i;
             let a = typed_array_read_element(vm, ta, i);
             let b = typed_array_read_element(vm, ta, j);
-            typed_array_write_element(vm, ta, i, b)?;
-            typed_array_write_element(vm, ta, j, a)?;
+            typed_array_write_element_checked(vm, ta_h, ta, i, b)?;
+            typed_array_write_element_checked(vm, ta_h, ta, j, a)?;
         }
         Ok(t)
     });
-    define_method(vm, tap, "sort", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
+    define_method_len(vm, tap, "sort", 1, |vm, t, args| {
         let cmp = arg(args, 0);
-        let mut vals = Vec::with_capacity(ta.length as usize);
-        for i in 0..ta.length {
+        if !cmp.is_undefined() {
+            require_callable(vm, cmp)?;
+        }
+        let (ta_h, ta, len) = require_valid_ta(vm, t)?;
+        let mut vals = Vec::with_capacity(len as usize);
+        for i in 0..len {
             vals.push(typed_array_read_element(vm, ta, i));
         }
         if cmp.is_undefined() {
@@ -1920,42 +2505,72 @@ fn install_typed_arrays(vm: &mut JsVm) {
             }
         }
         for (i, v) in vals.into_iter().enumerate() {
-            typed_array_write_element(vm, ta, i as u32, v)?;
+            typed_array_write_element_checked(vm, ta_h, ta, i as u32, v)?;
         }
         Ok(t)
     });
-    define_method(vm, tap, "join", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
+    define_method_len(vm, tap, "join", 1, |vm, t, args| {
+        let (ta_h, ta, len) = require_valid_ta(vm, t)?;
         let sep = if arg(args, 0).is_undefined() {
             ",".to_string()
         } else {
-            vm.value_to_rust_string(arg(args, 0))
+            vm.to_js_string(arg(args, 0))?
         };
-        let parts: Vec<String> = (0..ta.length)
-            .map(|i| typed_array_read_element_string(vm, ta, i))
+        let parts: Vec<String> = (0..len)
+            .map(|i| {
+                if ta_effective_len(vm, ta_h, ta).is_some_and(|l| i < l) {
+                    typed_array_read_element_string(vm, ta, i)
+                } else {
+                    String::new()
+                }
+            })
             .collect();
         Ok(JsValue::from_string(vm.heap.alloc_string(parts.join(&sep))))
     });
-    define_method(vm, tap, "toString", |vm, t, _| {
-        let ta = require_typed_array(vm, t)?;
-        let parts: Vec<String> = (0..ta.length)
-            .map(|i| typed_array_read_element_string(vm, ta, i))
-            .collect();
+    // ECMA-262 §23.2.3.30: `%TypedArray%.prototype.toString === Array.prototype.toString`.
+    let k_to_str = vm.heap.intern_key("toString");
+    if let Ok(arr_to_str) = vm.get_property_by_key(vm.array_proto, k_to_str) {
+        vm.heap.object_define_data(
+            tap,
+            k_to_str,
+            arr_to_str,
+            PropertyAttrs::METHOD,
+            &mut vm.shapes,
+        );
+    }
+    define_method_len(vm, tap, "toLocaleString", 0, |vm, t, _| {
+        let (ta_h, ta, len) = require_valid_ta(vm, t)?;
+        let mut parts = Vec::with_capacity(len as usize);
+        let k_tls = vm.heap.intern_key("toLocaleString");
+        for i in 0..len {
+            if ta_effective_len(vm, ta_h, ta).is_some_and(|l| i < l) {
+                let v = typed_array_read_element(vm, ta, i);
+                let vh = vm.to_object(v)?;
+                let f = vm.get_property_by_key(vh, k_tls)?;
+                let r = vm.call_value(f, v, &[])?;
+                parts.push(vm.to_js_string(r)?);
+            } else {
+                parts.push(String::new());
+            }
+        }
         Ok(JsValue::from_string(vm.heap.alloc_string(parts.join(","))))
     });
-    define_method(vm, tap, "values", typed_array_values_fn);
-    define_symbol_iterator(vm, tap, typed_array_values_fn);
-    define_method(vm, tap, "keys", |vm, t, _| {
-        let ta = require_typed_array(vm, t)?;
-        let items: Vec<JsValue> = (0..ta.length)
-            .map(|i| JsValue::from_f64(f64::from(i)))
-            .collect();
+    define_method_len(vm, tap, "values", 0, typed_array_values_fn);
+    let k_values = vm.heap.intern_key("values");
+    if let Ok(vals_fn) = vm.get_property_by_key(tap, k_values) {
+        let k_iter = vm.key_symbol_iterator;
+        vm.heap
+            .object_define_data(tap, k_iter, vals_fn, PropertyAttrs::METHOD, &mut vm.shapes);
+    }
+    define_method_len(vm, tap, "keys", 0, |vm, t, _| {
+        let (_, _, len) = require_valid_ta(vm, t)?;
+        let items: Vec<JsValue> = (0..len).map(|i| JsValue::from_f64(f64::from(i))).collect();
         Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
     });
-    define_method(vm, tap, "entries", |vm, t, _| {
-        let ta = require_typed_array(vm, t)?;
-        let mut pairs = Vec::with_capacity(ta.length as usize);
-        for i in 0..ta.length {
+    define_method_len(vm, tap, "entries", 0, |vm, t, _| {
+        let (_, ta, len) = require_valid_ta(vm, t)?;
+        let mut pairs = Vec::with_capacity(len as usize);
+        for i in 0..len {
             let elem = typed_array_read_element(vm, ta, i);
             let p = vm.alloc_array();
             vm.heap
@@ -1965,19 +2580,23 @@ fn install_typed_arrays(vm: &mut JsVm) {
         }
         Ok(JsValue::from_object(alloc_values_iterator(vm, pairs)))
     });
-    define_method(vm, tap, "toReversed", |vm, t, _| {
-        let ta = require_typed_array(vm, t)?;
-        let (out_h, out_ta) = alloc_typed_array_pair(vm, ta.kind, ta.length);
-        for i in 0..ta.length {
-            let v = typed_array_read_element(vm, ta, ta.length - 1 - i);
+    define_method_len(vm, tap, "toReversed", 0, |vm, t, _| {
+        let (_, ta, len) = require_valid_ta(vm, t)?;
+        let (out_h, out_ta) = alloc_typed_array_pair(vm, ta.kind, len);
+        for i in 0..len {
+            let v = typed_array_read_element(vm, ta, len - 1 - i);
             typed_array_write_element(vm, out_ta, i, v)?;
         }
         Ok(JsValue::from_object(out_h))
     });
-    define_method(vm, tap, "toSorted", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
-        let (out_h, out_ta) = alloc_typed_array_pair(vm, ta.kind, ta.length);
-        for i in 0..ta.length {
+    define_method_len(vm, tap, "toSorted", 1, |vm, t, args| {
+        let cmp = arg(args, 0);
+        if !cmp.is_undefined() {
+            require_callable(vm, cmp)?;
+        }
+        let (_, ta, len) = require_valid_ta(vm, t)?;
+        let (out_h, out_ta) = alloc_typed_array_pair(vm, ta.kind, len);
+        for i in 0..len {
             let v = typed_array_read_element(vm, ta, i);
             typed_array_write_element(vm, out_ta, i, v)?;
         }
@@ -1985,71 +2604,77 @@ fn install_typed_arrays(vm: &mut JsVm) {
         let sort_fn = vm.get_property_by_key(out_h, sort_k)?;
         vm.call_value(sort_fn, JsValue::from_object(out_h), args)
     });
-    define_method(vm, tap, "with", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
-        let len = i64::from(ta.length);
-        let idx_f = vm.to_number(arg(args, 0))?;
-        let idx = if idx_f.is_nan() {
-            0
+    define_method_len(vm, tap, "with", 2, |vm, t, args| {
+        let (ta_h, ta, len_u32) = require_valid_ta(vm, t)?;
+        let len = len_u32 as f64;
+        let rel = vm.to_integer_or_infinity(arg(args, 0))?;
+        let actual_f = if rel >= 0.0 { rel } else { len + rel };
+        let new_val = if ta.kind.is_bigint() {
+            let bits = to_bigint_i64(vm, arg(args, 1))?;
+            JsValue::from_bigint(vm.heap.alloc_bigint(JsBigInt::from_i64(bits)))
         } else {
-            idx_f.trunc() as i64
+            JsValue::from_f64(vm.to_number(arg(args, 1))?)
         };
-        let actual = if idx < 0 { len + idx } else { idx };
-        if actual < 0 || actual >= len {
+        if actual_f < 0.0 || actual_f >= len {
             return Err(vm.range_error("Invalid index in TypedArray.prototype.with"));
         }
-        let (out_h, out_ta) = alloc_typed_array_pair(vm, ta.kind, ta.length);
-        for i in 0..ta.length {
-            let v = if i == actual as u32 {
-                arg(args, 1)
-            } else {
+        let Some(cur_len) = ta_effective_len(vm, ta_h, ta) else {
+            return Err(vm.type_error("TypedArray buffer was detached"));
+        };
+        let actual = actual_f as u32;
+        if actual >= cur_len {
+            return Err(vm.range_error("Invalid index in TypedArray.prototype.with"));
+        }
+        let (out_h, out_ta) = alloc_typed_array_pair(vm, ta.kind, len_u32);
+        for i in 0..len_u32 {
+            let v = if i == actual {
+                new_val
+            } else if i < cur_len {
                 typed_array_read_element(vm, ta, i)
+            } else {
+                JsValue::UNDEFINED
             };
             typed_array_write_element(vm, out_ta, i, v)?;
         }
         Ok(JsValue::from_object(out_h))
     });
-    define_method(vm, tap, "lastIndexOf", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
+    define_method_len(vm, tap, "lastIndexOf", 1, |vm, t, args| {
+        let (ta_h, ta, len_u32) = require_valid_ta(vm, t)?;
+        if len_u32 == 0 {
+            return Ok(JsValue::from_i32(-1));
+        }
         let target = arg(args, 0);
-        if ta.length == 0 {
-            return Ok(JsValue::from_i32(-1));
-        }
-        let len = i64::from(ta.length);
-        let from = if args.len() > 1 {
-            let f = vm.to_number(arg(args, 1))?;
-            let i = if f.is_nan() { 0 } else { f.trunc() as i64 };
-            if i < 0 {
-                len + i
-            } else {
-                i.min(len - 1)
-            }
+        let len = len_u32 as f64;
+        let n = if args.len() > 1 {
+            vm.to_integer_or_infinity(arg(args, 1))?
         } else {
-            len - 1
+            len - 1.0
         };
-        if from < 0 {
+        let k_f = if n >= 0.0 { n.min(len - 1.0) } else { len + n };
+        if k_f < 0.0 {
             return Ok(JsValue::from_i32(-1));
         }
-        for i in (0..=from as u32).rev() {
-            let v = typed_array_read_element(vm, ta, i);
-            if vm.strict_eq(v, target) {
-                return Ok(JsValue::from_f64(f64::from(i)));
+        for i in (0..=k_f as u32).rev() {
+            if ta_effective_len(vm, ta_h, ta).is_some_and(|l| i < l) {
+                let v = typed_array_read_element(vm, ta, i);
+                if vm.strict_eq(v, target) {
+                    return Ok(JsValue::from_f64(f64::from(i)));
+                }
             }
         }
         Ok(JsValue::from_i32(-1))
     });
-    define_method(vm, tap, "findLast", |vm, t, args| {
-        ta_find_last(vm, t, args, false)
-    });
-    define_method(vm, tap, "findLastIndex", |vm, t, args| {
-        ta_find_last(vm, t, args, true)
-    });
-    define_method(vm, tap, "reduceRight", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
+    define_method_len(vm, tap, "reduceRight", 1, |vm, t, args| {
+        let (ta_h, ta, len) = require_valid_ta(vm, t)?;
         let cb = arg(args, 0);
+        require_callable(vm, cb)?;
         let mut acc = (args.len() > 1).then(|| arg(args, 1));
-        for i in (0..ta.length).rev() {
-            let v = typed_array_read_element(vm, ta, i);
+        for i in (0..len).rev() {
+            let v = if ta_effective_len(vm, ta_h, ta).is_some_and(|l| i < l) {
+                typed_array_read_element(vm, ta, i)
+            } else {
+                JsValue::UNDEFINED
+            };
             acc = Some(if let Some(cur) = acc {
                 vm.call_value(
                     cb,
@@ -2062,37 +2687,31 @@ fn install_typed_arrays(vm: &mut JsVm) {
         }
         acc.ok_or_else(|| vm.type_error("Reduce of empty TypedArray with no initial value"))
     });
-    define_method(vm, tap, "copyWithin", |vm, t, args| {
-        let ta = require_typed_array(vm, t)?;
-        let len = i64::from(ta.length);
-        let clamp = |v: f64| -> usize {
-            let n = if v.is_nan() { 0 } else { v.trunc() as i64 };
-            if n < 0 {
-                (len + n).max(0) as usize
-            } else {
-                n.min(len) as usize
-            }
-        };
-        let to = clamp(vm.to_number(arg(args, 0))?);
-        let from = clamp(vm.to_number(arg(args, 1))?);
+    define_method_len(vm, tap, "copyWithin", 2, |vm, t, args| {
+        let (ta_h, ta, len_u32) = require_valid_ta(vm, t)?;
+        let len = len_u32 as usize;
+        let to = clamp_rel_usize(vm.to_integer_or_infinity(arg(args, 0))?, len);
+        let from = clamp_rel_usize(vm.to_integer_or_infinity(arg(args, 1))?, len);
         let end = if arg(args, 2).is_undefined() {
-            len as usize
+            len
         } else {
-            clamp(vm.to_number(arg(args, 2))?)
+            clamp_rel_usize(vm.to_integer_or_infinity(arg(args, 2))?, len)
         };
-        let count = end
-            .saturating_sub(from)
-            .min((len as usize).saturating_sub(to));
+        let Some(cur_len) = ta_effective_len(vm, ta_h, ta) else {
+            return Err(vm.type_error("TypedArray buffer was detached during copyWithin"));
+        };
+        let cl = cur_len as usize;
+        let count = end.min(cl).saturating_sub(from).min(cl.saturating_sub(to));
         let tmp: Vec<_> = (0..count)
             .map(|i| typed_array_read_element(vm, ta, (from + i) as u32))
             .collect();
         for (i, v) in tmp.into_iter().enumerate() {
-            typed_array_write_element(vm, ta, (to + i) as u32, v)?;
+            typed_array_write_element_checked(vm, ta_h, ta, (to + i) as u32, v)?;
         }
         Ok(t)
     });
 
-    // Install each concrete TypedArray constructor inheriting from `TypedArray.prototype`.
+    // Install each concrete TypedArray constructor inheriting from `%TypedArray%`.
     let k_bpe = vm.heap.intern_key("BYTES_PER_ELEMENT");
     for kind in TypedArrayKind::ALL {
         let proto = vm.typed_array_protos[kind as usize];
@@ -2110,52 +2729,6 @@ fn install_typed_arrays(vm: &mut JsVm) {
         vm.set_fn_length(ctor, 3);
         vm.heap
             .object_define_data(ctor, k_bpe, bpe_val, PropertyAttrs::empty(), &mut vm.shapes);
-        let from_fn = vm.alloc_host_fn("from", move |vm, _this, args| {
-            let src = collect_iterable_or_array_like(vm, arg(args, 0))?;
-            let map_fn = arg(args, 1);
-            let out_h = alloc_typed_array(vm, kind, src.len() as u32);
-            let out_ta = match vm.heap.get_object(out_h).map(|o| &o.kind) {
-                Some(ObjectKind::TypedArray(x)) => *x,
-                _ => unreachable!(),
-            };
-            for (i, item) in src.into_iter().enumerate() {
-                let v = if !map_fn.is_undefined() {
-                    vm.call_value(map_fn, arg(args, 2), &[item, JsValue::from_f64(i as f64)])?
-                } else {
-                    item
-                };
-                typed_array_write_element(vm, out_ta, i as u32, v)?;
-            }
-            Ok(JsValue::from_object(out_h))
-        });
-        vm.set_fn_length(from_fn, 1);
-        let of_fn = vm.alloc_host_fn("of", move |vm, _this, args| {
-            let out_h = alloc_typed_array(vm, kind, args.len() as u32);
-            let out_ta = match vm.heap.get_object(out_h).map(|o| &o.kind) {
-                Some(ObjectKind::TypedArray(x)) => *x,
-                _ => unreachable!(),
-            };
-            for (i, &v) in args.iter().enumerate() {
-                typed_array_write_element(vm, out_ta, i as u32, v)?;
-            }
-            Ok(JsValue::from_object(out_h))
-        });
-        let k_from = vm.heap.intern_key("from");
-        let k_of = vm.heap.intern_key("of");
-        vm.heap.object_define_data(
-            ctor,
-            k_from,
-            JsValue::from_object(from_fn),
-            PropertyAttrs::METHOD,
-            &mut vm.shapes,
-        );
-        vm.heap.object_define_data(
-            ctor,
-            k_of,
-            JsValue::from_object(of_fn),
-            PropertyAttrs::METHOD,
-            &mut vm.shapes,
-        );
         bind_ctor_proto(vm, ctor, proto);
         vm.heap
             .object_set_prototype(ctor, Some(typed_array_ctor), &mut vm.shapes);
@@ -2164,21 +2737,11 @@ fn install_typed_arrays(vm: &mut JsVm) {
 }
 
 fn collect_array_like_only(vm: &mut JsVm, src: JsValue) -> Result<Vec<JsValue>, JsException> {
-    if src.is_null() || src.is_undefined() {
-        return Err(vm.type_error("Cannot convert undefined or null to object"));
-    }
-    let Some(obj) = src.as_object() else {
-        return Ok(Vec::new());
-    };
-    let len_val = vm.get_property_by_key(obj, vm.key_length)?;
-    let n = vm.to_number(len_val)?;
-    if !n.is_finite() || n <= 0.0 {
-        return Ok(Vec::new());
-    }
-    let len = n.trunc().min(4_000_000.0) as u32;
-    let mut out = Vec::with_capacity((len as usize).min(16_384));
+    let obj = vm.to_object(src)?;
+    let len = vm.array_get_len(obj)?.min(4_000_000) as usize;
+    let mut out = Vec::with_capacity(len.min(16_384));
     for i in 0..len {
-        out.push(vm.get_elem(src, JsValue::from_f64(f64::from(i)))?);
+        out.push(vm.array_get_index(obj, i as u64)?);
     }
     Ok(out)
 }
@@ -2194,12 +2757,6 @@ fn collect_iterable_or_array_like(
         return vm.collect_iterable(src);
     }
     if let Some(obj) = src.as_object() {
-        if matches!(
-            vm.heap.get_object(obj).map(|o| &o.kind),
-            Some(ObjectKind::Array)
-        ) {
-            return vm.collect_iterable(src);
-        }
         let iter_m = vm.get_property_by_key(obj, vm.key_symbol_iterator)?;
         if !iter_m.is_undefined() && !iter_m.is_null() {
             return vm.collect_iterable(src);
@@ -2214,75 +2771,110 @@ fn typed_array_values_fn(
     t: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let ta = require_typed_array(vm, t)?;
-    let mut items = Vec::with_capacity(ta.length as usize);
-    for i in 0..ta.length {
+    let (_, ta, len) = require_valid_ta(vm, t)?;
+    let mut items = Vec::with_capacity(len as usize);
+    for i in 0..len {
         items.push(typed_array_read_element(vm, ta, i));
     }
     Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
 }
 
 // ---------------------------------------------------------------------------
-// SharedArrayBuffer (ECMA-262 §25.2)
+// SharedArrayBuffer (ECMA-262 §25.2, real cross-thread SharedBufferBacking)
 // ---------------------------------------------------------------------------
 
-fn require_sab(vm: &mut JsVm, t: JsValue) -> Result<(HeapHandle, usize), JsException> {
-    if let Some(h) = t.as_object() {
-        if let Some(ObjectKind::ArrayBuffer(b)) = vm.heap.get_object(h).map(|o| &o.kind) {
-            return Ok((h, b.len()));
-        }
+fn require_sab(vm: &mut JsVm, t: JsValue) -> Result<HeapHandle, JsException> {
+    let h = require_any_buffer(vm, t)?;
+    if !ab_is_shared(vm, h) {
+        return Err(vm.type_error("SharedArrayBuffer incompatible receiver"));
     }
-    Err(vm.type_error("SharedArrayBuffer incompatible receiver"))
+    Ok(h)
 }
 
 fn install_shared_array_buffer(vm: &mut JsVm) {
-    let sab_proto = vm.alloc_ordinary_object();
-    vm.heap.get_object_mut(sab_proto).unwrap().is_prototype = true;
+    let sab_proto = vm.shared_array_buffer_proto;
     define_getter(vm, sab_proto, "byteLength", |vm, t, _| {
-        Ok(JsValue::from_f64(require_sab(vm, t)?.1 as f64))
+        let h = require_sab(vm, t)?;
+        Ok(JsValue::from_f64(ab_byte_len(vm, h) as f64))
     });
-    define_getter(vm, sab_proto, "growable", |_, _, _| Ok(JsValue::FALSE));
-    define_method(vm, sab_proto, "slice", |vm, t, args| {
-        let (h, len) = require_sab(vm, t)?;
-        let s = if arg(args, 0).is_undefined() {
-            0
-        } else {
-            clamp_slice_index(vm.to_number(arg(args, 0))?.trunc() as i64, len)
+    define_getter(vm, sab_proto, "maxByteLength", |vm, t, _| {
+        let h = require_sab(vm, t)?;
+        let max = ab_max_byte_length(vm, h).unwrap_or_else(|| ab_byte_len(vm, h));
+        Ok(JsValue::from_f64(max as f64))
+    });
+    define_getter(vm, sab_proto, "growable", |vm, t, _| {
+        let h = require_sab(vm, t)?;
+        Ok(JsValue::from_bool(ab_max_byte_length(vm, h).is_some()))
+    });
+    define_method_len(vm, sab_proto, "grow", 1, |vm, t, args| {
+        let h = require_sab(vm, t)?;
+        let Some(shared) = ab_shared_backing(vm, h) else {
+            return Err(vm.type_error("SharedArrayBuffer incompatible receiver"));
         };
-        let e = if arg(args, 1).is_undefined() {
+        if shared.max_byte_length.is_none() {
+            return Err(vm.type_error("SharedArrayBuffer is not growable"));
+        }
+        let new_len = to_index(vm, arg(args, 0))?;
+        match shared.grow(new_len) {
+            Ok(()) => Ok(JsValue::UNDEFINED),
+            Err("not_growable") => Err(vm.type_error("SharedArrayBuffer is not growable")),
+            Err(_) => Err(vm.range_error("Invalid SharedArrayBuffer grow byteLength")),
+        }
+    });
+    define_method_len(vm, sab_proto, "slice", 2, |vm, t, args| {
+        let h = require_sab(vm, t)?;
+        let len = ab_byte_len(vm, h);
+        let first = clamp_rel_usize(vm.to_integer_or_infinity(arg(args, 0))?, len);
+        let fin = if arg(args, 1).is_undefined() {
             len
         } else {
-            clamp_slice_index(vm.to_number(arg(args, 1))?.trunc() as i64, len)
+            clamp_rel_usize(vm.to_integer_or_infinity(arg(args, 1))?, len)
         };
-        let sliced = match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::ArrayBuffer(b)) if e > s => b[s..e].to_vec(),
-            _ => Vec::new(),
-        };
-        let proto = vm.heap.get_object(h).and_then(|o| o.prototype);
-        let out = vm.heap.alloc_object(JsObject::with_kind(
-            ObjectKind::ArrayBuffer(Box::new(sliced)),
-            proto,
-        ));
-        Ok(JsValue::from_object(out))
+        let new_len = fin.saturating_sub(first);
+        let k_sab = vm.heap.intern_key("SharedArrayBuffer");
+        let default_ctor = vm
+            .get_property_by_key(vm.global, k_sab)
+            .ok()
+            .and_then(|v| v.as_object())
+            .unwrap_or(vm.shared_array_buffer_proto);
+        let ctor = species_ctor_for(vm, h, default_ctor)?;
+        let new_val = vm.construct_value(ctor, &[JsValue::from_f64(new_len as f64)], ctor)?;
+        let new_h = require_sab(vm, new_val)?;
+        if new_h == h {
+            return Err(vm.type_error("Species constructor returned same SharedArrayBuffer"));
+        }
+        if ab_byte_len(vm, new_h) < new_len {
+            return Err(vm.type_error("Species constructor returned too-small SharedArrayBuffer"));
+        }
+        if new_len > 0 {
+            let copied = ab_copy_slice(vm, h, first, first + new_len);
+            if let Some(dst_shared) = ab_shared_backing(vm, new_h) {
+                if let Ok(mut g) = dst_shared.data.lock() {
+                    let n = copied.len().min(g.len());
+                    g[..n].copy_from_slice(&copied[..n]);
+                }
+            }
+        }
+        Ok(new_val)
     });
+    define_to_string_tag(vm, sab_proto, "SharedArrayBuffer");
 
-    let ctor = vm.alloc_host_fn("SharedArrayBuffer", move |vm, _this, args| {
-        let byte_len_f = if arg(args, 0).is_undefined() {
-            0.0
-        } else {
-            vm.to_number(arg(args, 0))?
-        };
-        if !byte_len_f.is_finite() || byte_len_f < 0.0 || byte_len_f > 64.0 * 1024.0 * 1024.0 {
+    let ctor = vm.alloc_native_fn("SharedArrayBuffer", |vm, _this, args| {
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("Constructor SharedArrayBuffer requires 'new'"));
+        }
+        let len = to_index(vm, arg(args, 0))?;
+        let max_len = parse_max_byte_length_opt(vm, arg(args, 1), len)?;
+        if len > 64 * 1024 * 1024 {
             return Err(vm.range_error("Invalid SharedArrayBuffer length"));
         }
-        let len = byte_len_f.trunc() as usize;
-        let out = vm.heap.alloc_object(JsObject::with_kind(
-            ObjectKind::ArrayBuffer(Box::new(vec![0u8; len])),
-            Some(sab_proto),
-        ));
-        Ok(JsValue::from_object(out))
+        let backing = std::sync::Arc::new(SharedBufferBacking::new(vec![0u8; len], max_len));
+        Ok(JsValue::from_object(
+            vm.alloc_shared_array_buffer_from_backing(backing),
+        ))
     });
     vm.set_fn_length(ctor, 1);
+    define_species_getter(vm, ctor);
     bind_ctor_proto(vm, ctor, sab_proto);
     define_global(vm, "SharedArrayBuffer", JsValue::from_object(ctor));
 }

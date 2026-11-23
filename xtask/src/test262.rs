@@ -367,11 +367,7 @@ fn install_test262_host(vm: &mut JsVm) {
 
     let detach_fn = vm.alloc_native_fn("detachArrayBuffer", |vm, _this, args| {
         if let Some(h) = args.first().and_then(|v| v.as_object()) {
-            if let Some(ObjectKind::ArrayBuffer(buf)) =
-                vm.heap.get_object_mut(h).map(|o| &mut o.kind)
-            {
-                buf.clear();
-            }
+            vm.detach_array_buffer(h)?;
         }
         Ok(rix_js::JsValue::UNDEFINED)
     });
@@ -383,6 +379,8 @@ fn install_test262_host(vm: &mut JsVm) {
         PropertyAttrs::METHOD,
         &mut vm.shapes,
     );
+
+    install_test262_agent(vm, host);
 
     let create_realm_fn = vm.alloc_native_fn("createRealm", |vm, _this, _args| {
         let k_262 = vm.heap.intern_key("$262");
@@ -403,6 +401,185 @@ fn install_test262_host(vm: &mut JsVm) {
         g,
         k_262,
         rix_js::JsValue::from_object(host),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+}
+
+fn install_test262_agent(vm: &mut JsVm, host: rix_js::HeapHandle) {
+    use rix_js::heap::SharedBufferBacking;
+    use std::collections::VecDeque;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    type BroadcastMsg = (Arc<SharedBufferBacking>, i32);
+    let epoch = Instant::now();
+    let reports: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let workers: Arc<Mutex<Vec<mpsc::Sender<BroadcastMsg>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let agent = vm.alloc_ordinary_object();
+
+    let w_start = Arc::clone(&workers);
+    let r_start = Arc::clone(&reports);
+    let start_fn = vm.alloc_host_fn("start", move |vm, _this, args| {
+        let src = vm.to_js_string(args.first().copied().unwrap_or(rix_js::JsValue::UNDEFINED))?;
+        let (tx, rx) = mpsc::channel::<(Arc<SharedBufferBacking>, i32)>();
+        w_start.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
+        let rep = Arc::clone(&r_start);
+        std::thread::spawn(move || {
+            let mut wvm = JsVm::new();
+            wvm.max_loop_iterations = Some(2_500_000);
+            let w_host = wvm.alloc_ordinary_object();
+            let w_agent = wvm.alloc_ordinary_object();
+
+            let rx_rc = std::rc::Rc::new(std::cell::RefCell::new(Some(rx)));
+            let recv_fn = wvm.alloc_host_fn("receiveBroadcast", move |wvm, _t, args| {
+                let cb = args.first().copied().unwrap_or(rix_js::JsValue::UNDEFINED);
+                if let Some(rx_guard) = rx_rc.borrow().as_ref() {
+                    if let Ok((backing, extra)) = rx_guard.recv_timeout(Duration::from_secs(5)) {
+                        let sab = wvm.alloc_shared_array_buffer_from_backing(backing);
+                        let _ = wvm.call_value(
+                            cb,
+                            rix_js::JsValue::UNDEFINED,
+                            &[
+                                rix_js::JsValue::from_object(sab),
+                                rix_js::JsValue::from_i32(extra),
+                            ],
+                        );
+                    }
+                }
+                Ok(rix_js::JsValue::UNDEFINED)
+            });
+            let rep_w = Arc::clone(&rep);
+            let report_fn = wvm.alloc_host_fn("report", move |wvm, _t, args| {
+                let msg =
+                    wvm.to_js_string(args.first().copied().unwrap_or(rix_js::JsValue::UNDEFINED))?;
+                rep_w
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(msg);
+                Ok(rix_js::JsValue::UNDEFINED)
+            });
+            let sleep_fn = wvm.alloc_native_fn("sleep", |wvm, _t, args| {
+                let ms = wvm
+                    .to_number(args.first().copied().unwrap_or(rix_js::JsValue::UNDEFINED))?
+                    .clamp(0.0, 2000.0);
+                std::thread::sleep(Duration::from_millis(ms as u64));
+                Ok(rix_js::JsValue::UNDEFINED)
+            });
+            let leaving_fn =
+                wvm.alloc_native_fn("leaving", |_wvm, _t, _a| Ok(rix_js::JsValue::UNDEFINED));
+            let w_epoch = epoch;
+            let mono_fn = wvm.alloc_host_fn("monotonicNow", move |_wvm, _t, _a| {
+                Ok(rix_js::JsValue::from_f64(
+                    w_epoch.elapsed().as_secs_f64() * 1000.0,
+                ))
+            });
+            for (name, h) in [
+                ("receiveBroadcast", recv_fn),
+                ("report", report_fn),
+                ("sleep", sleep_fn),
+                ("leaving", leaving_fn),
+                ("monotonicNow", mono_fn),
+            ] {
+                let k = wvm.heap.intern_key(name);
+                wvm.heap.object_define_data(
+                    w_agent,
+                    k,
+                    rix_js::JsValue::from_object(h),
+                    PropertyAttrs::METHOD,
+                    &mut wvm.shapes,
+                );
+            }
+            let k_agent = wvm.heap.intern_key("agent");
+            wvm.heap.object_define_data(
+                w_host,
+                k_agent,
+                rix_js::JsValue::from_object(w_agent),
+                PropertyAttrs::METHOD,
+                &mut wvm.shapes,
+            );
+            let k_262 = wvm.heap.intern_key("$262");
+            let g = wvm.global;
+            wvm.heap.object_define_data(
+                g,
+                k_262,
+                rix_js::JsValue::from_object(w_host),
+                PropertyAttrs::METHOD,
+                &mut wvm.shapes,
+            );
+            let _ = wvm.eval_script(&src);
+            wvm.drain_microtasks();
+        });
+        Ok(rix_js::JsValue::UNDEFINED)
+    });
+
+    let w_bc = Arc::clone(&workers);
+    let broadcast_fn = vm.alloc_host_fn("broadcast", move |vm, _this, args| {
+        let sab_val = args.first().copied().unwrap_or(rix_js::JsValue::UNDEFINED);
+        let extra = args
+            .get(1)
+            .copied()
+            .map(|v| vm.to_i32(v))
+            .transpose()?
+            .unwrap_or(0);
+        let Some(sab_h) = sab_val.as_object() else {
+            return Err(vm.type_error("$262.agent.broadcast requires a SharedArrayBuffer"));
+        };
+        let Some(backing) = rix_js::builtins_atomics::ab_shared_backing(vm, sab_h) else {
+            return Err(vm.type_error("$262.agent.broadcast requires a SharedArrayBuffer"));
+        };
+        let list = w_bc.lock().unwrap_or_else(|e| e.into_inner());
+        for tx in list.iter() {
+            let _ = tx.send((Arc::clone(&backing), extra));
+        }
+        Ok(rix_js::JsValue::UNDEFINED)
+    });
+
+    let r_get = Arc::clone(&reports);
+    let get_report_fn = vm.alloc_host_fn("getReport", move |vm, _this, _args| {
+        let item = r_get.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        Ok(match item {
+            Some(s) => rix_js::JsValue::from_string(vm.heap.alloc_string(s)),
+            None => rix_js::JsValue::NULL,
+        })
+    });
+    let sleep_fn = vm.alloc_native_fn("sleep", |vm, _t, args| {
+        let ms = vm
+            .to_number(args.first().copied().unwrap_or(rix_js::JsValue::UNDEFINED))?
+            .clamp(0.0, 2000.0);
+        std::thread::sleep(Duration::from_millis(ms as u64));
+        Ok(rix_js::JsValue::UNDEFINED)
+    });
+    let leaving_fn = vm.alloc_native_fn("leaving", |_vm, _t, _a| Ok(rix_js::JsValue::UNDEFINED));
+    let mono_fn = vm.alloc_host_fn("monotonicNow", move |_vm, _t, _a| {
+        Ok(rix_js::JsValue::from_f64(
+            epoch.elapsed().as_secs_f64() * 1000.0,
+        ))
+    });
+
+    for (name, h) in [
+        ("start", start_fn),
+        ("broadcast", broadcast_fn),
+        ("getReport", get_report_fn),
+        ("sleep", sleep_fn),
+        ("leaving", leaving_fn),
+        ("monotonicNow", mono_fn),
+    ] {
+        let k = vm.heap.intern_key(name);
+        vm.heap.object_define_data(
+            agent,
+            k,
+            rix_js::JsValue::from_object(h),
+            PropertyAttrs::METHOD,
+            &mut vm.shapes,
+        );
+    }
+    let k_agent = vm.heap.intern_key("agent");
+    vm.heap.object_define_data(
+        host,
+        k_agent,
+        rix_js::JsValue::from_object(agent),
         PropertyAttrs::METHOD,
         &mut vm.shapes,
     );

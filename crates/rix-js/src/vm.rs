@@ -219,6 +219,7 @@ pub struct JsVm {
     pub weakset_proto: HeapHandle,
     pub weakref_proto: HeapHandle,
     pub array_buffer_proto: HeapHandle,
+    pub shared_array_buffer_proto: HeapHandle,
     pub data_view_proto: HeapHandle,
     pub typed_array_proto: HeapHandle,
     pub typed_array_protos: [HeapHandle; 12],
@@ -259,6 +260,8 @@ pub struct JsVm {
     pub symbol_registry: HashMap<String, SymbolId>,
     pub symbol_descriptions: HashMap<SymbolId, String>,
     pub regexp_statics: crate::builtins_regexp::RegExpLegacyStatics,
+    /// Pending same-agent `Atomics.waitAsync` waiters: `(sab_backing_ptr, byte_offset, promise)`.
+    pub atomic_async_waiters: Vec<(usize, usize, HeapHandle)>,
     pub rng_state: u64,
     microtasks: VecDeque<MicrotaskJob>,
     module_envs: HashMap<u32, ModuleEnv>,
@@ -406,6 +409,7 @@ impl JsVm {
         let weakset_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let weakref_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let array_buffer_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let shared_array_buffer_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let data_view_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let typed_array_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let typed_array_protos =
@@ -494,6 +498,7 @@ impl JsVm {
             weakset_proto,
             weakref_proto,
             array_buffer_proto,
+            shared_array_buffer_proto,
             data_view_proto,
             typed_array_proto,
             typed_array_protos,
@@ -534,6 +539,7 @@ impl JsVm {
             symbol_registry: HashMap::new(),
             symbol_descriptions: HashMap::new(),
             regexp_statics: crate::builtins_regexp::RegExpLegacyStatics::default(),
+            atomic_async_waiters: Vec::new(),
             rng_state: 0x9E37_79B9_7F4A_7C15,
             microtasks: VecDeque::new(),
             module_envs: HashMap::new(),
@@ -662,6 +668,7 @@ impl JsVm {
             self.weakset_proto,
             self.weakref_proto,
             self.array_buffer_proto,
+            self.shared_array_buffer_proto,
             self.data_view_proto,
             self.typed_array_proto,
             self.promise_proto,
@@ -712,6 +719,9 @@ impl JsVm {
                 IteratorState::String { .. } | IteratorState::Keys { .. } => {}
             }
         }
+        for &(_, _, p) in &self.atomic_async_waiters {
+            roots.push(JsValue::from_object(p));
+        }
         if let Some(h) = self.default_array_iter_fn {
             roots.push(JsValue::from_object(h));
         }
@@ -727,6 +737,41 @@ impl JsVm {
         let stats = self.heap.collect_major(&roots);
         self.iterators.retain(|&h, _| self.heap.is_alive(h));
         stats
+    }
+
+    /// Detaches an unshared mutable `ArrayBuffer` per ECMA-262 §25.1.2.3 `DetachArrayBuffer`.
+    pub fn detach_array_buffer(&mut self, h: HeapHandle) -> Result<(), JsException> {
+        if crate::builtins_atomics::ab_is_shared(self, h) {
+            return Err(self.type_error("Cannot detach a SharedArrayBuffer"));
+        }
+        if crate::builtins_atomics::ab_is_immutable(self, h) {
+            return Err(self.type_error("Cannot detach an immutable ArrayBuffer"));
+        }
+        if let Some(o) = self.heap.get_object_mut(h) {
+            if let ObjectKind::ArrayBuffer(buf) = &mut o.kind {
+                buf.clear();
+                o.rare_mut().ab_detached = true;
+                return Ok(());
+            }
+        }
+        Err(self.type_error("Expected an ArrayBuffer"))
+    }
+
+    /// Allocates a `SharedArrayBuffer` backed by an existing cross-thread [`SharedBufferBacking`].
+    pub fn alloc_shared_array_buffer_from_backing(
+        &mut self,
+        backing: std::sync::Arc<crate::heap::SharedBufferBacking>,
+    ) -> HeapHandle {
+        let h = self.heap.alloc_object(JsObject::with_kind(
+            ObjectKind::ArrayBuffer(Box::default()),
+            Some(self.shared_array_buffer_proto),
+        ));
+        if let Some(o) = self.heap.get_object_mut(h) {
+            let r = o.rare_mut();
+            r.ab_max_byte_length = backing.max_byte_length;
+            r.shared_mem = Some(backing);
+        }
+        h
     }
 
     /// Allocates a `RegExp` object with `RegExp.prototype` and own `lastIndex` per ECMA-262 §22.2.3.
@@ -3265,11 +3310,14 @@ impl JsVm {
             if let Some(idx) = idx_opt {
                 if let Some(o) = self.heap.get_object(holder) {
                     if let ObjectKind::TypedArray(ta) = o.kind {
-                        if idx < ta.length {
+                        let eff_len = crate::builtins_atomics::ta_effective_len(self, holder, ta)
+                            .unwrap_or(0);
+                        if idx < eff_len {
                             return Ok(crate::builtins_collections::typed_array_read_element(
                                 self, ta, idx,
                             ));
                         }
+                        return Ok(JsValue::UNDEFINED);
                     } else if let Some(val) = o.elements.get(idx) {
                         return Ok(val);
                     }
@@ -3545,11 +3593,14 @@ impl JsVm {
             if let Some(idx) = idx_opt {
                 if let Some(o) = self.heap.get_object(holder) {
                     if let ObjectKind::TypedArray(ta) = o.kind {
-                        if idx < ta.length {
+                        let eff_len = crate::builtins_atomics::ta_effective_len(self, holder, ta)
+                            .unwrap_or(0);
+                        if idx < eff_len {
                             return Ok(crate::builtins_collections::typed_array_read_element(
                                 self, ta, idx,
                             ));
                         }
+                        return Ok(JsValue::UNDEFINED);
                     } else if let Some(val) = o.elements.get(idx) {
                         return Ok(val);
                     }
@@ -3804,9 +3855,13 @@ impl JsVm {
         if let Some(idx) = self.as_array_index(key_val) {
             if let Some(ObjectKind::TypedArray(ta)) = self.heap.get_object(obj).map(|o| &o.kind) {
                 let ta = *ta;
-                return Ok(crate::builtins_collections::typed_array_read_element(
-                    self, ta, idx,
-                ));
+                let eff_len = crate::builtins_atomics::ta_effective_len(self, obj, ta).unwrap_or(0);
+                if idx < eff_len {
+                    return Ok(crate::builtins_collections::typed_array_read_element(
+                        self, ta, idx,
+                    ));
+                }
+                return Ok(JsValue::UNDEFINED);
             }
             if let Some(val) = self.heap.get_object(obj).and_then(|o| o.elements.get(idx)) {
                 return Ok(val);
@@ -3850,7 +3905,9 @@ impl JsVm {
         if let Some(idx) = self.as_array_index(key_val) {
             if let Some(ObjectKind::TypedArray(ta)) = self.heap.get_object(obj).map(|o| &o.kind) {
                 let ta = *ta;
-                crate::builtins_collections::typed_array_write_element(self, ta, idx, val)?;
+                crate::builtins_collections::typed_array_write_element_checked(
+                    self, obj, ta, idx, val,
+                )?;
                 return Ok(true);
             }
             // Check if this numeric key is defined as an accessor or named property on obj/prototype.
@@ -4692,7 +4749,8 @@ impl JsVm {
         let (mut idx_keys, mut str_keys) = (Vec::new(), Vec::new());
         if let Some(o) = self.heap.get_object(obj) {
             if let ObjectKind::TypedArray(ta) = o.kind {
-                idx_keys.extend(0..ta.length);
+                let eff = crate::builtins_atomics::ta_effective_len(self, obj, ta).unwrap_or(0);
+                idx_keys.extend(0..eff);
             } else {
                 idx_keys.extend(o.elements.present_indices());
             }
@@ -5675,7 +5733,9 @@ impl JsVm {
                         return parts.join(",");
                     }
                     if let ObjectKind::TypedArray(ta) = o.kind {
-                        let len = ta.length.min(65_536);
+                        let len = crate::builtins_atomics::ta_effective_len(self, h, ta)
+                            .unwrap_or(0)
+                            .min(65_536);
                         let parts: Vec<String> = (0..len)
                             .map(|i| {
                                 crate::builtins_collections::typed_array_read_element_string(

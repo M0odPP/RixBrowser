@@ -294,6 +294,138 @@ pub struct ClassInstanceInit {
     pub is_derived: bool,
 }
 
+/// Per-waiter condvar signal cell for FIFO `Atomics.wait` / `Atomics.notify`.
+pub type AtomicWaiterSignal = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+/// Thread-safe pure-Rust backing storage and FIFO waiter queue for `SharedArrayBuffer` & `Atomics`.
+#[derive(Debug)]
+pub struct SharedBufferBacking {
+    pub data: std::sync::Mutex<Vec<u8>>,
+    pub max_byte_length: Option<usize>,
+    pub waiters: std::sync::Mutex<std::collections::VecDeque<(usize, AtomicWaiterSignal)>>,
+}
+
+/// Outcome of an `Atomics.wait` operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicWaitResult {
+    Ok,
+    NotEqual,
+    TimedOut,
+}
+
+impl SharedBufferBacking {
+    pub fn new(bytes: Vec<u8>, max_byte_length: Option<usize>) -> Self {
+        Self {
+            data: std::sync::Mutex::new(bytes),
+            max_byte_length,
+            waiters: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.data.lock().map_or(0, |d| d.len())
+    }
+
+    pub fn grow(&self, new_len: usize) -> Result<(), &'static str> {
+        let Some(max) = self.max_byte_length else {
+            return Err("not_growable");
+        };
+        let mut guard = self.data.lock().map_err(|_| "poisoned")?;
+        if new_len < guard.len() || new_len > max {
+            return Err("range");
+        }
+        guard.resize(new_len, 0);
+        Ok(())
+    }
+
+    pub fn wait_at(
+        &self,
+        byte_offset: usize,
+        check_eq: impl FnOnce(&[u8]) -> bool,
+        timeout: Option<std::time::Duration>,
+    ) -> AtomicWaitResult {
+        let entry = {
+            let data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+            if !check_eq(&data) {
+                return AtomicWaitResult::NotEqual;
+            }
+            if timeout == Some(std::time::Duration::ZERO) {
+                return AtomicWaitResult::TimedOut;
+            }
+            let e = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let mut w = self.waiters.lock().unwrap_or_else(|e| e.into_inner());
+            w.push_back((byte_offset, std::sync::Arc::clone(&e)));
+            e
+        };
+        let (lock, cvar) = &*entry;
+        let mut notified = lock.lock().unwrap_or_else(|e| e.into_inner());
+        match timeout {
+            None => {
+                while !*notified {
+                    notified = cvar.wait(notified).unwrap_or_else(|e| e.into_inner());
+                }
+                AtomicWaitResult::Ok
+            }
+            Some(dur) => {
+                let deadline = std::time::Instant::now() + dur;
+                while !*notified {
+                    let Some(rem) = deadline.checked_duration_since(std::time::Instant::now())
+                    else {
+                        break;
+                    };
+                    let (g, res) = cvar
+                        .wait_timeout(notified, rem)
+                        .unwrap_or_else(|e| e.into_inner());
+                    notified = g;
+                    if res.timed_out() {
+                        break;
+                    }
+                }
+                if *notified {
+                    return AtomicWaitResult::Ok;
+                }
+                drop(notified);
+                let mut w = self.waiters.lock().unwrap_or_else(|e| e.into_inner());
+                let before = w.len();
+                w.retain(|(_, e)| !std::sync::Arc::ptr_eq(e, &entry));
+                if w.len() == before {
+                    AtomicWaitResult::Ok
+                } else {
+                    AtomicWaitResult::TimedOut
+                }
+            }
+        }
+    }
+
+    pub fn notify_at(&self, byte_offset: usize, count: usize) -> usize {
+        if count == 0 {
+            return 0;
+        }
+        let mut to_wake = Vec::new();
+        {
+            let mut w = self.waiters.lock().unwrap_or_else(|e| e.into_inner());
+            let mut i = 0usize;
+            while i < w.len() && to_wake.len() < count {
+                if w[i].0 == byte_offset {
+                    if let Some((_, e)) = w.remove(i) {
+                        to_wake.push(e);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        let woken = to_wake.len();
+        for e in to_wake {
+            let (lock, cvar) = &*e;
+            let mut n = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *n = true;
+            cvar.notify_one();
+        }
+        woken
+    }
+}
+
 /// Cold out-of-line object metadata (only allocated for dictionary-mode objects,
 /// accessors, class constructors, or private fields so ordinary shaped objects stay compact in cache).
 #[derive(Debug, Clone, Default)]
@@ -305,6 +437,16 @@ pub struct RareObjectData {
     pub class_instance_init: Option<ClassInstanceInit>,
     /// Primitive slot (`[[NumberData]]`, `[[StringData]]`, `[[BooleanData]]`, `[[BigIntData]]`, `[[SymbolData]]`).
     pub boxed_value: Option<JsValue>,
+    /// Resizable `ArrayBuffer` `[[ArrayBufferMaxByteLength]]` (`None` = fixed length).
+    pub ab_max_byte_length: Option<usize>,
+    /// `true` once an `ArrayBuffer` has been detached (`transfer` / `$262.detachArrayBuffer`).
+    pub ab_detached: bool,
+    /// `true` for immutable `ArrayBuffer` (`transferToImmutable` / `sliceToImmutable`).
+    pub ab_immutable: bool,
+    /// Shared cross-thread backing for `SharedArrayBuffer`.
+    pub shared_mem: Option<std::sync::Arc<SharedBufferBacking>>,
+    /// `true` when a `DataView` or `TypedArray` is length-tracking over a resizable/growable buffer.
+    pub view_auto_length: bool,
 }
 
 /// Specialized runtime tag for a [`JsObject`].
