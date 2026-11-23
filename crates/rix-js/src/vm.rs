@@ -2003,6 +2003,20 @@ impl JsVm {
                 };
                 self.define_prop_cached(obj, prog_id, func_idx, ic_idx, key, val)?;
             }
+            Opcode::SetProto => {
+                let obj_val = self.registers[a];
+                let proto_val = self.registers[base + usize::from(inst.b())];
+                if let Some(obj) = obj_val.as_object() {
+                    if proto_val.is_null() {
+                        self.heap.object_set_prototype(obj, None, &mut self.shapes);
+                        self.mega_ic.invalidate_prototypes();
+                    } else if let Some(ph) = proto_val.as_object() {
+                        self.heap
+                            .object_set_prototype(obj, Some(ph), &mut self.shapes);
+                        self.mega_ic.invalidate_prototypes();
+                    }
+                }
+            }
             Opcode::GetElem => {
                 let obj_val = self.registers[base + usize::from(inst.b())];
                 let key_val = self.registers[base + usize::from(inst.c())];

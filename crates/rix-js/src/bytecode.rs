@@ -236,6 +236,8 @@ pub enum Opcode {
     DefineClassSetter = 113,
     /// Direct `eval(...)` call site (`A = dst`, `B = base`, `C = DirectEvalMeta const index`).
     DirectEval = 114,
+    /// Annex B §B.3.1 object literal `__proto__: value` (`A = obj`, `B = proto_val`).
+    SetProto = 115,
 }
 
 impl Opcode {
@@ -356,6 +358,7 @@ impl Opcode {
             112 => Some(Self::DefineClassGetter),
             113 => Some(Self::DefineClassSetter),
             114 => Some(Self::DirectEval),
+            115 => Some(Self::SetProto),
             _ => None,
         }
     }
