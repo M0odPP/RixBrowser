@@ -42,6 +42,32 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
     define_method_len(vm, fn_proto, "apply", 2, fn_apply);
     define_method_len(vm, fn_proto, "bind", 1, fn_bind);
     define_method_len(vm, fn_proto, "toString", 0, fn_to_string);
+    // Function.prototype[Symbol.hasInstance] (ECMA-262 §20.2.3.6: non-writable/enum/config)
+    let has_inst_fn = vm.alloc_native_fn("[Symbol.hasInstance]", fn_has_instance);
+    vm.set_fn_length(has_inst_fn, 1);
+    let k_has_inst = vm.key_symbol_has_instance;
+    vm.heap.object_define_data(
+        fn_proto,
+        k_has_inst,
+        JsValue::from_object(has_inst_fn),
+        PropertyAttrs::empty(),
+        &mut vm.shapes,
+    );
+    // Restricted Function.prototype.{caller, arguments} thrower (ECMA-262 §10.2.4)
+    let thrower = vm.alloc_native_fn("", |vm, _this, _args| {
+        Err(vm.type_error("'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions"))
+    });
+    for restricted in ["caller", "arguments"] {
+        let rk = vm.heap.intern_key(restricted);
+        vm.heap.object_define_accessor(
+            fn_proto,
+            rk,
+            Some(thrower),
+            Some(thrower),
+            PropertyAttrs::CONFIGURABLE,
+            &mut vm.shapes,
+        );
+    }
     let function_ctor = vm.alloc_native_fn("Function", function_ctor_fn);
     vm.mark_constructor(function_ctor);
     vm.set_fn_length(function_ctor, 1);
@@ -93,30 +119,43 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
         PropertyAttrs::METHOD,
         &mut vm.shapes,
     );
-    define_method(vm, object_ctor, "create", object_create);
-    define_method(vm, object_ctor, "keys", object_keys);
-    define_method(vm, object_ctor, "values", object_values);
-    define_method(vm, object_ctor, "entries", object_entries);
-    define_method(vm, object_ctor, "assign", object_assign);
-    define_method(vm, object_ctor, "getPrototypeOf", object_get_prototype_of);
-    define_method(vm, object_ctor, "setPrototypeOf", object_set_prototype_of);
-    define_method(vm, object_ctor, "hasOwn", object_has_own);
-    define_method(vm, object_ctor, "freeze", object_freeze);
-    define_method(vm, object_ctor, "is", object_is);
+    define_method_len(vm, object_ctor, "create", 2, object_create);
+    define_method_len(vm, object_ctor, "keys", 1, object_keys);
+    define_method_len(vm, object_ctor, "values", 1, object_values);
+    define_method_len(vm, object_ctor, "entries", 1, object_entries);
+    define_method_len(vm, object_ctor, "assign", 2, object_assign);
+    define_method_len(
+        vm,
+        object_ctor,
+        "getPrototypeOf",
+        1,
+        object_get_prototype_of,
+    );
+    define_method_len(
+        vm,
+        object_ctor,
+        "setPrototypeOf",
+        2,
+        object_set_prototype_of,
+    );
+    define_method_len(vm, object_ctor, "hasOwn", 2, object_has_own);
+    define_method_len(vm, object_ctor, "freeze", 1, object_freeze);
+    define_method_len(vm, object_ctor, "is", 2, object_is);
     define_global(vm, "Object", JsValue::from_object(object_ctor));
 
     // Array.prototype methods + Array constructor
     let arr_proto = vm.array_proto;
-    define_method(vm, arr_proto, "push", array_push);
-    define_method(vm, arr_proto, "pop", array_pop);
-    define_method(vm, arr_proto, "map", array_map);
-    define_method(vm, arr_proto, "filter", array_filter);
-    define_method(vm, arr_proto, "reduce", array_reduce);
-    define_method(vm, arr_proto, "forEach", array_for_each);
-    define_method(vm, arr_proto, "join", array_join);
-    define_method(vm, arr_proto, "slice", array_slice);
-    define_method(vm, arr_proto, "indexOf", array_index_of);
-    define_method(vm, arr_proto, "includes", array_includes);
+    define_method_len(vm, arr_proto, "push", 1, array_push);
+    define_method_len(vm, arr_proto, "pop", 0, array_pop);
+    define_method_len(vm, arr_proto, "map", 1, array_map);
+    define_method_len(vm, arr_proto, "filter", 1, array_filter);
+    define_method_len(vm, arr_proto, "reduce", 1, array_reduce);
+    define_method_len(vm, arr_proto, "forEach", 1, array_for_each);
+    define_method_len(vm, arr_proto, "join", 1, array_join);
+    define_method_len(vm, arr_proto, "slice", 2, array_slice);
+    define_method_len(vm, arr_proto, "indexOf", 1, array_index_of);
+    define_method_len(vm, arr_proto, "includes", 1, array_includes);
+    define_method_len(vm, arr_proto, "toString", 0, array_to_string);
     let array_values_fn = vm.alloc_native_fn("values", array_values);
     let k_values = vm.heap.intern_key("values");
     vm.heap.object_define_data(
@@ -135,12 +174,59 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
         &mut vm.shapes,
     );
     vm.default_array_iter_fn = Some(array_values_fn);
-    define_method(vm, arr_proto, "keys", array_keys);
-    define_method(vm, arr_proto, "entries", array_entries);
+    define_method_len(vm, arr_proto, "keys", 0, array_keys);
+    define_method_len(vm, arr_proto, "entries", 0, array_entries);
+    // Array.prototype[Symbol.unscopables] (ECMA-262 §23.1.3.37)
+    let unscopables = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, None));
+    for name in [
+        "at",
+        "copyWithin",
+        "entries",
+        "fill",
+        "find",
+        "findIndex",
+        "findLast",
+        "findLastIndex",
+        "flat",
+        "flatMap",
+        "includes",
+        "keys",
+        "values",
+    ] {
+        let k = vm.heap.intern_key(name);
+        vm.heap.object_define_data(
+            unscopables,
+            k,
+            JsValue::TRUE,
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+    }
+    let k_unscop = vm.key_symbol_unscopables;
+    vm.heap.object_define_data(
+        arr_proto,
+        k_unscop,
+        JsValue::from_object(unscopables),
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
 
     let array_ctor = vm.alloc_native_fn("Array", array_ctor_fn);
     vm.mark_constructor(array_ctor);
     vm.set_fn_length(array_ctor, 1);
+    let species_getter =
+        vm.alloc_native_fn("get [Symbol.species]", |_vm, this_val, _| Ok(this_val));
+    let k_species = vm.key_symbol_species;
+    vm.heap.object_define_accessor(
+        array_ctor,
+        k_species,
+        Some(species_getter),
+        None,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
     vm.heap.object_define_data(
         array_ctor,
         vm.key_prototype,
@@ -348,13 +434,13 @@ fn function_ctor_fn(
     let (params_str, body_str) = if args.is_empty() {
         (String::new(), String::new())
     } else if args.len() == 1 {
-        (String::new(), vm.value_to_rust_string(args[0]))
+        (String::new(), vm.to_js_string(args[0])?)
     } else {
         let mut params = Vec::with_capacity(args.len() - 1);
         for &a in &args[..args.len() - 1] {
-            params.push(vm.value_to_rust_string(a));
+            params.push(vm.to_js_string(a)?);
         }
-        let body = vm.value_to_rust_string(args[args.len() - 1]);
+        let body = vm.to_js_string(args[args.len() - 1])?;
         (params.join(","), body)
     };
     // Validate parameter list independently so syntax like `Function("a) { } (", "")` cannot escape.
@@ -431,7 +517,7 @@ fn fn_apply(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValu
 }
 
 fn fn_bind(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let Some(target) = this_val.as_object() else {
+    let Some(target) = this_val.as_object().filter(|&h| vm.is_callable_handle(h)) else {
         return Err(vm.type_error("Function.prototype.bind called on non-function"));
     };
     let bound_this = args.first().copied().unwrap_or(JsValue::UNDEFINED);
@@ -440,26 +526,52 @@ fn fn_bind(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue
     } else {
         Vec::new()
     };
+    let target_proto = vm
+        .heap
+        .get_object(target)
+        .and_then(|o| o.prototype)
+        .or(Some(vm.function_proto));
     let bound = vm.heap.alloc_object(JsObject::with_kind(
         ObjectKind::BoundFunction(Box::new(BoundFunctionObject {
             target,
             bound_this,
             bound_args,
         })),
-        Some(vm.function_proto),
+        target_proto,
     ));
-    let target_len = vm
-        .get_property_by_key(target, vm.key_length)
-        .ok()
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    let bound_arg_count = args.len().saturating_sub(1) as f64;
-    let new_len = (target_len - bound_arg_count).max(0.0) as u32;
-    vm.set_fn_length(bound, new_len);
+    if vm.is_constructor_handle(target) {
+        vm.mark_constructor(bound);
+    }
+    let has_own_len = vm
+        .heap
+        .object_get_own(target, vm.key_length, &vm.shapes)
+        .is_some();
+    let new_len = if has_own_len {
+        let lv = vm.get_property_by_key(target, vm.key_length)?;
+        if let Some(n) = lv.as_number() {
+            if n.is_nan() || n == f64::NEG_INFINITY {
+                0.0
+            } else if n == f64::INFINITY {
+                f64::INFINITY
+            } else {
+                (n.trunc() - args.len().saturating_sub(1) as f64).max(0.0)
+            }
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    vm.heap.object_define_data(
+        bound,
+        vm.key_length,
+        JsValue::from_f64(new_len),
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
     let target_name = vm
-        .get_property_by_key(target, vm.key_name)
-        .ok()
-        .and_then(|v| v.as_string())
+        .get_property_by_key(target, vm.key_name)?
+        .as_string()
         .and_then(|sh| vm.heap.materialize_string(sh))
         .unwrap_or_default();
     let bound_name = JsValue::from_string(vm.heap.alloc_string(format!("bound {target_name}")));
@@ -471,6 +583,24 @@ fn fn_bind(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue
         &mut vm.shapes,
     );
     Ok(JsValue::from_object(bound))
+}
+
+fn fn_has_instance(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let v = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+    Ok(JsValue::from_bool(vm.ordinary_has_instance(this_val, v)?))
+}
+
+fn is_valid_native_fn_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let ok_start = first == '_' || first == '$' || first.is_alphabetic();
+    ok_start && chars.all(|c| c == '_' || c == '$' || c.is_alphanumeric())
 }
 
 fn fn_to_string(
@@ -490,7 +620,11 @@ fn fn_to_string(
         .and_then(|p| p.value.as_string())
         .and_then(|sh| vm.heap.materialize_string(sh))
         .unwrap_or_default();
-    let s = format!("function {name}() {{ [native code] }}");
+    let s = if is_valid_native_fn_ident(&name) {
+        format!("function {name}() {{ [native code] }}")
+    } else {
+        "function () { [native code] }".to_owned()
+    };
     Ok(JsValue::from_string(vm.heap.alloc_string(s)))
 }
 
@@ -529,10 +663,7 @@ fn obj_value_of(
     this_val: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    if this_val.is_null() || this_val.is_undefined() {
-        return Err(vm.type_error("Cannot convert undefined or null to object"));
-    }
-    Ok(this_val)
+    Ok(JsValue::from_object(vm.to_object(this_val)?))
 }
 
 fn obj_is_prototype_of(
@@ -543,12 +674,7 @@ fn obj_is_prototype_of(
     let Some(mut cur) = args.first().and_then(|v| v.as_object()) else {
         return Ok(JsValue::FALSE);
     };
-    let Some(target) = this_val.as_object() else {
-        if this_val.is_null() || this_val.is_undefined() {
-            return Err(vm.type_error("Cannot convert undefined or null to object"));
-        }
-        return Ok(JsValue::FALSE);
-    };
+    let target = vm.to_object(this_val)?;
     for _ in 0..1024 {
         let Some(proto) = vm.heap.get_object(cur).and_then(|o| o.prototype) else {
             return Ok(JsValue::FALSE);
@@ -566,24 +692,25 @@ fn obj_property_is_enumerable(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    if this_val.is_null() || this_val.is_undefined() {
-        return Err(vm.type_error("Cannot convert undefined or null to object"));
+    let prop = vm.to_property_key(args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
+    let h = vm.to_object(this_val)?;
+    let key = vm.heap.intern_key(&prop);
+    if let Some(p) = vm.heap.object_get_own(h, key, &vm.shapes) {
+        return Ok(JsValue::from_bool(
+            p.attrs.contains(PropertyAttrs::ENUMERABLE),
+        ));
     }
-    let Some(h) = this_val.as_object() else {
-        return Ok(JsValue::FALSE);
-    };
-    let prop = vm.value_to_rust_string(args.first().copied().unwrap_or(JsValue::UNDEFINED));
     if let Ok(idx) = prop.parse::<u32>() {
-        if vm.heap.get_object(h).is_some_and(|o| o.elements.has(idx)) {
-            return Ok(JsValue::TRUE);
+        if let Some(o) = vm.heap.get_object(h) {
+            if let ObjectKind::TypedArray(ta) = o.kind {
+                return Ok(JsValue::from_bool(idx < ta.length));
+            }
+            if o.elements.has(idx) {
+                return Ok(JsValue::TRUE);
+            }
         }
     }
-    let key = vm.heap.intern_key(&prop);
-    let enumerable = vm
-        .heap
-        .object_get_own(h, key, &vm.shapes)
-        .is_some_and(|p| p.attrs.contains(PropertyAttrs::ENUMERABLE));
-    Ok(JsValue::from_bool(enumerable))
+    Ok(JsValue::FALSE)
 }
 
 // ---------------------------------------------------------------------------
@@ -591,50 +718,11 @@ fn obj_property_is_enumerable(
 // ---------------------------------------------------------------------------
 
 fn object_ctor_fn(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    if let Some(&first) = args.first() {
-        if first.is_object() {
-            return Ok(first);
-        }
-        if !first.is_null() && !first.is_undefined() {
-            let proto = if first.is_string() {
-                vm.string_proto
-            } else if first.is_bool() {
-                vm.boolean_proto
-            } else if first.is_bigint() {
-                vm.bigint_proto
-            } else if first.is_symbol() {
-                vm.symbol_proto
-            } else {
-                vm.number_proto
-            };
-            let h = vm
-                .heap
-                .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
-            if let Some(o) = vm.heap.get_object_mut(h) {
-                o.rare_mut().boxed_value = Some(first);
-                if let Some(sh) = first.as_string() {
-                    let s = vm.heap.materialize_string(sh).unwrap_or_default();
-                    let len = s.encode_utf16().count() as f64;
-                    for (i, ch) in s.chars().enumerate() {
-                        let cv = JsValue::from_string(vm.heap.alloc_string(ch.to_string()));
-                        if let Some(obj_mut) = vm.heap.get_object_mut(h) {
-                            obj_mut.elements.set(i as u32, cv);
-                        }
-                    }
-                    vm.heap.object_define_data(
-                        h,
-                        vm.key_length,
-                        JsValue::from_f64(len),
-                        PropertyAttrs::empty(),
-                        &mut vm.shapes,
-                    );
-                }
-            }
-            vm.heap.write_barrier(h, first);
-            return Ok(JsValue::from_object(h));
-        }
+    let first = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+    if first.is_null() || first.is_undefined() {
+        return Ok(JsValue::from_object(vm.alloc_ordinary_object()));
     }
-    Ok(JsValue::from_object(vm.alloc_ordinary_object()))
+    Ok(JsValue::from_object(vm.to_object(first)?))
 }
 
 fn obj_has_own_property(
@@ -642,16 +730,24 @@ fn obj_has_own_property(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let Some(h) = this_val.as_object() else {
-        return Ok(JsValue::FALSE);
-    };
-    let ks = vm.value_to_rust_string(args.first().copied().unwrap_or(JsValue::UNDEFINED));
+    let ks = vm.to_property_key(args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
+    let h = vm.to_object(this_val)?;
     let key = vm.heap.intern_key(&ks);
     let has = vm.heap.object_get_own(h, key, &vm.shapes).is_some()
-        || ks
-            .parse::<u32>()
-            .ok()
-            .is_some_and(|i| vm.heap.get_object(h).is_some_and(|o| o.elements.has(i)));
+        || (ks == "length"
+            && matches!(
+                vm.heap.get_object(h).map(|o| &o.kind),
+                Some(ObjectKind::Array)
+            ))
+        || ks.parse::<u32>().ok().is_some_and(|i| {
+            vm.heap.get_object(h).is_some_and(|o| {
+                if let ObjectKind::TypedArray(ta) = o.kind {
+                    i < ta.length
+                } else {
+                    o.elements.has(i)
+                }
+            })
+        });
     Ok(JsValue::from_bool(has))
 }
 
@@ -678,24 +774,13 @@ fn obj_to_string(
         "Symbol"
     } else if let Some(h) = this_val.as_object() {
         // Check `Symbol.toStringTag` first on objects (ECMA-262 §20.1.3.6).
-        let k_sym = vm.heap.intern_key("Symbol");
-        if let Ok(sym_ctor) = vm.get_property_by_key(vm.global, k_sym) {
-            if let Some(sc_h) = sym_ctor.as_object() {
-                let k_tst = vm.heap.intern_key("toStringTag");
-                if let Ok(tag_sym) = vm.get_property_by_key(sc_h, k_tst) {
-                    if tag_sym.is_symbol() {
-                        let tag_key_s = vm.value_to_rust_string(tag_sym);
-                        let tag_key = vm.heap.intern_key(&tag_key_s);
-                        let tag_val = vm.get_property_by_key(h, tag_key)?;
-                        if let Some(sh) = tag_val.as_string() {
-                            let s = vm.heap.materialize_string(sh).unwrap_or_default();
-                            return Ok(JsValue::from_string(
-                                vm.heap.alloc_string(format!("[object {s}]")),
-                            ));
-                        }
-                    }
-                }
-            }
+        let tag_key = vm.key_symbol_to_string_tag;
+        let tag_val = vm.get_property_by_key(h, tag_key)?;
+        if let Some(sh) = tag_val.as_string() {
+            let s = vm.heap.materialize_string(sh).unwrap_or_default();
+            return Ok(JsValue::from_string(
+                vm.heap.alloc_string(format!("[object {s}]")),
+            ));
         }
         if let Some(bv) = vm
             .heap
@@ -756,63 +841,88 @@ fn object_create(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsVa
         .heap
         .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, None));
     vm.heap.object_set_prototype(obj, proto, &mut vm.shapes);
+    if let Some(&props_arg) = args.get(1) {
+        if !props_arg.is_undefined() {
+            crate::builtins_primitives::define_properties_on_object(vm, obj, props_arg)?;
+        }
+    }
     Ok(JsValue::from_object(obj))
 }
 
 fn object_keys(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
+    let h = vm.to_object(args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
     let arr = vm.alloc_array();
-    if let Some(h) = args.first().and_then(|v| v.as_object()) {
-        for k in vm.own_enumerable_keys_including_elements(h) {
-            let s = JsValue::from_string(vm.heap.alloc_string(k));
-            vm.heap.object_push_element(arr, s);
-        }
+    for k in vm.own_enumerable_keys_including_elements(h) {
+        let s = JsValue::from_string(vm.heap.alloc_string(k));
+        vm.heap.object_push_element(arr, s);
     }
     Ok(JsValue::from_object(arr))
 }
 
 fn object_values(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
+    let h = vm.to_object(args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
     let arr = vm.alloc_array();
-    if let Some(h) = args.first().and_then(|v| v.as_object()) {
-        let keys = vm.own_enumerable_keys_including_elements(h);
-        for ks in keys {
-            let kv = JsValue::from_string(vm.heap.alloc_string(ks));
-            let val = vm.get_elem(JsValue::from_object(h), kv)?;
-            vm.heap.object_push_element(arr, val);
-        }
+    let keys = vm.own_enumerable_keys_including_elements(h);
+    for ks in keys {
+        let kv = JsValue::from_string(vm.heap.alloc_string(ks));
+        let val = vm.get_elem(JsValue::from_object(h), kv)?;
+        vm.heap.object_push_element(arr, val);
     }
     Ok(JsValue::from_object(arr))
 }
 
 fn object_entries(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
+    let h = vm.to_object(args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
     let arr = vm.alloc_array();
-    if let Some(h) = args.first().and_then(|v| v.as_object()) {
-        let keys = vm.own_enumerable_keys_including_elements(h);
-        for ks in keys {
-            let kv = JsValue::from_string(vm.heap.alloc_string(ks));
-            let val = vm.get_elem(JsValue::from_object(h), kv)?;
-            let pair = vm.alloc_array();
-            vm.heap.object_push_element(pair, kv);
-            vm.heap.object_push_element(pair, val);
-            vm.heap.object_push_element(arr, JsValue::from_object(pair));
-        }
+    let keys = vm.own_enumerable_keys_including_elements(h);
+    for ks in keys {
+        let kv = JsValue::from_string(vm.heap.alloc_string(ks));
+        let val = vm.get_elem(JsValue::from_object(h), kv)?;
+        let pair = vm.alloc_array();
+        vm.heap.object_push_element(pair, kv);
+        vm.heap.object_push_element(pair, val);
+        vm.heap.object_push_element(arr, JsValue::from_object(pair));
     }
     Ok(JsValue::from_object(arr))
 }
 
 fn object_assign(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let target_val = args.first().copied().unwrap_or(JsValue::UNDEFINED);
-    let Some(target) = target_val.as_object() else {
-        return Err(vm.type_error("Cannot convert undefined or null to object"));
-    };
+    let target = vm.to_object(target_val)?;
     for &src_val in args.iter().skip(1) {
-        if let Some(src) = src_val.as_object() {
-            for k in vm.own_enumerable_keys(src) {
-                let v = vm.get_property_by_key(src, k)?;
-                vm.set_property_by_key(target, k, v)?;
+        if src_val.is_null() || src_val.is_undefined() {
+            continue;
+        }
+        let src = vm.to_object(src_val)?;
+        // Copy own enumerable string/index keys, then own enumerable Symbol keys (ECMA-262 §20.1.2.1).
+        let str_keys = vm.own_enumerable_keys_including_elements(src);
+        for ks in str_keys {
+            let kv = JsValue::from_string(vm.heap.alloc_string(ks));
+            let v = vm.get_elem(JsValue::from_object(src), kv)?;
+            let ok = vm.set_elem_checked(JsValue::from_object(target), kv, v)?;
+            if !ok {
+                return Err(vm.type_error("Cannot assign to read only property"));
+            }
+        }
+        let sym_keys: Vec<_> = vm
+            .own_enumerable_keys(src)
+            .into_iter()
+            .filter(|&k| {
+                vm.heap
+                    .interner()
+                    .get(k)
+                    .is_some_and(|s| crate::vm::is_symbol_key_str(s))
+            })
+            .collect();
+        for k in sym_keys {
+            let v = vm.get_property_by_key(src, k)?;
+            let ok = vm.set_property_by_key(target, k, v)?;
+            if !ok {
+                return Err(vm.type_error("Cannot assign to read only property"));
             }
         }
     }
-    Ok(target_val)
+    Ok(JsValue::from_object(target))
 }
 
 fn object_get_prototype_of(
@@ -820,9 +930,7 @@ fn object_get_prototype_of(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let Some(h) = args.first().and_then(|v| v.as_object()) else {
-        return Ok(JsValue::NULL);
-    };
+    let h = vm.to_object(args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
     let proto = vm.heap.get_object(h).and_then(|o| o.prototype);
     Ok(proto.map_or(JsValue::NULL, JsValue::from_object))
 }
@@ -889,9 +997,7 @@ fn object_has_own(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsV
 fn object_freeze(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let target = args.first().copied().unwrap_or(JsValue::UNDEFINED);
     if let Some(h) = target.as_object() {
-        if let Some(o) = vm.heap.get_object_mut(h) {
-            o.extensible = false;
-        }
+        crate::builtins_primitives::set_object_integrity_level(vm, h, true);
     }
     Ok(target)
 }
@@ -914,7 +1020,12 @@ fn object_is(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue,
 fn array_ctor_fn(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let arr = vm.alloc_array();
     if args.len() == 1 && args[0].is_number() {
-        let len = vm.to_u32(args[0])?;
+        let n = vm.to_number(args[0])?;
+        let len = if n.is_finite() && n >= 0.0 && n <= f64::from(u32::MAX) && n.trunc() == n {
+            n as u32
+        } else {
+            return Err(vm.range_error("Invalid array length"));
+        };
         if let Some(o) = vm.heap.get_object_mut(arr) {
             o.elements.set_len(len);
         }
@@ -927,84 +1038,82 @@ fn array_ctor_fn(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsVa
 }
 
 fn array_is_array(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let is_arr = args
-        .first()
-        .and_then(|v| v.as_object())
-        .and_then(|h| vm.heap.get_object(h))
-        .is_some_and(|o| matches!(o.kind, ObjectKind::Array));
+    let is_arr = vm
+        .is_array_value(args.first().copied().unwrap_or(JsValue::UNDEFINED))
+        .map_err(|_| vm.type_error("Cannot perform 'IsArray' on a revoked Proxy"))?;
     Ok(JsValue::from_bool(is_arr))
 }
 
 fn array_push(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let Some(h) = this_val.as_object() else {
-        return Err(vm.type_error("Array.prototype.push called on non-object"));
-    };
-    for &a in args {
-        vm.heap.object_push_element(h, a);
+    let h = vm.to_object(this_val)?;
+    let mut len = vm.array_get_len(h)?;
+    if len + (args.len() as u64) > 9_007_199_254_740_991 {
+        return Err(vm.type_error("Array length exceeds 2^53 - 1"));
     }
-    let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
-    Ok(JsValue::from_f64(f64::from(len)))
+    for &a in args {
+        vm.array_set_index_strict(h, len, a)?;
+        len += 1;
+    }
+    vm.array_set_length(h, len)?;
+    Ok(JsValue::from_f64(len as f64))
 }
 
 fn array_pop(vm: &mut JsVm, this_val: JsValue, _args: &[JsValue]) -> Result<JsValue, JsException> {
-    let Some(h) = this_val.as_object() else {
-        return Err(vm.type_error("Array.prototype.pop called on non-object"));
-    };
-    let val = vm
-        .heap
-        .get_object_mut(h)
-        .and_then(|o| o.elements.pop())
-        .unwrap_or(JsValue::UNDEFINED);
+    let h = vm.to_object(this_val)?;
+    let len = vm.array_get_len(h)?;
+    if len == 0 {
+        vm.array_set_length(h, 0)?;
+        return Ok(JsValue::UNDEFINED);
+    }
+    let new_len = len - 1;
+    let val = vm.array_get_index(h, new_len)?;
+    vm.array_delete_index_strict(h, new_len)?;
+    vm.array_set_length(h, new_len)?;
     Ok(val)
 }
 
-fn array_present_or_dense_indices(vm: &JsVm, h: HeapHandle) -> (u32, Option<Vec<u32>>) {
-    let Some(o) = vm.heap.get_object(h) else {
-        return (0, None);
-    };
-    let len = o.elements.len();
-    if len > 65_536 {
-        (len, Some(o.elements.present_indices()))
+fn require_callable(vm: &mut JsVm, cb: JsValue) -> Result<(), JsException> {
+    if cb.as_object().is_some_and(|h| vm.is_callable_handle(h)) {
+        Ok(())
     } else {
-        (len, None)
+        Err(vm.type_error("Callback is not a function"))
     }
 }
 
-fn array_map(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let Some(h) = this_val.as_object() else {
-        return Err(vm.type_error("Array.prototype.map called on non-object"));
-    };
-    let cb = args.first().copied().unwrap_or(JsValue::UNDEFINED);
-    let this_arg = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
-    let (len, sparse_indices) = array_present_or_dense_indices(vm, h);
-    let out = vm.alloc_array();
-    if let Some(indices) = sparse_indices {
-        if let Some(o) = vm.heap.get_object_mut(out) {
-            o.elements.set_len(len);
+fn for_each_present_idx(
+    vm: &mut JsVm,
+    h: HeapHandle,
+    len: u64,
+    mut f: impl FnMut(&mut JsVm, u64, JsValue) -> Result<(), JsException>,
+) -> Result<(), JsException> {
+    let sparse = vm.sparse_present_indices_if_safe(h, len);
+    let count = sparse.as_ref().map_or(len, |v| v.len() as u64);
+    let limit = vm.max_loop_iterations.unwrap_or(1_000_000).min(1_000_000);
+    for step in 0..count {
+        if step >= limit {
+            return Err(vm.range_error("Script execution iteration limit exceeded"));
         }
-        for i in indices {
-            if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-                let mapped = vm.call_value(
-                    cb,
-                    this_arg,
-                    &[elem, JsValue::from_f64(f64::from(i)), this_val],
-                )?;
-                if let Some(o) = vm.heap.get_object_mut(out) {
-                    o.elements.set(i, mapped);
-                }
-            }
-        }
-    } else {
-        for i in 0..len {
-            if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-                let mapped =
-                    vm.call_value(cb, this_arg, &[elem, JsValue::from_i32(i as i32), this_val])?;
-                vm.heap.object_push_element(out, mapped);
-            } else if let Some(o) = vm.heap.get_object_mut(out) {
-                o.elements.push_hole();
-            }
+        let i = sparse.as_ref().map_or(step, |v| v[step as usize]);
+        if vm.array_has_index(h, i)? {
+            let elem = vm.array_get_index(h, i)?;
+            f(vm, i, elem)?;
         }
     }
+    Ok(())
+}
+
+fn array_map(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
+    let h = vm.to_object(this_val)?;
+    let len = vm.array_get_len(h)?;
+    let cb = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+    require_callable(vm, cb)?;
+    let this_arg = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
+    let out = vm.array_species_create(h, len)?;
+    let obj_val = JsValue::from_object(h);
+    for_each_present_idx(vm, h, len, |vm, i, elem| {
+        let mapped = vm.call_value(cb, this_arg, &[elem, JsValue::from_f64(i as f64), obj_val])?;
+        vm.array_create_data_prop(out, i, mapped)
+    })?;
     Ok(JsValue::from_object(out))
 }
 
@@ -1013,37 +1122,22 @@ fn array_filter(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let Some(h) = this_val.as_object() else {
-        return Err(vm.type_error("Array.prototype.filter called on non-object"));
-    };
+    let h = vm.to_object(this_val)?;
+    let len = vm.array_get_len(h)?;
     let cb = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+    require_callable(vm, cb)?;
     let this_arg = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
-    let (len, sparse_indices) = array_present_or_dense_indices(vm, h);
-    let out = vm.alloc_array();
-    if let Some(indices) = sparse_indices {
-        for i in indices {
-            if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-                let keep = vm.call_value(
-                    cb,
-                    this_arg,
-                    &[elem, JsValue::from_f64(f64::from(i)), this_val],
-                )?;
-                if vm.to_boolean(keep) {
-                    vm.heap.object_push_element(out, elem);
-                }
-            }
+    let out = vm.array_species_create(h, 0)?;
+    let obj_val = JsValue::from_object(h);
+    let mut to = 0u64;
+    for_each_present_idx(vm, h, len, |vm, i, elem| {
+        let keep = vm.call_value(cb, this_arg, &[elem, JsValue::from_f64(i as f64), obj_val])?;
+        if vm.to_boolean(keep) {
+            vm.array_create_data_prop(out, to, elem)?;
+            to += 1;
         }
-    } else {
-        for i in 0..len {
-            if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-                let keep =
-                    vm.call_value(cb, this_arg, &[elem, JsValue::from_i32(i as i32), this_val])?;
-                if vm.to_boolean(keep) {
-                    vm.heap.object_push_element(out, elem);
-                }
-            }
-        }
-    }
+        Ok(())
+    })?;
     Ok(JsValue::from_object(out))
 }
 
@@ -1052,61 +1146,25 @@ fn array_reduce(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let Some(h) = this_val.as_object() else {
-        return Err(vm.type_error("Array.prototype.reduce called on non-object"));
-    };
+    let h = vm.to_object(this_val)?;
+    let len = vm.array_get_len(h)?;
     let cb = args.first().copied().unwrap_or(JsValue::UNDEFINED);
-    let (len, sparse_indices) = array_present_or_dense_indices(vm, h);
-    if let Some(indices) = sparse_indices {
-        let mut iter = indices.into_iter();
-        let mut acc = if args.len() >= 2 {
-            args[1]
-        } else {
-            let mut first = None;
-            for i in iter.by_ref() {
-                if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-                    first = Some(v);
-                    break;
-                }
-            }
-            first.ok_or_else(|| vm.type_error("Reduce of empty array with no initial value"))?
-        };
-        for i in iter {
-            if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-                acc = vm.call_value(
-                    cb,
-                    JsValue::UNDEFINED,
-                    &[acc, elem, JsValue::from_f64(f64::from(i)), this_val],
-                )?;
-            }
-        }
-        return Ok(acc);
-    }
-    let mut start = 0u32;
-    let mut acc = if args.len() >= 2 {
-        args[1]
-    } else {
-        let mut first = None;
-        while start < len {
-            if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(start)) {
-                first = Some(v);
-                start += 1;
-                break;
-            }
-            start += 1;
-        }
-        first.ok_or_else(|| vm.type_error("Reduce of empty array with no initial value"))?
-    };
-    for i in start..len {
-        if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-            acc = vm.call_value(
+    require_callable(vm, cb)?;
+    let obj_val = JsValue::from_object(h);
+    let mut acc = if args.len() >= 2 { Some(args[1]) } else { None };
+    for_each_present_idx(vm, h, len, |vm, i, elem| {
+        acc = Some(if let Some(cur) = acc {
+            vm.call_value(
                 cb,
                 JsValue::UNDEFINED,
-                &[acc, elem, JsValue::from_i32(i as i32), this_val],
-            )?;
-        }
-    }
-    Ok(acc)
+                &[cur, elem, JsValue::from_f64(i as f64), obj_val],
+            )?
+        } else {
+            elem
+        });
+        Ok(())
+    })?;
+    acc.ok_or_else(|| vm.type_error("Reduce of empty array with no initial value"))
 }
 
 fn array_for_each(
@@ -1114,105 +1172,95 @@ fn array_for_each(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let Some(h) = this_val.as_object() else {
-        return Err(vm.type_error("Array.prototype.forEach called on non-object"));
-    };
+    let h = vm.to_object(this_val)?;
+    let len = vm.array_get_len(h)?;
     let cb = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+    require_callable(vm, cb)?;
     let this_arg = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
-    let (len, sparse_indices) = array_present_or_dense_indices(vm, h);
-    if let Some(indices) = sparse_indices {
-        for i in indices {
-            if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-                vm.call_value(
-                    cb,
-                    this_arg,
-                    &[elem, JsValue::from_f64(f64::from(i)), this_val],
-                )?;
-            }
-        }
-    } else {
-        for i in 0..len {
-            if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-                vm.call_value(cb, this_arg, &[elem, JsValue::from_i32(i as i32), this_val])?;
-            }
-        }
-    }
+    let obj_val = JsValue::from_object(h);
+    for_each_present_idx(vm, h, len, |vm, i, elem| {
+        vm.call_value(cb, this_arg, &[elem, JsValue::from_f64(i as f64), obj_val])?;
+        Ok(())
+    })?;
     Ok(JsValue::UNDEFINED)
 }
 
 fn array_join(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let Some(h) = this_val.as_object() else {
-        return Err(vm.type_error("Array.prototype.join called on non-object"));
-    };
+    let h = vm.to_object(this_val)?;
+    let len = vm.array_get_len(h)?;
     let sep = match args.first().copied() {
-        Some(v) if !v.is_undefined() => vm.value_to_rust_string(v),
+        Some(v) if !v.is_undefined() => vm.to_js_string(v)?,
         _ => ",".to_owned(),
     };
-    let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
+    if len == 0 {
+        return Ok(JsValue::from_string(vm.heap.alloc_string("")));
+    }
     if len > 4_000_000 {
         return Err(vm.range_error("Invalid string length"));
     }
     let mut parts = Vec::with_capacity((len as usize).min(16_384));
     for i in 0..len {
-        match vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-            Some(v) if !v.is_null() && !v.is_undefined() => parts.push(vm.value_to_rust_string(v)),
-            _ => parts.push(String::new()),
+        let v = vm.array_get_index(h, i)?;
+        if v.is_null() || v.is_undefined() {
+            parts.push(String::new());
+        } else {
+            parts.push(vm.to_js_string(v)?);
         }
     }
     Ok(JsValue::from_string(vm.heap.alloc_string(parts.join(&sep))))
 }
 
+fn array_to_string(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let h = vm.to_object(this_val)?;
+    let k_join = vm.heap.intern_key("join");
+    let join_fn = vm.get_property_by_key(h, k_join)?;
+    if join_fn
+        .as_object()
+        .is_some_and(|fh| vm.is_callable_handle(fh))
+    {
+        vm.call_value(join_fn, JsValue::from_object(h), &[])
+    } else {
+        obj_to_string(vm, JsValue::from_object(h), &[])
+    }
+}
+
+fn clamp_rel_index(rel: f64, len: u64) -> u64 {
+    if rel == f64::NEG_INFINITY {
+        0
+    } else if rel < 0.0 {
+        (len as f64 + rel).max(0.0) as u64
+    } else if rel >= len as f64 {
+        len
+    } else {
+        rel as u64
+    }
+}
+
 fn array_slice(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let Some(h) = this_val.as_object() else {
-        return Err(vm.type_error("Array.prototype.slice called on non-object"));
-    };
-    let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len()) as i64;
+    let h = vm.to_object(this_val)?;
+    let len = vm.array_get_len(h)?;
     let rel_start = match args.first().copied() {
-        Some(v) if !v.is_undefined() => vm.to_i32(v)? as i64,
-        _ => 0,
+        Some(v) if !v.is_undefined() => vm.to_integer_or_infinity(v)?,
+        _ => 0.0,
     };
-    let rel_end = match args.get(1).copied() {
-        Some(v) if !v.is_undefined() => vm.to_i32(v)? as i64,
+    let start = clamp_rel_index(rel_start, len);
+    let end = match args.get(1).copied() {
+        Some(v) if !v.is_undefined() => clamp_rel_index(vm.to_integer_or_infinity(v)?, len),
         _ => len,
     };
-    let start = if rel_start < 0 {
-        (len + rel_start).max(0)
-    } else {
-        rel_start.min(len)
-    } as u32;
-    let end = if rel_end < 0 {
-        (len + rel_end).max(0)
-    } else {
-        rel_end.min(len)
-    } as u32;
-    let out = vm.alloc_array();
-    if end.saturating_sub(start) > 65_536 {
-        let indices = vm
-            .heap
-            .get_object(h)
-            .map(|o| o.elements.present_indices())
-            .unwrap_or_default();
-        if let Some(o) = vm.heap.get_object_mut(out) {
-            o.elements.set_len(end.saturating_sub(start));
+    let count = end.saturating_sub(start);
+    let out = vm.array_species_create(h, count)?;
+    for_each_present_idx(vm, h, end, |vm, i, v| {
+        if i >= start {
+            vm.array_create_data_prop(out, i - start, v)?;
         }
-        for i in indices {
-            if i >= start && i < end {
-                if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-                    if let Some(o) = vm.heap.get_object_mut(out) {
-                        o.elements.set(i - start, v);
-                    }
-                }
-            }
-        }
-    } else {
-        for i in start..end {
-            if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-                vm.heap.object_push_element(out, v);
-            } else if let Some(o) = vm.heap.get_object_mut(out) {
-                o.elements.push_hole();
-            }
-        }
-    }
+        Ok(())
+    })?;
+    vm.array_set_length(out, count)?;
     Ok(JsValue::from_object(out))
 }
 
@@ -1221,29 +1269,44 @@ fn array_index_of(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let Some(h) = this_val.as_object() else {
+    let h = vm.to_object(this_val)?;
+    let len = vm.array_get_len(h)?;
+    if len == 0 {
         return Ok(JsValue::from_i32(-1));
-    };
+    }
     let target = args.first().copied().unwrap_or(JsValue::UNDEFINED);
-    let (len, sparse_indices) = array_present_or_dense_indices(vm, h);
-    if let Some(indices) = sparse_indices {
-        for i in indices {
-            if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-                if vm.strict_eq(v, target) {
-                    return Ok(JsValue::from_f64(f64::from(i)));
-                }
-            }
+    let n = match args.get(1).copied() {
+        Some(v) if !v.is_undefined() => vm.to_integer_or_infinity(v)?,
+        _ => 0.0,
+    };
+    if n == f64::INFINITY || n >= len as f64 {
+        return Ok(JsValue::from_i32(-1));
+    }
+    let start = clamp_rel_index(n, len);
+    let sparse = vm.sparse_present_indices_if_safe(h, len);
+    let total = sparse.as_ref().map_or(len - start, |v| v.len() as u64);
+    let limit = vm.max_loop_iterations.unwrap_or(1_000_000).min(1_000_000);
+    for step in 0..total {
+        if step >= limit {
+            return Err(vm.range_error("Script execution iteration limit exceeded"));
         }
-    } else {
-        for i in 0..len {
-            if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-                if vm.strict_eq(v, target) {
-                    return Ok(JsValue::from_i32(i as i32));
-                }
+        let i = sparse.as_ref().map_or(start + step, |v| v[step as usize]);
+        if i >= start && vm.array_has_index(h, i)? {
+            let v = vm.array_get_index(h, i)?;
+            if vm.strict_eq(v, target) {
+                return Ok(JsValue::from_f64(i as f64));
             }
         }
     }
     Ok(JsValue::from_i32(-1))
+}
+
+fn same_value_zero(vm: &JsVm, a: JsValue, b: JsValue) -> bool {
+    if let (Some(na), Some(nb)) = (a.as_number(), b.as_number()) {
+        (na.is_nan() && nb.is_nan()) || na == nb
+    } else {
+        vm.strict_eq(a, b)
+    }
 }
 
 fn array_includes(
@@ -1251,8 +1314,44 @@ fn array_includes(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let idx = array_index_of(vm, this_val, args)?;
-    Ok(JsValue::from_bool(idx.as_i32() != Some(-1)))
+    let h = vm.to_object(this_val)?;
+    let len = vm.array_get_len(h)?;
+    if len == 0 {
+        return Ok(JsValue::FALSE);
+    }
+    let target = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+    let n = match args.get(1).copied() {
+        Some(v) if !v.is_undefined() => vm.to_integer_or_infinity(v)?,
+        _ => 0.0,
+    };
+    if n == f64::INFINITY || n >= len as f64 {
+        return Ok(JsValue::FALSE);
+    }
+    let start = clamp_rel_index(n, len);
+    if !target.is_undefined() {
+        if let Some(indices) = vm.sparse_present_indices_if_safe(h, len) {
+            for i in indices {
+                if i >= start {
+                    let v = vm.array_get_index(h, i)?;
+                    if same_value_zero(vm, v, target) {
+                        return Ok(JsValue::TRUE);
+                    }
+                }
+            }
+            return Ok(JsValue::FALSE);
+        }
+    }
+    let limit = vm.max_loop_iterations.unwrap_or(1_000_000).min(1_000_000);
+    for i in start..len {
+        if i - start >= limit {
+            return Err(vm.range_error("Script execution iteration limit exceeded"));
+        }
+        let v = vm.array_get_index(h, i)?;
+        if same_value_zero(vm, v, target) {
+            return Ok(JsValue::TRUE);
+        }
+    }
+    Ok(JsValue::FALSE)
 }
 
 #[derive(Clone, Copy)]
