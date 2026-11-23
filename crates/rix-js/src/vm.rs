@@ -79,6 +79,9 @@ pub enum RunOutcome {
         frame: SuspendedFrame,
         iterable: JsValue,
     },
+    SuspendedInitial {
+        frame: SuspendedFrame,
+    },
 }
 
 /// Tier-2 Baseline Cranelift JIT invocation threshold (Spec 05 §4.3).
@@ -164,11 +167,25 @@ struct CallFrame {
 
 #[derive(Debug, Clone)]
 enum IteratorState {
-    Array { arr: HeapHandle, index: u32 },
-    String { chars: Vec<char>, index: usize },
-    Keys { keys: Vec<String>, index: usize },
-    Custom { iter_obj: HeapHandle },
-    AsyncCustom { iter_obj: HeapHandle },
+    Array {
+        arr: HeapHandle,
+        index: u32,
+    },
+    String {
+        chars: Vec<char>,
+        index: usize,
+    },
+    Keys {
+        keys: Vec<String>,
+        index: usize,
+    },
+    Custom {
+        iter_obj: HeapHandle,
+        exhausted: bool,
+    },
+    AsyncCustom {
+        iter_obj: HeapHandle,
+    },
 }
 
 /// Core pure-Rust Register Bytecode Virtual Machine (`#![deny(unsafe_code)]`).
@@ -192,6 +209,8 @@ pub struct JsVm {
     pub string_proto: HeapHandle,
     pub number_proto: HeapHandle,
     pub boolean_proto: HeapHandle,
+    pub bigint_proto: HeapHandle,
+    pub symbol_proto: HeapHandle,
     pub regexp_proto: HeapHandle,
     pub date_proto: HeapHandle,
     pub map_proto: HeapHandle,
@@ -211,6 +230,10 @@ pub struct JsVm {
     pub key_symbol_iterator: PropertyKey,
     pub sym_async_iterator: SymbolId,
     pub key_symbol_async_iterator: PropertyKey,
+    pub sym_to_primitive: SymbolId,
+    pub key_symbol_to_primitive: PropertyKey,
+    pub default_array_iter_fn: Option<HeapHandle>,
+    pub eval_fn: Option<HeapHandle>,
     pub symbol_registry: HashMap<String, SymbolId>,
     pub symbol_descriptions: HashMap<SymbolId, String>,
     pub rng_state: u64,
@@ -253,6 +276,7 @@ pub struct JsVm {
     pub key_to_string: PropertyKey,
     pub key_value_of: PropertyKey,
     pub key_next: PropertyKey,
+    pub key_return: PropertyKey,
     pub key_done: PropertyKey,
     pub key_value: PropertyKey,
     pub key_get: PropertyKey,
@@ -319,6 +343,8 @@ impl JsVm {
             heap.get_object_mut(p).unwrap().is_prototype = true;
             p
         };
+        let bigint_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let symbol_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let type_error_proto = make_proto(&mut heap, &mut shapes, error_proto);
         let reference_error_proto = make_proto(&mut heap, &mut shapes, error_proto);
         let range_error_proto = make_proto(&mut heap, &mut shapes, error_proto);
@@ -346,6 +372,8 @@ impl JsVm {
         let sym_async_iterator = heap.alloc_symbol(Some("Symbol.asyncIterator".into()));
         let key_symbol_async_iterator =
             heap.intern_key(&format!("Symbol({})", sym_async_iterator.0));
+        let sym_to_primitive = heap.alloc_symbol(Some("Symbol.toPrimitive".into()));
+        let key_symbol_to_primitive = heap.intern_key(&format!("Symbol({})", sym_to_primitive.0));
 
         let global = heap.alloc_empty_object();
         heap.object_set_prototype(global, Some(object_proto), &mut shapes);
@@ -359,6 +387,7 @@ impl JsVm {
         let key_to_string = heap.intern_key("toString");
         let key_value_of = heap.intern_key("valueOf");
         let key_next = heap.intern_key("next");
+        let key_return = heap.intern_key("return");
         let key_done = heap.intern_key("done");
         let key_value = heap.intern_key("value");
         let key_get = heap.intern_key("get");
@@ -391,6 +420,8 @@ impl JsVm {
             string_proto,
             number_proto,
             boolean_proto,
+            bigint_proto,
+            symbol_proto,
             regexp_proto,
             date_proto,
             map_proto,
@@ -410,6 +441,10 @@ impl JsVm {
             key_symbol_iterator,
             sym_async_iterator,
             key_symbol_async_iterator,
+            sym_to_primitive,
+            key_symbol_to_primitive,
+            default_array_iter_fn: None,
+            eval_fn: None,
             symbol_registry: HashMap::new(),
             symbol_descriptions: HashMap::new(),
             rng_state: 0x9E37_79B9_7F4A_7C15,
@@ -443,6 +478,7 @@ impl JsVm {
             key_to_string,
             key_value_of,
             key_next,
+            key_return,
             key_done,
             key_value,
             key_get,
@@ -526,6 +562,8 @@ impl JsVm {
             self.string_proto,
             self.number_proto,
             self.boolean_proto,
+            self.bigint_proto,
+            self.symbol_proto,
             self.regexp_proto,
             self.date_proto,
             self.map_proto,
@@ -575,11 +613,18 @@ impl JsVm {
             roots.push(JsValue::from_object(iter_h));
             match state {
                 IteratorState::Array { arr, .. } => roots.push(JsValue::from_object(*arr)),
-                IteratorState::Custom { iter_obj } | IteratorState::AsyncCustom { iter_obj } => {
+                IteratorState::Custom { iter_obj, .. }
+                | IteratorState::AsyncCustom { iter_obj } => {
                     roots.push(JsValue::from_object(*iter_obj))
                 }
                 IteratorState::String { .. } | IteratorState::Keys { .. } => {}
             }
+        }
+        if let Some(h) = self.default_array_iter_fn {
+            roots.push(JsValue::from_object(h));
+        }
+        if let Some(h) = self.eval_fn {
+            roots.push(JsValue::from_object(h));
         }
         roots
     }
@@ -811,6 +856,16 @@ impl JsVm {
 
     /// Executes a pre-compiled [`CompiledProgram`] entry function.
     pub fn execute_program(&mut self, program: CompiledProgram) -> Result<JsValue, JsException> {
+        let global_val = JsValue::from_object(self.global);
+        self.execute_program_with_this(program, global_val)
+    }
+
+    /// Executes a pre-compiled [`CompiledProgram`] entry function with an explicit `this` receiver.
+    pub fn execute_program_with_this(
+        &mut self,
+        program: CompiledProgram,
+        this_val: JsValue,
+    ) -> Result<JsValue, JsException> {
         let entry_idx = program.entry_func;
         let prog_id = self.load_program(program);
         let entry_closure = self.heap.alloc_object(JsObject::with_kind(
@@ -824,8 +879,7 @@ impl JsVm {
             })),
             Some(self.function_proto),
         ));
-        let global_val = JsValue::from_object(self.global);
-        self.call_value(JsValue::from_object(entry_closure), global_val, &[])
+        self.call_value(JsValue::from_object(entry_closure), this_val, &[])
     }
 
     /// Invokes any callable [`JsValue`] (`Closure`, `NativeFunction`, `BoundFunction`, or `Proxy`).
@@ -1039,7 +1093,7 @@ impl JsVm {
                         closure.func_idx,
                         effective_this,
                         args,
-                    );
+                    )?;
                     return Ok(JsValue::from_object(gen_h));
                 }
                 if is_generator {
@@ -1050,7 +1104,7 @@ impl JsVm {
                         closure.func_idx,
                         effective_this,
                         args,
-                    );
+                    )?;
                     return Ok(JsValue::from_object(gen_h));
                 }
                 if is_async {
@@ -1210,7 +1264,7 @@ impl JsVm {
         &mut self,
         iter_val: JsValue,
     ) -> Result<(JsValue, bool), JsException> {
-        self.step_iterator(iter_val)
+        self.step_iterator_ex(iter_val, true)
     }
 
     pub(crate) fn create_async_iterator_public(
@@ -1268,7 +1322,8 @@ impl JsVm {
             RunOutcome::Completed(val) => Ok(val),
             RunOutcome::SuspendedAwait { .. }
             | RunOutcome::SuspendedYield { .. }
-            | RunOutcome::SuspendedYieldStar { .. } => {
+            | RunOutcome::SuspendedYieldStar { .. }
+            | RunOutcome::SuspendedInitial { .. } => {
                 Err(self.type_error("Unexpected suspension outside async or generator context"))
             }
         }
@@ -1378,6 +1433,10 @@ impl JsVm {
                 Ok(StepOutcome::SuspendYieldStar { dst, iterable }) => {
                     let frame = self.suspend_top_frame(dst);
                     return Ok(RunOutcome::SuspendedYieldStar { frame, iterable });
+                }
+                Ok(StepOutcome::SuspendInitial) => {
+                    let frame = self.suspend_top_frame(0);
+                    return Ok(RunOutcome::SuspendedInitial { frame });
                 }
                 Err(exc) => {
                     self.handle_exception(exc, stop_depth)?;
@@ -1521,23 +1580,51 @@ impl JsVm {
                 let name_idx = self.resolve_abx_idx(inst, prog_id, func_idx, frame_idx);
                 let key = self.const_key(prog_id, func_idx, name_idx);
                 let val = self.registers[a];
-                self.heap.object_define_data(
-                    self.global,
-                    key,
-                    val,
-                    PropertyAttrs::DEFAULT,
-                    &mut self.shapes,
-                );
+                let attrs = if self.programs[prog_id].functions[func_idx].name.as_deref()
+                    == Some("<script>")
+                {
+                    PropertyAttrs::WRITABLE | PropertyAttrs::ENUMERABLE
+                } else {
+                    PropertyAttrs::DEFAULT
+                };
+                if val.is_empty() {
+                    if self
+                        .heap
+                        .object_get_own(self.global, key, &self.shapes)
+                        .is_none()
+                    {
+                        self.heap.object_define_data(
+                            self.global,
+                            key,
+                            JsValue::UNDEFINED,
+                            attrs,
+                            &mut self.shapes,
+                        );
+                    }
+                } else {
+                    self.heap
+                        .object_define_data(self.global, key, val, attrs, &mut self.shapes);
+                }
             }
             Opcode::GetUpvalue => {
                 let uv_idx = usize::from(inst.bx());
                 let cell = self.frame_upvalue(frame_idx, uv_idx)?;
                 let val = self.read_upvalue_cell(cell);
+                if val.is_empty() {
+                    return Err(self.reference_error(
+                        "Cannot access lexical declaration before initialization",
+                    ));
+                }
                 self.registers[a] = val;
             }
             Opcode::SetUpvalue => {
                 let uv_idx = usize::from(inst.bx());
                 let cell = self.frame_upvalue(frame_idx, uv_idx)?;
+                if self.read_upvalue_cell(cell).is_empty() {
+                    return Err(self.reference_error(
+                        "Cannot access lexical declaration before initialization",
+                    ));
+                }
                 let val = self.registers[a];
                 self.write_upvalue_cell(cell, val);
             }
@@ -1823,10 +1910,16 @@ impl JsVm {
             Opcode::DefineGetter | Opcode::DefineSetter => {
                 let key_val = self.registers[base + usize::from(inst.b())];
                 let fn_val = self.registers[base + usize::from(inst.c())];
+                let s = self.to_property_key(key_val)?;
                 if let (Some(obj), Some(fn_h)) = (self.registers[a].as_object(), fn_val.as_object())
                 {
-                    let s = self.value_to_rust_string(key_val);
                     let key = self.heap.intern_key(&s);
+                    let prefix = if op == Opcode::DefineGetter {
+                        "get "
+                    } else {
+                        "set "
+                    };
+                    self.set_function_name_for_key(fn_h, key_val, &s, prefix);
                     let (g, set) = if op == Opcode::DefineGetter {
                         (Some(fn_h), None)
                     } else {
@@ -1840,6 +1933,71 @@ impl JsVm {
                         PropertyAttrs::ENUMERABLE | PropertyAttrs::CONFIGURABLE,
                         &mut self.shapes,
                     );
+                }
+            }
+            Opcode::DefineClassMethod | Opcode::DefineClassGetter | Opcode::DefineClassSetter => {
+                let key_val = self.registers[base + usize::from(inst.b())];
+                let fn_val = self.registers[base + usize::from(inst.c())];
+                let s = self.to_property_key(key_val)?;
+                if let (Some(obj), Some(fn_h)) = (self.registers[a].as_object(), fn_val.as_object())
+                {
+                    let key = self.heap.intern_key(&s);
+                    let prefix = match op {
+                        Opcode::DefineClassGetter => "get ",
+                        Opcode::DefineClassSetter => "set ",
+                        _ => "",
+                    };
+                    self.set_function_name_for_key(fn_h, key_val, &s, prefix);
+                    // Propagate class `super_ctor` onto computed class method closures.
+                    let sup_ctor = self
+                        .heap
+                        .object_get_own(obj, self.key_constructor, &self.shapes)
+                        .and_then(|p| p.value.as_object())
+                        .or(Some(obj))
+                        .and_then(|c| self.heap.get_object(c))
+                        .and_then(|o| match &o.kind {
+                            ObjectKind::Closure(cl) => cl.super_ctor,
+                            _ => None,
+                        });
+                    if let Some(sup) = sup_ctor {
+                        if let Some(ObjectKind::Closure(cl)) =
+                            self.heap.get_object_mut(fn_h).map(|o| &mut o.kind)
+                        {
+                            cl.super_ctor = Some(sup);
+                        }
+                    }
+                    match op {
+                        Opcode::DefineClassMethod => {
+                            self.heap.object_define_data(
+                                obj,
+                                key,
+                                JsValue::from_object(fn_h),
+                                PropertyAttrs::METHOD,
+                                &mut self.shapes,
+                            );
+                        }
+                        Opcode::DefineClassGetter => {
+                            self.heap.object_define_accessor(
+                                obj,
+                                key,
+                                Some(fn_h),
+                                None,
+                                PropertyAttrs::CONFIGURABLE,
+                                &mut self.shapes,
+                            );
+                        }
+                        Opcode::DefineClassSetter => {
+                            self.heap.object_define_accessor(
+                                obj,
+                                key,
+                                None,
+                                Some(fn_h),
+                                PropertyAttrs::CONFIGURABLE,
+                                &mut self.shapes,
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
                 }
             }
             Opcode::GetPrivate => {
@@ -2003,6 +2161,64 @@ impl JsVm {
                 };
                 self.registers[a] = res;
             }
+            Opcode::DirectEval => {
+                let call_base = base + usize::from(inst.b());
+                let meta_idx = usize::from(inst.c());
+                let meta = match self.programs[prog_id].functions[func_idx]
+                    .constants
+                    .get(meta_idx)
+                {
+                    Some(ConstantEntry::DirectEval(m)) => m.clone(),
+                    _ => return Err(self.type_error("Invalid direct eval metadata")),
+                };
+                let callee = self.registers[call_base];
+                let argc = usize::from(meta.argc);
+                let res = if callee.as_object() != self.eval_fn {
+                    let args: Vec<JsValue> = (0..argc)
+                        .map(|i| self.registers[call_base + 1 + i])
+                        .collect();
+                    self.call_value(callee, JsValue::UNDEFINED, &args)?
+                } else if argc == 0 {
+                    JsValue::UNDEFINED
+                } else {
+                    let first = self.registers[call_base + 1];
+                    if let Some(str_h) = first.as_string() {
+                        let src = self.heap.materialize_string(str_h).unwrap_or_default();
+                        let prog = crate::parser::parse_eval(
+                            &src,
+                            meta.is_strict,
+                            meta.in_class_field_or_static,
+                            meta.in_class_body,
+                        )
+                        .map_err(|e| self.make_error("SyntaxError", e.to_string()))?;
+                        let eval_is_strict = meta.is_strict || prog.strict;
+                        if !eval_is_strict && !meta.forbidden_vars.is_empty() {
+                            let var_names =
+                                crate::compiler::collect_eval_var_declared_names(&prog.body);
+                            for name in &var_names {
+                                if meta.forbidden_vars.contains(name) {
+                                    return Err(self.make_error(
+                                        "SyntaxError",
+                                        format!("Identifier '{name}' has already been declared"),
+                                    ));
+                                }
+                            }
+                        }
+                        let mode = if eval_is_strict || meta.in_function {
+                            crate::compiler::EvalScopeMode::LocalAll
+                        } else {
+                            crate::compiler::EvalScopeMode::GlobalVars
+                        };
+                        let compiled = crate::compiler::compile_eval_program(&prog, mode)
+                            .map_err(|e| self.make_error("SyntaxError", e.to_string()))?;
+                        let caller_this = self.frames[frame_idx].this_val;
+                        self.execute_program_with_this(compiled, caller_this)?
+                    } else {
+                        first
+                    }
+                };
+                self.registers[a] = res;
+            }
             Opcode::CallMethod => {
                 let call_base = base + usize::from(inst.b());
                 let ic_idx = self.resolve_ic_idx(inst, prog_id, func_idx, frame_idx);
@@ -2157,54 +2373,47 @@ impl JsVm {
             Opcode::Div => {
                 let lhs = self.registers[base + usize::from(inst.b())];
                 let rhs = self.registers[base + usize::from(inst.c())];
-                let l = self.to_number(lhs)?;
-                let r = self.to_number(rhs)?;
-                self.registers[a] = JsValue::from_f64(l / r);
+                self.registers[a] = self.op_numeric_bin(lhs, rhs, Opcode::Div)?;
             }
             Opcode::Rem => {
                 let lhs = self.registers[base + usize::from(inst.b())];
                 let rhs = self.registers[base + usize::from(inst.c())];
-                let l = self.to_number(lhs)?;
-                let r = self.to_number(rhs)?;
-                self.registers[a] = JsValue::from_f64(l % r);
+                self.registers[a] = self.op_numeric_bin(lhs, rhs, Opcode::Rem)?;
             }
             Opcode::Exp => {
                 let lhs = self.registers[base + usize::from(inst.b())];
                 let rhs = self.registers[base + usize::from(inst.c())];
-                let l = self.to_number(lhs)?;
-                let r = self.to_number(rhs)?;
-                self.registers[a] = JsValue::from_f64(l.powf(r));
+                self.registers[a] = self.op_numeric_bin(lhs, rhs, Opcode::Exp)?;
             }
             Opcode::BitAnd => {
-                let l = self.to_i32(self.registers[base + usize::from(inst.b())])?;
-                let r = self.to_i32(self.registers[base + usize::from(inst.c())])?;
-                self.registers[a] = JsValue::from_i32(l & r);
+                let lhs = self.registers[base + usize::from(inst.b())];
+                let rhs = self.registers[base + usize::from(inst.c())];
+                self.registers[a] = self.op_numeric_bin(lhs, rhs, Opcode::BitAnd)?;
             }
             Opcode::BitOr => {
-                let l = self.to_i32(self.registers[base + usize::from(inst.b())])?;
-                let r = self.to_i32(self.registers[base + usize::from(inst.c())])?;
-                self.registers[a] = JsValue::from_i32(l | r);
+                let lhs = self.registers[base + usize::from(inst.b())];
+                let rhs = self.registers[base + usize::from(inst.c())];
+                self.registers[a] = self.op_numeric_bin(lhs, rhs, Opcode::BitOr)?;
             }
             Opcode::BitXor => {
-                let l = self.to_i32(self.registers[base + usize::from(inst.b())])?;
-                let r = self.to_i32(self.registers[base + usize::from(inst.c())])?;
-                self.registers[a] = JsValue::from_i32(l ^ r);
+                let lhs = self.registers[base + usize::from(inst.b())];
+                let rhs = self.registers[base + usize::from(inst.c())];
+                self.registers[a] = self.op_numeric_bin(lhs, rhs, Opcode::BitXor)?;
             }
             Opcode::Shl => {
-                let l = self.to_i32(self.registers[base + usize::from(inst.b())])?;
-                let r = self.to_u32(self.registers[base + usize::from(inst.c())])? & 0x1F;
-                self.registers[a] = JsValue::from_i32(l.wrapping_shl(r));
+                let lhs = self.registers[base + usize::from(inst.b())];
+                let rhs = self.registers[base + usize::from(inst.c())];
+                self.registers[a] = self.op_numeric_bin(lhs, rhs, Opcode::Shl)?;
             }
             Opcode::Shr => {
-                let l = self.to_i32(self.registers[base + usize::from(inst.b())])?;
-                let r = self.to_u32(self.registers[base + usize::from(inst.c())])? & 0x1F;
-                self.registers[a] = JsValue::from_i32(l.wrapping_shr(r));
+                let lhs = self.registers[base + usize::from(inst.b())];
+                let rhs = self.registers[base + usize::from(inst.c())];
+                self.registers[a] = self.op_numeric_bin(lhs, rhs, Opcode::Shr)?;
             }
             Opcode::UShr => {
-                let l = self.to_u32(self.registers[base + usize::from(inst.b())])?;
-                let r = self.to_u32(self.registers[base + usize::from(inst.c())])? & 0x1F;
-                let res = l.wrapping_shr(r);
-                self.registers[a] = JsValue::from_f64(f64::from(res));
+                let lhs = self.registers[base + usize::from(inst.b())];
+                let rhs = self.registers[base + usize::from(inst.c())];
+                self.registers[a] = self.op_numeric_bin(lhs, rhs, Opcode::UShr)?;
             }
             // Comparisons
             Opcode::StrictEq => {
@@ -2255,7 +2464,7 @@ impl JsVm {
                 let Some(obj) = obj_val.as_object() else {
                     return Err(self.type_error("Right-hand side of 'in' is not an object"));
                 };
-                let s = self.value_to_rust_string(key_val);
+                let s = self.to_property_key(key_val)?;
                 let key = self.heap.intern_key(&s);
                 let has = self.has_property_by_key(obj, key)?;
                 self.registers[a] = JsValue::from_bool(has);
@@ -2269,9 +2478,15 @@ impl JsVm {
             // Unary ops
             Opcode::Neg => {
                 let v = self.registers[base + usize::from(inst.b())];
-                self.registers[a] = match v.kind() {
-                    JsValueKind::Int32(i) if i != 0 && i != i32::MIN => JsValue::from_i32(-i),
-                    JsValueKind::BigInt(h) => {
+                self.registers[a] = if let JsValueKind::Int32(i) = v.kind() {
+                    if i != 0 && i != i32::MIN {
+                        JsValue::from_i32(-i)
+                    } else {
+                        JsValue::from_f64(-f64::from(i))
+                    }
+                } else {
+                    let nv = self.coerce_numeric(v)?;
+                    if let Some(h) = nv.as_bigint() {
                         let bi = self
                             .heap
                             .get_bigint(h)
@@ -2279,8 +2494,9 @@ impl JsVm {
                             .unwrap_or_default()
                             .negate();
                         JsValue::from_bigint(self.heap.alloc_bigint(bi))
+                    } else {
+                        JsValue::from_f64(-self.to_number(nv)?)
                     }
-                    _ => JsValue::from_f64(-self.to_number(v)?),
                 };
             }
             Opcode::Pos | Opcode::ToNumber => {
@@ -2290,7 +2506,7 @@ impl JsVm {
             }
             Opcode::ToString => {
                 let v = self.registers[base + usize::from(inst.b())];
-                let s = self.value_to_rust_string(v);
+                let s = self.to_js_string(v)?;
                 self.registers[a] = JsValue::from_string(self.heap.alloc_string(s));
             }
             Opcode::Not => {
@@ -2299,7 +2515,8 @@ impl JsVm {
             }
             Opcode::BitNot => {
                 let raw = self.registers[base + usize::from(inst.b())];
-                self.registers[a] = if let Some(h) = raw.as_bigint() {
+                let nv = self.coerce_numeric(raw)?;
+                self.registers[a] = if let Some(h) = nv.as_bigint() {
                     let bi = self
                         .heap
                         .get_bigint(h)
@@ -2309,7 +2526,7 @@ impl JsVm {
                         .sub(&JsBigInt::from_i64(1));
                     JsValue::from_bigint(self.heap.alloc_bigint(bi))
                 } else {
-                    JsValue::from_i32(!self.to_i32(raw)?)
+                    JsValue::from_i32(!self.to_i32(nv)?)
                 };
             }
             Opcode::TypeOf => {
@@ -2511,9 +2728,25 @@ impl JsVm {
                 self.registers[done_reg] = JsValue::from_bool(done);
             }
             Opcode::IteratorClose => {
+                let abrupt = inst.b() != 0;
                 if let Some(h) = self.registers[a].as_object() {
-                    self.iterators.remove(&h);
+                    if let Some(IteratorState::Custom {
+                        iter_obj,
+                        exhausted: false,
+                    }) = self.iterators.remove(&h)
+                    {
+                        self.iterator_close_custom(iter_obj, abrupt)?;
+                    }
                 }
+            }
+            Opcode::RequireObjectCoercible => {
+                let v = self.registers[a];
+                if v.is_null() || v.is_undefined() {
+                    return Err(self.type_error("Cannot destructure null or undefined"));
+                }
+            }
+            Opcode::GeneratorStart => {
+                return Ok(StepOutcome::SuspendInitial);
             }
             Opcode::PushWith => {
                 if let Some(h) = self.registers[a].as_object() {
@@ -2551,7 +2784,15 @@ impl JsVm {
             }
             Opcode::DynamicImport => {
                 let spec_val = self.registers[base + usize::from(inst.b())];
-                let specifier = self.value_to_rust_string(spec_val);
+                let specifier = match self.to_js_string(spec_val) {
+                    Ok(s) => s,
+                    Err(exc) => {
+                        let p = crate::promise::alloc_promise(self);
+                        crate::promise::reject_promise(self, p, exc.value);
+                        self.registers[a] = JsValue::from_object(p);
+                        return Ok(StepOutcome::Continue);
+                    }
+                };
                 let referrer = self
                     .module_envs
                     .get(&(prog_id as u32))
@@ -2782,7 +3023,9 @@ impl JsVm {
             ConstantEntry::RegExp { pattern, flags } => {
                 JsValue::from_object(self.alloc_regexp(pattern, flags))
             }
-            ConstantEntry::Function(_) | ConstantEntry::Class(_) => JsValue::UNDEFINED,
+            ConstantEntry::Function(_) | ConstantEntry::Class(_) | ConstantEntry::DirectEval(_) => {
+                JsValue::UNDEFINED
+            }
         })
     }
 
@@ -2852,6 +3095,10 @@ impl JsVm {
         let Some(obj) = obj_val.as_object() else {
             let proto = if obj_val.is_bool() {
                 self.boolean_proto
+            } else if obj_val.is_bigint() {
+                self.bigint_proto
+            } else if obj_val.is_symbol() {
+                self.symbol_proto
             } else {
                 self.number_proto
             };
@@ -2922,7 +3169,21 @@ impl JsVm {
         let epoch = self.shapes.prototype_epoch();
 
         let mut cur = Some(obj);
+        let idx_opt = self.key_as_array_index(key);
         while let Some(holder) = cur {
+            if let Some(idx) = idx_opt {
+                if let Some(o) = self.heap.get_object(holder) {
+                    if let ObjectKind::TypedArray(ta) = o.kind {
+                        if idx < ta.length {
+                            return Ok(crate::builtins_collections::typed_array_read_element(
+                                self, ta, idx,
+                            ));
+                        }
+                    } else if let Some(val) = o.elements.get(idx) {
+                        return Ok(val);
+                    }
+                }
+            }
             if let Some(prop) = self.heap.object_get_own(holder, key, &self.shapes) {
                 if prop.attrs.contains(PropertyAttrs::ACCESSOR) {
                     if let Some(getter) = prop.getter {
@@ -3187,7 +3448,21 @@ impl JsVm {
             )));
         }
         let mut cur = Some(obj);
+        let idx_opt = self.key_as_array_index(key);
         while let Some(holder) = cur {
+            if let Some(idx) = idx_opt {
+                if let Some(o) = self.heap.get_object(holder) {
+                    if let ObjectKind::TypedArray(ta) = o.kind {
+                        if idx < ta.length {
+                            return Ok(crate::builtins_collections::typed_array_read_element(
+                                self, ta, idx,
+                            ));
+                        }
+                    } else if let Some(val) = o.elements.get(idx) {
+                        return Ok(val);
+                    }
+                }
+            }
             if let Some(prop) = self.heap.object_get_own(holder, key, &self.shapes) {
                 if prop.attrs.contains(PropertyAttrs::ACCESSOR) {
                     if let Some(getter) = prop.getter {
@@ -3410,6 +3685,13 @@ impl JsVm {
         if obj_val.is_null() || obj_val.is_undefined() {
             return Err(self.type_error("Cannot read properties of null or undefined"));
         }
+        // Convert object keys via ECMA-262 `ToPropertyKey` before indexing.
+        let key_val = if key_val.is_object() {
+            let ks = self.to_property_key(key_val)?;
+            JsValue::from_string(self.heap.alloc_string(ks))
+        } else {
+            key_val
+        };
         // Fast string indexing `"hello"[1] === "e"`.
         if let Some(str_h) = obj_val.as_string() {
             if let Some(idx) = key_val.as_i32().and_then(|i| u32::try_from(i).ok()) {
@@ -3419,7 +3701,7 @@ impl JsVm {
                 }
                 return Ok(JsValue::UNDEFINED);
             }
-            let ks = self.value_to_rust_string(key_val);
+            let ks = self.to_property_key(key_val)?;
             let k = self.heap.intern_key(&ks);
             return self.get_property_with_receiver(self.string_proto, k, obj_val);
         }
@@ -3427,7 +3709,7 @@ impl JsVm {
             return Ok(JsValue::UNDEFINED);
         };
         if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
-            let ks = self.value_to_rust_string(key_val);
+            let ks = self.to_property_key(key_val)?;
             let k = self.heap.intern_key(&ks);
             return self.proxy_get(p, k, obj_val);
         }
@@ -3442,7 +3724,7 @@ impl JsVm {
                 return Ok(val);
             }
         }
-        let ks = self.value_to_rust_string(key_val);
+        let ks = self.to_property_key(key_val)?;
         let key = self.heap.intern_key(&ks);
         self.get_property_by_key(obj, key)
     }
@@ -3466,8 +3748,14 @@ impl JsVm {
         let Some(obj) = obj_val.as_object() else {
             return Err(self.type_error("Cannot set element on non-object"));
         };
+        let key_val = if key_val.is_object() {
+            let ks = self.to_property_key(key_val)?;
+            JsValue::from_string(self.heap.alloc_string(ks))
+        } else {
+            key_val
+        };
         if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
-            let ks = self.value_to_rust_string(key_val);
+            let ks = self.to_property_key(key_val)?;
             let k = self.heap.intern_key(&ks);
             return self.proxy_set(p, k, val, obj_val);
         }
@@ -3476,6 +3764,40 @@ impl JsVm {
                 let ta = *ta;
                 crate::builtins_collections::typed_array_write_element(self, ta, idx, val)?;
                 return Ok(true);
+            }
+            // Check if this numeric key is defined as an accessor or named property on obj/prototype.
+            let has_named_idx = {
+                let is_arr = matches!(
+                    self.heap.get_object(obj).map(|o| &o.kind),
+                    Some(ObjectKind::Array)
+                );
+                let elem_present = self
+                    .heap
+                    .get_object(obj)
+                    .is_some_and(|o| o.elements.has(idx));
+                if is_arr && elem_present {
+                    false
+                } else {
+                    let ks = idx.to_string();
+                    if let Some(k) = self.heap.interner().lookup(&ks) {
+                        let mut cur = Some(obj);
+                        let mut found = false;
+                        while let Some(h) = cur {
+                            if self.heap.object_get_own(h, k, &self.shapes).is_some() {
+                                found = true;
+                                break;
+                            }
+                            cur = self.heap.get_object(h).and_then(|o| o.prototype);
+                        }
+                        found
+                    } else {
+                        false
+                    }
+                }
+            };
+            if has_named_idx {
+                let key = self.heap.intern_key(&idx.to_string());
+                return self.set_property_by_key(obj, key, val);
             }
             let extensible = self.heap.get_object(obj).is_some_and(|o| o.extensible);
             let exists = self
@@ -3491,7 +3813,7 @@ impl JsVm {
             self.heap.write_barrier(obj, val);
             return Ok(true);
         }
-        let ks = self.value_to_rust_string(key_val);
+        let ks = self.to_property_key(key_val)?;
         let key = self.heap.intern_key(&ks);
         self.set_property_by_key(obj, key, val)
     }
@@ -3500,14 +3822,36 @@ impl JsVm {
         let Some(obj) = obj_val.as_object() else {
             return Ok(true);
         };
+        let key_val = if key_val.is_object() {
+            let ks = self.to_property_key(key_val)?;
+            JsValue::from_string(self.heap.alloc_string(ks))
+        } else {
+            key_val
+        };
         if let Some(idx) = self.as_array_index(key_val) {
-            if let Some(o) = self.heap.get_object_mut(obj) {
-                return Ok(o.elements.delete(idx));
+            if self
+                .heap
+                .get_object(obj)
+                .is_some_and(|o| o.elements.has(idx))
+            {
+                if let Some(o) = self.heap.get_object_mut(obj) {
+                    return Ok(o.elements.delete(idx));
+                }
             }
         }
-        let ks = self.value_to_rust_string(key_val);
+        let ks = self.to_property_key(key_val)?;
         let key = self.heap.intern_key(&ks);
         self.delete_property_by_key(obj, key)
+    }
+
+    #[inline]
+    fn key_as_array_index(&self, key: PropertyKey) -> Option<u32> {
+        let s = self.heap.interner().get(key)?;
+        let b0 = *s.as_bytes().first()?;
+        if !b0.is_ascii_digit() || (s.len() > 1 && b0 == b'0') {
+            return None;
+        }
+        s.parse::<u32>().ok().filter(|&n| n < u32::MAX)
     }
 
     #[inline]
@@ -3908,6 +4252,67 @@ impl JsVm {
     // Iterators, Operators, Coercions & Errors
     // -----------------------------------------------------------------------
 
+    fn set_function_name_for_key(
+        &mut self,
+        fn_h: HeapHandle,
+        raw_key: JsValue,
+        key_str: &str,
+        prefix: &str,
+    ) {
+        let base_name = if let Some(sym_id) = raw_key.as_symbol() {
+            match self.symbol_descriptions.get(&sym_id) {
+                Some(desc) if !desc.is_empty() => format!("[{desc}]"),
+                _ => String::new(),
+            }
+        } else {
+            key_str.to_owned()
+        };
+        let full = if prefix.is_empty() {
+            base_name
+        } else {
+            format!("{prefix}{base_name}")
+        };
+        let nv = JsValue::from_string(self.heap.alloc_string(full));
+        self.heap.object_define_data(
+            fn_h,
+            self.key_name,
+            nv,
+            PropertyAttrs::CONFIGURABLE,
+            &mut self.shapes,
+        );
+    }
+
+    fn iterator_close_custom(
+        &mut self,
+        iter_obj: HeapHandle,
+        abrupt: bool,
+    ) -> Result<(), JsException> {
+        let ret_res = self.get_property_by_key(iter_obj, self.key_return);
+        let ret_fn = match ret_res {
+            Ok(v) => v,
+            Err(e) => return if abrupt { Ok(()) } else { Err(e) },
+        };
+        if ret_fn.is_undefined() || ret_fn.is_null() {
+            return Ok(());
+        }
+        let call_res = self.call_value(ret_fn, JsValue::from_object(iter_obj), &[]);
+        match call_res {
+            Ok(inner) => {
+                if !abrupt && !inner.is_object() {
+                    return Err(self.type_error("Iterator result is not an object"));
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if abrupt {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     fn create_iterator(&mut self, iterable: JsValue) -> Result<HeapHandle, JsException> {
         if let Some(s_h) = iterable.as_string() {
             let chars: Vec<char> = self
@@ -3924,10 +4329,23 @@ impl JsVm {
         let Some(obj) = iterable.as_object() else {
             return Err(self.type_error("Value is not iterable"));
         };
-        if matches!(
+        let is_unmodified_array = matches!(
             self.heap.get_object(obj).map(|o| &o.kind),
             Some(ObjectKind::Array)
-        ) {
+        ) && self.heap.get_object(obj).and_then(|o| o.prototype)
+            == Some(self.array_proto)
+            && self
+                .heap
+                .object_get_own(obj, self.key_symbol_iterator, &self.shapes)
+                .is_none()
+            && self
+                .heap
+                .object_get_own(self.array_proto, self.key_symbol_iterator, &self.shapes)
+                .is_some_and(|p| {
+                    !p.attrs.contains(PropertyAttrs::ACCESSOR)
+                        && p.value.as_object() == self.default_array_iter_fn
+                });
+        if is_unmodified_array {
             let h = self.alloc_ordinary_object();
             self.iterators
                 .insert(h, IteratorState::Array { arr: obj, index: 0 });
@@ -3941,19 +4359,27 @@ impl JsVm {
                 return Err(self.type_error("Result of Symbol.iterator method is not an object"));
             };
             let h = self.alloc_ordinary_object();
-            self.iterators.insert(h, IteratorState::Custom { iter_obj });
-            return Ok(h);
-        }
-        if self.has_property_by_key(obj, self.key_next)? {
-            let h = self.alloc_ordinary_object();
-            self.iterators
-                .insert(h, IteratorState::Custom { iter_obj: obj });
+            self.iterators.insert(
+                h,
+                IteratorState::Custom {
+                    iter_obj,
+                    exhausted: false,
+                },
+            );
             return Ok(h);
         }
         Err(self.type_error("Object is not iterable"))
     }
 
     fn step_iterator(&mut self, iter_val: JsValue) -> Result<(JsValue, bool), JsException> {
+        self.step_iterator_ex(iter_val, false)
+    }
+
+    fn step_iterator_ex(
+        &mut self,
+        iter_val: JsValue,
+        read_value_on_done: bool,
+    ) -> Result<(JsValue, bool), JsException> {
         let Some(h) = iter_val.as_object() else {
             return Ok((JsValue::UNDEFINED, true));
         };
@@ -3997,8 +4423,37 @@ impl JsVm {
                 }
                 Ok((JsValue::from_string(self.heap.alloc_string(k)), false))
             }
-            Some(IteratorState::Custom { iter_obj })
-            | Some(IteratorState::AsyncCustom { iter_obj }) => {
+            Some(IteratorState::Custom {
+                iter_obj,
+                exhausted,
+            }) => {
+                if exhausted {
+                    return Ok((JsValue::UNDEFINED, true));
+                }
+                let next_fn = self.get_property_by_key(iter_obj, self.key_next)?;
+                let res = self.call_value(next_fn, JsValue::from_object(iter_obj), &[])?;
+                let Some(res_h) = res.as_object() else {
+                    return Err(self.type_error("Iterator result is not an object"));
+                };
+                let done_val = self.get_property_by_key(res_h, self.key_done)?;
+                let done = self.to_boolean(done_val);
+                if done {
+                    if let Some(IteratorState::Custom { exhausted: ex, .. }) =
+                        self.iterators.get_mut(&h)
+                    {
+                        *ex = true;
+                    }
+                    let val = if read_value_on_done {
+                        self.get_property_by_key(res_h, self.key_value)?
+                    } else {
+                        JsValue::UNDEFINED
+                    };
+                    return Ok((val, true));
+                }
+                let val = self.get_property_by_key(res_h, self.key_value)?;
+                Ok((val, false))
+            }
+            Some(IteratorState::AsyncCustom { iter_obj }) => {
                 let next_fn = self.get_property_by_key(iter_obj, self.key_next)?;
                 let res = self.call_value(next_fn, JsValue::from_object(iter_obj), &[])?;
                 let Some(res_h) = res.as_object() else {
@@ -4157,94 +4612,270 @@ impl JsVm {
             (JsValueKind::Float(a), JsValueKind::Int32(b)) => {
                 return Ok(JsValue::from_f64(a + f64::from(b)));
             }
-            (JsValueKind::BigInt(a), JsValueKind::BigInt(b)) => {
-                let sum = self
-                    .heap
-                    .get_bigint(a)
-                    .unwrap()
-                    .add(self.heap.get_bigint(b).unwrap());
-                return Ok(JsValue::from_bigint(self.heap.alloc_bigint(sum)));
-            }
             (JsValueKind::String(a), JsValueKind::String(b)) => {
                 let rope = self.heap.alloc_rope(a, b).unwrap_or(a);
                 return Ok(JsValue::from_string(rope));
             }
             _ => {}
         }
-        if lhs.is_string() || rhs.is_string() {
-            let ls = self.value_to_rust_string(lhs);
-            let rs = self.value_to_rust_string(rhs);
+        let lprim = if lhs.is_object() {
+            self.to_primitive(lhs, PrimHint::Default)?
+        } else {
+            lhs
+        };
+        let rprim = if rhs.is_object() {
+            self.to_primitive(rhs, PrimHint::Default)?
+        } else {
+            rhs
+        };
+        if lprim.is_string() || rprim.is_string() {
+            let ls = self.to_js_string(lprim)?;
+            let rs = self.to_js_string(rprim)?;
             return Ok(JsValue::from_string(
                 self.heap.alloc_string(format!("{ls}{rs}")),
             ));
         }
-        let l = self.to_number(lhs)?;
-        let r = self.to_number(rhs)?;
+        if let (Some(a), Some(b)) = (lprim.as_bigint(), rprim.as_bigint()) {
+            let sum = self
+                .heap
+                .get_bigint(a)
+                .unwrap()
+                .add(self.heap.get_bigint(b).unwrap());
+            return Ok(JsValue::from_bigint(self.heap.alloc_bigint(sum)));
+        }
+        if lprim.is_bigint() || rprim.is_bigint() {
+            return Err(self.type_error("Cannot mix BigInt and other types"));
+        }
+        let l = self.to_number(lprim)?;
+        let r = self.to_number(rprim)?;
         Ok(JsValue::from_f64(l + r))
     }
 
-    fn op_sub(&mut self, lhs: JsValue, rhs: JsValue) -> Result<JsValue, JsException> {
-        match (lhs.kind(), rhs.kind()) {
-            (JsValueKind::Int32(a), JsValueKind::Int32(b)) => Ok(JsValue::sub_i32_overflow(a, b)),
-            (JsValueKind::BigInt(a), JsValueKind::BigInt(b)) => {
-                let diff = self
-                    .heap
-                    .get_bigint(a)
-                    .unwrap()
-                    .sub(self.heap.get_bigint(b).unwrap());
-                Ok(JsValue::from_bigint(self.heap.alloc_bigint(diff)))
-            }
-            _ => Ok(JsValue::from_f64(
-                self.to_number(lhs)? - self.to_number(rhs)?,
-            )),
+    fn coerce_numeric(&mut self, val: JsValue) -> Result<JsValue, JsException> {
+        let p = if val.is_object() {
+            self.to_primitive(val, PrimHint::Number)?
+        } else {
+            val
+        };
+        if p.as_bigint().is_some() {
+            Ok(p)
+        } else {
+            Ok(JsValue::from_f64(self.to_number(p)?))
         }
+    }
+
+    fn op_numeric_bin(
+        &mut self,
+        lhs: JsValue,
+        rhs: JsValue,
+        op: Opcode,
+    ) -> Result<JsValue, JsException> {
+        let ln = self.coerce_numeric(lhs)?;
+        let rn = self.coerce_numeric(rhs)?;
+        match (ln.as_bigint(), rn.as_bigint()) {
+            (Some(ah), Some(bh)) => {
+                let a = self.heap.get_bigint(ah).cloned().unwrap_or_default();
+                let b = self.heap.get_bigint(bh).cloned().unwrap_or_default();
+                let res = match op {
+                    Opcode::Div => a
+                        .div_rem(&b)
+                        .map(|(q, _)| q)
+                        .ok_or_else(|| self.range_error("Division by zero"))?,
+                    Opcode::Rem => a
+                        .div_rem(&b)
+                        .map(|(_, r)| r)
+                        .ok_or_else(|| self.range_error("Division by zero"))?,
+                    Opcode::Exp => a
+                        .pow(&b)
+                        .ok_or_else(|| self.range_error("Exponent must be positive"))?,
+                    Opcode::BitAnd => a.bitwise_op(&b, 0),
+                    Opcode::BitOr => a.bitwise_op(&b, 1),
+                    Opcode::BitXor => a.bitwise_op(&b, 2),
+                    Opcode::Shl => a
+                        .shl(&b)
+                        .ok_or_else(|| self.range_error("Maximum BigInt size exceeded"))?,
+                    Opcode::Shr => a
+                        .shr(&b)
+                        .ok_or_else(|| self.range_error("Maximum BigInt size exceeded"))?,
+                    Opcode::UShr => {
+                        return Err(self.type_error("BigInts have no unsigned right shift"));
+                    }
+                    _ => unreachable!(),
+                };
+                Ok(JsValue::from_bigint(self.heap.alloc_bigint(res)))
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                Err(self.type_error("Cannot mix BigInt and other types"))
+            }
+            (None, None) => {
+                let l = self.to_number(ln)?;
+                let r = self.to_number(rn)?;
+                Ok(match op {
+                    Opcode::Div => JsValue::from_f64(l / r),
+                    Opcode::Rem => JsValue::from_f64(l % r),
+                    Opcode::Exp => {
+                        // ECMA-262 §6.1.6.1.3: abs(base) == 1 && exp is ±Infinity => NaN.
+                        if r.is_nan() || (l.abs() == 1.0 && r.is_infinite()) {
+                            JsValue::NAN
+                        } else if r == 0.0 {
+                            JsValue::from_f64(1.0)
+                        } else {
+                            JsValue::from_f64(l.powf(r))
+                        }
+                    }
+                    Opcode::BitAnd => JsValue::from_i32(f64_to_i32(l) & f64_to_i32(r)),
+                    Opcode::BitOr => JsValue::from_i32(f64_to_i32(l) | f64_to_i32(r)),
+                    Opcode::BitXor => JsValue::from_i32(f64_to_i32(l) ^ f64_to_i32(r)),
+                    Opcode::Shl => {
+                        JsValue::from_i32(f64_to_i32(l).wrapping_shl(f64_to_u32(r) & 0x1F))
+                    }
+                    Opcode::Shr => {
+                        JsValue::from_i32(f64_to_i32(l).wrapping_shr(f64_to_u32(r) & 0x1F))
+                    }
+                    Opcode::UShr => JsValue::from_f64(f64::from(
+                        f64_to_u32(l).wrapping_shr(f64_to_u32(r) & 0x1F),
+                    )),
+                    _ => unreachable!(),
+                })
+            }
+        }
+    }
+
+    fn op_sub(&mut self, lhs: JsValue, rhs: JsValue) -> Result<JsValue, JsException> {
+        if let (JsValueKind::Int32(a), JsValueKind::Int32(b)) = (lhs.kind(), rhs.kind()) {
+            return Ok(JsValue::sub_i32_overflow(a, b));
+        }
+        let lp = self.coerce_numeric(lhs)?;
+        let rp = self.coerce_numeric(rhs)?;
+        if let (Some(a), Some(b)) = (lp.as_bigint(), rp.as_bigint()) {
+            let diff = self
+                .heap
+                .get_bigint(a)
+                .unwrap()
+                .sub(self.heap.get_bigint(b).unwrap());
+            return Ok(JsValue::from_bigint(self.heap.alloc_bigint(diff)));
+        }
+        if lp.as_bigint().is_some() || rp.as_bigint().is_some() {
+            return Err(self.type_error("Cannot mix BigInt and other types"));
+        }
+        Ok(JsValue::from_f64(self.to_number(lp)? - self.to_number(rp)?))
     }
 
     fn op_mul(&mut self, lhs: JsValue, rhs: JsValue) -> Result<JsValue, JsException> {
-        match (lhs.kind(), rhs.kind()) {
-            (JsValueKind::Int32(a), JsValueKind::Int32(b)) => Ok(JsValue::mul_i32_overflow(a, b)),
-            (JsValueKind::BigInt(a), JsValueKind::BigInt(b)) => {
-                let prod = self
-                    .heap
-                    .get_bigint(a)
-                    .unwrap()
-                    .mul(self.heap.get_bigint(b).unwrap());
-                Ok(JsValue::from_bigint(self.heap.alloc_bigint(prod)))
-            }
-            _ => Ok(JsValue::from_f64(
-                self.to_number(lhs)? * self.to_number(rhs)?,
-            )),
+        if let (JsValueKind::Int32(a), JsValueKind::Int32(b)) = (lhs.kind(), rhs.kind()) {
+            return Ok(JsValue::mul_i32_overflow(a, b));
         }
+        let lp = self.coerce_numeric(lhs)?;
+        let rp = self.coerce_numeric(rhs)?;
+        if let (Some(a), Some(b)) = (lp.as_bigint(), rp.as_bigint()) {
+            let prod = self
+                .heap
+                .get_bigint(a)
+                .unwrap()
+                .mul(self.heap.get_bigint(b).unwrap());
+            return Ok(JsValue::from_bigint(self.heap.alloc_bigint(prod)));
+        }
+        if lp.as_bigint().is_some() || rp.as_bigint().is_some() {
+            return Err(self.type_error("Cannot mix BigInt and other types"));
+        }
+        Ok(JsValue::from_f64(self.to_number(lp)? * self.to_number(rp)?))
+    }
+
+    fn compare_bigint_f64(&self, bi_h: HeapHandle, n: f64) -> Option<std::cmp::Ordering> {
+        if n.is_nan() {
+            return None;
+        }
+        if n == f64::INFINITY {
+            return Some(std::cmp::Ordering::Less);
+        }
+        if n == f64::NEG_INFINITY {
+            return Some(std::cmp::Ordering::Greater);
+        }
+        let bi = self.heap.get_bigint(bi_h)?;
+        let bi_f = bi.to_i64_lossy() as f64;
+        if bi_f.abs() < 9_007_199_254_740_991.0 && n.abs() < 9_007_199_254_740_991.0 {
+            bi_f.partial_cmp(&n)
+        } else {
+            let n_int = JsBigInt::from_i128(n.trunc() as i128);
+            let ord = bi.cmp(&n_int);
+            if ord != std::cmp::Ordering::Equal {
+                Some(ord)
+            } else if n.fract() > 0.0 {
+                Some(std::cmp::Ordering::Less)
+            } else if n.fract() < 0.0 {
+                Some(std::cmp::Ordering::Greater)
+            } else {
+                Some(std::cmp::Ordering::Equal)
+            }
+        }
+    }
+
+    fn relational_cmp(
+        &mut self,
+        lhs: JsValue,
+        rhs: JsValue,
+    ) -> Result<Option<std::cmp::Ordering>, JsException> {
+        if let (JsValueKind::Int32(a), JsValueKind::Int32(b)) = (lhs.kind(), rhs.kind()) {
+            return Ok(Some(a.cmp(&b)));
+        }
+        let lp = if lhs.is_object() {
+            self.to_primitive(lhs, PrimHint::Number)?
+        } else {
+            lhs
+        };
+        let rp = if rhs.is_object() {
+            self.to_primitive(rhs, PrimHint::Number)?
+        } else {
+            rhs
+        };
+        if let (Some(a), Some(b)) = (lp.as_string(), rp.as_string()) {
+            let sa = self.heap.materialize_string(a).unwrap_or_default();
+            let sb = self.heap.materialize_string(b).unwrap_or_default();
+            return Ok(Some(sa.encode_utf16().cmp(sb.encode_utf16())));
+        }
+        if let (Some(a), Some(b)) = (lp.as_bigint(), rp.as_bigint()) {
+            let ba = self.heap.get_bigint(a).unwrap();
+            let bb = self.heap.get_bigint(b).unwrap();
+            return Ok(Some(ba.cmp(bb)));
+        }
+        if let Some(a) = lp.as_bigint() {
+            if let Some(sh) = rp.as_string() {
+                let s = self.heap.materialize_string(sh).unwrap_or_default();
+                let Some(bb) = JsBigInt::parse_str(&s) else {
+                    return Ok(None);
+                };
+                return Ok(Some(self.heap.get_bigint(a).unwrap().cmp(&bb)));
+            }
+            let r = self.to_number(rp)?;
+            return Ok(self.compare_bigint_f64(a, r));
+        }
+        if let Some(b) = rp.as_bigint() {
+            if let Some(sh) = lp.as_string() {
+                let s = self.heap.materialize_string(sh).unwrap_or_default();
+                let Some(ba) = JsBigInt::parse_str(&s) else {
+                    return Ok(None);
+                };
+                return Ok(Some(ba.cmp(self.heap.get_bigint(b).unwrap())));
+            }
+            let l = self.to_number(lp)?;
+            return Ok(self
+                .compare_bigint_f64(b, l)
+                .map(std::cmp::Ordering::reverse));
+        }
+        let l = self.to_number(lp)?;
+        let r = self.to_number(rp)?;
+        Ok(l.partial_cmp(&r))
     }
 
     fn op_lt(&mut self, lhs: JsValue, rhs: JsValue) -> Result<bool, JsException> {
-        match (lhs.kind(), rhs.kind()) {
-            (JsValueKind::Int32(a), JsValueKind::Int32(b)) => return Ok(a < b),
-            (JsValueKind::String(a), JsValueKind::String(b)) => {
-                let sa = self.heap.materialize_string(a).unwrap_or_default();
-                let sb = self.heap.materialize_string(b).unwrap_or_default();
-                return Ok(sa < sb);
-            }
-            _ => {}
-        }
-        let l = self.to_number(lhs)?;
-        let r = self.to_number(rhs)?;
-        Ok(l < r)
+        Ok(self.relational_cmp(lhs, rhs)? == Some(std::cmp::Ordering::Less))
     }
 
     fn op_lteq(&mut self, lhs: JsValue, rhs: JsValue) -> Result<bool, JsException> {
-        match (lhs.kind(), rhs.kind()) {
-            (JsValueKind::Int32(a), JsValueKind::Int32(b)) => return Ok(a <= b),
-            (JsValueKind::String(a), JsValueKind::String(b)) => {
-                let sa = self.heap.materialize_string(a).unwrap_or_default();
-                let sb = self.heap.materialize_string(b).unwrap_or_default();
-                return Ok(sa <= sb);
-            }
-            _ => {}
-        }
-        let l = self.to_number(lhs)?;
-        let r = self.to_number(rhs)?;
-        Ok(l <= r)
+        Ok(matches!(
+            self.relational_cmp(lhs, rhs)?,
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        ))
     }
 
     fn op_instanceof(&mut self, lhs: JsValue, rhs: JsValue) -> Result<bool, JsException> {
@@ -4295,6 +4926,14 @@ impl JsVm {
         if b.is_bool() {
             return self.abstract_eq(a, JsValue::from_i32(i32::from(b.as_bool().unwrap())));
         }
+        if a.is_object() && (b.is_number() || b.is_string() || b.is_symbol() || b.is_bigint()) {
+            let ap = self.to_primitive(a, PrimHint::Default)?;
+            return self.abstract_eq(ap, b);
+        }
+        if b.is_object() && (a.is_number() || a.is_string() || a.is_symbol() || a.is_bigint()) {
+            let bp = self.to_primitive(b, PrimHint::Default)?;
+            return self.abstract_eq(a, bp);
+        }
         if a.is_number() && b.is_string() {
             let bn = self.to_number(b)?;
             return Ok(self.to_number(a)? == bn);
@@ -4303,7 +4942,96 @@ impl JsVm {
             let an = self.to_number(a)?;
             return Ok(an == self.to_number(b)?);
         }
+        if let (Some(bh), Some(sh)) = (a.as_bigint(), b.as_string()) {
+            let s = self.heap.materialize_string(sh).unwrap_or_default();
+            return Ok(
+                JsBigInt::parse_str(&s).is_some_and(|p| self.heap.get_bigint(bh) == Some(&p))
+            );
+        }
+        if let (Some(sh), Some(bh)) = (a.as_string(), b.as_bigint()) {
+            let s = self.heap.materialize_string(sh).unwrap_or_default();
+            return Ok(
+                JsBigInt::parse_str(&s).is_some_and(|p| self.heap.get_bigint(bh) == Some(&p))
+            );
+        }
+        if let (Some(bh), true) = (a.as_bigint(), b.is_number()) {
+            let n = self.to_number(b)?;
+            return Ok(self.compare_bigint_f64(bh, n) == Some(std::cmp::Ordering::Equal));
+        }
+        if let (true, Some(bh)) = (a.is_number(), b.as_bigint()) {
+            let n = self.to_number(a)?;
+            return Ok(self.compare_bigint_f64(bh, n) == Some(std::cmp::Ordering::Equal));
+        }
         Ok(false)
+    }
+
+    /// ECMA-262 §7.1.1 `ToPrimitive`.
+    pub fn to_primitive(&mut self, val: JsValue, hint: PrimHint) -> Result<JsValue, JsException> {
+        let Some(h) = val.as_object() else {
+            return Ok(val);
+        };
+        let exotic = self.get_property_by_key(h, self.key_symbol_to_primitive)?;
+        if !exotic.is_undefined() && !exotic.is_null() {
+            let hint_str = match hint {
+                PrimHint::Default => "default",
+                PrimHint::Number => "number",
+                PrimHint::String => "string",
+            };
+            let hs = JsValue::from_string(self.heap.alloc_string(hint_str));
+            let res = self.call_value(exotic, val, &[hs])?;
+            if res.is_object() {
+                return Err(self.type_error("Cannot convert object to primitive value"));
+            }
+            return Ok(res);
+        }
+        let is_date = matches!(
+            self.heap.get_object(h).map(|o| &o.kind),
+            Some(ObjectKind::Date(_))
+        );
+        let order = if hint == PrimHint::String || (hint == PrimHint::Default && is_date) {
+            [self.key_to_string, self.key_value_of]
+        } else {
+            [self.key_value_of, self.key_to_string]
+        };
+        for method_key in order {
+            let m = self.get_property_by_key(h, method_key)?;
+            if let Some(mh) = m.as_object() {
+                if self.is_callable_handle(mh) {
+                    let res = self.call_value(m, val, &[])?;
+                    if !res.is_object() {
+                        return Ok(res);
+                    }
+                }
+            }
+        }
+        Err(self.type_error("Cannot convert object to primitive value"))
+    }
+
+    /// ECMA-262 §7.1.17 `ToString` (invokes `ToPrimitive(..., "string")` and throws on `Symbol`).
+    pub fn to_js_string(&mut self, val: JsValue) -> Result<String, JsException> {
+        match val.kind() {
+            JsValueKind::Symbol(_) => {
+                Err(self.type_error("Cannot convert a Symbol value to a string"))
+            }
+            JsValueKind::Object(_) => {
+                let p = self.to_primitive(val, PrimHint::String)?;
+                self.to_js_string(p)
+            }
+            _ => Ok(self.value_to_rust_string(val)),
+        }
+    }
+
+    /// ECMA-262 §7.1.19 `ToPropertyKey` (preserves `Symbol` keys).
+    pub fn to_property_key(&mut self, val: JsValue) -> Result<String, JsException> {
+        let p = if val.is_object() {
+            self.to_primitive(val, PrimHint::String)?
+        } else {
+            val
+        };
+        if p.is_symbol() {
+            return Ok(self.value_to_rust_string(p));
+        }
+        self.to_js_string(p)
     }
 
     pub fn to_boolean(&self, val: JsValue) -> bool {
@@ -4338,28 +5066,22 @@ impl JsVm {
                     return Ok(f64::NEG_INFINITY);
                 }
                 if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                    return Ok(u64::from_str_radix(hex, 16).map_or(f64::NAN, |n| n as f64));
+                    return Ok(u128::from_str_radix(hex, 16).map_or(f64::NAN, |n| n as f64));
+                }
+                if let Some(bin) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+                    return Ok(u128::from_str_radix(bin, 2).map_or(f64::NAN, |n| n as f64));
+                }
+                if let Some(oct) = s.strip_prefix("0o").or_else(|| s.strip_prefix("0O")) {
+                    return Ok(u128::from_str_radix(oct, 8).map_or(f64::NAN, |n| n as f64));
                 }
                 Ok(s.parse::<f64>().unwrap_or(f64::NAN))
             }
             JsValueKind::Symbol(_) | JsValueKind::BigInt(_) => {
                 Err(self.type_error("Cannot convert Symbol or BigInt to number"))
             }
-            JsValueKind::Object(h) => {
-                let vo = self.get_property_by_key(h, self.key_value_of)?;
-                if vo.is_object() {
-                    let prim = self.call_value(vo, val, &[])?;
-                    if !prim.is_object() {
-                        return self.to_number(prim);
-                    }
-                }
-                let s = self.value_to_rust_string(val);
-                let trimmed = s.trim();
-                Ok(if trimmed.is_empty() {
-                    0.0
-                } else {
-                    trimmed.parse::<f64>().unwrap_or(f64::NAN)
-                })
+            JsValueKind::Object(_) => {
+                let prim = self.to_primitive(val, PrimHint::Number)?;
+                self.to_number(prim)
             }
         }
     }
@@ -4368,12 +5090,7 @@ impl JsVm {
         if let Some(i) = val.as_i32() {
             return Ok(i);
         }
-        let n = self.to_number(val)?;
-        if !n.is_finite() || n == 0.0 {
-            return Ok(0);
-        }
-        let int = n.trunc().rem_euclid(4_294_967_296.0) as u32;
-        Ok(int as i32)
+        Ok(f64_to_i32(self.to_number(val)?))
     }
 
     pub fn to_u32(&mut self, val: JsValue) -> Result<u32, JsException> {
@@ -4516,7 +5233,29 @@ impl JsVm {
                 cur = self.heap.get_object(obj_h).and_then(|o| o.prototype);
             }
             if let Some(m) = msg {
-                let n = name.unwrap_or_else(|| "Error".to_string());
+                let n = name.unwrap_or_else(|| {
+                    let mut c = Some(h);
+                    for _ in 0..32 {
+                        let Some(o) = c else { break };
+                        if let Some(cp) =
+                            self.heap
+                                .object_get_own(o, self.key_constructor, &self.shapes)
+                        {
+                            if let Some(ch) = cp.value.as_object() {
+                                if let Some(np) =
+                                    self.heap.object_get_own(ch, self.key_name, &self.shapes)
+                                {
+                                    let cn = self.value_to_rust_string(np.value);
+                                    if !cn.is_empty() && cn != "Object" {
+                                        return cn;
+                                    }
+                                }
+                            }
+                        }
+                        c = self.heap.get_object(o).and_then(|obj| obj.prototype);
+                    }
+                    "Error".to_string()
+                });
                 return if m.is_empty() { n } else { format!("{n}: {m}") };
             }
             if let Some(n) = name {
@@ -5209,15 +5948,34 @@ impl JsVm {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimHint {
+    Default,
+    Number,
+    String,
+}
+
 enum StepOutcome {
     Continue,
     ReturnTop(JsValue),
     SuspendAwait { dst: u8, awaited: JsValue },
     SuspendYield { dst: u8, yielded: JsValue },
     SuspendYieldStar { dst: u8, iterable: JsValue },
+    SuspendInitial,
 }
 
 enum NativeInv {
     Static(NativeFnPtr),
     Closure(NativeClosure),
+}
+
+fn f64_to_u32(n: f64) -> u32 {
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    n.trunc().rem_euclid(4_294_967_296.0) as u32
+}
+
+fn f64_to_i32(n: f64) -> i32 {
+    f64_to_u32(n) as i32
 }

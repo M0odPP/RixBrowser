@@ -236,6 +236,219 @@ impl JsBigInt {
             self.negative = false;
         }
     }
+
+    /// Truncating division and remainder (ECMA-262 `BigInt::divide` / `BigInt::remainder`).
+    pub fn div_rem(&self, rhs: &Self) -> Option<(Self, Self)> {
+        if rhs.is_zero() {
+            return None;
+        }
+        let cmp = cmp_mag(&self.limbs, &rhs.limbs);
+        if cmp == Ordering::Less {
+            return Some((Self::zero(), self.clone()));
+        }
+        let (q_limbs, r_limbs) = if rhs.limbs.len() == 1 {
+            let mut q = self.limbs.clone();
+            let r = div_rem_limb(&mut q, rhs.limbs[0]);
+            (q, if r == 0 { Vec::new() } else { vec![r] })
+        } else {
+            let total_bits = self.limbs.len() * 32;
+            let mut q = vec![0u32; self.limbs.len()];
+            let mut rem: Vec<u32> = Vec::new();
+            for bit in (0..total_bits).rev() {
+                // rem = (rem << 1) | bit_i(self)
+                let b = (self.limbs[bit / 32] >> (bit % 32)) & 1;
+                let mut carry = b;
+                for limb in &mut rem {
+                    let next = *limb >> 31;
+                    *limb = (*limb << 1) | carry;
+                    carry = next;
+                }
+                if carry != 0 {
+                    rem.push(carry);
+                }
+                while rem.last() == Some(&0) {
+                    rem.pop();
+                }
+                if cmp_mag(&rem, &rhs.limbs) != Ordering::Less {
+                    rem = sub_mag(&rem, &rhs.limbs);
+                    while rem.last() == Some(&0) {
+                        rem.pop();
+                    }
+                    q[bit / 32] |= 1 << (bit % 32);
+                }
+            }
+            (q, rem)
+        };
+        let mut quo = Self {
+            negative: self.negative ^ rhs.negative,
+            limbs: q_limbs,
+        };
+        let mut rem = Self {
+            negative: self.negative,
+            limbs: r_limbs,
+        };
+        quo.normalize();
+        rem.normalize();
+        Some((quo, rem))
+    }
+
+    /// Exponentiation (`self ** exp`); returns `None` on negative exponent or size overflow.
+    pub fn pow(&self, exp: &Self) -> Option<Self> {
+        if exp.is_negative() {
+            return None;
+        }
+        if exp.is_zero() {
+            return Some(Self::from_i64(1));
+        }
+        if self.is_zero() {
+            return Some(Self::zero());
+        }
+        if self.limbs.len() == 1 && self.limbs[0] == 1 {
+            let odd = (exp.limbs[0] & 1) == 1;
+            return Some(Self::from_i64(if self.negative && odd { -1 } else { 1 }));
+        }
+        let e = if exp.limbs.len() > 1 || exp.limbs[0] > 1_000_000 {
+            return None;
+        } else {
+            exp.limbs[0]
+        };
+        let mut base = self.clone();
+        let mut res = Self::from_i64(1);
+        let mut n = e;
+        while n > 0 {
+            if (n & 1) == 1 {
+                res = res.mul(&base);
+            }
+            n >>= 1;
+            if n > 0 {
+                base = base.mul(&base);
+                if base.limbs.len() > 32_768 {
+                    return None;
+                }
+            }
+        }
+        Some(res)
+    }
+
+    pub fn shl(&self, shift: &Self) -> Option<Self> {
+        if shift.is_negative() {
+            return self.shr(&shift.negate());
+        }
+        if self.is_zero() || shift.is_zero() {
+            return Some(self.clone());
+        }
+        if shift.limbs.len() > 1 || shift.limbs[0] > 1_048_576 {
+            return None;
+        }
+        let bits = shift.limbs[0] as usize;
+        let words = bits / 32;
+        let rem = (bits % 32) as u32;
+        let mut out = vec![0u32; words];
+        let mut carry = 0u32;
+        for &limb in &self.limbs {
+            if rem == 0 {
+                out.push(limb);
+            } else {
+                out.push((limb << rem) | carry);
+                carry = limb >> (32 - rem);
+            }
+        }
+        if carry != 0 {
+            out.push(carry);
+        }
+        let mut res = Self {
+            negative: self.negative,
+            limbs: out,
+        };
+        res.normalize();
+        Some(res)
+    }
+
+    pub fn shr(&self, shift: &Self) -> Option<Self> {
+        if shift.is_negative() {
+            return self.shl(&shift.negate());
+        }
+        if self.is_zero() || shift.is_zero() {
+            return Some(self.clone());
+        }
+        if shift.limbs.len() > 1 || (shift.limbs[0] as usize) >= self.limbs.len() * 32 {
+            return Some(if self.negative {
+                Self::from_i64(-1)
+            } else {
+                Self::zero()
+            });
+        }
+        let bits = shift.limbs[0] as usize;
+        let words = bits / 32;
+        let rem = (bits % 32) as u32;
+        let mut dropped_nonzero = self.limbs[..words].iter().any(|&l| l != 0);
+        if rem != 0 && (self.limbs[words] & ((1u32 << rem) - 1)) != 0 {
+            dropped_nonzero = true;
+        }
+        let mut out = Vec::with_capacity(self.limbs.len() - words);
+        for i in words..self.limbs.len() {
+            let lo = self.limbs[i] >> rem;
+            let hi = if rem == 0 || i + 1 >= self.limbs.len() {
+                0
+            } else {
+                self.limbs[i + 1] << (32 - rem)
+            };
+            out.push(lo | hi);
+        }
+        let mut res = Self {
+            negative: self.negative,
+            limbs: out,
+        };
+        res.normalize();
+        if self.negative && dropped_nonzero {
+            res = res.sub(&Self::from_i64(1));
+        }
+        Some(res)
+    }
+
+    pub fn bitwise_op(&self, rhs: &Self, op: u8) -> Self {
+        let n = self.limbs.len().max(rhs.limbs.len()) + 1;
+        let to_twos = |bi: &Self| -> Vec<u32> {
+            let mut v = vec![0u32; n];
+            for (i, &l) in bi.limbs.iter().enumerate() {
+                v[i] = l;
+            }
+            if bi.negative {
+                let mut carry = 1u64;
+                for limb in &mut v {
+                    let s = u64::from(!*limb) + carry;
+                    *limb = s as u32;
+                    carry = s >> 32;
+                }
+            }
+            v
+        };
+        let a = to_twos(self);
+        let b = to_twos(rhs);
+        let mut out = vec![0u32; n];
+        for i in 0..n {
+            out[i] = match op {
+                0 => a[i] & b[i],
+                1 => a[i] | b[i],
+                _ => a[i] ^ b[i],
+            };
+        }
+        let neg = (out[n - 1] & 0x8000_0000) != 0;
+        if neg {
+            let mut carry = 1u64;
+            for limb in &mut out {
+                let s = u64::from(!*limb) + carry;
+                *limb = s as u32;
+                carry = s >> 32;
+            }
+        }
+        let mut res = Self {
+            negative: neg,
+            limbs: out,
+        };
+        res.normalize();
+        res
+    }
 }
 
 impl Ord for JsBigInt {

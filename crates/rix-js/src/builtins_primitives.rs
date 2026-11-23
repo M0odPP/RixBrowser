@@ -139,12 +139,60 @@ fn str_symbol_iterator(
     ))
 }
 
-fn string_ctor(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let s = args
-        .first()
-        .map(|&v| vm.value_to_rust_string(v))
-        .unwrap_or_default();
-    Ok(JsValue::from_string(vm.heap.alloc_string(s)))
+fn unbox_prim(vm: &JsVm, val: JsValue) -> JsValue {
+    if let Some(h) = val.as_object() {
+        if let Some(bv) = vm
+            .heap
+            .get_object(h)
+            .and_then(|o| o.rare.as_ref())
+            .and_then(|r| r.boxed_value)
+        {
+            return bv;
+        }
+    }
+    val
+}
+
+fn string_ctor(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
+    let s = if let Some(&v) = args.first() {
+        if v.is_symbol() && this_val.as_object().is_none() {
+            let desc = v
+                .as_symbol()
+                .and_then(|id| vm.symbol_descriptions.get(&id))
+                .cloned()
+                .unwrap_or_default();
+            format!("Symbol({desc})")
+        } else {
+            vm.to_js_string(v)?
+        }
+    } else {
+        String::new()
+    };
+    let sv = JsValue::from_string(vm.heap.alloc_string(s.clone()));
+    if let Some(h) = this_val.as_object() {
+        let is_new_str = vm.heap.get_object(h).and_then(|o| o.prototype) == Some(vm.string_proto);
+        if is_new_str {
+            if let Some(o) = vm.heap.get_object_mut(h) {
+                o.rare_mut().boxed_value = Some(sv);
+                for (i, ch) in s.chars().enumerate() {
+                    let cv = JsValue::from_string(vm.heap.alloc_string(ch.to_string()));
+                    if let Some(obj_mut) = vm.heap.get_object_mut(h) {
+                        obj_mut.elements.set(i as u32, cv);
+                    }
+                }
+            }
+            vm.heap.object_define_data(
+                h,
+                vm.key_length,
+                JsValue::from_f64(s.encode_utf16().count() as f64),
+                PropertyAttrs::empty(),
+                &mut vm.shapes,
+            );
+            vm.heap.write_barrier(h, sv);
+            return Ok(this_val);
+        }
+    }
+    Ok(sv)
 }
 
 fn str_from_char_code(
@@ -189,8 +237,11 @@ fn str_to_string(
     this_val: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = vm.value_to_rust_string(this_val);
-    Ok(JsValue::from_string(vm.heap.alloc_string(s)))
+    let prim = unbox_prim(vm, this_val);
+    if prim.is_string() {
+        return Ok(prim);
+    }
+    Err(vm.type_error("String.prototype.toString requires that 'this' be a String"))
 }
 
 fn str_char_at(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
@@ -772,12 +823,29 @@ fn install_number(vm: &mut JsVm) {
     define_global(vm, "Number", JsValue::from_object(ctor));
 }
 
-fn number_ctor(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
+fn number_ctor(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let n = match args.first() {
-        Some(&v) => vm.to_number(v)?,
+        Some(&v) => {
+            if let Some(bh) = v.as_bigint() {
+                vm.heap
+                    .get_bigint(bh)
+                    .map_or(0.0, |b| b.to_i64_lossy() as f64)
+            } else {
+                vm.to_number(v)?
+            }
+        }
         None => 0.0,
     };
-    Ok(JsValue::from_f64(n))
+    let nv = JsValue::from_f64(n);
+    if let Some(h) = this_val.as_object() {
+        if vm.heap.get_object(h).and_then(|o| o.prototype) == Some(vm.number_proto) {
+            if let Some(o) = vm.heap.get_object_mut(h) {
+                o.rare_mut().boxed_value = Some(nv);
+            }
+            return Ok(this_val);
+        }
+    }
+    Ok(nv)
 }
 
 fn num_to_fixed(
@@ -807,6 +875,10 @@ fn num_to_string(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
+    let prim = unbox_prim(vm, this_val);
+    let Some(n) = prim.as_number() else {
+        return Err(vm.type_error("Number.prototype.toString requires that 'this' be a Number"));
+    };
     let radix = args
         .first()
         .filter(|v| !v.is_undefined())
@@ -816,14 +888,6 @@ fn num_to_string(
     if !(2..=36).contains(&radix) {
         return Err(vm.range_error("toString() radix must be between 2 and 36"));
     }
-    if let Some(bh) = this_val.as_bigint() {
-        let s = vm
-            .heap
-            .get_bigint(bh)
-            .map_or_else(|| "0".to_string(), |bi| bi.to_radix_string(radix as u32));
-        return Ok(JsValue::from_string(vm.heap.alloc_string(s)));
-    }
-    let n = vm.to_number(this_val)?;
     if radix == 10 || !n.is_finite() {
         return Ok(JsValue::from_string(
             vm.heap
@@ -854,10 +918,11 @@ fn num_value_of(
     this_val: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    if this_val.is_bigint() {
-        return Ok(this_val);
+    let prim = unbox_prim(vm, this_val);
+    if prim.is_number() {
+        return Ok(prim);
     }
-    Ok(JsValue::from_f64(vm.to_number(this_val)?))
+    Err(vm.type_error("Number.prototype.valueOf requires that 'this' be a Number"))
 }
 
 fn num_is_nan(_vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
@@ -1109,20 +1174,36 @@ fn global_decode_uri_component(
 fn install_boolean(vm: &mut JsVm) {
     let bp = vm.boolean_proto;
     define_method(vm, bp, "toString", |vm, this_val, _| {
-        let s = if vm.to_boolean(this_val) {
+        let Some(b) = unbox_prim(vm, this_val).as_bool() else {
+            return Err(
+                vm.type_error("Boolean.prototype.toString requires that 'this' be a Boolean")
+            );
+        };
+        Ok(JsValue::from_string(vm.heap.alloc_string(if b {
             "true"
         } else {
             "false"
-        };
-        Ok(JsValue::from_string(vm.heap.alloc_string(s)))
+        })))
     });
     define_method(vm, bp, "valueOf", |vm, this_val, _| {
-        Ok(JsValue::from_bool(vm.to_boolean(this_val)))
+        let prim = unbox_prim(vm, this_val);
+        if prim.is_bool() {
+            Ok(prim)
+        } else {
+            Err(vm.type_error("Boolean.prototype.valueOf requires that 'this' be a Boolean"))
+        }
     });
-    let ctor = vm.alloc_native_fn("Boolean", |vm, _this, args| {
-        Ok(JsValue::from_bool(
-            args.first().copied().is_some_and(|v| vm.to_boolean(v)),
-        ))
+    let ctor = vm.alloc_native_fn("Boolean", |vm, this_val, args| {
+        let bv = JsValue::from_bool(args.first().copied().is_some_and(|v| vm.to_boolean(v)));
+        if let Some(h) = this_val.as_object() {
+            if vm.heap.get_object(h).and_then(|o| o.prototype) == Some(vm.boolean_proto) {
+                if let Some(o) = vm.heap.get_object_mut(h) {
+                    o.rare_mut().boxed_value = Some(bv);
+                }
+                return Ok(this_val);
+            }
+        }
+        Ok(bv)
     });
     vm.heap.object_define_data(
         ctor,
@@ -1173,22 +1254,30 @@ fn bigint_as_n(vm: &mut JsVm, args: &[JsValue], signed: bool) -> Result<JsValue,
 }
 
 fn install_bigint(vm: &mut JsVm) {
-    let bi_proto = vm.alloc_ordinary_object();
-    vm.heap.get_object_mut(bi_proto).unwrap().is_prototype = true;
-    define_method(vm, bi_proto, "toString", |vm, this_val, _| {
-        let Some(h) = this_val.as_bigint() else {
+    let bi_proto = vm.bigint_proto;
+    define_method(vm, bi_proto, "toString", |vm, this_val, args| {
+        let Some(h) = unbox_prim(vm, this_val).as_bigint() else {
             return Err(vm.type_error("BigInt.prototype.toString requires a BigInt"));
         };
+        let radix = args
+            .first()
+            .filter(|v| !v.is_undefined())
+            .map(|&v| vm.to_i32(v))
+            .transpose()?
+            .unwrap_or(10);
+        if !(2..=36).contains(&radix) {
+            return Err(vm.range_error("toString() radix must be between 2 and 36"));
+        }
         let s = vm
             .heap
             .get_bigint(h)
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "0".to_owned());
+            .map_or_else(|| "0".to_owned(), |bi| bi.to_radix_string(radix as u32));
         Ok(JsValue::from_string(vm.heap.alloc_string(s)))
     });
     define_method(vm, bi_proto, "valueOf", |vm, this_val, _| {
-        if this_val.as_bigint().is_some() {
-            Ok(this_val)
+        let prim = unbox_prim(vm, this_val);
+        if prim.as_bigint().is_some() {
+            Ok(prim)
         } else {
             Err(vm.type_error("BigInt.prototype.valueOf requires a BigInt"))
         }
@@ -1408,17 +1497,62 @@ fn arg0(args: &[JsValue]) -> JsValue {
 // ---------------------------------------------------------------------------
 
 fn install_symbol(vm: &mut JsVm) {
+    let sym_proto = vm.symbol_proto;
+    define_method(vm, sym_proto, "valueOf", |vm, this_val, _| {
+        let prim = unbox_prim(vm, this_val);
+        if prim.is_symbol() {
+            Ok(prim)
+        } else {
+            Err(vm.type_error("Symbol.prototype.valueOf requires a Symbol"))
+        }
+    });
+    define_method(vm, sym_proto, "toString", |vm, this_val, _| {
+        let Some(id) = unbox_prim(vm, this_val).as_symbol() else {
+            return Err(vm.type_error("Symbol.prototype.toString requires a Symbol"));
+        };
+        let desc = vm.symbol_descriptions.get(&id).cloned().unwrap_or_default();
+        Ok(JsValue::from_string(
+            vm.heap.alloc_string(format!("Symbol({desc})")),
+        ))
+    });
+    let desc_getter = vm.alloc_native_fn("get description", |vm, this_val, _| {
+        let Some(id) = unbox_prim(vm, this_val).as_symbol() else {
+            return Err(vm.type_error("Symbol.prototype.description requires a Symbol"));
+        };
+        Ok(match vm.symbol_descriptions.get(&id).cloned() {
+            Some(d) => JsValue::from_string(vm.heap.alloc_string(d)),
+            None => JsValue::UNDEFINED,
+        })
+    });
+    let k_desc = vm.heap.intern_key("description");
+    vm.heap.object_define_accessor(
+        sym_proto,
+        k_desc,
+        Some(desc_getter),
+        None,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
     let ctor = vm.alloc_native_fn("Symbol", |vm, _this, args| {
         let desc = args
             .first()
             .filter(|v| !v.is_undefined())
-            .map(|&v| vm.value_to_rust_string(v));
+            .map(|&v| vm.to_js_string(v))
+            .transpose()?;
         let id = vm.heap.alloc_symbol(desc.clone());
         if let Some(d) = desc {
             vm.symbol_descriptions.insert(id, d);
         }
         Ok(JsValue::from_symbol(id))
     });
+    vm.heap.object_define_data(
+        ctor,
+        vm.key_prototype,
+        JsValue::from_object(sym_proto),
+        PropertyAttrs::empty(),
+        &mut vm.shapes,
+    );
+    link_ctor_meta(vm, ctor, sym_proto, 0, false);
     define_method(vm, ctor, "for", |vm, _this, args| {
         let key = vm.value_to_rust_string(arg0(args));
         if let Some(&id) = vm.symbol_registry.get(&key) {
@@ -1454,6 +1588,8 @@ fn install_symbol(vm: &mut JsVm) {
             vm.sym_iterator
         } else if well_known == "asyncIterator" {
             vm.sym_async_iterator
+        } else if well_known == "toPrimitive" {
+            vm.sym_to_primitive
         } else {
             vm.heap.alloc_symbol(Some(format!("Symbol.{well_known}")))
         };

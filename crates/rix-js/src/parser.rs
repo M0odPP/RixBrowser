@@ -61,6 +61,24 @@ pub fn parse(source: &str, source_type: SourceType) -> Result<Program, SyntaxErr
     parser.parse_program()
 }
 
+/// Parses `eval` source with caller strictness context.
+pub fn parse_eval(
+    source: &str,
+    force_strict: bool,
+    _in_class_field_or_static_block: bool,
+    _allow_unbound_private: bool,
+) -> Result<Program, SyntaxError> {
+    let mut parser = Parser::new(source, SourceType::Script)?;
+    if force_strict {
+        parser.ctx.strict = true;
+    }
+    let mut prog = parser.parse_program()?;
+    if force_strict {
+        prog.strict = true;
+    }
+    Ok(prog)
+}
+
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
     cur: Token,
@@ -74,7 +92,7 @@ const MAX_PARSE_DEPTH: u32 = 192;
 
 impl<'a> Parser<'a> {
     pub fn new(source: &'a str, source_type: SourceType) -> Result<Self, SyntaxError> {
-        let mut lexer = Lexer::new(source);
+        let mut lexer = Lexer::new_for_source(source, source_type == SourceType::Script);
         let cur = lexer.next_token()?;
         Ok(Self {
             lexer,
@@ -1061,6 +1079,42 @@ impl<'a> Parser<'a> {
     // ES Modules (`import` / `export`)
     // -----------------------------------------------------------------------
 
+    fn parse_optional_import_attributes(&mut self) -> Result<Option<String>, SyntaxError> {
+        if self.cur.line_terminator_before || self.cur.kind != TokenKind::Keyword(Keyword::With) {
+            return Ok(None);
+        }
+        self.advance()?;
+        self.expect(TokenKind::LBrace)?;
+        let mut import_type = None;
+        let mut seen_keys = HashSet::new();
+        while self.cur.kind != TokenKind::RBrace && self.cur.kind != TokenKind::Eof {
+            let key = match &self.cur.kind {
+                TokenKind::String { value, .. } => {
+                    let s = value.clone();
+                    self.advance()?;
+                    s
+                }
+                _ => self.parse_module_export_name()?,
+            };
+            if !seen_keys.insert(key.clone()) {
+                return Err(SyntaxError::new(
+                    format!("Duplicate import attribute '{key}'"),
+                    self.cur.span,
+                ));
+            }
+            self.expect(TokenKind::Colon)?;
+            let (val, _) = self.expect_string()?;
+            if key == "type" {
+                import_type = Some(val);
+            }
+            if !self.eat(TokenKind::Comma)? {
+                break;
+            }
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(import_type)
+    }
+
     fn parse_import_decl(&mut self) -> Result<ImportDecl, SyntaxError> {
         let start = self.expect_keyword(Keyword::Import)?.span.start;
         let mut specifiers = Vec::new();
@@ -1068,10 +1122,12 @@ impl<'a> Parser<'a> {
         // Side-effect import: `import "mod";`
         if let TokenKind::String { .. } = self.cur.kind {
             let (source, end) = self.expect_string()?;
+            let import_type = self.parse_optional_import_attributes()?;
             self.consume_semicolon()?;
             return Ok(ImportDecl {
                 specifiers,
                 source,
+                import_type,
                 span: Span::new(start, end),
             });
         }
@@ -1090,10 +1146,12 @@ impl<'a> Parser<'a> {
 
         self.expect_contextual("from")?;
         let (source, end) = self.expect_string()?;
+        let import_type = self.parse_optional_import_attributes()?;
         self.consume_semicolon()?;
         Ok(ImportDecl {
             specifiers,
             source,
+            import_type,
             span: Span::new(start, end),
         })
     }
@@ -1172,6 +1230,7 @@ impl<'a> Parser<'a> {
             };
             self.expect_contextual("from")?;
             let (source, end) = self.expect_string()?;
+            let _ = self.parse_optional_import_attributes()?;
             self.consume_semicolon()?;
             return Ok(ExportDecl {
                 kind: ExportKind::All { exported, source },
@@ -1199,6 +1258,7 @@ impl<'a> Parser<'a> {
             let source = if self.is_ident_word("from") {
                 self.advance()?;
                 let (s, s_end) = self.expect_string()?;
+                let _ = self.parse_optional_import_attributes()?;
                 end = s_end;
                 Some(s)
             } else {
@@ -2521,7 +2581,10 @@ impl<'a> Parser<'a> {
                 }
                 self.expect(TokenKind::LParen)?;
                 let source = self.parse_assign_expr()?;
-                let _ = self.eat(TokenKind::Comma)?;
+                if self.eat(TokenKind::Comma)? && self.cur.kind != TokenKind::RParen {
+                    let _options = self.parse_assign_expr()?;
+                    let _ = self.eat(TokenKind::Comma)?;
+                }
                 let end = self.expect(TokenKind::RParen)?.span.end;
                 Ok(Expr::new(
                     ExprKind::ImportCall {

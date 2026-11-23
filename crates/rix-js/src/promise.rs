@@ -562,7 +562,11 @@ fn drive_async_execution(vm: &mut JsVm, entry_depth: usize, promise: HeapHandle)
                 },
             );
         }
-        Ok(RunOutcome::SuspendedYield { .. } | RunOutcome::SuspendedYieldStar { .. }) => {
+        Ok(
+            RunOutcome::SuspendedYield { .. }
+            | RunOutcome::SuspendedYieldStar { .. }
+            | RunOutcome::SuspendedInitial { .. },
+        ) => {
             let err = vm.type_error("Unexpected yield inside async function");
             reject_promise(vm, promise, err.value);
         }
@@ -998,6 +1002,7 @@ fn promise_any_fn(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsV
 // ---------------------------------------------------------------------------
 
 /// Creates a new suspended `Generator` object for a `function*` invocation.
+/// Runs parameter initialization synchronously up to `Opcode::GeneratorStart` per ECMA-262 §15.5.5.
 pub fn create_generator(
     vm: &mut JsVm,
     callee: HeapHandle,
@@ -1005,11 +1010,12 @@ pub fn create_generator(
     func_idx: u32,
     this_val: JsValue,
     args: &[JsValue],
-) -> HeapHandle {
+) -> Result<HeapHandle, JsException> {
     create_generator_inner(vm, callee, program_id, func_idx, this_val, args, false)
 }
 
 /// Creates a new suspended `AsyncGenerator` object for an `async function*` invocation.
+/// Runs parameter initialization synchronously up to `Opcode::GeneratorStart` per ECMA-262 §15.6.5.
 pub fn create_async_generator(
     vm: &mut JsVm,
     callee: HeapHandle,
@@ -1017,7 +1023,7 @@ pub fn create_async_generator(
     func_idx: u32,
     this_val: JsValue,
     args: &[JsValue],
-) -> HeapHandle {
+) -> Result<HeapHandle, JsException> {
     create_generator_inner(vm, callee, program_id, func_idx, this_val, args, true)
 }
 
@@ -1029,35 +1035,71 @@ fn create_generator_inner(
     this_val: JsValue,
     args: &[JsValue],
     is_async: bool,
-) -> HeapHandle {
-    let (reg_count, param_count) = {
-        let f = vm.function_bytecode(program_id, func_idx).unwrap();
-        (f.register_count as usize, f.param_count as usize)
-    };
-    let mut saved_regs = vec![JsValue::UNDEFINED; reg_count.max(param_count + 1)];
-    for (i, &a) in args.iter().take(param_count).enumerate() {
-        saved_regs[i] = a;
-    }
-    if args.len() > param_count {
-        saved_regs.extend_from_slice(&args[param_count..]);
-    }
-    let frame = SuspendedFrame {
-        program_id,
-        func_idx,
-        pc: 0,
-        this_val,
-        callee,
-        saved_regs,
-        call_args: args.to_vec(),
-        saved_upvalues: Vec::new(),
-        resume_dst: 0,
+) -> Result<HeapHandle, JsException> {
+    let starts_with_gen_start = vm
+        .function_bytecode(program_id, func_idx)
+        .and_then(|f| f.code.first())
+        .and_then(|i| i.opcode())
+        == Some(crate::bytecode::Opcode::GeneratorStart);
+    let has_gen_start = vm.function_bytecode(program_id, func_idx).is_some_and(|f| {
+        f.code
+            .iter()
+            .any(|i| i.opcode() == Some(crate::bytecode::Opcode::GeneratorStart))
+    });
+
+    let frame = if !has_gen_start || starts_with_gen_start {
+        let (reg_count, param_count) = {
+            let f = vm.function_bytecode(program_id, func_idx).unwrap();
+            (f.register_count as usize, f.param_count as usize)
+        };
+        let mut saved_regs = vec![JsValue::UNDEFINED; reg_count.max(param_count + 1)];
+        for (i, &a) in args.iter().take(param_count).enumerate() {
+            saved_regs[i] = a;
+        }
+        if args.len() > param_count {
+            saved_regs.extend_from_slice(&args[param_count..]);
+        }
+        SuspendedFrame {
+            program_id,
+            func_idx,
+            pc: usize::from(starts_with_gen_start),
+            this_val,
+            callee,
+            saved_regs,
+            call_args: args.to_vec(),
+            saved_upvalues: Vec::new(),
+            resume_dst: 0,
+        }
+    } else {
+        let stop_depth = vm.frame_depth();
+        vm.push_closure_frame(
+            callee,
+            program_id,
+            func_idx,
+            this_val,
+            args,
+            None,
+            None,
+            JsValue::UNDEFINED,
+        )?;
+        match vm.run_suspendable(stop_depth) {
+            Ok(RunOutcome::SuspendedInitial { frame }) => frame,
+            Ok(_) => {
+                vm.discard_frames_to(stop_depth);
+                return Err(vm.type_error("Generator initialization failed unexpectedly"));
+            }
+            Err(exc) => {
+                vm.discard_frames_to(stop_depth);
+                return Err(exc);
+            }
+        }
     };
     let proto = if is_async {
         vm.async_generator_proto
     } else {
         vm.generator_proto
     };
-    vm.heap.alloc_object(JsObject::with_kind(
+    Ok(vm.heap.alloc_object(JsObject::with_kind(
         ObjectKind::Generator(Box::new(GeneratorObject {
             state: GeneratorState::SuspendedStart,
             frame: Some(frame),
@@ -1066,7 +1108,7 @@ fn create_generator_inner(
             pending_requests: VecDeque::new(),
         })),
         Some(proto),
-    ))
+    )))
 }
 
 pub fn make_iter_result(vm: &mut JsVm, value: JsValue, done: bool) -> JsValue {
@@ -1134,7 +1176,13 @@ pub fn step_generator(
                     g.delegate_iter = None;
                 }
                 // Delegate exhausted; pass its final value into the generator's `yield*` result reg.
-                return resume_generator_frame(vm, gen_h, frame_opt, GeneratorAction::Next(v));
+                return resume_generator_frame(
+                    vm,
+                    gen_h,
+                    frame_opt,
+                    GeneratorAction::Next(v),
+                    false,
+                );
             }
             GeneratorAction::Return(v) => {
                 if let Some(ObjectKind::Generator(g)) =
@@ -1152,7 +1200,13 @@ pub fn step_generator(
                 {
                     g.delegate_iter = None;
                 }
-                return resume_generator_frame(vm, gen_h, frame_opt, GeneratorAction::Throw(err));
+                return resume_generator_frame(
+                    vm,
+                    gen_h,
+                    frame_opt,
+                    GeneratorAction::Throw(err),
+                    false,
+                );
             }
         }
     }
@@ -1180,18 +1234,19 @@ pub fn step_generator(
                 });
             }
             GeneratorAction::Next(_) => {
-                // First `.next()` ignores passed argument and starts executing at pc = 0.
+                // First `.next()` ignores passed argument and resumes right after `GeneratorStart`.
                 return resume_generator_frame(
                     vm,
                     gen_h,
                     frame_opt.take(),
                     GeneratorAction::Next(JsValue::UNDEFINED),
+                    true,
                 );
             }
         }
     }
 
-    resume_generator_frame(vm, gen_h, frame_opt, action)
+    resume_generator_frame(vm, gen_h, frame_opt, action, false)
 }
 
 fn resume_generator_frame(
@@ -1199,6 +1254,7 @@ fn resume_generator_frame(
     gen_h: HeapHandle,
     frame_opt: Option<SuspendedFrame>,
     action: GeneratorAction,
+    is_initial_start: bool,
 ) -> Result<JsValue, JsException> {
     let Some(frame) = frame_opt else {
         return Ok(make_iter_result(vm, JsValue::UNDEFINED, true));
@@ -1210,7 +1266,7 @@ fn resume_generator_frame(
     let base = vm.restore_suspended_frame(&frame);
     match action {
         GeneratorAction::Next(v) => {
-            if frame.pc > 0 {
+            if !is_initial_start {
                 vm.write_register(base + usize::from(frame.resume_dst), v);
             }
         }
@@ -1280,7 +1336,7 @@ fn resume_generator_frame(
                 let b = vm.restore_suspended_frame(&frame);
                 vm.write_register(b + usize::from(frame.resume_dst), v);
             }
-            Ok(RunOutcome::SuspendedAwait { .. }) => {
+            Ok(RunOutcome::SuspendedAwait { .. } | RunOutcome::SuspendedInitial { .. }) => {
                 if let Some(ObjectKind::Generator(g)) =
                     vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind)
                 {
@@ -1532,6 +1588,7 @@ fn start_async_generator_request(vm: &mut JsVm, gen_h: HeapHandle, req: AsyncGen
                             value: val,
                             promise: step_p,
                         },
+                        false,
                     );
                 }
                 Ok(JsValue::UNDEFINED)
@@ -1553,6 +1610,7 @@ fn start_async_generator_request(vm: &mut JsVm, gen_h: HeapHandle, req: AsyncGen
                         value: arg(args, 0),
                         promise: step_p,
                     },
+                    false,
                 );
                 Ok(JsValue::UNDEFINED)
             });
@@ -1620,13 +1678,14 @@ fn start_async_generator_request(vm: &mut JsVm, gen_h: HeapHandle, req: AsyncGen
                         value: JsValue::UNDEFINED,
                         promise: req.promise,
                     },
+                    true,
                 );
                 return;
             }
         }
     }
 
-    resume_async_generator_frame(vm, gen_h, frame_opt, req);
+    resume_async_generator_frame(vm, gen_h, frame_opt, req, false);
 }
 
 fn resume_async_generator_frame(
@@ -1634,6 +1693,7 @@ fn resume_async_generator_frame(
     gen_h: HeapHandle,
     frame_opt: Option<SuspendedFrame>,
     req: AsyncGeneratorRequest,
+    is_initial_start: bool,
 ) {
     let Some(frame) = frame_opt else {
         if let Some(ObjectKind::Generator(g)) = vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind) {
@@ -1649,7 +1709,7 @@ fn resume_async_generator_frame(
     let base = vm.restore_suspended_frame(&frame);
     match req.kind {
         AsyncGeneratorRequestKind::Next => {
-            if frame.pc > 0 {
+            if !is_initial_start {
                 vm.write_register(base + usize::from(frame.resume_dst), req.value);
             }
         }
@@ -1766,6 +1826,7 @@ fn drive_async_generator_exec(
                             value: arg(args, 0),
                             promise: step_p,
                         },
+                        false,
                     );
                 }
                 Ok(JsValue::UNDEFINED)
@@ -1795,6 +1856,7 @@ fn drive_async_generator_exec(
                             value: arg(args, 0),
                             promise: step_p,
                         },
+                        false,
                     );
                 }
                 Ok(JsValue::UNDEFINED)
@@ -1811,6 +1873,7 @@ fn drive_async_generator_exec(
                             value: arg(args, 0),
                             promise: step_p,
                         },
+                        false,
                     );
                 }
                 Ok(JsValue::UNDEFINED)
@@ -1856,6 +1919,16 @@ fn drive_async_generator_exec(
                     finish_async_generator_step_reject(vm, gen_h, step_p, e.value);
                 }
             }
+        }
+        Ok(RunOutcome::SuspendedInitial { .. }) => {
+            if let Some(ObjectKind::Generator(g)) =
+                vm.heap.get_object_mut(gen_h).map(|o| &mut o.kind)
+            {
+                g.state = GeneratorState::Completed;
+                g.frame = None;
+            }
+            let err = vm.type_error("Unexpected GeneratorStart during execution");
+            finish_async_generator_step_reject(vm, gen_h, step_p, err.value);
         }
         Err(e) => {
             if let Some(ObjectKind::Generator(g)) =

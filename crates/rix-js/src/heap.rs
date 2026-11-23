@@ -302,6 +302,8 @@ pub struct RareObjectData {
     pub accessors: HashMap<PropertyKey, AccessorPair>,
     pub private_fields: HashMap<PropertyKey, PrivateEntry>,
     pub class_instance_init: Option<ClassInstanceInit>,
+    /// Primitive slot (`[[NumberData]]`, `[[StringData]]`, `[[BooleanData]]`, `[[BigIntData]]`, `[[SymbolData]]`).
+    pub boxed_value: Option<JsValue>,
 }
 
 /// Specialized runtime tag for a [`JsObject`].
@@ -501,6 +503,11 @@ impl JsObject {
                 visit(init.proto);
                 if let Some(f) = init.field_init_fn {
                     visit(f);
+                }
+            }
+            if let Some(bv) = rare.boxed_value {
+                if let Some(h) = bv.as_heap_handle() {
+                    visit(h);
                 }
             }
         }

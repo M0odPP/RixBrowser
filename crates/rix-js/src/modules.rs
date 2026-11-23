@@ -362,7 +362,14 @@ impl ModuleLoader {
                 Ok(p) => p,
                 Err(e) => {
                     let p = alloc_promise(vm);
-                    let err = vm.make_error("SyntaxError", e.to_string());
+                    let err_kind = match &e {
+                        ModuleError::Compile { .. } | ModuleError::Link { .. } => "SyntaxError",
+                        ModuleError::Load { reason, .. } if reason.starts_with("SyntaxError:") => {
+                            "SyntaxError"
+                        }
+                        _ => "TypeError",
+                    };
+                    let err = vm.make_error(err_kind, e.to_string());
                     reject_promise(vm, p, err.value);
                     p
                 }
@@ -428,13 +435,24 @@ impl ModuleLoader {
         if self.records.contains_key(url) {
             return Ok(());
         }
-        let source = self
+        let raw_source = self
             .provider
             .load_source(url)
             .map_err(|reason| ModuleError::Load {
                 url: url.to_string(),
                 reason,
             })?;
+        let source = if url.ends_with(".json") {
+            let _: serde_json::Value =
+                serde_json::from_str(&raw_source).map_err(|e| ModuleError::Load {
+                    url: url.to_string(),
+                    reason: format!("SyntaxError: invalid JSON module: {e}"),
+                })?;
+            let escaped = serde_json::to_string(&raw_source).unwrap_or_else(|_| "\"\"".into());
+            format!("export default JSON.parse({escaped});")
+        } else {
+            raw_source
+        };
         let compiled: CompiledProgram =
             compile(&source, SourceType::Module).map_err(|e| ModuleError::Compile {
                 url: url.to_string(),

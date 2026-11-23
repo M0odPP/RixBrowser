@@ -266,6 +266,7 @@ pub struct Token {
 #[derive(Debug, Clone, Copy)]
 pub struct LexerCheckpoint {
     pos: usize,
+    at_start: bool,
 }
 
 /// Stateful UTF-8 ECMAScript 2024 lexer.
@@ -273,14 +274,22 @@ pub struct Lexer<'a> {
     src: &'a str,
     bytes: &'a [u8],
     pos: usize,
+    allow_html_comments: bool,
+    at_start: bool,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
+        Self::new_for_source(src, true)
+    }
+
+    pub fn new_for_source(src: &'a str, allow_html_comments: bool) -> Self {
         let mut lexer = Self {
             src,
             bytes: src.as_bytes(),
             pos: 0,
+            allow_html_comments,
+            at_start: true,
         };
         // Skip optional UTF-8 BOM.
         if lexer.src.starts_with('\u{FEFF}') {
@@ -301,12 +310,16 @@ impl<'a> Lexer<'a> {
 
     #[inline]
     pub fn checkpoint(&self) -> LexerCheckpoint {
-        LexerCheckpoint { pos: self.pos }
+        LexerCheckpoint {
+            pos: self.pos,
+            at_start: self.at_start,
+        }
     }
 
     #[inline]
     pub fn restore(&mut self, cp: LexerCheckpoint) {
         self.pos = cp.pos;
+        self.at_start = cp.at_start;
     }
 
     #[inline]
@@ -385,6 +398,35 @@ impl<'a> Lexer<'a> {
                     _ => break,
                 }
             }
+            if self.allow_html_comments
+                && ch == '<'
+                && self.bytes.get(self.pos..self.pos + 4) == Some(b"<!--")
+            {
+                // Annex B §B.1.3 SingleLineHTMLOpenComment (`<!-- ...`).
+                self.pos += 4;
+                while let Some(c) = self.peek_char() {
+                    if is_line_terminator(c) {
+                        break;
+                    }
+                    self.pos += c.len_utf8();
+                }
+                continue;
+            }
+            if self.allow_html_comments
+                && (saw_newline || self.at_start)
+                && ch == '-'
+                && self.bytes.get(self.pos..self.pos + 3) == Some(b"-->")
+            {
+                // Annex B §B.1.3 SingleLineHTMLCloseComment (`--> ...` after line terminator / start).
+                self.pos += 3;
+                while let Some(c) = self.peek_char() {
+                    if is_line_terminator(c) {
+                        break;
+                    }
+                    self.pos += c.len_utf8();
+                }
+                continue;
+            }
             break;
         }
         Ok(saw_newline)
@@ -402,6 +444,7 @@ impl<'a> Lexer<'a> {
                 line_terminator_before,
             });
         };
+        self.at_start = false;
 
         // Private identifier: `#ident`
         if b == b'#' {
@@ -745,6 +788,12 @@ impl<'a> Lexer<'a> {
                 Some(b'0'..=b'9') => {
                     // Legacy octal or non-octal decimal integer with leading 0.
                     legacy_octal = true;
+                }
+                Some(b'_') => {
+                    return Err(SyntaxError::new(
+                        "Numeric separator cannot appear immediately after leading 0",
+                        Span::new(start, self.pos as u32 + 2),
+                    ));
                 }
                 _ => {}
             }

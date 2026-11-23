@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Byte range in the original UTF-8 source string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct Span {
     pub start: u32,
     pub end: u32,
@@ -318,6 +318,7 @@ pub enum ClassElement {
 pub struct ImportDecl {
     pub specifiers: Vec<ImportSpecifier>,
     pub source: String,
+    pub import_type: Option<String>,
     pub span: Span,
 }
 
