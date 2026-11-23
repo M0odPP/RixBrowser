@@ -268,7 +268,6 @@ pub(crate) fn get_disambiguation_option(
         .map_err(|_| vm.range_error(format!("Invalid disambiguation option: {s}")))
 }
 
-#[allow(dead_code)]
 pub(crate) fn get_offset_disambiguation_option(
     vm: &mut JsVm,
     obj: Option<HeapHandle>,
@@ -294,7 +293,6 @@ pub(crate) fn get_display_calendar_option(
     DisplayCalendar::from_str(&s).map_err(|e| temporal_err(vm, e))
 }
 
-#[allow(dead_code)]
 pub(crate) fn get_display_offset_option(
     vm: &mut JsVm,
     obj: HeapHandle,
@@ -305,7 +303,6 @@ pub(crate) fn get_display_offset_option(
     DisplayOffset::from_str(&s).map_err(|e| temporal_err(vm, e))
 }
 
-#[allow(dead_code)]
 pub(crate) fn get_display_time_zone_option(
     vm: &mut JsVm,
     obj: HeapHandle,

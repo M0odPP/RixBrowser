@@ -63,6 +63,9 @@ pub type NativeClosure = Rc<dyn Fn(&mut JsVm, JsValue, &[JsValue]) -> Result<JsV
 /// Dynamic `import(specifier)` handler callback `(vm, referrer_url, specifier) -> promise_handle`.
 pub type DynamicImportHandler = Rc<dyn Fn(&mut JsVm, Option<String>, String) -> HeapHandle>;
 
+/// Host GC root collector invoked during every automatic minor and major GC cycle.
+pub type HostRootCollector = Box<dyn Fn(&mut Vec<JsValue>)>;
+
 /// Outcome of running a potentially suspendable (`async` / generator) bytecode frame.
 #[derive(Debug, Clone)]
 pub enum RunOutcome {
@@ -286,6 +289,8 @@ pub struct JsVm {
     microtasks: VecDeque<MicrotaskJob>,
     module_envs: HashMap<u32, ModuleEnv>,
     dynamic_import_handler: Option<DynamicImportHandler>,
+    /// External host root collectors invoked during every automatic minor and major GC.
+    host_root_collectors: Vec<HostRootCollector>,
     programs: Vec<CompiledProgram>,
     ic_tables: Vec<Vec<IcTable>>,
     const_keys: Vec<Vec<Vec<Option<PropertyKey>>>>,
@@ -602,6 +607,7 @@ impl JsVm {
             microtasks: VecDeque::new(),
             module_envs: HashMap::new(),
             dynamic_import_handler: None,
+            host_root_collectors: Vec::new(),
             programs: Vec::new(),
             ic_tables: Vec::new(),
             const_keys: Vec::new(),
@@ -807,7 +813,15 @@ impl JsVm {
         if let Some(h) = self.eval_fn {
             roots.push(JsValue::from_object(h));
         }
+        for collector in &self.host_root_collectors {
+            collector(&mut roots);
+        }
         roots
+    }
+
+    /// Registers a host root collector invoked during every automatic minor and major GC.
+    pub fn add_host_root_collector(&mut self, collector: impl Fn(&mut Vec<JsValue>) + 'static) {
+        self.host_root_collectors.push(Box::new(collector));
     }
 
     /// Triggers a full stop-the-world Major GC across all live VM roots.

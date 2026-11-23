@@ -196,6 +196,78 @@ impl ContentRuntime {
         let webaudio = install_webaudio(&mut vm, &host, &media_elements);
         let webgpu = install_webgpu(&mut vm, &host, &canvas2d);
         let webgl2 = install_webgl2(&mut vm, &host, &canvas2d);
+
+        // Register all host subsystem GC root collectors so automatic minor/major GC
+        // inside `JsVm` never sweeps live DOM wrappers, event listeners, or Web API objects.
+        {
+            let event_loop_r = Rc::clone(&event_loop);
+            let events_r = Rc::clone(&events);
+            let observers_r = Rc::clone(&observers);
+            let web_apis_r = Rc::clone(&web_apis);
+            let streams_r = Rc::clone(&streams);
+            let net_r = Rc::clone(&net);
+            let canvas2d_r = Rc::clone(&canvas2d);
+            let webgpu_r = Rc::clone(&webgpu);
+            let webgl2_r = Rc::clone(&webgl2);
+            let frames_r = Rc::clone(&frames);
+            let workers_r = Rc::clone(&workers);
+            let sw_r = Rc::clone(&service_workers);
+            let idb_r = Rc::clone(&indexeddb);
+            let mse_r = Rc::clone(&media_source);
+            let audio_r = Rc::clone(&webaudio);
+            let host_r = Rc::clone(&host);
+            vm.add_host_root_collector(move |roots| {
+                if let Ok(g) = event_loop_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = events_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = observers_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = web_apis_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = streams_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = net_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = canvas2d_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = webgpu_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = webgl2_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = frames_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = workers_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = sw_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = idb_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = mse_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = audio_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = host_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+            });
+        }
+
         Self {
             vm,
             host,
@@ -1056,23 +1128,7 @@ impl ContentRuntime {
     /// Web APIs, Streams, Canvas2D, WebGPU, WebGL2, WebAudio, MediaSource, active network handles,
     /// and host-pinned DOM wrappers.
     pub fn collect_garbage(&mut self) -> GcCycleStats {
-        let mut roots = self.vm.collect_roots();
-        self.event_loop.borrow().collect_roots(&mut roots);
-        self.events.borrow().collect_roots(&mut roots);
-        self.observers.borrow().collect_roots(&mut roots);
-        self.web_apis.borrow().collect_roots(&mut roots);
-        self.streams.borrow().collect_roots(&mut roots);
-        self.net.borrow().collect_roots(&mut roots);
-        self.canvas2d.borrow().collect_roots(&mut roots);
-        self.webgpu.borrow().collect_roots(&mut roots);
-        self.webgl2.borrow().collect_roots(&mut roots);
-        self.frames.borrow().collect_roots(&mut roots);
-        self.workers.borrow().collect_roots(&mut roots);
-        self.service_workers.borrow().collect_roots(&mut roots);
-        self.indexeddb.borrow().collect_roots(&mut roots);
-        self.media_source.borrow().collect_roots(&mut roots);
-        self.webaudio.borrow().collect_roots(&mut roots);
-        self.host.borrow().collect_roots(&mut roots);
+        let roots = self.vm.collect_roots();
         let stats = self.vm.heap.collect_major(&roots);
         self.events.borrow_mut().sweep_dead(&self.vm.heap);
         self.web_apis.borrow_mut().sweep_dead(&self.vm.heap);
