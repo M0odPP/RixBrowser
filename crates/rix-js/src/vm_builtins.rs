@@ -159,6 +159,10 @@ fn fn_apply(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValu
     let mut call_args = Vec::new();
     if let Some(arr_h) = args.get(1).and_then(|v| v.as_object()) {
         let len = vm.heap.get_object(arr_h).map_or(0, |o| o.elements.len());
+        if len > 1_000_000 {
+            return Err(vm.range_error("Maximum call stack size exceeded"));
+        }
+        call_args.reserve(len as usize);
         for i in 0..len {
             let v = vm
                 .heap
@@ -333,15 +337,41 @@ fn object_get_prototype_of(
     Ok(proto.map_or(JsValue::NULL, JsValue::from_object))
 }
 
+/// ECMA-262 §10.1.2.1 `OrdinarySetPrototypeOf`: rejects non-extensible changes and prototype cycles.
+fn ordinary_set_prototype_of(vm: &mut JsVm, h: HeapHandle, proto: Option<HeapHandle>) -> bool {
+    let Some(obj) = vm.heap.get_object(h) else {
+        return false;
+    };
+    if obj.prototype == proto {
+        return true;
+    }
+    if !obj.extensible {
+        return false;
+    }
+    // Walk candidate prototype chain to prevent any cycle (including `p == h`).
+    let mut cur = proto;
+    let mut hops = 0usize;
+    while let Some(p) = cur {
+        if p == h || hops > 4096 {
+            return false;
+        }
+        cur = vm.heap.get_object(p).and_then(|o| o.prototype);
+        hops += 1;
+    }
+    vm.heap.object_set_prototype(h, proto, &mut vm.shapes);
+    vm.mega_ic.invalidate_prototypes();
+    true
+}
+
 fn object_set_prototype_of(
     vm: &mut JsVm,
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
     let obj_val = args.first().copied().unwrap_or(JsValue::UNDEFINED);
-    let Some(h) = obj_val.as_object() else {
-        return Err(vm.type_error("Object.setPrototypeOf called on non-object"));
-    };
+    if obj_val.is_undefined() || obj_val.is_null() {
+        return Err(vm.type_error("Object.setPrototypeOf called on null or undefined"));
+    }
     let proto_arg = args.get(1).copied().unwrap_or(JsValue::NULL);
     let proto = if proto_arg.is_null() {
         None
@@ -350,8 +380,13 @@ fn object_set_prototype_of(
     } else {
         return Err(vm.type_error("Object prototype may only be an Object or null"));
     };
-    vm.heap.object_set_prototype(h, proto, &mut vm.shapes);
-    vm.mega_ic.invalidate_prototypes();
+    let Some(h) = obj_val.as_object() else {
+        // Per ES spec §20.1.2.21 step 4: primitive targets return O unchanged after validating proto.
+        return Ok(obj_val);
+    };
+    if !ordinary_set_prototype_of(vm, h, proto) {
+        return Err(vm.type_error("Cyclic __proto__ value or non-extensible object"));
+    }
     Ok(obj_val)
 }
 
@@ -433,21 +468,51 @@ fn array_pop(vm: &mut JsVm, this_val: JsValue, _args: &[JsValue]) -> Result<JsVa
     Ok(val)
 }
 
+fn array_present_or_dense_indices(vm: &JsVm, h: HeapHandle) -> (u32, Option<Vec<u32>>) {
+    let Some(o) = vm.heap.get_object(h) else {
+        return (0, None);
+    };
+    let len = o.elements.len();
+    if len > 65_536 {
+        (len, Some(o.elements.present_indices()))
+    } else {
+        (len, None)
+    }
+}
+
 fn array_map(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let Some(h) = this_val.as_object() else {
         return Err(vm.type_error("Array.prototype.map called on non-object"));
     };
     let cb = args.first().copied().unwrap_or(JsValue::UNDEFINED);
     let this_arg = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
-    let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
+    let (len, sparse_indices) = array_present_or_dense_indices(vm, h);
     let out = vm.alloc_array();
-    for i in 0..len {
-        if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-            let mapped =
-                vm.call_value(cb, this_arg, &[elem, JsValue::from_i32(i as i32), this_val])?;
-            vm.heap.object_push_element(out, mapped);
-        } else if let Some(o) = vm.heap.get_object_mut(out) {
-            o.elements.push_hole();
+    if let Some(indices) = sparse_indices {
+        if let Some(o) = vm.heap.get_object_mut(out) {
+            o.elements.set_len(len);
+        }
+        for i in indices {
+            if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
+                let mapped = vm.call_value(
+                    cb,
+                    this_arg,
+                    &[elem, JsValue::from_f64(f64::from(i)), this_val],
+                )?;
+                if let Some(o) = vm.heap.get_object_mut(out) {
+                    o.elements.set(i, mapped);
+                }
+            }
+        }
+    } else {
+        for i in 0..len {
+            if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
+                let mapped =
+                    vm.call_value(cb, this_arg, &[elem, JsValue::from_i32(i as i32), this_val])?;
+                vm.heap.object_push_element(out, mapped);
+            } else if let Some(o) = vm.heap.get_object_mut(out) {
+                o.elements.push_hole();
+            }
         }
     }
     Ok(JsValue::from_object(out))
@@ -463,14 +528,29 @@ fn array_filter(
     };
     let cb = args.first().copied().unwrap_or(JsValue::UNDEFINED);
     let this_arg = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
-    let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
+    let (len, sparse_indices) = array_present_or_dense_indices(vm, h);
     let out = vm.alloc_array();
-    for i in 0..len {
-        if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-            let keep =
-                vm.call_value(cb, this_arg, &[elem, JsValue::from_i32(i as i32), this_val])?;
-            if vm.to_boolean(keep) {
-                vm.heap.object_push_element(out, elem);
+    if let Some(indices) = sparse_indices {
+        for i in indices {
+            if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
+                let keep = vm.call_value(
+                    cb,
+                    this_arg,
+                    &[elem, JsValue::from_f64(f64::from(i)), this_val],
+                )?;
+                if vm.to_boolean(keep) {
+                    vm.heap.object_push_element(out, elem);
+                }
+            }
+        }
+    } else {
+        for i in 0..len {
+            if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
+                let keep =
+                    vm.call_value(cb, this_arg, &[elem, JsValue::from_i32(i as i32), this_val])?;
+                if vm.to_boolean(keep) {
+                    vm.heap.object_push_element(out, elem);
+                }
             }
         }
     }
@@ -486,7 +566,32 @@ fn array_reduce(
         return Err(vm.type_error("Array.prototype.reduce called on non-object"));
     };
     let cb = args.first().copied().unwrap_or(JsValue::UNDEFINED);
-    let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
+    let (len, sparse_indices) = array_present_or_dense_indices(vm, h);
+    if let Some(indices) = sparse_indices {
+        let mut iter = indices.into_iter();
+        let mut acc = if args.len() >= 2 {
+            args[1]
+        } else {
+            let mut first = None;
+            for i in iter.by_ref() {
+                if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
+                    first = Some(v);
+                    break;
+                }
+            }
+            first.ok_or_else(|| vm.type_error("Reduce of empty array with no initial value"))?
+        };
+        for i in iter {
+            if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
+                acc = vm.call_value(
+                    cb,
+                    JsValue::UNDEFINED,
+                    &[acc, elem, JsValue::from_f64(f64::from(i)), this_val],
+                )?;
+            }
+        }
+        return Ok(acc);
+    }
     let mut start = 0u32;
     let mut acc = if args.len() >= 2 {
         args[1]
@@ -524,10 +629,22 @@ fn array_for_each(
     };
     let cb = args.first().copied().unwrap_or(JsValue::UNDEFINED);
     let this_arg = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
-    let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
-    for i in 0..len {
-        if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-            vm.call_value(cb, this_arg, &[elem, JsValue::from_i32(i as i32), this_val])?;
+    let (len, sparse_indices) = array_present_or_dense_indices(vm, h);
+    if let Some(indices) = sparse_indices {
+        for i in indices {
+            if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
+                vm.call_value(
+                    cb,
+                    this_arg,
+                    &[elem, JsValue::from_f64(f64::from(i)), this_val],
+                )?;
+            }
+        }
+    } else {
+        for i in 0..len {
+            if let Some(elem) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
+                vm.call_value(cb, this_arg, &[elem, JsValue::from_i32(i as i32), this_val])?;
+            }
         }
     }
     Ok(JsValue::UNDEFINED)
@@ -542,7 +659,10 @@ fn array_join(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsVa
         _ => ",".to_owned(),
     };
     let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
-    let mut parts = Vec::with_capacity(len as usize);
+    if len > 4_000_000 {
+        return Err(vm.range_error("Invalid string length"));
+    }
+    let mut parts = Vec::with_capacity((len as usize).min(16_384));
     for i in 0..len {
         match vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
             Some(v) if !v.is_null() && !v.is_undefined() => parts.push(vm.value_to_rust_string(v)),
@@ -576,11 +696,31 @@ fn array_slice(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsV
         rel_end.min(len)
     } as u32;
     let out = vm.alloc_array();
-    for i in start..end {
-        if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-            vm.heap.object_push_element(out, v);
-        } else if let Some(o) = vm.heap.get_object_mut(out) {
-            o.elements.push_hole();
+    if end.saturating_sub(start) > 65_536 {
+        let indices = vm
+            .heap
+            .get_object(h)
+            .map(|o| o.elements.present_indices())
+            .unwrap_or_default();
+        if let Some(o) = vm.heap.get_object_mut(out) {
+            o.elements.set_len(end.saturating_sub(start));
+        }
+        for i in indices {
+            if i >= start && i < end {
+                if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
+                    if let Some(o) = vm.heap.get_object_mut(out) {
+                        o.elements.set(i - start, v);
+                    }
+                }
+            }
+        }
+    } else {
+        for i in start..end {
+            if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
+                vm.heap.object_push_element(out, v);
+            } else if let Some(o) = vm.heap.get_object_mut(out) {
+                o.elements.push_hole();
+            }
         }
     }
     Ok(JsValue::from_object(out))
@@ -595,11 +735,21 @@ fn array_index_of(
         return Ok(JsValue::from_i32(-1));
     };
     let target = args.first().copied().unwrap_or(JsValue::UNDEFINED);
-    let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
-    for i in 0..len {
-        if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
-            if vm.strict_eq(v, target) {
-                return Ok(JsValue::from_i32(i as i32));
+    let (len, sparse_indices) = array_present_or_dense_indices(vm, h);
+    if let Some(indices) = sparse_indices {
+        for i in indices {
+            if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
+                if vm.strict_eq(v, target) {
+                    return Ok(JsValue::from_f64(f64::from(i)));
+                }
+            }
+        }
+    } else {
+        for i in 0..len {
+            if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
+                if vm.strict_eq(v, target) {
+                    return Ok(JsValue::from_i32(i as i32));
+                }
             }
         }
     }
@@ -732,6 +882,9 @@ fn reflect_construct(
     let mut call_args = Vec::new();
     if let Some(arr_h) = args.get(1).and_then(|v| v.as_object()) {
         let len = vm.heap.get_object(arr_h).map_or(0, |o| o.elements.len());
+        if len > 1_000_000 {
+            return Err(vm.range_error("Maximum call stack size exceeded"));
+        }
         for i in 0..len {
             let v = vm
                 .heap
@@ -754,11 +907,21 @@ fn reflect_get_prototype_of(
 
 fn reflect_set_prototype_of(
     vm: &mut JsVm,
-    this: JsValue,
+    _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    object_set_prototype_of(vm, this, args)?;
-    Ok(JsValue::TRUE)
+    let Some(h) = args.first().and_then(|v| v.as_object()) else {
+        return Err(vm.type_error("Reflect.setPrototypeOf called on non-object"));
+    };
+    let proto_arg = args.get(1).copied().unwrap_or(JsValue::NULL);
+    let proto = if proto_arg.is_null() {
+        None
+    } else if let Some(p) = proto_arg.as_object() {
+        Some(p)
+    } else {
+        return Err(vm.type_error("Object prototype may only be an Object or null"));
+    };
+    Ok(JsValue::from_bool(ordinary_set_prototype_of(vm, h, proto)))
 }
 
 fn reflect_own_keys(

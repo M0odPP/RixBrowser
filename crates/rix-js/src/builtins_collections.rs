@@ -912,7 +912,7 @@ fn install_array_buffer(vm: &mut JsVm) {
         } else {
             vm.to_number(arg(args, 0))?
         };
-        if !raw_len.is_finite() || raw_len < 0.0 || raw_len > 256.0 * 1024.0 * 1024.0 {
+        if !raw_len.is_finite() || raw_len < 0.0 || raw_len > 64.0 * 1024.0 * 1024.0 {
             return Err(vm.range_error("Invalid ArrayBuffer byteLength"));
         }
         let len = raw_len.trunc() as usize;
@@ -1437,7 +1437,8 @@ fn construct_typed_array(
 
     // 3. Length constructor.
     let len_f = vm.to_number(first)?;
-    if !len_f.is_finite() || len_f < 0.0 || len_f > 64.0 * 1024.0 * 1024.0 {
+    let max_elems = (64 * 1024 * 1024) / bpe;
+    if !len_f.is_finite() || len_f < 0.0 || len_f > max_elems as f64 {
         return Err(vm.range_error("Invalid TypedArray length"));
     }
     Ok(JsValue::from_object(alloc_typed_array(

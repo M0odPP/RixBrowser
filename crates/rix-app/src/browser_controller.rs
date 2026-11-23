@@ -82,6 +82,7 @@ pub struct TabDocumentState {
     pub is_chrome_page: bool,
     pub runtime: Option<ContentRuntime>,
     pub last_load_stats: PageLoadStats,
+    pub last_js_errors: Vec<String>,
     doc_snapshot_revision: u64,
 }
 
@@ -105,6 +106,7 @@ impl TabDocumentState {
             is_chrome_page: true,
             runtime: None,
             last_load_stats: PageLoadStats::default(),
+            last_js_errors: Vec::new(),
             doc_snapshot_revision: 0,
         }
     }
@@ -864,7 +866,11 @@ impl BrowserController {
         entry.raw_html = html.to_string();
         entry.page_css = inline_styles;
         entry.is_chrome_page = false;
-        entry.last_load_stats = loaded.stats;
+        let mut load_stats = loaded.stats;
+        load_stats.js_ms = js_ms;
+        load_stats.js_error_count = script_errors.len();
+        entry.last_load_stats = load_stats;
+        entry.last_js_errors = script_errors;
         entry.runtime = Some(rt);
 
         self.web_dirty = true;

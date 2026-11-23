@@ -160,9 +160,11 @@ pub struct PageLoadStats {
     pub wave2_ms: f32,
     pub css_parse_ms: f32,
     pub image_decode_ms: f32,
+    pub js_ms: f32,
     pub subresources_fetched: usize,
     pub network_cache_hits: usize,
     pub decoded_asset_cache_hits: usize,
+    pub js_error_count: usize,
 }
 
 /// Complete set of subresources loaded for a web navigation.

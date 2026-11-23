@@ -1,7 +1,7 @@
 #![deny(unsafe_code)]
 
 use rix_app::{
-    render_headless_demo, render_url_to_png, run_content_process, run_network_process,
+    render_headless_demo, render_url_to_png_with_metrics, run_content_process, run_network_process,
     run_window_shell,
 };
 use rix_chrome::ThemeMode;
@@ -13,6 +13,7 @@ use tracing::{error, info};
 struct RenderUrlCli {
     url: String,
     out_path: String,
+    metrics_json: Option<String>,
     width: u32,
     height: u32,
     theme: ThemeMode,
@@ -21,6 +22,7 @@ struct RenderUrlCli {
 fn parse_render_url_args(args: &[String]) -> Option<RenderUrlCli> {
     let mut url = None;
     let mut out_path = "rix-page.png".to_string();
+    let mut metrics_json = None;
     let mut width = 1280u32;
     let mut height = 800u32;
     let mut theme = ThemeMode::Dark;
@@ -38,6 +40,13 @@ fn parse_render_url_args(args: &[String]) -> Option<RenderUrlCli> {
         } else if arg == "--out" {
             if let Some(v) = args.get(idx + 1) {
                 out_path = v.clone();
+                idx += 1;
+            }
+        } else if let Some(v) = arg.strip_prefix("--metrics-json=") {
+            metrics_json = Some(v.to_string());
+        } else if arg == "--metrics-json" {
+            if let Some(v) = args.get(idx + 1) {
+                metrics_json = Some(v.clone());
                 idx += 1;
             }
         } else if let Some(v) = arg.strip_prefix("--width=") {
@@ -59,6 +68,7 @@ fn parse_render_url_args(args: &[String]) -> Option<RenderUrlCli> {
     url.map(|url| RenderUrlCli {
         url,
         out_path,
+        metrics_json,
         width,
         height,
         theme,
@@ -119,11 +129,27 @@ fn main() -> ExitCode {
             init_logging("info");
             if let Some(cli) = parse_render_url_args(&raw_args) {
                 info!(url = %cli.url, path = %cli.out_path, width = cli.width, height = cli.height, "rendering URL headlessly");
-                if let Err(err) =
-                    render_url_to_png(&cli.url, &cli.out_path, cli.width, cli.height, cli.theme)
-                {
-                    error!(%err, "headless URL render failed");
-                    return ExitCode::FAILURE;
+                match render_url_to_png_with_metrics(
+                    &cli.url,
+                    &cli.out_path,
+                    cli.width,
+                    cli.height,
+                    cli.theme,
+                ) {
+                    Ok(metrics) => {
+                        if let Some(ref mpath) = cli.metrics_json {
+                            if let Ok(json) = serde_json::to_string_pretty(&metrics) {
+                                if let Err(err) = std::fs::write(mpath, json) {
+                                    error!(%err, path = %mpath, "failed to write metrics JSON");
+                                    return ExitCode::FAILURE;
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        error!(%err, "headless URL render failed");
+                        return ExitCode::FAILURE;
+                    }
                 }
                 return ExitCode::SUCCESS;
             }

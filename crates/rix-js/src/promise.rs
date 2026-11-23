@@ -393,7 +393,13 @@ pub fn promise_resolve_value(vm: &mut JsVm, val: JsValue) -> HeapHandle {
 
 /// Drains all queued microtasks strictly FIFO until the microtask queue is empty.
 pub fn drain_microtasks(vm: &mut JsVm) {
+    let mut ran = 0u64;
+    let max_jobs = vm.max_loop_iterations.unwrap_or(u64::MAX);
     while let Some(job) = vm.pop_microtask() {
+        ran = ran.saturating_add(1);
+        if ran > max_jobs {
+            break;
+        }
         match job {
             MicrotaskJob::Callback {
                 func,

@@ -215,6 +215,7 @@ pub struct JsVm {
     /// Optional cooperative loop back-edge budget (`None` = unlimited).
     pub max_loop_iterations: Option<u64>,
     pub loop_iterations: u64,
+    native_call_depth: u32,
     /// Shared atomic flag checked on every `Opcode::LoopBack`.
     pub interrupt_flag: Arc<AtomicBool>,
     /// Per-function invocation counters (used for Tier-2/3 JIT tier-up in Phase 3).
@@ -388,6 +389,7 @@ impl JsVm {
             iterators: HashMap::new(),
             max_loop_iterations: None,
             loop_iterations: 0,
+            native_call_depth: 0,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             call_counts: Vec::new(),
             back_edge_counts: Vec::new(),
@@ -823,6 +825,24 @@ impl JsVm {
     }
 
     fn call_handle(
+        &mut self,
+        callee: HeapHandle,
+        this_val: JsValue,
+        args: &[JsValue],
+        construct_obj: Option<HeapHandle>,
+        new_target: JsValue,
+    ) -> Result<JsValue, JsException> {
+        const MAX_NATIVE_CALL_DEPTH: u32 = 160;
+        if self.native_call_depth >= MAX_NATIVE_CALL_DEPTH {
+            return Err(self.range_error("Maximum call stack size exceeded"));
+        }
+        self.native_call_depth += 1;
+        let res = self.call_handle_inner(callee, this_val, args, construct_obj, new_target);
+        self.native_call_depth -= 1;
+        res
+    }
+
+    fn call_handle_inner(
         &mut self,
         callee: HeapHandle,
         this_val: JsValue,
@@ -3389,7 +3409,19 @@ impl JsVm {
         let iter = self.create_iterator(iterable)?;
         let iter_val = JsValue::from_object(iter);
         let mut out = Vec::new();
+        let max_items = self.max_loop_iterations.unwrap_or(4_000_000).min(4_000_000) as usize;
         loop {
+            if out.len() >= max_items {
+                self.iterators.remove(&iter);
+                return Err(self.range_error("Maximum iterable length exceeded"));
+            }
+            self.loop_iterations = self.loop_iterations.saturating_add(1);
+            if let Some(limit) = self.max_loop_iterations {
+                if self.loop_iterations > limit {
+                    self.iterators.remove(&iter);
+                    return Err(self.range_error("Script execution iteration limit exceeded"));
+                }
+            }
             let (v, done) = self.step_iterator(iter_val)?;
             if done {
                 break;
@@ -3407,7 +3439,7 @@ impl JsVm {
         let Some(obj) = self.heap.get_object(h) else {
             return Vec::new();
         };
-        let len = obj.elements.len();
+        let len = obj.elements.len().min(1_000_000);
         (0..len)
             .map(|i| obj.elements.get(i).unwrap_or(JsValue::UNDEFINED))
             .collect()
@@ -3729,6 +3761,11 @@ impl JsVm {
     }
 
     pub fn value_to_rust_string(&self, val: JsValue) -> String {
+        let mut visited = Vec::new();
+        self.value_to_rust_string_inner(val, &mut visited)
+    }
+
+    fn value_to_rust_string_inner(&self, val: JsValue, visited: &mut Vec<HeapHandle>) -> String {
         match val.kind() {
             JsValueKind::Undefined | JsValueKind::Empty => "undefined".into(),
             JsValueKind::Null => "null".into(),
@@ -3760,19 +3797,25 @@ impl JsVm {
             JsValueKind::Object(h) => {
                 if let Some(o) = self.heap.get_object(h) {
                     if matches!(o.kind, ObjectKind::Array) {
-                        let len = o.elements.len();
+                        if visited.contains(&h) || visited.len() >= 64 {
+                            return String::new();
+                        }
+                        visited.push(h);
+                        let len = o.elements.len().min(65_536);
                         let parts: Vec<String> = (0..len)
                             .map(|i| match o.elements.get(i) {
                                 Some(v) if !v.is_null() && !v.is_undefined() => {
-                                    self.value_to_rust_string(v)
+                                    self.value_to_rust_string_inner(v, visited)
                                 }
                                 _ => String::new(),
                             })
                             .collect();
+                        visited.pop();
                         return parts.join(",");
                     }
                     if let ObjectKind::TypedArray(ta) = o.kind {
-                        let parts: Vec<String> = (0..ta.length)
+                        let len = ta.length.min(65_536);
+                        let parts: Vec<String> = (0..len)
                             .map(|i| {
                                 let v = crate::builtins_collections::typed_array_read_element(
                                     self, ta, i,

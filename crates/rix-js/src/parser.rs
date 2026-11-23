@@ -67,7 +67,10 @@ pub struct Parser<'a> {
     peek: Option<Token>,
     source_type: SourceType,
     ctx: ScopeContext,
+    recursion_depth: u32,
 }
+
+const MAX_PARSE_DEPTH: u32 = 192;
 
 impl<'a> Parser<'a> {
     pub fn new(source: &'a str, source_type: SourceType) -> Result<Self, SyntaxError> {
@@ -79,7 +82,26 @@ impl<'a> Parser<'a> {
             peek: None,
             source_type,
             ctx: ScopeContext::new(source_type),
+            recursion_depth: 0,
         })
+    }
+
+    #[inline]
+    fn with_depth<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, SyntaxError>,
+    ) -> Result<T, SyntaxError> {
+        if self.recursion_depth >= MAX_PARSE_DEPTH {
+            return Err(SyntaxError {
+                message: "Maximum parser recursion depth exceeded".into(),
+                span_start: self.cur.span.start,
+                span_end: self.cur.span.end,
+            });
+        }
+        self.recursion_depth += 1;
+        let res = f(self);
+        self.recursion_depth -= 1;
+        res
     }
 
     fn checkpoint(&self) -> ParserCheckpoint {
@@ -328,6 +350,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_statement(&mut self) -> Result<Statement, SyntaxError> {
+        self.with_depth(Self::parse_statement_inner)
+    }
+
+    fn parse_statement_inner(&mut self) -> Result<Statement, SyntaxError> {
         if self.is_ident_word("let") && self.is_let_declaration()? {
             return self.parse_var_decl_stmt(VarKind::Let);
         }
@@ -1724,6 +1750,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_assign_expr(&mut self) -> Result<Expr, SyntaxError> {
+        self.with_depth(Self::parse_assign_expr_inner)
+    }
+
+    fn parse_assign_expr_inner(&mut self) -> Result<Expr, SyntaxError> {
         // `yield` expression inside generators.
         if self.cur.kind == TokenKind::Keyword(Keyword::Yield) && self.ctx.in_generator {
             let start = self.advance()?.span.start;

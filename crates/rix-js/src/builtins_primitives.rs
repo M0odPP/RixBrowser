@@ -434,8 +434,12 @@ fn str_repeat(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsVa
     if count < 0.0 || !count.is_finite() {
         return Err(vm.range_error("Invalid count value for String.prototype.repeat"));
     }
+    let count_usize = count.trunc() as usize;
+    if !s.is_empty() && s.len().saturating_mul(count_usize) > 32 * 1024 * 1024 {
+        return Err(vm.range_error("Invalid string length"));
+    }
     Ok(JsValue::from_string(
-        vm.heap.alloc_string(s.repeat(count as usize)),
+        vm.heap.alloc_string(s.repeat(count_usize)),
     ))
 }
 
@@ -467,6 +471,9 @@ fn str_pad_impl(
     let cur_len = s.chars().count();
     if target_len <= cur_len {
         return Ok(JsValue::from_string(vm.heap.alloc_string(s)));
+    }
+    if target_len > 32 * 1024 * 1024 {
+        return Err(vm.range_error("Invalid string length"));
     }
     let fill = args
         .get(1)
@@ -1847,7 +1854,11 @@ fn stringify_value(
             );
             let out = if is_array {
                 let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
-                let mut items = Vec::with_capacity(len as usize);
+                if len > 4_000_000 {
+                    stack.pop();
+                    return Err(vm.range_error("Invalid string length"));
+                }
+                let mut items = Vec::with_capacity((len as usize).min(16_384));
                 for i in 0..len {
                     let elem = vm
                         .heap
@@ -1967,6 +1978,10 @@ fn array_from(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue
         } else {
             let len_val = vm.get_property_by_key(h, vm.key_length)?;
             let len = vm.to_u32(len_val)?;
+            let limit = vm.max_loop_iterations.unwrap_or(1_000_000).min(1_000_000) as u32;
+            if len > limit {
+                return Err(vm.range_error("Invalid array length"));
+            }
             for i in 0..len {
                 let mut v = vm.get_elem(src, JsValue::from_i32(i as i32))?;
                 if let Some(cb) = map_fn {
@@ -2027,6 +2042,9 @@ fn array_reverse(
 ) -> Result<JsValue, JsException> {
     if let Some(h) = this_val.as_object() {
         let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
+        if len > 1_000_000 {
+            return Err(vm.range_error("Invalid array length"));
+        }
         let items: Vec<Option<JsValue>> = (0..len)
             .map(|i| vm.heap.get_object(h).and_then(|o| o.elements.get(i)))
             .collect();
@@ -2053,9 +2071,22 @@ fn array_sort(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsVa
         .copied()
         .filter(|v| v.as_object().is_some_and(|fh| vm.is_callable_handle(fh)));
     let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
-    let mut vals: Vec<JsValue> = (0..len)
-        .filter_map(|i| vm.heap.get_object(h).and_then(|o| o.elements.get(i)))
-        .collect();
+    let mut vals: Vec<JsValue> = if len > 65_536 {
+        vm.heap
+            .get_object(h)
+            .map(|o| {
+                o.elements
+                    .present_indices()
+                    .into_iter()
+                    .filter_map(|i| o.elements.get(i))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        (0..len)
+            .filter_map(|i| vm.heap.get_object(h).and_then(|o| o.elements.get(i)))
+            .collect()
+    };
     // Insertion/merge stable sort supporting JS comparator callbacks cleanly.
     for i in 1..vals.len() {
         let mut j = i;
@@ -2115,6 +2146,9 @@ fn array_splice(
     .min((len as usize).saturating_sub(start));
     let insert = if args.len() > 2 { &args[2..] } else { &[] };
 
+    if len > 1_000_000 {
+        return Err(vm.range_error("Invalid array length"));
+    }
     let mut all: Vec<JsValue> = (0..len as u32)
         .map(|i| {
             vm.heap
@@ -2170,6 +2204,10 @@ fn array_find(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsVa
     };
     let cb = arg0(args);
     let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
+    let limit = vm.max_loop_iterations.unwrap_or(1_000_000).min(1_000_000) as u32;
+    if len > limit {
+        return Err(vm.range_error("Script execution iteration limit exceeded"));
+    }
     for i in 0..len {
         let v = vm
             .heap
@@ -2198,6 +2236,10 @@ fn array_find_index(
     };
     let cb = arg0(args);
     let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
+    let limit = vm.max_loop_iterations.unwrap_or(1_000_000).min(1_000_000) as u32;
+    if len > limit {
+        return Err(vm.range_error("Script execution iteration limit exceeded"));
+    }
     for i in 0..len {
         let v = vm
             .heap
@@ -2227,6 +2269,26 @@ fn array_every(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsV
     };
     let cb = arg0(args);
     let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
+    if len > 65_536 {
+        let indices = vm
+            .heap
+            .get_object(h)
+            .map(|o| o.elements.present_indices())
+            .unwrap_or_default();
+        for i in indices {
+            if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
+                let ok = vm.call_value(
+                    cb,
+                    JsValue::UNDEFINED,
+                    &[v, JsValue::from_f64(f64::from(i)), this_val],
+                )?;
+                if !vm.to_boolean(ok) {
+                    return Ok(JsValue::FALSE);
+                }
+            }
+        }
+        return Ok(JsValue::TRUE);
+    }
     for i in 0..len {
         if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
             let ok = vm.call_value(
@@ -2249,7 +2311,7 @@ fn array_flat(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsVa
         .map(|&v| vm.to_i32(v))
         .transpose()?
         .unwrap_or(1)
-        .max(0) as u32;
+        .clamp(0, 128) as u32;
     let out = vm.alloc_array();
     if let Some(h) = this_val.as_object() {
         flatten_into(vm, h, out, depth);
@@ -2259,6 +2321,30 @@ fn array_flat(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsVa
 
 fn flatten_into(vm: &mut JsVm, src: HeapHandle, out: HeapHandle, depth: u32) {
     let len = vm.heap.get_object(src).map_or(0, |o| o.elements.len());
+    if len > 65_536 {
+        let indices = vm
+            .heap
+            .get_object(src)
+            .map(|o| o.elements.present_indices())
+            .unwrap_or_default();
+        for i in indices {
+            if let Some(v) = vm.heap.get_object(src).and_then(|o| o.elements.get(i)) {
+                if depth > 0 {
+                    if let Some(sub) = v.as_object() {
+                        if matches!(
+                            vm.heap.get_object(sub).map(|o| &o.kind),
+                            Some(ObjectKind::Array)
+                        ) {
+                            flatten_into(vm, sub, out, depth - 1);
+                            continue;
+                        }
+                    }
+                }
+                vm.heap.object_push_element(out, v);
+            }
+        }
+        return;
+    }
     for i in 0..len {
         if let Some(v) = vm.heap.get_object(src).and_then(|o| o.elements.get(i)) {
             if depth > 0 {
@@ -2288,6 +2374,33 @@ fn array_flat_map(
     let cb = arg0(args);
     let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
     let out = vm.alloc_array();
+    if len > 65_536 {
+        let indices = vm
+            .heap
+            .get_object(h)
+            .map(|o| o.elements.present_indices())
+            .unwrap_or_default();
+        for i in indices {
+            if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
+                let mapped = vm.call_value(
+                    cb,
+                    JsValue::UNDEFINED,
+                    &[v, JsValue::from_f64(f64::from(i)), this_val],
+                )?;
+                if let Some(sub) = mapped.as_object() {
+                    if matches!(
+                        vm.heap.get_object(sub).map(|o| &o.kind),
+                        Some(ObjectKind::Array)
+                    ) {
+                        flatten_into(vm, sub, out, 0);
+                        continue;
+                    }
+                }
+                vm.heap.object_push_element(out, mapped);
+            }
+        }
+        return Ok(JsValue::from_object(out));
+    }
     for i in 0..len {
         if let Some(v) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
             let mapped = vm.call_value(
@@ -2338,6 +2451,9 @@ fn array_fill(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsVa
     } else {
         raw_end.min(len)
     } as u32;
+    if end.saturating_sub(start) > 1_000_000 {
+        return Err(vm.range_error("Invalid array fill length"));
+    }
     for i in start..end {
         if let Some(o) = vm.heap.get_object_mut(h) {
             o.elements.set(i, val);
@@ -2522,7 +2638,15 @@ fn object_from_entries(
     let out = vm.alloc_ordinary_object();
     if let Some(h) = arg0(args).as_object() {
         let len = vm.heap.get_object(h).map_or(0, |o| o.elements.len());
-        for i in 0..len {
+        let indices: Vec<u32> = if len > 65_536 {
+            vm.heap
+                .get_object(h)
+                .map(|o| o.elements.present_indices())
+                .unwrap_or_default()
+        } else {
+            (0..len).collect()
+        };
+        for i in indices {
             if let Some(pair) = vm.heap.get_object(h).and_then(|o| o.elements.get(i)) {
                 let k = vm.get_elem(pair, JsValue::from_i32(0))?;
                 let v = vm.get_elem(pair, JsValue::from_i32(1))?;
