@@ -1908,6 +1908,8 @@ fn install_symbol(vm: &mut JsVm) {
     for (well_known, id) in [
         ("iterator", vm.sym_iterator),
         ("asyncIterator", vm.sym_async_iterator),
+        ("dispose", vm.sym_dispose),
+        ("asyncDispose", vm.sym_async_dispose),
         ("toStringTag", vm.sym_to_string_tag),
         ("hasInstance", vm.sym_has_instance),
         ("toPrimitive", vm.sym_to_primitive),

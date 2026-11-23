@@ -206,6 +206,9 @@ pub struct JsVm {
     pub uri_error_proto: HeapHandle,
     pub eval_error_proto: HeapHandle,
     pub aggregate_error_proto: HeapHandle,
+    pub suppressed_error_proto: HeapHandle,
+    pub disposable_stack_proto: HeapHandle,
+    pub async_disposable_stack_proto: HeapHandle,
     pub string_proto: HeapHandle,
     pub number_proto: HeapHandle,
     pub boolean_proto: HeapHandle,
@@ -224,7 +227,11 @@ pub struct JsVm {
     pub typed_array_proto: HeapHandle,
     pub typed_array_protos: [HeapHandle; 12],
     pub promise_proto: HeapHandle,
+    pub promise_ctor: Option<HeapHandle>,
     pub iterator_proto: HeapHandle,
+    pub iterator_helper_proto: HeapHandle,
+    pub wrap_iterator_proto: HeapHandle,
+    pub async_iterator_proto: HeapHandle,
     pub string_iter_proto: HeapHandle,
     pub regexp_iter_proto: HeapHandle,
     pub generator_proto: HeapHandle,
@@ -233,6 +240,10 @@ pub struct JsVm {
     pub key_symbol_iterator: PropertyKey,
     pub sym_async_iterator: SymbolId,
     pub key_symbol_async_iterator: PropertyKey,
+    pub sym_dispose: SymbolId,
+    pub key_symbol_dispose: PropertyKey,
+    pub sym_async_dispose: SymbolId,
+    pub key_symbol_async_dispose: PropertyKey,
     pub sym_to_primitive: SymbolId,
     pub key_symbol_to_primitive: PropertyKey,
     pub sym_species: SymbolId,
@@ -403,6 +414,9 @@ impl JsVm {
         let uri_error_proto = make_proto(&mut heap, &mut shapes, error_proto);
         let eval_error_proto = make_proto(&mut heap, &mut shapes, error_proto);
         let aggregate_error_proto = make_proto(&mut heap, &mut shapes, error_proto);
+        let suppressed_error_proto = make_proto(&mut heap, &mut shapes, error_proto);
+        let disposable_stack_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let async_disposable_stack_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let map_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let set_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let weakmap_proto = make_proto(&mut heap, &mut shapes, object_proto);
@@ -416,10 +430,13 @@ impl JsVm {
             std::array::from_fn(|_| make_proto(&mut heap, &mut shapes, typed_array_proto));
         let promise_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let iterator_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let iterator_helper_proto = make_proto(&mut heap, &mut shapes, iterator_proto);
+        let wrap_iterator_proto = make_proto(&mut heap, &mut shapes, iterator_proto);
+        let async_iterator_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let string_iter_proto = make_proto(&mut heap, &mut shapes, iterator_proto);
         let regexp_iter_proto = make_proto(&mut heap, &mut shapes, iterator_proto);
         let generator_proto = make_proto(&mut heap, &mut shapes, iterator_proto);
-        let async_generator_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let async_generator_proto = make_proto(&mut heap, &mut shapes, async_iterator_proto);
 
         let alloc_wk = |heap: &mut GcHeap, desc: &str| {
             let s = heap.alloc_symbol(Some(desc.into()));
@@ -429,6 +446,9 @@ impl JsVm {
         let (sym_iterator, key_symbol_iterator) = alloc_wk(&mut heap, "Symbol.iterator");
         let (sym_async_iterator, key_symbol_async_iterator) =
             alloc_wk(&mut heap, "Symbol.asyncIterator");
+        let (sym_dispose, key_symbol_dispose) = alloc_wk(&mut heap, "Symbol.dispose");
+        let (sym_async_dispose, key_symbol_async_dispose) =
+            alloc_wk(&mut heap, "Symbol.asyncDispose");
         let (sym_to_primitive, key_symbol_to_primitive) = alloc_wk(&mut heap, "Symbol.toPrimitive");
         let (sym_species, key_symbol_species) = alloc_wk(&mut heap, "Symbol.species");
         let (sym_has_instance, key_symbol_has_instance) = alloc_wk(&mut heap, "Symbol.hasInstance");
@@ -485,6 +505,9 @@ impl JsVm {
             uri_error_proto,
             eval_error_proto,
             aggregate_error_proto,
+            suppressed_error_proto,
+            disposable_stack_proto,
+            async_disposable_stack_proto,
             string_proto,
             number_proto,
             boolean_proto,
@@ -503,7 +526,11 @@ impl JsVm {
             typed_array_proto,
             typed_array_protos,
             promise_proto,
+            promise_ctor: None,
             iterator_proto,
+            iterator_helper_proto,
+            wrap_iterator_proto,
+            async_iterator_proto,
             string_iter_proto,
             regexp_iter_proto,
             generator_proto,
@@ -512,6 +539,10 @@ impl JsVm {
             key_symbol_iterator,
             sym_async_iterator,
             key_symbol_async_iterator,
+            sym_dispose,
+            key_symbol_dispose,
+            sym_async_dispose,
+            key_symbol_async_dispose,
             sym_to_primitive,
             key_symbol_to_primitive,
             sym_species,
@@ -590,7 +621,9 @@ impl JsVm {
         crate::vm_builtins::install_core_intrinsics(&mut vm);
         crate::builtins_primitives::install_primitive_builtins(&mut vm);
         crate::builtins_collections::install_collection_builtins(&mut vm);
+        crate::builtins_iterator::install_iterator(&mut vm);
         crate::promise::install_promise_and_async(&mut vm);
+        crate::builtins_disposable::install_disposable(&mut vm);
         crate::intl::install_intl(&mut vm);
         crate::webcrypto::install_webcrypto(&mut vm);
         vm
@@ -655,6 +688,9 @@ impl JsVm {
             self.uri_error_proto,
             self.eval_error_proto,
             self.aggregate_error_proto,
+            self.suppressed_error_proto,
+            self.disposable_stack_proto,
+            self.async_disposable_stack_proto,
             self.string_proto,
             self.number_proto,
             self.boolean_proto,
@@ -673,12 +709,18 @@ impl JsVm {
             self.typed_array_proto,
             self.promise_proto,
             self.iterator_proto,
+            self.iterator_helper_proto,
+            self.wrap_iterator_proto,
+            self.async_iterator_proto,
             self.string_iter_proto,
             self.regexp_iter_proto,
             self.generator_proto,
             self.async_generator_proto,
         ] {
             roots.push(JsValue::from_object(h));
+        }
+        if let Some(pc) = self.promise_ctor {
+            roots.push(JsValue::from_object(pc));
         }
         for &h in &self.typed_array_protos {
             roots.push(JsValue::from_object(h));
@@ -4440,6 +4482,34 @@ impl JsVm {
             PropertyAttrs::CONFIGURABLE,
             &mut self.shapes,
         );
+    }
+
+    pub fn iterator_close_obj(
+        &mut self,
+        iter_obj: HeapHandle,
+        abrupt: bool,
+    ) -> Result<(), JsException> {
+        self.iterator_close_custom(iter_obj, abrupt)
+    }
+
+    pub fn iterator_close_handle(
+        &mut self,
+        iter_h: HeapHandle,
+        abrupt: bool,
+    ) -> Result<(), JsException> {
+        let state = self.iterators.remove(&iter_h);
+        if let Some(
+            IteratorState::Custom {
+                iter_obj,
+                exhausted: false,
+                ..
+            }
+            | IteratorState::AsyncCustom { iter_obj },
+        ) = state
+        {
+            return self.iterator_close_custom(iter_obj, abrupt);
+        }
+        Ok(())
     }
 
     fn iterator_close_custom(

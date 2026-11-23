@@ -426,6 +426,25 @@ impl SharedBufferBacking {
     }
 }
 
+/// Resource entry registered inside a `DisposableStack` or `AsyncDisposableStack`.
+#[derive(Debug, Clone, Copy)]
+pub struct DisposableEntry {
+    pub value: JsValue,
+    pub method: Option<HeapHandle>,
+    /// `0` = `use` (method.call(value)), `1` = `adopt` (method.call(undefined, value)),
+    /// `2` = `defer` (method.call(undefined)), `3` = sync-method wrapped for async stack,
+    /// `4` = null/undefined async tick entry.
+    pub kind: u8,
+}
+
+/// Internal slots for `DisposableStack` (`is_async = false`) and `AsyncDisposableStack` (`is_async = true`).
+#[derive(Debug, Clone)]
+pub struct DisposableStackData {
+    pub is_async: bool,
+    pub disposed: bool,
+    pub entries: Vec<DisposableEntry>,
+}
+
 /// Cold out-of-line object metadata (only allocated for dictionary-mode objects,
 /// accessors, class constructors, or private fields so ordinary shaped objects stay compact in cache).
 #[derive(Debug, Clone, Default)]
@@ -447,6 +466,8 @@ pub struct RareObjectData {
     pub shared_mem: Option<std::sync::Arc<SharedBufferBacking>>,
     /// `true` when a `DataView` or `TypedArray` is length-tracking over a resizable/growable buffer.
     pub view_auto_length: bool,
+    /// Explicit Resource Management stack slot (`[[DisposableState]]` / `[[DisposeCapability]]`).
+    pub disposable_stack: Option<Box<DisposableStackData>>,
 }
 
 /// Specialized runtime tag for a [`JsObject`].
@@ -651,6 +672,16 @@ impl JsObject {
             if let Some(bv) = rare.boxed_value {
                 if let Some(h) = bv.as_heap_handle() {
                     visit(h);
+                }
+            }
+            if let Some(ds) = &rare.disposable_stack {
+                for entry in &ds.entries {
+                    if let Some(h) = entry.value.as_heap_handle() {
+                        visit(h);
+                    }
+                    if let Some(m) = entry.method {
+                        visit(m);
+                    }
                 }
             }
         }
