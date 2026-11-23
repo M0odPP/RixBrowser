@@ -238,7 +238,6 @@ pub(crate) fn get_rounding_mode_option(
         .map_err(|e| temporal_err(vm, e))
 }
 
-#[allow(dead_code)]
 pub(crate) fn get_overflow_option(
     vm: &mut JsVm,
     obj: Option<HeapHandle>,
@@ -254,7 +253,6 @@ pub(crate) fn get_overflow_option(
         .map_err(|_| vm.range_error(format!("Invalid overflow option: {s}")))
 }
 
-#[allow(dead_code)]
 pub(crate) fn get_disambiguation_option(
     vm: &mut JsVm,
     obj: Option<HeapHandle>,
@@ -286,7 +284,6 @@ pub(crate) fn get_offset_disambiguation_option(
         .map_err(|_| vm.range_error(format!("Invalid offset option: {s}")))
 }
 
-#[allow(dead_code)]
 pub(crate) fn get_display_calendar_option(
     vm: &mut JsVm,
     obj: HeapHandle,
@@ -436,7 +433,7 @@ pub(crate) fn to_temporal_calendar_identifier(
         return Err(vm.type_error("Calendar must be a string or Temporal object with a calendar"));
     };
     let s = vm.heap.materialize_string(sh).unwrap_or_default();
-    Calendar::try_from_utf8(s.as_bytes()).map_err(|e| temporal_err(vm, e))
+    Calendar::from_str(&s).map_err(|e| temporal_err(vm, e))
 }
 
 /// Reads a `PartialDuration` property bag in strict alphabetical order:
@@ -661,4 +658,330 @@ pub(crate) fn get_relative_to_option(
             .map_err(|e| temporal_err(vm, e))?;
         Ok(Some(RelativeTo::PlainDate(pd)))
     }
+}
+
+/// Returns `true` if `calendar` uses era/eraYear fields per Temporal spec.
+pub(crate) fn calendar_has_eras(calendar: &Calendar) -> bool {
+    !matches!(calendar.identifier(), "iso8601" | "chinese" | "dangi")
+}
+
+/// Parses an optional `calendar` constructor argument (must be `undefined` or a string).
+pub(crate) fn parse_calendar_ctor_arg(
+    vm: &mut JsVm,
+    val: JsValue,
+) -> Result<Calendar, JsException> {
+    if val.is_undefined() {
+        return Ok(Calendar::ISO);
+    }
+    let Some(sh) = val.as_string() else {
+        return Err(vm.type_error("Calendar argument must be a string"));
+    };
+    let s = vm.heap.materialize_string(sh).unwrap_or_default();
+    Calendar::try_from_utf8(s.as_bytes()).map_err(|e| temporal_err(vm, e))
+}
+
+/// Converts a value via `ToPrimitive(String)` and requires the result to be a String.
+pub(crate) fn to_primitive_require_string(
+    vm: &mut JsVm,
+    val: JsValue,
+    label: &str,
+) -> Result<String, JsException> {
+    let prim = if val.is_object() {
+        vm.to_primitive(val, PrimHint::String)?
+    } else {
+        val
+    };
+    let Some(sh) = prim.as_string() else {
+        return Err(vm.type_error(format!("{label} must be a string")));
+    };
+    Ok(vm.heap.materialize_string(sh).unwrap_or_default())
+}
+
+/// Positive integer clamped to `u8::MAX` so `Overflow::Constrain` can clamp high values
+/// while `Overflow::Reject` still rejects them, and `<= 0` always throws `RangeError`.
+pub(crate) fn to_clamped_pos_u8(vm: &mut JsVm, val: JsValue) -> Result<u8, JsException> {
+    let n = vm.to_number(val)?;
+    if !n.is_finite() {
+        return Err(vm.range_error("Expected finite positive integer"));
+    }
+    let t = n.trunc();
+    if t < 1.0 {
+        return Err(vm.range_error("Expected positive integer"));
+    }
+    Ok(t.min(255.0) as u8)
+}
+
+/// Non-negative integer clamped to `u8::MAX` (for `hour`/`minute`/`second` in partial objects).
+pub(crate) fn to_clamped_u8(vm: &mut JsVm, val: JsValue) -> Result<u8, JsException> {
+    let n = vm.to_number(val)?;
+    if !n.is_finite() {
+        return Err(vm.range_error("Expected finite integer"));
+    }
+    let t = n.trunc();
+    if t < 0.0 {
+        return Err(vm.range_error("Expected non-negative integer"));
+    }
+    Ok(t.min(255.0) as u8)
+}
+
+/// Non-negative integer clamped to `9999u16` (for subsecond fields in partial objects).
+pub(crate) fn to_clamped_u16(vm: &mut JsVm, val: JsValue) -> Result<u16, JsException> {
+    let n = vm.to_number(val)?;
+    if !n.is_finite() {
+        return Err(vm.range_error("Expected finite integer"));
+    }
+    let t = n.trunc();
+    if t < 0.0 {
+        return Err(vm.range_error("Expected non-negative integer"));
+    }
+    Ok(t.min(9999.0) as u16)
+}
+
+/// ECMA-262 `IsPartialTemporalObject(value)` check for `.with(...)` methods.
+pub(crate) fn require_partial_temporal_object(
+    vm: &mut JsVm,
+    val: JsValue,
+) -> Result<HeapHandle, JsException> {
+    let Some(h) = val.as_object() else {
+        return Err(vm.type_error("with() requires a plain object"));
+    };
+    if get_temporal(vm, val).is_some() {
+        return Err(vm.type_error("with() argument cannot be a Temporal object"));
+    }
+    if !get_prop(vm, h, "calendar")?.is_undefined() {
+        return Err(vm.type_error("with() argument must not have a 'calendar' property"));
+    }
+    if !get_prop(vm, h, "timeZone")?.is_undefined() {
+        return Err(vm.type_error("with() argument must not have a 'timeZone' property"));
+    }
+    Ok(h)
+}
+
+/// Reads `CalendarFields` from `obj` in strict alphabetical order:
+/// `day` (if `read_day`), `era` & `eraYear` (if `has_eras`), `month`, `monthCode`, `year` (if `read_year`).
+pub(crate) fn read_calendar_fields(
+    vm: &mut JsVm,
+    obj: HeapHandle,
+    has_eras: bool,
+    read_day: bool,
+    read_year: bool,
+) -> Result<CalendarFields, JsException> {
+    let day = if read_day {
+        let v = get_prop(vm, obj, "day")?;
+        if v.is_undefined() {
+            None
+        } else {
+            Some(to_clamped_pos_u8(vm, v)?)
+        }
+    } else {
+        None
+    };
+    let (era, era_year) = if has_eras && read_year {
+        let ev = get_prop(vm, obj, "era")?;
+        let era = if ev.is_undefined() {
+            None
+        } else {
+            let s = to_primitive_require_string(vm, ev, "era")?;
+            Some(TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| vm.range_error("Invalid era"))?)
+        };
+        let eyv = get_prop(vm, obj, "eraYear")?;
+        let era_year = if eyv.is_undefined() {
+            None
+        } else {
+            Some(to_integer_with_truncation_i32(vm, eyv)?)
+        };
+        (era, era_year)
+    } else {
+        (None, None)
+    };
+    let mv = get_prop(vm, obj, "month")?;
+    let month = if mv.is_undefined() {
+        None
+    } else {
+        Some(to_clamped_pos_u8(vm, mv)?)
+    };
+    let mcv = get_prop(vm, obj, "monthCode")?;
+    let month_code = if mcv.is_undefined() {
+        None
+    } else {
+        let s = to_primitive_require_string(vm, mcv, "monthCode")?;
+        Some(MonthCode::try_from_utf8(s.as_bytes()).map_err(|e| temporal_err(vm, e))?)
+    };
+    let year = if read_year {
+        let yv = get_prop(vm, obj, "year")?;
+        if yv.is_undefined() {
+            None
+        } else {
+            Some(to_integer_with_truncation_i32(vm, yv)?)
+        }
+    } else {
+        None
+    };
+    Ok(CalendarFields {
+        year,
+        month,
+        month_code,
+        day,
+        era,
+        era_year,
+    })
+}
+
+/// Reads `PartialTime` from `obj` in strict alphabetical order:
+/// `hour`, `microsecond`, `millisecond`, `minute`, `nanosecond`, `second`.
+pub(crate) fn read_partial_time(
+    vm: &mut JsVm,
+    obj: HeapHandle,
+) -> Result<PartialTime, JsException> {
+    let hv = get_prop(vm, obj, "hour")?;
+    let hour = if hv.is_undefined() {
+        None
+    } else {
+        Some(to_clamped_u8(vm, hv)?)
+    };
+    let usv = get_prop(vm, obj, "microsecond")?;
+    let microsecond = if usv.is_undefined() {
+        None
+    } else {
+        Some(to_clamped_u16(vm, usv)?)
+    };
+    let msv = get_prop(vm, obj, "millisecond")?;
+    let millisecond = if msv.is_undefined() {
+        None
+    } else {
+        Some(to_clamped_u16(vm, msv)?)
+    };
+    let minv = get_prop(vm, obj, "minute")?;
+    let minute = if minv.is_undefined() {
+        None
+    } else {
+        Some(to_clamped_u8(vm, minv)?)
+    };
+    let nsv = get_prop(vm, obj, "nanosecond")?;
+    let nanosecond = if nsv.is_undefined() {
+        None
+    } else {
+        Some(to_clamped_u16(vm, nsv)?)
+    };
+    let secv = get_prop(vm, obj, "second")?;
+    let second = if secv.is_undefined() {
+        None
+    } else {
+        Some(to_clamped_u8(vm, secv)?)
+    };
+    Ok(PartialTime {
+        hour,
+        minute,
+        second,
+        millisecond,
+        microsecond,
+        nanosecond,
+    })
+}
+
+/// Reads calendar + time fields together in strict alphabetical order for `PlainDateTime`:
+/// `day`, `era`, `eraYear`, `hour`, `microsecond`, `millisecond`, `minute`,
+/// `month`, `monthCode`, `nanosecond`, `second`, `year`.
+pub(crate) fn read_date_time_fields(
+    vm: &mut JsVm,
+    obj: HeapHandle,
+    has_eras: bool,
+) -> Result<(CalendarFields, PartialTime), JsException> {
+    let dv = get_prop(vm, obj, "day")?;
+    let day = if dv.is_undefined() {
+        None
+    } else {
+        Some(to_clamped_pos_u8(vm, dv)?)
+    };
+    let (era, era_year) = if has_eras {
+        let ev = get_prop(vm, obj, "era")?;
+        let era = if ev.is_undefined() {
+            None
+        } else {
+            let s = to_primitive_require_string(vm, ev, "era")?;
+            Some(TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| vm.range_error("Invalid era"))?)
+        };
+        let eyv = get_prop(vm, obj, "eraYear")?;
+        let era_year = if eyv.is_undefined() {
+            None
+        } else {
+            Some(to_integer_with_truncation_i32(vm, eyv)?)
+        };
+        (era, era_year)
+    } else {
+        (None, None)
+    };
+    let hv = get_prop(vm, obj, "hour")?;
+    let hour = if hv.is_undefined() {
+        None
+    } else {
+        Some(to_clamped_u8(vm, hv)?)
+    };
+    let usv = get_prop(vm, obj, "microsecond")?;
+    let microsecond = if usv.is_undefined() {
+        None
+    } else {
+        Some(to_clamped_u16(vm, usv)?)
+    };
+    let msv = get_prop(vm, obj, "millisecond")?;
+    let millisecond = if msv.is_undefined() {
+        None
+    } else {
+        Some(to_clamped_u16(vm, msv)?)
+    };
+    let minv = get_prop(vm, obj, "minute")?;
+    let minute = if minv.is_undefined() {
+        None
+    } else {
+        Some(to_clamped_u8(vm, minv)?)
+    };
+    let mv = get_prop(vm, obj, "month")?;
+    let month = if mv.is_undefined() {
+        None
+    } else {
+        Some(to_clamped_pos_u8(vm, mv)?)
+    };
+    let mcv = get_prop(vm, obj, "monthCode")?;
+    let month_code = if mcv.is_undefined() {
+        None
+    } else {
+        let s = to_primitive_require_string(vm, mcv, "monthCode")?;
+        Some(MonthCode::try_from_utf8(s.as_bytes()).map_err(|e| temporal_err(vm, e))?)
+    };
+    let nsv = get_prop(vm, obj, "nanosecond")?;
+    let nanosecond = if nsv.is_undefined() {
+        None
+    } else {
+        Some(to_clamped_u16(vm, nsv)?)
+    };
+    let secv = get_prop(vm, obj, "second")?;
+    let second = if secv.is_undefined() {
+        None
+    } else {
+        Some(to_clamped_u8(vm, secv)?)
+    };
+    let yv = get_prop(vm, obj, "year")?;
+    let year = if yv.is_undefined() {
+        None
+    } else {
+        Some(to_integer_with_truncation_i32(vm, yv)?)
+    };
+    Ok((
+        CalendarFields {
+            year,
+            month,
+            month_code,
+            day,
+            era,
+            era_year,
+        },
+        PartialTime {
+            hour,
+            minute,
+            second,
+            millisecond,
+            microsecond,
+            nanosecond,
+        },
+    ))
 }

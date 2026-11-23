@@ -2492,11 +2492,28 @@ impl JsVm {
                 self.registers[a] = res;
             }
             Opcode::SuperConstruct => {
-                let call_base = base + usize::from(inst.b());
-                let argc = usize::from(inst.c());
-                let args: Vec<JsValue> = (0..argc)
-                    .map(|i| self.registers[call_base + 1 + i])
-                    .collect();
+                let args: Vec<JsValue> = if inst.c() == u8::MAX {
+                    let arr_val = self.registers[base + usize::from(inst.b())];
+                    if let Some(arr_h) = arr_val.as_object() {
+                        let len = self.heap.get_object(arr_h).map_or(0, |o| o.elements.len());
+                        (0..len)
+                            .map(|i| {
+                                self.heap
+                                    .get_object(arr_h)
+                                    .and_then(|o| o.elements.get(i))
+                                    .unwrap_or(JsValue::UNDEFINED)
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    let call_base = base + usize::from(inst.b());
+                    let argc = usize::from(inst.c());
+                    (0..argc)
+                        .map(|i| self.registers[call_base + 1 + i])
+                        .collect()
+                };
                 let callee_h = self.frames[frame_idx].callee;
                 let this_val = self.frames[frame_idx].this_val;
                 let new_target = self.frames[frame_idx].new_target;
