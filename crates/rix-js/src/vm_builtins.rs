@@ -17,14 +17,33 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
     let g = JsValue::from_object(vm.global);
     define_global(vm, "globalThis", g);
     let eval_fn = vm.alloc_native_fn("eval", global_eval_fn);
+    vm.set_fn_length(eval_fn, 1);
     define_global(vm, "eval", JsValue::from_object(eval_fn));
 
-    // Function.prototype.{call, apply, bind} + Function constructor
+    // Function.prototype.{call, apply, bind, toString} + Function constructor
     let fn_proto = vm.function_proto;
-    define_method(vm, fn_proto, "call", fn_call);
-    define_method(vm, fn_proto, "apply", fn_apply);
-    define_method(vm, fn_proto, "bind", fn_bind);
+    vm.heap.object_define_data(
+        fn_proto,
+        vm.key_length,
+        JsValue::from_i32(0),
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+    let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
+    vm.heap.object_define_data(
+        fn_proto,
+        vm.key_name,
+        empty_s,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+    define_method_len(vm, fn_proto, "call", 1, fn_call);
+    define_method_len(vm, fn_proto, "apply", 2, fn_apply);
+    define_method_len(vm, fn_proto, "bind", 1, fn_bind);
+    define_method_len(vm, fn_proto, "toString", 0, fn_to_string);
     let function_ctor = vm.alloc_native_fn("Function", function_ctor_fn);
+    vm.mark_constructor(function_ctor);
+    vm.set_fn_length(function_ctor, 1);
     vm.heap.object_define_data(
         function_ctor,
         vm.key_prototype,
@@ -41,13 +60,24 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
     );
     define_global(vm, "Function", JsValue::from_object(function_ctor));
 
-    // Object.prototype.{hasOwnProperty, toString}
+    // Object.prototype.{hasOwnProperty, toString, valueOf, isPrototypeOf, propertyIsEnumerable}
     let obj_proto = vm.object_proto;
-    define_method(vm, obj_proto, "hasOwnProperty", obj_has_own_property);
-    define_method(vm, obj_proto, "toString", obj_to_string);
+    define_method_len(vm, obj_proto, "hasOwnProperty", 1, obj_has_own_property);
+    define_method_len(vm, obj_proto, "toString", 0, obj_to_string);
+    define_method_len(vm, obj_proto, "valueOf", 0, obj_value_of);
+    define_method_len(vm, obj_proto, "isPrototypeOf", 1, obj_is_prototype_of);
+    define_method_len(
+        vm,
+        obj_proto,
+        "propertyIsEnumerable",
+        1,
+        obj_property_is_enumerable,
+    );
 
     // Object constructor + statics
     let object_ctor = vm.alloc_native_fn("Object", object_ctor_fn);
+    vm.mark_constructor(object_ctor);
+    vm.set_fn_length(object_ctor, 1);
     vm.heap.object_define_data(
         object_ctor,
         vm.key_prototype,
@@ -107,6 +137,8 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
     define_method(vm, arr_proto, "entries", array_entries);
 
     let array_ctor = vm.alloc_native_fn("Array", array_ctor_fn);
+    vm.mark_constructor(array_ctor);
+    vm.set_fn_length(array_ctor, 1);
     vm.heap.object_define_data(
         array_ctor,
         vm.key_prototype,
@@ -121,55 +153,132 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
         PropertyAttrs::METHOD,
         &mut vm.shapes,
     );
-    define_method(vm, array_ctor, "isArray", array_is_array);
+    define_method_len(vm, array_ctor, "isArray", 1, array_is_array);
     define_global(vm, "Array", JsValue::from_object(array_ctor));
 
     // Proxy & Reflect
     let proxy_ctor = vm.alloc_native_fn("Proxy", proxy_ctor_fn);
-    define_method(vm, proxy_ctor, "revocable", proxy_revocable);
+    vm.mark_constructor(proxy_ctor);
+    vm.set_fn_length(proxy_ctor, 2);
+    define_method_len(vm, proxy_ctor, "revocable", 2, proxy_revocable);
     define_global(vm, "Proxy", JsValue::from_object(proxy_ctor));
 
     let reflect = vm.alloc_ordinary_object();
-    define_method(vm, reflect, "get", reflect_get);
-    define_method(vm, reflect, "set", reflect_set);
-    define_method(vm, reflect, "has", reflect_has);
-    define_method(vm, reflect, "deleteProperty", reflect_delete_property);
-    define_method(vm, reflect, "apply", reflect_apply);
-    define_method(vm, reflect, "construct", reflect_construct);
-    define_method(vm, reflect, "getPrototypeOf", reflect_get_prototype_of);
-    define_method(vm, reflect, "setPrototypeOf", reflect_set_prototype_of);
-    define_method(vm, reflect, "ownKeys", reflect_own_keys);
+    define_method_len(vm, reflect, "get", 2, reflect_get);
+    define_method_len(vm, reflect, "set", 3, reflect_set);
+    define_method_len(vm, reflect, "has", 2, reflect_has);
+    define_method_len(vm, reflect, "deleteProperty", 2, reflect_delete_property);
+    define_method_len(vm, reflect, "apply", 3, reflect_apply);
+    define_method_len(vm, reflect, "construct", 2, reflect_construct);
+    define_method_len(vm, reflect, "getPrototypeOf", 1, reflect_get_prototype_of);
+    define_method_len(vm, reflect, "setPrototypeOf", 2, reflect_set_prototype_of);
+    define_method_len(vm, reflect, "ownKeys", 1, reflect_own_keys);
+    define_method_len(vm, reflect, "isExtensible", 1, reflect_is_extensible);
+    define_method_len(
+        vm,
+        reflect,
+        "preventExtensions",
+        1,
+        reflect_prevent_extensions,
+    );
     define_global(vm, "Reflect", JsValue::from_object(reflect));
 
-    // Error constructors
-    for err_name in [
-        "Error",
-        "TypeError",
-        "ReferenceError",
-        "RangeError",
-        "SyntaxError",
-        "URIError",
-        "EvalError",
+    // Error & NativeError constructors with distinct prototypes (ECMA-262 §20.5)
+    define_method_len(vm, vm.error_proto, "toString", 0, error_proto_to_string);
+
+    let mut error_root_ctor = None;
+    for (err_name, proto) in [
+        ("Error", vm.error_proto),
+        ("TypeError", vm.type_error_proto),
+        ("ReferenceError", vm.reference_error_proto),
+        ("RangeError", vm.range_error_proto),
+        ("SyntaxError", vm.syntax_error_proto),
+        ("URIError", vm.uri_error_proto),
+        ("EvalError", vm.eval_error_proto),
     ] {
-        let name_owned = err_name.to_owned();
         let ctor = vm.alloc_host_fn(err_name, move |vm, _this, args| {
-            let msg = args
-                .first()
-                .filter(|v| !v.is_undefined())
-                .map(|v| vm.value_to_rust_string(*v))
-                .unwrap_or_default();
-            Ok(vm.make_error(&name_owned, msg).value)
+            let err_obj = vm
+                .heap
+                .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+            if let Some(&msg_arg) = args.first().filter(|v| !v.is_undefined()) {
+                let msg = vm.value_to_rust_string(msg_arg);
+                let mv = JsValue::from_string(vm.heap.alloc_string(msg));
+                vm.heap.object_define_data(
+                    err_obj,
+                    vm.key_message,
+                    mv,
+                    PropertyAttrs::METHOD,
+                    &mut vm.shapes,
+                );
+            }
+            if let Some(opts) = args.get(1).and_then(|v| v.as_object()) {
+                let k_cause = vm.heap.intern_key("cause");
+                if vm.has_property_by_key(opts, k_cause)? {
+                    let cause = vm.get_property_by_key(opts, k_cause)?;
+                    vm.heap.object_define_data(
+                        err_obj,
+                        k_cause,
+                        cause,
+                        PropertyAttrs::METHOD,
+                        &mut vm.shapes,
+                    );
+                }
+            }
+            Ok(JsValue::from_object(err_obj))
         });
-        let ep = vm.error_proto;
+        vm.mark_constructor(ctor);
+        vm.set_fn_length(ctor, 1);
+        if let Some(root_ctor) = error_root_ctor {
+            vm.heap
+                .object_set_prototype(ctor, Some(root_ctor), &mut vm.shapes);
+        } else {
+            error_root_ctor = Some(ctor);
+        }
+        let pn = JsValue::from_string(vm.heap.alloc_string(err_name));
+        let pm = JsValue::from_string(vm.heap.alloc_string(""));
+        vm.heap.object_define_data(
+            proto,
+            vm.key_name,
+            pn,
+            PropertyAttrs::METHOD,
+            &mut vm.shapes,
+        );
+        vm.heap.object_define_data(
+            proto,
+            vm.key_message,
+            pm,
+            PropertyAttrs::METHOD,
+            &mut vm.shapes,
+        );
+        vm.heap.object_define_data(
+            proto,
+            vm.key_constructor,
+            JsValue::from_object(ctor),
+            PropertyAttrs::METHOD,
+            &mut vm.shapes,
+        );
         vm.heap.object_define_data(
             ctor,
             vm.key_prototype,
-            JsValue::from_object(ep),
+            JsValue::from_object(proto),
             PropertyAttrs::empty(),
             &mut vm.shapes,
         );
         define_global(vm, err_name, JsValue::from_object(ctor));
     }
+}
+
+pub fn define_method_len(vm: &mut JsVm, target: HeapHandle, name: &str, len: u32, f: NativeFnPtr) {
+    let fn_h = vm.alloc_native_fn(name, f);
+    vm.set_fn_length(fn_h, len);
+    let key = vm.heap.intern_key(name);
+    vm.heap.object_define_data(
+        target,
+        key,
+        JsValue::from_object(fn_h),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
 }
 
 pub fn define_global(vm: &mut JsVm, name: &str, value: JsValue) {
@@ -258,51 +367,56 @@ fn fn_call(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue
     vm.call_value(this_val, bound_this, rest)
 }
 
+fn create_list_from_array_like(
+    vm: &mut JsVm,
+    arg_array: JsValue,
+) -> Result<Vec<JsValue>, JsException> {
+    let Some(arr_h) = arg_array.as_object() else {
+        return Err(vm.type_error("CreateListFromArrayLike called on non-object"));
+    };
+    let is_dense = matches!(
+        vm.heap.get_object(arr_h).map(|o| &o.kind),
+        Some(ObjectKind::Array)
+    );
+    let len: u32 = if is_dense {
+        vm.heap.get_object(arr_h).map_or(0, |o| o.elements.len())
+    } else {
+        let lv = vm.get_property_by_key(arr_h, vm.key_length)?;
+        let n = vm.to_number(lv)?;
+        if !n.is_finite() || n <= 0.0 {
+            0
+        } else if n > 1_000_000.0 {
+            return Err(vm.range_error("Maximum call stack size exceeded"));
+        } else {
+            n.trunc() as u32
+        }
+    };
+    if len > 1_000_000 {
+        return Err(vm.range_error("Maximum call stack size exceeded"));
+    }
+    let mut call_args = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        let v = if is_dense {
+            vm.heap
+                .get_object(arr_h)
+                .and_then(|o| o.elements.get(i))
+                .unwrap_or(JsValue::UNDEFINED)
+        } else {
+            vm.get_elem(arg_array, JsValue::from_i32(i as i32))?
+        };
+        call_args.push(v);
+    }
+    Ok(call_args)
+}
+
 fn fn_apply(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let bound_this = args.first().copied().unwrap_or(JsValue::UNDEFINED);
-    let mut call_args = Vec::new();
     let arg_array = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
-    if !arg_array.is_undefined() && !arg_array.is_null() {
-        let Some(arr_h) = arg_array.as_object() else {
-            return Err(vm.type_error("CreateListFromArrayLike called on non-object"));
-        };
-        let is_dense_array = matches!(
-            vm.heap.get_object(arr_h).map(|o| &o.kind),
-            Some(ObjectKind::Array)
-        );
-        let len: u32 = if is_dense_array {
-            vm.heap.get_object(arr_h).map_or(0, |o| o.elements.len())
-        } else {
-            let lv = vm.get_property_by_key(arr_h, vm.key_length)?;
-            let n = vm.to_number(lv)?;
-            if !n.is_finite() || n <= 0.0 {
-                0
-            } else if n > 1_000_000.0 {
-                return Err(vm.range_error("Maximum call stack size exceeded"));
-            } else {
-                n.trunc() as u32
-            }
-        };
-        if len > 1_000_000 {
-            return Err(vm.range_error("Maximum call stack size exceeded"));
-        }
-        call_args.reserve(len as usize);
-        if is_dense_array {
-            for i in 0..len {
-                let v = vm
-                    .heap
-                    .get_object(arr_h)
-                    .and_then(|o| o.elements.get(i))
-                    .unwrap_or(JsValue::UNDEFINED);
-                call_args.push(v);
-            }
-        } else {
-            for i in 0..len {
-                let v = vm.get_elem(arg_array, JsValue::from_i32(i as i32))?;
-                call_args.push(v);
-            }
-        }
-    }
+    let call_args = if arg_array.is_undefined() || arg_array.is_null() {
+        Vec::new()
+    } else {
+        create_list_from_array_like(vm, arg_array)?
+    };
     vm.call_value(this_val, bound_this, &call_args)
 }
 
@@ -324,7 +438,142 @@ fn fn_bind(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue
         })),
         Some(vm.function_proto),
     ));
+    let target_len = vm
+        .get_property_by_key(target, vm.key_length)
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let bound_arg_count = args.len().saturating_sub(1) as f64;
+    let new_len = (target_len - bound_arg_count).max(0.0) as u32;
+    vm.set_fn_length(bound, new_len);
+    let target_name = vm
+        .get_property_by_key(target, vm.key_name)
+        .ok()
+        .and_then(|v| v.as_string())
+        .and_then(|sh| vm.heap.materialize_string(sh))
+        .unwrap_or_default();
+    let bound_name = JsValue::from_string(vm.heap.alloc_string(format!("bound {target_name}")));
+    vm.heap.object_define_data(
+        bound,
+        vm.key_name,
+        bound_name,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
     Ok(JsValue::from_object(bound))
+}
+
+fn fn_to_string(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let Some(h) = this_val.as_object() else {
+        return Err(vm.type_error("Function.prototype.toString requires a Function"));
+    };
+    if !vm.is_callable_handle(h) {
+        return Err(vm.type_error("Function.prototype.toString requires a Function"));
+    }
+    let name = vm
+        .heap
+        .object_get_own(h, vm.key_name, &vm.shapes)
+        .and_then(|p| p.value.as_string())
+        .and_then(|sh| vm.heap.materialize_string(sh))
+        .unwrap_or_default();
+    let s = format!("function {name}() {{ [native code] }}");
+    Ok(JsValue::from_string(vm.heap.alloc_string(s)))
+}
+
+fn error_proto_to_string(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let Some(h) = this_val.as_object() else {
+        return Err(vm.type_error("Error.prototype.toString called on non-object"));
+    };
+    let name_val = vm.get_property_by_key(h, vm.key_name)?;
+    let name = if name_val.is_undefined() {
+        "Error".to_owned()
+    } else {
+        vm.value_to_rust_string(name_val)
+    };
+    let msg_val = vm.get_property_by_key(h, vm.key_message)?;
+    let msg = if msg_val.is_undefined() {
+        String::new()
+    } else {
+        vm.value_to_rust_string(msg_val)
+    };
+    let out = if name.is_empty() {
+        msg
+    } else if msg.is_empty() {
+        name
+    } else {
+        format!("{name}: {msg}")
+    };
+    Ok(JsValue::from_string(vm.heap.alloc_string(out)))
+}
+
+fn obj_value_of(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    if this_val.is_null() || this_val.is_undefined() {
+        return Err(vm.type_error("Cannot convert undefined or null to object"));
+    }
+    Ok(this_val)
+}
+
+fn obj_is_prototype_of(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let Some(mut cur) = args.first().and_then(|v| v.as_object()) else {
+        return Ok(JsValue::FALSE);
+    };
+    let Some(target) = this_val.as_object() else {
+        if this_val.is_null() || this_val.is_undefined() {
+            return Err(vm.type_error("Cannot convert undefined or null to object"));
+        }
+        return Ok(JsValue::FALSE);
+    };
+    for _ in 0..1024 {
+        let Some(proto) = vm.heap.get_object(cur).and_then(|o| o.prototype) else {
+            return Ok(JsValue::FALSE);
+        };
+        if proto == target {
+            return Ok(JsValue::TRUE);
+        }
+        cur = proto;
+    }
+    Ok(JsValue::FALSE)
+}
+
+fn obj_property_is_enumerable(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    if this_val.is_null() || this_val.is_undefined() {
+        return Err(vm.type_error("Cannot convert undefined or null to object"));
+    }
+    let Some(h) = this_val.as_object() else {
+        return Ok(JsValue::FALSE);
+    };
+    let prop = vm.value_to_rust_string(args.first().copied().unwrap_or(JsValue::UNDEFINED));
+    if let Ok(idx) = prop.parse::<u32>() {
+        if vm.heap.get_object(h).is_some_and(|o| o.elements.has(idx)) {
+            return Ok(JsValue::TRUE);
+        }
+    }
+    let key = vm.heap.intern_key(&prop);
+    let enumerable = vm
+        .heap
+        .object_get_own(h, key, &vm.shapes)
+        .is_some_and(|p| p.attrs.contains(PropertyAttrs::ENUMERABLE));
+    Ok(JsValue::from_bool(enumerable))
 }
 
 // ---------------------------------------------------------------------------
@@ -914,7 +1163,10 @@ fn alloc_array_iterator(
     let Some(target) = this_val.as_object() else {
         return Err(vm.type_error("Array iterator requires an object"));
     };
-    let iter_obj = vm.alloc_ordinary_object();
+    let iter_obj = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Ordinary,
+        Some(vm.iterator_proto),
+    ));
     let idx_cell = std::rc::Rc::new(std::cell::Cell::new(0u32));
     let done_cell = std::rc::Rc::new(std::cell::Cell::new(false));
     let next_fn = vm.alloc_host_fn("next", move |vm, _this, _args| {
@@ -1118,23 +1370,48 @@ fn reflect_construct(
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
     let target = args.first().copied().unwrap_or(JsValue::UNDEFINED);
-    let new_target = args.get(2).copied().unwrap_or(target);
-    let mut call_args = Vec::new();
-    if let Some(arr_h) = args.get(1).and_then(|v| v.as_object()) {
-        let len = vm.heap.get_object(arr_h).map_or(0, |o| o.elements.len());
-        if len > 1_000_000 {
-            return Err(vm.range_error("Maximum call stack size exceeded"));
-        }
-        for i in 0..len {
-            let v = vm
-                .heap
-                .get_object(arr_h)
-                .and_then(|o| o.elements.get(i))
-                .unwrap_or(JsValue::UNDEFINED);
-            call_args.push(v);
-        }
+    let Some(target_h) = target.as_object() else {
+        return Err(vm.type_error("Reflect.construct target is not a constructor"));
+    };
+    if !vm.is_constructor_handle(target_h) {
+        return Err(vm.type_error("Reflect.construct target is not a constructor"));
     }
+    let new_target = if args.len() >= 3 { args[2] } else { target };
+    let Some(nt_h) = new_target.as_object() else {
+        return Err(vm.type_error("Reflect.construct newTarget is not a constructor"));
+    };
+    if !vm.is_constructor_handle(nt_h) {
+        return Err(vm.type_error("Reflect.construct newTarget is not a constructor"));
+    }
+    let arg_list = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
+    let call_args = create_list_from_array_like(vm, arg_list)?;
     vm.construct_value(target, &call_args, new_target)
+}
+
+fn reflect_is_extensible(
+    vm: &mut JsVm,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let Some(h) = args.first().and_then(|v| v.as_object()) else {
+        return Err(vm.type_error("Reflect.isExtensible called on non-object"));
+    };
+    let ext = vm.heap.get_object(h).is_some_and(|o| o.extensible);
+    Ok(JsValue::from_bool(ext))
+}
+
+fn reflect_prevent_extensions(
+    vm: &mut JsVm,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let Some(h) = args.first().and_then(|v| v.as_object()) else {
+        return Err(vm.type_error("Reflect.preventExtensions called on non-object"));
+    };
+    if let Some(o) = vm.heap.get_object_mut(h) {
+        o.extensible = false;
+    }
+    Ok(JsValue::TRUE)
 }
 
 fn reflect_get_prototype_of(

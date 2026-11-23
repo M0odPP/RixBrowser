@@ -324,6 +324,7 @@ fn def_host_getter(
 }
 
 fn bind_ctor_proto(vm: &mut JsVm, ctor: HeapHandle, proto: HeapHandle) {
+    vm.mark_constructor(ctor);
     def_data(
         vm,
         ctor,

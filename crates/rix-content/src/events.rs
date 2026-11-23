@@ -326,6 +326,7 @@ pub fn install_event_system(
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(etp)));
         Ok(JsValue::from_object(obj))
     });
+    vm.mark_constructor(et_ctor);
     vm.heap.object_define_data(
         et_ctor,
         vm.key_prototype,
@@ -657,6 +658,7 @@ fn register_event_subclass(
         extra_init(vm, obj, init)?;
         Ok(JsValue::from_object(obj))
     });
+    vm.mark_constructor(ctor);
     vm.heap.object_define_data(
         ctor,
         vm.key_prototype,

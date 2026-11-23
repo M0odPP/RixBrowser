@@ -31,6 +31,9 @@ pub struct IcEntry {
     pub target_shape: ShapeId,
     /// `None` for own-property access; `Some(proto)` for prototype-chain loads/method calls.
     pub holder: Option<HeapHandle>,
+    /// Direct `[[Prototype]]` of the receiver when `holder.is_some()` (prevents aliasing
+    /// objects that share a shape but have distinct prototypes, e.g. `Error` vs `TypeError`).
+    pub receiver_proto: Option<HeapHandle>,
     /// Prototype epoch snapshot at cache fill time (0 for own-property access).
     pub proto_epoch: u64,
     /// True if the cached property is an accessor (must slow-path invoke getter/setter).
@@ -45,6 +48,7 @@ impl IcEntry {
             offset: 0,
             target_shape: ShapeId::DICTIONARY,
             holder: None,
+            receiver_proto: None,
             proto_epoch: 0,
             is_accessor: false,
         }
@@ -57,6 +61,7 @@ impl IcEntry {
             offset,
             target_shape: shape,
             holder: None,
+            receiver_proto: None,
             proto_epoch: 0,
             is_accessor: false,
         }
@@ -69,6 +74,7 @@ impl IcEntry {
             offset,
             target_shape,
             holder: None,
+            receiver_proto: None,
             proto_epoch: 0,
             is_accessor: false,
         }
@@ -77,6 +83,7 @@ impl IcEntry {
     #[inline]
     pub const fn proto(
         receiver_shape: ShapeId,
+        receiver_proto: Option<HeapHandle>,
         holder: HeapHandle,
         offset: u32,
         proto_epoch: u64,
@@ -86,6 +93,7 @@ impl IcEntry {
             offset,
             target_shape: receiver_shape,
             holder: Some(holder),
+            receiver_proto,
             proto_epoch,
             is_accessor: false,
         }
@@ -93,9 +101,16 @@ impl IcEntry {
 
     #[inline]
     #[must_use]
-    pub fn matches(&self, receiver_shape: ShapeId, current_proto_epoch: u64) -> bool {
+    pub fn matches(
+        &self,
+        receiver_shape: ShapeId,
+        receiver_proto: Option<HeapHandle>,
+        current_proto_epoch: u64,
+    ) -> bool {
         self.shape == receiver_shape
-            && (self.holder.is_none() || self.proto_epoch == current_proto_epoch)
+            && (self.holder.is_none()
+                || (self.proto_epoch == current_proto_epoch
+                    && self.receiver_proto == receiver_proto))
     }
 }
 
@@ -124,13 +139,14 @@ pub struct MegamorphicEntry {
     pub offset: u32,
     pub target_shape: ShapeId,
     pub holder: Option<HeapHandle>,
+    pub receiver_proto: Option<HeapHandle>,
     pub proto_epoch: u64,
 }
 
 /// Shared global `(ShapeId, PropertyKey, is_store)` cache for megamorphic sites.
 #[derive(Debug, Default)]
 pub struct MegamorphicCache {
-    loads: HashMap<(ShapeId, PropertyKey), MegamorphicEntry>,
+    loads: HashMap<(ShapeId, Option<HeapHandle>, PropertyKey), MegamorphicEntry>,
     stores: HashMap<(ShapeId, PropertyKey), MegamorphicEntry>,
 }
 
@@ -145,11 +161,18 @@ impl MegamorphicCache {
     pub fn get_load(
         &self,
         shape: ShapeId,
+        receiver_proto: Option<HeapHandle>,
         key: PropertyKey,
         proto_epoch: u64,
     ) -> Option<MegamorphicEntry> {
-        let entry = *self.loads.get(&(shape, key))?;
-        if entry.holder.is_some() && entry.proto_epoch != proto_epoch {
+        let entry = self
+            .loads
+            .get(&(shape, None, key))
+            .or_else(|| self.loads.get(&(shape, receiver_proto, key)))
+            .copied()?;
+        if entry.holder.is_some()
+            && (entry.proto_epoch != proto_epoch || entry.receiver_proto != receiver_proto)
+        {
             return None;
         }
         Some(entry)
@@ -165,7 +188,12 @@ impl MegamorphicCache {
         if self.loads.len() >= MEGAMORPHIC_CACHE_LIMIT {
             self.loads.clear();
         }
-        self.loads.insert((shape, key), entry);
+        let proto_key = if entry.holder.is_some() {
+            entry.receiver_proto
+        } else {
+            None
+        };
+        self.loads.insert((shape, proto_key, key), entry);
     }
 
     pub fn insert_store(&mut self, shape: ShapeId, key: PropertyKey, entry: MegamorphicEntry) {
@@ -257,10 +285,12 @@ impl IcTable {
 
     /// Probes an IC site for a load/method lookup.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn probe_load(
         &self,
         ic_idx: usize,
         receiver_shape: ShapeId,
+        receiver_proto: Option<HeapHandle>,
         key: PropertyKey,
         proto_epoch: u64,
         mega: &MegamorphicCache,
@@ -273,27 +303,28 @@ impl IcTable {
         let state = *self.slots.get(ic_idx)?;
         match state {
             IcState::Monomorphic(entry) => {
-                if entry.matches(receiver_shape, proto_epoch) {
+                if entry.matches(receiver_shape, receiver_proto, proto_epoch) {
                     stats.monomorphic_hits += 1;
                     return Some(entry);
                 }
             }
             IcState::Polymorphic { len, entries } => {
                 for entry in entries.iter().take(len as usize) {
-                    if entry.matches(receiver_shape, proto_epoch) {
+                    if entry.matches(receiver_shape, receiver_proto, proto_epoch) {
                         stats.polymorphic_hits += 1;
                         return Some(*entry);
                     }
                 }
             }
             IcState::Megamorphic => {
-                if let Some(m) = mega.get_load(receiver_shape, key, proto_epoch) {
+                if let Some(m) = mega.get_load(receiver_shape, receiver_proto, key, proto_epoch) {
                     stats.megamorphic_hits += 1;
                     return Some(IcEntry {
                         shape: receiver_shape,
                         offset: m.offset,
                         target_shape: m.target_shape,
                         holder: m.holder,
+                        receiver_proto: m.receiver_proto,
                         proto_epoch: m.proto_epoch,
                         is_accessor: false,
                     });
@@ -343,6 +374,7 @@ impl IcTable {
                         offset: m.offset,
                         target_shape: m.target_shape,
                         holder: None,
+                        receiver_proto: None,
                         proto_epoch: 0,
                         is_accessor: false,
                     });
@@ -370,12 +402,17 @@ impl IcTable {
         let Some(slot) = self.slots.get_mut(ic_idx) else {
             return;
         };
+        let same_key = |a: &IcEntry, b: &IcEntry| {
+            a.shape == b.shape
+                && ((a.holder.is_none() && b.holder.is_none())
+                    || a.receiver_proto == b.receiver_proto)
+        };
         match *slot {
             IcState::Uninitialized => {
                 *slot = IcState::Monomorphic(entry);
             }
             IcState::Monomorphic(existing) => {
-                if existing.shape == entry.shape {
+                if same_key(&existing, &entry) {
                     // Refresh stale prototype-epoch entry in-place without widening to polymorphic.
                     *slot = IcState::Monomorphic(entry);
                 } else {
@@ -389,9 +426,9 @@ impl IcTable {
                 mut len,
                 mut entries,
             } => {
-                // Refresh existing shape entry in-place if present (e.g. after proto invalidation).
+                // Refresh existing shape+proto entry in-place if present (e.g. after proto invalidation).
                 for existing in entries.iter_mut().take(len as usize) {
-                    if existing.shape == entry.shape {
+                    if same_key(existing, &entry) {
                         *existing = entry;
                         *slot = IcState::Polymorphic { len, entries };
                         return;
@@ -408,6 +445,7 @@ impl IcTable {
                             offset: e.offset,
                             target_shape: e.target_shape,
                             holder: e.holder,
+                            receiver_proto: e.receiver_proto,
                             proto_epoch: e.proto_epoch,
                         };
                         if is_store {
@@ -424,6 +462,7 @@ impl IcTable {
                     offset: entry.offset,
                     target_shape: entry.target_shape,
                     holder: entry.holder,
+                    receiver_proto: entry.receiver_proto,
                     proto_epoch: entry.proto_epoch,
                 };
                 if is_store {

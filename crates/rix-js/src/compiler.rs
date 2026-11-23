@@ -63,10 +63,12 @@ struct LoopControl {
 struct FunctionCompiler {
     name: Option<String>,
     param_count: u16,
+    length: u16,
     is_strict: bool,
     is_async: bool,
     is_generator: bool,
     is_arrow: bool,
+    is_method: bool,
     code: Vec<Instruction>,
     constants: Vec<ConstantEntry>,
     string_consts: HashMap<String, u32>,
@@ -97,10 +99,12 @@ impl FunctionCompiler {
         Self {
             name,
             param_count,
+            length: param_count,
             is_strict,
             is_async,
             is_generator,
             is_arrow,
+            is_method: false,
             code: Vec::new(),
             constants: Vec::new(),
             string_consts: HashMap::new(),
@@ -323,11 +327,13 @@ impl FunctionCompiler {
         FunctionBytecode {
             name: self.name,
             param_count: self.param_count,
+            length: self.length,
             register_count: self.max_regs.max(1),
             is_strict: self.is_strict,
             is_async: self.is_async,
             is_generator: self.is_generator,
             is_arrow: self.is_arrow,
+            is_method: self.is_method,
             code: self.code,
             constants: self.constants,
             ic_slots: self.ic_slots,
@@ -1569,8 +1575,12 @@ impl Compiler {
         for d in decls {
             let saved = self.cur().next_reg;
             let val_reg = self.cur().alloc_reg()?;
+            let inferred = match &d.id {
+                Pattern::Ident { name, .. } => Some(name.as_str()),
+                _ => None,
+            };
             if let Some(ref init) = d.init {
-                self.compile_expr(init, val_reg)?;
+                self.compile_expr_named(init, val_reg, inferred)?;
             } else {
                 self.cur()
                     .emit(Instruction::abc(Opcode::LoadUndef, val_reg, 0, 0));
@@ -1628,7 +1638,11 @@ impl Compiler {
                 self.cur()
                     .emit(Instruction::abc(Opcode::Move, tmp, val_reg, 0));
                 let jmp_skip = self.cur().emit_jump(Opcode::JumpIfNotUndef, tmp);
-                self.compile_expr(right, tmp)?;
+                let inferred = match left.as_ref() {
+                    Pattern::Ident { name, .. } => Some(name.as_str()),
+                    _ => None,
+                };
+                self.compile_expr_named(right, tmp, inferred)?;
                 let after = self.cur().code.len();
                 self.cur().patch_jump(jmp_skip, after)?;
                 self.compile_pattern_bind(left, tmp)?;
@@ -1781,14 +1795,35 @@ impl Compiler {
         func: &Function,
         is_arrow: bool,
     ) -> Result<u32, CompileError> {
-        let frame = FunctionCompiler::new(
-            func.name.clone(),
+        self.compile_function_body_ex(func, is_arrow, false, None)
+    }
+
+    fn compile_function_body_ex(
+        &mut self,
+        func: &Function,
+        is_arrow: bool,
+        is_method: bool,
+        inferred_name: Option<&str>,
+    ) -> Result<u32, CompileError> {
+        let resolved_name = func
+            .name
+            .clone()
+            .or_else(|| inferred_name.map(ToOwned::to_owned));
+        let expected_len = func
+            .params
+            .iter()
+            .take_while(|p| !matches!(p, Pattern::Assign { .. }))
+            .count() as u16;
+        let mut frame = FunctionCompiler::new(
+            resolved_name,
             func.params.len() as u16,
             func.strict,
             func.is_async,
             func.is_generator,
             is_arrow,
         );
+        frame.length = expected_len;
+        frame.is_method = is_method;
         self.frames.push(frame);
 
         // Bind positional parameter registers (`0..params.len()`).
@@ -1858,6 +1893,15 @@ impl Compiler {
     }
 
     fn compile_class(&mut self, cls: &Class, dst: u8) -> Result<(), CompileError> {
+        self.compile_class_named(cls, dst, None)
+    }
+
+    fn compile_class_named(
+        &mut self,
+        cls: &Class,
+        dst: u8,
+        inferred_name: Option<&str>,
+    ) -> Result<(), CompileError> {
         let saved = self.cur().next_reg;
         let super_reg = self.cur().alloc_reg()?;
         if let Some(ref sup) = cls.super_class {
@@ -1881,8 +1925,13 @@ impl Compiler {
                     function,
                     ..
                 } => {
-                    let fn_idx = self.compile_function_body(function, false)?;
                     if *kind == MethodKind::Constructor && !is_static {
+                        let fn_idx = self.compile_function_body_ex(
+                            function,
+                            false,
+                            false,
+                            cls.name.as_deref().or(inferred_name),
+                        )?;
                         constructor_idx = Some(fn_idx);
                     } else {
                         let (name, is_private) = match key {
@@ -1891,6 +1940,31 @@ impl Compiler {
                             PropKey::Number(n) => (n.to_string(), false),
                             PropKey::Computed(_) => ("<computed>".into(), false),
                         };
+                        let disp_name = match kind {
+                            MethodKind::Get => {
+                                if is_private {
+                                    format!("get #{name}")
+                                } else {
+                                    format!("get {name}")
+                                }
+                            }
+                            MethodKind::Set => {
+                                if is_private {
+                                    format!("set #{name}")
+                                } else {
+                                    format!("set {name}")
+                                }
+                            }
+                            _ => {
+                                if is_private {
+                                    format!("#{name}")
+                                } else {
+                                    name.clone()
+                                }
+                            }
+                        };
+                        let fn_idx =
+                            self.compile_function_body_ex(function, false, true, Some(&disp_name))?;
                         methods.push(ClassMethodBlueprint {
                             name,
                             is_private,
@@ -1930,7 +2004,10 @@ impl Compiler {
         };
 
         let blueprint = ClassBlueprint {
-            name: cls.name.clone(),
+            name: cls
+                .name
+                .clone()
+                .or_else(|| inferred_name.map(ToOwned::to_owned)),
             has_super: cls.super_class.is_some(),
             constructor_idx,
             methods,
@@ -2020,8 +2097,17 @@ impl Compiler {
     // -----------------------------------------------------------------------
 
     fn compile_expr(&mut self, expr: &Expr, dst: u8) -> Result<(), CompileError> {
+        self.compile_expr_named(expr, dst, None)
+    }
+
+    fn compile_expr_named(
+        &mut self,
+        expr: &Expr,
+        dst: u8,
+        inferred_name: Option<&str>,
+    ) -> Result<(), CompileError> {
         match &expr.kind {
-            ExprKind::Paren(inner) => self.compile_expr(inner, dst),
+            ExprKind::Paren(inner) => self.compile_expr_named(inner, dst, inferred_name),
             ExprKind::Null => {
                 self.cur()
                     .emit(Instruction::abc(Opcode::LoadNull, dst, 0, 0));
@@ -2144,7 +2230,13 @@ impl Compiler {
                 for prop in props {
                     match prop {
                         ObjectProp::KeyValue { key, value, .. } => {
-                            self.compile_expr(value, val_reg)?;
+                            let prop_name = match key {
+                                PropKey::Ident(n) | PropKey::String(n) if n != "__proto__" => {
+                                    Some(n.as_str())
+                                }
+                                _ => None,
+                            };
+                            self.compile_expr_named(value, val_reg, prop_name)?;
                             self.emit_prop_define(dst, key, val_reg)?;
                         }
                         ObjectProp::Method {
@@ -2153,7 +2245,22 @@ impl Compiler {
                             function,
                             ..
                         } => {
-                            let fn_idx = self.compile_function_body(function, false)?;
+                            let base_name = match key {
+                                PropKey::Ident(n) | PropKey::String(n) => Some(n.clone()),
+                                PropKey::Number(n) => Some(n.to_string()),
+                                _ => None,
+                            };
+                            let m_name = base_name.map(|n| match kind {
+                                MethodKind::Get => format!("get {n}"),
+                                MethodKind::Set => format!("set {n}"),
+                                _ => n,
+                            });
+                            let fn_idx = self.compile_function_body_ex(
+                                function,
+                                false,
+                                true,
+                                m_name.as_deref(),
+                            )?;
                             let c = self.cur().add_const(ConstantEntry::Function(fn_idx))?;
                             self.cur().emit_abx_wide(Opcode::NewClosure, val_reg, c);
                             match kind {
@@ -2258,7 +2365,7 @@ impl Compiler {
                 Ok(())
             }
             ExprKind::Function(func) => {
-                let fn_idx = self.compile_function_body(func, false)?;
+                let fn_idx = self.compile_function_body_ex(func, false, false, inferred_name)?;
                 let c = self.cur().add_const(ConstantEntry::Function(fn_idx))?;
                 self.cur().emit_abx_wide(Opcode::NewClosure, dst, c);
                 Ok(())
@@ -2282,7 +2389,7 @@ impl Compiler {
                     ArrowBody::Expr(_) => self.cur().is_strict,
                 };
                 let synth = Function {
-                    name: None,
+                    name: inferred_name.map(ToOwned::to_owned),
                     params: params.clone(),
                     rest_param: rest_param.clone(),
                     body: stmts,
@@ -2292,12 +2399,12 @@ impl Compiler {
                     has_simple_params: *has_simple_params,
                     span: expr.span,
                 };
-                let fn_idx = self.compile_function_body(&synth, true)?;
+                let fn_idx = self.compile_function_body_ex(&synth, true, false, inferred_name)?;
                 let c = self.cur().add_const(ConstantEntry::Function(fn_idx))?;
                 self.cur().emit_abx_wide(Opcode::NewClosure, dst, c);
                 Ok(())
             }
-            ExprKind::Class(cls) => self.compile_class(cls, dst),
+            ExprKind::Class(cls) => self.compile_class_named(cls, dst, inferred_name),
             ExprKind::Chain(inner) => {
                 self.cur().chain_exits.push(Vec::new());
                 self.compile_expr(inner, dst)?;
@@ -2844,7 +2951,11 @@ impl Compiler {
         dst: u8,
     ) -> Result<(), CompileError> {
         if op == AssignOp::Assign {
-            self.compile_expr(right, dst)?;
+            let inferred = match left {
+                AssignTarget::Ident { name, .. } => Some(name.as_str()),
+                _ => None,
+            };
+            self.compile_expr_named(right, dst, inferred)?;
             self.compile_assign_target_store(left, dst)?;
             return Ok(());
         }

@@ -1974,6 +1974,7 @@ fn install_message_event(vm: &mut JsVm, events: &SharedEvents, frames: &SharedFr
         PropertyAttrs::METHOD,
         &mut vm.shapes,
     );
+    vm.mark_constructor(ctor);
     define_global(vm, "MessageEvent", JsValue::from_object(ctor));
 }
 
@@ -2252,6 +2253,7 @@ fn install_message_channel_and_port(
         PropertyAttrs::METHOD,
         &mut vm.shapes,
     );
+    vm.mark_constructor(port_ctor);
     define_global(vm, "MessagePort", JsValue::from_object(port_ctor));
 
     // MessageChannel constructor
@@ -2281,6 +2283,7 @@ fn install_message_channel_and_port(
         );
         Ok(JsValue::from_object(ch))
     });
+    vm.mark_constructor(mc_ctor);
     define_global(vm, "MessageChannel", JsValue::from_object(mc_ctor));
 }
 

@@ -444,11 +444,15 @@ pub enum ConstantEntry {
 pub struct FunctionBytecode {
     pub name: Option<String>,
     pub param_count: u16,
+    /// ECMA-262 `ExpectedArgumentCount` (number of params before the first default initializer).
+    pub length: u16,
     pub register_count: u16,
     pub is_strict: bool,
     pub is_async: bool,
     pub is_generator: bool,
     pub is_arrow: bool,
+    /// True for object/class concise methods and accessors (non-constructable per ECMA-262).
+    pub is_method: bool,
     pub code: Vec<Instruction>,
     pub constants: Vec<ConstantEntry>,
     pub ic_slots: Vec<IcSlotDescriptor>,
