@@ -232,6 +232,26 @@ pub struct JsVm {
     pub key_symbol_async_iterator: PropertyKey,
     pub sym_to_primitive: SymbolId,
     pub key_symbol_to_primitive: PropertyKey,
+    pub sym_species: SymbolId,
+    pub key_symbol_species: PropertyKey,
+    pub sym_has_instance: SymbolId,
+    pub key_symbol_has_instance: PropertyKey,
+    pub sym_is_concat_spreadable: SymbolId,
+    pub key_symbol_is_concat_spreadable: PropertyKey,
+    pub sym_to_string_tag: SymbolId,
+    pub key_symbol_to_string_tag: PropertyKey,
+    pub sym_unscopables: SymbolId,
+    pub key_symbol_unscopables: PropertyKey,
+    pub sym_match: SymbolId,
+    pub key_symbol_match: PropertyKey,
+    pub sym_match_all: SymbolId,
+    pub key_symbol_match_all: PropertyKey,
+    pub sym_replace: SymbolId,
+    pub key_symbol_replace: PropertyKey,
+    pub sym_search: SymbolId,
+    pub key_symbol_search: PropertyKey,
+    pub sym_split: SymbolId,
+    pub key_symbol_split: PropertyKey,
     pub default_array_iter_fn: Option<HeapHandle>,
     pub eval_fn: Option<HeapHandle>,
     pub symbol_registry: HashMap<String, SymbolId>,
@@ -305,12 +325,14 @@ impl JsVm {
         let object_proto = heap.alloc_empty_object();
         heap.get_object_mut(object_proto).unwrap().is_prototype = true;
 
-        let function_proto = heap.alloc_empty_object();
-        heap.object_set_prototype(function_proto, Some(object_proto), &mut shapes);
+        let function_proto = heap.alloc_object(JsObject::with_kind(
+            ObjectKind::NativeFunction(0),
+            Some(object_proto),
+        ));
         heap.get_object_mut(function_proto).unwrap().is_prototype = true;
 
-        let array_proto = heap.alloc_empty_object();
-        heap.object_set_prototype(array_proto, Some(object_proto), &mut shapes);
+        let array_proto =
+            heap.alloc_object(JsObject::with_kind(ObjectKind::Array, Some(object_proto)));
         heap.get_object_mut(array_proto).unwrap().is_prototype = true;
 
         let error_proto = heap.alloc_empty_object();
@@ -319,15 +341,36 @@ impl JsVm {
 
         let string_proto = heap.alloc_empty_object();
         heap.object_set_prototype(string_proto, Some(object_proto), &mut shapes);
-        heap.get_object_mut(string_proto).unwrap().is_prototype = true;
+        let empty_str_val = JsValue::from_string(heap.alloc_string(""));
+        {
+            let o = heap.get_object_mut(string_proto).unwrap();
+            o.is_prototype = true;
+            o.rare_mut().boxed_value = Some(empty_str_val);
+        }
+        let k_len_init = heap.intern_key("length");
+        heap.object_define_data(
+            string_proto,
+            k_len_init,
+            JsValue::from_i32(0),
+            PropertyAttrs::empty(),
+            &mut shapes,
+        );
 
         let number_proto = heap.alloc_empty_object();
         heap.object_set_prototype(number_proto, Some(object_proto), &mut shapes);
-        heap.get_object_mut(number_proto).unwrap().is_prototype = true;
+        {
+            let o = heap.get_object_mut(number_proto).unwrap();
+            o.is_prototype = true;
+            o.rare_mut().boxed_value = Some(JsValue::from_f64(0.0));
+        }
 
         let boolean_proto = heap.alloc_empty_object();
         heap.object_set_prototype(boolean_proto, Some(object_proto), &mut shapes);
-        heap.get_object_mut(boolean_proto).unwrap().is_prototype = true;
+        {
+            let o = heap.get_object_mut(boolean_proto).unwrap();
+            o.is_prototype = true;
+            o.rare_mut().boxed_value = Some(JsValue::FALSE);
+        }
 
         let regexp_proto = heap.alloc_empty_object();
         heap.object_set_prototype(regexp_proto, Some(object_proto), &mut shapes);
@@ -367,13 +410,27 @@ impl JsVm {
         let generator_proto = make_proto(&mut heap, &mut shapes, iterator_proto);
         let async_generator_proto = make_proto(&mut heap, &mut shapes, object_proto);
 
-        let sym_iterator = heap.alloc_symbol(Some("Symbol.iterator".into()));
-        let key_symbol_iterator = heap.intern_key(&format!("Symbol({})", sym_iterator.0));
-        let sym_async_iterator = heap.alloc_symbol(Some("Symbol.asyncIterator".into()));
-        let key_symbol_async_iterator =
-            heap.intern_key(&format!("Symbol({})", sym_async_iterator.0));
-        let sym_to_primitive = heap.alloc_symbol(Some("Symbol.toPrimitive".into()));
-        let key_symbol_to_primitive = heap.intern_key(&format!("Symbol({})", sym_to_primitive.0));
+        let alloc_wk = |heap: &mut GcHeap, desc: &str| {
+            let s = heap.alloc_symbol(Some(desc.into()));
+            let k = heap.intern_key(&format!("Symbol({})", s.0));
+            (s, k)
+        };
+        let (sym_iterator, key_symbol_iterator) = alloc_wk(&mut heap, "Symbol.iterator");
+        let (sym_async_iterator, key_symbol_async_iterator) =
+            alloc_wk(&mut heap, "Symbol.asyncIterator");
+        let (sym_to_primitive, key_symbol_to_primitive) = alloc_wk(&mut heap, "Symbol.toPrimitive");
+        let (sym_species, key_symbol_species) = alloc_wk(&mut heap, "Symbol.species");
+        let (sym_has_instance, key_symbol_has_instance) = alloc_wk(&mut heap, "Symbol.hasInstance");
+        let (sym_is_concat_spreadable, key_symbol_is_concat_spreadable) =
+            alloc_wk(&mut heap, "Symbol.isConcatSpreadable");
+        let (sym_to_string_tag, key_symbol_to_string_tag) =
+            alloc_wk(&mut heap, "Symbol.toStringTag");
+        let (sym_unscopables, key_symbol_unscopables) = alloc_wk(&mut heap, "Symbol.unscopables");
+        let (sym_match, key_symbol_match) = alloc_wk(&mut heap, "Symbol.match");
+        let (sym_match_all, key_symbol_match_all) = alloc_wk(&mut heap, "Symbol.matchAll");
+        let (sym_replace, key_symbol_replace) = alloc_wk(&mut heap, "Symbol.replace");
+        let (sym_search, key_symbol_search) = alloc_wk(&mut heap, "Symbol.search");
+        let (sym_split, key_symbol_split) = alloc_wk(&mut heap, "Symbol.split");
 
         let global = heap.alloc_empty_object();
         heap.object_set_prototype(global, Some(object_proto), &mut shapes);
@@ -443,6 +500,26 @@ impl JsVm {
             key_symbol_async_iterator,
             sym_to_primitive,
             key_symbol_to_primitive,
+            sym_species,
+            key_symbol_species,
+            sym_has_instance,
+            key_symbol_has_instance,
+            sym_is_concat_spreadable,
+            key_symbol_is_concat_spreadable,
+            sym_to_string_tag,
+            key_symbol_to_string_tag,
+            sym_unscopables,
+            key_symbol_unscopables,
+            sym_match,
+            key_symbol_match,
+            sym_match_all,
+            key_symbol_match_all,
+            sym_replace,
+            key_symbol_replace,
+            sym_search,
+            key_symbol_search,
+            sym_split,
+            key_symbol_split,
             default_array_iter_fn: None,
             eval_fn: None,
             symbol_registry: HashMap::new(),
@@ -454,7 +531,9 @@ impl JsVm {
             programs: Vec::new(),
             ic_tables: Vec::new(),
             const_keys: Vec::new(),
-            native_fns: Vec::new(),
+            native_fns: vec![NativeCallable::Static(|_vm, _this, _args| {
+                Ok(JsValue::UNDEFINED)
+            })],
             registers: Vec::with_capacity(1024),
             frames: Vec::with_capacity(64),
             open_upvalues: Vec::new(),
@@ -972,7 +1051,19 @@ impl JsVm {
             Some(instance),
             new_target,
         )?;
-        if res.is_object() {
+        if let Some(res_h) = res.as_object() {
+            if nt_handle != callee
+                && matches!(
+                    self.heap.get_object(callee).map(|o| &o.kind),
+                    Some(ObjectKind::NativeFunction(_))
+                )
+            {
+                if let Some(nt_proto) = proto_val.as_object() {
+                    if let Some(o) = self.heap.get_object_mut(res_h) {
+                        o.prototype = Some(nt_proto);
+                    }
+                }
+            }
             Ok(res)
         } else {
             Ok(JsValue::from_object(instance))
@@ -2287,10 +2378,26 @@ impl JsVm {
                 if let Some(sup) = super_ctor {
                     let sup_res =
                         self.call_handle(sup, this_val, &args, this_val.as_object(), new_target)?;
-                    if sup_res.is_object() {
+                    if let Some(res_h) = sup_res.as_object() {
+                        if matches!(
+                            self.heap.get_object(sup).map(|o| &o.kind),
+                            Some(ObjectKind::NativeFunction(_))
+                        ) {
+                            if let Some(nt_proto) = new_target
+                                .as_object()
+                                .and_then(|nt| {
+                                    self.get_property_by_key(nt, self.key_prototype).ok()
+                                })
+                                .and_then(|v| v.as_object())
+                            {
+                                if let Some(o) = self.heap.get_object_mut(res_h) {
+                                    o.prototype = Some(nt_proto);
+                                }
+                            }
+                        }
                         actual_this = sup_res;
                         self.frames[frame_idx].this_val = actual_this;
-                        self.frames[frame_idx].construct_obj = actual_this.as_object();
+                        self.frames[frame_idx].construct_obj = Some(res_h);
                     }
                 }
                 if let Some(actual_obj) = actual_this.as_object() {
@@ -3247,9 +3354,10 @@ impl JsVm {
         };
 
         if is_array && key == self.key_length {
-            let new_len = self.to_u32(val)?;
-            if let Some(o) = self.heap.get_object_mut(obj) {
-                o.elements.set_len(new_len);
+            let is_strict = self.programs[prog_id].functions[func_idx].is_strict;
+            let ok = self.set_array_length_checked(obj, val)?;
+            if !ok && is_strict {
+                return Err(self.type_error("Cannot assign to read only property 'length'"));
             }
             return Ok(());
         }
@@ -3491,11 +3599,7 @@ impl JsVm {
             Some(ObjectKind::Array)
         ) && key == self.key_length
         {
-            let new_len = self.to_u32(val)?;
-            if let Some(o) = self.heap.get_object_mut(obj) {
-                o.elements.set_len(new_len);
-            }
-            return Ok(true);
+            return self.set_array_length_checked(obj, val);
         }
         let mut cur = Some(obj);
         while let Some(holder) = cur {
@@ -4052,9 +4156,24 @@ impl JsVm {
                 bp.name.as_deref().unwrap_or(""),
                 move |vm, this_val, args| {
                     if let Some(sup) = sup_copy {
+                        let nt = ctor_cell_clone.get().map_or(this_val, JsValue::from_object);
                         let sup_res =
-                            vm.call_handle(sup, this_val, args, this_val.as_object(), this_val)?;
-                        let actual_this = if sup_res.is_object() {
+                            vm.call_handle(sup, this_val, args, this_val.as_object(), nt)?;
+                        let actual_this = if let Some(res_h) = sup_res.as_object() {
+                            if matches!(
+                                vm.heap.get_object(sup).map(|o| &o.kind),
+                                Some(ObjectKind::NativeFunction(_))
+                            ) {
+                                if let Some(tp) = this_val
+                                    .as_object()
+                                    .and_then(|t| vm.heap.get_object(t))
+                                    .and_then(|o| o.prototype)
+                                {
+                                    if let Some(o) = vm.heap.get_object_mut(res_h) {
+                                        o.prototype = Some(tp);
+                                    }
+                                }
+                            }
                             sup_res
                         } else {
                             this_val
@@ -4586,18 +4705,394 @@ impl JsVm {
     }
 
     pub fn own_enumerable_keys_including_elements(&self, obj: HeapHandle) -> Vec<String> {
-        let mut out = Vec::new();
+        let (mut idx_keys, mut str_keys) = (Vec::new(), Vec::new());
         if let Some(o) = self.heap.get_object(obj) {
-            for idx in o.elements.present_indices() {
-                out.push(idx.to_string());
+            if let ObjectKind::TypedArray(ta) = o.kind {
+                idx_keys.extend(0..ta.length);
+            } else {
+                idx_keys.extend(o.elements.present_indices());
             }
         }
         for k in self.own_enumerable_keys(obj) {
-            if let Some(s) = self.heap.interner().get(k) {
-                out.push(s.to_string());
+            let Some(s) = self.heap.interner().get(k) else {
+                continue;
+            };
+            if is_symbol_key_str(s) {
+                continue;
+            }
+            if let Some(idx) = parse_array_index_str(s) {
+                if !idx_keys.contains(&idx) {
+                    idx_keys.push(idx);
+                }
+            } else {
+                str_keys.push(s.to_string());
             }
         }
-        out
+        idx_keys.sort_unstable();
+        idx_keys.dedup();
+        idx_keys
+            .into_iter()
+            .map(|i| i.to_string())
+            .chain(str_keys)
+            .collect()
+    }
+
+    /// ECMA-262 §7.1.18 `ToObject`: boxes primitives and rejects `null`/`undefined`.
+    pub fn to_object(&mut self, val: JsValue) -> Result<HeapHandle, JsException> {
+        if val.is_null() || val.is_undefined() {
+            return Err(self.type_error("Cannot convert undefined or null to object"));
+        }
+        if let Some(h) = val.as_object() {
+            return Ok(h);
+        }
+        let proto = match val.kind() {
+            JsValueKind::String(_) => self.string_proto,
+            JsValueKind::Int32(_) | JsValueKind::Float(_) => self.number_proto,
+            JsValueKind::Bool(_) => self.boolean_proto,
+            JsValueKind::BigInt(_) => self.bigint_proto,
+            JsValueKind::Symbol(_) => self.symbol_proto,
+            _ => self.object_proto,
+        };
+        let h = self
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+        if let Some(o) = self.heap.get_object_mut(h) {
+            o.rare_mut().boxed_value = Some(val);
+        }
+        if let Some(s) = val
+            .as_string()
+            .and_then(|sh| self.heap.materialize_string(sh))
+        {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            let len = units.len() as f64;
+            for (i, u) in units.into_iter().enumerate() {
+                let ch = char::from_u32(u32::from(u))
+                    .map_or_else(|| "\u{FFFD}".into(), |c| c.to_string());
+                let cv = JsValue::from_string(self.heap.alloc_string(ch));
+                let k = self.heap.intern_key(&i.to_string());
+                self.heap
+                    .object_define_data(h, k, cv, PropertyAttrs::ENUMERABLE, &mut self.shapes);
+            }
+            self.heap.object_define_data(
+                h,
+                self.key_length,
+                JsValue::from_f64(len),
+                PropertyAttrs::empty(),
+                &mut self.shapes,
+            );
+        }
+        self.heap.write_barrier(h, val);
+        Ok(h)
+    }
+
+    /// ECMA-262 §7.1.5 `ToIntegerOrInfinity`.
+    pub fn to_integer_or_infinity(&mut self, val: JsValue) -> Result<f64, JsException> {
+        let n = self.to_number(val)?;
+        Ok(if n.is_nan() || n == 0.0 {
+            0.0
+        } else if n.is_infinite() {
+            n
+        } else {
+            n.trunc()
+        })
+    }
+
+    /// ECMA-262 §7.1.22 `ToLength` (clamped to `0..=2^53 - 1`).
+    pub fn to_length(&mut self, val: JsValue) -> Result<u64, JsException> {
+        let n = self.to_integer_or_infinity(val)?;
+        Ok(if n <= 0.0 {
+            0
+        } else {
+            n.min(9_007_199_254_740_991.0) as u64
+        })
+    }
+
+    /// ECMA-262 §10.4.2.4 `ArraySetLength` validation & truncation.
+    pub fn set_array_length_checked(
+        &mut self,
+        obj: HeapHandle,
+        val: JsValue,
+    ) -> Result<bool, JsException> {
+        let (new_len, num) = (self.to_u32(val)?, self.to_number(val)?);
+        if f64::from(new_len) != num {
+            return Err(self.range_error("Invalid array length"));
+        }
+        let cur_len = self.heap.get_object(obj).map_or(0, |o| o.elements.len());
+        if self
+            .heap
+            .object_get_own(obj, self.key_length, &self.shapes)
+            .is_some_and(|lp| !lp.attrs.contains(PropertyAttrs::WRITABLE))
+        {
+            return Ok(new_len == cur_len);
+        }
+        if new_len < cur_len {
+            let (mut highest_non_cfg, mut to_delete) = (None::<u32>, Vec::new());
+            if let Some(r) = self
+                .heap
+                .get_object(obj)
+                .filter(|o| o.is_dictionary())
+                .and_then(|o| o.rare.as_ref())
+            {
+                for (&k, p) in &r.dict_props {
+                    if let Some(idx) = self
+                        .heap
+                        .interner()
+                        .get(k)
+                        .and_then(|s| parse_array_index_str(s))
+                        .filter(|&i| i >= new_len)
+                    {
+                        if !p.attrs.contains(PropertyAttrs::CONFIGURABLE) {
+                            highest_non_cfg = Some(highest_non_cfg.map_or(idx, |m| m.max(idx)));
+                        } else {
+                            to_delete.push((k, idx));
+                        }
+                    }
+                }
+            }
+            if let Some(max_idx) = highest_non_cfg {
+                let stop_len = max_idx.saturating_add(1);
+                for (k, idx) in to_delete {
+                    if idx >= stop_len {
+                        self.heap.object_delete_own(obj, k, &mut self.shapes);
+                    }
+                }
+                if let Some(o) = self.heap.get_object_mut(obj) {
+                    o.elements.set_len(stop_len);
+                }
+                return Ok(false);
+            }
+            for (k, _) in to_delete {
+                self.heap.object_delete_own(obj, k, &mut self.shapes);
+            }
+        }
+        if let Some(o) = self.heap.get_object_mut(obj) {
+            o.elements.set_len(new_len);
+        }
+        Ok(true)
+    }
+
+    /// ECMA-262 §7.2.2 `IsArray` (unwraps Proxy chains, throws `TypeError` on revoked Proxy).
+    pub fn is_array_value(&self, val: JsValue) -> Result<bool, JsException> {
+        let Some(mut h) = val.as_object() else {
+            return Ok(false);
+        };
+        for _ in 0..64 {
+            match self.heap.get_object(h).map(|o| &o.kind) {
+                Some(ObjectKind::Array) => return Ok(true),
+                Some(ObjectKind::Proxy(p)) if p.revoked => {
+                    return Err(JsException {
+                        value: JsValue::UNDEFINED,
+                        message:
+                            "TypeError: Cannot perform 'IsArray' on a proxy that has been revoked"
+                                .into(),
+                    });
+                }
+                Some(ObjectKind::Proxy(p)) => h = p.target,
+                _ => return Ok(false),
+            }
+        }
+        Ok(false)
+    }
+
+    /// ECMA-262 §10.4.2.3 `ArraySpeciesCreate(originalArray, length)`.
+    pub fn array_species_create(
+        &mut self,
+        orig: HeapHandle,
+        len: u64,
+    ) -> Result<HeapHandle, JsException> {
+        let is_arr = self
+            .is_array_value(JsValue::from_object(orig))
+            .map_err(|_| self.type_error("Proxy has been revoked"))?;
+        let mut c = JsValue::UNDEFINED;
+        if is_arr {
+            c = self.get_property_by_key(orig, self.key_constructor)?;
+            if let Some(ch) = c.as_object() {
+                c = self.get_property_by_key(ch, self.key_symbol_species)?;
+                if c.is_null() {
+                    c = JsValue::UNDEFINED;
+                }
+            }
+        }
+        if c.is_undefined() {
+            if len > u64::from(u32::MAX) {
+                return Err(self.range_error("Invalid array length"));
+            }
+            let arr = self.alloc_array();
+            if len > 0 {
+                if let Some(o) = self.heap.get_object_mut(arr) {
+                    o.elements.set_len(len as u32);
+                }
+            }
+            return Ok(arr);
+        }
+        if !c.as_object().is_some_and(|h| self.is_constructor_handle(h)) {
+            return Err(self.type_error("Species constructor is not a constructor"));
+        }
+        self.construct_value(c, &[JsValue::from_f64(len as f64)], c)?
+            .as_object()
+            .ok_or_else(|| self.type_error("Species constructor returned non-object"))
+    }
+
+    pub fn array_get_len(&mut self, obj: HeapHandle) -> Result<u64, JsException> {
+        let v = self.get_property_by_key(obj, self.key_length)?;
+        self.to_length(v)
+    }
+
+    pub fn array_has_index(&mut self, obj: HeapHandle, idx: u64) -> Result<bool, JsException> {
+        if idx < u64::from(u32::MAX)
+            && self
+                .heap
+                .get_object(obj)
+                .is_some_and(|o| matches!(o.kind, ObjectKind::Array) && o.elements.has(idx as u32))
+        {
+            return Ok(true);
+        }
+        let key = self.heap.intern_key(&idx.to_string());
+        self.has_property_by_key(obj, key)
+    }
+
+    pub fn array_get_index(&mut self, obj: HeapHandle, idx: u64) -> Result<JsValue, JsException> {
+        if idx < u64::from(u32::MAX) {
+            if let Some(v) = self
+                .heap
+                .get_object(obj)
+                .filter(|o| matches!(o.kind, ObjectKind::Array))
+                .and_then(|o| o.elements.get(idx as u32))
+            {
+                return Ok(v);
+            }
+        }
+        self.get_elem(JsValue::from_object(obj), JsValue::from_f64(idx as f64))
+    }
+
+    pub fn array_set_index_strict(
+        &mut self,
+        obj: HeapHandle,
+        idx: u64,
+        val: JsValue,
+    ) -> Result<(), JsException> {
+        if !self.set_elem_checked(
+            JsValue::from_object(obj),
+            JsValue::from_f64(idx as f64),
+            val,
+        )? {
+            return Err(self.type_error(format!("Cannot assign to read only property '{idx}'")));
+        }
+        Ok(())
+    }
+
+    pub fn array_create_data_prop(
+        &mut self,
+        obj: HeapHandle,
+        idx: u64,
+        val: JsValue,
+    ) -> Result<(), JsException> {
+        let key = self.heap.intern_key(&idx.to_string());
+        let is_arr = matches!(
+            self.heap.get_object(obj).map(|o| &o.kind),
+            Some(ObjectKind::Array)
+        );
+        if let Some(cur) = self.heap.object_get_own(obj, key, &self.shapes) {
+            if !cur.attrs.contains(PropertyAttrs::CONFIGURABLE) {
+                return Err(self.type_error("Cannot redefine non-configurable property"));
+            }
+        } else if !self.heap.get_object(obj).is_some_and(|o| o.extensible) {
+            return Err(self.type_error("Cannot define property on non-extensible object"));
+        } else if is_arr && idx < u64::from(u32::MAX) {
+            if let Some(o) = self.heap.get_object_mut(obj) {
+                o.elements.set(idx as u32, val);
+            }
+            self.heap.write_barrier(obj, val);
+            return Ok(());
+        }
+        self.heap
+            .object_define_data(obj, key, val, PropertyAttrs::DEFAULT, &mut self.shapes);
+        Ok(())
+    }
+
+    pub fn array_delete_index_strict(
+        &mut self,
+        obj: HeapHandle,
+        idx: u64,
+    ) -> Result<(), JsException> {
+        if !self.delete_elem(JsValue::from_object(obj), JsValue::from_f64(idx as f64))? {
+            return Err(self.type_error(format!("Cannot delete property '{idx}'")));
+        }
+        Ok(())
+    }
+
+    pub fn array_set_length(&mut self, obj: HeapHandle, new_len: u64) -> Result<(), JsException> {
+        if !self.set_property_by_key(obj, self.key_length, JsValue::from_f64(new_len as f64))? {
+            return Err(self.type_error("Cannot assign to read only property 'length'"));
+        }
+        Ok(())
+    }
+
+    /// Returns sorted present indices `< len` when `len > 65_536` and it is spec-safe to skip holes.
+    pub fn sparse_present_indices_if_safe(&self, obj: HeapHandle, len: u64) -> Option<Vec<u64>> {
+        if len <= 65_536 {
+            return None;
+        }
+        let o = self.heap.get_object(obj)?;
+        if matches!(o.kind, ObjectKind::Proxy(_)) {
+            return None;
+        }
+        let has_idx_key = |k: PropertyKey| {
+            self.heap
+                .interner()
+                .get(k)
+                .is_some_and(|s| parse_array_index_str(s).is_some())
+        };
+        let mut cur = o.prototype;
+        for _ in 0..64 {
+            let Some(ph) = cur else { break };
+            let po = self.heap.get_object(ph)?;
+            if matches!(po.kind, ObjectKind::Proxy(_)) || !po.elements.present_indices().is_empty()
+            {
+                return None;
+            }
+            let proto_has = if po.is_dictionary() {
+                po.rare
+                    .as_ref()
+                    .is_some_and(|r| r.dict_props.keys().copied().any(has_idx_key))
+            } else {
+                self.shapes
+                    .get(po.shape())
+                    .is_some_and(|sh| sh.keys().iter().copied().any(has_idx_key))
+            };
+            if proto_has {
+                return None;
+            }
+            cur = po.prototype;
+        }
+        let mut out: Vec<u64> = o
+            .elements
+            .present_indices()
+            .into_iter()
+            .map(u64::from)
+            .filter(|&i| i < len)
+            .collect();
+        let mut push_key = |k: PropertyKey| {
+            if let Some(s) = self.heap.interner().get(k) {
+                if let Some(i) = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&i| i < len && i.to_string() == s.as_ref())
+                {
+                    out.push(i);
+                }
+            }
+        };
+        if o.is_dictionary() {
+            if let Some(r) = &o.rare {
+                r.dict_props.keys().copied().for_each(&mut push_key);
+            }
+        } else if let Some(sh) = self.shapes.get(o.shape()) {
+            sh.keys().iter().copied().for_each(&mut push_key);
+        }
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
     }
 
     fn op_add(&mut self, lhs: JsValue, rhs: JsValue) -> Result<JsValue, JsException> {
@@ -4878,14 +5373,27 @@ impl JsVm {
         ))
     }
 
-    fn op_instanceof(&mut self, lhs: JsValue, rhs: JsValue) -> Result<bool, JsException> {
-        let Some(rhs_h) = rhs.as_object() else {
-            return Err(self.type_error("Right-hand side of 'instanceof' is not an object"));
-        };
-        let Some(lhs_h) = lhs.as_object() else {
+    /// ECMA-262 §7.3.21 `OrdinaryHasInstance(C, O)`.
+    pub fn ordinary_has_instance(
+        &mut self,
+        ctor: JsValue,
+        val: JsValue,
+    ) -> Result<bool, JsException> {
+        let Some(mut ctor_h) = ctor.as_object() else {
             return Ok(false);
         };
-        let target_proto = self.get_property_by_key(rhs_h, self.key_prototype)?;
+        if !self.is_callable_handle(ctor_h) {
+            return Ok(false);
+        }
+        while let Some(ObjectKind::BoundFunction(bf)) =
+            self.heap.get_object(ctor_h).map(|o| o.kind.clone())
+        {
+            ctor_h = bf.target;
+        }
+        let Some(lhs_h) = val.as_object() else {
+            return Ok(false);
+        };
+        let target_proto = self.get_property_by_key(ctor_h, self.key_prototype)?;
         let Some(target_proto_h) = target_proto.as_object() else {
             return Err(self.type_error("Function has non-object prototype in instanceof check"));
         };
@@ -4897,6 +5405,21 @@ impl JsVm {
             cur = self.heap.get_object(p).and_then(|o| o.prototype);
         }
         Ok(false)
+    }
+
+    fn op_instanceof(&mut self, lhs: JsValue, rhs: JsValue) -> Result<bool, JsException> {
+        let Some(rhs_h) = rhs.as_object() else {
+            return Err(self.type_error("Right-hand side of 'instanceof' is not an object"));
+        };
+        let has_inst = self.get_property_by_key(rhs_h, self.key_symbol_has_instance)?;
+        if !has_inst.is_undefined() && !has_inst.is_null() {
+            let res = self.call_value(has_inst, rhs, &[lhs])?;
+            return Ok(self.to_boolean(res));
+        }
+        if !self.is_callable_handle(rhs_h) {
+            return Err(self.type_error("Right-hand side of 'instanceof' is not callable"));
+        }
+        self.ordinary_has_instance(rhs, lhs)
     }
 
     pub fn strict_eq(&self, a: JsValue, b: JsValue) -> bool {
@@ -5978,4 +6501,19 @@ fn f64_to_u32(n: f64) -> u32 {
 
 fn f64_to_i32(n: f64) -> i32 {
     f64_to_u32(n) as i32
+}
+
+pub(crate) fn is_symbol_key_str(s: &str) -> bool {
+    s.strip_prefix("Symbol(")
+        .and_then(|r| r.strip_suffix(')'))
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+}
+
+pub(crate) fn parse_array_index_str(s: &str) -> Option<u32> {
+    let idx = s.parse::<u32>().ok()?;
+    if idx < u32::MAX && idx.to_string() == s {
+        Some(idx)
+    } else {
+        None
+    }
 }
