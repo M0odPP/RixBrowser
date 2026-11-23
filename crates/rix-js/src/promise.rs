@@ -180,6 +180,9 @@ fn install_aggregate_error(vm: &mut JsVm) {
         let err = vm
             .heap
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+        if let Some(o) = vm.heap.get_object_mut(err) {
+            o.rare_mut().is_error_data = true;
+        }
         if !arg(args, 1).is_undefined() {
             let msg = vm.to_js_string(arg(args, 1))?;
             let mv = JsValue::from_string(vm.heap.alloc_string(msg));
@@ -1317,6 +1320,9 @@ fn make_aggregate_error_val(vm: &mut JsVm, errs: &[JsValue]) -> JsValue {
         ObjectKind::Ordinary,
         Some(vm.aggregate_error_proto),
     ));
+    if let Some(o) = vm.heap.get_object_mut(obj) {
+        o.rare_mut().is_error_data = true;
+    }
     let k_errors = vm.heap.intern_key("errors");
     vm.heap.object_define_data(
         obj,

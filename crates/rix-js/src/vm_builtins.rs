@@ -292,6 +292,81 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
 
     // Error & NativeError constructors with distinct prototypes (ECMA-262 §20.5)
     define_method_len(vm, vm.error_proto, "toString", 0, error_proto_to_string);
+    let stack_get = vm.alloc_native_fn("get stack", |vm, this_val, _| {
+        let Some(h) = this_val.as_object() else {
+            return Err(vm.type_error("Error.prototype.stack getter requires an object receiver"));
+        };
+        let is_err = vm
+            .heap
+            .get_object(h)
+            .and_then(|o| o.rare.as_ref())
+            .is_some_and(|r| r.is_error_data);
+        if !is_err {
+            return Ok(JsValue::UNDEFINED);
+        }
+        let name = vm
+            .get_property_by_key(h, vm.key_name)
+            .ok()
+            .filter(|v| !v.is_undefined())
+            .map(|v| vm.value_to_rust_string(v))
+            .unwrap_or_else(|| "Error".to_string());
+        let msg = vm
+            .get_property_by_key(h, vm.key_message)
+            .ok()
+            .filter(|v| !v.is_undefined())
+            .map(|v| vm.value_to_rust_string(v))
+            .unwrap_or_default();
+        let line = if msg.is_empty() {
+            name
+        } else {
+            format!("{name}: {msg}")
+        };
+        Ok(JsValue::from_string(vm.heap.alloc_string(line)))
+    });
+    vm.set_fn_length(stack_get, 0);
+    let stack_set = vm.alloc_native_fn("set stack", |vm, this_val, args| {
+        let Some(h) = this_val.as_object() else {
+            return Err(vm.type_error("Error.prototype.stack setter requires an object receiver"));
+        };
+        let val = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+        if !val.is_string() {
+            return Err(vm.type_error("Error.prototype.stack value must be a string"));
+        }
+        if h == vm.error_proto {
+            return Err(vm.type_error("Cannot set stack directly on Error.prototype"));
+        }
+        let k_stack = vm.heap.intern_key("stack");
+        if let Some(own) = vm.heap.object_get_own(h, k_stack, &vm.shapes) {
+            if own.attrs.contains(PropertyAttrs::ACCESSOR) {
+                if let Some(sh) = own.setter {
+                    vm.call_value(JsValue::from_object(sh), this_val, &[val])?;
+                } else {
+                    return Err(vm.type_error("Cannot set property which has only a getter"));
+                }
+            } else if !own.attrs.contains(PropertyAttrs::WRITABLE) {
+                return Err(vm.type_error("Cannot assign to read-only property 'stack'"));
+            } else {
+                vm.set_property_by_key(h, k_stack, val)?;
+            }
+        } else if !vm.heap.get_object(h).is_some_and(|o| o.extensible) {
+            return Err(vm.type_error("Cannot define property 'stack' on non-extensible object"));
+        } else {
+            vm.heap
+                .object_define_data(h, k_stack, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+            vm.heap.write_barrier(h, val);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    vm.set_fn_length(stack_set, 1);
+    let k_stack = vm.heap.intern_key("stack");
+    vm.heap.object_define_accessor(
+        vm.error_proto,
+        k_stack,
+        Some(stack_get),
+        Some(stack_set),
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
 
     let mut error_root_ctor = None;
     for (err_name, proto) in [
@@ -304,11 +379,21 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
         ("EvalError", vm.eval_error_proto),
     ] {
         let ctor = vm.alloc_host_fn(err_name, move |vm, _this, args| {
+            let obj_proto = if let Some(nth) = vm.native_new_target.as_object() {
+                vm.get_property_by_key(nth, vm.key_prototype)?
+                    .as_object()
+                    .unwrap_or(proto)
+            } else {
+                proto
+            };
             let err_obj = vm
                 .heap
-                .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+                .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(obj_proto)));
+            if let Some(o) = vm.heap.get_object_mut(err_obj) {
+                o.rare_mut().is_error_data = true;
+            }
             if let Some(&msg_arg) = args.first().filter(|v| !v.is_undefined()) {
-                let msg = vm.value_to_rust_string(msg_arg);
+                let msg = vm.to_js_string(msg_arg)?;
                 let mv = JsValue::from_string(vm.heap.alloc_string(msg));
                 vm.heap.object_define_data(
                     err_obj,
@@ -339,6 +424,15 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
             vm.heap
                 .object_set_prototype(ctor, Some(root_ctor), &mut vm.shapes);
         } else {
+            define_method_len(vm, ctor, "isError", 1, |vm, _this, args| {
+                let is_err = args
+                    .first()
+                    .and_then(|v| v.as_object())
+                    .and_then(|h| vm.heap.get_object(h))
+                    .and_then(|o| o.rare.as_ref())
+                    .is_some_and(|r| r.is_error_data);
+                Ok(JsValue::from_bool(is_err))
+            });
             error_root_ctor = Some(ctor);
         }
         let pn = JsValue::from_string(vm.heap.alloc_string(err_name));
@@ -961,6 +1055,13 @@ fn obj_to_string(
             } else {
                 "Object"
             }
+        } else if vm
+            .heap
+            .get_object(h)
+            .and_then(|o| o.rare.as_ref())
+            .is_some_and(|r| r.is_error_data)
+        {
+            "Error"
         } else {
             match vm.heap.get_object(h).map(|o| &o.kind) {
                 Some(ObjectKind::Array) => "Array",
