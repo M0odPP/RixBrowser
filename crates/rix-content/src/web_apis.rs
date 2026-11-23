@@ -381,16 +381,86 @@ pub(crate) fn extract_bytes_from_js(
     Ok(vm.value_to_rust_string(val).into_bytes())
 }
 
+const DOM_EXCEPTION_CODES: &[(&str, i32)] = &[
+    ("INDEX_SIZE_ERR", 1),
+    ("DOMSTRING_SIZE_ERR", 2),
+    ("HIERARCHY_REQUEST_ERR", 3),
+    ("WRONG_DOCUMENT_ERR", 4),
+    ("INVALID_CHARACTER_ERR", 5),
+    ("NO_DATA_ALLOWED_ERR", 6),
+    ("NO_MODIFICATION_ALLOWED_ERR", 7),
+    ("NOT_FOUND_ERR", 8),
+    ("NOT_SUPPORTED_ERR", 9),
+    ("INUSE_ATTRIBUTE_ERR", 10),
+    ("INVALID_STATE_ERR", 11),
+    ("SYNTAX_ERR", 12),
+    ("INVALID_MODIFICATION_ERR", 13),
+    ("NAMESPACE_ERR", 14),
+    ("INVALID_ACCESS_ERR", 15),
+    ("VALIDATION_ERR", 16),
+    ("TYPE_MISMATCH_ERR", 17),
+    ("SECURITY_ERR", 18),
+    ("NETWORK_ERR", 19),
+    ("ABORT_ERR", 20),
+    ("URL_MISMATCH_ERR", 21),
+    ("QUOTA_EXCEEDED_ERR", 22),
+    ("TIMEOUT_ERR", 23),
+    ("INVALID_NODE_TYPE_ERR", 24),
+    ("DATA_CLONE_ERR", 25),
+];
+
+fn dom_exception_legacy_code(name: &str) -> i32 {
+    match name {
+        "IndexSizeError" => 1,
+        "HierarchyRequestError" => 3,
+        "WrongDocumentError" => 4,
+        "InvalidCharacterError" => 5,
+        "NoModificationAllowedError" => 7,
+        "NotFoundError" => 8,
+        "NotSupportedError" => 9,
+        "InUseAttributeError" => 10,
+        "InvalidStateError" => 11,
+        "SyntaxError" => 12,
+        "InvalidModificationError" => 13,
+        "NamespaceError" => 14,
+        "InvalidAccessError" => 15,
+        "TypeMismatchError" => 17,
+        "SecurityError" => 18,
+        "NetworkError" => 19,
+        "AbortError" => 20,
+        "URLMismatchError" => 21,
+        "QuotaExceededError" => 22,
+        "TimeoutError" => 23,
+        "InvalidNodeTypeError" => 24,
+        "DataCloneError" => 25,
+        _ => 0,
+    }
+}
+
 pub(crate) fn create_dom_exception(vm: &mut JsVm, name: &str, message: &str) -> JsException {
-    let obj = vm.alloc_ordinary_object();
+    let k_de = vm.heap.intern_key("DOMException");
+    let proto = vm
+        .heap
+        .object_get_own(vm.global, k_de, &vm.shapes)
+        .and_then(|p| p.value.as_object())
+        .and_then(|ctor| vm.heap.object_get_own(ctor, vm.key_prototype, &vm.shapes))
+        .and_then(|p| p.value.as_object())
+        .unwrap_or(vm.error_proto);
+    let obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
     let k_name = vm.heap.intern_key("name");
     let k_msg = vm.heap.intern_key("message");
+    let k_code = vm.heap.intern_key("code");
     let n_val = JsValue::from_string(vm.heap.alloc_string(name));
     let m_val = JsValue::from_string(vm.heap.alloc_string(message));
+    let c_val = JsValue::from_i32(dom_exception_legacy_code(name));
     vm.heap
         .object_define_data(obj, k_name, n_val, PropertyAttrs::DEFAULT, &mut vm.shapes);
     vm.heap
         .object_define_data(obj, k_msg, m_val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    vm.heap
+        .object_define_data(obj, k_code, c_val, PropertyAttrs::DEFAULT, &mut vm.shapes);
     JsException {
         value: JsValue::from_object(obj),
         message: format!("{name}: {message}"),
@@ -459,7 +529,10 @@ pub fn install_web_apis(
 }
 
 fn install_dom_exception_ctor(vm: &mut JsVm) {
-    let proto = vm.alloc_ordinary_object();
+    let proto = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Ordinary,
+        Some(vm.error_proto),
+    ));
     vm.heap.get_object_mut(proto).unwrap().is_prototype = true;
     let ctor = vm.alloc_host_fn("DOMException", move |vm, _this, args| {
         let msg = if arg(args, 0).is_undefined() {
@@ -477,14 +550,26 @@ fn install_dom_exception_ctor(vm: &mut JsVm) {
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
         let k_name = vm.heap.intern_key("name");
         let k_msg = vm.heap.intern_key("message");
+        let k_code = vm.heap.intern_key("code");
         let nv = JsValue::from_string(vm.heap.alloc_string(&name));
         let mv = JsValue::from_string(vm.heap.alloc_string(&msg));
+        let cv = JsValue::from_i32(dom_exception_legacy_code(&name));
         vm.heap
             .object_define_data(obj, k_name, nv, PropertyAttrs::DEFAULT, &mut vm.shapes);
         vm.heap
             .object_define_data(obj, k_msg, mv, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        vm.heap
+            .object_define_data(obj, k_code, cv, PropertyAttrs::DEFAULT, &mut vm.shapes);
         Ok(JsValue::from_object(obj))
     });
+    for &(const_name, code) in DOM_EXCEPTION_CODES {
+        let k = vm.heap.intern_key(const_name);
+        let v = JsValue::from_i32(code);
+        vm.heap
+            .object_define_data(ctor, k, v, PropertyAttrs::empty(), &mut vm.shapes);
+        vm.heap
+            .object_define_data(proto, k, v, PropertyAttrs::empty(), &mut vm.shapes);
+    }
     bind_ctor_proto(vm, ctor, proto);
     define_global(vm, "DOMException", JsValue::from_object(ctor));
 }

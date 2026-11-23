@@ -12,10 +12,10 @@ use std::sync::Arc;
 
 use rix_core::{Point, Rect, Size};
 use rix_css::{
-    CascadeOrigin, ColorRgba, ComputedStyle, DisplayMode, LengthPercentage, LengthPercentageAuto,
-    MediaContext, PositionMode, SizeValue, StyleContext, Stylesheet, VisibilityMode,
+    matches_element_with_scope, parse_selector_list_strict, query_selector_all_in_subtree,
+    query_selector_in_subtree, CascadeOrigin, ComputedStyle, MediaContext, RixPseudoElement,
+    StyleContext, Stylesheet,
 };
-use rix_dom::query::{matches_complex, ComplexSelector};
 use rix_dom::{
     is_valid_custom_element_name, is_valid_shadow_host_name, Document, NodeData, NodeId,
 };
@@ -132,6 +132,11 @@ pub struct HostState {
     pub custom_validity: HashMap<NodeId, String>,
     pub dialog_return_values: HashMap<NodeId, String>,
     pub open_popovers: Vec<NodeId>,
+    pub css_stylesheet_proto: Option<HeapHandle>,
+    pub style_element_sheets: HashMap<NodeId, crate::cssom::SharedStyleSheet>,
+    pub stylesheet_handle_map: HashMap<HeapHandle, crate::cssom::SharedStyleSheet>,
+    pub adopted_stylesheets: Vec<crate::cssom::SharedStyleSheet>,
+    pub registered_properties: HashMap<String, (String, bool, Option<String>)>,
 }
 
 /// Shared handle to [`HostState`].
@@ -183,7 +188,20 @@ impl HostState {
             custom_validity: HashMap::new(),
             dialog_return_values: HashMap::new(),
             open_popovers: Vec::new(),
+            css_stylesheet_proto: None,
+            style_element_sheets: HashMap::new(),
+            stylesheet_handle_map: HashMap::new(),
+            adopted_stylesheets: Vec::new(),
+            registered_properties: HashMap::new(),
         }
+    }
+
+    /// Marks document stylesheets dirty so the next style/layout read rebuilds the cascade.
+    pub fn mark_sheets_dirty(&mut self) {
+        self.sheets_dirty = true;
+        self.last_style_revs = None;
+        self.last_layout_revs = None;
+        self.last_paint_revs = None;
     }
 
     /// Resolves a JS wrapper's `host_tag` back to its `NodeId`.
@@ -220,10 +238,15 @@ impl HostState {
                 out.push(JsValue::from_object(p));
             }
         }
+        if let Some(proto) = self.css_stylesheet_proto {
+            out.push(JsValue::from_object(proto));
+        }
     }
 
     /// Sweeps dead unpinned weak DOM wrappers and releases their tag table entries (zero leaks!).
     pub fn sweep_dead_wrappers(&mut self, heap: &GcHeap) -> usize {
+        self.stylesheet_handle_map
+            .retain(|h, _| heap.get_object(*h).is_some());
         let removed = self.wrappers.sweep_dead(heap);
         if removed > 0 {
             let mut dead_nodes = Vec::new();
@@ -315,6 +338,13 @@ impl HostState {
             for node in doc.descendants_with_shadow_roots(doc.root()) {
                 if let Some(NodeData::Element(el)) = doc.get(node) {
                     if el.name.local.as_str().eq_ignore_ascii_case("style") {
+                        let is_disabled = self
+                            .style_element_sheets
+                            .get(&node)
+                            .is_some_and(|sh| sh.borrow().disabled);
+                        if is_disabled {
+                            continue;
+                        }
                         let text = doc.inner_text(node);
                         if !text.trim().is_empty() {
                             h = fnv_mix(h, text.as_bytes());
@@ -327,6 +357,16 @@ impl HostState {
                 if !sheet.trim().is_empty() {
                     h = fnv_mix(h, sheet.as_bytes());
                     css_blocks.push(sheet.clone());
+                }
+            }
+            for adopted in &self.adopted_stylesheets {
+                let st = adopted.borrow();
+                if !st.disabled {
+                    let css = st.to_css_text();
+                    if !css.trim().is_empty() {
+                        h = fnv_mix(h, css.as_bytes());
+                        css_blocks.push(css);
+                    }
                 }
             }
             (h, css_blocks)
@@ -417,6 +457,19 @@ impl HostState {
     pub fn computed_style_for_node(&mut self, node: NodeId) -> Option<Arc<ComputedStyle>> {
         let ctx = self.ensure_styles();
         ctx.style_for(node).cloned()
+    }
+
+    /// Returns the cached `ComputedStyle` for `node` or its pseudo-element (`::before`, `::after`, etc.).
+    pub fn computed_style_for_node_pseudo(
+        &mut self,
+        node: NodeId,
+        pseudo: Option<RixPseudoElement>,
+    ) -> Option<Arc<ComputedStyle>> {
+        let ctx = self.ensure_styles();
+        match pseudo {
+            Some(pe) => ctx.pseudo_style_for(node, pe).cloned(),
+            None => ctx.style_for(node).cloned(),
+        }
     }
 
     /// Rebuilds the page [`rix_render::DisplayList`] ONLY when the DOM or CSS revisions changed,
@@ -619,15 +672,15 @@ pub fn install_dom_bridge(
         document, protos, viewport, font_db,
     )));
 
-    // Make global `window` inherit from `EventTarget.prototype`.
-    let g = vm.global;
-    vm.heap
-        .object_set_prototype(g, Some(event_target_proto), &mut vm.shapes);
+    // HTML Living Standard §7.3.3.1: `Window` inherits from `WindowProperties` (named access
+    // for element `id` / `name` attributes) -> `EventTarget.prototype` -> `Object.prototype`.
+    install_window_properties_proxy(vm, &host, event_target_proto);
 
     install_node_prototype(vm, &host);
     install_element_prototype(vm, &host);
     install_document_prototype(vm, &host);
     install_shadow_root_prototype(vm, &host);
+    install_fragment_prototype(vm, &host);
     install_window_and_cssom(vm, &host);
 
     // Pin root document wrapper on global `document`.
@@ -714,14 +767,14 @@ pub fn install_dom_bridge(
     host
 }
 
-fn define_global(vm: &mut JsVm, name: &str, val: JsValue) {
+pub(crate) fn define_global(vm: &mut JsVm, name: &str, val: JsValue) {
     let k = vm.heap.intern_key(name);
     let g = vm.global;
     vm.heap
         .object_define_data(g, k, val, PropertyAttrs::METHOD, &mut vm.shapes);
 }
 
-fn define_host_method(
+pub(crate) fn define_host_method(
     vm: &mut JsVm,
     target: HeapHandle,
     name: &str,
@@ -738,7 +791,7 @@ fn define_host_method(
     );
 }
 
-fn define_host_accessor(
+pub(crate) fn define_host_accessor(
     vm: &mut JsVm,
     target: HeapHandle,
     name: &str,
@@ -756,13 +809,17 @@ fn define_host_accessor(
     );
 }
 
-fn require_node(vm: &mut JsVm, host: &SharedHost, val: JsValue) -> Result<NodeId, JsException> {
+pub(crate) fn require_node(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    val: JsValue,
+) -> Result<NodeId, JsException> {
     host.borrow()
         .node_for_value(vm, val)
         .ok_or_else(|| vm.type_error("Illegal invocation: receiver is not a DOM Node"))
 }
 
-fn arg(args: &[JsValue], i: usize) -> JsValue {
+pub(crate) fn arg(args: &[JsValue], i: usize) -> JsValue {
     args.get(i).copied().unwrap_or(JsValue::UNDEFINED)
 }
 
@@ -1212,7 +1269,7 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
     let h = Rc::clone(host);
     let g = vm.alloc_host_fn("get style", move |vm, t, _| {
         let nid = require_node(vm, &h, t)?;
-        Ok(create_inline_style_proxy(vm, &h, nid))
+        Ok(crate::cssom::create_inline_style_proxy(vm, &h, nid))
     });
     define_host_accessor(vm, ep, "style", Some(g), None);
 
@@ -1390,38 +1447,50 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
     });
     define_host_accessor(vm, ep, "previousElementSibling", Some(g), None);
 
-    // Selector queries: querySelector, querySelectorAll, matches, closest, getElementsBy*
+    // Selector queries: querySelector, querySelectorAll, matches, closest (Selectors Level 4)
     let h = Rc::clone(host);
     define_host_method(vm, ep, "querySelector", move |vm, t, args| {
         let nid = require_node(vm, &h, t)?;
         let sel = vm.value_to_rust_string(arg(args, 0));
-        let found = h.borrow().document.borrow().query_selector(nid, &sel);
+        let parsed = parse_selector_list_strict(&sel)
+            .map_err(|e| crate::web_apis::create_dom_exception(vm, "SyntaxError", &e))?;
+        let found = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            query_selector_in_subtree(&doc, nid, &parsed, Some(nid), None)
+        };
         Ok(found.map_or(JsValue::NULL, |id| wrap_node(vm, &h, id)))
     });
     let h = Rc::clone(host);
     define_host_method(vm, ep, "querySelectorAll", move |vm, t, args| {
         let nid = require_node(vm, &h, t)?;
         let sel = vm.value_to_rust_string(arg(args, 0));
-        let list = h.borrow().document.borrow().query_selector_all(nid, &sel);
+        let parsed = parse_selector_list_strict(&sel)
+            .map_err(|e| crate::web_apis::create_dom_exception(vm, "SyntaxError", &e))?;
+        let list = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            query_selector_all_in_subtree(&doc, nid, &parsed, Some(nid), None)
+        };
         Ok(wrap_node_list(vm, &h, list))
     });
     let h = Rc::clone(host);
     define_host_method(vm, ep, "matches", move |vm, t, args| {
         let nid = require_node(vm, &h, t)?;
         let sel = vm.value_to_rust_string(arg(args, 0));
-        let parsed =
-            ComplexSelector::parse_shared(&sel).map_err(|e| vm.make_error("SyntaxError", e))?;
+        let parsed = parse_selector_list_strict(&sel)
+            .map_err(|e| crate::web_apis::create_dom_exception(vm, "SyntaxError", &e))?;
         let _doc_rc = Rc::clone(&h.borrow().document);
         let doc = _doc_rc.borrow();
-        let ok = parsed.iter().any(|cs| matches_complex(&doc, nid, cs));
+        let ok = matches_element_with_scope(&doc, nid, &parsed, Some(nid));
         Ok(JsValue::from_bool(ok))
     });
     let h = Rc::clone(host);
     define_host_method(vm, ep, "closest", move |vm, t, args| {
         let nid = require_node(vm, &h, t)?;
         let sel = vm.value_to_rust_string(arg(args, 0));
-        let parsed =
-            ComplexSelector::parse_shared(&sel).map_err(|e| vm.make_error("SyntaxError", e))?;
+        let parsed = parse_selector_list_strict(&sel)
+            .map_err(|e| crate::web_apis::create_dom_exception(vm, "SyntaxError", &e))?;
         let found = {
             let _doc_rc = Rc::clone(&h.borrow().document);
             let doc = _doc_rc.borrow();
@@ -1429,7 +1498,7 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
             let mut matched = None;
             while let Some(n) = cur {
                 if matches!(doc.get(n), Some(NodeData::Element(_)))
-                    && parsed.iter().any(|cs| matches_complex(&doc, n, cs))
+                    && matches_element_with_scope(&doc, n, &parsed, Some(nid))
                 {
                     matched = Some(n);
                     break;
@@ -2766,20 +2835,24 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
     let h = Rc::clone(host);
     define_host_method(vm, dp, "querySelector", move |vm, _, args| {
         let sel = vm.value_to_rust_string(arg(args, 0));
+        let parsed = parse_selector_list_strict(&sel)
+            .map_err(|e| crate::web_apis::create_dom_exception(vm, "SyntaxError", &e))?;
         let found = {
             let _doc_rc = Rc::clone(&h.borrow().document);
             let doc = _doc_rc.borrow();
-            doc.query_selector(doc.root(), &sel)
+            query_selector_in_subtree(&doc, doc.root(), &parsed, None, None)
         };
         Ok(found.map_or(JsValue::NULL, |nid| wrap_node(vm, &h, nid)))
     });
     let h = Rc::clone(host);
     define_host_method(vm, dp, "querySelectorAll", move |vm, _, args| {
         let sel = vm.value_to_rust_string(arg(args, 0));
+        let parsed = parse_selector_list_strict(&sel)
+            .map_err(|e| crate::web_apis::create_dom_exception(vm, "SyntaxError", &e))?;
         let list = {
             let _doc_rc = Rc::clone(&h.borrow().document);
             let doc = _doc_rc.borrow();
-            doc.query_selector_all(doc.root(), &sel)
+            query_selector_all_in_subtree(&doc, doc.root(), &parsed, None, None)
         };
         Ok(wrap_node_list(vm, &h, list))
     });
@@ -2878,14 +2951,34 @@ fn install_shadow_root_prototype(vm: &mut JsVm, host: &SharedHost) {
     define_host_method(vm, sp, "querySelector", move |vm, t, args| {
         let nid = require_node(vm, &h, t)?;
         let sel = vm.value_to_rust_string(arg(args, 0));
-        let found = h.borrow().document.borrow().query_selector(nid, &sel);
+        let parsed = parse_selector_list_strict(&sel)
+            .map_err(|e| crate::web_apis::create_dom_exception(vm, "SyntaxError", &e))?;
+        let found = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            let shadow_host = match doc.get(nid) {
+                Some(NodeData::ShadowRoot { host: he, .. }) => Some(*he),
+                _ => None,
+            };
+            query_selector_in_subtree(&doc, nid, &parsed, None, shadow_host)
+        };
         Ok(found.map_or(JsValue::NULL, |id| wrap_node(vm, &h, id)))
     });
     let h = Rc::clone(host);
     define_host_method(vm, sp, "querySelectorAll", move |vm, t, args| {
         let nid = require_node(vm, &h, t)?;
         let sel = vm.value_to_rust_string(arg(args, 0));
-        let list = h.borrow().document.borrow().query_selector_all(nid, &sel);
+        let parsed = parse_selector_list_strict(&sel)
+            .map_err(|e| crate::web_apis::create_dom_exception(vm, "SyntaxError", &e))?;
+        let list = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            let shadow_host = match doc.get(nid) {
+                Some(NodeData::ShadowRoot { host: he, .. }) => Some(*he),
+                _ => None,
+            };
+            query_selector_all_in_subtree(&doc, nid, &parsed, None, shadow_host)
+        };
         Ok(wrap_node_list(vm, &h, list))
     });
     let h = Rc::clone(host);
@@ -3025,18 +3118,162 @@ fn install_window_and_cssom(vm: &mut JsVm, host: &SharedHost) {
         Ok(JsValue::from_object(p))
     });
     define_global(vm, "customElements", JsValue::from_object(ce_reg));
+}
 
-    // window.getComputedStyle(element)
-    let h = Rc::clone(host);
-    let gcs = vm.alloc_host_fn("getComputedStyle", move |vm, _, args| {
-        let nid = require_node(vm, &h, arg(args, 0))?;
-        let style = h
-            .borrow_mut()
-            .computed_style_for_node(nid)
-            .unwrap_or_else(|| Arc::new(ComputedStyle::default()));
-        Ok(create_computed_style_proxy(vm, style))
+/// Installs HTML Living Standard §7.3.3.1 named access on `Window` via a `WindowProperties`
+/// Proxy sitting between `window` (`vm.global`) and `EventTarget.prototype`.
+fn install_window_properties_proxy(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    event_target_proto: HeapHandle,
+) {
+    let target = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Ordinary,
+        Some(event_target_proto),
+    ));
+    let handler = vm.alloc_ordinary_object();
+
+    let h_has = Rc::clone(host);
+    define_host_method(vm, handler, "has", move |vm, _, args| {
+        let target_h = arg(args, 0).as_object();
+        let prop_val = arg(args, 1);
+        if prop_val.is_symbol() {
+            if let Some(th) = target_h {
+                let k_str = vm.to_property_key(prop_val)?;
+                let key = vm.heap.intern_key(&k_str);
+                return Ok(JsValue::from_bool(vm.has_property_by_key(th, key)?));
+            }
+            return Ok(JsValue::FALSE);
+        }
+        let name = vm.value_to_rust_string(prop_val);
+        if let Some(th) = target_h {
+            let k = vm.heap.intern_key(&name);
+            if vm.has_property_by_key(th, k)? {
+                return Ok(JsValue::TRUE);
+            }
+        }
+        if name.is_empty() {
+            return Ok(JsValue::FALSE);
+        }
+        let found = {
+            let doc_rc = Rc::clone(&h_has.borrow().document);
+            let doc = doc_rc.borrow();
+            !find_window_named_elements(&doc, &name).is_empty()
+        };
+        Ok(JsValue::from_bool(found))
     });
-    define_global(vm, "getComputedStyle", JsValue::from_object(gcs));
+
+    let h_get = Rc::clone(host);
+    define_host_method(vm, handler, "get", move |vm, _, args| {
+        let target_h = arg(args, 0).as_object();
+        let prop_val = arg(args, 1);
+        let receiver = arg(args, 2);
+        if prop_val.is_symbol() {
+            if let Some(th) = target_h {
+                let k_str = vm.to_property_key(prop_val)?;
+                let key = vm.heap.intern_key(&k_str);
+                return vm.get_property_with_receiver(th, key, receiver);
+            }
+            return Ok(JsValue::UNDEFINED);
+        }
+        let name = vm.value_to_rust_string(prop_val);
+        if let Some(th) = target_h {
+            let k = vm.heap.intern_key(&name);
+            if vm.has_property_by_key(th, k)? {
+                return vm.get_property_with_receiver(th, k, receiver);
+            }
+        }
+        if name.is_empty() {
+            return Ok(JsValue::UNDEFINED);
+        }
+        let matches = {
+            let doc_rc = Rc::clone(&h_get.borrow().document);
+            let doc = doc_rc.borrow();
+            find_window_named_elements(&doc, &name)
+        };
+        match matches.as_slice() {
+            [] => Ok(JsValue::UNDEFINED),
+            [only] => Ok(wrap_node(vm, &h_get, *only)),
+            _ => Ok(wrap_node_list(vm, &h_get, matches)),
+        }
+    });
+
+    let proxy = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Proxy(rix_js::ProxyObject {
+            target,
+            handler,
+            revoked: false,
+        }),
+        Some(event_target_proto),
+    ));
+    let g = vm.global;
+    vm.heap.object_set_prototype(g, Some(proxy), &mut vm.shapes);
+}
+
+fn find_window_named_elements(doc: &Document, name: &str) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    for nid in doc.descendants(doc.root()) {
+        let Some(NodeData::Element(el)) = doc.get(nid) else {
+            continue;
+        };
+        if el.cached_id.as_deref() == Some(name) {
+            out.push(nid);
+            continue;
+        }
+        let tag = el.name.local.as_str();
+        if matches!(
+            tag,
+            "a" | "applet" | "area" | "embed" | "form" | "frameset" | "iframe" | "img" | "object"
+        ) && el.get_attribute("name") == Some(name)
+        {
+            out.push(nid);
+        }
+    }
+    out
+}
+
+fn install_fragment_prototype(vm: &mut JsVm, host: &SharedHost) {
+    let fp = host.borrow().prototypes.fragment_proto;
+    let h = Rc::clone(host);
+    define_host_method(vm, fp, "querySelector", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let sel = vm.value_to_rust_string(arg(args, 0));
+        let parsed = parse_selector_list_strict(&sel)
+            .map_err(|e| crate::web_apis::create_dom_exception(vm, "SyntaxError", &e))?;
+        let found = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            query_selector_in_subtree(&doc, nid, &parsed, None, None)
+        };
+        Ok(found.map_or(JsValue::NULL, |id| wrap_node(vm, &h, id)))
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, fp, "querySelectorAll", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let sel = vm.value_to_rust_string(arg(args, 0));
+        let parsed = parse_selector_list_strict(&sel)
+            .map_err(|e| crate::web_apis::create_dom_exception(vm, "SyntaxError", &e))?;
+        let list = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            query_selector_all_in_subtree(&doc, nid, &parsed, None, None)
+        };
+        Ok(wrap_node_list(vm, &h, list))
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, fp, "getElementById", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let id = vm.value_to_rust_string(arg(args, 0));
+        let found = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            let res = doc.descendants(nid).find(|&n| {
+                matches!(doc.get(n), Some(NodeData::Element(e)) if e.get_attribute("id") == Some(id.as_str()))
+            });
+            res
+        };
+        Ok(found.map_or(JsValue::NULL, |id| wrap_node(vm, &h, id)))
+    });
 }
 
 fn upgrade_if_custom_element(vm: &mut JsVm, host: &SharedHost, nid: NodeId, tag: &str) {
@@ -3108,7 +3345,7 @@ fn invoke_custom_element_lifecycle(
 // Attributes, classList, inline style Proxy, dataset Proxy & getComputedStyle
 // ---------------------------------------------------------------------------
 
-fn get_attr_string(host: &SharedHost, nid: NodeId, name: &str) -> Option<String> {
+pub(crate) fn get_attr_string(host: &SharedHost, nid: NodeId, name: &str) -> Option<String> {
     let _doc_rc = Rc::clone(&host.borrow().document);
     let doc = _doc_rc.borrow();
     match doc.get(nid) {
@@ -3367,132 +3604,6 @@ fn camel_to_kebab(input: &str) -> String {
     out
 }
 
-fn parse_style_decls(raw: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for part in raw.split(';') {
-        if let Some((k, v)) = part.split_once(':') {
-            let key = k.trim().to_ascii_lowercase();
-            let val = v.trim().to_string();
-            if !key.is_empty() && !val.is_empty() {
-                if let Some(existing) = out.iter_mut().find(|(ek, _)| ek == &key) {
-                    existing.1 = val;
-                } else {
-                    out.push((key, val));
-                }
-            }
-        }
-    }
-    out
-}
-
-fn serialize_style_decls(decls: &[(String, String)]) -> String {
-    decls
-        .iter()
-        .map(|(k, v)| format!("{k}: {v};"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: NodeId) -> JsValue {
-    let target = vm.alloc_ordinary_object();
-    let h = Rc::clone(host);
-    define_host_method(vm, target, "getPropertyValue", move |vm, _, args| {
-        let prop = vm.value_to_rust_string(arg(args, 0)).to_ascii_lowercase();
-        let raw = get_attr_string(&h, nid, "style").unwrap_or_default();
-        let val = parse_style_decls(&raw)
-            .into_iter()
-            .find(|(k, _)| k == &prop)
-            .map(|(_, v)| v)
-            .unwrap_or_default();
-        Ok(JsValue::from_string(vm.heap.alloc_string(val)))
-    });
-    let h = Rc::clone(host);
-    define_host_method(vm, target, "setProperty", move |vm, _, args| {
-        let prop = vm.value_to_rust_string(arg(args, 0)).to_ascii_lowercase();
-        let val = vm.value_to_rust_string(arg(args, 1));
-        let raw = get_attr_string(&h, nid, "style").unwrap_or_default();
-        let mut decls = parse_style_decls(&raw);
-        if val.is_empty() {
-            decls.retain(|(k, _)| k != &prop);
-        } else if let Some(existing) = decls.iter_mut().find(|(k, _)| k == &prop) {
-            existing.1 = val;
-        } else {
-            decls.push((prop, val));
-        }
-        set_element_attr(vm, &h, nid, "style", &serialize_style_decls(&decls));
-        Ok(JsValue::UNDEFINED)
-    });
-    let h = Rc::clone(host);
-    define_host_method(vm, target, "removeProperty", move |vm, _, args| {
-        let prop = vm.value_to_rust_string(arg(args, 0)).to_ascii_lowercase();
-        let raw = get_attr_string(&h, nid, "style").unwrap_or_default();
-        let mut decls = parse_style_decls(&raw);
-        let old = decls
-            .iter()
-            .find(|(k, _)| k == &prop)
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
-        decls.retain(|(k, _)| k != &prop);
-        set_element_attr(vm, &h, nid, "style", &serialize_style_decls(&decls));
-        Ok(JsValue::from_string(vm.heap.alloc_string(old)))
-    });
-
-    let handler = vm.alloc_ordinary_object();
-    let h_get = Rc::clone(host);
-    define_host_method(vm, handler, "get", move |vm, _, args| {
-        let prop_name = vm.value_to_rust_string(arg(args, 1));
-        if prop_name == "cssText" {
-            let raw = get_attr_string(&h_get, nid, "style").unwrap_or_default();
-            return Ok(JsValue::from_string(vm.heap.alloc_string(raw)));
-        }
-        let k = vm.heap.intern_key(&prop_name);
-        if let Some(t_h) = arg(args, 0).as_object() {
-            if vm.heap.object_get_own(t_h, k, &vm.shapes).is_some() {
-                return vm.get_property_by_key(t_h, k);
-            }
-        }
-        let css_key = camel_to_kebab(&prop_name);
-        let raw = get_attr_string(&h_get, nid, "style").unwrap_or_default();
-        let val = parse_style_decls(&raw)
-            .into_iter()
-            .find(|(k, _)| k == &css_key)
-            .map(|(_, v)| v)
-            .unwrap_or_default();
-        Ok(JsValue::from_string(vm.heap.alloc_string(val)))
-    });
-    let h_set = Rc::clone(host);
-    define_host_method(vm, handler, "set", move |vm, _, args| {
-        let prop_name = vm.value_to_rust_string(arg(args, 1));
-        let val = vm.value_to_rust_string(arg(args, 2));
-        if prop_name == "cssText" {
-            set_element_attr(vm, &h_set, nid, "style", &val);
-            return Ok(JsValue::TRUE);
-        }
-        let css_key = camel_to_kebab(&prop_name);
-        let raw = get_attr_string(&h_set, nid, "style").unwrap_or_default();
-        let mut decls = parse_style_decls(&raw);
-        if val.is_empty() {
-            decls.retain(|(k, _)| k != &css_key);
-        } else if let Some(existing) = decls.iter_mut().find(|(k, _)| k == &css_key) {
-            existing.1 = val;
-        } else {
-            decls.push((css_key, val));
-        }
-        set_element_attr(vm, &h_set, nid, "style", &serialize_style_decls(&decls));
-        Ok(JsValue::TRUE)
-    });
-
-    let proxy = vm.heap.alloc_object(JsObject::with_kind(
-        ObjectKind::Proxy(rix_js::ProxyObject {
-            target,
-            handler,
-            revoked: false,
-        }),
-        Some(vm.object_proto),
-    ));
-    JsValue::from_object(proxy)
-}
-
 fn create_dataset_proxy(vm: &mut JsVm, host: &SharedHost, nid: NodeId) -> JsValue {
     let target = vm.alloc_ordinary_object();
     let handler = vm.alloc_ordinary_object();
@@ -3522,140 +3633,4 @@ fn create_dataset_proxy(vm: &mut JsVm, host: &SharedHost, nid: NodeId) -> JsValu
         Some(vm.object_proto),
     ));
     JsValue::from_object(proxy)
-}
-
-fn create_computed_style_proxy(vm: &mut JsVm, style: Arc<ComputedStyle>) -> JsValue {
-    let target = vm.alloc_ordinary_object();
-    let s1 = Arc::clone(&style);
-    define_host_method(vm, target, "getPropertyValue", move |vm, _, args| {
-        let prop = vm.value_to_rust_string(arg(args, 0));
-        let val = format_computed_property(&s1, &prop);
-        Ok(JsValue::from_string(vm.heap.alloc_string(val)))
-    });
-    let handler = vm.alloc_ordinary_object();
-    let s2 = style;
-    define_host_method(vm, handler, "get", move |vm, _, args| {
-        let prop = vm.value_to_rust_string(arg(args, 1));
-        let k = vm.heap.intern_key(&prop);
-        if let Some(t_h) = arg(args, 0).as_object() {
-            if vm.heap.object_get_own(t_h, k, &vm.shapes).is_some() {
-                return vm.get_property_by_key(t_h, k);
-            }
-        }
-        let css_key = camel_to_kebab(&prop);
-        let val = format_computed_property(&s2, &css_key);
-        Ok(JsValue::from_string(vm.heap.alloc_string(val)))
-    });
-    let proxy = vm.heap.alloc_object(JsObject::with_kind(
-        ObjectKind::Proxy(rix_js::ProxyObject {
-            target,
-            handler,
-            revoked: false,
-        }),
-        Some(vm.object_proto),
-    ));
-    JsValue::from_object(proxy)
-}
-
-fn format_rgba(c: ColorRgba) -> String {
-    if c.a == 255 {
-        format!("rgb({}, {}, {})", c.r, c.g, c.b)
-    } else {
-        format!(
-            "rgba({}, {}, {}, {:.3})",
-            c.r,
-            c.g,
-            c.b,
-            f32::from(c.a) / 255.0
-        )
-    }
-}
-
-fn format_size(s: &SizeValue) -> String {
-    match s {
-        SizeValue::Auto => "auto".into(),
-        SizeValue::None => "none".into(),
-        SizeValue::MinContent => "min-content".into(),
-        SizeValue::MaxContent => "max-content".into(),
-        SizeValue::FitContent(_) => "fit-content".into(),
-        SizeValue::Stretch => "stretch".into(),
-        SizeValue::Length(lp) => format_lp(lp),
-    }
-}
-
-fn format_lp(lp: &LengthPercentage) -> String {
-    match lp {
-        LengthPercentage::Zero => "0px".into(),
-        LengthPercentage::Length(v, _) => format!("{v}px"),
-        LengthPercentage::Percent(p) => format!("{p}%"),
-        LengthPercentage::Calc(_) => "0px".into(),
-    }
-}
-
-fn format_lpa(v: &LengthPercentageAuto) -> String {
-    match v {
-        LengthPercentageAuto::Auto => "auto".into(),
-        LengthPercentageAuto::Value(lp) => format_lp(lp),
-    }
-}
-
-fn format_computed_property(style: &ComputedStyle, prop: &str) -> String {
-    if prop.starts_with("--") {
-        let key = rix_core::intern_str(prop);
-        if let Some(tokens) = style.custom_properties.get(&key) {
-            return tokens
-                .iter()
-                .map(|t| format!("{t:?}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-        }
-        return String::new();
-    }
-    match prop {
-        "display" => match style.display {
-            DisplayMode::None => "none",
-            DisplayMode::Block => "block",
-            DisplayMode::Inline => "inline",
-            DisplayMode::InlineBlock => "inline-block",
-            DisplayMode::Flex => "flex",
-            DisplayMode::InlineFlex => "inline-flex",
-            DisplayMode::Grid => "grid",
-            DisplayMode::InlineGrid => "inline-grid",
-            DisplayMode::Table => "table",
-            DisplayMode::ListItem => "list-item",
-            DisplayMode::Contents => "contents",
-            _ => "block",
-        }
-        .into(),
-        "position" => match style.position {
-            PositionMode::Static => "static",
-            PositionMode::Relative => "relative",
-            PositionMode::Absolute => "absolute",
-            PositionMode::Fixed => "fixed",
-            PositionMode::Sticky => "sticky",
-        }
-        .into(),
-        "visibility" => match style.visibility {
-            VisibilityMode::Visible => "visible",
-            VisibilityMode::Hidden => "hidden",
-            VisibilityMode::Collapse => "collapse",
-        }
-        .into(),
-        "color" => format_rgba(style.text.color),
-        "background-color" => format_rgba(style.visual.background_color),
-        "opacity" => format!("{}", style.opacity),
-        "font-size" => format!("{}px", style.text.font_size_px),
-        "font-weight" => format!("{}", style.text.font_weight),
-        "width" => format_size(&style.box_model.width),
-        "height" => format_size(&style.box_model.height),
-        "margin-top" => format_lpa(&style.box_model.margin.top),
-        "margin-right" => format_lpa(&style.box_model.margin.right),
-        "margin-bottom" => format_lpa(&style.box_model.margin.bottom),
-        "margin-left" => format_lpa(&style.box_model.margin.left),
-        "padding-top" => format_lp(&style.box_model.padding.top),
-        "padding-right" => format_lp(&style.box_model.padding.right),
-        "padding-bottom" => format_lp(&style.box_model.padding.bottom),
-        "padding-left" => format_lp(&style.box_model.padding.left),
-        _ => String::new(),
-    }
 }
