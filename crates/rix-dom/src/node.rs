@@ -23,6 +23,10 @@ pub enum NodeData {
     Element(ElementData),
     Text(String),
     Comment(String),
+    ProcessingInstruction {
+        target: String,
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

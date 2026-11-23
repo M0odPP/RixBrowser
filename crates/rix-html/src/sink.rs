@@ -5,11 +5,21 @@ use rix_dom::node::{ElementData, NodeData};
 use rix_dom::tree::Document;
 use rix_dom::NodeId;
 use std::cell::{Cell, RefCell};
+use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
+
+#[derive(Debug, Clone)]
+enum PiCommentAction {
+    KeepComment,
+    ProcessingInstruction { target: String, data: String },
+    DropEof,
+}
 
 pub struct DomTreeSink {
     document: Rc<RefCell<Document>>,
     quirks_mode: Cell<QuirksMode>,
+    pi_actions: RefCell<VecDeque<PiCommentAction>>,
+    dropped_nodes: RefCell<HashSet<NodeId>>,
 }
 
 impl Default for DomTreeSink {
@@ -23,6 +33,8 @@ impl DomTreeSink {
         Self {
             document: Rc::new(RefCell::new(Document::new())),
             quirks_mode: Cell::new(QuirksMode::NoQuirks),
+            pi_actions: RefCell::new(VecDeque::new()),
+            dropped_nodes: RefCell::new(HashSet::new()),
         }
     }
 
@@ -30,7 +42,19 @@ impl DomTreeSink {
         Self {
             document,
             quirks_mode: Cell::new(QuirksMode::NoQuirks),
+            pi_actions: RefCell::new(VecDeque::new()),
+            dropped_nodes: RefCell::new(HashSet::new()),
         }
+    }
+
+    /// Creates a tree sink pre-indexed with WHATWG HTML Processing Instruction classifications
+    /// when `source` contains `"<?"`. Zero overhead for documents without `"<?"`.
+    pub fn with_source_pi_scan(source: &str, scripting_enabled: bool) -> Self {
+        let sink = Self::new();
+        if source.contains("<?") {
+            *sink.pi_actions.borrow_mut() = scan_pi_comment_actions(source, scripting_enabled);
+        }
+        sink
     }
 
     pub fn document(&self) -> Rc<RefCell<Document>> {
@@ -40,6 +64,181 @@ impl DomTreeSink {
     pub fn quirks_mode(&self) -> QuirksMode {
         self.quirks_mode.get()
     }
+}
+
+fn is_ascii_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
+}
+
+fn is_pi_target_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+fn is_pi_target_cont(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// Scans an HTML source string in tokenizer order and records how each comment/bogus-comment
+/// emitted by `html5ever` maps to a WHATWG HTML Processing Instruction, Comment, or EOF drop.
+fn scan_pi_comment_actions(html: &str, scripting_enabled: bool) -> VecDeque<PiCommentAction> {
+    let mut actions = VecDeque::new();
+    let bytes = html.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+
+    while i < len {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        // Standard HTML comment `<!-- ... -->`
+        if html[i..].starts_with("<!--") {
+            actions.push_back(PiCommentAction::KeepComment);
+            i += 4;
+            if i < len && bytes[i] == b'>' {
+                i += 1;
+                continue;
+            }
+            if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'>' {
+                i += 2;
+                continue;
+            }
+            if let Some(rel) = html[i..].find("-->") {
+                i += rel + 3;
+            } else {
+                break;
+            }
+            continue;
+        }
+        // Processing instruction candidate `<?...`
+        if i + 1 < len && bytes[i + 1] == b'?' {
+            let start = i + 2;
+            let mut end = start;
+            while end < len && bytes[end] != b'>' {
+                end += 1;
+            }
+            let closed = end < len && bytes[end] == b'>';
+            if start >= len {
+                // `<?` at EOF
+                actions.push_back(PiCommentAction::DropEof);
+                break;
+            }
+            if !is_pi_target_start(bytes[start]) {
+                // Invalid PI target start -> bogus comment (e.g. `<? `, `<?1st`, `<?-x`)
+                actions.push_back(PiCommentAction::KeepComment);
+                i = if closed { end + 1 } else { len };
+                continue;
+            }
+            let mut t_end = start + 1;
+            while t_end < end && is_pi_target_cont(bytes[t_end]) {
+                t_end += 1;
+            }
+            let target = &html[start..t_end];
+            let valid_delim = t_end == end || is_ascii_ws(bytes[t_end]) || bytes[t_end] == b'?';
+            let is_xml_reserved = target.len() >= 3 && target[..3].eq_ignore_ascii_case("xml");
+            if !valid_delim || is_xml_reserved {
+                actions.push_back(PiCommentAction::KeepComment);
+            } else if !closed {
+                actions.push_back(PiCommentAction::DropEof);
+            } else {
+                let mut rest = &html[t_end..end];
+                if rest.as_bytes().first().is_some_and(|&b| is_ascii_ws(b)) {
+                    rest = rest.trim_start_matches(|c: char| {
+                        matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c')
+                    });
+                }
+                let normalized = rest.replace("\r\n", "\n").replace('\r', "\n");
+                let data = normalized
+                    .strip_suffix('?')
+                    .unwrap_or(&normalized)
+                    .to_string();
+                actions.push_back(PiCommentAction::ProcessingInstruction {
+                    target: target.to_string(),
+                    data,
+                });
+            }
+            i = if closed { end + 1 } else { len };
+            continue;
+        }
+        // `<!DOCTYPE ...>` vs other bogus `<!...>` comments
+        if i + 1 < len && bytes[i + 1] == b'!' {
+            let after = &html[i + 2..];
+            let is_doctype = after.len() >= 7 && after[..7].eq_ignore_ascii_case("doctype");
+            let is_cdata = after.starts_with("[CDATA[");
+            if is_cdata {
+                if let Some(rel) = after.find("]]>") {
+                    i = i + 2 + rel + 3;
+                } else {
+                    break;
+                }
+                continue;
+            }
+            if !is_doctype {
+                actions.push_back(PiCommentAction::KeepComment);
+            }
+            while i < len && bytes[i] != b'>' {
+                i += 1;
+            }
+            if i < len {
+                i += 1;
+            }
+            continue;
+        }
+        // Element start tag: skip attributes and rawtext/RCDATA bodies so `<?...>` inside them stays text.
+        if i + 1 < len && bytes[i + 1].is_ascii_alphabetic() {
+            let tstart = i + 1;
+            let mut tend = tstart;
+            while tend < len && (bytes[tend].is_ascii_alphanumeric() || bytes[tend] == b'-') {
+                tend += 1;
+            }
+            let tag = &html[tstart..tend];
+            let mut p = tend;
+            let mut quote = 0u8;
+            while p < len {
+                let b = bytes[p];
+                if quote != 0 {
+                    if b == quote {
+                        quote = 0;
+                    }
+                } else if b == b'"' || b == b'\'' {
+                    quote = b;
+                } else if b == b'>' {
+                    p += 1;
+                    break;
+                }
+                p += 1;
+            }
+            i = p;
+            let is_raw = tag.eq_ignore_ascii_case("script")
+                || tag.eq_ignore_ascii_case("style")
+                || tag.eq_ignore_ascii_case("textarea")
+                || tag.eq_ignore_ascii_case("title")
+                || tag.eq_ignore_ascii_case("xmp")
+                || tag.eq_ignore_ascii_case("iframe")
+                || tag.eq_ignore_ascii_case("noembed")
+                || tag.eq_ignore_ascii_case("noframes")
+                || (scripting_enabled && tag.eq_ignore_ascii_case("noscript"));
+            if is_raw {
+                let close_pat = format!("</{}", tag.to_ascii_lowercase());
+                let lower_rest = html[i..].to_ascii_lowercase();
+                if let Some(rel) = lower_rest.find(&close_pat) {
+                    i += rel;
+                    while i < len && bytes[i] != b'>' {
+                        i += 1;
+                    }
+                    if i < len {
+                        i += 1;
+                    }
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+
+    actions
 }
 
 impl TreeSink for DomTreeSink {
@@ -62,6 +261,12 @@ impl TreeSink for DomTreeSink {
 
     fn set_quirks_mode(&self, mode: QuirksMode) {
         self.quirks_mode.set(mode);
+        let code = match mode {
+            QuirksMode::NoQuirks => 0,
+            QuirksMode::LimitedQuirks => 1,
+            QuirksMode::Quirks => 2,
+        };
+        self.document.borrow_mut().set_quirks_mode(code);
     }
 
     fn same_node(&self, x: &Self::Handle, y: &Self::Handle) -> bool {
@@ -89,7 +294,9 @@ impl TreeSink for DomTreeSink {
         }
         elem_data.sync_cached_attrs();
 
-        if &*elem_data.name.local == "template" {
+        if &*elem_data.name.ns == "http://www.w3.org/1999/xhtml"
+            && &*elem_data.name.local == "template"
+        {
             let frag = self
                 .document
                 .borrow_mut()
@@ -122,21 +329,40 @@ impl TreeSink for DomTreeSink {
     }
 
     fn create_comment(&self, text: StrTendril) -> Self::Handle {
-        self.document
-            .borrow_mut()
-            .new_node(NodeData::Comment(text.to_string()))
+        let action = self.pi_actions.borrow_mut().pop_front();
+        match action {
+            Some(PiCommentAction::ProcessingInstruction { target, data }) => self
+                .document
+                .borrow_mut()
+                .create_processing_instruction(&target, &data),
+            Some(PiCommentAction::DropEof) => {
+                let placeholder = self
+                    .document
+                    .borrow_mut()
+                    .new_node(NodeData::Comment(String::new()));
+                self.dropped_nodes.borrow_mut().insert(placeholder);
+                placeholder
+            }
+            _ => self
+                .document
+                .borrow_mut()
+                .new_node(NodeData::Comment(text.to_string())),
+        }
     }
 
-    fn create_pi(&self, _target: StrTendril, _data: StrTendril) -> Self::Handle {
+    fn create_pi(&self, target: StrTendril, data: StrTendril) -> Self::Handle {
         self.document
             .borrow_mut()
-            .new_node(NodeData::Comment("pi".into()))
+            .create_processing_instruction(&target, &data)
     }
 
     fn append(&self, parent: &Self::Handle, child: NodeOrText<Self::Handle>) {
         let mut doc = self.document.borrow_mut();
         match child {
             NodeOrText::AppendNode(node) => {
+                if self.dropped_nodes.borrow().contains(&node) {
+                    return;
+                }
                 doc.append_child(*parent, node);
             }
             NodeOrText::AppendText(text) => {
@@ -157,9 +383,20 @@ impl TreeSink for DomTreeSink {
         let mut doc = self.document.borrow_mut();
         match new_node {
             NodeOrText::AppendNode(node) => {
+                if self.dropped_nodes.borrow().contains(&node) {
+                    return;
+                }
                 doc.insert_before(*sibling, node);
             }
             NodeOrText::AppendText(text) => {
+                // Per WHATWG HTML §13.2.6.1 ("insert a character"): merge with immediately
+                // preceding Text sibling when present (critical for foster-parented text).
+                if let Some(prev) = doc.previous_sibling(*sibling) {
+                    if let Some(NodeData::Text(existing)) = doc.get_mut(prev) {
+                        existing.push_str(&text);
+                        return;
+                    }
+                }
                 let text_node = doc.create_text(&text);
                 doc.insert_before(*sibling, text_node);
             }
@@ -233,5 +470,21 @@ impl TreeSink for DomTreeSink {
             Some(NodeData::Element(elem)) => elem.template_contents.unwrap_or(*target),
             _ => *target,
         }
+    }
+
+    fn is_mathml_annotation_xml_integration_point(&self, handle: &Self::Handle) -> bool {
+        let doc = self.document.borrow();
+        let Some(NodeData::Element(elem)) = doc.get(*handle) else {
+            return false;
+        };
+        if &*elem.name.ns != "http://www.w3.org/1998/Math/MathML"
+            || &*elem.name.local != "annotation-xml"
+        {
+            return false;
+        }
+        elem.get_attribute("encoding").is_some_and(|enc| {
+            enc.eq_ignore_ascii_case("text/html")
+                || enc.eq_ignore_ascii_case("application/xhtml+xml")
+        })
     }
 }

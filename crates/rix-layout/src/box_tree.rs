@@ -292,7 +292,10 @@ impl<'a> BoxTreeBuilder<'a> {
                 }
                 out
             }
-            NodeData::Document | NodeData::DocumentType { .. } | NodeData::Comment(_) => Vec::new(),
+            NodeData::Document
+            | NodeData::DocumentType { .. }
+            | NodeData::Comment(_)
+            | NodeData::ProcessingInstruction { .. } => Vec::new(),
         }
     }
 
