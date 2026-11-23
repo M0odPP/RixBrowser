@@ -1419,143 +1419,20 @@ pub(crate) fn own_property_keys_spec(
     vm: &mut JsVm,
     obj: HeapHandle,
 ) -> Result<Vec<(JsValue, crate::PropertyKey)>, JsException> {
-    if let Some(ObjectKind::Proxy(p)) = vm.heap.get_object(obj).map(|o| o.kind.clone()) {
-        if p.revoked {
-            return Err(vm.type_error("Proxy has been revoked"));
-        }
-        let trap = vm.get_property_by_key(p.handler, vm.key_own_keys)?;
-        if !trap.is_undefined() && !trap.is_null() {
-            let list_val = vm.call_value(
-                trap,
-                JsValue::from_object(p.handler),
-                &[JsValue::from_object(p.target)],
-            )?;
-            let list_h = list_val
-                .as_object()
-                .ok_or_else(|| vm.type_error("Proxy ownKeys trap must return an object"))?;
-            let len = vm.array_get_len(list_h)?;
-            let mut out = Vec::with_capacity(len.min(65_536) as usize);
-            for i in 0..len {
-                let kv = vm.array_get_index(list_h, i)?;
-                if !kv.is_string() && !kv.is_symbol() {
-                    return Err(vm.type_error("Proxy ownKeys trap returned non-string/symbol key"));
-                }
-                let ks = vm.to_property_key(kv)?;
-                let pk = vm.heap.intern_key(&ks);
-                out.push((kv, pk));
-            }
-            return Ok(out);
-        }
-        return own_property_keys_spec(vm, p.target);
-    }
-
-    let mut indices: Vec<u32> = Vec::new();
-    let mut str_keys: Vec<(String, crate::PropertyKey)> = Vec::new();
-    let mut sym_keys: Vec<(crate::SymbolId, crate::PropertyKey)> = Vec::new();
-
-    if let Some(o) = vm.heap.get_object(obj) {
-        let elen = o.elements.len();
-        for i in 0..elen {
-            if o.elements.has(i) {
-                indices.push(i);
-            }
-        }
-        let raw_keys: Vec<crate::PropertyKey> = if o.is_dictionary() {
-            o.rare
-                .as_ref()
-                .map(|r| r.dict_order.clone())
-                .unwrap_or_default()
-        } else {
-            vm.shapes
-                .get(o.shape())
-                .map(|s| s.keys().to_vec())
-                .unwrap_or_default()
-        };
-        for pk in raw_keys {
-            if let Some(name) = vm.heap.resolve_key(pk).map(str::to_string) {
-                if let Some(sym_num) = name
-                    .strip_prefix("Symbol(")
-                    .and_then(|s| s.strip_suffix(')'))
-                    .and_then(|n| n.parse::<u32>().ok())
-                {
-                    sym_keys.push((crate::SymbolId(sym_num), pk));
-                } else if let Ok(idx) = name.parse::<u32>() {
-                    if idx < u32::MAX && idx.to_string() == name {
-                        if !indices.contains(&idx) {
-                            indices.push(idx);
-                        }
-                    } else {
-                        str_keys.push((name, pk));
-                    }
-                } else {
-                    str_keys.push((name, pk));
-                }
-            }
-        }
-    }
-    indices.sort_unstable();
-    let mut out = Vec::with_capacity(indices.len() + str_keys.len() + sym_keys.len());
-    for i in indices {
-        let s = i.to_string();
-        let pk = vm.heap.intern_key(&s);
-        let kv = JsValue::from_string(vm.heap.alloc_string(s));
-        out.push((kv, pk));
-    }
-    for (s, pk) in str_keys {
-        let kv = JsValue::from_string(vm.heap.alloc_string(s));
-        out.push((kv, pk));
-    }
-    for (sid, pk) in sym_keys {
-        out.push((JsValue::from_symbol(sid), pk));
-    }
-    Ok(out)
+    crate::proxy::mop_own_property_keys(vm, obj)
 }
 
 /// Checks `GetOwnProperty(obj, key)` and returns `Ok(true)` iff it exists and `[[Enumerable]]` is true.
 pub(crate) fn is_own_prop_enumerable(
     vm: &mut JsVm,
     obj: HeapHandle,
-    key_val: JsValue,
+    _key_val: JsValue,
     pk: crate::PropertyKey,
 ) -> Result<bool, JsException> {
-    if let Some(ObjectKind::Proxy(p)) = vm.heap.get_object(obj).map(|o| o.kind.clone()) {
-        if p.revoked {
-            return Err(vm.type_error("Proxy has been revoked"));
-        }
-        let k_gopd = vm.heap.intern_key("getOwnPropertyDescriptor");
-        let trap = vm.get_property_by_key(p.handler, k_gopd)?;
-        if !trap.is_undefined() && !trap.is_null() {
-            let desc = vm.call_value(
-                trap,
-                JsValue::from_object(p.handler),
-                &[JsValue::from_object(p.target), key_val],
-            )?;
-            if desc.is_undefined() {
-                return Ok(false);
-            }
-            let dh = desc.as_object().ok_or_else(|| {
-                vm.type_error("Proxy getOwnPropertyDescriptor trap must return object or undefined")
-            })?;
-            let k_enum = vm.heap.intern_key("enumerable");
-            let ev = vm.get_property_by_key(dh, k_enum)?;
-            return Ok(vm.to_boolean(ev));
-        }
-        return is_own_prop_enumerable(vm, p.target, key_val, pk);
-    }
-    if let Some(prop) = vm.heap.object_get_own(obj, pk, &vm.shapes) {
-        return Ok(prop.attrs.contains(PropertyAttrs::ENUMERABLE));
-    }
-    if let Some(idx) = vm
-        .heap
-        .resolve_key(pk)
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|&i| i < u32::MAX)
-    {
-        if vm.heap.get_object(obj).is_some_and(|o| o.elements.has(idx)) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(
+        crate::proxy::mop_get_own_property(vm, obj, pk)?
+            .is_some_and(|d| d.enumerable == Some(true)),
+    )
 }
 
 fn build_keyed_result_object(

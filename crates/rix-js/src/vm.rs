@@ -285,7 +285,7 @@ pub struct JsVm {
     registers: Vec<JsValue>,
     frames: Vec<CallFrame>,
     open_upvalues: Vec<(usize, HeapHandle)>,
-    with_stack: Vec<HeapHandle>,
+    with_stack: Vec<(usize, HeapHandle)>,
     iterators: HashMap<HeapHandle, IteratorState>,
     /// Optional cooperative loop back-edge budget (`None` = unlimited).
     pub max_loop_iterations: Option<u64>,
@@ -751,7 +751,7 @@ impl JsVm {
         for &(_, uv) in &self.open_upvalues {
             roots.push(JsValue::from_object(uv));
         }
-        for &w in &self.with_stack {
+        for &(_, w) in &self.with_stack {
             roots.push(JsValue::from_object(w));
         }
         for (&iter_h, state) in &self.iterators {
@@ -881,9 +881,6 @@ impl JsVm {
             match &obj.kind {
                 ObjectKind::BoundFunction(b) => cur = b.target,
                 ObjectKind::Proxy(p) => {
-                    if p.revoked {
-                        return false;
-                    }
                     cur = p.target;
                 }
                 _ => return obj.is_constructor,
@@ -1072,6 +1069,9 @@ impl JsVm {
             }
             let trap = self.get_property_by_key(p.handler, self.key_construct)?;
             if !trap.is_undefined() && !trap.is_null() {
+                if !trap.as_object().is_some_and(|h| self.is_callable_handle(h)) {
+                    return Err(self.type_error("'construct' on proxy: trap is not a function"));
+                }
                 let arg_arr = self.alloc_array();
                 for &a in args {
                     self.heap.object_push_element(arg_arr, a);
@@ -1208,13 +1208,12 @@ impl JsVm {
                 let mut combined = Vec::with_capacity(bound.bound_args.len() + args.len());
                 combined.extend_from_slice(&bound.bound_args);
                 combined.extend_from_slice(args);
-                self.call_handle(
-                    bound.target,
-                    bound.bound_this,
-                    &combined,
-                    construct_obj,
-                    new_target,
-                )
+                let eff_this = if construct_obj.is_some() {
+                    this_val
+                } else {
+                    bound.bound_this
+                };
+                self.call_handle(bound.target, eff_this, &combined, construct_obj, new_target)
             }
             ObjectKind::Proxy(p) => {
                 if p.revoked {
@@ -1222,6 +1221,9 @@ impl JsVm {
                 }
                 let trap = self.get_property_by_key(p.handler, self.key_apply)?;
                 if !trap.is_undefined() && !trap.is_null() {
+                    if !trap.as_object().is_some_and(|h| self.is_callable_handle(h)) {
+                        return Err(self.type_error("'apply' on proxy: trap is not a function"));
+                    }
                     let arg_arr = self.alloc_array();
                     for &a in args {
                         self.heap.object_push_element(arg_arr, a);
@@ -1702,9 +1704,12 @@ impl JsVm {
             Opcode::GetGlobal => {
                 let ic_idx = self.resolve_abx_idx(inst, prog_id, func_idx, frame_idx);
                 let (key, name) = self.ic_key_and_name(prog_id, func_idx, ic_idx);
-                // Check `with` scope chain first if active.
+                // Check `with` scope chain first if active in this call frame.
                 for i in (0..self.with_stack.len()).rev() {
-                    let with_obj = self.with_stack[i];
+                    let (depth, with_obj) = self.with_stack[i];
+                    if depth != frame_idx {
+                        continue;
+                    }
                     if self.has_property_by_key(with_obj, key)? {
                         let v = self.get_property_by_key(with_obj, key)?;
                         self.registers[a] = v;
@@ -1730,7 +1735,10 @@ impl JsVm {
                 let (key, name) = self.ic_key_and_name(prog_id, func_idx, ic_idx);
                 let val = self.registers[a];
                 for i in (0..self.with_stack.len()).rev() {
-                    let with_obj = self.with_stack[i];
+                    let (depth, with_obj) = self.with_stack[i];
+                    if depth != frame_idx {
+                        continue;
+                    }
                     if self.has_property_by_key(with_obj, key)? {
                         self.set_property_by_key(with_obj, key, val)?;
                         return Ok(StepOutcome::Continue);
@@ -2896,16 +2904,27 @@ impl JsVm {
                 let obj_val = self.registers[base + usize::from(inst.b())];
                 let mut keys = Vec::new();
                 if let Some(mut cur) = obj_val.as_object() {
-                    let mut seen = Vec::new();
-                    loop {
-                        let own = self.own_enumerable_keys_including_elements(cur);
-                        for k in own {
-                            if !seen.contains(&k) {
-                                seen.push(k.clone());
-                                keys.push(k);
+                    let mut seen: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for _ in 0..1024 {
+                        let own = crate::proxy::mop_own_property_keys(self, cur)?;
+                        for (kv, pk) in own {
+                            if let Some(sh) = kv.as_string() {
+                                let name = self.heap.materialize_string(sh).unwrap_or_default();
+                                if seen.contains(&name) {
+                                    continue;
+                                }
+                                if let Some(desc) =
+                                    crate::proxy::mop_get_own_property(self, cur, pk)?
+                                {
+                                    seen.insert(name.clone());
+                                    if desc.enumerable == Some(true) {
+                                        keys.push(name);
+                                    }
+                                }
                             }
                         }
-                        match self.heap.get_object(cur).and_then(|o| o.prototype) {
+                        match crate::proxy::mop_get_prototype_of(self, cur)? {
                             Some(p) => cur = p,
                             None => break,
                         }
@@ -2946,7 +2965,7 @@ impl JsVm {
             }
             Opcode::PushWith => {
                 if let Some(h) = self.registers[a].as_object() {
-                    self.with_stack.push(h);
+                    self.with_stack.push((frame_idx, h));
                 } else {
                     return Err(
                         self.type_error("Cannot convert null or undefined to object in 'with'")
@@ -3367,6 +3386,10 @@ impl JsVm {
         let mut cur = Some(obj);
         let idx_opt = self.key_as_array_index(key);
         while let Some(holder) = cur {
+            if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(holder).map(|o| o.kind.clone())
+            {
+                return crate::proxy::proxy_get_trap(self, p, key, receiver);
+            }
             if let Some(idx) = idx_opt {
                 if let Some(o) = self.heap.get_object(holder) {
                     if let ObjectKind::TypedArray(ta) = o.kind {
@@ -3506,6 +3529,15 @@ impl JsVm {
         // Check existing own property or inherited setter on prototype chain.
         let mut cur = Some(obj);
         while let Some(holder) = cur {
+            if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(holder).map(|o| o.kind.clone())
+            {
+                let ok =
+                    crate::proxy::proxy_set_trap(self, p, key, val, JsValue::from_object(obj))?;
+                if !ok && is_strict {
+                    return Err(self.type_error("'set' on proxy returned falsy"));
+                }
+                return Ok(());
+            }
             if let Some(prop) = self.heap.object_get_own(holder, key, &self.shapes) {
                 if prop.attrs.contains(PropertyAttrs::ACCESSOR) {
                     if let Some(setter) = prop.setter {
@@ -3650,6 +3682,10 @@ impl JsVm {
         let mut cur = Some(obj);
         let idx_opt = self.key_as_array_index(key);
         while let Some(holder) = cur {
+            if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(holder).map(|o| o.kind.clone())
+            {
+                return crate::proxy::proxy_get_trap(self, p, key, receiver);
+            }
             if let Some(idx) = idx_opt {
                 if let Some(o) = self.heap.get_object(holder) {
                     if let ObjectKind::TypedArray(ta) = o.kind {
@@ -3680,6 +3716,93 @@ impl JsVm {
         Ok(JsValue::UNDEFINED)
     }
 
+    pub fn set_property_with_receiver(
+        &mut self,
+        obj: HeapHandle,
+        key: PropertyKey,
+        val: JsValue,
+        receiver: JsValue,
+    ) -> Result<bool, JsException> {
+        if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
+            return crate::proxy::proxy_set_trap(self, p, key, val, receiver);
+        }
+        if receiver == JsValue::from_object(obj) {
+            if matches!(
+                self.heap.get_object(obj).map(|o| &o.kind),
+                Some(ObjectKind::Array)
+            ) && key == self.key_length
+            {
+                return self.set_array_length_checked(obj, val);
+            }
+            if let Some(idx) = self.key_as_array_index(key) {
+                if let Some(ObjectKind::TypedArray(ta)) = self.heap.get_object(obj).map(|o| &o.kind)
+                {
+                    let ta = *ta;
+                    crate::builtins_collections::typed_array_write_element_checked(
+                        self, obj, ta, idx, val,
+                    )?;
+                    return Ok(true);
+                }
+            }
+        }
+        let own_desc = crate::proxy::mop_get_own_property(self, obj, key)?;
+        let desc = match own_desc {
+            Some(d) => d,
+            None => {
+                if let Some(parent) = crate::proxy::mop_get_prototype_of(self, obj)? {
+                    return self.set_property_with_receiver(parent, key, val, receiver);
+                }
+                crate::proxy::PropDesc {
+                    value: Some(JsValue::UNDEFINED),
+                    writable: Some(true),
+                    enumerable: Some(true),
+                    configurable: Some(true),
+                    ..crate::proxy::PropDesc::default()
+                }
+            }
+        };
+        if desc.is_accessor() {
+            if let Some(setter) = desc.set.filter(|s| !s.is_undefined()) {
+                self.call_value(setter, receiver, &[val])?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        if desc.writable == Some(false) {
+            return Ok(false);
+        }
+        let Some(rec_h) = receiver.as_object() else {
+            return Ok(false);
+        };
+        let existing = crate::proxy::mop_get_own_property(self, rec_h, key)?;
+        if let Some(ex) = existing {
+            if ex.is_accessor() || ex.writable == Some(false) {
+                return Ok(false);
+            }
+            return crate::proxy::mop_define_own_property(
+                self,
+                rec_h,
+                key,
+                crate::proxy::PropDesc {
+                    value: Some(val),
+                    ..crate::proxy::PropDesc::default()
+                },
+            );
+        }
+        crate::proxy::mop_define_own_property(
+            self,
+            rec_h,
+            key,
+            crate::proxy::PropDesc {
+                value: Some(val),
+                writable: Some(true),
+                enumerable: Some(true),
+                configurable: Some(true),
+                ..crate::proxy::PropDesc::default()
+            },
+        )
+    }
+
     pub fn set_property_by_key(
         &mut self,
         obj: HeapHandle,
@@ -3687,7 +3810,7 @@ impl JsVm {
         val: JsValue,
     ) -> Result<bool, JsException> {
         if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
-            return self.proxy_set(p, key, val, JsValue::from_object(obj));
+            return crate::proxy::proxy_set_trap(self, p, key, val, JsValue::from_object(obj));
         }
         if matches!(
             self.heap.get_object(obj).map(|o| &o.kind),
@@ -3698,6 +3821,10 @@ impl JsVm {
         }
         let mut cur = Some(obj);
         while let Some(holder) = cur {
+            if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(holder).map(|o| o.kind.clone())
+            {
+                return crate::proxy::proxy_set_trap(self, p, key, val, JsValue::from_object(obj));
+            }
             if let Some(prop) = self.heap.object_get_own(holder, key, &self.shapes) {
                 if prop.attrs.contains(PropertyAttrs::ACCESSOR) {
                     if let Some(setter) = prop.setter {
@@ -3735,41 +3862,31 @@ impl JsVm {
         obj: HeapHandle,
         key: PropertyKey,
     ) -> Result<bool, JsException> {
-        if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
-            if p.revoked {
-                return Err(self.type_error("Cannot perform 'has' on a revoked Proxy"));
-            }
-            let trap = self.get_property_by_key(p.handler, self.key_has)?;
-            if !trap.is_undefined() && !trap.is_null() {
-                let k_str = self
-                    .heap
-                    .interner()
-                    .get(key)
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                let kv = JsValue::from_string(self.heap.alloc_string(k_str));
-                let r = self.call_value(
-                    trap,
-                    JsValue::from_object(p.handler),
-                    &[JsValue::from_object(p.target), kv],
-                )?;
-                return Ok(self.to_boolean(r));
-            }
-            return self.has_property_by_key(p.target, key);
-        }
-        if let Some(name) = self.heap.interner().get(key).map(|s| s.to_string()) {
-            if let Ok(idx) = name.parse::<u32>() {
-                if self
-                    .heap
-                    .get_object(obj)
-                    .is_some_and(|o| o.elements.has(idx))
-                {
-                    return Ok(true);
-                }
-            }
-        }
+        let idx_opt = self.key_as_array_index(key);
         let mut cur = Some(obj);
         while let Some(holder) = cur {
+            if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(holder).map(|o| o.kind.clone())
+            {
+                return crate::proxy::proxy_has_trap(self, p, key);
+            }
+            if let Some(o) = self.heap.get_object(holder) {
+                if matches!(o.kind, ObjectKind::Array) && key == self.key_length {
+                    return Ok(true);
+                }
+                if let Some(idx) = idx_opt {
+                    if let ObjectKind::TypedArray(ta) = o.kind {
+                        if let Some(eff_len) =
+                            crate::builtins_atomics::ta_effective_len(self, holder, ta)
+                        {
+                            if idx < eff_len {
+                                return Ok(true);
+                            }
+                        }
+                    } else if o.elements.has(idx) {
+                        return Ok(true);
+                    }
+                }
+            }
             if self
                 .heap
                 .object_get_own(holder, key, &self.shapes)
@@ -3788,26 +3905,7 @@ impl JsVm {
         key: PropertyKey,
     ) -> Result<bool, JsException> {
         if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
-            if p.revoked {
-                return Err(self.type_error("Cannot perform 'deleteProperty' on a revoked Proxy"));
-            }
-            let trap = self.get_property_by_key(p.handler, self.key_delete_property)?;
-            if !trap.is_undefined() && !trap.is_null() {
-                let k_str = self
-                    .heap
-                    .interner()
-                    .get(key)
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                let kv = JsValue::from_string(self.heap.alloc_string(k_str));
-                let r = self.call_value(
-                    trap,
-                    JsValue::from_object(p.handler),
-                    &[JsValue::from_object(p.target), kv],
-                )?;
-                return Ok(self.to_boolean(r));
-            }
-            return self.delete_property_by_key(p.target, key);
+            return crate::proxy::proxy_delete_trap(self, p, key);
         }
         if let Some(prop) = self.heap.object_get_own(obj, key, &self.shapes) {
             if !prop.attrs.contains(PropertyAttrs::CONFIGURABLE) {
@@ -3821,6 +3919,17 @@ impl JsVm {
         {
             return Ok(false);
         }
+        if let Some(idx) = self.key_as_array_index(key) {
+            if let Some(o) = self.heap.get_object_mut(obj) {
+                if matches!(o.kind, ObjectKind::TypedArray(_)) {
+                    return Ok(false);
+                }
+                if o.elements.has(idx) {
+                    o.elements.delete(idx);
+                    return Ok(true);
+                }
+            }
+        }
         Ok(self.heap.object_delete_own(obj, key, &mut self.shapes))
     }
 
@@ -3830,25 +3939,7 @@ impl JsVm {
         key: PropertyKey,
         receiver: JsValue,
     ) -> Result<JsValue, JsException> {
-        if p.revoked {
-            return Err(self.type_error("Cannot perform 'get' on a revoked Proxy"));
-        }
-        let trap = self.get_property_by_key(p.handler, self.key_get)?;
-        if !trap.is_undefined() && !trap.is_null() {
-            let k_str = self
-                .heap
-                .interner()
-                .get(key)
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let kv = JsValue::from_string(self.heap.alloc_string(k_str));
-            return self.call_value(
-                trap,
-                JsValue::from_object(p.handler),
-                &[JsValue::from_object(p.target), kv, receiver],
-            );
-        }
-        self.get_property_with_receiver(p.target, key, receiver)
+        crate::proxy::proxy_get_trap(self, p, key, receiver)
     }
 
     fn proxy_set(
@@ -3858,26 +3949,7 @@ impl JsVm {
         val: JsValue,
         receiver: JsValue,
     ) -> Result<bool, JsException> {
-        if p.revoked {
-            return Err(self.type_error("Cannot perform 'set' on a revoked Proxy"));
-        }
-        let trap = self.get_property_by_key(p.handler, self.key_set)?;
-        if !trap.is_undefined() && !trap.is_null() {
-            let k_str = self
-                .heap
-                .interner()
-                .get(key)
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let kv = JsValue::from_string(self.heap.alloc_string(k_str));
-            let res = self.call_value(
-                trap,
-                JsValue::from_object(p.handler),
-                &[JsValue::from_object(p.target), kv, val, receiver],
-            )?;
-            return Ok(self.to_boolean(res));
-        }
-        self.set_property_by_key(p.target, key, val)
+        crate::proxy::proxy_set_trap(self, p, key, val, receiver)
     }
 
     pub fn get_elem(&mut self, obj_val: JsValue, key_val: JsValue) -> Result<JsValue, JsException> {
@@ -3993,20 +4065,26 @@ impl JsVm {
                     false
                 } else {
                     let ks = idx.to_string();
-                    if let Some(k) = self.heap.interner().lookup(&ks) {
-                        let mut cur = Some(obj);
-                        let mut found = false;
-                        while let Some(h) = cur {
+                    let k_opt = self.heap.interner().lookup(&ks);
+                    let mut cur = Some(obj);
+                    let mut found = false;
+                    while let Some(h) = cur {
+                        if matches!(
+                            self.heap.get_object(h).map(|o| &o.kind),
+                            Some(ObjectKind::Proxy(_))
+                        ) {
+                            found = true;
+                            break;
+                        }
+                        if let Some(k) = k_opt {
                             if self.heap.object_get_own(h, k, &self.shapes).is_some() {
                                 found = true;
                                 break;
                             }
-                            cur = self.heap.get_object(h).and_then(|o| o.prototype);
                         }
-                        found
-                    } else {
-                        false
+                        cur = self.heap.get_object(h).and_then(|o| o.prototype);
                     }
+                    found
                 }
             };
             if has_named_idx {
@@ -4966,24 +5044,43 @@ impl JsVm {
         }
         if new_len < cur_len {
             let (mut highest_non_cfg, mut to_delete) = (None::<u32>, Vec::new());
-            if let Some(r) = self
-                .heap
-                .get_object(obj)
-                .filter(|o| o.is_dictionary())
-                .and_then(|o| o.rare.as_ref())
-            {
-                for (&k, p) in &r.dict_props {
-                    if let Some(idx) = self
-                        .heap
-                        .interner()
-                        .get(k)
-                        .and_then(|s| parse_array_index_str(s))
-                        .filter(|&i| i >= new_len)
-                    {
-                        if !p.attrs.contains(PropertyAttrs::CONFIGURABLE) {
-                            highest_non_cfg = Some(highest_non_cfg.map_or(idx, |m| m.max(idx)));
-                        } else {
-                            to_delete.push((k, idx));
+            if let Some(o) = self.heap.get_object(obj) {
+                if o.is_dictionary() {
+                    if let Some(r) = o.rare.as_ref() {
+                        for (&k, p) in &r.dict_props {
+                            if let Some(idx) = self
+                                .heap
+                                .interner()
+                                .get(k)
+                                .and_then(|s| parse_array_index_str(s))
+                                .filter(|&i| i >= new_len)
+                            {
+                                if !p.attrs.contains(PropertyAttrs::CONFIGURABLE) {
+                                    highest_non_cfg =
+                                        Some(highest_non_cfg.map_or(idx, |m| m.max(idx)));
+                                } else {
+                                    to_delete.push((k, idx));
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(sh) = self.shapes.get(o.shape()) {
+                    for &k in sh.keys() {
+                        if let Some(slot) = sh.lookup(k) {
+                            if let Some(idx) = self
+                                .heap
+                                .interner()
+                                .get(k)
+                                .and_then(|s| parse_array_index_str(s))
+                                .filter(|&i| i >= new_len)
+                            {
+                                if !slot.attrs.contains(PropertyAttrs::CONFIGURABLE) {
+                                    highest_non_cfg =
+                                        Some(highest_non_cfg.map_or(idx, |m| m.max(idx)));
+                                } else {
+                                    to_delete.push((k, idx));
+                                }
+                            }
                         }
                     }
                 }
@@ -5536,12 +5633,15 @@ impl JsVm {
         let Some(target_proto_h) = target_proto.as_object() else {
             return Err(self.type_error("Function has non-object prototype in instanceof check"));
         };
-        let mut cur = self.heap.get_object(lhs_h).and_then(|o| o.prototype);
-        while let Some(p) = cur {
+        let mut cur = crate::proxy::mop_get_prototype_of(self, lhs_h)?;
+        for _ in 0..4096 {
+            let Some(p) = cur else {
+                break;
+            };
             if p == target_proto_h {
                 return Ok(true);
             }
-            cur = self.heap.get_object(p).and_then(|o| o.prototype);
+            cur = crate::proxy::mop_get_prototype_of(self, p)?;
         }
         Ok(false)
     }

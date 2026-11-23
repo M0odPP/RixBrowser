@@ -3744,302 +3744,6 @@ fn array_with(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsVa
     Ok(JsValue::from_object(out))
 }
 
-fn read_opt_bool(
-    vm: &mut JsVm,
-    desc: HeapHandle,
-    key: crate::PropertyKey,
-) -> Result<Option<bool>, JsException> {
-    if vm.has_property_by_key(desc, key)? {
-        let v = vm.get_property_by_key(desc, key)?;
-        Ok(Some(vm.to_boolean(v)))
-    } else {
-        Ok(None)
-    }
-}
-
-fn read_opt_accessor(
-    vm: &mut JsVm,
-    desc: HeapHandle,
-    key: crate::PropertyKey,
-    label: &str,
-) -> Result<Option<Option<HeapHandle>>, JsException> {
-    if !vm.has_property_by_key(desc, key)? {
-        return Ok(None);
-    }
-    let v = vm.get_property_by_key(desc, key)?;
-    if v.is_undefined() {
-        Ok(Some(None))
-    } else if let Some(h) = v.as_object().filter(|&h| vm.is_callable_handle(h)) {
-        Ok(Some(Some(h)))
-    } else {
-        Err(vm.type_error(format!("{label} must be a function")))
-    }
-}
-
-fn build_attrs(w: bool, e: bool, c: bool) -> PropertyAttrs {
-    let mut attrs = PropertyAttrs::empty();
-    attrs.set(PropertyAttrs::WRITABLE, w);
-    attrs.set(PropertyAttrs::ENUMERABLE, e);
-    attrs.set(PropertyAttrs::CONFIGURABLE, c);
-    attrs
-}
-
-fn define_property_checked(
-    vm: &mut JsVm,
-    obj: HeapHandle,
-    prop_name: &str,
-    desc: HeapHandle,
-) -> Result<bool, JsException> {
-    let (k_w, k_e, k_c) = (
-        vm.heap.intern_key("writable"),
-        vm.heap.intern_key("enumerable"),
-        vm.heap.intern_key("configurable"),
-    );
-    let desc_e = read_opt_bool(vm, desc, k_e)?;
-    let desc_c = read_opt_bool(vm, desc, k_c)?;
-    let desc_w = read_opt_bool(vm, desc, k_w)?;
-    let desc_v = if vm.has_property_by_key(desc, vm.key_value)? {
-        Some(vm.get_property_by_key(desc, vm.key_value)?)
-    } else {
-        None
-    };
-    let desc_get = read_opt_accessor(vm, desc, vm.key_get, "Getter")?;
-    let desc_set = read_opt_accessor(vm, desc, vm.key_set, "Setter")?;
-
-    let (is_data_desc, is_acc_desc) = (
-        desc_w.is_some() || desc_v.is_some(),
-        desc_get.is_some() || desc_set.is_some(),
-    );
-    if is_data_desc && is_acc_desc {
-        return Err(vm.type_error(
-            "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute",
-        ));
-    }
-
-    let is_arr = matches!(
-        vm.heap.get_object(obj).map(|o| &o.kind),
-        Some(ObjectKind::Array)
-    );
-    if prop_name == "length" && is_arr {
-        if desc_c == Some(true) || desc_e == Some(true) || is_acc_desc {
-            return Ok(false);
-        }
-        let cur_w = vm
-            .heap
-            .object_get_own(obj, vm.key_length, &vm.shapes)
-            .is_none_or(|p| p.attrs.contains(PropertyAttrs::WRITABLE));
-        if !cur_w && desc_w == Some(true) {
-            return Ok(false);
-        }
-        if let Some(v) = desc_v {
-            if !vm.set_array_length_checked(obj, v)? {
-                return Ok(false);
-            }
-        }
-        if desc_w == Some(false) {
-            let cur_len = vm.heap.get_object(obj).map_or(0, |o| o.elements.len());
-            vm.heap.object_define_data(
-                obj,
-                vm.key_length,
-                JsValue::from_f64(f64::from(cur_len)),
-                PropertyAttrs::empty(),
-                &mut vm.shapes,
-            );
-        }
-        return Ok(true);
-    }
-
-    let key = vm.heap.intern_key(prop_name);
-    if is_arr {
-        if let Some(idx) = crate::vm::parse_array_index_str(prop_name) {
-            let cur_len = vm.heap.get_object(obj).map_or(0, |o| o.elements.len());
-            let len_writable = vm
-                .heap
-                .object_get_own(obj, vm.key_length, &vm.shapes)
-                .is_none_or(|p| p.attrs.contains(PropertyAttrs::WRITABLE));
-            if idx >= cur_len && !len_writable {
-                return Ok(false);
-            }
-            let has_dict_own = vm.heap.object_get_own(obj, key, &vm.shapes).is_some();
-            if !has_dict_own {
-                let elem_val = vm.heap.get_object(obj).and_then(|o| o.elements.get(idx));
-                let default_data = !is_acc_desc
-                    && desc_w != Some(false)
-                    && desc_c != Some(false)
-                    && desc_e != Some(false);
-                if default_data
-                    && (elem_val.is_some()
-                        || (desc_w == Some(true) && desc_c == Some(true) && desc_e == Some(true)))
-                {
-                    if elem_val.is_none() && !vm.heap.get_object(obj).is_some_and(|o| o.extensible)
-                    {
-                        return Ok(false);
-                    }
-                    let val = desc_v.unwrap_or_else(|| elem_val.unwrap_or(JsValue::UNDEFINED));
-                    if let Some(o) = vm.heap.get_object_mut(obj) {
-                        o.elements.set(idx, val);
-                    }
-                    vm.heap.write_barrier(obj, val);
-                    return Ok(true);
-                }
-                // Migrate existing fast element to dictionary descriptor before applying non-default attrs.
-                if let Some(existing) = elem_val {
-                    if let Some(o) = vm.heap.get_object_mut(obj) {
-                        o.elements.delete(idx);
-                    }
-                    vm.heap.object_define_data(
-                        obj,
-                        key,
-                        existing,
-                        PropertyAttrs::DEFAULT,
-                        &mut vm.shapes,
-                    );
-                } else if idx >= cur_len {
-                    if !vm.heap.get_object(obj).is_some_and(|o| o.extensible) {
-                        return Ok(false);
-                    }
-                    if let Some(o) = vm.heap.get_object_mut(obj) {
-                        o.elements.set_len(idx + 1);
-                    }
-                }
-            }
-        }
-    }
-
-    let Some(cur) = vm.heap.object_get_own(obj, key, &vm.shapes) else {
-        if !vm.heap.get_object(obj).is_some_and(|o| o.extensible) {
-            return Ok(false);
-        }
-        let attrs = build_attrs(
-            !is_acc_desc && desc_w.unwrap_or(false),
-            desc_e.unwrap_or(false),
-            desc_c.unwrap_or(false),
-        );
-        if is_acc_desc {
-            vm.heap.object_define_accessor(
-                obj,
-                key,
-                desc_get.flatten(),
-                desc_set.flatten(),
-                attrs,
-                &mut vm.shapes,
-            );
-        } else {
-            vm.heap.object_define_data(
-                obj,
-                key,
-                desc_v.unwrap_or(JsValue::UNDEFINED),
-                attrs,
-                &mut vm.shapes,
-            );
-        }
-        return Ok(true);
-    };
-
-    // Existing own property validation (ECMA-262 §10.1.6.3 steps 4–10).
-    let cur_c = cur.attrs.contains(PropertyAttrs::CONFIGURABLE);
-    let cur_e = cur.attrs.contains(PropertyAttrs::ENUMERABLE);
-    let cur_w = cur.attrs.contains(PropertyAttrs::WRITABLE);
-    let cur_is_acc = cur.attrs.contains(PropertyAttrs::ACCESSOR);
-    if !cur_c && (desc_c == Some(true) || desc_e.is_some_and(|e| e != cur_e)) {
-        return Ok(false);
-    }
-
-    if !is_data_desc && !is_acc_desc {
-        let mut attrs = cur.attrs;
-        if let Some(e) = desc_e {
-            attrs.set(PropertyAttrs::ENUMERABLE, e);
-        }
-        if let Some(c) = desc_c {
-            attrs.set(PropertyAttrs::CONFIGURABLE, c);
-        }
-        if cur_is_acc {
-            vm.heap
-                .object_define_accessor(obj, key, cur.getter, cur.setter, attrs, &mut vm.shapes);
-        } else {
-            vm.heap
-                .object_define_data(obj, key, cur.value, attrs, &mut vm.shapes);
-        }
-        return Ok(true);
-    }
-
-    if cur_is_acc != is_acc_desc {
-        if !cur_c {
-            return Ok(false);
-        }
-        let attrs = build_attrs(
-            !is_acc_desc && desc_w.unwrap_or(false),
-            desc_e.unwrap_or(cur_e),
-            desc_c.unwrap_or(cur_c),
-        );
-        if is_acc_desc {
-            vm.heap.object_define_accessor(
-                obj,
-                key,
-                desc_get.flatten(),
-                desc_set.flatten(),
-                attrs,
-                &mut vm.shapes,
-            );
-        } else {
-            vm.heap.object_define_data(
-                obj,
-                key,
-                desc_v.unwrap_or(JsValue::UNDEFINED),
-                attrs,
-                &mut vm.shapes,
-            );
-        }
-        return Ok(true);
-    }
-
-    if !cur_is_acc {
-        if !cur_c && !cur_w {
-            if desc_w == Some(true) {
-                return Ok(false);
-            }
-            if let Some(v) = desc_v {
-                let same = match (v.as_number(), cur.value.as_number()) {
-                    (Some(a), Some(b)) => {
-                        (a.is_nan() && b.is_nan()) || (a == b && a.to_bits() == b.to_bits())
-                    }
-                    _ => vm.strict_eq(v, cur.value),
-                };
-                if !same {
-                    return Ok(false);
-                }
-            }
-            return Ok(true);
-        }
-        let attrs = build_attrs(
-            desc_w.unwrap_or(cur_w),
-            desc_e.unwrap_or(cur_e),
-            desc_c.unwrap_or(cur_c),
-        );
-        vm.heap
-            .object_define_data(obj, key, desc_v.unwrap_or(cur.value), attrs, &mut vm.shapes);
-    } else {
-        if !cur_c {
-            if desc_get.is_some_and(|g| g != cur.getter)
-                || desc_set.is_some_and(|s| s != cur.setter)
-            {
-                return Ok(false);
-            }
-            return Ok(true);
-        }
-        let attrs = build_attrs(false, desc_e.unwrap_or(cur_e), desc_c.unwrap_or(cur_c));
-        vm.heap.object_define_accessor(
-            obj,
-            key,
-            desc_get.unwrap_or(cur.getter),
-            desc_set.unwrap_or(cur.setter),
-            attrs,
-            &mut vm.shapes,
-        );
-    }
-    Ok(true)
-}
-
 fn object_define_property(
     vm: &mut JsVm,
     _this: JsValue,
@@ -4050,10 +3754,12 @@ fn object_define_property(
         return Err(vm.type_error("Object.defineProperty called on non-object"));
     };
     let prop_name = vm.to_property_key(args.get(1).copied().unwrap_or(JsValue::UNDEFINED))?;
-    let Some(desc) = args.get(2).and_then(|v| v.as_object()) else {
-        return Err(vm.type_error("Property description must be an object"));
-    };
-    if !define_property_checked(vm, obj, &prop_name, desc)? {
+    let desc = crate::proxy::to_property_descriptor(
+        vm,
+        args.get(2).copied().unwrap_or(JsValue::UNDEFINED),
+    )?;
+    let key = vm.heap.intern_key(&prop_name);
+    if !crate::proxy::mop_define_own_property(vm, obj, key, desc)? {
         return Err(vm.type_error(format!("Cannot redefine property: {prop_name}")));
     }
     Ok(obj_val)
@@ -4068,11 +3774,13 @@ fn reflect_define_property(
         return Err(vm.type_error("Reflect.defineProperty called on non-object"));
     };
     let prop_name = vm.to_property_key(args.get(1).copied().unwrap_or(JsValue::UNDEFINED))?;
-    let Some(desc) = args.get(2).and_then(|v| v.as_object()) else {
-        return Err(vm.type_error("Property description must be an object"));
-    };
-    Ok(JsValue::from_bool(define_property_checked(
-        vm, obj, &prop_name, desc,
+    let desc = crate::proxy::to_property_descriptor(
+        vm,
+        args.get(2).copied().unwrap_or(JsValue::UNDEFINED),
+    )?;
+    let key = vm.heap.intern_key(&prop_name);
+    Ok(JsValue::from_bool(crate::proxy::mop_define_own_property(
+        vm, obj, key, desc,
     )?))
 }
 
@@ -4082,33 +3790,20 @@ pub(crate) fn define_properties_on_object(
     props_arg: JsValue,
 ) -> Result<(), JsException> {
     let props_h = vm.to_object(props_arg)?;
-    let mut keys = vm.own_enumerable_keys_including_elements(props_h);
-    let sym_keys: Vec<String> = vm
-        .own_enumerable_keys(props_h)
-        .into_iter()
-        .filter_map(|k| {
-            let s = vm.heap.interner().get(k)?;
-            crate::vm::is_symbol_key_str(s).then(|| s.to_string())
-        })
-        .collect();
-    keys.extend(sym_keys);
+    let keys = crate::proxy::mop_own_property_keys(vm, props_h)?;
     let mut pairs = Vec::with_capacity(keys.len());
-    for name in keys {
-        let k = vm.heap.intern_key(&name);
-        let desc_val = if crate::vm::is_symbol_key_str(&name) {
-            vm.get_property_by_key(props_h, k)?
-        } else {
-            let kv = JsValue::from_string(vm.heap.alloc_string(name.clone()));
-            vm.get_elem(JsValue::from_object(props_h), kv)?
-        };
-        let Some(desc_h) = desc_val.as_object() else {
-            return Err(vm.type_error("Property description must be an object"));
-        };
-        pairs.push((name, desc_h));
+    for (_, pk) in keys {
+        if crate::proxy::mop_get_own_property(vm, props_h, pk)?
+            .is_some_and(|d| d.enumerable == Some(true))
+        {
+            let desc_val = vm.get_property_by_key(props_h, pk)?;
+            let desc = crate::proxy::to_property_descriptor(vm, desc_val)?;
+            pairs.push((pk, desc));
+        }
     }
-    for (name, desc_h) in pairs {
-        if !define_property_checked(vm, obj, &name, desc_h)? {
-            return Err(vm.type_error(format!("Cannot redefine property: {name}")));
+    for (pk, desc) in pairs {
+        if !crate::proxy::mop_define_own_property(vm, obj, pk, desc)? {
+            return Err(vm.type_error("Cannot redefine property"));
         }
     }
     Ok(())
@@ -4128,32 +3823,6 @@ fn object_define_properties(
     Ok(obj_val)
 }
 
-fn make_desc_obj(vm: &mut JsVm, pairs: &[(crate::PropertyKey, JsValue)]) -> JsValue {
-    let out = vm.alloc_ordinary_object();
-    for &(k, v) in pairs {
-        vm.heap
-            .object_define_data(out, k, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
-    }
-    JsValue::from_object(out)
-}
-
-fn make_data_desc_obj(vm: &mut JsVm, value: JsValue, w: bool, e: bool, c: bool) -> JsValue {
-    let (kw, ke, kc) = (
-        vm.heap.intern_key("writable"),
-        vm.heap.intern_key("enumerable"),
-        vm.heap.intern_key("configurable"),
-    );
-    make_desc_obj(
-        vm,
-        &[
-            (vm.key_value, value),
-            (kw, JsValue::from_bool(w)),
-            (ke, JsValue::from_bool(e)),
-            (kc, JsValue::from_bool(c)),
-        ],
-    )
-}
-
 fn object_get_own_descriptor(
     vm: &mut JsVm,
     _this: JsValue,
@@ -4167,12 +3836,15 @@ fn object_get_own_descriptor(
     if let Some(sh) = target.as_string() {
         let s = vm.heap.materialize_string(sh).unwrap_or_default();
         if prop_name == "length" {
-            return Ok(make_data_desc_obj(
+            return Ok(crate::proxy::from_property_descriptor(
                 vm,
-                JsValue::from_f64(s.encode_utf16().count() as f64),
-                false,
-                false,
-                false,
+                Some(crate::proxy::PropDesc {
+                    value: Some(JsValue::from_f64(s.encode_utf16().count() as f64)),
+                    writable: Some(false),
+                    enumerable: Some(false),
+                    configurable: Some(false),
+                    ..crate::proxy::PropDesc::default()
+                }),
             ));
         }
         if let Some(ch) = prop_name
@@ -4181,7 +3853,16 @@ fn object_get_own_descriptor(
             .and_then(|idx| s.chars().nth(idx))
         {
             let cv = JsValue::from_string(vm.heap.alloc_string(ch.to_string()));
-            return Ok(make_data_desc_obj(vm, cv, false, true, false));
+            return Ok(crate::proxy::from_property_descriptor(
+                vm,
+                Some(crate::proxy::PropDesc {
+                    value: Some(cv),
+                    writable: Some(false),
+                    enumerable: Some(true),
+                    configurable: Some(false),
+                    ..crate::proxy::PropDesc::default()
+                }),
+            ));
         }
         return Ok(JsValue::UNDEFINED);
     }
@@ -4189,70 +3870,8 @@ fn object_get_own_descriptor(
         return Ok(JsValue::UNDEFINED);
     };
     let key = vm.heap.intern_key(&prop_name);
-    if let Some(prop) = vm.heap.object_get_own(obj, key, &vm.shapes) {
-        if prop.attrs.contains(PropertyAttrs::ACCESSOR) {
-            let (ke, kc) = (
-                vm.heap.intern_key("enumerable"),
-                vm.heap.intern_key("configurable"),
-            );
-            return Ok(make_desc_obj(
-                vm,
-                &[
-                    (
-                        vm.key_get,
-                        prop.getter.map_or(JsValue::UNDEFINED, JsValue::from_object),
-                    ),
-                    (
-                        vm.key_set,
-                        prop.setter.map_or(JsValue::UNDEFINED, JsValue::from_object),
-                    ),
-                    (
-                        ke,
-                        JsValue::from_bool(prop.attrs.contains(PropertyAttrs::ENUMERABLE)),
-                    ),
-                    (
-                        kc,
-                        JsValue::from_bool(prop.attrs.contains(PropertyAttrs::CONFIGURABLE)),
-                    ),
-                ],
-            ));
-        }
-        return Ok(make_data_desc_obj(
-            vm,
-            prop.value,
-            prop.attrs.contains(PropertyAttrs::WRITABLE),
-            prop.attrs.contains(PropertyAttrs::ENUMERABLE),
-            prop.attrs.contains(PropertyAttrs::CONFIGURABLE),
-        ));
-    }
-    if prop_name == "length"
-        && matches!(
-            vm.heap.get_object(obj).map(|o| &o.kind),
-            Some(ObjectKind::Array)
-        )
-    {
-        let len = vm.heap.get_object(obj).map_or(0, |o| o.elements.len());
-        return Ok(make_data_desc_obj(
-            vm,
-            JsValue::from_f64(f64::from(len)),
-            true,
-            false,
-            false,
-        ));
-    }
-    if let Ok(idx) = prop_name.parse::<u32>() {
-        if let Some(ObjectKind::TypedArray(ta)) = vm.heap.get_object(obj).map(|o| &o.kind) {
-            let ta = *ta;
-            if idx < ta.length {
-                let v = crate::builtins_collections::typed_array_read_element(vm, ta, idx);
-                return Ok(make_data_desc_obj(vm, v, true, true, true));
-            }
-        }
-        if let Some(v) = vm.heap.get_object(obj).and_then(|o| o.elements.get(idx)) {
-            return Ok(make_data_desc_obj(vm, v, true, true, true));
-        }
-    }
-    Ok(JsValue::UNDEFINED)
+    let desc = crate::proxy::mop_get_own_property(vm, obj, key)?;
+    Ok(crate::proxy::from_property_descriptor(vm, desc))
 }
 
 fn reflect_get_own_descriptor(
@@ -4271,32 +3890,14 @@ fn object_get_own_descriptors(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let target = arg0(args);
-    if target.is_null() || target.is_undefined() {
-        return Err(vm.type_error("Cannot convert undefined or null to object"));
-    }
+    let obj = vm.to_object(arg0(args))?;
     let out = vm.alloc_ordinary_object();
-    let names_arr = object_get_own_property_names(vm, JsValue::UNDEFINED, &[target])?;
-    let syms_arr = object_get_own_property_symbols(vm, JsValue::UNDEFINED, &[target])?;
-    for keys_arr in [names_arr, syms_arr] {
-        if let Some(nh) = keys_arr.as_object() {
-            let len = vm.heap.get_object(nh).map_or(0, |o| o.elements.len());
-            for i in 0..len {
-                if let Some(kv) = vm.heap.get_object(nh).and_then(|o| o.elements.get(i)) {
-                    let desc = object_get_own_descriptor(vm, JsValue::UNDEFINED, &[target, kv])?;
-                    if !desc.is_undefined() {
-                        let s = vm.to_property_key(kv)?;
-                        let k = vm.heap.intern_key(&s);
-                        vm.heap.object_define_data(
-                            out,
-                            k,
-                            desc,
-                            PropertyAttrs::DEFAULT,
-                            &mut vm.shapes,
-                        );
-                    }
-                }
-            }
+    let keys = crate::proxy::mop_own_property_keys(vm, obj)?;
+    for (_, pk) in keys {
+        if let Some(desc) = crate::proxy::mop_get_own_property(vm, obj, pk)? {
+            let desc_val = crate::proxy::from_property_descriptor(vm, Some(desc));
+            vm.heap
+                .object_define_data(out, pk, desc_val, PropertyAttrs::DEFAULT, &mut vm.shapes);
         }
     }
     Ok(JsValue::from_object(out))
@@ -4307,33 +3908,11 @@ fn object_get_own_property_symbols(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let target = arg0(args);
-    if target.is_null() || target.is_undefined() {
-        return Err(vm.type_error("Cannot convert undefined or null to object"));
-    }
+    let h = vm.to_object(arg0(args))?;
     let arr = vm.alloc_array();
-    if let Some(h) = target.as_object() {
-        let mut keys = Vec::new();
-        if let Some(o) = vm.heap.get_object(h) {
-            if o.is_dictionary() {
-                if let Some(rare) = &o.rare {
-                    keys.extend(rare.dict_order.iter().copied());
-                }
-            } else if let Some(shape) = vm.shapes.get(o.shape()) {
-                keys.extend(shape.keys().iter().copied());
-            }
-        }
-        for k in keys {
-            if let Some(s) = vm.heap.interner().get(k) {
-                if let Some(id_str) = s.strip_prefix("Symbol(").and_then(|r| r.strip_suffix(')')) {
-                    if let Ok(id) = id_str.parse::<u32>() {
-                        vm.heap.object_push_element(
-                            arr,
-                            JsValue::from_symbol(crate::value::SymbolId(id)),
-                        );
-                    }
-                }
-            }
+    for (kv, _) in crate::proxy::mop_own_property_keys(vm, h)? {
+        if kv.is_symbol() {
+            vm.heap.object_push_element(arr, kv);
         }
     }
     Ok(JsValue::from_object(arr))
@@ -4347,8 +3926,7 @@ fn object_is_extensible(
     let Some(h) = arg0(args).as_object() else {
         return Ok(JsValue::FALSE);
     };
-    let ext = vm.heap.get_object(h).is_some_and(|o| o.extensible);
-    Ok(JsValue::from_bool(ext))
+    Ok(JsValue::from_bool(crate::proxy::mop_is_extensible(vm, h)?))
 }
 
 fn object_prevent_extensions(
@@ -4358,14 +3936,59 @@ fn object_prevent_extensions(
 ) -> Result<JsValue, JsException> {
     let v = arg0(args);
     if let Some(h) = v.as_object() {
-        if let Some(o) = vm.heap.get_object_mut(h) {
-            o.extensible = false;
+        if !crate::proxy::mop_prevent_extensions(vm, h)? {
+            return Err(vm.type_error("Cannot prevent extensions on object"));
         }
     }
     Ok(v)
 }
 
-pub(crate) fn set_object_integrity_level(vm: &mut JsVm, h: HeapHandle, freeze: bool) {
+pub(crate) fn set_object_integrity_level(
+    vm: &mut JsVm,
+    h: HeapHandle,
+    freeze: bool,
+) -> Result<bool, JsException> {
+    if matches!(
+        vm.heap.get_object(h).map(|o| &o.kind),
+        Some(ObjectKind::Proxy(_))
+    ) {
+        if !crate::proxy::mop_prevent_extensions(vm, h)? {
+            return Ok(false);
+        }
+        let keys = crate::proxy::mop_own_property_keys(vm, h)?;
+        if !freeze {
+            for (_, pk) in keys {
+                let d = crate::proxy::PropDesc {
+                    configurable: Some(false),
+                    ..crate::proxy::PropDesc::default()
+                };
+                if !crate::proxy::mop_define_own_property(vm, h, pk, d)? {
+                    return Err(vm.type_error("Cannot seal property on Proxy"));
+                }
+            }
+        } else {
+            for (_, pk) in keys {
+                if let Some(cur) = crate::proxy::mop_get_own_property(vm, h, pk)? {
+                    let d = if cur.is_accessor() {
+                        crate::proxy::PropDesc {
+                            configurable: Some(false),
+                            ..crate::proxy::PropDesc::default()
+                        }
+                    } else {
+                        crate::proxy::PropDesc {
+                            configurable: Some(false),
+                            writable: Some(false),
+                            ..crate::proxy::PropDesc::default()
+                        }
+                    };
+                    if !crate::proxy::mop_define_own_property(vm, h, pk, d)? {
+                        return Err(vm.type_error("Cannot freeze property on Proxy"));
+                    }
+                }
+            }
+        }
+        return Ok(true);
+    }
     let (is_arr, arr_len, elem_pairs) = match vm.heap.get_object(h) {
         Some(o) => {
             let pairs: Vec<(u32, JsValue)> = o
@@ -4376,7 +3999,7 @@ pub(crate) fn set_object_integrity_level(vm: &mut JsVm, h: HeapHandle, freeze: b
                 .collect();
             (matches!(o.kind, ObjectKind::Array), o.elements.len(), pairs)
         }
-        None => return,
+        None => return Ok(true),
     };
     // Migrate fast elements into dictionary properties so their attributes can be locked.
     for (idx, val) in elem_pairs {
@@ -4416,25 +4039,52 @@ pub(crate) fn set_object_integrity_level(vm: &mut JsVm, h: HeapHandle, freeze: b
             }
         }
     }
+    Ok(true)
 }
 
 fn object_seal(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let v = arg0(args);
     if let Some(h) = v.as_object() {
-        set_object_integrity_level(vm, h, false);
+        if !set_object_integrity_level(vm, h, false)? {
+            return Err(vm.type_error("Cannot seal object"));
+        }
     }
     Ok(v)
 }
 
-fn test_object_integrity_level(vm: &JsVm, val: JsValue, frozen: bool) -> bool {
+fn test_object_integrity_level(
+    vm: &mut JsVm,
+    val: JsValue,
+    frozen: bool,
+) -> Result<bool, JsException> {
     let Some(h) = val.as_object() else {
-        return true;
+        return Ok(true);
     };
+    if matches!(
+        vm.heap.get_object(h).map(|o| &o.kind),
+        Some(ObjectKind::Proxy(_))
+    ) {
+        if crate::proxy::mop_is_extensible(vm, h)? {
+            return Ok(false);
+        }
+        let keys = crate::proxy::mop_own_property_keys(vm, h)?;
+        for (_, pk) in keys {
+            if let Some(cur) = crate::proxy::mop_get_own_property(vm, h, pk)? {
+                if cur.configurable == Some(true) {
+                    return Ok(false);
+                }
+                if frozen && cur.is_data() && cur.writable == Some(true) {
+                    return Ok(false);
+                }
+            }
+        }
+        return Ok(true);
+    }
     let Some(o) = vm.heap.get_object(h) else {
-        return true;
+        return Ok(true);
     };
     if o.extensible || !o.elements.present_indices().is_empty() {
-        return false;
+        return Ok(false);
     }
     if frozen
         && matches!(o.kind, ObjectKind::Array)
@@ -4443,7 +4093,7 @@ fn test_object_integrity_level(vm: &JsVm, val: JsValue, frozen: bool) -> bool {
             .object_get_own(h, vm.key_length, &vm.shapes)
             .is_none_or(|p| p.attrs.contains(PropertyAttrs::WRITABLE))
     {
-        return false;
+        return Ok(false);
     }
     let ok = |a: PropertyAttrs| {
         !a.contains(PropertyAttrs::CONFIGURABLE)
@@ -4451,7 +4101,7 @@ fn test_object_integrity_level(vm: &JsVm, val: JsValue, frozen: bool) -> bool {
                 && !a.contains(PropertyAttrs::ACCESSOR)
                 && a.contains(PropertyAttrs::WRITABLE))
     };
-    if o.is_dictionary() {
+    Ok(if o.is_dictionary() {
         o.rare
             .as_ref()
             .is_none_or(|r| r.dict_props.values().all(|p| ok(p.attrs)))
@@ -4462,7 +4112,7 @@ fn test_object_integrity_level(vm: &JsVm, val: JsValue, frozen: bool) -> bool {
                 .filter_map(|&k| sh.lookup(k))
                 .all(|s| ok(s.attrs))
         })
-    }
+    })
 }
 
 fn object_is_sealed(vm: &mut JsVm, _t: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
@@ -4470,7 +4120,7 @@ fn object_is_sealed(vm: &mut JsVm, _t: JsValue, args: &[JsValue]) -> Result<JsVa
         vm,
         arg0(args),
         false,
-    )))
+    )?))
 }
 
 fn object_group_by(
@@ -4516,51 +4166,10 @@ fn object_get_own_property_names(
 ) -> Result<JsValue, JsException> {
     let h = vm.to_object(arg0(args))?;
     let arr = vm.alloc_array();
-    let (mut idx_keys, mut str_keys, mut has_len) = (Vec::new(), Vec::new(), false);
-    let is_arr = matches!(
-        vm.heap.get_object(h).map(|o| &o.kind),
-        Some(ObjectKind::Array)
-    );
-    if let Some(o) = vm.heap.get_object(h) {
-        if let ObjectKind::TypedArray(ta) = o.kind {
-            idx_keys.extend(0..ta.length);
-        } else {
-            idx_keys.extend(o.elements.present_indices());
+    for (kv, _) in crate::proxy::mop_own_property_keys(vm, h)? {
+        if kv.is_string() {
+            vm.heap.object_push_element(arr, kv);
         }
-        let mut push_key = |k: crate::PropertyKey| {
-            let Some(s) = vm.heap.interner().get(k) else {
-                return;
-            };
-            if crate::vm::is_symbol_key_str(s) {
-                return;
-            }
-            if s.as_ref() == "length" {
-                has_len = true;
-            }
-            if let Some(idx) = crate::vm::parse_array_index_str(s) {
-                if !idx_keys.contains(&idx) {
-                    idx_keys.push(idx);
-                }
-            } else if !str_keys.iter().any(|x: &String| x == s.as_ref()) {
-                str_keys.push(s.to_string());
-            }
-        };
-        if o.is_dictionary() {
-            if let Some(r) = &o.rare {
-                r.dict_order.iter().copied().for_each(&mut push_key);
-            }
-        } else if let Some(sh) = vm.shapes.get(o.shape()) {
-            sh.keys().iter().copied().for_each(&mut push_key);
-        }
-    }
-    if is_arr && !has_len {
-        str_keys.push("length".to_string());
-    }
-    idx_keys.sort_unstable();
-    idx_keys.dedup();
-    for s in idx_keys.into_iter().map(|i| i.to_string()).chain(str_keys) {
-        let v = JsValue::from_string(vm.heap.alloc_string(s));
-        vm.heap.object_push_element(arr, v);
     }
     Ok(JsValue::from_object(arr))
 }
@@ -4591,5 +4200,5 @@ fn object_is_frozen(vm: &mut JsVm, _t: JsValue, args: &[JsValue]) -> Result<JsVa
         vm,
         arg0(args),
         true,
-    )))
+    )?))
 }
