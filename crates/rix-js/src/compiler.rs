@@ -2621,14 +2621,23 @@ impl Compiler {
                 for prop in props {
                     match prop {
                         ObjectProp::KeyValue { key, value, .. } => {
-                            let prop_name = match key {
-                                PropKey::Ident(n) | PropKey::String(n) if n != "__proto__" => {
-                                    Some(n.as_str())
-                                }
-                                _ => None,
-                            };
-                            self.compile_expr_named(value, val_reg, prop_name)?;
-                            self.emit_prop_define(dst, key, val_reg)?;
+                            if matches!(key, PropKey::Ident(n) | PropKey::String(n) if n == "__proto__")
+                            {
+                                self.compile_expr(value, val_reg)?;
+                                self.cur().emit(Instruction::abc(
+                                    Opcode::SetProto,
+                                    dst,
+                                    val_reg,
+                                    0,
+                                ));
+                            } else {
+                                let prop_name = match key {
+                                    PropKey::Ident(n) | PropKey::String(n) => Some(n.as_str()),
+                                    _ => None,
+                                };
+                                self.compile_expr_named(value, val_reg, prop_name)?;
+                                self.emit_prop_define(dst, key, val_reg)?;
+                            }
                         }
                         ObjectProp::Method {
                             key,

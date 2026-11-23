@@ -62,6 +62,28 @@ enum HelperKind {
         index: usize,
         inner: Option<(HeapHandle, JsValue)>,
     },
+    Chunks {
+        iter: HeapHandle,
+        next_method: JsValue,
+        size: usize,
+    },
+    Windows {
+        iter: HeapHandle,
+        next_method: JsValue,
+        size: usize,
+        allow_partial: bool,
+        buf: Vec<JsValue>,
+        started: bool,
+    },
+    Zip {
+        /// `None` entry means that iterator has already completed (for `"longest"` mode).
+        iters: Vec<Option<(HeapHandle, JsValue)>>,
+        /// `None` => array output (`Iterator.zip`), `Some(keys)` => null-proto object (`Iterator.zipKeyed`).
+        keys: Option<Vec<crate::PropertyKey>>,
+        padding: Vec<JsValue>,
+        /// `0` = shortest, `1` = longest, `2` = strict.
+        mode: u8,
+    },
 }
 
 struct HelperRecord {
@@ -71,6 +93,93 @@ struct HelperRecord {
 
 type HelperTable = Rc<RefCell<HashMap<HeapHandle, HelperRecord>>>;
 type WrapTable = Rc<RefCell<HashMap<HeapHandle, (HeapHandle, JsValue)>>>;
+
+fn iterator_close_all(
+    vm: &mut JsVm,
+    iters: &[Option<(HeapHandle, JsValue)>],
+    abrupt: bool,
+) -> Result<(), JsException> {
+    let mut first_err: Option<JsException> = None;
+    for slot in iters.iter().rev() {
+        if let Some((h, _)) = *slot {
+            let res = vm.iterator_close_obj(h, abrupt || first_err.is_some());
+            if let Err(e) = res {
+                if !abrupt && first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn validate_chunk_or_window_size(
+    vm: &mut JsVm,
+    obj: HeapHandle,
+    val: JsValue,
+    name: &str,
+) -> Result<usize, JsException> {
+    let Some(n) = val.as_number() else {
+        let _ = vm.iterator_close_obj(obj, true);
+        return Err(vm.type_error(format!("Iterator.prototype.{name} size must be a number")));
+    };
+    if !n.is_finite() || n.fract() != 0.0 {
+        let _ = vm.iterator_close_obj(obj, true);
+        return Err(vm.type_error(format!(
+            "Iterator.prototype.{name} size must be an integral number"
+        )));
+    }
+    if !(1.0..=4_294_967_295.0).contains(&n) {
+        let _ = vm.iterator_close_obj(obj, true);
+        return Err(vm.range_error(format!(
+            "Iterator.prototype.{name} size must be between 1 and 2^32 - 1"
+        )));
+    }
+    Ok(n as usize)
+}
+
+fn parse_zip_options(
+    vm: &mut JsVm,
+    opts_val: JsValue,
+) -> Result<(u8, Option<HeapHandle>), JsException> {
+    if opts_val.is_undefined() {
+        return Ok((0, None));
+    }
+    let Some(oh) = opts_val.as_object() else {
+        return Err(vm.type_error("Iterator.zip options must be an object"));
+    };
+    let k_mode = vm.heap.intern_key("mode");
+    let mode_val = vm.get_property_by_key(oh, k_mode)?;
+    let mode = if mode_val.is_undefined() {
+        0u8
+    } else if let Some(sh) = mode_val.as_string() {
+        match vm.heap.materialize_string(sh).as_deref() {
+            Some("shortest") => 0,
+            Some("longest") => 1,
+            Some("strict") => 2,
+            _ => return Err(vm.type_error("Invalid Iterator.zip mode")),
+        }
+    } else {
+        return Err(vm.type_error("Invalid Iterator.zip mode"));
+    };
+    let padding = if mode == 1 {
+        let k_pad = vm.heap.intern_key("padding");
+        let pv = vm.get_property_by_key(oh, k_pad)?;
+        if pv.is_undefined() {
+            None
+        } else if let Some(ph) = pv.as_object() {
+            Some(ph)
+        } else {
+            return Err(vm.type_error("Iterator.zip padding must be an object"));
+        }
+    } else {
+        None
+    };
+    Ok((mode, padding))
+}
 
 fn iter_done(vm: &mut JsVm) -> JsValue {
     make_iter_result(vm, JsValue::UNDEFINED, true)
@@ -408,6 +517,223 @@ fn helper_next(
             }
             *inner = Some((in_h, in_next));
         },
+        HelperKind::Chunks {
+            iter,
+            next_method,
+            size,
+        } => {
+            let mut items = Vec::with_capacity((*size).min(1024));
+            let mut step_err = None;
+            while items.len() < *size {
+                match step_record(vm, *iter, *next_method) {
+                    Ok(Some(v)) => items.push(v),
+                    Ok(None) => break,
+                    Err(e) => {
+                        step_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = step_err {
+                Err(e)
+            } else if items.is_empty() {
+                Ok(None)
+            } else {
+                let arr = vm.alloc_array();
+                for v in items {
+                    vm.heap.object_push_element(arr, v);
+                }
+                Ok(Some(JsValue::from_object(arr)))
+            }
+        }
+        HelperKind::Windows {
+            iter,
+            next_method,
+            size,
+            allow_partial,
+            buf,
+            started,
+        } => {
+            let mut res: Result<Option<JsValue>, JsException> = Ok(None);
+            if !*started {
+                *started = true;
+                let mut err_opt = None;
+                while buf.len() < *size {
+                    match step_record(vm, *iter, *next_method) {
+                        Ok(Some(v)) => buf.push(v),
+                        Ok(None) => break,
+                        Err(e) => {
+                            err_opt = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = err_opt {
+                    res = Err(e);
+                } else if buf.len() == *size || (*allow_partial && !buf.is_empty()) {
+                    let arr = vm.alloc_array();
+                    for &v in buf.iter() {
+                        vm.heap.object_push_element(arr, v);
+                    }
+                    res = Ok(Some(JsValue::from_object(arr)));
+                }
+            } else if buf.len() < *size {
+                // Already yielded the lone partial window.
+                res = Ok(None);
+            } else {
+                match step_record(vm, *iter, *next_method) {
+                    Ok(Some(v)) => {
+                        buf.remove(0);
+                        buf.push(v);
+                        let arr = vm.alloc_array();
+                        for &item in buf.iter() {
+                            vm.heap.object_push_element(arr, item);
+                        }
+                        res = Ok(Some(JsValue::from_object(arr)));
+                    }
+                    Ok(None) => res = Ok(None),
+                    Err(e) => res = Err(e),
+                }
+            }
+            res
+        }
+        HelperKind::Zip {
+            iters,
+            keys,
+            padding,
+            mode,
+        } => {
+            if iters.is_empty() {
+                Ok(None)
+            } else {
+                let n = iters.len();
+                let mut results = Vec::with_capacity(n);
+                let mut any_open = false;
+                let mut zip_out: Option<Result<Option<JsValue>, JsException>> = None;
+                for i in 0..n {
+                    let Some((it_h, it_next)) = iters[i] else {
+                        // Already exhausted in "longest" mode.
+                        results.push(padding.get(i).copied().unwrap_or(JsValue::UNDEFINED));
+                        continue;
+                    };
+                    match step_record(vm, it_h, it_next) {
+                        Ok(Some(v)) => {
+                            any_open = true;
+                            results.push(v);
+                        }
+                        Ok(None) => {
+                            iters[i] = None;
+                            match *mode {
+                                0 => {
+                                    // "shortest": close all other open iterators and stop.
+                                    let close_r = iterator_close_all(vm, iters, false);
+                                    for slot in iters.iter_mut() {
+                                        *slot = None;
+                                    }
+                                    zip_out = Some(close_r.map(|()| None));
+                                    break;
+                                }
+                                1 => {
+                                    // "longest": pad this slot and continue.
+                                    results.push(
+                                        padding.get(i).copied().unwrap_or(JsValue::UNDEFINED),
+                                    );
+                                }
+                                _ => {
+                                    // "strict": if i == 0 verify all remaining are also done; else TypeError.
+                                    if i == 0 {
+                                        let mut mismatch = false;
+                                        let mut step_err = None;
+                                        for slot in iters.iter_mut().skip(1) {
+                                            if let Some((oh, onext)) = *slot {
+                                                match step_record(vm, oh, onext) {
+                                                    Ok(Some(_)) => {
+                                                        mismatch = true;
+                                                        break;
+                                                    }
+                                                    Ok(None) => {
+                                                        *slot = None;
+                                                    }
+                                                    Err(e) => {
+                                                        *slot = None;
+                                                        step_err = Some(e);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if let Some(e) = step_err {
+                                            let _ = iterator_close_all(vm, iters, true);
+                                            for slot in iters.iter_mut() {
+                                                *slot = None;
+                                            }
+                                            zip_out = Some(Err(e));
+                                            break;
+                                        }
+                                        if mismatch {
+                                            let _ = iterator_close_all(vm, iters, true);
+                                            for slot in iters.iter_mut() {
+                                                *slot = None;
+                                            }
+                                            zip_out = Some(Err(vm.type_error(
+                                                "Iterator.zip strict mode: iterators have different lengths",
+                                            )));
+                                            break;
+                                        }
+                                        zip_out = Some(Ok(None));
+                                        break;
+                                    } else {
+                                        let _ = iterator_close_all(vm, iters, true);
+                                        for slot in iters.iter_mut() {
+                                            *slot = None;
+                                        }
+                                        zip_out = Some(Err(vm.type_error(
+                                            "Iterator.zip strict mode: iterators have different lengths",
+                                        )));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            iters[i] = None;
+                            let _ = iterator_close_all(vm, iters, true);
+                            for slot in iters.iter_mut() {
+                                *slot = None;
+                            }
+                            zip_out = Some(Err(e));
+                            break;
+                        }
+                    }
+                }
+                if let Some(r) = zip_out {
+                    r
+                } else if !any_open {
+                    Ok(None)
+                } else if let Some(ks) = keys {
+                    let obj = vm
+                        .heap
+                        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, None));
+                    for (&pk, &val) in ks.iter().zip(results.iter()) {
+                        vm.heap.object_define_data(
+                            obj,
+                            pk,
+                            val,
+                            PropertyAttrs::DEFAULT,
+                            &mut vm.shapes,
+                        );
+                        vm.heap.write_barrier(obj, val);
+                    }
+                    Ok(Some(JsValue::from_object(obj)))
+                } else {
+                    let arr = vm.alloc_array();
+                    for val in results {
+                        vm.heap.object_push_element(arr, val);
+                    }
+                    Ok(Some(JsValue::from_object(arr)))
+                }
+            }
+        }
     };
 
     let mut map = table.borrow_mut();
@@ -454,7 +780,10 @@ fn helper_return(
         HelperKind::Map { iter, .. }
         | HelperKind::Filter { iter, .. }
         | HelperKind::Take { iter, .. }
-        | HelperKind::Drop { iter, .. } => vm.iterator_close_obj(iter, false),
+        | HelperKind::Drop { iter, .. }
+        | HelperKind::Chunks { iter, .. }
+        | HelperKind::Windows { iter, .. } => vm.iterator_close_obj(iter, false),
+        HelperKind::Zip { iters, .. } => iterator_close_all(vm, &iters, false),
         HelperKind::FlatMap { iter, inner, .. } => {
             if let Some((in_h, _)) = inner {
                 match vm.iterator_close_obj(in_h, false) {
@@ -933,6 +1262,67 @@ pub fn install_iterator(vm: &mut JsVm) {
             Ok(JsValue::from_object(h))
         });
     }
+    {
+        let ht = Rc::clone(&helpers);
+        def_helper(vm, ip, "chunks", 1, move |vm, this_val, args| {
+            let Some(obj) = this_val.as_object() else {
+                return Err(vm.type_error("Iterator.prototype.chunks called on non-object"));
+            };
+            let size = validate_chunk_or_window_size(vm, obj, arg(args, 0), "chunks")?;
+            let (_, next_method) = get_iterator_direct(vm, obj)?;
+            let h = alloc_helper(
+                vm,
+                &ht,
+                HelperKind::Chunks {
+                    iter: obj,
+                    next_method,
+                    size,
+                },
+                &[JsValue::from_object(obj), next_method],
+            );
+            Ok(JsValue::from_object(h))
+        });
+    }
+    {
+        let ht = Rc::clone(&helpers);
+        def_helper(vm, ip, "windows", 1, move |vm, this_val, args| {
+            let Some(obj) = this_val.as_object() else {
+                return Err(vm.type_error("Iterator.prototype.windows called on non-object"));
+            };
+            let size = validate_chunk_or_window_size(vm, obj, arg(args, 0), "windows")?;
+            let under_v = arg(args, 1);
+            let allow_partial = if under_v.is_undefined() {
+                false
+            } else if let Some(sh) = under_v.as_string() {
+                match vm.heap.materialize_string(sh).as_deref() {
+                    Some("only-full") => false,
+                    Some("allow-partial") => true,
+                    _ => {
+                        let _ = vm.iterator_close_obj(obj, true);
+                        return Err(vm.type_error("Invalid undersized option for windows"));
+                    }
+                }
+            } else {
+                let _ = vm.iterator_close_obj(obj, true);
+                return Err(vm.type_error("Invalid undersized option for windows"));
+            };
+            let (_, next_method) = get_iterator_direct(vm, obj)?;
+            let h = alloc_helper(
+                vm,
+                &ht,
+                HelperKind::Windows {
+                    iter: obj,
+                    next_method,
+                    size,
+                    allow_partial,
+                    buf: Vec::new(),
+                    started: false,
+                },
+                &[JsValue::from_object(obj), next_method],
+            );
+            Ok(JsValue::from_object(h))
+        });
+    }
 
     // Consuming methods on %Iterator.prototype%
     let consumers: &[(&str, u32, NativeFnPtr)] = &[
@@ -992,6 +1382,101 @@ pub fn install_iterator(vm: &mut JsVm) {
         ("some", 1, |vm, t, a| iter_predicate_scan(vm, t, a, 0)),
         ("every", 1, |vm, t, a| iter_predicate_scan(vm, t, a, 1)),
         ("find", 1, |vm, t, a| iter_predicate_scan(vm, t, a, 2)),
+        ("join", 1, |vm, this_val, args| {
+            let Some(obj) = this_val.as_object() else {
+                return Err(vm.type_error("Iterator.prototype.join called on non-object"));
+            };
+            let sep_v = arg(args, 0);
+            let sep = if sep_v.is_undefined() {
+                ",".to_string()
+            } else {
+                match vm.to_js_string(sep_v) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = vm.iterator_close_obj(obj, true);
+                        return Err(e);
+                    }
+                }
+            };
+            let (_, next_method) = get_iterator_direct(vm, obj)?;
+            let mut out = String::new();
+            let mut first = true;
+            while let Some(v) = step_record(vm, obj, next_method)? {
+                if !first {
+                    out.push_str(&sep);
+                }
+                first = false;
+                if !v.is_null() && !v.is_undefined() {
+                    match vm.to_js_string(v) {
+                        Ok(s) => out.push_str(&s),
+                        Err(e) => {
+                            let _ = vm.iterator_close_obj(obj, true);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            Ok(JsValue::from_string(vm.heap.alloc_string(out)))
+        }),
+        ("includes", 1, |vm, this_val, args| {
+            let Some(obj) = this_val.as_object() else {
+                return Err(vm.type_error("Iterator.prototype.includes called on non-object"));
+            };
+            let search = arg(args, 0);
+            let skip_v = arg(args, 1);
+            let skip: u64 = if skip_v.is_undefined() {
+                0
+            } else {
+                let Some(n) = skip_v.as_number() else {
+                    let _ = vm.iterator_close_obj(obj, true);
+                    return Err(vm.type_error(
+                        "Iterator.prototype.includes skippedElements must be a number",
+                    ));
+                };
+                if n.is_nan() {
+                    let _ = vm.iterator_close_obj(obj, true);
+                    return Err(vm.type_error(
+                        "Iterator.prototype.includes skippedElements must not be NaN",
+                    ));
+                }
+                if n == f64::INFINITY {
+                    u64::MAX
+                } else if n == f64::NEG_INFINITY || n < 0.0 || n > 9_007_199_254_740_991.0 {
+                    let _ = vm.iterator_close_obj(obj, true);
+                    return Err(
+                        vm.range_error("Iterator.prototype.includes skippedElements out of range")
+                    );
+                } else if n.fract() != 0.0 {
+                    let _ = vm.iterator_close_obj(obj, true);
+                    return Err(vm.type_error(
+                        "Iterator.prototype.includes skippedElements must be integral",
+                    ));
+                } else {
+                    n as u64
+                }
+            };
+            let (_, next_method) = get_iterator_direct(vm, obj)?;
+            let mut rem_skip = skip;
+            while rem_skip > 0 {
+                if rem_skip != u64::MAX {
+                    rem_skip -= 1;
+                }
+                if step_record(vm, obj, next_method)?.is_none() {
+                    return Ok(JsValue::FALSE);
+                }
+            }
+            while let Some(v) = step_record(vm, obj, next_method)? {
+                let matched = match (v.as_number(), search.as_number()) {
+                    (Some(a), Some(b)) if a.is_nan() && b.is_nan() => true,
+                    _ => vm.strict_eq(v, search),
+                };
+                if matched {
+                    vm.iterator_close_obj(obj, false)?;
+                    return Ok(JsValue::TRUE);
+                }
+            }
+            Ok(JsValue::FALSE)
+        }),
     ];
     for &(name, len, f) in consumers {
         define_method_len(vm, ip, name, len, f);
@@ -1146,6 +1631,195 @@ pub fn install_iterator(vm: &mut JsVm) {
             ctor,
             k_concat,
             JsValue::from_object(concat_fn),
+            PropertyAttrs::METHOD,
+            &mut vm.shapes,
+        );
+    }
+
+    // `Iterator.zip(iterables [, options])` (Joint Iteration)
+    {
+        let ht = Rc::clone(&helpers);
+        let zip_fn = vm.alloc_host_fn("zip", move |vm, _this, args| {
+            let iterables_val = arg(args, 0);
+            if !iterables_val.is_object() {
+                return Err(vm.type_error("Iterator.zip requires an object iterables argument"));
+            }
+            let (mode, pad_opt) = parse_zip_options(vm, arg(args, 1))?;
+            let outer = vm.create_iterator_public(iterables_val)?;
+            let mut iters: Vec<Option<(HeapHandle, JsValue)>> = Vec::new();
+            let mut roots: Vec<JsValue> = Vec::new();
+            loop {
+                let (item, done) = match vm.step_iterator_public(JsValue::from_object(outer)) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = iterator_close_all(vm, &iters, true);
+                        return Err(e);
+                    }
+                };
+                if done {
+                    break;
+                }
+                match get_iterator_flattenable(vm, item, false) {
+                    Ok((ih, nm)) => {
+                        iters.push(Some((ih, nm)));
+                        roots.push(JsValue::from_object(ih));
+                        roots.push(nm);
+                    }
+                    Err(e) => {
+                        let _ = vm.iterator_close_handle(outer, true);
+                        let _ = iterator_close_all(vm, &iters, true);
+                        return Err(e);
+                    }
+                }
+            }
+            let mut padding = vec![JsValue::UNDEFINED; iters.len()];
+            if mode == 1 {
+                if let Some(pad_h) = pad_opt {
+                    let pad_iter = match vm.create_iterator_public(JsValue::from_object(pad_h)) {
+                        Ok(it) => it,
+                        Err(e) => {
+                            let _ = iterator_close_all(vm, &iters, true);
+                            return Err(e);
+                        }
+                    };
+                    let mut pad_done = false;
+                    for slot in &mut padding {
+                        match vm.step_iterator_public(JsValue::from_object(pad_iter)) {
+                            Ok((v, false)) => {
+                                *slot = v;
+                                roots.push(v);
+                            }
+                            Ok((_, true)) => {
+                                pad_done = true;
+                                break;
+                            }
+                            Err(e) => {
+                                let _ = iterator_close_all(vm, &iters, true);
+                                return Err(e);
+                            }
+                        }
+                    }
+                    if !pad_done {
+                        if let Err(e) = vm.iterator_close_handle(pad_iter, false) {
+                            let _ = iterator_close_all(vm, &iters, true);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            let h = alloc_helper(
+                vm,
+                &ht,
+                HelperKind::Zip {
+                    iters,
+                    keys: None,
+                    padding,
+                    mode,
+                },
+                &roots,
+            );
+            Ok(JsValue::from_object(h))
+        });
+        vm.set_fn_length(zip_fn, 1);
+        let k_zip = vm.heap.intern_key("zip");
+        vm.heap.object_define_data(
+            ctor,
+            k_zip,
+            JsValue::from_object(zip_fn),
+            PropertyAttrs::METHOD,
+            &mut vm.shapes,
+        );
+    }
+
+    // `Iterator.zipKeyed(iterables [, options])` (Joint Iteration)
+    {
+        let ht = Rc::clone(&helpers);
+        let zip_keyed_fn = vm.alloc_host_fn("zipKeyed", move |vm, _this, args| {
+            let iterables_val = arg(args, 0);
+            let Some(iterables_h) = iterables_val.as_object() else {
+                return Err(
+                    vm.type_error("Iterator.zipKeyed requires an object iterables argument")
+                );
+            };
+            let (mode, pad_opt) = parse_zip_options(vm, arg(args, 1))?;
+            let all_keys = crate::promise::own_property_keys_spec(vm, iterables_h)?;
+            let mut iters: Vec<Option<(HeapHandle, JsValue)>> = Vec::new();
+            let mut keys: Vec<crate::PropertyKey> = Vec::new();
+            let mut key_vals: Vec<JsValue> = Vec::new();
+            let mut roots: Vec<JsValue> = Vec::new();
+            for (kv, pk) in all_keys {
+                let is_enum = match crate::promise::is_own_prop_enumerable(vm, iterables_h, kv, pk)
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = iterator_close_all(vm, &iters, true);
+                        return Err(e);
+                    }
+                };
+                if !is_enum {
+                    continue;
+                }
+                let val = match vm.get_elem(iterables_val, kv) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = iterator_close_all(vm, &iters, true);
+                        return Err(e);
+                    }
+                };
+                if val.is_undefined() {
+                    continue;
+                }
+                match get_iterator_flattenable(vm, val, false) {
+                    Ok((ih, nm)) => {
+                        iters.push(Some((ih, nm)));
+                        keys.push(pk);
+                        key_vals.push(kv);
+                        roots.push(JsValue::from_object(ih));
+                        roots.push(nm);
+                    }
+                    Err(e) => {
+                        let _ = iterator_close_all(vm, &iters, true);
+                        return Err(e);
+                    }
+                }
+            }
+            let mut padding = vec![JsValue::UNDEFINED; iters.len()];
+            if mode == 1 {
+                if let Some(pad_h) = pad_opt {
+                    let pad_val = JsValue::from_object(pad_h);
+                    for (slot, &kv) in padding.iter_mut().zip(key_vals.iter()) {
+                        match vm.get_elem(pad_val, kv) {
+                            Ok(v) => {
+                                *slot = v;
+                                roots.push(v);
+                            }
+                            Err(e) => {
+                                let _ = iterator_close_all(vm, &iters, true);
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+            }
+            let h = alloc_helper(
+                vm,
+                &ht,
+                HelperKind::Zip {
+                    iters,
+                    keys: Some(keys),
+                    padding,
+                    mode,
+                },
+                &roots,
+            );
+            Ok(JsValue::from_object(h))
+        });
+        vm.set_fn_length(zip_keyed_fn, 1);
+        let k_zk = vm.heap.intern_key("zipKeyed");
+        vm.heap.object_define_data(
+            ctor,
+            k_zk,
+            JsValue::from_object(zip_keyed_fn),
             PropertyAttrs::METHOD,
             &mut vm.shapes,
         );

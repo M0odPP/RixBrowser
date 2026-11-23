@@ -2222,6 +2222,7 @@ fn install_extended_array_and_object(vm: &mut JsVm) {
         .and_then(|v| v.as_object())
     {
         define_method_len(vm, h, "from", 1, array_from);
+        define_method_len(vm, h, "fromAsync", 1, crate::promise::array_from_async);
         define_method_len(vm, h, "of", 0, array_of);
     }
 

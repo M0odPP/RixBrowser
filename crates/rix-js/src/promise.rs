@@ -3,7 +3,7 @@
 //!
 //! Reference: Spec 05 §6 & Issue #15.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -14,6 +14,7 @@ use crate::heap::{
 use crate::shape::PropertyAttrs;
 use crate::value::{HeapHandle, JsValue};
 use crate::vm::{JsException, JsVm, NativeFnPtr, RunOutcome};
+use crate::vm_builtins::define_method_len;
 
 /// Queued ECMAScript microtask job executed FIFO at every microtask checkpoint.
 #[derive(Debug, Clone)]
@@ -22,6 +23,12 @@ pub enum MicrotaskJob {
         func: HeapHandle,
         this_val: JsValue,
         args: Vec<JsValue>,
+    },
+    ResolveThenable {
+        thenable: JsValue,
+        then_fn: HeapHandle,
+        resolve_fn: HeapHandle,
+        reject_fn: HeapHandle,
     },
     PromiseReaction {
         reaction: PromiseReaction,
@@ -47,6 +54,17 @@ impl MicrotaskJob {
                 out.push(JsValue::from_object(*func));
                 out.push(*this_val);
                 out.extend_from_slice(args);
+            }
+            Self::ResolveThenable {
+                thenable,
+                then_fn,
+                resolve_fn,
+                reject_fn,
+            } => {
+                out.push(*thenable);
+                out.push(JsValue::from_object(*then_fn));
+                out.push(JsValue::from_object(*resolve_fn));
+                out.push(JsValue::from_object(*reject_fn));
             }
             Self::PromiseReaction {
                 reaction, value, ..
@@ -152,24 +170,18 @@ fn install_aggregate_error(vm: &mut JsVm) {
     );
 
     let ctor = vm.alloc_host_fn("AggregateError", move |vm, _this, args| {
+        let proto = if let Some(nth) = vm.native_new_target.as_object() {
+            vm.get_property_by_key(nth, vm.key_prototype)?
+                .as_object()
+                .unwrap_or(agg_proto)
+        } else {
+            agg_proto
+        };
         let err = vm
             .heap
-            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(agg_proto)));
-        let errors_arr = vm.alloc_array();
-        let iterable = arg(args, 0);
-        for item in vm.collect_iterable(iterable)? {
-            vm.heap.object_push_element(errors_arr, item);
-        }
-        let k_errors = vm.heap.intern_key("errors");
-        vm.heap.object_define_data(
-            err,
-            k_errors,
-            JsValue::from_object(errors_arr),
-            PropertyAttrs::METHOD,
-            &mut vm.shapes,
-        );
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
         if !arg(args, 1).is_undefined() {
-            let msg = vm.value_to_rust_string(arg(args, 1));
+            let msg = vm.to_js_string(arg(args, 1))?;
             let mv = JsValue::from_string(vm.heap.alloc_string(msg));
             vm.heap.object_define_data(
                 err,
@@ -192,6 +204,19 @@ fn install_aggregate_error(vm: &mut JsVm) {
                 );
             }
         }
+        let errors_arr = vm.alloc_array();
+        let iterable = arg(args, 0);
+        for item in vm.collect_iterable(iterable)? {
+            vm.heap.object_push_element(errors_arr, item);
+        }
+        let k_errors = vm.heap.intern_key("errors");
+        vm.heap.object_define_data(
+            err,
+            k_errors,
+            JsValue::from_object(errors_arr),
+            PropertyAttrs::METHOD,
+            &mut vm.shapes,
+        );
         Ok(JsValue::from_object(err))
     });
     vm.mark_constructor(ctor);
@@ -228,28 +253,31 @@ pub fn alloc_promise(vm: &mut JsVm) -> HeapHandle {
 }
 
 /// Returns `(resolve_fn, reject_fn)` paired to settle `promise` at most once.
+/// Per ECMA-262 §27.2.1.3 both functions are anonymous (`name === ""`) with `length === 1`.
 pub fn create_resolving_functions(vm: &mut JsVm, promise: HeapHandle) -> (HeapHandle, HeapHandle) {
     let settled = Rc::new(Cell::new(false));
     let s1 = Rc::clone(&settled);
-    let resolve_fn = vm.alloc_host_fn("resolve", move |vm, _this, args| {
+    let resolve_fn = vm.alloc_host_fn("", move |vm, _this, args| {
         if s1.replace(true) {
             return Ok(JsValue::UNDEFINED);
         }
         resolve_promise(vm, promise, arg(args, 0));
         Ok(JsValue::UNDEFINED)
     });
+    vm.set_fn_length(resolve_fn, 1);
     let s2 = settled;
-    let reject_fn = vm.alloc_host_fn("reject", move |vm, _this, args| {
+    let reject_fn = vm.alloc_host_fn("", move |vm, _this, args| {
         if s2.replace(true) {
             return Ok(JsValue::UNDEFINED);
         }
         reject_promise(vm, promise, arg(args, 0));
         Ok(JsValue::UNDEFINED)
     });
+    vm.set_fn_length(reject_fn, 1);
     (resolve_fn, reject_fn)
 }
 
-/// Resolves `promise` with `value` (chaining if `value` is a `Promise` or thenable).
+/// Resolves `promise` with `value` per ECMA-262 §27.2.1.3.2 (chaining via `.then`).
 pub fn resolve_promise(vm: &mut JsVm, promise: HeapHandle, value: JsValue) {
     let is_pending = matches!(
         vm.heap.get_object(promise).map(|o| &o.kind),
@@ -264,34 +292,17 @@ pub fn resolve_promise(vm: &mut JsVm, promise: HeapHandle, value: JsValue) {
         return;
     }
     if let Some(vh) = value.as_object() {
-        // Fast path: resolving with another native Promise.
-        if matches!(
-            vm.heap.get_object(vh).map(|o| &o.kind),
-            Some(ObjectKind::Promise(_))
-        ) {
-            let (res_fn, rej_fn) = create_resolving_functions(vm, promise);
-            attach_promise_reaction(
-                vm,
-                vh,
-                PromiseReaction {
-                    on_fulfilled: Some(res_fn),
-                    on_rejected: Some(rej_fn),
-                    result_promise: None,
-                },
-            );
-            return;
-        }
-        // Generic thenable check (`typeof value.then === "function"`).
         let k_then = vm.heap.intern_key("then");
         match vm.get_property_by_key(vh, k_then) {
             Ok(then_val) => {
                 if let Some(then_h) = then_val.as_object() {
                     if vm.is_callable_handle(then_h) {
                         let (res_fn, rej_fn) = create_resolving_functions(vm, promise);
-                        vm.enqueue_microtask(MicrotaskJob::Callback {
-                            func: then_h,
-                            this_val: value,
-                            args: vec![JsValue::from_object(res_fn), JsValue::from_object(rej_fn)],
+                        vm.enqueue_microtask(MicrotaskJob::ResolveThenable {
+                            thenable: value,
+                            then_fn: then_h,
+                            resolve_fn: res_fn,
+                            reject_fn: rej_fn,
                         });
                         return;
                     }
@@ -435,6 +446,27 @@ pub fn drain_microtasks(vm: &mut JsVm) {
             } => {
                 let _ = vm.call_value(JsValue::from_object(func), this_val, &args);
             }
+            MicrotaskJob::ResolveThenable {
+                thenable,
+                then_fn,
+                resolve_fn,
+                reject_fn,
+            } => {
+                if let Err(e) = vm.call_value(
+                    JsValue::from_object(then_fn),
+                    thenable,
+                    &[
+                        JsValue::from_object(resolve_fn),
+                        JsValue::from_object(reject_fn),
+                    ],
+                ) {
+                    let _ = vm.call_value(
+                        JsValue::from_object(reject_fn),
+                        JsValue::UNDEFINED,
+                        &[e.value],
+                    );
+                }
+            }
             MicrotaskJob::PromiseReaction {
                 reaction,
                 is_rejected,
@@ -574,9 +606,212 @@ fn drive_async_execution(vm: &mut JsVm, entry_depth: usize, promise: HeapHandle)
     }
 }
 
+struct PromiseCapability {
+    promise: JsValue,
+    resolve: HeapHandle,
+    reject: HeapHandle,
+}
+
+fn new_promise_capability(vm: &mut JsVm, ctor: JsValue) -> Result<PromiseCapability, JsException> {
+    if !ctor
+        .as_object()
+        .is_some_and(|h| vm.is_constructor_handle(h))
+    {
+        return Err(vm.type_error("Promise constructor is not a constructor"));
+    }
+    if ctor.as_object() == vm.promise_ctor {
+        let p = alloc_promise(vm);
+        let (resolve, reject) = create_resolving_functions(vm, p);
+        return Ok(PromiseCapability {
+            promise: JsValue::from_object(p),
+            resolve,
+            reject,
+        });
+    }
+    let res_cell = Rc::new(Cell::new(JsValue::UNDEFINED));
+    let rej_cell = Rc::new(Cell::new(JsValue::UNDEFINED));
+    let r1 = Rc::clone(&res_cell);
+    let r2 = Rc::clone(&rej_cell);
+    let exec = vm.alloc_host_fn("", move |vm, _this, args| {
+        if !r1.get().is_undefined() || !r2.get().is_undefined() {
+            return Err(vm.type_error("Promise executor already called"));
+        }
+        r1.set(arg(args, 0));
+        r2.set(arg(args, 1));
+        Ok(JsValue::UNDEFINED)
+    });
+    vm.set_fn_length(exec, 2);
+    let promise = vm.construct_value(ctor, &[JsValue::from_object(exec)], ctor)?;
+    let Some(resolve) = res_cell
+        .get()
+        .as_object()
+        .filter(|&h| vm.is_callable_handle(h))
+    else {
+        return Err(vm.type_error("Promise resolve function is not callable"));
+    };
+    let Some(reject) = rej_cell
+        .get()
+        .as_object()
+        .filter(|&h| vm.is_callable_handle(h))
+    else {
+        return Err(vm.type_error("Promise reject function is not callable"));
+    };
+    Ok(PromiseCapability {
+        promise,
+        resolve,
+        reject,
+    })
+}
+
+fn species_constructor(
+    vm: &mut JsVm,
+    obj: HeapHandle,
+    default_ctor: JsValue,
+) -> Result<JsValue, JsException> {
+    let c = vm.get_property_by_key(obj, vm.key_constructor)?;
+    if c.is_undefined() {
+        return Ok(default_ctor);
+    }
+    let Some(ch) = c.as_object() else {
+        return Err(vm.type_error("Constructor property is not an object"));
+    };
+    let s = vm.get_property_by_key(ch, vm.key_symbol_species)?;
+    if s.is_undefined() || s.is_null() {
+        return Ok(default_ctor);
+    }
+    if s.as_object().is_some_and(|sh| vm.is_constructor_handle(sh)) {
+        return Ok(s);
+    }
+    Err(vm.type_error("Species is not a constructor"))
+}
+
+fn promise_resolve_with_ctor(
+    vm: &mut JsVm,
+    ctor: JsValue,
+    val: JsValue,
+) -> Result<JsValue, JsException> {
+    if !ctor.is_object() {
+        return Err(vm.type_error("Promise.resolve called on non-object"));
+    }
+    if let Some(vh) = val.as_object() {
+        if matches!(
+            vm.heap.get_object(vh).map(|o| &o.kind),
+            Some(ObjectKind::Promise(_))
+        ) {
+            let xc = vm.get_property_by_key(vh, vm.key_constructor)?;
+            if xc.is_object() && xc.as_object() == ctor.as_object() {
+                return Ok(val);
+            }
+        }
+    }
+    let cap = new_promise_capability(vm, ctor)?;
+    vm.call_value(
+        JsValue::from_object(cap.resolve),
+        JsValue::UNDEFINED,
+        &[val],
+    )?;
+    Ok(cap.promise)
+}
+
+fn get_promise_resolve(vm: &mut JsVm, ctor: JsValue) -> Result<JsValue, JsException> {
+    let Some(ch) = ctor.as_object() else {
+        return Err(vm.type_error("Promise combinator called on non-object"));
+    };
+    let k_resolve = vm.heap.intern_key("resolve");
+    let r = vm.get_property_by_key(ch, k_resolve)?;
+    if !r.as_object().is_some_and(|h| vm.is_callable_handle(h)) {
+        return Err(vm.type_error("Promise resolve property is not callable"));
+    }
+    Ok(r)
+}
+
+fn perform_promise_then_cap(
+    vm: &mut JsVm,
+    promise: HeapHandle,
+    on_ful: Option<HeapHandle>,
+    on_rej: Option<HeapHandle>,
+    cap: PromiseCapability,
+) -> JsValue {
+    if let Some(rp) = cap.promise.as_object() {
+        if matches!(
+            vm.heap.get_object(rp).map(|o| &o.kind),
+            Some(ObjectKind::Promise(_))
+        ) && vm.promise_ctor.is_some()
+        {
+            // Check whether cap came from native Promise by wrapping with cap.resolve/cap.reject
+            // only if needed; using wrapper guarantees custom subclass resolve/reject hooks fire.
+        }
+    }
+    let cap_res = cap.resolve;
+    let cap_rej = cap.reject;
+    let wrapped_ful = vm.alloc_host_fn("", move |vm, _this, args| {
+        let v = arg(args, 0);
+        if let Some(fh) = on_ful {
+            match vm.call_value(JsValue::from_object(fh), JsValue::UNDEFINED, &[v]) {
+                Ok(r) => {
+                    let _ = vm.call_value(JsValue::from_object(cap_res), JsValue::UNDEFINED, &[r]);
+                }
+                Err(e) => {
+                    let _ = vm.call_value(
+                        JsValue::from_object(cap_rej),
+                        JsValue::UNDEFINED,
+                        &[e.value],
+                    );
+                }
+            }
+        } else {
+            let _ = vm.call_value(JsValue::from_object(cap_res), JsValue::UNDEFINED, &[v]);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    let wrapped_rej = vm.alloc_host_fn("", move |vm, _this, args| {
+        let r = arg(args, 0);
+        if let Some(rh) = on_rej {
+            match vm.call_value(JsValue::from_object(rh), JsValue::UNDEFINED, &[r]) {
+                Ok(res) => {
+                    let _ =
+                        vm.call_value(JsValue::from_object(cap_res), JsValue::UNDEFINED, &[res]);
+                }
+                Err(e) => {
+                    let _ = vm.call_value(
+                        JsValue::from_object(cap_rej),
+                        JsValue::UNDEFINED,
+                        &[e.value],
+                    );
+                }
+            }
+        } else {
+            let _ = vm.call_value(JsValue::from_object(cap_rej), JsValue::UNDEFINED, &[r]);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    attach_promise_reaction(
+        vm,
+        promise,
+        PromiseReaction {
+            on_fulfilled: Some(wrapped_ful),
+            on_rejected: Some(wrapped_rej),
+            result_promise: None,
+        },
+    );
+    cap.promise
+}
+
+fn invoke_then(
+    vm: &mut JsVm,
+    promise_val: JsValue,
+    on_ful: JsValue,
+    on_rej: JsValue,
+) -> Result<JsValue, JsException> {
+    let h = vm.to_object(promise_val)?;
+    let k_then = vm.heap.intern_key("then");
+    let then_fn = vm.get_property_by_key(h, k_then)?;
+    vm.call_value(then_fn, promise_val, &[on_ful, on_rej])
+}
+
 fn install_promise(vm: &mut JsVm) {
     let pp = vm.promise_proto;
-    define_method(vm, pp, "then", |vm, this_val, args| {
+    define_method_len(vm, pp, "then", 2, |vm, this_val, args| {
         let Some(ph) = this_val.as_object() else {
             return Err(vm.type_error("Promise.prototype.then called on non-Promise"));
         };
@@ -586,76 +821,97 @@ fn install_promise(vm: &mut JsVm) {
         ) {
             return Err(vm.type_error("Promise.prototype.then called on non-Promise"));
         }
+        let default_ctor = vm
+            .promise_ctor
+            .map(JsValue::from_object)
+            .unwrap_or(JsValue::UNDEFINED);
+        let c = species_constructor(vm, ph, default_ctor)?;
         let on_ful = arg(args, 0)
             .as_object()
             .filter(|&h| vm.is_callable_handle(h));
         let on_rej = arg(args, 1)
             .as_object()
             .filter(|&h| vm.is_callable_handle(h));
-        Ok(JsValue::from_object(promise_then(vm, ph, on_ful, on_rej)))
+        if c.as_object() == vm.promise_ctor {
+            return Ok(JsValue::from_object(promise_then(vm, ph, on_ful, on_rej)));
+        }
+        let cap = new_promise_capability(vm, c)?;
+        Ok(perform_promise_then_cap(vm, ph, on_ful, on_rej, cap))
     });
-    define_method(vm, pp, "catch", |vm, this_val, args| {
-        let k_then = vm.heap.intern_key("then");
-        let Some(ph) = this_val.as_object() else {
-            return Err(vm.type_error("Promise.prototype.catch called on non-object"));
-        };
-        let then_fn = vm.get_property_by_key(ph, k_then)?;
-        vm.call_value(then_fn, this_val, &[JsValue::UNDEFINED, arg(args, 0)])
+    define_method_len(vm, pp, "catch", 1, |vm, this_val, args| {
+        invoke_then(vm, this_val, JsValue::UNDEFINED, arg(args, 0))
     });
-    define_method(vm, pp, "finally", |vm, this_val, args| {
+    define_method_len(vm, pp, "finally", 1, |vm, this_val, args| {
         let Some(ph) = this_val.as_object() else {
             return Err(vm.type_error("Promise.prototype.finally called on non-object"));
         };
+        let default_ctor = vm
+            .promise_ctor
+            .map(JsValue::from_object)
+            .unwrap_or(JsValue::UNDEFINED);
+        let c = species_constructor(vm, ph, default_ctor)?;
         let on_finally = arg(args, 0);
         let Some(fin_h) = on_finally.as_object().filter(|&h| vm.is_callable_handle(h)) else {
-            return Ok(JsValue::from_object(promise_then(vm, ph, None, None)));
+            return invoke_then(vm, this_val, on_finally, on_finally);
         };
-        let on_ful = vm.alloc_host_fn("finally_ful", move |vm, _this, fargs| {
+        let on_ful = vm.alloc_host_fn("", move |vm, _this, fargs| {
             let val = arg(fargs, 0);
             let res = vm.call_value(JsValue::from_object(fin_h), JsValue::UNDEFINED, &[])?;
-            let p = promise_resolve_value(vm, res);
-            let ret_val = vm.alloc_host_fn("finally_ret", move |_vm, _, _| Ok(val));
-            Ok(JsValue::from_object(promise_then(
-                vm,
-                p,
-                Some(ret_val),
-                None,
-            )))
+            let p = promise_resolve_with_ctor(vm, c, res)?;
+            let ret_val = vm.alloc_host_fn("", move |_vm, _, _| Ok(val));
+            vm.set_fn_length(ret_val, 0);
+            invoke_then(vm, p, JsValue::from_object(ret_val), JsValue::UNDEFINED)
         });
-        let on_rej = vm.alloc_host_fn("finally_rej", move |vm, _this, fargs| {
+        vm.set_fn_length(on_ful, 1);
+        let on_rej = vm.alloc_host_fn("", move |vm, _this, fargs| {
             let reason = arg(fargs, 0);
             let res = vm.call_value(JsValue::from_object(fin_h), JsValue::UNDEFINED, &[])?;
-            let p = promise_resolve_value(vm, res);
-            let rethrow = vm.alloc_host_fn("finally_throw", move |vm, _, _| {
+            let p = promise_resolve_with_ctor(vm, c, res)?;
+            let rethrow = vm.alloc_host_fn("", move |vm, _, _| {
                 let msg = vm.format_exception_public(reason);
                 Err(JsException {
                     value: reason,
                     message: msg,
                 })
             });
-            Ok(JsValue::from_object(promise_then(
-                vm,
-                p,
-                Some(rethrow),
-                None,
-            )))
+            vm.set_fn_length(rethrow, 0);
+            invoke_then(vm, p, JsValue::from_object(rethrow), JsValue::UNDEFINED)
         });
-        Ok(JsValue::from_object(promise_then(
+        vm.set_fn_length(on_rej, 1);
+        invoke_then(
             vm,
-            ph,
-            Some(on_ful),
-            Some(on_rej),
-        )))
+            this_val,
+            JsValue::from_object(on_ful),
+            JsValue::from_object(on_rej),
+        )
     });
 
+    let ptag = JsValue::from_string(vm.heap.alloc_string("Promise"));
+    let k_tag = vm.key_symbol_to_string_tag;
+    vm.heap
+        .object_define_data(pp, k_tag, ptag, PropertyAttrs::CONFIGURABLE, &mut vm.shapes);
+
     let ctor = vm.alloc_native_fn("Promise", |vm, _this, args| {
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("Constructor Promise requires 'new'"));
+        }
         let Some(exec) = arg(args, 0).as_object() else {
             return Err(vm.type_error("Promise resolver is not a function"));
         };
         if !vm.is_callable_handle(exec) {
             return Err(vm.type_error("Promise resolver is not a function"));
         }
-        let p = alloc_promise(vm);
+        let proto = if let Some(nth) = vm.native_new_target.as_object() {
+            vm.get_property_by_key(nth, vm.key_prototype)?
+                .as_object()
+                .unwrap_or(vm.promise_proto)
+        } else {
+            vm.promise_proto
+        };
+        let p = vm.heap.alloc_object(JsObject::with_kind(
+            ObjectKind::Promise(Box::default()),
+            Some(proto),
+        ));
         let (res_fn, rej_fn) = create_resolving_functions(vm, p);
         if let Err(e) = vm.call_value(
             JsValue::from_object(exec),
@@ -668,51 +924,87 @@ fn install_promise(vm: &mut JsVm) {
     });
     vm.mark_constructor(ctor);
     vm.set_fn_length(ctor, 1);
-    define_method(vm, ctor, "resolve", |vm, _this, args| {
-        Ok(JsValue::from_object(promise_resolve_value(
-            vm,
-            arg(args, 0),
-        )))
+    vm.promise_ctor = Some(ctor);
+
+    let species_get = vm.alloc_native_fn("get [Symbol.species]", |_vm, this_val, _| Ok(this_val));
+    vm.set_fn_length(species_get, 0);
+    let k_species = vm.key_symbol_species;
+    vm.heap.object_define_accessor(
+        ctor,
+        k_species,
+        Some(species_get),
+        None,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+
+    define_method_len(vm, ctor, "resolve", 1, |vm, this_val, args| {
+        promise_resolve_with_ctor(vm, this_val, arg(args, 0))
     });
-    define_method(vm, ctor, "reject", |vm, _this, args| {
-        let p = alloc_promise(vm);
-        reject_promise(vm, p, arg(args, 0));
-        Ok(JsValue::from_object(p))
+    define_method_len(vm, ctor, "reject", 1, |vm, this_val, args| {
+        let cap = new_promise_capability(vm, this_val)?;
+        vm.call_value(
+            JsValue::from_object(cap.reject),
+            JsValue::UNDEFINED,
+            &[arg(args, 0)],
+        )?;
+        Ok(cap.promise)
     });
-    define_method(vm, ctor, "withResolvers", |vm, _this, _| {
-        let p = alloc_promise(vm);
-        let (res_fn, rej_fn) = create_resolving_functions(vm, p);
+    define_method_len(vm, ctor, "withResolvers", 0, |vm, this_val, _| {
+        let cap = new_promise_capability(vm, this_val)?;
         let obj = vm.alloc_ordinary_object();
         let kp = vm.heap.intern_key("promise");
         let kres = vm.heap.intern_key("resolve");
         let krej = vm.heap.intern_key("reject");
-        vm.heap.object_define_data(
-            obj,
-            kp,
-            JsValue::from_object(p),
-            PropertyAttrs::DEFAULT,
-            &mut vm.shapes,
-        );
+        vm.heap
+            .object_define_data(obj, kp, cap.promise, PropertyAttrs::DEFAULT, &mut vm.shapes);
         vm.heap.object_define_data(
             obj,
             kres,
-            JsValue::from_object(res_fn),
+            JsValue::from_object(cap.resolve),
             PropertyAttrs::DEFAULT,
             &mut vm.shapes,
         );
         vm.heap.object_define_data(
             obj,
             krej,
-            JsValue::from_object(rej_fn),
+            JsValue::from_object(cap.reject),
             PropertyAttrs::DEFAULT,
             &mut vm.shapes,
         );
         Ok(JsValue::from_object(obj))
     });
-    define_method(vm, ctor, "all", promise_all_fn);
-    define_method(vm, ctor, "race", promise_race_fn);
-    define_method(vm, ctor, "allSettled", promise_all_settled_fn);
-    define_method(vm, ctor, "any", promise_any_fn);
+    define_method_len(vm, ctor, "try", 1, |vm, this_val, args| {
+        if !this_val.is_object() {
+            return Err(vm.type_error("Promise.try called on non-object"));
+        }
+        let cap = new_promise_capability(vm, this_val)?;
+        let cb = arg(args, 0);
+        let rest = if args.len() > 1 { &args[1..] } else { &[] };
+        match vm.call_value(cb, JsValue::UNDEFINED, rest) {
+            Ok(v) => {
+                vm.call_value(JsValue::from_object(cap.resolve), JsValue::UNDEFINED, &[v])?;
+            }
+            Err(e) => {
+                vm.call_value(
+                    JsValue::from_object(cap.reject),
+                    JsValue::UNDEFINED,
+                    &[e.value],
+                )?;
+            }
+        }
+        Ok(cap.promise)
+    });
+    define_method_len(vm, ctor, "all", 1, promise_all_fn);
+    define_method_len(vm, ctor, "race", 1, promise_race_fn);
+    define_method_len(vm, ctor, "allSettled", 1, promise_all_settled_fn);
+    define_method_len(vm, ctor, "any", 1, promise_any_fn);
+    define_method_len(vm, ctor, "allKeyed", 1, |vm, t, a| {
+        promise_all_keyed_impl(vm, t, a, false)
+    });
+    define_method_len(vm, ctor, "allSettledKeyed", 1, |vm, t, a| {
+        promise_all_keyed_impl(vm, t, a, true)
+    });
 
     vm.heap.object_define_data(
         ctor,
@@ -731,117 +1023,198 @@ fn install_promise(vm: &mut JsVm) {
     define_global(vm, "Promise", JsValue::from_object(ctor));
 }
 
-fn promise_all_fn(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let out_p = alloc_promise(vm);
-    let items = match vm.collect_iterable(arg(args, 0)) {
-        Ok(v) => v,
-        Err(e) => {
-            reject_promise(vm, out_p, e.value);
-            return Ok(JsValue::from_object(out_p));
-        }
+fn reject_cap_and_return(
+    vm: &mut JsVm,
+    cap: &PromiseCapability,
+    err: JsValue,
+) -> Result<JsValue, JsException> {
+    vm.call_value(JsValue::from_object(cap.reject), JsValue::UNDEFINED, &[err])?;
+    Ok(cap.promise)
+}
+
+fn promise_all_fn(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let cap = new_promise_capability(vm, this_val)?;
+    let promise_resolve = match get_promise_resolve(vm, this_val) {
+        Ok(r) => r,
+        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
     };
-    if items.is_empty() {
-        let empty = vm.alloc_array();
-        resolve_promise(vm, out_p, JsValue::from_object(empty));
-        return Ok(JsValue::from_object(out_p));
-    }
-    let total = items.len();
-    let results = vm.alloc_array();
-    if let Some(o) = vm.heap.get_object_mut(results) {
-        o.elements.set_len(total as u32);
-    }
-    let remaining = Rc::new(Cell::new(total));
-    let (res_out, rej_out) = create_resolving_functions(vm, out_p);
-    for (idx, item) in items.into_iter().enumerate() {
-        let p = promise_resolve_value(vm, item);
-        let rem = Rc::clone(&remaining);
-        let on_ful = vm.alloc_host_fn("all_ful", move |vm, _this, fargs| {
-            let v = arg(fargs, 0);
-            if let Some(o) = vm.heap.get_object_mut(results) {
-                o.elements.set(idx as u32, v);
-            }
-            vm.heap.write_barrier(results, v);
-            let left = rem.get().saturating_sub(1);
-            rem.set(left);
+    let iter = match vm.create_iterator_public(arg(args, 0)) {
+        Ok(it) => it,
+        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+    };
+    let values = Rc::new(RefCell::new(Vec::<JsValue>::new()));
+    let remaining = Rc::new(Cell::new(1usize));
+    let mut index = 0usize;
+    loop {
+        let (next_val, done) = match vm.step_iterator_public(JsValue::from_object(iter)) {
+            Ok(pair) => pair,
+            Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+        };
+        if done {
+            let left = remaining.get().saturating_sub(1);
+            remaining.set(left);
             if left == 0 {
-                let _ = vm.call_value(
-                    JsValue::from_object(res_out),
+                let arr = vm.alloc_array();
+                for &v in values.borrow().iter() {
+                    vm.heap.object_push_element(arr, v);
+                }
+                vm.call_value(
+                    JsValue::from_object(cap.resolve),
                     JsValue::UNDEFINED,
-                    &[JsValue::from_object(results)],
-                );
+                    &[JsValue::from_object(arr)],
+                )?;
+            }
+            return Ok(cap.promise);
+        }
+        values.borrow_mut().push(JsValue::UNDEFINED);
+        let next_p = match vm.call_value(promise_resolve, this_val, &[next_val]) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = vm.iterator_close_handle(iter, true);
+                return reject_cap_and_return(vm, &cap, e.value);
+            }
+        };
+        let already_called = Rc::new(Cell::new(false));
+        let vals_c = Rc::clone(&values);
+        let rem_c = Rc::clone(&remaining);
+        let cap_res = cap.resolve;
+        let idx = index;
+        let on_ful = vm.alloc_host_fn("", move |vm, _this, fargs| {
+            if already_called.replace(true) {
+                return Ok(JsValue::UNDEFINED);
+            }
+            vals_c.borrow_mut()[idx] = arg(fargs, 0);
+            let left = rem_c.get().saturating_sub(1);
+            rem_c.set(left);
+            if left == 0 {
+                let arr = vm.alloc_array();
+                for &v in vals_c.borrow().iter() {
+                    vm.heap.object_push_element(arr, v);
+                }
+                vm.call_value(
+                    JsValue::from_object(cap_res),
+                    JsValue::UNDEFINED,
+                    &[JsValue::from_object(arr)],
+                )?;
             }
             Ok(JsValue::UNDEFINED)
         });
-        attach_promise_reaction(
+        vm.set_fn_length(on_ful, 1);
+        remaining.set(remaining.get() + 1);
+        if let Err(e) = invoke_then(
             vm,
-            p,
-            PromiseReaction {
-                on_fulfilled: Some(on_ful),
-                on_rejected: Some(rej_out),
-                result_promise: None,
-            },
-        );
+            next_p,
+            JsValue::from_object(on_ful),
+            JsValue::from_object(cap.reject),
+        ) {
+            let _ = vm.iterator_close_handle(iter, true);
+            return reject_cap_and_return(vm, &cap, e.value);
+        }
+        index += 1;
     }
-    Ok(JsValue::from_object(out_p))
 }
 
 fn promise_race_fn(
     vm: &mut JsVm,
-    _this: JsValue,
+    this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let out_p = alloc_promise(vm);
-    let items = match vm.collect_iterable(arg(args, 0)) {
-        Ok(v) => v,
-        Err(e) => {
-            reject_promise(vm, out_p, e.value);
-            return Ok(JsValue::from_object(out_p));
-        }
+    let cap = new_promise_capability(vm, this_val)?;
+    let promise_resolve = match get_promise_resolve(vm, this_val) {
+        Ok(r) => r,
+        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
     };
-    let (res_out, rej_out) = create_resolving_functions(vm, out_p);
-    for item in items {
-        let p = promise_resolve_value(vm, item);
-        attach_promise_reaction(
+    let iter = match vm.create_iterator_public(arg(args, 0)) {
+        Ok(it) => it,
+        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+    };
+    loop {
+        let (next_val, done) = match vm.step_iterator_public(JsValue::from_object(iter)) {
+            Ok(pair) => pair,
+            Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+        };
+        if done {
+            return Ok(cap.promise);
+        }
+        let next_p = match vm.call_value(promise_resolve, this_val, &[next_val]) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = vm.iterator_close_handle(iter, true);
+                return reject_cap_and_return(vm, &cap, e.value);
+            }
+        };
+        if let Err(e) = invoke_then(
             vm,
-            p,
-            PromiseReaction {
-                on_fulfilled: Some(res_out),
-                on_rejected: Some(rej_out),
-                result_promise: None,
-            },
-        );
+            next_p,
+            JsValue::from_object(cap.resolve),
+            JsValue::from_object(cap.reject),
+        ) {
+            let _ = vm.iterator_close_handle(iter, true);
+            return reject_cap_and_return(vm, &cap, e.value);
+        }
     }
-    Ok(JsValue::from_object(out_p))
 }
 
 fn promise_all_settled_fn(
     vm: &mut JsVm,
-    _this: JsValue,
+    this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let out_p = alloc_promise(vm);
-    let items = match vm.collect_iterable(arg(args, 0)) {
-        Ok(v) => v,
-        Err(e) => {
-            reject_promise(vm, out_p, e.value);
-            return Ok(JsValue::from_object(out_p));
-        }
+    let cap = new_promise_capability(vm, this_val)?;
+    let promise_resolve = match get_promise_resolve(vm, this_val) {
+        Ok(r) => r,
+        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
     };
-    if items.is_empty() {
-        let empty = vm.alloc_array();
-        resolve_promise(vm, out_p, JsValue::from_object(empty));
-        return Ok(JsValue::from_object(out_p));
-    }
-    let total = items.len();
-    let results = vm.alloc_array();
-    if let Some(o) = vm.heap.get_object_mut(results) {
-        o.elements.set_len(total as u32);
-    }
-    let remaining = Rc::new(Cell::new(total));
-    for (idx, item) in items.into_iter().enumerate() {
-        let p = promise_resolve_value(vm, item);
+    let iter = match vm.create_iterator_public(arg(args, 0)) {
+        Ok(it) => it,
+        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+    };
+    let values = Rc::new(RefCell::new(Vec::<JsValue>::new()));
+    let remaining = Rc::new(Cell::new(1usize));
+    let mut index = 0usize;
+    loop {
+        let (next_val, done) = match vm.step_iterator_public(JsValue::from_object(iter)) {
+            Ok(pair) => pair,
+            Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+        };
+        if done {
+            let left = remaining.get().saturating_sub(1);
+            remaining.set(left);
+            if left == 0 {
+                let arr = vm.alloc_array();
+                for &v in values.borrow().iter() {
+                    vm.heap.object_push_element(arr, v);
+                }
+                vm.call_value(
+                    JsValue::from_object(cap.resolve),
+                    JsValue::UNDEFINED,
+                    &[JsValue::from_object(arr)],
+                )?;
+            }
+            return Ok(cap.promise);
+        }
+        values.borrow_mut().push(JsValue::UNDEFINED);
+        let next_p = match vm.call_value(promise_resolve, this_val, &[next_val]) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = vm.iterator_close_handle(iter, true);
+                return reject_cap_and_return(vm, &cap, e.value);
+            }
+        };
+        let already_called = Rc::new(Cell::new(false));
+        let ac1 = Rc::clone(&already_called);
+        let vals1 = Rc::clone(&values);
         let rem1 = Rc::clone(&remaining);
-        let on_ful = vm.alloc_host_fn("settled_ful", move |vm, _this, fargs| {
+        let cap_res1 = cap.resolve;
+        let idx = index;
+        let on_ful = vm.alloc_host_fn("", move |vm, _this, fargs| {
+            if ac1.replace(true) {
+                return Ok(JsValue::UNDEFINED);
+            }
             let entry = vm.alloc_ordinary_object();
             let k_status = vm.heap.intern_key("status");
             let s_val = JsValue::from_string(vm.heap.alloc_string("fulfilled"));
@@ -859,20 +1232,32 @@ fn promise_all_settled_fn(
                 PropertyAttrs::DEFAULT,
                 &mut vm.shapes,
             );
-            let ev = JsValue::from_object(entry);
-            if let Some(o) = vm.heap.get_object_mut(results) {
-                o.elements.set(idx as u32, ev);
-            }
-            vm.heap.write_barrier(results, ev);
+            vals1.borrow_mut()[idx] = JsValue::from_object(entry);
             let left = rem1.get().saturating_sub(1);
             rem1.set(left);
             if left == 0 {
-                resolve_promise(vm, out_p, JsValue::from_object(results));
+                let arr = vm.alloc_array();
+                for &v in vals1.borrow().iter() {
+                    vm.heap.object_push_element(arr, v);
+                }
+                vm.call_value(
+                    JsValue::from_object(cap_res1),
+                    JsValue::UNDEFINED,
+                    &[JsValue::from_object(arr)],
+                )?;
             }
             Ok(JsValue::UNDEFINED)
         });
+        vm.set_fn_length(on_ful, 1);
+
+        let ac2 = already_called;
+        let vals2 = Rc::clone(&values);
         let rem2 = Rc::clone(&remaining);
-        let on_rej = vm.alloc_host_fn("settled_rej", move |vm, _this, fargs| {
+        let cap_res2 = cap.resolve;
+        let on_rej = vm.alloc_host_fn("", move |vm, _this, fargs| {
+            if ac2.replace(true) {
+                return Ok(JsValue::UNDEFINED);
+            }
             let entry = vm.alloc_ordinary_object();
             let k_status = vm.heap.intern_key("status");
             let k_reason = vm.heap.intern_key("reason");
@@ -891,110 +1276,446 @@ fn promise_all_settled_fn(
                 PropertyAttrs::DEFAULT,
                 &mut vm.shapes,
             );
-            let ev = JsValue::from_object(entry);
-            if let Some(o) = vm.heap.get_object_mut(results) {
-                o.elements.set(idx as u32, ev);
-            }
-            vm.heap.write_barrier(results, ev);
+            vals2.borrow_mut()[idx] = JsValue::from_object(entry);
             let left = rem2.get().saturating_sub(1);
             rem2.set(left);
             if left == 0 {
-                resolve_promise(vm, out_p, JsValue::from_object(results));
+                let arr = vm.alloc_array();
+                for &v in vals2.borrow().iter() {
+                    vm.heap.object_push_element(arr, v);
+                }
+                vm.call_value(
+                    JsValue::from_object(cap_res2),
+                    JsValue::UNDEFINED,
+                    &[JsValue::from_object(arr)],
+                )?;
             }
             Ok(JsValue::UNDEFINED)
         });
-        attach_promise_reaction(
+        vm.set_fn_length(on_rej, 1);
+
+        remaining.set(remaining.get() + 1);
+        if let Err(e) = invoke_then(
             vm,
-            p,
-            PromiseReaction {
-                on_fulfilled: Some(on_ful),
-                on_rejected: Some(on_rej),
-                result_promise: None,
-            },
-        );
+            next_p,
+            JsValue::from_object(on_ful),
+            JsValue::from_object(on_rej),
+        ) {
+            let _ = vm.iterator_close_handle(iter, true);
+            return reject_cap_and_return(vm, &cap, e.value);
+        }
+        index += 1;
     }
-    Ok(JsValue::from_object(out_p))
 }
 
-fn promise_any_fn(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let out_p = alloc_promise(vm);
-    let items = match vm.collect_iterable(arg(args, 0)) {
-        Ok(v) => v,
-        Err(e) => {
-            reject_promise(vm, out_p, e.value);
-            return Ok(JsValue::from_object(out_p));
-        }
-    };
-    let reject_aggregate = |vm: &mut JsVm, errs: HeapHandle| {
-        let k_agg = vm.heap.intern_key("AggregateError");
-        let agg = vm
-            .get_property_by_key(vm.global, k_agg)
-            .ok()
-            .and_then(|ctor| {
-                let msg = JsValue::from_string(vm.heap.alloc_string("All promises were rejected"));
-                vm.construct_value(ctor, &[JsValue::from_object(errs), msg], ctor)
-                    .ok()
-            })
-            .unwrap_or_else(|| {
-                vm.make_error("AggregateError", "All promises were rejected")
-                    .value
-            });
-        reject_promise(vm, out_p, agg);
-    };
-    if items.is_empty() {
-        let empty = vm.alloc_array();
-        reject_aggregate(vm, empty);
-        return Ok(JsValue::from_object(out_p));
+fn make_aggregate_error_val(vm: &mut JsVm, errs: &[JsValue]) -> JsValue {
+    let arr = vm.alloc_array();
+    for &e in errs {
+        vm.heap.object_push_element(arr, e);
     }
-    let total = items.len();
-    let errors = vm.alloc_array();
-    if let Some(o) = vm.heap.get_object_mut(errors) {
-        o.elements.set_len(total as u32);
-    }
-    let remaining = Rc::new(Cell::new(total));
-    let (res_out, _rej_unused) = create_resolving_functions(vm, out_p);
-    for (idx, item) in items.into_iter().enumerate() {
-        let p = promise_resolve_value(vm, item);
-        let rem = Rc::clone(&remaining);
-        let on_rej = vm.alloc_host_fn("any_rej", move |vm, _this, fargs| {
-            let reason = arg(fargs, 0);
-            if let Some(o) = vm.heap.get_object_mut(errors) {
-                o.elements.set(idx as u32, reason);
-            }
-            vm.heap.write_barrier(errors, reason);
-            let left = rem.get().saturating_sub(1);
-            rem.set(left);
+    let obj = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Ordinary,
+        Some(vm.aggregate_error_proto),
+    ));
+    let k_errors = vm.heap.intern_key("errors");
+    vm.heap.object_define_data(
+        obj,
+        k_errors,
+        JsValue::from_object(arr),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    let msg = JsValue::from_string(vm.heap.alloc_string("All promises were rejected"));
+    vm.heap.object_define_data(
+        obj,
+        vm.key_message,
+        msg,
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    JsValue::from_object(obj)
+}
+
+fn promise_any_fn(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let cap = new_promise_capability(vm, this_val)?;
+    let promise_resolve = match get_promise_resolve(vm, this_val) {
+        Ok(r) => r,
+        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+    };
+    let iter = match vm.create_iterator_public(arg(args, 0)) {
+        Ok(it) => it,
+        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+    };
+    let errors = Rc::new(RefCell::new(Vec::<JsValue>::new()));
+    let remaining = Rc::new(Cell::new(1usize));
+    let mut index = 0usize;
+    loop {
+        let (next_val, done) = match vm.step_iterator_public(JsValue::from_object(iter)) {
+            Ok(pair) => pair,
+            Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+        };
+        if done {
+            let left = remaining.get().saturating_sub(1);
+            remaining.set(left);
             if left == 0 {
-                let k_agg = vm.heap.intern_key("AggregateError");
-                let agg = vm
-                    .get_property_by_key(vm.global, k_agg)
-                    .ok()
-                    .and_then(|ctor| {
-                        let msg = JsValue::from_string(
-                            vm.heap.alloc_string("All promises were rejected"),
-                        );
-                        vm.construct_value(ctor, &[JsValue::from_object(errors), msg], ctor)
-                            .ok()
-                    })
-                    .unwrap_or_else(|| {
-                        vm.make_error("AggregateError", "All promises were rejected")
-                            .value
-                    });
-                reject_promise(vm, out_p, agg);
+                let agg = make_aggregate_error_val(vm, &errors.borrow());
+                vm.call_value(JsValue::from_object(cap.reject), JsValue::UNDEFINED, &[agg])?;
+            }
+            return Ok(cap.promise);
+        }
+        errors.borrow_mut().push(JsValue::UNDEFINED);
+        let next_p = match vm.call_value(promise_resolve, this_val, &[next_val]) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = vm.iterator_close_handle(iter, true);
+                return reject_cap_and_return(vm, &cap, e.value);
+            }
+        };
+        let already_called = Rc::new(Cell::new(false));
+        let errs_c = Rc::clone(&errors);
+        let rem_c = Rc::clone(&remaining);
+        let cap_rej = cap.reject;
+        let idx = index;
+        let on_rej = vm.alloc_host_fn("", move |vm, _this, fargs| {
+            if already_called.replace(true) {
+                return Ok(JsValue::UNDEFINED);
+            }
+            errs_c.borrow_mut()[idx] = arg(fargs, 0);
+            let left = rem_c.get().saturating_sub(1);
+            rem_c.set(left);
+            if left == 0 {
+                let agg = make_aggregate_error_val(vm, &errs_c.borrow());
+                vm.call_value(JsValue::from_object(cap_rej), JsValue::UNDEFINED, &[agg])?;
             }
             Ok(JsValue::UNDEFINED)
         });
-        attach_promise_reaction(
+        vm.set_fn_length(on_rej, 1);
+        remaining.set(remaining.get() + 1);
+        if let Err(e) = invoke_then(
             vm,
-            p,
-            PromiseReaction {
-                on_fulfilled: Some(res_out),
-                on_rejected: Some(on_rej),
-                result_promise: None,
-            },
-        );
+            next_p,
+            JsValue::from_object(cap.resolve),
+            JsValue::from_object(on_rej),
+        ) {
+            let _ = vm.iterator_close_handle(iter, true);
+            return reject_cap_and_return(vm, &cap, e.value);
+        }
+        index += 1;
     }
-    Ok(JsValue::from_object(out_p))
+}
+
+/// Returns `obj.[[OwnPropertyKeys]]()` as `(JsValue key, PropertyKey)` honoring Proxy `ownKeys`.
+pub(crate) fn own_property_keys_spec(
+    vm: &mut JsVm,
+    obj: HeapHandle,
+) -> Result<Vec<(JsValue, crate::PropertyKey)>, JsException> {
+    if let Some(ObjectKind::Proxy(p)) = vm.heap.get_object(obj).map(|o| o.kind.clone()) {
+        if p.revoked {
+            return Err(vm.type_error("Proxy has been revoked"));
+        }
+        let trap = vm.get_property_by_key(p.handler, vm.key_own_keys)?;
+        if !trap.is_undefined() && !trap.is_null() {
+            let list_val = vm.call_value(
+                trap,
+                JsValue::from_object(p.handler),
+                &[JsValue::from_object(p.target)],
+            )?;
+            let list_h = list_val
+                .as_object()
+                .ok_or_else(|| vm.type_error("Proxy ownKeys trap must return an object"))?;
+            let len = vm.array_get_len(list_h)?;
+            let mut out = Vec::with_capacity(len.min(65_536) as usize);
+            for i in 0..len {
+                let kv = vm.array_get_index(list_h, i)?;
+                if !kv.is_string() && !kv.is_symbol() {
+                    return Err(vm.type_error("Proxy ownKeys trap returned non-string/symbol key"));
+                }
+                let ks = vm.to_property_key(kv)?;
+                let pk = vm.heap.intern_key(&ks);
+                out.push((kv, pk));
+            }
+            return Ok(out);
+        }
+        return own_property_keys_spec(vm, p.target);
+    }
+
+    let mut indices: Vec<u32> = Vec::new();
+    let mut str_keys: Vec<(String, crate::PropertyKey)> = Vec::new();
+    let mut sym_keys: Vec<(crate::SymbolId, crate::PropertyKey)> = Vec::new();
+
+    if let Some(o) = vm.heap.get_object(obj) {
+        let elen = o.elements.len();
+        for i in 0..elen {
+            if o.elements.has(i) {
+                indices.push(i);
+            }
+        }
+        let raw_keys: Vec<crate::PropertyKey> = if o.is_dictionary() {
+            o.rare
+                .as_ref()
+                .map(|r| r.dict_order.clone())
+                .unwrap_or_default()
+        } else {
+            vm.shapes
+                .get(o.shape())
+                .map(|s| s.keys().to_vec())
+                .unwrap_or_default()
+        };
+        for pk in raw_keys {
+            if let Some(name) = vm.heap.resolve_key(pk).map(str::to_string) {
+                if let Some(sym_num) = name
+                    .strip_prefix("Symbol(")
+                    .and_then(|s| s.strip_suffix(')'))
+                    .and_then(|n| n.parse::<u32>().ok())
+                {
+                    sym_keys.push((crate::SymbolId(sym_num), pk));
+                } else if let Ok(idx) = name.parse::<u32>() {
+                    if idx < u32::MAX && idx.to_string() == name {
+                        if !indices.contains(&idx) {
+                            indices.push(idx);
+                        }
+                    } else {
+                        str_keys.push((name, pk));
+                    }
+                } else {
+                    str_keys.push((name, pk));
+                }
+            }
+        }
+    }
+    indices.sort_unstable();
+    let mut out = Vec::with_capacity(indices.len() + str_keys.len() + sym_keys.len());
+    for i in indices {
+        let s = i.to_string();
+        let pk = vm.heap.intern_key(&s);
+        let kv = JsValue::from_string(vm.heap.alloc_string(s));
+        out.push((kv, pk));
+    }
+    for (s, pk) in str_keys {
+        let kv = JsValue::from_string(vm.heap.alloc_string(s));
+        out.push((kv, pk));
+    }
+    for (sid, pk) in sym_keys {
+        out.push((JsValue::from_symbol(sid), pk));
+    }
+    Ok(out)
+}
+
+/// Checks `GetOwnProperty(obj, key)` and returns `Ok(true)` iff it exists and `[[Enumerable]]` is true.
+pub(crate) fn is_own_prop_enumerable(
+    vm: &mut JsVm,
+    obj: HeapHandle,
+    key_val: JsValue,
+    pk: crate::PropertyKey,
+) -> Result<bool, JsException> {
+    if let Some(ObjectKind::Proxy(p)) = vm.heap.get_object(obj).map(|o| o.kind.clone()) {
+        if p.revoked {
+            return Err(vm.type_error("Proxy has been revoked"));
+        }
+        let k_gopd = vm.heap.intern_key("getOwnPropertyDescriptor");
+        let trap = vm.get_property_by_key(p.handler, k_gopd)?;
+        if !trap.is_undefined() && !trap.is_null() {
+            let desc = vm.call_value(
+                trap,
+                JsValue::from_object(p.handler),
+                &[JsValue::from_object(p.target), key_val],
+            )?;
+            if desc.is_undefined() {
+                return Ok(false);
+            }
+            let dh = desc.as_object().ok_or_else(|| {
+                vm.type_error("Proxy getOwnPropertyDescriptor trap must return object or undefined")
+            })?;
+            let k_enum = vm.heap.intern_key("enumerable");
+            let ev = vm.get_property_by_key(dh, k_enum)?;
+            return Ok(vm.to_boolean(ev));
+        }
+        return is_own_prop_enumerable(vm, p.target, key_val, pk);
+    }
+    if let Some(prop) = vm.heap.object_get_own(obj, pk, &vm.shapes) {
+        return Ok(prop.attrs.contains(PropertyAttrs::ENUMERABLE));
+    }
+    if let Some(idx) = vm
+        .heap
+        .resolve_key(pk)
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&i| i < u32::MAX)
+    {
+        if vm.heap.get_object(obj).is_some_and(|o| o.elements.has(idx)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn build_keyed_result_object(
+    vm: &mut JsVm,
+    keys: &[crate::PropertyKey],
+    values: &[JsValue],
+) -> JsValue {
+    let out = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, None));
+    for (&pk, &val) in keys.iter().zip(values.iter()) {
+        vm.heap
+            .object_define_data(out, pk, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        vm.heap.write_barrier(out, val);
+    }
+    JsValue::from_object(out)
+}
+
+fn promise_all_keyed_impl(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+    all_settled: bool,
+) -> Result<JsValue, JsException> {
+    let cap = new_promise_capability(vm, this_val)?;
+    let promise_resolve = match get_promise_resolve(vm, this_val) {
+        Ok(r) => r,
+        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+    };
+    let promises_val = arg(args, 0);
+    let Some(promises_h) = promises_val.as_object() else {
+        let err = vm.type_error("Promise.allKeyed requires an object argument");
+        return reject_cap_and_return(vm, &cap, err.value);
+    };
+    let all_keys = match own_property_keys_spec(vm, promises_h) {
+        Ok(k) => k,
+        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+    };
+
+    let keys = Rc::new(RefCell::new(Vec::<crate::PropertyKey>::new()));
+    let values = Rc::new(RefCell::new(Vec::<JsValue>::new()));
+    let remaining = Rc::new(Cell::new(1usize));
+
+    for (key_val, pk) in all_keys {
+        let is_enum = match is_own_prop_enumerable(vm, promises_h, key_val, pk) {
+            Ok(b) => b,
+            Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+        };
+        if !is_enum {
+            continue;
+        }
+        let prop_val = match vm.get_elem(promises_val, key_val) {
+            Ok(v) => v,
+            Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+        };
+        let next_p = match vm.call_value(promise_resolve, this_val, &[prop_val]) {
+            Ok(p) => p,
+            Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+        };
+        let idx = keys.borrow().len();
+        keys.borrow_mut().push(pk);
+        values.borrow_mut().push(JsValue::UNDEFINED);
+
+        let already_called = Rc::new(Cell::new(false));
+        let ac1 = Rc::clone(&already_called);
+        let keys1 = Rc::clone(&keys);
+        let vals1 = Rc::clone(&values);
+        let rem1 = Rc::clone(&remaining);
+        let cap_res1 = cap.resolve;
+        let on_ful = vm.alloc_host_fn("", move |vm, _this, fargs| {
+            if ac1.replace(true) {
+                return Ok(JsValue::UNDEFINED);
+            }
+            let stored = if all_settled {
+                let entry = vm.alloc_ordinary_object();
+                let k_status = vm.heap.intern_key("status");
+                let s_val = JsValue::from_string(vm.heap.alloc_string("fulfilled"));
+                vm.heap.object_define_data(
+                    entry,
+                    k_status,
+                    s_val,
+                    PropertyAttrs::DEFAULT,
+                    &mut vm.shapes,
+                );
+                vm.heap.object_define_data(
+                    entry,
+                    vm.key_value,
+                    arg(fargs, 0),
+                    PropertyAttrs::DEFAULT,
+                    &mut vm.shapes,
+                );
+                JsValue::from_object(entry)
+            } else {
+                arg(fargs, 0)
+            };
+            vals1.borrow_mut()[idx] = stored;
+            let left = rem1.get().saturating_sub(1);
+            rem1.set(left);
+            if left == 0 {
+                let obj = build_keyed_result_object(vm, &keys1.borrow(), &vals1.borrow());
+                vm.call_value(JsValue::from_object(cap_res1), JsValue::UNDEFINED, &[obj])?;
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+        vm.set_fn_length(on_ful, 1);
+
+        let rej_handler = if all_settled {
+            let ac2 = already_called;
+            let keys2 = Rc::clone(&keys);
+            let vals2 = Rc::clone(&values);
+            let rem2 = Rc::clone(&remaining);
+            let cap_res2 = cap.resolve;
+            let on_rej = vm.alloc_host_fn("", move |vm, _this, fargs| {
+                if ac2.replace(true) {
+                    return Ok(JsValue::UNDEFINED);
+                }
+                let entry = vm.alloc_ordinary_object();
+                let k_status = vm.heap.intern_key("status");
+                let k_reason = vm.heap.intern_key("reason");
+                let s_val = JsValue::from_string(vm.heap.alloc_string("rejected"));
+                vm.heap.object_define_data(
+                    entry,
+                    k_status,
+                    s_val,
+                    PropertyAttrs::DEFAULT,
+                    &mut vm.shapes,
+                );
+                vm.heap.object_define_data(
+                    entry,
+                    k_reason,
+                    arg(fargs, 0),
+                    PropertyAttrs::DEFAULT,
+                    &mut vm.shapes,
+                );
+                vals2.borrow_mut()[idx] = JsValue::from_object(entry);
+                let left = rem2.get().saturating_sub(1);
+                rem2.set(left);
+                if left == 0 {
+                    let obj = build_keyed_result_object(vm, &keys2.borrow(), &vals2.borrow());
+                    vm.call_value(JsValue::from_object(cap_res2), JsValue::UNDEFINED, &[obj])?;
+                }
+                Ok(JsValue::UNDEFINED)
+            });
+            vm.set_fn_length(on_rej, 1);
+            JsValue::from_object(on_rej)
+        } else {
+            JsValue::from_object(cap.reject)
+        };
+
+        remaining.set(remaining.get() + 1);
+        if let Err(e) = invoke_then(vm, next_p, JsValue::from_object(on_ful), rej_handler) {
+            return reject_cap_and_return(vm, &cap, e.value);
+        }
+    }
+
+    let left = remaining.get().saturating_sub(1);
+    remaining.set(left);
+    if left == 0 {
+        let obj = build_keyed_result_object(vm, &keys.borrow(), &values.borrow());
+        vm.call_value(
+            JsValue::from_object(cap.resolve),
+            JsValue::UNDEFINED,
+            &[obj],
+        )?;
+    }
+    Ok(cap.promise)
 }
 
 // ---------------------------------------------------------------------------
@@ -1980,4 +2701,442 @@ fn install_async_generator_proto(vm: &mut JsVm) {
         PropertyAttrs::METHOD,
         &mut vm.shapes,
     );
+}
+
+// ---------------------------------------------------------------------------
+// ES2024 `Array.fromAsync(asyncItems [, mapfn [, thisArg]])` (ECMA-262 §23.1.2.2)
+// ---------------------------------------------------------------------------
+
+fn close_from_async_iter_and_reject(
+    vm: &mut JsVm,
+    iter_obj: HeapHandle,
+    is_async_iter: bool,
+    err_val: JsValue,
+    out_p: HeapHandle,
+) {
+    if !is_async_iter {
+        let _ = vm.iterator_close_obj(iter_obj, true);
+        reject_promise(vm, out_p, err_val);
+        return;
+    }
+    let ret_fn = match vm.get_property_by_key(iter_obj, vm.key_return) {
+        Ok(v) if !v.is_undefined() && !v.is_null() => v,
+        _ => {
+            reject_promise(vm, out_p, err_val);
+            return;
+        }
+    };
+    if !ret_fn.as_object().is_some_and(|h| vm.is_callable_handle(h)) {
+        reject_promise(vm, out_p, err_val);
+        return;
+    }
+    match vm.call_value(ret_fn, JsValue::from_object(iter_obj), &[]) {
+        Ok(res) => {
+            let p = promise_resolve_value(vm, res);
+            let done = vm.alloc_host_fn("", move |vm, _, _| {
+                reject_promise(vm, out_p, err_val);
+                Ok(JsValue::UNDEFINED)
+            });
+            attach_promise_reaction(
+                vm,
+                p,
+                PromiseReaction {
+                    on_fulfilled: Some(done),
+                    on_rejected: Some(done),
+                    result_promise: None,
+                },
+            );
+        }
+        Err(_) => reject_promise(vm, out_p, err_val),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FromAsyncIterCtx {
+    iter_obj: HeapHandle,
+    next_method: JsValue,
+    is_async_iter: bool,
+    out_arr: HeapHandle,
+    map_fn: Option<JsValue>,
+    this_arg: JsValue,
+    out_p: HeapHandle,
+}
+
+fn drive_from_async_iter(vm: &mut JsVm, ctx: FromAsyncIterCtx, k: u64) {
+    if k >= 9_007_199_254_740_991 {
+        let err = vm.type_error("Array.fromAsync length exceeds 2^53 - 1");
+        close_from_async_iter_and_reject(vm, ctx.iter_obj, ctx.is_async_iter, err.value, ctx.out_p);
+        return;
+    }
+    let step_res = match vm.call_value(ctx.next_method, JsValue::from_object(ctx.iter_obj), &[]) {
+        Ok(v) => v,
+        Err(e) => {
+            reject_promise(vm, ctx.out_p, e.value);
+            return;
+        }
+    };
+
+    let process_value = move |vm: &mut JsVm, val: JsValue| {
+        if let Some(mf) = ctx.map_fn {
+            match vm.call_value(mf, ctx.this_arg, &[val, JsValue::from_f64(k as f64)]) {
+                Ok(mapped) => {
+                    let mp = promise_resolve_value(vm, mapped);
+                    let on_ok = vm.alloc_host_fn("", move |vm, _, args| {
+                        if let Err(e) = vm.array_create_data_prop(ctx.out_arr, k, arg(args, 0)) {
+                            close_from_async_iter_and_reject(
+                                vm,
+                                ctx.iter_obj,
+                                ctx.is_async_iter,
+                                e.value,
+                                ctx.out_p,
+                            );
+                            return Ok(JsValue::UNDEFINED);
+                        }
+                        drive_from_async_iter(vm, ctx, k + 1);
+                        Ok(JsValue::UNDEFINED)
+                    });
+                    let on_err = vm.alloc_host_fn("", move |vm, _, args| {
+                        close_from_async_iter_and_reject(
+                            vm,
+                            ctx.iter_obj,
+                            ctx.is_async_iter,
+                            arg(args, 0),
+                            ctx.out_p,
+                        );
+                        Ok(JsValue::UNDEFINED)
+                    });
+                    attach_promise_reaction(
+                        vm,
+                        mp,
+                        PromiseReaction {
+                            on_fulfilled: Some(on_ok),
+                            on_rejected: Some(on_err),
+                            result_promise: None,
+                        },
+                    );
+                }
+                Err(e) => {
+                    close_from_async_iter_and_reject(
+                        vm,
+                        ctx.iter_obj,
+                        ctx.is_async_iter,
+                        e.value,
+                        ctx.out_p,
+                    );
+                }
+            }
+        } else {
+            if let Err(e) = vm.array_create_data_prop(ctx.out_arr, k, val) {
+                close_from_async_iter_and_reject(
+                    vm,
+                    ctx.iter_obj,
+                    ctx.is_async_iter,
+                    e.value,
+                    ctx.out_p,
+                );
+                return;
+            }
+            drive_from_async_iter(vm, ctx, k + 1);
+        }
+    };
+
+    if ctx.is_async_iter {
+        let p = promise_resolve_value(vm, step_res);
+        let on_ok = vm.alloc_host_fn("", move |vm, _, args| {
+            let res_val = arg(args, 0);
+            let Some(res_h) = res_val.as_object() else {
+                let err = vm.type_error("Async iterator result is not an object");
+                reject_promise(vm, ctx.out_p, err.value);
+                return Ok(JsValue::UNDEFINED);
+            };
+            let done_v = match vm.get_property_by_key(res_h, vm.key_done) {
+                Ok(v) => v,
+                Err(e) => {
+                    reject_promise(vm, ctx.out_p, e.value);
+                    return Ok(JsValue::UNDEFINED);
+                }
+            };
+            if vm.to_boolean(done_v) {
+                if let Err(e) = vm.array_set_length(ctx.out_arr, k) {
+                    reject_promise(vm, ctx.out_p, e.value);
+                } else {
+                    resolve_promise(vm, ctx.out_p, JsValue::from_object(ctx.out_arr));
+                }
+                return Ok(JsValue::UNDEFINED);
+            }
+            let val = match vm.get_property_by_key(res_h, vm.key_value) {
+                Ok(v) => v,
+                Err(e) => {
+                    reject_promise(vm, ctx.out_p, e.value);
+                    return Ok(JsValue::UNDEFINED);
+                }
+            };
+            process_value(vm, val);
+            Ok(JsValue::UNDEFINED)
+        });
+        let on_err = vm.alloc_host_fn("", move |vm, _, args| {
+            reject_promise(vm, ctx.out_p, arg(args, 0));
+            Ok(JsValue::UNDEFINED)
+        });
+        attach_promise_reaction(
+            vm,
+            p,
+            PromiseReaction {
+                on_fulfilled: Some(on_ok),
+                on_rejected: Some(on_err),
+                result_promise: None,
+            },
+        );
+    } else {
+        // Sync iterator wrapped with Async-from-Sync awaiting each yielded value.
+        let Some(res_h) = step_res.as_object() else {
+            let err = vm.type_error("Iterator result is not an object");
+            reject_promise(vm, ctx.out_p, err.value);
+            return;
+        };
+        let done_v = match vm.get_property_by_key(res_h, vm.key_done) {
+            Ok(v) => v,
+            Err(e) => {
+                reject_promise(vm, ctx.out_p, e.value);
+                return;
+            }
+        };
+        if vm.to_boolean(done_v) {
+            if let Err(e) = vm.array_set_length(ctx.out_arr, k) {
+                reject_promise(vm, ctx.out_p, e.value);
+            } else {
+                resolve_promise(vm, ctx.out_p, JsValue::from_object(ctx.out_arr));
+            }
+            return;
+        }
+        let val = match vm.get_property_by_key(res_h, vm.key_value) {
+            Ok(v) => v,
+            Err(e) => {
+                reject_promise(vm, ctx.out_p, e.value);
+                return;
+            }
+        };
+        let vp = promise_resolve_value(vm, val);
+        let on_ok = vm.alloc_host_fn("", move |vm, _, args| {
+            process_value(vm, arg(args, 0));
+            Ok(JsValue::UNDEFINED)
+        });
+        let on_err = vm.alloc_host_fn("", move |vm, _, args| {
+            close_from_async_iter_and_reject(vm, ctx.iter_obj, false, arg(args, 0), ctx.out_p);
+            Ok(JsValue::UNDEFINED)
+        });
+        attach_promise_reaction(
+            vm,
+            vp,
+            PromiseReaction {
+                on_fulfilled: Some(on_ok),
+                on_rejected: Some(on_err),
+                result_promise: None,
+            },
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FromAsyncArrayLikeCtx {
+    src_h: HeapHandle,
+    len: u64,
+    out_arr: HeapHandle,
+    map_fn: Option<JsValue>,
+    this_arg: JsValue,
+    out_p: HeapHandle,
+}
+
+fn drive_from_async_array_like(vm: &mut JsVm, ctx: FromAsyncArrayLikeCtx, k: u64) {
+    if k >= ctx.len {
+        if let Err(e) = vm.array_set_length(ctx.out_arr, ctx.len) {
+            reject_promise(vm, ctx.out_p, e.value);
+        } else {
+            resolve_promise(vm, ctx.out_p, JsValue::from_object(ctx.out_arr));
+        }
+        return;
+    }
+    let val = match vm.array_get_index(ctx.src_h, k) {
+        Ok(v) => v,
+        Err(e) => {
+            reject_promise(vm, ctx.out_p, e.value);
+            return;
+        }
+    };
+    let vp = promise_resolve_value(vm, val);
+    let on_ok = vm.alloc_host_fn("", move |vm, _, args| {
+        let awaited = arg(args, 0);
+        if let Some(mf) = ctx.map_fn {
+            match vm.call_value(mf, ctx.this_arg, &[awaited, JsValue::from_f64(k as f64)]) {
+                Ok(mapped) => {
+                    let mp = promise_resolve_value(vm, mapped);
+                    let on_m_ok = vm.alloc_host_fn("", move |vm, _, margs| {
+                        if let Err(e) = vm.array_create_data_prop(ctx.out_arr, k, arg(margs, 0)) {
+                            reject_promise(vm, ctx.out_p, e.value);
+                            return Ok(JsValue::UNDEFINED);
+                        }
+                        drive_from_async_array_like(vm, ctx, k + 1);
+                        Ok(JsValue::UNDEFINED)
+                    });
+                    let on_m_err = vm.alloc_host_fn("", move |vm, _, margs| {
+                        reject_promise(vm, ctx.out_p, arg(margs, 0));
+                        Ok(JsValue::UNDEFINED)
+                    });
+                    attach_promise_reaction(
+                        vm,
+                        mp,
+                        PromiseReaction {
+                            on_fulfilled: Some(on_m_ok),
+                            on_rejected: Some(on_m_err),
+                            result_promise: None,
+                        },
+                    );
+                }
+                Err(e) => reject_promise(vm, ctx.out_p, e.value),
+            }
+        } else {
+            if let Err(e) = vm.array_create_data_prop(ctx.out_arr, k, awaited) {
+                reject_promise(vm, ctx.out_p, e.value);
+                return Ok(JsValue::UNDEFINED);
+            }
+            drive_from_async_array_like(vm, ctx, k + 1);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    let on_err = vm.alloc_host_fn("", move |vm, _, args| {
+        reject_promise(vm, ctx.out_p, arg(args, 0));
+        Ok(JsValue::UNDEFINED)
+    });
+    attach_promise_reaction(
+        vm,
+        vp,
+        PromiseReaction {
+            on_fulfilled: Some(on_ok),
+            on_rejected: Some(on_err),
+            result_promise: None,
+        },
+    );
+}
+
+fn array_from_async_inner(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+    out_p: HeapHandle,
+) -> Result<(), JsException> {
+    let async_items = arg(args, 0);
+    let map_arg = arg(args, 1);
+    let this_arg = arg(args, 2);
+    let map_fn = if map_arg.is_undefined() {
+        None
+    } else {
+        if !map_arg
+            .as_object()
+            .is_some_and(|h| vm.is_callable_handle(h))
+        {
+            return Err(vm.type_error("Array.fromAsync mapfn is not a function"));
+        }
+        Some(map_arg)
+    };
+    if async_items.is_null() || async_items.is_undefined() {
+        return Err(vm.type_error("Cannot convert undefined or null to object"));
+    }
+
+    let items_obj = vm.to_object(async_items)?;
+    let async_m = vm.get_property_by_key(items_obj, vm.key_symbol_async_iterator)?;
+    let (iter_method, is_async_iter) = if !async_m.is_undefined() && !async_m.is_null() {
+        if !async_m
+            .as_object()
+            .is_some_and(|h| vm.is_callable_handle(h))
+        {
+            return Err(vm.type_error("Symbol.asyncIterator is not callable"));
+        }
+        (Some(async_m), true)
+    } else {
+        let sync_m = vm.get_property_by_key(items_obj, vm.key_symbol_iterator)?;
+        if !sync_m.is_undefined() && !sync_m.is_null() {
+            if !sync_m.as_object().is_some_and(|h| vm.is_callable_handle(h)) {
+                return Err(vm.type_error("Symbol.iterator is not callable"));
+            }
+            (Some(sync_m), false)
+        } else {
+            (None, false)
+        }
+    };
+
+    if let Some(im) = iter_method {
+        let iter_res = vm.call_value(im, async_items, &[])?;
+        let Some(iter_obj) = iter_res.as_object() else {
+            return Err(vm.type_error("Iterator method returned non-object"));
+        };
+        let next_method = vm.get_property_by_key(iter_obj, vm.key_next)?;
+        let out_arr = if this_val
+            .as_object()
+            .is_some_and(|h| vm.is_constructor_handle(h))
+        {
+            vm.construct_value(this_val, &[], this_val)?
+                .as_object()
+                .ok_or_else(|| vm.type_error("Constructor returned non-object"))?
+        } else {
+            vm.alloc_array()
+        };
+        drive_from_async_iter(
+            vm,
+            FromAsyncIterCtx {
+                iter_obj,
+                next_method,
+                is_async_iter,
+                out_arr,
+                map_fn,
+                this_arg,
+                out_p,
+            },
+            0,
+        );
+        return Ok(());
+    }
+
+    let len = vm.array_get_len(items_obj)?;
+    let out_arr = if this_val
+        .as_object()
+        .is_some_and(|h| vm.is_constructor_handle(h))
+    {
+        vm.construct_value(this_val, &[JsValue::from_f64(len as f64)], this_val)?
+            .as_object()
+            .ok_or_else(|| vm.type_error("Constructor returned non-object"))?
+    } else {
+        if len > u64::from(u32::MAX) {
+            return Err(vm.range_error("Invalid array length"));
+        }
+        let a = vm.alloc_array();
+        if let Some(o) = vm.heap.get_object_mut(a) {
+            o.elements.set_len(len as u32);
+        }
+        a
+    };
+    drive_from_async_array_like(
+        vm,
+        FromAsyncArrayLikeCtx {
+            src_h: items_obj,
+            len,
+            out_arr,
+            map_fn,
+            this_arg,
+            out_p,
+        },
+        0,
+    );
+    Ok(())
+}
+
+pub fn array_from_async(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let out_p = alloc_promise(vm);
+    if let Err(e) = array_from_async_inner(vm, this_val, args, out_p) {
+        reject_promise(vm, out_p, e.value);
+    }
+    Ok(JsValue::from_object(out_p))
 }
