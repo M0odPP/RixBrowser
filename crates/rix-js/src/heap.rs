@@ -70,11 +70,12 @@ pub struct ProxyObject {
     pub revoked: bool,
 }
 
-/// Out-of-line RegExp pattern and flags payload.
+/// Out-of-line RegExp pattern, canonical flags, and cached compiled ECMAScript engine.
 #[derive(Debug, Clone)]
 pub struct RegExpObject {
     pub pattern: String,
     pub flags: String,
+    pub compiled: Option<std::sync::Arc<regress::Regex>>,
 }
 
 /// Element type tag for ES6+ TypedArrays (including BigInt64, BigUint64, and Float16).

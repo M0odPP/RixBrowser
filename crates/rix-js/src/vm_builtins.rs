@@ -100,6 +100,25 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
         1,
         obj_property_is_enumerable,
     );
+    define_method_len(vm, obj_proto, "toLocaleString", 0, obj_to_locale_string);
+    // Annex B §B.2.2 legacy Object.prototype accessors & __proto__.
+    define_method_len(vm, obj_proto, "__defineGetter__", 2, obj_define_getter);
+    define_method_len(vm, obj_proto, "__defineSetter__", 2, obj_define_setter);
+    define_method_len(vm, obj_proto, "__lookupGetter__", 1, obj_lookup_getter);
+    define_method_len(vm, obj_proto, "__lookupSetter__", 1, obj_lookup_setter);
+    let get_proto_fn = vm.alloc_native_fn("get __proto__", obj_get_proto_accessor);
+    vm.set_fn_length(get_proto_fn, 0);
+    let set_proto_fn = vm.alloc_native_fn("set __proto__", obj_set_proto_accessor);
+    vm.set_fn_length(set_proto_fn, 1);
+    let k_dunder_proto = vm.heap.intern_key("__proto__");
+    vm.heap.object_define_accessor(
+        obj_proto,
+        k_dunder_proto,
+        Some(get_proto_fn),
+        Some(set_proto_fn),
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
 
     // Object constructor + statics
     let object_ctor = vm.alloc_native_fn("Object", object_ctor_fn);
@@ -749,6 +768,147 @@ fn obj_has_own_property(
             })
         });
     Ok(JsValue::from_bool(has))
+}
+
+fn obj_to_locale_string(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let h = vm.to_object(this_val)?;
+    let k_to_str = vm.heap.intern_key("toString");
+    let to_str = vm.get_property_by_key(h, k_to_str)?;
+    vm.call_value(to_str, this_val, &[])
+}
+
+fn obj_get_proto_accessor(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let h = vm.to_object(this_val)?;
+    Ok(match vm.heap.get_object(h).and_then(|o| o.prototype) {
+        Some(p) => JsValue::from_object(p),
+        None => JsValue::NULL,
+    })
+}
+
+fn obj_set_proto_accessor(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    if this_val.is_null() || this_val.is_undefined() {
+        return Err(vm.type_error("Cannot convert undefined or null to object"));
+    }
+    let proto_val = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+    if !proto_val.is_object() && !proto_val.is_null() {
+        return Ok(JsValue::UNDEFINED);
+    }
+    let Some(h) = this_val.as_object() else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let new_proto = proto_val.as_object();
+    if !ordinary_set_prototype_of(vm, h, new_proto) {
+        return Err(vm.type_error("Cyclic __proto__ value or non-extensible object"));
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn obj_define_accessor_legacy(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+    is_getter: bool,
+) -> Result<JsValue, JsException> {
+    let h = vm.to_object(this_val)?;
+    let fn_val = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
+    let Some(fh) = fn_val.as_object().filter(|&f| vm.is_callable_handle(f)) else {
+        return Err(vm.type_error(if is_getter {
+            "__defineGetter__: getter must be a function"
+        } else {
+            "__defineSetter__: setter must be a function"
+        }));
+    };
+    let key_s = vm.to_property_key(args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
+    let key = vm.heap.intern_key(&key_s);
+    let existing = vm.heap.object_get_own(h, key, &vm.shapes);
+    if let Some(cur) = &existing {
+        if !cur.attrs.contains(PropertyAttrs::CONFIGURABLE) {
+            return Err(vm.type_error("Cannot redefine non-configurable property"));
+        }
+    } else if !vm.heap.get_object(h).is_some_and(|o| o.extensible) {
+        return Err(vm.type_error("Cannot define property on non-extensible object"));
+    }
+    let (g, s) = if is_getter {
+        (Some(fh), existing.and_then(|p| p.setter))
+    } else {
+        (existing.and_then(|p| p.getter), Some(fh))
+    };
+    vm.heap.object_define_accessor(
+        h,
+        key,
+        g,
+        s,
+        PropertyAttrs::ENUMERABLE | PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+    Ok(JsValue::UNDEFINED)
+}
+
+fn obj_define_getter(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    obj_define_accessor_legacy(vm, this_val, args, true)
+}
+
+fn obj_define_setter(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    obj_define_accessor_legacy(vm, this_val, args, false)
+}
+
+fn obj_lookup_accessor_legacy(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+    is_getter: bool,
+) -> Result<JsValue, JsException> {
+    let mut cur = Some(vm.to_object(this_val)?);
+    let key_s = vm.to_property_key(args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
+    let key = vm.heap.intern_key(&key_s);
+    for _ in 0..64 {
+        let Some(h) = cur else { break };
+        if let Some(prop) = vm.heap.object_get_own(h, key, &vm.shapes) {
+            if prop.attrs.contains(PropertyAttrs::ACCESSOR) {
+                let acc = if is_getter { prop.getter } else { prop.setter };
+                return Ok(acc.map_or(JsValue::UNDEFINED, JsValue::from_object));
+            }
+            return Ok(JsValue::UNDEFINED);
+        }
+        cur = vm.heap.get_object(h).and_then(|o| o.prototype);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn obj_lookup_getter(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    obj_lookup_accessor_legacy(vm, this_val, args, true)
+}
+
+fn obj_lookup_setter(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    obj_lookup_accessor_legacy(vm, this_val, args, false)
 }
 
 fn obj_to_string(

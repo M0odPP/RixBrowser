@@ -224,6 +224,8 @@ pub struct JsVm {
     pub typed_array_protos: [HeapHandle; 12],
     pub promise_proto: HeapHandle,
     pub iterator_proto: HeapHandle,
+    pub string_iter_proto: HeapHandle,
+    pub regexp_iter_proto: HeapHandle,
     pub generator_proto: HeapHandle,
     pub async_generator_proto: HeapHandle,
     pub sym_iterator: SymbolId,
@@ -256,6 +258,7 @@ pub struct JsVm {
     pub eval_fn: Option<HeapHandle>,
     pub symbol_registry: HashMap<String, SymbolId>,
     pub symbol_descriptions: HashMap<SymbolId, String>,
+    pub regexp_statics: crate::builtins_regexp::RegExpLegacyStatics,
     pub rng_state: u64,
     microtasks: VecDeque<MicrotaskJob>,
     module_envs: HashMap<u32, ModuleEnv>,
@@ -273,6 +276,8 @@ pub struct JsVm {
     pub max_loop_iterations: Option<u64>,
     pub loop_iterations: u64,
     native_call_depth: u32,
+    /// Active `new.target` during a `NativeFunction` constructor invocation (`undefined` if called).
+    pub native_new_target: JsValue,
     /// Shared atomic flag checked on every `Opcode::LoopBack`.
     pub interrupt_flag: Arc<AtomicBool>,
     /// Per-function invocation counters (used for Tier-2/3 JIT tier-up in Phase 3).
@@ -407,6 +412,8 @@ impl JsVm {
             std::array::from_fn(|_| make_proto(&mut heap, &mut shapes, typed_array_proto));
         let promise_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let iterator_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let string_iter_proto = make_proto(&mut heap, &mut shapes, iterator_proto);
+        let regexp_iter_proto = make_proto(&mut heap, &mut shapes, iterator_proto);
         let generator_proto = make_proto(&mut heap, &mut shapes, iterator_proto);
         let async_generator_proto = make_proto(&mut heap, &mut shapes, object_proto);
 
@@ -492,6 +499,8 @@ impl JsVm {
             typed_array_protos,
             promise_proto,
             iterator_proto,
+            string_iter_proto,
+            regexp_iter_proto,
             generator_proto,
             async_generator_proto,
             sym_iterator,
@@ -524,6 +533,7 @@ impl JsVm {
             eval_fn: None,
             symbol_registry: HashMap::new(),
             symbol_descriptions: HashMap::new(),
+            regexp_statics: crate::builtins_regexp::RegExpLegacyStatics::default(),
             rng_state: 0x9E37_79B9_7F4A_7C15,
             microtasks: VecDeque::new(),
             module_envs: HashMap::new(),
@@ -542,6 +552,7 @@ impl JsVm {
             max_loop_iterations: None,
             loop_iterations: 0,
             native_call_depth: 0,
+            native_new_target: JsValue::UNDEFINED,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             call_counts: Vec::new(),
             back_edge_counts: Vec::new(),
@@ -655,6 +666,8 @@ impl JsVm {
             self.typed_array_proto,
             self.promise_proto,
             self.iterator_proto,
+            self.string_iter_proto,
+            self.regexp_iter_proto,
             self.generator_proto,
             self.async_generator_proto,
         ] {
@@ -716,58 +729,21 @@ impl JsVm {
         stats
     }
 
-    /// Allocates a `RegExp` object with `RegExp.prototype` and standard metadata properties.
+    /// Allocates a `RegExp` object with `RegExp.prototype` and own `lastIndex` per ECMA-262 §22.2.3.
     pub fn alloc_regexp(&mut self, pattern: String, flags: String) -> HeapHandle {
+        let canonical_flags = crate::builtins_regexp::canonicalize_flags(&flags);
+        let compiled = crate::builtins_regexp::compile_regress_raw(&pattern, &canonical_flags)
+            .ok()
+            .map(std::sync::Arc::new);
         let re = self.heap.alloc_object(JsObject::with_kind(
             ObjectKind::RegExp(Box::new(RegExpObject {
-                pattern: pattern.clone(),
-                flags: flags.clone(),
+                pattern,
+                flags: canonical_flags,
+                compiled,
             })),
             Some(self.regexp_proto),
         ));
-        let k_src = self.heap.intern_key("source");
-        let k_flags = self.heap.intern_key("flags");
-        let k_global = self.heap.intern_key("global");
-        let k_icase = self.heap.intern_key("ignoreCase");
-        let k_multi = self.heap.intern_key("multiline");
         let k_last = self.heap.intern_key("lastIndex");
-        let src_v = JsValue::from_string(self.heap.alloc_string(pattern));
-        let flg_v = JsValue::from_string(self.heap.alloc_string(flags.clone()));
-        self.heap.object_define_data(
-            re,
-            k_src,
-            src_v,
-            PropertyAttrs::CONFIGURABLE,
-            &mut self.shapes,
-        );
-        self.heap.object_define_data(
-            re,
-            k_flags,
-            flg_v,
-            PropertyAttrs::CONFIGURABLE,
-            &mut self.shapes,
-        );
-        self.heap.object_define_data(
-            re,
-            k_global,
-            JsValue::from_bool(flags.contains('g')),
-            PropertyAttrs::CONFIGURABLE,
-            &mut self.shapes,
-        );
-        self.heap.object_define_data(
-            re,
-            k_icase,
-            JsValue::from_bool(flags.contains('i')),
-            PropertyAttrs::CONFIGURABLE,
-            &mut self.shapes,
-        );
-        self.heap.object_define_data(
-            re,
-            k_multi,
-            JsValue::from_bool(flags.contains('m')),
-            PropertyAttrs::CONFIGURABLE,
-            &mut self.shapes,
-        );
         self.heap.object_define_data(
             re,
             k_last,
@@ -1124,10 +1100,18 @@ impl JsVm {
                     Some(NativeCallable::Closure(rc)) => NativeInv::Closure(Rc::clone(rc)),
                     None => return Err(self.type_error("Invalid native function ID")),
                 };
-                match callable {
+                let prev_nt = self.native_new_target;
+                self.native_new_target = if construct_obj.is_some() {
+                    new_target
+                } else {
+                    JsValue::UNDEFINED
+                };
+                let res = match callable {
                     NativeInv::Static(fp) => fp(self, this_val, args),
                     NativeInv::Closure(rc) => rc(self, this_val, args),
-                }
+                };
+                self.native_new_target = prev_nt;
+                res
             }
             ObjectKind::BoundFunction(bound) => {
                 let mut combined = Vec::with_capacity(bound.bound_args.len() + args.len());
@@ -5663,21 +5647,7 @@ impl JsVm {
             JsValueKind::Bool(true) => "true".into(),
             JsValueKind::Bool(false) => "false".into(),
             JsValueKind::Int32(i) => i.to_string(),
-            JsValueKind::Float(f) => {
-                if f.is_nan() {
-                    "NaN".into()
-                } else if f.is_infinite() {
-                    if f.is_sign_positive() {
-                        "Infinity".into()
-                    } else {
-                        "-Infinity".into()
-                    }
-                } else if f == 0.0 {
-                    "0".into()
-                } else {
-                    f.to_string()
-                }
-            }
+            JsValueKind::Float(f) => format_ecma_f64(f),
             JsValueKind::String(h) => self.heap.materialize_string(h).unwrap_or_default(),
             JsValueKind::BigInt(h) => self
                 .heap
@@ -6516,4 +6486,34 @@ pub(crate) fn parse_array_index_str(s: &str) -> Option<u32> {
     } else {
         None
     }
+}
+
+/// ECMA-262 §6.1.6.1.20 `Number::toString(x, 10)` decimal/scientific formatting.
+fn format_ecma_f64(f: f64) -> String {
+    if f.is_nan() {
+        return "NaN".into();
+    }
+    if f.is_infinite() {
+        return if f.is_sign_positive() {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        };
+    }
+    if f == 0.0 {
+        return "0".into();
+    }
+    let abs = f.abs();
+    if !(1e-6..1e21).contains(&abs) {
+        let s = format!("{f:e}");
+        if let Some((mant, exp)) = s.split_once('e') {
+            return if exp.starts_with('-') {
+                format!("{mant}e{exp}")
+            } else {
+                format!("{mant}e+{exp}")
+            };
+        }
+        return s;
+    }
+    f.to_string()
 }

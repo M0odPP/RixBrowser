@@ -141,101 +141,19 @@ fn validate_regex_literal(pattern: &str, flags: &str, span: Span) -> Result<(), 
             span,
         ));
     }
-    // Validate group syntax, especially ES2025 inline modifier groups `(?ims-ims:...)`.
-    let bytes = pattern.as_bytes();
-    let mut i = 0usize;
-    let mut in_class = false;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            i += 2;
-            continue;
-        }
-        if bytes[i] == b'[' {
-            in_class = true;
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b']' && in_class {
-            in_class = false;
-            i += 1;
-            continue;
-        }
-        if !in_class && bytes[i] == b'(' && bytes.get(i + 1) == Some(&b'?') {
-            i += 2;
-            match bytes.get(i) {
-                Some(b':' | b'=' | b'!') => {
-                    i += 1;
-                }
-                Some(b'<') => {
-                    i += 1;
-                    if matches!(bytes.get(i), Some(b'=' | b'!')) {
-                        i += 1;
-                    }
-                }
-                _ => {
-                    // ES2025 modifier group: `(?[ims]*(-[ims]*)?:...)`
-                    let mut add_mask = 0u8;
-                    let mut rem_mask = 0u8;
-                    let mut saw_dash = false;
-                    let mut saw_any = false;
-                    loop {
-                        let Some(&ch) = bytes.get(i) else {
-                            return Err(SyntaxError::new("Invalid RegExp modifier group", span));
-                        };
-                        if ch == b':' {
-                            if !saw_any {
-                                return Err(SyntaxError::new("Empty RegExp modifier group", span));
-                            }
-                            i += 1;
-                            break;
-                        }
-                        if ch == b'-' {
-                            if saw_dash {
-                                return Err(SyntaxError::new(
-                                    "Duplicate '-' in RegExp modifier group",
-                                    span,
-                                ));
-                            }
-                            saw_dash = true;
-                            i += 1;
-                            continue;
-                        }
-                        let bit = match ch {
-                            b'i' => 1u8,
-                            b'm' => 2u8,
-                            b's' => 4u8,
-                            _ => {
-                                return Err(SyntaxError::new(
-                                    "Invalid RegExp group modifier",
-                                    span,
-                                ));
-                            }
-                        };
-                        saw_any = true;
-                        if saw_dash {
-                            if (rem_mask & bit) != 0 || (add_mask & bit) != 0 {
-                                return Err(SyntaxError::new(
-                                    "Duplicate or conflicting RegExp group modifier",
-                                    span,
-                                ));
-                            }
-                            rem_mask |= bit;
-                        } else {
-                            if (add_mask & bit) != 0 {
-                                return Err(SyntaxError::new(
-                                    "Duplicate RegExp group modifier",
-                                    span,
-                                ));
-                            }
-                            add_mask |= bit;
-                        }
-                        i += 1;
-                    }
-                }
-            }
-            continue;
-        }
-        i += 1;
+    let rf = regress::Flags {
+        icase: (seen_flags & (1 << 2)) != 0,
+        multiline: (seen_flags & (1 << 3)) != 0,
+        dot_all: (seen_flags & (1 << 4)) != 0,
+        unicode: (seen_flags & (1 << 5)) != 0,
+        unicode_sets: (seen_flags & (1 << 6)) != 0,
+        no_opt: false,
+    };
+    if let Err(err) = regress::Regex::with_flags(pattern, rf) {
+        return Err(SyntaxError::new(
+            format!("Invalid regular expression /{pattern}/{flags}: {err}"),
+            span,
+        ));
     }
     Ok(())
 }
