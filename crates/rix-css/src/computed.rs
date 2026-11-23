@@ -25,7 +25,9 @@ use crate::values::{
     VisibilityMode, WhiteSpaceMode, WordBreakMode, ZIndexValue,
 };
 
-const MAX_VAR_DEPTH: u8 = 32;
+const MAX_VAR_DEPTH: u8 = 64;
+const MAX_VAR_EXPANDED_TOKENS: usize = 8_192;
+const MAX_VAR_EXPANDED_BYTES: usize = 65_536;
 
 /// Non-inherited box-model geometry shared via copy-on-write `Arc`.
 #[derive(Debug, Clone, PartialEq)]
@@ -403,10 +405,11 @@ impl ComputedStyle {
     }
 }
 
-/// Expands `var()` references in `tokens` against `custom_props`, detecting cycles.
+/// Expands `var()` references in `tokens` against `custom_props`, detecting cycles
+/// and enforcing strict token/byte limits to prevent exponential expansion OOM.
 ///
-/// Returns `None` if an undefined variable has no fallback or a cycle is encountered
-/// (invalid at computed-value time).
+/// Returns `None` if an undefined variable has no fallback, a cycle is encountered,
+/// or the expansion exceeds the spec-sanctioned size cap (invalid at computed-value time).
 #[must_use]
 pub fn resolve_var_tokens(
     tokens: &[CssToken],
@@ -414,8 +417,29 @@ pub fn resolve_var_tokens(
 ) -> Option<Vec<CssToken>> {
     let mut active = SmallVec::<[InternedStr; 8]>::new();
     let mut out = Vec::with_capacity(tokens.len());
-    expand_var_tokens(tokens, custom_props, 0, &mut active, &mut out)?;
+    let mut byte_budget = MAX_VAR_EXPANDED_BYTES;
+    expand_var_tokens(
+        tokens,
+        custom_props,
+        0,
+        &mut active,
+        &mut out,
+        &mut byte_budget,
+    )?;
     Some(out)
+}
+
+#[inline]
+fn token_approx_bytes(tok: &CssToken) -> usize {
+    match tok {
+        CssToken::Ident(s) | CssToken::String(s) | CssToken::Url(s) | CssToken::Hash(s) => {
+            s.as_str().len().max(1)
+        }
+        CssToken::Dimension(_, u) => 8 + u.as_str().len(),
+        CssToken::Function { name, args } => name.as_str().len() + 2 + args.len() * 4,
+        CssToken::Var { name, .. } => name.as_str().len() + 6,
+        _ => 4,
+    }
 }
 
 fn expand_var_tokens(
@@ -424,8 +448,9 @@ fn expand_var_tokens(
     depth: u8,
     active: &mut SmallVec<[InternedStr; 8]>,
     out: &mut Vec<CssToken>,
+    byte_budget: &mut usize,
 ) -> Option<()> {
-    if depth > MAX_VAR_DEPTH {
+    if depth > MAX_VAR_DEPTH || out.len() > MAX_VAR_EXPANDED_TOKENS {
         return None;
     }
     for tok in tokens {
@@ -436,30 +461,214 @@ fn expand_var_tokens(
                 }
                 if let Some(val_tokens) = custom_props.get(name) {
                     active.push(name.clone());
-                    let res = expand_var_tokens(val_tokens, custom_props, depth + 1, active, out);
+                    let saved_len = out.len();
+                    let saved_budget = *byte_budget;
+                    let res = expand_var_tokens(
+                        val_tokens,
+                        custom_props,
+                        depth + 1,
+                        active,
+                        out,
+                        byte_budget,
+                    );
                     active.pop();
                     if res.is_some() {
                         continue;
                     }
+                    // Roll back partial output before trying fallback.
+                    out.truncate(saved_len);
+                    *byte_budget = saved_budget;
+                    // If the referenced custom property failed due to an expansion budget overflow
+                    // or cycle involving `active`, propagate failure instead of using fallback.
+                    if *byte_budget == 0 {
+                        return None;
+                    }
                 }
                 if let Some(fb) = fallback {
-                    expand_var_tokens(fb, custom_props, depth + 1, active, out)?;
+                    expand_var_tokens(fb, custom_props, depth + 1, active, out, byte_budget)?;
                 } else {
                     return None;
                 }
             }
             CssToken::Function { name, args } => {
+                let cost = name.as_str().len() + 2;
+                if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
+                    *byte_budget = 0;
+                    return None;
+                }
+                *byte_budget -= cost;
                 let mut resolved_args = Vec::with_capacity(args.len());
-                expand_var_tokens(args, custom_props, depth + 1, active, &mut resolved_args)?;
+                expand_var_tokens(
+                    args,
+                    custom_props,
+                    depth + 1,
+                    active,
+                    &mut resolved_args,
+                    byte_budget,
+                )?;
                 out.push(CssToken::Function {
                     name: name.clone(),
                     args: resolved_args,
                 });
             }
-            other => out.push(other.clone()),
+            other => {
+                let cost = token_approx_bytes(other);
+                if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
+                    *byte_budget = 0;
+                    return None;
+                }
+                *byte_budget -= cost;
+                out.push(other.clone());
+            }
         }
     }
     Some(())
+}
+
+#[derive(Clone)]
+enum CustomVarResolveState {
+    Visiting,
+    Resolved(Option<Vec<CssToken>>),
+}
+
+enum CustomVarErr {
+    /// Hit a cycle back to an ancestor variable; caller must invalidate the cycle.
+    Cycle(InternedStr),
+    /// Exceeded expansion token/byte budget (guaranteed-invalid).
+    BudgetExceeded,
+    /// Referenced variable is undefined/guaranteed-invalid (fallback permitted).
+    Invalid,
+}
+
+fn expand_custom_prop_tokens(
+    tokens: &[CssToken],
+    raw_map: &HashMap<InternedStr, Vec<CssToken>>,
+    states: &mut HashMap<InternedStr, CustomVarResolveState>,
+    depth: u8,
+    out: &mut Vec<CssToken>,
+    byte_budget: &mut usize,
+) -> Result<(), CustomVarErr> {
+    if depth > MAX_VAR_DEPTH || out.len() > MAX_VAR_EXPANDED_TOKENS {
+        *byte_budget = 0;
+        return Err(CustomVarErr::BudgetExceeded);
+    }
+    for tok in tokens {
+        match tok {
+            CssToken::Var { name, fallback } => {
+                match resolve_single_custom_prop(name, raw_map, states, depth + 1) {
+                    Ok(Some(resolved)) => {
+                        for rt in &resolved {
+                            let cost = token_approx_bytes(rt);
+                            if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
+                                *byte_budget = 0;
+                                return Err(CustomVarErr::BudgetExceeded);
+                            }
+                            *byte_budget -= cost;
+                            out.push(rt.clone());
+                        }
+                    }
+                    Ok(None) | Err(CustomVarErr::Invalid) => {
+                        if let Some(fb) = fallback {
+                            expand_custom_prop_tokens(
+                                fb,
+                                raw_map,
+                                states,
+                                depth + 1,
+                                out,
+                                byte_budget,
+                            )?;
+                        } else {
+                            return Err(CustomVarErr::Invalid);
+                        }
+                    }
+                    Err(CustomVarErr::Cycle(root)) => return Err(CustomVarErr::Cycle(root)),
+                    Err(CustomVarErr::BudgetExceeded) => return Err(CustomVarErr::BudgetExceeded),
+                }
+            }
+            CssToken::Function { name, args } => {
+                let cost = name.as_str().len() + 2;
+                if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
+                    *byte_budget = 0;
+                    return Err(CustomVarErr::BudgetExceeded);
+                }
+                *byte_budget -= cost;
+                let mut resolved_args = Vec::with_capacity(args.len());
+                expand_custom_prop_tokens(
+                    args,
+                    raw_map,
+                    states,
+                    depth + 1,
+                    &mut resolved_args,
+                    byte_budget,
+                )?;
+                out.push(CssToken::Function {
+                    name: name.clone(),
+                    args: resolved_args,
+                });
+            }
+            other => {
+                let cost = token_approx_bytes(other);
+                if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
+                    *byte_budget = 0;
+                    return Err(CustomVarErr::BudgetExceeded);
+                }
+                *byte_budget -= cost;
+                out.push(other.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_single_custom_prop(
+    name: &InternedStr,
+    raw_map: &HashMap<InternedStr, Vec<CssToken>>,
+    states: &mut HashMap<InternedStr, CustomVarResolveState>,
+    depth: u8,
+) -> Result<Option<Vec<CssToken>>, CustomVarErr> {
+    if let Some(st) = states.get(name) {
+        return match st {
+            CustomVarResolveState::Visiting => Err(CustomVarErr::Cycle(name.clone())),
+            CustomVarResolveState::Resolved(v) => Ok(v.clone()),
+        };
+    }
+    let Some(tokens) = raw_map.get(name) else {
+        return Ok(None);
+    };
+    if !tokens.iter().any(token_has_var) {
+        let cloned = tokens.clone();
+        states.insert(
+            name.clone(),
+            CustomVarResolveState::Resolved(Some(cloned.clone())),
+        );
+        return Ok(Some(cloned));
+    }
+    states.insert(name.clone(), CustomVarResolveState::Visiting);
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut byte_budget = MAX_VAR_EXPANDED_BYTES;
+    match expand_custom_prop_tokens(tokens, raw_map, states, depth, &mut out, &mut byte_budget) {
+        Ok(()) => {
+            states.insert(
+                name.clone(),
+                CustomVarResolveState::Resolved(Some(out.clone())),
+            );
+            Ok(Some(out))
+        }
+        Err(CustomVarErr::Cycle(root)) => {
+            states.insert(name.clone(), CustomVarResolveState::Resolved(None));
+            if &root == name {
+                // We closed the cycle at its entry point; this variable is guaranteed-invalid
+                // (so non-cyclic outsiders referencing it can still fall back).
+                Ok(None)
+            } else {
+                Err(CustomVarErr::Cycle(root))
+            }
+        }
+        Err(CustomVarErr::Invalid | CustomVarErr::BudgetExceeded) => {
+            states.insert(name.clone(), CustomVarResolveState::Resolved(None));
+            Ok(None)
+        }
+    }
 }
 
 /// Cascade Level 5 ordering key (strictly ascending priority; highest wins).
@@ -626,24 +835,35 @@ pub fn resolve_element_style_with_hints(
                     PropertyValue::Global(GlobalKeyword::Initial) => {
                         custom_map.entries.remove(name);
                     }
+                    PropertyValue::Global(
+                        GlobalKeyword::Inherit
+                        | GlobalKeyword::Unset
+                        | GlobalKeyword::Revert
+                        | GlobalKeyword::RevertLayer,
+                    ) => {
+                        // Custom properties are inherited: keep parent's computed value.
+                    }
                     _ => {}
                 }
             }
         }
-        // Substitute var() references inside newly declared custom properties.
-        let snapshot = custom_map.clone();
+        // Substitute var() references inside newly declared custom properties using
+        // memoized DFS with cycle detection and strict token/byte budgets (O(N), no OOM!).
+        let raw_entries = custom_map.entries.clone();
+        let mut states: HashMap<InternedStr, CustomVarResolveState> =
+            HashMap::with_capacity(raw_entries.len());
         let keys: Vec<InternedStr> = raw_custom.keys().cloned().collect();
         for name in keys {
-            if let Some(tokens) = snapshot.get(&name) {
-                if tokens.iter().any(token_has_var) {
-                    let mut active = SmallVec::<[InternedStr; 8]>::new();
-                    active.push(name.clone());
-                    let mut resolved = Vec::new();
-                    if expand_var_tokens(tokens, &snapshot, 0, &mut active, &mut resolved).is_some()
-                    {
+            if raw_entries
+                .get(&name)
+                .is_some_and(|t| t.iter().any(token_has_var))
+            {
+                match resolve_single_custom_prop(&name, &raw_entries, &mut states, 0) {
+                    Ok(Some(resolved)) => {
                         custom_map.insert(name, resolved);
-                    } else {
-                        // Cyclic or invalid custom property becomes IACVT (removed/reverted).
+                    }
+                    Ok(None) | Err(_) => {
+                        // Cyclic, undefined, or over-budget custom property is guaranteed-invalid.
                         custom_map.entries.remove(&name);
                     }
                 }
@@ -653,6 +873,9 @@ pub fn resolve_element_style_with_hints(
     }
 
     // Pass 2: Expand any `var()`-bearing declarations into typed declarations, preserving cascade key.
+    // Per CSS Variables Level 1 §3, an Unresolved declaration whose substitution fails or parses
+    // to an invalid value becomes Invalid At Computed-Value Time (IACVT -> behaves as `unset`),
+    // rather than falling back to lower-specificity cascaded declarations.
     let mut expanded_owned: Vec<(CascadeKey, SpecifiedDeclaration)> = Vec::new();
     let mut standard_candidates: Vec<(CascadeKey, &SpecifiedDeclaration)> = Vec::new();
     for c in &candidates {
@@ -660,11 +883,26 @@ pub fn resolve_element_style_with_hints(
             continue;
         }
         if let PropertyValue::Unresolved(tokens) = &c.decl.value {
-            if let Some(resolved_tokens) = resolve_var_tokens(tokens, &style.custom_properties) {
-                for decl in
-                    parse_property_from_tokens(c.decl.property, &resolved_tokens, c.decl.important)
-                {
+            let expanded = resolve_var_tokens(tokens, &style.custom_properties)
+                .map(|rt| parse_property_from_tokens(c.decl.property, &rt, c.decl.important))
+                .unwrap_or_default();
+            if !expanded.is_empty() {
+                for decl in expanded {
                     expanded_owned.push((c.key, decl));
+                }
+            } else {
+                // IACVT: emit `unset` for the property (or constituent longhands if shorthand).
+                for target_prop in c.decl.property.shorthand_longhands() {
+                    expanded_owned.push((
+                        c.key,
+                        SpecifiedDeclaration {
+                            property: target_prop,
+                            custom_name: None,
+                            value: PropertyValue::Global(GlobalKeyword::Unset),
+                            important: c.decl.important,
+                            order: c.decl.order,
+                        },
+                    ));
                 }
             }
         } else {

@@ -8,8 +8,8 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use crate::heap::{
-    AsyncGeneratorRequest, AsyncGeneratorRequestKind, GeneratorObject, GeneratorState, JsObject,
-    ObjectKind, PromiseReaction, PromiseState, SuspendedFrame,
+    AsyncGeneratorRequest, AsyncGeneratorRequestKind, AsyncResumeObject, GeneratorObject,
+    GeneratorState, JsObject, ObjectKind, PromiseReaction, PromiseState, SuspendedFrame,
 };
 use crate::shape::PropertyAttrs;
 use crate::value::{HeapHandle, JsValue};
@@ -441,6 +441,8 @@ pub fn drain_microtasks(vm: &mut JsVm) {
         if ran > max_jobs {
             break;
         }
+        let root_mark = vm.temp_roots.len();
+        job.trace_roots(&mut vm.temp_roots);
         match job {
             MicrotaskJob::Callback {
                 func,
@@ -481,15 +483,26 @@ pub fn drain_microtasks(vm: &mut JsVm) {
                     reaction.on_fulfilled
                 };
                 if let Some(h) = handler {
-                    match vm.call_value(JsValue::from_object(h), JsValue::UNDEFINED, &[value]) {
-                        Ok(res) => {
-                            if let Some(rp) = reaction.result_promise {
-                                resolve_promise(vm, rp, res);
-                            }
+                    let async_resume = vm.heap.get_object_mut(h).and_then(|o| {
+                        if let ObjectKind::AsyncResume(st) = &mut o.kind {
+                            st.frame.take().map(|f| (f, st.promise))
+                        } else {
+                            None
                         }
-                        Err(e) => {
-                            if let Some(rp) = reaction.result_promise {
-                                reject_promise(vm, rp, e.value);
+                    });
+                    if let Some((frame, promise)) = async_resume {
+                        resume_async_frame(vm, frame, promise, value, is_rejected);
+                    } else {
+                        match vm.call_value(JsValue::from_object(h), JsValue::UNDEFINED, &[value]) {
+                            Ok(res) => {
+                                if let Some(rp) = reaction.result_promise {
+                                    resolve_promise(vm, rp, res);
+                                }
+                            }
+                            Err(e) => {
+                                if let Some(rp) = reaction.result_promise {
+                                    reject_promise(vm, rp, e.value);
+                                }
                             }
                         }
                     }
@@ -510,6 +523,7 @@ pub fn drain_microtasks(vm: &mut JsVm) {
                 resume_async_frame(vm, frame, promise, value, is_throw);
             }
         }
+        vm.temp_roots.truncate(root_mark);
     }
 }
 
@@ -523,6 +537,8 @@ pub fn start_async_call(
     args: &[JsValue],
 ) -> HeapHandle {
     let promise = alloc_promise(vm);
+    let root_mark = vm.temp_roots.len();
+    vm.temp_roots.push(JsValue::from_object(promise));
     let entry_depth = vm.frame_depth();
     if let Err(e) = vm.push_closure_frame(
         callee,
@@ -535,9 +551,11 @@ pub fn start_async_call(
         JsValue::UNDEFINED,
     ) {
         reject_promise(vm, promise, e.value);
+        vm.temp_roots.truncate(root_mark);
         return promise;
     }
     drive_async_execution(vm, entry_depth, promise);
+    vm.temp_roots.truncate(root_mark);
     promise
 }
 
@@ -549,6 +567,9 @@ pub fn resume_async_frame(
     value: JsValue,
     is_throw: bool,
 ) {
+    let root_mark = vm.temp_roots.len();
+    vm.temp_roots.push(JsValue::from_object(promise));
+    vm.temp_roots.push(value);
     let entry_depth = vm.frame_depth();
     let base = vm.restore_suspended_frame(&frame);
     if is_throw {
@@ -559,43 +580,43 @@ pub fn resume_async_frame(
         };
         if !vm.unwind_into_frame(entry_depth, exc) {
             reject_promise(vm, promise, value);
+            vm.temp_roots.truncate(root_mark);
             return;
         }
     } else {
         vm.write_register(base + usize::from(frame.resume_dst), value);
     }
     drive_async_execution(vm, entry_depth, promise);
+    vm.temp_roots.truncate(root_mark);
 }
 
 fn drive_async_execution(vm: &mut JsVm, entry_depth: usize, promise: HeapHandle) {
     match vm.run_suspendable(entry_depth) {
         Ok(RunOutcome::Completed(val)) => resolve_promise(vm, promise, val),
         Ok(RunOutcome::SuspendedAwait { frame, awaited }) => {
+            let root_mark = vm.temp_roots.len();
+            frame.trace_children(|h| vm.temp_roots.push(JsValue::from_object(h)));
+            vm.temp_roots.push(JsValue::from_object(promise));
+            vm.temp_roots.push(awaited);
             let awaited_p = promise_resolve_value(vm, awaited);
-            let frame_rc = Rc::new(std::cell::RefCell::new(Some(frame)));
-            let f_ok = Rc::clone(&frame_rc);
-            let on_ok = vm.alloc_host_fn("async_resume_ok", move |vm, _this, args| {
-                if let Some(f) = f_ok.borrow_mut().take() {
-                    resume_async_frame(vm, f, promise, arg(args, 0), false);
-                }
-                Ok(JsValue::UNDEFINED)
-            });
-            let f_err = frame_rc;
-            let on_err = vm.alloc_host_fn("async_resume_err", move |vm, _this, args| {
-                if let Some(f) = f_err.borrow_mut().take() {
-                    resume_async_frame(vm, f, promise, arg(args, 0), true);
-                }
-                Ok(JsValue::UNDEFINED)
-            });
+            vm.temp_roots.push(JsValue::from_object(awaited_p));
+            let ctx_h = vm.heap.alloc_object(JsObject::with_kind(
+                ObjectKind::AsyncResume(Box::new(AsyncResumeObject {
+                    frame: Some(frame),
+                    promise,
+                })),
+                None,
+            ));
             attach_promise_reaction(
                 vm,
                 awaited_p,
                 PromiseReaction {
-                    on_fulfilled: Some(on_ok),
-                    on_rejected: Some(on_err),
+                    on_fulfilled: Some(ctx_h),
+                    on_rejected: Some(ctx_h),
                     result_promise: None,
                 },
             );
+            vm.temp_roots.truncate(root_mark);
         }
         Ok(
             RunOutcome::SuspendedYield { .. }

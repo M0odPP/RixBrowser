@@ -9,7 +9,6 @@ use lightningcss::media_query::{
     MediaType, Operator, Qualifier, QueryFeature,
 };
 use lightningcss::printer::Printer;
-use lightningcss::properties::{Property, PropertyId};
 use lightningcss::rules::{
     font_face::{FontFaceProperty, FontFaceRule as LightningFontFace, Source},
     keyframes::{KeyframeSelector, KeyframesName, KeyframesRule as LightningKeyframes},
@@ -27,7 +26,10 @@ use crate::properties::{
     compile_declaration_block, MissingCssFeature, MissingCssKind, PropertyIdKind, PropertyValue,
     SpecifiedDeclaration,
 };
-use crate::selector::{compile_lightning_selector_list, parse_selector_list, RixSelectorImpl};
+use crate::selector::{
+    compile_lightning_selector_list, parse_selector_list, parse_selector_list_strict,
+    serialize_selector_list, RixSelectorImpl,
+};
 use crate::values::{convert_font_family_name, convert_length, BackgroundImageValue, EvalContext};
 
 /// CSS Cascade origin priority order.
@@ -302,23 +304,46 @@ pub fn evaluate_supports(cond: &SupportsCondition<'_>) -> bool {
         SupportsCondition::And(list) => list.iter().all(evaluate_supports),
         SupportsCondition::Or(list) => list.iter().any(evaluate_supports),
         SupportsCondition::Declaration { property_id, value } => {
-            let name = property_id.name();
-            if PropertyIdKind::from_name(name).is_none() {
-                return false;
-            }
-            if name.starts_with("--") {
-                return true;
-            }
-            let opts = ParserOptions::default();
-            match Property::parse_string(PropertyId::from(name), value.as_ref(), opts) {
-                Ok(Property::Unparsed(_)) => value.contains("var("),
-                Ok(_) => true,
-                Err(_) => false,
-            }
+            crate::properties::parse_and_serialize_declaration(property_id.name(), value.as_ref())
+                .is_some()
         }
-        SupportsCondition::Selector(sel) => parse_selector_list(sel.as_ref()).is_some(),
+        SupportsCondition::Selector(sel) => {
+            crate::selector::parse_selector_list_strict(sel.as_ref()).is_ok()
+        }
         SupportsCondition::Unknown(_) => false,
     }
+}
+
+/// Evaluates a CSS Conditional Rules L3/L4 condition string for `CSS.supports(conditionText)`.
+#[must_use]
+pub fn evaluate_supports_condition_str(condition: &str) -> bool {
+    let trimmed = condition.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // CSS.supports("(color: red)") or CSS.supports("color: red") or CSS.supports("selector(:has(*))")
+    let wrapped = if trimmed.starts_with('(')
+        || trimmed.to_ascii_lowercase().starts_with("not ")
+        || trimmed.to_ascii_lowercase().starts_with("not(")
+        || trimmed.to_ascii_lowercase().starts_with("selector(")
+    {
+        format!("@supports {trimmed} {{ a {{ color: red; }} }}")
+    } else {
+        format!("@supports ({trimmed}) {{ a {{ color: red; }} }}")
+    };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let opts = ParserOptions::default();
+        let Ok(parsed) = StyleSheet::parse(&wrapped, opts) else {
+            return false;
+        };
+        for rule in &parsed.rules.0 {
+            if let CssRule::Supports(sr) = rule {
+                return evaluate_supports(&sr.condition);
+            }
+        }
+        false
+    }))
+    .unwrap_or(false)
 }
 
 /// Font source entry parsed from `@font-face`.
@@ -408,9 +433,11 @@ impl Stylesheet {
             ..ParserOptions::default()
         };
         let mut compiler = StylesheetCompiler::new(origin, *media);
-        if let Ok(sheet) = StyleSheet::parse(css, opts) {
-            compiler.compile_rule_list(&sheet.rules, None, LayerId::UNLAYERED, None);
-        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Ok(sheet) = StyleSheet::parse(css, opts) {
+                compiler.compile_rule_list(&sheet.rules, None, LayerId::UNLAYERED, None);
+            }
+        }));
         compiler.finish()
     }
 
@@ -856,4 +883,218 @@ fn flatten_nested_selector(parent: &str, child_list: &str) -> String {
         }
     }
     parts.join(", ")
+}
+
+/// Structured CSSOM rule representation exposed to `CSSStyleSheet.cssRules` and `insertRule`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CssomRuleKind {
+    Style {
+        selector_text: String,
+        declarations_text: String,
+    },
+    Media {
+        condition_text: String,
+        body_text: String,
+    },
+    Supports {
+        condition_text: String,
+        body_text: String,
+    },
+    LayerBlock {
+        name: String,
+        body_text: String,
+    },
+    LayerStatement {
+        names: Vec<String>,
+    },
+    Scope {
+        prelude: String,
+        body_text: String,
+    },
+    Keyframes {
+        name: String,
+        body_text: String,
+    },
+    Property {
+        name: String,
+        css_text: String,
+    },
+    Other {
+        css_text: String,
+    },
+}
+
+impl CssomRuleKind {
+    /// Serializes this CSSOM rule back into valid CSS text.
+    #[must_use]
+    pub fn to_css_text(&self) -> String {
+        match self {
+            Self::Style {
+                selector_text,
+                declarations_text,
+            } => {
+                if declarations_text.trim().is_empty() {
+                    format!("{selector_text} {{ }}")
+                } else {
+                    format!("{selector_text} {{ {declarations_text} }}")
+                }
+            }
+            Self::Media {
+                condition_text,
+                body_text,
+            } => format!("@media {condition_text} {{ {body_text} }}"),
+            Self::Supports {
+                condition_text,
+                body_text,
+            } => format!("@supports {condition_text} {{ {body_text} }}"),
+            Self::LayerBlock { name, body_text } => {
+                if name.is_empty() {
+                    format!("@layer {{ {body_text} }}")
+                } else {
+                    format!("@layer {name} {{ {body_text} }}")
+                }
+            }
+            Self::LayerStatement { names } => format!("@layer {};", names.join(", ")),
+            Self::Scope { prelude, body_text } => {
+                if prelude.is_empty() {
+                    format!("@scope {{ {body_text} }}")
+                } else {
+                    format!("@scope {prelude} {{ {body_text} }}")
+                }
+            }
+            Self::Keyframes { name, body_text } => format!("@keyframes {name} {{ {body_text} }}"),
+            Self::Property { css_text, .. } | Self::Other { css_text } => css_text.clone(),
+        }
+    }
+}
+
+fn lightning_to_css_string<T: LightningToCss>(val: &T) -> String {
+    let mut out = String::new();
+    let mut printer = Printer::new(&mut out, PrinterOptions::default());
+    let _ = val.to_css(&mut printer);
+    out
+}
+
+fn convert_lightning_rule_to_cssom(
+    rule: &CssRule<'_>,
+    strict: bool,
+) -> Result<CssomRuleKind, String> {
+    match rule {
+        CssRule::Style(sr) => {
+            let raw_sel = lightning_to_css_string(&sr.selectors);
+            let selector_text = match parse_selector_list_strict(&raw_sel) {
+                Ok(parsed) => serialize_selector_list(&parsed),
+                Err(e) => {
+                    if strict {
+                        return Err(e);
+                    }
+                    raw_sel
+                }
+            };
+            let declarations_text = lightning_to_css_string(&sr.declarations);
+            Ok(CssomRuleKind::Style {
+                selector_text,
+                declarations_text,
+            })
+        }
+        CssRule::Media(mr) => Ok(CssomRuleKind::Media {
+            condition_text: lightning_to_css_string(&mr.query),
+            body_text: lightning_to_css_string(&mr.rules),
+        }),
+        CssRule::Supports(sr) => Ok(CssomRuleKind::Supports {
+            condition_text: lightning_to_css_string(&sr.condition),
+            body_text: lightning_to_css_string(&sr.rules),
+        }),
+        CssRule::LayerBlock(lb) => Ok(CssomRuleKind::LayerBlock {
+            name: lb.name.as_ref().map(join_layer_name).unwrap_or_default(),
+            body_text: lightning_to_css_string(&lb.rules),
+        }),
+        CssRule::LayerStatement(ls) => Ok(CssomRuleKind::LayerStatement {
+            names: ls.names.iter().map(join_layer_name).collect(),
+        }),
+        CssRule::Scope(sc) => {
+            let mut prelude = String::new();
+            if let Some(ref start) = sc.scope_start {
+                prelude.push('(');
+                prelude.push_str(&lightning_to_css_string(start));
+                prelude.push(')');
+            }
+            if let Some(ref end) = sc.scope_end {
+                if !prelude.is_empty() {
+                    prelude.push(' ');
+                }
+                prelude.push_str("to (");
+                prelude.push_str(&lightning_to_css_string(end));
+                prelude.push(')');
+            }
+            Ok(CssomRuleKind::Scope {
+                prelude,
+                body_text: lightning_to_css_string(&sc.rules),
+            })
+        }
+        CssRule::Keyframes(kf) => {
+            let name = match &kf.name {
+                KeyframesName::Ident(id) => id.as_ref().to_string(),
+                KeyframesName::Custom(s) => s.as_ref().to_string(),
+            };
+            let full = lightning_to_css_string(kf);
+            let body_text = full
+                .find('{')
+                .and_then(|s| full.rfind('}').map(|e| full[s + 1..e].trim().to_string()))
+                .unwrap_or_default();
+            Ok(CssomRuleKind::Keyframes { name, body_text })
+        }
+        CssRule::Property(pr) => Ok(CssomRuleKind::Property {
+            name: pr.name.as_ref().to_string(),
+            css_text: lightning_to_css_string(pr),
+        }),
+        other => Ok(CssomRuleKind::Other {
+            css_text: lightning_to_css_string(other),
+        }),
+    }
+}
+
+/// Parses a CSS stylesheet into top-level [`CssomRuleKind`] items (error-recovering).
+#[must_use]
+pub fn parse_cssom_rules(css: &str) -> Vec<CssomRuleKind> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let opts = ParserOptions {
+            error_recovery: true,
+            ..ParserOptions::default()
+        };
+        let Ok(parsed) = StyleSheet::parse(css, opts) else {
+            return Vec::new();
+        };
+        parsed
+            .rules
+            .0
+            .iter()
+            .filter_map(|r| convert_lightning_rule_to_cssom(r, false).ok())
+            .collect()
+    }))
+    .unwrap_or_default()
+}
+
+/// Strictly parses a single CSS rule for `CSSStyleSheet.insertRule(rule, index)`.
+pub fn parse_single_cssom_rule(rule_css: &str) -> Result<CssomRuleKind, String> {
+    let trimmed = rule_css.trim();
+    if trimmed.is_empty() {
+        return Err("Empty CSS rule".to_string());
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let opts = ParserOptions {
+            error_recovery: false,
+            ..ParserOptions::default()
+        };
+        let parsed = StyleSheet::parse(trimmed, opts)
+            .map_err(|e| format!("Failed to parse CSS rule '{trimmed}': {e}"))?;
+        if parsed.rules.0.len() != 1 {
+            return Err(format!(
+                "Expected exactly 1 CSS rule, got {}",
+                parsed.rules.0.len()
+            ));
+        }
+        convert_lightning_rule_to_cssom(&parsed.rules.0[0], true)
+    }))
+    .unwrap_or_else(|_| Err(format!("Internal CSS parser rejected rule '{trimmed}'")))
 }

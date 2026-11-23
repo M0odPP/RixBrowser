@@ -12,7 +12,7 @@ use lightningcss::properties::{
     size::BoxSizing,
     Property, PropertyId,
 };
-use lightningcss::stylesheet::ParserOptions;
+use lightningcss::stylesheet::{ParserOptions, PrinterOptions};
 use rix_core::{intern_str, InternedStr};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -215,8 +215,12 @@ pub fn write_tokens_to_buf(tokens: &[CssToken], buf: &mut String) {
             CssToken::Color(c) => match c {
                 CssColor::CurrentColor => buf.push_str("currentColor"),
                 CssColor::Rgba(rgba) => {
-                    let a = f32::from(rgba.a) / 255.0;
-                    let _ = write!(buf, "rgba({}, {}, {}, {a})", rgba.r, rgba.g, rgba.b);
+                    if rgba.a == 255 {
+                        let _ = write!(buf, "rgb({}, {}, {})", rgba.r, rgba.g, rgba.b);
+                    } else {
+                        let a = f32::from(rgba.a) / 255.0;
+                        let _ = write!(buf, "rgba({}, {}, {}, {a})", rgba.r, rgba.g, rgba.b);
+                    }
                 }
                 CssColor::LightDark(l, d) => {
                     let _ = write!(
@@ -240,7 +244,7 @@ pub fn write_tokens_to_buf(tokens: &[CssToken], buf: &mut String) {
                 buf.push_str(h.as_str());
             }
             CssToken::Delim(c) => buf.push(*c),
-            CssToken::Comma => buf.push_str(", "),
+            CssToken::Comma => buf.push(','),
             CssToken::Colon => buf.push(':'),
             CssToken::Space => buf.push(' '),
             CssToken::ParenOpen => buf.push('('),
@@ -262,6 +266,204 @@ pub fn write_tokens_to_buf(tokens: &[CssToken], buf: &mut String) {
             }
         }
     }
+}
+
+/// Serializes a slice of [`CssToken`]s into CSS text (for CSSOM custom property getters).
+#[must_use]
+pub fn serialize_css_tokens(tokens: &[CssToken]) -> String {
+    let mut buf = String::with_capacity(tokens.len() * 6);
+    write_tokens_to_buf(tokens, &mut buf);
+    buf
+}
+
+/// Validates and canonically serializes a single CSS property declaration (`name: value`).
+///
+/// Returns `None` if `name` is unsupported or `value` fails CSS syntax validation.
+/// Follows CSSOM §6.7.2 (`setProperty` / `CSS.supports(property, value)`).
+#[must_use]
+pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String> {
+    if name.starts_with("--") {
+        // CSS Custom Properties L1 §2: `--` alone is reserved and not a valid custom property name.
+        if name.len() <= 2 || value.is_empty() || !has_balanced_css_tokens(value) {
+            return None;
+        }
+        return Some(value.to_string());
+    }
+    let trimmed = value.trim();
+    if trimmed.is_empty() || !has_balanced_css_tokens(trimmed) {
+        return None;
+    }
+    let lower_name = name.to_ascii_lowercase();
+    let prop_kind = PropertyIdKind::from_name(&lower_name)?;
+
+    // Reject `!important` inside property value (CSSOM requires priority as 3rd arg of setProperty).
+    if has_top_level_bang_or_semicolon(trimmed) {
+        return None;
+    }
+
+    let lower_val = trimmed.to_ascii_lowercase();
+    if GlobalKeyword::from_ident(&lower_val).is_some() {
+        return Some(lower_val);
+    }
+
+    let parsed_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let opts = ParserOptions::default();
+        match Property::parse_string(PropertyId::from(lower_name.as_str()), trimmed, opts) {
+            Ok(Property::Unparsed(_)) => {
+                if trimmed.contains("var(") || trimmed.contains("env(") {
+                    Some(trimmed.to_string())
+                } else {
+                    None
+                }
+            }
+            Ok(Property::Custom(custom)) => {
+                let mut out = Vec::new();
+                let mut order = 0u32;
+                let mut missing = Vec::new();
+                compile_extra_standard_property(
+                    &lower_name,
+                    &custom.value,
+                    false,
+                    &mut order,
+                    &mut out,
+                    &mut missing,
+                );
+                if out.is_empty() && prop_kind != PropertyIdKind::Custom {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Ok(parsed) => {
+                let _ = prop_kind;
+                if let Some(serialized) = serialize_cssom_color_property(&parsed, trimmed) {
+                    return Some(serialized);
+                }
+                parsed
+                    .value_to_css_string(PrinterOptions::default())
+                    .ok()
+                    .or_else(|| Some(trimmed.to_string()))
+            }
+            Err(_) => None,
+        }
+    }));
+    parsed_res.ok().flatten()
+}
+
+fn serialize_cssom_color_property(prop: &Property<'_>, raw_input: &str) -> Option<String> {
+    let color = match prop {
+        Property::Color(c)
+        | Property::BackgroundColor(c)
+        | Property::BorderTopColor(c)
+        | Property::BorderRightColor(c)
+        | Property::BorderBottomColor(c)
+        | Property::BorderLeftColor(c)
+        | Property::OutlineColor(c)
+        | Property::TextDecorationColor(c, _) => c,
+        _ => return None,
+    };
+    if matches!(color, lightningcss::values::color::CssColor::CurrentColor) {
+        return Some("currentcolor".to_string());
+    }
+    // Preserve specified CSS named color keywords (e.g. `red`, `transparent`) per CSSOM.
+    if raw_input.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return Some(raw_input.to_ascii_lowercase());
+    }
+    if let lightningcss::values::color::CssColor::RGBA(rgba) = color {
+        if rgba.alpha == 255 {
+            return Some(format!("rgb({}, {}, {})", rgba.red, rgba.green, rgba.blue));
+        }
+        let a = if rgba.alpha == 0 {
+            "0".to_string()
+        } else {
+            let rounded = (f64::from(rgba.alpha) / 255.0 * 1000.0).round() / 1000.0;
+            format!("{rounded}")
+        };
+        return Some(format!(
+            "rgba({}, {}, {}, {a})",
+            rgba.red, rgba.green, rgba.blue
+        ));
+    }
+    None
+}
+
+fn has_balanced_css_tokens(input: &str) -> bool {
+    let mut stack: SmallVec<[u8; 8]> = SmallVec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    let mut in_str: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            } else if b == b'\n' || b == b'\r' {
+                return false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'"' | b'\'' => in_str = Some(b),
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            b'(' => stack.push(b')'),
+            b'[' => stack.push(b']'),
+            b'{' => stack.push(b'}'),
+            b')' | b']' | b'}' if stack.pop() != Some(b) => return false,
+            _ => {}
+        }
+        i += 1;
+    }
+    in_str.is_none() && stack.is_empty()
+}
+
+fn has_top_level_bang_or_semicolon(input: &str) -> bool {
+    let mut depth = 0usize;
+    let mut in_str: Option<u8> = None;
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'"' | b'\'' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b';' | b'!' if depth == 0 => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Supported CSS property identifier.
@@ -751,6 +953,109 @@ impl PropertyIdKind {
                 | Self::Custom
         )
     }
+
+    /// Returns the constituent longhand properties for a shorthand (or `[self]` for longhands).
+    #[must_use]
+    pub fn shorthand_longhands(self) -> SmallVec<[Self; 8]> {
+        match self {
+            Self::Margin => SmallVec::from_slice(&[
+                Self::MarginTop,
+                Self::MarginRight,
+                Self::MarginBottom,
+                Self::MarginLeft,
+            ]),
+            Self::Padding => SmallVec::from_slice(&[
+                Self::PaddingTop,
+                Self::PaddingRight,
+                Self::PaddingBottom,
+                Self::PaddingLeft,
+            ]),
+            Self::Inset => {
+                SmallVec::from_slice(&[Self::Top, Self::Right, Self::Bottom, Self::Left])
+            }
+            Self::BorderWidth => SmallVec::from_slice(&[
+                Self::BorderTopWidth,
+                Self::BorderRightWidth,
+                Self::BorderBottomWidth,
+                Self::BorderLeftWidth,
+            ]),
+            Self::BorderStyle => SmallVec::from_slice(&[
+                Self::BorderTopStyle,
+                Self::BorderRightStyle,
+                Self::BorderBottomStyle,
+                Self::BorderLeftStyle,
+            ]),
+            Self::BorderColor => SmallVec::from_slice(&[
+                Self::BorderTopColor,
+                Self::BorderRightColor,
+                Self::BorderBottomColor,
+                Self::BorderLeftColor,
+            ]),
+            Self::BorderTop => SmallVec::from_slice(&[
+                Self::BorderTopWidth,
+                Self::BorderTopStyle,
+                Self::BorderTopColor,
+            ]),
+            Self::BorderRight => SmallVec::from_slice(&[
+                Self::BorderRightWidth,
+                Self::BorderRightStyle,
+                Self::BorderRightColor,
+            ]),
+            Self::BorderBottom => SmallVec::from_slice(&[
+                Self::BorderBottomWidth,
+                Self::BorderBottomStyle,
+                Self::BorderBottomColor,
+            ]),
+            Self::BorderLeft => SmallVec::from_slice(&[
+                Self::BorderLeftWidth,
+                Self::BorderLeftStyle,
+                Self::BorderLeftColor,
+            ]),
+            Self::Border => SmallVec::from_slice(&[
+                Self::BorderTopWidth,
+                Self::BorderRightWidth,
+                Self::BorderBottomWidth,
+                Self::BorderLeftWidth,
+                Self::BorderTopStyle,
+                Self::BorderRightStyle,
+                Self::BorderBottomStyle,
+                Self::BorderLeftStyle,
+                Self::BorderTopColor,
+                Self::BorderRightColor,
+                Self::BorderBottomColor,
+                Self::BorderLeftColor,
+            ]),
+            Self::BorderRadius => SmallVec::from_slice(&[
+                Self::BorderTopLeftRadius,
+                Self::BorderTopRightRadius,
+                Self::BorderBottomRightRadius,
+                Self::BorderBottomLeftRadius,
+            ]),
+            Self::Flex => {
+                SmallVec::from_slice(&[Self::FlexGrow, Self::FlexShrink, Self::FlexBasis])
+            }
+            Self::FlexFlow => SmallVec::from_slice(&[Self::FlexDirection, Self::FlexWrap]),
+            Self::Gap => SmallVec::from_slice(&[Self::RowGap, Self::ColumnGap]),
+            Self::Overflow => SmallVec::from_slice(&[Self::OverflowX, Self::OverflowY]),
+            Self::Background => {
+                SmallVec::from_slice(&[Self::BackgroundColor, Self::BackgroundLayers])
+            }
+            Self::Outline => {
+                SmallVec::from_slice(&[Self::OutlineWidth, Self::OutlineStyle, Self::OutlineColor])
+            }
+            Self::PlaceContent => SmallVec::from_slice(&[Self::AlignContent, Self::JustifyContent]),
+            Self::PlaceItems => SmallVec::from_slice(&[Self::AlignItems, Self::JustifyItems]),
+            Self::PlaceSelf => SmallVec::from_slice(&[Self::AlignSelf, Self::JustifySelf]),
+            Self::TextDecoration => {
+                SmallVec::from_slice(&[Self::TextDecorationLine, Self::TextDecorationColor])
+            }
+            other => {
+                let mut v = SmallVec::new();
+                v.push(other);
+                v
+            }
+        }
+    }
 }
 
 /// Typed specified value for any supported CSS declaration.
@@ -868,16 +1173,19 @@ pub fn parse_inline_style(
     style_attr: &str,
     missing: &mut Vec<MissingCssFeature>,
 ) -> Vec<SpecifiedDeclaration> {
-    let opts = ParserOptions {
-        error_recovery: true,
-        ..ParserOptions::default()
-    };
-    let Ok(block) = DeclarationBlock::parse_string(style_attr, opts) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    compile_declaration_block(&block, &mut out, missing);
-    out
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let opts = ParserOptions {
+            error_recovery: true,
+            ..ParserOptions::default()
+        };
+        let Ok(block) = DeclarationBlock::parse_string(style_attr, opts) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        compile_declaration_block(&block, &mut out, missing);
+        out
+    }))
+    .unwrap_or_default()
 }
 
 /// Re-parses a resolved `var()` token stream into one or more typed declarations.
@@ -920,25 +1228,28 @@ pub fn parse_property_from_tokens(
 
     let mut buf = String::with_capacity(64);
     write_tokens_to_buf(tokens, &mut buf);
-    let opts = ParserOptions {
-        error_recovery: true,
-        ..ParserOptions::default()
-    };
-    let mut out = Vec::new();
-    let mut order = 0u32;
-    let mut ignored_missing = Vec::new();
-    if let Ok(parsed) = Property::parse_string(PropertyId::from(prop.css_name()), &buf, opts) {
-        if !matches!(parsed, Property::Unparsed(_)) {
-            compile_property(
-                &parsed,
-                important,
-                &mut order,
-                &mut out,
-                &mut ignored_missing,
-            );
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let opts = ParserOptions {
+            error_recovery: true,
+            ..ParserOptions::default()
+        };
+        let mut out = Vec::new();
+        let mut order = 0u32;
+        let mut ignored_missing = Vec::new();
+        if let Ok(parsed) = Property::parse_string(PropertyId::from(prop.css_name()), &buf, opts) {
+            if !matches!(parsed, Property::Unparsed(_)) {
+                compile_property(
+                    &parsed,
+                    important,
+                    &mut order,
+                    &mut out,
+                    &mut ignored_missing,
+                );
+            }
         }
-    }
-    out
+        out
+    }))
+    .unwrap_or_default()
 }
 
 fn fast_parse_single_token(prop: PropertyIdKind, tok: &CssToken) -> Option<PropertyValue> {
@@ -2763,10 +3074,22 @@ fn compile_property(
             CustomPropertyName::Custom(dashed) => {
                 let idx = *ord;
                 *ord = ord.saturating_add(1);
+                let tokens = convert_token_list(&custom.value);
+                let global_kw = {
+                    let mut iter = tokens.iter().filter(|t| !matches!(t, CssToken::Space));
+                    match (iter.next(), iter.next()) {
+                        (Some(CssToken::Ident(id)), None) => GlobalKeyword::from_ident(id.as_str()),
+                        _ => None,
+                    }
+                };
+                let value = match global_kw {
+                    Some(kw) => PropertyValue::Global(kw),
+                    None => PropertyValue::Custom(tokens),
+                };
                 out.push(SpecifiedDeclaration {
                     property: PropertyIdKind::Custom,
                     custom_name: Some(intern_str(dashed.as_ref())),
-                    value: PropertyValue::Custom(convert_token_list(&custom.value)),
+                    value,
                     important: imp,
                     order: idx,
                 });

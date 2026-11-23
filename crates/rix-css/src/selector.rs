@@ -423,9 +423,55 @@ impl<'i> SelectorsParser<'i> for RixSelectorParser {
 /// Parses a CSS selector list string into a Servo `SelectorList`.
 #[must_use]
 pub fn parse_selector_list(input: &str) -> Option<SelectorList<RixSelectorImpl>> {
+    parse_selector_list_strict(input).ok()
+}
+
+/// Parses a CSS selector list string strictly, returning a human-readable syntax error on failure.
+///
+/// Used by DOM `querySelector`/`matches`/`closest`, `CSSStyleSheet.insertRule`, and `CSS.supports(selector(...))`.
+pub fn parse_selector_list_strict(input: &str) -> Result<SelectorList<RixSelectorImpl>, String> {
+    if input.trim().is_empty() {
+        return Err("Empty CSS selector".to_string());
+    }
     let mut parser_input = ParserInput::new(input);
     let mut parser = CssParser::new(&mut parser_input);
-    SelectorList::parse(&RixSelectorParser, &mut parser, ParseRelative::No).ok()
+    let list = SelectorList::parse(&RixSelectorParser, &mut parser, ParseRelative::No)
+        .map_err(|e| format!("Invalid CSS selector '{input}': {e:?}"))?;
+    if !parser.is_exhausted() {
+        return Err(format!("Trailing tokens in CSS selector '{input}'"));
+    }
+    Ok(list)
+}
+
+/// Serializes a compiled Servo `SelectorList` using canonical CSSOM `ToCss` formatting.
+#[must_use]
+pub fn serialize_selector_list(list: &SelectorList<RixSelectorImpl>) -> String {
+    let mut out = String::new();
+    let _ = list.to_css(&mut out);
+    out
+}
+
+/// Parses a pseudo-element argument (e.g. `"::before"`, `":before"`, `"::after"`) for `getComputedStyle`.
+#[must_use]
+pub fn parse_pseudo_element_str(raw: &str) -> Option<RixPseudoElement> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let name = trimmed
+        .strip_prefix("::")
+        .or_else(|| trimmed.strip_prefix(':'))?;
+    match name.to_ascii_lowercase().as_str() {
+        "before" => Some(RixPseudoElement::Before),
+        "after" => Some(RixPseudoElement::After),
+        "marker" => Some(RixPseudoElement::Marker),
+        "placeholder" => Some(RixPseudoElement::Placeholder),
+        "selection" => Some(RixPseudoElement::Selection),
+        "first-line" => Some(RixPseudoElement::FirstLine),
+        "first-letter" => Some(RixPseudoElement::FirstLetter),
+        "backdrop" => Some(RixPseudoElement::Backdrop),
+        _ => None,
+    }
 }
 
 /// Compiles a `lightningcss` selector list into a Servo `SelectorList` using a reusable buffer.
@@ -836,9 +882,103 @@ pub fn matches_selector_list_for_element(
     caches: &mut SelectorCaches,
     shadow_host: Option<OpaqueElement>,
 ) -> bool {
+    matches_selector_list_with_scope(list, element, None, bloom, caches, shadow_host)
+}
+
+/// Matches a parsed `SelectorList` against `element` with an optional `:scope` element.
+#[must_use]
+pub fn matches_selector_list_with_scope(
+    list: &SelectorList<RixSelectorImpl>,
+    element: &DomElement<'_>,
+    scope: Option<OpaqueElement>,
+    bloom: Option<&BloomFilter>,
+    caches: &mut SelectorCaches,
+    shadow_host: Option<OpaqueElement>,
+) -> bool {
+    let mut ctx = MatchingContext::new(
+        MatchingMode::Normal,
+        bloom,
+        caches,
+        QuirksMode::NoQuirks,
+        NeedsSelectorFlags::No,
+        MatchingForInvalidation::No,
+    );
+    ctx.current_host = shadow_host;
+    ctx.scope_element = scope;
     list.slice()
         .iter()
-        .any(|sel| matches_single_selector(sel, element, bloom, caches, shadow_host))
+        .any(|sel| matches_selector(sel, 0, None, element, &mut ctx))
+}
+
+/// Tests whether a single `node` matches `list` with an optional `:scope` element.
+#[must_use]
+pub fn matches_element_with_scope(
+    doc: &Document,
+    node: NodeId,
+    list: &SelectorList<RixSelectorImpl>,
+    scope_node: Option<NodeId>,
+) -> bool {
+    let el = DomElement::new(doc, node);
+    let scope_opaque = scope_node.map(|n| DomElement::new(doc, n).opaque());
+    let mut caches = SelectorCaches::default();
+    matches_selector_list_with_scope(list, &el, scope_opaque, None, &mut caches, None)
+}
+
+/// Finds the first descendant element of `root` matching `list` (Selectores Level 4).
+#[must_use]
+pub fn query_selector_in_subtree(
+    doc: &Document,
+    root: NodeId,
+    list: &SelectorList<RixSelectorImpl>,
+    scope_node: Option<NodeId>,
+    shadow_host: Option<NodeId>,
+) -> Option<NodeId> {
+    let scope_opaque = scope_node.map(|n| DomElement::new(doc, n).opaque());
+    let host_opaque = shadow_host.map(|n| DomElement::new(doc, n).opaque());
+    let mut caches = SelectorCaches::default();
+    for node in doc.descendants(root) {
+        if node == root {
+            continue;
+        }
+        if !matches!(doc.get(node), Some(NodeData::Element(_))) {
+            continue;
+        }
+        let el = DomElement::new(doc, node);
+        if matches_selector_list_with_scope(list, &el, scope_opaque, None, &mut caches, host_opaque)
+        {
+            return Some(node);
+        }
+    }
+    None
+}
+
+/// Finds all descendant elements of `root` matching `list` in tree order (Selectors Level 4).
+#[must_use]
+pub fn query_selector_all_in_subtree(
+    doc: &Document,
+    root: NodeId,
+    list: &SelectorList<RixSelectorImpl>,
+    scope_node: Option<NodeId>,
+    shadow_host: Option<NodeId>,
+) -> Vec<NodeId> {
+    let scope_opaque = scope_node.map(|n| DomElement::new(doc, n).opaque());
+    let host_opaque = shadow_host.map(|n| DomElement::new(doc, n).opaque());
+    let mut caches = SelectorCaches::default();
+    let mut out = Vec::new();
+    for node in doc.descendants(root) {
+        if node == root {
+            continue;
+        }
+        if !matches!(doc.get(node), Some(NodeData::Element(_))) {
+            continue;
+        }
+        let el = DomElement::new(doc, node);
+        if matches_selector_list_with_scope(list, &el, scope_opaque, None, &mut caches, host_opaque)
+        {
+            out.push(node);
+        }
+    }
+    out
 }
 
 /// Convenience helper for matching a single compiled `Selector` against a `DomElement`.
