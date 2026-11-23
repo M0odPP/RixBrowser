@@ -37,6 +37,7 @@ icu = { workspace = true }
 fixed_decimal = { workspace = true }
 writeable = { workspace = true }
 jiff = { workspace = true }
+temporal_rs = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

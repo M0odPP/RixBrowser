@@ -478,6 +478,21 @@ pub struct RareObjectData {
     pub weak_sym_set: HashSet<crate::value::SymbolId>,
     /// Non-registered Symbol target held by a `WeakRef` (ECMA-262 ES2023).
     pub weak_ref_sym: Option<crate::value::SymbolId>,
+    /// Internal slot for ECMAScript `Temporal` objects.
+    pub temporal: Option<Box<TemporalValue>>,
+}
+
+/// Internal brand and payload for ECMAScript `Temporal` instances.
+#[derive(Debug, Clone)]
+pub enum TemporalValue {
+    Instant(temporal_rs::Instant),
+    Duration(temporal_rs::Duration),
+    PlainDate(temporal_rs::PlainDate),
+    PlainTime(temporal_rs::PlainTime),
+    PlainDateTime(temporal_rs::PlainDateTime),
+    PlainYearMonth(temporal_rs::PlainYearMonth),
+    PlainMonthDay(temporal_rs::PlainMonthDay),
+    ZonedDateTime(temporal_rs::ZonedDateTime),
 }
 
 /// Specialized runtime tag for a [`JsObject`].

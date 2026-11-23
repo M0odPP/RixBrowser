@@ -25,6 +25,7 @@ pub mod promise;
 pub mod proxy;
 pub mod shape;
 pub mod string;
+pub mod temporal;
 pub mod value;
 pub mod vm;
 pub mod vm_builtins;
