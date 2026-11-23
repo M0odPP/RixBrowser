@@ -7,7 +7,7 @@
 
 use crate::ast::*;
 use crate::lexer::{is_strict_reserved_word, Keyword, Lexer, LexerCheckpoint, Token, TokenKind};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 type FormalParams = (Vec<Pattern>, Option<Box<Pattern>>, bool);
 
@@ -27,12 +27,17 @@ struct ScopeContext {
     in_loop: bool,
     in_switch: bool,
     in_class_body: bool,
+    in_class_field_init: bool,
+    in_static_block: bool,
     in_method: bool,
     in_derived_constructor: bool,
     allow_in: bool,
     labels: Vec<(String, bool)>,
     lex_scopes: Vec<HashSet<String>>,
+    block_func_scopes: Vec<HashSet<String>>,
+    block_var_scopes: Vec<HashSet<String>>,
     var_scopes: Vec<HashSet<String>>,
+    exported_names: HashSet<String>,
 }
 
 impl ScopeContext {
@@ -45,36 +50,224 @@ impl ScopeContext {
             in_loop: false,
             in_switch: false,
             in_class_body: false,
+            in_class_field_init: false,
+            in_static_block: false,
             in_method: false,
             in_derived_constructor: false,
             allow_in: true,
             labels: Vec::new(),
             lex_scopes: vec![HashSet::new()],
+            block_func_scopes: vec![HashSet::new()],
+            block_var_scopes: vec![HashSet::new()],
             var_scopes: vec![HashSet::new()],
+            exported_names: HashSet::new(),
         }
     }
+}
+
+fn is_reserved_word(name: &str) -> bool {
+    matches!(
+        name,
+        "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "new"
+            | "null"
+            | "return"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+    )
+}
+
+/// Validates ECMAScript RegExp literal flags and ES2025 modifier groups at parse time.
+fn validate_regex_literal(pattern: &str, flags: &str, span: Span) -> Result<(), SyntaxError> {
+    let mut seen_flags = 0u16;
+    for ch in flags.chars() {
+        let bit = match ch {
+            'd' => 1 << 0,
+            'g' => 1 << 1,
+            'i' => 1 << 2,
+            'm' => 1 << 3,
+            's' => 1 << 4,
+            'u' => 1 << 5,
+            'v' => 1 << 6,
+            'y' => 1 << 7,
+            _ => {
+                return Err(SyntaxError::new(
+                    format!("Invalid regular expression flag '{ch}'"),
+                    span,
+                ));
+            }
+        };
+        if (seen_flags & bit) != 0 {
+            return Err(SyntaxError::new(
+                format!("Duplicate regular expression flag '{ch}'"),
+                span,
+            ));
+        }
+        seen_flags |= bit;
+    }
+    if (seen_flags & (1 << 5)) != 0 && (seen_flags & (1 << 6)) != 0 {
+        return Err(SyntaxError::new(
+            "RegExp flags 'u' and 'v' cannot be combined",
+            span,
+        ));
+    }
+    // Validate group syntax, especially ES2025 inline modifier groups `(?ims-ims:...)`.
+    let bytes = pattern.as_bytes();
+    let mut i = 0usize;
+    let mut in_class = false;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'[' {
+            in_class = true;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b']' && in_class {
+            in_class = false;
+            i += 1;
+            continue;
+        }
+        if !in_class && bytes[i] == b'(' && bytes.get(i + 1) == Some(&b'?') {
+            i += 2;
+            match bytes.get(i) {
+                Some(b':' | b'=' | b'!') => {
+                    i += 1;
+                }
+                Some(b'<') => {
+                    i += 1;
+                    if matches!(bytes.get(i), Some(b'=' | b'!')) {
+                        i += 1;
+                    }
+                }
+                _ => {
+                    // ES2025 modifier group: `(?[ims]*(-[ims]*)?:...)`
+                    let mut add_mask = 0u8;
+                    let mut rem_mask = 0u8;
+                    let mut saw_dash = false;
+                    let mut saw_any = false;
+                    loop {
+                        let Some(&ch) = bytes.get(i) else {
+                            return Err(SyntaxError::new("Invalid RegExp modifier group", span));
+                        };
+                        if ch == b':' {
+                            if !saw_any {
+                                return Err(SyntaxError::new("Empty RegExp modifier group", span));
+                            }
+                            i += 1;
+                            break;
+                        }
+                        if ch == b'-' {
+                            if saw_dash {
+                                return Err(SyntaxError::new(
+                                    "Duplicate '-' in RegExp modifier group",
+                                    span,
+                                ));
+                            }
+                            saw_dash = true;
+                            i += 1;
+                            continue;
+                        }
+                        let bit = match ch {
+                            b'i' => 1u8,
+                            b'm' => 2u8,
+                            b's' => 4u8,
+                            _ => {
+                                return Err(SyntaxError::new(
+                                    "Invalid RegExp group modifier",
+                                    span,
+                                ));
+                            }
+                        };
+                        saw_any = true;
+                        if saw_dash {
+                            if (rem_mask & bit) != 0 || (add_mask & bit) != 0 {
+                                return Err(SyntaxError::new(
+                                    "Duplicate or conflicting RegExp group modifier",
+                                    span,
+                                ));
+                            }
+                            rem_mask |= bit;
+                        } else {
+                            if (add_mask & bit) != 0 {
+                                return Err(SyntaxError::new(
+                                    "Duplicate RegExp group modifier",
+                                    span,
+                                ));
+                            }
+                            add_mask |= bit;
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    Ok(())
 }
 
 /// Parses an ECMAScript 2024 `Script` or `Module` into an AST [`Program`].
 pub fn parse(source: &str, source_type: SourceType) -> Result<Program, SyntaxError> {
     let mut parser = Parser::new(source, source_type)?;
-    parser.parse_program()
+    let prog = parser.parse_program()?;
+    validate_private_names(&prog)?;
+    Ok(prog)
 }
 
-/// Parses `eval` source with caller strictness context.
+/// Parses `eval` source with caller strictness and class-body context.
 pub fn parse_eval(
     source: &str,
     force_strict: bool,
-    _in_class_field_or_static_block: bool,
-    _allow_unbound_private: bool,
+    in_class_field_or_static_block: bool,
+    allow_unbound_private: bool,
 ) -> Result<Program, SyntaxError> {
     let mut parser = Parser::new(source, SourceType::Script)?;
     if force_strict {
         parser.ctx.strict = true;
     }
+    if in_class_field_or_static_block {
+        parser.ctx.in_class_field_init = true;
+    }
     let mut prog = parser.parse_program()?;
     if force_strict {
         prog.strict = true;
+    }
+    if !allow_unbound_private {
+        validate_private_names(&prog)?;
     }
     Ok(prog)
 }
@@ -86,6 +279,7 @@ pub struct Parser<'a> {
     source_type: SourceType,
     ctx: ScopeContext,
     recursion_depth: u32,
+    spread_trailing_comma_spans: HashSet<Span>,
 }
 
 const MAX_PARSE_DEPTH: u32 = 192;
@@ -101,6 +295,7 @@ impl<'a> Parser<'a> {
             source_type,
             ctx: ScopeContext::new(source_type),
             recursion_depth: 0,
+            spread_trailing_comma_spans: HashSet::new(),
         })
     }
 
@@ -206,7 +401,51 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn validate_ident_ref(&self, name: &str, span: Span) -> Result<(), SyntaxError> {
+        if is_reserved_word(name) {
+            return Err(SyntaxError::new(
+                format!("Unexpected reserved word '{name}'"),
+                span,
+            ));
+        }
+        if self.ctx.strict && is_strict_reserved_word(name) {
+            return Err(SyntaxError::new(
+                format!("Unexpected strict mode reserved word '{name}'"),
+                span,
+            ));
+        }
+        if name == "await"
+            && (self.ctx.in_async
+                || self.source_type == SourceType::Module
+                || self.ctx.in_static_block)
+        {
+            return Err(SyntaxError::new(
+                "'await' cannot be used as an identifier here",
+                span,
+            ));
+        }
+        if name == "yield" && (self.ctx.in_generator || self.ctx.strict) {
+            return Err(SyntaxError::new(
+                "'yield' cannot be used as an identifier here",
+                span,
+            ));
+        }
+        if name == "arguments" && (self.ctx.in_class_field_init || self.ctx.in_static_block) {
+            return Err(SyntaxError::new(
+                "'arguments' is not allowed in class field initializer or static block",
+                span,
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_binding_ident(&self, name: &str, span: Span) -> Result<(), SyntaxError> {
+        if is_reserved_word(name) {
+            return Err(SyntaxError::new(
+                format!("Unexpected reserved word '{name}'"),
+                span,
+            ));
+        }
         if self.ctx.strict {
             if name == "eval" || name == "arguments" {
                 return Err(SyntaxError::new(
@@ -221,7 +460,11 @@ impl<'a> Parser<'a> {
                 ));
             }
         }
-        if name == "await" && (self.ctx.in_async || self.source_type == SourceType::Module) {
+        if name == "await"
+            && (self.ctx.in_async
+                || self.source_type == SourceType::Module
+                || self.ctx.in_static_block)
+        {
             return Err(SyntaxError::new(
                 "'await' cannot be used as a binding identifier here",
                 span,
@@ -237,6 +480,7 @@ impl<'a> Parser<'a> {
     }
 
     fn validate_assign_ident(&self, name: &str, span: Span) -> Result<(), SyntaxError> {
+        self.validate_ident_ref(name, span)?;
         if self.ctx.strict && (name == "eval" || name == "arguments") {
             return Err(SyntaxError::new(
                 format!("Cannot assign to '{name}' in strict mode"),
@@ -246,8 +490,54 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    fn push_block_scope(&mut self) {
+        self.ctx.lex_scopes.push(HashSet::new());
+        self.ctx.block_func_scopes.push(HashSet::new());
+        self.ctx.block_var_scopes.push(HashSet::new());
+    }
+
+    fn pop_block_scope(&mut self) {
+        self.ctx.lex_scopes.pop();
+        self.ctx.block_func_scopes.pop();
+        if let Some(vars) = self.ctx.block_var_scopes.pop() {
+            if let Some(parent) = self.ctx.block_var_scopes.last_mut() {
+                parent.extend(vars);
+            }
+        }
+    }
+
     fn register_lex_binding(&mut self, name: &str, span: Span) -> Result<(), SyntaxError> {
         self.validate_binding_ident(name, span)?;
+        if self
+            .ctx
+            .block_var_scopes
+            .last()
+            .is_some_and(|v| v.contains(name))
+        {
+            return Err(SyntaxError::new(
+                format!("Identifier '{name}' has already been declared"),
+                span,
+            ));
+        }
+        if self.ctx.lex_scopes.len() == 1
+            && self.ctx.var_scopes.last().is_some_and(|v| v.contains(name))
+        {
+            return Err(SyntaxError::new(
+                format!("Identifier '{name}' has already been declared"),
+                span,
+            ));
+        }
+        if self
+            .ctx
+            .block_func_scopes
+            .last()
+            .is_some_and(|s| s.contains(name))
+        {
+            return Err(SyntaxError::new(
+                format!("Identifier '{name}' has already been declared"),
+                span,
+            ));
+        }
         if let Some(scope) = self.ctx.lex_scopes.last_mut() {
             if !scope.insert(name.to_owned()) {
                 return Err(SyntaxError::new(
@@ -259,10 +549,61 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    fn register_func_decl_binding(
+        &mut self,
+        name: &str,
+        is_async: bool,
+        is_generator: bool,
+        span: Span,
+    ) -> Result<(), SyntaxError> {
+        let in_block = self.ctx.lex_scopes.len() > 1;
+        let is_module_top = self.source_type == SourceType::Module && !self.ctx.in_function;
+        if is_module_top || (in_block && (self.ctx.strict || is_async || is_generator)) {
+            return self.register_lex_binding(name, span);
+        }
+        if in_block {
+            // Sloppy-mode plain function in block: collides with lexical bindings in same block,
+            // but allows Annex B duplicate sloppy function declarations in the same block.
+            self.validate_binding_ident(name, span)?;
+            if self.ctx.lex_scopes.last().is_some_and(|s| s.contains(name)) {
+                return Err(SyntaxError::new(
+                    format!("Identifier '{name}' has already been declared"),
+                    span,
+                ));
+            }
+            if let Some(bf) = self.ctx.block_func_scopes.last_mut() {
+                bf.insert(name.to_owned());
+            }
+            return Ok(());
+        }
+        self.register_var_binding(name, span)
+    }
+
     fn register_var_binding(&mut self, name: &str, span: Span) -> Result<(), SyntaxError> {
         self.validate_binding_ident(name, span)?;
+        for lex in &self.ctx.lex_scopes {
+            if lex.contains(name) {
+                return Err(SyntaxError::new(
+                    format!("Identifier '{name}' has already been declared"),
+                    span,
+                ));
+            }
+        }
         if let Some(scope) = self.ctx.var_scopes.last_mut() {
             scope.insert(name.to_owned());
+        }
+        if let Some(bvars) = self.ctx.block_var_scopes.last_mut() {
+            bvars.insert(name.to_owned());
+        }
+        Ok(())
+    }
+
+    fn register_export_name(&mut self, name: &str, span: Span) -> Result<(), SyntaxError> {
+        if !self.ctx.exported_names.insert(name.to_owned()) {
+            return Err(SyntaxError::new(
+                format!("Duplicate export of '{name}'"),
+                span,
+            ));
         }
         Ok(())
     }
@@ -371,6 +712,54 @@ impl<'a> Parser<'a> {
         self.with_depth(Self::parse_statement_inner)
     }
 
+    /// Parses a single-statement position (`Statement` production: `if`/`while`/`do`/`for`/`with`/`labeled`).
+    /// Rejects lexical declarations (`let`/`const`/`class`), `async function`, `function*`, and strict `function`.
+    fn parse_sub_statement(&mut self, allow_annex_b_func: bool) -> Result<Statement, SyntaxError> {
+        if self.is_ident_word("let") && self.is_let_declaration()? {
+            return Err(SyntaxError::new(
+                "Lexical declaration cannot appear in a single-statement context",
+                self.cur.span,
+            ));
+        }
+        if matches!(
+            self.cur.kind,
+            TokenKind::Keyword(Keyword::Const | Keyword::Class)
+        ) {
+            return Err(SyntaxError::new(
+                "Lexical declaration cannot appear in a single-statement context",
+                self.cur.span,
+            ));
+        }
+        if self.is_ident_word("async") && self.is_async_function_ahead()? {
+            return Err(SyntaxError::new(
+                "Async function declaration cannot appear in a single-statement context",
+                self.cur.span,
+            ));
+        }
+        if self.cur.kind == TokenKind::Keyword(Keyword::Function) {
+            let is_gen = self.peek_token()?.kind == TokenKind::Star;
+            if is_gen || self.ctx.strict || !allow_annex_b_func {
+                return Err(SyntaxError::new(
+                    "Function declaration cannot appear in this single-statement context",
+                    self.cur.span,
+                ));
+            }
+            // Annex B §B.3.4: `if (cond) function f() {}` is parsed with an implicit Block scope.
+            self.push_block_scope();
+            let func = self.parse_function(false, true)?;
+            if let Some(ref name) = func.name {
+                self.register_func_decl_binding(name, false, false, func.span)?;
+            }
+            self.pop_block_scope();
+            let span = func.span;
+            return Ok(Statement::Block {
+                body: vec![Statement::FunctionDecl(func)],
+                span,
+            });
+        }
+        self.parse_statement()
+    }
+
     fn parse_statement_inner(&mut self) -> Result<Statement, SyntaxError> {
         if self.is_ident_word("let") && self.is_let_declaration()? {
             return self.parse_var_decl_stmt(VarKind::Let);
@@ -378,7 +767,7 @@ impl<'a> Parser<'a> {
         if self.is_ident_word("async") && self.is_async_function_ahead()? {
             let func = self.parse_function(true, true)?;
             if let Some(ref name) = func.name {
-                self.register_var_binding(name, func.span)?;
+                self.register_func_decl_binding(name, true, func.is_generator, func.span)?;
             }
             return Ok(Statement::FunctionDecl(func));
         }
@@ -409,7 +798,7 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Function) => {
                 let func = self.parse_function(false, true)?;
                 if let Some(ref name) = func.name {
-                    self.register_var_binding(name, func.span)?;
+                    self.register_func_decl_binding(name, false, func.is_generator, func.span)?;
                 }
                 Ok(Statement::FunctionDecl(func))
             }
@@ -448,9 +837,19 @@ impl<'a> Parser<'a> {
 
     fn can_be_label_name(&self) -> bool {
         match &self.cur.kind {
-            TokenKind::Ident { .. } => true,
+            TokenKind::Ident { name, .. } => {
+                !is_reserved_word(name)
+                    && !(self.ctx.strict && is_strict_reserved_word(name))
+                    && !(name == "await"
+                        && (self.ctx.in_async
+                            || self.source_type == SourceType::Module
+                            || self.ctx.in_static_block))
+                    && !(name == "yield" && (self.ctx.in_generator || self.ctx.strict))
+            }
             TokenKind::Keyword(Keyword::Await) => {
-                !self.ctx.in_async && self.source_type != SourceType::Module
+                !self.ctx.in_async
+                    && self.source_type != SourceType::Module
+                    && !self.ctx.in_static_block
             }
             TokenKind::Keyword(Keyword::Yield) => !self.ctx.in_generator && !self.ctx.strict,
             _ => false,
@@ -459,12 +858,12 @@ impl<'a> Parser<'a> {
 
     fn parse_block_statement(&mut self) -> Result<Statement, SyntaxError> {
         let start = self.expect(TokenKind::LBrace)?.span.start;
-        self.ctx.lex_scopes.push(HashSet::new());
+        self.push_block_scope();
         let mut body = Vec::new();
         while self.cur.kind != TokenKind::RBrace && self.cur.kind != TokenKind::Eof {
             body.push(self.parse_statement()?);
         }
-        self.ctx.lex_scopes.pop();
+        self.pop_block_scope();
         let end = self.expect(TokenKind::RBrace)?.span.end;
         Ok(Statement::Block {
             body,
@@ -541,10 +940,10 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::LParen)?;
         let test = self.parse_expr()?;
         self.expect(TokenKind::RParen)?;
-        let consequent = Box::new(self.parse_statement()?);
+        let consequent = Box::new(self.parse_sub_statement(true)?);
         let alternate = if self.cur.kind == TokenKind::Keyword(Keyword::Else) {
             self.advance()?;
-            Some(Box::new(self.parse_statement()?))
+            Some(Box::new(self.parse_sub_statement(true)?))
         } else {
             None
         };
@@ -566,7 +965,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::RParen)?;
         let prev_loop = self.ctx.in_loop;
         self.ctx.in_loop = true;
-        let body = Box::new(self.parse_statement()?);
+        let body = Box::new(self.parse_sub_statement(false)?);
         self.ctx.in_loop = prev_loop;
         let end = body.span().end;
         Ok(Statement::While {
@@ -580,7 +979,7 @@ impl<'a> Parser<'a> {
         let start = self.expect_keyword(Keyword::Do)?.span.start;
         let prev_loop = self.ctx.in_loop;
         self.ctx.in_loop = true;
-        let body = Box::new(self.parse_statement()?);
+        let body = Box::new(self.parse_sub_statement(false)?);
         self.ctx.in_loop = prev_loop;
         self.expect_keyword(Keyword::While)?;
         self.expect(TokenKind::LParen)?;
@@ -610,7 +1009,7 @@ impl<'a> Parser<'a> {
         };
 
         self.expect(TokenKind::LParen)?;
-        self.ctx.lex_scopes.push(HashSet::new());
+        self.push_block_scope();
         let saved_allow_in = self.ctx.allow_in;
         self.ctx.allow_in = false;
 
@@ -705,7 +1104,7 @@ impl<'a> Parser<'a> {
             }
         };
 
-        self.ctx.lex_scopes.pop();
+        self.pop_block_scope();
         Ok(stmt)
     }
 
@@ -725,7 +1124,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::RParen)?;
         let prev_loop = self.ctx.in_loop;
         self.ctx.in_loop = true;
-        let body = Box::new(self.parse_statement()?);
+        let body = Box::new(self.parse_sub_statement(false)?);
         self.ctx.in_loop = prev_loop;
         let end = body.span().end;
         if is_of {
@@ -766,7 +1165,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::RParen)?;
         let prev_loop = self.ctx.in_loop;
         self.ctx.in_loop = true;
-        let body = Box::new(self.parse_statement()?);
+        let body = Box::new(self.parse_sub_statement(false)?);
         self.ctx.in_loop = prev_loop;
         let end = body.span().end;
         Ok(Statement::For {
@@ -787,7 +1186,7 @@ impl<'a> Parser<'a> {
 
         let prev_switch = self.ctx.in_switch;
         self.ctx.in_switch = true;
-        self.ctx.lex_scopes.push(HashSet::new());
+        self.push_block_scope();
 
         let mut cases = Vec::new();
         let mut saw_default = false;
@@ -833,7 +1232,7 @@ impl<'a> Parser<'a> {
             });
         }
 
-        self.ctx.lex_scopes.pop();
+        self.pop_block_scope();
         self.ctx.in_switch = prev_switch;
         let end = self.expect(TokenKind::RBrace)?.span.end;
         Ok(Statement::Switch {
@@ -960,13 +1359,22 @@ impl<'a> Parser<'a> {
 
         let handler = if self.cur.kind == TokenKind::Keyword(Keyword::Catch) {
             let c_start = self.advance()?.span.start;
-            self.ctx.lex_scopes.push(HashSet::new());
+            self.push_block_scope();
             let param = if self.eat(TokenKind::LParen)? {
                 let pat = self.parse_binding_pattern()?;
-                let mut names = Vec::new();
-                pat.collect_bound_names(&mut names);
-                for (name, span) in names {
-                    self.register_lex_binding(&name, span)?;
+                if let Pattern::Ident { ref name, span } = pat {
+                    // Annex B §B.3.5: simple catch parameter blocks same-block `let`/`const`
+                    // (and strict `function`), while permitting `var` of the same name.
+                    self.validate_binding_ident(name, span)?;
+                    if let Some(bf) = self.ctx.block_func_scopes.last_mut() {
+                        bf.insert(name.clone());
+                    }
+                } else {
+                    let mut names = Vec::new();
+                    pat.collect_bound_names(&mut names);
+                    for (name, span) in names {
+                        self.register_lex_binding(&name, span)?;
+                    }
                 }
                 self.expect(TokenKind::RParen)?;
                 Some(pat)
@@ -974,7 +1382,7 @@ impl<'a> Parser<'a> {
                 None
             };
             let body = self.parse_block_body_in_current_scope()?;
-            self.ctx.lex_scopes.pop();
+            self.pop_block_scope();
             let c_end = self.cur.span.start;
             Some(CatchClause {
                 param,
@@ -1008,9 +1416,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_block_body(&mut self) -> Result<Vec<Statement>, SyntaxError> {
-        self.ctx.lex_scopes.push(HashSet::new());
+        self.push_block_scope();
         let body = self.parse_block_body_in_current_scope()?;
-        self.ctx.lex_scopes.pop();
+        self.pop_block_scope();
         Ok(body)
     }
 
@@ -1035,7 +1443,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::LParen)?;
         let object = self.parse_expr()?;
         self.expect(TokenKind::RParen)?;
-        let body = Box::new(self.parse_statement()?);
+        let body = Box::new(self.parse_sub_statement(false)?);
         let end = body.span().end;
         Ok(Statement::With {
             object,
@@ -1058,7 +1466,7 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::For | Keyword::While | Keyword::Do)
         );
         self.ctx.labels.push((label.clone(), is_loop));
-        let body = Box::new(self.parse_statement()?);
+        let body = Box::new(self.parse_sub_statement(true)?);
         self.ctx.labels.pop();
         let end = body.span().end;
         Ok(Statement::Labeled {
@@ -1094,7 +1502,7 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                     s
                 }
-                _ => self.parse_module_export_name()?,
+                _ => self.parse_ident_name()?.0,
             };
             if !seen_keys.insert(key.clone()) {
                 return Err(SyntaxError::new(
@@ -1191,12 +1599,16 @@ impl<'a> Parser<'a> {
 
         // `export default ...`
         if self.cur.kind == TokenKind::Keyword(Keyword::Default) {
-            self.advance()?;
+            let def_span = self.advance()?.span;
+            self.register_export_name("default", def_span)?;
             if self.cur.kind == TokenKind::Keyword(Keyword::Function)
                 || (self.is_ident_word("async") && self.is_async_function_ahead()?)
             {
                 let is_async = self.is_ident_word("async");
                 let func = self.parse_function(is_async, false)?;
+                if let Some(ref name) = func.name {
+                    self.register_lex_binding(name, func.span)?;
+                }
                 let end = func.span.end;
                 return Ok(ExportDecl {
                     kind: ExportKind::DefaultFunction(func),
@@ -1205,6 +1617,9 @@ impl<'a> Parser<'a> {
             }
             if self.cur.kind == TokenKind::Keyword(Keyword::Class) {
                 let cls = self.parse_class(false)?;
+                if let Some(ref name) = cls.name {
+                    self.register_lex_binding(name, cls.span)?;
+                }
                 let end = cls.span.end;
                 return Ok(ExportDecl {
                     kind: ExportKind::DefaultClass(cls),
@@ -1224,7 +1639,9 @@ impl<'a> Parser<'a> {
         if self.eat(TokenKind::Star)? {
             let exported = if self.is_ident_word("as") {
                 self.advance()?;
-                Some(self.parse_module_export_name()?)
+                let n = self.parse_module_export_name()?;
+                self.register_export_name(&n, Span::new(start, self.cur.span.end))?;
+                Some(n)
             } else {
                 None
             };
@@ -1242,6 +1659,7 @@ impl<'a> Parser<'a> {
         if self.eat(TokenKind::LBrace)? {
             let mut specifiers = Vec::new();
             while self.cur.kind != TokenKind::RBrace && self.cur.kind != TokenKind::Eof {
+                let sp_start = self.cur.span.start;
                 let local = self.parse_module_export_name()?;
                 let exported = if self.is_ident_word("as") {
                     self.advance()?;
@@ -1249,6 +1667,7 @@ impl<'a> Parser<'a> {
                 } else {
                     local.clone()
                 };
+                self.register_export_name(&exported, Span::new(sp_start, self.cur.span.end))?;
                 specifiers.push(ExportSpecifier { local, exported });
                 if !self.eat(TokenKind::Comma)? {
                     break;
@@ -1275,15 +1694,32 @@ impl<'a> Parser<'a> {
         let decl = if self.is_ident_word("let") {
             self.parse_var_decl_stmt(VarKind::Let)?
         } else if self.is_ident_word("async") && self.is_async_function_ahead()? {
-            Statement::FunctionDecl(self.parse_function(true, true)?)
+            let func = self.parse_function(true, true)?;
+            if let Some(ref name) = func.name {
+                self.register_lex_binding(name, func.span)?;
+                self.register_export_name(name, func.span)?;
+            }
+            Statement::FunctionDecl(func)
         } else {
             match self.cur.kind {
                 TokenKind::Keyword(Keyword::Var) => self.parse_var_decl_stmt(VarKind::Var)?,
                 TokenKind::Keyword(Keyword::Const) => self.parse_var_decl_stmt(VarKind::Const)?,
                 TokenKind::Keyword(Keyword::Function) => {
-                    Statement::FunctionDecl(self.parse_function(false, true)?)
+                    let func = self.parse_function(false, true)?;
+                    if let Some(ref name) = func.name {
+                        self.register_lex_binding(name, func.span)?;
+                        self.register_export_name(name, func.span)?;
+                    }
+                    Statement::FunctionDecl(func)
                 }
-                TokenKind::Keyword(Keyword::Class) => Statement::ClassDecl(self.parse_class(true)?),
+                TokenKind::Keyword(Keyword::Class) => {
+                    let cls = self.parse_class(true)?;
+                    if let Some(ref name) = cls.name {
+                        self.register_lex_binding(name, cls.span)?;
+                        self.register_export_name(name, cls.span)?;
+                    }
+                    Statement::ClassDecl(cls)
+                }
                 _ => {
                     return Err(SyntaxError::new(
                         "Unexpected token after 'export'",
@@ -1292,6 +1728,15 @@ impl<'a> Parser<'a> {
                 }
             }
         };
+        if let Statement::VarDecl { decls, .. } = &decl {
+            let mut bound = Vec::new();
+            for d in decls {
+                d.id.collect_bound_names(&mut bound);
+            }
+            for (name, sp) in bound {
+                self.register_export_name(&name, sp)?;
+            }
+        }
         let end = decl.span().end;
         Ok(ExportDecl {
             kind: ExportKind::Declaration(Box::new(decl)),
@@ -1368,10 +1813,14 @@ impl<'a> Parser<'a> {
         self.ctx.in_generator = is_generator;
         self.ctx.in_loop = false;
         self.ctx.in_switch = false;
+        self.ctx.in_class_field_init = false;
+        self.ctx.in_static_block = false;
         self.ctx.in_method = in_method;
         self.ctx.in_derived_constructor = in_derived_constructor;
         self.ctx.labels.clear();
         self.ctx.lex_scopes = vec![HashSet::new()];
+        self.ctx.block_func_scopes = vec![HashSet::new()];
+        self.ctx.block_var_scopes = vec![HashSet::new()];
         self.ctx.var_scopes = vec![HashSet::new()];
 
         let (params, rest_param, has_simple_params) = self.parse_formal_params()?;
@@ -1393,6 +1842,25 @@ impl<'a> Parser<'a> {
             rest_param.as_deref(),
             strict || !has_simple_params || in_method,
         )?;
+        // Reject top-level body lexical (`let`/`const`/`class`) declarations shadowing a formal parameter.
+        let mut param_bound = Vec::new();
+        for p in &params {
+            p.collect_bound_names(&mut param_bound);
+        }
+        if let Some(ref r) = rest_param {
+            r.collect_bound_names(&mut param_bound);
+        }
+        if let Some(top_lex) = self.ctx.lex_scopes.first() {
+            for (pname, pspan) in &param_bound {
+                if top_lex.contains(pname) {
+                    self.ctx = saved_ctx;
+                    return Err(SyntaxError::new(
+                        format!("Identifier '{pname}' has already been declared as a parameter"),
+                        *pspan,
+                    ));
+                }
+            }
+        }
 
         self.ctx = saved_ctx;
         Ok(Function {
@@ -1512,6 +1980,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::LBrace)?;
         let mut elements = Vec::new();
         let mut has_constructor = false;
+        let mut private_names: HashMap<String, (bool, u8)> = HashMap::new();
 
         while self.cur.kind != TokenKind::RBrace && self.cur.kind != TokenKind::Eof {
             if self.eat(TokenKind::Semicolon)? {
@@ -1524,11 +1993,23 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 let saved_in_fn = self.ctx.in_function;
                 let saved_method = self.ctx.in_method;
+                let saved_sb = self.ctx.in_static_block;
+                let saved_derived = self.ctx.in_derived_constructor;
+                let saved_async = self.ctx.in_async;
+                let saved_gen = self.ctx.in_generator;
                 self.ctx.in_function = false;
                 self.ctx.in_method = true;
+                self.ctx.in_static_block = true;
+                self.ctx.in_derived_constructor = false;
+                self.ctx.in_async = false;
+                self.ctx.in_generator = false;
                 let body = self.parse_block_body()?;
                 self.ctx.in_function = saved_in_fn;
                 self.ctx.in_method = saved_method;
+                self.ctx.in_static_block = saved_sb;
+                self.ctx.in_derived_constructor = saved_derived;
+                self.ctx.in_async = saved_async;
+                self.ctx.in_generator = saved_gen;
                 let elem_end = self.cur.span.start;
                 elements.push(ClassElement::StaticBlock {
                     body,
@@ -1580,6 +2061,41 @@ impl<'a> Parser<'a> {
             }
 
             let key = self.parse_prop_key(true)?;
+            let elem_err_span = Span::new(elem_start, self.cur.span.end);
+            if let PropKey::Private(ref pname) = key {
+                if pname == "constructor" {
+                    return Err(SyntaxError::new(
+                        "Classes may not have a private element named '#constructor'",
+                        elem_err_span,
+                    ));
+                }
+                let mask: u8 = match kind {
+                    MethodKind::Get => 2,
+                    MethodKind::Set => 4,
+                    _ => 1,
+                };
+                if let Some(&(prev_static, prev_mask)) = private_names.get(pname) {
+                    let valid_pair = prev_static == is_static
+                        && ((prev_mask == 2 && mask == 4) || (prev_mask == 4 && mask == 2));
+                    if !valid_pair {
+                        return Err(SyntaxError::new(
+                            format!("Duplicate private identifier '#{pname}'"),
+                            elem_err_span,
+                        ));
+                    }
+                    private_names.insert(pname.clone(), (is_static, prev_mask | mask));
+                } else {
+                    private_names.insert(pname.clone(), (is_static, mask));
+                }
+            }
+            if is_static
+                && matches!(&key, PropKey::Ident(s) | PropKey::String(s) if s == "prototype")
+            {
+                return Err(SyntaxError::new(
+                    "Classes may not have a static property named 'prototype'",
+                    elem_err_span,
+                ));
+            }
 
             if self.cur.kind == TokenKind::LParen {
                 if !is_static
@@ -1588,13 +2104,13 @@ impl<'a> Parser<'a> {
                     if is_async || is_generator || kind != MethodKind::Method {
                         return Err(SyntaxError::new(
                             "Class constructor may not be async, generator, getter, or setter",
-                            Span::new(elem_start, self.cur.span.end),
+                            elem_err_span,
                         ));
                     }
                     if has_constructor {
                         return Err(SyntaxError::new(
                             "A class may only have one constructor",
-                            Span::new(elem_start, self.cur.span.end),
+                            elem_err_span,
                         ));
                     }
                     has_constructor = true;
@@ -1609,6 +2125,20 @@ impl<'a> Parser<'a> {
                     true,
                     is_derived_ctor,
                 )?;
+                if kind == MethodKind::Get && (!func.params.is_empty() || func.rest_param.is_some())
+                {
+                    return Err(SyntaxError::new(
+                        "Getter must not have any formal parameters",
+                        func.span,
+                    ));
+                }
+                if kind == MethodKind::Set && (func.params.len() != 1 || func.rest_param.is_some())
+                {
+                    return Err(SyntaxError::new(
+                        "Setter must have exactly one formal parameter",
+                        func.span,
+                    ));
+                }
                 let elem_end = func.span.end;
                 elements.push(ClassElement::Method {
                     key,
@@ -1618,17 +2148,29 @@ impl<'a> Parser<'a> {
                     span: Span::new(elem_start, elem_end),
                 });
             } else {
+                if matches!(&key, PropKey::Ident(s) | PropKey::String(s) if s == "constructor") {
+                    return Err(SyntaxError::new(
+                        "Classes may not have a field named 'constructor'",
+                        elem_err_span,
+                    ));
+                }
                 if is_async || is_generator || kind != MethodKind::Method {
                     return Err(SyntaxError::new(
                         "Invalid class field modifier",
-                        Span::new(elem_start, self.cur.span.end),
+                        elem_err_span,
                     ));
                 }
                 let value = if self.eat(TokenKind::Eq)? {
                     let prev_method = self.ctx.in_method;
+                    let prev_fi = self.ctx.in_class_field_init;
+                    let prev_derived = self.ctx.in_derived_constructor;
                     self.ctx.in_method = true;
+                    self.ctx.in_class_field_init = true;
+                    self.ctx.in_derived_constructor = false;
                     let v = self.parse_assign_expr()?;
                     self.ctx.in_method = prev_method;
+                    self.ctx.in_class_field_init = prev_fi;
+                    self.ctx.in_derived_constructor = prev_derived;
                     Some(v)
                 } else {
                     None
@@ -1930,7 +2472,7 @@ impl<'a> Parser<'a> {
                         .parse_arrow_body(start, params, rest_param, is_async, simple)
                         .map(Some);
                 }
-                Err(e) if is_async => return Err(e),
+                Err(e) => return Err(e),
                 _ => {
                     self.restore(cp);
                     return Ok(None);
@@ -2042,6 +2584,8 @@ impl<'a> Parser<'a> {
         self.ctx.in_switch = false;
         self.ctx.labels.clear();
         self.ctx.lex_scopes = vec![HashSet::new()];
+        self.ctx.block_func_scopes = vec![HashSet::new()];
+        self.ctx.block_var_scopes = vec![HashSet::new()];
         self.ctx.var_scopes = vec![HashSet::new()];
 
         let (body, end, strict) = if self.cur.kind == TokenKind::LBrace {
@@ -2070,9 +2614,27 @@ impl<'a> Parser<'a> {
             (ArrowBody::Expr(Box::new(expr)), end, self.ctx.strict)
         };
 
-        // Arrow functions never permit duplicate parameter names.
+        // Arrow functions never permit duplicate parameter names or body lexical shadowing.
         self.ctx.strict = strict;
         self.validate_param_names(&params, rest_param.as_deref(), true)?;
+        let mut param_bound = Vec::new();
+        for p in &params {
+            p.collect_bound_names(&mut param_bound);
+        }
+        if let Some(ref r) = rest_param {
+            r.collect_bound_names(&mut param_bound);
+        }
+        if let Some(top_lex) = self.ctx.lex_scopes.first() {
+            for (pname, pspan) in &param_bound {
+                if top_lex.contains(pname) {
+                    self.ctx = saved_ctx;
+                    return Err(SyntaxError::new(
+                        format!("Identifier '{pname}' has already been declared as a parameter"),
+                        *pspan,
+                    ));
+                }
+            }
+        }
         self.ctx = saved_ctx;
 
         Ok(Expr::new(
@@ -2229,14 +2791,19 @@ impl<'a> Parser<'a> {
             self.advance()?;
             let arg = self.parse_unary_expr()?;
             if op == UnaryOp::Delete {
-                if self.ctx.strict && matches!(arg.kind, ExprKind::Ident(_)) {
+                // ECMA-262 §13.5.1.1: unwrap parenthesized expressions recursively.
+                let mut inner = &arg;
+                while let ExprKind::Paren(e) = &inner.kind {
+                    inner = e;
+                }
+                if self.ctx.strict && matches!(inner.kind, ExprKind::Ident(_)) {
                     return Err(SyntaxError::new(
                         "Delete of an unqualified identifier in strict mode",
                         arg.span,
                     ));
                 }
                 if matches!(
-                    arg.kind,
+                    inner.kind,
                     ExprKind::Member {
                         property: MemberProp::Private(_),
                         ..
@@ -2629,6 +3196,7 @@ impl<'a> Parser<'a> {
                 let slash_start = self.cur.span.start as usize;
                 self.peek = None;
                 let (pattern, flags, span) = self.lexer.lex_regex_literal(slash_start)?;
+                validate_regex_literal(&pattern, &flags, span)?;
                 self.cur = self.lexer.next_token()?;
                 Ok(Expr::new(ExprKind::RegExp { pattern, flags }, span))
             }
@@ -2653,12 +3221,7 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::new(ExprKind::Function(Box::new(func)), span));
                 }
                 let tok = self.advance()?;
-                if self.ctx.strict && is_strict_reserved_word(&name) {
-                    return Err(SyntaxError::new(
-                        format!("Unexpected strict mode reserved word '{name}'"),
-                        tok.span,
-                    ));
-                }
+                self.validate_ident_ref(&name, tok.span)?;
                 Ok(Expr::new(ExprKind::Ident(name), tok.span))
             }
             TokenKind::Keyword(Keyword::Await) => {
@@ -2709,12 +3272,14 @@ impl<'a> Parser<'a> {
     fn parse_array_literal(&mut self) -> Result<Expr, SyntaxError> {
         let start = self.expect(TokenKind::LBracket)?.span.start;
         let mut elements = Vec::new();
+        let mut rest_had_trailing_comma = false;
         while self.cur.kind != TokenKind::RBracket && self.cur.kind != TokenKind::Eof {
             if self.eat(TokenKind::Comma)? {
                 elements.push(None);
                 continue;
             }
-            if self.eat(TokenKind::Ellipsis)? {
+            let is_spread = self.eat(TokenKind::Ellipsis)?;
+            if is_spread {
                 elements.push(Some(ArrayElement::Spread(self.parse_assign_expr()?)));
             } else {
                 elements.push(Some(ArrayElement::Expr(self.parse_assign_expr()?)));
@@ -2722,14 +3287,22 @@ impl<'a> Parser<'a> {
             if !self.eat(TokenKind::Comma)? {
                 break;
             }
+            if is_spread {
+                rest_had_trailing_comma = true;
+            }
         }
         let end = self.expect(TokenKind::RBracket)?.span.end;
-        Ok(Expr::new(ExprKind::Array(elements), Span::new(start, end)))
+        let span = Span::new(start, end);
+        if rest_had_trailing_comma {
+            self.spread_trailing_comma_spans.insert(span);
+        }
+        Ok(Expr::new(ExprKind::Array(elements), span))
     }
 
     fn parse_object_literal(&mut self) -> Result<Expr, SyntaxError> {
         let start = self.expect(TokenKind::LBrace)?.span.start;
         let mut props = Vec::new();
+        let mut rest_had_trailing_comma = false;
         while self.cur.kind != TokenKind::RBrace && self.cur.kind != TokenKind::Eof {
             let prop_start = self.cur.span.start;
             if self.eat(TokenKind::Ellipsis)? {
@@ -2742,6 +3315,7 @@ impl<'a> Parser<'a> {
                 if !self.eat(TokenKind::Comma)? {
                     break;
                 }
+                rest_had_trailing_comma = true;
                 continue;
             }
 
@@ -2794,6 +3368,22 @@ impl<'a> Parser<'a> {
                     true,
                     false,
                 )?;
+                if method_kind == MethodKind::Get
+                    && (!func.params.is_empty() || func.rest_param.is_some())
+                {
+                    return Err(SyntaxError::new(
+                        "Getter must not have any formal parameters",
+                        func.span,
+                    ));
+                }
+                if method_kind == MethodKind::Set
+                    && (func.params.len() != 1 || func.rest_param.is_some())
+                {
+                    return Err(SyntaxError::new(
+                        "Setter must have exactly one formal parameter",
+                        func.span,
+                    ));
+                }
                 let end = func.span.end;
                 props.push(ObjectProp::Method {
                     key,
@@ -2802,6 +3392,12 @@ impl<'a> Parser<'a> {
                     span: Span::new(prop_start, end),
                 });
             } else if self.eat(TokenKind::Colon)? {
+                if is_async || is_generator || method_kind != MethodKind::Method {
+                    return Err(SyntaxError::new(
+                        "Unexpected ':' after method modifier",
+                        self.cur.span,
+                    ));
+                }
                 let value = self.parse_assign_expr()?;
                 let end = value.span.end;
                 props.push(ObjectProp::KeyValue {
@@ -2811,6 +3407,12 @@ impl<'a> Parser<'a> {
                     span: Span::new(prop_start, end),
                 });
             } else {
+                if is_async || is_generator || method_kind != MethodKind::Method {
+                    return Err(SyntaxError::new(
+                        "Expected '(' after method modifier",
+                        self.cur.span,
+                    ));
+                }
                 // Shorthand property (`{ a }` or cover destructuring default `{ a = 1 }`).
                 let PropKey::Ident(ref name) = key else {
                     return Err(SyntaxError::new(
@@ -2819,6 +3421,17 @@ impl<'a> Parser<'a> {
                     ));
                 };
                 let ident_span = Span::new(prop_start, self.cur.span.start);
+                if is_reserved_word(name)
+                    || (name == "await"
+                        && (self.ctx.in_async || self.source_type == SourceType::Module))
+                    || (name == "yield" && (self.ctx.in_generator || self.ctx.strict))
+                {
+                    return Err(SyntaxError::new(
+                        format!("Unexpected reserved word '{name}' in shorthand property"),
+                        ident_span,
+                    ));
+                }
+                self.validate_ident_ref(name, ident_span)?;
                 let mut value = Expr::new(ExprKind::Ident(name.clone()), ident_span);
                 if self.eat(TokenKind::Eq)? {
                     let default_val = self.parse_assign_expr()?;
@@ -2849,7 +3462,11 @@ impl<'a> Parser<'a> {
             }
         }
         let end = self.expect(TokenKind::RBrace)?.span.end;
-        Ok(Expr::new(ExprKind::Object(props), Span::new(start, end)))
+        let span = Span::new(start, end);
+        if rest_had_trailing_comma {
+            self.spread_trailing_comma_spans.insert(span);
+        }
+        Ok(Expr::new(ExprKind::Object(props), span))
     }
 
     fn parse_template_parts(
@@ -3007,7 +3624,10 @@ impl<'a> Parser<'a> {
                 right,
             } => {
                 let pat = match left {
-                    AssignTarget::Ident { name, span: s } => Pattern::Ident { name, span: s },
+                    AssignTarget::Ident { name, span: s } => {
+                        self.validate_assign_ident(&name, s)?;
+                        Pattern::Ident { name, span: s }
+                    }
                     AssignTarget::Pattern(p) => p,
                     AssignTarget::Member { span: s, .. } => {
                         return Err(SyntaxError::new("Invalid assignment pattern element", s));
@@ -3020,6 +3640,12 @@ impl<'a> Parser<'a> {
                 })
             }
             ExprKind::Array(items) => {
+                if self.spread_trailing_comma_spans.contains(&span) {
+                    return Err(SyntaxError::new(
+                        "Rest element may not have a trailing comma in destructuring assignment",
+                        span,
+                    ));
+                }
                 let mut elements = Vec::with_capacity(items.len());
                 let mut rest = None;
                 let total = items.len();
@@ -3036,6 +3662,12 @@ impl<'a> Parser<'a> {
                                     e.span,
                                 ));
                             }
+                            if matches!(e.kind, ExprKind::Assign { .. }) {
+                                return Err(SyntaxError::new(
+                                    "Rest element may not have a default initializer",
+                                    e.span,
+                                ));
+                            }
                             rest = Some(Box::new(self.expr_to_pattern(e)?));
                         }
                     }
@@ -3047,6 +3679,12 @@ impl<'a> Parser<'a> {
                 })
             }
             ExprKind::Object(obj_props) => {
+                if self.spread_trailing_comma_spans.contains(&span) {
+                    return Err(SyntaxError::new(
+                        "Rest property may not have a trailing comma in destructuring assignment",
+                        span,
+                    ));
+                }
                 let mut props = Vec::with_capacity(obj_props.len());
                 let mut rest = None;
                 let total = obj_props.len();
@@ -3069,6 +3707,12 @@ impl<'a> Parser<'a> {
                             if idx + 1 != total {
                                 return Err(SyntaxError::new(
                                     "Rest property must be last in object destructuring",
+                                    arg.span,
+                                ));
+                            }
+                            if matches!(arg.kind, ExprKind::Assign { .. }) {
+                                return Err(SyntaxError::new(
+                                    "Rest property may not have a default initializer",
                                     arg.span,
                                 ));
                             }
@@ -3244,4 +3888,437 @@ fn is_bare_and_or(expr: &Expr) -> bool {
             ..
         }
     )
+}
+
+/// ECMA-262 §13.3.1 / §16.1.1 Static Semantics: `AllPrivateNamesValid`.
+fn validate_private_names(program: &Program) -> Result<(), SyntaxError> {
+    let mut scopes: Vec<HashSet<String>> = Vec::new();
+    for stmt in &program.body {
+        check_stmt_private_names(stmt, &mut scopes)?;
+    }
+    Ok(())
+}
+
+fn check_private_in_scope(
+    name: &str,
+    span: Span,
+    scopes: &[HashSet<String>],
+) -> Result<(), SyntaxError> {
+    if scopes.iter().any(|s| s.contains(name)) {
+        Ok(())
+    } else {
+        Err(SyntaxError::new(
+            format!("Private field '#{name}' must be declared in an enclosing class"),
+            span,
+        ))
+    }
+}
+
+fn check_prop_key_private_names(
+    key: &PropKey,
+    scopes: &mut Vec<HashSet<String>>,
+) -> Result<(), SyntaxError> {
+    if let PropKey::Computed(e) = key {
+        check_expr_private_names(e, scopes)?;
+    }
+    Ok(())
+}
+
+fn check_pattern_private_names(
+    pat: &Pattern,
+    scopes: &mut Vec<HashSet<String>>,
+) -> Result<(), SyntaxError> {
+    match pat {
+        Pattern::Ident { .. } => Ok(()),
+        Pattern::Assign { left, right, .. } => {
+            check_pattern_private_names(left, scopes)?;
+            check_expr_private_names(right, scopes)
+        }
+        Pattern::Array { elements, rest, .. } => {
+            for e in elements.iter().flatten() {
+                check_pattern_private_names(e, scopes)?;
+            }
+            if let Some(r) = rest {
+                check_pattern_private_names(r, scopes)?;
+            }
+            Ok(())
+        }
+        Pattern::Object { props, rest, .. } => {
+            for p in props {
+                check_prop_key_private_names(&p.key, scopes)?;
+                check_pattern_private_names(&p.value, scopes)?;
+            }
+            if let Some(r) = rest {
+                check_pattern_private_names(r, scopes)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn check_func_private_names(
+    func: &Function,
+    scopes: &mut Vec<HashSet<String>>,
+) -> Result<(), SyntaxError> {
+    for p in &func.params {
+        check_pattern_private_names(p, scopes)?;
+    }
+    if let Some(ref r) = func.rest_param {
+        check_pattern_private_names(r, scopes)?;
+    }
+    for s in &func.body {
+        check_stmt_private_names(s, scopes)?;
+    }
+    Ok(())
+}
+
+fn check_class_private_names(
+    cls: &Class,
+    scopes: &mut Vec<HashSet<String>>,
+) -> Result<(), SyntaxError> {
+    if let Some(ref sup) = cls.super_class {
+        check_expr_private_names(sup, scopes)?;
+    }
+    let mut own = HashSet::new();
+    for el in &cls.elements {
+        match el {
+            ClassElement::Method {
+                key: PropKey::Private(n),
+                ..
+            }
+            | ClassElement::Field {
+                key: PropKey::Private(n),
+                ..
+            } => {
+                own.insert(n.clone());
+            }
+            _ => {}
+        }
+    }
+    scopes.push(own);
+    let res = (|| -> Result<(), SyntaxError> {
+        for el in &cls.elements {
+            match el {
+                ClassElement::Method { key, function, .. } => {
+                    check_prop_key_private_names(key, scopes)?;
+                    check_func_private_names(function, scopes)?;
+                }
+                ClassElement::Field { key, value, .. } => {
+                    check_prop_key_private_names(key, scopes)?;
+                    if let Some(v) = value {
+                        check_expr_private_names(v, scopes)?;
+                    }
+                }
+                ClassElement::StaticBlock { body, .. } => {
+                    for s in body {
+                        check_stmt_private_names(s, scopes)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+    scopes.pop();
+    res
+}
+
+fn check_stmt_private_names(
+    stmt: &Statement,
+    scopes: &mut Vec<HashSet<String>>,
+) -> Result<(), SyntaxError> {
+    match stmt {
+        Statement::Block { body, .. } => {
+            for s in body {
+                check_stmt_private_names(s, scopes)?;
+            }
+        }
+        Statement::VarDecl { decls, .. } => {
+            for d in decls {
+                check_pattern_private_names(&d.id, scopes)?;
+                if let Some(ref init) = d.init {
+                    check_expr_private_names(init, scopes)?;
+                }
+            }
+        }
+        Statement::Expr { expr, .. } | Statement::Throw { arg: expr, .. } => {
+            check_expr_private_names(expr, scopes)?;
+        }
+        Statement::Return { arg, .. } => {
+            if let Some(e) = arg {
+                check_expr_private_names(e, scopes)?;
+            }
+        }
+        Statement::If {
+            test,
+            consequent,
+            alternate,
+            ..
+        } => {
+            check_expr_private_names(test, scopes)?;
+            check_stmt_private_names(consequent, scopes)?;
+            if let Some(alt) = alternate {
+                check_stmt_private_names(alt, scopes)?;
+            }
+        }
+        Statement::While { test, body, .. } | Statement::DoWhile { body, test, .. } => {
+            check_expr_private_names(test, scopes)?;
+            check_stmt_private_names(body, scopes)?;
+        }
+        Statement::For {
+            init,
+            test,
+            update,
+            body,
+            ..
+        } => {
+            if let Some(i) = init {
+                match i {
+                    ForInit::Expr(e) => check_expr_private_names(e, scopes)?,
+                    ForInit::VarDecl { decls, .. } => {
+                        for d in decls {
+                            check_pattern_private_names(&d.id, scopes)?;
+                            if let Some(ref e) = d.init {
+                                check_expr_private_names(e, scopes)?;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(t) = test {
+                check_expr_private_names(t, scopes)?;
+            }
+            if let Some(u) = update {
+                check_expr_private_names(u, scopes)?;
+            }
+            check_stmt_private_names(body, scopes)?;
+        }
+        Statement::ForIn {
+            left, right, body, ..
+        }
+        | Statement::ForOf {
+            left, right, body, ..
+        } => {
+            match left {
+                ForEachLeft::VarDecl { id, .. } => check_pattern_private_names(id, scopes)?,
+                ForEachLeft::Target(t) => check_assign_target_private_names(t, scopes)?,
+            }
+            check_expr_private_names(right, scopes)?;
+            check_stmt_private_names(body, scopes)?;
+        }
+        Statement::Switch {
+            discriminant,
+            cases,
+            ..
+        } => {
+            check_expr_private_names(discriminant, scopes)?;
+            for c in cases {
+                if let Some(ref t) = c.test {
+                    check_expr_private_names(t, scopes)?;
+                }
+                for s in &c.consequent {
+                    check_stmt_private_names(s, scopes)?;
+                }
+            }
+        }
+        Statement::Try {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
+            for s in block {
+                check_stmt_private_names(s, scopes)?;
+            }
+            if let Some(h) = handler {
+                if let Some(ref p) = h.param {
+                    check_pattern_private_names(p, scopes)?;
+                }
+                for s in &h.body {
+                    check_stmt_private_names(s, scopes)?;
+                }
+            }
+            if let Some(fin) = finalizer {
+                for s in fin {
+                    check_stmt_private_names(s, scopes)?;
+                }
+            }
+        }
+        Statement::With { object, body, .. } => {
+            check_expr_private_names(object, scopes)?;
+            check_stmt_private_names(body, scopes)?;
+        }
+        Statement::Labeled { body, .. } => check_stmt_private_names(body, scopes)?,
+        Statement::FunctionDecl(f) => check_func_private_names(f, scopes)?,
+        Statement::ClassDecl(c) => check_class_private_names(c, scopes)?,
+        Statement::ExportDecl(exp) => match &exp.kind {
+            ExportKind::Declaration(s) => check_stmt_private_names(s, scopes)?,
+            ExportKind::DefaultExpr(e) => check_expr_private_names(e, scopes)?,
+            _ => {}
+        },
+        Statement::Empty { .. }
+        | Statement::Break { .. }
+        | Statement::Continue { .. }
+        | Statement::Debugger { .. }
+        | Statement::ImportDecl(_) => {}
+    }
+    Ok(())
+}
+
+fn check_assign_target_private_names(
+    target: &AssignTarget,
+    scopes: &mut Vec<HashSet<String>>,
+) -> Result<(), SyntaxError> {
+    match target {
+        AssignTarget::Ident { .. } => Ok(()),
+        AssignTarget::Pattern(p) => check_pattern_private_names(p, scopes),
+        AssignTarget::Member {
+            object,
+            property,
+            span,
+        } => {
+            check_expr_private_names(object, scopes)?;
+            match property {
+                MemberProp::Private(n) => check_private_in_scope(n, *span, scopes),
+                MemberProp::Computed(e) => check_expr_private_names(e, scopes),
+                MemberProp::Ident(_) => Ok(()),
+            }
+        }
+    }
+}
+
+fn check_expr_private_names(
+    expr: &Expr,
+    scopes: &mut Vec<HashSet<String>>,
+) -> Result<(), SyntaxError> {
+    match &expr.kind {
+        ExprKind::PrivateIdent(n) => check_private_in_scope(n, expr.span, scopes),
+        ExprKind::Array(items) => {
+            for item in items.iter().flatten() {
+                match item {
+                    ArrayElement::Expr(e) | ArrayElement::Spread(e) => {
+                        check_expr_private_names(e, scopes)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        ExprKind::Object(props) => {
+            for p in props {
+                match p {
+                    ObjectProp::KeyValue { key, value, .. } => {
+                        check_prop_key_private_names(key, scopes)?;
+                        check_expr_private_names(value, scopes)?;
+                    }
+                    ObjectProp::Method { key, function, .. } => {
+                        check_prop_key_private_names(key, scopes)?;
+                        check_func_private_names(function, scopes)?;
+                    }
+                    ObjectProp::Spread { arg, .. } => check_expr_private_names(arg, scopes)?,
+                }
+            }
+            Ok(())
+        }
+        ExprKind::Template { exprs, .. } => {
+            for e in exprs {
+                check_expr_private_names(e, scopes)?;
+            }
+            Ok(())
+        }
+        ExprKind::TaggedTemplate { tag, exprs, .. } => {
+            check_expr_private_names(tag, scopes)?;
+            for e in exprs {
+                check_expr_private_names(e, scopes)?;
+            }
+            Ok(())
+        }
+        ExprKind::Function(f) => check_func_private_names(f, scopes),
+        ExprKind::Arrow {
+            params,
+            rest_param,
+            body,
+            ..
+        } => {
+            for p in params {
+                check_pattern_private_names(p, scopes)?;
+            }
+            if let Some(r) = rest_param {
+                check_pattern_private_names(r, scopes)?;
+            }
+            match body {
+                ArrowBody::Expr(e) => check_expr_private_names(e, scopes),
+                ArrowBody::Block { body, .. } => {
+                    for s in body {
+                        check_stmt_private_names(s, scopes)?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+        ExprKind::Class(c) => check_class_private_names(c, scopes),
+        ExprKind::Member {
+            object, property, ..
+        } => {
+            check_expr_private_names(object, scopes)?;
+            match property {
+                MemberProp::Private(n) => check_private_in_scope(n, expr.span, scopes),
+                MemberProp::Computed(e) => check_expr_private_names(e, scopes),
+                MemberProp::Ident(_) => Ok(()),
+            }
+        }
+        ExprKind::Call { callee, args, .. } | ExprKind::New { callee, args } => {
+            check_expr_private_names(callee, scopes)?;
+            for a in args {
+                match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => check_expr_private_names(e, scopes)?,
+                }
+            }
+            Ok(())
+        }
+        ExprKind::ImportCall { source }
+        | ExprKind::Unary { arg: source, .. }
+        | ExprKind::Update { arg: source, .. }
+        | ExprKind::Await(source)
+        | ExprKind::Chain(source)
+        | ExprKind::Paren(source) => check_expr_private_names(source, scopes),
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            check_expr_private_names(left, scopes)?;
+            check_expr_private_names(right, scopes)
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            check_expr_private_names(test, scopes)?;
+            check_expr_private_names(consequent, scopes)?;
+            check_expr_private_names(alternate, scopes)
+        }
+        ExprKind::Assign { left, right, .. } => {
+            check_assign_target_private_names(left, scopes)?;
+            check_expr_private_names(right, scopes)
+        }
+        ExprKind::Sequence(es) => {
+            for e in es {
+                check_expr_private_names(e, scopes)?;
+            }
+            Ok(())
+        }
+        ExprKind::Yield { arg, .. } => {
+            if let Some(e) = arg {
+                check_expr_private_names(e, scopes)?;
+            }
+            Ok(())
+        }
+        ExprKind::Null
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::BigInt(_)
+        | ExprKind::String(_)
+        | ExprKind::RegExp { .. }
+        | ExprKind::Ident(_)
+        | ExprKind::This
+        | ExprKind::Super
+        | ExprKind::NewTarget
+        | ExprKind::ImportMeta => Ok(()),
+    }
 }
