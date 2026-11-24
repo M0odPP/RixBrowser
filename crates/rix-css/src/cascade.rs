@@ -14,11 +14,11 @@ use selectors::context::SelectorCaches;
 use selectors::Element as _;
 use smallvec::SmallVec;
 
-use crate::computed::{resolve_element_style, resolve_element_style_with_hints, ComputedStyle};
+use crate::computed::{resolve_element_style_full, ComputedStyle};
 use crate::properties::{parse_inline_style, MissingCssFeature, SpecifiedDeclaration};
 use crate::rule_index::{InvalidationMap, InvalidationScope, RuleIndex};
 use crate::selector::{matches_single_selector, DomElement, RixPseudoElement};
-use crate::stylesheet::{CompiledRule, MediaContext, Stylesheet};
+use crate::stylesheet::{CompiledRule, MediaContext, RegisteredProperty, Stylesheet};
 use crate::ua::default_ua_stylesheet;
 
 const PARALLEL_CHILD_THRESHOLD: usize = 32;
@@ -202,6 +202,7 @@ pub struct StyleContext {
     media: MediaContext,
     ua_sheet: Arc<Stylesheet>,
     author_sheets: Vec<Arc<Stylesheet>>,
+    js_registered_properties: Vec<RegisteredProperty>,
     rule_index: RuleIndex,
     invalidation_map: InvalidationMap,
     styles: FastMap<NodeId, Arc<ComputedStyle>>,
@@ -220,6 +221,7 @@ impl StyleContext {
             media,
             ua_sheet,
             author_sheets: Vec::new(),
+            js_registered_properties: Vec::new(),
             rule_index: RuleIndex::default(),
             invalidation_map: InvalidationMap::default(),
             styles: FastMap::default(),
@@ -243,6 +245,7 @@ impl StyleContext {
                 &media,
             )),
             author_sheets: Vec::new(),
+            js_registered_properties: Vec::new(),
             rule_index: RuleIndex::default(),
             invalidation_map: InvalidationMap::default(),
             styles: FastMap::default(),
@@ -321,13 +324,24 @@ impl StyleContext {
         }
     }
 
+    /// Registers a JS `CSS.registerProperty` definition (overrides `@property` rules).
+    pub fn register_property(&mut self, prop: RegisteredProperty) {
+        self.js_registered_properties.push(prop);
+        self.index_dirty = true;
+    }
+
     fn rebuild_index(&mut self) {
         let mut all = Vec::with_capacity(1 + self.author_sheets.len());
         if !self.ua_sheet.rules.is_empty() {
             all.push(Arc::clone(&self.ua_sheet));
         }
         all.extend(self.author_sheets.iter().cloned());
-        let (index, inv) = RuleIndex::build(&all);
+        let (mut index, inv) = RuleIndex::build(&all);
+        for rp in &self.js_registered_properties {
+            index
+                .registered_properties
+                .insert(rp.name.clone(), rp.clone());
+        }
         self.rule_index = index;
         self.invalidation_map = inv;
         self.index_dirty = false;
@@ -851,7 +865,12 @@ fn restyle_dirty_walk(
             caches,
             &mut pseudos,
         );
-        for pe in [RixPseudoElement::Before, RixPseudoElement::After] {
+        for pe in [
+            RixPseudoElement::Before,
+            RixPseudoElement::After,
+            RixPseudoElement::FirstLine,
+            RixPseudoElement::FirstLetter,
+        ] {
             pseudo_styles.remove(&(node, pe));
         }
         for ((nid, pe), pstyle) in pseudos {
@@ -981,13 +1000,14 @@ fn compute_single_element_style(
         .map(|&idx| &rule_index.rules[idx as usize])
         .collect();
 
-    let resolved = Arc::new(resolve_element_style_with_hints(
+    let resolved = Arc::new(resolve_element_style_full(
         &matched_refs,
         &pres_decls,
         &inline_decls,
         parent_style.map(Arc::as_ref),
         root_font_size,
         media,
+        Some(&rule_index.registered_properties),
     ));
 
     if inline_attr.is_none() && !has_pres_hints {
@@ -1143,7 +1163,12 @@ fn collect_pseudo_element_styles(
     caches: &mut SelectorCaches,
     out_pseudos: &mut Vec<((NodeId, RixPseudoElement), Arc<ComputedStyle>)>,
 ) {
-    for pseudo in [RixPseudoElement::Before, RixPseudoElement::After] {
+    for pseudo in [
+        RixPseudoElement::Before,
+        RixPseudoElement::After,
+        RixPseudoElement::FirstLine,
+        RixPseudoElement::FirstLetter,
+    ] {
         if !rule_index.has_pseudo_rules(pseudo) {
             continue;
         }
@@ -1161,12 +1186,14 @@ fn collect_pseudo_element_styles(
             }
         }
         if !matched.is_empty() {
-            let style = Arc::new(resolve_element_style(
+            let style = Arc::new(resolve_element_style_full(
                 &matched,
+                &[],
                 &[],
                 Some(originating_style.as_ref()),
                 root_font_size,
                 media,
+                Some(&rule_index.registered_properties),
             ));
             out_pseudos.push(((node, pseudo), style));
         }

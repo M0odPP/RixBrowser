@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
+use rix_core::InternedStr;
 use rix_dom::{hash_ident, hash_ident_ascii_lower, ElementData, ElementState};
 use selectors::bloom::BloomFilter;
 use selectors::matching::selector_may_match;
@@ -15,7 +16,7 @@ use selectors::parser::{AncestorHashes, Combinator, Component, Selector};
 use smallvec::SmallVec;
 
 use crate::selector::{RixPseudoClass, RixPseudoElement, RixSelectorImpl};
-use crate::stylesheet::{CompiledRule, Stylesheet};
+use crate::stylesheet::{CompiledRule, RegisteredProperty, Stylesheet};
 
 /// Zero-overhead identity hasher for pre-hashed `u64` FNV-1a keys.
 #[derive(Default)]
@@ -75,6 +76,8 @@ pub struct RuleIndex {
     /// True when no rule uses sibling combinators, `:nth-*` / `:empty`, or `:has()`,
     /// enabling O(1) Stylo-style sibling style sharing for attribute-free siblings.
     pub allows_sibling_sharing: bool,
+    /// Merged `@property` / `CSS.registerProperty` custom property registrations.
+    pub registered_properties: HashMap<InternedStr, RegisteredProperty>,
 }
 
 impl RuleIndex {
@@ -92,11 +95,25 @@ impl RuleIndex {
             has_relative_selectors: false,
             has_non_subject_has: false,
             allows_sibling_sharing: true,
+            registered_properties: HashMap::new(),
         };
         let mut inv = InvalidationMap::default();
+        let mut reg_layers: HashMap<InternedStr, u32> = HashMap::new();
 
         let mut global_order: u32 = 0;
         for sheet in stylesheets {
+            for rp in &sheet.registered_properties {
+                let rank = rp.layer_id.0;
+                let wins = reg_layers
+                    .get(&rp.name)
+                    .is_none_or(|&prev_rank| rank >= prev_rank);
+                if wins {
+                    reg_layers.insert(rp.name.clone(), rank);
+                    index
+                        .registered_properties
+                        .insert(rp.name.clone(), rp.clone());
+                }
+            }
             for rule in &sheet.rules {
                 let mut compiled = rule.clone();
                 compiled.source_order = global_order;

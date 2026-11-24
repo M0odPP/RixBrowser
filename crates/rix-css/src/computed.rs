@@ -8,10 +8,11 @@ use rix_core::InternedStr;
 use smallvec::SmallVec;
 
 use crate::properties::{
-    is_logical_property, parse_property_from_tokens, resolve_logical_to_physical, CssToken,
-    GlobalKeyword, PropertyIdKind, PropertyValue, SpecifiedDeclaration,
+    is_logical_property, parse_property_from_tokens, resolve_logical_to_physical,
+    serialize_css_tokens, CssToken, GlobalKeyword, PropertyIdKind, PropertyValue,
+    SpecifiedDeclaration,
 };
-use crate::stylesheet::{CascadeOrigin, CompiledRule, LayerId, MediaContext};
+use crate::stylesheet::{CascadeOrigin, CompiledRule, LayerId, MediaContext, RegisteredProperty};
 use crate::values::{
     AlignValue, AnimationDirectionMode, AnimationFillModeKind, AnimationPlayStateMode,
     AnimationSpec, BackgroundLayerValue, BorderCollapseMode, BoxShadowValue, BoxSizingMode,
@@ -129,6 +130,7 @@ pub struct InheritedTextStyle {
     pub line_height: LineHeightValue,
     pub letter_spacing: LengthPercentage,
     pub word_spacing: LengthPercentage,
+    pub text_indent: LengthPercentage,
     pub text_align: TextAlignMode,
     pub text_transform: TextTransformMode,
     pub white_space: WhiteSpaceMode,
@@ -150,6 +152,7 @@ impl Default for InheritedTextStyle {
             line_height: LineHeightValue::Normal,
             letter_spacing: LengthPercentage::Zero,
             word_spacing: LengthPercentage::Zero,
+            text_indent: LengthPercentage::Zero,
             text_align: TextAlignMode::Start,
             text_transform: TextTransformMode::None,
             white_space: WhiteSpaceMode::Normal,
@@ -173,6 +176,7 @@ impl InheritedTextStyle {
             && self.line_height == other.line_height
             && self.letter_spacing == other.letter_spacing
             && self.word_spacing == other.word_spacing
+            && self.text_indent == other.text_indent
             && self.text_align == other.text_align
             && self.text_transform == other.text_transform
             && self.white_space == other.white_space
@@ -497,11 +501,54 @@ fn expand_var_tokens(
                         return None;
                     }
                 }
-                if let Some(fb) = fallback {
-                    expand_var_tokens(fb, custom_props, depth + 1, active, out, byte_budget)?;
-                } else {
-                    return None;
+                let fb = fallback.as_deref()?;
+                expand_var_tokens(fb, custom_props, depth + 1, active, out, byte_budget)?;
+            }
+            CssToken::Function { name, args } if name.as_str().eq_ignore_ascii_case("var") => {
+                // CSS Variables L2 §3: `var(<declaration-value> [, <declaration-value>?]?)`
+                // where the name argument is itself expanded (e.g. `var(var(--myvar))`, `var({--other})`).
+                let (name_args, fallback) = split_var_fn_args(args);
+                let mut resolved_name_toks = Vec::new();
+                let mut name_budget = *byte_budget;
+                let resolved_name = expand_var_tokens(
+                    name_args,
+                    custom_props,
+                    depth + 1,
+                    active,
+                    &mut resolved_name_toks,
+                    &mut name_budget,
+                )
+                .and_then(|()| extract_single_custom_prop_name(&resolved_name_toks));
+                if let Some(target_name) = resolved_name {
+                    if !active.contains(&target_name) {
+                        if let Some(val_tokens) = custom_props.get(&target_name) {
+                            active.push(target_name);
+                            let saved_len = out.len();
+                            let saved_budget = *byte_budget;
+                            let res = expand_var_tokens(
+                                val_tokens,
+                                custom_props,
+                                depth + 1,
+                                active,
+                                out,
+                                byte_budget,
+                            );
+                            active.pop();
+                            if res.is_some() {
+                                continue;
+                            }
+                            out.truncate(saved_len);
+                            *byte_budget = saved_budget;
+                            if *byte_budget == 0 {
+                                return None;
+                            }
+                        }
+                    } else {
+                        return None;
+                    }
                 }
+                let fb = fallback?;
+                expand_var_tokens(fb, custom_props, depth + 1, active, out, byte_budget)?;
             }
             CssToken::Function { name, args } => {
                 let cost = name.as_str().len() + 2;
@@ -669,6 +716,80 @@ impl<'a> CustomPropResolver<'a> {
                             if let Some(cur_low) = self.lowlink.get_mut(owner) {
                                 *cur_low = (*cur_low).min(target_low);
                             }
+                        }
+                        DynamicVarOutcome::Invalid => {
+                            if let Some(fb) = fallback {
+                                let saved_len = out.len();
+                                let mut fb_failed = false;
+                                let mut fb_cycle = false;
+                                let fb_out = self.eval_token_slice(
+                                    owner,
+                                    fb,
+                                    depth + 1,
+                                    out,
+                                    byte_budget,
+                                    &mut fb_failed,
+                                    &mut fb_cycle,
+                                );
+                                if fb_cycle {
+                                    *hit_cycle = true;
+                                }
+                                match fb_out {
+                                    DynamicVarOutcome::Valid => {}
+                                    DynamicVarOutcome::Cycle(low) => {
+                                        out.truncate(saved_len);
+                                        *failed = true;
+                                        slice_failed = true;
+                                        slice_cycle = Some(slice_cycle.map_or(low, |c| c.min(low)));
+                                    }
+                                    DynamicVarOutcome::Invalid => {
+                                        out.truncate(saved_len);
+                                        *failed = true;
+                                        slice_failed = true;
+                                    }
+                                }
+                            } else {
+                                *failed = true;
+                                slice_failed = true;
+                            }
+                        }
+                    }
+                }
+                CssToken::Function { name, args } if name.as_str().eq_ignore_ascii_case("var") => {
+                    let (name_args, fallback) = split_var_fn_args(args);
+                    let mut name_toks = Vec::new();
+                    let mut name_failed = false;
+                    let mut name_cycle = false;
+                    let name_out = self.eval_token_slice(
+                        owner,
+                        name_args,
+                        depth + 1,
+                        &mut name_toks,
+                        byte_budget,
+                        &mut name_failed,
+                        &mut name_cycle,
+                    );
+                    if name_cycle {
+                        *hit_cycle = true;
+                    }
+                    let dep_outcome = match name_out {
+                        DynamicVarOutcome::Cycle(low) => DynamicVarOutcome::Cycle(low),
+                        DynamicVarOutcome::Invalid => DynamicVarOutcome::Invalid,
+                        DynamicVarOutcome::Valid => {
+                            if let Some(target_name) = extract_single_custom_prop_name(&name_toks) {
+                                self.eval_var_ref(owner, &target_name, depth + 1, out, byte_budget)
+                            } else {
+                                DynamicVarOutcome::Invalid
+                            }
+                        }
+                    };
+                    match dep_outcome {
+                        DynamicVarOutcome::Valid => {}
+                        DynamicVarOutcome::Cycle(low) => {
+                            *hit_cycle = true;
+                            *failed = true;
+                            slice_failed = true;
+                            slice_cycle = Some(slice_cycle.map_or(low, |c| c.min(low)));
                         }
                         DynamicVarOutcome::Invalid => {
                             if let Some(fb) = fallback {
@@ -932,10 +1053,34 @@ pub fn resolve_element_style_with_hints(
     root_font_size_px: f32,
     media: &MediaContext,
 ) -> ComputedStyle {
+    resolve_element_style_full(
+        matched_rules,
+        pres_hint_decls,
+        inline_decls,
+        parent_style,
+        root_font_size_px,
+        media,
+        None,
+    )
+}
+
+/// Resolves an element's [`ComputedStyle`] with presentational hints and optional
+/// `@property` / `CSS.registerProperty` custom property registrations.
+#[must_use]
+pub fn resolve_element_style_full(
+    matched_rules: &[&CompiledRule],
+    pres_hint_decls: &[SpecifiedDeclaration],
+    inline_decls: &[SpecifiedDeclaration],
+    parent_style: Option<&ComputedStyle>,
+    root_font_size_px: f32,
+    media: &MediaContext,
+    registered_props: Option<&HashMap<InternedStr, RegisteredProperty>>,
+) -> ComputedStyle {
     let mut style = match parent_style {
         Some(p) => ComputedStyle::inherit_from(p),
         None => ComputedStyle::default(),
     };
+    let has_registered = registered_props.is_some_and(|m| !m.is_empty());
 
     let mut candidates: Vec<CandidateDecl<'_>> =
         Vec::with_capacity(matched_rules.len() * 4 + pres_hint_decls.len() + inline_decls.len());
@@ -985,13 +1130,13 @@ pub fn resolve_element_style_with_hints(
         });
     }
 
-    if candidates.is_empty() {
+    if candidates.is_empty() && !has_registered {
         return style;
     }
 
     candidates.sort_by_key(|c| c.key);
 
-    // Pass 1: Resolve CSS custom properties (`--*`).
+    // Pass 1: Resolve CSS custom properties (`--*`) & `@property` registrations.
     let mut raw_custom: HashMap<InternedStr, Vec<(CascadeKey, &SpecifiedDeclaration)>> =
         HashMap::new();
     for c in &candidates {
@@ -1002,24 +1147,57 @@ pub fn resolve_element_style_with_hints(
                 .push((c.key, c.decl));
         }
     }
-    if !raw_custom.is_empty() {
+    if !raw_custom.is_empty() || has_registered {
         let mut custom_map = (*style.custom_properties).clone();
+        if let Some(regs) = registered_props {
+            for (name, reg) in regs {
+                if !reg.inherits {
+                    if let Some(iv) = &reg.initial_value {
+                        custom_map.insert(name.clone(), iv.clone());
+                    } else {
+                        custom_map.entries.remove(name);
+                    }
+                } else if !custom_map.entries.contains_key(name) {
+                    if let Some(iv) = &reg.initial_value {
+                        custom_map.insert(name.clone(), iv.clone());
+                    }
+                }
+            }
+        }
+        let apply_custom_kw =
+            |map: &mut CustomPropertyMap, name: &InternedStr, kw: GlobalKeyword| {
+                let reg = registered_props.and_then(|m| m.get(name));
+                let inherit_val = || {
+                    parent_style
+                        .and_then(|p| p.custom_properties.get(name).map(<[CssToken]>::to_vec))
+                        .or_else(|| reg.and_then(|r| r.initial_value.clone()))
+                };
+                let initial_val = || reg.and_then(|r| r.initial_value.clone());
+                let val = match kw {
+                    GlobalKeyword::Initial => initial_val(),
+                    GlobalKeyword::Inherit => inherit_val(),
+                    GlobalKeyword::Unset | GlobalKeyword::Revert | GlobalKeyword::RevertLayer => {
+                        if reg.is_some_and(|r| !r.inherits) {
+                            initial_val()
+                        } else {
+                            inherit_val()
+                        }
+                    }
+                };
+                if let Some(v) = val {
+                    map.insert(name.clone(), v);
+                } else {
+                    map.entries.remove(name);
+                }
+            };
         for (name, stack) in &raw_custom {
             if let Some(winner) = select_winning_candidate(stack) {
                 match &winner.value {
                     PropertyValue::Custom(tokens) => {
                         custom_map.insert(name.clone(), tokens.clone());
                     }
-                    PropertyValue::Global(GlobalKeyword::Initial) => {
-                        custom_map.entries.remove(name);
-                    }
-                    PropertyValue::Global(
-                        GlobalKeyword::Inherit
-                        | GlobalKeyword::Unset
-                        | GlobalKeyword::Revert
-                        | GlobalKeyword::RevertLayer,
-                    ) => {
-                        // Custom properties are inherited: keep parent's computed value.
+                    PropertyValue::Global(kw) => {
+                        apply_custom_kw(&mut custom_map, name, *kw);
                     }
                     _ => {}
                 }
@@ -1031,62 +1209,70 @@ pub fn resolve_element_style_with_hints(
         let mut resolver = CustomPropResolver::new(&raw_entries);
         let keys: Vec<InternedStr> = raw_custom.keys().cloned().collect();
         for name in keys {
-            if !raw_entries
+            let has_var = raw_entries
                 .get(&name)
-                .is_some_and(|t| t.iter().any(token_has_var))
-            {
-                continue;
-            }
-            match resolver.resolve(&name, 0) {
+                .is_some_and(|t| t.iter().any(token_has_var));
+            let resolved_opt = if has_var {
+                resolver.resolve(&name, 0)
+            } else {
+                custom_map.get(&name).map(<[CssToken]>::to_vec)
+            };
+            match resolved_opt {
                 Some(resolved) => {
-                    if let Some(kw) = single_global_keyword_token(&resolved) {
-                        match kw {
-                            GlobalKeyword::Initial => {
-                                custom_map.entries.remove(&name);
-                            }
-                            GlobalKeyword::Inherit | GlobalKeyword::Unset => {
-                                if let Some(pv) =
-                                    parent_style.and_then(|p| p.custom_properties.get(&name))
-                                {
-                                    custom_map.insert(name, pv.to_vec());
-                                } else {
-                                    custom_map.entries.remove(&name);
+                    if has_var {
+                        if let Some(kw) = single_global_keyword_token(&resolved) {
+                            match kw {
+                                GlobalKeyword::Revert | GlobalKeyword::RevertLayer => {
+                                    let reverted = raw_custom
+                                        .get(&name)
+                                        .and_then(|st| select_candidate_after_revert(st, kw));
+                                    match reverted.map(|d| &d.value) {
+                                        Some(PropertyValue::Custom(toks)) => {
+                                            if let Some(sub) = resolve_var_tokens(toks, &custom_map)
+                                            {
+                                                custom_map.insert(name, sub);
+                                            } else {
+                                                apply_custom_kw(
+                                                    &mut custom_map,
+                                                    &name,
+                                                    GlobalKeyword::Unset,
+                                                );
+                                            }
+                                        }
+                                        Some(PropertyValue::Global(gkw)) => {
+                                            apply_custom_kw(&mut custom_map, &name, *gkw);
+                                        }
+                                        _ => {
+                                            apply_custom_kw(&mut custom_map, &name, kw);
+                                        }
+                                    }
+                                    continue;
                                 }
-                            }
-                            GlobalKeyword::Revert | GlobalKeyword::RevertLayer => {
-                                let reverted = raw_custom
-                                    .get(&name)
-                                    .and_then(|st| select_candidate_after_revert(st, kw));
-                                match reverted.map(|d| &d.value) {
-                                    Some(PropertyValue::Custom(toks)) => {
-                                        if let Some(sub) = resolve_var_tokens(toks, &custom_map) {
-                                            custom_map.insert(name, sub);
-                                        } else {
-                                            custom_map.entries.remove(&name);
-                                        }
-                                    }
-                                    Some(PropertyValue::Global(GlobalKeyword::Initial)) => {
-                                        custom_map.entries.remove(&name);
-                                    }
-                                    _ => {
-                                        if let Some(pv) = parent_style
-                                            .and_then(|p| p.custom_properties.get(&name))
-                                        {
-                                            custom_map.insert(name, pv.to_vec());
-                                        } else {
-                                            custom_map.entries.remove(&name);
-                                        }
-                                    }
+                                other_kw => {
+                                    apply_custom_kw(&mut custom_map, &name, other_kw);
+                                    continue;
                                 }
                             }
                         }
-                    } else {
+                    }
+                    if let Some(reg) = registered_props.and_then(|m| m.get(&name)) {
+                        if !registered_value_matches_syntax(&reg.syntax, &resolved) {
+                            apply_custom_kw(&mut custom_map, &name, GlobalKeyword::Unset);
+                            continue;
+                        }
+                    }
+                    if has_var {
                         custom_map.insert(name, resolved);
                     }
                 }
                 None => {
-                    // Cyclic, undefined, or over-budget custom property is guaranteed-invalid.
-                    custom_map.entries.remove(&name);
+                    if has_var {
+                        if registered_props.and_then(|m| m.get(&name)).is_some() {
+                            apply_custom_kw(&mut custom_map, &name, GlobalKeyword::Unset);
+                        } else {
+                            custom_map.entries.remove(&name);
+                        }
+                    }
                 }
             }
         }
@@ -1265,10 +1451,84 @@ pub fn resolve_element_style_with_hints(
     style
 }
 
+fn registered_value_matches_syntax(syntax: &str, tokens: &[CssToken]) -> bool {
+    let syn = syntax.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    if syn.is_empty() || syn == "*" {
+        return true;
+    }
+    let raw = serialize_css_tokens(tokens);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    for alt in syn.split('|').map(str::trim) {
+        let base = alt.trim_end_matches(['+', '#']).trim();
+        let ok = match base {
+            "<color>" => {
+                crate::cssom_decl::parse_and_serialize_declaration("color", trimmed).is_some()
+            }
+            "<length>" | "<length-percentage>" => {
+                crate::cssom_decl::parse_and_serialize_declaration("margin-top", trimmed).is_some()
+                    && !trimmed.eq_ignore_ascii_case("auto")
+            }
+            "<number>" => trimmed.parse::<f64>().is_ok(),
+            "<integer>" => trimmed.parse::<i64>().is_ok(),
+            "<percentage>" => trimmed
+                .strip_suffix('%')
+                .is_some_and(|n| n.parse::<f64>().is_ok()),
+            "<custom-ident>" => {
+                !trimmed.contains(char::is_whitespace)
+                    && GlobalKeyword::from_ident(trimmed).is_none()
+            }
+            "<string>" => {
+                (trimmed.starts_with('"') && trimmed.ends_with('"'))
+                    || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            }
+            _ if base.starts_with('<') && base.ends_with('>') => true,
+            kw => trimmed.eq_ignore_ascii_case(kw),
+        };
+        if ok {
+            return true;
+        }
+    }
+    false
+}
+
+fn split_var_fn_args(args: &[CssToken]) -> (&[CssToken], Option<&[CssToken]>) {
+    let mut depth = 0usize;
+    for (i, tok) in args.iter().enumerate() {
+        match tok {
+            CssToken::ParenOpen => depth += 1,
+            CssToken::ParenClose => depth = depth.saturating_sub(1),
+            CssToken::Comma if depth == 0 => {
+                return (&args[..i], Some(&args[i + 1..]));
+            }
+            _ => {}
+        }
+    }
+    (args, None)
+}
+
+fn extract_single_custom_prop_name(tokens: &[CssToken]) -> Option<InternedStr> {
+    let mut found: Option<&InternedStr> = None;
+    for tok in tokens {
+        match tok {
+            CssToken::Space => continue,
+            CssToken::Ident(id) if found.is_none() => found = Some(id),
+            _ => return None,
+        }
+    }
+    let id = found?;
+    let s = id.as_str();
+    (s.starts_with("--") && s.len() > 2).then(|| id.clone())
+}
+
 fn token_has_var(tok: &CssToken) -> bool {
     match tok {
         CssToken::Var { .. } => true,
-        CssToken::Function { args, .. } => args.iter().any(token_has_var),
+        CssToken::Function { name, args } => {
+            name.as_str().eq_ignore_ascii_case("var") || args.iter().any(token_has_var)
+        }
         _ => false,
     }
 }
@@ -1589,6 +1849,9 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::WordSpacing, PropertyValue::Length(l)) => {
             Arc::make_mut(&mut style.text).word_spacing = l.clone();
+        }
+        (PropertyIdKind::TextIndent, PropertyValue::Length(l)) => {
+            Arc::make_mut(&mut style.text).text_indent = l.clone();
         }
         (PropertyIdKind::TextAlign, PropertyValue::TextAlign(ta)) => {
             Arc::make_mut(&mut style.text).text_align = *ta;

@@ -12,7 +12,7 @@ use lightningcss::properties::{
     size::BoxSizing,
     Property, PropertyId,
 };
-use lightningcss::stylesheet::{ParserOptions, PrinterOptions};
+use lightningcss::stylesheet::ParserOptions;
 use rix_core::{intern_str, InternedStr};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -124,6 +124,29 @@ pub enum CssToken {
     },
 }
 
+/// Tokenizes a raw CSS value string into owned [`CssToken`]s (used by `@property` and
+/// `CSS.registerProperty` `initial-value` parsing).
+#[must_use]
+pub fn tokenize_custom_value_str(raw: &str) -> Vec<CssToken> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let opts = ParserOptions {
+            error_recovery: true,
+            ..ParserOptions::default()
+        };
+        if let Ok(Property::Custom(custom)) =
+            Property::parse_string(PropertyId::from("--_rix_init"), trimmed, opts)
+        {
+            return convert_token_list(&custom.value);
+        }
+        vec![CssToken::Ident(intern_str(trimmed))]
+    }))
+    .unwrap_or_default()
+}
+
 /// Converts a `lightningcss` [`TokenList`] directly into owned [`CssToken`]s.
 #[must_use]
 pub fn convert_token_list(list: &TokenList<'_>) -> Vec<CssToken> {
@@ -153,7 +176,11 @@ fn convert_token_or_value(item: &TokenOrValue<'_>, out: &mut Vec<CssToken>) {
             LightningToken::Delim(c) => out.push(CssToken::Delim(*c)),
             LightningToken::Comma => out.push(CssToken::Comma),
             LightningToken::Colon => out.push(CssToken::Colon),
-            LightningToken::WhiteSpace(_) => out.push(CssToken::Space),
+            LightningToken::WhiteSpace(ws) => {
+                for _ in 0..ws.len().clamp(1, 64) {
+                    out.push(CssToken::Space);
+                }
+            }
             LightningToken::ParenthesisBlock => out.push(CssToken::ParenOpen),
             LightningToken::CloseParenthesis => out.push(CssToken::ParenClose),
             LightningToken::Function(name) => out.push(CssToken::Ident(intern_str(name.as_ref()))),
@@ -172,10 +199,17 @@ fn convert_token_or_value(item: &TokenOrValue<'_>, out: &mut Vec<CssToken>) {
                 fallback,
             });
         }
-        TokenOrValue::Function(f) => out.push(CssToken::Function {
-            name: intern_str(f.name.as_ref()),
-            args: convert_token_list(&f.arguments),
-        }),
+        TokenOrValue::Function(f) => {
+            let fname = if f.name.as_ref() == "__rix_var__" {
+                intern_str("var")
+            } else {
+                intern_str(f.name.as_ref())
+            };
+            out.push(CssToken::Function {
+                name: fname,
+                args: convert_token_list(&f.arguments),
+            });
+        }
         TokenOrValue::Length(lv) => {
             let (v, u) = lv.to_unit_value();
             out.push(CssToken::Dimension(v, intern_str(u)));
@@ -277,194 +311,58 @@ pub fn serialize_css_tokens(tokens: &[CssToken]) -> String {
     buf
 }
 
-/// Validates and canonically serializes a single CSS property declaration (`name: value`).
-///
-/// Returns `None` if `name` is unsupported or `value` fails CSS syntax validation.
-/// Follows CSSOM §6.7.2 (`setProperty` / `CSS.supports(property, value)`).
-#[must_use]
-pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String> {
-    if name.starts_with("--") {
-        // CSS Custom Properties L1 §2: `--` alone is reserved and not a valid custom property name.
-        if name.len() <= 2 || value.is_empty() || !has_balanced_css_tokens(value) {
-            return None;
-        }
-        return Some(value.to_string());
-    }
-    let trimmed = value.trim();
-    if trimmed.is_empty() || !has_balanced_css_tokens(trimmed) {
-        return None;
-    }
-    let lower_name = name.to_ascii_lowercase();
-    let prop_kind = PropertyIdKind::from_name(&lower_name)?;
-
-    // Reject `!important` inside property value (CSSOM requires priority as 3rd arg of setProperty).
-    if has_top_level_bang_or_semicolon(trimmed) {
-        return None;
-    }
-
-    let lower_val = trimmed.to_ascii_lowercase();
-    if GlobalKeyword::from_ident(&lower_val).is_some() {
-        return Some(lower_val);
-    }
-
-    let parsed_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let opts = ParserOptions::default();
-        match Property::parse_string(PropertyId::from(lower_name.as_str()), trimmed, opts) {
-            Ok(Property::Unparsed(_)) => {
-                if trimmed.contains("var(") || trimmed.contains("env(") {
-                    Some(trimmed.to_string())
-                } else {
-                    None
-                }
-            }
-            Ok(Property::Custom(custom)) => {
-                let mut out = Vec::new();
-                let mut order = 0u32;
-                let mut missing = Vec::new();
-                compile_extra_standard_property(
-                    &lower_name,
-                    &custom.value,
-                    false,
-                    &mut order,
-                    &mut out,
-                    &mut missing,
-                );
-                if out.is_empty() && prop_kind != PropertyIdKind::Custom {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            }
-            Ok(parsed) => {
-                let _ = prop_kind;
-                if let Some(serialized) = serialize_cssom_color_property(&parsed, trimmed) {
-                    return Some(serialized);
-                }
-                parsed
-                    .value_to_css_string(PrinterOptions::default())
-                    .ok()
-                    .or_else(|| Some(trimmed.to_string()))
-            }
-            Err(_) => None,
-        }
-    }));
-    parsed_res.ok().flatten()
+fn needs_token_boundary_comment(prev: &CssToken, next: &CssToken) -> bool {
+    matches!(
+        (prev, next),
+        (
+            CssToken::Number(_) | CssToken::Dimension(_, _) | CssToken::Percentage(_),
+            CssToken::Ident(_)
+                | CssToken::Number(_)
+                | CssToken::Dimension(_, _)
+                | CssToken::Percentage(_)
+                | CssToken::Delim('%' | '+' | '-')
+                | CssToken::Function { .. }
+        ) | (
+            CssToken::Ident(_) | CssToken::Hash(_),
+            CssToken::Ident(_)
+                | CssToken::Number(_)
+                | CssToken::Dimension(_, _)
+                | CssToken::Percentage(_)
+                | CssToken::Function { .. }
+                | CssToken::ParenOpen
+                | CssToken::Delim('-')
+        ) | (
+            CssToken::Delim('+' | '-' | '.' | '/'),
+            CssToken::Number(_)
+                | CssToken::Dimension(_, _)
+                | CssToken::Percentage(_)
+                | CssToken::Ident(_)
+                | CssToken::Delim('*' | '-')
+        )
+    )
 }
 
-fn serialize_cssom_color_property(prop: &Property<'_>, raw_input: &str) -> Option<String> {
-    let color = match prop {
-        Property::Color(c)
-        | Property::BackgroundColor(c)
-        | Property::BorderTopColor(c)
-        | Property::BorderRightColor(c)
-        | Property::BorderBottomColor(c)
-        | Property::BorderLeftColor(c)
-        | Property::OutlineColor(c)
-        | Property::TextDecorationColor(c, _) => c,
-        _ => return None,
-    };
-    if matches!(color, lightningcss::values::color::CssColor::CurrentColor) {
-        return Some("currentcolor".to_string());
-    }
-    // Preserve specified CSS named color keywords (e.g. `red`, `transparent`) per CSSOM.
-    if raw_input.bytes().all(|b| b.is_ascii_alphabetic()) {
-        return Some(raw_input.to_ascii_lowercase());
-    }
-    if let lightningcss::values::color::CssColor::RGBA(rgba) = color {
-        if rgba.alpha == 255 {
-            return Some(format!("rgb({}, {}, {})", rgba.red, rgba.green, rgba.blue));
+/// Formats tokens for re-parsing after `var()` expansion, inserting `/**/` separators
+/// between adjacent tokens that would otherwise fuse into a single CSS token (CSS Syntax L3 §6).
+fn write_tokens_for_reparse(tokens: &[CssToken], buf: &mut String) {
+    let mut prev: Option<&CssToken> = None;
+    for tok in tokens {
+        if let Some(p) = prev {
+            if needs_token_boundary_comment(p, tok) {
+                buf.push_str("/**/");
+            }
         }
-        let a = if rgba.alpha == 0 {
-            "0".to_string()
-        } else {
-            let rounded = (f64::from(rgba.alpha) / 255.0 * 1000.0).round() / 1000.0;
-            format!("{rounded}")
-        };
-        return Some(format!(
-            "rgba({}, {}, {}, {a})",
-            rgba.red, rgba.green, rgba.blue
-        ));
+        match tok {
+            CssToken::Function { name, args } => {
+                buf.push_str(name.as_str());
+                buf.push('(');
+                write_tokens_for_reparse(args, buf);
+                buf.push(')');
+            }
+            _ => write_tokens_to_buf(std::slice::from_ref(tok), buf),
+        }
+        prev = Some(tok);
     }
-    None
-}
-
-fn has_balanced_css_tokens(input: &str) -> bool {
-    let mut stack: SmallVec<[u8; 8]> = SmallVec::new();
-    let bytes = input.as_bytes();
-    let mut i = 0usize;
-    let mut in_str: Option<u8> = None;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = in_str {
-            if b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                in_str = None;
-            } else if b == b'\n' || b == b'\r' {
-                return false;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'\\' => {
-                i += 2;
-                continue;
-            }
-            b'"' | b'\'' => in_str = Some(b),
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i += 2;
-                continue;
-            }
-            b'(' => stack.push(b')'),
-            b'[' => stack.push(b']'),
-            b'{' => stack.push(b'}'),
-            b')' | b']' | b'}' if stack.pop() != Some(b) => return false,
-            _ => {}
-        }
-        i += 1;
-    }
-    in_str.is_none() && stack.is_empty()
-}
-
-fn has_top_level_bang_or_semicolon(input: &str) -> bool {
-    let mut depth = 0usize;
-    let mut in_str: Option<u8> = None;
-    let bytes = input.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = in_str {
-            if b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                in_str = None;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'\\' => {
-                i += 2;
-                continue;
-            }
-            b'"' | b'\'' => in_str = Some(b),
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
-            b';' | b'!' if depth == 0 => return true,
-            _ => {}
-        }
-        i += 1;
-    }
-    false
 }
 
 /// Supported CSS property identifier.
@@ -556,6 +454,7 @@ pub enum PropertyIdKind {
     LineHeight,
     LetterSpacing,
     WordSpacing,
+    TextIndent,
     TextAlign,
     TextDecorationLine,
     TextDecorationColor,
@@ -834,6 +733,7 @@ impl PropertyIdKind {
             "line-height" => Self::LineHeight,
             "letter-spacing" => Self::LetterSpacing,
             "word-spacing" => Self::WordSpacing,
+            "text-indent" => Self::TextIndent,
             "text-align" => Self::TextAlign,
             "text-decoration-line" => Self::TextDecorationLine,
             "text-decoration-color" => Self::TextDecorationColor,
@@ -984,6 +884,7 @@ impl PropertyIdKind {
             Self::LineHeight => "line-height",
             Self::LetterSpacing => "letter-spacing",
             Self::WordSpacing => "word-spacing",
+            Self::TextIndent => "text-indent",
             Self::TextAlign => "text-align",
             Self::TextDecorationLine => "text-decoration-line",
             Self::TextDecorationColor => "text-decoration-color",
@@ -1127,6 +1028,7 @@ impl PropertyIdKind {
                 | Self::LineHeight
                 | Self::LetterSpacing
                 | Self::WordSpacing
+                | Self::TextIndent
                 | Self::TextAlign
                 | Self::TextTransform
                 | Self::WhiteSpace
@@ -1835,18 +1737,103 @@ pub fn compile_declaration_block(
     }
 }
 
+/// Rewrites CSS Variables L2 dynamic `var(...)` name arguments (`var(var(--x))`, `var({--x})`)
+/// into forms accepted by `lightningcss`'s L1 `Variable::parse`, preserving exact L2 semantics.
+/// Zero allocation fast-path when no dynamic `var(` occurs.
+#[must_use]
+pub(crate) fn rewrite_dynamic_var_names(css: &str) -> std::borrow::Cow<'_, str> {
+    if !css.contains("var(") && !css.contains("VAR(") && !css.contains("Var(") {
+        return std::borrow::Cow::Borrowed(css);
+    }
+    let bytes = css.as_bytes();
+    let mut out: Option<String> = None;
+    let mut last = 0usize;
+    let mut i = 0usize;
+    let mut in_str: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\\' {
+            i += 2;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_str = Some(b);
+            i += 1;
+            continue;
+        }
+        if i + 4 <= bytes.len()
+            && bytes[i..i + 4].eq_ignore_ascii_case(b"var(")
+            && (i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric()
+                    || bytes[i - 1] == b'-'
+                    || bytes[i - 1] == b'_'))
+        {
+            let mut k = i + 4;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            // Case 1: `var(var(...))` -> rewrite outer `var(` to `__rix_var__(`
+            if k + 4 <= bytes.len() && bytes[k..k + 4].eq_ignore_ascii_case(b"var(") {
+                let buf = out.get_or_insert_with(|| String::with_capacity(css.len() + 16));
+                buf.push_str(&css[last..i]);
+                buf.push_str("__rix_var__(");
+                i += 4;
+                last = i;
+                continue;
+            }
+            // Case 2: `var({--ident} ...)` -> unwrap `{` and `}` around single dashed-ident name
+            if k < bytes.len() && bytes[k] == b'{' {
+                if let Some(rel_close) = css[k + 1..].find('}') {
+                    let inside = css[k + 1..k + 1 + rel_close].trim();
+                    if inside.starts_with("--")
+                        && inside.len() > 2
+                        && !inside.contains(|c: char| c.is_ascii_whitespace() || c == ',')
+                    {
+                        let buf = out.get_or_insert_with(|| String::with_capacity(css.len()));
+                        buf.push_str(&css[last..k]);
+                        buf.push_str(inside);
+                        i = k + 1 + rel_close + 1;
+                        last = i;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    match out {
+        Some(mut buf) => {
+            buf.push_str(&css[last..]);
+            std::borrow::Cow::Owned(buf)
+        }
+        None => std::borrow::Cow::Borrowed(css),
+    }
+}
+
 /// Parses an HTML `style="..."` attribute into typed [`SpecifiedDeclaration`]s.
 #[must_use]
 pub fn parse_inline_style(
     style_attr: &str,
     missing: &mut Vec<MissingCssFeature>,
 ) -> Vec<SpecifiedDeclaration> {
+    let rewritten = rewrite_dynamic_var_names(style_attr);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let opts = ParserOptions {
             error_recovery: true,
             ..ParserOptions::default()
         };
-        let Ok(block) = DeclarationBlock::parse_string(style_attr, opts) else {
+        let Ok(block) = DeclarationBlock::parse_string(&rewritten, opts) else {
             return Vec::new();
         };
         let mut out = Vec::new();
@@ -1899,7 +1886,7 @@ pub fn parse_property_from_tokens(
     }
 
     let mut buf = String::with_capacity(64);
-    write_tokens_to_buf(tokens, &mut buf);
+    write_tokens_for_reparse(tokens, &mut buf);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let opts = ParserOptions {
             error_recovery: true,
@@ -3642,6 +3629,13 @@ fn compile_property(
             PropertyValue::Length(convert_spacing(sp)),
             imp,
         ),
+        Property::TextIndent(ti) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::TextIndent,
+            PropertyValue::Length(convert_length_percentage(&ti.value)),
+            imp,
+        ),
         Property::TextAlign(ta) => push_decl(
             out,
             ord,
@@ -4380,13 +4374,29 @@ fn compile_property(
         }
         Property::Custom(custom) => match &custom.name {
             CustomPropertyName::Custom(dashed) => {
+                if dashed.as_ref().len() <= 2 || token_list_has_unbalanced_delims(&custom.value) {
+                    return;
+                }
                 let idx = *ord;
                 *ord = ord.saturating_add(1);
                 let mut tokens = convert_token_list(&custom.value);
-                if tokens.is_empty() {
-                    // CSS Custom Properties L1 §2: `--empty: ;` has a single-space token value (" "),
-                    // distinct from an absent/guaranteed-invalid custom property ("").
+                if tokens.is_empty() || tokens.iter().all(|t| matches!(t, CssToken::Space)) {
+                    // CSS Custom Properties L1 §2: empty/whitespace-only custom property
+                    // serializes as a single space (" ").
+                    tokens.clear();
                     tokens.push(CssToken::Space);
+                } else {
+                    // CSS Syntax L3 §5.4.5: trim leading/trailing whitespace tokens while
+                    // preserving interior whitespace.
+                    let start = tokens
+                        .iter()
+                        .position(|t| !matches!(t, CssToken::Space))
+                        .unwrap_or(0);
+                    let end = tokens
+                        .iter()
+                        .rposition(|t| !matches!(t, CssToken::Space))
+                        .map_or(start, |p| p + 1);
+                    tokens = tokens[start..end].to_vec();
                 }
                 let global_kw = {
                     let mut iter = tokens.iter().filter(|t| !matches!(t, CssToken::Space));
@@ -4471,6 +4481,37 @@ fn convert_grid_line(line: &lightningcss::properties::grid::GridLine<'_>) -> Gri
     }
 }
 
+fn token_list_has_unbalanced_delims(list: &TokenList<'_>) -> bool {
+    let mut stack: SmallVec<[u8; 8]> = SmallVec::new();
+    for item in &list.0 {
+        match item {
+            TokenOrValue::Token(tok) => match tok {
+                LightningToken::ParenthesisBlock => stack.push(b')'),
+                LightningToken::SquareBracketBlock => stack.push(b']'),
+                LightningToken::CurlyBracketBlock => stack.push(b'}'),
+                LightningToken::CloseParenthesis if stack.pop() != Some(b')') => return true,
+                LightningToken::CloseSquareBracket if stack.pop() != Some(b']') => return true,
+                LightningToken::CloseCurlyBracket if stack.pop() != Some(b'}') => return true,
+                _ => {}
+            },
+            TokenOrValue::Function(f) => {
+                if token_list_has_unbalanced_delims(&f.arguments) {
+                    return true;
+                }
+            }
+            TokenOrValue::Var(v) => {
+                if let Some(fb) = &v.fallback {
+                    if token_list_has_unbalanced_delims(fb) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    !stack.is_empty()
+}
+
 fn css_token_has_var(tok: &CssToken) -> bool {
     match tok {
         CssToken::Var { .. } => true,
@@ -4488,7 +4529,7 @@ fn parse_overscroll_mode(ident: &str) -> Option<OverscrollBehaviorMode> {
     }
 }
 
-fn compile_extra_standard_property(
+pub(crate) fn compile_extra_standard_property(
     name: &str,
     tokens: &TokenList<'_>,
     imp: bool,
