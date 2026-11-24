@@ -8,21 +8,22 @@ use rix_core::InternedStr;
 use smallvec::SmallVec;
 
 use crate::properties::{
-    parse_property_from_tokens, CssToken, GlobalKeyword, PropertyIdKind, PropertyValue,
-    SpecifiedDeclaration,
+    is_logical_property, parse_property_from_tokens, resolve_logical_to_physical, CssToken,
+    GlobalKeyword, PropertyIdKind, PropertyValue, SpecifiedDeclaration,
 };
 use crate::stylesheet::{CascadeOrigin, CompiledRule, LayerId, MediaContext};
 use crate::values::{
     AlignValue, AnimationDirectionMode, AnimationFillModeKind, AnimationPlayStateMode,
     AnimationSpec, BackgroundLayerValue, BorderCollapseMode, BoxShadowValue, BoxSizingMode,
-    ClearMode, ClipPathValue, ColorRgba, CornerRadii, CssColor, CursorKind, DirectionMode,
-    DisplayMode, EdgeValues, EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode,
-    FontStyleMode, GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
-    LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
-    OverflowPair, OverflowWrapMode, PointerEventsMode, PositionMode, SizeValue, TableLayoutMode,
-    TextAlignMode, TextDecorationLine, TextOverflowMode, TextTransformMode, TimingFunction,
-    TransformOp, TransformOrigin, TransitionSpec, UserSelectMode, VerticalAlignMode,
-    VisibilityMode, WhiteSpaceMode, WordBreakMode, ZIndexValue,
+    CaptionSideMode, ClearMode, ClipPathValue, ColorRgba, CornerRadii, CssColor, CursorKind,
+    DirectionMode, DisplayMode, EdgeValues, EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode,
+    FloatMode, FontStyleMode, GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue,
+    GridTrackSize, LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle,
+    MixBlendMode, OverflowMode, OverflowPair, OverflowWrapMode, OverscrollBehaviorMode,
+    PointerEventsMode, PositionMode, ResizeMode, SizeValue, TableLayoutMode, TextAlignMode,
+    TextDecorationLine, TextOverflowMode, TextTransformMode, TimingFunction, TransformOp,
+    TransformOrigin, TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode,
+    WhiteSpaceMode, WordBreakMode, WritingMode, ZIndexValue,
 };
 
 const MAX_VAR_DEPTH: u8 = 64;
@@ -90,6 +91,9 @@ pub struct VisualStyle {
     pub text_decoration_line: TextDecorationLine,
     pub text_decoration_color: Option<CssColor>,
     pub user_select: UserSelectMode,
+    pub resize: ResizeMode,
+    pub overscroll_behavior_x: OverscrollBehaviorMode,
+    pub overscroll_behavior_y: OverscrollBehaviorMode,
 }
 
 impl Default for VisualStyle {
@@ -107,6 +111,9 @@ impl Default for VisualStyle {
             text_decoration_line: TextDecorationLine::NONE,
             text_decoration_color: None,
             user_select: UserSelectMode::Auto,
+            resize: ResizeMode::None,
+            overscroll_behavior_x: OverscrollBehaviorMode::Auto,
+            overscroll_behavior_y: OverscrollBehaviorMode::Auto,
         }
     }
 }
@@ -128,6 +135,8 @@ pub struct InheritedTextStyle {
     pub word_break: WordBreakMode,
     pub overflow_wrap: OverflowWrapMode,
     pub direction: DirectionMode,
+    pub writing_mode: WritingMode,
+    pub caption_side: CaptionSideMode,
 }
 
 impl Default for InheritedTextStyle {
@@ -147,6 +156,8 @@ impl Default for InheritedTextStyle {
             word_break: WordBreakMode::Normal,
             overflow_wrap: OverflowWrapMode::Normal,
             direction: DirectionMode::Ltr,
+            writing_mode: WritingMode::HorizontalTb,
+            caption_side: CaptionSideMode::Top,
         }
     }
 }
@@ -168,6 +179,8 @@ impl InheritedTextStyle {
             && self.word_break == other.word_break
             && self.overflow_wrap == other.overflow_wrap
             && self.direction == other.direction
+            && self.writing_mode == other.writing_mode
+            && self.caption_side == other.caption_side
     }
 }
 
@@ -525,148 +538,313 @@ fn expand_var_tokens(
     Some(())
 }
 
-#[derive(Clone)]
-enum CustomVarResolveState {
-    Visiting,
-    Resolved(Option<Vec<CssToken>>),
+/// Dynamic Tarjan SCC resolver for CSS custom properties (CSS Variables L1 §3 + CSSWG #11500).
+///
+/// Traverses only actually-evaluated `var()` edges (fallbacks are only entered when the
+/// primary variable is undefined or independently guaranteed-invalid), while continuing to
+/// evaluate remaining top-level tokens so overlapping secondary cycles are discovered while
+/// the SCC root is still on the Tarjan stack.
+struct CustomPropResolver<'a> {
+    raw_map: &'a HashMap<InternedStr, Vec<CssToken>>,
+    next_index: usize,
+    indices: HashMap<InternedStr, usize>,
+    lowlink: HashMap<InternedStr, usize>,
+    on_stack: HashMap<InternedStr, bool>,
+    tarjan_stack: Vec<InternedStr>,
+    resolved: HashMap<InternedStr, Option<Vec<CssToken>>>,
 }
 
-enum CustomVarErr {
-    /// Hit a cycle back to an ancestor variable; caller must invalidate the cycle.
-    Cycle(InternedStr),
-    /// Exceeded expansion token/byte budget (guaranteed-invalid).
-    BudgetExceeded,
-    /// Referenced variable is undefined/guaranteed-invalid (fallback permitted).
+enum DynamicVarOutcome {
+    Valid,
     Invalid,
+    Cycle(usize),
 }
 
-fn expand_custom_prop_tokens(
-    tokens: &[CssToken],
-    raw_map: &HashMap<InternedStr, Vec<CssToken>>,
-    states: &mut HashMap<InternedStr, CustomVarResolveState>,
-    depth: u8,
-    out: &mut Vec<CssToken>,
-    byte_budget: &mut usize,
-) -> Result<(), CustomVarErr> {
-    if depth > MAX_VAR_DEPTH || out.len() > MAX_VAR_EXPANDED_TOKENS {
-        *byte_budget = 0;
-        return Err(CustomVarErr::BudgetExceeded);
-    }
-    for tok in tokens {
-        match tok {
-            CssToken::Var { name, fallback } => {
-                match resolve_single_custom_prop(name, raw_map, states, depth + 1) {
-                    Ok(Some(resolved)) => {
-                        for rt in &resolved {
-                            let cost = token_approx_bytes(rt);
-                            if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
-                                *byte_budget = 0;
-                                return Err(CustomVarErr::BudgetExceeded);
-                            }
-                            *byte_budget -= cost;
-                            out.push(rt.clone());
-                        }
-                    }
-                    Ok(None) | Err(CustomVarErr::Invalid) => {
-                        if let Some(fb) = fallback {
-                            expand_custom_prop_tokens(
-                                fb,
-                                raw_map,
-                                states,
-                                depth + 1,
-                                out,
-                                byte_budget,
-                            )?;
-                        } else {
-                            return Err(CustomVarErr::Invalid);
-                        }
-                    }
-                    Err(CustomVarErr::Cycle(root)) => return Err(CustomVarErr::Cycle(root)),
-                    Err(CustomVarErr::BudgetExceeded) => return Err(CustomVarErr::BudgetExceeded),
-                }
-            }
-            CssToken::Function { name, args } => {
-                let cost = name.as_str().len() + 2;
-                if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
-                    *byte_budget = 0;
-                    return Err(CustomVarErr::BudgetExceeded);
-                }
-                *byte_budget -= cost;
-                let mut resolved_args = Vec::with_capacity(args.len());
-                expand_custom_prop_tokens(
-                    args,
-                    raw_map,
-                    states,
-                    depth + 1,
-                    &mut resolved_args,
-                    byte_budget,
-                )?;
-                out.push(CssToken::Function {
-                    name: name.clone(),
-                    args: resolved_args,
-                });
-            }
-            other => {
-                let cost = token_approx_bytes(other);
-                if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
-                    *byte_budget = 0;
-                    return Err(CustomVarErr::BudgetExceeded);
-                }
-                *byte_budget -= cost;
-                out.push(other.clone());
-            }
+impl<'a> CustomPropResolver<'a> {
+    fn new(raw_map: &'a HashMap<InternedStr, Vec<CssToken>>) -> Self {
+        let cap = raw_map.len();
+        Self {
+            raw_map,
+            next_index: 0,
+            indices: HashMap::with_capacity(cap),
+            lowlink: HashMap::with_capacity(cap),
+            on_stack: HashMap::with_capacity(cap),
+            tarjan_stack: Vec::with_capacity(cap),
+            resolved: HashMap::with_capacity(cap),
         }
     }
-    Ok(())
-}
 
-fn resolve_single_custom_prop(
-    name: &InternedStr,
-    raw_map: &HashMap<InternedStr, Vec<CssToken>>,
-    states: &mut HashMap<InternedStr, CustomVarResolveState>,
-    depth: u8,
-) -> Result<Option<Vec<CssToken>>, CustomVarErr> {
-    if let Some(st) = states.get(name) {
-        return match st {
-            CustomVarResolveState::Visiting => Err(CustomVarErr::Cycle(name.clone())),
-            CustomVarResolveState::Resolved(v) => Ok(v.clone()),
-        };
+    fn resolve(&mut self, name: &InternedStr, depth: u8) -> Option<Vec<CssToken>> {
+        if let Some(res) = self.resolved.get(name) {
+            return res.clone();
+        }
+        let tokens = self.raw_map.get(name)?;
+        if !tokens.iter().any(token_has_var) {
+            let cloned = tokens.clone();
+            self.resolved.insert(name.clone(), Some(cloned.clone()));
+            return Some(cloned);
+        }
+        self.strongconnect(name, depth);
+        self.resolved.get(name).cloned().flatten()
     }
-    let Some(tokens) = raw_map.get(name) else {
-        return Ok(None);
-    };
-    if !tokens.iter().any(token_has_var) {
-        let cloned = tokens.clone();
-        states.insert(
-            name.clone(),
-            CustomVarResolveState::Resolved(Some(cloned.clone())),
+
+    fn strongconnect(&mut self, name: &InternedStr, depth: u8) {
+        let my_idx = self.next_index;
+        self.next_index += 1;
+        self.indices.insert(name.clone(), my_idx);
+        self.lowlink.insert(name.clone(), my_idx);
+        self.on_stack.insert(name.clone(), true);
+        self.tarjan_stack.push(name.clone());
+
+        let tokens = self.raw_map.get(name).map(Vec::as_slice).unwrap_or(&[]);
+        let mut out = Vec::with_capacity(tokens.len());
+        let mut byte_budget = MAX_VAR_EXPANDED_BYTES;
+        let mut failed = false;
+        let mut hit_cycle = false;
+
+        self.eval_token_slice(
+            name,
+            tokens,
+            depth,
+            &mut out,
+            &mut byte_budget,
+            &mut failed,
+            &mut hit_cycle,
         );
-        return Ok(Some(cloned));
-    }
-    states.insert(name.clone(), CustomVarResolveState::Visiting);
-    let mut out = Vec::with_capacity(tokens.len());
-    let mut byte_budget = MAX_VAR_EXPANDED_BYTES;
-    match expand_custom_prop_tokens(tokens, raw_map, states, depth, &mut out, &mut byte_budget) {
-        Ok(()) => {
-            states.insert(
-                name.clone(),
-                CustomVarResolveState::Resolved(Some(out.clone())),
-            );
-            Ok(Some(out))
-        }
-        Err(CustomVarErr::Cycle(root)) => {
-            states.insert(name.clone(), CustomVarResolveState::Resolved(None));
-            if &root == name {
-                // We closed the cycle at its entry point; this variable is guaranteed-invalid
-                // (so non-cyclic outsiders referencing it can still fall back).
-                Ok(None)
+
+        let my_low = self.lowlink.get(name).copied().unwrap_or(my_idx);
+        if my_low == my_idx {
+            let mut scc = Vec::new();
+            while let Some(w) = self.tarjan_stack.pop() {
+                self.on_stack.insert(w.clone(), false);
+                let is_root = &w == name;
+                scc.push(w);
+                if is_root {
+                    break;
+                }
+            }
+            if scc.len() > 1 || hit_cycle {
+                for node in scc {
+                    self.resolved.insert(node, None);
+                }
+            } else if failed {
+                self.resolved.insert(name.clone(), None);
             } else {
-                Err(CustomVarErr::Cycle(root))
+                self.resolved.insert(name.clone(), Some(out));
             }
         }
-        Err(CustomVarErr::Invalid | CustomVarErr::BudgetExceeded) => {
-            states.insert(name.clone(), CustomVarResolveState::Resolved(None));
-            Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn eval_token_slice(
+        &mut self,
+        owner: &InternedStr,
+        tokens: &[CssToken],
+        depth: u8,
+        out: &mut Vec<CssToken>,
+        byte_budget: &mut usize,
+        failed: &mut bool,
+        hit_cycle: &mut bool,
+    ) -> DynamicVarOutcome {
+        if depth > MAX_VAR_DEPTH || out.len() > MAX_VAR_EXPANDED_TOKENS || *byte_budget == 0 {
+            *byte_budget = 0;
+            *failed = true;
+            return DynamicVarOutcome::Invalid;
+        }
+        let mut slice_failed = false;
+        let mut slice_cycle: Option<usize> = None;
+
+        for tok in tokens {
+            match tok {
+                CssToken::Var { name, fallback } => {
+                    let dep_outcome = self.eval_var_ref(owner, name, depth + 1, out, byte_budget);
+                    match dep_outcome {
+                        DynamicVarOutcome::Valid => {}
+                        DynamicVarOutcome::Cycle(target_low) => {
+                            *hit_cycle = true;
+                            *failed = true;
+                            slice_failed = true;
+                            slice_cycle =
+                                Some(slice_cycle.map_or(target_low, |c| c.min(target_low)));
+                            if let Some(cur_low) = self.lowlink.get_mut(owner) {
+                                *cur_low = (*cur_low).min(target_low);
+                            }
+                        }
+                        DynamicVarOutcome::Invalid => {
+                            if let Some(fb) = fallback {
+                                let saved_len = out.len();
+                                let mut fb_failed = false;
+                                let mut fb_cycle = false;
+                                let fb_out = self.eval_token_slice(
+                                    owner,
+                                    fb,
+                                    depth + 1,
+                                    out,
+                                    byte_budget,
+                                    &mut fb_failed,
+                                    &mut fb_cycle,
+                                );
+                                if fb_cycle {
+                                    *hit_cycle = true;
+                                }
+                                match fb_out {
+                                    DynamicVarOutcome::Valid => {}
+                                    DynamicVarOutcome::Cycle(low) => {
+                                        out.truncate(saved_len);
+                                        *failed = true;
+                                        slice_failed = true;
+                                        slice_cycle = Some(slice_cycle.map_or(low, |c| c.min(low)));
+                                    }
+                                    DynamicVarOutcome::Invalid => {
+                                        out.truncate(saved_len);
+                                        *failed = true;
+                                        slice_failed = true;
+                                    }
+                                }
+                            } else {
+                                *failed = true;
+                                slice_failed = true;
+                            }
+                        }
+                    }
+                }
+                CssToken::Function { name, args } => {
+                    let cost = name.as_str().len() + 2;
+                    if !*failed && (cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS) {
+                        *byte_budget = 0;
+                        *failed = true;
+                        slice_failed = true;
+                    } else if !*failed {
+                        *byte_budget = byte_budget.saturating_sub(cost);
+                    }
+                    let mut resolved_args = Vec::with_capacity(args.len());
+                    let arg_out = self.eval_token_slice(
+                        owner,
+                        args,
+                        depth + 1,
+                        &mut resolved_args,
+                        byte_budget,
+                        failed,
+                        hit_cycle,
+                    );
+                    match arg_out {
+                        DynamicVarOutcome::Valid if !*failed => {
+                            out.push(CssToken::Function {
+                                name: name.clone(),
+                                args: resolved_args,
+                            });
+                        }
+                        DynamicVarOutcome::Cycle(low) => {
+                            slice_failed = true;
+                            slice_cycle = Some(slice_cycle.map_or(low, |c| c.min(low)));
+                        }
+                        _ => {
+                            slice_failed = true;
+                        }
+                    }
+                }
+                other => {
+                    if !*failed {
+                        let cost = token_approx_bytes(other);
+                        if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
+                            *byte_budget = 0;
+                            *failed = true;
+                            slice_failed = true;
+                        } else {
+                            *byte_budget -= cost;
+                            out.push(other.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(low) = slice_cycle {
+            DynamicVarOutcome::Cycle(low)
+        } else if slice_failed {
+            DynamicVarOutcome::Invalid
+        } else {
+            DynamicVarOutcome::Valid
+        }
+    }
+
+    fn eval_var_ref(
+        &mut self,
+        owner: &InternedStr,
+        dep: &InternedStr,
+        depth: u8,
+        out: &mut Vec<CssToken>,
+        byte_budget: &mut usize,
+    ) -> DynamicVarOutcome {
+        if depth > MAX_VAR_DEPTH {
+            *byte_budget = 0;
+            return DynamicVarOutcome::Invalid;
+        }
+        if let Some(resolved_opt) = self.resolved.get(dep) {
+            return match resolved_opt {
+                Some(toks) => {
+                    for rt in toks {
+                        let cost = token_approx_bytes(rt);
+                        if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
+                            *byte_budget = 0;
+                            return DynamicVarOutcome::Invalid;
+                        }
+                        *byte_budget -= cost;
+                        out.push(rt.clone());
+                    }
+                    DynamicVarOutcome::Valid
+                }
+                None => DynamicVarOutcome::Invalid,
+            };
+        }
+        if self.on_stack.get(dep).copied().unwrap_or(false) {
+            let dep_idx = self.indices.get(dep).copied().unwrap_or(0);
+            if let Some(cur_low) = self.lowlink.get_mut(owner) {
+                *cur_low = (*cur_low).min(dep_idx);
+            }
+            return DynamicVarOutcome::Cycle(dep_idx);
+        }
+        let Some(dep_tokens) = self.raw_map.get(dep) else {
+            return DynamicVarOutcome::Invalid;
+        };
+        if !dep_tokens.iter().any(token_has_var) {
+            let cloned = dep_tokens.clone();
+            self.resolved.insert(dep.clone(), Some(cloned.clone()));
+            for rt in &cloned {
+                let cost = token_approx_bytes(rt);
+                if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
+                    *byte_budget = 0;
+                    return DynamicVarOutcome::Invalid;
+                }
+                *byte_budget -= cost;
+                out.push(rt.clone());
+            }
+            return DynamicVarOutcome::Valid;
+        }
+
+        self.strongconnect(dep, depth);
+
+        if self.on_stack.get(dep).copied().unwrap_or(false) {
+            let dep_low = self.lowlink.get(dep).copied().unwrap_or(0);
+            if let Some(cur_low) = self.lowlink.get_mut(owner) {
+                *cur_low = (*cur_low).min(dep_low);
+            }
+            return DynamicVarOutcome::Cycle(dep_low);
+        }
+        match self.resolved.get(dep).and_then(Option::as_ref) {
+            Some(toks) => {
+                for rt in toks {
+                    let cost = token_approx_bytes(rt);
+                    if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
+                        *byte_budget = 0;
+                        return DynamicVarOutcome::Invalid;
+                    }
+                    *byte_budget -= cost;
+                    out.push(rt.clone());
+                }
+                DynamicVarOutcome::Valid
+            }
+            None => DynamicVarOutcome::Invalid,
         }
     }
 }
@@ -847,25 +1025,68 @@ pub fn resolve_element_style_with_hints(
                 }
             }
         }
-        // Substitute var() references inside newly declared custom properties using
-        // memoized DFS with cycle detection and strict token/byte budgets (O(N), no OOM!).
+        // Substitute `var()` references inside newly declared custom properties using
+        // Dynamic Tarjan SCC over actually-evaluated edges (CSS Variables L1 §3 + CSSWG #11500).
         let raw_entries = custom_map.entries.clone();
-        let mut states: HashMap<InternedStr, CustomVarResolveState> =
-            HashMap::with_capacity(raw_entries.len());
+        let mut resolver = CustomPropResolver::new(&raw_entries);
         let keys: Vec<InternedStr> = raw_custom.keys().cloned().collect();
         for name in keys {
-            if raw_entries
+            if !raw_entries
                 .get(&name)
                 .is_some_and(|t| t.iter().any(token_has_var))
             {
-                match resolve_single_custom_prop(&name, &raw_entries, &mut states, 0) {
-                    Ok(Some(resolved)) => {
+                continue;
+            }
+            match resolver.resolve(&name, 0) {
+                Some(resolved) => {
+                    if let Some(kw) = single_global_keyword_token(&resolved) {
+                        match kw {
+                            GlobalKeyword::Initial => {
+                                custom_map.entries.remove(&name);
+                            }
+                            GlobalKeyword::Inherit | GlobalKeyword::Unset => {
+                                if let Some(pv) =
+                                    parent_style.and_then(|p| p.custom_properties.get(&name))
+                                {
+                                    custom_map.insert(name, pv.to_vec());
+                                } else {
+                                    custom_map.entries.remove(&name);
+                                }
+                            }
+                            GlobalKeyword::Revert | GlobalKeyword::RevertLayer => {
+                                let reverted = raw_custom
+                                    .get(&name)
+                                    .and_then(|st| select_candidate_after_revert(st, kw));
+                                match reverted.map(|d| &d.value) {
+                                    Some(PropertyValue::Custom(toks)) => {
+                                        if let Some(sub) = resolve_var_tokens(toks, &custom_map) {
+                                            custom_map.insert(name, sub);
+                                        } else {
+                                            custom_map.entries.remove(&name);
+                                        }
+                                    }
+                                    Some(PropertyValue::Global(GlobalKeyword::Initial)) => {
+                                        custom_map.entries.remove(&name);
+                                    }
+                                    _ => {
+                                        if let Some(pv) = parent_style
+                                            .and_then(|p| p.custom_properties.get(&name))
+                                        {
+                                            custom_map.insert(name, pv.to_vec());
+                                        } else {
+                                            custom_map.entries.remove(&name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
                         custom_map.insert(name, resolved);
                     }
-                    Ok(None) | Err(_) => {
-                        // Cyclic, undefined, or over-budget custom property is guaranteed-invalid.
-                        custom_map.entries.remove(&name);
-                    }
+                }
+                None => {
+                    // Cyclic, undefined, or over-budget custom property is guaranteed-invalid.
+                    custom_map.entries.remove(&name);
                 }
             }
         }
@@ -919,23 +1140,56 @@ pub fn resolve_element_style_with_hints(
         per_prop.entry(d.property).or_default().push((*k, d));
     }
 
-    // Pass 2a: Resolve `font-size` first so `em` units on the same element use this element's font size.
+    // Pass 2a: Resolve `writing-mode`, `direction`, and `font-size` first so logical
+    // property mapping and `em` units on the same element use this element's computed values.
     let parent_font_size = parent_style.map_or(16.0, |p| p.text.font_size_px);
-    if let Some(stack) = per_prop.get_mut(&PropertyIdKind::FontSize) {
-        stack.sort_by_key(|(k, _)| *k);
-        if let Some(winner) = select_winning_candidate(stack) {
-            let parent_eval = media.eval_context(parent_font_size, root_font_size_px);
-            apply_declaration(
-                &mut style,
-                winner,
-                parent_style,
-                &parent_eval,
-                media.dark_mode,
-            );
+    let parent_eval = media.eval_context(parent_font_size, root_font_size_px);
+    for early_prop in [
+        PropertyIdKind::WritingMode,
+        PropertyIdKind::Direction,
+        PropertyIdKind::FontSize,
+    ] {
+        if let Some(stack) = per_prop.get_mut(&early_prop) {
+            stack.sort_by_key(|(k, _)| *k);
+            if let Some(winner) = select_winning_candidate(stack) {
+                apply_declaration(
+                    &mut style,
+                    winner,
+                    parent_style,
+                    &parent_eval,
+                    media.dark_mode,
+                );
+            }
         }
     }
 
-    // Pass 2b: Resolve `color-scheme` and `color` next so CanvasText & `currentColor` match.
+    // Pass 2b: Map all logical property candidates onto their corresponding physical
+    // property stacks using the element's resolved `writing-mode` and `direction`
+    // (preserving `CascadeKey` so specificity, source order, `!important`, and `revert`
+    // cascade seamlessly between logical and physical associates).
+    let resolved_wm = style.text.writing_mode;
+    let resolved_dir = style.text.direction;
+    let logical_keys: Vec<PropertyIdKind> = per_prop
+        .keys()
+        .copied()
+        .filter(|&p| is_logical_property(p))
+        .collect();
+    let mut remapped_owned: Vec<(PropertyIdKind, CascadeKey, SpecifiedDeclaration)> = Vec::new();
+    for lprop in logical_keys {
+        let phys = resolve_logical_to_physical(lprop, resolved_wm, resolved_dir);
+        if let Some(stack) = per_prop.remove(&lprop) {
+            for (k, d) in stack {
+                let mut mapped = d.clone();
+                mapped.property = phys;
+                remapped_owned.push((phys, k, mapped));
+            }
+        }
+    }
+    for (phys, k, decl) in &remapped_owned {
+        per_prop.entry(*phys).or_default().push((*k, decl));
+    }
+
+    // Pass 2c: Resolve `color-scheme` and `color` next so CanvasText & `currentColor` match.
     let eval_ctx = media.eval_context(style.text.font_size_px, root_font_size_px);
     if let Some(stack) = per_prop.get_mut(&PropertyIdKind::ColorScheme) {
         stack.sort_by_key(|(k, _)| *k);
@@ -959,18 +1213,53 @@ pub fn resolve_element_style_with_hints(
         Arc::make_mut(&mut style.text).color = ColorRgba::rgb(241, 245, 249);
     }
 
-    // Pass 2c: Resolve all remaining properties.
+    // Pass 2d: Resolve all remaining physical properties.
+    let mut explicit_bw = [false; 4]; // top, right, bottom, left
     for (&prop, stack) in &mut per_prop {
         if matches!(
             prop,
-            PropertyIdKind::FontSize | PropertyIdKind::Color | PropertyIdKind::ColorScheme
+            PropertyIdKind::WritingMode
+                | PropertyIdKind::Direction
+                | PropertyIdKind::FontSize
+                | PropertyIdKind::Color
+                | PropertyIdKind::ColorScheme
         ) {
             continue;
         }
         stack.sort_by_key(|(k, _)| *k);
         if let Some(winner) = select_winning_candidate(stack) {
+            match prop {
+                PropertyIdKind::BorderTopWidth => explicit_bw[0] = true,
+                PropertyIdKind::BorderRightWidth => explicit_bw[1] = true,
+                PropertyIdKind::BorderBottomWidth => explicit_bw[2] = true,
+                PropertyIdKind::BorderLeftWidth => explicit_bw[3] = true,
+                _ => {}
+            }
             apply_declaration(&mut style, winner, parent_style, &eval_ctx, media.dark_mode);
         }
+    }
+
+    // CSS Backgrounds L3 §3.3: initial `border-*-width` is `medium` (3px), and computed
+    // `border-*-width` becomes `0px` whenever the side's `border-*-style` is `none` or `hidden`.
+    let bs = style.visual.border_style;
+    let bw = style.box_model.border_width;
+    let fix_side = |s: LineStyle, cur: f32, explicit: bool| -> f32 {
+        if matches!(s, LineStyle::None | LineStyle::Hidden) {
+            0.0
+        } else if !explicit {
+            3.0
+        } else {
+            cur
+        }
+    };
+    let next_bw = EdgeValues {
+        top: fix_side(bs.top, bw.top, explicit_bw[0]),
+        right: fix_side(bs.right, bw.right, explicit_bw[1]),
+        bottom: fix_side(bs.bottom, bw.bottom, explicit_bw[2]),
+        left: fix_side(bs.left, bw.left, explicit_bw[3]),
+    };
+    if next_bw != bw {
+        Arc::make_mut(&mut style.box_model).border_width = next_bw;
     }
 
     style
@@ -984,10 +1273,38 @@ fn token_has_var(tok: &CssToken) -> bool {
     }
 }
 
+fn single_global_keyword_token(tokens: &[CssToken]) -> Option<GlobalKeyword> {
+    let mut found: Option<&str> = None;
+    for tok in tokens {
+        match tok {
+            CssToken::Space => continue,
+            CssToken::Ident(id) if found.is_none() => found = Some(id.as_str()),
+            _ => return None,
+        }
+    }
+    found.and_then(GlobalKeyword::from_ident)
+}
+
+#[inline]
+const fn cascade_origin_group(band: u8) -> u8 {
+    match band {
+        0 | 7 => 0, // UserAgent (normal / !important)
+        1 | 6 => 1, // User & Presentational Hints
+        2..=5 => 2, // Author (stylesheet & inline, normal & !important)
+        _ => 2,
+    }
+}
+
 fn select_winning_candidate<'a>(
     sorted_asc: &[(CascadeKey, &'a SpecifiedDeclaration)],
 ) -> Option<&'a SpecifiedDeclaration> {
-    let mut idx = sorted_asc.len();
+    select_winning_candidate_from(sorted_asc, sorted_asc.len())
+}
+
+fn select_winning_candidate_from<'a>(
+    sorted_asc: &[(CascadeKey, &'a SpecifiedDeclaration)],
+    mut idx: usize,
+) -> Option<&'a SpecifiedDeclaration> {
     while idx > 0 {
         idx -= 1;
         let (key, decl) = sorted_asc[idx];
@@ -1001,7 +1318,8 @@ fn select_winning_candidate<'a>(
                 }
             }
             PropertyValue::Global(GlobalKeyword::Revert) => {
-                while idx > 0 && sorted_asc[idx - 1].0.band == key.band {
+                let grp = cascade_origin_group(key.band);
+                while idx > 0 && cascade_origin_group(sorted_asc[idx - 1].0.band) == grp {
                     idx -= 1;
                 }
             }
@@ -1009,6 +1327,32 @@ fn select_winning_candidate<'a>(
         }
     }
     None
+}
+
+fn select_candidate_after_revert<'a>(
+    sorted_asc: &[(CascadeKey, &'a SpecifiedDeclaration)],
+    kw: GlobalKeyword,
+) -> Option<&'a SpecifiedDeclaration> {
+    let &(win_key, _) = sorted_asc.last()?;
+    let mut idx = sorted_asc.len() - 1;
+    match kw {
+        GlobalKeyword::RevertLayer => {
+            while idx > 0
+                && sorted_asc[idx - 1].0.band == win_key.band
+                && sorted_asc[idx - 1].0.layer_rank == win_key.layer_rank
+            {
+                idx -= 1;
+            }
+        }
+        GlobalKeyword::Revert => {
+            let grp = cascade_origin_group(win_key.band);
+            while idx > 0 && cascade_origin_group(sorted_asc[idx - 1].0.band) == grp {
+                idx -= 1;
+            }
+        }
+        _ => {}
+    }
+    select_winning_candidate_from(sorted_asc, idx)
 }
 
 /// Applies a single winning [`SpecifiedDeclaration`] onto `style`.
@@ -1126,16 +1470,32 @@ pub fn apply_declaration(
             Arc::make_mut(&mut style.box_model).inset.left = v.clone();
         }
         (PropertyIdKind::BorderTopWidth, PropertyValue::Number(v)) => {
-            Arc::make_mut(&mut style.box_model).border_width.top = *v;
+            Arc::make_mut(&mut style.box_model).border_width.top = v.max(0.0);
+        }
+        (PropertyIdKind::BorderTopWidth, PropertyValue::Length(lp)) => {
+            Arc::make_mut(&mut style.box_model).border_width.top =
+                lp.resolve_px(0.0, eval).max(0.0);
         }
         (PropertyIdKind::BorderRightWidth, PropertyValue::Number(v)) => {
-            Arc::make_mut(&mut style.box_model).border_width.right = *v;
+            Arc::make_mut(&mut style.box_model).border_width.right = v.max(0.0);
+        }
+        (PropertyIdKind::BorderRightWidth, PropertyValue::Length(lp)) => {
+            Arc::make_mut(&mut style.box_model).border_width.right =
+                lp.resolve_px(0.0, eval).max(0.0);
         }
         (PropertyIdKind::BorderBottomWidth, PropertyValue::Number(v)) => {
-            Arc::make_mut(&mut style.box_model).border_width.bottom = *v;
+            Arc::make_mut(&mut style.box_model).border_width.bottom = v.max(0.0);
+        }
+        (PropertyIdKind::BorderBottomWidth, PropertyValue::Length(lp)) => {
+            Arc::make_mut(&mut style.box_model).border_width.bottom =
+                lp.resolve_px(0.0, eval).max(0.0);
         }
         (PropertyIdKind::BorderLeftWidth, PropertyValue::Number(v)) => {
-            Arc::make_mut(&mut style.box_model).border_width.left = *v;
+            Arc::make_mut(&mut style.box_model).border_width.left = v.max(0.0);
+        }
+        (PropertyIdKind::BorderLeftWidth, PropertyValue::Length(lp)) => {
+            Arc::make_mut(&mut style.box_model).border_width.left =
+                lp.resolve_px(0.0, eval).max(0.0);
         }
 
         // Visual
@@ -1486,6 +1846,21 @@ pub fn apply_declaration(
         (PropertyIdKind::Content, PropertyValue::Content(v)) => {
             Arc::make_mut(&mut style.box_model).content = v.clone();
         }
+        (PropertyIdKind::WritingMode, PropertyValue::WritingMode(v)) => {
+            Arc::make_mut(&mut style.text).writing_mode = *v;
+        }
+        (PropertyIdKind::CaptionSide, PropertyValue::CaptionSide(v)) => {
+            Arc::make_mut(&mut style.text).caption_side = *v;
+        }
+        (PropertyIdKind::Resize, PropertyValue::Resize(v)) => {
+            Arc::make_mut(&mut style.visual).resize = *v;
+        }
+        (PropertyIdKind::OverscrollBehaviorX, PropertyValue::OverscrollBehavior(v)) => {
+            Arc::make_mut(&mut style.visual).overscroll_behavior_x = *v;
+        }
+        (PropertyIdKind::OverscrollBehaviorY, PropertyValue::OverscrollBehavior(v)) => {
+            Arc::make_mut(&mut style.visual).overscroll_behavior_y = *v;
+        }
         _ => {}
     }
 }
@@ -1498,9 +1873,15 @@ fn copy_property_from_parent(
     match prop {
         PropertyIdKind::Display => style.display = parent.display,
         PropertyIdKind::Position => style.position = parent.position,
+        PropertyIdKind::Float => style.float_mode = parent.float_mode,
+        PropertyIdKind::Clear => style.clear_mode = parent.clear_mode,
+        PropertyIdKind::BoxSizing => style.box_sizing = parent.box_sizing,
+        PropertyIdKind::OverflowX => style.overflow.x = parent.overflow.x,
+        PropertyIdKind::OverflowY => style.overflow.y = parent.overflow.y,
         PropertyIdKind::Visibility => style.visibility = parent.visibility,
         PropertyIdKind::PointerEvents => style.pointer_events = parent.pointer_events,
         PropertyIdKind::Cursor => style.cursor = parent.cursor,
+        PropertyIdKind::ZIndex => style.z_index = parent.z_index,
         PropertyIdKind::Opacity => style.opacity = parent.opacity,
         PropertyIdKind::Color => Arc::make_mut(&mut style.text).color = parent.text.color,
         PropertyIdKind::BackgroundColor => {
@@ -1526,6 +1907,144 @@ fn copy_property_from_parent(
         }
         PropertyIdKind::WhiteSpace => {
             Arc::make_mut(&mut style.text).white_space = parent.text.white_space;
+        }
+        PropertyIdKind::Direction => {
+            Arc::make_mut(&mut style.text).direction = parent.text.direction;
+        }
+        PropertyIdKind::WritingMode => {
+            Arc::make_mut(&mut style.text).writing_mode = parent.text.writing_mode;
+        }
+        PropertyIdKind::CaptionSide => {
+            Arc::make_mut(&mut style.text).caption_side = parent.text.caption_side;
+        }
+        PropertyIdKind::Resize => {
+            Arc::make_mut(&mut style.visual).resize = parent.visual.resize;
+        }
+        PropertyIdKind::OverscrollBehaviorX => {
+            Arc::make_mut(&mut style.visual).overscroll_behavior_x =
+                parent.visual.overscroll_behavior_x;
+        }
+        PropertyIdKind::OverscrollBehaviorY => {
+            Arc::make_mut(&mut style.visual).overscroll_behavior_y =
+                parent.visual.overscroll_behavior_y;
+        }
+        PropertyIdKind::Width => {
+            Arc::make_mut(&mut style.box_model).width = parent.box_model.width.clone();
+        }
+        PropertyIdKind::Height => {
+            Arc::make_mut(&mut style.box_model).height = parent.box_model.height.clone();
+        }
+        PropertyIdKind::MinWidth => {
+            Arc::make_mut(&mut style.box_model).min_width = parent.box_model.min_width.clone();
+        }
+        PropertyIdKind::MinHeight => {
+            Arc::make_mut(&mut style.box_model).min_height = parent.box_model.min_height.clone();
+        }
+        PropertyIdKind::MaxWidth => {
+            Arc::make_mut(&mut style.box_model).max_width = parent.box_model.max_width.clone();
+        }
+        PropertyIdKind::MaxHeight => {
+            Arc::make_mut(&mut style.box_model).max_height = parent.box_model.max_height.clone();
+        }
+        PropertyIdKind::MarginTop => {
+            Arc::make_mut(&mut style.box_model).margin.top = parent.box_model.margin.top.clone();
+        }
+        PropertyIdKind::MarginRight => {
+            Arc::make_mut(&mut style.box_model).margin.right =
+                parent.box_model.margin.right.clone();
+        }
+        PropertyIdKind::MarginBottom => {
+            Arc::make_mut(&mut style.box_model).margin.bottom =
+                parent.box_model.margin.bottom.clone();
+        }
+        PropertyIdKind::MarginLeft => {
+            Arc::make_mut(&mut style.box_model).margin.left = parent.box_model.margin.left.clone();
+        }
+        PropertyIdKind::PaddingTop => {
+            Arc::make_mut(&mut style.box_model).padding.top = parent.box_model.padding.top.clone();
+        }
+        PropertyIdKind::PaddingRight => {
+            Arc::make_mut(&mut style.box_model).padding.right =
+                parent.box_model.padding.right.clone();
+        }
+        PropertyIdKind::PaddingBottom => {
+            Arc::make_mut(&mut style.box_model).padding.bottom =
+                parent.box_model.padding.bottom.clone();
+        }
+        PropertyIdKind::PaddingLeft => {
+            Arc::make_mut(&mut style.box_model).padding.left =
+                parent.box_model.padding.left.clone();
+        }
+        PropertyIdKind::Top => {
+            Arc::make_mut(&mut style.box_model).inset.top = parent.box_model.inset.top.clone();
+        }
+        PropertyIdKind::Right => {
+            Arc::make_mut(&mut style.box_model).inset.right = parent.box_model.inset.right.clone();
+        }
+        PropertyIdKind::Bottom => {
+            Arc::make_mut(&mut style.box_model).inset.bottom =
+                parent.box_model.inset.bottom.clone();
+        }
+        PropertyIdKind::Left => {
+            Arc::make_mut(&mut style.box_model).inset.left = parent.box_model.inset.left.clone();
+        }
+        PropertyIdKind::BorderTopWidth => {
+            Arc::make_mut(&mut style.box_model).border_width.top =
+                parent.box_model.border_width.top;
+        }
+        PropertyIdKind::BorderRightWidth => {
+            Arc::make_mut(&mut style.box_model).border_width.right =
+                parent.box_model.border_width.right;
+        }
+        PropertyIdKind::BorderBottomWidth => {
+            Arc::make_mut(&mut style.box_model).border_width.bottom =
+                parent.box_model.border_width.bottom;
+        }
+        PropertyIdKind::BorderLeftWidth => {
+            Arc::make_mut(&mut style.box_model).border_width.left =
+                parent.box_model.border_width.left;
+        }
+        PropertyIdKind::BorderTopStyle => {
+            Arc::make_mut(&mut style.visual).border_style.top = parent.visual.border_style.top;
+        }
+        PropertyIdKind::BorderRightStyle => {
+            Arc::make_mut(&mut style.visual).border_style.right = parent.visual.border_style.right;
+        }
+        PropertyIdKind::BorderBottomStyle => {
+            Arc::make_mut(&mut style.visual).border_style.bottom =
+                parent.visual.border_style.bottom;
+        }
+        PropertyIdKind::BorderLeftStyle => {
+            Arc::make_mut(&mut style.visual).border_style.left = parent.visual.border_style.left;
+        }
+        PropertyIdKind::BorderTopColor => {
+            Arc::make_mut(&mut style.visual).border_color.top = parent.visual.border_color.top;
+        }
+        PropertyIdKind::BorderRightColor => {
+            Arc::make_mut(&mut style.visual).border_color.right = parent.visual.border_color.right;
+        }
+        PropertyIdKind::BorderBottomColor => {
+            Arc::make_mut(&mut style.visual).border_color.bottom =
+                parent.visual.border_color.bottom;
+        }
+        PropertyIdKind::BorderLeftColor => {
+            Arc::make_mut(&mut style.visual).border_color.left = parent.visual.border_color.left;
+        }
+        PropertyIdKind::BorderTopLeftRadius => {
+            Arc::make_mut(&mut style.visual).border_radius.top_left =
+                parent.visual.border_radius.top_left.clone();
+        }
+        PropertyIdKind::BorderTopRightRadius => {
+            Arc::make_mut(&mut style.visual).border_radius.top_right =
+                parent.visual.border_radius.top_right.clone();
+        }
+        PropertyIdKind::BorderBottomRightRadius => {
+            Arc::make_mut(&mut style.visual).border_radius.bottom_right =
+                parent.visual.border_radius.bottom_right.clone();
+        }
+        PropertyIdKind::BorderBottomLeftRadius => {
+            Arc::make_mut(&mut style.visual).border_radius.bottom_left =
+                parent.visual.border_radius.bottom_left.clone();
         }
         _ => {}
     }
@@ -1556,8 +2075,130 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         PropertyIdKind::FontWeight => {
             Arc::make_mut(&mut style.text).font_weight = init.text.font_weight;
         }
+        PropertyIdKind::Direction => {
+            Arc::make_mut(&mut style.text).direction = DirectionMode::Ltr;
+        }
+        PropertyIdKind::WritingMode => {
+            Arc::make_mut(&mut style.text).writing_mode = WritingMode::HorizontalTb;
+        }
+        PropertyIdKind::CaptionSide => {
+            Arc::make_mut(&mut style.text).caption_side = CaptionSideMode::Top;
+        }
+        PropertyIdKind::Resize => {
+            Arc::make_mut(&mut style.visual).resize = ResizeMode::None;
+        }
+        PropertyIdKind::OverscrollBehaviorX => {
+            Arc::make_mut(&mut style.visual).overscroll_behavior_x = OverscrollBehaviorMode::Auto;
+        }
+        PropertyIdKind::OverscrollBehaviorY => {
+            Arc::make_mut(&mut style.visual).overscroll_behavior_y = OverscrollBehaviorMode::Auto;
+        }
         PropertyIdKind::Width => Arc::make_mut(&mut style.box_model).width = SizeValue::Auto,
         PropertyIdKind::Height => Arc::make_mut(&mut style.box_model).height = SizeValue::Auto,
+        PropertyIdKind::MinWidth => {
+            Arc::make_mut(&mut style.box_model).min_width = SizeValue::Auto;
+        }
+        PropertyIdKind::MinHeight => {
+            Arc::make_mut(&mut style.box_model).min_height = SizeValue::Auto;
+        }
+        PropertyIdKind::MaxWidth => {
+            Arc::make_mut(&mut style.box_model).max_width = SizeValue::None;
+        }
+        PropertyIdKind::MaxHeight => {
+            Arc::make_mut(&mut style.box_model).max_height = SizeValue::None;
+        }
+        PropertyIdKind::MarginTop => {
+            Arc::make_mut(&mut style.box_model).margin.top =
+                LengthPercentageAuto::Value(LengthPercentage::Zero);
+        }
+        PropertyIdKind::MarginRight => {
+            Arc::make_mut(&mut style.box_model).margin.right =
+                LengthPercentageAuto::Value(LengthPercentage::Zero);
+        }
+        PropertyIdKind::MarginBottom => {
+            Arc::make_mut(&mut style.box_model).margin.bottom =
+                LengthPercentageAuto::Value(LengthPercentage::Zero);
+        }
+        PropertyIdKind::MarginLeft => {
+            Arc::make_mut(&mut style.box_model).margin.left =
+                LengthPercentageAuto::Value(LengthPercentage::Zero);
+        }
+        PropertyIdKind::PaddingTop => {
+            Arc::make_mut(&mut style.box_model).padding.top = LengthPercentage::Zero;
+        }
+        PropertyIdKind::PaddingRight => {
+            Arc::make_mut(&mut style.box_model).padding.right = LengthPercentage::Zero;
+        }
+        PropertyIdKind::PaddingBottom => {
+            Arc::make_mut(&mut style.box_model).padding.bottom = LengthPercentage::Zero;
+        }
+        PropertyIdKind::PaddingLeft => {
+            Arc::make_mut(&mut style.box_model).padding.left = LengthPercentage::Zero;
+        }
+        PropertyIdKind::Top => {
+            Arc::make_mut(&mut style.box_model).inset.top = LengthPercentageAuto::Auto;
+        }
+        PropertyIdKind::Right => {
+            Arc::make_mut(&mut style.box_model).inset.right = LengthPercentageAuto::Auto;
+        }
+        PropertyIdKind::Bottom => {
+            Arc::make_mut(&mut style.box_model).inset.bottom = LengthPercentageAuto::Auto;
+        }
+        PropertyIdKind::Left => {
+            Arc::make_mut(&mut style.box_model).inset.left = LengthPercentageAuto::Auto;
+        }
+        PropertyIdKind::BorderTopWidth => {
+            Arc::make_mut(&mut style.box_model).border_width.top = 3.0;
+        }
+        PropertyIdKind::BorderRightWidth => {
+            Arc::make_mut(&mut style.box_model).border_width.right = 3.0;
+        }
+        PropertyIdKind::BorderBottomWidth => {
+            Arc::make_mut(&mut style.box_model).border_width.bottom = 3.0;
+        }
+        PropertyIdKind::BorderLeftWidth => {
+            Arc::make_mut(&mut style.box_model).border_width.left = 3.0;
+        }
+        PropertyIdKind::BorderTopStyle => {
+            Arc::make_mut(&mut style.visual).border_style.top = LineStyle::None;
+        }
+        PropertyIdKind::BorderRightStyle => {
+            Arc::make_mut(&mut style.visual).border_style.right = LineStyle::None;
+        }
+        PropertyIdKind::BorderBottomStyle => {
+            Arc::make_mut(&mut style.visual).border_style.bottom = LineStyle::None;
+        }
+        PropertyIdKind::BorderLeftStyle => {
+            Arc::make_mut(&mut style.visual).border_style.left = LineStyle::None;
+        }
+        PropertyIdKind::BorderTopColor => {
+            Arc::make_mut(&mut style.visual).border_color.top = CssColor::CurrentColor;
+        }
+        PropertyIdKind::BorderRightColor => {
+            Arc::make_mut(&mut style.visual).border_color.right = CssColor::CurrentColor;
+        }
+        PropertyIdKind::BorderBottomColor => {
+            Arc::make_mut(&mut style.visual).border_color.bottom = CssColor::CurrentColor;
+        }
+        PropertyIdKind::BorderLeftColor => {
+            Arc::make_mut(&mut style.visual).border_color.left = CssColor::CurrentColor;
+        }
+        PropertyIdKind::BorderTopLeftRadius => {
+            Arc::make_mut(&mut style.visual).border_radius.top_left =
+                init.visual.border_radius.top_left.clone();
+        }
+        PropertyIdKind::BorderTopRightRadius => {
+            Arc::make_mut(&mut style.visual).border_radius.top_right =
+                init.visual.border_radius.top_right.clone();
+        }
+        PropertyIdKind::BorderBottomRightRadius => {
+            Arc::make_mut(&mut style.visual).border_radius.bottom_right =
+                init.visual.border_radius.bottom_right.clone();
+        }
+        PropertyIdKind::BorderBottomLeftRadius => {
+            Arc::make_mut(&mut style.visual).border_radius.bottom_left =
+                init.visual.border_radius.bottom_left.clone();
+        }
         _ => {}
     }
 }

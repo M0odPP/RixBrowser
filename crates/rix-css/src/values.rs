@@ -354,6 +354,14 @@ impl LengthPercentage {
     }
 
     #[must_use]
+    pub fn is_negative_literal(&self) -> bool {
+        match self {
+            Self::Length(v, _) | Self::Percent(v) => *v < 0.0,
+            Self::Zero | Self::Calc(_) => false,
+        }
+    }
+
+    #[must_use]
     pub fn resolve_px(&self, percent_basis: f32, ctx: &EvalContext) -> f32 {
         match self {
             Self::Zero => 0.0,
@@ -616,6 +624,107 @@ pub enum DirectionMode {
     #[default]
     Ltr,
     Rtl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum WritingMode {
+    #[default]
+    HorizontalTb,
+    VerticalRl,
+    VerticalLr,
+    SidewaysRl,
+    SidewaysLr,
+}
+
+impl WritingMode {
+    #[must_use]
+    pub const fn is_vertical(self) -> bool {
+        !matches!(self, Self::HorizontalTb)
+    }
+
+    #[must_use]
+    pub const fn as_css_str(self) -> &'static str {
+        match self {
+            Self::HorizontalTb => "horizontal-tb",
+            Self::VerticalRl => "vertical-rl",
+            Self::VerticalLr => "vertical-lr",
+            Self::SidewaysRl => "sideways-rl",
+            Self::SidewaysLr => "sideways-lr",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ResizeMode {
+    #[default]
+    None,
+    Both,
+    Horizontal,
+    Vertical,
+    Block,
+    Inline,
+}
+
+impl ResizeMode {
+    #[must_use]
+    pub const fn as_css_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Both => "both",
+            Self::Horizontal => "horizontal",
+            Self::Vertical => "vertical",
+            Self::Block => "block",
+            Self::Inline => "inline",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum CaptionSideMode {
+    #[default]
+    Top,
+    Bottom,
+    BlockStart,
+    BlockEnd,
+    InlineStart,
+    InlineEnd,
+}
+
+impl CaptionSideMode {
+    #[must_use]
+    pub const fn as_css_str(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+            Self::BlockStart => "block-start",
+            Self::BlockEnd => "block-end",
+            Self::InlineStart => "inline-start",
+            Self::InlineEnd => "inline-end",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum OverscrollBehaviorMode {
+    #[default]
+    Auto,
+    Contain,
+    None,
+}
+
+impl OverscrollBehaviorMode {
+    #[must_use]
+    pub const fn as_css_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Contain => "contain",
+            Self::None => "none",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -1331,15 +1440,20 @@ pub fn convert_alpha(alpha: &AlphaValue) -> f32 {
 }
 
 #[must_use]
-pub fn convert_border_width(width: &BorderSideWidth) -> f32 {
+pub fn convert_border_width_lp(width: &BorderSideWidth) -> LengthPercentage {
     match width {
-        BorderSideWidth::Thin => 1.0,
-        BorderSideWidth::Medium => 3.0,
-        BorderSideWidth::Thick => 5.0,
-        BorderSideWidth::Length(len) => convert_length(len)
-            .resolve_px(0.0, &EvalContext::default())
-            .max(0.0),
+        BorderSideWidth::Thin => LengthPercentage::px(1.0),
+        BorderSideWidth::Medium => LengthPercentage::px(3.0),
+        BorderSideWidth::Thick => LengthPercentage::px(5.0),
+        BorderSideWidth::Length(len) => convert_length(len),
     }
+}
+
+#[must_use]
+pub fn convert_border_width(width: &BorderSideWidth) -> f32 {
+    convert_border_width_lp(width)
+        .resolve_px(0.0, &EvalContext::default())
+        .max(0.0)
 }
 
 #[must_use]
