@@ -2348,6 +2348,321 @@ fn is_json_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n')
 }
 
+/// Pure-Rust ECMA-262 §25.5.1 JSON parser that allocates directly onto `JsVm`'s heap,
+/// accepts lone UTF-16 surrogates in `\uXXXX` escapes (required by ECMA-262, rejected by
+/// `serde_json`), preserves `-0`, and enforces strict RFC 8259 / ECMA-262 syntax.
+struct EcmaJsonParser<'a> {
+    src: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
+    depth: usize,
+}
+
+impl<'a> EcmaJsonParser<'a> {
+    fn new(src: &'a str) -> Self {
+        Self {
+            src,
+            bytes: src.as_bytes(),
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while self.pos < self.bytes.len() && is_json_ws(self.bytes[self.pos]) {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn err(&self, vm: &mut JsVm, msg: &str) -> JsException {
+        vm.make_error(
+            "SyntaxError",
+            format!("JSON.parse: {msg} at position {}", self.pos),
+        )
+    }
+
+    fn parse_root(&mut self, vm: &mut JsVm) -> Result<JsValue, JsException> {
+        self.skip_ws();
+        let val = self.parse_value(vm)?;
+        self.skip_ws();
+        if self.pos != self.bytes.len() {
+            return Err(self.err(vm, "unexpected trailing token"));
+        }
+        Ok(val)
+    }
+
+    fn parse_value(&mut self, vm: &mut JsVm) -> Result<JsValue, JsException> {
+        self.skip_ws();
+        let Some(b) = self.peek() else {
+            return Err(self.err(vm, "unexpected end of JSON input"));
+        };
+        match b {
+            b'"' => {
+                let s = self.parse_string(vm)?;
+                Ok(JsValue::from_string(vm.heap.alloc_string(s)))
+            }
+            b'{' => self.parse_object(vm),
+            b'[' => self.parse_array(vm),
+            b't' => {
+                if self.bytes[self.pos..].starts_with(b"true") {
+                    self.pos += 4;
+                    Ok(JsValue::TRUE)
+                } else {
+                    Err(self.err(vm, "invalid token"))
+                }
+            }
+            b'f' => {
+                if self.bytes[self.pos..].starts_with(b"false") {
+                    self.pos += 5;
+                    Ok(JsValue::FALSE)
+                } else {
+                    Err(self.err(vm, "invalid token"))
+                }
+            }
+            b'n' => {
+                if self.bytes[self.pos..].starts_with(b"null") {
+                    self.pos += 4;
+                    Ok(JsValue::NULL)
+                } else {
+                    Err(self.err(vm, "invalid token"))
+                }
+            }
+            b'-' | b'0'..=b'9' => self.parse_number(vm),
+            _ => Err(self.err(vm, "unexpected token")),
+        }
+    }
+
+    fn parse_hex4(&mut self, vm: &mut JsVm) -> Result<u16, JsException> {
+        if self.pos + 4 > self.bytes.len() {
+            return Err(self.err(vm, "unexpected end of unicode escape"));
+        }
+        let mut val = 0u16;
+        for i in 0..4 {
+            let b = self.bytes[self.pos + i];
+            let d = match b {
+                b'0'..=b'9' => (b - b'0') as u16,
+                b'a'..=b'f' => (b - b'a' + 10) as u16,
+                b'A'..=b'F' => (b - b'A' + 10) as u16,
+                _ => return Err(self.err(vm, "invalid unicode escape")),
+            };
+            val = (val << 4) | d;
+        }
+        self.pos += 4;
+        Ok(val)
+    }
+
+    fn parse_string(&mut self, vm: &mut JsVm) -> Result<String, JsException> {
+        if self.peek() != Some(b'"') {
+            return Err(self.err(vm, "expected '\"'"));
+        }
+        self.pos += 1;
+        let mut out = String::new();
+        let mut chunk_start = self.pos;
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+            if b == b'"' {
+                out.push_str(&self.src[chunk_start..self.pos]);
+                self.pos += 1;
+                return Ok(out);
+            }
+            if b < 0x20 {
+                return Err(self.err(vm, "unescaped control character in string"));
+            }
+            if b == b'\\' {
+                out.push_str(&self.src[chunk_start..self.pos]);
+                self.pos += 1;
+                let Some(esc) = self.peek() else {
+                    return Err(self.err(vm, "unterminated escape sequence"));
+                };
+                self.pos += 1;
+                match esc {
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'/' => out.push('/'),
+                    b'b' => out.push('\x08'),
+                    b'f' => out.push('\x0C'),
+                    b'n' => out.push('\n'),
+                    b'r' => out.push('\r'),
+                    b't' => out.push('\t'),
+                    b'u' => {
+                        let unit = self.parse_hex4(vm)?;
+                        if (0xD800..=0xDBFF).contains(&unit)
+                            && self.pos + 6 <= self.bytes.len()
+                            && self.bytes[self.pos] == b'\\'
+                            && self.bytes[self.pos + 1] == b'u'
+                        {
+                            let saved = self.pos;
+                            self.pos += 2;
+                            if let Ok(low) = self.parse_hex4(vm) {
+                                if (0xDC00..=0xDFFF).contains(&low) {
+                                    let cp = 0x10000
+                                        + (((u32::from(unit) - 0xD800) << 10)
+                                            | (u32::from(low) - 0xDC00));
+                                    if let Some(ch) = char::from_u32(cp) {
+                                        out.push(ch);
+                                        chunk_start = self.pos;
+                                        continue;
+                                    }
+                                }
+                            }
+                            self.pos = saved;
+                        }
+                        if let Some(ch) = char::from_u32(u32::from(unit)) {
+                            out.push(ch);
+                        } else {
+                            // Lone UTF-16 surrogate: ECMA-262 permits it in JSON strings.
+                            out.push('\u{FFFD}');
+                        }
+                    }
+                    _ => return Err(self.err(vm, "invalid escape character")),
+                }
+                chunk_start = self.pos;
+            } else {
+                self.pos += 1;
+            }
+        }
+        Err(self.err(vm, "unterminated string"))
+    }
+
+    fn parse_number(&mut self, vm: &mut JsVm) -> Result<JsValue, JsException> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+                if matches!(self.peek(), Some(b'0'..=b'9')) {
+                    return Err(self.err(vm, "leading zero in number"));
+                }
+            }
+            Some(b'1'..=b'9') => {
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => return Err(self.err(vm, "invalid number")),
+        }
+        let mut is_float = false;
+        if self.peek() == Some(b'.') {
+            is_float = true;
+            self.pos += 1;
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(self.err(vm, "missing fractional digits"));
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            is_float = true;
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(self.err(vm, "missing exponent digits"));
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        let slice = &self.src[start..self.pos];
+        if !is_float && !slice.starts_with("-0") {
+            if let Ok(i) = slice.parse::<i32>() {
+                return Ok(JsValue::from_i32(i));
+            }
+        }
+        let f = slice
+            .parse::<f64>()
+            .map_err(|_| self.err(vm, "invalid number"))?;
+        Ok(JsValue::from_f64(f))
+    }
+
+    fn parse_array(&mut self, vm: &mut JsVm) -> Result<JsValue, JsException> {
+        self.depth += 1;
+        if self.depth > 512 {
+            return Err(vm.range_error("JSON.parse: maximum nesting depth exceeded"));
+        }
+        self.pos += 1; // '['
+        let arr = vm.alloc_array();
+        vm.temp_roots.push(JsValue::from_object(arr));
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            vm.temp_roots.pop();
+            self.depth -= 1;
+            return Ok(JsValue::from_object(arr));
+        }
+        let res = (|| loop {
+            let item = self.parse_value(vm)?;
+            vm.heap.object_push_element(arr, item);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b']') => {
+                    self.pos += 1;
+                    return Ok(JsValue::from_object(arr));
+                }
+                _ => return Err(self.err(vm, "expected ',' or ']' in array")),
+            }
+        })();
+        vm.temp_roots.pop();
+        self.depth -= 1;
+        res
+    }
+
+    fn parse_object(&mut self, vm: &mut JsVm) -> Result<JsValue, JsException> {
+        self.depth += 1;
+        if self.depth > 512 {
+            return Err(vm.range_error("JSON.parse: maximum nesting depth exceeded"));
+        }
+        self.pos += 1; // '{'
+        let obj = vm.alloc_ordinary_object();
+        vm.temp_roots.push(JsValue::from_object(obj));
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            vm.temp_roots.pop();
+            self.depth -= 1;
+            return Ok(JsValue::from_object(obj));
+        }
+        let res = (|| loop {
+            self.skip_ws();
+            let key_str = self.parse_string(vm)?;
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return Err(self.err(vm, "expected ':' after property name"));
+            }
+            self.pos += 1;
+            let val = self.parse_value(vm)?;
+            let key = vm.heap.intern_key(&key_str);
+            vm.heap
+                .object_define_data(obj, key, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Ok(JsValue::from_object(obj));
+                }
+                _ => return Err(self.err(vm, "expected ',' or '}' in object")),
+            }
+        })();
+        vm.temp_roots.pop();
+        self.depth -= 1;
+        res
+    }
+}
+
 fn json_raw_json(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let text = vm.to_js_string(arg0(args))?;
     let bytes = text.as_bytes();
@@ -2361,12 +2676,8 @@ fn json_raw_json(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsVa
             "JSON.rawJSON requires a valid JSON primitive",
         ));
     }
-    let parsed: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| vm.make_error("SyntaxError", format!("JSON.rawJSON: {e}")))?;
-    if matches!(
-        parsed,
-        serde_json::Value::Array(_) | serde_json::Value::Object(_)
-    ) {
+    let parsed = EcmaJsonParser::new(&text).parse_root(vm)?;
+    if parsed.is_object() {
         return Err(vm.make_error("SyntaxError", "JSON.rawJSON cannot wrap an object or array"));
     }
     let obj = vm
@@ -2398,9 +2709,7 @@ fn json_is_raw_json(
 
 fn json_parse(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
     let text = vm.to_js_string(arg0(args))?;
-    let parsed: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| vm.make_error("SyntaxError", format!("JSON.parse: {e}")))?;
-    let val = serde_to_js(vm, &parsed);
+    let val = EcmaJsonParser::new(&text).parse_root(vm)?;
     if let Some(reviver) = args
         .get(1)
         .copied()
@@ -2418,39 +2727,6 @@ fn json_parse(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsValue
         return json_revive(vm, holder, "", reviver, root_src.as_deref());
     }
     Ok(val)
-}
-
-fn serde_to_js(vm: &mut JsVm, val: &serde_json::Value) -> JsValue {
-    match val {
-        serde_json::Value::Null => JsValue::NULL,
-        serde_json::Value::Bool(b) => JsValue::from_bool(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64().and_then(|v| i32::try_from(v).ok()) {
-                JsValue::from_i32(i)
-            } else {
-                JsValue::from_f64(n.as_f64().unwrap_or(f64::NAN))
-            }
-        }
-        serde_json::Value::String(s) => JsValue::from_string(vm.heap.alloc_string(s.as_str())),
-        serde_json::Value::Array(items) => {
-            let arr = vm.alloc_array();
-            for item in items {
-                let v = serde_to_js(vm, item);
-                vm.heap.object_push_element(arr, v);
-            }
-            JsValue::from_object(arr)
-        }
-        serde_json::Value::Object(map) => {
-            let obj = vm.alloc_ordinary_object();
-            for (k, v) in map {
-                let key = vm.heap.intern_key(k);
-                let jv = serde_to_js(vm, v);
-                vm.heap
-                    .object_define_data(obj, key, jv, PropertyAttrs::DEFAULT, &mut vm.shapes);
-            }
-            JsValue::from_object(obj)
-        }
-    }
 }
 
 fn json_revive(
@@ -2968,31 +3244,47 @@ fn array_from(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsVa
     };
     if !iter_method.is_undefined() && !iter_method.is_null() {
         require_callable_cb(vm, iter_method)?;
-        let out = alloc_from_target(vm, this_val, None)?;
-        let items = vm.collect_iterable(src)?;
-        let count = items.len() as u64;
-        for (i, mut v) in items.into_iter().enumerate() {
-            if let Some(cb) = map_fn {
-                v = vm.call_value(cb, this_arg, &[v, JsValue::from_f64(i as f64)])?;
+        let mark = vm.temp_roots.len();
+        let res = (|| {
+            let out = alloc_from_target(vm, this_val, None)?;
+            vm.temp_roots.push(JsValue::from_object(out));
+            let items = vm.collect_iterable(src)?;
+            for &it in &items {
+                vm.temp_roots.push(it);
             }
-            vm.array_create_data_prop(out, i as u64, v)?;
-        }
-        vm.array_set_length(out, count)?;
-        return Ok(JsValue::from_object(out));
+            let count = items.len() as u64;
+            for (i, mut v) in items.into_iter().enumerate() {
+                if let Some(cb) = map_fn {
+                    v = vm.call_value(cb, this_arg, &[v, JsValue::from_f64(i as f64)])?;
+                }
+                vm.array_create_data_prop(out, i as u64, v)?;
+            }
+            vm.array_set_length(out, count)?;
+            Ok(JsValue::from_object(out))
+        })();
+        vm.temp_roots.truncate(mark);
+        return res;
     }
     let src_h = vm.to_object(src)?;
     let len = vm.array_get_len(src_h)?;
     check_iter_limit(vm, len)?;
-    let out = alloc_from_target(vm, this_val, Some(len))?;
-    for i in 0..len {
-        let mut v = vm.array_get_index(src_h, i)?;
-        if let Some(cb) = map_fn {
-            v = vm.call_value(cb, this_arg, &[v, JsValue::from_f64(i as f64)])?;
+    let mark = vm.temp_roots.len();
+    let res = (|| {
+        vm.temp_roots.push(JsValue::from_object(src_h));
+        let out = alloc_from_target(vm, this_val, Some(len))?;
+        vm.temp_roots.push(JsValue::from_object(out));
+        for i in 0..len {
+            let mut v = vm.array_get_index(src_h, i)?;
+            if let Some(cb) = map_fn {
+                v = vm.call_value(cb, this_arg, &[v, JsValue::from_f64(i as f64)])?;
+            }
+            vm.array_create_data_prop(out, i, v)?;
         }
-        vm.array_create_data_prop(out, i, v)?;
-    }
-    vm.array_set_length(out, len)?;
-    Ok(JsValue::from_object(out))
+        vm.array_set_length(out, len)?;
+        Ok(JsValue::from_object(out))
+    })();
+    vm.temp_roots.truncate(mark);
+    res
 }
 
 fn array_of(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
@@ -3474,9 +3766,16 @@ fn array_flat(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsVa
         }
         _ => 1.0,
     };
-    let out = vm.array_species_create(h, 0)?;
-    let _ = flatten_into_array(vm, out, h, len, 0, depth, None)?;
-    Ok(JsValue::from_object(out))
+    let mark = vm.temp_roots.len();
+    let res = (|| {
+        vm.temp_roots.push(JsValue::from_object(h));
+        let out = vm.array_species_create(h, 0)?;
+        vm.temp_roots.push(JsValue::from_object(out));
+        let _ = flatten_into_array(vm, out, h, len, 0, depth, None)?;
+        Ok(JsValue::from_object(out))
+    })();
+    vm.temp_roots.truncate(mark);
+    res
 }
 
 fn array_flat_map(
@@ -3489,9 +3788,16 @@ fn array_flat_map(
     let cb = arg0(args);
     require_callable_cb(vm, cb)?;
     let this_arg = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
-    let out = vm.array_species_create(h, 0)?;
-    let _ = flatten_into_array(vm, out, h, len, 0, 1.0, Some((cb, this_arg)))?;
-    Ok(JsValue::from_object(out))
+    let mark = vm.temp_roots.len();
+    let res = (|| {
+        vm.temp_roots.push(JsValue::from_object(h));
+        let out = vm.array_species_create(h, 0)?;
+        vm.temp_roots.push(JsValue::from_object(out));
+        let _ = flatten_into_array(vm, out, h, len, 0, 1.0, Some((cb, this_arg)))?;
+        Ok(JsValue::from_object(out))
+    })();
+    vm.temp_roots.truncate(mark);
+    res
 }
 
 fn array_fill(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {

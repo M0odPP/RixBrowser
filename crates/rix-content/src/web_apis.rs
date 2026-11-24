@@ -58,6 +58,54 @@ struct UrlEntry {
     search_params: HeapHandle,
 }
 
+struct TextDecoderEntry {
+    encoding: &'static Encoding,
+    decoder: encoding_rs::Decoder,
+    fatal: bool,
+    ignore_bom: bool,
+    bom_seen: bool,
+    do_not_flush: bool,
+}
+
+impl TextDecoderEntry {
+    fn new(encoding: &'static Encoding, fatal: bool, ignore_bom: bool) -> Self {
+        let decoder = if ignore_bom {
+            encoding.new_decoder_without_bom_handling()
+        } else {
+            encoding.new_decoder_with_bom_removal()
+        };
+        Self {
+            encoding,
+            decoder,
+            fatal,
+            ignore_bom,
+            bom_seen: false,
+            do_not_flush: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.decoder = if self.ignore_bom {
+            self.encoding.new_decoder_without_bom_handling()
+        } else {
+            self.encoding.new_decoder_with_bom_removal()
+        };
+        self.bom_seen = false;
+        self.do_not_flush = false;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum FormDataVal {
+    Text(String),
+    File(HeapHandle),
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FormDataEntry {
+    pub pairs: Vec<(String, FormDataVal)>,
+}
+
 #[derive(Debug, Clone)]
 struct HistoryItem {
     url: Url,
@@ -79,6 +127,8 @@ pub(crate) struct WebApiPrototypes {
     pub abort_signal_proto: Option<HeapHandle>,
     pub url_proto: Option<HeapHandle>,
     pub search_params_proto: Option<HeapHandle>,
+    pub form_data_proto: Option<HeapHandle>,
+    pub text_decoder_proto: Option<HeapHandle>,
 }
 
 /// Shared state backing all non-network WHATWG Web APIs in a `ContentRuntime`.
@@ -87,6 +137,8 @@ pub struct WebApiState {
     pub(crate) abort_signals: HashMap<HeapHandle, AbortSignalEntry>,
     url_objects: HashMap<HeapHandle, UrlEntry>,
     search_params: HashMap<HeapHandle, SearchParamsEntry>,
+    text_decoders: HashMap<HeapHandle, TextDecoderEntry>,
+    pub(crate) form_data: HashMap<HeapHandle, FormDataEntry>,
     pub(crate) location_url: Url,
     history: Vec<HistoryItem>,
     history_index: usize,
@@ -113,6 +165,8 @@ impl WebApiState {
             abort_signals: HashMap::new(),
             url_objects: HashMap::new(),
             search_params: HashMap::new(),
+            text_decoders: HashMap::new(),
+            form_data: HashMap::new(),
             history: vec![HistoryItem {
                 url: parsed.clone(),
                 state: JsValue::NULL,
@@ -187,6 +241,8 @@ impl WebApiState {
             self.protos.abort_signal_proto,
             self.protos.url_proto,
             self.protos.search_params_proto,
+            self.protos.form_data_proto,
+            self.protos.text_decoder_proto,
         ]
         .into_iter()
         .flatten()
@@ -198,6 +254,13 @@ impl WebApiState {
         }
         for u in self.url_objects.values() {
             out.push(JsValue::from_object(u.search_params));
+        }
+        for fd in self.form_data.values() {
+            for (_, v) in &fd.pairs {
+                if let FormDataVal::File(fh) = v {
+                    out.push(JsValue::from_object(*fh));
+                }
+            }
         }
         for &h in self.object_url_objects.values() {
             out.push(JsValue::from_object(h));
@@ -213,6 +276,8 @@ impl WebApiState {
         self.abort_signals.retain(|&h, _| heap.is_alive(h));
         self.url_objects.retain(|&h, _| heap.is_alive(h));
         self.search_params.retain(|&h, _| heap.is_alive(h));
+        self.text_decoders.retain(|&h, _| heap.is_alive(h));
+        self.form_data.retain(|&h, _| heap.is_alive(h));
         self.object_url_objects.retain(|_, &mut h| heap.is_alive(h));
     }
 }
@@ -334,8 +399,82 @@ pub(crate) fn alloc_uint8_array(vm: &mut JsVm, bytes: Vec<u8>) -> HeapHandle {
     ))
 }
 
-/// Extracts raw bytes from JS `String`, `ArrayBuffer`, `TypedArray`, `DataView`, `Blob`,
-/// or `URLSearchParams`.
+fn read_buffer_slice(vm: &JsVm, buf_h: HeapHandle, off: usize, len: usize) -> Option<Vec<u8>> {
+    let obj = vm.heap.get_object(buf_h)?;
+    if let Some(shared) = obj.rare.as_ref().and_then(|r| r.shared_mem.as_ref()) {
+        let data = shared.data.lock().unwrap_or_else(|e| e.into_inner());
+        let fixed_cap = obj
+            .rare
+            .as_ref()
+            .and_then(|r| r.ab_fixed_byte_len)
+            .map_or(data.len(), |f| f.min(data.len()));
+        let end = off.saturating_add(len).min(fixed_cap);
+        return Some(data[off.min(end)..end].to_vec());
+    }
+    if let ObjectKind::ArrayBuffer(b) = &obj.kind {
+        let end = off.saturating_add(len).min(b.len());
+        return Some(b[off.min(end)..end].to_vec());
+    }
+    None
+}
+
+fn read_buffer_all(vm: &JsVm, buf_h: HeapHandle) -> Option<Vec<u8>> {
+    let obj = vm.heap.get_object(buf_h)?;
+    if let Some(shared) = obj.rare.as_ref().and_then(|r| r.shared_mem.as_ref()) {
+        let data = shared.data.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = obj
+            .rare
+            .as_ref()
+            .and_then(|r| r.ab_fixed_byte_len)
+            .map_or(data.len(), |f| f.min(data.len()));
+        return Some(data[..cap].to_vec());
+    }
+    if let ObjectKind::ArrayBuffer(b) = &obj.kind {
+        return Some((**b).clone());
+    }
+    None
+}
+
+fn extract_allow_shared_buffer_source(vm: &mut JsVm, val: JsValue) -> Result<Vec<u8>, JsException> {
+    let Some(h) = val.as_object() else {
+        return Err(vm.type_error("Expected an ArrayBuffer, SharedArrayBuffer, or ArrayBufferView"));
+    };
+    let kind_info = vm.heap.get_object(h).map(|o| match &o.kind {
+        ObjectKind::ArrayBuffer(_) => 1u8,
+        ObjectKind::TypedArray(_) => 2,
+        ObjectKind::DataView(_) => 3,
+        _ => 0,
+    });
+    match kind_info {
+        Some(1) => read_buffer_all(vm, h).ok_or_else(|| vm.type_error("Invalid ArrayBuffer")),
+        Some(2) => {
+            let Some(ObjectKind::TypedArray(ta)) = vm.heap.get_object(h).map(|o| &o.kind) else {
+                unreachable!()
+            };
+            let ta = *ta;
+            let byte_len = (ta.length as usize).saturating_mul(ta.kind.bytes_per_element());
+            read_buffer_slice(vm, ta.buffer, ta.byte_offset as usize, byte_len)
+                .ok_or_else(|| vm.type_error("Invalid TypedArray buffer"))
+        }
+        Some(3) => {
+            let Some(ObjectKind::DataView(dv)) = vm.heap.get_object(h).map(|o| &o.kind) else {
+                unreachable!()
+            };
+            let dv = *dv;
+            read_buffer_slice(
+                vm,
+                dv.buffer,
+                dv.byte_offset as usize,
+                dv.byte_length as usize,
+            )
+            .ok_or_else(|| vm.type_error("Invalid DataView buffer"))
+        }
+        _ => Err(vm.type_error("Expected an ArrayBuffer, SharedArrayBuffer, or ArrayBufferView")),
+    }
+}
+
+/// Extracts raw bytes from JS `String`, `ArrayBuffer`, `SharedArrayBuffer`, `TypedArray`,
+/// `DataView`, `Blob`, or `URLSearchParams`.
 pub(crate) fn extract_bytes_from_js(
     vm: &mut JsVm,
     web_apis: &SharedWebApis,
@@ -352,27 +491,29 @@ pub(crate) fn extract_bytes_from_js(
             return Ok(serialize_query_pairs(&sp.pairs).into_bytes());
         }
         match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::ArrayBuffer(b)) => return Ok((**b).clone()),
+            Some(ObjectKind::ArrayBuffer(_)) => {
+                if let Some(bytes) = read_buffer_all(vm, h) {
+                    return Ok(bytes);
+                }
+            }
             Some(ObjectKind::TypedArray(ta)) => {
                 let ta = *ta;
-                let byte_len = (ta.length as usize) * ta.kind.bytes_per_element();
-                let off = ta.byte_offset as usize;
-                if let Some(ObjectKind::ArrayBuffer(b)) =
-                    vm.heap.get_object(ta.buffer).map(|o| &o.kind)
+                let byte_len = (ta.length as usize).saturating_mul(ta.kind.bytes_per_element());
+                if let Some(bytes) =
+                    read_buffer_slice(vm, ta.buffer, ta.byte_offset as usize, byte_len)
                 {
-                    let end = (off + byte_len).min(b.len());
-                    return Ok(b[off.min(end)..end].to_vec());
+                    return Ok(bytes);
                 }
             }
             Some(ObjectKind::DataView(dv)) => {
                 let dv = *dv;
-                let off = dv.byte_offset as usize;
-                let len = dv.byte_length as usize;
-                if let Some(ObjectKind::ArrayBuffer(b)) =
-                    vm.heap.get_object(dv.buffer).map(|o| &o.kind)
-                {
-                    let end = (off + len).min(b.len());
-                    return Ok(b[off.min(end)..end].to_vec());
+                if let Some(bytes) = read_buffer_slice(
+                    vm,
+                    dv.buffer,
+                    dv.byte_offset as usize,
+                    dv.byte_length as usize,
+                ) {
+                    return Ok(bytes);
                 }
             }
             _ => {}
@@ -449,18 +590,26 @@ pub(crate) fn create_dom_exception(vm: &mut JsVm, name: &str, message: &str) -> 
     let obj = vm
         .heap
         .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
-    let k_name = vm.heap.intern_key("name");
-    let k_msg = vm.heap.intern_key("message");
-    let k_code = vm.heap.intern_key("code");
+    let k_brand = vm.heap.intern_key("__rix_dom_exception__");
+    let k_name = vm.heap.intern_key("__rix_de_name__");
+    let k_msg = vm.heap.intern_key("__rix_de_message__");
+    let k_code = vm.heap.intern_key("__rix_de_code__");
     let n_val = JsValue::from_string(vm.heap.alloc_string(name));
     let m_val = JsValue::from_string(vm.heap.alloc_string(message));
     let c_val = JsValue::from_i32(dom_exception_legacy_code(name));
+    vm.heap.object_define_data(
+        obj,
+        k_brand,
+        JsValue::TRUE,
+        PropertyAttrs::empty(),
+        &mut vm.shapes,
+    );
     vm.heap
-        .object_define_data(obj, k_name, n_val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        .object_define_data(obj, k_name, n_val, PropertyAttrs::empty(), &mut vm.shapes);
     vm.heap
-        .object_define_data(obj, k_msg, m_val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        .object_define_data(obj, k_msg, m_val, PropertyAttrs::empty(), &mut vm.shapes);
     vm.heap
-        .object_define_data(obj, k_code, c_val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        .object_define_data(obj, k_code, c_val, PropertyAttrs::empty(), &mut vm.shapes);
     JsException {
         value: JsValue::from_object(obj),
         message: format!("{name}: {message}"),
@@ -518,13 +667,14 @@ pub fn install_web_apis(
     install_url_and_search_params(vm, &web_apis);
     install_text_encoding(vm, &web_apis);
     install_blob_and_file(vm, &web_apis);
+    install_form_data(vm, host, &web_apis);
     install_structured_clone(vm, &web_apis);
     install_abort_controller(vm, host, events, event_loop, &web_apis);
     install_location_and_history(vm, &web_apis);
     install_web_storage(vm, &web_apis);
     install_performance(vm, event_loop, &web_apis);
     install_console(vm, &web_apis);
-    install_window_and_navigator(vm, host, event_loop);
+    install_window_and_navigator(vm, host, event_loop, &web_apis);
     web_apis
 }
 
@@ -534,6 +684,43 @@ fn install_dom_exception_ctor(vm: &mut JsVm) {
         Some(vm.error_proto),
     ));
     vm.heap.get_object_mut(proto).unwrap().is_prototype = true;
+
+    let brand_check = |vm: &mut JsVm, this_val: JsValue| -> Result<HeapHandle, JsException> {
+        let Some(h) = this_val.as_object() else {
+            return Err(vm.type_error("Illegal invocation on DOMException.prototype"));
+        };
+        let k_brand = vm.heap.intern_key("__rix_dom_exception__");
+        if vm.heap.object_get_own(h, k_brand, &vm.shapes).is_some() {
+            Ok(h)
+        } else {
+            Err(vm.type_error("Illegal invocation on DOMException.prototype"))
+        }
+    };
+
+    for (prop, hidden) in [
+        ("name", "__rix_de_name__"),
+        ("message", "__rix_de_message__"),
+        ("code", "__rix_de_code__"),
+    ] {
+        let key = vm.heap.intern_key(prop);
+        let getter = vm.alloc_host_fn(prop, move |vm, this_val, _| {
+            let h = brand_check(vm, this_val)?;
+            let kh = vm.heap.intern_key(hidden);
+            Ok(vm
+                .heap
+                .object_get_own(h, kh, &vm.shapes)
+                .map_or(JsValue::UNDEFINED, |p| p.value))
+        });
+        vm.heap.object_define_accessor(
+            proto,
+            key,
+            Some(getter),
+            None,
+            PropertyAttrs::ENUMERABLE | PropertyAttrs::CONFIGURABLE,
+            &mut vm.shapes,
+        );
+    }
+
     let ctor = vm.alloc_host_fn("DOMException", move |vm, _this, args| {
         let msg = if arg(args, 0).is_undefined() {
             String::new()
@@ -548,44 +735,258 @@ fn install_dom_exception_ctor(vm: &mut JsVm) {
         let obj = vm
             .heap
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
-        let k_name = vm.heap.intern_key("name");
-        let k_msg = vm.heap.intern_key("message");
-        let k_code = vm.heap.intern_key("code");
+        let k_brand = vm.heap.intern_key("__rix_dom_exception__");
+        let k_name = vm.heap.intern_key("__rix_de_name__");
+        let k_msg = vm.heap.intern_key("__rix_de_message__");
+        let k_code = vm.heap.intern_key("__rix_de_code__");
         let nv = JsValue::from_string(vm.heap.alloc_string(&name));
         let mv = JsValue::from_string(vm.heap.alloc_string(&msg));
         let cv = JsValue::from_i32(dom_exception_legacy_code(&name));
+        vm.heap.object_define_data(
+            obj,
+            k_brand,
+            JsValue::TRUE,
+            PropertyAttrs::empty(),
+            &mut vm.shapes,
+        );
         vm.heap
-            .object_define_data(obj, k_name, nv, PropertyAttrs::DEFAULT, &mut vm.shapes);
+            .object_define_data(obj, k_name, nv, PropertyAttrs::empty(), &mut vm.shapes);
         vm.heap
-            .object_define_data(obj, k_msg, mv, PropertyAttrs::DEFAULT, &mut vm.shapes);
+            .object_define_data(obj, k_msg, mv, PropertyAttrs::empty(), &mut vm.shapes);
         vm.heap
-            .object_define_data(obj, k_code, cv, PropertyAttrs::DEFAULT, &mut vm.shapes);
+            .object_define_data(obj, k_code, cv, PropertyAttrs::empty(), &mut vm.shapes);
         Ok(JsValue::from_object(obj))
     });
     for &(const_name, code) in DOM_EXCEPTION_CODES {
         let k = vm.heap.intern_key(const_name);
         let v = JsValue::from_i32(code);
         vm.heap
-            .object_define_data(ctor, k, v, PropertyAttrs::empty(), &mut vm.shapes);
+            .object_define_data(ctor, k, v, PropertyAttrs::ENUMERABLE, &mut vm.shapes);
         vm.heap
-            .object_define_data(proto, k, v, PropertyAttrs::empty(), &mut vm.shapes);
+            .object_define_data(proto, k, v, PropertyAttrs::ENUMERABLE, &mut vm.shapes);
     }
     bind_ctor_proto(vm, ctor, proto);
     define_global(vm, "DOMException", JsValue::from_object(ctor));
 }
 
 // ---------------------------------------------------------------------------
-// URL & URLSearchParams
+// URL & URLSearchParams (WHATWG URL Standard + Encoding HTML error mode)
 // ---------------------------------------------------------------------------
 
-fn parse_query_pairs(query: &str) -> Vec<(String, String)> {
-    let stripped = query.strip_prefix('?').unwrap_or(query);
-    if stripped.is_empty() {
+/// WHATWG Encoding §4.3 "get an output encoding": maps replacement/UTF-16 to UTF-8.
+pub(crate) fn output_encoding_for_charset(charset: &str) -> &'static Encoding {
+    let trimmed = charset.trim_matches(|c: char| matches!(c, '\t' | '\n' | '\x0c' | '\r' | ' '));
+    let Some(enc) = Encoding::for_label(trimmed.as_bytes()) else {
+        return encoding_rs::UTF_8;
+    };
+    if enc == encoding_rs::REPLACEMENT
+        || enc == encoding_rs::UTF_16LE
+        || enc == encoding_rs::UTF_16BE
+    {
+        encoding_rs::UTF_8
+    } else {
+        enc
+    }
+}
+
+/// Percent-encodes a URL query string using `charset` per WHATWG URL §4.3 ("query state") and
+/// Encoding §4.2 (HTML error mode: unmappable scalar values become `%26%23<decimal>%3B`).
+#[allow(dead_code)]
+pub(crate) fn percent_encode_query_with_charset(
+    query: &str,
+    charset: &str,
+    is_special: bool,
+) -> String {
+    use std::fmt::Write;
+    let enc = output_encoding_for_charset(charset);
+    let push_query_bytes = |bytes: &[u8], out: &mut String| {
+        for &b in bytes {
+            let must_encode = !(0x21..=0x7E).contains(&b)
+                || matches!(b, b'"' | b'#' | b'<' | b'>')
+                || (is_special && b == b'\'');
+            if must_encode {
+                let _ = write!(out, "%{b:02X}");
+            } else {
+                out.push(b as char);
+            }
+        }
+    };
+    let mut out = String::with_capacity(query.len());
+    if enc == encoding_rs::UTF_8 {
+        push_query_bytes(query.as_bytes(), &mut out);
+        return out;
+    }
+    let mut encoder = enc.new_encoder();
+    let mut buf = [0u8; 256];
+    let mut src = query;
+    loop {
+        let (res, read, written) =
+            encoder.encode_from_utf8_without_replacement(src, &mut buf, true);
+        if written > 0 {
+            push_query_bytes(&buf[..written], &mut out);
+        }
+        src = &src[read..];
+        match res {
+            encoding_rs::EncoderResult::InputEmpty => break,
+            encoding_rs::EncoderResult::OutputFull => {}
+            encoding_rs::EncoderResult::Unmappable(ch) => {
+                let _ = write!(out, "%26%23{}%3B", ch as u32);
+            }
+        }
+    }
+    out
+}
+
+/// Encodes `(name, value)` pairs as `application/x-www-form-urlencoded` using `charset`
+/// (WHATWG URL §5.2 & HTML §4.10.21.5).
+#[allow(dead_code)]
+pub(crate) fn form_urlencode_pairs_with_charset(
+    pairs: &[(String, String)],
+    charset: &str,
+) -> String {
+    use std::fmt::Write;
+    let enc = output_encoding_for_charset(charset);
+    let push_form_bytes = |bytes: &[u8], out: &mut String| {
+        for &b in bytes {
+            if b == b' ' {
+                out.push('+');
+            } else if b.is_ascii_alphanumeric() || matches!(b, b'*' | b'-' | b'.' | b'_') {
+                out.push(b as char);
+            } else {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    };
+    let encode_component = |s: &str, out: &mut String| {
+        if enc == encoding_rs::UTF_8 {
+            push_form_bytes(s.as_bytes(), out);
+            return;
+        }
+        let mut encoder = enc.new_encoder();
+        let mut buf = [0u8; 256];
+        let mut src = s;
+        loop {
+            let (res, read, written) =
+                encoder.encode_from_utf8_without_replacement(src, &mut buf, true);
+            if written > 0 {
+                push_form_bytes(&buf[..written], out);
+            }
+            src = &src[read..];
+            match res {
+                encoding_rs::EncoderResult::InputEmpty => break,
+                encoding_rs::EncoderResult::OutputFull => {}
+                encoding_rs::EncoderResult::Unmappable(ch) => {
+                    let _ = write!(out, "%26%23{}%3B", ch as u32);
+                }
+            }
+        }
+    };
+    let mut out = String::new();
+    for (idx, (k, v)) in pairs.iter().enumerate() {
+        if idx > 0 {
+            out.push('&');
+        }
+        encode_component(k, &mut out);
+        out.push('=');
+        encode_component(v, &mut out);
+    }
+    out
+}
+
+/// Parses `raw` relative to `base` using `charset` as the WHATWG URL query encoding override
+/// (used by `<a>` / `<area>` `HTMLHyperlinkElementUtils`).
+/// WHATWG URL §4.3 post-parse normalization:
+/// 1) Normalize Windows drive letter `|` to `:` in `file:` URLs (`file:///w|/m` -> `file:///w:/m`).
+/// 2) Percent-encode a trailing ASCII space in opaque paths before `?`/`#` (`non-special:opaque  ?hi`).
+fn normalize_file_drive_pipe(mut u: Url) -> Url {
+    if u.scheme() == "file" && (u.host_str().is_none() || u.host_str() == Some("")) {
+        let p = u.path();
+        let bytes = p.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b'|'
+            && (bytes.len() == 3 || bytes[3] == b'/')
+        {
+            let mut fixed = String::with_capacity(p.len());
+            fixed.push('/');
+            fixed.push(bytes[1] as char);
+            fixed.push(':');
+            fixed.push_str(&p[3..]);
+            u.set_path(&fixed);
+        }
+    }
+    if u.cannot_be_a_base() {
+        let p = u.path();
+        if let Some(prefix) = p.strip_suffix(' ') {
+            let mut rebuilt = format!("{}:{prefix}%20", u.scheme());
+            if let Some(q) = u.query() {
+                rebuilt.push('?');
+                rebuilt.push_str(q);
+            }
+            if let Some(f) = u.fragment() {
+                rebuilt.push('#');
+                rebuilt.push_str(f);
+            }
+            if let Ok(reparsed) = Url::parse(&rebuilt) {
+                return reparsed;
+            }
+        }
+    }
+    u
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_url_with_charset(raw: &str, base: &Url, charset: &str) -> Option<Url> {
+    let cleaned = strip_ascii_tab_lf(raw);
+    let trimmed = cleaned.trim_matches(|c: char| (c as u32) <= 0x20);
+    let enc = output_encoding_for_charset(charset);
+    if enc != encoding_rs::UTF_8 {
+        // Locate first `?` occurring before any `#`.
+        let hash_pos = trimmed.find('#').unwrap_or(trimmed.len());
+        if let Some(q_pos) = trimmed[..hash_pos].find('?') {
+            let before_q = &trimmed[..q_pos];
+            let raw_q = &trimmed[q_pos + 1..hash_pos];
+            let hash_part = &trimmed[hash_pos..];
+            if let Ok(base_parsed) = base.join(before_q) {
+                if is_special_scheme(base_parsed.scheme()) {
+                    let encoded_q = percent_encode_query_with_charset(raw_q, charset, true);
+                    let rebuilt = format!("{before_q}?{encoded_q}{hash_part}");
+                    if let Ok(u) = base.join(&rebuilt) {
+                        return Some(normalize_file_drive_pipe(u));
+                    }
+                }
+            }
+        }
+    }
+    base.join(trimmed).ok().map(normalize_file_drive_pipe)
+}
+
+pub(crate) fn strip_ascii_tab_lf(s: &str) -> String {
+    s.chars()
+        .filter(|&c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect()
+}
+
+fn is_special_scheme(scheme: &str) -> bool {
+    matches!(scheme, "http" | "https" | "ws" | "wss" | "ftp" | "file")
+}
+
+/// Parses raw `application/x-www-form-urlencoded` bytes WITHOUT stripping a leading `?`
+/// (used for `URL.query()` and `Request/Response.formData()`).
+pub(crate) fn parse_query_pairs_raw(query: &[u8]) -> Vec<(String, String)> {
+    if query.is_empty() {
         return Vec::new();
     }
-    url::form_urlencoded::parse(stripped.as_bytes())
+    url::form_urlencoded::parse(query)
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect()
+}
+
+/// Parses a `URLSearchParams(string)` initializer (strips at most one leading `?`).
+fn parse_query_pairs_from_input(query: &str) -> Vec<(String, String)> {
+    let stripped = query.strip_prefix('?').unwrap_or(query);
+    parse_query_pairs_raw(stripped.as_bytes())
 }
 
 fn serialize_query_pairs(pairs: &[(String, String)]) -> String {
@@ -594,6 +995,31 @@ fn serialize_query_pairs(pairs: &[(String, String)]) -> String {
         ser.append_pair(k, v);
     }
     ser.finish()
+}
+
+/// WHATWG URL §6: when clearing query on an opaque-path URL whose path ends in ASCII space,
+/// percent-encode the last trailing space so serialization preserves all trailing spaces.
+fn opaque_trailing_space_prefix(u: &Url) -> Option<String> {
+    if u.cannot_be_a_base() {
+        u.path().strip_suffix(' ').map(str::to_string)
+    } else {
+        None
+    }
+}
+
+fn restore_opaque_trailing_space(u: &mut Url, trailing_prefix: Option<String>) {
+    if u.cannot_be_a_base() && u.query().is_none() {
+        if let Some(prefix) = trailing_prefix {
+            let mut rebuilt = format!("{}:{prefix}%20", u.scheme());
+            if let Some(frag) = u.fragment() {
+                rebuilt.push('#');
+                rebuilt.push_str(frag);
+            }
+            if let Ok(reparsed) = Url::parse(&rebuilt) {
+                *u = reparsed;
+            }
+        }
+    }
 }
 
 fn sync_owner_url_from_params(web_apis: &SharedWebApis, sp_h: HeapHandle) {
@@ -607,10 +1033,227 @@ fn sync_owner_url_from_params(web_apis: &SharedWebApis, sp_h: HeapHandle) {
     let encoded = serialize_query_pairs(&entry.pairs);
     if let Some(u_entry) = st.url_objects.get_mut(&owner) {
         if encoded.is_empty() {
+            let trailing = opaque_trailing_space_prefix(&u_entry.url);
             u_entry.url.set_query(None);
+            restore_opaque_trailing_space(&mut u_entry.url, trailing);
         } else {
             u_entry.url.set_query(Some(&encoded));
         }
+    }
+}
+
+fn alloc_live_search_params_iterator(
+    vm: &mut JsVm,
+    web_apis: &SharedWebApis,
+    sp_h: HeapHandle,
+    mode: u8, // 0 = entries, 1 = keys, 2 = values
+) -> HeapHandle {
+    let iter = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Ordinary,
+        Some(vm.iterator_proto),
+    ));
+    let idx_cell = Rc::new(std::cell::Cell::new(0usize));
+    let wa = Rc::clone(web_apis);
+    let next_fn = vm.alloc_host_fn("next", move |vm, _, _| {
+        let cur = idx_cell.get();
+        let pair_opt = wa
+            .borrow()
+            .search_params
+            .get(&sp_h)
+            .and_then(|e| e.pairs.get(cur).cloned());
+        let res = vm.alloc_ordinary_object();
+        let k_val = vm.heap.intern_key("value");
+        let k_done = vm.heap.intern_key("done");
+        if let Some((k, v)) = pair_opt {
+            idx_cell.set(cur + 1);
+            let out_val = match mode {
+                1 => JsValue::from_string(vm.heap.alloc_string(&k)),
+                2 => JsValue::from_string(vm.heap.alloc_string(&v)),
+                _ => {
+                    let pair = vm.alloc_array();
+                    let kv = JsValue::from_string(vm.heap.alloc_string(&k));
+                    let vv = JsValue::from_string(vm.heap.alloc_string(&v));
+                    vm.heap.object_push_element(pair, kv);
+                    vm.heap.object_push_element(pair, vv);
+                    JsValue::from_object(pair)
+                }
+            };
+            vm.heap
+                .object_define_data(res, k_val, out_val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+            vm.heap.object_define_data(
+                res,
+                k_done,
+                JsValue::FALSE,
+                PropertyAttrs::DEFAULT,
+                &mut vm.shapes,
+            );
+        } else {
+            vm.heap.object_define_data(
+                res,
+                k_val,
+                JsValue::UNDEFINED,
+                PropertyAttrs::DEFAULT,
+                &mut vm.shapes,
+            );
+            vm.heap.object_define_data(
+                res,
+                k_done,
+                JsValue::TRUE,
+                PropertyAttrs::DEFAULT,
+                &mut vm.shapes,
+            );
+        }
+        Ok(JsValue::from_object(res))
+    });
+    let k_next = vm.heap.intern_key("next");
+    vm.heap.object_define_data(
+        iter,
+        k_next,
+        JsValue::from_object(next_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    iter
+}
+
+fn alloc_url_instance(vm: &mut JsVm, web_apis: &SharedWebApis, parsed: Url) -> HeapHandle {
+    let parsed = normalize_file_drive_pipe(parsed);
+    let (up, spp) = {
+        let st = web_apis.borrow();
+        (
+            st.protos.url_proto.unwrap_or(vm.object_proto),
+            st.protos.search_params_proto.unwrap_or(vm.object_proto),
+        )
+    };
+    let sp_obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(spp)));
+    let url_obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(up)));
+    let pairs = parse_query_pairs_raw(parsed.query().unwrap_or("").as_bytes());
+    let mut st = web_apis.borrow_mut();
+    st.search_params.insert(
+        sp_obj,
+        SearchParamsEntry {
+            pairs,
+            owner_url: Some(url_obj),
+        },
+    );
+    st.url_objects.insert(
+        url_obj,
+        UrlEntry {
+            url: parsed,
+            search_params: sp_obj,
+        },
+    );
+    url_obj
+}
+
+pub(crate) fn apply_url_host_setter(u: &mut Url, raw: &str, allow_port: bool) {
+    let cleaned_full = strip_ascii_tab_lf(raw);
+    if u.cannot_be_a_base() {
+        return;
+    }
+    let special = is_special_scheme(u.scheme());
+    // WHATWG URL §4.3 "host state": terminate input at `/`, `?`, `#` (and `\` for special schemes).
+    let term_pos = cleaned_full
+        .find(|c: char| matches!(c, '/' | '?' | '#') || (special && c == '\\'))
+        .unwrap_or(cleaned_full.len());
+    let cleaned = &cleaned_full[..term_pos];
+
+    // Reject U+0000 in all host setters and forbidden host code points in special schemes.
+    if cleaned.contains('\0') {
+        return;
+    }
+    if special
+        && cleaned.bytes().any(|b| {
+            b <= 0x1F
+                || b == 0x7F
+                || matches!(
+                    b,
+                    b' ' | b'#' | b'/' | b'<' | b'>' | b'?' | b'@' | b'\\' | b'^' | b'|'
+                )
+        })
+    {
+        return;
+    }
+    if !allow_port && !cleaned.starts_with('[') && cleaned.contains(':') {
+        return;
+    }
+    if allow_port && cleaned.starts_with('[') {
+        if let Some(close_bracket) = cleaned.find(']') {
+            let host_part = &cleaned[..=close_bracket];
+            let rest = &cleaned[close_bracket + 1..];
+            if rest.is_empty() {
+                let _ = u.set_host(Some(host_part));
+                return;
+            }
+            if let Some(port_part) = rest.strip_prefix(':') {
+                if u.set_host(Some(host_part)).is_ok() && !port_part.is_empty() {
+                    apply_url_port_setter(u, port_part);
+                }
+            }
+            return;
+        }
+    }
+    if allow_port && !cleaned.starts_with('[') {
+        if let Some(colon) = cleaned.rfind(':') {
+            let host_part = &cleaned[..colon];
+            let port_part = &cleaned[colon + 1..];
+            if special && u.scheme() != "file" && host_part.is_empty() {
+                return;
+            }
+            if !special && host_part.is_empty() && !port_part.is_empty() {
+                return;
+            }
+            let set_res = if host_part.is_empty() {
+                if u.scheme() == "file" {
+                    u.set_host(None)
+                } else {
+                    u.set_host(Some(""))
+                }
+            } else {
+                u.set_host(Some(host_part))
+            };
+            if set_res.is_ok() && !port_part.is_empty() {
+                apply_url_port_setter(u, port_part);
+            }
+            return;
+        }
+    }
+    if cleaned.is_empty() {
+        if special {
+            if u.scheme() == "file" {
+                let _ = u.set_host(None);
+            }
+        } else if u.host_str().is_some()
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.port().is_none()
+        {
+            let _ = u.set_host(Some(""));
+        }
+        return;
+    }
+    let _ = u.set_host(Some(cleaned));
+}
+
+pub(crate) fn apply_url_port_setter(u: &mut Url, raw: &str) {
+    if u.cannot_be_a_base() || u.host_str().is_none() || u.scheme() == "file" {
+        return;
+    }
+    let cleaned = strip_ascii_tab_lf(raw);
+    if cleaned.is_empty() {
+        let _ = u.set_port(None);
+        return;
+    }
+    let digits_end = cleaned.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits_end == 0 {
+        return;
+    }
+    if let Ok(port) = cleaned[..digits_end].parse::<u16>() {
+        let _ = u.set_port(Some(port));
     }
 }
 
@@ -745,7 +1388,9 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
     define_host_method(vm, spp, "sort", move |vm, this_val, _| {
         let h = require_search_params(vm, &wa, this_val)?;
         if let Some(e) = wa.borrow_mut().search_params.get_mut(&h) {
-            e.pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            // WHATWG URL §6.1: sort stably by UTF-16 code units.
+            e.pairs
+                .sort_by(|a, b| a.0.encode_utf16().cmp(b.0.encode_utf16()));
         }
         sync_owner_url_from_params(&wa, h);
         Ok(JsValue::UNDEFINED)
@@ -775,51 +1420,25 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
     });
 
     let wa = Rc::clone(web_apis);
-    define_host_method(vm, spp, "entries", move |vm, this_val, _| {
+    let entries_fn = vm.alloc_host_fn("entries", move |vm, this_val, _| {
         let h = require_search_params(vm, &wa, this_val)?;
-        let pairs = wa
-            .borrow()
-            .search_params
-            .get(&h)
-            .map(|e| e.pairs.clone())
-            .unwrap_or_default();
-        let mut items = Vec::with_capacity(pairs.len());
-        for (k, v) in pairs {
-            let pair = vm.alloc_array();
-            let kv = JsValue::from_string(vm.heap.alloc_string(&k));
-            let vv = JsValue::from_string(vm.heap.alloc_string(&v));
-            vm.heap.object_push_element(pair, kv);
-            vm.heap.object_push_element(pair, vv);
-            items.push(JsValue::from_object(pair));
-        }
-        Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
+        Ok(JsValue::from_object(alloc_live_search_params_iterator(
+            vm, &wa, h, 0,
+        )))
     });
-
-    let wa = Rc::clone(web_apis);
-    let sym_iter_fn = vm.alloc_host_fn("[Symbol.iterator]", move |vm, this_val, _| {
-        let h = require_search_params(vm, &wa, this_val)?;
-        let pairs = wa
-            .borrow()
-            .search_params
-            .get(&h)
-            .map(|e| e.pairs.clone())
-            .unwrap_or_default();
-        let mut items = Vec::with_capacity(pairs.len());
-        for (k, v) in pairs {
-            let pair = vm.alloc_array();
-            let kv = JsValue::from_string(vm.heap.alloc_string(&k));
-            let vv = JsValue::from_string(vm.heap.alloc_string(&v));
-            vm.heap.object_push_element(pair, kv);
-            vm.heap.object_push_element(pair, vv);
-            items.push(JsValue::from_object(pair));
-        }
-        Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
-    });
+    let k_entries = vm.heap.intern_key("entries");
+    vm.heap.object_define_data(
+        spp,
+        k_entries,
+        JsValue::from_object(entries_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
     let sym_key = vm.key_symbol_iterator;
     vm.heap.object_define_data(
         spp,
         sym_key,
-        JsValue::from_object(sym_iter_fn),
+        JsValue::from_object(entries_fn),
         PropertyAttrs::METHOD,
         &mut vm.shapes,
     );
@@ -827,33 +1446,17 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
     let wa = Rc::clone(web_apis);
     define_host_method(vm, spp, "keys", move |vm, this_val, _| {
         let h = require_search_params(vm, &wa, this_val)?;
-        let pairs = wa
-            .borrow()
-            .search_params
-            .get(&h)
-            .map(|e| e.pairs.clone())
-            .unwrap_or_default();
-        let items = pairs
-            .into_iter()
-            .map(|(k, _)| JsValue::from_string(vm.heap.alloc_string(&k)))
-            .collect();
-        Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
+        Ok(JsValue::from_object(alloc_live_search_params_iterator(
+            vm, &wa, h, 1,
+        )))
     });
 
     let wa = Rc::clone(web_apis);
     define_host_method(vm, spp, "values", move |vm, this_val, _| {
         let h = require_search_params(vm, &wa, this_val)?;
-        let pairs = wa
-            .borrow()
-            .search_params
-            .get(&h)
-            .map(|e| e.pairs.clone())
-            .unwrap_or_default();
-        let items = pairs
-            .into_iter()
-            .map(|(_, v)| JsValue::from_string(vm.heap.alloc_string(&v)))
-            .collect();
-        Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
+        Ok(JsValue::from_object(alloc_live_search_params_iterator(
+            vm, &wa, h, 2,
+        )))
     });
 
     let wa = Rc::clone(web_apis);
@@ -861,13 +1464,17 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
         let h = require_search_params(vm, &wa, this_val)?;
         let cb = arg(args, 0);
         let this_arg = arg(args, 1);
-        let pairs = wa
-            .borrow()
-            .search_params
-            .get(&h)
-            .map(|e| e.pairs.clone())
-            .unwrap_or_default();
-        for (k, v) in pairs {
+        let mut idx = 0usize;
+        loop {
+            let pair_opt = wa
+                .borrow()
+                .search_params
+                .get(&h)
+                .and_then(|e| e.pairs.get(idx).cloned());
+            let Some((k, v)) = pair_opt else {
+                break;
+            };
+            idx += 1;
             let kv = JsValue::from_string(vm.heap.alloc_string(&k));
             let vv = JsValue::from_string(vm.heap.alloc_string(&v));
             vm.call_value(cb, this_arg, &[vv, kv, this_val])?;
@@ -881,12 +1488,29 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
         let mut pairs = Vec::new();
         if !init.is_undefined() && !init.is_null() {
             if let Some(ih) = init.as_object() {
-                if let Some(existing) = wa.borrow().search_params.get(&ih) {
-                    pairs = existing.pairs.clone();
-                } else if matches!(
-                    vm.heap.get_object(ih).map(|o| &o.kind),
-                    Some(ObjectKind::Array)
-                ) {
+                let iter_method = vm
+                    .get_property_by_key(ih, vm.key_symbol_iterator)
+                    .ok()
+                    .filter(|v| !v.is_undefined() && !v.is_null());
+                if let Some(existing) = wa.borrow().search_params.get(&ih).cloned() {
+                    if iter_method.is_some() {
+                        // Use iterable protocol if user overrode @@iterator, or fast-path default.
+                        let items = vm.collect_iterable(init)?;
+                        for item in items {
+                            let sub = vm.collect_iterable(item)?;
+                            if sub.len() != 2 {
+                                return Err(
+                                    vm.type_error("URLSearchParams pair must have 2 elements")
+                                );
+                            }
+                            let k = vm.value_to_rust_string(sub[0]);
+                            let v = vm.value_to_rust_string(sub[1]);
+                            pairs.push((k, v));
+                        }
+                    } else {
+                        pairs = existing.pairs;
+                    }
+                } else if iter_method.is_some() {
                     let items = vm.collect_iterable(init)?;
                     for item in items {
                         let sub = vm.collect_iterable(item)?;
@@ -907,7 +1531,7 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
                 }
             } else {
                 let s = vm.value_to_rust_string(init);
-                pairs = parse_query_pairs(&s);
+                pairs = parse_query_pairs_from_input(&s);
             }
         }
         let obj = vm
@@ -953,7 +1577,7 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
             let raw = vm.value_to_rust_string(arg(args, 0));
             let parsed =
                 Url::parse(&raw).map_err(|_| vm.type_error(format!("Invalid URL: {raw}")))?;
-            let new_pairs = parse_query_pairs(parsed.query().unwrap_or(""));
+            let new_pairs = parse_query_pairs_raw(parsed.query().unwrap_or("").as_bytes());
             let mut st = wa.borrow_mut();
             let sp_h = st.url_objects.get(&h).map(|u| u.search_params);
             if let Some(u) = st.url_objects.get_mut(&h) {
@@ -1000,10 +1624,81 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
         },
         move |vm, this_val, args| {
             let h = require_url(vm, &wa, this_val)?;
+            let raw = vm.value_to_rust_string(arg(args, 0));
+            let cleaned = strip_ascii_tab_lf(&raw);
+            let scheme = cleaned.split(':').next().unwrap_or("");
+            if !scheme.is_empty() {
+                if let Some(u) = wa.borrow_mut().url_objects.get_mut(&h) {
+                    let _ = u.url.set_scheme(scheme);
+                }
+            }
+            Ok(JsValue::UNDEFINED)
+        },
+    );
+
+    let wa = Rc::clone(web_apis);
+    define_host_accessor(
+        vm,
+        up,
+        "username",
+        {
+            let wa = Rc::clone(&wa);
+            move |vm, this_val, _| {
+                let h = require_url(vm, &wa, this_val)?;
+                let s = wa
+                    .borrow()
+                    .url_objects
+                    .get(&h)
+                    .map(|u| u.url.username().to_string())
+                    .unwrap_or_default();
+                Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+            }
+        },
+        move |vm, this_val, args| {
+            let h = require_url(vm, &wa, this_val)?;
             let val = vm.value_to_rust_string(arg(args, 0));
-            let scheme = val.trim_end_matches(':');
             if let Some(u) = wa.borrow_mut().url_objects.get_mut(&h) {
-                let _ = u.url.set_scheme(scheme);
+                if !u.url.cannot_be_a_base()
+                    && u.url.host_str().is_some()
+                    && u.url.scheme() != "file"
+                {
+                    let _ = u.url.set_username(&val);
+                }
+            }
+            Ok(JsValue::UNDEFINED)
+        },
+    );
+
+    let wa = Rc::clone(web_apis);
+    define_host_accessor(
+        vm,
+        up,
+        "password",
+        {
+            let wa = Rc::clone(&wa);
+            move |vm, this_val, _| {
+                let h = require_url(vm, &wa, this_val)?;
+                let s = wa
+                    .borrow()
+                    .url_objects
+                    .get(&h)
+                    .and_then(|u| u.url.password().map(str::to_string))
+                    .unwrap_or_default();
+                Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+            }
+        },
+        move |vm, this_val, args| {
+            let h = require_url(vm, &wa, this_val)?;
+            let val = vm.value_to_rust_string(arg(args, 0));
+            if let Some(u) = wa.borrow_mut().url_objects.get_mut(&h) {
+                if !u.url.cannot_be_a_base()
+                    && u.url.host_str().is_some()
+                    && u.url.scheme() != "file"
+                {
+                    let _ = u
+                        .url
+                        .set_password(if val.is_empty() { None } else { Some(&val) });
+                }
             }
             Ok(JsValue::UNDEFINED)
         },
@@ -1031,7 +1726,7 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
             let h = require_url(vm, &wa, this_val)?;
             let val = vm.value_to_rust_string(arg(args, 0));
             if let Some(u) = wa.borrow_mut().url_objects.get_mut(&h) {
-                let _ = u.url.set_host(Some(&val));
+                apply_url_host_setter(&mut u.url, &val, false);
             }
             Ok(JsValue::UNDEFINED)
         },
@@ -1058,33 +1753,44 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
         move |vm, this_val, args| {
             let h = require_url(vm, &wa, this_val)?;
             let val = vm.value_to_rust_string(arg(args, 0));
-            let port = if val.is_empty() {
-                None
-            } else {
-                val.parse::<u16>().ok()
-            };
             if let Some(u) = wa.borrow_mut().url_objects.get_mut(&h) {
-                let _ = u.url.set_port(port);
+                apply_url_port_setter(&mut u.url, &val);
             }
             Ok(JsValue::UNDEFINED)
         },
     );
 
     let wa = Rc::clone(web_apis);
-    define_host_getter(vm, up, "host", move |vm, this_val, _| {
-        let h = require_url(vm, &wa, this_val)?;
-        let s = wa
-            .borrow()
-            .url_objects
-            .get(&h)
-            .map(|u| match (u.url.host_str(), u.url.port()) {
-                (Some(host), Some(port)) => format!("{host}:{port}"),
-                (Some(host), None) => host.to_string(),
-                _ => String::new(),
-            })
-            .unwrap_or_default();
-        Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
-    });
+    define_host_accessor(
+        vm,
+        up,
+        "host",
+        {
+            let wa = Rc::clone(&wa);
+            move |vm, this_val, _| {
+                let h = require_url(vm, &wa, this_val)?;
+                let s = wa
+                    .borrow()
+                    .url_objects
+                    .get(&h)
+                    .map(|u| match (u.url.host_str(), u.url.port()) {
+                        (Some(host), Some(port)) => format!("{host}:{port}"),
+                        (Some(host), None) => host.to_string(),
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default();
+                Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+            }
+        },
+        move |vm, this_val, args| {
+            let h = require_url(vm, &wa, this_val)?;
+            let val = vm.value_to_rust_string(arg(args, 0));
+            if let Some(u) = wa.borrow_mut().url_objects.get_mut(&h) {
+                apply_url_host_setter(&mut u.url, &val, true);
+            }
+            Ok(JsValue::UNDEFINED)
+        },
+    );
 
     let wa = Rc::clone(web_apis);
     define_host_accessor(
@@ -1106,9 +1812,11 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
         },
         move |vm, this_val, args| {
             let h = require_url(vm, &wa, this_val)?;
-            let val = vm.value_to_rust_string(arg(args, 0));
+            let val = strip_ascii_tab_lf(&vm.value_to_rust_string(arg(args, 0)));
             if let Some(u) = wa.borrow_mut().url_objects.get_mut(&h) {
-                u.url.set_path(&val);
+                if !u.url.cannot_be_a_base() {
+                    u.url.set_path(&val);
+                }
             }
             Ok(JsValue::UNDEFINED)
         },
@@ -1136,18 +1844,26 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
         },
         move |vm, this_val, args| {
             let h = require_url(vm, &wa, this_val)?;
-            let val = vm.value_to_rust_string(arg(args, 0));
-            let trimmed = val.strip_prefix('?').unwrap_or(&val);
-            let new_pairs = parse_query_pairs(trimmed);
+            let raw = vm.value_to_rust_string(arg(args, 0));
+            let trimmed = raw.strip_prefix('?').unwrap_or(&raw);
+            let cleaned = strip_ascii_tab_lf(trimmed);
             let mut st = wa.borrow_mut();
             let sp_h = st.url_objects.get(&h).map(|u| u.search_params);
-            if let Some(u) = st.url_objects.get_mut(&h) {
-                if trimmed.is_empty() {
+            let final_query = if let Some(u) = st.url_objects.get_mut(&h) {
+                if raw.is_empty() {
+                    let trailing = opaque_trailing_space_prefix(&u.url);
                     u.url.set_query(None);
+                    restore_opaque_trailing_space(&mut u.url, trailing);
+                } else if trimmed.is_empty() {
+                    u.url.set_query(Some(""));
                 } else {
-                    u.url.set_query(Some(trimmed));
+                    u.url.set_query(Some(&cleaned));
                 }
-            }
+                u.url.query().unwrap_or("").to_string()
+            } else {
+                String::new()
+            };
+            let new_pairs = parse_query_pairs_raw(final_query.as_bytes());
             if let Some(sp_h) = sp_h {
                 if let Some(sp) = st.search_params.get_mut(&sp_h) {
                     sp.pairs = new_pairs;
@@ -1179,13 +1895,16 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
         },
         move |vm, this_val, args| {
             let h = require_url(vm, &wa, this_val)?;
-            let val = vm.value_to_rust_string(arg(args, 0));
-            let trimmed = val.strip_prefix('#').unwrap_or(&val);
+            let raw = vm.value_to_rust_string(arg(args, 0));
+            let trimmed = raw.strip_prefix('#').unwrap_or(&raw);
+            let cleaned = strip_ascii_tab_lf(trimmed);
             if let Some(u) = wa.borrow_mut().url_objects.get_mut(&h) {
-                if trimmed.is_empty() {
+                if raw.is_empty() {
+                    let trailing = opaque_trailing_space_prefix(&u.url);
                     u.url.set_fragment(None);
+                    restore_opaque_trailing_space(&mut u.url, trailing);
                 } else {
-                    u.url.set_fragment(Some(trimmed));
+                    u.url.set_fragment(Some(&cleaned));
                 }
             }
             Ok(JsValue::UNDEFINED)
@@ -1234,9 +1953,12 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
 
     let wa = Rc::clone(web_apis);
     let url_ctor = vm.alloc_host_fn("URL", move |vm, _this, args| {
-        let raw = vm.value_to_rust_string(arg(args, 0));
+        if args.is_empty() {
+            return Err(vm.type_error("URL constructor requires at least 1 argument"));
+        }
+        let raw = vm.to_js_string(arg(args, 0))?;
         let parsed = if args.len() > 1 && !arg(args, 1).is_undefined() {
-            let base_raw = vm.value_to_rust_string(arg(args, 1));
+            let base_raw = vm.to_js_string(arg(args, 1))?;
             let base = Url::parse(&base_raw)
                 .map_err(|_| vm.type_error(format!("Invalid base URL: {base_raw}")))?;
             base.join(&raw)
@@ -1244,40 +1966,96 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
         } else {
             Url::parse(&raw).map_err(|_| vm.type_error(format!("Invalid URL: {raw}")))?
         };
-        let sp_obj = vm
-            .heap
-            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(spp)));
-        let url_obj = vm
-            .heap
-            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(up)));
-        let pairs = parse_query_pairs(parsed.query().unwrap_or(""));
-        let mut st = wa.borrow_mut();
-        st.search_params.insert(
-            sp_obj,
-            SearchParamsEntry {
-                pairs,
-                owner_url: Some(url_obj),
-            },
-        );
-        st.url_objects.insert(
-            url_obj,
-            UrlEntry {
-                url: parsed,
-                search_params: sp_obj,
-            },
-        );
-        Ok(JsValue::from_object(url_obj))
+        Ok(JsValue::from_object(alloc_url_instance(vm, &wa, parsed)))
     });
+    vm.set_fn_length(url_ctor, 1);
+    {
+        let tag_v = JsValue::from_string(vm.heap.alloc_string("URL"));
+        let k_tag = vm.key_symbol_to_string_tag;
+        vm.heap.object_define_data(
+            up,
+            k_tag,
+            tag_v,
+            PropertyAttrs::CONFIGURABLE,
+            &mut vm.shapes,
+        );
+        let sp_tag_v = JsValue::from_string(vm.heap.alloc_string("URLSearchParams"));
+        vm.heap.object_define_data(
+            spp,
+            k_tag,
+            sp_tag_v,
+            PropertyAttrs::CONFIGURABLE,
+            &mut vm.shapes,
+        );
+        for (method, arity) in [
+            ("append", 2u32),
+            ("set", 2),
+            ("delete", 1),
+            ("get", 1),
+            ("getAll", 1),
+            ("has", 1),
+            ("forEach", 1),
+        ] {
+            let km = vm.heap.intern_key(method);
+            if let Some(mh) = vm
+                .heap
+                .object_get_own(spp, km, &vm.shapes)
+                .and_then(|p| p.value.as_object())
+            {
+                vm.set_fn_length(mh, arity);
+            }
+        }
+    }
+    {
+        let wa_p = Rc::clone(web_apis);
+        define_host_method(vm, url_ctor, "parse", move |vm, _, args| {
+            if args.is_empty() {
+                return Err(vm.type_error("URL.parse requires at least 1 argument"));
+            }
+            let raw = vm.to_js_string(arg(args, 0))?;
+            let parsed = if args.len() > 1 && !arg(args, 1).is_undefined() {
+                let base_raw = vm.to_js_string(arg(args, 1))?;
+                Url::parse(&base_raw).and_then(|b| b.join(&raw)).ok()
+            } else {
+                Url::parse(&raw).ok()
+            };
+            Ok(match parsed {
+                Some(u) => JsValue::from_object(alloc_url_instance(vm, &wa_p, u)),
+                None => JsValue::NULL,
+            })
+        });
+        let kp = vm.heap.intern_key("parse");
+        if let Some(fh) = vm
+            .heap
+            .object_get_own(url_ctor, kp, &vm.shapes)
+            .and_then(|p| p.value.as_object())
+        {
+            vm.set_fn_length(fh, 1);
+        }
+    }
     define_host_method(vm, url_ctor, "canParse", |vm, _, args| {
-        let raw = vm.value_to_rust_string(arg(args, 0));
+        if args.is_empty() {
+            return Err(vm.type_error("URL.canParse requires at least 1 argument"));
+        }
+        let raw = vm.to_js_string(arg(args, 0))?;
         let ok = if args.len() > 1 && !arg(args, 1).is_undefined() {
-            let base_raw = vm.value_to_rust_string(arg(args, 1));
+            let base_raw = vm.to_js_string(arg(args, 1))?;
             Url::parse(&base_raw).and_then(|b| b.join(&raw)).is_ok()
         } else {
             Url::parse(&raw).is_ok()
         };
         Ok(JsValue::from_bool(ok))
     });
+    {
+        let kc = vm.heap.intern_key("canParse");
+        if let Some(fh) = vm
+            .heap
+            .object_get_own(url_ctor, kc, &vm.shapes)
+            .and_then(|p| p.value.as_object())
+        {
+            vm.set_fn_length(fh, 1);
+        }
+    }
     {
         let wa_c = Rc::clone(web_apis);
         define_host_method(vm, url_ctor, "createObjectURL", move |vm, _, args| {
@@ -1364,12 +2142,25 @@ fn install_text_encoding(vm: &mut JsVm, web_apis: &SharedWebApis) {
     // TextEncoder
     let ep = vm.alloc_ordinary_object();
     vm.heap.get_object_mut(ep).unwrap().is_prototype = true;
-    let k_enc = vm.heap.intern_key("encoding");
-    let utf8_val = JsValue::from_string(vm.heap.alloc_string("utf-8"));
-    vm.heap
-        .object_define_data(ep, k_enc, utf8_val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    define_host_getter(vm, ep, "encoding", move |vm, this_val, _| {
+        let Some(h) = this_val.as_object() else {
+            return Err(vm.type_error("Incompatible TextEncoder receiver"));
+        };
+        let k_b = vm.heap.intern_key("__rix_text_encoder__");
+        if vm.heap.object_get_own(h, k_b, &vm.shapes).is_none() {
+            return Err(vm.type_error("Incompatible TextEncoder receiver"));
+        }
+        Ok(JsValue::from_string(vm.heap.alloc_string("utf-8")))
+    });
 
-    define_host_method(vm, ep, "encode", |vm, _, args| {
+    define_host_method(vm, ep, "encode", |vm, this_val, args| {
+        let Some(h) = this_val.as_object() else {
+            return Err(vm.type_error("Incompatible TextEncoder receiver"));
+        };
+        let k_b = vm.heap.intern_key("__rix_text_encoder__");
+        if vm.heap.object_get_own(h, k_b, &vm.shapes).is_none() {
+            return Err(vm.type_error("Incompatible TextEncoder receiver"));
+        }
         let s = if arg(args, 0).is_undefined() {
             String::new()
         } else {
@@ -1379,8 +2170,19 @@ fn install_text_encoding(vm: &mut JsVm, web_apis: &SharedWebApis) {
         Ok(JsValue::from_object(u8a))
     });
 
-    define_host_method(vm, ep, "encodeInto", |vm, _, args| {
-        let s = vm.value_to_rust_string(arg(args, 0));
+    define_host_method(vm, ep, "encodeInto", |vm, this_val, args| {
+        let Some(h) = this_val.as_object() else {
+            return Err(vm.type_error("Incompatible TextEncoder receiver"));
+        };
+        let k_b = vm.heap.intern_key("__rix_text_encoder__");
+        if vm.heap.object_get_own(h, k_b, &vm.shapes).is_none() {
+            return Err(vm.type_error("Incompatible TextEncoder receiver"));
+        }
+        let s = if arg(args, 0).is_undefined() {
+            String::new()
+        } else {
+            vm.value_to_rust_string(arg(args, 0))
+        };
         let Some(dst_h) = arg(args, 1).as_object() else {
             return Err(vm.type_error("TextEncoder.encodeInto requires a Uint8Array"));
         };
@@ -1388,26 +2190,51 @@ fn install_text_encoding(vm: &mut JsVm, web_apis: &SharedWebApis) {
             return Err(vm.type_error("TextEncoder.encodeInto requires a Uint8Array"));
         };
         let ta = *ta;
-        let max_bytes = ta.length as usize;
+        if ta.kind != TypedArrayKind::Uint8 {
+            return Err(vm.type_error("TextEncoder.encodeInto requires a Uint8Array"));
+        }
+        let off = ta.byte_offset as usize;
+        // Determine available byte capacity in either ArrayBuffer or SharedArrayBuffer.
+        let avail_len = vm.heap.get_object(ta.buffer).map_or(0usize, |o| {
+            if let Some(shared) = o.rare.as_ref().and_then(|r| r.shared_mem.as_ref()) {
+                let data_len = shared.byte_len();
+                let cap = o
+                    .rare
+                    .as_ref()
+                    .and_then(|r| r.ab_fixed_byte_len)
+                    .map_or(data_len, |f| f.min(data_len));
+                cap.saturating_sub(off).min(ta.length as usize)
+            } else if let ObjectKind::ArrayBuffer(buf) = &o.kind {
+                buf.len().saturating_sub(off).min(ta.length as usize)
+            } else {
+                0
+            }
+        });
         let mut read_units = 0usize;
-        let mut out_bytes = Vec::new();
+        let mut out_bytes = Vec::with_capacity(avail_len.min(s.len()));
         for ch in s.chars() {
             let mut tmp = [0u8; 4];
             let encoded = ch.encode_utf8(&mut tmp).as_bytes();
-            if out_bytes.len() + encoded.len() > max_bytes {
+            if out_bytes.len() + encoded.len() > avail_len {
                 break;
             }
             out_bytes.extend_from_slice(encoded);
             read_units += ch.len_utf16();
         }
         let written = out_bytes.len();
-        let off = ta.byte_offset as usize;
-        if let Some(ObjectKind::ArrayBuffer(buf)) =
-            vm.heap.get_object_mut(ta.buffer).map(|o| &mut o.kind)
-        {
-            let end = (off + written).min(buf.len());
-            let copy_len = end.saturating_sub(off);
-            buf[off..off + copy_len].copy_from_slice(&out_bytes[..copy_len]);
+        if written > 0 {
+            if let Some(buf_obj) = vm.heap.get_object_mut(ta.buffer) {
+                if let Some(shared) = buf_obj.rare.as_ref().and_then(|r| r.shared_mem.as_ref()) {
+                    let mut guard = shared.data.lock().unwrap_or_else(|e| e.into_inner());
+                    let end = off.saturating_add(written).min(guard.len());
+                    let copy_len = end.saturating_sub(off);
+                    guard[off..off + copy_len].copy_from_slice(&out_bytes[..copy_len]);
+                } else if let ObjectKind::ArrayBuffer(buf) = &mut buf_obj.kind {
+                    let end = off.saturating_add(written).min(buf.len());
+                    let copy_len = end.saturating_sub(off);
+                    buf[off..off + copy_len].copy_from_slice(&out_bytes[..copy_len]);
+                }
+            }
         }
         let res = vm.alloc_ordinary_object();
         let k_read = vm.heap.intern_key("read");
@@ -1415,14 +2242,14 @@ fn install_text_encoding(vm: &mut JsVm, web_apis: &SharedWebApis) {
         vm.heap.object_define_data(
             res,
             k_read,
-            JsValue::from_i32(read_units as i32),
+            JsValue::from_f64(read_units as f64),
             PropertyAttrs::DEFAULT,
             &mut vm.shapes,
         );
         vm.heap.object_define_data(
             res,
             k_written,
-            JsValue::from_i32(written as i32),
+            JsValue::from_f64(written as f64),
             PropertyAttrs::DEFAULT,
             &mut vm.shapes,
         );
@@ -1433,99 +2260,480 @@ fn install_text_encoding(vm: &mut JsVm, web_apis: &SharedWebApis) {
         let obj = vm
             .heap
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(ep)));
+        let k_b = vm.heap.intern_key("__rix_text_encoder__");
+        vm.heap.object_define_data(
+            obj,
+            k_b,
+            JsValue::TRUE,
+            PropertyAttrs::empty(),
+            &mut vm.shapes,
+        );
         Ok(JsValue::from_object(obj))
     });
     bind_ctor_proto(vm, enc_ctor, ep);
     define_global(vm, "TextEncoder", JsValue::from_object(enc_ctor));
 
-    // TextDecoder
+    // TextDecoder (full WHATWG Encoding Standard stateful decoder via encoding_rs)
     let dp = vm.alloc_ordinary_object();
     vm.heap.get_object_mut(dp).unwrap().is_prototype = true;
-    let wa = Rc::clone(web_apis);
-    define_host_method(vm, dp, "decode", move |vm, this_val, args| {
-        let Some(this_h) = this_val.as_object() else {
-            return Err(vm.type_error("Incompatible TextDecoder receiver"));
-        };
-        let k_enc = vm.heap.intern_key("encoding");
-        let k_fatal = vm.heap.intern_key("fatal");
-        let k_bom = vm.heap.intern_key("ignoreBOM");
-        let enc_label = vm
-            .get_property_by_key(this_h, k_enc)
-            .map(|v| vm.value_to_rust_string(v))
-            .unwrap_or_else(|_| "utf-8".to_string());
-        let fatal = vm
-            .get_property_by_key(this_h, k_fatal)
-            .is_ok_and(|v| vm.to_boolean(v));
-        let ignore_bom = vm
-            .get_property_by_key(this_h, k_bom)
-            .is_ok_and(|v| vm.to_boolean(v));
-        let input = arg(args, 0);
-        if input.is_undefined() {
-            return Ok(JsValue::from_string(vm.heap.alloc_string("")));
-        }
-        let bytes = extract_bytes_from_js(vm, &wa, input)?;
-        let enc = Encoding::for_label(enc_label.as_bytes()).unwrap_or(encoding_rs::UTF_8);
-        let slice =
-            if !ignore_bom && enc == encoding_rs::UTF_8 && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-                &bytes[3..]
-            } else {
-                &bytes
+    web_apis.borrow_mut().protos.text_decoder_proto = Some(dp);
+
+    let require_decoder =
+        |vm: &mut JsVm, wa: &SharedWebApis, val: JsValue| -> Result<HeapHandle, JsException> {
+            let Some(h) = val.as_object() else {
+                return Err(vm.type_error("Incompatible TextDecoder receiver"));
             };
-        let (decoded, had_errors) = enc.decode_without_bom_handling(slice);
-        if fatal && had_errors {
-            return Err(vm.type_error("The encoded data was not valid for encoding"));
-        }
-        Ok(JsValue::from_string(vm.heap.alloc_string(decoded.as_ref())))
+            if wa.borrow().text_decoders.contains_key(&h) {
+                Ok(h)
+            } else {
+                Err(vm.type_error("Incompatible TextDecoder receiver"))
+            }
+        };
+
+    let wa = Rc::clone(web_apis);
+    define_host_getter(vm, dp, "encoding", move |vm, this_val, _| {
+        let h = require_decoder(vm, &wa, this_val)?;
+        let name = wa
+            .borrow()
+            .text_decoders
+            .get(&h)
+            .map(|d| d.encoding.name().to_ascii_lowercase())
+            .unwrap_or_else(|| "utf-8".to_string());
+        Ok(JsValue::from_string(vm.heap.alloc_string(&name)))
     });
 
+    let wa = Rc::clone(web_apis);
+    define_host_getter(vm, dp, "fatal", move |vm, this_val, _| {
+        let h = require_decoder(vm, &wa, this_val)?;
+        let fatal = wa.borrow().text_decoders.get(&h).is_some_and(|d| d.fatal);
+        Ok(JsValue::from_bool(fatal))
+    });
+
+    let wa = Rc::clone(web_apis);
+    define_host_getter(vm, dp, "ignoreBOM", move |vm, this_val, _| {
+        let h = require_decoder(vm, &wa, this_val)?;
+        let ignore_bom = wa
+            .borrow()
+            .text_decoders
+            .get(&h)
+            .is_some_and(|d| d.ignore_bom);
+        Ok(JsValue::from_bool(ignore_bom))
+    });
+
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, dp, "decode", move |vm, this_val, args| {
+        let h = require_decoder(vm, &wa, this_val)?;
+        let input = arg(args, 0);
+        let bytes = if input.is_undefined() {
+            Vec::new()
+        } else {
+            extract_allow_shared_buffer_source(vm, input)?
+        };
+        let mut stream = false;
+        let opt_val = arg(args, 1);
+        if !opt_val.is_undefined() && !opt_val.is_null() {
+            let Some(opt_h) = opt_val.as_object() else {
+                return Err(vm.type_error("TextDecoder.decode options must be an object"));
+            };
+            let k_stream = vm.heap.intern_key("stream");
+            stream = vm
+                .get_property_by_key(opt_h, k_stream)
+                .map(|v| vm.to_boolean(v))?;
+        }
+        let mut st = wa.borrow_mut();
+        let dec = st
+            .text_decoders
+            .get_mut(&h)
+            .ok_or_else(|| vm.type_error("Incompatible TextDecoder receiver"))?;
+        if !dec.do_not_flush {
+            dec.reset();
+        }
+        dec.do_not_flush = stream;
+        let last = !stream;
+        let max_len = dec
+            .decoder
+            .max_utf8_buffer_length_without_replacement(bytes.len())
+            .unwrap_or(bytes.len().saturating_mul(4).saturating_add(16))
+            .max(16);
+        let mut out = String::with_capacity(max_len.min(65536));
+        let mut offset = 0usize;
+        let mut had_error = false;
+        loop {
+            let chunk = &bytes[offset..];
+            if dec.fatal {
+                let (res, read) = dec
+                    .decoder
+                    .decode_to_string_without_replacement(chunk, &mut out, last);
+                offset += read;
+                match res {
+                    encoding_rs::DecoderResult::InputEmpty => break,
+                    encoding_rs::DecoderResult::OutputFull => {
+                        out.reserve(chunk.len().saturating_mul(3).max(64));
+                    }
+                    encoding_rs::DecoderResult::Malformed(_, _) => {
+                        had_error = true;
+                        break;
+                    }
+                }
+            } else {
+                let (res, read, _) = dec.decoder.decode_to_string(chunk, &mut out, last);
+                offset += read;
+                match res {
+                    encoding_rs::CoderResult::InputEmpty => break,
+                    encoding_rs::CoderResult::OutputFull => {
+                        out.reserve(chunk.len().saturating_mul(3).max(64));
+                    }
+                }
+            }
+        }
+        if last || had_error {
+            dec.reset();
+        }
+        drop(st);
+        if had_error {
+            return Err(vm.type_error("The encoded data was not valid for encoding"));
+        }
+        Ok(JsValue::from_string(vm.heap.alloc_string(&out)))
+    });
+
+    let wa = Rc::clone(web_apis);
     let dec_ctor = vm.alloc_host_fn("TextDecoder", move |vm, _, args| {
         let label = if arg(args, 0).is_undefined() {
             "utf-8".to_string()
         } else {
             vm.value_to_rust_string(arg(args, 0))
         };
-        let Some(enc) = Encoding::for_label(label.trim().as_bytes()) else {
+        // WHATWG Encoding §4.2: trim ONLY ASCII whitespace (U+0009, U+000A, U+000C, U+000D, U+0020).
+        let trimmed = label.trim_matches(|c: char| matches!(c, '\t' | '\n' | '\x0c' | '\r' | ' '));
+        let Some(enc) = Encoding::for_label(trimmed.as_bytes()) else {
             return Err(vm.range_error(format!("Unsupported encoding label: {label}")));
         };
+        // WHATWG Encoding §7.4 step 2: replacement encoding MUST throw RangeError.
+        if enc == encoding_rs::REPLACEMENT {
+            return Err(vm.range_error(format!("Unsupported encoding label: {label}")));
+        }
         let mut fatal = false;
         let mut ignore_bom = false;
-        if let Some(opt_h) = arg(args, 1).as_object() {
+        let opt_val = arg(args, 1);
+        if !opt_val.is_undefined() && !opt_val.is_null() {
+            let Some(opt_h) = opt_val.as_object() else {
+                return Err(vm.type_error("TextDecoder options must be an object"));
+            };
             let kf = vm.heap.intern_key("fatal");
             let kb = vm.heap.intern_key("ignoreBOM");
             fatal = vm
                 .get_property_by_key(opt_h, kf)
-                .is_ok_and(|v| vm.to_boolean(v));
+                .map(|v| vm.to_boolean(v))?;
             ignore_bom = vm
                 .get_property_by_key(opt_h, kb)
-                .is_ok_and(|v| vm.to_boolean(v));
+                .map(|v| vm.to_boolean(v))?;
         }
         let obj = vm
             .heap
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(dp)));
-        let k_enc = vm.heap.intern_key("encoding");
-        let k_fatal = vm.heap.intern_key("fatal");
-        let k_bom = vm.heap.intern_key("ignoreBOM");
-        let enc_val = JsValue::from_string(vm.heap.alloc_string(enc.name().to_ascii_lowercase()));
-        vm.heap
-            .object_define_data(obj, k_enc, enc_val, PropertyAttrs::DEFAULT, &mut vm.shapes);
-        vm.heap.object_define_data(
-            obj,
-            k_fatal,
-            JsValue::from_bool(fatal),
-            PropertyAttrs::DEFAULT,
-            &mut vm.shapes,
-        );
-        vm.heap.object_define_data(
-            obj,
-            k_bom,
-            JsValue::from_bool(ignore_bom),
-            PropertyAttrs::DEFAULT,
-            &mut vm.shapes,
-        );
+        wa.borrow_mut()
+            .text_decoders
+            .insert(obj, TextDecoderEntry::new(enc, fatal, ignore_bom));
         Ok(JsValue::from_object(obj))
     });
     bind_ctor_proto(vm, dec_ctor, dp);
     define_global(vm, "TextDecoder", JsValue::from_object(dec_ctor));
+}
+
+// ---------------------------------------------------------------------------
+// FormData (WHATWG XMLHttpRequest / Fetch)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn alloc_form_data_from_urlencoded(
+    vm: &mut JsVm,
+    web_apis: &SharedWebApis,
+    bytes: &[u8],
+) -> HeapHandle {
+    let pairs = parse_query_pairs_raw(bytes)
+        .into_iter()
+        .map(|(k, v)| (k, FormDataVal::Text(v)))
+        .collect();
+    let proto = web_apis
+        .borrow()
+        .protos
+        .form_data_proto
+        .unwrap_or(vm.object_proto);
+    let obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    web_apis
+        .borrow_mut()
+        .form_data
+        .insert(obj, FormDataEntry { pairs });
+    obj
+}
+
+fn require_form_data(
+    vm: &mut JsVm,
+    web_apis: &SharedWebApis,
+    val: JsValue,
+) -> Result<HeapHandle, JsException> {
+    let Some(h) = val.as_object() else {
+        return Err(vm.type_error("Incompatible FormData receiver"));
+    };
+    if web_apis.borrow().form_data.contains_key(&h) {
+        Ok(h)
+    } else {
+        Err(vm.type_error("Incompatible FormData receiver"))
+    }
+}
+
+fn form_data_val_to_js(vm: &mut JsVm, v: &FormDataVal) -> JsValue {
+    match v {
+        FormDataVal::Text(s) => JsValue::from_string(vm.heap.alloc_string(s)),
+        FormDataVal::File(fh) => JsValue::from_object(*fh),
+    }
+}
+
+fn install_form_data(vm: &mut JsVm, host: &SharedHost, web_apis: &SharedWebApis) {
+    let fdp = vm.alloc_ordinary_object();
+    vm.heap.get_object_mut(fdp).unwrap().is_prototype = true;
+    web_apis.borrow_mut().protos.form_data_proto = Some(fdp);
+
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, fdp, "append", move |vm, this_val, args| {
+        let h = require_form_data(vm, &wa, this_val)?;
+        let name = vm.value_to_rust_string(arg(args, 0));
+        let val = arg(args, 1);
+        let entry_val = if let Some(bh) = val.as_object() {
+            if wa.borrow().blobs.contains_key(&bh) {
+                FormDataVal::File(bh)
+            } else {
+                FormDataVal::Text(vm.value_to_rust_string(val))
+            }
+        } else {
+            FormDataVal::Text(vm.value_to_rust_string(val))
+        };
+        if let Some(fd) = wa.borrow_mut().form_data.get_mut(&h) {
+            fd.pairs.push((name, entry_val));
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, fdp, "set", move |vm, this_val, args| {
+        let h = require_form_data(vm, &wa, this_val)?;
+        let name = vm.value_to_rust_string(arg(args, 0));
+        let val = arg(args, 1);
+        let entry_val = if let Some(bh) = val.as_object() {
+            if wa.borrow().blobs.contains_key(&bh) {
+                FormDataVal::File(bh)
+            } else {
+                FormDataVal::Text(vm.value_to_rust_string(val))
+            }
+        } else {
+            FormDataVal::Text(vm.value_to_rust_string(val))
+        };
+        if let Some(fd) = wa.borrow_mut().form_data.get_mut(&h) {
+            let mut replaced = false;
+            let mut next = Vec::with_capacity(fd.pairs.len() + 1);
+            for (k, v) in fd.pairs.drain(..) {
+                if k == name {
+                    if !replaced {
+                        next.push((name.clone(), entry_val.clone()));
+                        replaced = true;
+                    }
+                } else {
+                    next.push((k, v));
+                }
+            }
+            if !replaced {
+                next.push((name, entry_val));
+            }
+            fd.pairs = next;
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, fdp, "delete", move |vm, this_val, args| {
+        let h = require_form_data(vm, &wa, this_val)?;
+        let name = vm.value_to_rust_string(arg(args, 0));
+        if let Some(fd) = wa.borrow_mut().form_data.get_mut(&h) {
+            fd.pairs.retain(|(k, _)| k != &name);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, fdp, "get", move |vm, this_val, args| {
+        let h = require_form_data(vm, &wa, this_val)?;
+        let name = vm.value_to_rust_string(arg(args, 0));
+        let found = wa.borrow().form_data.get(&h).and_then(|fd| {
+            fd.pairs
+                .iter()
+                .find(|(k, _)| k == &name)
+                .map(|(_, v)| v.clone())
+        });
+        Ok(match found {
+            Some(v) => form_data_val_to_js(vm, &v),
+            None => JsValue::NULL,
+        })
+    });
+
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, fdp, "getAll", move |vm, this_val, args| {
+        let h = require_form_data(vm, &wa, this_val)?;
+        let name = vm.value_to_rust_string(arg(args, 0));
+        let vals: Vec<FormDataVal> = wa
+            .borrow()
+            .form_data
+            .get(&h)
+            .map(|fd| {
+                fd.pairs
+                    .iter()
+                    .filter(|(k, _)| k == &name)
+                    .map(|(_, v)| v.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let arr = vm.alloc_array();
+        for v in vals {
+            let jv = form_data_val_to_js(vm, &v);
+            vm.heap.object_push_element(arr, jv);
+        }
+        Ok(JsValue::from_object(arr))
+    });
+
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, fdp, "has", move |vm, this_val, args| {
+        let h = require_form_data(vm, &wa, this_val)?;
+        let name = vm.value_to_rust_string(arg(args, 0));
+        let found = wa
+            .borrow()
+            .form_data
+            .get(&h)
+            .is_some_and(|fd| fd.pairs.iter().any(|(k, _)| k == &name));
+        Ok(JsValue::from_bool(found))
+    });
+
+    let wa = Rc::clone(web_apis);
+    let entries_fn = vm.alloc_host_fn("entries", move |vm, this_val, _| {
+        let h = require_form_data(vm, &wa, this_val)?;
+        let pairs = wa
+            .borrow()
+            .form_data
+            .get(&h)
+            .map(|fd| fd.pairs.clone())
+            .unwrap_or_default();
+        let mut items = Vec::with_capacity(pairs.len());
+        for (k, v) in pairs {
+            let pair = vm.alloc_array();
+            let kv = JsValue::from_string(vm.heap.alloc_string(&k));
+            let vv = form_data_val_to_js(vm, &v);
+            vm.heap.object_push_element(pair, kv);
+            vm.heap.object_push_element(pair, vv);
+            items.push(JsValue::from_object(pair));
+        }
+        Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
+    });
+    let k_ent = vm.heap.intern_key("entries");
+    vm.heap.object_define_data(
+        fdp,
+        k_ent,
+        JsValue::from_object(entries_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+    let sym_it = vm.key_symbol_iterator;
+    vm.heap.object_define_data(
+        fdp,
+        sym_it,
+        JsValue::from_object(entries_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
+
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, fdp, "keys", move |vm, this_val, _| {
+        let h = require_form_data(vm, &wa, this_val)?;
+        let pairs = wa
+            .borrow()
+            .form_data
+            .get(&h)
+            .map(|fd| fd.pairs.clone())
+            .unwrap_or_default();
+        let items = pairs
+            .into_iter()
+            .map(|(k, _)| JsValue::from_string(vm.heap.alloc_string(&k)))
+            .collect();
+        Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
+    });
+
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, fdp, "values", move |vm, this_val, _| {
+        let h = require_form_data(vm, &wa, this_val)?;
+        let pairs = wa
+            .borrow()
+            .form_data
+            .get(&h)
+            .map(|fd| fd.pairs.clone())
+            .unwrap_or_default();
+        let items = pairs
+            .iter()
+            .map(|(_, v)| form_data_val_to_js(vm, v))
+            .collect();
+        Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
+    });
+
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, fdp, "forEach", move |vm, this_val, args| {
+        let h = require_form_data(vm, &wa, this_val)?;
+        let cb = arg(args, 0);
+        let this_arg = arg(args, 1);
+        let pairs = wa
+            .borrow()
+            .form_data
+            .get(&h)
+            .map(|fd| fd.pairs.clone())
+            .unwrap_or_default();
+        for (k, v) in pairs {
+            let kv = JsValue::from_string(vm.heap.alloc_string(&k));
+            let vv = form_data_val_to_js(vm, &v);
+            vm.call_value(cb, this_arg, &[vv, kv, this_val])?;
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    let wa = Rc::clone(web_apis);
+    let h_dom = Rc::clone(host);
+    let ctor = vm.alloc_host_fn("FormData", move |vm, _, args| {
+        let mut pairs = Vec::new();
+        let form_val = arg(args, 0);
+        if !form_val.is_undefined() && !form_val.is_null() {
+            if let Some(form_nid) = h_dom.borrow().node_for_value(vm, form_val) {
+                let doc_rc = Rc::clone(&h_dom.borrow().document);
+                let doc = doc_rc.borrow();
+                for desc in doc.descendants(form_nid) {
+                    if let Some(rix_dom::NodeData::Element(el)) = doc.get(desc) {
+                        let tag = el.name.local.as_str();
+                        if matches!(tag, "input" | "textarea" | "select")
+                            && !el.has_attribute("disabled")
+                        {
+                            if let Some(name) = el.get_attribute("name").filter(|n| !n.is_empty()) {
+                                let val = el.get_attribute("value").unwrap_or("").to_string();
+                                pairs.push((name.to_string(), FormDataVal::Text(val)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let obj = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(fdp)));
+        wa.borrow_mut()
+            .form_data
+            .insert(obj, FormDataEntry { pairs });
+        Ok(JsValue::from_object(obj))
+    });
+    bind_ctor_proto(vm, ctor, fdp);
+    define_global(vm, "FormData", JsValue::from_object(ctor));
 }
 
 // ---------------------------------------------------------------------------
@@ -1800,7 +3008,23 @@ pub(crate) fn structured_clone_inner(
             "Function could not be cloned",
         ));
     }
-    if let Some(blob) = web_apis.borrow().blobs.get(&h).cloned() {
+    {
+        let st = web_apis.borrow();
+        if st.url_objects.contains_key(&h)
+            || st.search_params.contains_key(&h)
+            || st.text_decoders.contains_key(&h)
+            || st.form_data.contains_key(&h)
+            || st.abort_signals.contains_key(&h)
+        {
+            return Err(create_dom_exception(
+                vm,
+                "DataCloneError",
+                "Object could not be cloned",
+            ));
+        }
+    }
+    let blob_opt = web_apis.borrow().blobs.get(&h).cloned();
+    if let Some(blob) = blob_opt {
         let proto = if blob.name.is_some() {
             web_apis.borrow().protos.file_proto
         } else {
@@ -2860,7 +4084,12 @@ fn install_console(vm: &mut JsVm, web_apis: &SharedWebApis) {
     define_global(vm, "console", JsValue::from_object(console_obj));
 }
 
-fn install_window_and_navigator(vm: &mut JsVm, host: &SharedHost, event_loop: &SharedEventLoop) {
+fn install_window_and_navigator(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
+) {
     let global = vm.global;
 
     // Live viewport & scroll getters on `window` / `globalThis`.
@@ -3035,7 +4264,123 @@ fn install_window_and_navigator(vm: &mut JsVm, host: &SharedHost, event_loop: &S
         vm.heap
             .object_define_data(nav, key, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
     }
+    {
+        let wa_sb = Rc::clone(web_apis);
+        define_host_method(vm, nav, "sendBeacon", move |vm, _, args| {
+            if args.is_empty() {
+                return Err(vm.type_error("navigator.sendBeacon requires a url argument"));
+            }
+            let raw_url = vm.value_to_rust_string(arg(args, 0));
+            let base = wa_sb.borrow().location_url.clone();
+            let parsed = base
+                .join(&raw_url)
+                .map_err(|_| vm.type_error(format!("Invalid URL: {raw_url}")))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(vm.type_error("navigator.sendBeacon only supports http(s) URLs"));
+            }
+            Ok(JsValue::TRUE)
+        });
+    }
     define_global(vm, "navigator", JsValue::from_object(nav));
+
+    // HTML §8.4 base64 utilities: `btoa` & `atob`
+    define_host_method(vm, global, "btoa", |vm, _, args| {
+        if args.is_empty() {
+            return Err(vm.type_error("btoa requires 1 argument"));
+        }
+        let s = vm.value_to_rust_string(arg(args, 0));
+        let mut bytes = Vec::with_capacity(s.len());
+        for ch in s.chars() {
+            let cp = ch as u32;
+            if cp > 0xFF {
+                return Err(create_dom_exception(
+                    vm,
+                    "InvalidCharacterError",
+                    "The string to be encoded contains characters outside of the Latin1 range.",
+                ));
+            }
+            bytes.push(cp as u8);
+        }
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        let mut i = 0;
+        while i < bytes.len() {
+            let b0 = bytes[i];
+            let b1 = if i + 1 < bytes.len() { bytes[i + 1] } else { 0 };
+            let b2 = if i + 2 < bytes.len() { bytes[i + 2] } else { 0 };
+            out.push(TABLE[(b0 >> 2) as usize] as char);
+            out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+            if i + 1 < bytes.len() {
+                out.push(TABLE[(((b1 & 0x0F) << 2) | (b2 >> 6)) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            if i + 2 < bytes.len() {
+                out.push(TABLE[(b2 & 0x3F) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            i += 3;
+        }
+        Ok(JsValue::from_string(vm.heap.alloc_string(&out)))
+    });
+
+    define_host_method(vm, global, "atob", |vm, _, args| {
+        if args.is_empty() {
+            return Err(vm.type_error("atob requires 1 argument"));
+        }
+        let raw = vm.value_to_rust_string(arg(args, 0));
+        let cleaned: Vec<u8> = raw
+            .bytes()
+            .filter(|b| !matches!(b, b'\t' | b'\n' | b'\x0c' | b'\r' | b' '))
+            .collect();
+        let mut bytes = cleaned.as_slice();
+        if bytes.len().is_multiple_of(4) {
+            if bytes.ends_with(b"==") {
+                bytes = &bytes[..bytes.len() - 2];
+            } else if bytes.ends_with(b"=") {
+                bytes = &bytes[..bytes.len() - 1];
+            }
+        }
+        if bytes.len() % 4 == 1 {
+            return Err(create_dom_exception(
+                vm,
+                "InvalidCharacterError",
+                "The string to be decoded is not correctly encoded.",
+            ));
+        }
+        let decode_val = |b: u8| -> Option<u32> {
+            match b {
+                b'A'..=b'Z' => Some(u32::from(b - b'A')),
+                b'a'..=b'z' => Some(u32::from(b - b'a') + 26),
+                b'0'..=b'9' => Some(u32::from(b - b'0') + 52),
+                b'+' => Some(62),
+                b'/' => Some(63),
+                _ => None,
+            }
+        };
+        let mut out = String::with_capacity(bytes.len());
+        let mut acc = 0u32;
+        let mut bits = 0u32;
+        for &b in bytes {
+            let Some(v) = decode_val(b) else {
+                return Err(create_dom_exception(
+                    vm,
+                    "InvalidCharacterError",
+                    "The string to be decoded is not correctly encoded.",
+                ));
+            };
+            acc = (acc << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                let byte = ((acc >> bits) & 0xFF) as u8;
+                out.push(char::from(byte));
+            }
+        }
+        Ok(JsValue::from_string(vm.heap.alloc_string(&out)))
+    });
 }
 
 fn evaluate_simple_media_query(query: &str, vw: f32, vh: f32, dark_mode: bool) -> bool {
@@ -3078,4 +4423,21 @@ fn extract_media_px(haystack: &str, key: &str) -> Option<f32> {
         .find(|c: char| !c.is_ascii_digit() && c != '.')
         .unwrap_or(rest.len());
     rest[..num_end].parse::<f32>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whatwg_url_and_form_charset_encoding_matches_spec() {
+        let base = Url::parse("https://example.com/").unwrap();
+        let u = parse_url_with_charset("https://example.com/?¡", &base, "EUC-KR").unwrap();
+        assert_eq!(u.query(), Some("%A2%AE"));
+        let u_err = parse_url_with_charset("https://example.com/?丂", &base, "EUC-KR").unwrap();
+        assert_eq!(u_err.query(), Some("%26%2319970%3B"));
+        let form =
+            form_urlencode_pairs_with_charset(&[("q".to_string(), "¡ 丂".to_string())], "EUC-KR");
+        assert_eq!(form, "q=%A2%AE+%26%2319970%3B");
+    }
 }
