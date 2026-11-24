@@ -313,7 +313,9 @@ pub fn layout_table(
     }
 
     // Pass 3: Layout every cell at its exact column-span width to determine intrinsic cell heights.
-    let mut cell_fragments: Vec<(usize, Fragment)> = Vec::with_capacity(grid.cells.len());
+    let my_oof_start = ctx.pending_oof.len();
+    let mut cell_fragments: Vec<(usize, Fragment, usize, usize)> =
+        Vec::with_capacity(grid.cells.len());
     let mut row_heights = vec![0.0f32; grid.num_rows];
 
     for (cell_i, cell) in grid.cells.iter().enumerate() {
@@ -321,8 +323,10 @@ pub fn layout_table(
         let span_w: f32 = col_widths[cell.col_idx..span_end].iter().sum::<f32>()
             + h_spacing * (cell.colspan.saturating_sub(1) as f32);
 
+        let cell_oof_start = ctx.pending_oof.len();
         let cell_space = space.with_available(span_w, None);
         let mut frag = layout_box(ctx, cell.box_id, cell_space);
+        let cell_oof_end = ctx.pending_oof.len();
         // Enforce exact column-span border-box width on the cell fragment.
         let c_pb_w = frag.padding.horizontal() + frag.border.horizontal();
         frag.border_rect.size.width = span_w;
@@ -341,11 +345,11 @@ pub fn layout_table(
         if cell.rowspan == 1 {
             row_heights[cell.row_idx] = row_heights[cell.row_idx].max(frag.border_rect.size.height);
         }
-        cell_fragments.push((cell_i, frag));
+        cell_fragments.push((cell_i, frag, cell_oof_start, cell_oof_end));
     }
 
     // Pass 4: Distribute `rowspan > 1` cell heights across their spanned rows.
-    for (cell_i, frag) in &cell_fragments {
+    for (cell_i, frag, _, _) in &cell_fragments {
         let cell = &grid.cells[*cell_i];
         if cell.rowspan > 1 {
             let end_r = (cell.row_idx + cell.rowspan).min(grid.num_rows);
@@ -380,7 +384,7 @@ pub fn layout_table(
 
     // Group positioned cell fragments into row fragments for clean paint & DOM correlation.
     let mut row_children: Vec<Vec<Fragment>> = (0..grid.num_rows).map(|_| Vec::new()).collect();
-    for (cell_i, mut frag) in cell_fragments {
+    for (cell_i, mut frag, oof_s, oof_e) in cell_fragments {
         let cell = &grid.cells[cell_i];
         let end_r = (cell.row_idx + cell.rowspan).min(grid.num_rows);
         let span_r = end_r.saturating_sub(cell.row_idx);
@@ -403,6 +407,10 @@ pub fn layout_table(
         }
         frag.border_rect.size.height = cell_h;
         frag.border_rect.origin = Point::new(col_x[cell.col_idx], 0.0);
+        for p in &mut ctx.pending_oof[oof_s..oof_e] {
+            p.static_pos.x += content_origin_x + col_x[cell.col_idx];
+            p.static_pos.y += content_origin_y + row_y[cell.row_idx];
+        }
         frag.compute_overflow_rect();
         row_children[cell.row_idx].push(frag);
     }
@@ -439,6 +447,21 @@ pub fn layout_table(
 
     let border_w = final_content_w + pb_w;
     let border_h = final_content_h + pb_h;
+
+    crate::position::resolve_oof_for_container(
+        ctx,
+        my_oof_start,
+        &style,
+        Rect::new(
+            metrics.border.left,
+            metrics.border.top,
+            (border_w - metrics.border.horizontal()).max(0.0),
+            (border_h - metrics.border.vertical()).max(0.0),
+        ),
+        false,
+        space,
+        &mut placed_rows,
+    );
 
     let (resolved_ml, resolved_mr) = if metrics.margin_left_auto || metrics.margin_right_auto {
         let remaining = (space.available_width - border_w).max(0.0);

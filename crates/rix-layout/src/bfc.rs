@@ -7,13 +7,14 @@ use std::sync::Arc;
 use rix_core::{Point, Rect, Size};
 use rix_css::{ClearMode, FloatMode, LengthPercentageAuto, PositionMode};
 
-use crate::box_tree::{BoxId, BoxKind, LayoutBox};
+use crate::box_tree::{BoxId, BoxKind};
 use crate::fragment::{
     layout_box, measure_content_intrinsic_widths, resolve_size_with_intrinsic,
     size_value_needs_intrinsic, BoxMetrics, ConstraintSpace, EdgeInsets, Fragment, FragmentKind,
     LayoutContext,
 };
 use crate::ifc::layout_ifc;
+use crate::position::{offset_pending_oof, resolve_oof_for_container, PendingOof};
 
 /// Single placed float exclusion rectangle in BFC content-area coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -337,7 +338,52 @@ pub fn layout_block_box(
 
     let content_origin_x = metrics.border.left + metrics.padding.left;
     let content_origin_y = metrics.border.top + metrics.padding.top;
-    let child_space = space.with_available(content_width, metrics.specified_height);
+    // Definite height for child `%` resolution: explicit `height`, stretched OOF (`top`+`bottom`),
+    // or definite `width` combined with `aspect-ratio` (CSS Sizing L4 / Position L3 §5.1).
+    let oof_both_v_insets = b.is_out_of_flow
+        && matches!(style.box_model.inset.top, LengthPercentageAuto::Value(_))
+        && matches!(style.box_model.inset.bottom, LengthPercentageAuto::Value(_));
+    let definite_height = metrics.specified_height.or_else(|| {
+        if oof_both_v_insets && matches!(style.box_model.height, rix_css::SizeValue::Auto) {
+            space.available_height.map(|ah| {
+                (ah - metrics.margin.vertical() - pb_h)
+                    .max(0.0)
+                    .min(metrics.max_height)
+                    .max(metrics.min_height)
+            })
+        } else if resolved_spec_w.is_some()
+            && matches!(style.box_model.height, rix_css::SizeValue::Auto)
+        {
+            style
+                .effects
+                .as_ref()
+                .and_then(|e| e.aspect_ratio_math.as_ref())
+                .and_then(|(num, den)| {
+                    let n = num.eval_scalar(&eval, None);
+                    let d = den.as_ref().map_or(1.0, |x| x.eval_scalar(&eval, None));
+                    let ratio = n / d;
+                    if ratio.is_finite() && ratio > 0.0 {
+                        let box_w = if is_bb {
+                            content_width + pb_w
+                        } else {
+                            content_width
+                        };
+                        let box_h = box_w / ratio as f32;
+                        let ch = if is_bb {
+                            (box_h - pb_h).max(0.0)
+                        } else {
+                            box_h
+                        };
+                        Some(ch.min(metrics.max_height).max(metrics.min_height).max(0.0))
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            None
+        }
+    });
+    let child_space = space.with_available(content_width, definite_height);
 
     let children_ids = ctx.tree.get(box_id).children.clone();
     let establishes_bfc = ctx.tree.get(box_id).establishes_bfc;
@@ -355,7 +401,7 @@ pub fn layout_block_box(
     });
 
     let mut placed_children: Vec<Fragment> = Vec::with_capacity(children_ids.len());
-    let mut out_of_flow_ids: Vec<BoxId> = Vec::new();
+    let my_oof_start = ctx.pending_oof.len();
     let mut collapsed_top = resolved_margin.top;
     let mut collapsed_bottom = resolved_margin.bottom;
 
@@ -363,11 +409,7 @@ pub fn layout_block_box(
         0.0
     } else if !has_in_flow_blocks {
         // Pure Inline Formatting Context inside this block container!
-        for &cid in &children_ids {
-            if ctx.tree.get(cid).is_out_of_flow {
-                out_of_flow_ids.push(cid);
-            }
-        }
+        // `layout_ifc` records exact static positions for both direct and inline-nested OOF boxes.
         let ifc_result = layout_ifc(
             ctx,
             box_id,
@@ -392,7 +434,12 @@ pub fn layout_block_box(
         for cid in children_ids {
             let child_box = ctx.tree.get(cid);
             if child_box.is_out_of_flow {
-                out_of_flow_ids.push(cid);
+                let static_y = content_origin_y + cursor_y + prev_margin_bottom.unwrap_or(0.0);
+                ctx.pending_oof.push(PendingOof {
+                    box_id: cid,
+                    static_pos: Point::new(content_origin_x, static_y),
+                    is_fixed: child_box.style.position == PositionMode::Fixed,
+                });
                 continue;
             }
 
@@ -409,6 +456,7 @@ pub fn layout_block_box(
                     child_box.style.float_mode,
                     FloatMode::Left | FloatMode::InlineStart
                 );
+                let child_oof_start = ctx.pending_oof.len();
                 let mut frag = layout_box(ctx, cid, child_space);
                 let margin_box = Size::new(
                     frag.border_rect.size.width + frag.margin.horizontal(),
@@ -420,6 +468,12 @@ pub fn layout_block_box(
                     content_origin_y + pos.y + frag.margin.top,
                 );
                 apply_relative_offset(&mut frag, child_space);
+                offset_pending_oof(
+                    &mut ctx.pending_oof,
+                    child_oof_start,
+                    frag.border_rect.origin.x,
+                    frag.border_rect.origin.y,
+                );
                 placed_children.push(frag);
                 continue;
             }
@@ -428,6 +482,7 @@ pub fn layout_block_box(
             let child_clear = child_box.style.clear_mode;
             let child_is_bfc = child_box.establishes_bfc;
 
+            let child_oof_start = ctx.pending_oof.len();
             // Compute child layout; if child establishes a BFC next to floats, shrink available width if needed.
             let mut frag = if child_is_bfc && !local_floats.is_empty() {
                 let probe_y = if child_clear != ClearMode::None {
@@ -488,6 +543,12 @@ pub fn layout_block_box(
             frag.border_rect.origin =
                 Point::new(content_origin_x + x_offset, content_origin_y + cursor_y);
             apply_relative_offset(&mut frag, child_space);
+            offset_pending_oof(
+                &mut ctx.pending_oof,
+                child_oof_start,
+                frag.border_rect.origin.x,
+                frag.border_rect.origin.y,
+            );
 
             if is_empty_self_collapsing {
                 let combined = collapse_margins(child_top_margin, child_bottom_margin);
@@ -564,7 +625,7 @@ pub fn layout_block_box(
         intr_h_fn,
     )
     .unwrap_or(metrics.max_height);
-    let raw_content_h = metrics.specified_height.unwrap_or_else(|| {
+    let raw_content_h = definite_height.unwrap_or_else(|| {
         resolve_size_with_intrinsic(
             &style.box_model.height,
             space.available_height,
@@ -580,31 +641,24 @@ pub fn layout_block_box(
     let border_w = content_width + pb_w;
     let border_h = final_content_height + pb_h;
 
-    // Layout out-of-flow (`position: absolute | fixed`) children against this container's padding box
-    // (or viewport for `fixed`).
+    // Resolve out-of-flow (`position: absolute | fixed`) descendants whose true CSS containing
+    // block is this box's padding box; all other pending OOFs propagate up to an ancestor CB.
     let padding_box_w = content_width + metrics.padding.horizontal();
     let padding_box_h = final_content_height + metrics.padding.vertical();
-    for oof_id in out_of_flow_ids {
-        let oof_box = ctx.tree.get(oof_id);
-        let is_fixed = oof_box.style.position == PositionMode::Fixed;
-        let (cb_w, cb_h, base_x, base_y) = if is_fixed {
-            (
-                space.viewport_size.width,
-                space.viewport_size.height,
-                0.0,
-                0.0,
-            )
-        } else {
-            (
-                padding_box_w,
-                padding_box_h,
-                metrics.border.left,
-                metrics.border.top,
-            )
-        };
-        let oof_frag = layout_out_of_flow(ctx, oof_box, space, cb_w, cb_h, base_x, base_y);
-        placed_children.push(oof_frag);
-    }
+    resolve_oof_for_container(
+        ctx,
+        my_oof_start,
+        &style,
+        Rect::new(
+            metrics.border.left,
+            metrics.border.top,
+            padding_box_w,
+            padding_box_h,
+        ),
+        false,
+        space,
+        &mut placed_children,
+    );
 
     let first_baseline = placed_children.iter().find_map(|c| {
         if c.is_out_of_flow || c.is_float {
@@ -640,86 +694,6 @@ pub fn layout_block_box(
     fragment
 }
 
-fn layout_out_of_flow(
-    ctx: &mut LayoutContext<'_>,
-    oof_box: &LayoutBox,
-    parent_space: ConstraintSpace,
-    cb_w: f32,
-    cb_h: f32,
-    base_x: f32,
-    base_y: f32,
-) -> Fragment {
-    let style = &oof_box.style;
-    let eval = parent_space.eval_context_for(style);
-    let inset = &style.box_model.inset;
-    let left = match &inset.left {
-        LengthPercentageAuto::Auto => None,
-        LengthPercentageAuto::Value(lp) => Some(lp.resolve_px(cb_w, &eval)),
-    };
-    let right = match &inset.right {
-        LengthPercentageAuto::Auto => None,
-        LengthPercentageAuto::Value(lp) => Some(lp.resolve_px(cb_w, &eval)),
-    };
-    let top = match &inset.top {
-        LengthPercentageAuto::Auto => None,
-        LengthPercentageAuto::Value(lp) => Some(lp.resolve_px(cb_h, &eval)),
-    };
-    let bottom = match &inset.bottom {
-        LengthPercentageAuto::Auto => None,
-        LengthPercentageAuto::Value(lp) => Some(lp.resolve_px(cb_h, &eval)),
-    };
-
-    // If both left & right are specified and width is auto (or calc-size with auto basis),
-    // stretch available width between insets.
-    let stretched_w = match (left, right, &style.box_model.width) {
-        (Some(l), Some(r), rix_css::SizeValue::Auto) => Some((cb_w - l - r).max(0.0)),
-        _ => None,
-    };
-    let calc_size_inset_w = match (left, right, &style.box_model.width) {
-        (Some(l), Some(r), rix_css::SizeValue::CalcSize(_)) => Some((cb_w - l - r).max(0.0)),
-        _ => None,
-    };
-    let stretched_h = match (top, bottom, &style.box_model.height) {
-        (Some(t), Some(b), rix_css::SizeValue::Auto) => Some((cb_h - t - b).max(0.0)),
-        _ => None,
-    };
-    let calc_size_inset_h = match (top, bottom, &style.box_model.height) {
-        (Some(t), Some(b), rix_css::SizeValue::CalcSize(_)) => Some((cb_h - t - b).max(0.0)),
-        _ => None,
-    };
-
-    let avail_w = stretched_w.or(calc_size_inset_w).unwrap_or(cb_w);
-    let avail_h = stretched_h.or(calc_size_inset_h).or(Some(cb_h));
-    let mut sub_space = parent_space.with_available(avail_w, avail_h);
-    sub_space.containing_block_width = cb_w;
-    sub_space.containing_block_height = cb_h;
-
-    let mut frag = layout_box(ctx, oof_box.id, sub_space);
-    if let Some(sw) = stretched_w {
-        let pb_w = frag.padding.horizontal() + frag.border.horizontal();
-        frag.border_rect.size.width = sw;
-        frag.content_rect.size.width = (sw - pb_w).max(0.0);
-    }
-    if let Some(sh) = stretched_h {
-        let pb_h = frag.padding.vertical() + frag.border.vertical();
-        frag.border_rect.size.height = sh;
-        frag.content_rect.size.height = (sh - pb_h).max(0.0);
-    }
-
-    let x = match (left, right) {
-        (Some(l), _) => base_x + l + frag.margin.left,
-        (None, Some(r)) => base_x + cb_w - r - frag.border_rect.size.width - frag.margin.right,
-        (None, None) => base_x + frag.margin.left,
-    };
-    let y = match (top, bottom) {
-        (Some(t), _) => base_y + t + frag.margin.top,
-        (None, Some(b)) => base_y + cb_h - b - frag.border_rect.size.height - frag.margin.bottom,
-        (None, None) => base_y + frag.margin.top,
-    };
-    frag.border_rect.origin = Point::new(x, y);
-    frag
-}
-
 /// Applies CSS `position: relative` visual offset after normal-flow placement.
 pub fn apply_relative_offset(frag: &mut Fragment, space: ConstraintSpace) {
     if frag.style.position != PositionMode::Relative {
@@ -727,18 +701,50 @@ pub fn apply_relative_offset(frag: &mut Fragment, space: ConstraintSpace) {
     }
     let eval = space.eval_context_for(&frag.style);
     let inset = &frag.style.box_model.inset;
-    let dx = match (&inset.left, &inset.right) {
-        (LengthPercentageAuto::Value(l), _) => l.resolve_px(space.containing_block_width, &eval),
-        (LengthPercentageAuto::Auto, LengthPercentageAuto::Value(r)) => {
-            -r.resolve_px(space.containing_block_width, &eval)
+    let is_rtl = frag.style.text.direction == rix_css::DirectionMode::Rtl;
+    let dx = if is_rtl {
+        match (&inset.left, &inset.right) {
+            (_, LengthPercentageAuto::Value(r)) => {
+                -r.resolve_px(space.containing_block_width, &eval)
+            }
+            (LengthPercentageAuto::Value(l), LengthPercentageAuto::Auto) => {
+                l.resolve_px(space.containing_block_width, &eval)
+            }
+            _ => 0.0,
         }
-        _ => 0.0,
+    } else {
+        match (&inset.left, &inset.right) {
+            (LengthPercentageAuto::Value(l), _) => {
+                l.resolve_px(space.containing_block_width, &eval)
+            }
+            (LengthPercentageAuto::Auto, LengthPercentageAuto::Value(r)) => {
+                -r.resolve_px(space.containing_block_width, &eval)
+            }
+            _ => 0.0,
+        }
     };
-    let dy = match (&inset.top, &inset.bottom) {
-        (LengthPercentageAuto::Value(t), _) => t.resolve_px(space.containing_block_height, &eval),
-        (LengthPercentageAuto::Auto, LengthPercentageAuto::Value(b)) => {
-            -b.resolve_px(space.containing_block_height, &eval)
+    let resolve_v = |v: &LengthPercentageAuto| -> Option<f32> {
+        match v {
+            LengthPercentageAuto::Auto => None,
+            LengthPercentageAuto::Value(lp) => {
+                if lp.has_percentage() && space.available_height.is_none() {
+                    Some(0.0)
+                } else {
+                    Some(
+                        lp.resolve_px(
+                            space
+                                .available_height
+                                .unwrap_or(space.containing_block_height),
+                            &eval,
+                        ),
+                    )
+                }
+            }
         }
+    };
+    let dy = match (resolve_v(&inset.top), resolve_v(&inset.bottom)) {
+        (Some(t), _) => t,
+        (None, Some(b)) => -b,
         _ => 0.0,
     };
     frag.border_rect.origin.x += dx;

@@ -212,6 +212,7 @@ pub fn layout_flex_grid_container(
     let border_w = root_layout.size.width;
     let border_h = root_layout.size.height;
 
+    let my_oof_start = ctx.pending_oof.len();
     let mut placed_children = Vec::with_capacity(item_layouts.len() + oof_children.len());
     for (cid, item_layout) in item_layouts {
         let item_w = item_layout.size.width.max(0.0);
@@ -228,6 +229,7 @@ pub fn layout_flex_grid_container(
         } else {
             None
         };
+        let child_oof_start = ctx.pending_oof.len();
         let mut frag = match reused_frag {
             Some(f) => f,
             None => {
@@ -251,50 +253,43 @@ pub fn layout_flex_grid_container(
             (item_h - i_pb_h).max(0.0),
         );
         apply_relative_offset(&mut frag, space);
+        crate::position::offset_pending_oof(
+            &mut ctx.pending_oof,
+            child_oof_start,
+            frag.border_rect.origin.x,
+            frag.border_rect.origin.y,
+        );
         frag.compute_overflow_rect();
         placed_children.push(frag);
     }
 
-    // Place out-of-flow (`position: absolute | fixed`) children against container padding box.
+    // Push direct out-of-flow (`position: absolute | fixed`) children and resolve any
+    // whose true CSS containing block is this Flex/Grid container's padding box.
     for oof_id in oof_children {
-        let oof_box = ctx.tree.get(oof_id);
-        let is_fixed = oof_box.style.position == PositionMode::Fixed;
-        let (cb_w, cb_h, base_x, base_y) = if is_fixed {
-            (
-                space.viewport_size.width,
-                space.viewport_size.height,
-                0.0,
-                0.0,
-            )
-        } else {
-            (
-                (border_w - metrics.border.horizontal()).max(0.0),
-                (border_h - metrics.border.vertical()).max(0.0),
-                metrics.border.left,
-                metrics.border.top,
-            )
-        };
-        let oof_space = space.with_available(cb_w, Some(cb_h));
-        let mut frag = layout_box(ctx, oof_id, oof_space);
-        let oof_eval = space.eval_context_for(&oof_box.style);
-        let inset = &oof_box.style.box_model.inset;
-        let x = match (&inset.left, &inset.right) {
-            (LengthPercentageAuto::Value(l), _) => base_x + l.resolve_px(cb_w, &oof_eval),
-            (LengthPercentageAuto::Auto, LengthPercentageAuto::Value(r)) => {
-                base_x + cb_w - r.resolve_px(cb_w, &oof_eval) - frag.border_rect.size.width
-            }
-            _ => base_x,
-        };
-        let y = match (&inset.top, &inset.bottom) {
-            (LengthPercentageAuto::Value(t), _) => base_y + t.resolve_px(cb_h, &oof_eval),
-            (LengthPercentageAuto::Auto, LengthPercentageAuto::Value(b)) => {
-                base_y + cb_h - b.resolve_px(cb_h, &oof_eval) - frag.border_rect.size.height
-            }
-            _ => base_y,
-        };
-        frag.border_rect.origin = Point::new(x, y);
-        placed_children.push(frag);
+        let is_fixed = ctx.tree.get(oof_id).style.position == PositionMode::Fixed;
+        ctx.pending_oof.push(crate::position::PendingOof {
+            box_id: oof_id,
+            static_pos: Point::new(
+                metrics.border.left + metrics.padding.left,
+                metrics.border.top + metrics.padding.top,
+            ),
+            is_fixed,
+        });
     }
+    crate::position::resolve_oof_for_container(
+        ctx,
+        my_oof_start,
+        &container_style,
+        Rect::new(
+            metrics.border.left,
+            metrics.border.top,
+            (border_w - metrics.border.horizontal()).max(0.0),
+            (border_h - metrics.border.vertical()).max(0.0),
+        ),
+        false,
+        space,
+        &mut placed_children,
+    );
 
     let mut fragment = Fragment {
         box_id: container_id,
@@ -494,7 +489,8 @@ fn measure_content_intrinsic_height(
         .children
         .iter()
         .any(|&c| ctx.tree.get(c).is_block_level() || ctx.tree.get(c).is_float);
-    if has_block {
+    let saved_oof = ctx.pending_oof.len();
+    let res = if has_block {
         let mut h = 0.0f32;
         for cid in b.children.clone() {
             if ctx.tree.get(cid).is_out_of_flow {
@@ -507,7 +503,9 @@ fn measure_content_intrinsic_height(
     } else {
         let floats = crate::bfc::FloatContext::new();
         crate::ifc::layout_ifc(ctx, box_id, space, &floats, Point::ZERO).height
-    }
+    };
+    ctx.pending_oof.truncate(saved_oof);
+    res
 }
 
 #[inline]
@@ -546,8 +544,10 @@ fn measure_taffy_leaf(
         Some(h) => h.max(0.0),
         None if matches!(input.axis, taffy::RequestedAxis::Horizontal) => 0.0,
         None => {
+            let saved_oof = ctx.pending_oof.len();
             let sub_space = container_space.with_available(resolved_w, None);
             let frag = layout_box(ctx, box_id, sub_space);
+            ctx.pending_oof.truncate(saved_oof);
             frag.border_rect.size.height
         }
     };

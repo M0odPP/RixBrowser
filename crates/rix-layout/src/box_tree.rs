@@ -325,11 +325,38 @@ impl<'a> BoxTreeBuilder<'a> {
         }
 
         // `display: contents` generates no box of its own; its children participate directly.
+        // Per CSS Display L3 Appendix B, replaced elements with `display: contents` render as `none`.
         if style.display == DisplayMode::Contents {
+            if matches!(
+                tag,
+                "img"
+                    | "br"
+                    | "wbr"
+                    | "hr"
+                    | "canvas"
+                    | "iframe"
+                    | "video"
+                    | "audio"
+                    | "input"
+                    | "textarea"
+                    | "select"
+                    | "svg"
+                    | "object"
+                    | "embed"
+            ) {
+                return Vec::new();
+            }
             let mut flattened = Vec::new();
-            let children: Vec<NodeId> = self.doc.children(node).collect();
+            if let Some(before_box) = self.build_pseudo_box(node, RixPseudoElement::Before) {
+                flattened.push(before_box);
+            }
+            let child_source = elem.shadow_root.unwrap_or(node);
+            let children: Vec<NodeId> = self.doc.children(child_source).collect();
             for child in children {
                 flattened.extend(self.build_dom_node(child, Some(&style)));
+            }
+            if let Some(after_box) = self.build_pseudo_box(node, RixPseudoElement::After) {
+                flattened.push(after_box);
             }
             return flattened;
         }
@@ -417,18 +444,29 @@ impl<'a> BoxTreeBuilder<'a> {
             subtree_dirty: false,
             subtree_hash: 0,
         });
+        if pseudo_style.display == DisplayMode::Contents {
+            return Some(text_id);
+        }
         let is_out_of_flow = matches!(
             pseudo_style.position,
             PositionMode::Absolute | PositionMode::Fixed
         );
         let is_float = !is_out_of_flow && pseudo_style.float_mode != FloatMode::None;
         let kind = match pseudo_style.display {
-            DisplayMode::Block | DisplayMode::FlowRoot | DisplayMode::ListItem => BoxKind::Block {
+            DisplayMode::Block
+            | DisplayMode::FlowRoot
+            | DisplayMode::ListItem
+            | DisplayMode::FlowRootListItem
+            | DisplayMode::BlockMath
+            | DisplayMode::BlockRuby
+            | DisplayMode::TableCaption => BoxKind::Block {
                 formatting_context: FormattingContextKind::Block,
             },
-            DisplayMode::InlineBlock => BoxKind::InlineBlock {
-                formatting_context: FormattingContextKind::Block,
-            },
+            DisplayMode::InlineBlock | DisplayMode::InlineFlowRootListItem => {
+                BoxKind::InlineBlock {
+                    formatting_context: FormattingContextKind::Block,
+                }
+            }
             DisplayMode::Flex => BoxKind::Block {
                 formatting_context: FormattingContextKind::Flex,
             },
@@ -440,6 +478,10 @@ impl<'a> BoxTreeBuilder<'a> {
             },
             DisplayMode::InlineGrid => BoxKind::InlineBlock {
                 formatting_context: FormattingContextKind::Grid,
+            },
+            DisplayMode::Table => BoxKind::Table,
+            DisplayMode::InlineTable => BoxKind::InlineBlock {
+                formatting_context: FormattingContextKind::Table,
             },
             _ => BoxKind::Inline,
         };
@@ -1178,43 +1220,33 @@ fn classify_element_box_kind(
         return BoxKind::TableRowGroup;
     }
 
-    // Floated or out-of-flow inline boxes blockify per CSS Display Level 3 §2.7.
-    let effective_display = if (is_float || is_out_of_flow)
-        && matches!(
-            style.display,
-            DisplayMode::Inline
-                | DisplayMode::InlineBlock
-                | DisplayMode::InlineFlex
-                | DisplayMode::InlineGrid
-                | DisplayMode::InlineTable
-        ) {
-        match style.display {
-            DisplayMode::InlineFlex => DisplayMode::Flex,
-            DisplayMode::InlineGrid => DisplayMode::Grid,
-            DisplayMode::InlineTable => DisplayMode::Table,
-            _ => DisplayMode::Block,
-        }
+    // Floated or out-of-flow boxes blockify per CSS Display Level 3 §2.7.
+    let effective_display = if is_float || is_out_of_flow {
+        style.display.blockify()
     } else {
         style.display
     };
 
     match effective_display {
-        DisplayMode::Flex => BoxKind::Block {
+        DisplayMode::Flex | DisplayMode::RunInFlex => BoxKind::Block {
             formatting_context: FormattingContextKind::Flex,
         },
         DisplayMode::InlineFlex => BoxKind::InlineBlock {
             formatting_context: FormattingContextKind::Flex,
         },
-        DisplayMode::Grid => BoxKind::Block {
+        DisplayMode::Grid | DisplayMode::RunInGrid => BoxKind::Block {
             formatting_context: FormattingContextKind::Grid,
         },
         DisplayMode::InlineGrid => BoxKind::InlineBlock {
             formatting_context: FormattingContextKind::Grid,
         },
-        DisplayMode::Table => BoxKind::Table,
+        DisplayMode::Table | DisplayMode::RunInTable => BoxKind::Table,
         DisplayMode::InlineTable => BoxKind::InlineBlock {
             formatting_context: FormattingContextKind::Table,
         },
+        DisplayMode::TableRowGroup
+        | DisplayMode::TableHeaderGroup
+        | DisplayMode::TableFooterGroup => BoxKind::TableRowGroup,
         DisplayMode::TableRow => BoxKind::TableRow,
         DisplayMode::TableCell => {
             let colspan = elem
@@ -1229,13 +1261,31 @@ fn classify_element_box_kind(
                 .clamp(1, 1000);
             BoxKind::TableCell { colspan, rowspan }
         }
-        DisplayMode::InlineBlock => BoxKind::InlineBlock {
+        DisplayMode::InlineBlock | DisplayMode::InlineFlowRootListItem => BoxKind::InlineBlock {
             formatting_context: FormattingContextKind::Block,
         },
-        DisplayMode::Inline => BoxKind::Inline,
+        DisplayMode::Inline
+        | DisplayMode::InlineListItem
+        | DisplayMode::Math
+        | DisplayMode::Ruby
+        | DisplayMode::RubyBase
+        | DisplayMode::RubyText
+        | DisplayMode::RubyBaseContainer
+        | DisplayMode::RubyTextContainer
+        | DisplayMode::RunIn
+        | DisplayMode::RunInListItem
+        | DisplayMode::RunInRuby => BoxKind::Inline,
         DisplayMode::Block
         | DisplayMode::FlowRoot
         | DisplayMode::ListItem
+        | DisplayMode::FlowRootListItem
+        | DisplayMode::RunInFlowRoot
+        | DisplayMode::RunInFlowRootListItem
+        | DisplayMode::BlockMath
+        | DisplayMode::BlockRuby
+        | DisplayMode::TableCaption
+        | DisplayMode::TableColumnGroup
+        | DisplayMode::TableColumn
         | DisplayMode::Contents
         | DisplayMode::None => BoxKind::Block {
             formatting_context: FormattingContextKind::Block,
@@ -1252,7 +1302,10 @@ fn box_establishes_bfc(
     if is_float || is_out_of_flow {
         return true;
     }
-    if style.display == DisplayMode::FlowRoot {
+    if matches!(
+        style.display,
+        DisplayMode::FlowRoot | DisplayMode::FlowRootListItem | DisplayMode::TableCaption
+    ) {
         return true;
     }
     if style.overflow.x != rix_css::OverflowMode::Visible

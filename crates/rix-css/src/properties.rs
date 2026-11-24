@@ -40,11 +40,11 @@ use crate::values::{
     FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode, GridPlacementValue,
     GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode, LengthPercentage,
     LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
-    OverflowWrapMode, OverscrollBehaviorMode, PointerEventsMode, PositionMode, ResizeMode,
-    SizeValue, TableLayoutMode, TextAlignMode, TextDecorationLine, TextOverflowMode,
-    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode,
-    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
-    WordBreakMode, WritingMode, ZIndexValue,
+    OverflowWrapMode, OverlayMode, OverscrollBehaviorMode, PointerEventsMode, PositionMode,
+    ReadingFlowMode, ResizeMode, SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode,
+    TextDecorationLine, TextJustifyMode, TextOverflowMode, TextTransformMode, TimingFunction,
+    TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec, UserSelectMode,
+    VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode, ZIndexValue,
 };
 
 /// Category of an unsupported CSS feature recorded during compilation.
@@ -513,6 +513,14 @@ pub enum PropertyIdKind {
     AnimationComposition,
     InterpolateSize,
     ViewTransitionName,
+    Overlay,
+    ReadingFlow,
+    ReadingOrder,
+    TextJustify,
+    TextAlignLast,
+    HyphenateCharacter,
+    HyphenateLimitLines,
+    Contain,
     // Typography
     FontSize,
     FontWeight,
@@ -828,6 +836,14 @@ impl PropertyIdKind {
             "animation-composition" => Self::AnimationComposition,
             "interpolate-size" => Self::InterpolateSize,
             "view-transition-name" => Self::ViewTransitionName,
+            "overlay" => Self::Overlay,
+            "reading-flow" => Self::ReadingFlow,
+            "reading-order" => Self::ReadingOrder,
+            "text-justify" => Self::TextJustify,
+            "text-align-last" => Self::TextAlignLast,
+            "hyphenate-character" => Self::HyphenateCharacter,
+            "hyphenate-limit-lines" => Self::HyphenateLimitLines,
+            "contain" => Self::Contain,
             "font-size" => Self::FontSize,
             "font-weight" => Self::FontWeight,
             "font-style" => Self::FontStyle,
@@ -1013,6 +1029,14 @@ impl PropertyIdKind {
             Self::AnimationComposition => "animation-composition",
             Self::InterpolateSize => "interpolate-size",
             Self::ViewTransitionName => "view-transition-name",
+            Self::Overlay => "overlay",
+            Self::ReadingFlow => "reading-flow",
+            Self::ReadingOrder => "reading-order",
+            Self::TextJustify => "text-justify",
+            Self::TextAlignLast => "text-align-last",
+            Self::HyphenateCharacter => "hyphenate-character",
+            Self::HyphenateLimitLines => "hyphenate-limit-lines",
+            Self::Contain => "contain",
             Self::FontSize => "font-size",
             Self::FontWeight => "font-weight",
             Self::FontStyle => "font-style",
@@ -1178,6 +1202,10 @@ impl PropertyIdKind {
                 | Self::Widows
                 | Self::TabSize
                 | Self::InterpolateSize
+                | Self::TextJustify
+                | Self::TextAlignLast
+                | Self::HyphenateCharacter
+                | Self::HyphenateLimitLines
                 | Self::BorderCollapse
                 | Self::BorderSpacing
                 | Self::Custom
@@ -1474,6 +1502,13 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "inset-inline-end",
     "inset-inline-start",
     "interpolate-size",
+    "overlay",
+    "reading-flow",
+    "reading-order",
+    "text-justify",
+    "text-align-last",
+    "hyphenate-character",
+    "hyphenate-limit-lines",
     "justify-content",
     "justify-items",
     "justify-self",
@@ -1664,6 +1699,14 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::AnimationPlayState,
     PropertyIdKind::AnimationComposition,
     PropertyIdKind::InterpolateSize,
+    PropertyIdKind::Overlay,
+    PropertyIdKind::ReadingFlow,
+    PropertyIdKind::ReadingOrder,
+    PropertyIdKind::TextJustify,
+    PropertyIdKind::TextAlignLast,
+    PropertyIdKind::HyphenateCharacter,
+    PropertyIdKind::HyphenateLimitLines,
+    PropertyIdKind::Contain,
     PropertyIdKind::FontSize,
     PropertyIdKind::FontWeight,
     PropertyIdKind::FontStyle,
@@ -2044,6 +2087,13 @@ pub enum PropertyValue {
     TransitionBehaviorList(Vec<TransitionBehaviorMode>),
     AnimationCompositionList(Vec<AnimationCompositionMode>),
     ViewTransitionName(Option<InternedStr>),
+    Overlay(OverlayMode),
+    ReadingFlow(ReadingFlowMode),
+    TextJustify(TextJustifyMode),
+    TextAlignLast(TextAlignLastMode),
+    HyphenateChar(Option<InternedStr>),
+    HyphenateLimitLines(Option<i32>),
+    Contain(u8),
     BackgroundImageRaw(String),
     FontStyleObliqueMath(Box<crate::values_math::MathNode>),
 }
@@ -2362,6 +2412,15 @@ pub fn is_values4_native_property(prop: PropertyIdKind) -> bool {
             | PropertyIdKind::TransitionTimingFunction
             | PropertyIdKind::AnimationTimingFunction
             | PropertyIdKind::ViewTransitionName
+            | PropertyIdKind::Overlay
+            | PropertyIdKind::ReadingFlow
+            | PropertyIdKind::ReadingOrder
+            | PropertyIdKind::TextJustify
+            | PropertyIdKind::TextAlignLast
+            | PropertyIdKind::HyphenateCharacter
+            | PropertyIdKind::HyphenateLimitLines
+            | PropertyIdKind::Contain
+            | PropertyIdKind::Display
     )
 }
 
@@ -2376,6 +2435,15 @@ pub fn should_use_values4_parser(prop: PropertyIdKind, raw: &str) -> bool {
         return true;
     }
     let lower = trimmed.to_ascii_lowercase();
+    if prop == PropertyIdKind::Display
+        && (lower.contains(' ')
+            || matches!(
+                lower.as_str(),
+                "math" | "run-in" | "flow" | "ruby" | "ruby-base" | "ruby-text"
+            ))
+    {
+        return true;
+    }
     if lower.starts_with("fit-content(") {
         return false;
     }
@@ -2406,6 +2474,7 @@ pub fn should_use_values4_parser(prop: PropertyIdKind, raw: &str) -> bool {
             || lower.contains("block-size")
             || lower.contains("inline-size")
             || lower.contains("interpolate-size")
+            || lower.contains("overlay")
             || lower.contains("--"))
     {
         return true;
@@ -2625,6 +2694,156 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
         PropertyIdKind::ObjectPosition => {
             let (pos, s) = crate::values_math::PositionSpec::parse(trimmed)?;
             return Some((PropertyValue::ObjectPos(Box::new(pos)), s));
+        }
+        PropertyIdKind::Display => {
+            let d = DisplayMode::parse_css(trimmed)?;
+            return Some((PropertyValue::Display(d), d.to_css_string().to_string()));
+        }
+        PropertyIdKind::Overlay => {
+            let mode = match trimmed.to_ascii_lowercase().as_str() {
+                "none" => OverlayMode::None,
+                "auto" => OverlayMode::Auto,
+                _ => return None,
+            };
+            let s = match mode {
+                OverlayMode::None => "none",
+                OverlayMode::Auto => "auto",
+            };
+            return Some((PropertyValue::Overlay(mode), s.to_string()));
+        }
+        PropertyIdKind::ReadingFlow => {
+            let mode = match trimmed.to_ascii_lowercase().as_str() {
+                "normal" => ReadingFlowMode::Normal,
+                "flex-visual" => ReadingFlowMode::FlexVisual,
+                "flex-flow" => ReadingFlowMode::FlexFlow,
+                "grid-rows" => ReadingFlowMode::GridRows,
+                "grid-columns" => ReadingFlowMode::GridColumns,
+                "grid-order" => ReadingFlowMode::GridOrder,
+                "source-order" => ReadingFlowMode::SourceOrder,
+                _ => return None,
+            };
+            return Some((
+                PropertyValue::ReadingFlow(mode),
+                trimmed.to_ascii_lowercase(),
+            ));
+        }
+        PropertyIdKind::ReadingOrder => {
+            let pm = parse_math_value(trimmed, ValueKind::Integer)?;
+            let s = pm.node.serialize_specified(pm.was_math_fn);
+            return Some((PropertyValue::MathVal(Box::new(pm.node)), s));
+        }
+        PropertyIdKind::TextJustify => {
+            let mode = match trimmed.to_ascii_lowercase().as_str() {
+                "auto" => TextJustifyMode::Auto,
+                "none" => TextJustifyMode::None,
+                "inter-word" => TextJustifyMode::InterWord,
+                "inter-character" => TextJustifyMode::InterCharacter,
+                _ => return None,
+            };
+            return Some((
+                PropertyValue::TextJustify(mode),
+                trimmed.to_ascii_lowercase(),
+            ));
+        }
+        PropertyIdKind::TextAlignLast => {
+            let mode = match trimmed.to_ascii_lowercase().as_str() {
+                "auto" => TextAlignLastMode::Auto,
+                "start" => TextAlignLastMode::Start,
+                "end" => TextAlignLastMode::End,
+                "left" => TextAlignLastMode::Left,
+                "right" => TextAlignLastMode::Right,
+                "center" => TextAlignLastMode::Center,
+                "justify" => TextAlignLastMode::Justify,
+                "match-parent" => TextAlignLastMode::MatchParent,
+                _ => return None,
+            };
+            return Some((
+                PropertyValue::TextAlignLast(mode),
+                trimmed.to_ascii_lowercase(),
+            ));
+        }
+        PropertyIdKind::HyphenateCharacter => {
+            if trimmed.eq_ignore_ascii_case("auto") {
+                return Some((PropertyValue::HyphenateChar(None), "auto".to_string()));
+            }
+            let mut pi = cssparser::ParserInput::new(trimmed);
+            let mut p = cssparser::Parser::new(&mut pi);
+            let s = p.expect_string().ok()?.as_ref().to_string();
+            if !p.is_exhausted() {
+                return None;
+            }
+            let quoted = crate::substitution::quote_css_string(&s);
+            return Some((PropertyValue::HyphenateChar(Some(intern_str(&s))), quoted));
+        }
+        PropertyIdKind::HyphenateLimitLines => {
+            if trimmed.eq_ignore_ascii_case("no-limit") {
+                return Some((
+                    PropertyValue::HyphenateLimitLines(None),
+                    "no-limit".to_string(),
+                ));
+            }
+            let pm = parse_math_value(trimmed, ValueKind::Integer)?;
+            let v = pm
+                .node
+                .eval_scalar(&crate::values::EvalContext::default(), None);
+            if !v.is_finite() || (!pm.was_math_fn && v < 1.0) {
+                return None;
+            }
+            let n = (v + 0.5).floor().max(1.0) as i32;
+            let s = pm.node.serialize_specified(pm.was_math_fn);
+            return Some((PropertyValue::HyphenateLimitLines(Some(n)), s));
+        }
+        PropertyIdKind::Contain => {
+            let lower = trimmed.to_ascii_lowercase();
+            let toks: Vec<&str> = lower.split_ascii_whitespace().collect();
+            if toks.is_empty() {
+                return None;
+            }
+            if toks.len() == 1 {
+                match toks[0] {
+                    "none" => return Some((PropertyValue::Contain(0), "none".to_string())),
+                    "strict" => return Some((PropertyValue::Contain(0x1D), "strict".to_string())),
+                    "content" => {
+                        return Some((PropertyValue::Contain(0x1C), "content".to_string()))
+                    }
+                    _ => {}
+                }
+            }
+            let mut bits = 0u8;
+            for t in toks {
+                let bit = match t {
+                    "size" => 0x01,
+                    "inline-size" => 0x02,
+                    "layout" => 0x04,
+                    "style" => 0x08,
+                    "paint" => 0x10,
+                    _ => return None,
+                };
+                if bits & bit != 0 {
+                    return None;
+                }
+                bits |= bit;
+            }
+            if bits & 0x03 == 0x03 {
+                return None;
+            }
+            let mut parts = Vec::new();
+            if bits & 0x01 != 0 {
+                parts.push("size");
+            }
+            if bits & 0x02 != 0 {
+                parts.push("inline-size");
+            }
+            if bits & 0x04 != 0 {
+                parts.push("layout");
+            }
+            if bits & 0x08 != 0 {
+                parts.push("style");
+            }
+            if bits & 0x10 != 0 {
+                parts.push("paint");
+            }
+            return Some((PropertyValue::Contain(bits), parts.join(" ")));
         }
         PropertyIdKind::ViewTransitionName => {
             if trimmed.eq_ignore_ascii_case("none") {
@@ -3215,6 +3434,7 @@ fn wrap_color4_declarations(css: &str) -> std::borrow::Cow<'_, str> {
             let is_color_prop = prop_kind.is_some_and(crate::cssom_decl::is_color_longhand);
             let is_val4_prop = prop_kind.is_some_and(|pk| {
                 supports_values4_math(pk)
+                    || is_values4_native_property(pk)
                     || matches!(
                         pk,
                         PropertyIdKind::Transition

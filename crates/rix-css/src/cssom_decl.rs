@@ -89,6 +89,10 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
             return Some(trimmed.to_string());
         }
     }
+    if prop_kind == PropertyIdKind::Display {
+        return crate::values::DisplayMode::parse_css(trimmed)
+            .map(|d| d.to_css_string().to_string());
+    }
     if prop_kind == PropertyIdKind::ViewTransitionName {
         if lower_val == "none" {
             return Some("none".to_string());
