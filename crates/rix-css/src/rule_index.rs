@@ -262,6 +262,32 @@ impl RuleIndex {
                 {
                     index.allows_sibling_sharing = false;
                 }
+                let mut attr_refs = Vec::new();
+                for d in compiled.declarations.iter() {
+                    if let crate::properties::PropertyValue::Unresolved(toks)
+                    | crate::properties::PropertyValue::Custom(toks) = &d.value
+                    {
+                        attr_refs.clear();
+                        crate::substitution::collect_attr_names_from_tokens(
+                            toks.as_slice(),
+                            &mut attr_refs,
+                        );
+                        let attr_scope = if d.property == crate::properties::PropertyIdKind::Custom
+                        {
+                            InvalidationScope::SELF | InvalidationScope::DESCENDANTS
+                        } else {
+                            InvalidationScope::SELF
+                        };
+                        for a in &attr_refs {
+                            if a == "*" {
+                                inv.any_attr_dep |= attr_scope;
+                            } else {
+                                *inv.attr_deps.entry(hash_ident_ascii_lower(a)).or_default() |=
+                                    attr_scope;
+                            }
+                        }
+                    }
+                }
                 let (has_rel, has_non_subject) = inv.record_selector(&compiled.selector);
                 if has_rel {
                     index.has_relative_selectors = true;
@@ -458,6 +484,7 @@ pub struct InvalidationMap {
     class_deps: HashMap<u64, InvalidationScope>,
     id_deps: HashMap<u64, InvalidationScope>,
     attr_deps: HashMap<u64, InvalidationScope>,
+    any_attr_dep: InvalidationScope,
     state_deps: HashMap<ElementState, InvalidationScope>,
 }
 
@@ -492,10 +519,12 @@ impl InvalidationMap {
     /// Returns the invalidation scope for mutating attribute `attr_name`.
     #[must_use]
     pub fn scope_for_attribute(&self, attr_name: &str) -> InvalidationScope {
-        self.attr_deps
-            .get(&hash_ident_ascii_lower(attr_name))
-            .copied()
-            .unwrap_or(InvalidationScope::empty())
+        self.any_attr_dep
+            | self
+                .attr_deps
+                .get(&hash_ident_ascii_lower(attr_name))
+                .copied()
+                .unwrap_or(InvalidationScope::empty())
     }
 
     /// Returns the combined invalidation scope for toggling `changed_states`.

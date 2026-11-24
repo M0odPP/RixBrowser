@@ -179,6 +179,11 @@ fn convert_token_or_value(item: &TokenOrValue<'_>, out: &mut Vec<CssToken>) {
             LightningToken::Delim(c) => out.push(CssToken::Delim(*c)),
             LightningToken::Comma => out.push(CssToken::Comma),
             LightningToken::Colon => out.push(CssToken::Colon),
+            LightningToken::Semicolon => out.push(CssToken::Delim(';')),
+            LightningToken::CurlyBracketBlock => out.push(CssToken::Delim('{')),
+            LightningToken::CloseCurlyBracket => out.push(CssToken::Delim('}')),
+            LightningToken::SquareBracketBlock => out.push(CssToken::Delim('[')),
+            LightningToken::CloseSquareBracket => out.push(CssToken::Delim(']')),
             LightningToken::WhiteSpace(ws) => {
                 for _ in 0..ws.len().clamp(1, 64) {
                     out.push(CssToken::Space);
@@ -247,7 +252,17 @@ fn convert_token_or_value(item: &TokenOrValue<'_>, out: &mut Vec<CssToken>) {
 pub fn write_tokens_to_buf(tokens: &[CssToken], buf: &mut String) {
     for tok in tokens {
         match tok {
-            CssToken::Ident(s) => buf.push_str(s.as_str()),
+            CssToken::Ident(s) => {
+                let raw = s.as_str();
+                let b = raw.as_bytes();
+                let needs_escape = b.first().is_some_and(u8::is_ascii_digit)
+                    || (b.len() >= 2 && b[0] == b'-' && b[1].is_ascii_digit());
+                if needs_escape {
+                    buf.push_str(&crate::substitution::escape_css_ident(raw));
+                } else {
+                    buf.push_str(raw);
+                }
+            }
             CssToken::Number(n) => {
                 let _ = write!(buf, "{n}");
             }
@@ -282,7 +297,16 @@ pub fn write_tokens_to_buf(tokens: &[CssToken], buf: &mut String) {
                 buf.push('"');
             }
             CssToken::Url(u) => {
-                let _ = write!(buf, "url(\"{}\")", u.as_str());
+                let raw = u.as_str();
+                let needs_quote = raw.is_empty()
+                    || raw.bytes().any(|b| {
+                        b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'(' | b')' | b'\\')
+                    });
+                if needs_quote {
+                    let _ = write!(buf, "url({})", crate::substitution::quote_css_string(raw));
+                } else {
+                    let _ = write!(buf, "url({raw})");
+                }
             }
             CssToken::Hash(h) => {
                 buf.push('#');
@@ -488,6 +512,7 @@ pub enum PropertyIdKind {
     AnimationPlayState,
     AnimationComposition,
     InterpolateSize,
+    ViewTransitionName,
     // Typography
     FontSize,
     FontWeight,
@@ -802,6 +827,7 @@ impl PropertyIdKind {
             "animation-play-state" => Self::AnimationPlayState,
             "animation-composition" => Self::AnimationComposition,
             "interpolate-size" => Self::InterpolateSize,
+            "view-transition-name" => Self::ViewTransitionName,
             "font-size" => Self::FontSize,
             "font-weight" => Self::FontWeight,
             "font-style" => Self::FontStyle,
@@ -986,6 +1012,7 @@ impl PropertyIdKind {
             Self::AnimationPlayState => "animation-play-state",
             Self::AnimationComposition => "animation-composition",
             Self::InterpolateSize => "interpolate-size",
+            Self::ViewTransitionName => "view-transition-name",
             Self::FontSize => "font-size",
             Self::FontWeight => "font-weight",
             Self::FontStyle => "font-style",
@@ -2016,6 +2043,9 @@ pub enum PropertyValue {
     InterpolateSize(InterpolateSizeMode),
     TransitionBehaviorList(Vec<TransitionBehaviorMode>),
     AnimationCompositionList(Vec<AnimationCompositionMode>),
+    ViewTransitionName(Option<InternedStr>),
+    BackgroundImageRaw(String),
+    FontStyleObliqueMath(Box<crate::values_math::MathNode>),
 }
 
 impl PropertyValue {
@@ -2061,7 +2091,10 @@ impl PropertyValue {
             Self::AspectRatioMath(Some((a, b))) => {
                 node_has(a) || b.as_deref().is_some_and(node_has)
             }
-            Self::Custom(toks) | Self::Unresolved(toks) => tokens_contain_sibling_fn(toks),
+            Self::Custom(toks) | Self::Unresolved(toks) => {
+                tokens_contain_sibling_fn(toks) || crate::substitution::tokens_contain_subst(toks)
+            }
+            Self::FontStyleObliqueMath(n) => node_has(n),
             _ => false,
         }
     }
@@ -2218,8 +2251,19 @@ pub(crate) fn rewrite_dynamic_var_names(css: &str) -> std::borrow::Cow<'_, str> 
             while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                 k += 1;
             }
-            // Case 1: `var(var(...))` -> rewrite outer `var(` to `__rix_var__(`
-            if k + 4 <= bytes.len() && bytes[k..k + 4].eq_ignore_ascii_case(b"var(") {
+            // Case 1: `var(<subst-fn>(...))` or `var({<subst-fn>(...)})` -> rewrite outer `var(` to `__rix_var__(`
+            let is_braced_plain_custom = bytes[k] == b'{'
+                && src[k + 1..].find('}').is_some_and(|rel| {
+                    let ins = src[k + 1..k + 1 + rel].trim();
+                    ins.starts_with("--")
+                        && ins.len() > 2
+                        && !ins.contains(|c: char| c.is_ascii_whitespace() || c == ',' || c == '(')
+                });
+            if k < bytes.len()
+                && !bytes[k..].starts_with(b"--")
+                && !is_braced_plain_custom
+                && crate::substitution::contains_subst_fn_str(&src[k..])
+            {
                 let buf = out.get_or_insert_with(|| String::with_capacity(src.len() + 16));
                 buf.push_str(&src[last..i]);
                 buf.push_str("__rix_var__(");
@@ -2317,6 +2361,7 @@ pub fn is_values4_native_property(prop: PropertyIdKind) -> bool {
             | PropertyIdKind::TransitionProperty
             | PropertyIdKind::TransitionTimingFunction
             | PropertyIdKind::AnimationTimingFunction
+            | PropertyIdKind::ViewTransitionName
     )
 }
 
@@ -2333,6 +2378,17 @@ pub fn should_use_values4_parser(prop: PropertyIdKind, raw: &str) -> bool {
     let lower = trimmed.to_ascii_lowercase();
     if lower.starts_with("fit-content(") {
         return false;
+    }
+    if prop == PropertyIdKind::BackgroundLayers
+        && (lower.starts_with("image-set(")
+            || lower.starts_with("-webkit-image-set(")
+            || lower.starts_with("src(")
+            || lower.starts_with("image("))
+    {
+        return true;
+    }
+    if prop == PropertyIdKind::FontStyle && lower.starts_with("oblique") && lower.contains('(') {
+        return true;
     }
     if is_sizing_property(prop)
         && (lower.starts_with("calc-size(")
@@ -2569,6 +2625,56 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
         PropertyIdKind::ObjectPosition => {
             let (pos, s) = crate::values_math::PositionSpec::parse(trimmed)?;
             return Some((PropertyValue::ObjectPos(Box::new(pos)), s));
+        }
+        PropertyIdKind::ViewTransitionName => {
+            if trimmed.eq_ignore_ascii_case("none") {
+                return Some((PropertyValue::ViewTransitionName(None), "none".to_string()));
+            }
+            let mut pi = cssparser::ParserInput::new(trimmed);
+            let mut p = cssparser::Parser::new(&mut pi);
+            let id = p.expect_ident().ok()?.as_ref().to_string();
+            if !p.is_exhausted() || GlobalKeyword::from_ident(&id).is_some() {
+                return None;
+            }
+            let esc = crate::substitution::escape_css_ident(&id);
+            return Some((
+                PropertyValue::ViewTransitionName(Some(intern_str(&esc))),
+                esc,
+            ));
+        }
+        PropertyIdKind::BackgroundLayers => {
+            let l = trimmed.to_ascii_lowercase();
+            if l.starts_with("image-set(")
+                || l.starts_with("-webkit-image-set(")
+                || l.starts_with("src(")
+                || l.starts_with("image(")
+            {
+                let _ = crate::substitution::parse_and_serialize_bg_image_fn(
+                    trimmed,
+                    &crate::values::EvalContext::default(),
+                )?;
+                return Some((
+                    PropertyValue::BackgroundImageRaw(trimmed.to_string()),
+                    trimmed.to_string(),
+                ));
+            }
+            return None;
+        }
+        PropertyIdKind::FontStyle => {
+            let l = trimmed.to_ascii_lowercase();
+            let rest = l.strip_prefix("oblique")?.trim();
+            if rest.is_empty() {
+                return None;
+            }
+            let rest_orig = trimmed[trimmed.len() - rest.len()..].trim();
+            let mut pm = parse_math_value(rest_orig, ValueKind::Angle)?;
+            let mut rc = 0u32;
+            pm.node.bind_random_property("font-style", &mut rc);
+            let spec = pm.node.serialize_specified(pm.was_math_fn);
+            return Some((
+                PropertyValue::FontStyleObliqueMath(Box::new(pm.node)),
+                format!("oblique {spec}"),
+            ));
         }
         PropertyIdKind::AspectRatio => {
             if trimmed.eq_ignore_ascii_case("auto") {
@@ -3105,12 +3211,19 @@ fn wrap_color4_declarations(css: &str) -> std::borrow::Cow<'_, str> {
             }
             let prop_name = &css[p..name_end];
             let prop_kind = PropertyIdKind::from_name(&prop_name.to_ascii_lowercase());
+            let is_std_prop = prop_kind.is_some_and(|pk| pk != PropertyIdKind::Custom);
             let is_color_prop = prop_kind.is_some_and(crate::cssom_decl::is_color_longhand);
             let is_val4_prop = prop_kind.is_some_and(|pk| {
                 supports_values4_math(pk)
-                    || matches!(pk, PropertyIdKind::Transition | PropertyIdKind::Animation)
+                    || matches!(
+                        pk,
+                        PropertyIdKind::Transition
+                            | PropertyIdKind::Animation
+                            | PropertyIdKind::BackgroundLayers
+                            | PropertyIdKind::FontStyle
+                    )
             });
-            if is_color_prop || is_val4_prop {
+            if is_std_prop {
                 // Scan value to top-level `;`, `}`, `!`, or EOF (abort if `{` -> selector).
                 let val_start = i + 1;
                 let mut j = val_start;
@@ -3167,23 +3280,27 @@ fn wrap_color4_declarations(css: &str) -> std::borrow::Cow<'_, str> {
                 }
                 if !saw_brace && (vp == 0 || j == bytes.len()) && vs.is_none() {
                     let raw = css[val_start..j].trim();
-                    let sentinel =
-                        if !raw.is_empty() && !crate::cssom_decl::contains_var_or_env_ci(raw) {
-                            if is_color_prop
-                                && (raw.contains('(')
-                                    || crate::color::SystemColor::from_ident(raw).is_some())
-                            {
-                                Some("--__rix_color4__")
-                            } else if is_val4_prop
-                                && prop_kind.is_some_and(|pk| should_use_values4_parser(pk, raw))
-                            {
-                                Some("--__rix_val4__")
-                            } else {
-                                None
-                            }
+                    let sentinel = if !raw.is_empty()
+                        && !raw.contains("--__rix_")
+                        && crate::substitution::contains_values5_subst_fn_str(raw)
+                    {
+                        Some("--__rix_subst__")
+                    } else if !raw.is_empty() && !crate::cssom_decl::contains_var_or_env_ci(raw) {
+                        if is_color_prop
+                            && (raw.contains('(')
+                                || crate::color::SystemColor::from_ident(raw).is_some())
+                        {
+                            Some("--__rix_color4__")
+                        } else if is_val4_prop
+                            && prop_kind.is_some_and(|pk| should_use_values4_parser(pk, raw))
+                        {
+                            Some("--__rix_val4__")
                         } else {
                             None
-                        };
+                        }
+                    } else {
+                        None
+                    };
                     if let Some(sent_var) = sentinel {
                         let buf = out.get_or_insert_with(|| String::with_capacity(css.len() + 32));
                         buf.push_str(&css[last..val_start]);
@@ -3232,6 +3349,7 @@ pub(crate) fn restore_revert_rule_sentinel(text: &str) -> String {
     for (tag, is_color) in [
         ("var(--__rix_color4__", true),
         ("var(--__rix_val4__", false),
+        ("var(--__rix_subst__", false),
     ] {
         if let Some(pos) = s.find(tag) {
             if let Some(q1) = s[pos..].find('"') {
@@ -3340,8 +3458,36 @@ pub fn parse_property_from_tokens(
 
     let mut buf = String::with_capacity(64);
     write_tokens_for_reparse(tokens, &mut buf);
+    parse_property_from_str(prop, &buf, important)
+}
+
+/// Parses a substituted CSS declaration value string for `prop` directly without a lossy
+/// intermediate token round-trip (preserving wide-gamut colors, `image-set()`, and `/**/` boundaries).
+#[must_use]
+pub fn parse_property_from_str(
+    prop: PropertyIdKind,
+    raw: &str,
+    important: bool,
+) -> Vec<SpecifiedDeclaration> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if let Some(kw) = GlobalKeyword::from_ident(trimmed) {
+        return prop
+            .shorthand_longhands()
+            .into_iter()
+            .map(|target| SpecifiedDeclaration {
+                property: target,
+                custom_name: None,
+                value: PropertyValue::Global(kw),
+                important,
+                order: 0,
+            })
+            .collect();
+    }
     if crate::cssom_decl::is_color_longhand(prop) {
-        if let Some(mut expr) = crate::color::parse_css_color(buf.trim()) {
+        if let Some(mut expr) = crate::color::parse_css_color(trimmed) {
             expr.bind_random_property(prop.css_name());
             return vec![SpecifiedDeclaration {
                 property: prop,
@@ -3353,10 +3499,83 @@ pub fn parse_property_from_tokens(
         }
         return Vec::new();
     }
-    if is_values4_native_property(prop)
-        || (supports_values4_math(prop) && crate::values_math::has_values4_syntax(buf.trim()))
+    if prop == PropertyIdKind::Background {
+        let lower = trimmed.to_ascii_lowercase();
+        let fn_prefix = ["image-set(", "-webkit-image-set(", "src(", "image("]
+            .into_iter()
+            .find(|p| lower.starts_with(p));
+        if let Some(pfx) = fn_prefix {
+            let bytes = trimmed.as_bytes();
+            let mut depth = 0usize;
+            let mut end = None;
+            let mut in_str: Option<u8> = None;
+            for (idx, &b) in bytes.iter().enumerate().skip(pfx.len() - 1) {
+                if let Some(q) = in_str {
+                    if b == q && (idx == 0 || bytes[idx - 1] != b'\\') {
+                        in_str = None;
+                    }
+                    continue;
+                }
+                match b {
+                    b'"' | b'\'' => in_str = Some(b),
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            end = Some(idx);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(close) = end {
+                let img_part = &trimmed[..=close];
+                let rest = trimmed[close + 1..].trim();
+                if crate::substitution::parse_and_serialize_bg_image_fn(
+                    img_part,
+                    &crate::values::EvalContext::default(),
+                )
+                .is_some()
+                {
+                    let mut decls = vec![SpecifiedDeclaration {
+                        property: PropertyIdKind::BackgroundLayers,
+                        custom_name: None,
+                        value: PropertyValue::BackgroundImageRaw(img_part.to_string()),
+                        important,
+                        order: 0,
+                    }];
+                    if rest.is_empty() {
+                        decls.push(SpecifiedDeclaration {
+                            property: PropertyIdKind::BackgroundColor,
+                            custom_name: None,
+                            value: PropertyValue::Color(CssColor::Rgba(
+                                crate::values::ColorRgba::TRANSPARENT,
+                            )),
+                            important,
+                            order: 1,
+                        });
+                        return decls;
+                    } else if let Some(mut expr) = crate::color::parse_css_color(rest) {
+                        expr.bind_random_property("background-color");
+                        decls.push(SpecifiedDeclaration {
+                            property: PropertyIdKind::BackgroundColor,
+                            custom_name: None,
+                            value: PropertyValue::Color4(Box::new(expr)),
+                            important,
+                            order: 1,
+                        });
+                        return decls;
+                    }
+                }
+            }
+        }
+    }
+    if should_use_values4_parser(prop, trimmed)
+        || is_values4_native_property(prop)
+        || (supports_values4_math(prop) && crate::values_math::has_values4_syntax(trimmed))
     {
-        if let Some((val, _)) = parse_values4_property(prop, buf.trim()) {
+        if let Some((val, _)) = parse_values4_property(prop, trimmed) {
             return vec![SpecifiedDeclaration {
                 property: prop,
                 custom_name: None,
@@ -3377,7 +3596,8 @@ pub fn parse_property_from_tokens(
         let mut out = Vec::new();
         let mut order = 0u32;
         let mut ignored_missing = Vec::new();
-        if let Ok(parsed) = Property::parse_string(PropertyId::from(prop.css_name()), &buf, opts) {
+        if let Ok(parsed) = Property::parse_string(PropertyId::from(prop.css_name()), trimmed, opts)
+        {
             if !matches!(parsed, Property::Unparsed(_)) {
                 compile_property(
                     &parsed,
@@ -5892,7 +6112,10 @@ fn compile_property(
                         fallback: Some(fb),
                     } = non_ws[0]
                     {
-                        if matches!(name.as_str(), "--__rix_color4__" | "--__rix_val4__") {
+                        if matches!(
+                            name.as_str(),
+                            "--__rix_color4__" | "--__rix_val4__" | "--__rix_subst__"
+                        ) {
                             fb.iter().find_map(|t| match t {
                                 CssToken::String(s) => Some((name.as_str(), s.as_str())),
                                 _ => None,
@@ -5908,7 +6131,15 @@ fn compile_property(
                 }
             };
             if let Some((sent_name, raw_val)) = sentinel_raw {
-                if sent_name == "--__rix_color4__" {
+                if sent_name == "--__rix_subst__" {
+                    push_decl(
+                        out,
+                        ord,
+                        kind,
+                        PropertyValue::Unresolved(tokenize_custom_value_str(raw_val)),
+                        imp,
+                    );
+                } else if sent_name == "--__rix_color4__" {
                     if let Some(mut expr) = crate::color::parse_css_color(raw_val) {
                         expr.bind_random_property(kind.css_name());
                         push_decl(out, ord, kind, PropertyValue::Color4(Box::new(expr)), imp);
@@ -5977,8 +6208,44 @@ fn compile_property(
             CustomPropertyName::Unknown(ident) => {
                 if let Some(kind) = PropertyIdKind::from_name(&ident.as_ref().to_ascii_lowercase())
                 {
+                    let tokens = convert_token_list(&custom.value);
+                    let subst_unwrapped = {
+                        let non_ws: SmallVec<[&CssToken; 2]> = tokens
+                            .iter()
+                            .filter(|t| !matches!(t, CssToken::Space))
+                            .collect();
+                        if non_ws.len() == 1 {
+                            if let CssToken::Var {
+                                name,
+                                fallback: Some(fb),
+                            } = non_ws[0]
+                            {
+                                if name.as_str() == "--__rix_subst__" {
+                                    fb.iter().find_map(|t| match t {
+                                        CssToken::String(s) => Some(s.as_str()),
+                                        _ => None,
+                                    })
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(raw_val) = subst_unwrapped {
+                        push_decl(
+                            out,
+                            ord,
+                            kind,
+                            PropertyValue::Unresolved(tokenize_custom_value_str(raw_val)),
+                            imp,
+                        );
+                        return;
+                    }
                     if is_values4_native_property(kind) {
-                        let tokens = convert_token_list(&custom.value);
                         let mut handled = false;
                         {
                             let non_ws: SmallVec<[&CssToken; 2]> = tokens
@@ -6035,7 +6302,7 @@ fn compile_property(
                         if handled {
                             return;
                         }
-                        if tokens.iter().any(|t| matches!(t, CssToken::Var { .. })) {
+                        if tokens.iter().any(css_token_has_var) {
                             push_decl(out, ord, kind, PropertyValue::Unresolved(tokens), imp);
                             return;
                         }
@@ -6142,11 +6409,7 @@ fn token_list_has_unbalanced_delims(list: &TokenList<'_>) -> bool {
 }
 
 fn css_token_has_var(tok: &CssToken) -> bool {
-    match tok {
-        CssToken::Var { .. } => true,
-        CssToken::Function { args, .. } => args.iter().any(css_token_has_var),
-        _ => false,
-    }
+    crate::substitution::token_has_subst(tok)
 }
 
 fn parse_overscroll_mode(ident: &str) -> Option<OverscrollBehaviorMode> {

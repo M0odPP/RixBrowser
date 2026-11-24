@@ -539,6 +539,17 @@ impl StyleContext {
         if attr_name.eq_ignore_ascii_case("style") {
             mark_node_and_ancestors_dirty(doc, node);
         }
+        let inline_has_attr = matches!(
+            doc.get(node),
+            Some(NodeData::Element(e))
+                if e.attributes.iter().any(|(q, v)| {
+                    q.local.eq_str_ignore_ascii_case("style")
+                        && crate::substitution::contains_values5_subst_fn_str(v)
+                })
+        );
+        if inline_has_attr {
+            mark_node_and_ancestors_dirty(doc, node);
+        }
         let scope = self.invalidation_map.scope_for_attribute(attr_name);
         apply_invalidation_scope(doc, node, scope);
     }
@@ -1072,6 +1083,11 @@ fn restyle_dirty_walk(
             RixPseudoElement::After,
             RixPseudoElement::FirstLine,
             RixPseudoElement::FirstLetter,
+            RixPseudoElement::Marker,
+            RixPseudoElement::Placeholder,
+            RixPseudoElement::Backdrop,
+            RixPseudoElement::FileSelectorButton,
+            RixPseudoElement::DetailsContent,
         ] {
             pseudo_styles.remove(&(node, pe));
         }
@@ -1247,6 +1263,7 @@ fn compute_single_element_style(
         sib_cnt,
         usize::from(node) as u64,
         rule_index.random_doc_seed,
+        &elem.attributes,
     ));
 
     if inline_attr.is_none() && !has_pres_hints && !any_scoped && !any_sibling_math {
@@ -1554,11 +1571,20 @@ fn collect_pseudo_element_styles(
     caches: &mut SelectorCaches,
     out_pseudos: &mut Vec<((NodeId, RixPseudoElement), Arc<ComputedStyle>)>,
 ) {
+    let elem_attrs: &[(rix_dom::QualName, String)] = match doc.get(node) {
+        Some(NodeData::Element(e)) => &e.attributes,
+        _ => &[],
+    };
     for pseudo in [
         RixPseudoElement::Before,
         RixPseudoElement::After,
         RixPseudoElement::FirstLine,
         RixPseudoElement::FirstLetter,
+        RixPseudoElement::Marker,
+        RixPseudoElement::Placeholder,
+        RixPseudoElement::Backdrop,
+        RixPseudoElement::FileSelectorButton,
+        RixPseudoElement::DetailsContent,
     ] {
         if !rule_index.has_pseudo_rules(pseudo) {
             continue;
@@ -1606,6 +1632,7 @@ fn collect_pseudo_element_styles(
                 sc,
                 pseudo_nid,
                 rule_index.random_doc_seed,
+                elem_attrs,
             ));
             out_pseudos.push(((node, pseudo), style));
         }

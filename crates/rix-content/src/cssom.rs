@@ -3179,12 +3179,37 @@ fn format_computed_property_resolved(
         ),
         "font-size" => format_px(style.text.font_size_px),
         "font-weight" => format_num(style.text.font_weight),
-        "font-style" => match style.text.font_style {
-            FontStyleMode::Normal => "normal",
-            FontStyleMode::Italic => "italic",
-            FontStyleMode::Oblique(_) => "oblique",
+        "font-style" => {
+            if let Some(n) = style
+                .effects
+                .as_ref()
+                .and_then(|e| e.font_style_oblique_math.as_ref())
+            {
+                let a = n.serialize_computed(
+                    &eval,
+                    None,
+                    rix_css::values_math::ValueKind::Angle,
+                    Some(-90.0),
+                    Some(90.0),
+                );
+                return if a == "14deg" {
+                    "oblique".to_string()
+                } else {
+                    format!("oblique {a}")
+                };
+            }
+            match style.text.font_style {
+                FontStyleMode::Normal => "normal".into(),
+                FontStyleMode::Italic => "italic".into(),
+                FontStyleMode::Oblique(deg) => {
+                    if (deg - 14.0).abs() < 1e-4 {
+                        "oblique".into()
+                    } else {
+                        format!("oblique {}deg", format_num(deg))
+                    }
+                }
+            }
         }
-        .into(),
         "font-family" => style
             .text
             .font_family
@@ -3759,6 +3784,72 @@ fn format_computed_property_resolved(
                     .collect::<Vec<_>>()
                     .join(", "),
                 _ => "0s".into(),
+            }
+        }
+        "view-transition-name" => style
+            .effects
+            .as_ref()
+            .and_then(|e| e.view_transition_name.as_ref())
+            .map_or_else(|| "none".to_string(), |s| s.as_str().to_string()),
+        "animation-name" => match style.effects.as_ref().map(|e| e.animations.as_slice()) {
+            Some(list) if !list.is_empty() => list
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => "none".into(),
+        },
+        "background-image" => {
+            if let Some(raw) = style.visual.background_image_raw.as_deref() {
+                rix_css::substitution::parse_and_serialize_bg_image_fn(raw, &eval)
+                    .unwrap_or_else(|| "none".to_string())
+            } else if !style.visual.background_layers.is_empty() {
+                style
+                    .visual
+                    .background_layers
+                    .iter()
+                    .map(|l| match &l.image {
+                        rix_css::BackgroundImageValue::None => "none".to_string(),
+                        rix_css::BackgroundImageValue::Url(u) => {
+                            format!(
+                                "url({})",
+                                rix_css::substitution::quote_css_string(u.as_str())
+                            )
+                        }
+                        rix_css::BackgroundImageValue::LinearGradient { angle_deg, stops } => {
+                            let mut parts = Vec::with_capacity(stops.len() + 1);
+                            if (*angle_deg - 180.0).abs() > 0.01 {
+                                parts.push(format!("{}deg", format_num(*angle_deg)));
+                            }
+                            for st in stops {
+                                let col = format_css_color(st.color, style.text.color, dark);
+                                if let Some(ref pos) = st.position {
+                                    parts.push(format!("{col} {}", format_lp(pos, &eval)));
+                                } else {
+                                    parts.push(col);
+                                }
+                            }
+                            format!("linear-gradient({})", parts.join(", "))
+                        }
+                        rix_css::BackgroundImageValue::RadialGradient { stops, .. } => {
+                            let parts: Vec<String> = stops
+                                .iter()
+                                .map(|st| {
+                                    let col = format_css_color(st.color, style.text.color, dark);
+                                    if let Some(ref pos) = st.position {
+                                        format!("{col} {}", format_lp(pos, &eval))
+                                    } else {
+                                        col
+                                    }
+                                })
+                                .collect();
+                            format!("radial-gradient({})", parts.join(", "))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                "none".into()
             }
         }
         "animation-duration" => {

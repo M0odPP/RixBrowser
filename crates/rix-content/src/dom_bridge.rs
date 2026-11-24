@@ -667,7 +667,10 @@ impl HostState {
     ) -> Option<Arc<ComputedStyle>> {
         let ctx = self.ensure_styles();
         match pseudo {
-            Some(pe) => ctx.pseudo_style_for(node, pe).cloned(),
+            Some(pe) => ctx.pseudo_style_for(node, pe).cloned().or_else(|| {
+                ctx.style_for(node)
+                    .map(|orig| Arc::new(ComputedStyle::inherit_from(orig)))
+            }),
             None => ctx.style_for(node).cloned(),
         }
     }

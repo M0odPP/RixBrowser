@@ -11,6 +11,7 @@ pub mod properties;
 pub mod rule_index;
 pub mod selector;
 pub mod stylesheet;
+pub mod substitution;
 pub mod ua;
 pub mod values;
 pub mod values_math;

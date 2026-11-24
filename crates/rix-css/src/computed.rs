@@ -8,9 +8,8 @@ use rix_core::InternedStr;
 use smallvec::SmallVec;
 
 use crate::properties::{
-    is_logical_property, parse_property_from_tokens, resolve_logical_to_physical,
-    serialize_css_tokens, CssToken, GlobalKeyword, PropertyIdKind, PropertyValue,
-    SpecifiedDeclaration,
+    is_logical_property, resolve_logical_to_physical, serialize_css_tokens, CssToken,
+    GlobalKeyword, PropertyIdKind, PropertyValue, SpecifiedDeclaration,
 };
 use crate::stylesheet::{CascadeOrigin, CompiledRule, LayerId, MediaContext, RegisteredProperty};
 use crate::values::{
@@ -86,6 +85,7 @@ pub struct VisualStyle {
     pub background_color: ColorRgba,
     pub background_color_computed: Option<Arc<crate::color::CssColorExpr>>,
     pub background_layers: Vec<BackgroundLayerValue>,
+    pub background_image_raw: Option<String>,
     pub background_position: (LengthPercentage, LengthPercentage),
     pub object_position: Option<Box<crate::values_math::PositionSpec>>,
     pub border_style: EdgeValues<LineStyle>,
@@ -112,6 +112,7 @@ impl Default for VisualStyle {
             background_color: ColorRgba::TRANSPARENT,
             background_color_computed: None,
             background_layers: Vec::new(),
+            background_image_raw: None,
             background_position: (
                 LengthPercentage::Percent(0.0),
                 LengthPercentage::Percent(0.0),
@@ -313,12 +314,16 @@ pub struct EffectsStyle {
         crate::values_math::MathNode,
         Option<crate::values_math::MathNode>,
     )>,
+    pub view_transition_name: Option<InternedStr>,
+    pub font_style_oblique_math: Option<crate::values_math::MathNode>,
 }
 
-/// Inherited map of CSS custom properties (`--*`) stored as owned token streams.
+/// Inherited map of CSS custom properties (`--*`) stored as owned token streams,
+/// together with token-level `attr()`-tainted byte ranges (CSS Values L5 §9.4.1).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct CustomPropertyMap {
     pub entries: HashMap<InternedStr, Vec<CssToken>>,
+    pub tainted_ranges: HashMap<InternedStr, Vec<(usize, usize)>>,
 }
 
 impl CustomPropertyMap {
@@ -638,391 +643,6 @@ fn expand_var_tokens(
     Some(())
 }
 
-/// Dynamic Tarjan SCC resolver for CSS custom properties (CSS Variables L1 §3 + CSSWG #11500).
-///
-/// Traverses only actually-evaluated `var()` edges (fallbacks are only entered when the
-/// primary variable is undefined or independently guaranteed-invalid), while continuing to
-/// evaluate remaining top-level tokens so overlapping secondary cycles are discovered while
-/// the SCC root is still on the Tarjan stack.
-struct CustomPropResolver<'a> {
-    raw_map: &'a HashMap<InternedStr, Vec<CssToken>>,
-    next_index: usize,
-    indices: HashMap<InternedStr, usize>,
-    lowlink: HashMap<InternedStr, usize>,
-    on_stack: HashMap<InternedStr, bool>,
-    tarjan_stack: Vec<InternedStr>,
-    resolved: HashMap<InternedStr, Option<Vec<CssToken>>>,
-}
-
-enum DynamicVarOutcome {
-    Valid,
-    Invalid,
-    Cycle(usize),
-}
-
-impl<'a> CustomPropResolver<'a> {
-    fn new(raw_map: &'a HashMap<InternedStr, Vec<CssToken>>) -> Self {
-        let cap = raw_map.len();
-        Self {
-            raw_map,
-            next_index: 0,
-            indices: HashMap::with_capacity(cap),
-            lowlink: HashMap::with_capacity(cap),
-            on_stack: HashMap::with_capacity(cap),
-            tarjan_stack: Vec::with_capacity(cap),
-            resolved: HashMap::with_capacity(cap),
-        }
-    }
-
-    fn resolve(&mut self, name: &InternedStr, depth: u8) -> Option<Vec<CssToken>> {
-        if let Some(res) = self.resolved.get(name) {
-            return res.clone();
-        }
-        let tokens = self.raw_map.get(name)?;
-        if !tokens.iter().any(token_has_var) {
-            let cloned = tokens.clone();
-            self.resolved.insert(name.clone(), Some(cloned.clone()));
-            return Some(cloned);
-        }
-        self.strongconnect(name, depth);
-        self.resolved.get(name).cloned().flatten()
-    }
-
-    fn strongconnect(&mut self, name: &InternedStr, depth: u8) {
-        let my_idx = self.next_index;
-        self.next_index += 1;
-        self.indices.insert(name.clone(), my_idx);
-        self.lowlink.insert(name.clone(), my_idx);
-        self.on_stack.insert(name.clone(), true);
-        self.tarjan_stack.push(name.clone());
-
-        let tokens = self.raw_map.get(name).map(Vec::as_slice).unwrap_or(&[]);
-        let mut out = Vec::with_capacity(tokens.len());
-        let mut byte_budget = MAX_VAR_EXPANDED_BYTES;
-        let mut failed = false;
-        let mut hit_cycle = false;
-
-        self.eval_token_slice(
-            name,
-            tokens,
-            depth,
-            &mut out,
-            &mut byte_budget,
-            &mut failed,
-            &mut hit_cycle,
-        );
-
-        let my_low = self.lowlink.get(name).copied().unwrap_or(my_idx);
-        if my_low == my_idx {
-            let mut scc = Vec::new();
-            while let Some(w) = self.tarjan_stack.pop() {
-                self.on_stack.insert(w.clone(), false);
-                let is_root = &w == name;
-                scc.push(w);
-                if is_root {
-                    break;
-                }
-            }
-            if scc.len() > 1 || hit_cycle {
-                for node in scc {
-                    self.resolved.insert(node, None);
-                }
-            } else if failed {
-                self.resolved.insert(name.clone(), None);
-            } else {
-                self.resolved.insert(name.clone(), Some(out));
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn eval_token_slice(
-        &mut self,
-        owner: &InternedStr,
-        tokens: &[CssToken],
-        depth: u8,
-        out: &mut Vec<CssToken>,
-        byte_budget: &mut usize,
-        failed: &mut bool,
-        hit_cycle: &mut bool,
-    ) -> DynamicVarOutcome {
-        if depth > MAX_VAR_DEPTH || out.len() > MAX_VAR_EXPANDED_TOKENS || *byte_budget == 0 {
-            *byte_budget = 0;
-            *failed = true;
-            return DynamicVarOutcome::Invalid;
-        }
-        let mut slice_failed = false;
-        let mut slice_cycle: Option<usize> = None;
-
-        for tok in tokens {
-            match tok {
-                CssToken::Var { name, fallback } => {
-                    let dep_outcome = self.eval_var_ref(owner, name, depth + 1, out, byte_budget);
-                    match dep_outcome {
-                        DynamicVarOutcome::Valid => {}
-                        DynamicVarOutcome::Cycle(target_low) => {
-                            *hit_cycle = true;
-                            *failed = true;
-                            slice_failed = true;
-                            slice_cycle =
-                                Some(slice_cycle.map_or(target_low, |c| c.min(target_low)));
-                            if let Some(cur_low) = self.lowlink.get_mut(owner) {
-                                *cur_low = (*cur_low).min(target_low);
-                            }
-                        }
-                        DynamicVarOutcome::Invalid => {
-                            if let Some(fb) = fallback {
-                                let saved_len = out.len();
-                                let mut fb_failed = false;
-                                let mut fb_cycle = false;
-                                let fb_out = self.eval_token_slice(
-                                    owner,
-                                    fb,
-                                    depth + 1,
-                                    out,
-                                    byte_budget,
-                                    &mut fb_failed,
-                                    &mut fb_cycle,
-                                );
-                                if fb_cycle {
-                                    *hit_cycle = true;
-                                }
-                                match fb_out {
-                                    DynamicVarOutcome::Valid => {}
-                                    DynamicVarOutcome::Cycle(low) => {
-                                        out.truncate(saved_len);
-                                        *failed = true;
-                                        slice_failed = true;
-                                        slice_cycle = Some(slice_cycle.map_or(low, |c| c.min(low)));
-                                    }
-                                    DynamicVarOutcome::Invalid => {
-                                        out.truncate(saved_len);
-                                        *failed = true;
-                                        slice_failed = true;
-                                    }
-                                }
-                            } else {
-                                *failed = true;
-                                slice_failed = true;
-                            }
-                        }
-                    }
-                }
-                CssToken::Function { name, args } if name.as_str().eq_ignore_ascii_case("var") => {
-                    let (name_args, fallback) = split_var_fn_args(args);
-                    let mut name_toks = Vec::new();
-                    let mut name_failed = false;
-                    let mut name_cycle = false;
-                    let name_out = self.eval_token_slice(
-                        owner,
-                        name_args,
-                        depth + 1,
-                        &mut name_toks,
-                        byte_budget,
-                        &mut name_failed,
-                        &mut name_cycle,
-                    );
-                    if name_cycle {
-                        *hit_cycle = true;
-                    }
-                    let dep_outcome = match name_out {
-                        DynamicVarOutcome::Cycle(low) => DynamicVarOutcome::Cycle(low),
-                        DynamicVarOutcome::Invalid => DynamicVarOutcome::Invalid,
-                        DynamicVarOutcome::Valid => {
-                            if let Some(target_name) = extract_single_custom_prop_name(&name_toks) {
-                                self.eval_var_ref(owner, &target_name, depth + 1, out, byte_budget)
-                            } else {
-                                DynamicVarOutcome::Invalid
-                            }
-                        }
-                    };
-                    match dep_outcome {
-                        DynamicVarOutcome::Valid => {}
-                        DynamicVarOutcome::Cycle(low) => {
-                            *hit_cycle = true;
-                            *failed = true;
-                            slice_failed = true;
-                            slice_cycle = Some(slice_cycle.map_or(low, |c| c.min(low)));
-                        }
-                        DynamicVarOutcome::Invalid => {
-                            if let Some(fb) = fallback {
-                                let saved_len = out.len();
-                                let mut fb_failed = false;
-                                let mut fb_cycle = false;
-                                let fb_out = self.eval_token_slice(
-                                    owner,
-                                    fb,
-                                    depth + 1,
-                                    out,
-                                    byte_budget,
-                                    &mut fb_failed,
-                                    &mut fb_cycle,
-                                );
-                                if fb_cycle {
-                                    *hit_cycle = true;
-                                }
-                                match fb_out {
-                                    DynamicVarOutcome::Valid => {}
-                                    DynamicVarOutcome::Cycle(low) => {
-                                        out.truncate(saved_len);
-                                        *failed = true;
-                                        slice_failed = true;
-                                        slice_cycle = Some(slice_cycle.map_or(low, |c| c.min(low)));
-                                    }
-                                    DynamicVarOutcome::Invalid => {
-                                        out.truncate(saved_len);
-                                        *failed = true;
-                                        slice_failed = true;
-                                    }
-                                }
-                            } else {
-                                *failed = true;
-                                slice_failed = true;
-                            }
-                        }
-                    }
-                }
-                CssToken::Function { name, args } => {
-                    let cost = name.as_str().len() + 2;
-                    if !*failed && (cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS) {
-                        *byte_budget = 0;
-                        *failed = true;
-                        slice_failed = true;
-                    } else if !*failed {
-                        *byte_budget = byte_budget.saturating_sub(cost);
-                    }
-                    let mut resolved_args = Vec::with_capacity(args.len());
-                    let arg_out = self.eval_token_slice(
-                        owner,
-                        args,
-                        depth + 1,
-                        &mut resolved_args,
-                        byte_budget,
-                        failed,
-                        hit_cycle,
-                    );
-                    match arg_out {
-                        DynamicVarOutcome::Valid if !*failed => {
-                            out.push(CssToken::Function {
-                                name: name.clone(),
-                                args: resolved_args,
-                            });
-                        }
-                        DynamicVarOutcome::Cycle(low) => {
-                            slice_failed = true;
-                            slice_cycle = Some(slice_cycle.map_or(low, |c| c.min(low)));
-                        }
-                        _ => {
-                            slice_failed = true;
-                        }
-                    }
-                }
-                other => {
-                    if !*failed {
-                        let cost = token_approx_bytes(other);
-                        if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
-                            *byte_budget = 0;
-                            *failed = true;
-                            slice_failed = true;
-                        } else {
-                            *byte_budget -= cost;
-                            out.push(other.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(low) = slice_cycle {
-            DynamicVarOutcome::Cycle(low)
-        } else if slice_failed {
-            DynamicVarOutcome::Invalid
-        } else {
-            DynamicVarOutcome::Valid
-        }
-    }
-
-    fn eval_var_ref(
-        &mut self,
-        owner: &InternedStr,
-        dep: &InternedStr,
-        depth: u8,
-        out: &mut Vec<CssToken>,
-        byte_budget: &mut usize,
-    ) -> DynamicVarOutcome {
-        if depth > MAX_VAR_DEPTH {
-            *byte_budget = 0;
-            return DynamicVarOutcome::Invalid;
-        }
-        if let Some(resolved_opt) = self.resolved.get(dep) {
-            return match resolved_opt {
-                Some(toks) => {
-                    for rt in toks {
-                        let cost = token_approx_bytes(rt);
-                        if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
-                            *byte_budget = 0;
-                            return DynamicVarOutcome::Invalid;
-                        }
-                        *byte_budget -= cost;
-                        out.push(rt.clone());
-                    }
-                    DynamicVarOutcome::Valid
-                }
-                None => DynamicVarOutcome::Invalid,
-            };
-        }
-        if self.on_stack.get(dep).copied().unwrap_or(false) {
-            let dep_idx = self.indices.get(dep).copied().unwrap_or(0);
-            if let Some(cur_low) = self.lowlink.get_mut(owner) {
-                *cur_low = (*cur_low).min(dep_idx);
-            }
-            return DynamicVarOutcome::Cycle(dep_idx);
-        }
-        let Some(dep_tokens) = self.raw_map.get(dep) else {
-            return DynamicVarOutcome::Invalid;
-        };
-        if !dep_tokens.iter().any(token_has_var) {
-            let cloned = dep_tokens.clone();
-            self.resolved.insert(dep.clone(), Some(cloned.clone()));
-            for rt in &cloned {
-                let cost = token_approx_bytes(rt);
-                if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
-                    *byte_budget = 0;
-                    return DynamicVarOutcome::Invalid;
-                }
-                *byte_budget -= cost;
-                out.push(rt.clone());
-            }
-            return DynamicVarOutcome::Valid;
-        }
-
-        self.strongconnect(dep, depth);
-
-        if self.on_stack.get(dep).copied().unwrap_or(false) {
-            let dep_low = self.lowlink.get(dep).copied().unwrap_or(0);
-            if let Some(cur_low) = self.lowlink.get_mut(owner) {
-                *cur_low = (*cur_low).min(dep_low);
-            }
-            return DynamicVarOutcome::Cycle(dep_low);
-        }
-        match self.resolved.get(dep).and_then(Option::as_ref) {
-            Some(toks) => {
-                for rt in toks {
-                    let cost = token_approx_bytes(rt);
-                    if cost > *byte_budget || out.len() >= MAX_VAR_EXPANDED_TOKENS {
-                        *byte_budget = 0;
-                        return DynamicVarOutcome::Invalid;
-                    }
-                    *byte_budget -= cost;
-                    out.push(rt.clone());
-                }
-                DynamicVarOutcome::Valid
-            }
-            None => DynamicVarOutcome::Invalid,
-        }
-    }
-}
-
 /// A matched compiled rule paired with its `@scope` proximity (ancestor hops from element
 /// to scoping root; `u32::MAX` for unscoped rules).
 #[derive(Debug, Clone, Copy)]
@@ -1226,10 +846,11 @@ pub fn resolve_element_style_with_siblings(
         sibling_count,
         0,
         EvalContext::default().random_doc_seed,
+        &[],
     )
 }
 
-/// Resolves an element's [`ComputedStyle`] with sibling indices and per-element/per-document `random()` seeds.
+/// Resolves an element's [`ComputedStyle`] with sibling indices, `random()` seeds, and live DOM attributes.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_element_style_with_context(
@@ -1244,6 +865,7 @@ pub fn resolve_element_style_with_context(
     sibling_count: u32,
     random_node_id: u64,
     random_doc_seed: u64,
+    elem_attrs: &[(rix_dom::QualName, String)],
 ) -> ComputedStyle {
     let mut style = match parent_style {
         Some(p) => ComputedStyle::inherit_from(p),
@@ -1325,6 +947,54 @@ pub fn resolve_element_style_with_context(
 
     candidates.sort_by_key(|c| c.key);
 
+    // Preliminary evaluation context for Pass 1/Pass 2 CSS Values L5 substitution functions
+    // (`if()`, `attr()`, `random-item()`, `ident()`, `inherit()`).
+    let prelim_parent_fs = parent_style.map_or(16.0, |p| p.text.font_size_px);
+    let mut prelim_parent_eval = media.eval_context(prelim_parent_fs, root_font_size_px);
+    prelim_parent_eval.line_height_px =
+        parent_style.map_or(19.2, |p| p.text.eval_ctx.line_height_px);
+    prelim_parent_eval.root_line_height_px =
+        parent_style.map_or(19.2, |p| p.text.eval_ctx.root_line_height_px);
+    prelim_parent_eval.sibling_index = sibling_index;
+    prelim_parent_eval.sibling_count = sibling_count;
+    prelim_parent_eval.random_node_id = random_node_id;
+    prelim_parent_eval.random_doc_seed = random_doc_seed;
+    let prelim_self_fs = candidates
+        .iter()
+        .rev()
+        .find(|c| c.decl.property == PropertyIdKind::FontSize)
+        .and_then(|c| match &c.decl.value {
+            PropertyValue::Length(lp) => Some(
+                lp.resolve_px(prelim_parent_fs, &prelim_parent_eval)
+                    .max(0.0),
+            ),
+            PropertyValue::MathVal(n) => {
+                let px = n.eval_scalar(
+                    &prelim_parent_eval,
+                    Some((f64::from(prelim_parent_fs), false)),
+                );
+                Some(if px.is_nan() {
+                    0.0
+                } else {
+                    px.clamp(0.0, crate::values_math::MAX_CSS_PX) as f32
+                })
+            }
+            _ => None,
+        })
+        .unwrap_or(prelim_parent_fs);
+    let mut prelim_eval = prelim_parent_eval;
+    prelim_eval.font_size_px = prelim_self_fs;
+    if parent_style.is_none() {
+        prelim_eval.root_font_size_px = prelim_self_fs;
+    }
+    let subst_env = crate::substitution::SubstEnv {
+        elem_attrs,
+        parent_style,
+        registered_props,
+        media,
+        eval: &prelim_eval,
+    };
+
     // Pass 1: Resolve CSS custom properties (`--*`) & `@property` registrations.
     let mut raw_custom: HashMap<InternedStr, Vec<(CascadeKey, &SpecifiedDeclaration)>> =
         HashMap::new();
@@ -1340,15 +1010,23 @@ pub fn resolve_element_style_with_context(
         let mut custom_map = (*style.custom_properties).clone();
         if let Some(regs) = registered_props {
             for (name, reg) in regs {
+                let canonical_iv = reg.initial_value.as_ref().map(|iv| {
+                    if is_registered_url_syntax(&reg.syntax) {
+                        canonicalize_registered_url_tokens(iv)
+                    } else {
+                        iv.clone()
+                    }
+                });
                 if !reg.inherits {
-                    if let Some(iv) = &reg.initial_value {
-                        custom_map.insert(name.clone(), iv.clone());
+                    custom_map.tainted_ranges.remove(name);
+                    if let Some(iv) = canonical_iv {
+                        custom_map.insert(name.clone(), iv);
                     } else {
                         custom_map.entries.remove(name);
                     }
                 } else if !custom_map.entries.contains_key(name) {
-                    if let Some(iv) = &reg.initial_value {
-                        custom_map.insert(name.clone(), iv.clone());
+                    if let Some(iv) = canonical_iv {
+                        custom_map.insert(name.clone(), iv);
                     }
                 }
             }
@@ -1358,10 +1036,39 @@ pub fn resolve_element_style_with_context(
                 let reg = registered_props.and_then(|m| m.get(name));
                 let inherit_val = || {
                     parent_style
-                        .and_then(|p| p.custom_properties.get(name).map(<[CssToken]>::to_vec))
-                        .or_else(|| reg.and_then(|r| r.initial_value.clone()))
+                        .and_then(|p| {
+                            p.custom_properties.get(name).map(|v| {
+                                (
+                                    v.to_vec(),
+                                    p.custom_properties.tainted_ranges.get(name).cloned(),
+                                )
+                            })
+                        })
+                        .or_else(|| {
+                            reg.and_then(|r| {
+                                r.initial_value.clone().map(|v| {
+                                    let v = if is_registered_url_syntax(&r.syntax) {
+                                        canonicalize_registered_url_tokens(&v)
+                                    } else {
+                                        v
+                                    };
+                                    (v, None)
+                                })
+                            })
+                        })
                 };
-                let initial_val = || reg.and_then(|r| r.initial_value.clone());
+                let initial_val = || {
+                    reg.and_then(|r| {
+                        r.initial_value.clone().map(|v| {
+                            let v = if is_registered_url_syntax(&r.syntax) {
+                                canonicalize_registered_url_tokens(&v)
+                            } else {
+                                v
+                            };
+                            (v, None)
+                        })
+                    })
+                };
                 let val = match kw {
                     GlobalKeyword::Initial => initial_val(),
                     GlobalKeyword::Inherit => inherit_val(),
@@ -1376,10 +1083,16 @@ pub fn resolve_element_style_with_context(
                         }
                     }
                 };
-                if let Some(v) = val {
+                if let Some((v, t)) = val {
                     map.insert(name.clone(), v);
+                    if let Some(tr) = t {
+                        map.tainted_ranges.insert(name.clone(), tr);
+                    } else {
+                        map.tainted_ranges.remove(name);
+                    }
                 } else {
                     map.entries.remove(name);
+                    map.tainted_ranges.remove(name);
                 }
             };
         for (name, stack) in &raw_custom {
@@ -1387,6 +1100,7 @@ pub fn resolve_element_style_with_context(
                 match &winner.value {
                     PropertyValue::Custom(tokens) => {
                         custom_map.insert(name.clone(), tokens.clone());
+                        custom_map.tainted_ranges.remove(name);
                     }
                     PropertyValue::Global(kw) => {
                         apply_custom_kw(&mut custom_map, name, *kw);
@@ -1395,23 +1109,49 @@ pub fn resolve_element_style_with_context(
                 }
             }
         }
-        // Substitute `var()` references inside newly declared custom properties using
-        // Dynamic Tarjan SCC over actually-evaluated edges (CSS Variables L1 §3 + CSSWG #11500).
+        // Substitute `var()`, `inherit()`, `attr()`, `if()`, `random-item()`, `ident()`
+        // inside declared custom properties using Dynamic Tarjan SCC (CSSWG #11500) + taint tracking.
         let raw_entries = custom_map.entries.clone();
-        let mut resolver = CustomPropResolver::new(&raw_entries);
         let keys: Vec<InternedStr> = raw_custom.keys().cloned().collect();
+        let any_subst = keys.iter().any(|k| {
+            raw_entries
+                .get(k)
+                .is_some_and(|t| crate::substitution::tokens_contain_subst(t))
+        });
+        let resolved_map = if any_subst {
+            crate::substitution::resolve_custom_properties_l5(&custom_map, &keys, &subst_env)
+        } else {
+            HashMap::new()
+        };
         for name in keys {
-            let has_var = raw_entries
+            let has_subst = raw_entries
                 .get(&name)
-                .is_some_and(|t| t.iter().any(token_has_var));
-            let resolved_opt = if has_var {
-                resolver.resolve(&name, 0)
+                .is_some_and(|t| crate::substitution::tokens_contain_subst(t));
+            let resolved_opt = if has_subst {
+                resolved_map.get(&name).cloned().flatten()
             } else {
-                custom_map.get(&name).map(<[CssToken]>::to_vec)
+                custom_map
+                    .get(&name)
+                    .map(|t| crate::substitution::SubstOutput {
+                        text: serialize_css_tokens(t),
+                        tainted_ranges: custom_map
+                            .tainted_ranges
+                            .get(&name)
+                            .cloned()
+                            .unwrap_or_default(),
+                    })
             };
             match resolved_opt {
-                Some(resolved) => {
-                    if has_var {
+                Some(sub_out) => {
+                    let resolved = if has_subst {
+                        crate::substitution::subst_output_to_tokens(&sub_out)
+                    } else {
+                        custom_map
+                            .get(&name)
+                            .map(<[CssToken]>::to_vec)
+                            .unwrap_or_default()
+                    };
+                    if has_subst {
                         if let Some(kw) = single_global_keyword_token(&resolved) {
                             match kw {
                                 GlobalKeyword::Revert
@@ -1424,7 +1164,8 @@ pub fn resolve_element_style_with_context(
                                         Some(PropertyValue::Custom(toks)) => {
                                             if let Some(sub) = resolve_var_tokens(toks, &custom_map)
                                             {
-                                                custom_map.insert(name, sub);
+                                                custom_map.insert(name.clone(), sub);
+                                                custom_map.tainted_ranges.remove(&name);
                                             } else {
                                                 apply_custom_kw(
                                                     &mut custom_map,
@@ -1450,21 +1191,34 @@ pub fn resolve_element_style_with_context(
                         }
                     }
                     if let Some(reg) = registered_props.and_then(|m| m.get(&name)) {
-                        if !registered_value_matches_syntax(&reg.syntax, &resolved) {
+                        let syn_l = reg.syntax.to_ascii_lowercase();
+                        let url_taint_fail = (syn_l.contains("<url>") || syn_l.contains("<image>"))
+                            && crate::substitution::has_tainted_url_in_output(&sub_out);
+                        if url_taint_fail
+                            || !registered_value_matches_syntax(&reg.syntax, &resolved)
+                        {
                             apply_custom_kw(&mut custom_map, &name, GlobalKeyword::Unset);
                             continue;
                         }
                     }
-                    if has_var {
-                        custom_map.insert(name, resolved);
+                    if has_subst {
+                        custom_map.insert(name.clone(), resolved);
+                        if sub_out.is_tainted() {
+                            custom_map
+                                .tainted_ranges
+                                .insert(name, sub_out.tainted_ranges);
+                        } else {
+                            custom_map.tainted_ranges.remove(&name);
+                        }
                     }
                 }
                 None => {
-                    if has_var {
+                    if has_subst {
                         if registered_props.and_then(|m| m.get(&name)).is_some() {
                             apply_custom_kw(&mut custom_map, &name, GlobalKeyword::Unset);
                         } else {
                             custom_map.entries.remove(&name);
+                            custom_map.tainted_ranges.remove(&name);
                         }
                     }
                 }
@@ -1473,10 +1227,10 @@ pub fn resolve_element_style_with_context(
         style.custom_properties = Arc::new(custom_map);
     }
 
-    // Pass 2: Expand any `var()`-bearing declarations into typed declarations, preserving cascade key.
-    // Per CSS Variables Level 1 §3, an Unresolved declaration whose substitution fails or parses
-    // to an invalid value becomes Invalid At Computed-Value Time (IACVT -> behaves as `unset`),
-    // rather than falling back to lower-specificity cascaded declarations.
+    // Pass 2: Expand any substitution-bearing (`var()`, `if()`, `attr()`, `random-item()`,
+    // `ident()`, `inherit()`) declarations into typed declarations, preserving cascade key.
+    // Per CSS Variables L1 §3 / CSS Values L5, failed substitution, attr()-tainted URLs, or
+    // invalid parsed values become IACVT (behave as `unset`).
     let mut expanded_owned: Vec<(CascadeKey, SpecifiedDeclaration)> = Vec::new();
     let mut standard_candidates: Vec<(CascadeKey, &SpecifiedDeclaration)> = Vec::new();
     for c in &candidates {
@@ -1484,9 +1238,20 @@ pub fn resolve_element_style_with_context(
             continue;
         }
         if let PropertyValue::Unresolved(tokens) = &c.decl.value {
-            let expanded = resolve_var_tokens(tokens, &style.custom_properties)
-                .map(|rt| parse_property_from_tokens(c.decl.property, &rt, c.decl.important))
-                .unwrap_or_default();
+            let expanded = crate::substitution::substitute_standard_property_l5(
+                tokens,
+                c.decl.property,
+                &style.custom_properties,
+                &subst_env,
+            )
+            .map(|sub| {
+                crate::properties::parse_property_from_str(
+                    c.decl.property,
+                    &sub.text,
+                    c.decl.important,
+                )
+            })
+            .unwrap_or_default();
             if !expanded.is_empty() {
                 for decl in expanded {
                     expanded_owned.push((c.key, decl));
@@ -1939,14 +1704,25 @@ fn extract_single_custom_prop_name(tokens: &[CssToken]) -> Option<InternedStr> {
     (s.starts_with("--") && s.len() > 2).then(|| id.clone())
 }
 
-fn token_has_var(tok: &CssToken) -> bool {
-    match tok {
-        CssToken::Var { .. } => true,
-        CssToken::Function { name, args } => {
-            name.as_str().eq_ignore_ascii_case("var") || args.iter().any(token_has_var)
-        }
-        _ => false,
-    }
+fn is_registered_url_syntax(syntax: &str) -> bool {
+    syntax
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim()
+        .eq_ignore_ascii_case("<url>")
+}
+
+fn canonicalize_registered_url_tokens(tokens: &[CssToken]) -> Vec<CssToken> {
+    tokens
+        .iter()
+        .map(|t| match t {
+            CssToken::Url(u) => CssToken::Function {
+                name: rix_core::intern_str("url"),
+                args: vec![CssToken::String(u.clone())],
+            },
+            other => other.clone(),
+        })
+        .collect()
 }
 
 fn single_global_keyword_token(tokens: &[CssToken]) -> Option<GlobalKeyword> {
@@ -2266,7 +2042,17 @@ pub fn apply_declaration(
             }));
         }
         (PropertyIdKind::BackgroundLayers, PropertyValue::BackgroundLayers(l)) => {
-            Arc::make_mut(&mut style.visual).background_layers = l.clone();
+            let v = Arc::make_mut(&mut style.visual);
+            v.background_layers = l.clone();
+            v.background_image_raw = None;
+        }
+        (PropertyIdKind::BackgroundLayers, PropertyValue::BackgroundImageRaw(raw)) => {
+            let v = Arc::make_mut(&mut style.visual);
+            v.background_layers.clear();
+            v.background_image_raw = Some(raw.clone());
+        }
+        (PropertyIdKind::ViewTransitionName, PropertyValue::ViewTransitionName(v)) => {
+            style.effects_mut().view_transition_name = v.clone();
         }
         (PropertyIdKind::BorderTopStyle, PropertyValue::LineStyle(s)) => {
             Arc::make_mut(&mut style.visual).border_style.top = *s;
@@ -2440,6 +2226,19 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::FontStyle, PropertyValue::FontStyle(s)) => {
             Arc::make_mut(&mut style.text).font_style = *s;
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).font_style_oblique_math = None;
+            }
+        }
+        (PropertyIdKind::FontStyle, PropertyValue::FontStyleObliqueMath(node)) => {
+            let deg = node.eval_scalar(eval, None);
+            let deg_f = if deg.is_finite() {
+                deg.clamp(-90.0, 90.0) as f32
+            } else {
+                14.0
+            };
+            Arc::make_mut(&mut style.text).font_style = FontStyleMode::Oblique(deg_f);
+            style.effects_mut().font_style_oblique_math = Some((**node).clone());
         }
         (PropertyIdKind::FontFamily, PropertyValue::FontFamily(f)) => {
             Arc::make_mut(&mut style.text).font_family = f.clone();
@@ -3269,6 +3068,19 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         }
         PropertyIdKind::FontStyle => {
             Arc::make_mut(&mut style.text).font_style = init.text.font_style;
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).font_style_oblique_math = None;
+            }
+        }
+        PropertyIdKind::BackgroundLayers => {
+            let v = Arc::make_mut(&mut style.visual);
+            v.background_layers.clear();
+            v.background_image_raw = None;
+        }
+        PropertyIdKind::ViewTransitionName => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).view_transition_name = None;
+            }
         }
         PropertyIdKind::FontFamily => {
             Arc::make_mut(&mut style.text).font_family = init.text.font_family.clone();

@@ -72,10 +72,36 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
         });
     }
     if prop_kind == PropertyIdKind::BackgroundLayers
-        && lower_val.starts_with("image-set(")
-        && crate::values_math::has_values4_syntax(trimmed)
+        && (lower_val.starts_with("image-set(")
+            || lower_val.starts_with("-webkit-image-set(")
+            || lower_val.starts_with("src(")
+            || lower_val.starts_with("image("))
     {
-        return crate::values_math::parse_image_set_resolution_specified(trimmed);
+        if lower_val.starts_with("image-set(") && crate::values_math::has_values4_syntax(trimmed) {
+            return crate::values_math::parse_image_set_resolution_specified(trimmed);
+        }
+        if crate::substitution::parse_and_serialize_bg_image_fn(
+            trimmed,
+            &crate::values::EvalContext::default(),
+        )
+        .is_some()
+        {
+            return Some(trimmed.to_string());
+        }
+    }
+    if prop_kind == PropertyIdKind::ViewTransitionName {
+        if lower_val == "none" {
+            return Some("none".to_string());
+        }
+        let mut pi = cssparser::ParserInput::new(trimmed);
+        let mut p = cssparser::Parser::new(&mut pi);
+        if let Ok(id) = p.expect_ident() {
+            let s = id.as_ref().to_string();
+            if p.is_exhausted() && GlobalKeyword::from_ident(&s).is_none() {
+                return Some(crate::substitution::escape_css_ident(&s));
+            }
+        }
+        return None;
     }
     if crate::properties::should_use_values4_parser(prop_kind, trimmed) {
         return crate::properties::parse_values4_property(prop_kind, trimmed).map(|(_, s)| s);
@@ -260,8 +286,7 @@ pub fn is_color_longhand(kind: PropertyIdKind) -> bool {
 }
 
 pub(crate) fn contains_var_or_env_ci(s: &str) -> bool {
-    let lower = s.to_ascii_lowercase();
-    lower.contains("var(") || lower.contains("env(")
+    crate::substitution::contains_subst_fn_str(s)
 }
 
 fn prop_disallows_unitless_nonzero(kind: PropertyIdKind) -> bool {
@@ -326,152 +351,9 @@ fn has_top_level_unitless_nonzero(input: &str) -> bool {
     false
 }
 
-/// Validates CSS Variables L2 `var(<declaration-value> [, <declaration-value>?]?)`
-/// and CSS Values L5 `{...}`-wrapped component function arguments.
+/// Validates CSS Variables L2 `var()` and CSS Values L5 arbitrary substitution syntax.
 fn validate_var_and_braces_syntax(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    let mut i = 0usize;
-    let mut in_str: Option<u8> = None;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = in_str {
-            if b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                in_str = None;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'\\' => {
-                i += 2;
-                continue;
-            }
-            b'"' | b'\'' => {
-                in_str = Some(b);
-                i += 1;
-                continue;
-            }
-            b'{' | b'}' => return false,
-            _ => {}
-        }
-        if i + 4 <= bytes.len()
-            && bytes[i..i + 4].eq_ignore_ascii_case(b"var(")
-            && (i == 0
-                || !(bytes[i - 1].is_ascii_alphanumeric()
-                    || bytes[i - 1] == b'-'
-                    || bytes[i - 1] == b'_'))
-        {
-            let arg_start = i + 4;
-            let mut depth = 1usize;
-            let mut j = arg_start;
-            let mut s_q: Option<u8> = None;
-            let mut first_comma = None;
-            while j < bytes.len() && depth > 0 {
-                let c = bytes[j];
-                if let Some(q) = s_q {
-                    if c == b'\\' {
-                        j += 2;
-                        continue;
-                    }
-                    if c == q {
-                        s_q = None;
-                    }
-                    j += 1;
-                    continue;
-                }
-                match c {
-                    b'\\' => {
-                        j += 2;
-                        continue;
-                    }
-                    b'"' | b'\'' => s_q = Some(c),
-                    b'(' | b'[' | b'{' => depth += 1,
-                    b')' | b']' | b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    b',' if depth == 1 && first_comma.is_none() => first_comma = Some(j),
-                    _ => {}
-                }
-                j += 1;
-            }
-            if depth != 0 {
-                return false;
-            }
-            let inner_end = j;
-            let name_part = s[arg_start..first_comma.unwrap_or(inner_end)].trim();
-            if name_part.is_empty() {
-                return false;
-            }
-            // If name argument contains `{` or `}`, it must be a single `{...}` wrapping a non-empty value.
-            if name_part.contains('{') || name_part.contains('}') {
-                if !is_single_brace_wrapped(name_part) {
-                    return false;
-                }
-                let inside = name_part[1..name_part.len() - 1].trim();
-                if inside.is_empty() {
-                    return false;
-                }
-            }
-            if let Some(comma) = first_comma {
-                let fb = s[comma + 1..inner_end].trim();
-                if (fb.contains('{') || fb.contains('}')) && !is_single_brace_wrapped(fb) {
-                    return false;
-                }
-            }
-            i = inner_end + 1;
-            continue;
-        }
-        i += 1;
-    }
-    true
-}
-
-fn is_single_brace_wrapped(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    if bytes.len() < 2 || bytes[0] != b'{' || bytes[bytes.len() - 1] != b'}' {
-        return false;
-    }
-    let mut depth = 0usize;
-    let mut in_str: Option<u8> = None;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = in_str {
-            if b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                in_str = None;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'\\' => {
-                i += 2;
-                continue;
-            }
-            b'"' | b'\'' => in_str = Some(b),
-            b'{' => depth += 1,
-            b'}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 && i + 1 != bytes.len() {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    depth == 0
+    crate::substitution::validate_subst_syntax(s)
 }
 
 pub(crate) fn format_cssom_color(
@@ -951,6 +833,10 @@ fn expand_lightning_shorthand_cssom(
 }
 
 /// Validates that `input` has balanced strings/delimiters and no top-level `;` or `!`.
+pub(crate) fn has_valid_css_tokens_pub(input: &str, require_closed: bool) -> bool {
+    has_valid_css_tokens(input, require_closed)
+}
+
 fn has_valid_css_tokens(input: &str, require_closed: bool) -> bool {
     let mut stack: SmallVec<[u8; 8]> = SmallVec::new();
     let bytes = input.as_bytes();

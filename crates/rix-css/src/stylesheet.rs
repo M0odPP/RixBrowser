@@ -285,6 +285,42 @@ impl MediaContext {
             _ => None,
         }
     }
+
+    /// Evaluates a CSS media query string (e.g. `if(media(height <= 999999px): ...)`).
+    #[must_use]
+    pub fn evaluate_media_query_str(&self, query: &str) -> bool {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let needs_parens = !trimmed.starts_with('(')
+            && !lower.starts_with("not ")
+            && !lower.starts_with("not(")
+            && !lower.starts_with("only ")
+            && !matches!(
+                lower.split_ascii_whitespace().next(),
+                Some("all" | "screen" | "print")
+            );
+        let wrapped = if needs_parens {
+            format!("@media ({trimmed}) {{ a {{ color: red; }} }}")
+        } else {
+            format!("@media {trimmed} {{ a {{ color: red; }} }}")
+        };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let opts = ParserOptions::default();
+            let Ok(parsed) = StyleSheet::parse(&wrapped, opts) else {
+                return false;
+            };
+            for rule in &parsed.rules.0 {
+                if let CssRule::Media(mr) = rule {
+                    return self.matches_media_list(&mr.query);
+                }
+            }
+            false
+        }))
+        .unwrap_or(false)
+    }
 }
 
 fn compare_f32(lhs: f32, op: lightningcss::media_query::MediaFeatureComparison, rhs: f32) -> bool {

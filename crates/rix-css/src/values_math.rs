@@ -71,7 +71,7 @@ impl CalcType {
         Some(self)
     }
 
-    fn single_base_dim(self) -> Option<BaseDim> {
+    pub(crate) fn single_base_dim(self) -> Option<BaseDim> {
         let mut found = None;
         for (i, &exp) in self.dims.iter().enumerate() {
             if exp != 0 {
