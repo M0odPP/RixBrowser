@@ -970,6 +970,8 @@ pub enum WordBreakMode {
     BreakAll,
     KeepAll,
     BreakWord,
+    Manual,
+    AutoPhrase,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]

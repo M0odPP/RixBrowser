@@ -13,6 +13,7 @@ pub mod rule_index;
 pub mod selector;
 pub mod stylesheet;
 pub mod substitution;
+pub mod text_css;
 pub mod ua;
 pub mod values;
 pub mod values_math;
@@ -62,6 +63,12 @@ pub use stylesheet::{
     CompiledRule, CompiledScope, CssomNestingContext, CssomParseError, CssomRuleKind, FontFaceRule,
     FontFaceSource, KeyframeStep, KeyframesRule, LayerId, LayerSeg, MediaContext, MediaTypeKind,
     RegisteredProperty, Stylesheet,
+};
+pub use text_css::{
+    decompose_legacy_white_space, derive_white_space_mode, HangingPunctuation, HyphenateLimitChars,
+    HyphensMode, LineBreakMode, TextAutospaceValue, TextFitMethod, TextFitValue,
+    TextGroupAlignMode, TextSpacingTrimMode, TextTransformFlags, TextWrapMode, TextWrapStyle,
+    WhiteSpaceCollapseMode, WhiteSpaceTrim, WordSpaceTransformMode, WrapInsideMode,
 };
 pub use ua::{default_ua_stylesheet, UA_CSS};
 pub use values::{
