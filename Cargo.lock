@@ -5402,6 +5402,7 @@ name = "rix-layout"
 version = "0.2.0-alpha.1"
 dependencies = [
  "criterion",
+ "icu",
  "image",
  "rayon",
  "rix-core",
