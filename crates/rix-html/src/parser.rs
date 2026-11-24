@@ -381,6 +381,33 @@ pub fn detect_html_charset(bytes: &[u8]) -> &'static str {
     UTF_8.name()
 }
 
+/// Decodes raw HTML response bytes per WHATWG HTML §13.2.3.3 (BOM -> HTTP `charset` ->
+/// `<meta>` prescan -> UTF-8), returning the decoded UTF-8 string and canonical encoding name.
+pub fn decode_html_bytes(bytes: &[u8], http_charset: Option<&str>) -> (String, &'static str) {
+    if let Some((enc, bom_len)) = Encoding::for_bom(bytes) {
+        let (decoded, _) = enc.decode_without_bom_handling(&bytes[bom_len..]);
+        return (decoded.into_owned(), enc.name());
+    }
+    let enc = http_charset
+        .and_then(|c| {
+            let trimmed =
+                c.trim_matches(|ch: char| matches!(ch, '\t' | '\n' | '\x0c' | '\r' | ' '));
+            Encoding::for_label(trimmed.as_bytes())
+        })
+        .or_else(|| {
+            prescan_meta_charset(bytes).map(|e| {
+                if e == encoding_rs::UTF_16LE || e == encoding_rs::UTF_16BE {
+                    UTF_8
+                } else {
+                    e
+                }
+            })
+        })
+        .unwrap_or(UTF_8);
+    let (decoded, _) = enc.decode_without_bom_handling(bytes);
+    (decoded.into_owned(), enc.name())
+}
+
 pub fn parse_html(html: &str) -> Document {
     parse_html_with_scripting(html, true)
 }

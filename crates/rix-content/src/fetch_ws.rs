@@ -24,9 +24,10 @@ use crate::event_loop::{run_microtask_checkpoint, SharedEventLoop};
 use crate::events::{fire_object_event, SharedEvents};
 use crate::streams::{create_readable_stream_from_bytes, SharedStreams};
 use crate::web_apis::{
-    abort_info_for_signal, alloc_array_buffer, alloc_uint8_array, arg, bind_ctor_proto,
-    create_blob_object, create_dom_exception, define_global, define_host_accessor,
-    define_host_getter, define_host_method, extract_bytes_from_js, SharedWebApis,
+    abort_info_for_signal, alloc_array_buffer, alloc_form_data_from_urlencoded, alloc_uint8_array,
+    arg, bind_ctor_proto, create_blob_object, create_dom_exception, define_global,
+    define_host_accessor, define_host_getter, define_host_method, extract_bytes_from_js,
+    SharedWebApis,
 };
 
 /// Reactive async event pushed from background network / WebSocket tokio tasks
@@ -320,6 +321,7 @@ pub fn install_fetch_and_websocket(
     install_response(vm, web_apis, streams, &net);
     install_fetch_fn(vm, web_apis, &net);
     install_websocket(vm, host, web_apis, &net);
+    install_xml_http_request(vm, host, web_apis, &net);
     net
 }
 
@@ -1009,6 +1011,17 @@ fn install_request(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBridg
         )))
     });
     let nb = Rc::clone(net);
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, rp, "formData", move |vm, this_val, _| {
+        let h = require_request(vm, &nb, this_val)?;
+        let bytes = consume_request_body(vm, &nb, h)?;
+        let fd = alloc_form_data_from_urlencoded(vm, &wa, &bytes);
+        Ok(JsValue::from_object(promise_resolve_value(
+            vm,
+            JsValue::from_object(fd),
+        )))
+    });
+    let nb = Rc::clone(net);
     define_host_method(vm, rp, "clone", move |vm, this_val, _| {
         let h = require_request(vm, &nb, this_val)?;
         let mut entry = nb.borrow().requests.get(&h).cloned().unwrap();
@@ -1368,6 +1381,17 @@ fn install_response(
         Ok(JsValue::from_object(promise_resolve_value(
             vm,
             JsValue::from_object(blob),
+        )))
+    });
+    let nb = Rc::clone(net);
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, rp, "formData", move |vm, this_val, _| {
+        let h = require_response(vm, &nb, this_val)?;
+        let bytes = consume_response_body(vm, &nb, h)?;
+        let fd = alloc_form_data_from_urlencoded(vm, &wa, &bytes);
+        Ok(JsValue::from_object(promise_resolve_value(
+            vm,
+            JsValue::from_object(fd),
         )))
     });
     let nb = Rc::clone(net);
@@ -1948,4 +1972,490 @@ fn require_ws_id(vm: &mut JsVm, net: &SharedNetBridge, val: JsValue) -> Result<u
         .get(&h)
         .copied()
         .ok_or_else(|| vm.type_error("Incompatible WebSocket receiver"))
+}
+
+// ---------------------------------------------------------------------------
+// XMLHttpRequest (WHATWG XHR Standard backed by FetchEngine)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct XhrState {
+    method: String,
+    url: String,
+    async_flag: bool,
+    ready_state: i32,
+    status: u16,
+    status_text: String,
+    response_url: String,
+    response_text: String,
+    response_bytes: Vec<u8>,
+    response_type: String,
+    override_mime: Option<String>,
+    req_headers: HashMap<String, String>,
+    resp_headers: HashMap<String, String>,
+}
+
+impl Default for XhrState {
+    fn default() -> Self {
+        Self {
+            method: String::new(),
+            url: String::new(),
+            async_flag: true,
+            ready_state: 0,
+            status: 0,
+            status_text: String::new(),
+            response_url: String::new(),
+            response_text: String::new(),
+            response_bytes: Vec::new(),
+            response_type: String::new(),
+            override_mime: None,
+            req_headers: HashMap::new(),
+            resp_headers: HashMap::new(),
+        }
+    }
+}
+
+fn is_valid_http_method_token(m: &str) -> bool {
+    !m.is_empty()
+        && m.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn install_xml_http_request(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    web_apis: &SharedWebApis,
+    net: &SharedNetBridge,
+) {
+    let etp = host.borrow().prototypes.event_target_proto;
+    let xp = vm.heap.alloc_empty_object();
+    vm.heap.object_set_prototype(xp, Some(etp), &mut vm.shapes);
+    vm.heap.get_object_mut(xp).unwrap().is_prototype = true;
+
+    let xhrs: Rc<RefCell<HashMap<HeapHandle, XhrState>>> = Rc::new(RefCell::new(HashMap::new()));
+
+    let define_xhr_consts = |vm: &mut JsVm, obj: HeapHandle| {
+        for (name, v) in [
+            ("UNSENT", 0),
+            ("OPENED", 1),
+            ("HEADERS_RECEIVED", 2),
+            ("LOADING", 3),
+            ("DONE", 4),
+        ] {
+            let k = vm.heap.intern_key(name);
+            vm.heap.object_define_data(
+                obj,
+                k,
+                JsValue::from_i32(v),
+                PropertyAttrs::ENUMERABLE,
+                &mut vm.shapes,
+            );
+        }
+    };
+    define_xhr_consts(vm, xp);
+
+    let require_xhr = |vm: &mut JsVm,
+                       map: &Rc<RefCell<HashMap<HeapHandle, XhrState>>>,
+                       val: JsValue|
+     -> Result<HeapHandle, JsException> {
+        let Some(h) = val.as_object() else {
+            return Err(vm.type_error("Incompatible XMLHttpRequest receiver"));
+        };
+        if map.borrow().contains_key(&h) {
+            Ok(h)
+        } else {
+            Err(vm.type_error("Incompatible XMLHttpRequest receiver"))
+        }
+    };
+
+    // open(method, url, async=true, username?, password?)
+    {
+        let xm = Rc::clone(&xhrs);
+        let wa = Rc::clone(web_apis);
+        define_host_method(vm, xp, "open", move |vm, this_val, args| {
+            let h = require_xhr(vm, &xm, this_val)?;
+            if args.len() < 2 {
+                return Err(vm.type_error("XMLHttpRequest.open requires at least 2 arguments"));
+            }
+            let raw_method = vm.value_to_rust_string(arg(args, 0));
+            if !is_valid_http_method_token(&raw_method) {
+                return Err(create_dom_exception(
+                    vm,
+                    "SyntaxError",
+                    &format!("Invalid HTTP method: {raw_method}"),
+                ));
+            }
+            let upper = raw_method.to_ascii_uppercase();
+            if matches!(upper.as_str(), "CONNECT" | "TRACE" | "TRACK") {
+                return Err(create_dom_exception(
+                    vm,
+                    "SecurityError",
+                    &format!("Forbidden HTTP method: {raw_method}"),
+                ));
+            }
+            let method = if matches!(
+                upper.as_str(),
+                "DELETE" | "GET" | "HEAD" | "OPTIONS" | "POST" | "PUT"
+            ) {
+                upper
+            } else {
+                raw_method
+            };
+            let raw_url = vm.value_to_rust_string(arg(args, 1));
+            let base = wa.borrow().location_url.clone();
+            let parsed = base.join(&raw_url).map_err(|_| {
+                create_dom_exception(vm, "SyntaxError", &format!("Invalid URL: {raw_url}"))
+            })?;
+            let async_flag = if args.len() >= 3 && !arg(args, 2).is_undefined() {
+                vm.to_boolean(arg(args, 2))
+            } else {
+                true
+            };
+            if let Some(st) = xm.borrow_mut().get_mut(&h) {
+                st.method = method;
+                st.url = parsed.to_string();
+                st.async_flag = async_flag;
+                st.ready_state = 1;
+                st.status = 0;
+                st.status_text.clear();
+                st.response_text.clear();
+                st.response_bytes.clear();
+                st.req_headers.clear();
+                st.resp_headers.clear();
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+
+    // setRequestHeader(name, value)
+    {
+        let xm = Rc::clone(&xhrs);
+        define_host_method(vm, xp, "setRequestHeader", move |vm, this_val, args| {
+            let h = require_xhr(vm, &xm, this_val)?;
+            let name = vm.value_to_rust_string(arg(args, 0));
+            let value = vm.value_to_rust_string(arg(args, 1));
+            if let Some(st) = xm.borrow_mut().get_mut(&h) {
+                if st.ready_state != 1 {
+                    return Err(create_dom_exception(
+                        vm,
+                        "InvalidStateError",
+                        "XMLHttpRequest must be OPENED",
+                    ));
+                }
+                st.req_headers
+                    .entry(name.to_ascii_lowercase())
+                    .and_modify(|v| {
+                        v.push_str(", ");
+                        v.push_str(&value);
+                    })
+                    .or_insert(value);
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+
+    // overrideMimeType(mime)
+    {
+        let xm = Rc::clone(&xhrs);
+        define_host_method(vm, xp, "overrideMimeType", move |vm, this_val, args| {
+            let h = require_xhr(vm, &xm, this_val)?;
+            let mime = vm.value_to_rust_string(arg(args, 0));
+            if let Some(st) = xm.borrow_mut().get_mut(&h) {
+                st.override_mime = Some(mime);
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+
+    // abort()
+    {
+        let xm = Rc::clone(&xhrs);
+        define_host_method(vm, xp, "abort", move |vm, this_val, _| {
+            let h = require_xhr(vm, &xm, this_val)?;
+            if let Some(st) = xm.borrow_mut().get_mut(&h) {
+                st.ready_state = 0;
+                st.status = 0;
+                st.response_text.clear();
+                st.response_bytes.clear();
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+
+    // send(body?)
+    {
+        let xm = Rc::clone(&xhrs);
+        let wa = Rc::clone(web_apis);
+        let nb = Rc::clone(net);
+        define_host_method(vm, xp, "send", move |vm, this_val, args| {
+            let h = require_xhr(vm, &xm, this_val)?;
+            let body = if args.is_empty() || arg(args, 0).is_undefined() || arg(args, 0).is_null() {
+                Vec::new()
+            } else {
+                extract_bytes_from_js(vm, &wa, arg(args, 0))?
+            };
+            let (method, url, headers, override_mime) = {
+                let map = xm.borrow();
+                let st = map.get(&h).unwrap();
+                if st.ready_state != 1 {
+                    return Err(create_dom_exception(
+                        vm,
+                        "InvalidStateError",
+                        "XMLHttpRequest must be OPENED before send()",
+                    ));
+                }
+                (
+                    st.method.clone(),
+                    st.url.clone(),
+                    st.req_headers.clone(),
+                    st.override_mime.clone(),
+                )
+            };
+            let origin = wa.borrow().current_origin();
+            let engine = Arc::clone(&nb.borrow().fetch_engine);
+            let req = FetchRequest {
+                url: url.clone(),
+                method,
+                headers,
+                body,
+                mode: FetchMode::Cors,
+                credentials: FetchCredentials::SameOrigin,
+                redirect: FetchRedirect::Follow,
+                origin,
+                abort_signal: None,
+            };
+            let fetched = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                    std::thread::spawn(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .ok()
+                            .and_then(|rt| rt.block_on(engine.fetch(req)).ok())
+                    })
+                    .join()
+                    .ok()
+                    .flatten()
+                } else {
+                    tokio::task::block_in_place(|| handle.block_on(engine.fetch(req)).ok())
+                }
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()
+                    .and_then(|rt| rt.block_on(engine.fetch(req)).ok())
+            };
+            let Some(resp) = fetched else {
+                return Err(create_dom_exception(
+                    vm,
+                    "NetworkError",
+                    "Network request failed",
+                ));
+            };
+            let ct = override_mime.or_else(|| {
+                resp.headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                    .map(|(_, v)| v.clone())
+            });
+            let http_charset = ct.as_deref().and_then(|c| {
+                c.split(';').skip(1).find_map(|p| {
+                    let (k, v) = p.trim().split_once('=')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("charset")
+                        .then(|| v.trim().trim_matches('"').trim_matches('\'').to_string())
+                })
+            });
+            let (decoded, _) = rix_html::decode_html_bytes(&resp.body, http_charset.as_deref());
+            if let Some(st) = xm.borrow_mut().get_mut(&h) {
+                st.status = resp.status;
+                st.status_text = resp.status_text;
+                st.response_url = resp.url;
+                st.response_bytes = resp.body;
+                st.response_text = decoded;
+                st.resp_headers = resp.headers;
+                st.ready_state = 4;
+            }
+            for ev_name in ["onreadystatechange", "onload", "onloadend"] {
+                let k = vm.heap.intern_key(ev_name);
+                if let Ok(cb) = vm.get_property_by_key(h, k) {
+                    if cb.as_object().is_some_and(|ch| vm.is_callable_handle(ch)) {
+                        let _ = vm.call_value(cb, this_val, &[]);
+                    }
+                }
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+
+    // getResponseHeader / getAllResponseHeaders
+    {
+        let xm = Rc::clone(&xhrs);
+        define_host_method(vm, xp, "getResponseHeader", move |vm, this_val, args| {
+            let h = require_xhr(vm, &xm, this_val)?;
+            let name = vm.value_to_rust_string(arg(args, 0)).to_ascii_lowercase();
+            let found = xm.borrow().get(&h).and_then(|st| {
+                st.resp_headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+                    .map(|(_, v)| v.clone())
+            });
+            Ok(match found {
+                Some(v) => JsValue::from_string(vm.heap.alloc_string(&v)),
+                None => JsValue::NULL,
+            })
+        });
+    }
+    {
+        let xm = Rc::clone(&xhrs);
+        define_host_method(vm, xp, "getAllResponseHeaders", move |vm, this_val, _| {
+            let h = require_xhr(vm, &xm, this_val)?;
+            let out = xm
+                .borrow()
+                .get(&h)
+                .map(|st| {
+                    let mut pairs: Vec<(&String, &String)> = st.resp_headers.iter().collect();
+                    pairs.sort_by(|a, b| a.0.cmp(b.0));
+                    pairs
+                        .into_iter()
+                        .map(|(k, v)| format!("{}: {}\r\n", k.to_ascii_lowercase(), v))
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            Ok(JsValue::from_string(vm.heap.alloc_string(&out)))
+        });
+    }
+
+    // Readonly getters (`readyState`, `status`, `statusText`, `responseURL`, `responseText`, `response`)
+    {
+        let xm = Rc::clone(&xhrs);
+        define_host_getter(vm, xp, "readyState", move |vm, this_val, _| {
+            let h = require_xhr(vm, &xm, this_val)?;
+            let v = xm.borrow().get(&h).map_or(0, |s| s.ready_state);
+            Ok(JsValue::from_i32(v))
+        });
+    }
+    {
+        let xm = Rc::clone(&xhrs);
+        define_host_getter(vm, xp, "status", move |vm, this_val, _| {
+            let h = require_xhr(vm, &xm, this_val)?;
+            let v = xm.borrow().get(&h).map_or(0, |s| i32::from(s.status));
+            Ok(JsValue::from_i32(v))
+        });
+    }
+    {
+        let xm = Rc::clone(&xhrs);
+        define_host_getter(vm, xp, "statusText", move |vm, this_val, _| {
+            let h = require_xhr(vm, &xm, this_val)?;
+            let s = xm
+                .borrow()
+                .get(&h)
+                .map(|st| st.status_text.clone())
+                .unwrap_or_default();
+            Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+        });
+    }
+    {
+        let xm = Rc::clone(&xhrs);
+        define_host_getter(vm, xp, "responseURL", move |vm, this_val, _| {
+            let h = require_xhr(vm, &xm, this_val)?;
+            let s = xm
+                .borrow()
+                .get(&h)
+                .map(|st| st.response_url.clone())
+                .unwrap_or_default();
+            Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+        });
+    }
+    {
+        let xm = Rc::clone(&xhrs);
+        define_host_getter(vm, xp, "responseText", move |vm, this_val, _| {
+            let h = require_xhr(vm, &xm, this_val)?;
+            let s = xm
+                .borrow()
+                .get(&h)
+                .map(|st| st.response_text.clone())
+                .unwrap_or_default();
+            Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+        });
+    }
+    {
+        let xm = Rc::clone(&xhrs);
+        define_host_getter(vm, xp, "response", move |vm, this_val, _| {
+            let h = require_xhr(vm, &xm, this_val)?;
+            let (ty, txt, bytes) = xm
+                .borrow()
+                .get(&h)
+                .map(|st| {
+                    (
+                        st.response_type.clone(),
+                        st.response_text.clone(),
+                        st.response_bytes.clone(),
+                    )
+                })
+                .unwrap_or_default();
+            if ty == "arraybuffer" {
+                Ok(JsValue::from_object(alloc_array_buffer(vm, bytes)))
+            } else {
+                Ok(JsValue::from_string(vm.heap.alloc_string(&txt)))
+            }
+        });
+    }
+    {
+        let xmg = Rc::clone(&xhrs);
+        let xms = Rc::clone(&xhrs);
+        define_host_accessor(
+            vm,
+            xp,
+            "responseType",
+            move |vm, this_val, _| {
+                let h = require_xhr(vm, &xmg, this_val)?;
+                let s = xmg
+                    .borrow()
+                    .get(&h)
+                    .map(|st| st.response_type.clone())
+                    .unwrap_or_default();
+                Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+            },
+            move |vm, this_val, args| {
+                let h = require_xhr(vm, &xms, this_val)?;
+                let v = vm.value_to_rust_string(arg(args, 0));
+                if let Some(st) = xms.borrow_mut().get_mut(&h) {
+                    st.response_type = v;
+                }
+                Ok(JsValue::UNDEFINED)
+            },
+        );
+    }
+
+    let xm_ctor = Rc::clone(&xhrs);
+    let ctor = vm.alloc_host_fn("XMLHttpRequest", move |vm, _, _| {
+        let obj = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(xp)));
+        xm_ctor.borrow_mut().insert(obj, XhrState::default());
+        Ok(JsValue::from_object(obj))
+    });
+    define_xhr_consts(vm, ctor);
+    bind_ctor_proto(vm, ctor, xp);
+    define_global(vm, "XMLHttpRequest", JsValue::from_object(ctor));
 }

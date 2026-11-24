@@ -103,6 +103,6 @@ fn regexp_date_json_and_extended_array_object_builtins() {
 
     assert_eq!(
         vm.value_to_rust_string(res),
-        "true|true|{\"arr\":[1,2,3],\"x\":20}|true|2,5,10,30|1,2,3|15|99|false"
+        "true|true|{\"x\":20,\"arr\":[1,2,3]}|true|2,5,10,30|1,2,3|15|99|false"
     );
 }

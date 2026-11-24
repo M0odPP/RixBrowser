@@ -1332,13 +1332,21 @@ fn array_map(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsVal
     let cb = args.first().copied().unwrap_or(JsValue::UNDEFINED);
     require_callable(vm, cb)?;
     let this_arg = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
-    let out = vm.array_species_create(h, len)?;
-    let obj_val = JsValue::from_object(h);
-    for_each_present_idx(vm, h, len, |vm, i, elem| {
-        let mapped = vm.call_value(cb, this_arg, &[elem, JsValue::from_f64(i as f64), obj_val])?;
-        vm.array_create_data_prop(out, i, mapped)
-    })?;
-    Ok(JsValue::from_object(out))
+    let mark = vm.temp_roots.len();
+    let res = (|| {
+        vm.temp_roots.push(JsValue::from_object(h));
+        let out = vm.array_species_create(h, len)?;
+        vm.temp_roots.push(JsValue::from_object(out));
+        let obj_val = JsValue::from_object(h);
+        for_each_present_idx(vm, h, len, |vm, i, elem| {
+            let mapped =
+                vm.call_value(cb, this_arg, &[elem, JsValue::from_f64(i as f64), obj_val])?;
+            vm.array_create_data_prop(out, i, mapped)
+        })?;
+        Ok(JsValue::from_object(out))
+    })();
+    vm.temp_roots.truncate(mark);
+    res
 }
 
 fn array_filter(
@@ -1351,18 +1359,26 @@ fn array_filter(
     let cb = args.first().copied().unwrap_or(JsValue::UNDEFINED);
     require_callable(vm, cb)?;
     let this_arg = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
-    let out = vm.array_species_create(h, 0)?;
-    let obj_val = JsValue::from_object(h);
-    let mut to = 0u64;
-    for_each_present_idx(vm, h, len, |vm, i, elem| {
-        let keep = vm.call_value(cb, this_arg, &[elem, JsValue::from_f64(i as f64), obj_val])?;
-        if vm.to_boolean(keep) {
-            vm.array_create_data_prop(out, to, elem)?;
-            to += 1;
-        }
-        Ok(())
-    })?;
-    Ok(JsValue::from_object(out))
+    let mark = vm.temp_roots.len();
+    let res = (|| {
+        vm.temp_roots.push(JsValue::from_object(h));
+        let out = vm.array_species_create(h, 0)?;
+        vm.temp_roots.push(JsValue::from_object(out));
+        let obj_val = JsValue::from_object(h);
+        let mut to = 0u64;
+        for_each_present_idx(vm, h, len, |vm, i, elem| {
+            let keep =
+                vm.call_value(cb, this_arg, &[elem, JsValue::from_f64(i as f64), obj_val])?;
+            if vm.to_boolean(keep) {
+                vm.array_create_data_prop(out, to, elem)?;
+                to += 1;
+            }
+            Ok(())
+        })?;
+        Ok(JsValue::from_object(out))
+    })();
+    vm.temp_roots.truncate(mark);
+    res
 }
 
 fn array_reduce(
