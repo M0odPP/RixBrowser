@@ -14,7 +14,7 @@ const zero = document.createElement("li");
 zero.textContent = "zero";
 list.insertBefore(zero, list.firstChild);
 list.removeChild(list.lastChild);
-var text = list.children.map(el => el.textContent).join(",");
+var text = Array.from(list.children).map(el => el.textContent).join(",");
 """
 assert_expr = "text"
 expected = "zero,one,two"
