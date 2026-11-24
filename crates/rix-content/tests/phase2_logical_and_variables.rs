@@ -301,3 +301,41 @@ fn css_values_l4_l5_math_units_and_sibling_functions() {
         .expect("script should succeed");
     assert_eq!(rt.vm.value_to_rust_string(res), "ok");
 }
+
+#[test]
+fn calc_size_interpolate_size_and_css_animations() {
+    let mut rt = make_runtime();
+    let html = r#"<!doctype html><style>
+      @keyframes grow { from { width: 0px; } to { width: auto; } }
+      #box { width: calc-size(auto, size / 2 + 10px); interpolate-size: allow-keywords; }
+      #anim { width: 100px; interpolate-size: allow-keywords; animation: grow 2s -1s linear paused; }
+      #tr { width: 100px; interpolate-size: allow-keywords; }
+      #wa { width: 40px; interpolate-size: allow-keywords; }
+    </style>
+    <div style="width: 200px;"><div id="box"></div><div id="anim"></div><div id="tr"></div><div id="wa"></div></div>"#;
+    assert!(rt
+        .load_document_with_external_scripts(html, &HashMap::new())
+        .is_empty());
+    let res = rt
+        .eval_script(
+            r#"(function() {
+                const box = document.getElementById("box");
+                if (box.offsetWidth !== 110) return "calc-size-w:" + box.offsetWidth;
+                if (getComputedStyle(box).interpolateSize !== "allow-keywords") return "interp-size";
+                const anim = document.getElementById("anim");
+                if (getComputedStyle(anim).width !== "100px") return "anim-w:" + getComputedStyle(anim).width;
+                const tr = document.getElementById("tr");
+                getComputedStyle(tr).width;
+                tr.style.transition = "width 2s -1s linear";
+                tr.style.width = "auto";
+                if (getComputedStyle(tr).width !== "150px") return "tr-w:" + getComputedStyle(tr).width;
+                const wa = document.getElementById("wa");
+                const a = wa.animate([{ width: "40px" }, { width: "auto" }], { duration: 1000, fill: "both" });
+                a.pause(); a.currentTime = 500;
+                if (getComputedStyle(wa).width !== "120px") return "wa-w:" + getComputedStyle(wa).width;
+                return "ok";
+            })()"#,
+        )
+        .expect("script should succeed");
+    assert_eq!(rt.vm.value_to_rust_string(res), "ok");
+}

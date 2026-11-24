@@ -1708,7 +1708,9 @@ fn to_timing_curve(t: TimingFunction) -> TimingCurve {
         TimingFunction::EaseIn => TimingCurve::EaseIn,
         TimingFunction::EaseOut => TimingCurve::EaseOut,
         TimingFunction::EaseInOut => TimingCurve::EaseInOut,
-        TimingFunction::CubicBezier(x1, y1, x2, y2) => TimingCurve::CubicBezier(x1, y1, x2, y2),
+        TimingFunction::CubicBezier(x1, y1, x2, y2) => {
+            TimingCurve::CubicBezier(x1 as f32, y1 as f32, x2 as f32, y2 as f32)
+        }
         TimingFunction::Steps(c, s) => TimingCurve::Steps(c, s),
     }
 }

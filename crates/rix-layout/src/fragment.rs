@@ -163,31 +163,58 @@ impl BoxMetrics {
         let pb_h = padding.vertical() + border.vertical();
         let is_border_box = style.box_sizing == BoxSizingMode::BorderBox;
 
-        let specified_width = resolve_size_value(&bm.width, cb_w, &eval)
-            .map(|v| to_content_dim(v, pb_w, is_border_box));
-        let specified_height = space
-            .available_height
-            .and_then(|ah| {
-                resolve_size_value(&bm.height, ah, &eval)
-                    .map(|v| to_content_dim(v, pb_h, is_border_box))
-            })
-            .or_else(|| match &bm.height {
-                SizeValue::Length(lp) if !is_percent_dep(lp) => Some(to_content_dim(
-                    lp.resolve_px(cb_h, &eval),
-                    pb_h,
-                    is_border_box,
-                )),
+        let resolve_h = |sz: &SizeValue| -> Option<f32> {
+            match sz {
+                SizeValue::Length(lp)
+                    if !lp.has_percentage() || space.available_height.is_some() =>
+                {
+                    let basis = space.available_height.unwrap_or(cb_h);
+                    Some(to_content_dim(
+                        lp.resolve_px(basis, &eval).max(0.0),
+                        pb_h,
+                        is_border_box,
+                    ))
+                }
+                SizeValue::Stretch => space
+                    .available_height
+                    .map(|ah| (ah - margin.vertical() - pb_h).max(0.0)),
+                SizeValue::CalcSize(cs) if cs.is_definite(space.available_height.is_some()) => {
+                    let st = space.available_height.map_or(0.0, |ah| {
+                        let c = (ah - margin.vertical() - pb_h).max(0.0);
+                        if is_border_box {
+                            c + pb_h
+                        } else {
+                            c
+                        }
+                    });
+                    Some(to_content_dim(
+                        cs.eval_px(space.available_height, &eval, &|_| st),
+                        pb_h,
+                        is_border_box,
+                    ))
+                }
                 _ => None,
-            });
+            }
+        };
+        let specified_width = match &bm.width {
+            SizeValue::Length(lp) => Some(to_content_dim(
+                lp.resolve_px(cb_w, &eval).max(0.0),
+                pb_w,
+                is_border_box,
+            )),
+            SizeValue::Stretch => {
+                Some((space.available_width - margin.horizontal() - pb_w).max(0.0))
+            }
+            _ => None,
+        };
+        let specified_height = resolve_h(&bm.height);
 
         let min_width = resolve_size_value(&bm.min_width, cb_w, &eval)
             .map_or(0.0, |v| to_content_dim(v, pb_w, is_border_box));
         let max_width = resolve_size_value(&bm.max_width, cb_w, &eval)
             .map_or(f32::INFINITY, |v| to_content_dim(v, pb_w, is_border_box));
-        let min_height = resolve_size_value(&bm.min_height, cb_h, &eval)
-            .map_or(0.0, |v| to_content_dim(v, pb_h, is_border_box));
-        let max_height = resolve_size_value(&bm.max_height, cb_h, &eval)
-            .map_or(f32::INFINITY, |v| to_content_dim(v, pb_h, is_border_box));
+        let min_height = resolve_h(&bm.min_height).unwrap_or(0.0);
+        let max_height = resolve_h(&bm.max_height).unwrap_or(f32::INFINITY);
 
         Self {
             padding,
@@ -251,10 +278,72 @@ fn to_content_dim(val: f32, pb: f32, is_border_box: bool) -> f32 {
     }
 }
 
-fn is_percent_dep(lp: &rix_css::LengthPercentage) -> bool {
+/// Resolves any CSS `SizeValue` (including `calc-size()`, `stretch`, `min-content`,
+/// `max-content`, `fit-content`) to a content-box dimension given an intrinsic content-box closure.
+#[must_use]
+pub fn resolve_size_with_intrinsic<F>(
+    v: &SizeValue,
+    avail: Option<f32>,
+    pb: f32,
+    margin_sum: f32,
+    is_border_box: bool,
+    eval: &EvalContext,
+    intrinsic_content: F,
+) -> Option<f32>
+where
+    F: Fn(&rix_css::values_math::CalcSizeBasis) -> f32,
+{
+    use rix_css::values_math::CalcSizeBasis;
+    match v {
+        SizeValue::Length(lp) => {
+            if avail.is_none() && lp.has_percentage() {
+                None
+            } else {
+                Some(to_content_dim(
+                    lp.resolve_px(avail.unwrap_or(0.0), eval).max(0.0),
+                    pb,
+                    is_border_box,
+                ))
+            }
+        }
+        SizeValue::Stretch => avail.map(|a| (a - margin_sum - pb).max(0.0)),
+        SizeValue::MinContent => Some(intrinsic_content(&CalcSizeBasis::MinContent).max(0.0)),
+        SizeValue::MaxContent => Some(intrinsic_content(&CalcSizeBasis::MaxContent).max(0.0)),
+        SizeValue::FitContent(None) => Some(intrinsic_content(&CalcSizeBasis::FitContent).max(0.0)),
+        SizeValue::FitContent(Some(lp)) => {
+            let lim = to_content_dim(
+                lp.resolve_px(avail.unwrap_or(0.0), eval).max(0.0),
+                pb,
+                is_border_box,
+            );
+            let min_c = intrinsic_content(&CalcSizeBasis::MinContent);
+            let max_c = intrinsic_content(&CalcSizeBasis::MaxContent);
+            Some(max_c.min(lim).max(min_c).max(0.0))
+        }
+        SizeValue::CalcSize(cs) => {
+            let box_intrinsic = |b: &CalcSizeBasis| -> f32 {
+                let c = intrinsic_content(b).max(0.0);
+                if is_border_box {
+                    c + pb
+                } else {
+                    c
+                }
+            };
+            let raw = cs.eval_px(avail, eval, &box_intrinsic);
+            Some(to_content_dim(raw, pb, is_border_box))
+        }
+        SizeValue::Auto | SizeValue::None | SizeValue::Content => None,
+    }
+}
+
+#[inline]
+pub(crate) fn size_value_needs_intrinsic(v: &SizeValue) -> bool {
     matches!(
-        lp,
-        rix_css::LengthPercentage::Percent(_) | rix_css::LengthPercentage::Calc(_)
+        v,
+        SizeValue::MinContent
+            | SizeValue::MaxContent
+            | SizeValue::FitContent(_)
+            | SizeValue::CalcSize(_)
     )
 }
 
@@ -675,6 +764,89 @@ pub fn measure_intrinsic_widths(
     result
 }
 
+/// Measures the raw intrinsic content widths `(min_content_px, max_content_px)` of `box_id`'s
+/// children without applying `box_id`'s own `width`/`min-width`/`max-width`/padding/border.
+pub(crate) fn measure_content_intrinsic_widths(
+    ctx: &mut LayoutContext<'_>,
+    box_id: BoxId,
+    space: ConstraintSpace,
+) -> (f32, f32) {
+    let b = ctx.tree.get(box_id);
+    if b.children.is_empty() {
+        return (0.0, 0.0);
+    }
+    let fc = b.formatting_context();
+    if fc == FormattingContextKind::Flex {
+        let fg = b.style.flex_grid.as_deref();
+        let is_row = fg.is_none_or(|f| {
+            matches!(
+                f.flex_direction,
+                FlexDirectionMode::Row | FlexDirectionMode::RowReverse
+            )
+        });
+        let is_nowrap = fg.is_none_or(|f| f.flex_wrap == FlexWrapMode::NoWrap);
+        let col_gap = fg.map_or(0.0, |f| {
+            f.column_gap.resolve_px(
+                space.available_width,
+                &space.eval_context(b.style.text.font_size_px),
+            )
+        });
+        let mut min_w = 0.0f32;
+        let mut max_w = 0.0f32;
+        let mut count = 0usize;
+        for &cid in &b.children {
+            if ctx.tree.get(cid).is_out_of_flow {
+                continue;
+            }
+            let cm = BoxMetrics::resolve(&ctx.tree.get(cid).style, &space);
+            let (cmin, cmax) = measure_intrinsic_widths(ctx, cid, space);
+            let item_min = cmin + cm.margin.horizontal();
+            let item_max = cmax + cm.margin.horizontal();
+            if is_row {
+                max_w += item_max;
+                if is_nowrap {
+                    min_w += item_min;
+                } else {
+                    min_w = min_w.max(item_min);
+                }
+            } else {
+                min_w = min_w.max(item_min);
+                max_w = max_w.max(item_max);
+            }
+            count += 1;
+        }
+        if is_row && count > 1 {
+            let gaps = col_gap * (count - 1) as f32;
+            max_w += gaps;
+            if is_nowrap {
+                min_w += gaps;
+            }
+        }
+        (min_w, max_w.max(min_w))
+    } else {
+        let has_block = b
+            .children
+            .iter()
+            .any(|&c| ctx.tree.get(c).is_block_level() || ctx.tree.get(c).is_float);
+        if has_block {
+            let mut min_w = 0.0f32;
+            let mut max_w = 0.0f32;
+            for &cid in &b.children {
+                if ctx.tree.get(cid).is_out_of_flow {
+                    continue;
+                }
+                let cm = BoxMetrics::resolve(&ctx.tree.get(cid).style, &space);
+                let (cmin, cmax) = measure_intrinsic_widths(ctx, cid, space);
+                min_w = min_w.max(cmin + cm.margin.horizontal());
+                max_w = max_w.max(cmax + cm.margin.horizontal());
+            }
+            (min_w, max_w)
+        } else {
+            measure_ifc_min_max_content(ctx, box_id, space)
+        }
+    }
+}
+
 fn measure_intrinsic_widths_uncached(
     ctx: &mut LayoutContext<'_>,
     box_id: BoxId,
@@ -684,13 +856,14 @@ fn measure_intrinsic_widths_uncached(
     let metrics = BoxMetrics::resolve(&b.style, &space);
     let pb_w = metrics.padding.horizontal() + metrics.border.horizontal();
 
-    let is_percent_width = matches!(
-        b.style.box_model.width,
-        SizeValue::Length(
-            rix_css::LengthPercentage::Percent(_) | rix_css::LengthPercentage::Calc(_)
-        )
-    );
-    if !is_percent_width {
+    let is_percent_width = match &b.style.box_model.width {
+        SizeValue::Length(lp) => lp.has_percentage(),
+        _ => false,
+    };
+    if !is_percent_width
+        && !size_value_needs_intrinsic(&b.style.box_model.min_width)
+        && !size_value_needs_intrinsic(&b.style.box_model.max_width)
+    {
         if let Some(spec_w) = metrics.specified_width {
             let total = metrics.clamp_content_width(spec_w) + pb_w;
             return (total, total);
@@ -710,83 +883,63 @@ fn measure_intrinsic_widths_uncached(
             crate::table::measure_table_intrinsic_widths(ctx, box_id, space)
         }
         _ => {
-            if b.children.is_empty() {
-                let w = metrics.clamp_content_width(0.0) + pb_w;
-                return (w, w);
-            }
-            let fc = b.formatting_context();
-            let (content_min, content_max) = if fc == FormattingContextKind::Flex {
-                let fg = b.style.flex_grid.as_deref();
-                let is_row = fg.is_none_or(|f| {
-                    matches!(
-                        f.flex_direction,
-                        FlexDirectionMode::Row | FlexDirectionMode::RowReverse
-                    )
-                });
-                let is_nowrap = fg.is_none_or(|f| f.flex_wrap == FlexWrapMode::NoWrap);
-                let col_gap = fg.map_or(0.0, |f| {
-                    f.column_gap.resolve_px(
-                        space.available_width,
-                        &space.eval_context(b.style.text.font_size_px),
-                    )
-                });
-                let mut min_w = 0.0f32;
-                let mut max_w = 0.0f32;
-                let mut count = 0usize;
-                for &cid in &b.children {
-                    if ctx.tree.get(cid).is_out_of_flow {
-                        continue;
-                    }
-                    let cm = BoxMetrics::resolve(&ctx.tree.get(cid).style, &space);
-                    let (cmin, cmax) = measure_intrinsic_widths(ctx, cid, space);
-                    let item_min = cmin + cm.margin.horizontal();
-                    let item_max = cmax + cm.margin.horizontal();
-                    if is_row {
-                        max_w += item_max;
-                        if is_nowrap {
-                            min_w += item_min;
-                        } else {
-                            min_w = min_w.max(item_min);
-                        }
-                    } else {
-                        min_w = min_w.max(item_min);
-                        max_w = max_w.max(item_max);
-                    }
-                    count += 1;
-                }
-                if is_row && count > 1 {
-                    let gaps = col_gap * (count - 1) as f32;
-                    max_w += gaps;
-                    if is_nowrap {
-                        min_w += gaps;
-                    }
-                }
-                (min_w, max_w.max(min_w))
-            } else {
-                let has_block = b
-                    .children
-                    .iter()
-                    .any(|&c| ctx.tree.get(c).is_block_level() || ctx.tree.get(c).is_float);
-                if has_block {
-                    let mut min_w = 0.0f32;
-                    let mut max_w = 0.0f32;
-                    for &cid in &b.children {
-                        if ctx.tree.get(cid).is_out_of_flow {
-                            continue;
-                        }
-                        let cm = BoxMetrics::resolve(&ctx.tree.get(cid).style, &space);
-                        let (cmin, cmax) = measure_intrinsic_widths(ctx, cid, space);
-                        min_w = min_w.max(cmin + cm.margin.horizontal());
-                        max_w = max_w.max(cmax + cm.margin.horizontal());
-                    }
-                    (min_w, max_w)
-                } else {
-                    measure_ifc_min_max_content(ctx, box_id, space)
+            let (content_min, content_max) = measure_content_intrinsic_widths(ctx, box_id, space);
+            let b = ctx.tree.get(box_id);
+            let eval = space.eval_context_for(&b.style);
+            let is_bb = b.style.box_sizing == BoxSizingMode::BorderBox;
+            let avail_c = (space.available_width - metrics.margin.horizontal() - pb_w).max(0.0);
+            let stf = content_max.min(avail_c).max(content_min);
+            let intr_fn = |basis: &rix_css::values_math::CalcSizeBasis| -> f32 {
+                match basis {
+                    rix_css::values_math::CalcSizeBasis::MinContent => content_min,
+                    rix_css::values_math::CalcSizeBasis::MaxContent => content_max,
+                    rix_css::values_math::CalcSizeBasis::Stretch => avail_c,
+                    _ => stf,
                 }
             };
+            let min_w = resolve_size_with_intrinsic(
+                &b.style.box_model.min_width,
+                Some(space.containing_block_width),
+                pb_w,
+                metrics.margin.horizontal(),
+                is_bb,
+                &eval,
+                intr_fn,
+            )
+            .unwrap_or(metrics.min_width);
+            let max_w = resolve_size_with_intrinsic(
+                &b.style.box_model.max_width,
+                Some(space.containing_block_width),
+                pb_w,
+                metrics.margin.horizontal(),
+                is_bb,
+                &eval,
+                intr_fn,
+            )
+            .unwrap_or(metrics.max_width);
+            if matches!(b.style.box_model.width, SizeValue::CalcSize(_)) {
+                if let Some(cw) = resolve_size_with_intrinsic(
+                    &b.style.box_model.width,
+                    Some(space.containing_block_width),
+                    pb_w,
+                    metrics.margin.horizontal(),
+                    is_bb,
+                    &eval,
+                    intr_fn,
+                ) {
+                    let total = cw.min(max_w).max(min_w).max(0.0) + pb_w;
+                    return (total, total);
+                }
+            }
+            if let Some(spec_w) = metrics.specified_width {
+                if !is_percent_width {
+                    let total = spec_w.min(max_w).max(min_w).max(0.0) + pb_w;
+                    return (total, total);
+                }
+            }
             (
-                metrics.clamp_content_width(content_min) + pb_w,
-                metrics.clamp_content_width(content_max) + pb_w,
+                content_min.min(max_w).max(min_w).max(0.0) + pb_w,
+                content_max.min(max_w).max(min_w).max(0.0) + pb_w,
             )
         }
     }
@@ -867,7 +1020,7 @@ pub fn layout_replaced(
             intrinsic_size,
             ..
         } => {
-            let (w, h) = resolve_replaced_size(*intrinsic_size, &metrics);
+            let (w, h) = resolve_replaced_size_styled(*intrinsic_size, &b.style, &space, &metrics);
             (
                 w,
                 h,
@@ -881,7 +1034,7 @@ pub fn layout_replaced(
             surface_id,
             intrinsic_size,
         } => {
-            let (w, h) = resolve_replaced_size(*intrinsic_size, &metrics);
+            let (w, h) = resolve_replaced_size_styled(*intrinsic_size, &b.style, &space, &metrics);
             (
                 w,
                 h,
@@ -896,7 +1049,7 @@ pub fn layout_replaced(
             intrinsic_size,
             paths,
         } => {
-            let (w, h) = resolve_replaced_size(*intrinsic_size, &metrics);
+            let (w, h) = resolve_replaced_size_styled(*intrinsic_size, &b.style, &space, &metrics);
             let vb = view_box.map_or_else(
                 || {
                     Rect::new(
@@ -967,13 +1120,72 @@ pub fn layout_replaced(
     }
 }
 
+fn resolve_replaced_size_styled(
+    intrinsic: Size,
+    style: &ComputedStyle,
+    space: &ConstraintSpace,
+    metrics: &BoxMetrics,
+) -> (f32, f32) {
+    use rix_css::values_math::CalcSizeBasis;
+    let eval = space.eval_context_for(style);
+    let pb_w = metrics.padding.horizontal() + metrics.border.horizontal();
+    let pb_h = metrics.padding.vertical() + metrics.border.vertical();
+    let is_bb = style.box_sizing == BoxSizingMode::BorderBox;
+    let avail_w = (space.available_width - metrics.margin.horizontal() - pb_w).max(0.0);
+    let spec_w = metrics.specified_width.or_else(|| {
+        resolve_size_with_intrinsic(
+            &style.box_model.width,
+            Some(space.containing_block_width),
+            pb_w,
+            metrics.margin.horizontal(),
+            is_bb,
+            &eval,
+            |b| {
+                if matches!(b, CalcSizeBasis::Stretch) {
+                    avail_w
+                } else {
+                    intrinsic.width
+                }
+            },
+        )
+    });
+    let spec_h = metrics.specified_height.or_else(|| {
+        resolve_size_with_intrinsic(
+            &style.box_model.height,
+            space.available_height,
+            pb_h,
+            metrics.margin.vertical(),
+            is_bb,
+            &eval,
+            |b| match b {
+                CalcSizeBasis::Stretch => space.available_height.map_or(intrinsic.height, |ah| {
+                    (ah - metrics.margin.vertical() - pb_h).max(0.0)
+                }),
+                _ => intrinsic.height,
+            },
+        )
+    });
+    resolve_replaced_pair(intrinsic, spec_w, spec_h, metrics)
+}
+
 fn resolve_replaced_size(intrinsic: Size, metrics: &BoxMetrics) -> (f32, f32) {
-    let ratio = if intrinsic.height > 0.0 && intrinsic.width > 0.0 {
-        Some(intrinsic.width / intrinsic.height)
-    } else {
-        None
-    };
-    let (w, h) = match (metrics.specified_width, metrics.specified_height, ratio) {
+    resolve_replaced_pair(
+        intrinsic,
+        metrics.specified_width,
+        metrics.specified_height,
+        metrics,
+    )
+}
+
+fn resolve_replaced_pair(
+    intrinsic: Size,
+    spec_w: Option<f32>,
+    spec_h: Option<f32>,
+    metrics: &BoxMetrics,
+) -> (f32, f32) {
+    let ratio = (intrinsic.height > 0.0 && intrinsic.width > 0.0)
+        .then(|| intrinsic.width / intrinsic.height);
+    let (w, h) = match (spec_w, spec_h, ratio) {
         (Some(w), Some(h), _) => (w, h),
         (Some(w), None, Some(r)) => (w, (w / r).max(0.0)),
         (None, Some(h), Some(r)) => ((h * r).max(0.0), h),

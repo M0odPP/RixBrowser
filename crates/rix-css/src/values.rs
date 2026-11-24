@@ -342,6 +342,21 @@ pub enum CalcExpr {
 }
 
 impl CalcExpr {
+    #[must_use]
+    pub fn has_percentage(&self) -> bool {
+        match self {
+            Self::Percent(_) => true,
+            Self::Length(_, _) | Self::Number(_) => false,
+            Self::Sum(a, b) | Self::Rem(a, b) | Self::Mod(a, b) => {
+                a.has_percentage() || b.has_percentage()
+            }
+            Self::Product(_, a) | Self::Abs(a) | Self::Sign(a) => a.has_percentage(),
+            Self::Min(args) | Self::Max(args) => args.iter().any(Self::has_percentage),
+            Self::Clamp(a, b, c) => a.has_percentage() || b.has_percentage() || c.has_percentage(),
+            Self::Math(node) => node.has_percentage(),
+        }
+    }
+
     /// Evaluates the expression to pixels given a percentage basis and unit context.
     #[must_use]
     pub fn resolve_px(&self, percent_basis: f32, ctx: &EvalContext) -> f32 {
@@ -426,6 +441,15 @@ impl LengthPercentage {
     }
 
     #[must_use]
+    pub fn has_percentage(&self) -> bool {
+        match self {
+            Self::Zero | Self::Length(_, _) => false,
+            Self::Percent(_) => true,
+            Self::Calc(expr) => expr.has_percentage(),
+        }
+    }
+
+    #[must_use]
     pub fn resolve_px(&self, percent_basis: f32, ctx: &EvalContext) -> f32 {
         match self {
             Self::Zero => 0.0,
@@ -455,6 +479,36 @@ pub enum SizeValue {
     MaxContent,
     FitContent(Option<LengthPercentage>),
     Stretch,
+    Content,
+    CalcSize(Box<crate::values_math::CalcSizeExpr>),
+}
+
+/// CSS Values L5 `interpolate-size` inherited keyword property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum InterpolateSizeMode {
+    #[default]
+    NumericOnly,
+    AllowKeywords,
+}
+
+/// CSS Transitions L2 `transition-behavior` mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum TransitionBehaviorMode {
+    #[default]
+    Normal,
+    AllowDiscrete,
+}
+
+/// CSS Animations L2 `animation-composition` mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum AnimationCompositionMode {
+    #[default]
+    Replace,
+    Add,
+    Accumulate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -1148,14 +1202,14 @@ pub enum TimingFunction {
     EaseIn,
     EaseOut,
     EaseInOut,
-    CubicBezier(f32, f32, f32, f32),
+    CubicBezier(f64, f64, f64, f64),
     Steps(u32, bool),
 }
 
 impl TimingFunction {
-    /// Evaluates the CSS easing curve at normalized progress `t` in `[0.0, 1.0]`.
+    /// Evaluates the CSS easing curve at normalized progress `t` in `[0.0, 1.0]` in `f64` precision.
     #[must_use]
-    pub fn evaluate(self, t: f32) -> f32 {
+    pub fn evaluate_f64(self, t: f64) -> f64 {
         let t = t.clamp(0.0, 1.0);
         match self {
             Self::Linear => t,
@@ -1165,7 +1219,7 @@ impl TimingFunction {
             Self::EaseInOut => eval_cubic_bezier(0.42, 0.0, 0.58, 1.0, t),
             Self::CubicBezier(x1, y1, x2, y2) => eval_cubic_bezier(x1, y1, x2, y2, t),
             Self::Steps(count, jump_start) => {
-                let n = count.max(1) as f32;
+                let n = f64::from(count.max(1));
                 if jump_start {
                     ((t * n).floor() + 1.0).min(n) / n
                 } else {
@@ -1174,38 +1228,62 @@ impl TimingFunction {
             }
         }
     }
+
+    /// Evaluates the CSS easing curve at normalized progress `t` in `[0.0, 1.0]`.
+    #[must_use]
+    pub fn evaluate(self, t: f32) -> f32 {
+        self.evaluate_f64(f64::from(t)) as f32
+    }
 }
 
-fn eval_cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
+fn eval_cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, x: f64) -> f64 {
     if x <= 0.0 {
         return 0.0;
     }
     if x >= 1.0 {
         return 1.0;
     }
-    let sample_x = |u: f32| {
+    let sample_x = |u: f64| {
         let inv = 1.0 - u;
         3.0 * inv * inv * u * x1 + 3.0 * inv * u * u * x2 + u * u * u
     };
-    let sample_dx = |u: f32| {
+    let sample_dx = |u: f64| {
         let inv = 1.0 - u;
         3.0 * inv * inv * x1 + 6.0 * inv * u * (x2 - x1) + 3.0 * u * u * (1.0 - x2)
     };
-    let sample_y = |u: f32| {
+    let sample_y = |u: f64| {
         let inv = 1.0 - u;
         3.0 * inv * inv * u * y1 + 3.0 * inv * u * u * y2 + u * u * u
     };
     let mut u = x;
-    for _ in 0..6 {
+    let mut converged = false;
+    for _ in 0..8 {
         let err = sample_x(u) - x;
-        if err.abs() < 1e-5 {
+        if err.abs() < 1e-11 {
+            converged = true;
             break;
         }
         let d = sample_dx(u);
-        if d.abs() < 1e-6 {
+        if d.abs() < 1e-12 {
             break;
         }
         u = (u - err / d).clamp(0.0, 1.0);
+    }
+    if !converged {
+        let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+        u = x;
+        for _ in 0..42 {
+            let sx = sample_x(u);
+            if (sx - x).abs() < 1e-11 {
+                break;
+            }
+            if sx < x {
+                lo = u;
+            } else {
+                hi = u;
+            }
+            u = 0.5 * (lo + hi);
+        }
     }
     sample_y(u)
 }
@@ -1216,6 +1294,7 @@ pub struct TransitionSpec {
     pub duration_ms: f32,
     pub delay_ms: f32,
     pub timing: TimingFunction,
+    pub behavior: TransitionBehaviorMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -1257,6 +1336,7 @@ pub struct AnimationSpec {
     pub direction: AnimationDirectionMode,
     pub fill_mode: AnimationFillModeKind,
     pub play_state: AnimationPlayStateMode,
+    pub composition: AnimationCompositionMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2199,9 +2279,12 @@ pub fn convert_easing(ef: &EasingFunction) -> TimingFunction {
         EasingFunction::EaseIn => TimingFunction::EaseIn,
         EasingFunction::EaseOut => TimingFunction::EaseOut,
         EasingFunction::EaseInOut => TimingFunction::EaseInOut,
-        EasingFunction::CubicBezier { x1, y1, x2, y2 } => {
-            TimingFunction::CubicBezier(*x1, *y1, *x2, *y2)
-        }
+        EasingFunction::CubicBezier { x1, y1, x2, y2 } => TimingFunction::CubicBezier(
+            f64::from(*x1),
+            f64::from(*y1),
+            f64::from(*x2),
+            f64::from(*y2),
+        ),
         EasingFunction::Steps { count, position } => TimingFunction::Steps(
             (*count).max(1) as u32,
             matches!(position, StepPosition::Start | StepPosition::JumpBoth),
@@ -2221,6 +2304,7 @@ pub fn convert_transition(tr: &LightningTransition<'_>) -> TransitionSpec {
         duration_ms: tr.duration.to_ms().max(0.0),
         delay_ms: tr.delay.to_ms(),
         timing: convert_easing(&tr.timing_function),
+        behavior: TransitionBehaviorMode::Normal,
     }
 }
 
@@ -2280,6 +2364,7 @@ pub fn convert_animation(anim: &LightningAnimation<'_>) -> AnimationSpec {
         direction: convert_animation_direction(&anim.direction),
         fill_mode: convert_animation_fill(&anim.fill_mode),
         play_state: convert_animation_play_state(&anim.play_state),
+        composition: AnimationCompositionMode::Replace,
     }
 }
 

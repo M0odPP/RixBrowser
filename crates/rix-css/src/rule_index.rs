@@ -205,6 +205,13 @@ impl RuleIndex {
                     kf_layers.insert(kf.name.clone(), key_rank);
                     let mut kf_copy = kf.clone();
                     kf_copy.layer_id = remapped;
+                    if kf_copy.steps.iter().any(|st| {
+                        st.declarations
+                            .iter()
+                            .any(|d| d.value.contains_sibling_fn())
+                    }) {
+                        index.allows_sibling_sharing = false;
+                    }
                     index.keyframes.insert(kf.name.clone(), kf_copy);
                 }
             }

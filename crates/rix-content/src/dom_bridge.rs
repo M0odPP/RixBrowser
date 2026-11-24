@@ -140,6 +140,7 @@ pub struct HostState {
     pub adopted_stylesheets: Vec<crate::cssom::SharedStyleSheet>,
     pub registered_properties: HashMap<String, (String, bool, Option<String>)>,
     pub active_element: Option<NodeId>,
+    pub next_web_anim_id: u64,
 }
 
 /// Shared handle to [`HostState`].
@@ -198,6 +199,7 @@ impl HostState {
             adopted_stylesheets: Vec::new(),
             registered_properties: HashMap::new(),
             active_element: None,
+            next_web_anim_id: 1,
         }
     }
 
@@ -482,6 +484,8 @@ impl HostState {
             ..MediaContext::default()
         };
         let mut ctx = StyleContext::new(media);
+        let anim_snap = self.style_ctx.take_animation_state();
+        ctx.restore_animation_state(anim_snap);
         for (name, (syntax, inherits, init)) in &self.registered_properties {
             ctx.register_property(RegisteredProperty {
                 name: rix_core::intern_str(name),
@@ -598,6 +602,44 @@ impl HostState {
     /// Clears all preserved unquantized inline color expressions for `node`.
     pub fn clear_inline_color_exprs(&mut self, node: NodeId) {
         self.style_ctx.clear_inline_color_exprs(node);
+    }
+
+    /// Attaches a Web Animation (`Element.prototype.animate`) to `node` and marks it dirty.
+    pub fn add_web_animation(&mut self, node: NodeId, mut anim: rix_css::WebAnimationSpec) -> u64 {
+        let id = self.next_web_anim_id;
+        self.next_web_anim_id += 1;
+        anim.id = id;
+        self.style_ctx.add_web_animation(node, anim);
+        self.mark_node_style_dirty(node);
+        id
+    }
+
+    /// Mutates a Web Animation on `node` by `id` and marks `node` dirty.
+    pub fn update_web_animation(
+        &mut self,
+        node: NodeId,
+        id: u64,
+        f: impl FnOnce(&mut rix_css::WebAnimationSpec),
+    ) -> bool {
+        let changed = self.style_ctx.update_web_animation(node, id, f);
+        if changed {
+            self.mark_node_style_dirty(node);
+        }
+        changed
+    }
+
+    /// Marks `node` and its ancestors dirty for style/layout recalculation.
+    pub fn mark_node_style_dirty(&mut self, node: NodeId) {
+        let mut doc = self.document.borrow_mut();
+        doc.bump_style_revision_for(node);
+        doc.mark_node_dirty(node, rix_dom::DirtyFlags::SELF_STYLE_DIRTY);
+        let mut cur = doc.parent(node);
+        while let Some(anc) = cur {
+            doc.mark_node_dirty(anc, rix_dom::DirtyFlags::DESCENDANT_STYLE_DIRTY);
+            cur = doc.parent(anc);
+        }
+        self.last_style_revs = None;
+        self.last_layout_revs = None;
     }
 
     /// Returns the cached `ComputedStyle` for `node`, running dirty-checked cascade if needed.
@@ -2196,6 +2238,7 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
         ("lang", "lang"),
         ("dir", "dir"),
         ("htmlFor", "for"),
+        ("src", "src"),
     ] {
         let h1 = Rc::clone(host);
         let g = vm.alloc_host_fn(prop, move |vm, t, _| {

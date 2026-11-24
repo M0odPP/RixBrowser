@@ -517,6 +517,19 @@ impl<'a> BoxTreeBuilder<'a> {
                         paths: svg.paths.clone(),
                     });
                 }
+                if let Some((nat_w, nat_h)) = parse_inline_svg_data_uri_size(&src) {
+                    let (iw, ih) = match (attr_w, attr_h) {
+                        (Some(w), Some(h)) => (w, h),
+                        (Some(w), None) => (w, (w * (nat_h / nat_w.max(1.0))).max(1.0)),
+                        (None, Some(h)) => ((h * (nat_w / nat_h.max(1.0))).max(1.0), h),
+                        (None, None) => (nat_w, nat_h),
+                    };
+                    return Some(ReplacedKind::Image {
+                        src,
+                        image_id: None,
+                        intrinsic_size: Size::new(iw, ih),
+                    });
+                }
 
                 let decoded = self.assets.get_by_src(&src).or_else(|| {
                     srcset_pick
@@ -1260,4 +1273,63 @@ fn box_establishes_bfc(
                     | FormattingContextKind::Table
             }
     )
+}
+
+/// Parses intrinsic `(width, height)` from an inline `data:image/svg+xml,...` URL when
+/// not pre-loaded in `AssetRegistry` (e.g. dynamically assigned via `img.src = ...`).
+fn parse_inline_svg_data_uri_size(src: &str) -> Option<(f32, f32)> {
+    let lower = src.to_ascii_lowercase();
+    if !lower.starts_with("data:image/svg+xml") {
+        return None;
+    }
+    let comma = src.find(',')?;
+    let meta = &lower[..comma];
+    let payload = &src[comma + 1..];
+    if meta.contains(";base64") {
+        return None;
+    }
+    // Percent-decode payload into UTF-8 string.
+    let mut bytes = Vec::with_capacity(payload.len());
+    let pb = payload.as_bytes();
+    let mut i = 0;
+    while i < pb.len() {
+        if pb[i] == b'%' && i + 2 < pb.len() {
+            if let Ok(hex) = std::str::from_utf8(&pb[i + 1..i + 3]) {
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    bytes.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        bytes.push(pb[i]);
+        i += 1;
+    }
+    let svg = String::from_utf8(bytes).ok()?;
+    let tag_start = svg.to_ascii_lowercase().find("<svg")?;
+    let tag_end = svg[tag_start..].find('>')? + tag_start;
+    let tag = &svg[tag_start..tag_end];
+    let extract_attr = |name: &str| -> Option<String> {
+        let low = tag.to_ascii_lowercase();
+        let needle = format!("{name}=");
+        let pos = low.find(&needle)? + needle.len();
+        let rest = tag[pos..].trim_start();
+        let quote = rest.bytes().next()?;
+        if quote == b'"' || quote == b'\'' {
+            let inner = &rest[1..];
+            let end = inner.find(quote as char)?;
+            Some(inner[..end].to_string())
+        } else {
+            None
+        }
+    };
+    let w = extract_attr("width").and_then(|s| parse_html_dimension_attr(&s));
+    let h = extract_attr("height").and_then(|s| parse_html_dimension_attr(&s));
+    if let (Some(wv), Some(hv)) = (w, h) {
+        return Some((wv, hv));
+    }
+    if let Some(vb) = extract_attr("viewbox").and_then(|s| SvgViewBox::parse(&s)) {
+        return Some((w.unwrap_or(vb.width), h.unwrap_or(vb.height)));
+    }
+    None
 }

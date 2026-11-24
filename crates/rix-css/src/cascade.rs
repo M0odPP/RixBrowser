@@ -14,6 +14,9 @@ use selectors::context::SelectorCaches;
 use selectors::Element as _;
 use smallvec::SmallVec;
 
+use crate::animations::{
+    apply_animations_and_transitions, ActiveTransition, AnimationStateSnapshot, WebAnimationSpec,
+};
 use crate::color::CssColorExpr;
 use crate::computed::{resolve_element_style_with_siblings, ComputedStyle, MatchedRule};
 use crate::properties::{
@@ -216,6 +219,10 @@ pub struct StyleContext {
     styles: FastMap<NodeId, Arc<ComputedStyle>>,
     pseudo_styles: FastMap<(NodeId, RixPseudoElement), Arc<ComputedStyle>>,
     inline_color_exprs: FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
+    before_change_styles: FastMap<NodeId, Arc<ComputedStyle>>,
+    active_transitions: FastMap<NodeId, Vec<ActiveTransition>>,
+    web_animations: FastMap<NodeId, Vec<WebAnimationSpec>>,
+    animation_clock_ms: f32,
     missing_seen: HashSet<MissingCssFeature>,
     missing_features: Vec<MissingCssFeature>,
     index_dirty: bool,
@@ -236,6 +243,10 @@ impl StyleContext {
             styles: FastMap::default(),
             pseudo_styles: FastMap::default(),
             inline_color_exprs: FastMap::default(),
+            before_change_styles: FastMap::default(),
+            active_transitions: FastMap::default(),
+            web_animations: FastMap::default(),
+            animation_clock_ms: 0.0,
             missing_seen: HashSet::new(),
             missing_features: Vec::new(),
             index_dirty: true,
@@ -261,10 +272,70 @@ impl StyleContext {
             styles: FastMap::default(),
             pseudo_styles: FastMap::default(),
             inline_color_exprs: FastMap::default(),
+            before_change_styles: FastMap::default(),
+            active_transitions: FastMap::default(),
+            web_animations: FastMap::default(),
+            animation_clock_ms: 0.0,
             missing_seen: HashSet::new(),
             missing_features: Vec::new(),
             index_dirty: true,
         }
+    }
+
+    /// Extracts portable animation/transition state so it survives full stylesheet rebuilds.
+    pub fn take_animation_state(&mut self) -> AnimationStateSnapshot {
+        AnimationStateSnapshot {
+            before_change: self.before_change_styles.drain().collect(),
+            active_transitions: self.active_transitions.drain().collect(),
+            web_animations: self.web_animations.drain().collect(),
+        }
+    }
+
+    /// Restores portable animation/transition state onto a newly constructed [`StyleContext`].
+    pub fn restore_animation_state(&mut self, snap: AnimationStateSnapshot) {
+        self.before_change_styles.extend(snap.before_change);
+        self.active_transitions.extend(snap.active_transitions);
+        self.web_animations.extend(snap.web_animations);
+    }
+
+    /// Attaches a Web Animation (`Element.prototype.animate`) to `node`.
+    pub fn add_web_animation(&mut self, node: NodeId, anim: WebAnimationSpec) {
+        self.web_animations.entry(node).or_default().push(anim);
+    }
+
+    /// Mutates a Web Animation on `node` by `id`.
+    pub fn update_web_animation(
+        &mut self,
+        node: NodeId,
+        id: u64,
+        f: impl FnOnce(&mut WebAnimationSpec),
+    ) -> bool {
+        if let Some(list) = self.web_animations.get_mut(&node) {
+            if let Some(anim) = list.iter_mut().find(|a| a.id == id) {
+                f(anim);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns the current document animation clock in milliseconds.
+    #[must_use]
+    pub const fn animation_clock_ms(&self) -> f32 {
+        self.animation_clock_ms
+    }
+
+    /// Advances the document animation clock (e.g. per animation frame).
+    pub fn advance_animation_clock_ms(&mut self, delta_ms: f32) {
+        if delta_ms > 0.0 {
+            self.animation_clock_ms += delta_ms;
+        }
+    }
+
+    /// Returns `true` if any element has active transitions or animations.
+    #[must_use]
+    pub fn has_active_animations(&self) -> bool {
+        !self.active_transitions.is_empty() || !self.web_animations.is_empty()
     }
 
     /// Appends a compiled author or user stylesheet and marks the rule index dirty.
@@ -575,7 +646,9 @@ impl StyleContext {
 
         self.styles.reserve(results.len());
         report.layout_dirty_count += results.len();
+        let mut styled_ids = Vec::with_capacity(results.len());
         for (id, style) in results {
+            styled_ids.push(id);
             self.styles.insert(id, style);
             if let Some(NodeData::Element(el)) = doc.get_mut(id) {
                 el.dirty_flags
@@ -584,6 +657,7 @@ impl StyleContext {
                     .insert(DirtyFlags::SELF_LAYOUT_DIRTY | DirtyFlags::PAINT_DIRTY);
             }
         }
+        self.apply_post_cascade_animations(doc, &styled_ids, None);
         doc.clear_dirty_flags(
             doc.root(),
             DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::DESCENDANT_STYLE_DIRTY,
@@ -656,6 +730,8 @@ impl StyleContext {
             );
         }
 
+        self.apply_post_cascade_animations(doc, &cleared_nodes, Some(&mut layout_dirty_nodes));
+
         for id in cleared_nodes {
             doc.clear_dirty_flags(
                 id,
@@ -678,6 +754,47 @@ impl StyleContext {
             }
         }
         report
+    }
+
+    #[rustfmt::skip]
+    fn apply_post_cascade_animations(
+        &mut self, doc: &Document, node_ids: &[NodeId], mut extra_layout_dirty: Option<&mut Vec<NodeId>>,
+    ) {
+        let (dark_mode, elapsed_ms) = (self.media.dark_mode, self.animation_clock_ms);
+        for &id in node_ids {
+            let Some(mut base_style) = self.styles.get(&id).cloned() else { continue; };
+            let eff = base_style.effects.as_ref();
+            let has_css_anims = eff.is_some_and(|e| !e.animations.is_empty());
+            let has_css_tr = eff.is_some_and(|e| !e.transitions.is_empty());
+            let has_web = self.web_animations.contains_key(&id);
+            if !has_css_anims && !has_css_tr && !has_web && !self.active_transitions.contains_key(&id) {
+                self.before_change_styles.insert(id, base_style);
+                continue;
+            }
+            if has_css_anims || has_web {
+                let (sib_idx, sib_cnt) = element_sibling_position(doc, id);
+                let mut cloned = (*base_style).clone();
+                let t = Arc::make_mut(&mut cloned.text);
+                t.eval_ctx.sibling_index = sib_idx;
+                t.eval_ctx.sibling_count = sib_cnt;
+                base_style = Arc::new(cloned);
+            }
+            let parent_style = doc.parent(id).and_then(|pid| self.styles.get(&pid)).cloned();
+            let before = self.before_change_styles.get(&id).cloned();
+            let web_slice = self.web_animations.get(&id).cloned();
+            let mut active_trs = self.active_transitions.remove(&id).unwrap_or_default();
+            let final_style = apply_animations_and_transitions(
+                Arc::clone(&base_style), parent_style.as_deref(), dark_mode, elapsed_ms,
+                &|name| self.keyframes(name), web_slice.as_deref(), before.as_ref(),
+                &mut active_trs, &self.rule_index.registered_properties,
+            );
+            if !active_trs.is_empty() { self.active_transitions.insert(id, active_trs); }
+            if let Some(dirty_out) = extra_layout_dirty.as_deref_mut() {
+                if before.as_deref() != Some(&*final_style) || final_style != base_style { dirty_out.push(id); }
+            }
+            self.before_change_styles.insert(id, Arc::clone(&final_style));
+            self.styles.insert(id, final_style);
+        }
     }
 }
 

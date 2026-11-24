@@ -2,6 +2,7 @@
 //! Typed CSS stylesheet compiler, Selectors Level 4 integration, and compact
 //! `Arc`-grouped `ComputedStyle` for RixBrowser.
 
+pub mod animations;
 pub mod cascade;
 pub mod color;
 pub mod computed;
@@ -14,6 +15,9 @@ pub mod ua;
 pub mod values;
 pub mod values_math;
 
+pub use animations::{
+    ActiveTransition, AnimationStateSnapshot, WebAnimationKeyframe, WebAnimationSpec,
+};
 pub use cascade::{RestyleReport, StyleContext, StyleMemo};
 pub use color::{
     format_legacy_rgba, parse_and_serialize_color_specified, parse_css_color, ColorSpace,
@@ -28,10 +32,11 @@ pub use cssom_decl::{
     parse_and_expand_declaration, parse_and_serialize_declaration, strip_outer_css_comments,
 };
 pub use properties::{
-    compile_declaration_block, is_logical_property, parse_inline_style, parse_property_from_tokens,
-    resolve_logical_to_physical, serialize_css_tokens, tokenize_custom_value_str, CssToken,
-    GlobalKeyword, MissingCssFeature, MissingCssKind, PropertyIdKind, PropertyValue,
-    SpecifiedDeclaration, ALL_RESETTABLE_LONGHANDS, COMPUTED_STYLE_LONGHANDS,
+    compile_declaration_block, is_logical_property, is_sizing_property, parse_inline_style,
+    parse_property_from_tokens, parse_single_timing_function, resolve_logical_to_physical,
+    serialize_css_tokens, tokenize_custom_value_str, CssToken, GlobalKeyword, MissingCssFeature,
+    MissingCssKind, PropertyIdKind, PropertyValue, SpecifiedDeclaration, ALL_RESETTABLE_LONGHANDS,
+    COMPUTED_STYLE_LONGHANDS,
 };
 pub use rule_index::{InvalidationMap, InvalidationScope, RuleBucketEntry, RuleIndex};
 pub use selector::{
@@ -54,16 +59,17 @@ pub use stylesheet::{
 };
 pub use ua::{default_ua_stylesheet, UA_CSS};
 pub use values::{
-    AlignValue, AnimationDirectionMode, AnimationFillModeKind, AnimationPlayStateMode,
-    AnimationSpec, BackgroundImageValue, BackgroundLayerValue, BorderCollapseMode, BorderEdge,
-    BoxShadowValue, BoxSizingMode, CalcExpr, CaptionSideMode, ClearMode, ClipPathValue, ClipRadius,
-    ColorRgba, CornerRadii, CornerRadius, CssColor, CssGradientStop, CursorKind, DirectionMode,
-    DisplayMode, EdgeValues, EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode,
-    FontStyleMode, GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
+    AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
+    AnimationPlayStateMode, AnimationSpec, BackgroundImageValue, BackgroundLayerValue,
+    BorderCollapseMode, BorderEdge, BoxShadowValue, BoxSizingMode, CalcExpr, CaptionSideMode,
+    ClearMode, ClipPathValue, ClipRadius, ColorRgba, CornerRadii, CornerRadius, CssColor,
+    CssGradientStop, CursorKind, DirectionMode, DisplayMode, EdgeValues, EvalContext, FilterOp,
+    FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
+    GridPlacementValue, GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode,
     LengthPercentage, LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, MixBlendMode,
     OverflowMode, OverflowPair, OverflowWrapMode, OverscrollBehaviorMode, PointerEventsMode,
     PositionMode, ResizeMode, SizeValue, TableLayoutMode, TextAlignMode, TextDecorationLine,
     TextOverflowMode, TextTransformMode, TimingFunction, TransformOp, TransformOrigin,
-    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
-    WordBreakMode, WritingMode, ZIndexValue,
+    TransitionBehaviorMode, TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode,
+    WhiteSpaceMode, WordBreakMode, WritingMode, ZIndexValue,
 };
