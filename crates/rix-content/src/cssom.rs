@@ -1711,6 +1711,9 @@ fn canonicalize_legacy_css_prop_alias(lower: &str) -> &str {
         "-webkit-flex-wrap" => "flex-wrap",
         "-webkit-justify-content" => "justify-content",
         "-webkit-order" => "order",
+        "grid-gap" => "gap",
+        "grid-row-gap" => "row-gap",
+        "grid-column-gap" => "column-gap",
         other => other,
     }
 }
@@ -1885,26 +1888,62 @@ fn split_css_declarations(raw: &str) -> Vec<&str> {
 }
 
 fn serialize_style_decls_with_priority(decls: &[(String, String, bool)]) -> String {
-    decls
-        .iter()
-        .map(|(k, v, imp)| {
-            let sep = if k.starts_with("--") && v.starts_with(' ') {
-                ":"
+    const GRID_ALL: [&str; 6] = [
+        "grid-template-rows",
+        "grid-template-columns",
+        "grid-template-areas",
+        "grid-auto-rows",
+        "grid-auto-columns",
+        "grid-auto-flow",
+    ];
+    const GRID_TMPL: [&str; 3] = [
+        "grid-template-rows",
+        "grid-template-columns",
+        "grid-template-areas",
+    ];
+    let grid_sh = lookup_decl_or_shorthand(decls, "grid");
+    let grid_tmpl_sh = if grid_sh.is_empty() {
+        lookup_decl_or_shorthand(decls, "grid-template")
+    } else {
+        String::new()
+    };
+    let mut emitted_grid = false;
+    let mut emitted_tmpl = false;
+    let mut out = Vec::with_capacity(decls.len());
+    let fmt_one = |k: &str, v: &str, imp: bool| -> String {
+        let sep = if k.starts_with("--") && v.starts_with(' ') {
+            ":"
+        } else {
+            ": "
+        };
+        if imp {
+            if v.is_empty() {
+                format!("{k}{sep}!important;")
             } else {
-                ": "
-            };
-            if *imp {
-                if v.is_empty() {
-                    format!("{k}{sep}!important;")
-                } else {
-                    format!("{k}{sep}{v} !important;")
-                }
-            } else {
-                format!("{k}{sep}{v};")
+                format!("{k}{sep}{v} !important;")
             }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+        } else {
+            format!("{k}{sep}{v};")
+        }
+    };
+    for (k, v, imp) in decls {
+        if !grid_sh.is_empty() && GRID_ALL.contains(&k.as_str()) {
+            if !emitted_grid {
+                emitted_grid = true;
+                out.push(fmt_one("grid", &grid_sh, *imp));
+            }
+            continue;
+        }
+        if !grid_tmpl_sh.is_empty() && GRID_TMPL.contains(&k.as_str()) {
+            if !emitted_tmpl {
+                emitted_tmpl = true;
+                out.push(fmt_one("grid-template", &grid_tmpl_sh, *imp));
+            }
+            continue;
+        }
+        out.push(fmt_one(k, v, *imp));
+    }
+    out.join(" ")
 }
 
 fn upsert_decl(
@@ -2097,6 +2136,91 @@ fn lookup_decl_or_shorthand(decls: &[(String, String, bool)], prop: &str) -> Str
             } else {
                 Some(format!("{d} {w}"))
             }
+        })(),
+        "gap" => get_pair("row-gap", "column-gap"),
+        "grid-row" => (|| {
+            let (s, is_) = get("grid-row-start")?;
+            let (e, ie) = get("grid-row-end")?;
+            if is_ != ie {
+                return None;
+            }
+            let ps = rix_css::grid_css::parse_grid_line(s)?;
+            let pe = rix_css::grid_css::parse_grid_line(e)?;
+            Some(rix_css::grid_css::serialize_grid_row_or_col_shortest(
+                &ps, &pe, None,
+            ))
+        })(),
+        "grid-column" => (|| {
+            let (s, is_) = get("grid-column-start")?;
+            let (e, ie) = get("grid-column-end")?;
+            if is_ != ie {
+                return None;
+            }
+            let ps = rix_css::grid_css::parse_grid_line(s)?;
+            let pe = rix_css::grid_css::parse_grid_line(e)?;
+            Some(rix_css::grid_css::serialize_grid_row_or_col_shortest(
+                &ps, &pe, None,
+            ))
+        })(),
+        "grid-area" => (|| {
+            let (rs, irs) = get("grid-row-start")?;
+            let (cs, ics) = get("grid-column-start")?;
+            let (re, ire) = get("grid-row-end")?;
+            let (ce, ice) = get("grid-column-end")?;
+            if irs != ics || ics != ire || ire != ice {
+                return None;
+            }
+            let prs = rix_css::grid_css::parse_grid_line(rs)?;
+            let pcs = rix_css::grid_css::parse_grid_line(cs)?;
+            let pre = rix_css::grid_css::parse_grid_line(re)?;
+            let pce = rix_css::grid_css::parse_grid_line(ce)?;
+            Some(rix_css::grid_css::serialize_grid_area_shortest(
+                &prs, &pcs, &pre, &pce, None,
+            ))
+        })(),
+        "grid-template" => (|| {
+            let (r, ir) = get("grid-template-rows")?;
+            let (c, ic) = get("grid-template-columns")?;
+            let (a, ia) = get("grid-template-areas")?;
+            if ir != ic || ic != ia {
+                return None;
+            }
+            let pr = rix_css::grid_css::parse_grid_template_track_list(r)?;
+            let pc = rix_css::grid_css::parse_grid_template_track_list(c)?;
+            let pa = rix_css::grid_css::parse_grid_template_areas(a)?;
+            rix_css::grid_css::serialize_grid_template_from_values(&pr, &pc, &pa)
+        })(),
+        "grid" => (|| {
+            let (r, ir) = get("grid-template-rows")?;
+            let (c, ic) = get("grid-template-columns")?;
+            let (a, ia) = get("grid-template-areas")?;
+            let (ar, iar) = get("grid-auto-rows")?;
+            let (ac, iac) = get("grid-auto-columns")?;
+            let (af, iaf) = get("grid-auto-flow")?;
+            if ir != ic || ic != ia || ia != iar || iar != iac || iac != iaf {
+                return None;
+            }
+            let pr = rix_css::grid_css::parse_grid_template_track_list(r)?;
+            let pc = rix_css::grid_css::parse_grid_template_track_list(c)?;
+            let pa = rix_css::grid_css::parse_grid_template_areas(a)?;
+            let par = rix_css::grid_css::parse_grid_auto_tracks(ar)?;
+            let pac = rix_css::grid_css::parse_grid_auto_tracks(ac)?;
+            let paf = rix_css::grid_css::parse_grid_auto_flow(af)?;
+            rix_css::grid_css::serialize_grid_from_values(&pr, &pc, &pa, &par, &pac, paf)
+        })(),
+        "grid-lanes" => (|| {
+            let (c, ic) = get("grid-template-columns")?;
+            let (r, ir) = get("grid-template-rows")?;
+            let (a, ia) = get("grid-template-areas")?;
+            let (d, id) = get("grid-lanes-direction")?;
+            if ic != ir || ir != ia || ia != id {
+                return None;
+            }
+            let pc = rix_css::grid_css::parse_grid_template_track_list(c)?;
+            let pr = rix_css::grid_css::parse_grid_template_track_list(r)?;
+            let pa = rix_css::grid_css::parse_grid_template_areas(a)?;
+            let pd = rix_css::grid_css::parse_grid_lanes_direction(d)?;
+            rix_css::grid_css::serialize_grid_lanes_from_values(&pc, &pr, &pa, pd, None)
         })(),
         _ => None,
     };
@@ -2515,6 +2639,9 @@ fn live_computed_property(
     pseudo: Option<RixPseudoElement>,
     prop: &str,
 ) -> String {
+    if !host.borrow().document.borrow().is_connected(nid) {
+        return String::new();
+    }
     let style = live_style_for(host, nid, pseudo);
     let layout_box = if pseudo.is_none() && prop_needs_layout_resolution(prop) {
         host.borrow_mut().resolved_layout_box_for_node(nid)
@@ -3825,12 +3952,12 @@ fn format_computed_property_resolved(
             .flex_grid
             .as_ref()
             .map_or_else(|| "normal".into(), |f| format_lp(&f.column_gap, &eval)),
-        "grid-auto-flow" => match style.flex_grid.as_ref().map(|f| f.grid_auto_flow) {
-            Some(GridAutoFlowMode::Column) => "column",
-            Some(GridAutoFlowMode::RowDense) => "row dense",
-            Some(GridAutoFlowMode::ColumnDense) => "column dense",
-            _ => "row",
-        }
+        "grid-auto-flow" => rix_css::grid_css::serialize_grid_auto_flow(
+            style
+                .flex_grid
+                .as_ref()
+                .map_or(GridAutoFlowMode::Row, |f| f.grid_auto_flow),
+        )
         .into(),
         "mix-blend-mode" => match style.effects.as_ref().map(|e| e.mix_blend_mode) {
             Some(MixBlendMode::Multiply) => "multiply",
@@ -4285,12 +4412,171 @@ fn format_computed_property_resolved(
         },
         "grid-template-rows" => style.flex_grid.as_ref().map_or_else(
             || "none".into(),
-            |f| rix_css::values_math::format_grid_tracks_computed(&f.grid_template_rows, &eval),
+            |f| {
+                let is_grid = matches!(
+                    style.display,
+                    DisplayMode::Grid
+                        | DisplayMode::InlineGrid
+                        | DisplayMode::GridLanes
+                        | DisplayMode::InlineGridLanes
+                        | DisplayMode::InlineGridLanesMulti
+                );
+                if !is_grid && f.grid_template_rows_list.has_intrinsic_auto_repeat() {
+                    "none".into()
+                } else {
+                    rix_css::grid_css::serialize_track_list(&f.grid_template_rows_list, Some(&eval))
+                }
+            },
         ),
         "grid-template-columns" => style.flex_grid.as_ref().map_or_else(
             || "none".into(),
-            |f| rix_css::values_math::format_grid_tracks_computed(&f.grid_template_columns, &eval),
+            |f| {
+                let is_grid = matches!(
+                    style.display,
+                    DisplayMode::Grid
+                        | DisplayMode::InlineGrid
+                        | DisplayMode::GridLanes
+                        | DisplayMode::InlineGridLanes
+                        | DisplayMode::InlineGridLanesMulti
+                );
+                if !is_grid && f.grid_template_columns_list.has_intrinsic_auto_repeat() {
+                    "none".into()
+                } else {
+                    rix_css::grid_css::serialize_track_list(
+                        &f.grid_template_columns_list,
+                        Some(&eval),
+                    )
+                }
+            },
         ),
+        "grid-template-areas" => style.flex_grid.as_ref().map_or_else(
+            || "none".into(),
+            |f| rix_css::grid_css::serialize_grid_areas(&f.grid_template_areas),
+        ),
+        "grid-auto-columns" => style.flex_grid.as_ref().map_or_else(
+            || "auto".into(),
+            |f| rix_css::grid_css::serialize_auto_tracks(&f.grid_auto_columns, Some(&eval)),
+        ),
+        "grid-auto-rows" => style.flex_grid.as_ref().map_or_else(
+            || "auto".into(),
+            |f| rix_css::grid_css::serialize_auto_tracks(&f.grid_auto_rows, Some(&eval)),
+        ),
+        "grid-row-start" => style.flex_grid.as_ref().map_or_else(
+            || "auto".into(),
+            |f| rix_css::grid_css::serialize_grid_line(&f.grid_row_start, Some(&eval)),
+        ),
+        "grid-row-end" => style.flex_grid.as_ref().map_or_else(
+            || "auto".into(),
+            |f| rix_css::grid_css::serialize_grid_line(&f.grid_row_end, Some(&eval)),
+        ),
+        "grid-column-start" => style.flex_grid.as_ref().map_or_else(
+            || "auto".into(),
+            |f| rix_css::grid_css::serialize_grid_line(&f.grid_column_start, Some(&eval)),
+        ),
+        "grid-column-end" => style.flex_grid.as_ref().map_or_else(
+            || "auto".into(),
+            |f| rix_css::grid_css::serialize_grid_line(&f.grid_column_end, Some(&eval)),
+        ),
+        "grid-row" => style.flex_grid.as_ref().map_or_else(
+            || "auto".into(),
+            |f| {
+                rix_css::grid_css::serialize_grid_row_or_col_shortest(
+                    &f.grid_row_start,
+                    &f.grid_row_end,
+                    Some(&eval),
+                )
+            },
+        ),
+        "grid-column" => style.flex_grid.as_ref().map_or_else(
+            || "auto".into(),
+            |f| {
+                rix_css::grid_css::serialize_grid_row_or_col_shortest(
+                    &f.grid_column_start,
+                    &f.grid_column_end,
+                    Some(&eval),
+                )
+            },
+        ),
+        "grid-area" => style.flex_grid.as_ref().map_or_else(
+            || "auto".into(),
+            |f| {
+                rix_css::grid_css::serialize_grid_area_shortest(
+                    &f.grid_row_start,
+                    &f.grid_column_start,
+                    &f.grid_row_end,
+                    &f.grid_column_end,
+                    Some(&eval),
+                )
+            },
+        ),
+        "grid-template" => style.flex_grid.as_ref().map_or_else(
+            || "none".into(),
+            |f| {
+                rix_css::grid_css::serialize_grid_template_from_values(
+                    &f.grid_template_rows_list,
+                    &f.grid_template_columns_list,
+                    &f.grid_template_areas,
+                )
+                .unwrap_or_default()
+            },
+        ),
+        "grid" => style.flex_grid.as_ref().map_or_else(
+            || "none".into(),
+            |f| {
+                rix_css::grid_css::serialize_grid_from_values(
+                    &f.grid_template_rows_list,
+                    &f.grid_template_columns_list,
+                    &f.grid_template_areas,
+                    &f.grid_auto_rows,
+                    &f.grid_auto_columns,
+                    f.grid_auto_flow,
+                )
+                .unwrap_or_default()
+            },
+        ),
+        "fit-tolerance" => style.flex_grid.as_ref().map_or_else(
+            || "normal".into(),
+            |f| rix_css::grid_css::serialize_fit_tolerance(&f.fit_tolerance, Some(&eval)),
+        ),
+        "grid-lanes-direction" => style.flex_grid.as_ref().map_or_else(
+            || "normal".into(),
+            |f| rix_css::grid_css::serialize_grid_lanes_direction_computed(f.grid_lanes_direction),
+        ),
+        "grid-lanes-pack" => rix_css::grid_css::serialize_grid_lanes_pack(
+            style
+                .flex_grid
+                .as_ref()
+                .map_or_else(Default::default, |f| f.grid_lanes_pack),
+        )
+        .into(),
+        "grid-lanes" => style.flex_grid.as_ref().map_or_else(
+            || "normal".into(),
+            |f| {
+                rix_css::grid_css::serialize_grid_lanes_from_values(
+                    &f.grid_template_columns_list,
+                    &f.grid_template_rows_list,
+                    &f.grid_template_areas,
+                    f.grid_lanes_direction,
+                    Some(&eval),
+                )
+                .unwrap_or_default()
+            },
+        ),
+        "gap" => {
+            let r = style
+                .flex_grid
+                .as_ref()
+                .map_or_else(|| "normal".into(), |f| format_lp(&f.row_gap, &eval));
+            let c = style
+                .flex_grid
+                .as_ref()
+                .map_or_else(|| "normal".into(), |f| format_lp(&f.column_gap, &eval));
+            if r == c {
+                r
+            } else {
+                format!("{r} {c}")
+            }
+        }
         "transition-timing-function" => {
             match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
                 Some(list) if !list.is_empty() => list

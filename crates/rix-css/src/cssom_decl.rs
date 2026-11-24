@@ -109,6 +109,30 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
             }
         });
     }
+    if prop_kind == PropertyIdKind::GridRow || prop_kind == PropertyIdKind::GridColumn {
+        return crate::grid_css::parse_grid_row_or_col_shorthand(trimmed)
+            .map(|(s, e)| crate::grid_css::serialize_grid_row_or_col_shortest(&s, &e, None));
+    }
+    if prop_kind == PropertyIdKind::GridArea {
+        return crate::grid_css::parse_grid_area_shorthand(trimmed).map(|(rs, cs, re, ce)| {
+            crate::grid_css::serialize_grid_area_shortest(&rs, &cs, &re, &ce, None)
+        });
+    }
+    if prop_kind == PropertyIdKind::GridTemplate {
+        return crate::grid_css::parse_grid_template_shorthand(trimmed).and_then(|(r, c, a)| {
+            crate::grid_css::serialize_grid_template_from_values(&r, &c, &a)
+        });
+    }
+    if prop_kind == PropertyIdKind::Grid {
+        return crate::grid_css::parse_grid_shorthand(trimmed).and_then(|(r, c, a, ar, ac, af)| {
+            crate::grid_css::serialize_grid_from_values(&r, &c, &a, &ar, &ac, af)
+        });
+    }
+    if prop_kind == PropertyIdKind::GridLanes {
+        return crate::grid_css::parse_grid_lanes_shorthand(trimmed).and_then(|(c, r, a, d)| {
+            crate::grid_css::serialize_grid_lanes_from_values(&c, &r, &a, d, None)
+        });
+    }
     if prop_kind == PropertyIdKind::ViewTransitionName {
         if lower_val == "none" {
             return Some("none".to_string());
@@ -201,12 +225,6 @@ pub fn parse_and_expand_declaration(name: &str, value: &str) -> Option<Vec<(Stri
         )]);
     }
     let prop_kind = PropertyIdKind::from_name(&lower_name)?;
-    if is_color_longhand(prop_kind)
-        || prop_kind == PropertyIdKind::Opacity
-        || crate::properties::should_use_values4_parser(prop_kind, &canonical)
-    {
-        return Some(vec![(lower_name, canonical)]);
-    }
     let lower_val = canonical.to_ascii_lowercase();
     if GlobalKeyword::from_ident(&lower_val).is_some() {
         let longhands = prop_kind.shorthand_longhands();
@@ -221,6 +239,126 @@ pub fn parse_and_expand_declaration(name: &str, value: &str) -> Option<Vec<(Stri
         return Some(vec![(lower_name, lower_val)]);
     }
     let cleaned = strip_outer_css_comments(value);
+    if prop_kind == PropertyIdKind::GridRow {
+        let (s, e) = crate::grid_css::parse_grid_row_or_col_shorthand(cleaned.trim())?;
+        return Some(vec![
+            (
+                "grid-row-start".to_string(),
+                crate::grid_css::serialize_grid_line(&s, None),
+            ),
+            (
+                "grid-row-end".to_string(),
+                crate::grid_css::serialize_grid_line(&e, None),
+            ),
+        ]);
+    }
+    if prop_kind == PropertyIdKind::GridColumn {
+        let (s, e) = crate::grid_css::parse_grid_row_or_col_shorthand(cleaned.trim())?;
+        return Some(vec![
+            (
+                "grid-column-start".to_string(),
+                crate::grid_css::serialize_grid_line(&s, None),
+            ),
+            (
+                "grid-column-end".to_string(),
+                crate::grid_css::serialize_grid_line(&e, None),
+            ),
+        ]);
+    }
+    if prop_kind == PropertyIdKind::GridArea {
+        let (rs, cs, re, ce) = crate::grid_css::parse_grid_area_shorthand(cleaned.trim())?;
+        return Some(vec![
+            (
+                "grid-row-start".to_string(),
+                crate::grid_css::serialize_grid_line(&rs, None),
+            ),
+            (
+                "grid-column-start".to_string(),
+                crate::grid_css::serialize_grid_line(&cs, None),
+            ),
+            (
+                "grid-row-end".to_string(),
+                crate::grid_css::serialize_grid_line(&re, None),
+            ),
+            (
+                "grid-column-end".to_string(),
+                crate::grid_css::serialize_grid_line(&ce, None),
+            ),
+        ]);
+    }
+    if prop_kind == PropertyIdKind::GridTemplate {
+        let (r, c, a) = crate::grid_css::parse_grid_template_shorthand(cleaned.trim())?;
+        return Some(vec![
+            (
+                "grid-template-rows".to_string(),
+                crate::grid_css::serialize_track_list(&r, None),
+            ),
+            (
+                "grid-template-columns".to_string(),
+                crate::grid_css::serialize_track_list(&c, None),
+            ),
+            (
+                "grid-template-areas".to_string(),
+                crate::grid_css::serialize_grid_areas(&a),
+            ),
+        ]);
+    }
+    if prop_kind == PropertyIdKind::Grid {
+        let (r, c, a, ar, ac, af) = crate::grid_css::parse_grid_shorthand(cleaned.trim())?;
+        return Some(vec![
+            (
+                "grid-template-rows".to_string(),
+                crate::grid_css::serialize_track_list(&r, None),
+            ),
+            (
+                "grid-template-columns".to_string(),
+                crate::grid_css::serialize_track_list(&c, None),
+            ),
+            (
+                "grid-template-areas".to_string(),
+                crate::grid_css::serialize_grid_areas(&a),
+            ),
+            (
+                "grid-auto-rows".to_string(),
+                crate::grid_css::serialize_auto_tracks(&ar, None),
+            ),
+            (
+                "grid-auto-columns".to_string(),
+                crate::grid_css::serialize_auto_tracks(&ac, None),
+            ),
+            (
+                "grid-auto-flow".to_string(),
+                crate::grid_css::serialize_grid_auto_flow(af).to_string(),
+            ),
+        ]);
+    }
+    if prop_kind == PropertyIdKind::GridLanes {
+        let (c, r, a, d) = crate::grid_css::parse_grid_lanes_shorthand(cleaned.trim())?;
+        return Some(vec![
+            (
+                "grid-template-columns".to_string(),
+                crate::grid_css::serialize_track_list(&c, None),
+            ),
+            (
+                "grid-template-rows".to_string(),
+                crate::grid_css::serialize_track_list(&r, None),
+            ),
+            (
+                "grid-template-areas".to_string(),
+                crate::grid_css::serialize_grid_areas(&a),
+            ),
+            (
+                "grid-lanes-direction".to_string(),
+                crate::grid_css::serialize_grid_lanes_direction(d),
+            ),
+        ]);
+    }
+    if is_color_longhand(prop_kind)
+        || prop_kind == PropertyIdKind::Opacity
+        || crate::properties::should_use_values4_parser(prop_kind, &canonical)
+    {
+        return Some(vec![(lower_name, canonical)]);
+    }
     if prop_kind == PropertyIdKind::Flex {
         let (g, s, b) = parse_flex_shorthand_cssom(cleaned.trim())?;
         return Some(vec![
