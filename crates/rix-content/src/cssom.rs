@@ -1697,13 +1697,32 @@ fn camel_to_kebab(input: &str) -> String {
     out
 }
 
+fn canonicalize_legacy_css_prop_alias(lower: &str) -> &str {
+    match lower {
+        "-webkit-align-content" => "align-content",
+        "-webkit-align-items" => "align-items",
+        "-webkit-align-self" => "align-self",
+        "-webkit-flex" => "flex",
+        "-webkit-flex-basis" => "flex-basis",
+        "-webkit-flex-direction" => "flex-direction",
+        "-webkit-flex-flow" => "flex-flow",
+        "-webkit-flex-grow" => "flex-grow",
+        "-webkit-flex-shrink" => "flex-shrink",
+        "-webkit-flex-wrap" => "flex-wrap",
+        "-webkit-justify-content" => "justify-content",
+        "-webkit-order" => "order",
+        other => other,
+    }
+}
+
 fn normalize_css_prop_name(input: &str) -> String {
     if input.starts_with("--") {
         // CSSOM §6.7.2: custom property names are case-sensitive and must NOT be trimmed
         // (so `setProperty("--foo ", "bar")` is rejected as invalid).
         input.to_string()
     } else {
-        input.trim().to_ascii_lowercase()
+        let lower = input.trim().to_ascii_lowercase();
+        canonicalize_legacy_css_prop_alias(&lower).to_string()
     }
 }
 
@@ -2054,6 +2073,31 @@ fn lookup_decl_or_shorthand(decls: &[(String, String, bool)], prop: &str) -> Str
             "border-bottom-right-radius",
             "border-bottom-left-radius",
         ),
+        "flex" => (|| {
+            let (g, ig) = get("flex-grow")?;
+            let (s, is_) = get("flex-shrink")?;
+            let (b, ib) = get("flex-basis")?;
+            if ig != is_ || is_ != ib {
+                return None;
+            }
+            Some(format!("{g} {s} {b}"))
+        })(),
+        "flex-flow" => (|| {
+            let (d, id) = get("flex-direction")?;
+            let (w, iw) = get("flex-wrap")?;
+            if id != iw {
+                return None;
+            }
+            if d == "row" && w == "nowrap" {
+                Some("row".to_string())
+            } else if d == "row" {
+                Some(w.to_string())
+            } else if w == "nowrap" {
+                Some(d.to_string())
+            } else {
+                Some(format!("{d} {w}"))
+            }
+        })(),
         _ => None,
     };
     res.unwrap_or_default()
@@ -2879,20 +2923,7 @@ fn format_overflow(m: OverflowMode) -> &'static str {
 }
 
 fn format_align(a: AlignValue) -> &'static str {
-    match a {
-        AlignValue::Auto => "auto",
-        AlignValue::Normal => "normal",
-        AlignValue::Stretch => "stretch",
-        AlignValue::Center => "center",
-        AlignValue::Start => "start",
-        AlignValue::End => "end",
-        AlignValue::FlexStart => "flex-start",
-        AlignValue::FlexEnd => "flex-end",
-        AlignValue::Baseline => "baseline",
-        AlignValue::SpaceBetween => "space-between",
-        AlignValue::SpaceAround => "space-around",
-        AlignValue::SpaceEvenly => "space-evenly",
-    }
+    a.as_css_str()
 }
 
 /// Serializes any computed CSS property from [`ComputedStyle`] according to CSSOM.
@@ -3671,13 +3702,71 @@ fn format_computed_property_resolved(
             _ => "nowrap",
         }
         .into(),
-        "flex-grow" => format_num(style.flex_grid.as_ref().map_or(0.0, |f| f.flex_grow)),
-        "flex-shrink" => format_num(style.flex_grid.as_ref().map_or(1.0, |f| f.flex_shrink)),
+        "flex" => {
+            let g = format_num(
+                style
+                    .flex_grid
+                    .as_ref()
+                    .map_or(0.0, |f| f.flex_grow.max(0.0)),
+            );
+            let s = format_num(
+                style
+                    .flex_grid
+                    .as_ref()
+                    .map_or(1.0, |f| f.flex_shrink.max(0.0)),
+            );
+            let b = style.flex_grid.as_ref().map_or_else(
+                || "auto".to_string(),
+                |f| {
+                    f.flex_basis_size.as_ref().map_or_else(
+                        || match &f.flex_basis {
+                            LengthPercentageAuto::Auto => "auto".to_string(),
+                            LengthPercentageAuto::Value(lp) => {
+                                format_size_opts(&SizeValue::Length(lp.clone()), &eval, true)
+                            }
+                        },
+                        |sz| format_size_opts(sz, &eval, true),
+                    )
+                },
+            );
+            format!("{g} {s} {b}")
+        }
+        "flex-flow" => {
+            let d = match style.flex_grid.as_ref().map(|f| f.flex_direction) {
+                Some(FlexDirectionMode::RowReverse) => "row-reverse",
+                Some(FlexDirectionMode::Column) => "column",
+                Some(FlexDirectionMode::ColumnReverse) => "column-reverse",
+                _ => "row",
+            };
+            let w = match style.flex_grid.as_ref().map(|f| f.flex_wrap) {
+                Some(FlexWrapMode::Wrap) => "wrap",
+                Some(FlexWrapMode::WrapReverse) => "wrap-reverse",
+                _ => "nowrap",
+            };
+            format!("{d} {w}")
+        }
+        "flex-grow" => format_num(
+            style
+                .flex_grid
+                .as_ref()
+                .map_or(0.0, |f| f.flex_grow.max(0.0)),
+        ),
+        "flex-shrink" => format_num(
+            style
+                .flex_grid
+                .as_ref()
+                .map_or(1.0, |f| f.flex_shrink.max(0.0)),
+        ),
         "flex-basis" => style.flex_grid.as_ref().map_or_else(
             || "auto".into(),
             |f| {
                 f.flex_basis_size.as_ref().map_or_else(
-                    || format_lpa(&f.flex_basis, &eval),
+                    || match &f.flex_basis {
+                        LengthPercentageAuto::Auto => "auto".to_string(),
+                        LengthPercentageAuto::Value(lp) => {
+                            format_size_opts(&SizeValue::Length(lp.clone()), &eval, true)
+                        }
+                    },
                     |s| format_size_opts(s, &eval, true),
                 )
             },

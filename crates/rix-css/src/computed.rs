@@ -3129,6 +3129,75 @@ fn copy_property_from_parent(
         PropertyIdKind::Contain => {
             style.effects_mut().contain = parent.effects.as_ref().map_or(0, |e| e.contain);
         }
+        PropertyIdKind::FlexDirection => {
+            style.flex_grid_mut().flex_direction = parent
+                .flex_grid
+                .as_ref()
+                .map_or(FlexDirectionMode::Row, |f| f.flex_direction);
+        }
+        PropertyIdKind::FlexWrap => {
+            style.flex_grid_mut().flex_wrap = parent
+                .flex_grid
+                .as_ref()
+                .map_or(FlexWrapMode::NoWrap, |f| f.flex_wrap);
+        }
+        PropertyIdKind::FlexGrow => {
+            style.flex_grid_mut().flex_grow =
+                parent.flex_grid.as_ref().map_or(0.0, |f| f.flex_grow);
+        }
+        PropertyIdKind::FlexShrink => {
+            style.flex_grid_mut().flex_shrink =
+                parent.flex_grid.as_ref().map_or(1.0, |f| f.flex_shrink);
+        }
+        PropertyIdKind::FlexBasis => {
+            let fg = style.flex_grid_mut();
+            if let Some(pf) = parent.flex_grid.as_ref() {
+                fg.flex_basis = pf.flex_basis.clone();
+                fg.flex_basis_size = pf.flex_basis_size.clone();
+            } else {
+                fg.flex_basis = LengthPercentageAuto::Auto;
+                fg.flex_basis_size = None;
+            }
+        }
+        PropertyIdKind::Order => {
+            style.flex_grid_mut().order = parent.flex_grid.as_ref().map_or(0, |f| f.order);
+        }
+        PropertyIdKind::AlignItems => {
+            style.flex_grid_mut().align_items = parent
+                .flex_grid
+                .as_ref()
+                .map_or(AlignValue::Normal, |f| f.align_items);
+        }
+        PropertyIdKind::AlignSelf => {
+            style.flex_grid_mut().align_self = parent
+                .flex_grid
+                .as_ref()
+                .map_or(AlignValue::Auto, |f| f.align_self);
+        }
+        PropertyIdKind::AlignContent => {
+            style.flex_grid_mut().align_content = parent
+                .flex_grid
+                .as_ref()
+                .map_or(AlignValue::Normal, |f| f.align_content);
+        }
+        PropertyIdKind::JustifyContent => {
+            style.flex_grid_mut().justify_content = parent
+                .flex_grid
+                .as_ref()
+                .map_or(AlignValue::Normal, |f| f.justify_content);
+        }
+        PropertyIdKind::JustifyItems => {
+            style.flex_grid_mut().justify_items = parent
+                .flex_grid
+                .as_ref()
+                .map_or(AlignValue::Normal, |f| f.justify_items);
+        }
+        PropertyIdKind::JustifySelf => {
+            style.flex_grid_mut().justify_self = parent
+                .flex_grid
+                .as_ref()
+                .map_or(AlignValue::Auto, |f| f.justify_self);
+        }
         _ => {}
     }
 }
@@ -3406,6 +3475,39 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
             let fg = style.flex_grid_mut();
             fg.flex_basis = LengthPercentageAuto::Auto;
             fg.flex_basis_size = None;
+        }
+        PropertyIdKind::FlexDirection => {
+            style.flex_grid_mut().flex_direction = FlexDirectionMode::Row;
+        }
+        PropertyIdKind::FlexWrap => {
+            style.flex_grid_mut().flex_wrap = FlexWrapMode::NoWrap;
+        }
+        PropertyIdKind::FlexGrow => {
+            style.flex_grid_mut().flex_grow = 0.0;
+        }
+        PropertyIdKind::FlexShrink => {
+            style.flex_grid_mut().flex_shrink = 1.0;
+        }
+        PropertyIdKind::Order => {
+            style.flex_grid_mut().order = 0;
+        }
+        PropertyIdKind::AlignItems => {
+            style.flex_grid_mut().align_items = AlignValue::Normal;
+        }
+        PropertyIdKind::AlignSelf => {
+            style.flex_grid_mut().align_self = AlignValue::Auto;
+        }
+        PropertyIdKind::AlignContent => {
+            style.flex_grid_mut().align_content = AlignValue::Normal;
+        }
+        PropertyIdKind::JustifyContent => {
+            style.flex_grid_mut().justify_content = AlignValue::Normal;
+        }
+        PropertyIdKind::JustifyItems => {
+            style.flex_grid_mut().justify_items = AlignValue::Normal;
+        }
+        PropertyIdKind::JustifySelf => {
+            style.flex_grid_mut().justify_self = AlignValue::Auto;
         }
         PropertyIdKind::TransitionDelay => style.effects_mut().transition_delay_math = None,
         PropertyIdKind::TransitionDuration => style.effects_mut().transition_duration_math = None,

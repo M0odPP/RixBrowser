@@ -93,6 +93,22 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
         return crate::values::DisplayMode::parse_css(trimmed)
             .map(|d| d.to_css_string().to_string());
     }
+    if prop_kind == PropertyIdKind::Flex {
+        return parse_flex_shorthand_cssom(trimmed).map(|(g, s, b)| format!("{g} {s} {b}"));
+    }
+    if prop_kind == PropertyIdKind::FlexFlow {
+        return parse_flex_flow_cssom(trimmed).map(|(dir, wrap)| {
+            if dir == "row" && wrap == "nowrap" {
+                "row".to_string()
+            } else if dir == "row" {
+                wrap
+            } else if wrap == "nowrap" {
+                dir
+            } else {
+                format!("{dir} {wrap}")
+            }
+        });
+    }
     if prop_kind == PropertyIdKind::ViewTransitionName {
         if lower_val == "none" {
             return Some("none".to_string());
@@ -113,6 +129,11 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
 
     // CSS Standards Mode & Logical Properties: reject bare non-zero unitless numbers on lengths.
     if prop_disallows_unitless_nonzero(prop_kind) && has_top_level_unitless_nonzero(trimmed) {
+        return None;
+    }
+    // CSS Flexbox L1 §7.2.3: negative literal lengths/percentages are invalid for `flex-basis`
+    // (while `calc(...)` expressions are valid at parse time and clamped at computed-value time).
+    if prop_kind == PropertyIdKind::FlexBasis && trimmed.starts_with('-') {
         return None;
     }
 
@@ -200,6 +221,21 @@ pub fn parse_and_expand_declaration(name: &str, value: &str) -> Option<Vec<(Stri
         return Some(vec![(lower_name, lower_val)]);
     }
     let cleaned = strip_outer_css_comments(value);
+    if prop_kind == PropertyIdKind::Flex {
+        let (g, s, b) = parse_flex_shorthand_cssom(cleaned.trim())?;
+        return Some(vec![
+            ("flex-grow".to_string(), g),
+            ("flex-shrink".to_string(), s),
+            ("flex-basis".to_string(), b),
+        ]);
+    }
+    if prop_kind == PropertyIdKind::FlexFlow {
+        let (dir, wrap) = parse_flex_flow_cssom(cleaned.trim())?;
+        return Some(vec![
+            ("flex-direction".to_string(), dir),
+            ("flex-wrap".to_string(), wrap),
+        ]);
+    }
     let expanded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let opts = ParserOptions::default();
         let parsed =
@@ -213,6 +249,131 @@ pub fn parse_and_expand_declaration(name: &str, value: &str) -> Option<Vec<(Stri
         return Some(pairs);
     }
     Some(vec![(lower_name, canonical)])
+}
+
+/// Parses W3C CSS Flexbox L1 `flex` shorthand (`none | [ <flex-grow> <flex-shrink>? || <flex-basis> ]`)
+/// into canonical `(flex-grow, flex-shrink, flex-basis)` strings.
+fn parse_flex_shorthand_cssom(raw: &str) -> Option<(String, String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("none") {
+        return Some(("0".to_string(), "0".to_string(), "auto".to_string()));
+    }
+    // Split into top-level whitespace-separated components (preserving parentheses like `calc(...)`).
+    let mut parts: Vec<&str> = Vec::new();
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let start = i;
+        let mut depth = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                b if b.is_ascii_whitespace() && depth == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        parts.push(&trimmed[start..i]);
+    }
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let parse_nonneg_num = |s: &str| -> Option<String> {
+        let low = s.to_ascii_lowercase();
+        if let Ok(v) = low.parse::<f64>() {
+            if v.is_finite() && v >= 0.0 {
+                return Some(crate::values_math::format_math_f64(v));
+            }
+            return None;
+        }
+        if low.contains('(') {
+            let pm =
+                crate::values_math::parse_math_value(s, crate::values_math::ValueKind::Number)?;
+            // Per CSS Values 4 §10.9, `calc(...)` with negative result is valid at parse time
+            // and clamped to 0 at computed-value time.
+            return Some(pm.node.serialize_specified(pm.was_math_fn));
+        }
+        None
+    };
+    let parse_basis = |s: &str, allow_unitless_zero: bool| -> Option<String> {
+        // Reject bare unitless numbers (except literal `0` when 2 numbers already precede it,
+        // per CSS Flexbox §7.1: `flex: 1 2 0` -> `1 2 0px`, while `flex: 1 2 calc(0)` is invalid).
+        if let Ok(v) = s.parse::<f64>() {
+            if allow_unitless_zero && v == 0.0 && !s.starts_with('-') {
+                return Some("0px".to_string());
+            }
+            return None;
+        }
+        let ser = parse_and_serialize_declaration("flex-basis", s)?;
+        Some(if ser == "0" { "0px".to_string() } else { ser })
+    };
+    let mut nums: Vec<String> = Vec::new();
+    let mut basis: Option<String> = None;
+    let mut saw_basis_between_nums = false;
+    for part in parts {
+        if nums.len() < 2 && !saw_basis_between_nums {
+            if let Some(n) = parse_nonneg_num(part) {
+                nums.push(n);
+                continue;
+            }
+        }
+        if basis.is_none() {
+            let b = parse_basis(part, nums.len() == 2)?;
+            if !nums.is_empty() {
+                saw_basis_between_nums = true;
+            }
+            basis = Some(b);
+        } else {
+            return None;
+        }
+    }
+    let grow = nums.first().cloned().unwrap_or_else(|| "1".to_string());
+    let shrink = nums.get(1).cloned().unwrap_or_else(|| "1".to_string());
+    let basis_str = basis.unwrap_or_else(|| "0%".to_string());
+    Some((grow, shrink, basis_str))
+}
+
+/// Parses W3C CSS Flexbox L1 `flex-flow` shorthand (`<flex-direction> || <flex-wrap>`).
+fn parse_flex_flow_cssom(raw: &str) -> Option<(String, String)> {
+    let toks: Vec<String> = raw
+        .split_ascii_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if toks.is_empty() || toks.len() > 2 {
+        return None;
+    }
+    let (mut dir, mut wrap) = (None::<String>, None::<String>);
+    for t in toks {
+        match t.as_str() {
+            "row" | "row-reverse" | "column" | "column-reverse" => {
+                if dir.is_some() {
+                    return None;
+                }
+                dir = Some(t);
+            }
+            "nowrap" | "wrap" | "wrap-reverse" => {
+                if wrap.is_some() {
+                    return None;
+                }
+                wrap = Some(t);
+            }
+            _ => return None,
+        }
+    }
+    Some((
+        dir.unwrap_or_else(|| "row".to_string()),
+        wrap.unwrap_or_else(|| "nowrap".to_string()),
+    ))
 }
 
 /// Strips leading and trailing CSS comments (`/* ... */`) while preserving interior comments.
@@ -318,6 +479,7 @@ fn prop_disallows_unitless_nonzero(kind: PropertyIdKind) -> bool {
                 | "gap"
                 | "border-spacing"
                 | "text-indent"
+                | "flex-basis"
         )
 }
 

@@ -654,6 +654,100 @@ fn collect_local_stylesheets(
     sheets
 }
 
+fn preload_local_wpt_images(
+    wpt_root: &Path,
+    doc_path: &Path,
+    doc: &Document,
+    assets: &mut rix_layout::AssetRegistry,
+) {
+    #[derive(Clone)]
+    enum CachedImg {
+        Raster {
+            width: u32,
+            height: u32,
+            rgba: Arc<Vec<u8>>,
+        },
+        Svg(rix_layout::DecodedSvg),
+        Failed,
+    }
+    static IMG_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, CachedImg>>> =
+        std::sync::OnceLock::new();
+    let cache = IMG_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+
+    for node in doc.descendants(doc.root()) {
+        let Some(NodeData::Element(elem)) = doc.get(node) else {
+            continue;
+        };
+        if !elem.name.local.as_str().eq_ignore_ascii_case("img") {
+            continue;
+        }
+        let Some(src) = elem.get_attribute("src") else {
+            continue;
+        };
+        let src_trimmed = src.trim();
+        if src_trimmed.is_empty()
+            || src_trimmed.starts_with("data:")
+            || src_trimmed.starts_with("http://")
+            || src_trimmed.starts_with("https://")
+        {
+            continue;
+        }
+        if assets.get_by_src(src_trimmed).is_some() || assets.get_svg_by_src(src_trimmed).is_some()
+        {
+            continue;
+        }
+        let img_path = resolve_wpt_path(wpt_root, doc_path, src_trimmed);
+        let canonical = fs::canonicalize(&img_path).unwrap_or(img_path);
+        let entry = {
+            let guard = cache.lock().expect("img cache lock");
+            guard.get(&canonical).cloned()
+        };
+        let decoded = if let Some(hit) = entry {
+            hit
+        } else {
+            let loaded = if canonical
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("svg"))
+            {
+                fs::read_to_string(&canonical)
+                    .ok()
+                    .and_then(|svg_txt| {
+                        let svg_doc = parse_html(&svg_txt);
+                        rix_layout::extract_svg_from_document(&svg_doc, rix_css::ColorRgba::BLACK)
+                    })
+                    .map_or(CachedImg::Failed, CachedImg::Svg)
+            } else {
+                fs::read(&canonical)
+                    .ok()
+                    .and_then(|bytes| rix_layout::decode_single_raster(&bytes).ok())
+                    .map_or(CachedImg::Failed, |d| CachedImg::Raster {
+                        width: d.width,
+                        height: d.height,
+                        rgba: d.rgba,
+                    })
+            };
+            if let Ok(mut guard) = cache.lock() {
+                guard.insert(canonical, loaded.clone());
+            }
+            loaded
+        };
+        match decoded {
+            CachedImg::Raster {
+                width,
+                height,
+                rgba,
+            } => {
+                let _ = assets.register_rgba8_shared(src_trimmed.to_string(), width, height, rgba);
+            }
+            CachedImg::Svg(svg) => {
+                assets.register_svg(src_trimmed.to_string(), svg);
+            }
+            CachedImg::Failed => {}
+        }
+    }
+}
+
 fn render_wpt_reftest_rgba(
     renderer: &mut VelloRenderer,
     wpt_root: &Path,
@@ -683,6 +777,7 @@ fn render_wpt_reftest_rgba(
     styles.cascade_full(&mut doc);
 
     let mut engine = LayoutEngine::new();
+    preload_local_wpt_images(wpt_root, doc_path, &doc, &mut engine.assets);
     let pipeline = PipelineId(1);
     let mut resources = ResourceRegistry::default();
     let font_db = wpt_font_db(wpt_root);
@@ -803,6 +898,12 @@ fn run_wpt_testharness_file(wpt_root: &Path, path: &Path, html: &str) -> ScriptR
     rt.vm.max_loop_iterations = Some(250_000);
     rt.event_loop.borrow_mut().enable_virtual_clock();
     rt.host.borrow_mut().set_external_stylesheets(ext_sheets);
+    preload_local_wpt_images(
+        wpt_root,
+        path,
+        &parsed,
+        &mut rt.host.borrow_mut().layout_engine.assets,
+    );
     let rel = path.strip_prefix(wpt_root).unwrap_or(path);
     rt.set_document_url(&format!("http://web-platform.test:8000/{}", rel.display()));
 

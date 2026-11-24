@@ -848,32 +848,35 @@ fn map_overflow(mode: OverflowMode) -> taffy::Overflow {
 }
 
 fn map_align_items(val: AlignValue) -> Option<tp::AlignItems> {
-    match val {
+    match val.base() {
         AlignValue::Normal | AlignValue::Auto => None,
         AlignValue::Stretch => Some(tp::AlignItems::STRETCH),
-        AlignValue::Start => Some(tp::AlignItems::START),
-        AlignValue::End => Some(tp::AlignItems::END),
+        AlignValue::Start | AlignValue::SelfStart | AlignValue::Left => Some(tp::AlignItems::START),
+        AlignValue::End | AlignValue::SelfEnd | AlignValue::Right => Some(tp::AlignItems::END),
         AlignValue::FlexStart => Some(tp::AlignItems::FLEX_START),
         AlignValue::FlexEnd => Some(tp::AlignItems::FLEX_END),
         AlignValue::Center => Some(tp::AlignItems::CENTER),
-        AlignValue::Baseline => Some(tp::AlignItems::BASELINE),
+        AlignValue::Baseline | AlignValue::LastBaseline => Some(tp::AlignItems::BASELINE),
         _ => None,
     }
 }
 
 fn map_align_content(val: AlignValue) -> Option<tp::AlignContent> {
-    match val {
+    match val.base() {
         AlignValue::Normal | AlignValue::Auto => None,
         AlignValue::Stretch => Some(tp::AlignContent::STRETCH),
-        AlignValue::Start => Some(tp::AlignContent::START),
-        AlignValue::End => Some(tp::AlignContent::END),
+        AlignValue::Start | AlignValue::SelfStart | AlignValue::Left => {
+            Some(tp::AlignContent::START)
+        }
+        AlignValue::End | AlignValue::SelfEnd | AlignValue::Right => Some(tp::AlignContent::END),
         AlignValue::FlexStart => Some(tp::AlignContent::FLEX_START),
         AlignValue::FlexEnd => Some(tp::AlignContent::FLEX_END),
         AlignValue::Center => Some(tp::AlignContent::CENTER),
         AlignValue::SpaceBetween => Some(tp::AlignContent::SPACE_BETWEEN),
         AlignValue::SpaceAround => Some(tp::AlignContent::SPACE_AROUND),
         AlignValue::SpaceEvenly => Some(tp::AlignContent::SPACE_EVENLY),
-        AlignValue::Baseline => None,
+        AlignValue::Baseline | AlignValue::LastBaseline => None,
+        _ => None,
     }
 }
 
