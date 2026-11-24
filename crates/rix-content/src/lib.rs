@@ -18,6 +18,7 @@ pub mod indexeddb_engine;
 pub mod media_elements;
 pub mod media_source;
 pub mod observers;
+pub mod selection;
 pub mod service_worker;
 pub mod streams;
 pub mod web_apis;

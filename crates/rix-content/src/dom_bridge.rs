@@ -116,7 +116,7 @@ pub struct HostState {
     pub dark_mode: bool,
     pub font_db: Arc<FontDatabase>,
     pub layout_engine: LayoutEngine,
-    style_ctx: StyleContext,
+    pub(crate) style_ctx: StyleContext,
     external_stylesheets: Vec<Arc<Stylesheet>>,
     sheets_dirty: bool,
     last_inline_style_hash: u64,
@@ -142,6 +142,7 @@ pub struct HostState {
     pub registered_properties: HashMap<String, (String, bool, Option<String>)>,
     pub active_element: Option<NodeId>,
     pub next_web_anim_id: u64,
+    pub selection: crate::selection::SelectionState,
 }
 
 /// Shared handle to [`HostState`].
@@ -202,6 +203,7 @@ impl HostState {
             registered_properties: HashMap::new(),
             active_element: None,
             next_web_anim_id: 1,
+            selection: crate::selection::SelectionState::default(),
         }
     }
 
@@ -324,11 +326,17 @@ impl HostState {
         for &proto in self.css_rule_protos.values() {
             out.push(JsValue::from_object(proto));
         }
+        if let Some(sel) = self.selection.selection_handle {
+            out.push(JsValue::from_object(sel));
+        }
     }
 
     /// Sweeps dead unpinned weak DOM wrappers and releases their tag table entries (zero leaks!).
     pub fn sweep_dead_wrappers(&mut self, heap: &GcHeap) -> usize {
         self.stylesheet_handle_map
+            .retain(|h, _| heap.get_object(*h).is_some());
+        self.selection
+            .ranges
             .retain(|h, _| heap.get_object(*h).is_some());
         let removed = self.wrappers.sweep_dead(heap);
         if removed > 0 {
@@ -1281,6 +1289,7 @@ pub fn install_dom_bridge(
     install_fragment_prototype(vm, &host);
     install_text_prototype(vm, &host);
     install_window_and_cssom(vm, &host);
+    crate::selection::install_selection_and_range(vm, &host);
 
     // Pin root document wrapper on global `document`.
     let doc_root = host.borrow().document.borrow().root();
@@ -1898,7 +1907,7 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
     let h1 = Rc::clone(host);
     let g_it = vm.alloc_host_fn("get innerText", move |vm, t, _| {
         let nid = require_node(vm, &h1, t)?;
-        let txt = h1.borrow().document.borrow().inner_text(nid);
+        let txt = crate::selection::compute_inner_text(&h1, nid);
         Ok(JsValue::from_string(vm.heap.alloc_string(txt)))
     });
     let h2 = Rc::clone(host);

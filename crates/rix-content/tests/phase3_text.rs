@@ -136,3 +136,64 @@ fn css_text_l4_inheritance_and_non_inheritance_rules() {
         "none|auto|none|auto|strict|6 3|ideograph-alpha|0.25|first allow-end|grow per-line 150%|space auto-phrase"
     );
 }
+
+#[test]
+fn selection_and_inner_text_apply_math_auto_kana_german_georgian_and_capitalize() {
+    let html = r#"<!doctype html>
+    <html><body>
+      <span id="m" style="text-transform: math-auto;">hA</span>
+      <span id="k" style="text-transform: full-size-kana;">ぁ&#x1B167;&#xFF6F;</span>
+      <span id="de" lang="de" style="text-transform: uppercase;">&#x00DF;</span>
+      <div id="ka1" lang="ka" style="text-transform: uppercase;">ა</div>
+      <div id="ka2" lang="ka" style="text-transform: capitalize;">ა ბ</div>
+      <div id="cap1" style="text-transform: capitalize;">foo-bar john's foo_bar</div>
+      <div>a<span id="cap2" style="text-transform: capitalize;">b</span>c</div>
+    </body></html>"#;
+    let res = run_script(
+        html,
+        r#"(() => {
+          const sel = window.getSelection();
+          const m = document.getElementById('m');
+          sel.setBaseAndExtent(m.firstChild, 0, m.firstChild, 2);
+          const sm = sel.toString();
+          const k = document.getElementById('k');
+          sel.setBaseAndExtent(k.firstChild, 0, k.firstChild, k.firstChild.data.length);
+          const sk = sel.toString();
+          const de = document.getElementById('de');
+          sel.setBaseAndExtent(de, 0, de, 1);
+          const sde = sel.toString();
+          return [
+            sm === '\u210E\u{1D434}',
+            sk === '\u3042\u30F3\uFF82',
+            sde,
+            document.getElementById('ka1').innerText === 'Ა',
+            document.getElementById('ka2').innerText === 'ა ბ',
+            document.getElementById('cap1').innerText,
+            document.getElementById('cap2').innerText
+          ].join('|');
+        })()"#,
+    );
+    assert_eq!(res, "true|true|SS|true|true|Foo-Bar John's Foo_bar|b");
+}
+
+#[test]
+fn uax14_line_break_strictness_and_atomic_nowrap_min_content() {
+    let html = r#"<!doctype html>
+    <html lang="en"><body>
+      <div id="strict" lang="" style="font-size: 30px; width: 105px; line-height: 1em; line-break: strict;">文文文文文文&#x3005;字<span id="sStrict">字</span></div>
+      <div id="loose" lang="" style="font-size: 30px; width: 105px; line-height: 1em; line-break: loose;">文文文文文文&#x3005;字<span id="sLoose">字</span></div>
+      <div id="danda" style="font-family: monospace; font-size: 20px; width: 30ch; line-height: 24px;">aaaaaaaaaaaaaaaaaaaaaaaaa&#x0964;bbbbbbbbbbbbbbbbbb</div>
+      <div style="width: 0;"><span id="atom" style="display: inline-block; text-wrap-mode: nowrap; width: min-content;"><span style="display:inline-block;width:50px;height:10px"></span><span style="display:inline-block;width:50px;height:10px"></span></span></div>
+    </body></html>"#;
+    let res = run_script(
+        html,
+        r#"(() => {
+          const xs = document.getElementById('sStrict').getBoundingClientRect().left;
+          const xl = document.getElementById('sLoose').getBoundingClientRect().left;
+          const dh = document.getElementById('danda').offsetHeight;
+          const aw = document.getElementById('atom').clientWidth;
+          return [xs > xl + 10, dh > 30, aw].join('|');
+        })()"#,
+    );
+    assert_eq!(res, "true|true|100");
+}

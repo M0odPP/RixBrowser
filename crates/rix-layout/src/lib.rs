@@ -13,10 +13,12 @@ pub mod grid;
 pub mod grid_lanes;
 pub mod grid_tracks;
 pub mod ifc;
+pub mod line_break;
 pub mod paint;
 pub mod position;
 pub mod table;
 pub mod table_grid;
+pub mod text_transform;
 
 pub use assets::{
     collect_svg_paths_from_dom, decode_raster_batch_parallel, decode_single_raster,

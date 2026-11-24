@@ -133,6 +133,7 @@ pub struct LayoutBox {
     pub dom_node: Option<NodeId>,
     pub kind: BoxKind,
     pub style: Arc<ComputedStyle>,
+    pub lang: Option<rix_core::InternedStr>,
     pub children: Vec<BoxId>,
     pub is_out_of_flow: bool,
     pub is_float: bool,
@@ -287,7 +288,7 @@ impl BoxTree {
             assets,
         };
         if let Some(doc_elem) = doc.document_element() {
-            let roots = builder.build_dom_node(doc_elem, None);
+            let roots = builder.build_dom_node(doc_elem, None, None);
             if let Some(&first) = roots.first() {
                 builder.tree.root = Some(first);
                 builder.finalize_subtree_hashes(first);
@@ -319,6 +320,7 @@ impl<'a> BoxTreeBuilder<'a> {
         &mut self,
         node: NodeId,
         parent_style: Option<&Arc<ComputedStyle>>,
+        current_lang: Option<&rix_core::InternedStr>,
     ) -> Vec<BoxId> {
         let Some(data) = self.doc.get(node) else {
             return Vec::new();
@@ -336,6 +338,7 @@ impl<'a> BoxTreeBuilder<'a> {
                     dom_node: Some(node),
                     kind: BoxKind::Text(text.clone()),
                     style,
+                    lang: current_lang.cloned(),
                     children: Vec::new(),
                     is_out_of_flow: false,
                     is_float: false,
@@ -345,11 +348,11 @@ impl<'a> BoxTreeBuilder<'a> {
                 });
                 vec![id]
             }
-            NodeData::Element(elem) => self.build_element(node, elem, parent_style),
+            NodeData::Element(elem) => self.build_element(node, elem, parent_style, current_lang),
             NodeData::ShadowRoot { .. } | NodeData::DocumentFragment => {
                 let mut out = Vec::new();
                 for child in self.doc.children(node) {
-                    out.extend(self.build_dom_node(child, parent_style));
+                    out.extend(self.build_dom_node(child, parent_style, current_lang));
                 }
                 out
             }
@@ -365,6 +368,7 @@ impl<'a> BoxTreeBuilder<'a> {
         node: NodeId,
         elem: &ElementData,
         parent_style: Option<&Arc<ComputedStyle>>,
+        parent_lang: Option<&rix_core::InternedStr>,
     ) -> Vec<BoxId> {
         let tag = elem.name.local.as_str();
         if matches!(
@@ -373,6 +377,22 @@ impl<'a> BoxTreeBuilder<'a> {
         ) {
             return Vec::new();
         }
+
+        // HTML Living Standard §3.2.6.2: an explicit empty `lang=""` resets the
+        // element's language to unknown rather than inheriting from ancestors.
+        let effective_lang = if let Some(raw_lang) = elem
+            .get_attribute("lang")
+            .or_else(|| elem.get_attribute("xml:lang"))
+        {
+            let trimmed = raw_lang.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(rix_core::intern_str(trimmed))
+            }
+        } else {
+            parent_lang.cloned()
+        };
 
         let style = self.styles.style_for(node).cloned().unwrap_or_else(|| {
             parent_style.map_or_else(
@@ -408,15 +428,19 @@ impl<'a> BoxTreeBuilder<'a> {
                 return Vec::new();
             }
             let mut flattened = Vec::new();
-            if let Some(before_box) = self.build_pseudo_box(node, RixPseudoElement::Before) {
+            if let Some(before_box) =
+                self.build_pseudo_box(node, RixPseudoElement::Before, effective_lang.as_ref())
+            {
                 flattened.push(before_box);
             }
             let child_source = elem.shadow_root.unwrap_or(node);
             let children: Vec<NodeId> = self.doc.children(child_source).collect();
             for child in children {
-                flattened.extend(self.build_dom_node(child, Some(&style)));
+                flattened.extend(self.build_dom_node(child, Some(&style), effective_lang.as_ref()));
             }
-            if let Some(after_box) = self.build_pseudo_box(node, RixPseudoElement::After) {
+            if let Some(after_box) =
+                self.build_pseudo_box(node, RixPseudoElement::After, effective_lang.as_ref())
+            {
                 flattened.push(after_box);
             }
             return flattened;
@@ -436,6 +460,7 @@ impl<'a> BoxTreeBuilder<'a> {
                 dom_node: Some(node),
                 kind: BoxKind::Replaced(replaced),
                 style,
+                lang: effective_lang,
                 children: Vec::new(),
                 is_out_of_flow,
                 is_float,
@@ -459,7 +484,9 @@ impl<'a> BoxTreeBuilder<'a> {
         if !matches!(kind, BoxKind::TableColumn { .. }) {
             // Emit `::before` generated pseudo-box if `content` is specified.
             if !matches!(kind, BoxKind::TableColumnGroup { .. }) {
-                if let Some(before_box) = self.build_pseudo_box(node, RixPseudoElement::Before) {
+                if let Some(before_box) =
+                    self.build_pseudo_box(node, RixPseudoElement::Before, effective_lang.as_ref())
+                {
                     raw_children.push(before_box);
                 }
             }
@@ -477,18 +504,28 @@ impl<'a> BoxTreeBuilder<'a> {
                             && st.float_mode == FloatMode::None
                     });
                     if is_table_col {
-                        raw_children.extend(self.build_dom_node(child, Some(&style)));
+                        raw_children.extend(self.build_dom_node(
+                            child,
+                            Some(&style),
+                            effective_lang.as_ref(),
+                        ));
                     }
                 }
             } else {
                 for child in dom_children {
-                    raw_children.extend(self.build_dom_node(child, Some(&style)));
+                    raw_children.extend(self.build_dom_node(
+                        child,
+                        Some(&style),
+                        effective_lang.as_ref(),
+                    ));
                 }
             }
 
             // Emit `::after` generated pseudo-box if `content` is specified.
             if !matches!(kind, BoxKind::TableColumnGroup { .. }) {
-                if let Some(after_box) = self.build_pseudo_box(node, RixPseudoElement::After) {
+                if let Some(after_box) =
+                    self.build_pseudo_box(node, RixPseudoElement::After, effective_lang.as_ref())
+                {
                     raw_children.push(after_box);
                 }
             }
@@ -501,6 +538,7 @@ impl<'a> BoxTreeBuilder<'a> {
             dom_node: Some(node),
             kind,
             style,
+            lang: effective_lang,
             children: fixed_children,
             is_out_of_flow,
             is_float,
@@ -511,7 +549,12 @@ impl<'a> BoxTreeBuilder<'a> {
         vec![id]
     }
 
-    fn build_pseudo_box(&mut self, host: NodeId, pseudo: RixPseudoElement) -> Option<BoxId> {
+    fn build_pseudo_box(
+        &mut self,
+        host: NodeId,
+        pseudo: RixPseudoElement,
+        effective_lang: Option<&rix_core::InternedStr>,
+    ) -> Option<BoxId> {
         let pseudo_style = self.styles.pseudo_style_for(host, pseudo)?.clone();
         if pseudo_style.display == DisplayMode::None {
             return None;
@@ -522,6 +565,7 @@ impl<'a> BoxTreeBuilder<'a> {
             dom_node: None,
             kind: BoxKind::Text(content_text),
             style: Arc::clone(&pseudo_style),
+            lang: effective_lang.cloned(),
             children: Vec::new(),
             is_out_of_flow: false,
             is_float: false,
@@ -594,6 +638,7 @@ impl<'a> BoxTreeBuilder<'a> {
             dom_node: None,
             kind,
             style: pseudo_style,
+            lang: effective_lang.cloned(),
             children: vec![text_id],
             is_out_of_flow,
             is_float,
@@ -1185,11 +1230,12 @@ impl<'a> BoxTreeBuilder<'a> {
             if matches!(self.tree.get(cid).kind, BoxKind::Inline)
                 && self.inline_contains_block_descendant(cid)
             {
-                let (dom_node, style, subtree_dirty, raw_kids) = {
+                let (dom_node, style, lang, subtree_dirty, raw_kids) = {
                     let b = self.tree.get(cid);
                     (
                         b.dom_node,
                         Arc::clone(&b.style),
+                        b.lang.clone(),
                         b.subtree_dirty,
                         b.children.clone(),
                     )
@@ -1209,6 +1255,7 @@ impl<'a> BoxTreeBuilder<'a> {
                                 dom_node,
                                 kind: BoxKind::Inline,
                                 style: Arc::clone(&style),
+                                lang: lang.clone(),
                                 children: seg,
                                 is_out_of_flow: false,
                                 is_float: false,
@@ -1228,6 +1275,7 @@ impl<'a> BoxTreeBuilder<'a> {
                         dom_node,
                         kind: BoxKind::Inline,
                         style,
+                        lang,
                         children: inline_seg,
                         is_out_of_flow: false,
                         is_float: false,
@@ -1266,11 +1314,15 @@ impl<'a> BoxTreeBuilder<'a> {
             _ => DisplayMode::Block,
         };
         let subtree_dirty = children.iter().any(|&c| self.tree.get(c).subtree_dirty);
+        let lang = children
+            .first()
+            .and_then(|&c| self.tree.get(c).lang.clone());
         self.alloc_box(LayoutBox {
             id: BoxId(0),
             dom_node: None,
             kind,
             style: Arc::new(anon_style),
+            lang,
             children,
             is_out_of_flow: false,
             is_float: false,
