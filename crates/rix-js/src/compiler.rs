@@ -69,6 +69,9 @@ struct LocalVar {
     reg: u8,
     depth: u32,
     is_const: bool,
+    /// `true` for a named function expression's self-binding (ECMA-262 §15.2.5):
+    /// immutable in all modes, throwing only in strict mode and silently ignored in sloppy mode.
+    is_fn_expr_name: bool,
     is_captured: bool,
     is_tdz: bool,
     is_lex: bool,
@@ -84,6 +87,7 @@ enum VarResolution {
     Upvalue {
         index: u8,
         is_const: bool,
+        is_fn_expr_name: bool,
     },
     ModuleImport(u16),
     Global(String),
@@ -339,6 +343,7 @@ impl FunctionCompiler {
             reg,
             depth: self.scope_depth,
             is_const,
+            is_fn_expr_name: false,
             is_captured: false,
             is_tdz,
             is_lex: is_tdz || is_const,
@@ -775,9 +780,15 @@ impl Compiler {
             let parent_res = self.resolve_var(frame_idx - 1, name)?;
             match parent_res {
                 VarResolution::Local { reg, is_const, .. } => {
-                    if let Some((idx, _)) = self.frames[frame_idx - 1].find_local(name) {
+                    let is_fn_expr_name = if let Some((idx, flag)) = self.frames[frame_idx - 1]
+                        .find_local(name)
+                        .map(|(idx, l)| (idx, l.is_fn_expr_name))
+                    {
                         self.frames[frame_idx - 1].locals[idx].is_captured = true;
-                    }
+                        flag
+                    } else {
+                        false
+                    };
                     let uv_idx = self.frames[frame_idx].add_upvalue(UpvalueDescriptor {
                         is_local: true,
                         index: reg,
@@ -786,9 +797,14 @@ impl Compiler {
                     return Ok(VarResolution::Upvalue {
                         index: uv_idx,
                         is_const,
+                        is_fn_expr_name,
                     });
                 }
-                VarResolution::Upvalue { index, is_const } => {
+                VarResolution::Upvalue {
+                    index,
+                    is_const,
+                    is_fn_expr_name,
+                } => {
                     let uv_idx = self.frames[frame_idx].add_upvalue(UpvalueDescriptor {
                         is_local: false,
                         index,
@@ -797,6 +813,7 @@ impl Compiler {
                     return Ok(VarResolution::Upvalue {
                         index: uv_idx,
                         is_const,
+                        is_fn_expr_name,
                     });
                 }
                 other => return Ok(other),
@@ -867,9 +884,15 @@ impl Compiler {
                     self.cur().emit(Instruction::abc(Opcode::Move, reg, src, 0));
                 }
             }
-            VarResolution::Upvalue { index, is_const } => {
-                let (index, is_const) = (*index, *is_const);
-                if is_const {
+            VarResolution::Upvalue {
+                index,
+                is_const,
+                is_fn_expr_name,
+            } => {
+                let (index, is_const, is_fn_expr_name) = (*index, *is_const, *is_fn_expr_name);
+                if is_fn_expr_name && !self.cur().is_strict {
+                    // Sloppy-mode assignment to named function expression binding is silently ignored.
+                } else if is_const {
                     let msg = self
                         .cur()
                         .add_string_const(&format!("Assignment to constant variable '{name}'"))?;
@@ -2765,10 +2788,36 @@ impl Compiler {
                 Ok(())
             }
             ExprKind::Function(func) => {
-                let fn_idx = self.compile_function_body_ex(func, false, false, inferred_name)?;
-                let c = self.cur().add_const(ConstantEntry::Function(fn_idx))?;
-                self.cur().emit_abx_wide(Opcode::NewClosure, dst, c);
-                Ok(())
+                if let Some(ref self_name) = func.name {
+                    // ECMA-262 §15.2.5: Named function expressions introduce an immutable
+                    // self-binding visible ONLY within the function body (not enclosing scope).
+                    let saved_reg = self.cur().next_reg;
+                    self.cur().scope_depth += 1;
+                    let self_reg = self.cur().declare_local(self_name, true, false)?;
+                    if let Some(last) = self.cur().locals.last_mut() {
+                        last.is_fn_expr_name = true;
+                    }
+                    let fn_idx =
+                        self.compile_function_body_ex(func, false, false, inferred_name)?;
+                    let c = self.cur().add_const(ConstantEntry::Function(fn_idx))?;
+                    self.cur().emit_abx_wide(Opcode::NewClosure, dst, c);
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::Move, self_reg, dst, 0));
+                    if self.cur().locals.last().is_some_and(|l| l.is_captured) {
+                        self.cur()
+                            .emit(Instruction::abc(Opcode::CloseUpvalues, self_reg, 0, 0));
+                    }
+                    self.cur().locals.pop();
+                    self.cur().scope_depth -= 1;
+                    self.cur().free_to(saved_reg);
+                    Ok(())
+                } else {
+                    let fn_idx =
+                        self.compile_function_body_ex(func, false, false, inferred_name)?;
+                    let c = self.cur().add_const(ConstantEntry::Function(fn_idx))?;
+                    self.cur().emit_abx_wide(Opcode::NewClosure, dst, c);
+                    Ok(())
+                }
             }
             ExprKind::Arrow {
                 params,

@@ -1530,6 +1530,14 @@ fn ab_transfer_impl(
     if ab_is_detached(vm, h) || ab_is_immutable(vm, h) {
         return Err(vm.type_error("Cannot transfer a detached or immutable ArrayBuffer"));
     }
+    if vm
+        .heap
+        .get_object(h)
+        .and_then(|o| o.rare.as_ref())
+        .is_some_and(|r| r.ab_wasm_memory)
+    {
+        return Err(vm.type_error("Cannot transfer a WebAssembly.Memory ArrayBuffer"));
+    }
     let old_max = ab_max_byte_length(vm, h);
     let new_max = if preserve_resizable && !make_immutable {
         old_max
@@ -1598,6 +1606,19 @@ fn install_array_buffer(vm: &mut JsVm) {
         }
         if new_len > max {
             return Err(vm.range_error("New length exceeds maxByteLength"));
+        }
+        let is_wasm_mem = vm
+            .heap
+            .get_object(h)
+            .and_then(|o| o.rare.as_ref())
+            .is_some_and(|r| r.ab_wasm_memory);
+        if is_wasm_mem {
+            let cur_len = ab_byte_len(vm, h);
+            if new_len < cur_len || new_len % 65_536 != 0 {
+                return Err(vm.range_error(
+                    "WebAssembly.Memory resizable buffer can only grow by 64 KiB page multiples",
+                ));
+            }
         }
         if let Some(ObjectKind::ArrayBuffer(buf)) = vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
             buf.resize(new_len, 0);
@@ -3352,6 +3373,19 @@ fn install_shared_array_buffer(vm: &mut JsVm) {
             return Err(vm.type_error("SharedArrayBuffer is not growable"));
         }
         let new_len = to_index(vm, arg(args, 0))?;
+        let is_wasm_mem = vm
+            .heap
+            .get_object(h)
+            .and_then(|o| o.rare.as_ref())
+            .is_some_and(|r| r.ab_wasm_memory);
+        if is_wasm_mem {
+            let cur_len = ab_byte_len(vm, h);
+            if new_len < cur_len || !new_len.is_multiple_of(65_536) {
+                return Err(vm.range_error(
+                    "WebAssembly SharedMemory buffer can only grow by 64 KiB page multiples",
+                ));
+            }
+        }
         match shared.grow(new_len) {
             Ok(()) => Ok(JsValue::UNDEFINED),
             Err("not_growable") => Err(vm.type_error("SharedArrayBuffer is not growable")),

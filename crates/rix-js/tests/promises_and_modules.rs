@@ -257,3 +257,74 @@ fn es_modules_cycles_import_maps_dynamic_import_and_top_level_await() {
     assert!(order_str.contains("a:after:15:hello-from-a"), "{order_str}");
     assert!(order_str.contains("main:dyn:lazy-loaded:2"), "{order_str}");
 }
+
+#[test]
+fn promise_chains_survive_gc_pressure_via_host_fn_roots() {
+    let mut vm = JsVm::new();
+    let res = vm
+        .eval_script(
+            r#"
+            let chain = Promise.resolve(0);
+            for (let i = 1; i <= 200; i++) {
+                const step = Promise.resolve(i);
+                chain = Promise.all([step, chain]).then(vals => vals[0] + vals[1]);
+            }
+            var finalSum = -1;
+            chain.then(v => { finalSum = v; });
+            "#,
+        )
+        .expect("enqueue deep Promise.all chain");
+    let _ = res;
+    // Force full GC while the 200-deep Promise.all chain is pending in microtasks!
+    vm.collect_garbage();
+    vm.drain_microtasks();
+    let sum = vm
+        .eval_script("finalSum")
+        .expect("read finalSum")
+        .as_i32()
+        .unwrap_or(-1);
+    assert_eq!(sum, 20_100, "deep Promise.all chain must survive GC");
+}
+
+#[test]
+fn named_function_expression_self_binding_and_iterator_next_caching() {
+    let mut vm = JsVm::new();
+    let out = vm
+        .eval_script(
+            r#"
+            const fact = (function f(n) {
+                return n <= 1 ? 1 : n * f(n - 1);
+            })(6);
+            const leaked = typeof f;
+
+            let strictThrew = false;
+            try {
+                (function g() { "use strict"; g = 1; })();
+            } catch (e) {
+                strictThrew = true;
+            }
+            const sloppyVal = (function h() { h = 99; return typeof h; })();
+
+            let nextGetterCalls = 0;
+            const iterable = {
+                [Symbol.iterator]() {
+                    let i = 0;
+                    return {
+                        get next() {
+                            nextGetterCalls++;
+                            return () => (i < 3 ? { value: ++i, done: false } : { done: true });
+                        }
+                    };
+                }
+            };
+            const collected = [...iterable];
+            JSON.stringify({ fact, leaked, strictThrew, sloppyVal, nextGetterCalls, collected });
+            "#,
+        )
+        .expect("named fn expr + iterator next caching");
+    let s = vm.value_to_rust_string(out);
+    assert_eq!(
+        s,
+        r#"{"fact":720,"leaked":"undefined","strictThrew":true,"sloppyVal":"function","nextGetterCalls":1,"collected":[1,2,3]}"#
+    );
+}
