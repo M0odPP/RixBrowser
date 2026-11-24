@@ -81,16 +81,20 @@ impl Default for BoxModelStyle {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VisualStyle {
     pub background_color: ColorRgba,
+    pub background_color_computed: Option<Arc<crate::color::CssColorExpr>>,
     pub background_layers: Vec<BackgroundLayerValue>,
     pub border_style: EdgeValues<LineStyle>,
     pub border_color: EdgeValues<CssColor>,
+    pub border_color_computed: [Option<Arc<crate::color::CssColorExpr>>; 4],
     pub border_radius: CornerRadii,
     pub outline_color: CssColor,
+    pub outline_color_computed: Option<Arc<crate::color::CssColorExpr>>,
     pub outline_style: LineStyle,
     pub outline_width: f32,
     pub outline_offset: LengthPercentage,
     pub text_decoration_line: TextDecorationLine,
     pub text_decoration_color: Option<CssColor>,
+    pub text_decoration_color_computed: Option<Arc<crate::color::CssColorExpr>>,
     pub user_select: UserSelectMode,
     pub resize: ResizeMode,
     pub overscroll_behavior_x: OverscrollBehaviorMode,
@@ -101,16 +105,20 @@ impl Default for VisualStyle {
     fn default() -> Self {
         Self {
             background_color: ColorRgba::TRANSPARENT,
+            background_color_computed: None,
             background_layers: Vec::new(),
             border_style: EdgeValues::all(LineStyle::None),
             border_color: EdgeValues::all(CssColor::CurrentColor),
+            border_color_computed: [None, None, None, None],
             border_radius: CornerRadii::default(),
             outline_color: CssColor::CurrentColor,
+            outline_color_computed: None,
             outline_style: LineStyle::None,
             outline_width: 0.0,
             outline_offset: LengthPercentage::Zero,
             text_decoration_line: TextDecorationLine::NONE,
             text_decoration_color: None,
+            text_decoration_color_computed: None,
             user_select: UserSelectMode::Auto,
             resize: ResizeMode::None,
             overscroll_behavior_x: OverscrollBehaviorMode::Auto,
@@ -123,6 +131,9 @@ impl Default for VisualStyle {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InheritedTextStyle {
     pub color: ColorRgba,
+    pub color_computed: Option<Arc<crate::color::CssColorExpr>>,
+    /// CSS Color Adjustment L1 `color-scheme`: 0=normal, 1=light, 2=dark, 3=light dark.
+    pub color_scheme_mode: u8,
     pub font_size_px: f32,
     pub font_weight: f32,
     pub font_style: FontStyleMode,
@@ -145,6 +156,8 @@ impl Default for InheritedTextStyle {
     fn default() -> Self {
         Self {
             color: ColorRgba::BLACK,
+            color_computed: None,
+            color_scheme_mode: 0,
             font_size_px: 16.0,
             font_weight: 400.0,
             font_style: FontStyleMode::Normal,
@@ -1450,7 +1463,21 @@ pub fn resolve_element_style_scoped(
     }
 
     // Pass 2c: Resolve `color-scheme` and `color` next so CanvasText & `currentColor` match.
-    let eval_ctx = media.eval_context(style.text.font_size_px, root_font_size_px);
+    let mut eval_ctx = media.eval_context(style.text.font_size_px, root_font_size_px);
+    if let Some(p) = parent_style {
+        if let SizeValue::Length(ref lp) = p.box_model.width {
+            let w = lp.resolve_px(eval_ctx.viewport_width_px, &eval_ctx);
+            if w > 0.0 {
+                eval_ctx.container_width_px = w;
+            }
+        }
+        if let SizeValue::Length(ref lp) = p.box_model.height {
+            let h = lp.resolve_px(eval_ctx.viewport_height_px, &eval_ctx);
+            if h > 0.0 {
+                eval_ctx.container_height_px = h;
+            }
+        }
+    }
     if let Some(stack) = per_prop.get_mut(&PropertyIdKind::ColorScheme) {
         stack.sort_by_key(|(k, _)| *k);
         if let Some(winner) = select_winning_candidate(stack) {
@@ -1520,6 +1547,70 @@ pub fn resolve_element_style_scoped(
     };
     if next_bw != bw {
         Arc::make_mut(&mut style.box_model).border_width = next_bw;
+    }
+
+    // Re-resolve any visual Color 4/5 expressions referencing `currentcolor` (including those
+    // inherited via `background-color: inherit`) against this element's final `color`.
+    let eff_dark = match style.text.color_scheme_mode {
+        1 => false,
+        2 => true,
+        _ => media.dark_mode,
+    };
+    let self_color_res = style.text.color_computed.as_deref().map_or_else(
+        || crate::color::ResolvedColor::from_rgba(style.text.color),
+        |e| {
+            e.resolve(
+                crate::color::ResolvedColor::from_rgba(style.text.color),
+                eff_dark,
+                &eval_ctx,
+            )
+        },
+    );
+    if let Some(bg_expr) = style.visual.background_color_computed.clone() {
+        if bg_expr.contains_current_color() {
+            let resolved = bg_expr
+                .resolve(self_color_res, eff_dark, &eval_ctx)
+                .to_srgb_u8();
+            Arc::make_mut(&mut style.visual).background_color = resolved;
+        }
+    }
+    for side in 0..4 {
+        if let Some(b_expr) = style.visual.border_color_computed[side].clone() {
+            if b_expr.contains_current_color() {
+                let c = CssColor::Rgba(
+                    b_expr
+                        .resolve(self_color_res, eff_dark, &eval_ctx)
+                        .to_srgb_u8(),
+                );
+                let vis = Arc::make_mut(&mut style.visual);
+                match side {
+                    0 => vis.border_color.top = c,
+                    1 => vis.border_color.right = c,
+                    2 => vis.border_color.bottom = c,
+                    _ => vis.border_color.left = c,
+                }
+            }
+        }
+    }
+    if let Some(ol_expr) = style.visual.outline_color_computed.clone() {
+        if ol_expr.contains_current_color() {
+            let c = CssColor::Rgba(
+                ol_expr
+                    .resolve(self_color_res, eff_dark, &eval_ctx)
+                    .to_srgb_u8(),
+            );
+            Arc::make_mut(&mut style.visual).outline_color = c;
+        }
+    }
+    if let Some(td_expr) = style.visual.text_decoration_color_computed.clone() {
+        if td_expr.contains_current_color() {
+            let c = CssColor::Rgba(
+                td_expr
+                    .resolve(self_color_res, eff_dark, &eval_ctx)
+                    .to_srgb_u8(),
+            );
+            Arc::make_mut(&mut style.visual).text_decoration_color = Some(c);
+        }
     }
 
     style
@@ -1748,6 +1839,21 @@ pub fn apply_declaration(
     }
 
     let current_color = style.text.color;
+    let effective_dark = match style.text.color_scheme_mode {
+        1 => false,
+        2 => true,
+        _ => dark_mode,
+    };
+    let current_resolved = style.text.color_computed.as_deref().map_or_else(
+        || crate::color::ResolvedColor::from_rgba(current_color),
+        |expr| {
+            expr.resolve(
+                crate::color::ResolvedColor::from_rgba(current_color),
+                effective_dark,
+                eval,
+            )
+        },
+    );
     match (decl.property, &decl.value) {
         (PropertyIdKind::Display, PropertyValue::Display(v)) => style.display = *v,
         (PropertyIdKind::Position, PropertyValue::Position(v)) => style.position = *v,
@@ -1764,7 +1870,9 @@ pub fn apply_declaration(
         (PropertyIdKind::ZIndex, PropertyValue::ZIndex(v)) => style.z_index = *v,
         (PropertyIdKind::Opacity, PropertyValue::Number(v)) => style.opacity = v.clamp(0.0, 1.0),
         (PropertyIdKind::ColorScheme, PropertyValue::Number(v)) => {
-            style.color_scheme_dark = *v > 0.5;
+            let mode = (*v).round().clamp(0.0, 3.0) as u8;
+            style.color_scheme_dark = matches!(mode, 2 | 3);
+            Arc::make_mut(&mut style.text).color_scheme_mode = mode;
         }
 
         // Box model
@@ -1866,7 +1974,23 @@ pub fn apply_declaration(
 
         // Visual
         (PropertyIdKind::BackgroundColor, PropertyValue::Color(c)) => {
-            Arc::make_mut(&mut style.visual).background_color = c.resolve(current_color, dark_mode);
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.background_color = c.resolve(current_color, effective_dark);
+            vis.background_color_computed = if *c == CssColor::CurrentColor {
+                Some(Arc::new(crate::color::CssColorExpr::CurrentColor))
+            } else {
+                None
+            };
+        }
+        (PropertyIdKind::BackgroundColor, PropertyValue::Color4(expr)) => {
+            let res = expr.resolve(current_resolved, effective_dark, eval);
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.background_color = res.to_srgb_u8();
+            vis.background_color_computed = Some(Arc::new(if expr.contains_current_color() {
+                (**expr).clone()
+            } else {
+                crate::color::CssColorExpr::Resolved(res)
+            }));
         }
         (PropertyIdKind::BackgroundLayers, PropertyValue::BackgroundLayers(l)) => {
             Arc::make_mut(&mut style.visual).background_layers = l.clone();
@@ -1883,17 +2007,68 @@ pub fn apply_declaration(
         (PropertyIdKind::BorderLeftStyle, PropertyValue::LineStyle(s)) => {
             Arc::make_mut(&mut style.visual).border_style.left = *s;
         }
-        (PropertyIdKind::BorderTopColor, PropertyValue::Color(c)) => {
-            Arc::make_mut(&mut style.visual).border_color.top = *c;
+        (
+            PropertyIdKind::BorderTopColor
+            | PropertyIdKind::BorderRightColor
+            | PropertyIdKind::BorderBottomColor
+            | PropertyIdKind::BorderLeftColor,
+            PropertyValue::Color(c),
+        ) => {
+            let vis = Arc::make_mut(&mut style.visual);
+            let idx = match decl.property {
+                PropertyIdKind::BorderTopColor => {
+                    vis.border_color.top = *c;
+                    0
+                }
+                PropertyIdKind::BorderRightColor => {
+                    vis.border_color.right = *c;
+                    1
+                }
+                PropertyIdKind::BorderBottomColor => {
+                    vis.border_color.bottom = *c;
+                    2
+                }
+                _ => {
+                    vis.border_color.left = *c;
+                    3
+                }
+            };
+            vis.border_color_computed[idx] = None;
         }
-        (PropertyIdKind::BorderRightColor, PropertyValue::Color(c)) => {
-            Arc::make_mut(&mut style.visual).border_color.right = *c;
-        }
-        (PropertyIdKind::BorderBottomColor, PropertyValue::Color(c)) => {
-            Arc::make_mut(&mut style.visual).border_color.bottom = *c;
-        }
-        (PropertyIdKind::BorderLeftColor, PropertyValue::Color(c)) => {
-            Arc::make_mut(&mut style.visual).border_color.left = *c;
+        (
+            PropertyIdKind::BorderTopColor
+            | PropertyIdKind::BorderRightColor
+            | PropertyIdKind::BorderBottomColor
+            | PropertyIdKind::BorderLeftColor,
+            PropertyValue::Color4(expr),
+        ) => {
+            let res = expr.resolve(current_resolved, effective_dark, eval);
+            let c = CssColor::Rgba(res.to_srgb_u8());
+            let stored = Some(Arc::new(if expr.contains_current_color() {
+                (**expr).clone()
+            } else {
+                crate::color::CssColorExpr::Resolved(res)
+            }));
+            let vis = Arc::make_mut(&mut style.visual);
+            let idx = match decl.property {
+                PropertyIdKind::BorderTopColor => {
+                    vis.border_color.top = c;
+                    0
+                }
+                PropertyIdKind::BorderRightColor => {
+                    vis.border_color.right = c;
+                    1
+                }
+                PropertyIdKind::BorderBottomColor => {
+                    vis.border_color.bottom = c;
+                    2
+                }
+                _ => {
+                    vis.border_color.left = c;
+                    3
+                }
+            };
+            vis.border_color_computed[idx] = stored;
         }
         (PropertyIdKind::BorderTopLeftRadius, PropertyValue::CornerRadius(r)) => {
             Arc::make_mut(&mut style.visual).border_radius.top_left = r.clone();
@@ -1908,7 +2083,19 @@ pub fn apply_declaration(
             Arc::make_mut(&mut style.visual).border_radius.bottom_left = r.clone();
         }
         (PropertyIdKind::OutlineColor, PropertyValue::Color(c)) => {
-            Arc::make_mut(&mut style.visual).outline_color = *c;
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.outline_color = *c;
+            vis.outline_color_computed = None;
+        }
+        (PropertyIdKind::OutlineColor, PropertyValue::Color4(expr)) => {
+            let res = expr.resolve(current_resolved, effective_dark, eval);
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.outline_color = CssColor::Rgba(res.to_srgb_u8());
+            vis.outline_color_computed = Some(Arc::new(if expr.contains_current_color() {
+                (**expr).clone()
+            } else {
+                crate::color::CssColorExpr::Resolved(res)
+            }));
         }
         (PropertyIdKind::OutlineStyle, PropertyValue::LineStyle(s)) => {
             Arc::make_mut(&mut style.visual).outline_style = *s;
@@ -1923,7 +2110,19 @@ pub fn apply_declaration(
             Arc::make_mut(&mut style.visual).text_decoration_line = *l;
         }
         (PropertyIdKind::TextDecorationColor, PropertyValue::Color(c)) => {
-            Arc::make_mut(&mut style.visual).text_decoration_color = Some(*c);
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.text_decoration_color = Some(*c);
+            vis.text_decoration_color_computed = None;
+        }
+        (PropertyIdKind::TextDecorationColor, PropertyValue::Color4(expr)) => {
+            let res = expr.resolve(current_resolved, effective_dark, eval);
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.text_decoration_color = Some(CssColor::Rgba(res.to_srgb_u8()));
+            vis.text_decoration_color_computed = Some(Arc::new(if expr.contains_current_color() {
+                (**expr).clone()
+            } else {
+                crate::color::CssColorExpr::Resolved(res)
+            }));
         }
         (PropertyIdKind::UserSelect, PropertyValue::UserSelect(u)) => {
             Arc::make_mut(&mut style.visual).user_select = *u;
@@ -1932,7 +2131,32 @@ pub fn apply_declaration(
         // Typography (inherited)
         (PropertyIdKind::Color, PropertyValue::Color(c)) => {
             let inherited = parent.map_or(ColorRgba::BLACK, |p| p.text.color);
-            Arc::make_mut(&mut style.text).color = c.resolve(inherited, dark_mode);
+            let txt = Arc::make_mut(&mut style.text);
+            if *c == CssColor::CurrentColor {
+                txt.color = inherited;
+                txt.color_computed = parent.and_then(|p| p.text.color_computed.clone());
+            } else {
+                txt.color = c.resolve(inherited, effective_dark);
+                txt.color_computed = None;
+            }
+        }
+        (PropertyIdKind::Color, PropertyValue::Color4(expr)) => {
+            let parent_resolved = parent.map_or(crate::color::ResolvedColor::BLACK_LEGACY, |p| {
+                p.text.color_computed.as_deref().map_or_else(
+                    || crate::color::ResolvedColor::from_rgba(p.text.color),
+                    |pe| {
+                        pe.resolve(
+                            crate::color::ResolvedColor::from_rgba(p.text.color),
+                            effective_dark,
+                            eval,
+                        )
+                    },
+                )
+            });
+            let res = expr.resolve(parent_resolved, effective_dark, eval);
+            let txt = Arc::make_mut(&mut style.text);
+            txt.color = res.to_srgb_u8();
+            txt.color_computed = Some(Arc::new(crate::color::CssColorExpr::Resolved(res)));
         }
         (PropertyIdKind::FontSize, PropertyValue::Length(lp)) => {
             let px = lp.resolve_px(eval.font_size_px, eval).max(1.0);
@@ -2252,9 +2476,15 @@ fn copy_property_from_parent(
         PropertyIdKind::Cursor => style.cursor = parent.cursor,
         PropertyIdKind::ZIndex => style.z_index = parent.z_index,
         PropertyIdKind::Opacity => style.opacity = parent.opacity,
-        PropertyIdKind::Color => Arc::make_mut(&mut style.text).color = parent.text.color,
+        PropertyIdKind::Color => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.color = parent.text.color;
+            txt.color_computed = parent.text.color_computed.clone();
+        }
         PropertyIdKind::BackgroundColor => {
-            Arc::make_mut(&mut style.visual).background_color = parent.visual.background_color;
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.background_color = parent.visual.background_color;
+            vis.background_color_computed = parent.visual.background_color_computed.clone();
         }
         PropertyIdKind::FontSize => {
             Arc::make_mut(&mut style.text).font_size_px = parent.text.font_size_px;
@@ -2434,9 +2664,15 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         PropertyIdKind::Cursor => style.cursor = init.cursor,
         PropertyIdKind::ZIndex => style.z_index = ZIndexValue::Auto,
         PropertyIdKind::Opacity => style.opacity = 1.0,
-        PropertyIdKind::Color => Arc::make_mut(&mut style.text).color = init.text.color,
+        PropertyIdKind::Color => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.color = init.text.color;
+            txt.color_computed = None;
+        }
         PropertyIdKind::BackgroundColor => {
-            Arc::make_mut(&mut style.visual).background_color = ColorRgba::TRANSPARENT;
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.background_color = ColorRgba::TRANSPARENT;
+            vis.background_color_computed = None;
         }
         PropertyIdKind::FontSize => {
             Arc::make_mut(&mut style.text).font_size_px = init.text.font_size_px;

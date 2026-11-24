@@ -1779,6 +1779,7 @@ pub enum PropertyValue {
     Number(f32),
     Integer(i32),
     Color(CssColor),
+    Color4(Box<crate::color::CssColorExpr>),
     Size(SizeValue),
     Length(LengthPercentage),
     LengthAuto(LengthPercentageAuto),
@@ -1878,13 +1879,15 @@ pub fn compile_declaration_block(
 /// preserving exact spec semantics. Zero-allocation fast path when neither occurs.
 #[must_use]
 pub(crate) fn rewrite_dynamic_var_names(css: &str) -> std::borrow::Cow<'_, str> {
-    let bytes = css.as_bytes();
+    let color_wrapped = wrap_color4_declarations(css);
+    let src: &str = &color_wrapped;
+    let bytes = src.as_bytes();
     let has_var = bytes.windows(4).any(|w| w.eq_ignore_ascii_case(b"var("));
     let has_rr = bytes
         .windows(11)
         .any(|w| w.eq_ignore_ascii_case(b"revert-rule"));
     if !has_var && !has_rr {
-        return std::borrow::Cow::Borrowed(css);
+        return color_wrapped;
     }
     let mut out: Option<String> = None;
     let mut last = 0usize;
@@ -1943,8 +1946,8 @@ pub(crate) fn rewrite_dynamic_var_names(css: &str) -> std::borrow::Cow<'_, str> 
             }
             let before_end = q == bytes.len() || matches!(bytes[q], b';' | b'}' | b'!');
             if after_colon && before_end {
-                let buf = out.get_or_insert_with(|| String::with_capacity(css.len() + 24));
-                buf.push_str(&css[last..i]);
+                let buf = out.get_or_insert_with(|| String::with_capacity(src.len() + 24));
+                buf.push_str(&src[last..i]);
                 buf.push_str("var(--__rix_revert_rule__)");
                 i += 11;
                 last = i;
@@ -1965,8 +1968,8 @@ pub(crate) fn rewrite_dynamic_var_names(css: &str) -> std::borrow::Cow<'_, str> 
             }
             // Case 1: `var(var(...))` -> rewrite outer `var(` to `__rix_var__(`
             if k + 4 <= bytes.len() && bytes[k..k + 4].eq_ignore_ascii_case(b"var(") {
-                let buf = out.get_or_insert_with(|| String::with_capacity(css.len() + 16));
-                buf.push_str(&css[last..i]);
+                let buf = out.get_or_insert_with(|| String::with_capacity(src.len() + 16));
+                buf.push_str(&src[last..i]);
                 buf.push_str("__rix_var__(");
                 i += 4;
                 last = i;
@@ -1974,17 +1977,172 @@ pub(crate) fn rewrite_dynamic_var_names(css: &str) -> std::borrow::Cow<'_, str> 
             }
             // Case 2: `var({--ident} ...)` -> unwrap `{` and `}` around single dashed-ident name
             if k < bytes.len() && bytes[k] == b'{' {
-                if let Some(rel_close) = css[k + 1..].find('}') {
-                    let inside = css[k + 1..k + 1 + rel_close].trim();
+                if let Some(rel_close) = src[k + 1..].find('}') {
+                    let inside = src[k + 1..k + 1 + rel_close].trim();
                     if inside.starts_with("--")
                         && inside.len() > 2
                         && !inside.contains(|c: char| c.is_ascii_whitespace() || c == ',')
                     {
-                        let buf = out.get_or_insert_with(|| String::with_capacity(css.len()));
-                        buf.push_str(&css[last..k]);
+                        let buf = out.get_or_insert_with(|| String::with_capacity(src.len()));
+                        buf.push_str(&src[last..k]);
                         buf.push_str(inside);
                         i = k + 1 + rel_close + 1;
                         last = i;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    match out {
+        Some(mut buf) => {
+            buf.push_str(&src[last..]);
+            std::borrow::Cow::Owned(buf)
+        }
+        None => color_wrapped,
+    }
+}
+
+/// Wraps CSS Color 4/5 functional & system-color longhand declarations into an opaque
+/// quoted sentinel `var(--__rix_color4__, "...")` so `lightningcss` never panics on
+/// `NaN`/`infinity` hues, never drops `contrast-color()`/`alpha()`, and never clamps
+/// wide-gamut colors or strips `none` components. Zero-alloc fast path for plain colors.
+fn wrap_color4_declarations(css: &str) -> std::borrow::Cow<'_, str> {
+    if !css.contains(':') {
+        return std::borrow::Cow::Borrowed(css);
+    }
+    let bytes = css.as_bytes();
+    let mut out: Option<String> = None;
+    let (mut last, mut i, mut paren_depth, mut in_str) = (0usize, 0usize, 0usize, None::<u8>);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            i = if b == b'\\' {
+                (i + 2).min(bytes.len())
+            } else {
+                i + 1
+            };
+            if b == q {
+                in_str = None;
+            }
+            continue;
+        }
+        if b == b'\\' {
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_str = Some(b);
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if b == b'(' {
+            paren_depth += 1;
+            i += 1;
+            continue;
+        }
+        if b == b')' {
+            paren_depth = paren_depth.saturating_sub(1);
+            i += 1;
+            continue;
+        }
+        if b == b':' && paren_depth == 0 {
+            let mut p = i;
+            while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+                p -= 1;
+            }
+            let name_end = p;
+            while p > 0 && (bytes[p - 1].is_ascii_alphanumeric() || bytes[p - 1] == b'-') {
+                p -= 1;
+            }
+            let prop_name = &css[p..name_end];
+            let is_color_prop = PropertyIdKind::from_name(&prop_name.to_ascii_lowercase())
+                .is_some_and(crate::cssom_decl::is_color_longhand);
+            if is_color_prop {
+                // Scan value to top-level `;`, `}`, `!`, or EOF (abort if `{` -> selector).
+                let val_start = i + 1;
+                let mut j = val_start;
+                let mut vp = 0usize;
+                let mut vs: Option<u8> = None;
+                let mut saw_brace = false;
+                while j < bytes.len() {
+                    let c = bytes[j];
+                    if let Some(q) = vs {
+                        j = if c == b'\\' {
+                            (j + 2).min(bytes.len())
+                        } else {
+                            j + 1
+                        };
+                        if c == q {
+                            vs = None;
+                        }
+                        continue;
+                    }
+                    if c == b'\\' {
+                        j = (j + 2).min(bytes.len());
+                        continue;
+                    }
+                    if c == b'"' || c == b'\'' {
+                        vs = Some(c);
+                        j += 1;
+                        continue;
+                    }
+                    if c == b'/' && j + 1 < bytes.len() && bytes[j + 1] == b'*' {
+                        j += 2;
+                        while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                            j += 1;
+                        }
+                        j = (j + 2).min(bytes.len());
+                        continue;
+                    }
+                    match c {
+                        b'(' => vp += 1,
+                        b')' => {
+                            if vp == 0 {
+                                saw_brace = true;
+                                break;
+                            }
+                            vp -= 1;
+                        }
+                        b'{' if vp == 0 => {
+                            saw_brace = true;
+                            break;
+                        }
+                        b';' | b'}' | b'!' if vp == 0 => break,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if !saw_brace && vp == 0 && vs.is_none() {
+                    let raw = css[val_start..j].trim();
+                    let needs_color4 = !raw.is_empty()
+                        && !crate::cssom_decl::contains_var_or_env_ci(raw)
+                        && (raw.contains('(')
+                            || crate::color::SystemColor::from_ident(raw).is_some());
+                    if needs_color4 {
+                        let buf = out.get_or_insert_with(|| String::with_capacity(css.len() + 32));
+                        buf.push_str(&css[last..val_start]);
+                        buf.push_str(" var(--__rix_color4__, \"");
+                        for ch in raw.chars() {
+                            match ch {
+                                '\\' => buf.push_str("\\\\"),
+                                '"' => buf.push_str("\\\""),
+                                '\n' | '\r' => buf.push(' '),
+                                _ => buf.push(ch),
+                            }
+                        }
+                        buf.push_str("\")");
+                        last = j;
+                        i = j;
                         continue;
                     }
                 }
@@ -2001,14 +2159,49 @@ pub(crate) fn rewrite_dynamic_var_names(css: &str) -> std::borrow::Cow<'_, str> 
     }
 }
 
-/// Restores internal `var(--__rix_revert_rule__)` sentinel back to `revert-rule` for CSSOM text.
+/// Restores internal `var(--__rix_revert_rule__)` and `var(--__rix_color4__, "...")`
+/// sentinels back to canonical CSSOM text.
 #[must_use]
 pub(crate) fn restore_revert_rule_sentinel(text: &str) -> String {
-    if text.contains("--__rix_revert_rule__") {
+    let mut s = if text.contains("--__rix_revert_rule__") {
         text.replace("var(--__rix_revert_rule__)", "revert-rule")
     } else {
         text.to_string()
+    };
+    if let Some(pos) = s.find("var(--__rix_color4__") {
+        if let Some(q1) = s[pos..].find('"') {
+            let start = pos + q1 + 1;
+            let bytes = s.as_bytes();
+            let mut k = start;
+            let mut unescaped = String::new();
+            while k < bytes.len() {
+                if bytes[k] == b'\\' && k + 1 < bytes.len() {
+                    unescaped.push(bytes[k + 1] as char);
+                    k += 2;
+                    continue;
+                }
+                if bytes[k] == b'"' {
+                    break;
+                }
+                let ch = s[k..].chars().next().unwrap();
+                unescaped.push(ch);
+                k += ch.len_utf8();
+            }
+            if let Some(end_paren) = s[k..].find(')') {
+                let replacement = crate::color::parse_and_serialize_color_specified(&unescaped)
+                    .unwrap_or_default();
+                if replacement.is_empty() {
+                    return String::new();
+                }
+                let mut rebuilt = String::with_capacity(s.len());
+                rebuilt.push_str(&s[..pos]);
+                rebuilt.push_str(&replacement);
+                rebuilt.push_str(&s[k + end_paren + 1..]);
+                s = rebuilt;
+            }
+        }
     }
+    s
 }
 
 /// Parses an HTML `style="..."` attribute into typed [`SpecifiedDeclaration`]s.
@@ -2077,6 +2270,18 @@ pub fn parse_property_from_tokens(
 
     let mut buf = String::with_capacity(64);
     write_tokens_for_reparse(tokens, &mut buf);
+    if crate::cssom_decl::is_color_longhand(prop) {
+        if let Some(expr) = crate::color::parse_css_color(buf.trim()) {
+            return vec![SpecifiedDeclaration {
+                property: prop,
+                custom_name: None,
+                value: PropertyValue::Color4(Box::new(expr)),
+                important,
+                order: 0,
+            }];
+        }
+        return Vec::new();
+    }
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let opts = ParserOptions {
             error_recovery: true,
@@ -4268,12 +4473,19 @@ fn compile_property(
             imp,
         ),
         Property::ColorScheme(cs) => {
-            let supports_dark = cs.contains(lightningcss::properties::ui::ColorScheme::Dark);
+            let has_light = cs.contains(lightningcss::properties::ui::ColorScheme::Light);
+            let has_dark = cs.contains(lightningcss::properties::ui::ColorScheme::Dark);
+            let mode = match (has_light, has_dark) {
+                (false, false) => 0.0,
+                (true, false) => 1.0,
+                (false, true) => 2.0,
+                (true, true) => 3.0,
+            };
             push_decl(
                 out,
                 ord,
                 PropertyIdKind::ColorScheme,
-                PropertyValue::Number(if supports_dark { 1.0 } else { 0.0 }),
+                PropertyValue::Number(mode),
                 imp,
             );
         }
@@ -4578,6 +4790,39 @@ fn compile_property(
             if let Some(kw) = global_kw {
                 for target in kind.shorthand_longhands() {
                     push_decl(out, ord, target, PropertyValue::Global(kw), imp);
+                }
+                return;
+            }
+            // Unwrap CSS Color 4/5 quoted sentinel `var(--__rix_color4__, "...")`.
+            let color4_raw = {
+                let non_ws: SmallVec<[&CssToken; 2]> = tokens
+                    .iter()
+                    .filter(|t| !matches!(t, CssToken::Space))
+                    .collect();
+                if non_ws.len() == 1 {
+                    if let CssToken::Var {
+                        name,
+                        fallback: Some(fb),
+                    } = non_ws[0]
+                    {
+                        if name.as_str() == "--__rix_color4__" {
+                            fb.iter().find_map(|t| match t {
+                                CssToken::String(s) => Some(s.as_str()),
+                                _ => None,
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(raw_color) = color4_raw {
+                if let Some(expr) = crate::color::parse_css_color(raw_color) {
+                    push_decl(out, ord, kind, PropertyValue::Color4(Box::new(expr)), imp);
                 }
                 return;
             }
@@ -4971,14 +5216,23 @@ pub(crate) fn compile_extra_standard_property(
             );
         }
         "color-scheme" => {
-            let supports_dark = owned.iter().any(
+            let has_light = owned.iter().any(
+                |t| matches!(t, CssToken::Ident(id) if id.as_str().eq_ignore_ascii_case("light")),
+            );
+            let has_dark = owned.iter().any(
                 |t| matches!(t, CssToken::Ident(id) if id.as_str().eq_ignore_ascii_case("dark")),
             );
+            let mode = match (has_light, has_dark) {
+                (false, false) => 0.0,
+                (true, false) => 1.0,
+                (false, true) => 2.0,
+                (true, true) => 3.0,
+            };
             push_decl(
                 out,
                 ord,
                 PropertyIdKind::ColorScheme,
-                PropertyValue::Number(if supports_dark { 1.0 } else { 0.0 }),
+                PropertyValue::Number(mode),
                 imp,
             );
         }

@@ -201,3 +201,51 @@ fn cascade_l5_layers_scope_revert_rule_and_nesting_cssom() {
         .expect("script should succeed");
     assert_eq!(rt.vm.value_to_rust_string(res), "ok");
 }
+
+#[test]
+fn css_color_l4_l5_wide_gamut_mix_relative_alpha_contrast_light_dark() {
+    let mut rt = make_runtime();
+    let html = r#"<!doctype html>
+    <style>
+      #parent { color: red; background-color: color-mix(in srgb, currentColor 50%, green); }
+      #child { color: green; background-color: inherit; }
+      #dark { color-scheme: dark; color: light-dark(black, lime); }
+      #light { color-scheme: light; color: light-dark(navy, lime); }
+      #t { color: black; }
+    </style>
+    <div id="parent"><div id="child"></div></div>
+    <div id="dark"></div>
+    <div id="light"></div>
+    <div id="t"></div>"#;
+    let errs = rt.load_document_with_external_scripts(html, &HashMap::new());
+    assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+    let res = rt
+        .eval_script(
+            r#"(function() {
+                const t = document.getElementById("t");
+                if (getComputedStyle(document.getElementById("child")).backgroundColor !== "color(srgb 0 0.501961 0)") {
+                    return "cc-inherit:" + getComputedStyle(document.getElementById("child")).backgroundColor;
+                }
+                if (getComputedStyle(document.getElementById("dark")).color !== "rgb(0, 255, 0)") return "dark";
+                if (getComputedStyle(document.getElementById("light")).color !== "rgb(0, 0, 128)") return "light";
+                t.style.color = "hwb(150 20% 10%)";
+                if (getComputedStyle(t).color !== "rgb(51, 230, 140)") return "hwb:" + getComputedStyle(t).color;
+                t.style.color = "hsl(from hsl(180 0 50%) h s l)";
+                if (getComputedStyle(t).color !== "color(srgb 0.5 0.5 0.5)") return "powerless:" + getComputedStyle(t).color;
+                t.style.color = "hwb(from hwb(120deg 20% 50% / .5) h w b / none)";
+                if (getComputedStyle(t).color !== "hwb(120 20% 50% / none)") return "hwb-rel:" + getComputedStyle(t).color;
+                t.style.color = "color-mix(in hsl longer hue, red, white)";
+                if (getComputedStyle(t).color !== "color(srgb 0.625 0.875 0.875)") return "mix-long:" + getComputedStyle(t).color;
+                t.style.color = "alpha(from currentcolor / calc(alpha * 0.5))";
+                if (t.style.color !== "alpha(from currentcolor / calc(0.5 * alpha))") return "alpha:" + t.style.color;
+                t.style.color = "contrast-color(navy)";
+                if (getComputedStyle(t).color !== "rgb(255, 255, 255)") return "contrast:" + getComputedStyle(t).color;
+                t.style.opacity = "clamp(50%, 80%, 70%)";
+                if (t.style.opacity !== "calc(70%)") return "opacity:" + t.style.opacity;
+                return "ok";
+            })()"#,
+        )
+        .expect("script should succeed");
+    assert_eq!(rt.vm.value_to_rust_string(res), "ok");
+}

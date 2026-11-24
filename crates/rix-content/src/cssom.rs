@@ -2119,6 +2119,7 @@ fn set_decl_expanded(
 /// Parses and validates inline `cssText`, updating the element's `style` attribute.
 /// Used by both `el.style.cssText = ...` and `el.style = ...` (`[PutForwards=cssText]`).
 pub(crate) fn set_inline_style_css_text(vm: &mut JsVm, host: &SharedHost, nid: NodeId, val: &str) {
+    host.borrow_mut().clear_inline_color_exprs(nid);
     let validated = canonicalize_css_decls(val);
     set_element_attr(
         vm,
@@ -2127,6 +2128,19 @@ pub(crate) fn set_inline_style_css_text(vm: &mut JsVm, host: &SharedHost, nid: N
         "style",
         &serialize_style_decls_with_priority(&validated),
     );
+}
+
+fn sync_inline_color_expr(host: &SharedHost, nid: NodeId, prop: &str, raw_val: &str) {
+    if let Some(kind) = PropertyIdKind::from_name(prop) {
+        if rix_css::cssom_decl::is_color_longhand(kind) {
+            let expr = if raw_val.trim().is_empty() {
+                None
+            } else {
+                rix_css::parse_css_color(raw_val.trim())
+            };
+            host.borrow_mut().set_inline_color_expr(nid, kind, expr);
+        }
+    }
 }
 
 /// Creates a CSSOM-validated inline `CSSStyleDeclaration` Proxy for `element.style`.
@@ -2190,6 +2204,7 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
             // Invalid CSS value: ignore per CSSOM §6.7.2!
             return Ok(JsValue::UNDEFINED);
         }
+        sync_inline_color_expr(&h, nid, &prop, &raw_val);
         set_element_attr(
             vm,
             &h,
@@ -2205,6 +2220,7 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
         let raw = get_attr_string(&h, nid, "style").unwrap_or_default();
         let mut decls = parse_style_decls_with_priority(&raw);
         let old = remove_decl_or_shorthand(&mut decls, &prop);
+        sync_inline_color_expr(&h, nid, &prop, "");
         set_element_attr(
             vm,
             &h,
@@ -2305,6 +2321,7 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
         if !set_decl_expanded(&mut decls, &css_key, &val, false, false) {
             return Ok(JsValue::TRUE);
         }
+        sync_inline_color_expr(&h_set, nid, &css_key, &val);
         set_element_attr(
             vm,
             &h_set,
@@ -2642,18 +2659,26 @@ pub(crate) fn create_computed_style_proxy(
 }
 
 fn format_rgba(c: ColorRgba) -> String {
-    if c.a == 255 {
-        format!("rgb({}, {}, {})", c.r, c.g, c.b)
-    } else if c.a == 0 {
-        format!("rgba({}, {}, {}, 0)", c.r, c.g, c.b)
-    } else {
-        let a = (f64::from(c.a) / 255.0 * 1000.0).round() / 1000.0;
-        format!("rgba({}, {}, {}, {a})", c.r, c.g, c.b)
-    }
+    rix_css::format_legacy_rgba(c)
 }
 
 fn format_css_color(c: CssColor, current_color: ColorRgba, dark: bool) -> String {
     format_rgba(c.resolve(current_color, dark))
+}
+
+fn format_computed_color4(
+    expr_opt: Option<&rix_css::CssColorExpr>,
+    fallback: ColorRgba,
+    current_resolved: rix_css::ResolvedColor,
+    dark: bool,
+    eval: &EvalContext,
+) -> String {
+    if let Some(expr) = expr_opt {
+        expr.resolve(current_resolved, dark, eval)
+            .to_computed_css_string()
+    } else {
+        format_rgba(fallback)
+    }
 }
 
 fn format_num(v: f32) -> String {
@@ -2831,8 +2856,16 @@ fn format_computed_property_resolved(
         _ => lower.as_str(),
     };
     let cc = style.text.color;
-    let dark = style.color_scheme_dark;
+    let dark = match style.text.color_scheme_mode {
+        1 => false,
+        2 => true,
+        _ => style.color_scheme_dark,
+    };
     let eval = eval_ctx_for_style(style);
+    let cc_resolved = style.text.color_computed.as_deref().map_or_else(
+        || rix_css::ResolvedColor::from_rgba(cc),
+        |e| e.resolve(rix_css::ResolvedColor::from_rgba(cc), dark, &eval),
+    );
 
     // Computed shorthand serialization (both logical and physical)
     let fmt_pair = |a: &str, b: &str| -> String {
@@ -3056,8 +3089,20 @@ fn format_computed_property_resolved(
             ZIndexValue::Integer(n) => n.to_string(),
         },
         "opacity" => format_num(style.opacity),
-        "color" => format_rgba(style.text.color),
-        "background-color" => format_rgba(style.visual.background_color),
+        "color" => format_computed_color4(
+            style.text.color_computed.as_deref(),
+            style.text.color,
+            cc_resolved,
+            dark,
+            &eval,
+        ),
+        "background-color" => format_computed_color4(
+            style.visual.background_color_computed.as_deref(),
+            style.visual.background_color,
+            cc_resolved,
+            dark,
+            &eval,
+        ),
         "font-size" => format_px(style.text.font_size_px),
         "font-weight" => format_num(style.text.font_weight),
         "font-style" => match style.text.font_style {
@@ -3216,10 +3261,30 @@ fn format_computed_property_resolved(
         "border-right-style" => format_line_style(style.visual.border_style.right).into(),
         "border-bottom-style" => format_line_style(style.visual.border_style.bottom).into(),
         "border-left-style" => format_line_style(style.visual.border_style.left).into(),
-        "border-top-color" => format_css_color(style.visual.border_color.top, cc, dark),
-        "border-right-color" => format_css_color(style.visual.border_color.right, cc, dark),
-        "border-bottom-color" => format_css_color(style.visual.border_color.bottom, cc, dark),
-        "border-left-color" => format_css_color(style.visual.border_color.left, cc, dark),
+        "border-top-color" => style.visual.border_color_computed[0]
+            .as_deref()
+            .map_or_else(
+                || format_css_color(style.visual.border_color.top, cc, dark),
+                |e| e.resolve(cc_resolved, dark, &eval).to_computed_css_string(),
+            ),
+        "border-right-color" => style.visual.border_color_computed[1]
+            .as_deref()
+            .map_or_else(
+                || format_css_color(style.visual.border_color.right, cc, dark),
+                |e| e.resolve(cc_resolved, dark, &eval).to_computed_css_string(),
+            ),
+        "border-bottom-color" => style.visual.border_color_computed[2]
+            .as_deref()
+            .map_or_else(
+                || format_css_color(style.visual.border_color.bottom, cc, dark),
+                |e| e.resolve(cc_resolved, dark, &eval).to_computed_css_string(),
+            ),
+        "border-left-color" => style.visual.border_color_computed[3]
+            .as_deref()
+            .map_or_else(
+                || format_css_color(style.visual.border_color.left, cc, dark),
+                |e| e.resolve(cc_resolved, dark, &eval).to_computed_css_string(),
+            ),
         "border-top-left-radius" => {
             format_corner_radius(&style.visual.border_radius.top_left, &eval)
         }
@@ -3232,7 +3297,10 @@ fn format_computed_property_resolved(
         "border-bottom-left-radius" => {
             format_corner_radius(&style.visual.border_radius.bottom_left, &eval)
         }
-        "outline-color" => format_css_color(style.visual.outline_color, cc, dark),
+        "outline-color" => style.visual.outline_color_computed.as_deref().map_or_else(
+            || format_css_color(style.visual.outline_color, cc, dark),
+            |e| e.resolve(cc_resolved, dark, &eval).to_computed_css_string(),
+        ),
         "outline-style" => format_line_style(style.visual.outline_style).into(),
         "outline-width" => format_px(style.visual.outline_width),
         "outline-offset" => format_lp(&style.visual.outline_offset, &eval),

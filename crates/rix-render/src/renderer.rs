@@ -68,9 +68,18 @@ impl Default for VelloRenderer {
 
 impl VelloRenderer {
     pub fn new() -> Self {
+        // Serialize Vulkan/wgpu loader initialization across concurrent threads (Linux
+        // `libvulkan.so.1` races on simultaneous first-time `vkEnumerateInstanceExtensionProperties`).
+        static RENDER_CTX_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let context = {
+            let _guard = RENDER_CTX_INIT_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            RenderContext::new()
+        };
         Self {
             renderer_token: NEXT_RENDERER_TOKEN.fetch_add(1, Ordering::Relaxed),
-            context: RenderContext::new(),
+            context,
             renderer: None,
             renderer_device_id: None,
             surface: None,
