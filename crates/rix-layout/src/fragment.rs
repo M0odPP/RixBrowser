@@ -667,6 +667,8 @@ pub struct LayoutContext<'a> {
     pub(crate) pass_intrinsic_memo: HashMap<(BoxId, u32), (f32, f32)>,
     /// Per-pass memo for `layout_box` keyed by `(box_id, avail_w_q, avail_h_q)` (active even on initial dirty passes!).
     pub(crate) pass_fragment_memo: HashMap<(BoxId, u32, u32), Fragment>,
+    /// Out-of-flow (`position: absolute | fixed`) boxes propagating upward to their true CSS containing block.
+    pub(crate) pending_oof: Vec<crate::position::PendingOof>,
 }
 
 impl<'a> LayoutContext<'a> {
@@ -686,6 +688,7 @@ impl<'a> LayoutContext<'a> {
             cache,
             pass_intrinsic_memo: HashMap::with_capacity(256),
             pass_fragment_memo: HashMap::with_capacity(256),
+            pending_oof: Vec::new(),
         }
     }
     pub fn resolve_font(&mut self, style: &ComputedStyle) -> FontId {
@@ -759,6 +762,33 @@ pub fn layout_tree(
     shaping_cache: Arc<TextShapingCache>,
     cache: &mut LayoutCache,
 ) -> FragmentTree {
+    static EMPTY_SCROLL: std::sync::OnceLock<HashMap<NodeId, Point>> = std::sync::OnceLock::new();
+    let empty = EMPTY_SCROLL.get_or_init(HashMap::new);
+    layout_tree_with_scroll(
+        tree,
+        viewport,
+        font_db,
+        web_fonts,
+        shaping_cache,
+        cache,
+        empty,
+        Point::ZERO,
+    )
+}
+
+/// Lays out `tree` against `viewport`, resolving remaining out-of-flow boxes against the
+/// Initial Containing Block (ICB) and applying `position: sticky` offsets for active scrolls.
+#[allow(clippy::too_many_arguments)]
+pub fn layout_tree_with_scroll(
+    tree: &BoxTree,
+    viewport: Size,
+    font_db: &FontDatabase,
+    web_fonts: Option<&FontFaceSet>,
+    shaping_cache: Arc<TextShapingCache>,
+    cache: &mut LayoutCache,
+    scroll_offsets: &HashMap<NodeId, Point>,
+    root_scroll: Point,
+) -> FragmentTree {
     cache.reset_counters();
     let Some(root_id) = tree.root else {
         return FragmentTree::default();
@@ -768,7 +798,33 @@ pub fn layout_tree(
     space.root_font_size_px = root_font_size;
 
     let mut ctx = LayoutContext::new(tree, font_db, web_fonts, shaping_cache, cache);
-    let root = layout_box(&mut ctx, root_id, space);
+    let mut root = layout_box(&mut ctx, root_id, space);
+    // Drain any out-of-flow (`position: absolute | fixed`) boxes whose containing block
+    // is the Initial Containing Block (the viewport `0..viewport.width x 0..viewport.height`).
+    if !ctx.pending_oof.is_empty() {
+        let icb_rect = Rect::new(
+            -root.border_rect.origin.x,
+            -root.border_rect.origin.y,
+            viewport.width,
+            viewport.height,
+        );
+        let root_style = Arc::clone(&root.style);
+        let mut icb_children = Vec::new();
+        crate::position::resolve_oof_for_container(
+            &mut ctx,
+            0,
+            &root_style,
+            icb_rect,
+            true,
+            space,
+            &mut icb_children,
+        );
+        if !icb_children.is_empty() {
+            Arc::make_mut(&mut root.children).extend(icb_children);
+            root.compute_overflow_rect();
+        }
+    }
+    crate::position::apply_sticky_offsets(&mut root, scroll_offsets, root_scroll, viewport);
     let content_bounds = Rect::new(
         0.0,
         0.0,
@@ -802,6 +858,7 @@ pub fn layout_box(ctx: &mut LayoutContext<'_>, box_id: BoxId, space: ConstraintS
         }
     }
 
+    let oof_before = ctx.pending_oof.len();
     let frag = match &b.kind {
         BoxKind::Replaced(replaced) => layout_replaced(b, replaced, space),
         BoxKind::Table | BoxKind::AnonymousTable => layout_table(ctx, box_id, space),
@@ -816,8 +873,9 @@ pub fn layout_box(ctx: &mut LayoutContext<'_>, box_id: BoxId, space: ConstraintS
         } => layout_table(ctx, box_id, space),
         _ => layout_bfc_root(ctx, box_id, space),
     };
+    let propagated_oof = ctx.pending_oof.len() > oof_before;
 
-    if cacheable {
+    if cacheable && !propagated_oof {
         if ctx.pass_fragment_memo.len() < 16_384 {
             ctx.pass_fragment_memo.insert(pass_key, frag.clone());
         }

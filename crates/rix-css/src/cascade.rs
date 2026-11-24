@@ -93,6 +93,7 @@ pub struct RestyleReport {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct StyleMemoKey {
     parent_ptr: usize,
+    layout_parent_flex_grid: bool,
     rule_indices: SmallVec<[u32; 8]>,
 }
 
@@ -176,18 +177,31 @@ impl StyleMemo {
         });
     }
 
-    fn lookup(&self, parent_ptr: usize, matched: &[u32]) -> Option<Arc<ComputedStyle>> {
+    fn lookup(
+        &self,
+        parent_ptr: usize,
+        layout_parent_flex_grid: bool,
+        matched: &[u32],
+    ) -> Option<Arc<ComputedStyle>> {
         let key = StyleMemoKey {
             parent_ptr,
+            layout_parent_flex_grid,
             rule_indices: SmallVec::from_slice(matched),
         };
         self.entries.get(&key).map(Arc::clone)
     }
 
-    fn insert(&mut self, parent_ptr: usize, matched: &[u32], style: Arc<ComputedStyle>) {
+    fn insert(
+        &mut self,
+        parent_ptr: usize,
+        layout_parent_flex_grid: bool,
+        matched: &[u32],
+        style: Arc<ComputedStyle>,
+    ) {
         if self.entries.len() < 4096 {
             let key = StyleMemoKey {
                 parent_ptr,
+                layout_parent_flex_grid,
                 rule_indices: SmallVec::from_slice(matched),
             };
             self.entries.insert(key, style);
@@ -674,6 +688,7 @@ impl StyleContext {
                 doc,
                 child,
                 None,
+                false,
                 16.0,
                 true,
                 &self.rule_index,
@@ -757,6 +772,7 @@ impl StyleContext {
                 doc,
                 child,
                 None,
+                false,
                 root_font_size,
                 false,
                 &self.rule_index,
@@ -843,11 +859,24 @@ impl StyleContext {
     }
 }
 
+#[inline]
+fn next_layout_parent_flex_grid(style: &ComputedStyle, inherited: bool) -> bool {
+    match style.display {
+        crate::values::DisplayMode::Contents => inherited,
+        crate::values::DisplayMode::Flex
+        | crate::values::DisplayMode::InlineFlex
+        | crate::values::DisplayMode::Grid
+        | crate::values::DisplayMode::InlineGrid => true,
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cascade_subtree_par(
     doc: &Document,
     node: NodeId,
     parent_style: Option<&Arc<ComputedStyle>>,
+    layout_parent_flex_grid: bool,
     root_font_size: f32,
     allow_parallel: bool,
     rule_index: &RuleIndex,
@@ -870,6 +899,7 @@ fn cascade_subtree_par(
         node,
         elem,
         parent_style,
+        layout_parent_flex_grid,
         root_font_size,
         rule_index,
         inline_color_exprs,
@@ -889,11 +919,13 @@ fn cascade_subtree_par(
     } else {
         root_font_size
     };
+    let next_lp_fg = next_layout_parent_flex_grid(&style, layout_parent_flex_grid);
 
     collect_pseudo_element_styles(
         doc,
         node,
         &style,
+        next_lp_fg,
         next_root_font,
         rule_index,
         media,
@@ -939,6 +971,7 @@ fn cascade_subtree_par(
                         doc,
                         child,
                         Some(&parent_arc),
+                        next_lp_fg,
                         next_root_font,
                         false,
                         rule_index,
@@ -970,6 +1003,7 @@ fn cascade_subtree_par(
                 doc,
                 child,
                 Some(&style),
+                next_lp_fg,
                 next_root_font,
                 allow_parallel,
                 rule_index,
@@ -995,6 +1029,7 @@ fn restyle_dirty_walk(
     doc: &Document,
     node: NodeId,
     parent_style: Option<&Arc<ComputedStyle>>,
+    layout_parent_flex_grid: bool,
     root_font_size: f32,
     force_inherit_restyle: bool,
     rule_index: &RuleIndex,
@@ -1029,6 +1064,7 @@ fn restyle_dirty_walk(
             node,
             elem,
             parent_style,
+            layout_parent_flex_grid,
             root_font_size,
             rule_index,
             inline_color_exprs,
@@ -1059,18 +1095,37 @@ fn restyle_dirty_walk(
             let inherited_scalar_changed = old_style.visibility != new_style.visibility
                 || old_style.pointer_events != new_style.pointer_events
                 || old_style.cursor != new_style.cursor;
-            propagate_inherited = text_changed || vars_changed || inherited_scalar_changed;
+            let blockify_changed = old_style.display != new_style.display
+                && (matches!(
+                    old_style.display,
+                    crate::values::DisplayMode::Flex
+                        | crate::values::DisplayMode::InlineFlex
+                        | crate::values::DisplayMode::Grid
+                        | crate::values::DisplayMode::InlineGrid
+                        | crate::values::DisplayMode::Contents
+                ) || matches!(
+                    new_style.display,
+                    crate::values::DisplayMode::Flex
+                        | crate::values::DisplayMode::InlineFlex
+                        | crate::values::DisplayMode::Grid
+                        | crate::values::DisplayMode::InlineGrid
+                        | crate::values::DisplayMode::Contents
+                ));
+            propagate_inherited =
+                text_changed || vars_changed || inherited_scalar_changed || blockify_changed;
         } else {
             layout_dirty.push(node);
             report.layout_dirty_count += 1;
             propagate_inherited = true;
         }
 
+        let next_lp_fg = next_layout_parent_flex_grid(&new_style, layout_parent_flex_grid);
         let mut pseudos = Vec::new();
         collect_pseudo_element_styles(
             doc,
             node,
             &new_style,
+            next_lp_fg,
             root_font_size,
             rule_index,
             media,
@@ -1107,7 +1162,9 @@ fn restyle_dirty_walk(
         cleared_nodes.push(node);
     }
 
-    if !needs_desc && !propagate_inherited {
+    let propagate_through_contents =
+        force_inherit_restyle && current_style.display == crate::values::DisplayMode::Contents;
+    if !needs_desc && !propagate_inherited && !propagate_through_contents {
         return;
     }
 
@@ -1118,6 +1175,8 @@ fn restyle_dirty_walk(
     } else {
         root_font_size
     };
+    let next_lp_fg = next_layout_parent_flex_grid(&current_style, layout_parent_flex_grid);
+    let force_children = propagate_inherited || propagate_through_contents;
 
     for child in doc.children(node) {
         if matches!(doc.get(child), Some(NodeData::Element(_))) {
@@ -1125,8 +1184,9 @@ fn restyle_dirty_walk(
                 doc,
                 child,
                 Some(&current_style),
+                next_lp_fg,
                 next_root_font,
-                propagate_inherited,
+                force_children,
                 rule_index,
                 inline_color_exprs,
                 media,
@@ -1152,6 +1212,7 @@ fn compute_single_element_style(
     node: NodeId,
     elem: &ElementData,
     parent_style: Option<&Arc<ComputedStyle>>,
+    layout_parent_flex_grid: bool,
     root_font_size: f32,
     rule_index: &RuleIndex,
     inline_color_exprs: &FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
@@ -1209,8 +1270,19 @@ fn compute_single_element_style(
                 .any(|d| d.value.contains_sibling_fn())
         });
 
-    if inline_attr.is_none() && !has_pres_hints && !any_scoped && !any_sibling_math {
-        if let Some(cached) = memo.lookup(parent_ptr, &matched_indices) {
+    let is_mathml = &*elem.name.ns == "http://www.w3.org/1998/Math/MathML";
+    let is_top_layer = elem
+        .pseudo_state
+        .intersects(ElementState::MODAL | ElementState::POPOVER_OPEN);
+
+    if inline_attr.is_none()
+        && !has_pres_hints
+        && !any_scoped
+        && !any_sibling_math
+        && !is_mathml
+        && !is_top_layer
+    {
+        if let Some(cached) = memo.lookup(parent_ptr, layout_parent_flex_grid, &matched_indices) {
             if let Some(p_node) = sibling_parent {
                 memo.insert_sibling(p_node, elem, Arc::clone(&cached));
             }
@@ -1251,7 +1323,7 @@ fn compute_single_element_style(
     } else {
         (1, 1)
     };
-    let resolved = Arc::new(resolve_element_style_with_context(
+    let mut resolved_val = resolve_element_style_with_context(
         &matched_refs,
         &pres_decls,
         &inline_decls,
@@ -1264,10 +1336,54 @@ fn compute_single_element_style(
         usize::from(node) as u64,
         rule_index.random_doc_seed,
         &elem.attributes,
-    ));
+    );
+    // CSS Display L3 §2.7: Blockify items whose layout parent (skipping `display: contents`)
+    // is a flex or grid container.
+    if layout_parent_flex_grid {
+        resolved_val.display = resolved_val.display.blockify();
+    }
+    // CSS Display L3 / MathML Core: `display: math` / `block math` on non-MathML elements
+    // computes to `inline` / `block` (unless already blockified).
+    if !is_mathml {
+        match resolved_val.display {
+            crate::values::DisplayMode::Math => {
+                resolved_val.display = crate::values::DisplayMode::Inline;
+            }
+            crate::values::DisplayMode::BlockMath => {
+                resolved_val.display = crate::values::DisplayMode::Block;
+            }
+            _ => {}
+        }
+    }
+    // CSS Position L4 / Fullscreen Top Layer: elements in the top layer compute
+    // `position: static | relative | sticky` to `absolute` and blockify their `display`.
+    if is_top_layer {
+        if matches!(
+            resolved_val.position,
+            crate::values::PositionMode::Static
+                | crate::values::PositionMode::Relative
+                | crate::values::PositionMode::Sticky
+        ) {
+            resolved_val.position = crate::values::PositionMode::Absolute;
+        }
+        resolved_val.float_mode = crate::values::FloatMode::None;
+        resolved_val.display = resolved_val.display.blockify();
+    }
+    let resolved = Arc::new(resolved_val);
 
-    if inline_attr.is_none() && !has_pres_hints && !any_scoped && !any_sibling_math {
-        memo.insert(parent_ptr, &matched_indices, Arc::clone(&resolved));
+    if inline_attr.is_none()
+        && !has_pres_hints
+        && !any_scoped
+        && !any_sibling_math
+        && !is_mathml
+        && !is_top_layer
+    {
+        memo.insert(
+            parent_ptr,
+            layout_parent_flex_grid,
+            &matched_indices,
+            Arc::clone(&resolved),
+        );
         if let Some(p_node) = sibling_parent {
             memo.insert_sibling(p_node, elem, Arc::clone(&resolved));
         }
@@ -1564,6 +1680,7 @@ fn collect_pseudo_element_styles(
     doc: &Document,
     node: NodeId,
     originating_style: &Arc<ComputedStyle>,
+    layout_parent_flex_grid: bool,
     root_font_size: f32,
     rule_index: &RuleIndex,
     media: &MediaContext,
@@ -1620,7 +1737,7 @@ fn collect_pseudo_element_styles(
                 (1, 1)
             };
             let pseudo_nid = (usize::from(node) as u64) ^ (((pseudo as u64) + 1) << 48);
-            let style = Arc::new(resolve_element_style_with_context(
+            let mut pstyle = resolve_element_style_with_context(
                 &matched,
                 &[],
                 &[],
@@ -1633,7 +1750,37 @@ fn collect_pseudo_element_styles(
                 pseudo_nid,
                 rule_index.random_doc_seed,
                 elem_attrs,
-            ));
+            );
+            if layout_parent_flex_grid
+                && matches!(pseudo, RixPseudoElement::Before | RixPseudoElement::After)
+            {
+                pstyle.display = pstyle.display.blockify();
+            }
+            // CSS Pseudo-Elements L4: `display` does not apply to `::first-line` or `::first-letter`.
+            match pseudo {
+                RixPseudoElement::FirstLine => {
+                    pstyle.display = crate::values::DisplayMode::Inline;
+                }
+                RixPseudoElement::FirstLetter => {
+                    pstyle.display = if pstyle.float_mode != crate::values::FloatMode::None {
+                        crate::values::DisplayMode::Block
+                    } else {
+                        crate::values::DisplayMode::Inline
+                    };
+                }
+                _ => {}
+            }
+            // Pseudo-elements are never in the MathML namespace.
+            match pstyle.display {
+                crate::values::DisplayMode::Math => {
+                    pstyle.display = crate::values::DisplayMode::Inline;
+                }
+                crate::values::DisplayMode::BlockMath => {
+                    pstyle.display = crate::values::DisplayMode::Block;
+                }
+                _ => {}
+            }
+            let style = Arc::new(pstyle);
             out_pseudos.push(((node, pseudo), style));
         }
     }

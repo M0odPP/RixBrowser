@@ -12,7 +12,7 @@ head, title, meta, link, style, script, template, noscript, [hidden] {
 html, body, div, p, section, article, main, header, footer, nav, aside,
 figure, figcaption, blockquote, pre, form, fieldset, legend, hr,
 ul, ol, dl, dt, dd, h1, h2, h3, h4, h5, h6, address,
-center, details, summary, dialog, hgroup, search, menu, dir, caption {
+center, details, summary, dialog, hgroup, search, menu, dir {
     display: block;
 }
 center {
@@ -31,11 +31,42 @@ table {
     box-sizing: border-box;
     text-align: left;
 }
+thead {
+    display: table-header-group;
+}
+tbody {
+    display: table-row-group;
+}
+tfoot {
+    display: table-footer-group;
+}
+colgroup {
+    display: table-column-group;
+}
+col {
+    display: table-column;
+}
+caption {
+    display: table-caption;
+}
 tr {
     display: table-row;
 }
 td, th {
     display: table-cell;
+}
+* {
+    overlay: none !important;
+}
+:popover-open, dialog:modal {
+    overlay: auto !important;
+}
+::backdrop {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
 }
 body {
     margin: 8px;

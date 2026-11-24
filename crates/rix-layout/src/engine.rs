@@ -1,6 +1,7 @@
 //! High-level [`LayoutEngine`] orchestrating `BoxTree -> FragmentTree -> DisplayList`
 //! with incremental subtree caching, frame-time metrics, and hit-testing.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,7 +15,7 @@ use rix_text::{shared_shaping_cache, FontDatabase, FontFaceSet, TextShapingCache
 
 use crate::assets::AssetRegistry;
 use crate::box_tree::BoxTree;
-use crate::fragment::{layout_tree, Fragment, FragmentTree, LayoutCache};
+use crate::fragment::{layout_tree, layout_tree_with_scroll, Fragment, FragmentTree, LayoutCache};
 use crate::paint::paint_fragment_tree_with_keyframes;
 
 /// Timing and cache telemetry emitted by [`LayoutEngine::layout_and_paint`].
@@ -91,6 +92,42 @@ impl LayoutEngine {
             Some(&self.web_fonts),
             Arc::clone(&self.shaping_cache),
             &mut self.cache,
+        );
+        let t2 = Instant::now();
+        let metrics = LayoutMetrics {
+            box_tree_ms: (t1 - t0).as_secs_f32() * 1000.0,
+            layout_ms: (t2 - t1).as_secs_f32() * 1000.0,
+            paint_ms: 0.0,
+            cache_hits: self.cache.cache_hits,
+            cache_misses: self.cache.cache_misses,
+            display_items: 0,
+        };
+        (fragment_tree, metrics)
+    }
+
+    /// Runs `BoxTree -> FragmentTree` layout pass with active element/root scroll offsets
+    /// (used for live `position: sticky` offsets and CSSOM View queries).
+    pub fn layout_only_with_scroll(
+        &mut self,
+        doc: &Document,
+        styles: &StyleContext,
+        viewport: Size,
+        font_db: &FontDatabase,
+        scroll_offsets: &HashMap<NodeId, Point>,
+        root_scroll: Point,
+    ) -> (FragmentTree, LayoutMetrics) {
+        let t0 = Instant::now();
+        let box_tree = BoxTree::build(doc, styles, &self.assets);
+        let t1 = Instant::now();
+        let fragment_tree = layout_tree_with_scroll(
+            &box_tree,
+            viewport,
+            font_db,
+            Some(&self.web_fonts),
+            Arc::clone(&self.shaping_cache),
+            &mut self.cache,
+            scroll_offsets,
+            root_scroll,
         );
         let t2 = Instant::now();
         let metrics = LayoutMetrics {

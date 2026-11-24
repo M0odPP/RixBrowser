@@ -3064,24 +3064,85 @@ fn format_computed_property_resolved(
         "resize" => style.visual.resize.as_css_str().into(),
         "overscroll-behavior-x" => style.visual.overscroll_behavior_x.as_css_str().into(),
         "overscroll-behavior-y" => style.visual.overscroll_behavior_y.as_css_str().into(),
-        "display" => match style.display {
-            DisplayMode::None => "none",
-            DisplayMode::Block => "block",
-            DisplayMode::Inline => "inline",
-            DisplayMode::InlineBlock => "inline-block",
-            DisplayMode::Flex => "flex",
-            DisplayMode::InlineFlex => "inline-flex",
-            DisplayMode::Grid => "grid",
-            DisplayMode::InlineGrid => "inline-grid",
-            DisplayMode::Table => "table",
-            DisplayMode::InlineTable => "inline-table",
-            DisplayMode::TableRow => "table-row",
-            DisplayMode::TableCell => "table-cell",
-            DisplayMode::ListItem => "list-item",
-            DisplayMode::Contents => "contents",
-            DisplayMode::FlowRoot => "flow-root",
+        "display" => style.display.to_css_string().into(),
+        "overlay" => match style.overlay {
+            rix_css::OverlayMode::None => "none",
+            rix_css::OverlayMode::Auto => "auto",
         }
         .into(),
+        "reading-flow" => match style
+            .effects
+            .as_ref()
+            .map_or(rix_css::ReadingFlowMode::Normal, |e| e.reading_flow)
+        {
+            rix_css::ReadingFlowMode::Normal => "normal",
+            rix_css::ReadingFlowMode::FlexVisual => "flex-visual",
+            rix_css::ReadingFlowMode::FlexFlow => "flex-flow",
+            rix_css::ReadingFlowMode::GridRows => "grid-rows",
+            rix_css::ReadingFlowMode::GridColumns => "grid-columns",
+            rix_css::ReadingFlowMode::GridOrder => "grid-order",
+            rix_css::ReadingFlowMode::SourceOrder => "source-order",
+        }
+        .into(),
+        "reading-order" => style
+            .effects
+            .as_ref()
+            .map_or(0, |e| e.reading_order)
+            .to_string(),
+        "text-justify" => match style.text.text_justify {
+            rix_css::TextJustifyMode::Auto => "auto",
+            rix_css::TextJustifyMode::None => "none",
+            rix_css::TextJustifyMode::InterWord => "inter-word",
+            rix_css::TextJustifyMode::InterCharacter => "inter-character",
+        }
+        .into(),
+        "text-align-last" => match style.text.text_align_last {
+            rix_css::TextAlignLastMode::Auto => "auto",
+            rix_css::TextAlignLastMode::Start => "start",
+            rix_css::TextAlignLastMode::End => "end",
+            rix_css::TextAlignLastMode::Left => "left",
+            rix_css::TextAlignLastMode::Right => "right",
+            rix_css::TextAlignLastMode::Center => "center",
+            rix_css::TextAlignLastMode::Justify => "justify",
+            rix_css::TextAlignLastMode::MatchParent => "match-parent",
+        }
+        .into(),
+        "hyphenate-character" => match &style.text.hyphenate_character {
+            Some(s) => rix_css::substitution::quote_css_string(s.as_str()),
+            None => "auto".into(),
+        },
+        "hyphenate-limit-lines" => match style.text.hyphenate_limit_lines {
+            Some(n) => n.to_string(),
+            None => "no-limit".into(),
+        },
+        "contain" => {
+            let bits = style.effects.as_ref().map_or(0, |e| e.contain);
+            if bits == 0 {
+                "none".into()
+            } else if bits == 0x1D {
+                "strict".into()
+            } else if bits == 0x1C {
+                "content".into()
+            } else {
+                let mut parts = Vec::new();
+                if bits & 0x01 != 0 {
+                    parts.push("size");
+                }
+                if bits & 0x02 != 0 {
+                    parts.push("inline-size");
+                }
+                if bits & 0x04 != 0 {
+                    parts.push("layout");
+                }
+                if bits & 0x08 != 0 {
+                    parts.push("style");
+                }
+                if bits & 0x10 != 0 {
+                    parts.push("paint");
+                }
+                parts.join(" ")
+            }
+        }
         "position" => match style.position {
             PositionMode::Static => "static",
             PositionMode::Relative => "relative",
@@ -3731,6 +3792,61 @@ fn format_computed_property_resolved(
                 .collect::<Vec<_>>()
                 .join(", "),
             _ => "replace".into(),
+        },
+        "transition" => match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
+            Some(list) if !list.is_empty() => list
+                .iter()
+                .map(|t| {
+                    let mut parts: Vec<String> = Vec::new();
+                    let dur_s = t.duration_ms / 1000.0;
+                    let del_s = t.delay_ms / 1000.0;
+                    let is_def_timing = t.timing == rix_css::TimingFunction::Ease;
+                    let is_def_beh = t.behavior == rix_css::TransitionBehaviorMode::Normal;
+                    if t.property.as_str() != "all"
+                        || (dur_s == 0.0 && del_s == 0.0 && is_def_timing && is_def_beh)
+                    {
+                        parts.push(t.property.as_str().to_string());
+                    }
+                    if dur_s != 0.0 || del_s != 0.0 {
+                        parts.push(format!("{}s", format_num(dur_s)));
+                    }
+                    if !is_def_timing {
+                        parts.push(match t.timing {
+                            rix_css::TimingFunction::Linear => "linear".to_string(),
+                            rix_css::TimingFunction::Ease => "ease".to_string(),
+                            rix_css::TimingFunction::EaseIn => "ease-in".to_string(),
+                            rix_css::TimingFunction::EaseOut => "ease-out".to_string(),
+                            rix_css::TimingFunction::EaseInOut => "ease-in-out".to_string(),
+                            rix_css::TimingFunction::CubicBezier(a, b, c, d) => {
+                                use rix_css::values_math::format_math_f64;
+                                format!(
+                                    "cubic-bezier({}, {}, {}, {})",
+                                    format_math_f64(a),
+                                    format_math_f64(b),
+                                    format_math_f64(c),
+                                    format_math_f64(d)
+                                )
+                            }
+                            rix_css::TimingFunction::Steps(n, start) => {
+                                if start {
+                                    format!("steps({n}, start)")
+                                } else {
+                                    format!("steps({n})")
+                                }
+                            }
+                        });
+                    }
+                    if del_s != 0.0 {
+                        parts.push(format!("{}s", format_num(del_s)));
+                    }
+                    if !is_def_beh {
+                        parts.push("allow-discrete".to_string());
+                    }
+                    parts.join(" ")
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => "all".into(),
         },
         "transition-property" => match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
             Some(list) if !list.is_empty() => list

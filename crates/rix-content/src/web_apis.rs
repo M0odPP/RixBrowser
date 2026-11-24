@@ -2901,54 +2901,44 @@ fn install_window_and_navigator(vm: &mut JsVm, host: &SharedHost, event_loop: &S
         Ok(JsValue::from_number(f64::from(h.borrow().scroll_offset.y)))
     });
 
-    let h = Rc::clone(host);
-    define_host_method(vm, global, "scrollTo", move |vm, _, args| {
-        let first = arg(args, 0);
-        if let Some(obj) = first.as_object() {
-            let k_top = vm.heap.intern_key("top");
-            let k_left = vm.heap.intern_key("left");
-            if let Ok(v) = vm.get_property_by_key(obj, k_left) {
-                if !v.is_undefined() {
-                    let x = vm.to_number(v)?;
-                    if x.is_finite() {
-                        h.borrow_mut().scroll_offset.x = (x as f32).max(0.0);
+    for (name, relative) in [("scrollTo", false), ("scroll", false), ("scrollBy", true)] {
+        let h = Rc::clone(host);
+        define_host_method(vm, global, name, move |vm, _, args| {
+            let first = arg(args, 0);
+            let (mut x_opt, mut y_opt) = (None, None);
+            if let Some(obj) = first.as_object() {
+                let k_top = vm.heap.intern_key("top");
+                let k_left = vm.heap.intern_key("left");
+                if let Ok(v) = vm.get_property_by_key(obj, k_left) {
+                    if !v.is_undefined() {
+                        let x = vm.to_number(v)?;
+                        if x.is_finite() {
+                            x_opt = Some(x as f32);
+                        }
                     }
                 }
-            }
-            if let Ok(v) = vm.get_property_by_key(obj, k_top) {
-                if !v.is_undefined() {
-                    let y = vm.to_number(v)?;
-                    if y.is_finite() {
-                        h.borrow_mut().scroll_offset.y = (y as f32).max(0.0);
+                if let Ok(v) = vm.get_property_by_key(obj, k_top) {
+                    if !v.is_undefined() {
+                        let y = vm.to_number(v)?;
+                        if y.is_finite() {
+                            y_opt = Some(y as f32);
+                        }
                     }
                 }
+            } else {
+                let x = vm.to_number(first)?;
+                let y = vm.to_number(arg(args, 1))?;
+                if x.is_finite() {
+                    x_opt = Some(x as f32);
+                }
+                if y.is_finite() {
+                    y_opt = Some(y as f32);
+                }
             }
-        } else {
-            let x = vm.to_number(first)?;
-            let y = vm.to_number(arg(args, 1))?;
-            if x.is_finite() {
-                h.borrow_mut().scroll_offset.x = (x as f32).max(0.0);
-            }
-            if y.is_finite() {
-                h.borrow_mut().scroll_offset.y = (y as f32).max(0.0);
-            }
-        }
-        Ok(JsValue::UNDEFINED)
-    });
-
-    let h = Rc::clone(host);
-    define_host_method(vm, global, "scrollBy", move |vm, _, args| {
-        let dx = vm.to_number(arg(args, 0))?;
-        let dy = vm.to_number(arg(args, 1))?;
-        let mut hs = h.borrow_mut();
-        if dx.is_finite() {
-            hs.scroll_offset.x = (hs.scroll_offset.x + dx as f32).max(0.0);
-        }
-        if dy.is_finite() {
-            hs.scroll_offset.y = (hs.scroll_offset.y + dy as f32).max(0.0);
-        }
-        Ok(JsValue::UNDEFINED)
-    });
+            h.borrow_mut().set_root_scroll(x_opt, y_opt, relative);
+            Ok(JsValue::UNDEFINED)
+        });
+    }
 
     // window.matchMedia(query)
     let h = Rc::clone(host);

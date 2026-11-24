@@ -17,9 +17,9 @@ use crate::properties::{
 use crate::stylesheet::{KeyframesRule, RegisteredProperty};
 use crate::values::{
     AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
-    AnimationPlayStateMode, CalcExpr, ColorRgba, EvalContext, InterpolateSizeMode,
-    LengthPercentage, LengthPercentageAuto, LengthUnit, LineHeightValue, SizeValue, TimingFunction,
-    TransitionBehaviorMode, TransitionSpec, ZIndexValue,
+    AnimationPlayStateMode, CalcExpr, ColorRgba, DisplayMode, EvalContext, InterpolateSizeMode,
+    LengthPercentage, LengthPercentageAuto, LengthUnit, LineHeightValue, OverlayMode, SizeValue,
+    TimingFunction, TransitionBehaviorMode, TransitionSpec, ZIndexValue,
 };
 use crate::values_math::{
     format_math_f64, CalcSizeBasis, CalcSizeExpr, MathNode, MathUnit, RotateSpec, ScaleSpec,
@@ -194,16 +194,19 @@ where F: Fn(&str) -> Option<&'a KeyframesRule>,
                 .is_some_and(|m| compute_transition_eased_progress(&m, elapsed_ms, tr.start_elapsed_ms).is_some())
         });
         if let Some(before) = before_change {
-            for (prop, cname, spec) in collect_transition_candidates(before, &after, &specs) {
-                if is_property_not_animatable(prop) || compute_transition_eased_progress(&spec, elapsed_ms, elapsed_ms).is_none()
-                    || !properties_differ(before, &after, prop, cname.as_ref()) { continue; }
-                if let Some(ex) = active_transitions.iter_mut().find(|t| t.prop == prop && t.custom_name == cname) {
-                    if !properties_differ(&ex.to_style, &after, prop, cname.as_ref()) { ex.spec = spec; }
-                    else { ex.from_style = Arc::clone(before); ex.to_style = Arc::clone(&after); ex.spec = spec; ex.start_elapsed_ms = elapsed_ms; }
-                } else {
-                    active_transitions.push(ActiveTransition {
-                        prop, custom_name: cname, from_style: Arc::clone(before), to_style: Arc::clone(&after), spec, start_elapsed_ms: elapsed_ms,
-                    });
+            // CSS Transitions L2 §3: transitions do not start from `display: none`.
+            if before.display != DisplayMode::None {
+                for (prop, cname, spec) in collect_transition_candidates(before, &after, &specs) {
+                    if is_property_not_animatable(prop) || compute_transition_eased_progress(&spec, elapsed_ms, elapsed_ms).is_none()
+                        || !properties_differ(before, &after, prop, cname.as_ref()) { continue; }
+                    if let Some(ex) = active_transitions.iter_mut().find(|t| t.prop == prop && t.custom_name == cname) {
+                        if !properties_differ(&ex.to_style, &after, prop, cname.as_ref()) { ex.spec = spec; }
+                        else { ex.from_style = Arc::clone(before); ex.to_style = Arc::clone(&after); ex.spec = spec; ex.start_elapsed_ms = elapsed_ms; }
+                    } else {
+                        active_transitions.push(ActiveTransition {
+                            prop, custom_name: cname, from_style: Arc::clone(before), to_style: Arc::clone(&after), spec, start_elapsed_ms: elapsed_ms,
+                        });
+                    }
                 }
             }
         }
@@ -389,18 +392,23 @@ fn collect_transition_candidates(before: &ComputedStyle, after: &ComputedStyle, 
         if !Arc::ptr_eq(&before.box_model, &after.box_model) && before.box_model != after.box_model {
             all_p.extend_from_slice(&[P::Width, P::Height, P::MinWidth, P::MinHeight, P::MaxWidth, P::MaxHeight,
                 P::MarginTop, P::MarginRight, P::MarginBottom, P::MarginLeft, P::PaddingTop, P::PaddingRight,
-                P::PaddingBottom, P::PaddingLeft, P::Top, P::Right, P::Bottom, P::Left, P::ColumnCount]);
+                P::PaddingBottom, P::PaddingLeft, P::Top, P::Right, P::Bottom, P::Left, P::ColumnCount, P::BorderSpacing]);
         }
         if !Arc::ptr_eq(&before.visual, &after.visual) && before.visual != after.visual {
             all_p.extend_from_slice(&[P::BackgroundColor, P::BorderTopColor, P::BorderRightColor, P::BorderBottomColor, P::BorderLeftColor, P::OutlineColor]);
         }
+        if before.display != after.display { all_p.push(P::Display); }
+        if before.position != after.position { all_p.push(P::Position); }
+        if before.overlay != after.overlay { all_p.push(P::Overlay); }
         if before.opacity != after.opacity { all_p.push(P::Opacity); }
         if !Arc::ptr_eq(&before.text, &after.text) && before.text != after.text {
-            all_p.extend_from_slice(&[P::Color, P::FontSize, P::FontWeight, P::LineHeight, P::LetterSpacing, P::WordSpacing, P::TextIndent, P::Orphans, P::Widows]);
+            all_p.extend_from_slice(&[P::Color, P::FontSize, P::FontWeight, P::LineHeight, P::LetterSpacing, P::WordSpacing,
+                P::TextIndent, P::Orphans, P::Widows, P::TabSize, P::TextJustify, P::TextAlignLast,
+                P::HyphenateCharacter, P::HyphenateLimitLines]);
         }
         if before.z_index != after.z_index { all_p.push(P::ZIndex); }
         if before.flex_grid != after.flex_grid { all_p.extend_from_slice(&[P::FlexGrow, P::FlexShrink, P::FlexBasis, P::Order]); }
-        if before.effects != after.effects { all_p.extend_from_slice(&[P::Scale, P::Rotate, P::Translate, P::Transform]); }
+        if before.effects != after.effects { all_p.extend_from_slice(&[P::Scale, P::Rotate, P::Translate, P::Transform, P::ReadingFlow, P::ReadingOrder]); }
         for pk in all_p {
             if let Some(sp) = find_matching_transition_spec(specs, pk, None, after) {
                 if !out.iter().any(|(p, c, _)| *p == pk && c.is_none()) { out.push((pk, None, sp)); }
@@ -430,10 +438,48 @@ fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind,
         P::LetterSpacing => a.text.letter_spacing != b.text.letter_spacing, P::WordSpacing => a.text.word_spacing != b.text.word_spacing,
         P::TextIndent => a.text.text_indent != b.text.text_indent, P::ZIndex => a.z_index != b.z_index,
         P::Orphans => a.text.orphans != b.text.orphans, P::Widows => a.text.widows != b.text.widows,
+        P::Display => a.display != b.display,
+        P::Position => a.position != b.position,
+        P::Overlay => a.overlay != b.overlay,
         P::ColumnCount => a.box_model.column_count != b.box_model.column_count,
+        P::BorderSpacing => a.box_model.border_spacing_x != b.box_model.border_spacing_x || a.box_model.border_spacing_y != b.box_model.border_spacing_y,
+        P::TabSize => a.text.tab_size_num != b.text.tab_size_num || a.text.tab_size_len != b.text.tab_size_len,
+        P::TextJustify => a.text.text_justify != b.text.text_justify,
+        P::TextAlignLast => a.text.text_align_last != b.text.text_align_last,
+        P::HyphenateCharacter => a.text.hyphenate_character != b.text.hyphenate_character,
+        P::HyphenateLimitLines => a.text.hyphenate_limit_lines != b.text.hyphenate_limit_lines,
+        P::Order => a.flex_grid.as_ref().map_or(0, |f| f.order) != b.flex_grid.as_ref().map_or(0, |f| f.order),
+        P::FlexGrow => a.flex_grid.as_ref().map_or(0.0, |f| f.flex_grow) != b.flex_grid.as_ref().map_or(0.0, |f| f.flex_grow),
+        P::FlexShrink => a.flex_grid.as_ref().map_or(1.0, |f| f.flex_shrink) != b.flex_grid.as_ref().map_or(1.0, |f| f.flex_shrink),
         P::FlexBasis => a.flex_grid.as_ref().map(|f| (&f.flex_basis, &f.flex_basis_size)) != b.flex_grid.as_ref().map(|f| (&f.flex_basis, &f.flex_basis_size)),
+        P::ReadingFlow => a.effects.as_ref().map(|e| e.reading_flow) != b.effects.as_ref().map(|e| e.reading_flow),
+        P::ReadingOrder => a.effects.as_ref().map_or(0, |e| e.reading_order) != b.effects.as_ref().map_or(0, |e| e.reading_order),
         P::Custom => cname.and_then(|n| a.custom_properties.get(n)) != cname.and_then(|n| b.custom_properties.get(n)),
         _ => true,
+    }
+}
+
+#[rustfmt::skip]
+fn compose_lp(u: &LengthPercentage, k: &LengthPercentage, eval: &EvalContext, clamp_non_neg: bool) -> LengthPercentage {
+    let sum = MathNode::Sum(vec![math_node_from_lp(u, eval, false), math_node_from_lp(k, eval, false)]).simplify(Some(eval), None);
+    let lp = lp_from_math_node(sum);
+    if clamp_non_neg { clamp_lp_non_neg(lp) } else { lp }
+}
+
+#[rustfmt::skip]
+fn clamp_lp_non_neg(lp: LengthPercentage) -> LengthPercentage {
+    match lp {
+        LengthPercentage::Length(v, u) => LengthPercentage::Length(v.max(0.0), u),
+        LengthPercentage::Percent(p) => LengthPercentage::Percent(p.max(0.0)),
+        other => other,
+    }
+}
+
+#[rustfmt::skip]
+fn compose_lpa(u: &LengthPercentageAuto, k: &LengthPercentageAuto, eval: &EvalContext) -> LengthPercentageAuto {
+    match (u, k) {
+        (LengthPercentageAuto::Value(a), LengthPercentageAuto::Value(b)) => LengthPercentageAuto::Value(compose_lp(a, b, eval, false)),
+        _ => k.clone(),
     }
 }
 
@@ -450,6 +496,55 @@ fn compose_property(
         P::MinHeight => Arc::make_mut(&mut kf.box_model).min_height = compose_size_value(&underlying.box_model.min_height, &kf.box_model.min_height, mode, allow_kw, eval),
         P::MaxWidth => Arc::make_mut(&mut kf.box_model).max_width = compose_size_value(&underlying.box_model.max_width, &kf.box_model.max_width, mode, allow_kw, eval),
         P::MaxHeight => Arc::make_mut(&mut kf.box_model).max_height = compose_size_value(&underlying.box_model.max_height, &kf.box_model.max_height, mode, allow_kw, eval),
+        P::Left => Arc::make_mut(&mut kf.box_model).inset.left = compose_lpa(&underlying.box_model.inset.left, &kf.box_model.inset.left, eval),
+        P::Right => Arc::make_mut(&mut kf.box_model).inset.right = compose_lpa(&underlying.box_model.inset.right, &kf.box_model.inset.right, eval),
+        P::Top => Arc::make_mut(&mut kf.box_model).inset.top = compose_lpa(&underlying.box_model.inset.top, &kf.box_model.inset.top, eval),
+        P::Bottom => Arc::make_mut(&mut kf.box_model).inset.bottom = compose_lpa(&underlying.box_model.inset.bottom, &kf.box_model.inset.bottom, eval),
+        P::MarginLeft => Arc::make_mut(&mut kf.box_model).margin.left = compose_lpa(&underlying.box_model.margin.left, &kf.box_model.margin.left, eval),
+        P::MarginRight => Arc::make_mut(&mut kf.box_model).margin.right = compose_lpa(&underlying.box_model.margin.right, &kf.box_model.margin.right, eval),
+        P::MarginTop => Arc::make_mut(&mut kf.box_model).margin.top = compose_lpa(&underlying.box_model.margin.top, &kf.box_model.margin.top, eval),
+        P::MarginBottom => Arc::make_mut(&mut kf.box_model).margin.bottom = compose_lpa(&underlying.box_model.margin.bottom, &kf.box_model.margin.bottom, eval),
+        P::PaddingLeft => Arc::make_mut(&mut kf.box_model).padding.left = compose_lp(&underlying.box_model.padding.left, &kf.box_model.padding.left, eval, true),
+        P::PaddingRight => Arc::make_mut(&mut kf.box_model).padding.right = compose_lp(&underlying.box_model.padding.right, &kf.box_model.padding.right, eval, true),
+        P::PaddingTop => Arc::make_mut(&mut kf.box_model).padding.top = compose_lp(&underlying.box_model.padding.top, &kf.box_model.padding.top, eval, true),
+        P::PaddingBottom => Arc::make_mut(&mut kf.box_model).padding.bottom = compose_lp(&underlying.box_model.padding.bottom, &kf.box_model.padding.bottom, eval, true),
+        P::TextIndent => Arc::make_mut(&mut kf.text).text_indent = compose_lp(&underlying.text.text_indent, &kf.text.text_indent, eval, false),
+        P::LetterSpacing => Arc::make_mut(&mut kf.text).letter_spacing = compose_lp(&underlying.text.letter_spacing, &kf.text.letter_spacing, eval, false),
+        P::WordSpacing => Arc::make_mut(&mut kf.text).word_spacing = compose_lp(&underlying.text.word_spacing, &kf.text.word_spacing, eval, false),
+        P::BorderSpacing => {
+            let x = compose_lp(&underlying.box_model.border_spacing_x, &kf.box_model.border_spacing_x, eval, true);
+            let y = compose_lp(&underlying.box_model.border_spacing_y, &kf.box_model.border_spacing_y, eval, true);
+            let bm = Arc::make_mut(&mut kf.box_model); bm.border_spacing_x = x; bm.border_spacing_y = y;
+        }
+        P::TabSize => {
+            match (&underlying.text.tab_size_len, &kf.text.tab_size_len) {
+                (Some(a), Some(b)) => { let v = compose_lp(a, b, eval, true); Arc::make_mut(&mut kf.text).tab_size_len = Some(v); }
+                (None, None) => Arc::make_mut(&mut kf.text).tab_size_num = (underlying.text.tab_size_num + kf.text.tab_size_num).max(0.0),
+                _ => {}
+            }
+        }
+        P::Order => {
+            let u = underlying.flex_grid.as_ref().map_or(0, |f| f.order);
+            let k = kf.flex_grid.as_ref().map_or(0, |f| f.order);
+            kf.flex_grid_mut().order = u.saturating_add(k);
+        }
+        P::FlexGrow => {
+            let u = underlying.flex_grid.as_ref().map_or(0.0, |f| f.flex_grow);
+            let k = kf.flex_grid.as_ref().map_or(0.0, |f| f.flex_grow);
+            kf.flex_grid_mut().flex_grow = (u + k).max(0.0);
+        }
+        P::FlexShrink => {
+            let u = underlying.flex_grid.as_ref().map_or(1.0, |f| f.flex_shrink);
+            let k = kf.flex_grid.as_ref().map_or(1.0, |f| f.flex_shrink);
+            kf.flex_grid_mut().flex_shrink = (u + k).max(0.0);
+        }
+        P::ZIndex => if let (ZIndexValue::Integer(u), ZIndexValue::Integer(k)) = (underlying.z_index, kf.z_index) { kf.z_index = ZIndexValue::Integer(u.saturating_add(k)); },
+        P::HyphenateLimitLines => if let (Some(u), Some(k)) = (underlying.text.hyphenate_limit_lines, kf.text.hyphenate_limit_lines) { Arc::make_mut(&mut kf.text).hyphenate_limit_lines = Some(u.saturating_add(k).max(1)); },
+        P::ReadingOrder => {
+            let u = underlying.effects.as_ref().map_or(0, |e| e.reading_order);
+            let k = kf.effects.as_ref().map_or(0, |e| e.reading_order);
+            kf.effects_mut().reading_order = u.saturating_add(k);
+        }
         P::Color => { let c = compose_resolved_color(resolved_text_color(underlying, eval), resolved_text_color(kf, eval)); let t = Arc::make_mut(&mut kf.text); t.color = c.to_srgb_u8(); t.color_computed = Some(Arc::new(CssColorExpr::Resolved(c))); }
         P::BackgroundColor => { let c = compose_resolved_color(resolved_bg_color(underlying, eval), resolved_bg_color(kf, eval)); let v = Arc::make_mut(&mut kf.visual); v.background_color = c.to_srgb_u8(); v.background_color_computed = Some(Arc::new(CssColorExpr::Resolved(c))); }
         P::Opacity => kf.opacity = (underlying.opacity + kf.opacity).clamp(0.0, 1.0),
@@ -499,13 +594,82 @@ fn interpolate_property_into(
                 P::TextIndent => (&from.text.text_indent, &to.text.text_indent), P::LetterSpacing => (&from.text.letter_spacing, &to.text.letter_spacing),
                 _ => (&from.text.word_spacing, &to.text.word_spacing),
             };
-            let res = interpolate_lp(fv, tv, p, eval, is_transition);
+            let mut res = interpolate_lp(fv, tv, p, eval, is_transition);
+            if matches!(prop, P::PaddingTop | P::PaddingRight | P::PaddingBottom | P::PaddingLeft) {
+                res = clamp_lp_non_neg(res);
+            }
             match prop {
                 P::PaddingTop => Arc::make_mut(&mut target.box_model).padding.top = res, P::PaddingRight => Arc::make_mut(&mut target.box_model).padding.right = res,
                 P::PaddingBottom => Arc::make_mut(&mut target.box_model).padding.bottom = res, P::PaddingLeft => Arc::make_mut(&mut target.box_model).padding.left = res,
                 P::TextIndent => Arc::make_mut(&mut target.text).text_indent = res, P::LetterSpacing => Arc::make_mut(&mut target.text).letter_spacing = res,
                 _ => Arc::make_mut(&mut target.text).word_spacing = res,
             }
+        }
+        P::Display => {
+            target.display = if is_transition && !allow_discrete {
+                to.display
+            } else if from.display == DisplayMode::None && to.display != DisplayMode::None {
+                if p > 0.0 { to.display } else { DisplayMode::None }
+            } else if from.display != DisplayMode::None && to.display == DisplayMode::None {
+                if p < 1.0 { from.display } else { DisplayMode::None }
+            } else if use_from_disc {
+                from.display
+            } else {
+                to.display
+            };
+        }
+        P::Overlay => {
+            target.overlay = if is_transition && !allow_discrete {
+                to.overlay
+            } else if from.overlay == OverlayMode::None && to.overlay == OverlayMode::Auto {
+                if p > 0.0 { OverlayMode::Auto } else { OverlayMode::None }
+            } else if from.overlay == OverlayMode::Auto && to.overlay == OverlayMode::None {
+                if p < 1.0 { OverlayMode::Auto } else { OverlayMode::None }
+            } else {
+                to.overlay
+            };
+        }
+        P::Position => target.position = if use_from_disc { from.position } else { to.position },
+        P::Order => {
+            let (a, b) = (from.flex_grid.as_ref().map_or(0, |f| f.order), to.flex_grid.as_ref().map_or(0, |f| f.order));
+            target.flex_grid_mut().order = ((f64::from(a) * (1.0 - p) + f64::from(b) * p) + 0.5).floor() as i32;
+        }
+        P::FlexGrow => {
+            let (a, b) = (from.flex_grid.as_ref().map_or(0.0, |f| f.flex_grow), to.flex_grid.as_ref().map_or(0.0, |f| f.flex_grow));
+            target.flex_grid_mut().flex_grow = (f64::from(a) * (1.0 - p) + f64::from(b) * p).max(0.0) as f32;
+        }
+        P::FlexShrink => {
+            let (a, b) = (from.flex_grid.as_ref().map_or(1.0, |f| f.flex_shrink), to.flex_grid.as_ref().map_or(1.0, |f| f.flex_shrink));
+            target.flex_grid_mut().flex_shrink = (f64::from(a) * (1.0 - p) + f64::from(b) * p).max(0.0) as f32;
+        }
+        P::BorderSpacing => {
+            let x = clamp_lp_non_neg(interpolate_lp(&from.box_model.border_spacing_x, &to.box_model.border_spacing_x, p, eval, is_transition));
+            let y = clamp_lp_non_neg(interpolate_lp(&from.box_model.border_spacing_y, &to.box_model.border_spacing_y, p, eval, is_transition));
+            let bm = Arc::make_mut(&mut target.box_model); bm.border_spacing_x = x; bm.border_spacing_y = y;
+        }
+        P::TabSize => {
+            let t = Arc::make_mut(&mut target.text);
+            match (&from.text.tab_size_len, &to.text.tab_size_len) {
+                (Some(a), Some(b)) => { t.tab_size_len = Some(clamp_lp_non_neg(interpolate_lp(a, b, p, eval, is_transition))); }
+                (None, None) => { t.tab_size_len = None; t.tab_size_num = (f64::from(from.text.tab_size_num) * (1.0 - p) + f64::from(to.text.tab_size_num) * p).max(0.0) as f32; }
+                _ => {
+                    let src = if use_from_disc { &from.text } else { &to.text };
+                    t.tab_size_len = src.tab_size_len.clone();
+                    t.tab_size_num = src.tab_size_num;
+                }
+            }
+        }
+        P::TextJustify => Arc::make_mut(&mut target.text).text_justify = if use_from_disc { from.text.text_justify } else { to.text.text_justify },
+        P::TextAlignLast => Arc::make_mut(&mut target.text).text_align_last = if use_from_disc { from.text.text_align_last } else { to.text.text_align_last },
+        P::HyphenateCharacter => Arc::make_mut(&mut target.text).hyphenate_character = if use_from_disc { from.text.hyphenate_character.clone() } else { to.text.hyphenate_character.clone() },
+        P::HyphenateLimitLines => Arc::make_mut(&mut target.text).hyphenate_limit_lines = match (from.text.hyphenate_limit_lines, to.text.hyphenate_limit_lines) {
+            (Some(a), Some(b)) => Some((((f64::from(a) * (1.0 - p) + f64::from(b) * p) + 0.5).floor() as i32).max(1)),
+            _ => if use_from_disc { from.text.hyphenate_limit_lines } else { to.text.hyphenate_limit_lines },
+        },
+        P::ReadingFlow => target.effects_mut().reading_flow = if use_from_disc { from.effects.as_ref().map_or_else(Default::default, |e| e.reading_flow) } else { to.effects.as_ref().map_or_else(Default::default, |e| e.reading_flow) },
+        P::ReadingOrder => {
+            let (a, b) = (from.effects.as_ref().map_or(0, |e| e.reading_order), to.effects.as_ref().map_or(0, |e| e.reading_order));
+            target.effects_mut().reading_order = ((f64::from(a) * (1.0 - p) + f64::from(b) * p) + 0.5).floor() as i32;
         }
         P::Opacity => target.opacity = (f64::from(from.opacity) * (1.0 - p) + f64::from(to.opacity) * p).clamp(0.0, 1.0) as f32,
         P::FontSize => {
@@ -615,6 +779,7 @@ fn scale_math_for_interp(n: MathNode, w: f64) -> MathNode {
 #[rustfmt::skip]
 fn interpolate_lp(a: &LengthPercentage, b: &LengthPercentage, p: f64, eval: &EvalContext, is_tr: bool) -> LengthPercentage {
     if p == 0.0 { return lp_from_math_node(math_node_from_lp(a, eval, is_tr)); }
+    if p == 1.0 { return lp_from_math_node(math_node_from_lp(b, eval, is_tr)); }
     let combined = MathNode::Sum(vec![scale_math_for_interp(math_node_from_lp(a, eval, is_tr), 1.0 - p), scale_math_for_interp(math_node_from_lp(b, eval, is_tr), p)]).simplify(Some(eval), None);
     lp_from_math_node(combined)
 }

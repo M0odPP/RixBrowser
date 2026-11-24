@@ -20,11 +20,12 @@ use crate::values::{
     FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
     GridPlacementValue, GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode,
     LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
-    OverflowPair, OverflowWrapMode, OverscrollBehaviorMode, PointerEventsMode, PositionMode,
-    ResizeMode, SizeValue, TableLayoutMode, TextAlignMode, TextDecorationLine, TextOverflowMode,
-    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode,
-    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
-    WordBreakMode, WritingMode, ZIndexValue,
+    OverflowPair, OverflowWrapMode, OverlayMode, OverscrollBehaviorMode, PointerEventsMode,
+    PositionMode, ReadingFlowMode, ResizeMode, SizeValue, TableLayoutMode, TextAlignLastMode,
+    TextAlignMode, TextDecorationLine, TextJustifyMode, TextOverflowMode, TextTransformMode,
+    TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec,
+    UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode,
+    ZIndexValue,
 };
 
 const MAX_VAR_DEPTH: u8 = 64;
@@ -165,6 +166,10 @@ pub struct InheritedTextStyle {
     pub widows: i32,
     pub tab_size_num: f32,
     pub tab_size_len: Option<LengthPercentage>,
+    pub text_justify: TextJustifyMode,
+    pub text_align_last: TextAlignLastMode,
+    pub hyphenate_character: Option<InternedStr>,
+    pub hyphenate_limit_lines: Option<i32>,
     pub interpolate_size: InterpolateSizeMode,
     /// Full CSS Values L4/L5 evaluation context snapshot for this element (`em`/`rem`/`lh`/`rlh`/viewport/container/sibling).
     pub eval_ctx: EvalContext,
@@ -196,6 +201,10 @@ impl Default for InheritedTextStyle {
             widows: 2,
             tab_size_num: 8.0,
             tab_size_len: None,
+            text_justify: TextJustifyMode::Auto,
+            text_align_last: TextAlignLastMode::Auto,
+            hyphenate_character: None,
+            hyphenate_limit_lines: None,
             interpolate_size: InterpolateSizeMode::NumericOnly,
             eval_ctx: EvalContext::default(),
         }
@@ -222,6 +231,10 @@ impl InheritedTextStyle {
             && self.direction == other.direction
             && self.writing_mode == other.writing_mode
             && self.caption_side == other.caption_side
+            && self.text_justify == other.text_justify
+            && self.text_align_last == other.text_align_last
+            && self.hyphenate_character == other.hyphenate_character
+            && self.hyphenate_limit_lines == other.hyphenate_limit_lines
     }
 }
 
@@ -316,6 +329,10 @@ pub struct EffectsStyle {
     )>,
     pub view_transition_name: Option<InternedStr>,
     pub font_style_oblique_math: Option<crate::values_math::MathNode>,
+    pub reading_flow: ReadingFlowMode,
+    pub reading_order: i32,
+    /// CSS Containment L2 bitmask: 0x01=size, 0x02=inline-size, 0x04=layout, 0x08=style, 0x10=paint.
+    pub contain: u8,
 }
 
 /// Inherited map of CSS custom properties (`--*`) stored as owned token streams,
@@ -374,6 +391,7 @@ pub struct ComputedStyle {
     pub visibility: VisibilityMode,
     pub pointer_events: PointerEventsMode,
     pub cursor: CursorKind,
+    pub overlay: OverlayMode,
     pub z_index: ZIndexValue,
     pub opacity: f32,
     pub color_scheme_dark: bool,
@@ -397,6 +415,7 @@ impl Default for ComputedStyle {
             visibility: VisibilityMode::Visible,
             pointer_events: PointerEventsMode::Auto,
             cursor: CursorKind::Auto,
+            overlay: OverlayMode::None,
             z_index: ZIndexValue::Auto,
             opacity: 1.0,
             color_scheme_dark: false,
@@ -424,6 +443,7 @@ impl ComputedStyle {
             visibility: parent.visibility,
             pointer_events: parent.pointer_events,
             cursor: parent.cursor,
+            overlay: OverlayMode::None,
             z_index: ZIndexValue::Auto,
             opacity: 1.0,
             color_scheme_dark: parent.color_scheme_dark,
@@ -1542,6 +1562,29 @@ pub fn resolve_element_style_with_context(
 
     if let Some(regs) = registered_props {
         compute_registered_custom_properties(&mut style, regs, &eval_ctx);
+    }
+
+    // CSS 2.1 §9.7 & CSS Display L3 §2.7: Blockification for root, out-of-flow, floated,
+    // and flex/grid children (`position: absolute | fixed` also forces `float: none`).
+    let is_root = parent_style.is_none();
+    let is_abs_or_fixed = matches!(style.position, PositionMode::Absolute | PositionMode::Fixed);
+    if is_abs_or_fixed {
+        style.float_mode = FloatMode::None;
+    }
+    let is_floated = style.float_mode != FloatMode::None;
+    let parent_is_flex_or_grid = parent_style.is_some_and(|p| {
+        matches!(
+            p.display,
+            DisplayMode::Flex
+                | DisplayMode::InlineFlex
+                | DisplayMode::Grid
+                | DisplayMode::InlineGrid
+        )
+    });
+    if is_root && style.display == DisplayMode::Contents {
+        style.display = DisplayMode::Block;
+    } else if is_root || is_abs_or_fixed || is_floated || parent_is_flex_or_grid {
+        style.display = style.display.blockify();
     }
 
     style
@@ -2837,6 +2880,33 @@ pub fn apply_declaration(
         (PropertyIdKind::OverscrollBehaviorY, PropertyValue::OverscrollBehavior(v)) => {
             Arc::make_mut(&mut style.visual).overscroll_behavior_y = *v;
         }
+        (PropertyIdKind::Overlay, PropertyValue::Overlay(v)) => {
+            style.overlay = *v;
+        }
+        (PropertyIdKind::ReadingFlow, PropertyValue::ReadingFlow(v)) => {
+            style.effects_mut().reading_flow = *v;
+        }
+        (PropertyIdKind::ReadingOrder, PropertyValue::MathVal(n)) => {
+            let v = n.eval_scalar(eval, None);
+            if v.is_finite() {
+                style.effects_mut().reading_order = (v + 0.5).floor() as i32;
+            }
+        }
+        (PropertyIdKind::TextJustify, PropertyValue::TextJustify(v)) => {
+            Arc::make_mut(&mut style.text).text_justify = *v;
+        }
+        (PropertyIdKind::TextAlignLast, PropertyValue::TextAlignLast(v)) => {
+            Arc::make_mut(&mut style.text).text_align_last = *v;
+        }
+        (PropertyIdKind::HyphenateCharacter, PropertyValue::HyphenateChar(v)) => {
+            Arc::make_mut(&mut style.text).hyphenate_character = v.clone();
+        }
+        (PropertyIdKind::HyphenateLimitLines, PropertyValue::HyphenateLimitLines(v)) => {
+            Arc::make_mut(&mut style.text).hyphenate_limit_lines = *v;
+        }
+        (PropertyIdKind::Contain, PropertyValue::Contain(bits)) => {
+            style.effects_mut().contain = *bits;
+        }
         _ => {}
     }
 }
@@ -3030,6 +3100,34 @@ fn copy_property_from_parent(
         PropertyIdKind::BorderBottomLeftRadius => {
             Arc::make_mut(&mut style.visual).border_radius.bottom_left =
                 parent.visual.border_radius.bottom_left.clone();
+        }
+        PropertyIdKind::Overlay => style.overlay = parent.overlay,
+        PropertyIdKind::ReadingFlow => {
+            style.effects_mut().reading_flow = parent
+                .effects
+                .as_ref()
+                .map_or(ReadingFlowMode::Normal, |e| e.reading_flow);
+        }
+        PropertyIdKind::ReadingOrder => {
+            style.effects_mut().reading_order =
+                parent.effects.as_ref().map_or(0, |e| e.reading_order);
+        }
+        PropertyIdKind::TextJustify => {
+            Arc::make_mut(&mut style.text).text_justify = parent.text.text_justify;
+        }
+        PropertyIdKind::TextAlignLast => {
+            Arc::make_mut(&mut style.text).text_align_last = parent.text.text_align_last;
+        }
+        PropertyIdKind::HyphenateCharacter => {
+            Arc::make_mut(&mut style.text).hyphenate_character =
+                parent.text.hyphenate_character.clone();
+        }
+        PropertyIdKind::HyphenateLimitLines => {
+            Arc::make_mut(&mut style.text).hyphenate_limit_lines =
+                parent.text.hyphenate_limit_lines;
+        }
+        PropertyIdKind::Contain => {
+            style.effects_mut().contain = parent.effects.as_ref().map_or(0, |e| e.contain);
         }
         _ => {}
     }
@@ -3324,6 +3422,34 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
             t.tab_size_len = None;
         }
         PropertyIdKind::ColumnCount => Arc::make_mut(&mut style.box_model).column_count = None,
+        PropertyIdKind::Overlay => style.overlay = OverlayMode::None,
+        PropertyIdKind::ReadingFlow => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).reading_flow = ReadingFlowMode::Normal;
+            }
+        }
+        PropertyIdKind::ReadingOrder => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).reading_order = 0;
+            }
+        }
+        PropertyIdKind::TextJustify => {
+            Arc::make_mut(&mut style.text).text_justify = TextJustifyMode::Auto;
+        }
+        PropertyIdKind::TextAlignLast => {
+            Arc::make_mut(&mut style.text).text_align_last = TextAlignLastMode::Auto;
+        }
+        PropertyIdKind::HyphenateCharacter => {
+            Arc::make_mut(&mut style.text).hyphenate_character = None;
+        }
+        PropertyIdKind::HyphenateLimitLines => {
+            Arc::make_mut(&mut style.text).hyphenate_limit_lines = None;
+        }
+        PropertyIdKind::Contain => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).contain = 0;
+            }
+        }
         _ => {}
     }
 }

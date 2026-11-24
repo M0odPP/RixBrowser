@@ -548,11 +548,229 @@ pub enum DisplayMode {
     InlineGrid,
     Table,
     InlineTable,
+    TableRowGroup,
+    TableHeaderGroup,
+    TableFooterGroup,
     TableRow,
+    TableColumnGroup,
+    TableColumn,
     TableCell,
+    TableCaption,
     ListItem,
+    InlineListItem,
+    FlowRootListItem,
+    InlineFlowRootListItem,
+    Ruby,
+    BlockRuby,
+    RubyBase,
+    RubyText,
+    RubyBaseContainer,
+    RubyTextContainer,
+    RunIn,
+    RunInFlowRoot,
+    RunInFlex,
+    RunInGrid,
+    RunInTable,
+    RunInRuby,
+    RunInListItem,
+    RunInFlowRootListItem,
+    Math,
+    BlockMath,
     Contents,
     None,
+}
+
+impl DisplayMode {
+    /// Parses a CSS Display Level 3/4 `<display>` value per W3C grammar.
+    #[must_use]
+    #[rustfmt::skip]
+    pub fn parse_css(raw: &str) -> Option<Self> {
+        let toks: Vec<String> = raw.split_ascii_whitespace().map(str::to_ascii_lowercase).collect();
+        if toks.is_empty() || toks.len() > 3 { return None; }
+        if toks.len() == 1 {
+            return match toks[0].as_str() {
+                "block" | "flow" => Some(Self::Block),
+                "inline" => Some(Self::Inline),
+                "inline-block" => Some(Self::InlineBlock),
+                "flow-root" => Some(Self::FlowRoot),
+                "flex" => Some(Self::Flex),
+                "inline-flex" => Some(Self::InlineFlex),
+                "grid" => Some(Self::Grid),
+                "inline-grid" => Some(Self::InlineGrid),
+                "table" => Some(Self::Table),
+                "inline-table" => Some(Self::InlineTable),
+                "table-row-group" => Some(Self::TableRowGroup),
+                "table-header-group" => Some(Self::TableHeaderGroup),
+                "table-footer-group" => Some(Self::TableFooterGroup),
+                "table-row" => Some(Self::TableRow),
+                "table-column-group" => Some(Self::TableColumnGroup),
+                "table-column" => Some(Self::TableColumn),
+                "table-cell" => Some(Self::TableCell),
+                "table-caption" => Some(Self::TableCaption),
+                "list-item" => Some(Self::ListItem),
+                "ruby" => Some(Self::Ruby),
+                "ruby-base" => Some(Self::RubyBase),
+                "ruby-text" => Some(Self::RubyText),
+                "ruby-base-container" => Some(Self::RubyBaseContainer),
+                "ruby-text-container" => Some(Self::RubyTextContainer),
+                "run-in" => Some(Self::RunIn),
+                "math" => Some(Self::Math),
+                "contents" => Some(Self::Contents),
+                "none" => Some(Self::None),
+                _ => None,
+            };
+        }
+        // Multi-keyword grammar: `[ <display-outside> || <display-inside> ]` or
+        // `<display-outside>? && [ flow | flow-root ]? && list-item`.
+        let (mut outside, mut inside, mut list_item) = (None::<&str>, None::<&str>, false);
+        for t in &toks {
+            match t.as_str() {
+                "block" | "inline" | "run-in" => {
+                    if outside.is_some() { return None; }
+                    outside = Some(t.as_str());
+                }
+                "flow" | "flow-root" | "table" | "flex" | "grid" | "ruby" | "math" => {
+                    if inside.is_some() { return None; }
+                    inside = Some(t.as_str());
+                }
+                "list-item" => {
+                    if list_item { return None; }
+                    list_item = true;
+                }
+                _ => return None,
+            }
+        }
+        if list_item {
+            if !matches!(inside, None | Some("flow" | "flow-root")) { return None; }
+            return Some(match (outside.unwrap_or("block"), inside.unwrap_or("flow")) {
+                ("block", "flow") => Self::ListItem,
+                ("block", "flow-root") => Self::FlowRootListItem,
+                ("inline", "flow") => Self::InlineListItem,
+                ("inline", "flow-root") => Self::InlineFlowRootListItem,
+                ("run-in", "flow") => Self::RunInListItem,
+                ("run-in", "flow-root") => Self::RunInFlowRootListItem,
+                _ => return None,
+            });
+        }
+        let (out_k, in_k) = (outside?, inside?);
+        Some(match (out_k, in_k) {
+            ("block", "flow") => Self::Block,
+            ("block", "flow-root") => Self::FlowRoot,
+            ("block", "flex") => Self::Flex,
+            ("block", "grid") => Self::Grid,
+            ("block", "table") => Self::Table,
+            ("block", "ruby") => Self::BlockRuby,
+            ("block", "math") => Self::BlockMath,
+            ("inline", "flow") => Self::Inline,
+            ("inline", "flow-root") => Self::InlineBlock,
+            ("inline", "flex") => Self::InlineFlex,
+            ("inline", "grid") => Self::InlineGrid,
+            ("inline", "table") => Self::InlineTable,
+            ("inline", "ruby") => Self::Ruby,
+            ("inline", "math") => Self::Math,
+            ("run-in", "flow") => Self::RunIn,
+            ("run-in", "flow-root") => Self::RunInFlowRoot,
+            ("run-in", "flex") => Self::RunInFlex,
+            ("run-in", "grid") => Self::RunInGrid,
+            ("run-in", "table") => Self::RunInTable,
+            ("run-in", "ruby") => Self::RunInRuby,
+            _ => return None,
+        })
+    }
+
+    /// Canonical shortest W3C CSS Display Level 3 serialization.
+    #[must_use]
+    #[rustfmt::skip]
+    pub const fn to_css_string(self) -> &'static str {
+        match self {
+            Self::Block => "block", Self::Inline => "inline", Self::InlineBlock => "inline-block",
+            Self::FlowRoot => "flow-root", Self::Flex => "flex", Self::InlineFlex => "inline-flex",
+            Self::Grid => "grid", Self::InlineGrid => "inline-grid", Self::Table => "table",
+            Self::InlineTable => "inline-table", Self::TableRowGroup => "table-row-group",
+            Self::TableHeaderGroup => "table-header-group", Self::TableFooterGroup => "table-footer-group",
+            Self::TableRow => "table-row", Self::TableColumnGroup => "table-column-group",
+            Self::TableColumn => "table-column", Self::TableCell => "table-cell",
+            Self::TableCaption => "table-caption", Self::ListItem => "list-item",
+            Self::InlineListItem => "inline list-item", Self::FlowRootListItem => "flow-root list-item",
+            Self::InlineFlowRootListItem => "inline flow-root list-item",
+            Self::Ruby => "ruby", Self::BlockRuby => "block ruby",
+            Self::RubyBase => "ruby-base", Self::RubyText => "ruby-text",
+            Self::RubyBaseContainer => "ruby-base-container", Self::RubyTextContainer => "ruby-text-container",
+            Self::RunIn => "run-in", Self::RunInFlowRoot => "run-in flow-root",
+            Self::RunInFlex => "run-in flex", Self::RunInGrid => "run-in grid",
+            Self::RunInTable => "run-in table", Self::RunInRuby => "run-in ruby",
+            Self::RunInListItem => "run-in list-item", Self::RunInFlowRootListItem => "run-in flow-root list-item",
+            Self::Math => "math", Self::BlockMath => "block math",
+            Self::Contents => "contents", Self::None => "none",
+        }
+    }
+
+    /// CSS Display L3 §2.7 / CSS 2.1 §9.7 blockification (`float`, `position: absolute|fixed`,
+    /// root element, flex/grid items).
+    #[must_use]
+    #[rustfmt::skip]
+    pub const fn blockify(self) -> Self {
+        match self {
+            Self::Inline | Self::InlineBlock | Self::TableRowGroup | Self::TableHeaderGroup
+            | Self::TableFooterGroup | Self::TableRow | Self::TableColumnGroup | Self::TableColumn
+            | Self::TableCell | Self::TableCaption | Self::Ruby | Self::RubyBase | Self::RubyText
+            | Self::RubyBaseContainer | Self::RubyTextContainer | Self::RunIn | Self::BlockRuby => Self::Block,
+            Self::InlineTable | Self::RunInTable => Self::Table,
+            Self::InlineFlex | Self::RunInFlex => Self::Flex,
+            Self::InlineGrid | Self::RunInGrid => Self::Grid,
+            Self::RunInFlowRoot => Self::FlowRoot,
+            Self::RunInRuby => Self::BlockRuby,
+            Self::InlineListItem | Self::RunInListItem => Self::ListItem,
+            Self::InlineFlowRootListItem | Self::RunInFlowRootListItem => Self::FlowRootListItem,
+            Self::Math => Self::BlockMath,
+            other => other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum OverlayMode {
+    #[default]
+    None,
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ReadingFlowMode {
+    #[default]
+    Normal,
+    FlexVisual,
+    FlexFlow,
+    GridRows,
+    GridColumns,
+    GridOrder,
+    SourceOrder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum TextJustifyMode {
+    #[default]
+    Auto,
+    None,
+    InterWord,
+    InterCharacter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum TextAlignLastMode {
+    #[default]
+    Auto,
+    Start,
+    End,
+    Left,
+    Right,
+    Center,
+    Justify,
+    MatchParent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -1537,13 +1755,31 @@ pub fn convert_display(display: &Display) -> DisplayMode {
         Display::Keyword(kw) => match kw {
             DisplayKeyword::None => DisplayMode::None,
             DisplayKeyword::Contents => DisplayMode::Contents,
+            DisplayKeyword::TableRowGroup => DisplayMode::TableRowGroup,
+            DisplayKeyword::TableHeaderGroup => DisplayMode::TableHeaderGroup,
+            DisplayKeyword::TableFooterGroup => DisplayMode::TableFooterGroup,
             DisplayKeyword::TableRow => DisplayMode::TableRow,
+            DisplayKeyword::TableColumnGroup => DisplayMode::TableColumnGroup,
+            DisplayKeyword::TableColumn => DisplayMode::TableColumn,
             DisplayKeyword::TableCell => DisplayMode::TableCell,
-            _ => DisplayMode::Block,
+            DisplayKeyword::TableCaption => DisplayMode::TableCaption,
+            DisplayKeyword::RubyBase => DisplayMode::RubyBase,
+            DisplayKeyword::RubyText => DisplayMode::RubyText,
+            DisplayKeyword::RubyBaseContainer => DisplayMode::RubyBaseContainer,
+            DisplayKeyword::RubyTextContainer => DisplayMode::RubyTextContainer,
         },
         Display::Pair(pair) => {
             if pair.is_list_item {
-                return DisplayMode::ListItem;
+                return match (pair.outside, &pair.inside) {
+                    (DisplayOutside::Inline, DisplayInside::FlowRoot) => {
+                        DisplayMode::InlineFlowRootListItem
+                    }
+                    (DisplayOutside::Inline, _) => DisplayMode::InlineListItem,
+                    (DisplayOutside::Block, DisplayInside::FlowRoot) => {
+                        DisplayMode::FlowRootListItem
+                    }
+                    _ => DisplayMode::ListItem,
+                };
             }
             match (pair.outside, &pair.inside) {
                 (DisplayOutside::Inline, DisplayInside::Flow) => DisplayMode::Inline,
@@ -1553,6 +1789,8 @@ pub fn convert_display(display: &Display) -> DisplayMode {
                 }
                 (DisplayOutside::Inline, DisplayInside::Grid) => DisplayMode::InlineGrid,
                 (DisplayOutside::Inline, DisplayInside::Table) => DisplayMode::InlineTable,
+                (DisplayOutside::Inline, DisplayInside::Ruby) => DisplayMode::Ruby,
+                (DisplayOutside::Block, DisplayInside::Ruby) => DisplayMode::BlockRuby,
                 (_, DisplayInside::Flex(_) | DisplayInside::Box(_)) => DisplayMode::Flex,
                 (_, DisplayInside::Grid) => DisplayMode::Grid,
                 (_, DisplayInside::Table) => DisplayMode::Table,

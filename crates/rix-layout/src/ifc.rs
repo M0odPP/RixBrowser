@@ -116,6 +116,7 @@ struct ActiveInline {
 enum InlineItem {
     PushInline(ActiveInline),
     PopInline(BoxId),
+    OutOfFlow(BoxId),
     Word {
         text: String,
         style: Arc<ComputedStyle>,
@@ -217,6 +218,7 @@ pub fn measure_ifc_min_max_content(
                 seen_non_space = true;
                 max_w = max_w.max(current_line_w);
             }
+            InlineItem::OutOfFlow(_) => {}
         }
     }
     (min_w, max_w.max(min_w))
@@ -277,6 +279,17 @@ pub fn layout_ifc(
                         cur_x += right;
                     }
                 }
+            }
+            InlineItem::OutOfFlow(oof_id) => {
+                let is_fixed = ctx.tree.get(oof_id).style.position == rix_css::PositionMode::Fixed;
+                ctx.pending_oof.push(crate::position::PendingOof {
+                    box_id: oof_id,
+                    static_pos: Point::new(
+                        content_origin.x + band_left + cur_x + pending_left_edge,
+                        content_origin.y + cursor_y,
+                    ),
+                    is_fixed,
+                });
             }
             InlineItem::HardBreak => {
                 let line = finish_line(
@@ -448,6 +461,7 @@ pub fn layout_ifc(
                 style,
                 inline_stack,
             } => {
+                let atomic_oof_start = ctx.pending_oof.len();
                 let mut frag = layout_box(ctx, box_id, space);
                 let total_w = frag.border_rect.size.width + frag.margin.horizontal();
                 let total_h = frag.border_rect.size.height + frag.margin.vertical();
@@ -505,6 +519,12 @@ pub fn layout_ifc(
                 let asc = base_y.min(total_h);
                 let desc = (total_h - asc).max(0.0);
                 apply_relative_offset(&mut frag, space);
+                crate::position::offset_pending_oof(
+                    &mut ctx.pending_oof,
+                    atomic_oof_start,
+                    content_origin.x + band_left + cur_x + frag.margin.left,
+                    content_origin.y + cursor_y + frag.margin.top,
+                );
 
                 cur_pieces.push(LinePiece {
                     box_id,
@@ -997,7 +1017,11 @@ fn collect_inline_recursive(
     out: &mut Vec<InlineItem>,
 ) {
     let b = ctx.tree.get(box_id);
-    if b.is_out_of_flow || b.is_float {
+    if b.is_out_of_flow {
+        out.push(InlineItem::OutOfFlow(box_id));
+        return;
+    }
+    if b.is_float {
         return;
     }
     match &b.kind {
