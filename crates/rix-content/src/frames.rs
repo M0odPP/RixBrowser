@@ -3157,8 +3157,10 @@ fn install_html_iframe_element_proto(
 ) {
     let ip = host.borrow().prototypes.html_iframe_element_proto;
 
-    // Reflected string attributes that trigger iframe re-sync on mutation (`src`, `srcdoc`, `sandbox`)
-    for attr_name in ["src", "srcdoc", "sandbox"] {
+    // Reflected string attributes that trigger iframe re-sync on mutation (`src`, `srcdoc`).
+    // Note: `HTMLIFrameElement.prototype.sandbox` is a `[PutForwards=value] DOMTokenList`
+    // installed by `dom_collections::install_collections_and_traversal` (HTML §4.8.5).
+    for attr_name in ["src", "srcdoc"] {
         let h_get = Rc::clone(host);
         let h_set = Rc::clone(host);
         let ev_set = Rc::clone(events);

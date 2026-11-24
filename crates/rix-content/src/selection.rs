@@ -1122,3 +1122,11 @@ pub fn adjust_ranges_for_normalize_merge(
     _prev_len: usize,
 ) {
 }
+
+pub fn adjust_ranges_for_insert_nodes(
+    _host: &SharedHost,
+    _parent: NodeId,
+    _insert_index: usize,
+    _count: usize,
+) {
+}
