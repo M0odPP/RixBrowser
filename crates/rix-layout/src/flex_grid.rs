@@ -751,9 +751,8 @@ fn resolve_grid_axis(
     parent_areas: Option<&GridTemplateAreasValue>,
     is_row: bool,
 ) -> (tp::GridPlacement, tp::GridPlacement) {
-    // Handle `grid-area: <ident>` (lightningcss expands `grid-area: foo` into
-    // `row_start = Area("foo"), col_start = Area("foo"), row_end = Area("foo"), col_end = Area("foo")`).
-    if let GridPlacementValue::Area(name) = start {
+    // Handle `grid-area: <ident>` (`row_start = Named("foo"), ...`).
+    if let GridPlacementValue::Named(name) = start {
         if let Some((rs, re, cs, ce)) = parent_areas.and_then(|a| a.find_area_lines(name.as_str()))
         {
             return if is_row {
@@ -783,9 +782,14 @@ fn placement_to_taffy(
 ) -> tp::GridPlacement {
     match p {
         GridPlacementValue::Auto => tp::GridPlacement::Auto,
-        GridPlacementValue::Line(n) => tp::GridPlacement::Line((*n).into()),
-        GridPlacementValue::Span(n) => tp::GridPlacement::Span(*n),
-        GridPlacementValue::Area(name) => {
+        GridPlacementValue::Line { index, .. } => tp::GridPlacement::Line(
+            ((*index).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16).into(),
+        ),
+        GridPlacementValue::Span { count, .. } => {
+            let n = (*count).clamp(1, u32::from(u16::MAX)) as u16;
+            tp::GridPlacement::Span(n)
+        }
+        GridPlacementValue::Named(name) => {
             if let Some((rs, re, cs, ce)) =
                 parent_areas.and_then(|a| a.find_area_lines(name.as_str()))
             {
@@ -893,6 +897,10 @@ fn grid_track_to_taffy(track: &GridTrackSize, eval: &EvalContext) -> tp::TrackSi
         },
         GridTrackSize::Fr(f) => tp::fr(*f),
         GridTrackSize::FrMath(n) => tp::fr((n.eval_scalar(eval, None) as f32).max(0.0)),
+        GridTrackSize::FitContent(lp) => match lp {
+            LengthPercentage::Percent(p) => tp::fit_content(tp::percent(*p)),
+            other => tp::fit_content(tp::length(other.resolve_px(eval.container_width_px, eval))),
+        },
         GridTrackSize::MinMax(min_t, max_t) => {
             let min_fn = match min_t.as_ref() {
                 GridTrackSize::MinContent => tp::min_content(),

@@ -3112,6 +3112,9 @@ fn format_computed_property_resolved(
             rix_css::ReadingFlowMode::GridRows => "grid-rows",
             rix_css::ReadingFlowMode::GridColumns => "grid-columns",
             rix_css::ReadingFlowMode::GridOrder => "grid-order",
+            rix_css::ReadingFlowMode::GridLanesFlow => "grid-lanes-flow",
+            rix_css::ReadingFlowMode::GridLanesTrack => "grid-lanes-track",
+            rix_css::ReadingFlowMode::GridLanesOrder => "grid-lanes-order",
             rix_css::ReadingFlowMode::SourceOrder => "source-order",
         }
         .into(),

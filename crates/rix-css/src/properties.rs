@@ -6611,13 +6611,21 @@ fn convert_grid_line(line: &lightningcss::properties::grid::GridLine<'_>) -> Gri
     match line {
         lightningcss::properties::grid::GridLine::Auto => GridPlacementValue::Auto,
         lightningcss::properties::grid::GridLine::Area { name } => {
-            GridPlacementValue::Area(intern_str(name.0.as_ref()))
+            GridPlacementValue::Named(intern_str(name.0.as_ref()))
         }
-        lightningcss::properties::grid::GridLine::Line { index, .. } => {
-            GridPlacementValue::Line((*index).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16)
+        lightningcss::properties::grid::GridLine::Line { index, name } => {
+            GridPlacementValue::Line {
+                index: *index,
+                index_math: None,
+                name: name.as_ref().map(|n| intern_str(n.0.as_ref())),
+            }
         }
-        lightningcss::properties::grid::GridLine::Span { index, .. } => {
-            GridPlacementValue::Span((*index).clamp(1, i32::from(u16::MAX)) as u16)
+        lightningcss::properties::grid::GridLine::Span { index, name } => {
+            GridPlacementValue::Span {
+                count: (*index).max(1) as u32,
+                count_math: None,
+                name: name.as_ref().map(|n| intern_str(n.0.as_ref())),
+            }
         }
     }
 }

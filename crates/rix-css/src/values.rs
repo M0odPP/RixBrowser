@@ -546,6 +546,9 @@ pub enum DisplayMode {
     InlineFlex,
     Grid,
     InlineGrid,
+    GridLanes,
+    InlineGridLanes,
+    InlineGridLanesMulti,
     Table,
     InlineTable,
     TableRowGroup,
@@ -597,6 +600,8 @@ impl DisplayMode {
                 "inline-flex" => Some(Self::InlineFlex),
                 "grid" => Some(Self::Grid),
                 "inline-grid" => Some(Self::InlineGrid),
+                "grid-lanes" => Some(Self::GridLanes),
+                "inline-grid-lanes" => Some(Self::InlineGridLanes),
                 "table" => Some(Self::Table),
                 "inline-table" => Some(Self::InlineTable),
                 "table-row-group" => Some(Self::TableRowGroup),
@@ -629,7 +634,7 @@ impl DisplayMode {
                     if outside.is_some() { return None; }
                     outside = Some(t.as_str());
                 }
-                "flow" | "flow-root" | "table" | "flex" | "grid" | "ruby" | "math" => {
+                "flow" | "flow-root" | "table" | "flex" | "grid" | "grid-lanes" | "ruby" | "math" => {
                     if inside.is_some() { return None; }
                     inside = Some(t.as_str());
                 }
@@ -658,6 +663,7 @@ impl DisplayMode {
             ("block", "flow-root") => Self::FlowRoot,
             ("block", "flex") => Self::Flex,
             ("block", "grid") => Self::Grid,
+            ("block", "grid-lanes") => Self::GridLanes,
             ("block", "table") => Self::Table,
             ("block", "ruby") => Self::BlockRuby,
             ("block", "math") => Self::BlockMath,
@@ -665,6 +671,7 @@ impl DisplayMode {
             ("inline", "flow-root") => Self::InlineBlock,
             ("inline", "flex") => Self::InlineFlex,
             ("inline", "grid") => Self::InlineGrid,
+            ("inline", "grid-lanes") => Self::InlineGridLanesMulti,
             ("inline", "table") => Self::InlineTable,
             ("inline", "ruby") => Self::Ruby,
             ("inline", "math") => Self::Math,
@@ -685,7 +692,10 @@ impl DisplayMode {
         match self {
             Self::Block => "block", Self::Inline => "inline", Self::InlineBlock => "inline-block",
             Self::FlowRoot => "flow-root", Self::Flex => "flex", Self::InlineFlex => "inline-flex",
-            Self::Grid => "grid", Self::InlineGrid => "inline-grid", Self::Table => "table",
+            Self::Grid => "grid", Self::InlineGrid => "inline-grid",
+            Self::GridLanes => "grid-lanes", Self::InlineGridLanes => "inline-grid-lanes",
+            Self::InlineGridLanesMulti => "inline grid-lanes",
+            Self::Table => "table",
             Self::InlineTable => "inline-table", Self::TableRowGroup => "table-row-group",
             Self::TableHeaderGroup => "table-header-group", Self::TableFooterGroup => "table-footer-group",
             Self::TableRow => "table-row", Self::TableColumnGroup => "table-column-group",
@@ -718,6 +728,7 @@ impl DisplayMode {
             Self::InlineTable | Self::RunInTable => Self::Table,
             Self::InlineFlex | Self::RunInFlex => Self::Flex,
             Self::InlineGrid | Self::RunInGrid => Self::Grid,
+            Self::InlineGridLanes | Self::InlineGridLanesMulti => Self::GridLanes,
             Self::RunInFlowRoot => Self::FlowRoot,
             Self::RunInRuby => Self::BlockRuby,
             Self::InlineListItem | Self::RunInListItem => Self::ListItem,
@@ -746,6 +757,9 @@ pub enum ReadingFlowMode {
     GridRows,
     GridColumns,
     GridOrder,
+    GridLanesFlow,
+    GridLanesTrack,
+    GridLanesOrder,
     SourceOrder,
 }
 
@@ -1268,13 +1282,21 @@ pub enum GridAutoFlowMode {
 }
 
 /// Typed CSS Grid line / span / named area placement (`grid-row-*`, `grid-column-*`, `grid-area`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum GridPlacementValue {
     #[default]
     Auto,
-    Line(i16),
-    Span(u16),
-    Area(InternedStr),
+    Named(InternedStr),
+    Line {
+        index: i32,
+        index_math: Option<Box<crate::values_math::MathNode>>,
+        name: Option<InternedStr>,
+    },
+    Span {
+        count: u32,
+        count_math: Option<Box<crate::values_math::MathNode>>,
+        name: Option<InternedStr>,
+    },
 }
 
 /// Typed CSS `grid-template-areas` matrix (`columns` wide, `None` for `.` unnamed cells).
@@ -1712,6 +1734,7 @@ pub enum GridTrackSize {
     Fr(f32),
     FrMath(Box<crate::values_math::MathNode>),
     MinMax(Box<GridTrackSize>, Box<GridTrackSize>),
+    FitContent(LengthPercentage),
 }
 
 // ---------------------------------------------------------------------------
@@ -2812,7 +2835,7 @@ pub fn convert_track_size(ts: &TrackSize) -> GridTrackSize {
             Box::new(convert_track_breadth(min)),
             Box::new(convert_track_breadth(max)),
         ),
-        TrackSize::FitContent(lp) => GridTrackSize::Length(convert_length_percentage(lp)),
+        TrackSize::FitContent(lp) => GridTrackSize::FitContent(convert_length_percentage(lp)),
     }
 }
 

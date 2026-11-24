@@ -475,10 +475,12 @@ impl<'a> BoxTreeBuilder<'a> {
             DisplayMode::InlineFlex => BoxKind::InlineBlock {
                 formatting_context: FormattingContextKind::Flex,
             },
-            DisplayMode::Grid => BoxKind::Block {
+            DisplayMode::Grid | DisplayMode::GridLanes => BoxKind::Block {
                 formatting_context: FormattingContextKind::Grid,
             },
-            DisplayMode::InlineGrid => BoxKind::InlineBlock {
+            DisplayMode::InlineGrid
+            | DisplayMode::InlineGridLanes
+            | DisplayMode::InlineGridLanesMulti => BoxKind::InlineBlock {
                 formatting_context: FormattingContextKind::Grid,
             },
             DisplayMode::Table => BoxKind::Table,
@@ -1236,10 +1238,12 @@ fn classify_element_box_kind(
         DisplayMode::InlineFlex => BoxKind::InlineBlock {
             formatting_context: FormattingContextKind::Flex,
         },
-        DisplayMode::Grid | DisplayMode::RunInGrid => BoxKind::Block {
+        DisplayMode::Grid | DisplayMode::RunInGrid | DisplayMode::GridLanes => BoxKind::Block {
             formatting_context: FormattingContextKind::Grid,
         },
-        DisplayMode::InlineGrid => BoxKind::InlineBlock {
+        DisplayMode::InlineGrid
+        | DisplayMode::InlineGridLanes
+        | DisplayMode::InlineGridLanesMulti => BoxKind::InlineBlock {
             formatting_context: FormattingContextKind::Grid,
         },
         DisplayMode::Table | DisplayMode::RunInTable => BoxKind::Table,

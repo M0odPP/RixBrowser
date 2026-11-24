@@ -817,6 +817,9 @@ impl HostState {
                     | DisplayMode::InlineFlex
                     | DisplayMode::Grid
                     | DisplayMode::InlineGrid
+                    | DisplayMode::GridLanes
+                    | DisplayMode::InlineGridLanes
+                    | DisplayMode::InlineGridLanesMulti
             )
         })
     }
@@ -3507,6 +3510,20 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         Ok(el.map_or(JsValue::NULL, |id| wrap_node(vm, &h, id)))
     });
     define_host_accessor(vm, dp, "documentElement", Some(g), None);
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get children", move |vm, _, _| {
+        let ids: Vec<NodeId> = {
+            let hb = h.borrow();
+            let doc = hb.document.borrow();
+            let root = doc.root();
+            doc.children(root)
+                .filter(|&c| matches!(doc.get(c), Some(NodeData::Element(_))))
+                .collect()
+        };
+        Ok(wrap_node_list(vm, &h, ids))
+    });
+    define_host_accessor(vm, dp, "children", Some(g), None);
 
     let h = Rc::clone(host);
     let g = vm.alloc_host_fn("get scrollingElement", move |vm, _, _| {

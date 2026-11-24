@@ -2341,6 +2341,10 @@ pub fn format_grid_tracks_computed(tracks: &[crate::values::GridTrackSize], ctx:
             LengthPercentage::Percent(p) => format!("{}%", format_math_f64(f64::from(*p * 100.0))),
             _ => format!("{}px", format_math_f64(f64::from(lp.resolve_px(0.0, ctx).max(0.0)))),
         },
+        GridTrackSize::FitContent(lp) => format!(
+            "fit-content({})",
+            format_grid_tracks_computed(&[GridTrackSize::Length(lp.clone())], ctx)
+        ),
         GridTrackSize::MinMax(a, b) => format!("minmax({}, {})", format_grid_tracks_computed(&[(**a).clone()], ctx), format_grid_tracks_computed(&[(**b).clone()], ctx)),
     }).collect::<Vec<_>>().join(" ")
 }
