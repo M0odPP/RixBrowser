@@ -75,8 +75,8 @@ pub use values::{
     LengthPercentage, LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, MixBlendMode,
     OverflowMode, OverflowPair, OverflowWrapMode, OverlayMode, OverscrollBehaviorMode,
     PointerEventsMode, PositionMode, ReadingFlowMode, ResizeMode, SizeValue, TableLayoutMode,
-    TextAlignLastMode, TextAlignMode, TextDecorationLine, TextJustifyMode, TextOverflowMode,
-    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode,
-    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
-    WordBreakMode, WritingMode, ZIndexValue,
+    TextAlignLastMode, TextAlignMode, TextDecorationLine, TextJustifyMode, TextOrientationMode,
+    TextOverflowMode, TextTransformMode, TimingFunction, TransformOp, TransformOrigin,
+    TransitionBehaviorMode, TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode,
+    WhiteSpaceMode, WordBreakMode, WritingMode, ZIndexValue,
 };
