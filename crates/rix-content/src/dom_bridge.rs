@@ -41,6 +41,7 @@ pub enum DomMutation {
     Attributes {
         target: NodeId,
         attribute_name: String,
+        attribute_namespace: Option<String>,
         old_value: Option<String>,
     },
     CharacterData {
@@ -75,10 +76,28 @@ pub struct DomPrototypes {
     pub html_media_element_proto: HeapHandle,
     pub html_video_element_proto: HeapHandle,
     pub html_audio_element_proto: HeapHandle,
+    pub svg_element_proto: HeapHandle,
+    pub mathml_element_proto: HeapHandle,
     pub document_proto: HeapHandle,
+    pub html_document_proto: HeapHandle,
+    pub xml_document_proto: HeapHandle,
     pub shadow_root_proto: HeapHandle,
+    pub character_data_proto: HeapHandle,
     pub text_proto: HeapHandle,
+    pub cdata_section_proto: HeapHandle,
+    pub comment_proto: HeapHandle,
+    pub processing_instruction_proto: HeapHandle,
+    pub document_type_proto: HeapHandle,
+    pub attr_proto: HeapHandle,
     pub fragment_proto: HeapHandle,
+    pub dom_implementation_proto: HeapHandle,
+    pub dom_token_list_proto: HeapHandle,
+    pub named_node_map_proto: HeapHandle,
+    pub node_list_proto: HeapHandle,
+    pub html_collection_proto: HeapHandle,
+    pub dom_string_map_proto: HeapHandle,
+    pub tree_walker_proto: HeapHandle,
+    pub node_iterator_proto: HeapHandle,
 }
 
 impl DomPrototypes {
@@ -97,10 +116,28 @@ impl DomPrototypes {
             self.html_media_element_proto,
             self.html_video_element_proto,
             self.html_audio_element_proto,
+            self.svg_element_proto,
+            self.mathml_element_proto,
             self.document_proto,
+            self.html_document_proto,
+            self.xml_document_proto,
             self.shadow_root_proto,
+            self.character_data_proto,
             self.text_proto,
+            self.cdata_section_proto,
+            self.comment_proto,
+            self.processing_instruction_proto,
+            self.document_type_proto,
+            self.attr_proto,
             self.fragment_proto,
+            self.dom_implementation_proto,
+            self.dom_token_list_proto,
+            self.named_node_map_proto,
+            self.node_list_proto,
+            self.html_collection_proto,
+            self.dom_string_map_proto,
+            self.tree_walker_proto,
+            self.node_iterator_proto,
         ] {
             out.push(JsValue::from_object(h));
         }
@@ -115,6 +152,23 @@ pub struct HostState {
     node_to_tag: HashMap<NodeId, u64>,
     next_tag: u64,
     pub prototypes: DomPrototypes,
+    pub interface_protos: HashMap<&'static str, HeapHandle>,
+    pub doc_meta: HashMap<NodeId, crate::dom_interfaces::DocumentMeta>,
+    pub owner_docs: HashMap<NodeId, NodeId>,
+    pub main_document_url: String,
+    pub doc_implementations: HashMap<NodeId, HeapHandle>,
+    pub implementation_to_doc: HashMap<HeapHandle, NodeId>,
+    pub attrs: HashMap<HeapHandle, crate::dom_interfaces::AttrEntry>,
+    pub elem_attr_handles: HashMap<(NodeId, String, String), HeapHandle>,
+    pub named_node_maps: HashMap<NodeId, HeapHandle>,
+    pub named_node_map_to_elem: HashMap<HeapHandle, NodeId>,
+    pub token_list_cache: HashMap<(NodeId, &'static str), HeapHandle>,
+    pub token_lists: HashMap<HeapHandle, crate::dom_interfaces::TokenListEntry>,
+    pub html_collections: HashMap<HeapHandle, crate::dom_interfaces::HtmlCollectionKind>,
+    pub child_nodes_cache: HashMap<NodeId, HeapHandle>,
+    pub live_node_lists: HashMap<HeapHandle, NodeId>,
+    pub static_node_lists: HashMap<HeapHandle, Vec<NodeId>>,
+    pub traversals: HashMap<HeapHandle, crate::dom_interfaces::TraversalEntry>,
     pub active_parser: Option<Rc<RefCell<HtmlParserStream>>>,
     pub ready_state: String,
     pub viewport: Size,
@@ -161,6 +215,7 @@ impl HostState {
     pub fn new(
         document: Rc<RefCell<Document>>,
         prototypes: DomPrototypes,
+        interface_protos: HashMap<&'static str, HeapHandle>,
         viewport: Size,
         font_db: Arc<FontDatabase>,
     ) -> Self {
@@ -176,6 +231,23 @@ impl HostState {
             node_to_tag: HashMap::new(),
             next_tag: 1,
             prototypes,
+            interface_protos,
+            doc_meta: HashMap::new(),
+            owner_docs: HashMap::new(),
+            main_document_url: crate::web_apis::DEFAULT_DOCUMENT_URL.to_string(),
+            doc_implementations: HashMap::new(),
+            implementation_to_doc: HashMap::new(),
+            attrs: HashMap::new(),
+            elem_attr_handles: HashMap::new(),
+            named_node_maps: HashMap::new(),
+            named_node_map_to_elem: HashMap::new(),
+            token_list_cache: HashMap::new(),
+            token_lists: HashMap::new(),
+            html_collections: HashMap::new(),
+            child_nodes_cache: HashMap::new(),
+            live_node_lists: HashMap::new(),
+            static_node_lists: HashMap::new(),
+            traversals: HashMap::new(),
             active_parser: None,
             ready_state: "complete".to_string(),
             viewport,
@@ -318,7 +390,15 @@ impl HostState {
 
     /// Collects all host-pinned roots (prototypes, pinned weak wrappers, custom element ctors).
     pub fn collect_roots(&self, out: &mut Vec<JsValue>) {
+        for meta in self.doc_meta.values() {
+            if let Some(dv) = meta.default_view {
+                out.push(JsValue::from_object(dv));
+            }
+        }
         self.prototypes.collect_roots(out);
+        for &proto in self.interface_protos.values() {
+            out.push(JsValue::from_object(proto));
+        }
         self.wrappers.collect_pinned_roots(out);
         for def in self.custom_elements.values() {
             out.push(JsValue::from_object(def.constructor));
@@ -337,6 +417,11 @@ impl HostState {
         if let Some(sel) = self.selection.selection_handle {
             out.push(JsValue::from_object(sel));
         }
+        for entry in self.traversals.values() {
+            if let Some(f) = entry.filter {
+                out.push(JsValue::from_object(f));
+            }
+        }
     }
 
     /// Sweeps dead unpinned weak DOM wrappers and releases their tag table entries (zero leaks!).
@@ -346,6 +431,30 @@ impl HostState {
         self.selection
             .ranges
             .retain(|h, _| heap.get_object(*h).is_some());
+        self.doc_implementations
+            .retain(|_, h| heap.get_object(*h).is_some());
+        self.implementation_to_doc
+            .retain(|h, _| heap.get_object(*h).is_some());
+        self.attrs.retain(|h, _| heap.get_object(*h).is_some());
+        self.elem_attr_handles
+            .retain(|_, h| heap.get_object(*h).is_some());
+        self.named_node_maps
+            .retain(|_, h| heap.get_object(*h).is_some());
+        self.named_node_map_to_elem
+            .retain(|h, _| heap.get_object(*h).is_some());
+        self.token_list_cache
+            .retain(|_, h| heap.get_object(*h).is_some());
+        self.token_lists
+            .retain(|h, _| heap.get_object(*h).is_some());
+        self.html_collections
+            .retain(|h, _| heap.get_object(*h).is_some());
+        self.child_nodes_cache
+            .retain(|_, h| heap.get_object(*h).is_some());
+        self.live_node_lists
+            .retain(|h, _| heap.get_object(*h).is_some());
+        self.static_node_lists
+            .retain(|h, _| heap.get_object(*h).is_some());
+        self.traversals.retain(|h, _| heap.get_object(*h).is_some());
         let removed = self.wrappers.sweep_dead(heap);
         if removed > 0 {
             let mut dead_nodes = Vec::new();
@@ -1252,31 +1361,51 @@ pub fn install_dom_bridge(
     viewport: Size,
     font_db: Arc<FontDatabase>,
 ) -> SharedHost {
-    let make_proto = |vm: &mut JsVm, parent: HeapHandle| {
-        let p = vm.heap.alloc_empty_object();
-        vm.heap
-            .object_set_prototype(p, Some(parent), &mut vm.shapes);
-        vm.heap.get_object_mut(p).unwrap().is_prototype = true;
-        p
-    };
+    let make_proto = crate::dom_interfaces::make_proto;
 
     let event_target_proto = make_proto(vm, vm.object_proto);
     let node_proto = make_proto(vm, event_target_proto);
     let element_proto = make_proto(vm, node_proto);
     let html_element_proto = make_proto(vm, element_proto);
-    let html_canvas_element_proto = make_proto(vm, html_element_proto);
-    let html_iframe_element_proto = make_proto(vm, html_element_proto);
-    let html_anchor_element_proto = make_proto(vm, html_element_proto);
-    let html_area_element_proto = make_proto(vm, html_element_proto);
-    let html_base_element_proto = make_proto(vm, html_element_proto);
-    let html_form_element_proto = make_proto(vm, html_element_proto);
-    let html_media_element_proto = make_proto(vm, html_element_proto);
+    let svg_element_proto = make_proto(vm, element_proto);
+    let mathml_element_proto = make_proto(vm, element_proto);
+
+    let interface_protos = crate::dom_interfaces::build_element_interface_protos(
+        vm,
+        html_element_proto,
+        svg_element_proto,
+    );
+    let html_canvas_element_proto = interface_protos["HTMLCanvasElement"];
+    let html_iframe_element_proto = interface_protos["HTMLIFrameElement"];
+    let html_anchor_element_proto = interface_protos["HTMLAnchorElement"];
+    let html_area_element_proto = interface_protos["HTMLAreaElement"];
+    let html_base_element_proto = interface_protos["HTMLBaseElement"];
+    let html_form_element_proto = interface_protos["HTMLFormElement"];
+    let html_media_element_proto = interface_protos["HTMLMediaElement"];
     let html_video_element_proto = make_proto(vm, html_media_element_proto);
     let html_audio_element_proto = make_proto(vm, html_media_element_proto);
+
     let document_proto = make_proto(vm, node_proto);
-    let shadow_root_proto = make_proto(vm, node_proto);
-    let text_proto = make_proto(vm, node_proto);
+    let html_document_proto = make_proto(vm, document_proto);
+    let xml_document_proto = make_proto(vm, document_proto);
     let fragment_proto = make_proto(vm, node_proto);
+    let shadow_root_proto = make_proto(vm, fragment_proto);
+    let character_data_proto = make_proto(vm, node_proto);
+    let text_proto = make_proto(vm, character_data_proto);
+    let cdata_section_proto = make_proto(vm, text_proto);
+    let comment_proto = make_proto(vm, character_data_proto);
+    let processing_instruction_proto = make_proto(vm, character_data_proto);
+    let document_type_proto = make_proto(vm, node_proto);
+    let attr_proto = make_proto(vm, node_proto);
+
+    let dom_implementation_proto = make_proto(vm, vm.object_proto);
+    let dom_token_list_proto = make_proto(vm, vm.object_proto);
+    let named_node_map_proto = make_proto(vm, vm.object_proto);
+    let node_list_proto = make_proto(vm, vm.object_proto);
+    let html_collection_proto = make_proto(vm, vm.object_proto);
+    let dom_string_map_proto = make_proto(vm, vm.object_proto);
+    let tree_walker_proto = make_proto(vm, vm.object_proto);
+    let node_iterator_proto = make_proto(vm, vm.object_proto);
 
     let protos = DomPrototypes {
         event_target_proto,
@@ -1292,14 +1421,36 @@ pub fn install_dom_bridge(
         html_media_element_proto,
         html_video_element_proto,
         html_audio_element_proto,
+        svg_element_proto,
+        mathml_element_proto,
         document_proto,
+        html_document_proto,
+        xml_document_proto,
         shadow_root_proto,
+        character_data_proto,
         text_proto,
+        cdata_section_proto,
+        comment_proto,
+        processing_instruction_proto,
+        document_type_proto,
+        attr_proto,
         fragment_proto,
+        dom_implementation_proto,
+        dom_token_list_proto,
+        named_node_map_proto,
+        node_list_proto,
+        html_collection_proto,
+        dom_string_map_proto,
+        tree_walker_proto,
+        node_iterator_proto,
     };
 
     let host = Rc::new(RefCell::new(HostState::new(
-        document, protos, viewport, font_db,
+        document,
+        protos,
+        interface_protos,
+        viewport,
+        font_db,
     )));
 
     // HTML Living Standard §7.3.3.1: `Window` inherits from `WindowProperties` (named access
@@ -1478,6 +1629,7 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
         let ty = match h.borrow().document.borrow().get(nid) {
             Some(NodeData::Element(_)) => 1,
             Some(NodeData::Text(_)) => 3,
+            Some(NodeData::CDataSection(_)) => 4,
             Some(NodeData::ProcessingInstruction { .. }) => 7,
             Some(NodeData::Comment(_)) => 8,
             Some(NodeData::Document) => 9,
@@ -1502,6 +1654,7 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
                 }
             }
             Some(NodeData::Text(_)) => "#text".into(),
+            Some(NodeData::CDataSection(_)) => "#cdata-section".into(),
             Some(NodeData::Comment(_)) => "#comment".into(),
             Some(NodeData::ProcessingInstruction { target, .. }) => target.clone(),
             Some(NodeData::Document) => "#document".into(),
@@ -2216,6 +2369,7 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         h.borrow_mut()
             .invalidate_attr_mutation(nid, local, old_val.as_deref(), Some(&val));
         h.borrow().emit_mutation(DomMutation::Attributes {
+            attribute_namespace: None,
             target: nid,
             attribute_name: local.to_string(),
             old_value: old_val,
@@ -2244,6 +2398,7 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
             .invalidate_attr_mutation(nid, &local, old_val.as_deref(), None);
         if old_val.is_some() {
             h.borrow().emit_mutation(DomMutation::Attributes {
+                attribute_namespace: None,
                 target: nid,
                 attribute_name: local,
                 old_value: old_val,
@@ -4468,7 +4623,7 @@ fn install_fragment_prototype(vm: &mut JsVm, host: &SharedHost) {
     });
 }
 
-fn install_child_node_mixin(vm: &mut JsVm, host: &SharedHost, proto: HeapHandle) {
+pub(crate) fn install_child_node_mixin(vm: &mut JsVm, host: &SharedHost, proto: HeapHandle) {
     let h = Rc::clone(host);
     define_host_method(vm, proto, "remove", move |vm, t, _| {
         let nid = require_node(vm, &h, t)?;
@@ -4795,6 +4950,7 @@ pub(crate) fn set_element_attr(
     host.borrow_mut()
         .invalidate_attr_mutation(nid, name, old_val.as_deref(), Some(val));
     host.borrow().emit_mutation(DomMutation::Attributes {
+        attribute_namespace: None,
         target: nid,
         attribute_name: name.to_string(),
         old_value: old_val.clone(),
@@ -4838,6 +4994,7 @@ fn remove_element_attr(vm: &mut JsVm, host: &SharedHost, nid: NodeId, name: &str
         .invalidate_attr_mutation(nid, name, old_val.as_deref(), None);
     if old_val.is_some() {
         host.borrow().emit_mutation(DomMutation::Attributes {
+            attribute_namespace: None,
             target: nid,
             attribute_name: name.to_string(),
             old_value: old_val.clone(),

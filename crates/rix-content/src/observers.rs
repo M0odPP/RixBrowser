@@ -37,6 +37,7 @@ struct PendingMutationRecord {
     previous_sibling: Option<NodeId>,
     next_sibling: Option<NodeId>,
     attribute_name: Option<String>,
+    attribute_namespace: Option<String>,
     old_value: Option<String>,
 }
 
@@ -144,6 +145,7 @@ impl ObserverSystem {
                             previous_sibling: *previous_sibling,
                             next_sibling: *next_sibling,
                             attribute_name: None,
+                            attribute_namespace: None,
                             old_value: None,
                         });
                     }
@@ -151,15 +153,17 @@ impl ObserverSystem {
                 DomMutation::Attributes {
                     target,
                     attribute_name,
+                    attribute_namespace,
                     old_value,
                 } => {
                     let matched = mo.watches.iter().find(|w| {
                         w.attributes
                             && (w.target == *target
                                 || (w.subtree && doc.ancestors(*target).any(|a| a == w.target)))
-                            && w.attribute_filter
-                                .as_ref()
-                                .is_none_or(|f| f.iter().any(|name| name == attribute_name))
+                            && w.attribute_filter.as_ref().is_none_or(|f| {
+                                attribute_namespace.is_none()
+                                    && f.iter().any(|name| name == attribute_name)
+                            })
                     });
                     if let Some(w) = matched {
                         mo.pending.push(PendingMutationRecord {
@@ -170,6 +174,7 @@ impl ObserverSystem {
                             previous_sibling: None,
                             next_sibling: None,
                             attribute_name: Some(attribute_name.clone()),
+                            attribute_namespace: attribute_namespace.clone(),
                             old_value: if w.attribute_old_value {
                                 old_value.clone()
                             } else {
@@ -193,6 +198,7 @@ impl ObserverSystem {
                             previous_sibling: None,
                             next_sibling: None,
                             attribute_name: None,
+                            attribute_namespace: None,
                             old_value: if w.character_data_old_value {
                                 Some(old_value.clone())
                             } else {
@@ -494,6 +500,10 @@ fn build_mutation_record_array(
             JsValue::from_string(vm.heap.alloc_string(s))
         });
         set_prop(vm, "attributeName", attr_v);
+        let attr_ns_v = rec.attribute_namespace.map_or(JsValue::NULL, |s| {
+            JsValue::from_string(vm.heap.alloc_string(s))
+        });
+        set_prop(vm, "attributeNamespace", attr_ns_v);
         let old_v = rec.old_value.map_or(JsValue::NULL, |s| {
             JsValue::from_string(vm.heap.alloc_string(s))
         });

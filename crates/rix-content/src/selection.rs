@@ -1084,3 +1084,41 @@ pub fn install_selection_and_range(vm: &mut JsVm, host: &SharedHost) {
     vm.mark_constructor(range_ctor);
     define_global(vm, "Range", JsValue::from_object(range_ctor));
 }
+
+/// Live `Range` mutation hook stubs (upgraded to full live WHATWG §5.2 tracking in Part 6B-3b).
+pub fn adjust_ranges_for_replace_data(
+    _host: &SharedHost,
+    _node: NodeId,
+    _offset: usize,
+    _count: usize,
+    _inserted_len: usize,
+) {
+}
+
+pub fn adjust_ranges_for_split_text(
+    _host: &SharedHost,
+    _old_node: NodeId,
+    _new_node: NodeId,
+    _parent: NodeId,
+    _old_index: usize,
+    _offset: usize,
+) {
+}
+
+pub fn adjust_ranges_for_remove_node(
+    _host: &SharedHost,
+    _removed: NodeId,
+    _old_parent: NodeId,
+    _old_index: usize,
+) {
+}
+
+pub fn adjust_ranges_for_normalize_merge(
+    _host: &SharedHost,
+    _first_text: NodeId,
+    _removed_text: NodeId,
+    _parent: NodeId,
+    _removed_index: usize,
+    _prev_len: usize,
+) {
+}
