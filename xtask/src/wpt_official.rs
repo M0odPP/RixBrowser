@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use vello::peniko::Color;
 use vello::Scene;
 
-use crate::reftest::{compare_rgba, extract_style_blocks, shared_font_db};
+use crate::reftest::{compare_rgba, extract_style_blocks};
 
 /// Spec-compatible WPT `testharness.js` bridge capturing exact subtest pass/fail outcomes.
 const WPT_TESTHARNESS_SHIM: &str = r#"
@@ -685,14 +685,9 @@ fn render_wpt_reftest_rgba(
     let mut engine = LayoutEngine::new();
     let pipeline = PipelineId(1);
     let mut resources = ResourceRegistry::default();
-    let frame = engine.layout_and_paint(
-        &doc,
-        &styles,
-        viewport,
-        shared_font_db(),
-        pipeline,
-        &mut resources,
-    );
+    let font_db = wpt_font_db(wpt_root);
+    let frame =
+        engine.layout_and_paint(&doc, &styles, viewport, &font_db, pipeline, &mut resources);
     let mut scene = Scene::new();
     encode_display_list(
         pipeline,
@@ -713,13 +708,21 @@ struct ScriptRunOutcome {
     reason: Option<String>,
 }
 
-fn run_wpt_testharness_file(wpt_root: &Path, path: &Path, html: &str) -> ScriptRunOutcome {
+fn wpt_font_db(wpt_root: &Path) -> Arc<rix_text::FontDatabase> {
     static FONT_DB: std::sync::OnceLock<Arc<rix_text::FontDatabase>> = std::sync::OnceLock::new();
-    let font_db = Arc::clone(FONT_DB.get_or_init(|| {
+    Arc::clone(FONT_DB.get_or_init(|| {
         let mut db = rix_text::FontDatabase::new();
         db.scan_system_fonts();
+        let ahem = wpt_root.join("fonts").join("Ahem.ttf");
+        if ahem.exists() {
+            let _ = db.load_font_file(&ahem);
+        }
         Arc::new(db)
-    }));
+    }))
+}
+
+fn run_wpt_testharness_file(wpt_root: &Path, path: &Path, html: &str) -> ScriptRunOutcome {
+    let font_db = wpt_font_db(wpt_root);
 
     let parsed = parse_html(html);
     let viewport = Size::new(800.0, 600.0);

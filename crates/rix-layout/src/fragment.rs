@@ -133,7 +133,15 @@ pub struct BoxMetrics {
 impl BoxMetrics {
     #[must_use]
     pub fn resolve(style: &ComputedStyle, space: &ConstraintSpace) -> Self {
-        let eval = space.eval_context_for(style);
+        Self::resolve_with_eval(style, space, space.eval_context_for(style))
+    }
+
+    #[must_use]
+    pub fn resolve_with_eval(
+        style: &ComputedStyle,
+        space: &ConstraintSpace,
+        eval: EvalContext,
+    ) -> Self {
         let cb_w = space.containing_block_width;
         let cb_h = space.containing_block_height;
         let bm = &style.box_model;
@@ -521,6 +529,7 @@ struct FragmentCacheKey {
 pub struct LayoutCache {
     fragments: FastMap<FragmentCacheKey, Arc<Fragment>>,
     font_matches: FastMap<(usize, usize), FontId>,
+    ch_advances: FastMap<(FontId, u32), f32>,
     pub(crate) taffy_containers: HashMap<u64, RetainedTaffyContainer>,
     pub cache_hits: usize,
     pub cache_misses: usize,
@@ -540,6 +549,7 @@ impl LayoutCache {
     pub fn clear(&mut self) {
         self.fragments.clear();
         self.font_matches.clear();
+        self.ch_advances.clear();
         self.taffy_containers.clear();
         self.cache_hits = 0;
         self.cache_misses = 0;
@@ -564,6 +574,37 @@ impl LayoutCache {
         }
         self.font_matches.insert(key, id);
         id
+    }
+
+    /// Resolves and caches the CSS Values L3 §5.1.1 `1ch` advance measure (`"0"` glyph width).
+    pub fn ch_advance_px(
+        &mut self,
+        font_db: &FontDatabase,
+        web_fonts: Option<&FontFaceSet>,
+        shaping_cache: &Arc<TextShapingCache>,
+        style: &ComputedStyle,
+    ) -> f32 {
+        if style.text.font_size_px <= 0.0 {
+            return 0.0;
+        }
+        let font_id = self.resolve_font(font_db, web_fonts, style);
+        let font_size = style.text.font_size_px;
+        let key = (font_id, font_size.to_bits());
+        if let Some(&w) = self.ch_advances.get(&key) {
+            return w;
+        }
+        let shaper = TextShaper::with_cache(font_db, Arc::clone(shaping_cache));
+        let w: f32 = shaper
+            .shape_text("0", font_id, font_size)
+            .iter()
+            .map(|r| r.width)
+            .sum();
+        let adv = if w > 0.0 { w } else { font_size * 0.5 };
+        if self.ch_advances.len() > 4096 {
+            self.ch_advances.clear();
+        }
+        self.ch_advances.insert(key, adv);
+        adv
     }
 
     fn make_key(
@@ -649,6 +690,48 @@ impl<'a> LayoutContext<'a> {
     }
     pub fn resolve_font(&mut self, style: &ComputedStyle) -> FontId {
         self.cache.resolve_font(self.font_db, self.web_fonts, style)
+    }
+
+    /// Resolves the CSS Values L3 §5.1.1 `1ch` advance measure (`"0"` glyph width) for `style`.
+    pub fn ch_advance_px(&mut self, style: &ComputedStyle) -> f32 {
+        if style.text.font_size_px <= 0.0 {
+            return 0.0;
+        }
+        let font_id = self.resolve_font(style);
+        let font_size = style.text.font_size_px;
+        let key = (font_id, font_size.to_bits());
+        if let Some(&w) = self.cache.ch_advances.get(&key) {
+            return w;
+        }
+        let w: f32 = self
+            .shaper
+            .shape_text("0", font_id, font_size)
+            .iter()
+            .map(|r| r.width)
+            .sum();
+        let adv = if w > 0.0 { w } else { font_size * 0.5 };
+        if self.cache.ch_advances.len() > 4096 {
+            self.cache.ch_advances.clear();
+        }
+        self.cache.ch_advances.insert(key, adv);
+        adv
+    }
+
+    /// Builds an [`EvalContext`] populated with the element's real font-metric `ch` advance.
+    pub fn eval_context_for(
+        &mut self,
+        style: &ComputedStyle,
+        space: &ConstraintSpace,
+    ) -> EvalContext {
+        let mut eval = space.eval_context_for(style);
+        eval.ch_px = Some(self.ch_advance_px(style));
+        eval
+    }
+
+    /// Resolves [`BoxMetrics`] using the element's real font-metric [`EvalContext`].
+    pub fn box_metrics(&mut self, style: &ComputedStyle, space: &ConstraintSpace) -> BoxMetrics {
+        let eval = self.eval_context_for(style, space);
+        BoxMetrics::resolve_with_eval(style, space, eval)
     }
 
     #[inline]

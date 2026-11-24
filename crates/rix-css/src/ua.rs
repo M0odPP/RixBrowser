@@ -122,10 +122,19 @@ button, input[type="submit"], input[type="button"], input[type="reset"] {
 img, svg, canvas, video {
     display: inline-block;
 }
-:dir(rtl) {
+[dir="rtl" i] {
     direction: rtl;
 }
-:dir(ltr) {
+[dir="ltr" i] {
+    direction: ltr;
+}
+[dir="auto" i]:dir(rtl) {
+    direction: rtl;
+}
+[dir="auto" i]:dir(ltr) {
+    direction: ltr;
+}
+input[type="tel" i]:dir(ltr) {
     direction: ltr;
 }
 "#;

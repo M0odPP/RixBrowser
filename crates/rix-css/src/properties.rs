@@ -221,15 +221,22 @@ fn convert_token_or_value(item: &TokenOrValue<'_>, out: &mut Vec<CssToken>) {
             out.push(CssToken::Dimension(angle_to_deg(a), intern_str("deg")));
         }
         TokenOrValue::Time(t) => {
-            let ms = match t {
-                lightningcss::values::time::Time::Seconds(s) => *s * 1000.0,
-                lightningcss::values::time::Time::Milliseconds(m) => *m,
+            let secs = match t {
+                lightningcss::values::time::Time::Seconds(s) => *s,
+                lightningcss::values::time::Time::Milliseconds(m) => *m / 1000.0,
             };
-            out.push(CssToken::Dimension(ms, intern_str("ms")));
+            out.push(CssToken::Dimension(secs, intern_str("s")));
         }
         TokenOrValue::DashedIdent(id) => out.push(CssToken::Ident(intern_str(id.as_ref()))),
-        TokenOrValue::Resolution(_)
-        | TokenOrValue::Env(_)
+        TokenOrValue::Resolution(r) => {
+            let dppx = match r {
+                lightningcss::values::resolution::Resolution::Dpi(v) => *v / 96.0,
+                lightningcss::values::resolution::Resolution::Dpcm(v) => *v * 2.54 / 96.0,
+                lightningcss::values::resolution::Resolution::Dppx(v) => *v,
+            };
+            out.push(CssToken::Dimension(dppx, intern_str("dppx")));
+        }
+        TokenOrValue::Env(_)
         | TokenOrValue::UnresolvedColor(_)
         | TokenOrValue::AnimationName(_) => {}
     }
@@ -430,6 +437,26 @@ pub enum PropertyIdKind {
     BackgroundColor,
     BackgroundLayers,
     BackgroundPosition,
+    BackgroundPositionX,
+    BackgroundPositionY,
+    ObjectPosition,
+    OffsetDistance,
+    ShapeMargin,
+    StrokeWidth,
+    StrokeDashoffset,
+    StrokeDasharray,
+    ScrollPaddingTop,
+    ScrollPaddingRight,
+    ScrollPaddingBottom,
+    ScrollPaddingLeft,
+    SvgCx,
+    SvgCy,
+    SvgRx,
+    SvgRy,
+    SvgX,
+    SvgY,
+    BorderImageSlice,
+    AspectRatio,
     BoxShadow,
     Transform,
     TransformOrigin,
@@ -724,6 +751,26 @@ impl PropertyIdKind {
             "background-color" => Self::BackgroundColor,
             "background-image" => Self::BackgroundLayers,
             "background-position" => Self::BackgroundPosition,
+            "background-position-x" => Self::BackgroundPositionX,
+            "background-position-y" => Self::BackgroundPositionY,
+            "object-position" => Self::ObjectPosition,
+            "offset-distance" => Self::OffsetDistance,
+            "shape-margin" => Self::ShapeMargin,
+            "stroke-width" => Self::StrokeWidth,
+            "stroke-dashoffset" => Self::StrokeDashoffset,
+            "stroke-dasharray" => Self::StrokeDasharray,
+            "scroll-padding-top" => Self::ScrollPaddingTop,
+            "scroll-padding-right" => Self::ScrollPaddingRight,
+            "scroll-padding-bottom" => Self::ScrollPaddingBottom,
+            "scroll-padding-left" => Self::ScrollPaddingLeft,
+            "cx" => Self::SvgCx,
+            "cy" => Self::SvgCy,
+            "rx" => Self::SvgRx,
+            "ry" => Self::SvgRy,
+            "x" => Self::SvgX,
+            "y" => Self::SvgY,
+            "border-image-slice" => Self::BorderImageSlice,
+            "aspect-ratio" => Self::AspectRatio,
             "box-shadow" => Self::BoxShadow,
             "transform" => Self::Transform,
             "transform-origin" => Self::TransformOrigin,
@@ -888,6 +935,26 @@ impl PropertyIdKind {
             Self::BackgroundColor => "background-color",
             Self::BackgroundLayers => "background-image",
             Self::BackgroundPosition => "background-position",
+            Self::BackgroundPositionX => "background-position-x",
+            Self::BackgroundPositionY => "background-position-y",
+            Self::ObjectPosition => "object-position",
+            Self::OffsetDistance => "offset-distance",
+            Self::ShapeMargin => "shape-margin",
+            Self::StrokeWidth => "stroke-width",
+            Self::StrokeDashoffset => "stroke-dashoffset",
+            Self::StrokeDasharray => "stroke-dasharray",
+            Self::ScrollPaddingTop => "scroll-padding-top",
+            Self::ScrollPaddingRight => "scroll-padding-right",
+            Self::ScrollPaddingBottom => "scroll-padding-bottom",
+            Self::ScrollPaddingLeft => "scroll-padding-left",
+            Self::SvgCx => "cx",
+            Self::SvgCy => "cy",
+            Self::SvgRx => "rx",
+            Self::SvgRy => "ry",
+            Self::SvgX => "x",
+            Self::SvgY => "y",
+            Self::BorderImageSlice => "border-image-slice",
+            Self::AspectRatio => "aspect-ratio",
             Self::BoxShadow => "box-shadow",
             Self::Transform => "transform",
             Self::TransformOrigin => "transform-origin",
@@ -1403,7 +1470,27 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "min-inline-size",
     "min-width",
     "mix-blend-mode",
+    "object-position",
+    "offset-distance",
     "opacity",
+    "scroll-padding-bottom",
+    "scroll-padding-left",
+    "scroll-padding-right",
+    "scroll-padding-top",
+    "shape-margin",
+    "stroke-dasharray",
+    "stroke-dashoffset",
+    "stroke-width",
+    "background-position-x",
+    "background-position-y",
+    "border-image-slice",
+    "aspect-ratio",
+    "cx",
+    "cy",
+    "rx",
+    "ry",
+    "x",
+    "y",
     "order",
     "orphans",
     "outline-color",
@@ -1518,6 +1605,7 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::BackgroundColor,
     PropertyIdKind::BackgroundLayers,
     PropertyIdKind::BackgroundPosition,
+    PropertyIdKind::ObjectPosition,
     PropertyIdKind::BoxShadow,
     PropertyIdKind::Transform,
     PropertyIdKind::TransformOrigin,
@@ -1918,6 +2006,13 @@ pub enum PropertyValue {
     Translate(crate::values_math::TranslateSpec),
     TransformRaw(String),
     BgPosition(LengthPercentage, LengthPercentage),
+    ObjectPos(Box<crate::values_math::PositionSpec>),
+    AspectRatioMath(
+        Option<(
+            Box<crate::values_math::MathNode>,
+            Option<Box<crate::values_math::MathNode>>,
+        )>,
+    ),
     InterpolateSize(InterpolateSizeMode),
     TransitionBehaviorList(Vec<TransitionBehaviorMode>),
     AnimationCompositionList(Vec<AnimationCompositionMode>),
@@ -1927,44 +2022,45 @@ impl PropertyValue {
     /// Returns `true` if this declaration's value depends on `sibling-index()` or `sibling-count()`.
     #[must_use]
     pub fn contains_sibling_fn(&self) -> bool {
+        let node_has =
+            |n: &crate::values_math::MathNode| n.contains_sibling_fn() || n.contains_random();
         let lp_has = |lp: &LengthPercentage| {
             matches!(
                 lp,
-                LengthPercentage::Calc(c) if matches!(c.as_ref(), crate::values::CalcExpr::Math(n) if n.contains_sibling_fn())
+                LengthPercentage::Calc(c) if matches!(c.as_ref(), crate::values::CalcExpr::Math(n) if node_has(n))
             )
         };
         match self {
-            Self::MathVal(n) => n.contains_sibling_fn(),
+            Self::MathVal(n) => node_has(n),
             Self::Length(lp)
             | Self::LengthAuto(LengthPercentageAuto::Value(lp))
             | Self::Size(SizeValue::Length(lp)) => lp_has(lp),
             Self::Size(SizeValue::CalcSize(cs)) => cs.contains_sibling_fn(),
             Self::CornerRadius(cr) => lp_has(&cr.x) || lp_has(&cr.y),
             Self::BgPosition(x, y) => lp_has(x) || lp_has(y),
-            Self::Scale(crate::values_math::ScaleSpec::Values(v)) => v
-                .iter()
-                .any(crate::values_math::MathNode::contains_sibling_fn),
+            Self::Scale(crate::values_math::ScaleSpec::Values(v)) => v.iter().any(node_has),
             Self::Rotate(crate::values_math::RotateSpec::Angle { axis, angle }) => {
-                angle.contains_sibling_fn()
-                    || axis.as_ref().is_some_and(|a| {
-                        a.iter()
-                            .any(crate::values_math::MathNode::contains_sibling_fn)
-                    })
+                node_has(angle) || axis.as_ref().is_some_and(|a| a.iter().any(node_has))
             }
             Self::Translate(crate::values_math::TranslateSpec::Values { x, y, z }) => {
-                x.contains_sibling_fn()
-                    || y.as_ref()
-                        .is_some_and(crate::values_math::MathNode::contains_sibling_fn)
-                    || z.as_ref()
-                        .is_some_and(crate::values_math::MathNode::contains_sibling_fn)
+                node_has(x) || y.as_ref().is_some_and(node_has) || z.as_ref().is_some_and(node_has)
             }
-            Self::TransformRaw(s) => s.to_ascii_lowercase().contains("sibling-"),
+            Self::TransformRaw(s) => {
+                let l = s.to_ascii_lowercase();
+                l.contains("sibling-") || l.contains("random(")
+            }
             Self::GridTracks(v) => v.iter().any(|t| match t {
-                GridTrackSize::FrMath(n) => n.contains_sibling_fn(),
+                GridTrackSize::FrMath(n) => node_has(n),
                 GridTrackSize::Length(lp) => lp_has(lp),
                 _ => false,
             }),
-            Self::Color4(c) => c.to_specified_css_string().contains("sibling-"),
+            Self::Color4(c) => {
+                let s = c.to_specified_css_string();
+                s.contains("sibling-") || s.contains("random(")
+            }
+            Self::AspectRatioMath(Some((a, b))) => {
+                node_has(a) || b.as_deref().is_some_and(node_has)
+            }
             Self::Custom(toks) | Self::Unresolved(toks) => tokens_contain_sibling_fn(toks),
             _ => false,
         }
@@ -1975,7 +2071,10 @@ fn tokens_contain_sibling_fn(toks: &[CssToken]) -> bool {
     toks.iter().any(|t| match t {
         CssToken::Function { name, args } => {
             let l = name.as_str().to_ascii_lowercase();
-            l == "sibling-index" || l == "sibling-count" || tokens_contain_sibling_fn(args)
+            l == "sibling-index"
+                || l == "sibling-count"
+                || l == "random"
+                || tokens_contain_sibling_fn(args)
         }
         CssToken::Var {
             fallback: Some(fb), ..
@@ -2188,6 +2287,26 @@ pub fn is_values4_native_property(prop: PropertyIdKind) -> bool {
             | PropertyIdKind::Translate
             | PropertyIdKind::ImageResolution
             | PropertyIdKind::BackgroundPosition
+            | PropertyIdKind::BackgroundPositionX
+            | PropertyIdKind::BackgroundPositionY
+            | PropertyIdKind::ObjectPosition
+            | PropertyIdKind::OffsetDistance
+            | PropertyIdKind::ShapeMargin
+            | PropertyIdKind::StrokeWidth
+            | PropertyIdKind::StrokeDashoffset
+            | PropertyIdKind::StrokeDasharray
+            | PropertyIdKind::ScrollPaddingTop
+            | PropertyIdKind::ScrollPaddingRight
+            | PropertyIdKind::ScrollPaddingBottom
+            | PropertyIdKind::ScrollPaddingLeft
+            | PropertyIdKind::SvgCx
+            | PropertyIdKind::SvgCy
+            | PropertyIdKind::SvgRx
+            | PropertyIdKind::SvgRy
+            | PropertyIdKind::SvgX
+            | PropertyIdKind::SvgY
+            | PropertyIdKind::BorderImageSlice
+            | PropertyIdKind::AspectRatio
             | PropertyIdKind::Orphans
             | PropertyIdKind::Widows
             | PropertyIdKind::TabSize
@@ -2218,7 +2337,11 @@ pub fn should_use_values4_parser(prop: PropertyIdKind, raw: &str) -> bool {
     if is_sizing_property(prop)
         && (lower.starts_with("calc-size(")
             || lower == "stretch"
-            || (prop == PropertyIdKind::FlexBasis && lower == "content"))
+            || (prop == PropertyIdKind::FlexBasis
+                && matches!(
+                    lower.as_str(),
+                    "content" | "min-content" | "max-content" | "fit-content"
+                )))
     {
         return true;
     }
@@ -2258,7 +2381,12 @@ pub fn values4_property_kind(prop: PropertyIdKind) -> Option<(crate::values_math
         | P::MarginBlockStart | P::MarginBlockEnd | P::MarginInlineStart | P::MarginInlineEnd
         | P::Top | P::Right | P::Bottom | P::Left | P::InsetBlockStart | P::InsetBlockEnd
         | P::InsetInlineStart | P::InsetInlineEnd | P::TextIndent | P::OutlineOffset
-        | P::WordSpacing | P::LetterSpacing => Some((VK::LengthPercentage, false)),
+        | P::WordSpacing | P::LetterSpacing | P::OffsetDistance | P::BackgroundPositionX
+        | P::BackgroundPositionY | P::StrokeDashoffset | P::SvgCx | P::SvgCy | P::SvgX | P::SvgY => Some((VK::LengthPercentage, false)),
+        P::ShapeMargin | P::StrokeWidth | P::StrokeDasharray | P::ScrollPaddingTop
+        | P::ScrollPaddingRight | P::ScrollPaddingBottom | P::ScrollPaddingLeft
+        | P::SvgRx | P::SvgRy => Some((VK::LengthPercentage, true)),
+        P::BorderImageSlice => Some((VK::NumberOrPercentage, true)),
         P::BorderTopWidth | P::BorderRightWidth | P::BorderBottomWidth | P::BorderLeftWidth
         | P::BorderBlockStartWidth | P::BorderBlockEndWidth | P::BorderInlineStartWidth
         | P::BorderInlineEndWidth | P::OutlineWidth => Some((VK::Length, true)),
@@ -2423,10 +2551,53 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
                 "stretch".to_string(),
             ));
         }
-        PropertyIdKind::FlexBasis if trimmed.eq_ignore_ascii_case("content") => {
+        PropertyIdKind::FlexBasis
+            if matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "content" | "min-content" | "max-content" | "fit-content"
+            ) =>
+        {
+            let lower = trimmed.to_ascii_lowercase();
+            let sv = match lower.as_str() {
+                "min-content" => SizeValue::MinContent,
+                "max-content" => SizeValue::MaxContent,
+                "fit-content" => SizeValue::FitContent(None),
+                _ => SizeValue::Content,
+            };
+            return Some((PropertyValue::Size(sv), lower));
+        }
+        PropertyIdKind::ObjectPosition => {
+            let (pos, s) = crate::values_math::PositionSpec::parse(trimmed)?;
+            return Some((PropertyValue::ObjectPos(Box::new(pos)), s));
+        }
+        PropertyIdKind::AspectRatio => {
+            if trimmed.eq_ignore_ascii_case("auto") {
+                return Some((PropertyValue::AspectRatioMath(None), "auto".to_string()));
+            }
+            let mut pi = cssparser::ParserInput::new(trimmed);
+            let mut p = cssparser::Parser::new(&mut pi);
+            let mut rc = 0u32;
+            let mut a = parse_math_value_from_parser(&mut p, ValueKind::Number)?;
+            a.node.bind_random_property("aspect-ratio", &mut rc);
+            let sa = a.node.serialize_specified(a.was_math_fn);
+            if p.is_exhausted() {
+                return Some((
+                    PropertyValue::AspectRatioMath(Some((Box::new(a.node), None))),
+                    sa,
+                ));
+            }
+            if p.expect_delim('/').is_err() {
+                return None;
+            }
+            let mut b = parse_math_value_from_parser(&mut p, ValueKind::Number)?;
+            if !p.is_exhausted() {
+                return None;
+            }
+            b.node.bind_random_property("aspect-ratio", &mut rc);
+            let sb = b.node.serialize_specified(b.was_math_fn);
             return Some((
-                PropertyValue::Size(SizeValue::Content),
-                "content".to_string(),
+                PropertyValue::AspectRatioMath(Some((Box::new(a.node), Some(Box::new(b.node))))),
+                format!("{sa} / {sb}"),
             ));
         }
         PropertyIdKind::Scale => {
@@ -2572,7 +2743,7 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
     }
 
     let (kind, nonneg) = values4_property_kind(prop)?;
-    let pm = parse_math_value(trimmed, kind)?;
+    let mut pm = parse_math_value(trimmed, kind)?;
     if nonneg && !pm.was_math_fn {
         let min_v = if matches!(
             prop,
@@ -2592,6 +2763,9 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
             _ => {}
         }
     }
+    let mut rand_counter = 0u32;
+    pm.node
+        .bind_random_property(prop.css_name(), &mut rand_counter);
     let spec = pm.node.serialize_specified(pm.was_math_fn);
     let lp = || LengthPercentage::Calc(Box::new(CalcExpr::Math(Box::new(pm.node.clone()))));
     let val = match prop {
@@ -2682,7 +2856,7 @@ fn parse_timing_fn_from_parser<'i, 't>(p: &mut cssparser::Parser<'i, 't>) -> Opt
                     || !y1.is_finite() || !y2.is_finite() {
                     return Err(n.new_custom_error(()));
                 }
-                let fmt = |v: f64| crate::values_math::format_math_f64(v);
+                let fmt = |v: f64| if v == 0.0 { "0".to_string() } else { format!("{v}") };
                 Ok((TimingFunction::CubicBezier(x1, y1, x2, y2), format!("cubic-bezier({}, {}, {}, {})", fmt(x1), fmt(y1), fmt(x2), fmt(y2))))
             }).ok();
             if res.is_none() { p.reset(&st); }
@@ -3167,7 +3341,8 @@ pub fn parse_property_from_tokens(
     let mut buf = String::with_capacity(64);
     write_tokens_for_reparse(tokens, &mut buf);
     if crate::cssom_decl::is_color_longhand(prop) {
-        if let Some(expr) = crate::color::parse_css_color(buf.trim()) {
+        if let Some(mut expr) = crate::color::parse_css_color(buf.trim()) {
+            expr.bind_random_property(prop.css_name());
             return vec![SpecifiedDeclaration {
                 property: prop,
                 custom_name: None,
@@ -5734,7 +5909,8 @@ fn compile_property(
             };
             if let Some((sent_name, raw_val)) = sentinel_raw {
                 if sent_name == "--__rix_color4__" {
-                    if let Some(expr) = crate::color::parse_css_color(raw_val) {
+                    if let Some(mut expr) = crate::color::parse_css_color(raw_val) {
+                        expr.bind_random_property(kind.css_name());
                         push_decl(out, ord, kind, PropertyValue::Color4(Box::new(expr)), imp);
                     }
                 } else if let Some((val, _)) = parse_values4_property(kind, raw_val) {

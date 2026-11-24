@@ -67,6 +67,12 @@ impl LayoutEngine {
         self.cache.clear();
     }
 
+    /// Resolves the CSS Values L3 §5.1.1 `1ch` advance measure (`"0"` glyph width) for `style`.
+    pub fn ch_advance_px(&mut self, style: &rix_css::ComputedStyle, font_db: &FontDatabase) -> f32 {
+        self.cache
+            .ch_advance_px(font_db, Some(&self.web_fonts), &self.shaping_cache, style)
+    }
+
     /// Runs `BoxTree -> FragmentTree` layout pass (without painting) and returns timing metrics.
     pub fn layout_only(
         &mut self,

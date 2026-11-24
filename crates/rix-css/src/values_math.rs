@@ -203,6 +203,27 @@ impl RoundStrategy {
     }
 }
 
+/// Parsed CSS Values L5 `random([<options>,]? <min>, <max> [, <step>]?)` AST node.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RandomNode {
+    pub dashed_ident: Option<String>,
+    pub element_scoped: bool,
+    pub prop_scoped: bool,
+    pub prop_index_scoped: bool,
+    pub ua_ident: Option<String>,
+    pub fixed: Option<(Box<MathNode>, bool)>,
+    pub min: Box<MathNode>,
+    pub max: Box<MathNode>,
+    pub step: Option<Box<MathNode>>,
+}
+
+/// Weighted item inside a CSS Values L5 `calc-mix(...)` expression.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalcMixItem {
+    pub value: MathNode,
+    pub weight: Option<(MathNode, bool)>,
+}
+
 /// W3C CSS Values L4/L5 canonical calculation tree node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MathNode {
@@ -237,6 +258,8 @@ pub enum MathNode {
     Abs(Box<MathNode>),
     Sign(Box<MathNode>),
     Progress(bool, Box<MathNode>, Box<MathNode>, Box<MathNode>),
+    CalcMix(Vec<CalcMixItem>),
+    Random(Box<RandomNode>),
 }
 
 /// Parsed CSS numeric/math value along with whether the top-level was a math function.
@@ -311,6 +334,24 @@ impl MathNode {
                 let t = CalcType::add_consistent(CalcType::add_consistent(v.calc_type()?, s.calc_type()?)?, e.calc_type()?)?;
                 Some(CalcType { dims: [0; 6], percent: 0, percent_hint: t.percent_hint, has_percent: t.percent_hint.is_some() })
             }
+            Self::CalcMix(items) => {
+                let mut acc = items.first()?.value.calc_type()?;
+                for it in items {
+                    if let Some((w, _)) = &it.weight {
+                        if !w.calc_type()?.is_pure_percent() { return None; }
+                    }
+                    acc = add_ok(acc, it.value.calc_type()?)?;
+                }
+                Some(acc)
+            }
+            Self::Random(r) => {
+                if let Some((f, _)) = &r.fixed {
+                    f.calc_type()?.as_hinted_number()?;
+                }
+                let mut acc = add_ok(r.min.calc_type()?, r.max.calc_type()?)?;
+                if let Some(st) = &r.step { acc = add_ok(acc, st.calc_type()?)?; }
+                Some(acc)
+            }
         }
     }
 
@@ -350,6 +391,8 @@ impl MathNode {
             Self::Hypot(items) => simplify_hypot(sv(items)),
             Self::Abs(a) => simplify_abs(s(a)), Self::Sign(a) => simplify_sign(s(a)),
             Self::Progress(nc, v, st, en) => simplify_progress(*nc, s(v), s(st), s(en)),
+            Self::CalcMix(items) => simplify_calc_mix(items, ctx, pct_basis),
+            Self::Random(r) => simplify_random(r, ctx, pct_basis),
         }
     }
 
@@ -380,13 +423,51 @@ impl MathNode {
 
     #[must_use]
     pub fn serialize_computed(&self, ctx: &EvalContext, pct_basis: Option<(f64, bool)>, target: ValueKind, min_bound: Option<f64>, max_bound: Option<f64>) -> String {
-        match self.simplify(Some(ctx), pct_basis) {
+        let mut simp = self.simplify(Some(ctx), pct_basis);
+        if pct_basis.is_none() && matches!(target, ValueKind::Percentage | ValueKind::NumberOrPercentage) {
+            simp = resolve_pure_percent_random(simp);
+        }
+        match simp {
             Self::Number(v) => format_computed_scalar(v, None, target, min_bound, max_bound),
             Self::Percent(p) => format_computed_scalar(p, Some("%"), target, min_bound, max_bound),
             Self::Dimension(v, u) => format_computed_scalar(v, Some(u.as_str()), target, min_bound, max_bound),
             other => serialize_top_level_calc(&other, false),
         }
     }
+}
+
+#[rustfmt::skip]
+fn resolve_pure_percent_random(node: MathNode) -> MathNode {
+    if let MathNode::Random(r) = &node {
+        if let (Some(MathNode::Number(rv)), MathNode::Percent(lo), MathNode::Percent(hi)) =
+            (r.fixed.as_ref().map(|(b, _)| b.as_ref()), r.min.as_ref(), r.max.as_ref())
+        {
+            let st_v = match r.step.as_deref() {
+                None => Some(None),
+                Some(MathNode::Percent(s)) => Some(Some(*s)),
+                _ => None,
+            };
+            if let Some(st) = st_v {
+                let out = if rv.is_nan() || lo.is_nan() || hi.is_nan() || st.is_some_and(f64::is_nan) {
+                    f64::NAN
+                } else if hi <= lo {
+                    *lo
+                } else if !lo.is_finite() || !hi.is_finite() {
+                    f64::NAN
+                } else if let Some(sv) = st.filter(|&s| s > 0.0) {
+                    if sv.is_infinite() || sv > (hi - lo) { *lo } else {
+                        let n = ((hi - lo) / sv).floor() + 1.0;
+                        let k = (rv * n).floor().min(n - 1.0);
+                        lo + k * sv
+                    }
+                } else {
+                    lo + rv * (hi - lo)
+                };
+                return MathNode::Percent(out);
+            }
+        }
+    }
+    node
 }
 
 #[rustfmt::skip]
@@ -399,7 +480,8 @@ fn resolve_length_unit_f64(unit: LengthUnit, v: f64, ctx: &EvalContext) -> f64 {
         LengthUnit::Px => v,
         LengthUnit::Em => v * fs,
         LengthUnit::Rem => v * rfs,
-        LengthUnit::Ex | LengthUnit::Ch => v * fs * 0.5,
+        LengthUnit::Ex => v * fs * 0.5,
+        LengthUnit::Ch => v * ctx.ch_px.map_or(fs * 0.5, f64::from),
         LengthUnit::Rex | LengthUnit::Rch => v * rfs * 0.5,
         LengthUnit::Cap => v * fs * 0.7,
         LengthUnit::Rcap => v * rfs * 0.7,
@@ -644,24 +726,8 @@ fn css_max_f64(a: f64, b: f64) -> f64 {
 fn simplify_clamp(lo: Option<MathNode>, val: MathNode, hi: Option<MathNode>, is_computed: bool, has_pct_basis: bool) -> MathNode {
     match (lo, hi) {
         (None, None) => val,
-        (None, Some(h)) => {
-            if let (Some((vv, vu)), Some((hv, hu))) = (leaf_parts(&val), leaf_parts(&h)) {
-                if vu == hu && (vu != LeafUnit::Pct || has_pct_basis) { return make_leaf(css_min_f64(vv, hv), vu); }
-            }
-            if is_computed && [&val, &h].iter().any(|x| leaf_parts(x).is_some_and(|(v, _)| v.is_nan())) {
-                return canonical_nan_for_type(MathNode::Clamp(None, Box::new(val), Some(Box::new(h))).calc_type());
-            }
-            MathNode::Clamp(None, Box::new(val), Some(Box::new(h)))
-        }
-        (Some(l), None) => {
-            if let (Some((lv, lu)), Some((vv, vu))) = (leaf_parts(&l), leaf_parts(&val)) {
-                if lu == vu && (lu != LeafUnit::Pct || has_pct_basis) { return make_leaf(css_max_f64(vv, lv), lu); }
-            }
-            if is_computed && [&l, &val].iter().any(|x| leaf_parts(x).is_some_and(|(v, _)| v.is_nan())) {
-                return canonical_nan_for_type(MathNode::Clamp(Some(Box::new(l)), Box::new(val), None).calc_type());
-            }
-            MathNode::Clamp(Some(Box::new(l)), Box::new(val), None)
-        }
+        (None, Some(h)) => simplify_minmax(true, vec![val, h], is_computed, has_pct_basis),
+        (Some(l), None) => simplify_minmax(false, vec![l, val], is_computed, has_pct_basis),
         (Some(l), Some(h)) => {
             let same = match (leaf_parts(&l), leaf_parts(&val), leaf_parts(&h)) {
                 (Some((lv, lu)), Some((vv, vu)), Some((hv, hu))) if lu == vu && vu == hu => Some((lv, vv, hv, lu)),
@@ -816,6 +882,9 @@ fn simplify_log(a: MathNode, b: Option<MathNode>) -> MathNode {
 fn simplify_hypot(args: Vec<MathNode>) -> MathNode {
     if let Some((_, u0)) = args.first().and_then(leaf_parts) {
         if args.iter().all(|a| leaf_parts(a).is_some_and(|(_, u)| u == u0)) {
+            if args.iter().any(|a| leaf_parts(a).unwrap().0.is_nan()) {
+                return make_leaf(f64::NAN, u0);
+            }
             let mut acc = 0.0_f64;
             for a in &args { acc = acc.hypot(leaf_parts(a).unwrap().0); }
             return make_leaf(acc, u0);
@@ -834,9 +903,25 @@ fn simplify_abs(a: MathNode) -> MathNode {
 
 #[rustfmt::skip]
 fn simplify_sign(a: MathNode) -> MathNode {
-    if let Some((v, _)) = leaf_parts(&a) {
-        MathNode::Number(if v.is_nan() { f64::NAN } else if v == 0.0 { v } else if v > 0.0 { 1.0 } else { -1.0 })
-    } else { MathNode::Sign(Box::new(a)) }
+    let can_eval = matches!(
+        &a,
+        MathNode::Number(_)
+            | MathNode::Dimension(
+                _,
+                MathUnit::Length(LengthUnit::Px)
+                    | MathUnit::Deg
+                    | MathUnit::Sec
+                    | MathUnit::Hz
+                    | MathUnit::Dppx
+                    | MathUnit::Fr
+            )
+    );
+    if can_eval {
+        if let Some((v, _)) = leaf_parts(&a) {
+            return MathNode::Number(if v.is_nan() { f64::NAN } else if v == 0.0 { v } else if v > 0.0 { 1.0 } else { -1.0 });
+        }
+    }
+    MathNode::Sign(Box::new(a))
 }
 
 #[rustfmt::skip]
@@ -850,6 +935,157 @@ fn simplify_progress(no_clamp: bool, v: MathNode, s: MathNode, e: MathNode) -> M
         }
     }
     MathNode::Progress(no_clamp, Box::new(v), Box::new(s), Box::new(e))
+}
+
+#[rustfmt::skip]
+fn zero_for_node(n: &MathNode) -> MathNode {
+    if let Some((_, u)) = leaf_parts(n) { return make_leaf(0.0, u); }
+    if n.has_percentage() && !n.calc_type().is_some_and(|t| t.single_base_dim().is_some()) {
+        return MathNode::Percent(0.0);
+    }
+    match n.calc_type() {
+        Some(ct) if ct.is_pure_percent() => MathNode::Percent(0.0),
+        Some(ct) => match ct.single_base_dim() {
+            Some(BaseDim::Length) => MathNode::Dimension(0.0, MathUnit::Length(LengthUnit::Px)),
+            Some(BaseDim::Angle) => MathNode::Dimension(0.0, MathUnit::Deg),
+            Some(BaseDim::Time) => MathNode::Dimension(0.0, MathUnit::Sec),
+            Some(BaseDim::Frequency) => MathNode::Dimension(0.0, MathUnit::Hz),
+            Some(BaseDim::Resolution) => MathNode::Dimension(0.0, MathUnit::Dppx),
+            Some(BaseDim::Flex) => MathNode::Dimension(0.0, MathUnit::Fr),
+            None => MathNode::Number(0.0),
+        },
+        None => MathNode::Number(0.0),
+    }
+}
+
+#[rustfmt::skip]
+fn simplify_calc_mix(items: &[CalcMixItem], ctx: Option<&EvalContext>, pct_basis: Option<(f64, bool)>) -> MathNode {
+    let mut simp: Vec<CalcMixItem> = items.iter().map(|it| CalcMixItem {
+        value: it.value.simplify(ctx, pct_basis),
+        weight: it.weight.as_ref().map(|(w, wm)| (w.simplify(ctx, None), *wm)),
+    }).collect();
+    // Check if every weight is statically known (and in [0,100] at specified time; clamped at computed time).
+    let mut concrete: Vec<Option<f64>> = Vec::with_capacity(simp.len());
+    let mut all_known = true;
+    for it in &simp {
+        match &it.weight {
+            None => concrete.push(None),
+            Some((MathNode::Percent(p), wm)) if p.is_finite() => {
+                if ctx.is_none() && *wm && !((0.0..=100.0).contains(p)) { all_known = false; break; }
+                concrete.push(Some(p.clamp(0.0, 100.0)));
+            }
+            Some((MathNode::Percent(p), _)) if p.is_nan() => {
+                if ctx.is_some() { concrete.push(Some(0.0)); } else { all_known = false; break; }
+            }
+            Some(_) => { all_known = false; break; }
+        }
+    }
+    if !all_known { return MathNode::CalcMix(simp); }
+    let explicit_sum: f64 = concrete.iter().flatten().sum();
+    let missing_cnt = concrete.iter().filter(|w| w.is_none()).count();
+    let fill = if missing_cnt > 0 { if explicit_sum >= 100.0 { 0.0 } else { (100.0 - explicit_sum) / (missing_cnt as f64) } } else { 0.0 };
+    let mut weights: Vec<f64> = concrete.into_iter().map(|w| w.unwrap_or(fill)).collect();
+    let total: f64 = weights.iter().sum();
+    if total > 100.0 { for w in &mut weights { *w = *w * 100.0 / total; } }
+    let first_val = simp.first().map(|it| it.value.clone());
+    let mut active: Vec<(MathNode, f64)> = simp.drain(..).zip(weights).filter(|(_, w)| *w > 0.0).map(|(it, w)| (it.value, w)).collect();
+    if active.is_empty() {
+        return first_val.map_or(MathNode::Number(0.0), |v| zero_for_node(&v));
+    }
+    let same_unit = active.first().and_then(|(v, _)| leaf_parts(v)).is_some_and(|(_, u0)| {
+        active.iter().all(|(v, _)| leaf_parts(v).is_some_and(|(_, u)| u == u0))
+    });
+    if ctx.is_some() || same_unit {
+        let terms: Vec<MathNode> = active.drain(..).map(|(v, w)| MathNode::Product(vec![MathNode::Number(w / 100.0), v])).collect();
+        return MathNode::Sum(terms).simplify(ctx, pct_basis);
+    }
+    MathNode::CalcMix(active.into_iter().map(|(v, w)| CalcMixItem { value: v, weight: Some((MathNode::Percent(w), false)) }).collect())
+}
+
+#[rustfmt::skip]
+pub(crate) fn hash_random_f64(seed: u64, node_id: u64, dashed: Option<&str>, ua: Option<&str>) -> f64 {
+    let mut h = seed ^ 0x9e37_79b9_7f4a_7c15;
+    let mix = |mut x: u64| -> u64 {
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    };
+    h = mix(h ^ node_id);
+    if let Some(d) = dashed { for &b in d.as_bytes() { h = mix(h ^ u64::from(b)); } h = mix(h ^ 0xff); }
+    if let Some(u) = ua { for &b in u.as_bytes() { h = mix(h ^ u64::from(b)); } }
+    ((h >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
+}
+
+#[rustfmt::skip]
+fn simplify_random(r: &RandomNode, ctx: Option<&EvalContext>, pct_basis: Option<(f64, bool)>) -> MathNode {
+    let min_n = r.min.simplify(ctx, pct_basis);
+    let max_n = r.max.simplify(ctx, pct_basis);
+    let step_n = r.step.as_deref().map(|s| s.simplify(ctx, pct_basis));
+    let fixed_n = r.fixed.as_ref().map(|(f, wm)| (f.simplify(ctx, None), *wm));
+
+    let base_r: Option<f64> = if let Some((MathNode::Number(v), _)) = &fixed_n {
+        if v.is_nan() { Some(f64::NAN) }
+        else if *v < 0.0 { Some(0.0) }
+        else if *v >= 1.0 { Some(1.0 - 1e-6) }
+        else { Some(*v) }
+    } else if fixed_n.is_none() {
+        ctx.map(|c| {
+            let nid = if r.element_scoped { c.random_node_id } else { 0 };
+            hash_random_f64(c.random_doc_seed, nid, r.dashed_ident.as_deref(), r.ua_ident.as_deref())
+        })
+    } else {
+        None
+    };
+
+    let has_unresolved_pct = pct_basis.is_none()
+        && (min_n.has_percentage() || max_n.has_percentage() || step_n.as_ref().is_some_and(MathNode::has_percentage));
+
+    if let Some(rv) = base_r {
+        if !has_unresolved_pct {
+            if let (Some((lo, lu)), Some((hi, hu))) = (leaf_parts(&min_n), leaf_parts(&max_n)) {
+                let step_parts = step_n.as_ref().map(leaf_parts);
+                let units_ok = lu == hu && step_parts.is_none_or(|sp| sp.is_some_and(|(_, su)| su == lu));
+                if units_ok {
+                    let st_v = step_parts.and_then(|sp| sp.map(|(v, _)| v));
+                    let out = if rv.is_nan() || lo.is_nan() || hi.is_nan() || st_v.is_some_and(f64::is_nan) {
+                        f64::NAN
+                    } else if hi <= lo {
+                        lo
+                    } else if !lo.is_finite() || !hi.is_finite() {
+                        f64::NAN
+                    } else if let Some(sv) = st_v.filter(|&s| s > 0.0) {
+                        if sv.is_infinite() || sv > (hi - lo) { lo }
+                        else {
+                            let n = ((hi - lo) / sv).floor() + 1.0;
+                            let k = (rv * n).floor().min(n - 1.0);
+                            lo + k * sv
+                        }
+                    } else {
+                        lo + rv * (hi - lo)
+                    };
+                    return make_leaf(out, lu);
+                }
+            }
+        }
+        if ctx.is_some() {
+            return MathNode::Random(Box::new(RandomNode {
+                dashed_ident: None, element_scoped: false, prop_scoped: false, prop_index_scoped: false, ua_ident: None,
+                fixed: Some((Box::new(MathNode::Number(rv)), false)),
+                min: Box::new(min_n), max: Box::new(max_n), step: step_n.map(Box::new),
+            }));
+        }
+    }
+    MathNode::Random(Box::new(RandomNode {
+        dashed_ident: r.dashed_ident.clone(),
+        element_scoped: r.element_scoped,
+        prop_scoped: r.prop_scoped,
+        prop_index_scoped: r.prop_index_scoped,
+        ua_ident: r.ua_ident.clone(),
+        fixed: fixed_n.map(|(n, wm)| (Box::new(n), wm)),
+        min: Box::new(min_n),
+        max: Box::new(max_n),
+        step: step_n.map(Box::new),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -912,7 +1148,8 @@ fn serialize_top_level_calc(n: &MathNode, specified: bool) -> String {
         | MathNode::Asin(_) | MathNode::Acos(_) | MathNode::Atan(_) | MathNode::Atan2(_, _)
         | MathNode::Pow(_, _) | MathNode::Sqrt(_) | MathNode::Hypot(_) | MathNode::Log(_, _)
         | MathNode::Exp(_) | MathNode::Abs(_) | MathNode::Sign(_) | MathNode::Progress(_, _, _, _)
-        | MathNode::SiblingIndex | MathNode::SiblingCount => serialize_inner(n, false),
+        | MathNode::SiblingIndex | MathNode::SiblingCount
+        | MathNode::CalcMix(_) | MathNode::Random(_) => serialize_inner(n, false),
         _ if !specified => serialize_simple_literal(n).unwrap_or_else(|| format!("calc({})", serialize_inner(n, false))),
         _ => format!("calc({})", serialize_inner(n, false)),
     }
@@ -982,7 +1219,49 @@ fn serialize_inner(n: &MathNode, parens: bool) -> String {
         MathNode::Log(a, Some(b)) => format!("log({}, {})", si(a), si(b)), MathNode::Log(a, None) => format!("log({})", si(a)),
         MathNode::Exp(a) => format!("exp({})", si(a)), MathNode::Abs(a) => format!("abs({})", si(a)), MathNode::Sign(a) => format!("sign({})", si(a)),
         MathNode::Progress(nc, v, s, e) => format!("progress({}{}, {}, {})", if *nc { "no-clamp " } else { "" }, si(v), si(s), si(e)),
+        MathNode::CalcMix(items) => {
+            let parts: Vec<String> = items.iter().map(|it| match &it.weight {
+                Some((w, true)) => format!("{} {}", si(&it.value), serialize_top_level_calc(w, true)),
+                Some((w, false)) => format!("{} {}", si(&it.value), si(w)),
+                None => si(&it.value),
+            }).collect();
+            format!("calc-mix({})", parts.join(", "))
+        }
+        MathNode::Random(r) => {
+            let mut args = Vec::with_capacity(4);
+            if let Some((f, wm)) = &r.fixed {
+                let fs = if *wm { serialize_top_level_calc(f, true) } else { si(f) };
+                args.push(format!("fixed {fs}"));
+            } else {
+                let mut opts = Vec::new();
+                if let Some(d) = &r.dashed_ident { opts.push(escape_css_ident(d)); }
+                if r.element_scoped { opts.push("element-scoped".to_string()); }
+                if let Some(u) = &r.ua_ident { opts.push(escape_css_ident(u)); }
+                if !opts.is_empty() { args.push(opts.join(" ")); }
+            }
+            args.push(si(&r.min));
+            args.push(si(&r.max));
+            if let Some(st) = &r.step { args.push(si(st)); }
+            format!("random({})", args.join(", "))
+        }
     }
+}
+
+fn escape_css_ident(ident: &str) -> String {
+    let mut out = String::with_capacity(ident.len());
+    for (i, ch) in ident.chars().enumerate() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || !ch.is_ascii() {
+            if i == 0 && ch.is_ascii_digit() {
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("\\{:x} ", ch as u32));
+            } else {
+                out.push(ch);
+            }
+        } else {
+            out.push('\\');
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn fmt_fn(name: &str, args: &[MathNode]) -> String {
@@ -1006,6 +1285,7 @@ pub fn is_css_math_fn(name: &str) -> bool {
             | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2"
             | "pow" | "sqrt" | "hypot" | "log" | "exp" | "abs" | "sign"
             | "progress" | "sibling-index" | "sibling-count"
+            | "calc-mix" | "random"
     )
 }
 
@@ -1099,6 +1379,8 @@ fn parse_math_fn_opt<'i, 't>(name: &str, p: &mut Parser<'i, 't>, allow_size: boo
             let b = if p.try_parse(Parser::expect_comma).is_ok() { Some(Box::new(parse_sum_opt(p, allow_size)?)) } else { None };
             p.is_exhausted().then_some(MathNode::Round(strat, Box::new(a), b))
         }
+        "calc-mix" => parse_calc_mix_fn(p, allow_size),
+        "random" => parse_random_fn(p, allow_size),
         _ => {
             let mut args = Vec::new();
             loop { args.push(parse_sum_opt(p, allow_size)?); if p.try_parse(Parser::expect_comma).is_err() { break; } }
@@ -1106,6 +1388,118 @@ fn parse_math_fn_opt<'i, 't>(name: &str, p: &mut Parser<'i, 't>, allow_size: boo
             build_math_fn(name, args)
         }
     }
+}
+
+#[rustfmt::skip]
+fn parse_calc_mix_fn<'i, 't>(p: &mut Parser<'i, 't>, allow_size: bool) -> Option<MathNode> {
+    let mut items = Vec::new();
+    loop {
+        let value = parse_sum_opt(p, allow_size)?;
+        let weight = if p.is_exhausted() {
+            None
+        } else if p.try_parse(Parser::expect_comma).is_ok() {
+            items.push(CalcMixItem { value, weight: None });
+            continue;
+        } else {
+            let pm = parse_math_value_from_parser(p, ValueKind::Percentage)?;
+            if !pm.was_math_fn {
+                if let MathNode::Percent(v) = pm.node {
+                    if !((0.0..=100.0).contains(&v)) { return None; }
+                }
+            }
+            Some((pm.node, pm.was_math_fn))
+        };
+        items.push(CalcMixItem { value, weight });
+        if p.try_parse(Parser::expect_comma).is_err() { break; }
+    }
+    (!items.is_empty() && p.is_exhausted()).then_some(MathNode::CalcMix(items))
+}
+
+#[rustfmt::skip]
+fn parse_random_fn<'i, 't>(p: &mut Parser<'i, 't>, allow_size: bool) -> Option<MathNode> {
+    let st0 = p.state();
+    let mut dashed_ident = None::<String>;
+    let mut element_scoped = false;
+    let mut prop_scoped = false;
+    let mut prop_index_scoped = false;
+    let mut ua_ident = None::<String>;
+    let mut fixed = None::<(Box<MathNode>, bool)>;
+    let mut saw_options = false;
+
+    if p.try_parse(|p| -> Result<(), cssparser::ParseError<'i, ()>> {
+        p.expect_ident_matching("fixed")?;
+        let pm = parse_math_value_from_parser(p, ValueKind::Number).ok_or_else(|| p.new_custom_error(()))?;
+        if !pm.was_math_fn {
+            if let MathNode::Number(v) = pm.node {
+                if !v.is_finite() || v < 0.0 || v >= 1.0 { return Err(p.new_custom_error(())); }
+            }
+        }
+        p.expect_comma()?;
+        fixed = Some((Box::new(pm.node), pm.was_math_fn));
+        Ok(())
+    }).is_ok() {
+        saw_options = true;
+    } else if p.try_parse(|p| -> Result<(), cssparser::ParseError<'i, ()>> {
+        p.expect_ident_matching("auto")?;
+        p.expect_comma()?;
+        Ok(())
+    }).is_ok() {
+        element_scoped = true;
+        prop_index_scoped = true;
+        saw_options = true;
+    } else {
+        type RandOpts = (Option<String>, bool, bool, bool, Option<String>);
+        let opt_res = p.try_parse(|p| -> Result<RandOpts, cssparser::ParseError<'i, ()>> {
+            let (mut d, mut es, mut ps, mut pis, mut ua) = (None, false, false, false, None);
+            let mut count = 0usize;
+            while count < 3 {
+                let Ok(id) = p.try_parse(|p| p.expect_ident().map(|s| s.as_ref().to_string())) else { break; };
+                let lower = id.to_ascii_lowercase();
+                if id.starts_with("--") {
+                    if d.is_some() { return Err(p.new_custom_error(())); }
+                    d = Some(id);
+                } else if lower == "element-scoped" {
+                    if es { return Err(p.new_custom_error(())); }
+                    es = true;
+                } else if lower == "property-scoped" {
+                    if ps || pis || ua.is_some() { return Err(p.new_custom_error(())); }
+                    ps = true;
+                } else if lower == "property-index-scoped" {
+                    if ps || pis || ua.is_some() { return Err(p.new_custom_error(())); }
+                    pis = true;
+                } else if id.starts_with("ua-") && id.len() > 3 {
+                    if ps || pis || ua.is_some() { return Err(p.new_custom_error(())); }
+                    ua = Some(id);
+                } else {
+                    return Err(p.new_custom_error(()));
+                }
+                count += 1;
+            }
+            if count == 0 { return Err(p.new_custom_error(())); }
+            p.expect_comma()?;
+            Ok((d, es, ps, pis, ua))
+        });
+        if let Ok((d, es, ps, pis, ua)) = opt_res {
+            dashed_ident = d; element_scoped = es; prop_scoped = ps; prop_index_scoped = pis; ua_ident = ua;
+            saw_options = true;
+        }
+    }
+    if !saw_options {
+        p.reset(&st0);
+        element_scoped = true;
+        prop_index_scoped = true;
+    }
+    let min = Box::new(parse_sum_opt(p, allow_size)?);
+    p.expect_comma().ok()?;
+    let max = Box::new(parse_sum_opt(p, allow_size)?);
+    let step = if p.try_parse(Parser::expect_comma).is_ok() {
+        Some(Box::new(parse_sum_opt(p, allow_size)?))
+    } else {
+        None
+    };
+    p.is_exhausted().then_some(MathNode::Random(Box::new(RandomNode {
+        dashed_ident, element_scoped, prop_scoped, prop_index_scoped, ua_ident, fixed, min, max, step,
+    })))
 }
 
 #[rustfmt::skip]
@@ -1237,8 +1631,10 @@ impl ScaleSpec {
         let mut p = Parser::new(&mut pi);
         if p.try_parse(|p| p.expect_ident_matching("none")).is_ok() { return p.is_exhausted().then_some((Self::None, "none".to_string())); }
         let (mut vals, mut texts) = (Vec::new(), Vec::new());
+        let mut rc = 0u32;
         while !p.is_exhausted() && vals.len() < 3 {
-            let pm = parse_math_value_from_parser(&mut p, ValueKind::NumberOrPercentage)?;
+            let mut pm = parse_math_value_from_parser(&mut p, ValueKind::NumberOrPercentage)?;
+            pm.node.bind_random_property("scale", &mut rc);
             texts.push(pm.node.serialize_specified(pm.was_math_fn));
             vals.push(pm.node);
         }
@@ -1267,10 +1663,12 @@ impl RotateSpec {
             return p.is_exhausted().then_some((Self::None, "none".to_string()));
         }
         let (mut axis_kw, mut axis_nums, mut angle) = (None::<&'static str>, None::<([MathNode; 3], [String; 3])>, None::<(MathNode, String)>);
+        let mut rc = 0u32;
         for _ in 0..2 {
             if p.is_exhausted() { break; }
             if angle.is_none() {
-                if let Some(pm) = parse_math_value_from_parser(&mut p, ValueKind::Angle) {
+                if let Some(mut pm) = parse_math_value_from_parser(&mut p, ValueKind::Angle) {
+                    pm.node.bind_random_property("rotate", &mut rc);
                     angle = Some((pm.node.clone(), pm.node.serialize_specified(pm.was_math_fn)));
                     continue;
                 }
@@ -1280,11 +1678,14 @@ impl RotateSpec {
                     match p.expect_ident()?.to_ascii_lowercase().as_str() { "x" => Ok("x"), "y" => Ok("y"), "z" => Ok("z"), _ => Err(p.new_custom_error(())) }
                 }) { axis_kw = Some(kw); continue; }
                 let st = p.state();
-                if let (Some(a), Some(b), Some(c)) = (
+                if let (Some(mut a), Some(mut b), Some(mut c)) = (
                     parse_math_value_from_parser(&mut p, ValueKind::Number),
                     parse_math_value_from_parser(&mut p, ValueKind::Number),
                     parse_math_value_from_parser(&mut p, ValueKind::Number),
                 ) {
+                    a.node.bind_random_property("rotate", &mut rc);
+                    b.node.bind_random_property("rotate", &mut rc);
+                    c.node.bind_random_property("rotate", &mut rc);
                     let ts = [a.node.serialize_specified(a.was_math_fn), b.node.serialize_specified(b.was_math_fn), c.node.serialize_specified(c.was_math_fn)];
                     axis_nums = Some(([a.node, b.node, c.node], ts));
                     continue;
@@ -1520,6 +1921,188 @@ fn try_compute_rotate3d_matrix3d(input: &str, ctx: &EvalContext) -> Option<Strin
     Some(format!("matrix3d({})", parts.join(", ")))
 }
 
+/// Edge keyword for W3C CSS Values L5 `<position>` (physical + logical `x-start`/`x-end`/`y-start`/`y-end`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PositionEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    Center,
+    XStart,
+    XEnd,
+    YStart,
+    YEnd,
+}
+
+#[rustfmt::skip]
+impl PositionEdge {
+    fn from_ident(s: &str) -> Option<Self> {
+        match s {
+            "left" => Some(Self::Left), "right" => Some(Self::Right), "top" => Some(Self::Top),
+            "bottom" => Some(Self::Bottom), "center" => Some(Self::Center),
+            "x-start" => Some(Self::XStart), "x-end" => Some(Self::XEnd),
+            "y-start" => Some(Self::YStart), "y-end" => Some(Self::YEnd),
+            _ => None,
+        }
+    }
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left", Self::Right => "right", Self::Top => "top",
+            Self::Bottom => "bottom", Self::Center => "center",
+            Self::XStart => "x-start", Self::XEnd => "x-end",
+            Self::YStart => "y-start", Self::YEnd => "y-end",
+        }
+    }
+    const fn is_horiz(self) -> bool { matches!(self, Self::Left | Self::Right | Self::XStart | Self::XEnd) }
+    const fn is_vert(self) -> bool { matches!(self, Self::Top | Self::Bottom | Self::YStart | Self::YEnd) }
+    fn to_physical(self, wm: crate::values::WritingMode, dir: crate::values::DirectionMode) -> Self {
+        use crate::values::{DirectionMode as D, WritingMode as W};
+        match self {
+            Self::XStart => match (wm, dir) {
+                (W::HorizontalTb, D::Rtl) | (W::VerticalRl | W::SidewaysRl, _) => Self::Right,
+                _ => Self::Left,
+            },
+            Self::XEnd => match (wm, dir) {
+                (W::HorizontalTb, D::Rtl) | (W::VerticalRl | W::SidewaysRl, _) => Self::Left,
+                _ => Self::Right,
+            },
+            Self::YStart => match (wm, dir) {
+                (W::VerticalRl | W::SidewaysRl | W::VerticalLr, D::Rtl) | (W::SidewaysLr, D::Ltr) => Self::Bottom,
+                _ => Self::Top,
+            },
+            Self::YEnd => match (wm, dir) {
+                (W::VerticalRl | W::SidewaysRl | W::VerticalLr, D::Rtl) | (W::SidewaysLr, D::Ltr) => Self::Top,
+                _ => Self::Bottom,
+            },
+            other => other,
+        }
+    }
+}
+
+/// One axis component of a CSS Values L5 `<position>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PositionComponent {
+    Edge(PositionEdge),
+    EdgeOffset(PositionEdge, Box<MathNode>, bool),
+    Length(Box<MathNode>, bool),
+}
+
+/// Parsed CSS Values L5 `<position>` value (e.g. `object-position`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PositionSpec {
+    pub x: PositionComponent,
+    pub y: PositionComponent,
+}
+
+impl Default for PositionSpec {
+    fn default() -> Self {
+        Self {
+            x: PositionComponent::Edge(PositionEdge::Center),
+            y: PositionComponent::Edge(PositionEdge::Center),
+        }
+    }
+}
+
+#[rustfmt::skip]
+impl PositionSpec {
+    /// Parses a CSS Values L5 `<position>` (1, 2, or 4 values) and returns `(spec, specified_css)`.
+    #[must_use]
+    pub fn parse(input: &str) -> Option<(Self, String)> {
+        enum Tok { Edge(PositionEdge), Len(MathNode, bool) }
+        let mut pi = ParserInput::new(input);
+        let mut p = Parser::new(&mut pi);
+        let mut toks = Vec::with_capacity(4);
+        while !p.is_exhausted() {
+            if toks.len() >= 4 { return None; }
+            if let Ok(edge) = p.try_parse(|p| -> Result<PositionEdge, cssparser::ParseError<'_, ()>> {
+                PositionEdge::from_ident(&p.expect_ident()?.to_ascii_lowercase()).ok_or_else(|| p.new_custom_error(()))
+            }) {
+                toks.push(Tok::Edge(edge));
+            } else {
+                let pm = parse_math_value_from_parser(&mut p, ValueKind::LengthPercentage)?;
+                toks.push(Tok::Len(pm.node, pm.was_math_fn));
+            }
+        }
+        let spec = match toks.len() {
+            1 => match toks.pop()? {
+                Tok::Edge(e) if e.is_vert() => Self { x: PositionComponent::Edge(PositionEdge::Center), y: PositionComponent::Edge(e) },
+                Tok::Edge(e) => Self { x: PositionComponent::Edge(e), y: PositionComponent::Edge(PositionEdge::Center) },
+                Tok::Len(n, m) => Self { x: PositionComponent::Length(Box::new(n), m), y: PositionComponent::Edge(PositionEdge::Center) },
+            },
+            2 => {
+                let b = toks.pop()?; let a = toks.pop()?;
+                match (a, b) {
+                    (Tok::Edge(e1), Tok::Edge(e2)) => {
+                        if (e1.is_horiz() && e2.is_horiz()) || (e1.is_vert() && e2.is_vert()) { return None; }
+                        if e1.is_vert() || e2.is_horiz() { Self { x: PositionComponent::Edge(e2), y: PositionComponent::Edge(e1) } }
+                        else { Self { x: PositionComponent::Edge(e1), y: PositionComponent::Edge(e2) } }
+                    }
+                    (Tok::Edge(e), Tok::Len(n, m)) if e.is_horiz() || e == PositionEdge::Center => {
+                        Self { x: PositionComponent::Edge(e), y: PositionComponent::Length(Box::new(n), m) }
+                    }
+                    (Tok::Len(n, m), Tok::Edge(e)) if e.is_vert() || e == PositionEdge::Center => {
+                        Self { x: PositionComponent::Length(Box::new(n), m), y: PositionComponent::Edge(e) }
+                    }
+                    (Tok::Len(nx, mx), Tok::Len(ny, my)) => {
+                        Self { x: PositionComponent::Length(Box::new(nx), mx), y: PositionComponent::Length(Box::new(ny), my) }
+                    }
+                    _ => return None,
+                }
+            }
+            4 => {
+                let d = toks.pop()?; let c = toks.pop()?; let b = toks.pop()?; let a = toks.pop()?;
+                match (a, b, c, d) {
+                    (Tok::Edge(e1), Tok::Len(n1, m1), Tok::Edge(e2), Tok::Len(n2, m2)) => {
+                        if e1.is_horiz() && e2.is_vert() {
+                            Self { x: PositionComponent::EdgeOffset(e1, Box::new(n1), m1), y: PositionComponent::EdgeOffset(e2, Box::new(n2), m2) }
+                        } else if e1.is_vert() && e2.is_horiz() {
+                            Self { x: PositionComponent::EdgeOffset(e2, Box::new(n2), m2), y: PositionComponent::EdgeOffset(e1, Box::new(n1), m1) }
+                        } else { return None; }
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        let specified = spec.serialize_specified();
+        Some((spec, specified))
+    }
+
+    #[must_use]
+    pub fn serialize_specified(&self) -> String {
+        let fmt = |c: &PositionComponent| match c {
+            PositionComponent::Edge(e) => e.as_str().to_string(),
+            PositionComponent::EdgeOffset(e, n, m) => format!("{} {}", e.as_str(), n.serialize_specified(*m)),
+            PositionComponent::Length(n, m) => n.serialize_specified(*m),
+        };
+        format!("{} {}", fmt(&self.x), fmt(&self.y))
+    }
+
+    #[must_use]
+    pub fn serialize_computed(&self, ctx: &EvalContext, wm: crate::values::WritingMode, dir: crate::values::DirectionMode) -> String {
+        let fmt_axis = |c: &PositionComponent| -> String {
+            match c {
+                PositionComponent::Edge(e) => match e.to_physical(wm, dir) {
+                    PositionEdge::Left | PositionEdge::Top => "0%".to_string(),
+                    PositionEdge::Center => "50%".to_string(),
+                    PositionEdge::Right | PositionEdge::Bottom => "100%".to_string(),
+                    _ => "50%".to_string(),
+                },
+                PositionComponent::Length(n, _) => n.serialize_computed(ctx, None, ValueKind::LengthPercentage, None, None),
+                PositionComponent::EdgeOffset(e, n, _) => match e.to_physical(wm, dir) {
+                    PositionEdge::Right | PositionEdge::Bottom => {
+                        let inv = MathNode::Sum(vec![MathNode::Percent(100.0), MathNode::Negate(n.clone())]);
+                        inv.serialize_computed(ctx, None, ValueKind::LengthPercentage, None, None)
+                    }
+                    _ => n.serialize_computed(ctx, None, ValueKind::LengthPercentage, None, None),
+                },
+            }
+        };
+        format!("{} {}", fmt_axis(&self.x), fmt_axis(&self.y))
+    }
+}
+
 #[must_use]
 #[rustfmt::skip]
 pub fn parse_background_position(input: &str) -> Option<(LengthPercentage, LengthPercentage, String)> {
@@ -1595,6 +2178,51 @@ impl MathNode {
             Self::Clamp(a, b, c) => a.as_deref().is_some_and(Self::contains_sibling_fn) || b.contains_sibling_fn() || c.as_deref().is_some_and(Self::contains_sibling_fn),
             Self::Progress(_, a, b, c) => a.contains_sibling_fn() || b.contains_sibling_fn() || c.contains_sibling_fn(),
             Self::Sum(v) | Self::Product(v) | Self::Min(v) | Self::Max(v) | Self::Hypot(v) => v.iter().any(Self::contains_sibling_fn),
+            Self::CalcMix(items) => items.iter().any(|it| it.value.contains_sibling_fn() || it.weight.as_ref().is_some_and(|(w, _)| w.contains_sibling_fn())),
+            Self::Random(r) => r.fixed.as_ref().is_some_and(|(f, _)| f.contains_sibling_fn()) || r.min.contains_sibling_fn() || r.max.contains_sibling_fn() || r.step.as_deref().is_some_and(Self::contains_sibling_fn),
+        }
+    }
+
+    #[must_use]
+    pub fn contains_random(&self) -> bool {
+        match self {
+            Self::Random(_) => true,
+            Self::Number(_) | Self::Percent(_) | Self::Dimension(_, _) | Self::SizeKeyword | Self::SiblingIndex | Self::SiblingCount => false,
+            Self::Negate(a) | Self::Invert(a) | Self::Sin(a) | Self::Cos(a) | Self::Tan(a) | Self::Asin(a) | Self::Acos(a) | Self::Atan(a) | Self::Sqrt(a) | Self::Exp(a) | Self::Abs(a) | Self::Sign(a) => a.contains_random(),
+            Self::Mod(a, b) | Self::Rem(a, b) | Self::Atan2(a, b) | Self::Pow(a, b) => a.contains_random() || b.contains_random(),
+            Self::Round(_, a, b) | Self::Log(a, b) => a.contains_random() || b.as_deref().is_some_and(Self::contains_random),
+            Self::Clamp(a, b, c) => a.as_deref().is_some_and(Self::contains_random) || b.contains_random() || c.as_deref().is_some_and(Self::contains_random),
+            Self::Progress(_, a, b, c) => a.contains_random() || b.contains_random() || c.contains_random(),
+            Self::Sum(v) | Self::Product(v) | Self::Min(v) | Self::Max(v) | Self::Hypot(v) => v.iter().any(Self::contains_random),
+            Self::CalcMix(items) => items.iter().any(|it| it.value.contains_random() || it.weight.as_ref().is_some_and(|(w, _)| w.contains_random())),
+        }
+    }
+
+    /// Assigns canonical `ua-<prop>` / `ua-<prop>-<index>` caching identifiers to `random()` nodes.
+    pub fn bind_random_property(&mut self, prop_name: &str, counter: &mut u32) {
+        match self {
+            Self::Number(_) | Self::Percent(_) | Self::Dimension(_, _) | Self::SizeKeyword | Self::SiblingIndex | Self::SiblingCount => {}
+            Self::Negate(a) | Self::Invert(a) | Self::Sin(a) | Self::Cos(a) | Self::Tan(a) | Self::Asin(a) | Self::Acos(a) | Self::Atan(a) | Self::Sqrt(a) | Self::Exp(a) | Self::Abs(a) | Self::Sign(a) => a.bind_random_property(prop_name, counter),
+            Self::Mod(a, b) | Self::Rem(a, b) | Self::Atan2(a, b) | Self::Pow(a, b) => { a.bind_random_property(prop_name, counter); b.bind_random_property(prop_name, counter); }
+            Self::Round(_, a, b) | Self::Log(a, b) => { a.bind_random_property(prop_name, counter); if let Some(x) = b { x.bind_random_property(prop_name, counter); } }
+            Self::Clamp(a, b, c) => { if let Some(x) = a { x.bind_random_property(prop_name, counter); } b.bind_random_property(prop_name, counter); if let Some(x) = c { x.bind_random_property(prop_name, counter); } }
+            Self::Progress(_, a, b, c) => { a.bind_random_property(prop_name, counter); b.bind_random_property(prop_name, counter); c.bind_random_property(prop_name, counter); }
+            Self::Sum(v) | Self::Product(v) | Self::Min(v) | Self::Max(v) | Self::Hypot(v) => { for x in v { x.bind_random_property(prop_name, counter); } }
+            Self::CalcMix(items) => { for it in items { it.value.bind_random_property(prop_name, counter); if let Some((w, _)) = &mut it.weight { w.bind_random_property(prop_name, counter); } } }
+            Self::Random(r) => {
+                if let Some((f, _)) = &mut r.fixed { f.bind_random_property(prop_name, counter); }
+                r.min.bind_random_property(prop_name, counter);
+                r.max.bind_random_property(prop_name, counter);
+                if let Some(st) = &mut r.step { st.bind_random_property(prop_name, counter); }
+                if r.fixed.is_none() && r.ua_ident.is_none() {
+                    if r.prop_index_scoped {
+                        *counter += 1;
+                        r.ua_ident = Some(format!("ua-{prop_name}-{counter}"));
+                    } else if r.prop_scoped {
+                        r.ua_ident = Some(format!("ua-{prop_name}"));
+                    }
+                }
+            }
         }
     }
 }
@@ -1604,7 +2232,7 @@ impl MathNode {
 pub fn has_values4_syntax(raw: &str) -> bool {
     if raw.contains('(') {
         let lower = raw.to_ascii_lowercase();
-        for fn_pfx in ["calc(", "calc-size(", "min(", "max(", "clamp(", "round(", "mod(", "rem(", "sin(", "cos(", "tan(", "asin(", "acos(", "atan(", "atan2(", "pow(", "sqrt(", "hypot(", "log(", "exp(", "abs(", "sign(", "progress(", "sibling-index(", "sibling-count("] {
+        for fn_pfx in ["calc(", "calc-size(", "calc-mix(", "random(", "min(", "max(", "clamp(", "round(", "mod(", "rem(", "sin(", "cos(", "tan(", "asin(", "acos(", "atan(", "atan2(", "pow(", "sqrt(", "hypot(", "log(", "exp(", "abs(", "sign(", "progress(", "sibling-index(", "sibling-count("] {
             if lower.contains(fn_pfx) { return true; }
         }
     }
@@ -1632,6 +2260,44 @@ pub fn parse_grid_tracks_math(input: &str) -> Option<(Vec<crate::values::GridTra
     if p.try_parse(|p| p.expect_ident_matching("none")).is_ok() { return p.is_exhausted().then_some((Vec::new(), "none".to_string())); }
     let (mut tracks, mut texts) = (Vec::new(), Vec::new());
     while !p.is_exhausted() {
+        if let Ok((rep_tracks, rep_text)) = p.try_parse(|p| -> Result<(Vec<GridTrackSize>, String), cssparser::ParseError<'_, ()>> {
+            let Token::Function(ref fname) = p.next()?.clone() else { return Err(p.new_custom_error(())); };
+            if !fname.eq_ignore_ascii_case("repeat") { return Err(p.new_custom_error(())); }
+            p.parse_nested_block(|n| {
+                let Some(cnt_pm) = parse_math_value_from_parser(n, ValueKind::Integer) else { return Err(n.new_custom_error(())); };
+                let cnt_eval = cnt_pm.node.eval_scalar(&EvalContext::default(), None);
+                if !cnt_eval.is_finite() { return Err(n.new_custom_error(())); }
+                let count = (cnt_eval + 0.5).floor() as i64;
+                if !(1..=1024).contains(&count) { return Err(n.new_custom_error(())); }
+                n.expect_comma()?;
+                let rest = n.current_line();
+                let _ = rest;
+                let mut inner_tracks = Vec::new();
+                let mut inner_texts = Vec::new();
+                while !n.is_exhausted() {
+                    if let Ok(kw) = n.try_parse(|p| -> Result<&'static str, cssparser::ParseError<'_, ()>> {
+                        match p.expect_ident()?.to_ascii_lowercase().as_str() { "auto" => Ok("auto"), "min-content" => Ok("min-content"), "max-content" => Ok("max-content"), _ => Err(p.new_custom_error(())) }
+                    }) {
+                        inner_tracks.push(match kw { "min-content" => GridTrackSize::MinContent, "max-content" => GridTrackSize::MaxContent, _ => GridTrackSize::Auto });
+                        inner_texts.push(kw.to_string());
+                    } else if let Some(pm) = parse_math_value_from_parser(n, ValueKind::Flex) {
+                        inner_texts.push(pm.node.serialize_specified(pm.was_math_fn));
+                        inner_tracks.push(GridTrackSize::FrMath(Box::new(pm.node)));
+                    } else if let Some(pm) = parse_math_value_from_parser(n, ValueKind::LengthPercentage) {
+                        inner_texts.push(pm.node.serialize_specified(pm.was_math_fn));
+                        inner_tracks.push(GridTrackSize::Length(LengthPercentage::Calc(Box::new(CalcExpr::Math(Box::new(pm.node))))));
+                    } else { return Err(n.new_custom_error(())); }
+                }
+                if inner_tracks.is_empty() { return Err(n.new_custom_error(())); }
+                let mut expanded = Vec::with_capacity(inner_tracks.len() * count as usize);
+                for _ in 0..count { expanded.extend(inner_tracks.iter().cloned()); }
+                Ok((expanded, format!("repeat({}, {})", cnt_pm.node.serialize_specified(cnt_pm.was_math_fn), inner_texts.join(" "))))
+            })
+        }) {
+            tracks.extend(rep_tracks);
+            texts.push(rep_text);
+            continue;
+        }
         if let Ok(kw) = p.try_parse(|p| -> Result<&'static str, cssparser::ParseError<'_, ()>> {
             match p.expect_ident()?.to_ascii_lowercase().as_str() { "auto" => Ok("auto"), "min-content" => Ok("min-content"), "max-content" => Ok("max-content"), _ => Err(p.new_custom_error(())) }
         }) {
@@ -1717,6 +2383,8 @@ impl MathNode {
             Self::Clamp(a, b, c) => a.as_deref().is_some_and(Self::has_percentage) || b.has_percentage() || c.as_deref().is_some_and(Self::has_percentage),
             Self::Progress(_, v, s, e) => v.has_percentage() || s.has_percentage() || e.has_percentage(),
             Self::Sum(v) | Self::Product(v) | Self::Min(v) | Self::Max(v) | Self::Hypot(v) => v.iter().any(Self::has_percentage),
+            Self::CalcMix(items) => items.iter().any(|it| it.value.has_percentage()),
+            Self::Random(r) => r.min.has_percentage() || r.max.has_percentage() || r.step.as_deref().is_some_and(Self::has_percentage),
         }
     }
 
@@ -1731,6 +2399,8 @@ impl MathNode {
             Self::Clamp(a, b, c) => a.as_deref().is_some_and(Self::contains_size_keyword) || b.contains_size_keyword() || c.as_deref().is_some_and(Self::contains_size_keyword),
             Self::Progress(_, v, s, e) => v.contains_size_keyword() || s.contains_size_keyword() || e.contains_size_keyword(),
             Self::Sum(v) | Self::Product(v) | Self::Min(v) | Self::Max(v) | Self::Hypot(v) => v.iter().any(Self::contains_size_keyword),
+            Self::CalcMix(items) => items.iter().any(|it| it.value.contains_size_keyword()),
+            Self::Random(r) => r.min.contains_size_keyword() || r.max.contains_size_keyword() || r.step.as_deref().is_some_and(Self::contains_size_keyword),
         }
     }
 
@@ -1744,6 +2414,8 @@ impl MathNode {
             Self::Clamp(a, b, c) => 1 + a.as_deref().map_or(0, Self::node_count) + b.node_count() + c.as_deref().map_or(0, Self::node_count),
             Self::Progress(_, v, s, e) => 1 + v.node_count() + s.node_count() + e.node_count(),
             Self::Sum(v) | Self::Product(v) | Self::Min(v) | Self::Max(v) | Self::Hypot(v) => 1 + v.iter().map(Self::node_count).sum::<usize>(),
+            Self::CalcMix(items) => 1 + items.iter().map(|it| it.value.node_count() + it.weight.as_ref().map_or(0, |(w, _)| w.node_count())).sum::<usize>(),
+            Self::Random(r) => 1 + r.min.node_count() + r.max.node_count() + r.step.as_deref().map_or(0, Self::node_count),
         }
     }
 
@@ -1798,6 +2470,17 @@ impl MathNode {
             Self::Abs(a) => Self::Abs(Box::new(sub(a, budget)?)),
             Self::Sign(a) => Self::Sign(Box::new(sub(a, budget)?)),
             Self::Progress(nc, v, s, e) => Self::Progress(*nc, Box::new(sub(v, budget)?), Box::new(sub(s, budget)?), Box::new(sub(e, budget)?)),
+            Self::CalcMix(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items { out.push(CalcMixItem { value: sub(&it.value, budget)?, weight: it.weight.clone() }); }
+                Self::CalcMix(out)
+            }
+            Self::Random(r) => Self::Random(Box::new(RandomNode {
+                min: Box::new(sub(&r.min, budget)?),
+                max: Box::new(sub(&r.max, budget)?),
+                step: match &r.step { Some(x) => Some(Box::new(sub(x, budget)?)), None => None },
+                ..(**r).clone()
+            })),
         })
     }
 
@@ -1834,6 +2517,13 @@ impl MathNode {
             Self::Abs(a) => Self::Abs(Box::new(r(a))),
             Self::Sign(a) => Self::Sign(Box::new(r(a))),
             Self::Progress(nc, v, s, e) => Self::Progress(*nc, Box::new(r(v)), Box::new(r(s)), Box::new(r(e))),
+            Self::CalcMix(items) => Self::CalcMix(items.iter().map(|it| CalcMixItem { value: r(&it.value), weight: it.weight.clone() }).collect()),
+            Self::Random(rn) => Self::Random(Box::new(RandomNode {
+                min: Box::new(r(&rn.min)),
+                max: Box::new(r(&rn.max)),
+                step: rn.step.as_deref().map(|x| Box::new(r(x))),
+                ..(**rn).clone()
+            })),
         }
     }
 

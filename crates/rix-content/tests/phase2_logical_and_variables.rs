@@ -339,3 +339,53 @@ fn calc_size_interpolate_size_and_css_animations() {
         .expect("script should succeed");
     assert_eq!(rt.vm.value_to_rust_string(res), "ok");
 }
+
+#[test]
+fn values_l5_calc_mix_random_position_and_ch_metrics() {
+    let mut rt = make_runtime();
+    let html = r#"<!doctype html><style>
+      #rtl-parent { direction: rtl; }
+      #pos { object-position: x-start 10px y-end 20px; }
+      #col { display: flex; flex-direction: column; height: 200px; font-size: 20px; line-height: 1; }
+      #col-item { height: 50px; flex-grow: 0; flex-shrink: 0; flex-basis: min-content; }
+      #rel-parent { width: 50px; position: relative; }
+      #rel-child { position: relative; left: calc(50% - 10px); }
+    </style>
+    <div id="rtl-parent"><div id="pos"></div></div>
+    <div id="col"><div id="col-item">hello</div></div>
+    <div id="rel-parent"><div id="rel-child"></div></div>
+    <div id="zero-fs" style="font-size: 0px"><div id="t"></div></div>"#;
+    assert!(rt
+        .load_document_with_external_scripts(html, &HashMap::new())
+        .is_empty());
+    let res = rt
+        .eval_script(
+            r#"(function() {
+                const pos = document.getElementById("pos");
+                if (getComputedStyle(pos).direction !== "rtl") return "dir:" + getComputedStyle(pos).direction;
+                if (getComputedStyle(pos).objectPosition !== "calc(100% - 10px) calc(100% - 20px)")
+                    return "obj-pos:" + getComputedStyle(pos).objectPosition;
+                const colItem = document.getElementById("col-item");
+                if (getComputedStyle(colItem).height !== "20px") return "col-h:" + getComputedStyle(colItem).height;
+                const rc = document.getElementById("rel-child");
+                if (getComputedStyle(rc).left !== "15px") return "rel-left:" + getComputedStyle(rc).left;
+                const t = document.getElementById("t");
+                t.style.zIndex = "sign(1em)";
+                if (getComputedStyle(t).zIndex !== "0") return "sign-0em:" + getComputedStyle(t).zIndex;
+                t.style.width = "calc-mix(10px 25%, 50px 75%)";
+                if (getComputedStyle(t).width !== "40px") return "calc-mix:" + getComputedStyle(t).width;
+                t.style.color = "rgb(random(30, 10) random(60, 10) random(90, 10))";
+                if (getComputedStyle(t).color !== "rgb(30, 60, 90)") return "rand-rgb:" + getComputedStyle(t).color;
+                t.style.aspectRatio = "random(3, 1) / random(9, 6)";
+                if (getComputedStyle(t).aspectRatio !== "3 / 9") return "rand-ar:" + getComputedStyle(t).aspectRatio;
+                t.style.width = "random(fixed random(1, 2), 10px, 100px)";
+                const uv = t.computedStyleMap().get("width");
+                if (!(uv instanceof CSSUnitValue) || uv.value === 100) return "rand-fixed:" + uv;
+                t.style.scale = "hypot(infinity, NaN)";
+                if (getComputedStyle(t).scale !== "0") return "hypot-nan:" + getComputedStyle(t).scale;
+                return "ok";
+            })()"#,
+        )
+        .expect("script should succeed");
+    assert_eq!(rt.vm.value_to_rust_string(res), "ok");
+}

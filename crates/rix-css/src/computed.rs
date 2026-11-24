@@ -87,6 +87,7 @@ pub struct VisualStyle {
     pub background_color_computed: Option<Arc<crate::color::CssColorExpr>>,
     pub background_layers: Vec<BackgroundLayerValue>,
     pub background_position: (LengthPercentage, LengthPercentage),
+    pub object_position: Option<Box<crate::values_math::PositionSpec>>,
     pub border_style: EdgeValues<LineStyle>,
     pub border_color: EdgeValues<CssColor>,
     pub border_color_computed: [Option<Arc<crate::color::CssColorExpr>>; 4],
@@ -115,6 +116,7 @@ impl Default for VisualStyle {
                 LengthPercentage::Percent(0.0),
                 LengthPercentage::Percent(0.0),
             ),
+            object_position: None,
             border_style: EdgeValues::all(LineStyle::None),
             border_color: EdgeValues::all(CssColor::CurrentColor),
             border_color_computed: [None, None, None, None],
@@ -306,6 +308,11 @@ pub struct EffectsStyle {
     pub animation_delay_math: Option<crate::values_math::MathNode>,
     pub animation_duration_math: Option<crate::values_math::MathNode>,
     pub animation_iteration_count_math: Option<crate::values_math::MathNode>,
+    pub extra_math_props: HashMap<PropertyIdKind, crate::values_math::MathNode>,
+    pub aspect_ratio_math: Option<(
+        crate::values_math::MathNode,
+        Option<crate::values_math::MathNode>,
+    )>,
 }
 
 /// Inherited map of CSS custom properties (`--*`) stored as owned token streams.
@@ -1161,7 +1168,7 @@ pub fn resolve_element_style_full(
 
 fn compute_line_height_px(lh: &LineHeightValue, font_size_px: f32, eval: &EvalContext) -> f32 {
     match lh {
-        LineHeightValue::Normal => (font_size_px * 1.2).max(1.0),
+        LineHeightValue::Normal => (font_size_px * 1.2).max(0.0),
         LineHeightValue::Number(n) => (n * font_size_px).max(0.0),
         LineHeightValue::Length(lp) => lp.resolve_px(font_size_px, eval).max(0.0),
     }
@@ -1206,6 +1213,37 @@ pub fn resolve_element_style_with_siblings(
     registered_props: Option<&HashMap<InternedStr, RegisteredProperty>>,
     sibling_index: u32,
     sibling_count: u32,
+) -> ComputedStyle {
+    resolve_element_style_with_context(
+        matched_rules,
+        pres_hint_decls,
+        inline_decls,
+        parent_style,
+        root_font_size_px,
+        media,
+        registered_props,
+        sibling_index,
+        sibling_count,
+        0,
+        EvalContext::default().random_doc_seed,
+    )
+}
+
+/// Resolves an element's [`ComputedStyle`] with sibling indices and per-element/per-document `random()` seeds.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_element_style_with_context(
+    matched_rules: &[MatchedRule<'_>],
+    pres_hint_decls: &[SpecifiedDeclaration],
+    inline_decls: &[SpecifiedDeclaration],
+    parent_style: Option<&ComputedStyle>,
+    root_font_size_px: f32,
+    media: &MediaContext,
+    registered_props: Option<&HashMap<InternedStr, RegisteredProperty>>,
+    sibling_index: u32,
+    sibling_count: u32,
+    random_node_id: u64,
+    random_doc_seed: u64,
 ) -> ComputedStyle {
     let mut style = match parent_style {
         Some(p) => ComputedStyle::inherit_from(p),
@@ -1277,6 +1315,8 @@ pub fn resolve_element_style_with_siblings(
         }
         ctx.sibling_index = sibling_index;
         ctx.sibling_count = sibling_count;
+        ctx.random_node_id = random_node_id;
+        ctx.random_doc_seed = random_doc_seed;
         if style.text.eval_ctx != ctx {
             Arc::make_mut(&mut style.text).eval_ctx = ctx;
         }
@@ -1580,6 +1620,8 @@ pub fn resolve_element_style_with_siblings(
     eval_ctx.root_line_height_px = eff_root_lh;
     eval_ctx.sibling_index = sibling_index;
     eval_ctx.sibling_count = sibling_count;
+    eval_ctx.random_node_id = random_node_id;
+    eval_ctx.random_doc_seed = random_doc_seed;
     if let Some(p) = parent_style {
         if let SizeValue::Length(ref lp) = p.box_model.width {
             let w = lp.resolve_px(eval_ctx.viewport_width_px, &eval_ctx);
@@ -1733,10 +1775,80 @@ pub fn resolve_element_style_with_siblings(
         }
     }
 
+    if let Some(regs) = registered_props {
+        compute_registered_custom_properties(&mut style, regs, &eval_ctx);
+    }
+
     style
 }
 
+#[rustfmt::skip]
+fn compute_registered_custom_properties(
+    style: &mut ComputedStyle,
+    regs: &HashMap<InternedStr, RegisteredProperty>,
+    eval: &EvalContext,
+) {
+    use crate::values_math::{parse_math_value, parse_math_value_from_parser, ValueKind};
+    let mut updates: Vec<(InternedStr, Vec<CssToken>)> = Vec::new();
+    for (name, reg) in regs {
+        let Some(toks) = style.custom_properties.get(name) else { continue; };
+        let syn = reg.syntax.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+        let is_list = syn.ends_with('+') || syn.ends_with('#');
+        let base = syn.trim_end_matches(['+', '#']).trim();
+        let kind = match base {
+            "<number>" => Some(ValueKind::Number),
+            "<integer>" => Some(ValueKind::Integer),
+            "<length>" => Some(ValueKind::Length),
+            "<percentage>" => Some(ValueKind::Percentage),
+            "<length-percentage>" => Some(ValueKind::LengthPercentage),
+            "<angle>" => Some(ValueKind::Angle),
+            "<time>" => Some(ValueKind::Time),
+            "<resolution>" => Some(ValueKind::Resolution),
+            _ => None,
+        };
+        let Some(vk) = kind else { continue; };
+        let raw = serialize_css_tokens(toks);
+        let trimmed = raw.trim();
+        if trimmed.is_empty() { continue; }
+        let mut rc = 0u32;
+        let formatted = if is_list {
+            let sep = if syn.ends_with('#') { ", " } else { " " };
+            let mut pi = cssparser::ParserInput::new(trimmed);
+            let mut p = cssparser::Parser::new(&mut pi);
+            let mut parts = Vec::new();
+            let mut ok = true;
+            while !p.is_exhausted() {
+                if let Some(mut pm) = parse_math_value_from_parser(&mut p, vk) {
+                    pm.node.bind_random_property(name.as_str(), &mut rc);
+                    parts.push(pm.node.serialize_computed(eval, None, vk, None, None));
+                    if syn.ends_with('#') && !p.is_exhausted() && p.expect_comma().is_err() {
+                        ok = false; break;
+                    }
+                } else { ok = false; break; }
+            }
+            if ok && !parts.is_empty() { Some(parts.join(sep)) } else { None }
+        } else if let Some(mut pm) = parse_math_value(trimmed, vk) {
+            pm.node.bind_random_property(name.as_str(), &mut rc);
+            Some(pm.node.serialize_computed(eval, None, vk, None, None))
+        } else {
+            None
+        };
+        if let Some(s) = formatted {
+            if s != trimmed {
+                updates.push((name.clone(), crate::properties::tokenize_custom_value_str(&s)));
+            }
+        }
+    }
+    if !updates.is_empty() {
+        let cmap = Arc::make_mut(&mut style.custom_properties);
+        for (name, toks) in updates {
+            cmap.insert(name, toks);
+        }
+    }
+}
+
 fn registered_value_matches_syntax(syntax: &str, tokens: &[CssToken]) -> bool {
+    use crate::values_math::{parse_math_value, parse_math_value_from_parser, ValueKind};
     let syn = syntax.trim().trim_matches(|c| c == '"' || c == '\'').trim();
     if syn.is_empty() || syn == "*" {
         return true;
@@ -1746,21 +1858,40 @@ fn registered_value_matches_syntax(syntax: &str, tokens: &[CssToken]) -> bool {
     if trimmed.is_empty() {
         return false;
     }
+    let check_math = |vk: ValueKind, is_list: bool, comma: bool| -> bool {
+        if !is_list {
+            return parse_math_value(trimmed, vk).is_some();
+        }
+        let mut pi = cssparser::ParserInput::new(trimmed);
+        let mut p = cssparser::Parser::new(&mut pi);
+        let mut count = 0usize;
+        while !p.is_exhausted() {
+            if parse_math_value_from_parser(&mut p, vk).is_none() {
+                return false;
+            }
+            count += 1;
+            if comma && !p.is_exhausted() && p.expect_comma().is_err() {
+                return false;
+            }
+        }
+        count > 0
+    };
     for alt in syn.split('|').map(str::trim) {
+        let is_list = alt.ends_with('+') || alt.ends_with('#');
+        let comma = alt.ends_with('#');
         let base = alt.trim_end_matches(['+', '#']).trim();
         let ok = match base {
             "<color>" => {
                 crate::cssom_decl::parse_and_serialize_declaration("color", trimmed).is_some()
             }
-            "<length>" | "<length-percentage>" => {
-                crate::cssom_decl::parse_and_serialize_declaration("margin-top", trimmed).is_some()
-                    && !trimmed.eq_ignore_ascii_case("auto")
-            }
-            "<number>" => trimmed.parse::<f64>().is_ok(),
-            "<integer>" => trimmed.parse::<i64>().is_ok(),
-            "<percentage>" => trimmed
-                .strip_suffix('%')
-                .is_some_and(|n| n.parse::<f64>().is_ok()),
+            "<length>" => check_math(ValueKind::Length, is_list, comma),
+            "<length-percentage>" => check_math(ValueKind::LengthPercentage, is_list, comma),
+            "<number>" => check_math(ValueKind::Number, is_list, comma),
+            "<integer>" => check_math(ValueKind::Integer, is_list, comma),
+            "<percentage>" => check_math(ValueKind::Percentage, is_list, comma),
+            "<angle>" => check_math(ValueKind::Angle, is_list, comma),
+            "<time>" => check_math(ValueKind::Time, is_list, comma),
+            "<resolution>" => check_math(ValueKind::Resolution, is_list, comma),
             "<custom-ident>" => {
                 !trimmed.contains(char::is_whitespace)
                     && GlobalKeyword::from_ident(trimmed).is_none()
@@ -2454,6 +2585,40 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::BackgroundPosition, PropertyValue::BgPosition(x, y)) => {
             Arc::make_mut(&mut style.visual).background_position = (x.clone(), y.clone());
+        }
+        (PropertyIdKind::ObjectPosition, PropertyValue::ObjectPos(pos)) => {
+            Arc::make_mut(&mut style.visual).object_position = Some(pos.clone());
+        }
+        (PropertyIdKind::AspectRatio, PropertyValue::AspectRatioMath(ar)) => {
+            style.effects_mut().aspect_ratio_math = ar
+                .as_ref()
+                .map(|(a, b)| ((**a).clone(), b.as_deref().cloned()));
+        }
+        (
+            prop @ (PropertyIdKind::OffsetDistance
+            | PropertyIdKind::ShapeMargin
+            | PropertyIdKind::StrokeWidth
+            | PropertyIdKind::StrokeDashoffset
+            | PropertyIdKind::StrokeDasharray
+            | PropertyIdKind::BackgroundPositionX
+            | PropertyIdKind::BackgroundPositionY
+            | PropertyIdKind::ScrollPaddingTop
+            | PropertyIdKind::ScrollPaddingRight
+            | PropertyIdKind::ScrollPaddingBottom
+            | PropertyIdKind::ScrollPaddingLeft
+            | PropertyIdKind::SvgCx
+            | PropertyIdKind::SvgCy
+            | PropertyIdKind::SvgRx
+            | PropertyIdKind::SvgRy
+            | PropertyIdKind::SvgX
+            | PropertyIdKind::SvgY
+            | PropertyIdKind::BorderImageSlice),
+            PropertyValue::MathVal(n),
+        ) => {
+            style
+                .effects_mut()
+                .extra_math_props
+                .insert(prop, (**n).clone());
         }
         (PropertyIdKind::FontSize, PropertyValue::MathVal(n)) => {
             let px = n.eval_scalar(eval, Some((f64::from(eval.font_size_px), false)));
@@ -3283,6 +3448,36 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
                 LengthPercentage::Percent(0.0),
                 LengthPercentage::Percent(0.0),
             );
+        }
+        PropertyIdKind::ObjectPosition => {
+            Arc::make_mut(&mut style.visual).object_position = None;
+        }
+        PropertyIdKind::AspectRatio => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).aspect_ratio_math = None;
+            }
+        }
+        prop @ (PropertyIdKind::OffsetDistance
+        | PropertyIdKind::ShapeMargin
+        | PropertyIdKind::StrokeWidth
+        | PropertyIdKind::StrokeDashoffset
+        | PropertyIdKind::StrokeDasharray
+        | PropertyIdKind::BackgroundPositionX
+        | PropertyIdKind::BackgroundPositionY
+        | PropertyIdKind::ScrollPaddingTop
+        | PropertyIdKind::ScrollPaddingRight
+        | PropertyIdKind::ScrollPaddingBottom
+        | PropertyIdKind::ScrollPaddingLeft
+        | PropertyIdKind::SvgCx
+        | PropertyIdKind::SvgCy
+        | PropertyIdKind::SvgRx
+        | PropertyIdKind::SvgRy
+        | PropertyIdKind::SvgX
+        | PropertyIdKind::SvgY
+        | PropertyIdKind::BorderImageSlice) => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).extra_math_props.remove(&prop);
+            }
         }
         PropertyIdKind::InterpolateSize => {
             Arc::make_mut(&mut style.text).interpolate_size = InterpolateSizeMode::NumericOnly;

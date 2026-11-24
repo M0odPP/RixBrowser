@@ -865,6 +865,19 @@ enum MathDim {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ChannelRandom {
+    pub dashed_ident: Option<String>,
+    pub element_scoped: bool,
+    pub prop_scoped: bool,
+    pub prop_index_scoped: bool,
+    pub ua_ident: Option<String>,
+    pub fixed: Option<Box<ChannelMath>>,
+    pub min: Box<ChannelMath>,
+    pub max: Box<ChannelMath>,
+    pub step: Option<Box<ChannelMath>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChannelMath {
     Num(f64),
     Pct(f64),
@@ -876,6 +889,7 @@ pub enum ChannelMath {
     Mul(Box<ChannelMath>, Box<ChannelMath>),
     Div(Box<ChannelMath>, Box<ChannelMath>),
     Func(String, Vec<ChannelMath>),
+    Random(Box<ChannelRandom>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -933,6 +947,16 @@ impl ChannelMath {
                 }
                 _ => None,
             },
+            Self::Random(r) => {
+                if let Some(f) = &r.fixed {
+                    if f.dim() != Some(MathDim::Number) {
+                        return None;
+                    }
+                }
+                let d = r.min.dim()?;
+                (r.max.dim()? == d && r.step.as_ref().is_none_or(|s| s.dim() == Some(d)))
+                    .then_some(d)
+            }
         }
     }
 
@@ -1041,6 +1065,32 @@ impl ChannelMath {
                     .join(", ");
                 format!("{name}({inner})")
             }
+            Self::Random(r) => {
+                let mut parts = Vec::with_capacity(4);
+                if let Some(f) = &r.fixed {
+                    parts.push(format!("fixed {}", f.serialize_inner(false)));
+                } else {
+                    let mut opts = Vec::new();
+                    if let Some(d) = &r.dashed_ident {
+                        opts.push(d.clone());
+                    }
+                    if r.element_scoped {
+                        opts.push("element-scoped".to_string());
+                    }
+                    if let Some(u) = &r.ua_ident {
+                        opts.push(u.clone());
+                    }
+                    if !opts.is_empty() {
+                        parts.push(opts.join(" "));
+                    }
+                }
+                parts.push(r.min.serialize_inner(false));
+                parts.push(r.max.serialize_inner(false));
+                if let Some(st) = &r.step {
+                    parts.push(st.serialize_inner(false));
+                }
+                format!("random({})", parts.join(", "))
+            }
         }
     }
 
@@ -1083,6 +1133,52 @@ impl ChannelMath {
                     )
             }
             Self::Func(name, args) => eval_math_fn(name, args, vars, ctx, pct_scale),
+            Self::Random(r) => {
+                let rv = if let Some(f) = &r.fixed {
+                    let v = f.eval(vars, ctx, 100.0);
+                    if v.is_nan() {
+                        f64::NAN
+                    } else if v < 0.0 {
+                        0.0
+                    } else if v >= 1.0 {
+                        f64::from_bits(1.0_f64.to_bits() - 1)
+                    } else {
+                        v
+                    }
+                } else {
+                    let nid = if r.element_scoped {
+                        ctx.random_node_id
+                    } else {
+                        0
+                    };
+                    crate::values_math::hash_random_f64(
+                        ctx.random_doc_seed,
+                        nid,
+                        r.dashed_ident.as_deref(),
+                        r.ua_ident.as_deref(),
+                    )
+                };
+                let lo = r.min.eval(vars, ctx, pct_scale);
+                let hi = r.max.eval(vars, ctx, pct_scale);
+                let st = r.step.as_deref().map(|s| s.eval(vars, ctx, pct_scale));
+                if rv.is_nan() || lo.is_nan() || hi.is_nan() || st.is_some_and(f64::is_nan) {
+                    f64::NAN
+                } else if hi <= lo {
+                    lo
+                } else if !lo.is_finite() || !hi.is_finite() {
+                    f64::NAN
+                } else if let Some(sv) = st.filter(|&s| s > 0.0) {
+                    if sv.is_infinite() || sv > (hi - lo) {
+                        lo
+                    } else {
+                        let n = ((hi - lo) / sv).floor() + 1.0;
+                        let k = (rv * n).floor().min(n - 1.0);
+                        lo + k * sv
+                    }
+                } else {
+                    lo + rv * (hi - lo)
+                }
+            }
         }
     }
 
@@ -1100,6 +1196,7 @@ impl ChannelMath {
                 matches!(name.as_str(), "sibling-index" | "sibling-count")
                     || args.iter().any(Self::uses_dynamic_units)
             }
+            Self::Random(_) => true,
             _ => false,
         }
     }
@@ -1111,7 +1208,45 @@ impl ChannelMath {
                 a.contains_percent() || b.contains_percent()
             }
             Self::Func(_, args) => args.iter().any(Self::contains_percent),
+            Self::Random(r) => {
+                r.min.contains_percent()
+                    || r.max.contains_percent()
+                    || r.step.as_deref().is_some_and(Self::contains_percent)
+            }
             _ => false,
+        }
+    }
+
+    fn bind_random_property(&mut self, prop_name: &str, counter: &mut u32) {
+        match self {
+            Self::Add(a, b) | Self::Sub(a, b) | Self::Mul(a, b) | Self::Div(a, b) => {
+                a.bind_random_property(prop_name, counter);
+                b.bind_random_property(prop_name, counter);
+            }
+            Self::Func(_, args) => {
+                for a in args {
+                    a.bind_random_property(prop_name, counter);
+                }
+            }
+            Self::Random(r) => {
+                if let Some(f) = &mut r.fixed {
+                    f.bind_random_property(prop_name, counter);
+                }
+                r.min.bind_random_property(prop_name, counter);
+                r.max.bind_random_property(prop_name, counter);
+                if let Some(st) = &mut r.step {
+                    st.bind_random_property(prop_name, counter);
+                }
+                if r.fixed.is_none() && r.ua_ident.is_none() {
+                    if r.prop_index_scoped {
+                        *counter += 1;
+                        r.ua_ident = Some(format!("ua-{prop_name}-{counter}"));
+                    } else if r.prop_scoped {
+                        r.ua_ident = Some(format!("ua-{prop_name}"));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1306,6 +1441,64 @@ pub enum CssColorExpr {
 }
 
 impl CssColorExpr {
+    /// Binds CSS Values L5 `property-scoped` / `property-index-scoped` `random()` keys inside this color.
+    pub fn bind_random_property(&mut self, prop_name: &str) {
+        let mut counter = 0u32;
+        self.bind_random_inner(prop_name, &mut counter);
+    }
+
+    fn bind_random_inner(&mut self, prop_name: &str, counter: &mut u32) {
+        let bind_ch = |ch: &mut ChannelSpec, c: &mut u32| {
+            if let ChannelSpec::Expr { expr, .. } = ch {
+                expr.bind_random_property(prop_name, c);
+            }
+        };
+        match self {
+            Self::Functional { c, alpha, .. } => {
+                for ch in c {
+                    bind_ch(ch, counter);
+                }
+                if let Some(a) = alpha {
+                    bind_ch(a, counter);
+                }
+            }
+            Self::Relative {
+                origin, c, alpha, ..
+            } => {
+                origin.bind_random_inner(prop_name, counter);
+                for ch in c {
+                    bind_ch(ch, counter);
+                }
+                if let Some(a) = alpha {
+                    bind_ch(a, counter);
+                }
+            }
+            Self::Alpha { origin, alpha } => {
+                origin.bind_random_inner(prop_name, counter);
+                bind_ch(alpha, counter);
+            }
+            Self::ColorMix { items, .. } => {
+                for (col, pct) in items {
+                    col.bind_random_inner(prop_name, counter);
+                    if let Some(m) = pct {
+                        m.expr.bind_random_property(prop_name, counter);
+                    }
+                }
+            }
+            Self::ColorLayers { layers, .. } => {
+                for l in layers {
+                    l.bind_random_inner(prop_name, counter);
+                }
+            }
+            Self::LightDark(a, b) => {
+                a.bind_random_inner(prop_name, counter);
+                b.bind_random_inner(prop_name, counter);
+            }
+            Self::ContrastColor(inner) => inner.bind_random_inner(prop_name, counter),
+            _ => {}
+        }
+    }
+
     #[must_use]
     pub fn contains_current_color(&self) -> bool {
         match self {
@@ -2430,7 +2623,7 @@ fn is_math_fn_name(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "calc" | "min" | "max" | "clamp" | "round" | "mod" | "rem" | "sin" | "cos" | "tan"
             | "asin" | "acos" | "atan" | "atan2" | "pow" | "sqrt" | "hypot" | "log" | "exp" | "abs" | "sign"
-            | "sibling-index" | "sibling-count"
+            | "sibling-index" | "sibling-count" | "random"
     )
 }
 
@@ -2444,11 +2637,91 @@ fn angle_unit_to_deg(v: f64, unit: &str) -> Option<f64> {
     }
 }
 
+#[rustfmt::skip]
+fn parse_random_channel<'i, 't>(p: &mut Parser<'i, 't>, kws: &[&str]) -> Option<ChannelMath> {
+    let st0 = p.state();
+    let (mut dashed_ident, mut element_scoped, mut prop_scoped, mut prop_index_scoped, mut ua_ident, mut fixed) =
+        (None::<String>, false, false, false, None::<String>, None::<Box<ChannelMath>>);
+    let mut saw_options = false;
+    if p.try_parse(|p| -> Result<(), cssparser::ParseError<'i, ()>> {
+        p.expect_ident_matching("fixed")?;
+        let f = parse_math_atom(p, kws).ok_or_else(|| p.new_custom_error(()))?;
+        if let ChannelMath::Num(v) = f {
+            if !v.is_finite() || v < 0.0 || v >= 1.0 { return Err(p.new_custom_error(())); }
+        }
+        p.expect_comma()?;
+        fixed = Some(Box::new(f));
+        Ok(())
+    }).is_ok() {
+        saw_options = true;
+    } else if p.try_parse(|p| -> Result<(), cssparser::ParseError<'i, ()>> {
+        p.expect_ident_matching("auto")?;
+        p.expect_comma()?;
+        Ok(())
+    }).is_ok() {
+        element_scoped = true; prop_index_scoped = true; saw_options = true;
+    } else {
+        type RandOpts = (Option<String>, bool, bool, bool, Option<String>);
+        let opt_res = p.try_parse(|p| -> Result<RandOpts, cssparser::ParseError<'i, ()>> {
+            let (mut d, mut es, mut ps, mut pis, mut ua, mut count) = (None, false, false, false, None, 0usize);
+            while count < 3 {
+                let Ok(id) = p.try_parse(|p| p.expect_ident().map(|s| s.as_ref().to_string())) else { break; };
+                let lower = id.to_ascii_lowercase();
+                if id.starts_with("--") {
+                    if d.is_some() { return Err(p.new_custom_error(())); }
+                    d = Some(id);
+                } else if lower == "element-scoped" {
+                    if es { return Err(p.new_custom_error(())); }
+                    es = true;
+                } else if lower == "property-scoped" {
+                    if ps || pis || ua.is_some() { return Err(p.new_custom_error(())); }
+                    ps = true;
+                } else if lower == "property-index-scoped" {
+                    if ps || pis || ua.is_some() { return Err(p.new_custom_error(())); }
+                    pis = true;
+                } else if id.starts_with("ua-") && id.len() > 3 {
+                    if ps || pis || ua.is_some() { return Err(p.new_custom_error(())); }
+                    ua = Some(id);
+                } else {
+                    return Err(p.new_custom_error(()));
+                }
+                count += 1;
+            }
+            if count == 0 { return Err(p.new_custom_error(())); }
+            p.expect_comma()?;
+            Ok((d, es, ps, pis, ua))
+        });
+        if let Ok((d, es, ps, pis, ua)) = opt_res {
+            dashed_ident = d; element_scoped = es; prop_scoped = ps; prop_index_scoped = pis; ua_ident = ua;
+            saw_options = true;
+        }
+    }
+    if !saw_options {
+        p.reset(&st0);
+        element_scoped = true;
+        prop_index_scoped = true;
+    }
+    let min = Box::new(parse_math_sum(p, kws)?);
+    p.expect_comma().ok()?;
+    let max = Box::new(parse_math_sum(p, kws)?);
+    let step = if p.try_parse(Parser::expect_comma).is_ok() {
+        Some(Box::new(parse_math_sum(p, kws)?))
+    } else {
+        None
+    };
+    p.is_exhausted().then_some(ChannelMath::Random(Box::new(ChannelRandom {
+        dashed_ident, element_scoped, prop_scoped, prop_index_scoped, ua_ident, fixed, min, max, step,
+    })))
+}
+
 fn parse_math_fn_args<'i, 't>(
     fn_name: &str,
     p: &mut Parser<'i, 't>,
     kws: &[&str],
 ) -> Option<ChannelMath> {
+    if fn_name == "random" {
+        return parse_random_channel(p, kws);
+    }
     if fn_name == "sibling-index" || fn_name == "sibling-count" {
         return p
             .is_exhausted()
