@@ -42,9 +42,10 @@ use crate::values::{
     LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
     OverflowWrapMode, OverlayMode, OverscrollBehaviorMode, PointerEventsMode, PositionMode,
     ReadingFlowMode, ResizeMode, SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode,
-    TextDecorationLine, TextJustifyMode, TextOverflowMode, TextTransformMode, TimingFunction,
-    TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec, UserSelectMode,
-    VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode, ZIndexValue,
+    TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode, TextTransformMode,
+    TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec,
+    UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode,
+    ZIndexValue,
 };
 
 /// Category of an unsupported CSS feature recorded during compilation.
@@ -401,7 +402,7 @@ fn write_tokens_for_reparse(tokens: &[CssToken], buf: &mut String) {
 
 /// Supported CSS property identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[repr(u8)]
+#[repr(u16)]
 pub enum PropertyIdKind {
     // Core display & flow
     Display,
@@ -606,6 +607,7 @@ pub enum PropertyIdKind {
     Content,
     // CSS Writing Modes & Logical Properties Level 1
     WritingMode,
+    TextOrientation,
     Resize,
     CaptionSide,
     OverscrollBehaviorX,
@@ -710,6 +712,7 @@ impl PropertyIdKind {
             "left" => Self::Left,
             // CSS Logical Properties Level 1 & Writing Modes
             "writing-mode" => Self::WritingMode,
+            "text-orientation" => Self::TextOrientation,
             "resize" => Self::Resize,
             "caption-side" => Self::CaptionSide,
             "overscroll-behavior-x" => Self::OverscrollBehaviorX,
@@ -1139,6 +1142,7 @@ impl PropertyIdKind {
             Self::ColorScheme => "color-scheme",
             Self::Content => "content",
             Self::WritingMode => "writing-mode",
+            Self::TextOrientation => "text-orientation",
             Self::Resize => "resize",
             Self::CaptionSide => "caption-side",
             Self::OverscrollBehaviorX => "overscroll-behavior-x",
@@ -1227,6 +1231,7 @@ impl PropertyIdKind {
                 | Self::OverflowWrap
                 | Self::Direction
                 | Self::WritingMode
+                | Self::TextOrientation
                 | Self::CaptionSide
                 | Self::Orphans
                 | Self::Widows
@@ -1818,6 +1823,7 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::ColorScheme,
     PropertyIdKind::Content,
     PropertyIdKind::WritingMode,
+    PropertyIdKind::TextOrientation,
     PropertyIdKind::Resize,
     PropertyIdKind::CaptionSide,
     PropertyIdKind::OverscrollBehaviorX,
@@ -2134,6 +2140,7 @@ pub enum PropertyValue {
     TableLayout(TableLayoutMode),
     Content(Option<InternedStr>),
     WritingMode(WritingMode),
+    TextOrientation(TextOrientationMode),
     Resize(ResizeMode),
     CaptionSide(CaptionSideMode),
     OverscrollBehavior(OverscrollBehaviorMode),
@@ -7059,6 +7066,38 @@ pub(crate) fn compile_extra_standard_property(
         }
     }
     match lower.as_str() {
+        "grid-gap" | "grid-row-gap" | "grid-column-gap" => {
+            let canonical = match lower.as_str() {
+                "grid-gap" => PropertyIdKind::Gap,
+                "grid-row-gap" => PropertyIdKind::RowGap,
+                _ => PropertyIdKind::ColumnGap,
+            };
+            let mut buf = String::new();
+            write_tokens_for_reparse(&owned, &mut buf);
+            for mut d in parse_property_from_str(canonical, buf.trim(), imp) {
+                let idx = *ord;
+                *ord = ord.saturating_add(1);
+                d.order = idx;
+                out.push(d);
+            }
+        }
+        "text-orientation" => {
+            let Some(mode) = single_ident.and_then(|s| match s.to_ascii_lowercase().as_str() {
+                "mixed" => Some(TextOrientationMode::Mixed),
+                "upright" => Some(TextOrientationMode::Upright),
+                "sideways" | "sideways-right" => Some(TextOrientationMode::Sideways),
+                _ => None,
+            }) else {
+                return;
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::TextOrientation,
+                PropertyValue::TextOrientation(mode),
+                imp,
+            );
+        }
         "writing-mode" => {
             let Some(mode) = single_ident.and_then(|s| match s.to_ascii_lowercase().as_str() {
                 "horizontal-tb" => Some(WritingMode::HorizontalTb),

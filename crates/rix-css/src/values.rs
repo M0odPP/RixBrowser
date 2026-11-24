@@ -1030,6 +1030,26 @@ impl WritingMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[repr(u8)]
+pub enum TextOrientationMode {
+    #[default]
+    Mixed,
+    Upright,
+    Sideways,
+}
+
+impl TextOrientationMode {
+    #[must_use]
+    pub const fn as_css_str(self) -> &'static str {
+        match self {
+            Self::Mixed => "mixed",
+            Self::Upright => "upright",
+            Self::Sideways => "sideways",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
 pub enum ResizeMode {
     #[default]
     None,

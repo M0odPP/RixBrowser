@@ -22,10 +22,10 @@ use crate::values::{
     LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
     OverflowPair, OverflowWrapMode, OverlayMode, OverscrollBehaviorMode, PointerEventsMode,
     PositionMode, ReadingFlowMode, ResizeMode, SizeValue, TableLayoutMode, TextAlignLastMode,
-    TextAlignMode, TextDecorationLine, TextJustifyMode, TextOverflowMode, TextTransformMode,
-    TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec,
-    UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode,
-    ZIndexValue,
+    TextAlignMode, TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode,
+    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode,
+    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
+    WordBreakMode, WritingMode, ZIndexValue,
 };
 
 const MAX_VAR_DEPTH: u8 = 64;
@@ -161,6 +161,7 @@ pub struct InheritedTextStyle {
     pub overflow_wrap: OverflowWrapMode,
     pub direction: DirectionMode,
     pub writing_mode: WritingMode,
+    pub text_orientation: TextOrientationMode,
     pub caption_side: CaptionSideMode,
     pub orphans: i32,
     pub widows: i32,
@@ -196,6 +197,7 @@ impl Default for InheritedTextStyle {
             overflow_wrap: OverflowWrapMode::Normal,
             direction: DirectionMode::Ltr,
             writing_mode: WritingMode::HorizontalTb,
+            text_orientation: TextOrientationMode::Mixed,
             caption_side: CaptionSideMode::Top,
             orphans: 2,
             widows: 2,
@@ -230,6 +232,7 @@ impl InheritedTextStyle {
             && self.overflow_wrap == other.overflow_wrap
             && self.direction == other.direction
             && self.writing_mode == other.writing_mode
+            && self.text_orientation == other.text_orientation
             && self.caption_side == other.caption_side
             && self.text_justify == other.text_justify
             && self.text_align_last == other.text_align_last
@@ -2903,6 +2906,9 @@ pub fn apply_declaration(
         (PropertyIdKind::WritingMode, PropertyValue::WritingMode(v)) => {
             Arc::make_mut(&mut style.text).writing_mode = *v;
         }
+        (PropertyIdKind::TextOrientation, PropertyValue::TextOrientation(v)) => {
+            Arc::make_mut(&mut style.text).text_orientation = *v;
+        }
         (PropertyIdKind::CaptionSide, PropertyValue::CaptionSide(v)) => {
             Arc::make_mut(&mut style.text).caption_side = *v;
         }
@@ -3000,6 +3006,9 @@ fn copy_property_from_parent(
         }
         PropertyIdKind::WritingMode => {
             Arc::make_mut(&mut style.text).writing_mode = parent.text.writing_mode;
+        }
+        PropertyIdKind::TextOrientation => {
+            Arc::make_mut(&mut style.text).text_orientation = parent.text.text_orientation;
         }
         PropertyIdKind::CaptionSide => {
             Arc::make_mut(&mut style.text).caption_side = parent.text.caption_side;
@@ -3423,6 +3432,9 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         }
         PropertyIdKind::WritingMode => {
             Arc::make_mut(&mut style.text).writing_mode = WritingMode::HorizontalTb;
+        }
+        PropertyIdKind::TextOrientation => {
+            Arc::make_mut(&mut style.text).text_orientation = TextOrientationMode::Mixed;
         }
         PropertyIdKind::CaptionSide => {
             Arc::make_mut(&mut style.text).caption_side = CaptionSideMode::Top;
