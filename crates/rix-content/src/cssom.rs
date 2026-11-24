@@ -12,13 +12,13 @@ use rix_css::{
     parse_pseudo_element_str, parse_single_cssom_rule_with_context, resolve_logical_to_physical,
     serialize_css_tokens, strip_outer_css_comments, AlignValue, BorderCollapseMode, BoxSizingMode,
     CalcExpr, ClearMode, ColorRgba, ComputedStyle, CssAtom, CssColor, CssomNestingContext,
-    CssomParseError, CssomRuleKind, CursorKind, DirectionMode, DisplayMode, EvalContext, FilterOp,
-    FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode, LengthPercentage,
-    LengthPercentageAuto, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
-    PointerEventsMode, PositionMode, PropertyIdKind, RixPseudoElement, SelectorNamespaceMap,
-    SizeValue, TableLayoutMode, TextAlignMode, TextOverflowMode, TextTransformMode, UserSelectMode,
-    VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, ZIndexValue,
-    COMPUTED_STYLE_LONGHANDS,
+    CssomParseError, CssomRuleKind, CursorKind, DirectionMode, DisplayMode, EmptyCellsMode,
+    EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
+    GridAutoFlowMode, LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle,
+    MixBlendMode, OverflowMode, PointerEventsMode, PositionMode, PropertyIdKind, RixPseudoElement,
+    SelectorNamespaceMap, SizeValue, TableLayoutMode, TextAlignMode, TextOverflowMode,
+    TextTransformMode, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
+    WordBreakMode, ZIndexValue, COMPUTED_STYLE_LONGHANDS,
 };
 use rix_dom::{NodeData, NodeId};
 use rix_js::promise::{alloc_promise, resolve_promise};
@@ -3763,16 +3763,21 @@ fn format_computed_property_resolved(
             TextOverflowMode::Ellipsis => "ellipsis",
         }
         .into(),
-        "border-collapse" => match style.box_model.border_collapse {
+        "border-collapse" => match style.text.border_collapse {
             BorderCollapseMode::Separate => "separate",
             BorderCollapseMode::Collapse => "collapse",
         }
         .into(),
         "border-spacing" => {
-            let x = format_lp_opts(&style.box_model.border_spacing_x, &eval, true);
-            let y = format_lp_opts(&style.box_model.border_spacing_y, &eval, true);
+            let x = format_lp_opts(&style.text.border_spacing_x, &eval, true);
+            let y = format_lp_opts(&style.text.border_spacing_y, &eval, true);
             collapse_2_sides_str(&x, &y)
         }
+        "empty-cells" => match style.text.empty_cells {
+            EmptyCellsMode::Show => "show",
+            EmptyCellsMode::Hide => "hide",
+        }
+        .into(),
         "box-shadow" => match style.effects.as_ref().map(|e| e.box_shadow.as_slice()) {
             Some(list) if !list.is_empty() => list
                 .iter()

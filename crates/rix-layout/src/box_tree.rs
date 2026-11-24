@@ -84,6 +84,14 @@ pub enum ReplacedKind {
     HorizontalRule,
 }
 
+/// Table row-group section classification per CSS Tables Level 3 §3.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TableSectionKind {
+    Header,
+    Body,
+    Footer,
+}
+
 /// Semantic kind of a CSS [`LayoutBox`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoxKind {
@@ -97,7 +105,16 @@ pub enum BoxKind {
     Text(String),
     Replaced(ReplacedKind),
     Table,
-    TableRowGroup,
+    TableCaption,
+    TableColumnGroup {
+        span: usize,
+    },
+    TableColumn {
+        span: usize,
+    },
+    TableRowGroup {
+        section: TableSectionKind,
+    },
     TableRow,
     TableCell {
         colspan: usize,
@@ -131,20 +148,41 @@ impl LayoutBox {
         if self.is_out_of_flow {
             return false;
         }
-        matches!(
-            self.kind,
+        match self.kind {
             BoxKind::Block { .. }
-                | BoxKind::Table
-                | BoxKind::AnonymousBlock
-                | BoxKind::AnonymousTable
-                | BoxKind::Replaced(ReplacedKind::HorizontalRule)
-        )
+            | BoxKind::Table
+            | BoxKind::AnonymousBlock
+            | BoxKind::AnonymousTable
+            | BoxKind::Replaced(ReplacedKind::HorizontalRule) => true,
+            // CSS Tables L3 §2.1: replaced elements with `display: table` behave as `block`,
+            // while other table display values behave as `inline`.
+            BoxKind::Replaced(
+                ReplacedKind::Image { .. }
+                | ReplacedKind::Svg { .. }
+                | ReplacedKind::FormControl { .. }
+                | ReplacedKind::ExternalSurface { .. },
+            ) => matches!(
+                self.style.display,
+                DisplayMode::Block
+                    | DisplayMode::FlowRoot
+                    | DisplayMode::ListItem
+                    | DisplayMode::FlowRootListItem
+                    | DisplayMode::Flex
+                    | DisplayMode::Grid
+                    | DisplayMode::GridLanes
+                    | DisplayMode::Table
+                    | DisplayMode::RunInTable
+                    | DisplayMode::BlockMath
+                    | DisplayMode::BlockRuby
+            ),
+            _ => false,
+        }
     }
 
     /// Returns `true` if this box participates as an inline-level box in flow.
     #[must_use]
     pub fn is_inline_level(&self) -> bool {
-        if self.is_out_of_flow || self.is_float {
+        if self.is_out_of_flow || self.is_float || self.is_block_level() {
             return false;
         }
         matches!(
@@ -162,11 +200,29 @@ impl LayoutBox {
         )
     }
 
+    /// Returns `true` for proper direct children of a `table-root` box (CSS Tables L3 §2.2).
+    #[must_use]
+    pub fn is_proper_table_child(&self) -> bool {
+        matches!(
+            self.kind,
+            BoxKind::TableCaption
+                | BoxKind::TableColumnGroup { .. }
+                | BoxKind::TableColumn { .. }
+                | BoxKind::TableRowGroup { .. }
+                | BoxKind::TableRow
+                | BoxKind::AnonymousTableRow
+        )
+    }
+
+    /// Returns `true` for table-non-root boxes (CSS Tables L3 §2.1).
     #[must_use]
     pub fn is_table_internal(&self) -> bool {
         matches!(
             self.kind,
-            BoxKind::TableRowGroup
+            BoxKind::TableCaption
+                | BoxKind::TableColumnGroup { .. }
+                | BoxKind::TableColumn { .. }
+                | BoxKind::TableRowGroup { .. }
                 | BoxKind::TableRow
                 | BoxKind::TableCell { .. }
                 | BoxKind::AnonymousTableRow
@@ -194,6 +250,8 @@ pub struct BoxTree {
     pub boxes: Vec<LayoutBox>,
     pub root: Option<BoxId>,
     pub dom_to_box: HashMap<NodeId, BoxId>,
+    /// Document quirks mode (`0` = NoQuirks, `1` = LimitedQuirks, `2` = Quirks).
+    pub quirks_mode: u8,
 }
 
 impl BoxTree {
@@ -220,7 +278,10 @@ impl BoxTree {
     #[must_use]
     pub fn build(doc: &Document, styles: &StyleContext, assets: &AssetRegistry) -> Self {
         let mut builder = BoxTreeBuilder {
-            tree: Self::default(),
+            tree: Self {
+                quirks_mode: doc.quirks_mode(),
+                ..Self::default()
+            },
             doc,
             styles,
             assets,
@@ -394,21 +455,43 @@ impl<'a> BoxTreeBuilder<'a> {
 
         let mut raw_children = Vec::new();
 
-        // Emit `::before` generated pseudo-box if `content` is specified.
-        if let Some(before_box) = self.build_pseudo_box(node, RixPseudoElement::Before) {
-            raw_children.push(before_box);
-        }
+        // CSS Tables L3 §2.2 Rule 1.1: Children of a `table-column` are treated as `display: none`.
+        if !matches!(kind, BoxKind::TableColumn { .. }) {
+            // Emit `::before` generated pseudo-box if `content` is specified.
+            if !matches!(kind, BoxKind::TableColumnGroup { .. }) {
+                if let Some(before_box) = self.build_pseudo_box(node, RixPseudoElement::Before) {
+                    raw_children.push(before_box);
+                }
+            }
 
-        // If element hosts a Shadow DOM, render its shadow root children; otherwise light children.
-        let child_source = elem.shadow_root.unwrap_or(node);
-        let dom_children: Vec<NodeId> = self.doc.children(child_source).collect();
-        for child in dom_children {
-            raw_children.extend(self.build_dom_node(child, Some(&style)));
-        }
+            // If element hosts a Shadow DOM, render its shadow root children; otherwise light children.
+            let child_source = elem.shadow_root.unwrap_or(node);
+            let dom_children: Vec<NodeId> = self.doc.children(child_source).collect();
+            if matches!(kind, BoxKind::TableColumnGroup { .. }) {
+                // CSS Tables L3 §2.2 Rule 1.2: Children of a `table-column-group` that are not
+                // `table-column` are treated as if they had `display: none`.
+                for child in dom_children {
+                    let is_table_col = self.styles.style_for(child).is_some_and(|st| {
+                        st.display == DisplayMode::TableColumn
+                            && !matches!(st.position, PositionMode::Absolute | PositionMode::Fixed)
+                            && st.float_mode == FloatMode::None
+                    });
+                    if is_table_col {
+                        raw_children.extend(self.build_dom_node(child, Some(&style)));
+                    }
+                }
+            } else {
+                for child in dom_children {
+                    raw_children.extend(self.build_dom_node(child, Some(&style)));
+                }
+            }
 
-        // Emit `::after` generated pseudo-box if `content` is specified.
-        if let Some(after_box) = self.build_pseudo_box(node, RixPseudoElement::After) {
-            raw_children.push(after_box);
+            // Emit `::after` generated pseudo-box if `content` is specified.
+            if !matches!(kind, BoxKind::TableColumnGroup { .. }) {
+                if let Some(after_box) = self.build_pseudo_box(node, RixPseudoElement::After) {
+                    raw_children.push(after_box);
+                }
+            }
         }
 
         let fixed_children = self.fixup_children(&kind, &style, raw_children);
@@ -460,10 +543,26 @@ impl<'a> BoxTreeBuilder<'a> {
             | DisplayMode::ListItem
             | DisplayMode::FlowRootListItem
             | DisplayMode::BlockMath
-            | DisplayMode::BlockRuby
-            | DisplayMode::TableCaption => BoxKind::Block {
+            | DisplayMode::BlockRuby => BoxKind::Block {
                 formatting_context: FormattingContextKind::Block,
             },
+            DisplayMode::TableCaption => BoxKind::TableCaption,
+            DisplayMode::TableHeaderGroup => BoxKind::TableRowGroup {
+                section: TableSectionKind::Header,
+            },
+            DisplayMode::TableRowGroup => BoxKind::TableRowGroup {
+                section: TableSectionKind::Body,
+            },
+            DisplayMode::TableFooterGroup => BoxKind::TableRowGroup {
+                section: TableSectionKind::Footer,
+            },
+            DisplayMode::TableRow => BoxKind::TableRow,
+            DisplayMode::TableCell => BoxKind::TableCell {
+                colspan: 1,
+                rowspan: 1,
+            },
+            DisplayMode::TableColumnGroup => BoxKind::TableColumnGroup { span: 1 },
+            DisplayMode::TableColumn => BoxKind::TableColumn { span: 1 },
             DisplayMode::InlineBlock | DisplayMode::InlineFlowRootListItem => {
                 BoxKind::InlineBlock {
                     formatting_context: FormattingContextKind::Block,
@@ -761,13 +860,16 @@ impl<'a> BoxTreeBuilder<'a> {
             return children;
         }
         match parent_kind {
-            BoxKind::Table | BoxKind::AnonymousTable => {
-                self.fixup_table_children(parent_style, children)
-            }
-            BoxKind::TableRowGroup => self.fixup_row_group_children(parent_style, children),
+            BoxKind::Table
+            | BoxKind::AnonymousTable
+            | BoxKind::InlineBlock {
+                formatting_context: FormattingContextKind::Table,
+            } => self.fixup_table_children(parent_style, children),
+            BoxKind::TableRowGroup { .. } => self.fixup_row_group_children(parent_style, children),
             BoxKind::TableRow | BoxKind::AnonymousTableRow => {
                 self.fixup_row_children(parent_style, children)
             }
+            BoxKind::TableColumnGroup { .. } | BoxKind::TableColumn { .. } => children,
             BoxKind::Block {
                 formatting_context: FormattingContextKind::Flex | FormattingContextKind::Grid,
             }
@@ -776,6 +878,7 @@ impl<'a> BoxTreeBuilder<'a> {
             } => self.fixup_flex_grid_children(parent_style, children),
             BoxKind::Block { .. }
             | BoxKind::InlineBlock { .. }
+            | BoxKind::TableCaption
             | BoxKind::TableCell { .. }
             | BoxKind::AnonymousBlock
             | BoxKind::AnonymousTableCell => {
@@ -783,9 +886,43 @@ impl<'a> BoxTreeBuilder<'a> {
                 let children = self.wrap_stray_table_internals(parent_style, children);
                 self.fixup_block_children(parent_style, children)
             }
-            BoxKind::Inline => children,
+            BoxKind::Inline => self.wrap_stray_table_internals(parent_style, children),
             _ => children,
         }
+    }
+
+    /// Removes ignorable whitespace-only text boxes inside table-root, row-group, and row boxes
+    /// per CSS Tables Level 3 §2.2 Rules 1.3 and 1.4.
+    fn strip_table_whitespace(&self, children: Vec<BoxId>) -> Vec<BoxId> {
+        let len = children.len();
+        if len == 0 {
+            return children;
+        }
+        // Rule 1.3: discard leading and trailing whitespace-only text boxes.
+        let mut start = 0usize;
+        while start < len && self.is_whitespace_only(children[start]) {
+            start += 1;
+        }
+        let mut end = len;
+        while end > start && self.is_whitespace_only(children[end - 1]) {
+            end -= 1;
+        }
+        let slice = &children[start..end];
+        // Rule 1.4: discard whitespace-only text boxes whose immediate previous AND next
+        // siblings are both table-non-root boxes (or table-internal boxes).
+        let mut out = Vec::with_capacity(slice.len());
+        for (i, &cid) in slice.iter().enumerate() {
+            if self.is_whitespace_only(cid) {
+                let prev_is_table = i > 0 && self.tree.get(slice[i - 1]).is_table_internal();
+                let next_is_table =
+                    i + 1 < slice.len() && self.tree.get(slice[i + 1]).is_table_internal();
+                if prev_is_table && next_is_table {
+                    continue;
+                }
+            }
+            out.push(cid);
+        }
+        out
     }
 
     fn wrap_stray_table_internals(
@@ -835,25 +972,24 @@ impl<'a> BoxTreeBuilder<'a> {
         parent_style: &Arc<ComputedStyle>,
         children: Vec<BoxId>,
     ) -> Vec<BoxId> {
+        let children = self.strip_table_whitespace(children);
         let mut out = Vec::new();
         let mut stray_cells = Vec::new();
         for cid in children {
-            match self.tree.get(cid).kind {
-                BoxKind::TableRowGroup | BoxKind::TableRow | BoxKind::AnonymousTableRow => {
-                    if !stray_cells.is_empty() {
-                        let row_children =
-                            self.fixup_row_children(parent_style, std::mem::take(&mut stray_cells));
-                        out.push(self.alloc_anonymous(
-                            BoxKind::AnonymousTableRow,
-                            parent_style,
-                            row_children,
-                            false,
-                        ));
-                    }
-                    out.push(cid);
+            if self.tree.get(cid).is_proper_table_child() {
+                if !stray_cells.is_empty() {
+                    let row_children =
+                        self.fixup_row_children(parent_style, std::mem::take(&mut stray_cells));
+                    out.push(self.alloc_anonymous(
+                        BoxKind::AnonymousTableRow,
+                        parent_style,
+                        row_children,
+                        false,
+                    ));
                 }
-                BoxKind::Text(ref t) if t.trim().is_empty() => {}
-                _ => stray_cells.push(cid),
+                out.push(cid);
+            } else {
+                stray_cells.push(cid);
             }
         }
         if !stray_cells.is_empty() {
@@ -873,6 +1009,7 @@ impl<'a> BoxTreeBuilder<'a> {
         parent_style: &Arc<ComputedStyle>,
         children: Vec<BoxId>,
     ) -> Vec<BoxId> {
+        let children = self.strip_table_whitespace(children);
         let mut out = Vec::new();
         let mut stray = Vec::new();
         for cid in children {
@@ -890,7 +1027,6 @@ impl<'a> BoxTreeBuilder<'a> {
                     }
                     out.push(cid);
                 }
-                BoxKind::Text(ref t) if t.trim().is_empty() => {}
                 _ => stray.push(cid),
             }
         }
@@ -911,14 +1047,16 @@ impl<'a> BoxTreeBuilder<'a> {
         parent_style: &Arc<ComputedStyle>,
         children: Vec<BoxId>,
     ) -> Vec<BoxId> {
+        let children = self.strip_table_whitespace(children);
         let mut out = Vec::new();
         let mut stray = Vec::new();
         for cid in children {
             match self.tree.get(cid).kind {
                 BoxKind::TableCell { .. } | BoxKind::AnonymousTableCell => {
                     if !stray.is_empty() {
-                        let cell_children =
-                            self.fixup_block_children(parent_style, std::mem::take(&mut stray));
+                        let wrapped = self
+                            .wrap_stray_table_internals(parent_style, std::mem::take(&mut stray));
+                        let cell_children = self.fixup_block_children(parent_style, wrapped);
                         out.push(self.alloc_anonymous(
                             BoxKind::AnonymousTableCell,
                             parent_style,
@@ -928,12 +1066,12 @@ impl<'a> BoxTreeBuilder<'a> {
                     }
                     out.push(cid);
                 }
-                BoxKind::Text(ref t) if t.trim().is_empty() => {}
                 _ => stray.push(cid),
             }
         }
         if !stray.is_empty() {
-            let cell_children = self.fixup_block_children(parent_style, stray);
+            let wrapped = self.wrap_stray_table_internals(parent_style, stray);
+            let cell_children = self.fixup_block_children(parent_style, wrapped);
             out.push(self.alloc_anonymous(
                 BoxKind::AnonymousTableCell,
                 parent_style,
@@ -1166,6 +1304,9 @@ impl<'a> BoxTreeBuilder<'a> {
             BoxKind::TableCell { colspan, rowspan } => {
                 hash = fnv_mix(hash, ((*colspan as u64) << 16) | (*rowspan as u64));
             }
+            BoxKind::TableColumn { span } | BoxKind::TableColumnGroup { span } => {
+                hash = fnv_mix(hash, (*span as u64) ^ 0x5555_0000);
+            }
             BoxKind::Replaced(ReplacedKind::Image {
                 image_id,
                 intrinsic_size,
@@ -1210,6 +1351,16 @@ fn fnv_mix(mut hash: u64, val: u64) -> u64 {
     hash
 }
 
+fn parse_html_non_negative_int(raw: &str) -> Option<usize> {
+    let s = raw.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let s = s.strip_prefix('+').unwrap_or(s);
+    let end = s.bytes().take_while(u8::is_ascii_digit).count();
+    if end == 0 {
+        return None;
+    }
+    s[..end].parse::<usize>().ok()
+}
+
 fn classify_element_box_kind(
     tag: &str,
     elem: &ElementData,
@@ -1217,13 +1368,6 @@ fn classify_element_box_kind(
     is_float: bool,
     is_out_of_flow: bool,
 ) -> BoxKind {
-    // HTML5 table row groups (`thead`, `tbody`, `tfoot`) act as table row groups when not overridden.
-    if matches!(tag, "thead" | "tbody" | "tfoot")
-        && matches!(style.display, DisplayMode::Inline | DisplayMode::Block)
-    {
-        return BoxKind::TableRowGroup;
-    }
-
     // Floated or out-of-flow boxes blockify per CSS Display Level 3 §2.7.
     let effective_display = if is_float || is_out_of_flow {
         style.display.blockify()
@@ -1250,21 +1394,61 @@ fn classify_element_box_kind(
         DisplayMode::InlineTable => BoxKind::InlineBlock {
             formatting_context: FormattingContextKind::Table,
         },
-        DisplayMode::TableRowGroup
-        | DisplayMode::TableHeaderGroup
-        | DisplayMode::TableFooterGroup => BoxKind::TableRowGroup,
+        DisplayMode::TableCaption => BoxKind::TableCaption,
+        DisplayMode::TableColumnGroup => {
+            let span = if tag.eq_ignore_ascii_case("colgroup") {
+                elem.get_attribute("span")
+                    .and_then(parse_html_non_negative_int)
+                    .filter(|&v| v > 0)
+                    .unwrap_or(1)
+                    .min(1000)
+            } else {
+                1
+            };
+            BoxKind::TableColumnGroup { span }
+        }
+        DisplayMode::TableColumn => {
+            let span = if tag.eq_ignore_ascii_case("col") {
+                elem.get_attribute("span")
+                    .and_then(parse_html_non_negative_int)
+                    .filter(|&v| v > 0)
+                    .unwrap_or(1)
+                    .min(1000)
+            } else {
+                1
+            };
+            BoxKind::TableColumn { span }
+        }
+        DisplayMode::TableHeaderGroup => BoxKind::TableRowGroup {
+            section: TableSectionKind::Header,
+        },
+        DisplayMode::TableRowGroup => BoxKind::TableRowGroup {
+            section: TableSectionKind::Body,
+        },
+        DisplayMode::TableFooterGroup => BoxKind::TableRowGroup {
+            section: TableSectionKind::Footer,
+        },
         DisplayMode::TableRow => BoxKind::TableRow,
         DisplayMode::TableCell => {
-            let colspan = elem
-                .get_attribute("colspan")
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(1)
-                .clamp(1, 1000);
-            let rowspan = elem
-                .get_attribute("rowspan")
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(1)
-                .clamp(1, 1000);
+            let is_html_cell = tag.eq_ignore_ascii_case("td") || tag.eq_ignore_ascii_case("th");
+            let colspan = if is_html_cell {
+                elem.get_attribute("colspan")
+                    .and_then(parse_html_non_negative_int)
+                    .filter(|&v| v > 0)
+                    .unwrap_or(1)
+                    .min(1000)
+            } else {
+                1
+            };
+            // HTML Standard §4.9.11: `rowspan="0"` means span all remaining rows in the row group.
+            let rowspan = if is_html_cell {
+                elem.get_attribute("rowspan")
+                    .and_then(parse_html_non_negative_int)
+                    .unwrap_or(1)
+                    .min(65_534)
+            } else {
+                1
+            };
             BoxKind::TableCell { colspan, rowspan }
         }
         DisplayMode::InlineBlock | DisplayMode::InlineFlowRootListItem => BoxKind::InlineBlock {
@@ -1289,9 +1473,6 @@ fn classify_element_box_kind(
         | DisplayMode::RunInFlowRootListItem
         | DisplayMode::BlockMath
         | DisplayMode::BlockRuby
-        | DisplayMode::TableCaption
-        | DisplayMode::TableColumnGroup
-        | DisplayMode::TableColumn
         | DisplayMode::Contents
         | DisplayMode::None => BoxKind::Block {
             formatting_context: FormattingContextKind::Block,

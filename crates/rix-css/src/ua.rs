@@ -29,16 +29,24 @@ table {
     display: table;
     border-collapse: separate;
     box-sizing: border-box;
-    text-align: left;
+    text-indent: initial;
+    border-spacing: 2px;
+    border-color: gray;
 }
 thead {
     display: table-header-group;
+    vertical-align: middle;
+    border-color: inherit;
 }
 tbody {
     display: table-row-group;
+    vertical-align: middle;
+    border-color: inherit;
 }
 tfoot {
     display: table-footer-group;
+    vertical-align: middle;
+    border-color: inherit;
 }
 colgroup {
     display: table-column-group;
@@ -48,12 +56,20 @@ col {
 }
 caption {
     display: table-caption;
+    text-align: center;
 }
 tr {
     display: table-row;
+    vertical-align: inherit;
+    border-color: inherit;
 }
 td, th {
     display: table-cell;
+    vertical-align: inherit;
+    padding: 1px;
+}
+th {
+    text-align: center;
 }
 * {
     overlay: none !important;

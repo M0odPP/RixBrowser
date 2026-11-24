@@ -83,6 +83,12 @@ impl Document {
         }
     }
 
+    /// Returns the document's quirks mode (`0` = NoQuirks, `1` = LimitedQuirks, `2` = Quirks).
+    #[must_use]
+    pub fn quirks_mode(&self) -> u8 {
+        self.quirks_mode
+    }
+
     /// Sets quirks mode (`0` = NoQuirks, `1` = LimitedQuirks, `2` = Quirks).
     pub fn set_quirks_mode(&mut self, mode: u8) {
         self.quirks_mode = mode;

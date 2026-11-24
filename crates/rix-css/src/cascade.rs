@@ -1269,7 +1269,7 @@ fn compute_single_element_style(
         .iter()
         .find(|(q, _)| q.local.eq_str_ignore_ascii_case("style"))
         .map(|(_, v)| v.as_str());
-    let has_pres_hints = has_presentational_hint_attrs(elem);
+    let has_pres_hints = has_presentational_hint_attrs(doc, node, elem);
 
     let any_sibling_math = !rule_index.allows_sibling_sharing
         && matched_indices.iter().any(|&idx| {
@@ -1300,7 +1300,7 @@ fn compute_single_element_style(
     }
 
     let pres_decls = if has_pres_hints {
-        collect_presentational_hint_decls(elem, missing_out)
+        collect_presentational_hint_decls(doc, node, elem, missing_out)
     } else {
         Vec::new()
     };
@@ -1552,29 +1552,239 @@ fn eval_nested_scopes(
     best_prox
 }
 
-fn has_presentational_hint_attrs(elem: &ElementData) -> bool {
-    elem.attributes.iter().any(|(q, _)| {
+fn owning_html_table<'a>(doc: &'a Document, node: NodeId, tag: &str) -> Option<&'a ElementData> {
+    if tag.eq_ignore_ascii_case("td") || tag.eq_ignore_ascii_case("th") {
+        let tr = doc.parent(node)?;
+        let tr_el = match doc.get(tr)? {
+            NodeData::Element(e) if e.name.local.eq_str_ignore_ascii_case("tr") => tr,
+            _ => return None,
+        };
+        let p = doc.parent(tr_el)?;
+        match doc.get(p)? {
+            NodeData::Element(e) if e.name.local.eq_str_ignore_ascii_case("table") => Some(e),
+            NodeData::Element(e)
+                if e.name.local.eq_str_ignore_ascii_case("tbody")
+                    || e.name.local.eq_str_ignore_ascii_case("thead")
+                    || e.name.local.eq_str_ignore_ascii_case("tfoot") =>
+            {
+                let tbl = doc.parent(p)?;
+                match doc.get(tbl)? {
+                    NodeData::Element(te) if te.name.local.eq_str_ignore_ascii_case("table") => {
+                        Some(te)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    } else if tag.eq_ignore_ascii_case("thead")
+        || tag.eq_ignore_ascii_case("tbody")
+        || tag.eq_ignore_ascii_case("tfoot")
+        || tag.eq_ignore_ascii_case("colgroup")
+    {
+        let p = doc.parent(node)?;
+        match doc.get(p)? {
+            NodeData::Element(te) if te.name.local.eq_str_ignore_ascii_case("table") => Some(te),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+fn parse_html_table_border_attr(raw: &str) -> f32 {
+    let trimmed = raw.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    if trimmed.is_empty() {
+        return 1.0;
+    }
+    let bytes = trimmed.as_bytes();
+    let mut end = 0usize;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == 0 {
+        return 1.0;
+    }
+    trimmed[..end].parse::<f32>().unwrap_or(1.0).max(0.0)
+}
+
+fn has_presentational_hint_attrs(doc: &Document, node: NodeId, elem: &ElementData) -> bool {
+    let tag: &str = elem.name.local.as_ref();
+    if doc.quirks_mode() == 2 && tag.eq_ignore_ascii_case("table") {
+        return true;
+    }
+    if elem.attributes.iter().any(|(q, _)| {
         let k: &str = q.local.as_ref();
         k.eq_ignore_ascii_case("bgcolor")
             || k.eq_ignore_ascii_case("width")
             || k.eq_ignore_ascii_case("height")
             || k.eq_ignore_ascii_case("align")
+            || k.eq_ignore_ascii_case("valign")
             || k.eq_ignore_ascii_case("cellspacing")
+            || k.eq_ignore_ascii_case("cellpadding")
+            || k.eq_ignore_ascii_case("border")
+            || k.eq_ignore_ascii_case("rules")
+            || k.eq_ignore_ascii_case("frame")
+            || k.eq_ignore_ascii_case("nowrap")
             || k.eq_ignore_ascii_case("color")
-    })
+    }) {
+        return true;
+    }
+    if let Some(tbl) = owning_html_table(doc, node, tag) {
+        return tbl.attributes.iter().any(|(q, _)| {
+            let k: &str = q.local.as_ref();
+            k.eq_ignore_ascii_case("border")
+                || k.eq_ignore_ascii_case("rules")
+                || k.eq_ignore_ascii_case("cellpadding")
+        });
+    }
+    false
 }
 
 /// Translates HTML5 §15.3 presentational attributes (`bgcolor`, `width`, `height`, `align`,
-/// `cellspacing`, `<font color>`) into zero-specificity CSS declarations overridden by author CSS.
+/// `valign`, `cellspacing`, `cellpadding`, `border`, `rules`, `frame`, `nowrap`, `<font color>`)
+/// and Quirks Mode table resets into zero-specificity CSS declarations overridden by author CSS.
 fn collect_presentational_hint_decls(
+    doc: &Document,
+    node: NodeId,
     elem: &ElementData,
     missing_out: &mut Vec<MissingCssFeature>,
 ) -> Vec<SpecifiedDeclaration> {
     let tag: &str = elem.name.local.as_ref();
     let mut css = String::new();
 
+    // WHATWG Quirks Mode §3.4 / HTML §15.3.9: in Quirks Mode (not Limited-Quirks),
+    // `<table>` resets inherited font & text properties to their initial values.
+    if doc.quirks_mode() == 2 && tag.eq_ignore_ascii_case("table") {
+        css.push_str(
+            "font-weight:initial;font-style:initial;font-size:initial;line-height:initial;white-space:initial;text-align:initial;",
+        );
+    }
+
+    // HTML §15.3.9 `<table>` border / rules / frame presentational hint mapping.
+    if tag.eq_ignore_ascii_case("table") {
+        let border_attr = elem.get_attribute("border");
+        let rules_attr = elem
+            .get_attribute("rules")
+            .map(|s| s.trim().to_ascii_lowercase());
+        let frame_attr = elem
+            .get_attribute("frame")
+            .map(|s| s.trim().to_ascii_lowercase());
+        let has_valid_rules = matches!(
+            rules_attr.as_deref(),
+            Some("none" | "groups" | "rows" | "cols" | "all")
+        );
+        let frame_sides: Option<(bool, bool, bool, bool)> = match frame_attr.as_deref() {
+            Some("void") => Some((false, false, false, false)),
+            Some("above") => Some((true, false, false, false)),
+            Some("below") => Some((false, false, true, false)),
+            Some("hsides") => Some((true, false, true, false)),
+            Some("lhs") => Some((false, false, false, true)),
+            Some("rhs") => Some((false, true, false, false)),
+            Some("vsides") => Some((false, true, false, true)),
+            Some("box" | "border") => Some((true, true, true, true)),
+            _ => None,
+        };
+        let border_w = border_attr.map(parse_html_table_border_attr);
+        if has_valid_rules {
+            css.push_str("border-style:hidden;border-collapse:collapse;");
+        }
+        if let Some((t, r, b, l)) = frame_sides {
+            let st = |on: bool| if on { "outset" } else { "hidden" };
+            css.push_str(&format!(
+                "border-top-style:{};border-right-style:{};border-bottom-style:{};border-left-style:{};",
+                st(t),
+                st(r),
+                st(b),
+                st(l)
+            ));
+            if border_w.is_none_or(|w| w <= 0.0) {
+                let wd = |on: bool| if on { "1px" } else { "0px" };
+                css.push_str(&format!(
+                    "border-top-width:{};border-right-width:{};border-bottom-width:{};border-left-width:{};border-color:currentcolor;",
+                    wd(t),
+                    wd(r),
+                    wd(b),
+                    wd(l)
+                ));
+            }
+        }
+        if let Some(w) = border_w {
+            if w > 0.0 {
+                css.push_str(&format!("border-width:{w}px;border-color:gray;"));
+                if frame_sides.is_none() {
+                    css.push_str("border-style:outset;");
+                }
+            } else if frame_sides.is_none() {
+                css.push_str("border-width:0px;");
+            }
+        }
+    }
+
+    // Inherited HTML table presentational hints from owning `<table>` (`border`, `rules`, `cellpadding`).
+    if let Some(tbl) = owning_html_table(doc, node, tag) {
+        if tag.eq_ignore_ascii_case("td") || tag.eq_ignore_ascii_case("th") {
+            if let Some(cp) = tbl.get_attribute("cellpadding") {
+                if let Some(dim) = normalize_html_dimension(cp.trim()) {
+                    css.push_str("padding:");
+                    css.push_str(&dim);
+                    css.push(';');
+                }
+            }
+            let rules_lc = tbl
+                .get_attribute("rules")
+                .map(|s| s.trim().to_ascii_lowercase());
+            let has_nonzero_border = tbl
+                .get_attribute("border")
+                .is_some_and(|v| parse_html_table_border_attr(v) > 0.0);
+            match rules_lc.as_deref() {
+                Some("all") => {
+                    css.push_str("border-width:1px;border-style:solid;border-color:inherit;");
+                }
+                Some("rows") => {
+                    css.push_str("border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-left-style:none;border-right-style:none;border-color:inherit;");
+                }
+                Some("cols") => {
+                    css.push_str("border-left-width:1px;border-right-width:1px;border-left-style:solid;border-right-style:solid;border-top-style:none;border-bottom-style:none;border-color:inherit;");
+                }
+                Some("none") => {
+                    css.push_str("border-style:none;");
+                }
+                _ => {
+                    if has_nonzero_border {
+                        css.push_str("border-width:1px;border-style:inset;border-color:inherit;");
+                    }
+                }
+            }
+        } else if matches!(
+            tbl.get_attribute("rules")
+                .map(|s| s.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("groups")
+        ) {
+            if tag.eq_ignore_ascii_case("thead")
+                || tag.eq_ignore_ascii_case("tbody")
+                || tag.eq_ignore_ascii_case("tfoot")
+            {
+                css.push_str(
+                    "border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;",
+                );
+            } else if tag.eq_ignore_ascii_case("colgroup") {
+                css.push_str(
+                    "border-left-width:1px;border-right-width:1px;border-left-style:solid;border-right-style:solid;",
+                );
+            }
+        }
+    }
+
     for (q, val) in &elem.attributes {
         let attr: &str = q.local.as_ref();
+        if attr.eq_ignore_ascii_case("nowrap")
+            && (tag.eq_ignore_ascii_case("td") || tag.eq_ignore_ascii_case("th"))
+        {
+            css.push_str("white-space:nowrap;");
+            continue;
+        }
         let trimmed = val.trim();
         if trimmed.is_empty() {
             continue;
@@ -1582,6 +1792,9 @@ fn collect_presentational_hint_decls(
         if attr.eq_ignore_ascii_case("bgcolor")
             && (tag.eq_ignore_ascii_case("body")
                 || tag.eq_ignore_ascii_case("table")
+                || tag.eq_ignore_ascii_case("thead")
+                || tag.eq_ignore_ascii_case("tbody")
+                || tag.eq_ignore_ascii_case("tfoot")
                 || tag.eq_ignore_ascii_case("tr")
                 || tag.eq_ignore_ascii_case("td")
                 || tag.eq_ignore_ascii_case("th"))
@@ -1599,6 +1812,8 @@ fn collect_presentational_hint_decls(
             && (tag.eq_ignore_ascii_case("table")
                 || tag.eq_ignore_ascii_case("td")
                 || tag.eq_ignore_ascii_case("th")
+                || tag.eq_ignore_ascii_case("col")
+                || tag.eq_ignore_ascii_case("colgroup")
                 || tag.eq_ignore_ascii_case("img")
                 || tag.eq_ignore_ascii_case("svg")
                 || tag.eq_ignore_ascii_case("canvas")
@@ -1612,6 +1827,10 @@ fn collect_presentational_hint_decls(
             }
         } else if attr.eq_ignore_ascii_case("height")
             && (tag.eq_ignore_ascii_case("table")
+                || tag.eq_ignore_ascii_case("thead")
+                || tag.eq_ignore_ascii_case("tbody")
+                || tag.eq_ignore_ascii_case("tfoot")
+                || tag.eq_ignore_ascii_case("tr")
                 || tag.eq_ignore_ascii_case("td")
                 || tag.eq_ignore_ascii_case("th")
                 || tag.eq_ignore_ascii_case("img")
@@ -1630,6 +1849,20 @@ fn collect_presentational_hint_decls(
                 css.push_str("margin-left:auto;margin-right:auto;");
             } else if matches!(lower.as_str(), "left" | "center" | "right" | "justify") {
                 css.push_str("text-align:");
+                css.push_str(&lower);
+                css.push(';');
+            }
+        } else if attr.eq_ignore_ascii_case("valign")
+            && (tag.eq_ignore_ascii_case("thead")
+                || tag.eq_ignore_ascii_case("tbody")
+                || tag.eq_ignore_ascii_case("tfoot")
+                || tag.eq_ignore_ascii_case("tr")
+                || tag.eq_ignore_ascii_case("td")
+                || tag.eq_ignore_ascii_case("th"))
+        {
+            let lower = trimmed.to_ascii_lowercase();
+            if matches!(lower.as_str(), "top" | "middle" | "bottom" | "baseline") {
+                css.push_str("vertical-align:");
                 css.push_str(&lower);
                 css.push(';');
             }

@@ -36,16 +36,16 @@ use crate::values::{
     AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
     AnimationPlayStateMode, AnimationSpec, BackgroundImageValue, BackgroundLayerValue,
     BorderCollapseMode, BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue,
-    CornerRadius, CssColor, CursorKind, DirectionMode, DisplayMode, FilterOp, FlexDirectionMode,
-    FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode, GridPlacementValue,
-    GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode, LengthPercentage,
-    LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
-    OverflowWrapMode, OverlayMode, OverscrollBehaviorMode, PointerEventsMode, PositionMode,
-    ReadingFlowMode, ResizeMode, SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode,
-    TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode, TextTransformMode,
-    TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec,
-    UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode,
-    ZIndexValue,
+    CornerRadius, CssColor, CursorKind, DirectionMode, DisplayMode, EmptyCellsMode, FilterOp,
+    FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
+    GridPlacementValue, GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode,
+    LengthPercentage, LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, MixBlendMode,
+    OverflowMode, OverflowWrapMode, OverlayMode, OverscrollBehaviorMode, PointerEventsMode,
+    PositionMode, ReadingFlowMode, ResizeMode, SizeValue, TableLayoutMode, TextAlignLastMode,
+    TextAlignMode, TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode,
+    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode,
+    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
+    WordBreakMode, WritingMode, ZIndexValue,
 };
 
 /// Category of an unsupported CSS feature recorded during compilation.
@@ -602,6 +602,7 @@ pub enum PropertyIdKind {
     TextOverflow,
     BorderCollapse,
     BorderSpacing,
+    EmptyCells,
     TableLayout,
     ColorScheme,
     Content,
@@ -936,6 +937,7 @@ impl PropertyIdKind {
             "text-overflow" => Self::TextOverflow,
             "border-collapse" => Self::BorderCollapse,
             "border-spacing" => Self::BorderSpacing,
+            "empty-cells" => Self::EmptyCells,
             "table-layout" => Self::TableLayout,
             "color-scheme" => Self::ColorScheme,
             "content" => Self::Content,
@@ -1138,6 +1140,7 @@ impl PropertyIdKind {
             Self::TextOverflow => "text-overflow",
             Self::BorderCollapse => "border-collapse",
             Self::BorderSpacing => "border-spacing",
+            Self::EmptyCells => "empty-cells",
             Self::TableLayout => "table-layout",
             Self::ColorScheme => "color-scheme",
             Self::Content => "content",
@@ -1243,6 +1246,7 @@ impl PropertyIdKind {
                 | Self::HyphenateLimitLines
                 | Self::BorderCollapse
                 | Self::BorderSpacing
+                | Self::EmptyCells
                 | Self::Custom
         )
     }
@@ -1535,6 +1539,7 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "cursor",
     "direction",
     "display",
+    "empty-cells",
     "filter",
     "flex-basis",
     "flex-direction",
@@ -1819,6 +1824,7 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::TextOverflow,
     PropertyIdKind::BorderCollapse,
     PropertyIdKind::BorderSpacing,
+    PropertyIdKind::EmptyCells,
     PropertyIdKind::TableLayout,
     PropertyIdKind::ColorScheme,
     PropertyIdKind::Content,
@@ -2137,6 +2143,7 @@ pub enum PropertyValue {
     TextOverflow(TextOverflowMode),
     BorderCollapse(BorderCollapseMode),
     BorderSpacing(LengthPercentage, LengthPercentage),
+    EmptyCells(EmptyCellsMode),
     TableLayout(TableLayoutMode),
     Content(Option<InternedStr>),
     WritingMode(WritingMode),
@@ -2571,7 +2578,10 @@ pub fn should_use_values4_parser(prop: PropertyIdKind, raw: &str) -> bool {
     }
     if is_sizing_property(prop)
         && (lower.starts_with("calc-size(")
-            || lower == "stretch"
+            || matches!(
+                lower.as_str(),
+                "stretch" | "-webkit-fill-available" | "-moz-available"
+            )
             || (prop == PropertyIdKind::FlexBasis
                 && matches!(
                     lower.as_str(),
@@ -2781,10 +2791,15 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
                 spec,
             ));
         }
-        p if is_sizing_property(p) && trimmed.eq_ignore_ascii_case("stretch") => {
+        p if is_sizing_property(p)
+            && matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "stretch" | "-webkit-fill-available" | "-moz-available"
+            ) =>
+        {
             return Some((
                 PropertyValue::Size(SizeValue::Stretch),
-                "stretch".to_string(),
+                trimmed.to_ascii_lowercase(),
             ));
         }
         PropertyIdKind::FlexBasis if trimmed.to_ascii_lowercase().starts_with("fit-content(") => {
@@ -4133,6 +4148,10 @@ pub(crate) fn property_has_disallowed_value(prop: &Property<'_>) -> bool {
         }
         Property::BorderBlockWidth(b) => bw_neg(&b.start) || bw_neg(&b.end),
         Property::BorderInlineWidth(b) => bw_neg(&b.start) || bw_neg(&b.end),
+        Property::BorderSpacing(bs) => {
+            matches!(&bs.0, Length::Value(lv) if convert_length_value(lv).is_negative_literal())
+                || matches!(&bs.1, Length::Value(lv) if convert_length_value(lv).is_negative_literal())
+        }
         Property::BorderTopLeftRadius(r, _)
         | Property::BorderTopRightRadius(r, _)
         | Property::BorderBottomRightRadius(r, _)
@@ -6433,6 +6452,11 @@ fn compile_property(
             );
         }
         Property::BorderSpacing(bs) => {
+            if matches!(&bs.0, lightningcss::values::length::Length::Value(lv) if convert_length_value(lv).is_negative_literal())
+                || matches!(&bs.1, lightningcss::values::length::Length::Value(lv) if convert_length_value(lv).is_negative_literal())
+            {
+                return;
+            }
             let x = convert_length(&bs.0);
             let y = convert_length(&bs.1);
             push_decl(
@@ -7261,6 +7285,22 @@ pub(crate) fn compile_extra_standard_property(
                 ord,
                 PropertyIdKind::BorderCollapse,
                 PropertyValue::BorderCollapse(mode),
+                imp,
+            );
+        }
+        "empty-cells" => {
+            let Some(mode) = single_ident.and_then(|s| match s.to_ascii_lowercase().as_str() {
+                "show" => Some(EmptyCellsMode::Show),
+                "hide" => Some(EmptyCellsMode::Hide),
+                _ => None,
+            }) else {
+                return;
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::EmptyCells,
+                PropertyValue::EmptyCells(mode),
                 imp,
             );
         }
