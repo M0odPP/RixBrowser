@@ -1396,7 +1396,10 @@ fn install_range_prototypes(
             let rh = this_val
                 .as_object()
                 .ok_or_else(|| vm.type_error("Illegal invocation"))?;
-            let html = vm.value_to_rust_string(arg(args, 0));
+            if args.is_empty() {
+                return Err(vm.type_error("createContextualFragment requires 1 argument"));
+            }
+            let html = crate::dom_parsing::to_dom_string(vm, arg(args, 0))?;
             let r = h
                 .borrow()
                 .selection
@@ -1447,8 +1450,9 @@ fn install_range_prototypes(
                 };
                 (ctx_name, owner_doc)
             };
-            let (frag_doc, frag_roots) = rix_html::parse_html_fragment(&html, ctx_name.as_ref());
-            let frag_id = {
+            let (frag_doc, frag_roots) =
+                rix_html::parse_html_fragment_with_options(&html, ctx_name.as_ref(), false, false);
+            let (frag_id, script_nodes) = {
                 let doc_rc = Rc::clone(&h.borrow().document);
                 let mut doc = doc_rc.borrow_mut();
                 let f = doc.new_node(NodeData::DocumentFragment);
@@ -1456,9 +1460,41 @@ fn install_range_prototypes(
                     let cloned = doc.clone_subtree_from(&frag_doc, src);
                     doc.append_child(f, cloned);
                 }
-                f
+                let scripts: Vec<NodeId> = doc
+                    .descendants(f)
+                    .filter(|&id| {
+                        matches!(
+                            doc.get(id),
+                            Some(NodeData::Element(e))
+                                if e.name.local.as_str().eq_ignore_ascii_case("script")
+                                    && matches!(
+                                        &*e.name.ns,
+                                        crate::dom_interfaces::HTML_NS
+                                            | crate::dom_interfaces::SVG_NS
+                                    )
+                        )
+                    })
+                    .collect();
+                (f, scripts)
             };
-            h.borrow_mut().adopt_subtree(frag_id, owner_doc);
+            {
+                let mut hb = h.borrow_mut();
+                hb.adopt_subtree(frag_id, owner_doc);
+                // Per HTML §13.2.6.4.8 (EOF in text mode), an unclosed `<script>` at the end
+                // of a fragment parse is marked "already started" and must never execute.
+                let lower_html = html.to_ascii_lowercase();
+                let open_count = lower_html.matches("<script").count();
+                let close_count = lower_html.matches("</script").count();
+                let unclosed_last = open_count > close_count;
+                let executable_len = if unclosed_last && !script_nodes.is_empty() {
+                    script_nodes.len() - 1
+                } else {
+                    script_nodes.len()
+                };
+                for &sid in &script_nodes[..executable_len] {
+                    hb.contextual_scripts.insert(sid);
+                }
+            }
             Ok(wrap_node(vm, &h, frag_id))
         },
     );

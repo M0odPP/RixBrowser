@@ -670,6 +670,7 @@ pub fn install_web_apis(
     storage: StorageEngine,
 ) -> SharedWebApis {
     let web_apis = Rc::new(RefCell::new(WebApiState::new(origin_url, storage)));
+    host.borrow_mut().main_document_url = web_apis.borrow().current_href();
     install_dom_exception_ctor(vm);
     install_url_and_search_params(vm, &web_apis);
     install_text_encoding(vm, &web_apis);
@@ -677,7 +678,7 @@ pub fn install_web_apis(
     install_form_data(vm, host, &web_apis);
     install_structured_clone(vm, &web_apis);
     install_abort_controller(vm, host, events, event_loop, &web_apis);
-    install_location_and_history(vm, &web_apis);
+    install_location_and_history(vm, host, &web_apis);
     install_web_storage(vm, &web_apis);
     install_performance(vm, event_loop, &web_apis);
     install_console(vm, &web_apis);
@@ -3539,10 +3540,11 @@ fn require_abort_signal(
 // Location & History
 // ---------------------------------------------------------------------------
 
-fn install_location_and_history(vm: &mut JsVm, web_apis: &SharedWebApis) {
+fn install_location_and_history(vm: &mut JsVm, host: &SharedHost, web_apis: &SharedWebApis) {
     let loc = vm.alloc_ordinary_object();
 
     let wa = Rc::clone(web_apis);
+    let h_href = Rc::clone(host);
     define_host_accessor(
         vm,
         loc,
@@ -3558,6 +3560,7 @@ fn install_location_and_history(vm: &mut JsVm, web_apis: &SharedWebApis) {
             let raw = vm.value_to_rust_string(arg(args, 0));
             let base = wa.borrow().location_url.clone();
             if let Ok(next) = base.join(&raw).or_else(|_| Url::parse(&raw)) {
+                h_href.borrow_mut().main_document_url = next.to_string();
                 wa.borrow_mut().location_url = next;
             }
             Ok(JsValue::UNDEFINED)
@@ -3723,6 +3726,7 @@ fn install_location_and_history(vm: &mut JsVm, web_apis: &SharedWebApis) {
         .object_define_data(hist, k_sr, auto_val, PropertyAttrs::DEFAULT, &mut vm.shapes);
 
     let wa = Rc::clone(web_apis);
+    let h_ps = Rc::clone(host);
     define_host_method(vm, hist, "pushState", move |vm, _, args| {
         let state_val = arg(args, 0);
         let url_arg = arg(args, 2);
@@ -3753,11 +3757,13 @@ fn install_location_and_history(vm: &mut JsVm, web_apis: &SharedWebApis) {
             state: cloned_state,
         });
         st.history_index = st.history.len() - 1;
+        h_ps.borrow_mut().main_document_url = next_url.to_string();
         st.location_url = next_url;
         Ok(JsValue::UNDEFINED)
     });
 
     let wa = Rc::clone(web_apis);
+    let h_rs = Rc::clone(host);
     define_host_method(vm, hist, "replaceState", move |vm, _, args| {
         let state_val = arg(args, 0);
         let url_arg = arg(args, 2);
@@ -3786,6 +3792,7 @@ fn install_location_and_history(vm: &mut JsVm, web_apis: &SharedWebApis) {
             cur.url = next_url.clone();
             cur.state = cloned_state;
         }
+        h_rs.borrow_mut().main_document_url = next_url.to_string();
         st.location_url = next_url;
         Ok(JsValue::UNDEFINED)
     });

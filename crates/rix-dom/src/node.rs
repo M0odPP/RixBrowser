@@ -14,6 +14,7 @@ pub enum NodeData {
         mode: String,
         delegates_focus: bool,
         clonable: bool,
+        serializable: bool,
     },
     DocumentType {
         name: String,

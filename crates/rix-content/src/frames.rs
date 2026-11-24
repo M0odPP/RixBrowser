@@ -1783,6 +1783,12 @@ pub(crate) fn sync_iframe_node(
     let is_same_origin = sandbox.same_origin_with(&parent_origin, &raw_child_origin);
     let surface_id = surface_id_for_node(node_id);
 
+    let existing_same_origin_proxy = frames
+        .borrow()
+        .iframes
+        .get(&node_id)
+        .filter(|r| !r.is_cross_origin)
+        .map(|r| r.proxy);
     let was_existing = frames.borrow().iframes.contains_key(&node_id);
     if is_same_origin {
         let (html_content, child_charset, child_ct) = if let Some(ref sd) = srcdoc_attr {
@@ -1795,19 +1801,34 @@ pub(crate) fn sync_iframe_node(
             (String::new(), "UTF-8", "text/html".to_string())
         };
 
-        let proxy_h = alloc_window_proxy(
-            vm,
-            web_apis,
-            frames,
-            WindowProxyKind::SameOriginChild {
-                iframe_node: node_id,
-                child_doc: vm.global, // replaced immediately below
-                origin: effective_child_origin.clone(),
-                url: resolved_url.clone(),
-                name: name_attr.clone(),
-                closed: false,
-            },
-        );
+        let proxy_h = if let Some(existing_p) = existing_same_origin_proxy {
+            frames.borrow_mut().proxies.insert(
+                existing_p,
+                WindowProxyKind::SameOriginChild {
+                    iframe_node: node_id,
+                    child_doc: vm.global,
+                    origin: effective_child_origin.clone(),
+                    url: resolved_url.clone(),
+                    name: name_attr.clone(),
+                    closed: false,
+                },
+            );
+            existing_p
+        } else {
+            alloc_window_proxy(
+                vm,
+                web_apis,
+                frames,
+                WindowProxyKind::SameOriginChild {
+                    iframe_node: node_id,
+                    child_doc: vm.global, // replaced immediately below
+                    origin: effective_child_origin.clone(),
+                    url: resolved_url.clone(),
+                    name: name_attr.clone(),
+                    closed: false,
+                },
+            )
+        };
         let (child_doc, _title, inline_scripts) = build_sub_document(
             vm,
             host,
@@ -1817,6 +1838,7 @@ pub(crate) fn sync_iframe_node(
             &child_ct,
             proxy_h,
         );
+        let child_doc_nid = host.borrow().node_for_handle(vm, child_doc);
         if let Some(WindowProxyKind::SameOriginChild {
             child_doc: slot, ..
         }) = frames.borrow_mut().proxies.get_mut(&proxy_h)
@@ -1844,19 +1866,24 @@ pub(crate) fn sync_iframe_node(
             );
         }
 
+        // Always populate child global intrinsics & child-bound `DOMParser`, even for scriptless frames.
+        let saved_global = vm.global;
+        let iframe_el = wrap_node(vm, host, node_id);
+        let top_val = frames.borrow().top_window;
+        install_same_origin_child_globals(vm, proxy_h, child_doc, saved_global, top_val, iframe_el);
+        let child_dp =
+            crate::dom_parsing::create_dom_parser_ctor_for_doc(vm, host, web_apis, child_doc_nid);
+        let k_dp = vm.heap.intern_key("DOMParser");
+        vm.heap.object_define_data(
+            proxy_h,
+            k_dp,
+            JsValue::from_object(child_dp),
+            PropertyAttrs::METHOD,
+            &mut vm.shapes,
+        );
+
         // Execute external & inline scripts inside the same-origin child iframe's isolated global.
         if sandbox.scripts_allowed() && !inline_scripts.is_empty() {
-            let saved_global = vm.global;
-            let iframe_el = wrap_node(vm, host, node_id);
-            let top_val = frames.borrow().top_window;
-            install_same_origin_child_globals(
-                vm,
-                proxy_h,
-                child_doc,
-                saved_global,
-                top_val,
-                iframe_el,
-            );
             let pre_keys: HashSet<rix_js::PropertyKey> = vm
                 .heap
                 .get_object(proxy_h)

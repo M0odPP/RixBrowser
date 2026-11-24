@@ -929,10 +929,11 @@ impl Document {
                             mode,
                             delegates_focus,
                             clonable,
+                            serializable,
                             ..
                         }) = source_document.get(sr)
                         {
-                            Some((sr, mode.clone(), *delegates_focus, *clonable))
+                            Some((sr, mode.clone(), *delegates_focus, *clonable, *serializable))
                         } else {
                             None
                         }
@@ -945,12 +946,15 @@ impl Document {
             if let (Some(sf), Some(cf)) = (source_fragment, copy_fragment) {
                 pending.push((sf, cf));
             }
-            if let Some((src_root, mode, delegates_focus, clonable)) = shadow_root_info {
+            if let Some((src_root, mode, delegates_focus, clonable, serializable)) =
+                shadow_root_info
+            {
                 let copy_root = self.new_node(NodeData::ShadowRoot {
                     host: parent,
                     mode,
                     delegates_focus,
                     clonable,
+                    serializable,
                 });
                 if let Some(NodeData::Element(copy_elem)) = self.get_mut(parent) {
                     copy_elem.shadow_root = Some(copy_root);
@@ -1318,6 +1322,7 @@ mod tests {
             mode: "open".into(),
             delegates_focus: false,
             clonable: true,
+            serializable: false,
         });
         let inner = doc.new_node(NodeData::Element(ElementData::new(
             markup5ever::QualName::new(None, "http://www.w3.org/1999/xhtml".into(), "p".into()),

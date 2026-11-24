@@ -11,6 +11,7 @@ pub mod cssom;
 pub mod dom_bridge;
 pub mod dom_collections;
 pub mod dom_interfaces;
+pub mod dom_parsing;
 pub mod event_loop;
 pub mod events;
 pub mod fetch_ws;
@@ -192,6 +193,7 @@ impl ContentRuntime {
         let events = install_event_system(&mut vm, &host, &event_loop);
         let observers = install_observers(&mut vm, &host, &event_loop);
         let web_apis = install_web_apis(&mut vm, &host, &events, &event_loop, origin_url, storage);
+        dom_parsing::install_dom_parsing(&mut vm, &host, &web_apis);
         cssom::install_cssom(&mut vm, &host);
         let streams = install_streams(&mut vm, &web_apis);
         let net = install_fetch_and_websocket(&mut vm, &host, &web_apis, &streams, fetch_engine);
