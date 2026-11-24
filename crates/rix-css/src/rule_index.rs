@@ -16,7 +16,9 @@ use selectors::parser::{AncestorHashes, Combinator, Component, Selector};
 use smallvec::SmallVec;
 
 use crate::selector::{RixPseudoClass, RixPseudoElement, RixSelectorImpl};
-use crate::stylesheet::{CompiledRule, RegisteredProperty, Stylesheet};
+use crate::stylesheet::{
+    CompiledRule, FontFaceRule, KeyframesRule, LayerId, LayerSeg, RegisteredProperty, Stylesheet,
+};
 
 /// Zero-overhead identity hasher for pre-hashed `u64` FNV-1a keys.
 #[derive(Default)]
@@ -73,15 +75,43 @@ pub struct RuleIndex {
     /// (e.g. `.parent:has(.a) .child` or `:has(.a) ~ .b`), requiring ancestor subtree
     /// invalidation on DOM tree mutations.
     pub has_non_subject_has: bool,
-    /// True when no rule uses sibling combinators, `:nth-*` / `:empty`, or `:has()`,
+    /// True when no rule uses sibling combinators, `:nth-*` / `:empty`, `:has()`, or `@scope`,
     /// enabling O(1) Stylo-style sibling style sharing for attribute-free siblings.
     pub allows_sibling_sharing: bool,
-    /// Merged `@property` / `CSS.registerProperty` custom property registrations.
+    /// True when any rule is enclosed in an `@scope` block.
+    pub has_scope_rules: bool,
+    /// Merged `@property` / `CSS.registerProperty` custom property registrations (layer-ordered).
     pub registered_properties: HashMap<InternedStr, RegisteredProperty>,
+    /// Merged `@keyframes` rules by name (layer-ordered per CSS Cascade L5).
+    pub keyframes: HashMap<InternedStr, KeyframesRule>,
+    /// Layer-ordered `@font-face` rules (ascending priority; highest-priority last).
+    pub font_faces: Vec<FontFaceRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum GlobalLayerKey {
+    Named(InternedStr),
+    Anon(u32, u32),
+}
+
+#[derive(Default)]
+struct LayerTreeNode {
+    children: Vec<(GlobalLayerKey, usize)>,
+    rank: u32,
+}
+
+fn assign_layer_postorder(nodes: &mut [LayerTreeNode], idx: usize, next_rank: &mut u32) {
+    let child_ids: SmallVec<[usize; 8]> = nodes[idx].children.iter().map(|&(_, id)| id).collect();
+    for cid in child_ids {
+        assign_layer_postorder(nodes, cid, next_rank);
+        nodes[cid].rank = *next_rank;
+        *next_rank = next_rank.saturating_add(1);
+    }
 }
 
 impl RuleIndex {
-    /// Builds a [`RuleIndex`] and matching [`InvalidationMap`] from ordered stylesheets.
+    /// Builds a [`RuleIndex`] and matching [`InvalidationMap`] from ordered stylesheets,
+    /// resolving a global post-order hierarchical `@layer` tree across all stylesheets.
     #[must_use]
     pub fn build(stylesheets: &[Arc<Stylesheet>]) -> (Self, InvalidationMap) {
         let total_rules: usize = stylesheets.iter().map(|s| s.rules.len()).sum();
@@ -95,27 +125,99 @@ impl RuleIndex {
             has_relative_selectors: false,
             has_non_subject_has: false,
             allows_sibling_sharing: true,
+            has_scope_rules: false,
             registered_properties: HashMap::new(),
+            keyframes: HashMap::new(),
+            font_faces: Vec::new(),
         };
         let mut inv = InvalidationMap::default();
+
+        // Build global hierarchical layer tree (3 origin roots: UA=0, User=1, Author=2).
+        let mut layer_nodes: Vec<LayerTreeNode> =
+            (0..3).map(|_| LayerTreeNode::default()).collect();
+        let mut sheet_layer_nodes: Vec<Vec<usize>> = Vec::with_capacity(stylesheets.len());
+        for (sheet_idx, sheet) in stylesheets.iter().enumerate() {
+            let root = (sheet.origin as usize).min(2);
+            let mut local_map = Vec::with_capacity(sheet.layer_paths.len());
+            for path in &sheet.layer_paths {
+                let mut cur = root;
+                for seg in path {
+                    let key = match seg {
+                        LayerSeg::Named(n) => GlobalLayerKey::Named(n.clone()),
+                        LayerSeg::Anon(a) => GlobalLayerKey::Anon(sheet_idx as u32, *a),
+                    };
+                    if let Some(&(_, child_idx)) =
+                        layer_nodes[cur].children.iter().find(|(k, _)| k == &key)
+                    {
+                        cur = child_idx;
+                    } else {
+                        let new_idx = layer_nodes.len();
+                        layer_nodes.push(LayerTreeNode::default());
+                        layer_nodes[cur].children.push((key, new_idx));
+                        cur = new_idx;
+                    }
+                }
+                local_map.push(cur);
+            }
+            sheet_layer_nodes.push(local_map);
+        }
+        for root in 0..3 {
+            let mut next_rank = 0u32;
+            assign_layer_postorder(&mut layer_nodes, root, &mut next_rank);
+        }
+
+        let remap_layer = |sheet_idx: usize, local: LayerId| -> LayerId {
+            if local.is_unlayered() {
+                return LayerId::UNLAYERED;
+            }
+            sheet_layer_nodes
+                .get(sheet_idx)
+                .and_then(|m| m.get(local.0 as usize))
+                .map_or(local, |&node_idx| LayerId(layer_nodes[node_idx].rank))
+        };
+
         let mut reg_layers: HashMap<InternedStr, u32> = HashMap::new();
+        let mut kf_layers: HashMap<InternedStr, (u8, u32)> = HashMap::new();
+        let mut ff_ranked: Vec<((u8, u32, u32), FontFaceRule)> = Vec::new();
+        let mut ff_order = 0u32;
 
         let mut global_order: u32 = 0;
-        for sheet in stylesheets {
+        for (sheet_idx, sheet) in stylesheets.iter().enumerate() {
+            let origin_rank = sheet.origin as u8;
             for rp in &sheet.registered_properties {
-                let rank = rp.layer_id.0;
+                let remapped = remap_layer(sheet_idx, rp.layer_id);
+                let rank = remapped.0;
                 let wins = reg_layers
                     .get(&rp.name)
                     .is_none_or(|&prev_rank| rank >= prev_rank);
                 if wins {
                     reg_layers.insert(rp.name.clone(), rank);
-                    index
-                        .registered_properties
-                        .insert(rp.name.clone(), rp.clone());
+                    let mut rp_copy = rp.clone();
+                    rp_copy.layer_id = remapped;
+                    index.registered_properties.insert(rp.name.clone(), rp_copy);
                 }
+            }
+            for kf in &sheet.keyframes {
+                let remapped = remap_layer(sheet_idx, kf.layer_id);
+                let key_rank = (origin_rank, remapped.0);
+                let wins = kf_layers.get(&kf.name).is_none_or(|&prev| key_rank >= prev);
+                if wins {
+                    kf_layers.insert(kf.name.clone(), key_rank);
+                    let mut kf_copy = kf.clone();
+                    kf_copy.layer_id = remapped;
+                    index.keyframes.insert(kf.name.clone(), kf_copy);
+                }
+            }
+            for ff in &sheet.font_faces {
+                let remapped = remap_layer(sheet_idx, ff.layer_id);
+                let mut ff_copy = ff.clone();
+                ff_copy.layer_id = remapped;
+                ff_ranked.push(((origin_rank, remapped.0, ff_order), ff_copy));
+                ff_order = ff_order.saturating_add(1);
             }
             for rule in &sheet.rules {
                 let mut compiled = rule.clone();
+                compiled.layer_id = remap_layer(sheet_idx, compiled.layer_id);
                 compiled.source_order = global_order;
                 global_order = global_order.saturating_add(1);
 
@@ -125,6 +227,23 @@ impl RuleIndex {
                     ancestor_hashes: compiled.ancestor_hashes.clone(),
                 };
                 index.insert_bucket(&compiled.selector, entry);
+                if let Some(ref scopes) = compiled.scopes {
+                    index.has_scope_rules = true;
+                    index.allows_sibling_sharing = false;
+                    let scope_inv = InvalidationScope::SELF | InvalidationScope::DESCENDANTS;
+                    for sc in scopes.iter() {
+                        if let Some(ref start_list) = sc.start {
+                            for sel in start_list.slice() {
+                                let _ = inv.record_selector_with_scope(sel, scope_inv);
+                            }
+                        }
+                        if let Some(ref end_list) = sc.end {
+                            for sel in end_list.slice() {
+                                let _ = inv.record_selector_with_scope(sel, scope_inv);
+                            }
+                        }
+                    }
+                }
                 if selector_prevents_sibling_sharing(&compiled.selector) {
                     index.allows_sibling_sharing = false;
                 }
@@ -139,6 +258,8 @@ impl RuleIndex {
                 index.rules.push(compiled);
             }
         }
+        ff_ranked.sort_by_key(|(k, _)| *k);
+        index.font_faces = ff_ranked.into_iter().map(|(_, ff)| ff).collect();
         (index, inv)
     }
 

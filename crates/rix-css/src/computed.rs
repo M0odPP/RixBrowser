@@ -970,35 +970,48 @@ impl<'a> CustomPropResolver<'a> {
     }
 }
 
-/// Cascade Level 5 ordering key (strictly ascending priority; highest wins).
+/// A matched compiled rule paired with its `@scope` proximity (ancestor hops from element
+/// to scoping root; `u32::MAX` for unscoped rules).
+#[derive(Debug, Clone, Copy)]
+pub struct MatchedRule<'a> {
+    pub rule: &'a CompiledRule,
+    pub scope_proximity: u32,
+}
+
+/// Cascade Level 5/6 ordering key (strictly ascending priority; highest wins).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct CascadeKey {
     band: u8,
     layer_rank: u32,
     specificity: u32,
+    scope_prox_rank: u32,
     rule_order: u32,
     decl_order: u32,
 }
 
 impl CascadeKey {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         origin: CascadeOrigin,
         is_inline: bool,
         important: bool,
         layer_id: LayerId,
         specificity: u32,
+        scope_proximity: u32,
         rule_order: u32,
         decl_order: u32,
     ) -> Self {
         let band = match (important, is_inline, origin) {
             (false, false, CascadeOrigin::UserAgent) => 0,
             (false, false, CascadeOrigin::User) => 1,
-            (false, false, CascadeOrigin::Author) => 2,
-            (false, true, _) => 3,
-            (true, false, CascadeOrigin::Author) => 4,
-            (true, true, _) => 5,
-            (true, false, CascadeOrigin::User) => 6,
-            (true, false, CascadeOrigin::UserAgent) => 7,
+            // band 2 is reserved for HTML5 §15.3 presentational hints (Author origin for `revert`,
+            // independent pre-author layer for `revert-layer` per CSS Cascade L5 §6.4.4).
+            (false, false, CascadeOrigin::Author) => 3,
+            (false, true, _) => 4,
+            (true, false, CascadeOrigin::Author) => 5,
+            (true, true, _) => 6,
+            (true, false, CascadeOrigin::User) => 7,
+            (true, false, CascadeOrigin::UserAgent) => 8,
         };
         let layer_rank = if !important {
             layer_id.0
@@ -1007,10 +1020,16 @@ impl CascadeKey {
         } else {
             u32::MAX - layer_id.0
         };
+        let scope_prox_rank = if scope_proximity == u32::MAX {
+            0
+        } else {
+            u32::MAX - scope_proximity
+        };
         Self {
             band,
             layer_rank,
             specificity,
+            scope_prox_rank,
             rule_order,
             decl_order,
         }
@@ -1076,6 +1095,36 @@ pub fn resolve_element_style_full(
     media: &MediaContext,
     registered_props: Option<&HashMap<InternedStr, RegisteredProperty>>,
 ) -> ComputedStyle {
+    let scoped: SmallVec<[MatchedRule<'_>; 16]> = matched_rules
+        .iter()
+        .map(|&rule| MatchedRule {
+            rule,
+            scope_proximity: u32::MAX,
+        })
+        .collect();
+    resolve_element_style_scoped(
+        &scoped,
+        pres_hint_decls,
+        inline_decls,
+        parent_style,
+        root_font_size_px,
+        media,
+        registered_props,
+    )
+}
+
+/// Resolves an element's [`ComputedStyle`] with `@scope` proximity, presentational hints,
+/// and `@property` / `CSS.registerProperty` custom property registrations.
+#[must_use]
+pub fn resolve_element_style_scoped(
+    matched_rules: &[MatchedRule<'_>],
+    pres_hint_decls: &[SpecifiedDeclaration],
+    inline_decls: &[SpecifiedDeclaration],
+    parent_style: Option<&ComputedStyle>,
+    root_font_size_px: f32,
+    media: &MediaContext,
+    registered_props: Option<&HashMap<InternedStr, RegisteredProperty>>,
+) -> ComputedStyle {
     let mut style = match parent_style {
         Some(p) => ComputedStyle::inherit_from(p),
         None => ComputedStyle::default(),
@@ -1085,20 +1134,22 @@ pub fn resolve_element_style_full(
     let mut candidates: Vec<CandidateDecl<'_>> =
         Vec::with_capacity(matched_rules.len() * 4 + pres_hint_decls.len() + inline_decls.len());
     for decl in pres_hint_decls {
-        // HTML5 §15.3 Presentational Hints: override UA stylesheet (band 0) while losing
-        // to every Author rule (even 0-specificity or layered author rules).
+        // HTML5 §15.3 Presentational Hints: override UA/User normal (bands 0..1) while losing
+        // to every Author rule (band 3+); treated as Author for `revert` and separate for `revert-layer`.
         candidates.push(CandidateDecl {
             key: CascadeKey {
-                band: 1,
+                band: 2,
                 layer_rank: 0,
                 specificity: 0,
+                scope_prox_rank: 0,
                 rule_order: 0,
                 decl_order: decl.order,
             },
             decl,
         });
     }
-    for (rule_idx, rule) in matched_rules.iter().enumerate() {
+    for (rule_idx, mr) in matched_rules.iter().enumerate() {
+        let rule = mr.rule;
         let r_order = (rule.source_order).max(rule_idx as u32);
         for decl in rule.declarations.iter() {
             candidates.push(CandidateDecl {
@@ -1108,6 +1159,7 @@ pub fn resolve_element_style_full(
                     decl.important,
                     rule.layer_id,
                     rule.specificity,
+                    mr.scope_proximity,
                     r_order,
                     decl.order,
                 ),
@@ -1122,6 +1174,7 @@ pub fn resolve_element_style_full(
                 true,
                 decl.important,
                 LayerId::UNLAYERED,
+                u32::MAX,
                 u32::MAX,
                 u32::MAX,
                 decl.order,
@@ -1176,7 +1229,10 @@ pub fn resolve_element_style_full(
                 let val = match kw {
                     GlobalKeyword::Initial => initial_val(),
                     GlobalKeyword::Inherit => inherit_val(),
-                    GlobalKeyword::Unset | GlobalKeyword::Revert | GlobalKeyword::RevertLayer => {
+                    GlobalKeyword::Unset
+                    | GlobalKeyword::Revert
+                    | GlobalKeyword::RevertLayer
+                    | GlobalKeyword::RevertRule => {
                         if reg.is_some_and(|r| !r.inherits) {
                             initial_val()
                         } else {
@@ -1222,7 +1278,9 @@ pub fn resolve_element_style_full(
                     if has_var {
                         if let Some(kw) = single_global_keyword_token(&resolved) {
                             match kw {
-                                GlobalKeyword::Revert | GlobalKeyword::RevertLayer => {
+                                GlobalKeyword::Revert
+                                | GlobalKeyword::RevertLayer
+                                | GlobalKeyword::RevertRule => {
                                     let reverted = raw_custom
                                         .get(&name)
                                         .and_then(|st| select_candidate_after_revert(st, kw));
@@ -1324,6 +1382,22 @@ pub fn resolve_element_style_full(
     }
     for (k, d) in &expanded_owned {
         per_prop.entry(d.property).or_default().push((*k, d));
+    }
+
+    // CSS Cascade L5 §3.1: Expand `all: <css-wide-keyword>` into every physical longhand
+    // property (except `direction`, `unicode-bidi`, and custom properties), preserving `CascadeKey`.
+    let mut all_expanded: Vec<(PropertyIdKind, CascadeKey, SpecifiedDeclaration)> = Vec::new();
+    if let Some(all_stack) = per_prop.remove(&PropertyIdKind::All) {
+        for (k, d) in all_stack {
+            for &target_prop in crate::properties::ALL_RESETTABLE_LONGHANDS {
+                let mut cloned = d.clone();
+                cloned.property = target_prop;
+                all_expanded.push((target_prop, k, cloned));
+            }
+        }
+    }
+    for (target_prop, k, decl) in &all_expanded {
+        per_prop.entry(*target_prop).or_default().push((*k, decl));
     }
 
     // Pass 2a: Resolve `writing-mode`, `direction`, and `font-size` first so logical
@@ -1548,9 +1622,9 @@ fn single_global_keyword_token(tokens: &[CssToken]) -> Option<GlobalKeyword> {
 #[inline]
 const fn cascade_origin_group(band: u8) -> u8 {
     match band {
-        0 | 7 => 0, // UserAgent (normal / !important)
-        1 | 6 => 1, // User & Presentational Hints
-        2..=5 => 2, // Author (stylesheet & inline, normal & !important)
+        0 | 8 => 0, // UserAgent (normal / !important)
+        1 | 7 => 1, // User (normal / !important)
+        2..=6 => 2, // Presentational Hints + Author (stylesheet & inline, normal & !important)
         _ => 2,
     }
 }
@@ -1565,11 +1639,33 @@ fn select_winning_candidate_from<'a>(
     sorted_asc: &[(CascadeKey, &'a SpecifiedDeclaration)],
     mut idx: usize,
 ) -> Option<&'a SpecifiedDeclaration> {
+    let mut reverted_rules: SmallVec<[(u8, u32); 4]> = SmallVec::new();
+    let mut reverted_imp_layer_normal: Option<u32> = None;
     while idx > 0 {
         idx -= 1;
         let (key, decl) = sorted_asc[idx];
+        let rule_id = (cascade_origin_group(key.band), key.rule_order);
+        if reverted_rules.contains(&rule_id) {
+            continue;
+        }
         match decl.value {
+            PropertyValue::Global(GlobalKeyword::RevertRule) => {
+                reverted_rules.push(rule_id);
+                if key.band == 5 && key.layer_rank != 0 {
+                    let normal_layer = u32::MAX - key.layer_rank;
+                    reverted_imp_layer_normal = Some(
+                        reverted_imp_layer_normal.map_or(normal_layer, |p| p.min(normal_layer)),
+                    );
+                }
+            }
             PropertyValue::Global(GlobalKeyword::RevertLayer) => {
+                // CSSWG #13916: `!important revert-rule` in an earlier layer cascading into
+                // normal `revert-layer` in a later layer forms a cascade cycle -> `unset`.
+                if key.band == 3
+                    && reverted_imp_layer_normal.is_some_and(|imp_l| key.layer_rank > imp_l)
+                {
+                    return None;
+                }
                 while idx > 0
                     && sorted_asc[idx - 1].0.band == key.band
                     && sorted_asc[idx - 1].0.layer_rank == key.layer_rank
@@ -1596,6 +1692,15 @@ fn select_candidate_after_revert<'a>(
     let &(win_key, _) = sorted_asc.last()?;
     let mut idx = sorted_asc.len() - 1;
     match kw {
+        GlobalKeyword::RevertRule => {
+            let win_grp = cascade_origin_group(win_key.band);
+            while idx > 0
+                && cascade_origin_group(sorted_asc[idx - 1].0.band) == win_grp
+                && sorted_asc[idx - 1].0.rule_order == win_key.rule_order
+            {
+                idx -= 1;
+            }
+        }
         GlobalKeyword::RevertLayer => {
             while idx > 0
                 && sorted_asc[idx - 1].0.band == win_key.band
@@ -1627,9 +1732,10 @@ pub fn apply_declaration(
         let should_inherit = match kw {
             GlobalKeyword::Inherit => true,
             GlobalKeyword::Initial => false,
-            GlobalKeyword::Unset | GlobalKeyword::Revert | GlobalKeyword::RevertLayer => {
-                decl.property.is_inherited()
-            }
+            GlobalKeyword::Unset
+            | GlobalKeyword::Revert
+            | GlobalKeyword::RevertLayer
+            | GlobalKeyword::RevertRule => decl.property.is_inherited(),
         };
         if should_inherit {
             if let Some(p) = parent {
@@ -2337,6 +2443,47 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         }
         PropertyIdKind::FontWeight => {
             Arc::make_mut(&mut style.text).font_weight = init.text.font_weight;
+        }
+        PropertyIdKind::FontStyle => {
+            Arc::make_mut(&mut style.text).font_style = init.text.font_style;
+        }
+        PropertyIdKind::FontFamily => {
+            Arc::make_mut(&mut style.text).font_family = init.text.font_family.clone();
+        }
+        PropertyIdKind::LineHeight => {
+            Arc::make_mut(&mut style.text).line_height = init.text.line_height.clone();
+        }
+        PropertyIdKind::LetterSpacing => {
+            Arc::make_mut(&mut style.text).letter_spacing = init.text.letter_spacing.clone();
+        }
+        PropertyIdKind::WordSpacing => {
+            Arc::make_mut(&mut style.text).word_spacing = init.text.word_spacing.clone();
+        }
+        PropertyIdKind::TextIndent => {
+            Arc::make_mut(&mut style.text).text_indent = init.text.text_indent.clone();
+        }
+        PropertyIdKind::TextAlign => {
+            Arc::make_mut(&mut style.text).text_align = init.text.text_align;
+        }
+        PropertyIdKind::TextTransform => {
+            Arc::make_mut(&mut style.text).text_transform = init.text.text_transform;
+        }
+        PropertyIdKind::WhiteSpace => {
+            Arc::make_mut(&mut style.text).white_space = init.text.white_space;
+        }
+        PropertyIdKind::WordBreak => {
+            Arc::make_mut(&mut style.text).word_break = init.text.word_break;
+        }
+        PropertyIdKind::OverflowWrap => {
+            Arc::make_mut(&mut style.text).overflow_wrap = init.text.overflow_wrap;
+        }
+        PropertyIdKind::BorderCollapse => {
+            Arc::make_mut(&mut style.box_model).border_collapse = init.box_model.border_collapse;
+        }
+        PropertyIdKind::BorderSpacing => {
+            let bm = Arc::make_mut(&mut style.box_model);
+            bm.border_spacing_x = init.box_model.border_spacing_x.clone();
+            bm.border_spacing_y = init.box_model.border_spacing_y.clone();
         }
         PropertyIdKind::Direction => {
             Arc::make_mut(&mut style.text).direction = DirectionMode::Ltr;

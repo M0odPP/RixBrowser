@@ -55,6 +55,11 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
         return Some(trimmed.to_string());
     }
 
+    // CSS Cascade L5 §3.1: `all` accepts ONLY CSS-wide keywords (or `var()`).
+    if prop_kind == PropertyIdKind::All {
+        return None;
+    }
+
     // CSS Standards Mode & Logical Properties: reject bare non-zero unitless numbers on lengths.
     if prop_disallows_unitless_nonzero(prop_kind) && has_top_level_unitless_nonzero(trimmed) {
         return None;
@@ -420,7 +425,7 @@ fn is_single_brace_wrapped(s: &str) -> bool {
     depth == 0
 }
 
-fn format_cssom_color(
+pub(crate) fn format_cssom_color(
     color: &lightningcss::values::color::CssColor,
     raw_hint: Option<&str>,
 ) -> String {
@@ -428,8 +433,8 @@ fn format_cssom_color(
         return "currentcolor".to_string();
     }
     if let Some(raw) = raw_hint {
-        for tok in raw.split_ascii_whitespace() {
-            if !tok.is_empty() && tok.bytes().all(|b| b.is_ascii_alphabetic()) {
+        for tok in raw.split(|c: char| !c.is_ascii_alphabetic()) {
+            if tok.len() >= 3 {
                 let lower = tok.to_ascii_lowercase();
                 if lower == "transparent"
                     && matches!(
@@ -667,7 +672,7 @@ fn format_cssom_generic_border<const P: u8>(
     parts.join(" ")
 }
 
-fn serialize_cssom_property(prop: &Property<'_>, raw_input: &str) -> Option<String> {
+pub(crate) fn serialize_cssom_property(prop: &Property<'_>, raw_input: &str) -> Option<String> {
     let hint = Some(raw_input);
     match prop {
         Property::Color(c)

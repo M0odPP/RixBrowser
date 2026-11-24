@@ -147,6 +147,9 @@ fn target_key_for_value(
     host: &SharedHost,
     val: JsValue,
 ) -> Result<EventTargetKey, JsException> {
+    if val.is_undefined() || val.is_null() {
+        return Ok(EventTargetKey::Window);
+    }
     let Some(h) = val.as_object() else {
         return Err(JsException {
             value: JsValue::UNDEFINED,

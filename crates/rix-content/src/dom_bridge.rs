@@ -134,6 +134,7 @@ pub struct HostState {
     pub dialog_return_values: HashMap<NodeId, String>,
     pub open_popovers: Vec<NodeId>,
     pub css_stylesheet_proto: Option<HeapHandle>,
+    pub css_rule_protos: HashMap<&'static str, HeapHandle>,
     pub style_element_sheets: HashMap<NodeId, crate::cssom::SharedStyleSheet>,
     pub stylesheet_handle_map: HashMap<HeapHandle, crate::cssom::SharedStyleSheet>,
     pub adopted_stylesheets: Vec<crate::cssom::SharedStyleSheet>,
@@ -191,6 +192,7 @@ impl HostState {
             dialog_return_values: HashMap::new(),
             open_popovers: Vec::new(),
             css_stylesheet_proto: None,
+            css_rule_protos: HashMap::new(),
             style_element_sheets: HashMap::new(),
             stylesheet_handle_map: HashMap::new(),
             adopted_stylesheets: Vec::new(),
@@ -315,6 +317,9 @@ impl HostState {
         if let Some(proto) = self.css_stylesheet_proto {
             out.push(JsValue::from_object(proto));
         }
+        for &proto in self.css_rule_protos.values() {
+            out.push(JsValue::from_object(proto));
+        }
     }
 
     /// Sweeps dead unpinned weak DOM wrappers and releases their tag table entries (zero leaks!).
@@ -408,7 +413,7 @@ impl HostState {
         let (inline_hash, maybe_sheets) = {
             let doc = self.document.borrow();
             let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            let mut css_blocks = Vec::new();
+            let mut css_blocks: Vec<(String, Option<NodeId>)> = Vec::new();
             for node in doc.descendants_with_shadow_roots(doc.root()) {
                 if let Some(NodeData::Element(el)) = doc.get(node) {
                     if el.name.local.as_str().eq_ignore_ascii_case("style") {
@@ -421,8 +426,14 @@ impl HostState {
                         }
                         let text = doc.inner_text(node);
                         if !text.trim().is_empty() {
+                            let owner_parent = doc.parent(node);
                             h = fnv_mix(h, text.as_bytes());
-                            css_blocks.push(text);
+                            if text.contains("@scope") || text.contains("@SCOPE") {
+                                if let Some(pid) = owner_parent {
+                                    h = fnv_mix(h, &usize::from(pid).to_le_bytes());
+                                }
+                            }
+                            css_blocks.push((text, owner_parent));
                         }
                     }
                 }
@@ -430,7 +441,7 @@ impl HostState {
             for sheet in doc.all_dynamic_stylesheets().values() {
                 if !sheet.trim().is_empty() {
                     h = fnv_mix(h, sheet.as_bytes());
-                    css_blocks.push(sheet.clone());
+                    css_blocks.push((sheet.clone(), None));
                 }
             }
             for adopted in &self.adopted_stylesheets {
@@ -439,7 +450,7 @@ impl HostState {
                     let css = st.to_css_text();
                     if !css.trim().is_empty() {
                         h = fnv_mix(h, css.as_bytes());
-                        css_blocks.push(css);
+                        css_blocks.push((css, None));
                     }
                 }
             }
@@ -483,12 +494,21 @@ impl HostState {
         for ext in &self.external_stylesheets {
             ctx.add_stylesheet(Arc::clone(ext));
         }
-        for css in maybe_sheets {
-            ctx.add_stylesheet(Stylesheet::parse_cached(
-                &css,
-                CascadeOrigin::Author,
-                &media,
-            ));
+        for (css, owner_parent) in maybe_sheets {
+            if owner_parent.is_some() && (css.contains("@scope") || css.contains("@SCOPE")) {
+                ctx.add_stylesheet(Arc::new(Stylesheet::parse_with_owner(
+                    &css,
+                    CascadeOrigin::Author,
+                    &media,
+                    owner_parent,
+                )));
+            } else {
+                ctx.add_stylesheet(Stylesheet::parse_cached(
+                    &css,
+                    CascadeOrigin::Author,
+                    &media,
+                ));
+            }
         }
         {
             let mut doc = self.document.borrow_mut();

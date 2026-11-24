@@ -644,27 +644,38 @@ pub fn parse_selector_list_with_namespaces(
     input: &str,
     namespaces: Option<&SelectorNamespaceMap>,
 ) -> Result<SelectorList<RixSelectorImpl>, String> {
-    parse_selector_list_internal(input, true, namespaces)
+    parse_selector_list_internal(input, true, namespaces, ParseRelative::No)
 }
 
 /// Parses a CSS selector list without forgiving selector-list recovery (for `CSS.supports(selector(...))`).
 pub fn parse_selector_list_non_forgiving(
     input: &str,
 ) -> Result<SelectorList<RixSelectorImpl>, String> {
-    parse_selector_list_internal(input, false, None)
+    parse_selector_list_internal(input, false, None, ParseRelative::No)
+}
+
+/// Parses a CSS selector list allowing relative selector syntax (`ForNesting` or `ForScope`).
+pub fn parse_selector_list_relative(
+    input: &str,
+    forgiving: bool,
+    namespaces: Option<&SelectorNamespaceMap>,
+    relative: ParseRelative,
+) -> Result<SelectorList<RixSelectorImpl>, String> {
+    parse_selector_list_internal(input, forgiving, namespaces, relative)
 }
 
 fn parse_selector_list_with_forgiving(
     input: &str,
     forgiving: bool,
 ) -> Result<SelectorList<RixSelectorImpl>, String> {
-    parse_selector_list_internal(input, forgiving, None)
+    parse_selector_list_internal(input, forgiving, None, ParseRelative::No)
 }
 
 fn parse_selector_list_internal(
     input: &str,
     forgiving: bool,
     namespaces: Option<&SelectorNamespaceMap>,
+    relative: ParseRelative,
 ) -> Result<SelectorList<RixSelectorImpl>, String> {
     if input.trim().is_empty() {
         return Err("Empty CSS selector".to_string());
@@ -675,7 +686,7 @@ fn parse_selector_list_internal(
         forgiving,
         namespaces,
     };
-    let list = SelectorList::parse(&sel_parser, &mut parser, ParseRelative::No)
+    let list = SelectorList::parse(&sel_parser, &mut parser, relative)
         .map_err(|e| format!("Invalid CSS selector '{input}': {e:?}"))?;
     if !parser.is_exhausted() {
         return Err(format!("Trailing tokens in CSS selector '{input}'"));
@@ -1507,6 +1518,19 @@ pub fn matches_single_selector(
     caches: &mut SelectorCaches,
     shadow_host: Option<OpaqueElement>,
 ) -> bool {
+    matches_single_selector_with_scope(selector, element, None, bloom, caches, shadow_host)
+}
+
+/// Matches a single compiled `Selector` against a `DomElement` with an optional `:scope` root.
+#[must_use]
+pub fn matches_single_selector_with_scope(
+    selector: &Selector<RixSelectorImpl>,
+    element: &DomElement<'_>,
+    scope: Option<OpaqueElement>,
+    bloom: Option<&BloomFilter>,
+    caches: &mut SelectorCaches,
+    shadow_host: Option<OpaqueElement>,
+) -> bool {
     if let Some(target_pseudo) = element.target_pseudo {
         if !selector.has_pseudo_element() {
             return false;
@@ -1522,6 +1546,7 @@ pub fn matches_single_selector(
             MatchingForInvalidation::No,
         );
         ctx.current_host = shadow_host;
+        ctx.scope_element = scope;
         ctx.pseudo_element_matching_fn = Some(&matcher);
         return matches_selector(selector, 0, None, &originating, &mut ctx);
     }
@@ -1535,5 +1560,6 @@ pub fn matches_single_selector(
         MatchingForInvalidation::No,
     );
     ctx.current_host = shadow_host;
+    ctx.scope_element = scope;
     matches_selector(selector, 0, None, element, &mut ctx)
 }
