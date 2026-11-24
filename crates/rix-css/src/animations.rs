@@ -407,7 +407,7 @@ fn collect_transition_candidates(before: &ComputedStyle, after: &ComputedStyle, 
                 P::HyphenateCharacter, P::HyphenateLimitLines]);
         }
         if before.z_index != after.z_index { all_p.push(P::ZIndex); }
-        if before.flex_grid != after.flex_grid { all_p.extend_from_slice(&[P::FlexGrow, P::FlexShrink, P::FlexBasis, P::Order, P::FlexDirection, P::FlexWrap, P::AlignItems, P::AlignSelf, P::AlignContent, P::JustifyContent, P::JustifyItems, P::JustifySelf]); }
+        if before.flex_grid != after.flex_grid { all_p.extend_from_slice(&[P::FlexGrow, P::FlexShrink, P::FlexBasis, P::Order, P::FlexDirection, P::FlexWrap, P::AlignItems, P::AlignSelf, P::AlignContent, P::JustifyContent, P::JustifyItems, P::JustifySelf, P::GridTemplateColumns, P::GridTemplateRows, P::GridTemplateAreas, P::GridAutoColumns, P::GridAutoRows, P::GridAutoFlow, P::GridRowStart, P::GridRowEnd, P::GridColumnStart, P::GridColumnEnd, P::FitTolerance, P::GridLanesDirection, P::GridLanesPack]); }
         if before.effects != after.effects { all_p.extend_from_slice(&[P::Scale, P::Rotate, P::Translate, P::Transform, P::ReadingFlow, P::ReadingOrder]); }
         for pk in all_p {
             if let Some(sp) = find_matching_transition_spec(specs, pk, None, after) {
@@ -460,6 +460,19 @@ fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind,
         P::JustifyContent => a.flex_grid.as_ref().map(|f| f.justify_content) != b.flex_grid.as_ref().map(|f| f.justify_content),
         P::JustifyItems => a.flex_grid.as_ref().map(|f| f.justify_items) != b.flex_grid.as_ref().map(|f| f.justify_items),
         P::JustifySelf => a.flex_grid.as_ref().map(|f| f.justify_self) != b.flex_grid.as_ref().map(|f| f.justify_self),
+        P::GridTemplateColumns => a.flex_grid.as_ref().map(|f| &f.grid_template_columns_list) != b.flex_grid.as_ref().map(|f| &f.grid_template_columns_list),
+        P::GridTemplateRows => a.flex_grid.as_ref().map(|f| &f.grid_template_rows_list) != b.flex_grid.as_ref().map(|f| &f.grid_template_rows_list),
+        P::GridTemplateAreas => a.flex_grid.as_ref().map(|f| &f.grid_template_areas) != b.flex_grid.as_ref().map(|f| &f.grid_template_areas),
+        P::GridAutoColumns => a.flex_grid.as_ref().map(|f| &f.grid_auto_columns) != b.flex_grid.as_ref().map(|f| &f.grid_auto_columns),
+        P::GridAutoRows => a.flex_grid.as_ref().map(|f| &f.grid_auto_rows) != b.flex_grid.as_ref().map(|f| &f.grid_auto_rows),
+        P::GridAutoFlow => a.flex_grid.as_ref().map(|f| f.grid_auto_flow) != b.flex_grid.as_ref().map(|f| f.grid_auto_flow),
+        P::GridRowStart => a.flex_grid.as_ref().map(|f| &f.grid_row_start) != b.flex_grid.as_ref().map(|f| &f.grid_row_start),
+        P::GridRowEnd => a.flex_grid.as_ref().map(|f| &f.grid_row_end) != b.flex_grid.as_ref().map(|f| &f.grid_row_end),
+        P::GridColumnStart => a.flex_grid.as_ref().map(|f| &f.grid_column_start) != b.flex_grid.as_ref().map(|f| &f.grid_column_start),
+        P::GridColumnEnd => a.flex_grid.as_ref().map(|f| &f.grid_column_end) != b.flex_grid.as_ref().map(|f| &f.grid_column_end),
+        P::FitTolerance => a.flex_grid.as_ref().map(|f| &f.fit_tolerance) != b.flex_grid.as_ref().map(|f| &f.fit_tolerance),
+        P::GridLanesDirection => a.flex_grid.as_ref().map(|f| f.grid_lanes_direction) != b.flex_grid.as_ref().map(|f| f.grid_lanes_direction),
+        P::GridLanesPack => a.flex_grid.as_ref().map(|f| f.grid_lanes_pack) != b.flex_grid.as_ref().map(|f| f.grid_lanes_pack),
         P::ReadingFlow => a.effects.as_ref().map(|e| e.reading_flow) != b.effects.as_ref().map(|e| e.reading_flow),
         P::ReadingOrder => a.effects.as_ref().map_or(0, |e| e.reading_order) != b.effects.as_ref().map_or(0, |e| e.reading_order),
         P::Custom => cname.and_then(|n| a.custom_properties.get(n)) != cname.and_then(|n| b.custom_properties.get(n)),
@@ -568,6 +581,27 @@ fn compose_property(
         P::Color => { let c = compose_resolved_color(resolved_text_color(underlying, eval), resolved_text_color(kf, eval)); let t = Arc::make_mut(&mut kf.text); t.color = c.to_srgb_u8(); t.color_computed = Some(Arc::new(CssColorExpr::Resolved(c))); }
         P::BackgroundColor => { let c = compose_resolved_color(resolved_bg_color(underlying, eval), resolved_bg_color(kf, eval)); let v = Arc::make_mut(&mut kf.visual); v.background_color = c.to_srgb_u8(); v.background_color_computed = Some(Arc::new(CssColorExpr::Resolved(c))); }
         P::Opacity => kf.opacity = (underlying.opacity + kf.opacity).clamp(0.0, 1.0),
+        P::GridTemplateColumns => {
+            let u = underlying.flex_grid.as_ref().map_or(crate::grid_css::GridTemplateTrackList::None, |f| f.grid_template_columns_list.clone());
+            let k = kf.flex_grid.as_ref().map_or(crate::grid_css::GridTemplateTrackList::None, |f| f.grid_template_columns_list.clone());
+            let c = crate::grid_css::compose_track_list(&u, &k, mode, eval);
+            let fg = kf.flex_grid_mut();
+            fg.grid_template_columns = c.flatten_simple_tracks();
+            fg.grid_template_columns_list = c;
+        }
+        P::GridTemplateRows => {
+            let u = underlying.flex_grid.as_ref().map_or(crate::grid_css::GridTemplateTrackList::None, |f| f.grid_template_rows_list.clone());
+            let k = kf.flex_grid.as_ref().map_or(crate::grid_css::GridTemplateTrackList::None, |f| f.grid_template_rows_list.clone());
+            let c = crate::grid_css::compose_track_list(&u, &k, mode, eval);
+            let fg = kf.flex_grid_mut();
+            fg.grid_template_rows = c.flatten_simple_tracks();
+            fg.grid_template_rows_list = c;
+        }
+        P::FitTolerance => {
+            let u = underlying.flex_grid.as_ref().map_or(crate::grid_css::FitToleranceValue::Normal, |f| f.fit_tolerance.clone());
+            let k = kf.flex_grid.as_ref().map_or(crate::grid_css::FitToleranceValue::Normal, |f| f.fit_tolerance.clone());
+            kf.flex_grid_mut().fit_tolerance = crate::grid_css::compose_fit_tolerance(&u, &k, mode, eval);
+        }
         _ => {}
     }
 }
@@ -796,6 +830,67 @@ fn interpolate_property_into(
         P::JustifySelf => {
             let src = if use_from_disc { from } else { to };
             target.flex_grid_mut().justify_self = src.flex_grid.as_ref().map_or(crate::values::AlignValue::Auto, |f| f.justify_self);
+        }
+        P::GridTemplateColumns => {
+            let fa = from.flex_grid.as_ref().map_or(crate::grid_css::GridTemplateTrackList::None, |f| f.grid_template_columns_list.clone());
+            let tb = to.flex_grid.as_ref().map_or(crate::grid_css::GridTemplateTrackList::None, |f| f.grid_template_columns_list.clone());
+            let res = crate::grid_css::interpolate_track_list(&fa, &tb, p, eval).unwrap_or(if use_from_disc { fa } else { tb });
+            let fg = target.flex_grid_mut();
+            fg.grid_template_columns = res.flatten_simple_tracks();
+            fg.grid_template_columns_list = res;
+        }
+        P::GridTemplateRows => {
+            let fa = from.flex_grid.as_ref().map_or(crate::grid_css::GridTemplateTrackList::None, |f| f.grid_template_rows_list.clone());
+            let tb = to.flex_grid.as_ref().map_or(crate::grid_css::GridTemplateTrackList::None, |f| f.grid_template_rows_list.clone());
+            let res = crate::grid_css::interpolate_track_list(&fa, &tb, p, eval).unwrap_or(if use_from_disc { fa } else { tb });
+            let fg = target.flex_grid_mut();
+            fg.grid_template_rows = res.flatten_simple_tracks();
+            fg.grid_template_rows_list = res;
+        }
+        P::FitTolerance => {
+            let fa = from.flex_grid.as_ref().map_or(crate::grid_css::FitToleranceValue::Normal, |f| f.fit_tolerance.clone());
+            let tb = to.flex_grid.as_ref().map_or(crate::grid_css::FitToleranceValue::Normal, |f| f.fit_tolerance.clone());
+            target.flex_grid_mut().fit_tolerance = crate::grid_css::interpolate_fit_tolerance(&fa, &tb, p, eval).unwrap_or(if use_from_disc { fa } else { tb });
+        }
+        P::GridTemplateAreas => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().grid_template_areas = src.flex_grid.as_ref().map_or_else(Default::default, |f| f.grid_template_areas.clone());
+        }
+        P::GridAutoColumns => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().grid_auto_columns = src.flex_grid.as_ref().map(|f| f.grid_auto_columns.clone()).unwrap_or_default();
+        }
+        P::GridAutoRows => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().grid_auto_rows = src.flex_grid.as_ref().map(|f| f.grid_auto_rows.clone()).unwrap_or_default();
+        }
+        P::GridAutoFlow => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().grid_auto_flow = src.flex_grid.as_ref().map_or_else(Default::default, |f| f.grid_auto_flow);
+        }
+        P::GridRowStart => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().grid_row_start = src.flex_grid.as_ref().map_or_else(Default::default, |f| f.grid_row_start.clone());
+        }
+        P::GridRowEnd => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().grid_row_end = src.flex_grid.as_ref().map_or_else(Default::default, |f| f.grid_row_end.clone());
+        }
+        P::GridColumnStart => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().grid_column_start = src.flex_grid.as_ref().map_or_else(Default::default, |f| f.grid_column_start.clone());
+        }
+        P::GridColumnEnd => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().grid_column_end = src.flex_grid.as_ref().map_or_else(Default::default, |f| f.grid_column_end.clone());
+        }
+        P::GridLanesDirection => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().grid_lanes_direction = src.flex_grid.as_ref().map_or_else(Default::default, |f| f.grid_lanes_direction);
+        }
+        P::GridLanesPack => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().grid_lanes_pack = src.flex_grid.as_ref().map_or_else(Default::default, |f| f.grid_lanes_pack);
         }
         _ => {}
     }

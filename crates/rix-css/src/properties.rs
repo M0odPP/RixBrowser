@@ -564,7 +564,16 @@ pub enum PropertyIdKind {
     GridRowEnd,
     GridColumnStart,
     GridColumnEnd,
+    FitTolerance,
+    GridLanesDirection,
+    GridLanesPack,
     // Shorthands (retained when unresolved via `var()`)
+    Grid,
+    GridTemplate,
+    GridRow,
+    GridColumn,
+    GridArea,
+    GridLanes,
     Margin,
     Padding,
     Inset,
@@ -885,6 +894,18 @@ impl PropertyIdKind {
             "grid-row-end" => Self::GridRowEnd,
             "grid-column-start" => Self::GridColumnStart,
             "grid-column-end" => Self::GridColumnEnd,
+            "fit-tolerance" => Self::FitTolerance,
+            "grid-lanes-direction" => Self::GridLanesDirection,
+            "grid-lanes-pack" => Self::GridLanesPack,
+            "grid" => Self::Grid,
+            "grid-template" => Self::GridTemplate,
+            "grid-row" => Self::GridRow,
+            "grid-column" => Self::GridColumn,
+            "grid-area" => Self::GridArea,
+            "grid-lanes" => Self::GridLanes,
+            "grid-gap" => Self::Gap,
+            "grid-row-gap" => Self::RowGap,
+            "grid-column-gap" => Self::ColumnGap,
             "margin" => Self::Margin,
             "padding" => Self::Padding,
             "inset" => Self::Inset,
@@ -1078,6 +1099,15 @@ impl PropertyIdKind {
             Self::GridRowEnd => "grid-row-end",
             Self::GridColumnStart => "grid-column-start",
             Self::GridColumnEnd => "grid-column-end",
+            Self::FitTolerance => "fit-tolerance",
+            Self::GridLanesDirection => "grid-lanes-direction",
+            Self::GridLanesPack => "grid-lanes-pack",
+            Self::Grid => "grid",
+            Self::GridTemplate => "grid-template",
+            Self::GridRow => "grid-row",
+            Self::GridColumn => "grid-column",
+            Self::GridArea => "grid-area",
+            Self::GridLanes => "grid-lanes",
             Self::Margin => "margin",
             Self::Padding => "padding",
             Self::Inset => "inset",
@@ -1367,6 +1397,33 @@ impl PropertyIdKind {
             }
             Self::FlexFlow => SmallVec::from_slice(&[Self::FlexDirection, Self::FlexWrap]),
             Self::Gap => SmallVec::from_slice(&[Self::RowGap, Self::ColumnGap]),
+            Self::GridRow => SmallVec::from_slice(&[Self::GridRowStart, Self::GridRowEnd]),
+            Self::GridColumn => SmallVec::from_slice(&[Self::GridColumnStart, Self::GridColumnEnd]),
+            Self::GridArea => SmallVec::from_slice(&[
+                Self::GridRowStart,
+                Self::GridColumnStart,
+                Self::GridRowEnd,
+                Self::GridColumnEnd,
+            ]),
+            Self::GridTemplate => SmallVec::from_slice(&[
+                Self::GridTemplateRows,
+                Self::GridTemplateColumns,
+                Self::GridTemplateAreas,
+            ]),
+            Self::Grid => SmallVec::from_slice(&[
+                Self::GridTemplateRows,
+                Self::GridTemplateColumns,
+                Self::GridTemplateAreas,
+                Self::GridAutoRows,
+                Self::GridAutoColumns,
+                Self::GridAutoFlow,
+            ]),
+            Self::GridLanes => SmallVec::from_slice(&[
+                Self::GridTemplateColumns,
+                Self::GridTemplateRows,
+                Self::GridTemplateAreas,
+                Self::GridLanesDirection,
+            ]),
             Self::Overflow => SmallVec::from_slice(&[Self::OverflowX, Self::OverflowY]),
             Self::Background => {
                 SmallVec::from_slice(&[Self::BackgroundColor, Self::BackgroundLayers])
@@ -1489,11 +1546,14 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "grid-auto-rows",
     "grid-column-end",
     "grid-column-start",
+    "grid-lanes-direction",
+    "grid-lanes-pack",
     "grid-row-end",
     "grid-row-start",
     "grid-template-areas",
     "grid-template-columns",
     "grid-template-rows",
+    "fit-tolerance",
     "height",
     "image-resolution",
     "inline-size",
@@ -1747,6 +1807,9 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::GridRowEnd,
     PropertyIdKind::GridColumnStart,
     PropertyIdKind::GridColumnEnd,
+    PropertyIdKind::FitTolerance,
+    PropertyIdKind::GridLanesDirection,
+    PropertyIdKind::GridLanesPack,
     PropertyIdKind::VerticalAlign,
     PropertyIdKind::TextOverflow,
     PropertyIdKind::BorderCollapse,
@@ -2042,9 +2105,13 @@ pub enum PropertyValue {
     Align(AlignValue),
     GridAutoFlow(GridAutoFlowMode),
     GridTracks(Vec<GridTrackSize>),
+    GridTemplateTracks(crate::grid_css::GridTemplateTrackList),
     GridLine(Option<i32>, Option<i32>),
     GridPlacement(GridPlacementValue),
     GridTemplateAreas(GridTemplateAreasValue),
+    FitTolerance(crate::grid_css::FitToleranceValue),
+    GridLanesDirection(crate::grid_css::GridLanesDirectionMode),
+    GridLanesPack(crate::grid_css::GridLanesPackMode),
     BoxShadow(Vec<BoxShadowValue>),
     BackgroundLayers(Vec<BackgroundLayerValue>),
     Transform(Vec<TransformOp>),
@@ -2131,9 +2198,27 @@ impl PropertyValue {
             }
             Self::GridTracks(v) => v.iter().any(|t| match t {
                 GridTrackSize::FrMath(n) => node_has(n),
-                GridTrackSize::Length(lp) => lp_has(lp),
+                GridTrackSize::Length(lp) | GridTrackSize::FitContent(lp) => lp_has(lp),
                 _ => false,
             }),
+            Self::GridTemplateTracks(crate::grid_css::GridTemplateTrackList::Tracks {
+                items,
+                ..
+            }) => items.iter().any(|it| match it {
+                crate::grid_css::GridTrackListEntry::Track(t) => match t {
+                    GridTrackSize::FrMath(n) => node_has(n),
+                    GridTrackSize::Length(lp) | GridTrackSize::FitContent(lp) => lp_has(lp),
+                    _ => false,
+                },
+                crate::grid_css::GridTrackListEntry::Repeat { tracks, .. } => {
+                    tracks.iter().any(|t| match t {
+                        GridTrackSize::FrMath(n) => node_has(n),
+                        GridTrackSize::Length(lp) | GridTrackSize::FitContent(lp) => lp_has(lp),
+                        _ => false,
+                    })
+                }
+            }),
+            Self::FitTolerance(crate::grid_css::FitToleranceValue::Length(lp)) => lp_has(lp),
             Self::Color4(c) => {
                 let s = c.to_specified_css_string();
                 s.contains("sibling-") || s.contains("random(")
@@ -2421,6 +2506,25 @@ pub fn is_values4_native_property(prop: PropertyIdKind) -> bool {
             | PropertyIdKind::HyphenateLimitLines
             | PropertyIdKind::Contain
             | PropertyIdKind::Display
+            | PropertyIdKind::GridTemplateColumns
+            | PropertyIdKind::GridTemplateRows
+            | PropertyIdKind::GridTemplateAreas
+            | PropertyIdKind::GridAutoColumns
+            | PropertyIdKind::GridAutoRows
+            | PropertyIdKind::GridAutoFlow
+            | PropertyIdKind::GridRowStart
+            | PropertyIdKind::GridRowEnd
+            | PropertyIdKind::GridColumnStart
+            | PropertyIdKind::GridColumnEnd
+            | PropertyIdKind::FitTolerance
+            | PropertyIdKind::GridLanesDirection
+            | PropertyIdKind::GridLanesPack
+            | PropertyIdKind::Grid
+            | PropertyIdKind::GridTemplate
+            | PropertyIdKind::GridRow
+            | PropertyIdKind::GridColumn
+            | PropertyIdKind::GridArea
+            | PropertyIdKind::GridLanes
     )
 }
 
@@ -2545,9 +2649,9 @@ pub fn supports_values4_math(prop: PropertyIdKind) -> bool {
 pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(PropertyValue, String)> {
     use crate::values::CalcExpr;
     use crate::values_math::{
-        parse_and_serialize_transform, parse_background_position, parse_grid_tracks_math,
-        parse_image_resolution, parse_math_value, parse_math_value_from_parser, MathNode,
-        RotateSpec, ScaleSpec, TranslateSpec, ValueKind,
+        parse_and_serialize_transform, parse_background_position, parse_image_resolution,
+        parse_math_value, parse_math_value_from_parser, MathNode, RotateSpec, ScaleSpec,
+        TranslateSpec, ValueKind,
     };
     let trimmed = raw.trim();
     match prop {
@@ -2744,6 +2848,9 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
                 "grid-rows" => ReadingFlowMode::GridRows,
                 "grid-columns" => ReadingFlowMode::GridColumns,
                 "grid-order" => ReadingFlowMode::GridOrder,
+                "grid-lanes-flow" => ReadingFlowMode::GridLanesFlow,
+                "grid-lanes-track" => ReadingFlowMode::GridLanesTrack,
+                "grid-lanes-order" => ReadingFlowMode::GridLanesOrder,
                 "source-order" => ReadingFlowMode::SourceOrder,
                 _ => return None,
             };
@@ -2975,8 +3082,47 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
             return Some((PropertyValue::TransformRaw(trimmed.to_string()), s));
         }
         PropertyIdKind::GridTemplateRows | PropertyIdKind::GridTemplateColumns => {
-            let (tracks, s) = parse_grid_tracks_math(trimmed)?;
+            let tl = crate::grid_css::parse_grid_template_track_list(trimmed)?;
+            let s = crate::grid_css::serialize_track_list(&tl, None);
+            return Some((PropertyValue::GridTemplateTracks(tl), s));
+        }
+        PropertyIdKind::GridTemplateAreas => {
+            let areas = crate::grid_css::parse_grid_template_areas(trimmed)?;
+            let s = crate::grid_css::serialize_grid_areas(&areas);
+            return Some((PropertyValue::GridTemplateAreas(areas), s));
+        }
+        PropertyIdKind::GridAutoColumns | PropertyIdKind::GridAutoRows => {
+            let tracks = crate::grid_css::parse_grid_auto_tracks(trimmed)?;
+            let s = crate::grid_css::serialize_auto_tracks(&tracks, None);
             return Some((PropertyValue::GridTracks(tracks), s));
+        }
+        PropertyIdKind::GridAutoFlow => {
+            let mode = crate::grid_css::parse_grid_auto_flow(trimmed)?;
+            let s = crate::grid_css::serialize_grid_auto_flow(mode).to_string();
+            return Some((PropertyValue::GridAutoFlow(mode), s));
+        }
+        PropertyIdKind::GridRowStart
+        | PropertyIdKind::GridRowEnd
+        | PropertyIdKind::GridColumnStart
+        | PropertyIdKind::GridColumnEnd => {
+            let gl = crate::grid_css::parse_grid_line(trimmed)?;
+            let s = crate::grid_css::serialize_grid_line(&gl, None);
+            return Some((PropertyValue::GridPlacement(gl), s));
+        }
+        PropertyIdKind::FitTolerance => {
+            let ft = crate::grid_css::parse_fit_tolerance(trimmed)?;
+            let s = crate::grid_css::serialize_fit_tolerance(&ft, None);
+            return Some((PropertyValue::FitTolerance(ft), s));
+        }
+        PropertyIdKind::GridLanesDirection => {
+            let dir = crate::grid_css::parse_grid_lanes_direction(trimmed)?;
+            let s = crate::grid_css::serialize_grid_lanes_direction(dir);
+            return Some((PropertyValue::GridLanesDirection(dir), s));
+        }
+        PropertyIdKind::GridLanesPack => {
+            let pack = crate::grid_css::parse_grid_lanes_pack(trimmed)?;
+            let s = crate::grid_css::serialize_grid_lanes_pack(pack).to_string();
+            return Some((PropertyValue::GridLanesPack(pack), s));
         }
         PropertyIdKind::ColumnCount if trimmed.eq_ignore_ascii_case("auto") => {
             return Some((PropertyValue::ZIndex(ZIndexValue::Auto), "auto".to_string()));
@@ -3820,14 +3966,10 @@ pub fn parse_property_from_str(
         || is_values4_native_property(prop)
         || (supports_values4_math(prop) && crate::values_math::has_values4_syntax(trimmed))
     {
-        if let Some((val, _)) = parse_values4_property(prop, trimmed) {
-            return vec![SpecifiedDeclaration {
-                property: prop,
-                custom_name: None,
-                value: val,
-                important,
-                order: 0,
-            }];
+        let mut out = Vec::new();
+        let mut order = 0u32;
+        if parse_values4_property_decls(prop, trimmed, important, &mut order, &mut out) {
+            return out;
         }
         if is_values4_native_property(prop) {
             return Vec::new();
@@ -6389,8 +6531,8 @@ fn compile_property(
                         expr.bind_random_property(kind.css_name());
                         push_decl(out, ord, kind, PropertyValue::Color4(Box::new(expr)), imp);
                     }
-                } else if let Some((val, _)) = parse_values4_property(kind, raw_val) {
-                    push_decl(out, ord, kind, val, imp);
+                } else {
+                    let _ = parse_values4_property_decls(kind, raw_val, imp, ord, out);
                 }
                 return;
             }
@@ -6501,13 +6643,15 @@ fn compile_property(
                                 match non_ws[0] {
                                     CssToken::Ident(id) => {
                                         if let Some(kw) = GlobalKeyword::from_ident(id.as_str()) {
-                                            push_decl(
-                                                out,
-                                                ord,
-                                                kind,
-                                                PropertyValue::Global(kw),
-                                                imp,
-                                            );
+                                            for target in kind.shorthand_longhands() {
+                                                push_decl(
+                                                    out,
+                                                    ord,
+                                                    target,
+                                                    PropertyValue::Global(kw),
+                                                    imp,
+                                                );
+                                            }
                                             handled = true;
                                         }
                                     }
@@ -6515,13 +6659,15 @@ fn compile_property(
                                         name,
                                         fallback: None,
                                     } if name.as_str() == "--__rix_revert_rule__" => {
-                                        push_decl(
-                                            out,
-                                            ord,
-                                            kind,
-                                            PropertyValue::Global(GlobalKeyword::RevertRule),
-                                            imp,
-                                        );
+                                        for target in kind.shorthand_longhands() {
+                                            push_decl(
+                                                out,
+                                                ord,
+                                                target,
+                                                PropertyValue::Global(GlobalKeyword::RevertRule),
+                                                imp,
+                                            );
+                                        }
                                         handled = true;
                                     }
                                     CssToken::Var {
@@ -6532,11 +6678,9 @@ fn compile_property(
                                             CssToken::String(s) => Some(s.as_str()),
                                             _ => None,
                                         }) {
-                                            if let Some((val, _)) =
-                                                parse_values4_property(kind, raw_val)
-                                            {
-                                                push_decl(out, ord, kind, val, imp);
-                                            }
+                                            let _ = parse_values4_property_decls(
+                                                kind, raw_val, imp, ord, out,
+                                            );
                                         }
                                         handled = true;
                                     }
@@ -6602,6 +6746,208 @@ fn convert_grid_template_areas(
                     .iter()
                     .map(|opt| opt.as_deref().map(intern_str))
                     .collect(),
+            }
+        }
+    }
+}
+
+fn parse_values4_property_decls(
+    prop: PropertyIdKind,
+    raw: &str,
+    imp: bool,
+    ord: &mut u32,
+    out: &mut Vec<SpecifiedDeclaration>,
+) -> bool {
+    match prop {
+        PropertyIdKind::GridRow => {
+            if let Some((s, e)) = crate::grid_css::parse_grid_row_or_col_shorthand(raw) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridRowStart,
+                    PropertyValue::GridPlacement(s),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridRowEnd,
+                    PropertyValue::GridPlacement(e),
+                    imp,
+                );
+                return true;
+            }
+            false
+        }
+        PropertyIdKind::GridColumn => {
+            if let Some((s, e)) = crate::grid_css::parse_grid_row_or_col_shorthand(raw) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridColumnStart,
+                    PropertyValue::GridPlacement(s),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridColumnEnd,
+                    PropertyValue::GridPlacement(e),
+                    imp,
+                );
+                return true;
+            }
+            false
+        }
+        PropertyIdKind::GridArea => {
+            if let Some((rs, cs, re, ce)) = crate::grid_css::parse_grid_area_shorthand(raw) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridRowStart,
+                    PropertyValue::GridPlacement(rs),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridColumnStart,
+                    PropertyValue::GridPlacement(cs),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridRowEnd,
+                    PropertyValue::GridPlacement(re),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridColumnEnd,
+                    PropertyValue::GridPlacement(ce),
+                    imp,
+                );
+                return true;
+            }
+            false
+        }
+        PropertyIdKind::GridTemplate => {
+            if let Some((r, c, a)) = crate::grid_css::parse_grid_template_shorthand(raw) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridTemplateRows,
+                    PropertyValue::GridTemplateTracks(r),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridTemplateColumns,
+                    PropertyValue::GridTemplateTracks(c),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridTemplateAreas,
+                    PropertyValue::GridTemplateAreas(a),
+                    imp,
+                );
+                return true;
+            }
+            false
+        }
+        PropertyIdKind::Grid => {
+            if let Some((r, c, a, ar, ac, af)) = crate::grid_css::parse_grid_shorthand(raw) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridTemplateRows,
+                    PropertyValue::GridTemplateTracks(r),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridTemplateColumns,
+                    PropertyValue::GridTemplateTracks(c),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridTemplateAreas,
+                    PropertyValue::GridTemplateAreas(a),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridAutoRows,
+                    PropertyValue::GridTracks(ar),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridAutoColumns,
+                    PropertyValue::GridTracks(ac),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridAutoFlow,
+                    PropertyValue::GridAutoFlow(af),
+                    imp,
+                );
+                return true;
+            }
+            false
+        }
+        PropertyIdKind::GridLanes => {
+            if let Some((c, r, a, d)) = crate::grid_css::parse_grid_lanes_shorthand(raw) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridTemplateColumns,
+                    PropertyValue::GridTemplateTracks(c),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridTemplateRows,
+                    PropertyValue::GridTemplateTracks(r),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridTemplateAreas,
+                    PropertyValue::GridTemplateAreas(a),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::GridLanesDirection,
+                    PropertyValue::GridLanesDirection(d),
+                    imp,
+                );
+                return true;
+            }
+            false
+        }
+        _ => {
+            if let Some((val, _)) = parse_values4_property(prop, raw) {
+                push_decl(out, ord, prop, val, imp);
+                true
+            } else {
+                false
             }
         }
     }

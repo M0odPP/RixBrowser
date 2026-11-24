@@ -258,6 +258,8 @@ pub struct FlexGridStyle {
     pub column_gap: LengthPercentage,
     pub grid_template_columns: Vec<GridTrackSize>,
     pub grid_template_rows: Vec<GridTrackSize>,
+    pub grid_template_columns_list: crate::grid_css::GridTemplateTrackList,
+    pub grid_template_rows_list: crate::grid_css::GridTemplateTrackList,
     pub grid_template_areas: GridTemplateAreasValue,
     pub grid_auto_columns: Vec<GridTrackSize>,
     pub grid_auto_rows: Vec<GridTrackSize>,
@@ -266,6 +268,9 @@ pub struct FlexGridStyle {
     pub grid_row_end: GridPlacementValue,
     pub grid_column_start: GridPlacementValue,
     pub grid_column_end: GridPlacementValue,
+    pub fit_tolerance: crate::grid_css::FitToleranceValue,
+    pub grid_lanes_direction: crate::grid_css::GridLanesDirectionMode,
+    pub grid_lanes_pack: crate::grid_css::GridLanesPackMode,
 }
 
 impl Default for FlexGridStyle {
@@ -288,6 +293,8 @@ impl Default for FlexGridStyle {
             column_gap: LengthPercentage::Zero,
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
+            grid_template_columns_list: crate::grid_css::GridTemplateTrackList::None,
+            grid_template_rows_list: crate::grid_css::GridTemplateTrackList::None,
             grid_template_areas: GridTemplateAreasValue::default(),
             grid_auto_columns: Vec::new(),
             grid_auto_rows: Vec::new(),
@@ -296,6 +303,9 @@ impl Default for FlexGridStyle {
             grid_row_end: GridPlacementValue::Auto,
             grid_column_start: GridPlacementValue::Auto,
             grid_column_end: GridPlacementValue::Auto,
+            fit_tolerance: crate::grid_css::FitToleranceValue::Normal,
+            grid_lanes_direction: crate::grid_css::GridLanesDirectionMode::Normal,
+            grid_lanes_pack: crate::grid_css::GridLanesPackMode::Normal,
         }
     }
 }
@@ -2371,10 +2381,26 @@ pub fn apply_declaration(
             style.flex_grid_mut().column_gap = v.clone();
         }
         (PropertyIdKind::GridTemplateColumns, PropertyValue::GridTracks(v)) => {
-            style.flex_grid_mut().grid_template_columns = v.clone();
+            let fg = style.flex_grid_mut();
+            fg.grid_template_columns = v.clone();
+            fg.grid_template_columns_list =
+                crate::grid_css::GridTemplateTrackList::from_simple_tracks(v.clone());
+        }
+        (PropertyIdKind::GridTemplateColumns, PropertyValue::GridTemplateTracks(v)) => {
+            let fg = style.flex_grid_mut();
+            fg.grid_template_columns = v.flatten_simple_tracks();
+            fg.grid_template_columns_list = v.clone();
         }
         (PropertyIdKind::GridTemplateRows, PropertyValue::GridTracks(v)) => {
-            style.flex_grid_mut().grid_template_rows = v.clone();
+            let fg = style.flex_grid_mut();
+            fg.grid_template_rows = v.clone();
+            fg.grid_template_rows_list =
+                crate::grid_css::GridTemplateTrackList::from_simple_tracks(v.clone());
+        }
+        (PropertyIdKind::GridTemplateRows, PropertyValue::GridTemplateTracks(v)) => {
+            let fg = style.flex_grid_mut();
+            fg.grid_template_rows = v.flatten_simple_tracks();
+            fg.grid_template_rows_list = v.clone();
         }
         (PropertyIdKind::GridTemplateAreas, PropertyValue::GridTemplateAreas(v)) => {
             style.flex_grid_mut().grid_template_areas = v.clone();
@@ -2399,6 +2425,15 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::GridColumnEnd, PropertyValue::GridPlacement(v)) => {
             style.flex_grid_mut().grid_column_end = v.clone();
+        }
+        (PropertyIdKind::FitTolerance, PropertyValue::FitTolerance(v)) => {
+            style.flex_grid_mut().fit_tolerance = v.clone();
+        }
+        (PropertyIdKind::GridLanesDirection, PropertyValue::GridLanesDirection(v)) => {
+            style.flex_grid_mut().grid_lanes_direction = *v;
+        }
+        (PropertyIdKind::GridLanesPack, PropertyValue::GridLanesPack(v)) => {
+            style.flex_grid_mut().grid_lanes_pack = *v;
         }
 
         // Effects (allocated lazily)
@@ -3135,6 +3170,102 @@ fn copy_property_from_parent(
                 .as_ref()
                 .map_or(FlexDirectionMode::Row, |f| f.flex_direction);
         }
+        PropertyIdKind::GridTemplateColumns => {
+            let list = parent
+                .flex_grid
+                .as_ref()
+                .map_or(crate::grid_css::GridTemplateTrackList::None, |f| {
+                    f.grid_template_columns_list.clone()
+                });
+            let fg = style.flex_grid_mut();
+            fg.grid_template_columns = list.flatten_simple_tracks();
+            fg.grid_template_columns_list = list;
+        }
+        PropertyIdKind::GridTemplateRows => {
+            let list = parent
+                .flex_grid
+                .as_ref()
+                .map_or(crate::grid_css::GridTemplateTrackList::None, |f| {
+                    f.grid_template_rows_list.clone()
+                });
+            let fg = style.flex_grid_mut();
+            fg.grid_template_rows = list.flatten_simple_tracks();
+            fg.grid_template_rows_list = list;
+        }
+        PropertyIdKind::GridTemplateAreas => {
+            style.flex_grid_mut().grid_template_areas = parent
+                .flex_grid
+                .as_ref()
+                .map_or_else(GridTemplateAreasValue::default, |f| {
+                    f.grid_template_areas.clone()
+                });
+        }
+        PropertyIdKind::GridAutoColumns => {
+            style.flex_grid_mut().grid_auto_columns = parent
+                .flex_grid
+                .as_ref()
+                .map_or_else(Vec::new, |f| f.grid_auto_columns.clone());
+        }
+        PropertyIdKind::GridAutoRows => {
+            style.flex_grid_mut().grid_auto_rows = parent
+                .flex_grid
+                .as_ref()
+                .map_or_else(Vec::new, |f| f.grid_auto_rows.clone());
+        }
+        PropertyIdKind::GridAutoFlow => {
+            style.flex_grid_mut().grid_auto_flow = parent
+                .flex_grid
+                .as_ref()
+                .map_or(GridAutoFlowMode::Row, |f| f.grid_auto_flow);
+        }
+        PropertyIdKind::GridRowStart => {
+            style.flex_grid_mut().grid_row_start = parent
+                .flex_grid
+                .as_ref()
+                .map_or(GridPlacementValue::Auto, |f| f.grid_row_start.clone());
+        }
+        PropertyIdKind::GridRowEnd => {
+            style.flex_grid_mut().grid_row_end = parent
+                .flex_grid
+                .as_ref()
+                .map_or(GridPlacementValue::Auto, |f| f.grid_row_end.clone());
+        }
+        PropertyIdKind::GridColumnStart => {
+            style.flex_grid_mut().grid_column_start = parent
+                .flex_grid
+                .as_ref()
+                .map_or(GridPlacementValue::Auto, |f| f.grid_column_start.clone());
+        }
+        PropertyIdKind::GridColumnEnd => {
+            style.flex_grid_mut().grid_column_end = parent
+                .flex_grid
+                .as_ref()
+                .map_or(GridPlacementValue::Auto, |f| f.grid_column_end.clone());
+        }
+        PropertyIdKind::FitTolerance => {
+            style.flex_grid_mut().fit_tolerance = parent
+                .flex_grid
+                .as_ref()
+                .map_or(crate::grid_css::FitToleranceValue::Normal, |f| {
+                    f.fit_tolerance.clone()
+                });
+        }
+        PropertyIdKind::GridLanesDirection => {
+            style.flex_grid_mut().grid_lanes_direction = parent
+                .flex_grid
+                .as_ref()
+                .map_or(crate::grid_css::GridLanesDirectionMode::Normal, |f| {
+                    f.grid_lanes_direction
+                });
+        }
+        PropertyIdKind::GridLanesPack => {
+            style.flex_grid_mut().grid_lanes_pack = parent
+                .flex_grid
+                .as_ref()
+                .map_or(crate::grid_css::GridLanesPackMode::Normal, |f| {
+                    f.grid_lanes_pack
+                });
+        }
         PropertyIdKind::FlexWrap => {
             style.flex_grid_mut().flex_wrap = parent
                 .flex_grid
@@ -3478,6 +3609,50 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         }
         PropertyIdKind::FlexDirection => {
             style.flex_grid_mut().flex_direction = FlexDirectionMode::Row;
+        }
+        PropertyIdKind::GridTemplateColumns => {
+            let fg = style.flex_grid_mut();
+            fg.grid_template_columns.clear();
+            fg.grid_template_columns_list = crate::grid_css::GridTemplateTrackList::None;
+        }
+        PropertyIdKind::GridTemplateRows => {
+            let fg = style.flex_grid_mut();
+            fg.grid_template_rows.clear();
+            fg.grid_template_rows_list = crate::grid_css::GridTemplateTrackList::None;
+        }
+        PropertyIdKind::GridTemplateAreas => {
+            style.flex_grid_mut().grid_template_areas = GridTemplateAreasValue::default();
+        }
+        PropertyIdKind::GridAutoColumns => {
+            style.flex_grid_mut().grid_auto_columns.clear();
+        }
+        PropertyIdKind::GridAutoRows => {
+            style.flex_grid_mut().grid_auto_rows.clear();
+        }
+        PropertyIdKind::GridAutoFlow => {
+            style.flex_grid_mut().grid_auto_flow = GridAutoFlowMode::Row;
+        }
+        PropertyIdKind::GridRowStart => {
+            style.flex_grid_mut().grid_row_start = GridPlacementValue::Auto;
+        }
+        PropertyIdKind::GridRowEnd => {
+            style.flex_grid_mut().grid_row_end = GridPlacementValue::Auto;
+        }
+        PropertyIdKind::GridColumnStart => {
+            style.flex_grid_mut().grid_column_start = GridPlacementValue::Auto;
+        }
+        PropertyIdKind::GridColumnEnd => {
+            style.flex_grid_mut().grid_column_end = GridPlacementValue::Auto;
+        }
+        PropertyIdKind::FitTolerance => {
+            style.flex_grid_mut().fit_tolerance = crate::grid_css::FitToleranceValue::Normal;
+        }
+        PropertyIdKind::GridLanesDirection => {
+            style.flex_grid_mut().grid_lanes_direction =
+                crate::grid_css::GridLanesDirectionMode::Normal;
+        }
+        PropertyIdKind::GridLanesPack => {
+            style.flex_grid_mut().grid_lanes_pack = crate::grid_css::GridLanesPackMode::Normal;
         }
         PropertyIdKind::FlexWrap => {
             style.flex_grid_mut().flex_wrap = FlexWrapMode::NoWrap;
