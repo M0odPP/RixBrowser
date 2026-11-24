@@ -244,7 +244,12 @@ impl RuleIndex {
                         }
                     }
                 }
-                if selector_prevents_sibling_sharing(&compiled.selector) {
+                if selector_prevents_sibling_sharing(&compiled.selector)
+                    || compiled
+                        .declarations
+                        .iter()
+                        .any(|d| d.value.contains_sibling_fn())
+                {
                     index.allows_sibling_sharing = false;
                 }
                 let (has_rel, has_non_subject) = inv.record_selector(&compiled.selector);

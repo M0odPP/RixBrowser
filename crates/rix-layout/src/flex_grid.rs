@@ -97,7 +97,7 @@ pub fn layout_flex_grid_container(
     in_flow_items.sort_by_key(|&(order, idx, _)| (order, idx));
     let ordered_items: Vec<BoxId> = in_flow_items.into_iter().map(|(_, _, cid)| cid).collect();
 
-    let eval = space.eval_context(container_style.text.font_size_px);
+    let eval = space.eval_context_for(&container_style);
     let root_taffy_style = to_taffy_container_style(&container_style, fc, &space, &eval);
     let root_style_hash = Arc::as_ptr(&container_style) as usize as u64
         ^ (u64::from(space.available_width.to_bits()) << 32);
@@ -236,7 +236,7 @@ pub fn layout_flex_grid_container(
         };
         let oof_space = space.with_available(cb_w, Some(cb_h));
         let mut frag = layout_box(ctx, oof_id, oof_space);
-        let oof_eval = space.eval_context(oof_box.style.text.font_size_px);
+        let oof_eval = space.eval_context_for(&oof_box.style);
         let inset = &oof_box.style.box_model.inset;
         let x = match (&inset.left, &inset.right) {
             (LengthPercentageAuto::Value(l), _) => base_x + l.resolve_px(cb_w, &oof_eval),
@@ -319,7 +319,7 @@ fn reconcile_retained_tree(
                 || child_box.subtree_dirty
                 || entry.subtree_hash != child_box.subtree_hash
             {
-                let eval = space.eval_context(child_box.style.text.font_size_px);
+                let eval = space.eval_context_for(&child_box.style);
                 let item_style = to_taffy_item_style(&child_box.style, space, &eval, parent_areas);
                 let _ = retained.taffy.set_style(entry.taffy_node, item_style);
                 let _ = retained.taffy.mark_dirty(entry.taffy_node);
@@ -336,7 +336,7 @@ fn reconcile_retained_tree(
     let mut taffy_kids = Vec::with_capacity(ordered_items.len());
     for &cid in ordered_items {
         let child_box = tree.get(cid);
-        let eval = space.eval_context(child_box.style.text.font_size_px);
+        let eval = space.eval_context_for(&child_box.style);
         let item_style = to_taffy_item_style(&child_box.style, space, &eval, parent_areas);
         let node = retained
             .taffy
@@ -713,6 +713,7 @@ fn grid_track_to_taffy(track: &GridTrackSize, eval: &EvalContext) -> tp::TrackSi
             other => tp::length(other.resolve_px(eval.container_width_px, eval)),
         },
         GridTrackSize::Fr(f) => tp::fr(*f),
+        GridTrackSize::FrMath(n) => tp::fr((n.eval_scalar(eval, None) as f32).max(0.0)),
         GridTrackSize::MinMax(min_t, max_t) => {
             let min_fn = match min_t.as_ref() {
                 GridTrackSize::MinContent => tp::min_content(),
@@ -727,6 +728,7 @@ fn grid_track_to_taffy(track: &GridTrackSize, eval: &EvalContext) -> tp::TrackSi
                 GridTrackSize::MinContent => tp::min_content(),
                 GridTrackSize::MaxContent => tp::max_content(),
                 GridTrackSize::Fr(f) => tp::fr(*f),
+                GridTrackSize::FrMath(n) => tp::fr((n.eval_scalar(eval, None) as f32).max(0.0)),
                 GridTrackSize::Length(lp) => match lp {
                     LengthPercentage::Percent(p) => tp::percent(*p),
                     other => tp::length(other.resolve_px(eval.container_width_px, eval)),

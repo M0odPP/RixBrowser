@@ -249,3 +249,55 @@ fn css_color_l4_l5_wide_gamut_mix_relative_alpha_contrast_light_dark() {
         .expect("script should succeed");
     assert_eq!(rt.vm.value_to_rust_string(res), "ok");
 }
+
+#[test]
+fn css_values_l4_l5_math_units_and_sibling_functions() {
+    let mut rt = make_runtime();
+    let html = r#"<!doctype html><style>
+      :root { font-size: 10px; line-height: 20px; }
+      #wrap { width: 100px; line-height: 20px; }
+      #sibs > div { width: calc(10px * sibling-index()); z-index: sibling-count(); }
+    </style>
+    <div id="wrap"><div id="t" style="font-size: 10px;"></div></div>
+    <div id="sibs"><div id="rm"></div><div></div><div id="s3"></div></div>"#;
+    let errs = rt.load_document_with_external_scripts(html, &HashMap::new());
+    assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+    let res = rt
+        .eval_script(
+            r#"(function() {
+                const t = document.getElementById("t");
+                const s3 = document.getElementById("s3");
+                if (s3.offsetWidth !== 30) return "sib-w:" + s3.offsetWidth;
+                if (getComputedStyle(s3).zIndex !== "3") return "sib-cnt:" + getComputedStyle(s3).zIndex;
+                document.getElementById("rm").remove();
+                if (s3.offsetWidth !== 20) return "sib-rm-w:" + s3.offsetWidth;
+                if (getComputedStyle(s3).zIndex !== "2") return "sib-rm-cnt:" + getComputedStyle(s3).zIndex;
+                t.style.marginLeft = "round(10%, 5px)";
+                if (getComputedStyle(t).marginLeft !== "10px") return "round:" + getComputedStyle(t).marginLeft;
+                t.style.scale = "calc(10em / 1rem)";
+                if (getComputedStyle(t).scale !== "10") return "typed:" + getComputedStyle(t).scale;
+                t.style.rotate = "atan2(10px, 10px)";
+                if (getComputedStyle(t).rotate !== "45deg") return "atan2:" + getComputedStyle(t).rotate;
+                t.style.scale = "progress(no-clamp 100px, 0px, 50px)";
+                if (getComputedStyle(t).scale !== "2") return "prog-nc:" + getComputedStyle(t).scale;
+                t.style.scale = "progress(100px, 0px, 50px)";
+                if (getComputedStyle(t).scale !== "1") return "prog:" + getComputedStyle(t).scale;
+                t.style.marginTop = "clamp(none, 33px, 30px)";
+                if (t.style.marginTop !== "calc(30px)") return "clamp-none:" + t.style.marginTop;
+                t.style.width = "calc(2lh + 1rlh)";
+                if (getComputedStyle(t).width !== "60px") return "lh:" + getComputedStyle(t).width;
+                t.style.lineHeight = "calc(10% / 1px)";
+                if (getComputedStyle(t).lineHeight !== "10px") return "lh-typed:" + getComputedStyle(t).lineHeight;
+                t.style.gridTemplateRows = "calc(1fr + 2fr)";
+                if (getComputedStyle(t).gridTemplateRows !== "3fr") return "fr:" + getComputedStyle(t).gridTemplateRows;
+                t.style.zIndex = "calc(10% / 20%)";
+                if (t.style.zIndex !== "") return "z-pct:" + t.style.zIndex;
+                t.style.zIndex = "calc(log(2, 1))";
+                if (getComputedStyle(t).zIndex !== "0") return "log-nan:" + getComputedStyle(t).zIndex;
+                return "ok";
+            })()"#,
+        )
+        .expect("script should succeed");
+    assert_eq!(rt.vm.value_to_rust_string(res), "ok");
+}

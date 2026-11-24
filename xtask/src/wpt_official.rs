@@ -457,6 +457,10 @@ fn collect_wpt_html_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
+    if dir.is_file() {
+        out.push(dir.to_path_buf());
+        return Ok(());
+    }
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -964,9 +968,9 @@ pub fn run_official_wpt_suite(opts: &OfficialWptOptions) -> Result<OfficialWptRe
                     let r = out.reason.unwrap_or_else(|| "subtest failure".into());
                     let bucket: String = r.chars().take(72).collect();
                     *reasons.entry(bucket).or_insert(0) += 1;
-                    if report.sample_failures.len() < 40 {
+                    if report.sample_failures.len() < 300 {
                         report.sample_failures.push(OfficialWptFailure {
-                            file: rel,
+                            file: format!("{rel} [{}/{}]", out.subtests_passed, out.subtests_total),
                             kind: "testharness".into(),
                             reason: r,
                         });

@@ -911,6 +911,7 @@ impl ChannelMath {
                 _ => None,
             },
             Self::Func(name, args) => match name.as_str() {
+                "sibling-index" | "sibling-count" => args.is_empty().then_some(MathDim::Number),
                 "calc" | "abs" => (args.len() == 1).then(|| args[0].dim()).flatten(),
                 "sign" => (args.len() == 1 && args[0].dim().is_some()).then_some(MathDim::Number),
                 "sin" | "cos" | "tan" => (args.len() == 1
@@ -1095,7 +1096,21 @@ impl ChannelMath {
             Self::Add(a, b) | Self::Sub(a, b) | Self::Mul(a, b) | Self::Div(a, b) => {
                 a.uses_dynamic_units() || b.uses_dynamic_units()
             }
-            Self::Func(_, args) => args.iter().any(Self::uses_dynamic_units),
+            Self::Func(name, args) => {
+                matches!(name.as_str(), "sibling-index" | "sibling-count")
+                    || args.iter().any(Self::uses_dynamic_units)
+            }
+            _ => false,
+        }
+    }
+
+    fn contains_percent(&self) -> bool {
+        match self {
+            Self::Pct(_) => true,
+            Self::Add(a, b) | Self::Sub(a, b) | Self::Mul(a, b) | Self::Div(a, b) => {
+                a.contains_percent() || b.contains_percent()
+            }
+            Self::Func(_, args) => args.iter().any(Self::contains_percent),
             _ => false,
         }
     }
@@ -1119,6 +1134,8 @@ fn eval_math_fn(name: &str, args: &[ChannelMath], vars: &[(&str, f64)], ctx: &Ev
         "mod" => { let (a, b) = (ea(0), ea(1)); if b == 0.0 || !a.is_finite() || b.is_nan() { f64::NAN } else if b.is_infinite() { if a.signum() == b.signum() { a } else { f64::NAN } } else { a - b * (a / b).floor() } }
         "rem" => { let (a, b) = (ea(0), ea(1)); if b == 0.0 || !a.is_finite() || b.is_nan() { f64::NAN } else { a % b } }
         "round" => { let (a, b) = (ea(0), ea(1)); if b == 0.0 { f64::NAN } else { (a / b).round() * b } }
+        "sibling-index" => f64::from(ctx.sibling_index),
+        "sibling-count" => f64::from(ctx.sibling_count),
         _ => f64::NAN,
     }
 }
@@ -1141,16 +1158,8 @@ fn collect_mul_factors<'a>(expr: &'a ChannelMath, out: &mut Vec<&'a ChannelMath>
     }
 }
 
-#[rustfmt::skip]
 const fn length_unit_str(u: LengthUnit) -> &'static str {
-    match u {
-        LengthUnit::Px => "px", LengthUnit::Rem => "rem", LengthUnit::Em => "em", LengthUnit::Ex => "ex",
-        LengthUnit::Ch => "ch", LengthUnit::Cap => "cap", LengthUnit::Ic => "ic", LengthUnit::Lh => "lh",
-        LengthUnit::Rlh => "rlh", LengthUnit::Vw => "vw", LengthUnit::Vh => "vh", LengthUnit::Vmin => "vmin",
-        LengthUnit::Vmax => "vmax", LengthUnit::Svw => "svw", LengthUnit::Svh => "svh", LengthUnit::Lvw => "lvw",
-        LengthUnit::Lvh => "lvh", LengthUnit::Dvw => "dvw", LengthUnit::Dvh => "dvh", LengthUnit::Cqw => "cqw",
-        LengthUnit::Cqh => "cqh", LengthUnit::Cqi => "cqi", LengthUnit::Cqb => "cqb",
-    }
+    u.as_str()
 }
 
 // ---------------------------------------------------------------------------
@@ -2392,6 +2401,9 @@ fn parse_channel_component<'i, 't>(
         }
         Token::Function(ref fname) if is_math_fn_name(fname.as_ref()) => {
             let expr = parse_nested_math(p, fname.as_ref(), kws)?;
+            if rule == ChannelRule::NumOrAngle && expr.contains_percent() {
+                return None;
+            }
             let dim = expr.dim()?;
             let ok = matches!(
                 (rule, dim),
@@ -2418,6 +2430,7 @@ fn is_math_fn_name(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "calc" | "min" | "max" | "clamp" | "round" | "mod" | "rem" | "sin" | "cos" | "tan"
             | "asin" | "acos" | "atan" | "atan2" | "pow" | "sqrt" | "hypot" | "log" | "exp" | "abs" | "sign"
+            | "sibling-index" | "sibling-count"
     )
 }
 
@@ -2436,11 +2449,34 @@ fn parse_math_fn_args<'i, 't>(
     p: &mut Parser<'i, 't>,
     kws: &[&str],
 ) -> Option<ChannelMath> {
+    if fn_name == "sibling-index" || fn_name == "sibling-count" {
+        return p
+            .is_exhausted()
+            .then_some(ChannelMath::Func(fn_name.to_string(), Vec::new()));
+    }
     if fn_name == "calc" {
         let e = parse_math_sum(p, kws)?;
         return p
             .is_exhausted()
             .then_some(ChannelMath::Func("calc".to_string(), vec![e]));
+    }
+    if fn_name == "clamp" {
+        let lo = if p.try_parse(|p| p.expect_ident_matching("none")).is_ok() {
+            ChannelMath::Num(f64::NEG_INFINITY)
+        } else {
+            parse_math_sum(p, kws)?
+        };
+        p.expect_comma().ok()?;
+        let mid = parse_math_sum(p, kws)?;
+        p.expect_comma().ok()?;
+        let hi = if p.try_parse(|p| p.expect_ident_matching("none")).is_ok() {
+            ChannelMath::Num(f64::INFINITY)
+        } else {
+            parse_math_sum(p, kws)?
+        };
+        return p
+            .is_exhausted()
+            .then_some(ChannelMath::Func("clamp".to_string(), vec![lo, mid, hi]));
     }
     if fn_name == "round" {
         let _ = p.try_parse(|p| -> Result<(), cssparser::ParseError<'i, ()>> {

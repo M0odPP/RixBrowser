@@ -561,7 +561,7 @@ impl HostState {
     pub fn resolved_layout_box_for_node(&mut self, node: NodeId) -> Option<ResolvedLayoutBox> {
         let tree = self.ensure_layout()?;
         let root = tree.root.as_ref()?;
-        find_fragment_metrics(root, node)
+        find_fragment_metrics(root, root.content_rect.size, node)
     }
 
     /// Returns `true` if `node`'s parent element has `display: flex | inline-flex | grid | inline-grid`.
@@ -700,19 +700,26 @@ pub struct ResolvedLayoutBox {
     pub border_size: Size,
     pub padding: EdgeInsets,
     pub margin: EdgeInsets,
+    pub parent_content_size: Size,
 }
 
-fn find_fragment_metrics(frag: &Fragment, target: NodeId) -> Option<ResolvedLayoutBox> {
+fn find_fragment_metrics(
+    frag: &Fragment,
+    parent_content_size: Size,
+    target: NodeId,
+) -> Option<ResolvedLayoutBox> {
     if frag.dom_node == Some(target) {
         return Some(ResolvedLayoutBox {
             content_size: frag.content_rect.size,
             border_size: frag.border_rect.size,
             padding: frag.padding,
             margin: frag.margin,
+            parent_content_size,
         });
     }
+    let next_parent = frag.content_rect.size;
     for child in frag.children.iter() {
-        if let Some(found) = find_fragment_metrics(child, target) {
+        if let Some(found) = find_fragment_metrics(child, next_parent, target) {
             return Some(found);
         }
     }

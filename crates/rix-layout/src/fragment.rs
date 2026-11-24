@@ -85,7 +85,20 @@ impl ConstraintSpace {
             viewport_height_px: self.viewport_size.height,
             container_width_px: self.containing_block_width,
             container_height_px: self.containing_block_height,
+            ..EvalContext::default()
         }
+    }
+
+    #[must_use]
+    pub fn eval_context_for(&self, style: &ComputedStyle) -> EvalContext {
+        let mut ctx = style.text.eval_ctx;
+        ctx.font_size_px = style.text.font_size_px;
+        ctx.root_font_size_px = self.root_font_size_px;
+        ctx.viewport_width_px = self.viewport_size.width;
+        ctx.viewport_height_px = self.viewport_size.height;
+        ctx.container_width_px = self.containing_block_width;
+        ctx.container_height_px = self.containing_block_height;
+        ctx
     }
 
     #[must_use]
@@ -120,7 +133,7 @@ pub struct BoxMetrics {
 impl BoxMetrics {
     #[must_use]
     pub fn resolve(style: &ComputedStyle, space: &ConstraintSpace) -> Self {
-        let eval = space.eval_context(style.text.font_size_px);
+        let eval = space.eval_context_for(style);
         let cb_w = space.containing_block_width;
         let cb_h = space.containing_block_height;
         let bm = &style.box_model;

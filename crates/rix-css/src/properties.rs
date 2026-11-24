@@ -428,9 +428,18 @@ pub enum PropertyIdKind {
     Color,
     BackgroundColor,
     BackgroundLayers,
+    BackgroundPosition,
     BoxShadow,
     Transform,
     TransformOrigin,
+    Scale,
+    Rotate,
+    Translate,
+    ImageResolution,
+    Orphans,
+    Widows,
+    TabSize,
+    ColumnCount,
     Filter,
     ClipPath,
     MixBlendMode,
@@ -710,9 +719,18 @@ impl PropertyIdKind {
             "color" => Self::Color,
             "background-color" => Self::BackgroundColor,
             "background-image" => Self::BackgroundLayers,
+            "background-position" => Self::BackgroundPosition,
             "box-shadow" => Self::BoxShadow,
             "transform" => Self::Transform,
             "transform-origin" => Self::TransformOrigin,
+            "scale" => Self::Scale,
+            "rotate" => Self::Rotate,
+            "translate" => Self::Translate,
+            "image-resolution" => Self::ImageResolution,
+            "orphans" => Self::Orphans,
+            "widows" => Self::Widows,
+            "tab-size" => Self::TabSize,
+            "column-count" => Self::ColumnCount,
             "filter" => Self::Filter,
             "clip-path" => Self::ClipPath,
             "mix-blend-mode" => Self::MixBlendMode,
@@ -862,9 +880,18 @@ impl PropertyIdKind {
             Self::Color => "color",
             Self::BackgroundColor => "background-color",
             Self::BackgroundLayers => "background-image",
+            Self::BackgroundPosition => "background-position",
             Self::BoxShadow => "box-shadow",
             Self::Transform => "transform",
             Self::TransformOrigin => "transform-origin",
+            Self::Scale => "scale",
+            Self::Rotate => "rotate",
+            Self::Translate => "translate",
+            Self::ImageResolution => "image-resolution",
+            Self::Orphans => "orphans",
+            Self::Widows => "widows",
+            Self::TabSize => "tab-size",
+            Self::ColumnCount => "column-count",
             Self::Filter => "filter",
             Self::ClipPath => "clip-path",
             Self::MixBlendMode => "mix-blend-mode",
@@ -1043,6 +1070,9 @@ impl PropertyIdKind {
                 | Self::Direction
                 | Self::WritingMode
                 | Self::CaptionSide
+                | Self::Orphans
+                | Self::Widows
+                | Self::TabSize
                 | Self::BorderCollapse
                 | Self::BorderSpacing
                 | Self::Custom
@@ -1242,6 +1272,7 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "animation-timing-function",
     "background-color",
     "background-image",
+    "background-position",
     "block-size",
     "border-block-end-color",
     "border-block-end-style",
@@ -1285,6 +1316,7 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "clip-path",
     "color",
     "color-scheme",
+    "column-count",
     "column-gap",
     "content",
     "cursor",
@@ -1312,6 +1344,7 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "grid-template-columns",
     "grid-template-rows",
     "height",
+    "image-resolution",
     "inline-size",
     "inset-block-end",
     "inset-block-start",
@@ -1342,6 +1375,7 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "mix-blend-mode",
     "opacity",
     "order",
+    "orphans",
     "outline-color",
     "outline-offset",
     "outline-style",
@@ -1365,11 +1399,15 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "position",
     "resize",
     "right",
+    "rotate",
     "row-gap",
+    "scale",
+    "tab-size",
     "table-layout",
     "text-align",
     "text-decoration-color",
     "text-decoration-line",
+    "text-indent",
     "text-overflow",
     "text-transform",
     "top",
@@ -1379,10 +1417,12 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "transition-duration",
     "transition-property",
     "transition-timing-function",
+    "translate",
     "user-select",
     "vertical-align",
     "visibility",
     "white-space",
+    "widows",
     "width",
     "word-break",
     "word-spacing",
@@ -1446,9 +1486,18 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::Color,
     PropertyIdKind::BackgroundColor,
     PropertyIdKind::BackgroundLayers,
+    PropertyIdKind::BackgroundPosition,
     PropertyIdKind::BoxShadow,
     PropertyIdKind::Transform,
     PropertyIdKind::TransformOrigin,
+    PropertyIdKind::Scale,
+    PropertyIdKind::Rotate,
+    PropertyIdKind::Translate,
+    PropertyIdKind::ImageResolution,
+    PropertyIdKind::Orphans,
+    PropertyIdKind::Widows,
+    PropertyIdKind::TabSize,
+    PropertyIdKind::ColumnCount,
     PropertyIdKind::Filter,
     PropertyIdKind::ClipPath,
     PropertyIdKind::MixBlendMode,
@@ -1829,6 +1878,72 @@ pub enum PropertyValue {
     Resize(ResizeMode),
     CaptionSide(CaptionSideMode),
     OverscrollBehavior(OverscrollBehaviorMode),
+    MathVal(Box<crate::values_math::MathNode>),
+    Scale(crate::values_math::ScaleSpec),
+    Rotate(crate::values_math::RotateSpec),
+    Translate(crate::values_math::TranslateSpec),
+    TransformRaw(String),
+    BgPosition(LengthPercentage, LengthPercentage),
+}
+
+impl PropertyValue {
+    /// Returns `true` if this declaration's value depends on `sibling-index()` or `sibling-count()`.
+    #[must_use]
+    pub fn contains_sibling_fn(&self) -> bool {
+        let lp_has = |lp: &LengthPercentage| {
+            matches!(
+                lp,
+                LengthPercentage::Calc(c) if matches!(c.as_ref(), crate::values::CalcExpr::Math(n) if n.contains_sibling_fn())
+            )
+        };
+        match self {
+            Self::MathVal(n) => n.contains_sibling_fn(),
+            Self::Length(lp)
+            | Self::LengthAuto(LengthPercentageAuto::Value(lp))
+            | Self::Size(SizeValue::Length(lp)) => lp_has(lp),
+            Self::CornerRadius(cr) => lp_has(&cr.x) || lp_has(&cr.y),
+            Self::BgPosition(x, y) => lp_has(x) || lp_has(y),
+            Self::Scale(crate::values_math::ScaleSpec::Values(v)) => v
+                .iter()
+                .any(crate::values_math::MathNode::contains_sibling_fn),
+            Self::Rotate(crate::values_math::RotateSpec::Angle { axis, angle }) => {
+                angle.contains_sibling_fn()
+                    || axis.as_ref().is_some_and(|a| {
+                        a.iter()
+                            .any(crate::values_math::MathNode::contains_sibling_fn)
+                    })
+            }
+            Self::Translate(crate::values_math::TranslateSpec::Values { x, y, z }) => {
+                x.contains_sibling_fn()
+                    || y.as_ref()
+                        .is_some_and(crate::values_math::MathNode::contains_sibling_fn)
+                    || z.as_ref()
+                        .is_some_and(crate::values_math::MathNode::contains_sibling_fn)
+            }
+            Self::TransformRaw(s) => s.to_ascii_lowercase().contains("sibling-"),
+            Self::GridTracks(v) => v.iter().any(|t| match t {
+                GridTrackSize::FrMath(n) => n.contains_sibling_fn(),
+                GridTrackSize::Length(lp) => lp_has(lp),
+                _ => false,
+            }),
+            Self::Color4(c) => c.to_specified_css_string().contains("sibling-"),
+            Self::Custom(toks) | Self::Unresolved(toks) => tokens_contain_sibling_fn(toks),
+            _ => false,
+        }
+    }
+}
+
+fn tokens_contain_sibling_fn(toks: &[CssToken]) -> bool {
+    toks.iter().any(|t| match t {
+        CssToken::Function { name, args } => {
+            let l = name.as_str().to_ascii_lowercase();
+            l == "sibling-index" || l == "sibling-count" || tokens_contain_sibling_fn(args)
+        }
+        CssToken::Var {
+            fallback: Some(fb), ..
+        } => tokens_contain_sibling_fn(fb),
+        _ => false,
+    })
 }
 
 /// A compiled single-property CSS declaration.
@@ -2004,10 +2119,301 @@ pub(crate) fn rewrite_dynamic_var_names(css: &str) -> std::borrow::Cow<'_, str> 
     }
 }
 
+/// Returns `true` for CSS properties parsed natively by our CSS Values L4/L5 engine.
+#[must_use]
+pub fn is_values4_native_property(prop: PropertyIdKind) -> bool {
+    matches!(
+        prop,
+        PropertyIdKind::Scale
+            | PropertyIdKind::Rotate
+            | PropertyIdKind::Translate
+            | PropertyIdKind::ImageResolution
+            | PropertyIdKind::BackgroundPosition
+            | PropertyIdKind::Orphans
+            | PropertyIdKind::Widows
+            | PropertyIdKind::TabSize
+            | PropertyIdKind::ColumnCount
+    )
+}
+
+/// Returns `(ValueKind, non_negative)` for single-value CSS properties supporting
+/// CSS Values L4/L5 typed math expressions.
+#[must_use]
+#[rustfmt::skip]
+pub fn values4_property_kind(prop: PropertyIdKind) -> Option<(crate::values_math::ValueKind, bool)> {
+    use crate::values_math::ValueKind as VK;
+    use PropertyIdKind as P;
+    match prop {
+        P::Width | P::Height | P::MinWidth | P::MinHeight | P::MaxWidth | P::MaxHeight
+        | P::InlineSize | P::BlockSize | P::MinInlineSize | P::MinBlockSize
+        | P::MaxInlineSize | P::MaxBlockSize | P::PaddingTop | P::PaddingRight
+        | P::PaddingBottom | P::PaddingLeft | P::PaddingBlockStart | P::PaddingBlockEnd
+        | P::PaddingInlineStart | P::PaddingInlineEnd | P::FlexBasis | P::RowGap
+        | P::ColumnGap | P::FontSize | P::BorderTopLeftRadius | P::BorderTopRightRadius
+        | P::BorderBottomRightRadius | P::BorderBottomLeftRadius
+        | P::BorderStartStartRadius | P::BorderStartEndRadius
+        | P::BorderEndStartRadius | P::BorderEndEndRadius => Some((VK::LengthPercentage, true)),
+        P::MarginTop | P::MarginRight | P::MarginBottom | P::MarginLeft
+        | P::MarginBlockStart | P::MarginBlockEnd | P::MarginInlineStart | P::MarginInlineEnd
+        | P::Top | P::Right | P::Bottom | P::Left | P::InsetBlockStart | P::InsetBlockEnd
+        | P::InsetInlineStart | P::InsetInlineEnd | P::TextIndent | P::OutlineOffset
+        | P::WordSpacing | P::LetterSpacing => Some((VK::LengthPercentage, false)),
+        P::BorderTopWidth | P::BorderRightWidth | P::BorderBottomWidth | P::BorderLeftWidth
+        | P::BorderBlockStartWidth | P::BorderBlockEndWidth | P::BorderInlineStartWidth
+        | P::BorderInlineEndWidth | P::OutlineWidth => Some((VK::Length, true)),
+        P::ZIndex | P::Order => Some((VK::Integer, false)),
+        P::Orphans | P::Widows | P::ColumnCount => Some((VK::Integer, true)),
+        P::FlexGrow | P::FlexShrink | P::FontWeight | P::AnimationIterationCount => Some((VK::Number, true)),
+        P::Opacity => Some((VK::NumberOrPercentage, false)),
+        P::TransitionDelay | P::AnimationDelay => Some((VK::Time, false)),
+        P::TransitionDuration | P::AnimationDuration => Some((VK::Time, true)),
+        _ => None,
+    }
+}
+
+/// Returns `true` if `prop` should be routed through `parse_values4_property` when its value
+/// contains CSS Values L4/L5 math functions or extended units.
+#[must_use]
+pub fn supports_values4_math(prop: PropertyIdKind) -> bool {
+    is_values4_native_property(prop)
+        || values4_property_kind(prop).is_some()
+        || matches!(
+            prop,
+            PropertyIdKind::Transform
+                | PropertyIdKind::GridTemplateRows
+                | PropertyIdKind::GridTemplateColumns
+                | PropertyIdKind::LineHeight
+        )
+}
+
+/// Parses a CSS Values L4/L5 declaration value for `prop`, returning `(PropertyValue, specified_css)`.
+#[must_use]
+pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(PropertyValue, String)> {
+    use crate::values::CalcExpr;
+    use crate::values_math::{
+        parse_and_serialize_transform, parse_background_position, parse_grid_tracks_math,
+        parse_image_resolution, parse_math_value, parse_math_value_from_parser, MathNode,
+        RotateSpec, ScaleSpec, TranslateSpec, ValueKind,
+    };
+    let trimmed = raw.trim();
+    match prop {
+        PropertyIdKind::Scale => {
+            let (spec, s) = ScaleSpec::parse(trimmed)?;
+            return Some((PropertyValue::Scale(spec), s));
+        }
+        PropertyIdKind::Rotate => {
+            let (spec, s) = RotateSpec::parse(trimmed)?;
+            return Some((PropertyValue::Rotate(spec), s));
+        }
+        PropertyIdKind::Translate => {
+            let (spec, s) = TranslateSpec::parse(trimmed)?;
+            return Some((PropertyValue::Translate(spec), s));
+        }
+        PropertyIdKind::ImageResolution => {
+            let (node, s) = parse_image_resolution(trimmed)?;
+            return Some((PropertyValue::MathVal(Box::new(node)), s));
+        }
+        PropertyIdKind::BackgroundPosition => {
+            let (x, y, s) = parse_background_position(trimmed)?;
+            return Some((PropertyValue::BgPosition(x, y), s));
+        }
+        PropertyIdKind::Transform => {
+            let s = parse_and_serialize_transform(trimmed, None)?;
+            return Some((PropertyValue::TransformRaw(trimmed.to_string()), s));
+        }
+        PropertyIdKind::GridTemplateRows | PropertyIdKind::GridTemplateColumns => {
+            let (tracks, s) = parse_grid_tracks_math(trimmed)?;
+            return Some((PropertyValue::GridTracks(tracks), s));
+        }
+        PropertyIdKind::ColumnCount if trimmed.eq_ignore_ascii_case("auto") => {
+            return Some((PropertyValue::ZIndex(ZIndexValue::Auto), "auto".to_string()));
+        }
+        PropertyIdKind::TabSize => {
+            let pm = parse_math_value(trimmed, ValueKind::Number)
+                .or_else(|| parse_math_value(trimmed, ValueKind::Length))?;
+            if !pm.was_math_fn {
+                if let MathNode::Number(v) | MathNode::Dimension(v, _) = pm.node {
+                    if v < 0.0 {
+                        return None;
+                    }
+                }
+            }
+            let s = pm.node.serialize_specified(pm.was_math_fn);
+            return Some((PropertyValue::MathVal(Box::new(pm.node)), s));
+        }
+        PropertyIdKind::LineHeight => {
+            let pm = parse_math_value(trimmed, ValueKind::LengthPercentage)
+                .or_else(|| parse_math_value(trimmed, ValueKind::Number))
+                .or_else(|| {
+                    // Typed arithmetic on `line-height`: e.g. `calc(10% / 1px)` resolves `%`
+                    // as Length (relative to font-size) to yield a dimensionless `<number>`.
+                    let mut pi = cssparser::ParserInput::new(trimmed);
+                    let mut p = cssparser::Parser::new(&mut pi);
+                    let node = parse_math_value_from_parser(&mut p, ValueKind::NumberOrPercentage);
+                    if node.is_some() && p.is_exhausted() {
+                        return node;
+                    }
+                    let mut pi2 = cssparser::ParserInput::new(trimmed);
+                    let mut p2 = cssparser::Parser::new(&mut pi2);
+                    let tok = p2.next().ok()?.clone();
+                    let cssparser::Token::Function(fname) = tok else {
+                        return None;
+                    };
+                    if !crate::values_math::is_css_math_fn(fname.as_ref()) {
+                        return None;
+                    }
+                    let lower = fname.to_ascii_lowercase();
+                    let n = crate::values_math::parse_math_fn_hinted(&lower, &mut p2)?;
+                    let ct = n
+                        .calc_type()?
+                        .apply_hint(crate::values_math::BaseDim::Length)?;
+                    (p2.is_exhausted() && ct.dims == [0; 6] && ct.percent == 0).then_some(
+                        crate::values_math::ParsedMath {
+                            node: n,
+                            calc_type: ct,
+                            was_math_fn: true,
+                        },
+                    )
+                })?;
+            if !pm.was_math_fn {
+                match pm.node {
+                    MathNode::Number(v) | MathNode::Percent(v) | MathNode::Dimension(v, _)
+                        if v < 0.0 =>
+                    {
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+            let s = pm.node.serialize_specified(pm.was_math_fn);
+            return Some((PropertyValue::MathVal(Box::new(pm.node)), s));
+        }
+        PropertyIdKind::BorderTopLeftRadius
+        | PropertyIdKind::BorderTopRightRadius
+        | PropertyIdKind::BorderBottomRightRadius
+        | PropertyIdKind::BorderBottomLeftRadius
+        | PropertyIdKind::BorderStartStartRadius
+        | PropertyIdKind::BorderStartEndRadius
+        | PropertyIdKind::BorderEndStartRadius
+        | PropertyIdKind::BorderEndEndRadius => {
+            let mut pi = cssparser::ParserInput::new(trimmed);
+            let mut p = cssparser::Parser::new(&mut pi);
+            let px = parse_math_value_from_parser(&mut p, ValueKind::LengthPercentage)?;
+            if !px.was_math_fn {
+                if let MathNode::Dimension(v, _) | MathNode::Percent(v) = px.node {
+                    if v < 0.0 {
+                        return None;
+                    }
+                }
+            }
+            let xs = px.node.serialize_specified(px.was_math_fn);
+            let lx = LengthPercentage::Calc(Box::new(CalcExpr::Math(Box::new(px.node))));
+            if p.is_exhausted() {
+                return Some((
+                    PropertyValue::CornerRadius(CornerRadius {
+                        x: lx.clone(),
+                        y: lx,
+                    }),
+                    xs,
+                ));
+            }
+            let py = parse_math_value_from_parser(&mut p, ValueKind::LengthPercentage)?;
+            if !p.is_exhausted() {
+                return None;
+            }
+            if !py.was_math_fn {
+                if let MathNode::Dimension(v, _) | MathNode::Percent(v) = py.node {
+                    if v < 0.0 {
+                        return None;
+                    }
+                }
+            }
+            let ys = py.node.serialize_specified(py.was_math_fn);
+            let ly = LengthPercentage::Calc(Box::new(CalcExpr::Math(Box::new(py.node))));
+            let spec = if xs == ys { xs } else { format!("{xs} {ys}") };
+            return Some((
+                PropertyValue::CornerRadius(CornerRadius { x: lx, y: ly }),
+                spec,
+            ));
+        }
+        _ => {}
+    }
+
+    let (kind, nonneg) = values4_property_kind(prop)?;
+    let pm = parse_math_value(trimmed, kind)?;
+    if nonneg && !pm.was_math_fn {
+        let min_v = if matches!(
+            prop,
+            PropertyIdKind::FontWeight
+                | PropertyIdKind::Orphans
+                | PropertyIdKind::Widows
+                | PropertyIdKind::ColumnCount
+        ) {
+            1.0
+        } else {
+            0.0
+        };
+        match pm.node {
+            MathNode::Number(v) | MathNode::Percent(v) | MathNode::Dimension(v, _) if v < min_v => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    let spec = pm.node.serialize_specified(pm.was_math_fn);
+    let lp = || LengthPercentage::Calc(Box::new(CalcExpr::Math(Box::new(pm.node.clone()))));
+    let val = match prop {
+        PropertyIdKind::Width
+        | PropertyIdKind::Height
+        | PropertyIdKind::MinWidth
+        | PropertyIdKind::MinHeight
+        | PropertyIdKind::MaxWidth
+        | PropertyIdKind::MaxHeight
+        | PropertyIdKind::InlineSize
+        | PropertyIdKind::BlockSize
+        | PropertyIdKind::MinInlineSize
+        | PropertyIdKind::MinBlockSize
+        | PropertyIdKind::MaxInlineSize
+        | PropertyIdKind::MaxBlockSize => PropertyValue::Size(SizeValue::Length(lp())),
+        PropertyIdKind::MarginTop
+        | PropertyIdKind::MarginRight
+        | PropertyIdKind::MarginBottom
+        | PropertyIdKind::MarginLeft
+        | PropertyIdKind::MarginBlockStart
+        | PropertyIdKind::MarginBlockEnd
+        | PropertyIdKind::MarginInlineStart
+        | PropertyIdKind::MarginInlineEnd
+        | PropertyIdKind::Top
+        | PropertyIdKind::Right
+        | PropertyIdKind::Bottom
+        | PropertyIdKind::Left
+        | PropertyIdKind::InsetBlockStart
+        | PropertyIdKind::InsetBlockEnd
+        | PropertyIdKind::InsetInlineStart
+        | PropertyIdKind::InsetInlineEnd
+        | PropertyIdKind::FlexBasis => PropertyValue::LengthAuto(LengthPercentageAuto::Value(lp())),
+        PropertyIdKind::PaddingTop
+        | PropertyIdKind::PaddingRight
+        | PropertyIdKind::PaddingBottom
+        | PropertyIdKind::PaddingLeft
+        | PropertyIdKind::PaddingBlockStart
+        | PropertyIdKind::PaddingBlockEnd
+        | PropertyIdKind::PaddingInlineStart
+        | PropertyIdKind::PaddingInlineEnd
+        | PropertyIdKind::RowGap
+        | PropertyIdKind::ColumnGap
+        | PropertyIdKind::TextIndent
+        | PropertyIdKind::LetterSpacing
+        | PropertyIdKind::WordSpacing
+        | PropertyIdKind::OutlineOffset => PropertyValue::Length(lp()),
+        _ => PropertyValue::MathVal(Box::new(pm.node)),
+    };
+    Some((val, spec))
+}
+
 /// Wraps CSS Color 4/5 functional & system-color longhand declarations into an opaque
-/// quoted sentinel `var(--__rix_color4__, "...")` so `lightningcss` never panics on
-/// `NaN`/`infinity` hues, never drops `contrast-color()`/`alpha()`, and never clamps
-/// wide-gamut colors or strips `none` components. Zero-alloc fast path for plain colors.
+/// quoted sentinel `var(--__rix_color4__, "...")` and CSS Values L4/L5 math/unit/transform
+/// declarations into `var(--__rix_val4__, "...")` so `lightningcss` never drops or corrupts them.
 fn wrap_color4_declarations(css: &str) -> std::borrow::Cow<'_, str> {
     if !css.contains(':') {
         return std::borrow::Cow::Borrowed(css);
@@ -2065,9 +2471,10 @@ fn wrap_color4_declarations(css: &str) -> std::borrow::Cow<'_, str> {
                 p -= 1;
             }
             let prop_name = &css[p..name_end];
-            let is_color_prop = PropertyIdKind::from_name(&prop_name.to_ascii_lowercase())
-                .is_some_and(crate::cssom_decl::is_color_longhand);
-            if is_color_prop {
+            let prop_kind = PropertyIdKind::from_name(&prop_name.to_ascii_lowercase());
+            let is_color_prop = prop_kind.is_some_and(crate::cssom_decl::is_color_longhand);
+            let is_val4_prop = prop_kind.is_some_and(supports_values4_math);
+            if is_color_prop || is_val4_prop {
                 // Scan value to top-level `;`, `}`, `!`, or EOF (abort if `{` -> selector).
                 let val_start = i + 1;
                 let mut j = val_start;
@@ -2122,16 +2529,34 @@ fn wrap_color4_declarations(css: &str) -> std::borrow::Cow<'_, str> {
                     }
                     j += 1;
                 }
-                if !saw_brace && vp == 0 && vs.is_none() {
+                if !saw_brace && (vp == 0 || j == bytes.len()) && vs.is_none() {
                     let raw = css[val_start..j].trim();
-                    let needs_color4 = !raw.is_empty()
-                        && !crate::cssom_decl::contains_var_or_env_ci(raw)
-                        && (raw.contains('(')
-                            || crate::color::SystemColor::from_ident(raw).is_some());
-                    if needs_color4 {
+                    let sentinel =
+                        if !raw.is_empty() && !crate::cssom_decl::contains_var_or_env_ci(raw) {
+                            if is_color_prop
+                                && (raw.contains('(')
+                                    || crate::color::SystemColor::from_ident(raw).is_some())
+                            {
+                                Some("--__rix_color4__")
+                            } else if is_val4_prop
+                                && GlobalKeyword::from_ident(&raw.to_ascii_lowercase()).is_none()
+                                && !raw.to_ascii_lowercase().starts_with("fit-content(")
+                                && (prop_kind.is_some_and(is_values4_native_property)
+                                    || crate::values_math::has_values4_syntax(raw))
+                            {
+                                Some("--__rix_val4__")
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                    if let Some(sent_var) = sentinel {
                         let buf = out.get_or_insert_with(|| String::with_capacity(css.len() + 32));
                         buf.push_str(&css[last..val_start]);
-                        buf.push_str(" var(--__rix_color4__, \"");
+                        buf.push_str(" var(");
+                        buf.push_str(sent_var);
+                        buf.push_str(", \"");
                         for ch in raw.chars() {
                             match ch {
                                 '\\' => buf.push_str("\\\\"),
@@ -2139,6 +2564,9 @@ fn wrap_color4_declarations(css: &str) -> std::borrow::Cow<'_, str> {
                                 '\n' | '\r' => buf.push(' '),
                                 _ => buf.push(ch),
                             }
+                        }
+                        for _ in 0..vp {
+                            buf.push(')');
                         }
                         buf.push_str("\")");
                         last = j;
@@ -2168,36 +2596,45 @@ pub(crate) fn restore_revert_rule_sentinel(text: &str) -> String {
     } else {
         text.to_string()
     };
-    if let Some(pos) = s.find("var(--__rix_color4__") {
-        if let Some(q1) = s[pos..].find('"') {
-            let start = pos + q1 + 1;
-            let bytes = s.as_bytes();
-            let mut k = start;
-            let mut unescaped = String::new();
-            while k < bytes.len() {
-                if bytes[k] == b'\\' && k + 1 < bytes.len() {
-                    unescaped.push(bytes[k + 1] as char);
-                    k += 2;
-                    continue;
+    for (tag, is_color) in [
+        ("var(--__rix_color4__", true),
+        ("var(--__rix_val4__", false),
+    ] {
+        if let Some(pos) = s.find(tag) {
+            if let Some(q1) = s[pos..].find('"') {
+                let start = pos + q1 + 1;
+                let bytes = s.as_bytes();
+                let mut k = start;
+                let mut unescaped = String::new();
+                while k < bytes.len() {
+                    if bytes[k] == b'\\' && k + 1 < bytes.len() {
+                        unescaped.push(bytes[k + 1] as char);
+                        k += 2;
+                        continue;
+                    }
+                    if bytes[k] == b'"' {
+                        break;
+                    }
+                    let ch = s[k..].chars().next().unwrap();
+                    unescaped.push(ch);
+                    k += ch.len_utf8();
                 }
-                if bytes[k] == b'"' {
-                    break;
+                if let Some(end_paren) = s[k..].find(')') {
+                    let replacement = if is_color {
+                        crate::color::parse_and_serialize_color_specified(&unescaped)
+                            .unwrap_or_default()
+                    } else {
+                        unescaped
+                    };
+                    if replacement.is_empty() {
+                        return String::new();
+                    }
+                    let mut rebuilt = String::with_capacity(s.len());
+                    rebuilt.push_str(&s[..pos]);
+                    rebuilt.push_str(&replacement);
+                    rebuilt.push_str(&s[k + end_paren + 1..]);
+                    s = rebuilt;
                 }
-                let ch = s[k..].chars().next().unwrap();
-                unescaped.push(ch);
-                k += ch.len_utf8();
-            }
-            if let Some(end_paren) = s[k..].find(')') {
-                let replacement = crate::color::parse_and_serialize_color_specified(&unescaped)
-                    .unwrap_or_default();
-                if replacement.is_empty() {
-                    return String::new();
-                }
-                let mut rebuilt = String::with_capacity(s.len());
-                rebuilt.push_str(&s[..pos]);
-                rebuilt.push_str(&replacement);
-                rebuilt.push_str(&s[k + end_paren + 1..]);
-                s = rebuilt;
             }
         }
     }
@@ -2281,6 +2718,22 @@ pub fn parse_property_from_tokens(
             }];
         }
         return Vec::new();
+    }
+    if is_values4_native_property(prop)
+        || (supports_values4_math(prop) && crate::values_math::has_values4_syntax(buf.trim()))
+    {
+        if let Some((val, _)) = parse_values4_property(prop, buf.trim()) {
+            return vec![SpecifiedDeclaration {
+                property: prop,
+                custom_name: None,
+                value: val,
+                important,
+                order: 0,
+            }];
+        }
+        if is_values4_native_property(prop) {
+            return Vec::new();
+        }
     }
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let opts = ParserOptions {
@@ -4793,8 +5246,8 @@ fn compile_property(
                 }
                 return;
             }
-            // Unwrap CSS Color 4/5 quoted sentinel `var(--__rix_color4__, "...")`.
-            let color4_raw = {
+            // Unwrap CSS Color 4/5 (`--__rix_color4__`) and CSS Values L4/L5 (`--__rix_val4__`) sentinels.
+            let sentinel_raw: Option<(&str, &str)> = {
                 let non_ws: SmallVec<[&CssToken; 2]> = tokens
                     .iter()
                     .filter(|t| !matches!(t, CssToken::Space))
@@ -4805,9 +5258,9 @@ fn compile_property(
                         fallback: Some(fb),
                     } = non_ws[0]
                     {
-                        if name.as_str() == "--__rix_color4__" {
+                        if matches!(name.as_str(), "--__rix_color4__" | "--__rix_val4__") {
                             fb.iter().find_map(|t| match t {
-                                CssToken::String(s) => Some(s.as_str()),
+                                CssToken::String(s) => Some((name.as_str(), s.as_str())),
                                 _ => None,
                             })
                         } else {
@@ -4820,9 +5273,13 @@ fn compile_property(
                     None
                 }
             };
-            if let Some(raw_color) = color4_raw {
-                if let Some(expr) = crate::color::parse_css_color(raw_color) {
-                    push_decl(out, ord, kind, PropertyValue::Color4(Box::new(expr)), imp);
+            if let Some((sent_name, raw_val)) = sentinel_raw {
+                if sent_name == "--__rix_color4__" {
+                    if let Some(expr) = crate::color::parse_css_color(raw_val) {
+                        push_decl(out, ord, kind, PropertyValue::Color4(Box::new(expr)), imp);
+                    }
+                } else if let Some((val, _)) = parse_values4_property(kind, raw_val) {
+                    push_decl(out, ord, kind, val, imp);
                 }
                 return;
             }
@@ -4883,6 +5340,78 @@ fn compile_property(
                 });
             }
             CustomPropertyName::Unknown(ident) => {
+                if let Some(kind) = PropertyIdKind::from_name(&ident.as_ref().to_ascii_lowercase())
+                {
+                    if is_values4_native_property(kind) {
+                        let tokens = convert_token_list(&custom.value);
+                        let mut handled = false;
+                        {
+                            let non_ws: SmallVec<[&CssToken; 2]> = tokens
+                                .iter()
+                                .filter(|t| !matches!(t, CssToken::Space))
+                                .collect();
+                            if non_ws.len() == 1 {
+                                match non_ws[0] {
+                                    CssToken::Ident(id) => {
+                                        if let Some(kw) = GlobalKeyword::from_ident(id.as_str()) {
+                                            push_decl(
+                                                out,
+                                                ord,
+                                                kind,
+                                                PropertyValue::Global(kw),
+                                                imp,
+                                            );
+                                            handled = true;
+                                        }
+                                    }
+                                    CssToken::Var {
+                                        name,
+                                        fallback: None,
+                                    } if name.as_str() == "--__rix_revert_rule__" => {
+                                        push_decl(
+                                            out,
+                                            ord,
+                                            kind,
+                                            PropertyValue::Global(GlobalKeyword::RevertRule),
+                                            imp,
+                                        );
+                                        handled = true;
+                                    }
+                                    CssToken::Var {
+                                        name,
+                                        fallback: Some(fb),
+                                    } if name.as_str() == "--__rix_val4__" => {
+                                        if let Some(raw_val) = fb.iter().find_map(|t| match t {
+                                            CssToken::String(s) => Some(s.as_str()),
+                                            _ => None,
+                                        }) {
+                                            if let Some((val, _)) =
+                                                parse_values4_property(kind, raw_val)
+                                            {
+                                                push_decl(out, ord, kind, val, imp);
+                                            }
+                                        }
+                                        handled = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if handled {
+                            return;
+                        }
+                        if tokens.iter().any(|t| matches!(t, CssToken::Var { .. })) {
+                            push_decl(out, ord, kind, PropertyValue::Unresolved(tokens), imp);
+                            return;
+                        }
+                        let mut buf = String::new();
+                        write_tokens_for_reparse(&tokens, &mut buf);
+                        if let Some((val, _)) = parse_values4_property(kind, buf.trim()) {
+                            push_decl(out, ord, kind, val, imp);
+                        }
+                        return;
+                    }
+                }
                 compile_extra_standard_property(
                     ident.as_ref(),
                     &custom.value,

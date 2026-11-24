@@ -51,6 +51,7 @@ pub struct BoxModelStyle {
     pub border_spacing_y: LengthPercentage,
     pub table_layout: TableLayoutMode,
     pub content: Option<InternedStr>,
+    pub column_count: Option<i32>,
 }
 
 impl Default for BoxModelStyle {
@@ -73,6 +74,7 @@ impl Default for BoxModelStyle {
             border_spacing_y: LengthPercentage::Zero,
             table_layout: TableLayoutMode::Auto,
             content: None,
+            column_count: None,
         }
     }
 }
@@ -83,6 +85,7 @@ pub struct VisualStyle {
     pub background_color: ColorRgba,
     pub background_color_computed: Option<Arc<crate::color::CssColorExpr>>,
     pub background_layers: Vec<BackgroundLayerValue>,
+    pub background_position: (LengthPercentage, LengthPercentage),
     pub border_style: EdgeValues<LineStyle>,
     pub border_color: EdgeValues<CssColor>,
     pub border_color_computed: [Option<Arc<crate::color::CssColorExpr>>; 4],
@@ -107,6 +110,10 @@ impl Default for VisualStyle {
             background_color: ColorRgba::TRANSPARENT,
             background_color_computed: None,
             background_layers: Vec::new(),
+            background_position: (
+                LengthPercentage::Percent(0.0),
+                LengthPercentage::Percent(0.0),
+            ),
             border_style: EdgeValues::all(LineStyle::None),
             border_color: EdgeValues::all(CssColor::CurrentColor),
             border_color_computed: [None, None, None, None],
@@ -150,6 +157,12 @@ pub struct InheritedTextStyle {
     pub direction: DirectionMode,
     pub writing_mode: WritingMode,
     pub caption_side: CaptionSideMode,
+    pub orphans: i32,
+    pub widows: i32,
+    pub tab_size_num: f32,
+    pub tab_size_len: Option<LengthPercentage>,
+    /// Full CSS Values L4/L5 evaluation context snapshot for this element (`em`/`rem`/`lh`/`rlh`/viewport/container/sibling).
+    pub eval_ctx: EvalContext,
 }
 
 impl Default for InheritedTextStyle {
@@ -174,6 +187,11 @@ impl Default for InheritedTextStyle {
             direction: DirectionMode::Ltr,
             writing_mode: WritingMode::HorizontalTb,
             caption_side: CaptionSideMode::Top,
+            orphans: 2,
+            widows: 2,
+            tab_size_num: 8.0,
+            tab_size_len: None,
+            eval_ctx: EvalContext::default(),
         }
     }
 }
@@ -267,12 +285,22 @@ impl Default for FlexGridStyle {
 pub struct EffectsStyle {
     pub box_shadow: Vec<BoxShadowValue>,
     pub transform: Vec<TransformOp>,
+    pub transform_raw: Option<String>,
     pub transform_origin: TransformOrigin,
+    pub scale: crate::values_math::ScaleSpec,
+    pub rotate: crate::values_math::RotateSpec,
+    pub translate: crate::values_math::TranslateSpec,
+    pub image_resolution: Option<crate::values_math::MathNode>,
     pub filter: Vec<FilterOp>,
     pub clip_path: ClipPathValue,
     pub mix_blend_mode: MixBlendMode,
     pub transitions: Vec<TransitionSpec>,
+    pub transition_delay_math: Option<crate::values_math::MathNode>,
+    pub transition_duration_math: Option<crate::values_math::MathNode>,
     pub animations: Vec<AnimationSpec>,
+    pub animation_delay_math: Option<crate::values_math::MathNode>,
+    pub animation_duration_math: Option<crate::values_math::MathNode>,
+    pub animation_iteration_count_math: Option<crate::values_math::MathNode>,
 }
 
 /// Inherited map of CSS custom properties (`--*`) stored as owned token streams.
@@ -1126,6 +1154,14 @@ pub fn resolve_element_style_full(
     )
 }
 
+fn compute_line_height_px(lh: &LineHeightValue, font_size_px: f32, eval: &EvalContext) -> f32 {
+    match lh {
+        LineHeightValue::Normal => (font_size_px * 1.2).max(1.0),
+        LineHeightValue::Number(n) => (n * font_size_px).max(0.0),
+        LineHeightValue::Length(lp) => lp.resolve_px(font_size_px, eval).max(0.0),
+    }
+}
+
 /// Resolves an element's [`ComputedStyle`] with `@scope` proximity, presentational hints,
 /// and `@property` / `CSS.registerProperty` custom property registrations.
 #[must_use]
@@ -1137,6 +1173,34 @@ pub fn resolve_element_style_scoped(
     root_font_size_px: f32,
     media: &MediaContext,
     registered_props: Option<&HashMap<InternedStr, RegisteredProperty>>,
+) -> ComputedStyle {
+    resolve_element_style_with_siblings(
+        matched_rules,
+        pres_hint_decls,
+        inline_decls,
+        parent_style,
+        root_font_size_px,
+        media,
+        registered_props,
+        1,
+        1,
+    )
+}
+
+/// Resolves an element's [`ComputedStyle`] with full CSS Values L4/L5 context including
+/// 1-based `sibling_index` and `sibling_count` among parent element children.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_element_style_with_siblings(
+    matched_rules: &[MatchedRule<'_>],
+    pres_hint_decls: &[SpecifiedDeclaration],
+    inline_decls: &[SpecifiedDeclaration],
+    parent_style: Option<&ComputedStyle>,
+    root_font_size_px: f32,
+    media: &MediaContext,
+    registered_props: Option<&HashMap<InternedStr, RegisteredProperty>>,
+    sibling_index: u32,
+    sibling_count: u32,
 ) -> ComputedStyle {
     let mut style = match parent_style {
         Some(p) => ComputedStyle::inherit_from(p),
@@ -1197,6 +1261,20 @@ pub fn resolve_element_style_scoped(
     }
 
     if candidates.is_empty() && !has_registered {
+        let mut ctx = media.eval_context(style.text.font_size_px, root_font_size_px);
+        if let Some(p) = parent_style {
+            ctx.root_line_height_px = p.text.eval_ctx.root_line_height_px;
+        }
+        ctx.line_height_px =
+            compute_line_height_px(&style.text.line_height, style.text.font_size_px, &ctx);
+        if parent_style.is_none() {
+            ctx.root_line_height_px = ctx.line_height_px;
+        }
+        ctx.sibling_index = sibling_index;
+        ctx.sibling_count = sibling_count;
+        if style.text.eval_ctx != ctx {
+            Arc::make_mut(&mut style.text).eval_ctx = ctx;
+        }
         return style;
     }
 
@@ -1413,10 +1491,16 @@ pub fn resolve_element_style_scoped(
         per_prop.entry(*target_prop).or_default().push((*k, decl));
     }
 
-    // Pass 2a: Resolve `writing-mode`, `direction`, and `font-size` first so logical
-    // property mapping and `em` units on the same element use this element's computed values.
+    // Pass 2a: Resolve `writing-mode`, `direction`, `font-size`, and `line-height` first so
+    // logical property mapping and `em`/`lh`/`rlh` units on the same element use computed values.
     let parent_font_size = parent_style.map_or(16.0, |p| p.text.font_size_px);
-    let parent_eval = media.eval_context(parent_font_size, root_font_size_px);
+    let parent_lh = parent_style.map_or(19.2, |p| p.text.eval_ctx.line_height_px);
+    let root_lh = parent_style.map_or(19.2, |p| p.text.eval_ctx.root_line_height_px);
+    let mut parent_eval = media.eval_context(parent_font_size, root_font_size_px);
+    parent_eval.line_height_px = parent_lh;
+    parent_eval.root_line_height_px = root_lh;
+    parent_eval.sibling_index = sibling_index;
+    parent_eval.sibling_count = sibling_count;
     for early_prop in [
         PropertyIdKind::WritingMode,
         PropertyIdKind::Direction,
@@ -1435,6 +1519,29 @@ pub fn resolve_element_style_scoped(
             }
         }
     }
+    let mut lh_eval = media.eval_context(style.text.font_size_px, root_font_size_px);
+    lh_eval.line_height_px = parent_lh;
+    lh_eval.root_line_height_px = root_lh;
+    lh_eval.sibling_index = sibling_index;
+    lh_eval.sibling_count = sibling_count;
+    if let Some(stack) = per_prop.get_mut(&PropertyIdKind::LineHeight) {
+        stack.sort_by_key(|(k, _)| *k);
+        if let Some(winner) = select_winning_candidate(stack) {
+            apply_declaration(&mut style, winner, parent_style, &lh_eval, media.dark_mode);
+        }
+    }
+    let self_lh_px =
+        compute_line_height_px(&style.text.line_height, style.text.font_size_px, &lh_eval);
+    let eff_root_lh = if parent_style.is_none() {
+        self_lh_px
+    } else {
+        root_lh
+    };
+    let eff_root_fs = if parent_style.is_none() {
+        style.text.font_size_px
+    } else {
+        root_font_size_px
+    };
 
     // Pass 2b: Map all logical property candidates onto their corresponding physical
     // property stacks using the element's resolved `writing-mode` and `direction`
@@ -1463,7 +1570,11 @@ pub fn resolve_element_style_scoped(
     }
 
     // Pass 2c: Resolve `color-scheme` and `color` next so CanvasText & `currentColor` match.
-    let mut eval_ctx = media.eval_context(style.text.font_size_px, root_font_size_px);
+    let mut eval_ctx = media.eval_context(style.text.font_size_px, eff_root_fs);
+    eval_ctx.line_height_px = self_lh_px;
+    eval_ctx.root_line_height_px = eff_root_lh;
+    eval_ctx.sibling_index = sibling_index;
+    eval_ctx.sibling_count = sibling_count;
     if let Some(p) = parent_style {
         if let SizeValue::Length(ref lp) = p.box_model.width {
             let w = lp.resolve_px(eval_ctx.viewport_width_px, &eval_ctx);
@@ -1477,6 +1588,9 @@ pub fn resolve_element_style_scoped(
                 eval_ctx.container_height_px = h;
             }
         }
+    }
+    if style.text.eval_ctx != eval_ctx {
+        Arc::make_mut(&mut style.text).eval_ctx = eval_ctx;
     }
     if let Some(stack) = per_prop.get_mut(&PropertyIdKind::ColorScheme) {
         stack.sort_by_key(|(k, _)| *k);
@@ -1508,6 +1622,7 @@ pub fn resolve_element_style_scoped(
             PropertyIdKind::WritingMode
                 | PropertyIdKind::Direction
                 | PropertyIdKind::FontSize
+                | PropertyIdKind::LineHeight
                 | PropertyIdKind::Color
                 | PropertyIdKind::ColorScheme
         ) {
@@ -1868,7 +1983,29 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::Cursor, PropertyValue::Cursor(v)) => style.cursor = *v,
         (PropertyIdKind::ZIndex, PropertyValue::ZIndex(v)) => style.z_index = *v,
+        (PropertyIdKind::ZIndex, PropertyValue::MathVal(node)) => {
+            let v = node.eval_scalar(eval, None);
+            let n = if v.is_nan() {
+                0
+            } else if v.is_infinite() {
+                if v.is_sign_positive() {
+                    i32::MAX
+                } else {
+                    i32::MIN
+                }
+            } else {
+                (v + 0.5)
+                    .floor()
+                    .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+            };
+            style.z_index = ZIndexValue::Integer(n);
+        }
         (PropertyIdKind::Opacity, PropertyValue::Number(v)) => style.opacity = v.clamp(0.0, 1.0),
+        (PropertyIdKind::Opacity, PropertyValue::MathVal(node)) => {
+            let v = node.eval_scalar(eval, Some((1.0, true)));
+            let c = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
+            style.opacity = c as f32;
+        }
         (PropertyIdKind::ColorScheme, PropertyValue::Number(v)) => {
             let mode = (*v).round().clamp(0.0, 3.0) as u8;
             style.color_scheme_dark = matches!(mode, 2 | 3);
@@ -2159,7 +2296,7 @@ pub fn apply_declaration(
             txt.color_computed = Some(Arc::new(crate::color::CssColorExpr::Resolved(res)));
         }
         (PropertyIdKind::FontSize, PropertyValue::Length(lp)) => {
-            let px = lp.resolve_px(eval.font_size_px, eval).max(1.0);
+            let px = lp.resolve_px(eval.font_size_px, eval).max(0.0);
             Arc::make_mut(&mut style.text).font_size_px = px;
         }
         (PropertyIdKind::FontWeight, PropertyValue::Number(w)) => {
@@ -2281,7 +2418,177 @@ pub fn apply_declaration(
             style.effects_mut().box_shadow = v.clone();
         }
         (PropertyIdKind::Transform, PropertyValue::Transform(v)) => {
-            style.effects_mut().transform = v.clone();
+            let eff = style.effects_mut();
+            eff.transform = v.clone();
+            eff.transform_raw = None;
+        }
+        (PropertyIdKind::Transform, PropertyValue::TransformRaw(raw)) => {
+            style.effects_mut().transform_raw = Some(raw.clone());
+        }
+        (PropertyIdKind::Scale, PropertyValue::Scale(s)) => {
+            style.effects_mut().scale = s.clone();
+        }
+        (PropertyIdKind::Rotate, PropertyValue::Rotate(r)) => {
+            style.effects_mut().rotate = r.clone();
+        }
+        (PropertyIdKind::Translate, PropertyValue::Translate(t)) => {
+            style.effects_mut().translate = t.clone();
+        }
+        (PropertyIdKind::ImageResolution, PropertyValue::MathVal(n)) => {
+            style.effects_mut().image_resolution = Some((**n).clone());
+        }
+        (PropertyIdKind::BackgroundPosition, PropertyValue::BgPosition(x, y)) => {
+            Arc::make_mut(&mut style.visual).background_position = (x.clone(), y.clone());
+        }
+        (PropertyIdKind::FontSize, PropertyValue::MathVal(n)) => {
+            let px = n.eval_scalar(eval, Some((f64::from(eval.font_size_px), false)));
+            let px = if px.is_nan() {
+                0.0
+            } else {
+                px.clamp(0.0, crate::values_math::MAX_CSS_PX)
+            } as f32;
+            Arc::make_mut(&mut style.text).font_size_px = px;
+        }
+        (PropertyIdKind::LineHeight, PropertyValue::MathVal(n)) => {
+            let is_num = n
+                .calc_type()
+                .and_then(|t| t.apply_hint(crate::values_math::BaseDim::Length))
+                .is_some_and(|t| t.dims == [0; 6] && t.percent == 0);
+            let lh = if is_num {
+                let v = n.eval_scalar(eval, Some((f64::from(eval.font_size_px), false)));
+                LineHeightValue::Number(if v.is_nan() { 0.0 } else { v.max(0.0) as f32 })
+            } else {
+                let px = n.eval_scalar(eval, Some((f64::from(eval.font_size_px), false)));
+                let px = if px.is_nan() {
+                    0.0
+                } else {
+                    px.clamp(0.0, crate::values_math::MAX_CSS_PX)
+                } as f32;
+                LineHeightValue::Length(LengthPercentage::px(px))
+            };
+            Arc::make_mut(&mut style.text).line_height = lh;
+        }
+        (PropertyIdKind::Orphans | PropertyIdKind::Widows, PropertyValue::MathVal(n)) => {
+            let v = n.eval_scalar(eval, None);
+            let iv = if v.is_nan() {
+                1
+            } else if v.is_infinite() {
+                if v.is_sign_positive() {
+                    i32::MAX
+                } else {
+                    1
+                }
+            } else {
+                (v + 0.5).floor().clamp(1.0, f64::from(i32::MAX)) as i32
+            };
+            if decl.property == PropertyIdKind::Orphans {
+                Arc::make_mut(&mut style.text).orphans = iv;
+            } else {
+                Arc::make_mut(&mut style.text).widows = iv;
+            }
+        }
+        (PropertyIdKind::ColumnCount, PropertyValue::ZIndex(ZIndexValue::Auto)) => {
+            Arc::make_mut(&mut style.box_model).column_count = None;
+        }
+        (PropertyIdKind::ColumnCount, PropertyValue::MathVal(n)) => {
+            let v = n.eval_scalar(eval, None);
+            let iv = if v.is_nan() {
+                1
+            } else if v.is_infinite() {
+                if v.is_sign_positive() {
+                    i32::MAX
+                } else {
+                    1
+                }
+            } else {
+                (v + 0.5).floor().clamp(1.0, f64::from(i32::MAX)) as i32
+            };
+            Arc::make_mut(&mut style.box_model).column_count = Some(iv);
+        }
+        (PropertyIdKind::TabSize, PropertyValue::MathVal(n)) => {
+            let txt = Arc::make_mut(&mut style.text);
+            if n.calc_type() == Some(crate::values_math::CalcType::NUMBER) {
+                let v = n.eval_scalar(eval, None);
+                txt.tab_size_num = if v.is_nan() { 0.0 } else { v.max(0.0) as f32 };
+                txt.tab_size_len = None;
+            } else {
+                txt.tab_size_len = Some(LengthPercentage::Calc(Box::new(
+                    crate::values::CalcExpr::Math(n.clone()),
+                )));
+            }
+        }
+        (PropertyIdKind::FontWeight, PropertyValue::MathVal(n)) => {
+            let v = n.eval_scalar(eval, None);
+            Arc::make_mut(&mut style.text).font_weight = if v.is_nan() {
+                1.0
+            } else {
+                v.clamp(1.0, 1000.0) as f32
+            };
+        }
+        (PropertyIdKind::FlexGrow, PropertyValue::MathVal(n)) => {
+            let v = n.eval_scalar(eval, None);
+            style.flex_grid_mut().flex_grow = if v.is_nan() { 0.0 } else { v.max(0.0) as f32 };
+        }
+        (PropertyIdKind::FlexShrink, PropertyValue::MathVal(n)) => {
+            let v = n.eval_scalar(eval, None);
+            style.flex_grid_mut().flex_shrink = if v.is_nan() { 0.0 } else { v.max(0.0) as f32 };
+        }
+        (PropertyIdKind::Order, PropertyValue::MathVal(n)) => {
+            let v = n.eval_scalar(eval, None);
+            let ord = if v.is_nan() {
+                0
+            } else if v.is_infinite() {
+                if v.is_sign_positive() {
+                    i32::MAX
+                } else {
+                    i32::MIN
+                }
+            } else {
+                (v + 0.5)
+                    .floor()
+                    .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+            };
+            style.flex_grid_mut().order = ord;
+        }
+        (
+            PropertyIdKind::BorderTopWidth
+            | PropertyIdKind::BorderRightWidth
+            | PropertyIdKind::BorderBottomWidth
+            | PropertyIdKind::BorderLeftWidth
+            | PropertyIdKind::OutlineWidth,
+            PropertyValue::MathVal(n),
+        ) => {
+            let px = n.resolve_px(0.0, eval).max(0.0);
+            match decl.property {
+                PropertyIdKind::BorderTopWidth => {
+                    Arc::make_mut(&mut style.box_model).border_width.top = px
+                }
+                PropertyIdKind::BorderRightWidth => {
+                    Arc::make_mut(&mut style.box_model).border_width.right = px
+                }
+                PropertyIdKind::BorderBottomWidth => {
+                    Arc::make_mut(&mut style.box_model).border_width.bottom = px
+                }
+                PropertyIdKind::BorderLeftWidth => {
+                    Arc::make_mut(&mut style.box_model).border_width.left = px
+                }
+                _ => Arc::make_mut(&mut style.visual).outline_width = px,
+            }
+        }
+        (PropertyIdKind::TransitionDelay, PropertyValue::MathVal(n)) => {
+            style.effects_mut().transition_delay_math = Some((**n).clone());
+        }
+        (PropertyIdKind::TransitionDuration, PropertyValue::MathVal(n)) => {
+            style.effects_mut().transition_duration_math = Some((**n).clone());
+        }
+        (PropertyIdKind::AnimationDelay, PropertyValue::MathVal(n)) => {
+            style.effects_mut().animation_delay_math = Some((**n).clone());
+        }
+        (PropertyIdKind::AnimationDuration, PropertyValue::MathVal(n)) => {
+            style.effects_mut().animation_duration_math = Some((**n).clone());
+        }
+        (PropertyIdKind::AnimationIterationCount, PropertyValue::MathVal(n)) => {
+            style.effects_mut().animation_iteration_count_math = Some((**n).clone());
         }
         (PropertyIdKind::TransformOrigin, PropertyValue::TransformOrigin(v)) => {
             style.effects_mut().transform_origin = v.clone();
@@ -2313,7 +2620,9 @@ pub fn apply_declaration(
             }
         }
         (PropertyIdKind::TransitionDuration, PropertyValue::DurationList(ms)) => {
-            let trs = &mut style.effects_mut().transitions;
+            let eff = style.effects_mut();
+            eff.transition_duration_math = None;
+            let trs = &mut eff.transitions;
             if trs.is_empty() && !ms.is_empty() {
                 trs.resize_with(ms.len(), || TransitionSpec {
                     property: rix_core::intern_str("all"),
@@ -2329,7 +2638,17 @@ pub fn apply_declaration(
             }
         }
         (PropertyIdKind::TransitionDelay, PropertyValue::DurationList(ms)) => {
-            let trs = &mut style.effects_mut().transitions;
+            let eff = style.effects_mut();
+            eff.transition_delay_math = None;
+            let trs = &mut eff.transitions;
+            if trs.is_empty() && !ms.is_empty() {
+                trs.resize_with(ms.len(), || TransitionSpec {
+                    property: rix_core::intern_str("all"),
+                    duration_ms: 0.0,
+                    delay_ms: 0.0,
+                    timing: TimingFunction::Ease,
+                });
+            }
             for (i, slot) in trs.iter_mut().enumerate() {
                 if !ms.is_empty() {
                     slot.delay_ms = ms[i % ms.len()];
@@ -2364,7 +2683,21 @@ pub fn apply_declaration(
             }
         }
         (PropertyIdKind::AnimationDuration, PropertyValue::DurationList(ms)) => {
-            let anims = &mut style.effects_mut().animations;
+            let eff = style.effects_mut();
+            eff.animation_duration_math = None;
+            let anims = &mut eff.animations;
+            if anims.is_empty() && !ms.is_empty() {
+                anims.resize_with(ms.len(), || AnimationSpec {
+                    name: rix_core::intern_str("none"),
+                    duration_ms: 0.0,
+                    delay_ms: 0.0,
+                    timing: TimingFunction::Ease,
+                    iteration_count: 1.0,
+                    direction: AnimationDirectionMode::Normal,
+                    fill_mode: AnimationFillModeKind::None,
+                    play_state: AnimationPlayStateMode::Running,
+                });
+            }
             for (i, slot) in anims.iter_mut().enumerate() {
                 if !ms.is_empty() {
                     slot.duration_ms = ms[i % ms.len()];
@@ -2372,7 +2705,21 @@ pub fn apply_declaration(
             }
         }
         (PropertyIdKind::AnimationDelay, PropertyValue::DurationList(ms)) => {
-            let anims = &mut style.effects_mut().animations;
+            let eff = style.effects_mut();
+            eff.animation_delay_math = None;
+            let anims = &mut eff.animations;
+            if anims.is_empty() && !ms.is_empty() {
+                anims.resize_with(ms.len(), || AnimationSpec {
+                    name: rix_core::intern_str("none"),
+                    duration_ms: 0.0,
+                    delay_ms: 0.0,
+                    timing: TimingFunction::Ease,
+                    iteration_count: 1.0,
+                    direction: AnimationDirectionMode::Normal,
+                    fill_mode: AnimationFillModeKind::None,
+                    play_state: AnimationPlayStateMode::Running,
+                });
+            }
             for (i, slot) in anims.iter_mut().enumerate() {
                 if !ms.is_empty() {
                     slot.delay_ms = ms[i % ms.len()];
@@ -2388,7 +2735,21 @@ pub fn apply_declaration(
             }
         }
         (PropertyIdKind::AnimationIterationCount, PropertyValue::DurationList(vals)) => {
-            let anims = &mut style.effects_mut().animations;
+            let eff = style.effects_mut();
+            eff.animation_iteration_count_math = None;
+            let anims = &mut eff.animations;
+            if anims.is_empty() && !vals.is_empty() {
+                anims.resize_with(vals.len(), || AnimationSpec {
+                    name: rix_core::intern_str("none"),
+                    duration_ms: 0.0,
+                    delay_ms: 0.0,
+                    timing: TimingFunction::Ease,
+                    iteration_count: 1.0,
+                    direction: AnimationDirectionMode::Normal,
+                    fill_mode: AnimationFillModeKind::None,
+                    play_state: AnimationPlayStateMode::Running,
+                });
+            }
             for (i, slot) in anims.iter_mut().enumerate() {
                 if !vals.is_empty() {
                     slot.iteration_count = vals[i % vals.len()];
@@ -2845,6 +3206,38 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
             Arc::make_mut(&mut style.visual).border_radius.bottom_left =
                 init.visual.border_radius.bottom_left.clone();
         }
+        PropertyIdKind::Scale => style.effects_mut().scale = crate::values_math::ScaleSpec::None,
+        PropertyIdKind::Rotate => style.effects_mut().rotate = crate::values_math::RotateSpec::None,
+        PropertyIdKind::Translate => {
+            style.effects_mut().translate = crate::values_math::TranslateSpec::None
+        }
+        PropertyIdKind::ImageResolution => style.effects_mut().image_resolution = None,
+        PropertyIdKind::Transform => {
+            let e = style.effects_mut();
+            e.transform.clear();
+            e.transform_raw = None;
+        }
+        PropertyIdKind::BackgroundPosition => {
+            Arc::make_mut(&mut style.visual).background_position = (
+                LengthPercentage::Percent(0.0),
+                LengthPercentage::Percent(0.0),
+            );
+        }
+        PropertyIdKind::TransitionDelay => style.effects_mut().transition_delay_math = None,
+        PropertyIdKind::TransitionDuration => style.effects_mut().transition_duration_math = None,
+        PropertyIdKind::AnimationDelay => style.effects_mut().animation_delay_math = None,
+        PropertyIdKind::AnimationDuration => style.effects_mut().animation_duration_math = None,
+        PropertyIdKind::AnimationIterationCount => {
+            style.effects_mut().animation_iteration_count_math = None
+        }
+        PropertyIdKind::Orphans => Arc::make_mut(&mut style.text).orphans = 2,
+        PropertyIdKind::Widows => Arc::make_mut(&mut style.text).widows = 2,
+        PropertyIdKind::TabSize => {
+            let t = Arc::make_mut(&mut style.text);
+            t.tab_size_num = 8.0;
+            t.tab_size_len = None;
+        }
+        PropertyIdKind::ColumnCount => Arc::make_mut(&mut style.box_model).column_count = None,
         _ => {}
     }
 }
