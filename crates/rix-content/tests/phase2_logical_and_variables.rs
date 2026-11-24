@@ -389,3 +389,74 @@ fn values_l5_calc_mix_random_position_and_ch_metrics() {
         .expect("script should succeed");
     assert_eq!(rt.vm.value_to_rust_string(res), "ok");
 }
+
+#[test]
+fn values_l5_if_attr_random_item_ident_and_inherit() {
+    let mut rt = make_runtime();
+    let html = r#"<!doctype html><style>
+      @property --reg-len { syntax: "<length>"; inherits: false; initial-value: 4px; }
+      @property --reg-url { syntax: "<url>"; inherits: false; initial-value: url("https://example.test/init.png"); }
+      #parent { --z: 2; --acc: p1; --url-taint: attr(data-url); }
+      #child {
+        --z: 13;
+        --acc: c1 inherit(--acc);
+        z-index: if(style(--z > inherit(--z)): 4; else: 7);
+        color: if(style(--flag: on) and supports(display: flex): green; else: red);
+        --flag: on;
+      }
+      #attr-box {
+        --raw-len: attr(data-len type(<length>));
+        width: attr(data-px px);
+        background-color: attr(data-col type(<color>), rgb(1, 2, 3));
+        content: attr(data-txt);
+      }
+      #taint-box { background-image: image-set(attr(data-url)); --reg-url: attr(data-url type(<url>)); }
+      #ri-box { font-family: random-item(fixed 0, {Times, serif}, {Arial, sans-serif}); }
+      #id-box { --myname: PASS; --picked: var(ident("--" attr(data-name type(*)))); view-transition-name: ident(3 "card"); }
+    </style>
+    <div id="parent" data-url="https://example.test/a.png">
+      <div id="child"></div>
+    </div>
+    <div id="attr-box" data-len="3EM" data-px="42" data-col="color-mix(in lch, red, pink)" data-txt="hello"></div>
+    <div id="taint-box" data-url="https://example.test/evil.png"></div>
+    <div id="ri-box"></div>
+    <div id="id-box" data-name="myname"></div>
+    <div id="cyc" data-a="attr(data-b type(*))" data-b="attr(data-a)" style="--y: attr(data-a type(*));"></div>
+    <div id="pseudo-host" data-fs="150%" style="font-size: attr(data-fs type(<percentage>));"></div>"#;
+    assert!(rt
+        .load_document_with_external_scripts(html, &HashMap::new())
+        .is_empty());
+    let res = rt
+        .eval_script(
+            r#"(function() {
+                const c = document.getElementById("child");
+                if (getComputedStyle(c).zIndex !== "4") return "if-inherit-z:" + getComputedStyle(c).zIndex;
+                if (getComputedStyle(c).color !== "rgb(0, 128, 0)") return "if-color:" + getComputedStyle(c).color;
+                if (getComputedStyle(c).getPropertyValue("--acc") !== "c1 p1") return "inherit-acc:" + getComputedStyle(c).getPropertyValue("--acc");
+                const ab = document.getElementById("attr-box");
+                if (getComputedStyle(ab).getPropertyValue("--raw-len") !== "3em") return "attr-len:" + getComputedStyle(ab).getPropertyValue("--raw-len");
+                if (getComputedStyle(ab).width !== "42px") return "attr-px:" + getComputedStyle(ab).width;
+                if (!getComputedStyle(ab).backgroundColor.startsWith("lch(")) return "attr-lch:" + getComputedStyle(ab).backgroundColor;
+                if (getComputedStyle(ab).content !== '"hello"') return "attr-content:" + getComputedStyle(ab).content;
+                const tb = document.getElementById("taint-box");
+                if (getComputedStyle(tb).backgroundImage !== "none") return "taint-bg:" + getComputedStyle(tb).backgroundImage;
+                if (getComputedStyle(tb).getPropertyValue("--reg-url") !== 'url("https://example.test/init.png")')
+                    return "taint-reg-url:" + getComputedStyle(tb).getPropertyValue("--reg-url");
+                const ri = document.getElementById("ri-box");
+                if (getComputedStyle(ri).fontFamily !== "Times, serif") return "ri-ff:" + getComputedStyle(ri).fontFamily;
+                const idb = document.getElementById("id-box");
+                if (getComputedStyle(idb).getPropertyValue("--picked") !== "PASS") return "ident-var:" + getComputedStyle(idb).getPropertyValue("--picked");
+                if (getComputedStyle(idb).viewTransitionName !== "\\33 card") return "ident-vtn:" + getComputedStyle(idb).viewTransitionName;
+                const cyc = document.getElementById("cyc");
+                if (getComputedStyle(cyc).getPropertyValue("--y") !== "") return "attr-cyc:" + getComputedStyle(cyc).getPropertyValue("--y");
+                const ph = document.getElementById("pseudo-host");
+                const beforeFs = getComputedStyle(ph, "::after").fontSize;
+                ph.setAttribute("data-fs", "300%");
+                const afterFs = getComputedStyle(ph, "::after").fontSize;
+                if (beforeFs !== "24px" || afterFs !== "48px") return "pseudo-fs:" + beforeFs + "->" + afterFs;
+                return "ok";
+            })()"#,
+        )
+        .expect("script should succeed");
+    assert_eq!(rt.vm.value_to_rust_string(res), "ok");
+}
