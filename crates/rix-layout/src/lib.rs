@@ -16,6 +16,7 @@ pub mod ifc;
 pub mod paint;
 pub mod position;
 pub mod table;
+pub mod table_grid;
 
 pub use assets::{
     collect_svg_paths_from_dom, decode_raster_batch_parallel, decode_single_raster,
