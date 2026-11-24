@@ -10,6 +10,7 @@ pub mod flex;
 pub mod flex_grid;
 pub mod fragment;
 pub mod grid;
+pub mod grid_lanes;
 pub mod grid_tracks;
 pub mod ifc;
 pub mod paint;

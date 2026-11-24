@@ -7,7 +7,9 @@
 use std::collections::{HashMap, HashSet};
 
 use rix_core::{InternedStr, Point, Rect};
-use rix_css::grid_css::{GridRepeatCount, GridTemplateTrackList, GridTrackListEntry};
+use rix_css::grid_css::{
+    GridRepeatCount, GridSubgridLineItem, GridTemplateTrackList, GridTrackListEntry,
+};
 use rix_css::substitution::escape_css_ident;
 use rix_css::values_math::format_math_f64;
 use rix_css::{
@@ -838,12 +840,161 @@ pub(crate) fn expand_explicit_axis(
     }
 }
 
+/// Parent-supplied resolved track state for a CSS Grid Level 2 subgridded axis (§2.3–§2.7).
+#[derive(Debug, Clone)]
+pub(crate) struct SubgridAxisContext {
+    /// Resolved parent track base sizes for the subgrid's spanned tracks (`len == span`).
+    pub(crate) track_sizes: Vec<f32>,
+    /// Logical track start positions relative to the subgrid's border-box start edge
+    /// (already shifted by `-area_start - margin_start`, preserving parent content-distribution gaps).
+    pub(crate) track_starts: Vec<f32>,
+    /// Effective gap between parent tracks (parent gap + parent content-distribution extra gap).
+    pub(crate) parent_gap: f32,
+    /// Inherited parent explicit line names for lines `[0..=span]`.
+    pub(crate) parent_line_names: Vec<Vec<InternedStr>>,
+    /// Subgrid's own border + padding on start/end edges of this axis (subtracted from first/last tracks).
+    pub(crate) start_bp: f32,
+    pub(crate) end_bp: f32,
+    /// Total logical span of the parent grid area minus subgrid margins (= subgrid border-box size).
+    pub(crate) border_span: f32,
+}
+
+/// Expands a CSS Grid Level 2 `subgrid <line-name-list>?` axis into an [`ExplicitAxis`]
+/// with `span` tracks by merging parent line names `[0..=span]` with the subgrid's own line names
+/// (including `repeat(auto-fill, ...)` filling up to `span + 1` lines per §2.2).
+pub(crate) fn expand_subgrid_axis(
+    parent_line_names: &[Vec<InternedStr>],
+    sub_items: &[GridSubgridLineItem],
+    span: usize,
+    eval: &EvalContext,
+) -> ExplicitAxis {
+    let line_count = span + 1;
+    let mut sub_names: Vec<Vec<InternedStr>> = Vec::with_capacity(line_count);
+
+    // Compute auto-fill repetition count if present in `sub_items`.
+    let mut fixed_lines = 0usize;
+    let mut auto_unit_len = 0usize;
+    for item in sub_items {
+        match item {
+            GridSubgridLineItem::Names(_) => fixed_lines += 1,
+            GridSubgridLineItem::Repeat { count, names } => {
+                if matches!(count, GridRepeatCount::AutoFill | GridRepeatCount::AutoFit) {
+                    auto_unit_len = names.len();
+                } else {
+                    let reps = count.resolve_number(eval).unwrap_or(1) as usize;
+                    fixed_lines += names.len().saturating_mul(reps);
+                }
+            }
+        }
+    }
+    let auto_reps = if auto_unit_len > 0 && line_count > fixed_lines {
+        (line_count - fixed_lines) / auto_unit_len
+    } else {
+        0
+    };
+
+    for item in sub_items {
+        match item {
+            GridSubgridLineItem::Names(ns) => sub_names.push(ns.clone()),
+            GridSubgridLineItem::Repeat { count, names } => {
+                let reps = if matches!(count, GridRepeatCount::AutoFill | GridRepeatCount::AutoFit)
+                {
+                    auto_reps
+                } else {
+                    (count.resolve_number(eval).unwrap_or(1) as usize).min(10_000)
+                };
+                for _ in 0..reps {
+                    for ns in names {
+                        sub_names.push(ns.clone());
+                        if sub_names.len() >= line_count {
+                            break;
+                        }
+                    }
+                    if sub_names.len() >= line_count {
+                        break;
+                    }
+                }
+            }
+        }
+        if sub_names.len() >= line_count {
+            break;
+        }
+    }
+
+    let mut explicit_line_names: Vec<Vec<InternedStr>> = Vec::with_capacity(line_count);
+    for i in 0..line_count {
+        let mut merged = Vec::new();
+        if let Some(pns) = parent_line_names.get(i) {
+            merged.extend(pns.iter().cloned());
+        }
+        if let Some(sns) = sub_names.get(i) {
+            merged.extend(sns.iter().cloned());
+        }
+        explicit_line_names.push(merged);
+    }
+
+    ExplicitAxis {
+        tracks: vec![GridTrackSize::Auto; span],
+        from_auto_fit: vec![false; span],
+        lookup_line_names: explicit_line_names.clone(),
+        explicit_line_names,
+    }
+}
+
+/// Runs §8.5 placement and clamps any subgridded axis into `[0..explicit_count]` so subgrids
+/// never generate implicit tracks on subgridded axes (CSS Grid Level 2 §2.2).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn place_grid_items_clamped(
+    ctx: &LayoutContext<'_>,
+    in_flow_ids: &[BoxId],
+    explicit_cols: &ExplicitAxis,
+    explicit_rows: &ExplicitAxis,
+    clamp_cols: bool,
+    clamp_rows: bool,
+    auto_flow: GridAutoFlowMode,
+    eval: &EvalContext,
+) -> PlacementResult {
+    let mut res = place_grid_items(
+        ctx,
+        in_flow_ids,
+        explicit_cols,
+        explicit_rows,
+        auto_flow,
+        eval,
+    );
+    if clamp_cols && explicit_cols.track_count() > 0 {
+        let max_c = explicit_cols.track_count();
+        let shift = (-res.col_min_idx).max(0) as usize;
+        for it in &mut res.items {
+            let s = it.col_start.saturating_sub(shift).min(max_c - 1);
+            let e = it.col_end.saturating_sub(shift).clamp(s + 1, max_c);
+            it.col_start = s;
+            it.col_end = e;
+        }
+        res.col_min_idx = 0;
+        res.col_total = max_c;
+    }
+    if clamp_rows && explicit_rows.track_count() > 0 {
+        let max_r = explicit_rows.track_count();
+        let shift = (-res.row_min_idx).max(0) as usize;
+        for it in &mut res.items {
+            let s = it.row_start.saturating_sub(shift).min(max_r - 1);
+            let e = it.row_end.saturating_sub(shift).clamp(s + 1, max_r);
+            it.row_start = s;
+            it.row_end = e;
+        }
+        res.row_min_idx = 0;
+        res.row_total = max_r;
+    }
+    res
+}
+
 // ---------------------------------------------------------------------------
 // Line Resolution & Auto-Placement (W3C CSS Grid Level 1 §8.3 & §8.5)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-enum AxisPlacement {
+pub(crate) enum AxisPlacement {
     Definite { start: i32, end: i32 },
     Auto { span: i32 },
 }
@@ -992,7 +1143,7 @@ fn resolve_definite_line(
     }
 }
 
-fn resolve_axis_placement(
+pub(crate) fn resolve_axis_placement(
     start_val: &GridPlacementValue,
     end_val: &GridPlacementValue,
     axis: &ExplicitAxis,
@@ -1472,13 +1623,12 @@ pub(crate) fn build_axis_tracks(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn active_gaps_in_range(tracks: &[Track], start: usize, end: usize, gap: f32) -> f32 {
-    if end <= start + 1 || gap <= 0.0 {
+    let s = start.min(tracks.len());
+    let e = end.min(tracks.len());
+    if e <= s + 1 || gap <= 0.0 {
         return 0.0;
     }
-    let active = tracks[start..end]
-        .iter()
-        .filter(|t| !t.is_collapsed)
-        .count();
+    let active = tracks[s..e].iter().filter(|t| !t.is_collapsed).count();
     if active > 1 {
         gap * (active - 1) as f32
     } else {
@@ -1487,8 +1637,13 @@ pub(crate) fn active_gaps_in_range(tracks: &[Track], start: usize, end: usize, g
 }
 
 pub(crate) fn span_track_size(tracks: &[Track], start: usize, end: usize, gap: f32) -> f32 {
-    let sum: f32 = tracks[start..end].iter().map(|t| t.base_size).sum();
-    sum + active_gaps_in_range(tracks, start, end, gap)
+    let s = start.min(tracks.len());
+    let e = end.min(tracks.len());
+    if e <= s {
+        return 0.0;
+    }
+    let sum: f32 = tracks[s..e].iter().map(|t| t.base_size).sum();
+    sum + active_gaps_in_range(tracks, s, e, gap)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

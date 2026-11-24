@@ -1375,6 +1375,10 @@ fn shape_word_glyphs(
         0.0
     };
 
+    if style.text.font_size_px <= 0.0 {
+        return (Vec::new(), 0.0);
+    }
+
     let runs = ctx.shaper.shape_text(text, font_id, font_size);
     if runs.is_empty() {
         // Deterministic fallback width when running in an environment with no system fonts installed.

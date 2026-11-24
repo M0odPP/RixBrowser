@@ -8,12 +8,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rix_core::{Point, Rect};
+use rix_core::{InternedStr, Point, Rect};
 use rix_css::grid_css::GridTemplateTrackList;
 use rix_css::{
     AlignValue, BoxSizingMode, ComputedStyle, DisplayMode, EvalContext, GridAutoFlowMode,
-    GridPlacementValue, GridTemplateAreasValue, LengthPercentage, LengthPercentageAuto,
-    PositionMode, SizeValue,
+    GridPlacementValue, GridTemplateAreasValue, GridTrackSize, LengthPercentage,
+    LengthPercentageAuto, PositionMode, SizeValue,
 };
 
 use crate::bfc::apply_relative_offset;
@@ -24,10 +24,11 @@ use crate::fragment::{
 };
 use crate::grid_tracks::{
     active_gaps_in_range, build_axis_tracks, compute_axis_baseline_metrics,
-    compute_track_positions, expand_explicit_axis, format_resolved_tracks,
-    mark_empty_auto_fit_tracks, place_grid_items, resolve_abspos_axis_edges, resolve_self_align,
-    resolve_tracks, solve_grid_item_axis, span_track_size, track_has_percentage, GridItem,
-    MaxSizing, ResolvedSelfAlign, SizingConstraint, Track,
+    compute_track_positions, expand_explicit_axis, expand_subgrid_axis, format_resolved_tracks,
+    mark_empty_auto_fit_tracks, place_grid_items, place_grid_items_clamped,
+    resolve_abspos_axis_edges, resolve_self_align, resolve_tracks, solve_grid_item_axis,
+    span_track_size, track_has_percentage, ExplicitAxis, GridItem, MaxSizing, MinSizing,
+    ResolvedSelfAlign, SizingConstraint, SubgridAxisContext, Track,
 };
 pub use crate::grid_tracks::{GridAbsposHint, GridAxes};
 use crate::position::{offset_pending_oof, resolve_oof_for_container, PendingOof};
@@ -62,7 +63,10 @@ fn replaced_intrinsic_dims(b: &crate::box_tree::LayoutBox) -> Option<(f32, f32)>
     }
 }
 
-fn effective_aspect_ratio(b: &crate::box_tree::LayoutBox, eval: &EvalContext) -> Option<f32> {
+pub(crate) fn effective_aspect_ratio(
+    b: &crate::box_tree::LayoutBox,
+    eval: &EvalContext,
+) -> Option<f32> {
     if let Some(ar) = parse_aspect_ratio_val(&b.style, eval) {
         return Some(ar);
     }
@@ -74,7 +78,7 @@ fn effective_aspect_ratio(b: &crate::box_tree::LayoutBox, eval: &EvalContext) ->
     None
 }
 
-fn measure_item_block_height(
+pub(crate) fn measure_item_block_height(
     ctx: &mut LayoutContext<'_>,
     box_id: BoxId,
     avail_w: f32,
@@ -92,7 +96,7 @@ fn measure_item_block_height(
 
 /// Computes `(min_contrib, min_content_contrib, max_content_contrib)` for `item` along `is_col`.
 #[allow(clippy::too_many_arguments)]
-fn compute_item_contributions(
+pub(crate) fn compute_item_contributions(
     ctx: &mut LayoutContext<'_>,
     item: &GridItem,
     is_col: bool,
@@ -569,6 +573,9 @@ pub fn measure_grid_intrinsic_widths(
     container_id: BoxId,
     space: ConstraintSpace,
 ) -> (f32, f32) {
+    if crate::grid_lanes::is_grid_lanes_display(ctx.tree.get(container_id).style.display) {
+        return crate::grid_lanes::measure_grid_lanes_intrinsic_widths(ctx, container_id, space);
+    }
     let b = ctx.tree.get(container_id);
     let style = Arc::clone(&b.style);
     let eval = space.eval_context_for(&style);
@@ -754,14 +761,284 @@ fn measure_grid_content_intrinsic_widths(
 }
 
 // ---------------------------------------------------------------------------
-// Main Grid Container Layout Entry Point (W3C CSS Grid Level 1)
+// CSS Grid Level 2 Subgrid Helpers (§2.2–§2.7)
 // ---------------------------------------------------------------------------
 
-/// Lays out a CSS Grid container (`display: grid | inline-grid`) per W3C CSS Grid Level 1.
+fn is_subgrid_on_axis(style: &ComputedStyle, is_col: bool) -> bool {
+    if !matches!(style.display, DisplayMode::Grid | DisplayMode::InlineGrid) {
+        return false;
+    }
+    style.flex_grid.as_deref().is_some_and(|f| {
+        if is_col {
+            f.grid_template_columns_list.is_subgrid()
+        } else {
+            f.grid_template_rows_list.is_subgrid()
+        }
+    })
+}
+
+fn slice_parent_line_names(
+    exp: &ExplicitAxis,
+    min_idx: i32,
+    s: usize,
+    e: usize,
+) -> Vec<Vec<InternedStr>> {
+    let explicit_origin = (-min_idx).max(0) as usize;
+    let mut out = Vec::with_capacity(e.saturating_sub(s) + 1);
+    for line in s..=e {
+        if line >= explicit_origin {
+            let ei = line - explicit_origin;
+            out.push(exp.explicit_line_names.get(ei).cloned().unwrap_or_default());
+        } else {
+            out.push(Vec::new());
+        }
+    }
+    out
+}
+
+fn logical_axis_bp_and_margin(
+    im: &BoxMetrics,
+    style: &ComputedStyle,
+    axes: GridAxes,
+    is_col: bool,
+) -> (f32, f32, f32, f32) {
+    let (ms_auto, me_auto) = if is_col {
+        axes.col_margins_auto(style)
+    } else {
+        axes.row_margins_auto(style)
+    };
+    let (ms_raw, me_raw) = if is_col {
+        axes.col_margins(im.margin)
+    } else {
+        axes.row_margins(im.margin)
+    };
+    let ms = if ms_auto { 0.0 } else { ms_raw };
+    let me = if me_auto { 0.0 } else { me_raw };
+    let (b_s, b_e) = if is_col {
+        axes.col_margins(im.border)
+    } else {
+        axes.row_margins(im.border)
+    };
+    let (p_s, p_e) = if is_col {
+        axes.col_margins(im.padding)
+    } else {
+        axes.row_margins(im.padding)
+    };
+    (b_s + p_s, b_e + p_e, ms, me)
+}
+
+/// Expands direct subgrid items into virtual subitem contributions (including subgrid start/end
+/// margin+border+padding per CSS Grid L2 §2.5) so parent tracks size to fit all subgrid items.
+#[allow(clippy::too_many_arguments)]
+fn collect_subgrid_sizing_items(
+    ctx: &mut LayoutContext<'_>,
+    items: &[GridItem],
+    is_col: bool,
+    axes: GridAxes,
+    tracks: &[Track],
+    other_tracks: Option<&[Track]>,
+    other_gap: f32,
+    exp_axis: &ExplicitAxis,
+    min_idx: i32,
+    space: ConstraintSpace,
+    depth: u8,
+) -> Vec<GridItem> {
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        let item_box = ctx.tree.get(it.box_id);
+        let item_style = Arc::clone(&item_box.style);
+        let same_axis_sub = depth < 6
+            && item_style.text.writing_mode.is_vertical() == !axes.col_is_x
+            && is_subgrid_on_axis(&item_style, is_col);
+        if !same_axis_sub {
+            out.push(it.clone());
+            continue;
+        }
+        let (ps, pe) = if is_col {
+            (it.col_start, it.col_end)
+        } else {
+            (it.row_start, it.row_end)
+        };
+        let span = pe.saturating_sub(ps).max(1);
+        let eval = space.eval_context_for(&item_style);
+        let im = BoxMetrics::resolve_with_eval(&item_style, &space, eval);
+        let (s_bp, e_bp, s_m, e_m) = logical_axis_bp_and_margin(&im, &item_style, axes, is_col);
+        let start_mbp = (s_bp + s_m).max(0.0);
+        let end_mbp = (e_bp + e_m).max(0.0);
+
+        // Floor contribution of the subgrid container's own MBP across its spanned parent tracks.
+        let mut floor_it = it.clone();
+        floor_it.min_contrib = start_mbp + end_mbp;
+        floor_it.min_content_contrib = start_mbp + end_mbp;
+        floor_it.max_content_contrib = start_mbp + end_mbp;
+        out.push(floor_it);
+
+        let sub_in_flow: Vec<BoxId> = item_box
+            .children
+            .iter()
+            .copied()
+            .filter(|&cid| !ctx.tree.get(cid).is_out_of_flow)
+            .collect();
+        if sub_in_flow.is_empty() {
+            continue;
+        }
+
+        let sfg = item_style.flex_grid.as_deref();
+        let default_tracks = GridTemplateTrackList::None;
+        let default_areas = GridTemplateAreasValue::default();
+        let s_cols_list = sfg.map_or(&default_tracks, |f| &f.grid_template_columns_list);
+        let s_rows_list = sfg.map_or(&default_tracks, |f| &f.grid_template_rows_list);
+        let s_areas = sfg.map_or(&default_areas, |f| &f.grid_template_areas);
+        let s_auto_cols = sfg.map_or(&[][..], |f| f.grid_auto_columns.as_slice());
+        let s_auto_rows = sfg.map_or(&[][..], |f| f.grid_auto_rows.as_slice());
+        let s_auto_flow = sfg.map_or(GridAutoFlowMode::Row, |f| f.grid_auto_flow);
+
+        let parent_names = slice_parent_line_names(exp_axis, min_idx, ps, pe);
+        let sub_col_flag = is_col;
+        let sub_row_flag = !is_col;
+
+        let sub_exp_cols = if sub_col_flag {
+            let sub_items = match s_cols_list {
+                GridTemplateTrackList::Subgrid(v) => v.as_slice(),
+                _ => &[],
+            };
+            expand_subgrid_axis(&parent_names, sub_items, span, &eval)
+        } else {
+            expand_explicit_axis(
+                s_cols_list,
+                s_areas,
+                s_auto_cols,
+                false,
+                None,
+                None,
+                None,
+                0.0,
+                &eval,
+                None,
+            )
+        };
+        let sub_exp_rows = if sub_row_flag {
+            let sub_items = match s_rows_list {
+                GridTemplateTrackList::Subgrid(v) => v.as_slice(),
+                _ => &[],
+            };
+            expand_subgrid_axis(&parent_names, sub_items, span, &eval)
+        } else {
+            expand_explicit_axis(
+                s_rows_list,
+                s_areas,
+                s_auto_rows,
+                true,
+                None,
+                None,
+                None,
+                0.0,
+                &eval,
+                None,
+            )
+        };
+
+        let mut sub_placed = place_grid_items_clamped(
+            ctx,
+            &sub_in_flow,
+            &sub_exp_cols,
+            &sub_exp_rows,
+            sub_col_flag,
+            sub_row_flag,
+            s_auto_flow,
+            &eval,
+        );
+        for sit in &mut sub_placed.items {
+            let (ss, se) = if is_col {
+                (sit.col_start, sit.col_end)
+            } else {
+                (sit.row_start, sit.row_end)
+            };
+            let mapped_s = (ps + ss).min(tracks.len().saturating_sub(1));
+            let mapped_e = (ps + se).clamp(mapped_s + 1, tracks.len());
+            if is_col {
+                sit.col_start = mapped_s;
+                sit.col_end = mapped_e;
+            } else {
+                sit.row_start = mapped_s;
+                sit.row_end = mapped_e;
+                // Map cross-axis (column) span to parent's span when parent col_tracks are passed.
+                if let Some(ot) = other_tracks {
+                    if is_subgrid_on_axis(&item_style, true) {
+                        let pcs = it.col_start;
+                        sit.col_start = (pcs + sit.col_start).min(ot.len().saturating_sub(1));
+                        sit.col_end = (pcs + sit.col_end).clamp(sit.col_start + 1, ot.len());
+                    } else {
+                        sit.col_start = it.col_start.min(ot.len().saturating_sub(1));
+                        sit.col_end = it.col_end.clamp(sit.col_start + 1, ot.len());
+                    }
+                }
+            }
+            let (mut mc, mut min_c, mut max_c) = compute_item_contributions(
+                ctx,
+                sit,
+                is_col,
+                axes,
+                tracks,
+                other_tracks,
+                other_gap,
+                space,
+            );
+            if ss == 0 {
+                mc += start_mbp;
+                min_c += start_mbp;
+                max_c += start_mbp;
+            }
+            if se == span {
+                mc += end_mbp;
+                min_c += end_mbp;
+                max_c += end_mbp;
+            }
+            sit.min_contrib = mc;
+            sit.min_content_contrib = min_c;
+            sit.max_content_contrib = max_c;
+        }
+        // Recurse for nested subgrids!
+        let nested = collect_subgrid_sizing_items(
+            ctx,
+            &sub_placed.items,
+            is_col,
+            axes,
+            tracks,
+            other_tracks,
+            other_gap,
+            exp_axis,
+            min_idx,
+            space,
+            depth + 1,
+        );
+        out.extend(nested);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Main Grid Container Layout Entry Point (W3C CSS Grid Level 1 & Level 2)
+// ---------------------------------------------------------------------------
+
+/// Lays out a CSS Grid or Grid Lanes container (`display: grid | inline-grid | grid-lanes`).
 pub fn layout_grid_container(
     ctx: &mut LayoutContext<'_>,
     container_id: BoxId,
     space: ConstraintSpace,
+) -> Fragment {
+    if crate::grid_lanes::is_grid_lanes_display(ctx.tree.get(container_id).style.display) {
+        return crate::grid_lanes::layout_grid_lanes_container(ctx, container_id, space);
+    }
+    layout_grid_container_with_subgrid(ctx, container_id, space, None, None)
+}
+
+fn layout_grid_container_with_subgrid(
+    ctx: &mut LayoutContext<'_>,
+    container_id: BoxId,
+    space: ConstraintSpace,
+    sub_col_ctx: Option<SubgridAxisContext>,
+    sub_row_ctx: Option<SubgridAxisContext>,
 ) -> Fragment {
     let b = ctx.tree.get(container_id);
     let style = Arc::clone(&b.style);
@@ -894,255 +1171,400 @@ pub fn layout_grid_container(
     let col_intr_probe = probe_intrinsic_repeat(ctx, true);
     let row_intr_probe = probe_intrinsic_repeat(ctx, false);
 
-    // 1. Expand explicit track lists and place all in-flow grid items (§7.2 & §8.5).
-    let exp_cols = expand_explicit_axis(
-        cols_list,
-        areas,
-        auto_cols,
-        false,
-        def_col,
-        min_col,
-        max_col,
-        col_gap,
-        &eval,
-        col_intr_probe,
-    );
-    let exp_rows = expand_explicit_axis(
-        rows_list,
-        areas,
-        auto_rows,
-        true,
-        def_row,
-        min_row,
-        max_row,
-        row_gap,
-        &eval,
-        row_intr_probe,
-    );
-    let mut placed = place_grid_items(ctx, &in_flow_ids, &exp_cols, &exp_rows, auto_flow, &eval);
-
-    // Build full track arrays and mark empty `auto-fit` tracks as collapsed (§7.2.3.2).
-    let mut col_tracks = build_axis_tracks(
-        &exp_cols,
-        auto_cols,
-        placed.col_min_idx,
-        placed.col_total,
-        def_col,
-        &eval,
-    );
-    let mut row_tracks = build_axis_tracks(
-        &exp_rows,
-        auto_rows,
-        placed.row_min_idx,
-        placed.row_total,
-        def_row,
-        &eval,
-    );
-    mark_empty_auto_fit_tracks(&mut col_tracks, &placed.items, true);
-    mark_empty_auto_fit_tracks(&mut row_tracks, &placed.items, false);
-
-    let col_sizing_constraint = if def_col.is_some() {
-        SizingConstraint::Definite(0)
-    } else if axes.col_is_x && matches!(style.box_model.width, SizeValue::MinContent) {
-        SizingConstraint::MinContent
-    } else if axes.col_is_x && matches!(style.box_model.width, SizeValue::MaxContent) {
-        SizingConstraint::MaxContent
+    // 1. Expand explicit track lists (or inherit parent tracks for CSS Grid L2 subgrid) and place items.
+    let exp_cols = if let Some(ref sc) = sub_col_ctx {
+        let sub_items = match cols_list {
+            GridTemplateTrackList::Subgrid(v) => v.as_slice(),
+            _ => &[],
+        };
+        expand_subgrid_axis(
+            &sc.parent_line_names,
+            sub_items,
+            sc.track_sizes.len(),
+            &eval,
+        )
     } else {
-        SizingConstraint::Indefinite
-    };
-
-    // 2. Track Sizing Pass 1: Columns (inline axis)
-    for it in &mut placed.items {
-        let (mc, min_c, max_c) =
-            compute_item_contributions(ctx, it, true, axes, &col_tracks, None, 0.0, space);
-        it.min_contrib = mc;
-        it.min_content_contrib = min_c;
-        it.max_content_contrib = max_c;
-    }
-    apply_baseline_shims_to_items(
-        ctx,
-        &mut placed.items,
-        true,
-        axes,
-        justify_items,
-        None,
-        0.0,
-        space,
-    );
-    let eff_max_col = if def_col.is_none()
-        && axes.col_is_x
-        && shrink_w
-        && matches!(style.box_model.width, SizeValue::Auto)
-    {
-        let avail_c = (space.available_width - metrics.margin.horizontal() - pb_w).max(0.0);
-        let capped = max_col.map_or(avail_c, |m| m.min(avail_c));
-        Some(min_col.map_or(capped, |mn| capped.max(mn)))
-    } else {
-        max_col
-    };
-    resolve_tracks(
-        &mut col_tracks,
-        &placed.items,
-        true,
-        def_col,
-        min_col,
-        eff_max_col,
-        col_gap,
-        justify_content,
-        col_sizing_constraint,
-    );
-
-    // Resolve container column size (clamping shrink-to-fit against available width if `inline-grid` / `fit-content`).
-    let used_cols_sum: f32 = col_tracks.iter().map(|t| t.base_size).sum::<f32>()
-        + active_gaps_in_range(&col_tracks, 0, col_tracks.len(), col_gap);
-    let final_col_size = if let Some(dc) = def_col {
-        dc
-    } else {
-        let mut sz = used_cols_sum;
-        if axes.col_is_x {
-            let avail_c = (space.available_width - metrics.margin.horizontal() - pb_w).max(0.0);
-            if matches!(style.box_model.width, SizeValue::FitContent(Some(_))) {
-                if let SizeValue::FitContent(Some(lp)) = &style.box_model.width {
-                    let lim = lp.resolve_px(space.containing_block_width, &eval).max(0.0);
-                    sz = sz.min(lim);
-                }
-            } else if matches!(style.box_model.width, SizeValue::FitContent(None)) {
-                sz = sz.min(avail_c);
-            }
-            if let Some(mx) = max_col {
-                sz = sz.min(mx);
-            }
-            if let Some(mn) = min_col {
-                sz = sz.max(mn);
-            }
-        } else {
-            if let Some(mx) = max_col {
-                sz = sz.min(mx);
-            }
-            if let Some(mn) = min_col {
-                sz = sz.max(mn);
-            }
-        }
-        sz.max(0.0)
-    };
-
-    // If column size was indefinite and percentage column tracks/gaps exist, re-resolve against `final_col_size` (§7.2.1).
-    let has_pct_cols = col_tracks.iter().any(|t| track_has_percentage(&t.raw))
-        || fg.is_some_and(|f| f.column_gap.has_percentage());
-    if def_col.is_none() && has_pct_cols && final_col_size > 0.0 {
-        col_gap = fg.map_or(0.0, |f| resolve_gap(&f.column_gap, Some(final_col_size)));
-        for t in &mut col_tracks {
-            t.refresh_fns(Some(final_col_size), &eval);
-        }
-        resolve_tracks(
-            &mut col_tracks,
-            &placed.items,
-            true,
-            Some(final_col_size),
+        expand_explicit_axis(
+            cols_list,
+            areas,
+            auto_cols,
+            false,
+            def_col,
             min_col,
             max_col,
             col_gap,
-            justify_content,
-            SizingConstraint::Definite(0),
-        );
-    }
-
-    // 3. Track Sizing Pass 2: Rows (block axis) using resolved column track sizes
-    for it in &mut placed.items {
-        let (mc, min_c, max_c) = compute_item_contributions(
-            ctx,
-            it,
-            false,
-            axes,
-            &row_tracks,
-            Some(&col_tracks),
-            col_gap,
-            space,
-        );
-        it.min_contrib = mc;
-        it.min_content_contrib = min_c;
-        it.max_content_contrib = max_c;
-    }
-    apply_baseline_shims_to_items(
-        ctx,
-        &mut placed.items,
-        false,
-        axes,
-        align_items,
-        Some(&col_tracks),
-        col_gap,
-        space,
-    );
-    let row_sizing_constraint = if def_row.is_some() {
-        SizingConstraint::Definite(0)
-    } else {
-        SizingConstraint::Indefinite
+            &eval,
+            col_intr_probe,
+        )
     };
-    resolve_tracks(
-        &mut row_tracks,
-        &placed.items,
-        false,
-        def_row,
-        min_row,
-        max_row,
-        row_gap,
-        align_content,
-        row_sizing_constraint,
-    );
-
-    let used_rows_sum: f32 = row_tracks.iter().map(|t| t.base_size).sum::<f32>()
-        + active_gaps_in_range(&row_tracks, 0, row_tracks.len(), row_gap);
-    let final_row_size = if let Some(dr) = def_row {
-        dr
+    let exp_rows = if let Some(ref sr) = sub_row_ctx {
+        let sub_items = match rows_list {
+            GridTemplateTrackList::Subgrid(v) => v.as_slice(),
+            _ => &[],
+        };
+        expand_subgrid_axis(
+            &sr.parent_line_names,
+            sub_items,
+            sr.track_sizes.len(),
+            &eval,
+        )
     } else {
-        let mut sz = used_rows_sum;
-        if let Some(mx) = max_row {
-            sz = sz.min(mx);
-        }
-        if let Some(mn) = min_row {
-            sz = sz.max(mn);
-        }
-        sz.max(0.0)
-    };
-
-    // Re-resolve percentage row tracks/gaps against `final_row_size` when container row size was indefinite (§7.2.1).
-    let has_pct_rows = row_tracks.iter().any(|t| track_has_percentage(&t.raw))
-        || fg.is_some_and(|f| f.row_gap.has_percentage());
-    if def_row.is_none() && has_pct_rows && final_row_size > 0.0 {
-        row_gap = fg.map_or(0.0, |f| resolve_gap(&f.row_gap, Some(final_row_size)));
-        for t in &mut row_tracks {
-            t.refresh_fns(Some(final_row_size), &eval);
-        }
-        resolve_tracks(
-            &mut row_tracks,
-            &placed.items,
-            false,
-            Some(final_row_size),
+        expand_explicit_axis(
+            rows_list,
+            areas,
+            auto_rows,
+            true,
+            def_row,
             min_row,
             max_row,
             row_gap,
-            align_content,
-            SizingConstraint::Definite(0),
-        );
-    }
+            &eval,
+            row_intr_probe,
+        )
+    };
+    let mut placed = place_grid_items_clamped(
+        ctx,
+        &in_flow_ids,
+        &exp_cols,
+        &exp_rows,
+        sub_col_ctx.is_some(),
+        sub_row_ctx.is_some(),
+        auto_flow,
+        &eval,
+    );
 
-    // 4. Content Alignment (§10.2–§10.3): compute logical track offsets
-    let (col_starts, _col_lines, _) = compute_track_positions(
-        &col_tracks,
-        col_gap,
-        final_col_size,
-        justify_content,
-        axes.col_is_x,
-        axes.col_reversed,
-    );
-    let (row_starts, _row_lines, _) = compute_track_positions(
-        &row_tracks,
-        row_gap,
-        final_row_size,
-        align_content,
-        !axes.col_is_x,
-        axes.row_reversed,
-    );
+    // Helper: construct subgridded tracks & logical starts relative to subgrid content box,
+    // applying CSS Grid L2 §2.4 half-gutter delta when the subgrid specifies its own gap.
+    let build_subgrid_tracks =
+        |sctx: &SubgridAxisContext, own_gap: f32| -> (Vec<Track>, Vec<Track>, Vec<f32>, f32, f32) {
+            let n = sctx.track_sizes.len();
+            let content_span = (sctx.border_span - sctx.start_bp - sctx.end_bp).max(0.0);
+            let eff_gap = if own_gap > 0.0 {
+                own_gap
+            } else {
+                sctx.parent_gap
+            };
+            let half_delta = (eff_gap - sctx.parent_gap) * 0.5;
+            let mut inner_tracks = Vec::with_capacity(n);
+            let mut cssom_tracks = Vec::with_capacity(n);
+            let mut inner_starts = Vec::with_capacity(n);
+            for k in 0..n {
+                let parent_sz = sctx.track_sizes[k];
+                let raw_start = sctx.track_starts[k] - sctx.start_bp;
+                let raw_end = raw_start + parent_sz;
+                let adj_start = if k == 0 {
+                    0.0
+                } else {
+                    (raw_start + half_delta).max(0.0)
+                };
+                let adj_end = if k + 1 == n {
+                    content_span
+                } else {
+                    (raw_end - half_delta).min(content_span)
+                };
+                let adj_sz = (adj_end - adj_start).max(0.0);
+                inner_starts.push(adj_start);
+                inner_tracks.push(Track {
+                    raw: GridTrackSize::Auto,
+                    min_fn: MinSizing::Fixed(adj_sz),
+                    max_fn: MaxSizing::Fixed(adj_sz),
+                    base_size: adj_sz,
+                    growth_limit: adj_sz,
+                    planned_increase: 0.0,
+                    item_incurred_increase: 0.0,
+                    infinitely_growable: false,
+                    from_auto_fit: false,
+                    is_collapsed: false,
+                });
+                cssom_tracks.push(Track {
+                    raw: GridTrackSize::Auto,
+                    min_fn: MinSizing::Fixed(parent_sz),
+                    max_fn: MaxSizing::Fixed(parent_sz),
+                    base_size: parent_sz,
+                    growth_limit: parent_sz,
+                    planned_increase: 0.0,
+                    item_incurred_increase: 0.0,
+                    infinitely_growable: false,
+                    from_auto_fit: false,
+                    is_collapsed: false,
+                });
+            }
+            (
+                inner_tracks,
+                cssom_tracks,
+                inner_starts,
+                content_span,
+                eff_gap,
+            )
+        };
+
+    // Build full track arrays and mark empty `auto-fit` tracks as collapsed (§7.2.3.2).
+    let (mut col_tracks, sub_col_cssom_tracks, sub_col_starts, final_col_size) =
+        if let Some(ref sc) = sub_col_ctx {
+            let (it, ct, st, csz, eg) = build_subgrid_tracks(sc, col_gap);
+            col_gap = eg;
+            (it, Some(ct), Some(st), csz)
+        } else {
+            let mut ct = build_axis_tracks(
+                &exp_cols,
+                auto_cols,
+                placed.col_min_idx,
+                placed.col_total,
+                def_col,
+                &eval,
+            );
+            mark_empty_auto_fit_tracks(&mut ct, &placed.items, true);
+
+            let col_sizing_constraint = if def_col.is_some() {
+                SizingConstraint::Definite(0)
+            } else if axes.col_is_x && matches!(style.box_model.width, SizeValue::MinContent) {
+                SizingConstraint::MinContent
+            } else if axes.col_is_x && matches!(style.box_model.width, SizeValue::MaxContent) {
+                SizingConstraint::MaxContent
+            } else {
+                SizingConstraint::Indefinite
+            };
+
+            // 2. Track Sizing Pass 1: Columns (inline axis)
+            for it in &mut placed.items {
+                let (mc, min_c, max_c) =
+                    compute_item_contributions(ctx, it, true, axes, &ct, None, 0.0, space);
+                it.min_contrib = mc;
+                it.min_content_contrib = min_c;
+                it.max_content_contrib = max_c;
+            }
+            apply_baseline_shims_to_items(
+                ctx,
+                &mut placed.items,
+                true,
+                axes,
+                justify_items,
+                None,
+                0.0,
+                space,
+            );
+            let col_sizing_items = collect_subgrid_sizing_items(
+                ctx,
+                &placed.items,
+                true,
+                axes,
+                &ct,
+                None,
+                0.0,
+                &exp_cols,
+                placed.col_min_idx,
+                space,
+                0,
+            );
+            let eff_max_col = if def_col.is_none()
+                && axes.col_is_x
+                && shrink_w
+                && matches!(style.box_model.width, SizeValue::Auto)
+            {
+                let avail_c = (space.available_width - metrics.margin.horizontal() - pb_w).max(0.0);
+                let capped = max_col.map_or(avail_c, |m| m.min(avail_c));
+                Some(min_col.map_or(capped, |mn| capped.max(mn)))
+            } else {
+                max_col
+            };
+            resolve_tracks(
+                &mut ct,
+                &col_sizing_items,
+                true,
+                def_col,
+                min_col,
+                eff_max_col,
+                col_gap,
+                justify_content,
+                col_sizing_constraint,
+            );
+
+            let used_cols_sum: f32 = ct.iter().map(|t| t.base_size).sum::<f32>()
+                + active_gaps_in_range(&ct, 0, ct.len(), col_gap);
+            let fcs = if let Some(dc) = def_col {
+                dc
+            } else {
+                let mut sz = used_cols_sum;
+                if axes.col_is_x {
+                    let avail_c =
+                        (space.available_width - metrics.margin.horizontal() - pb_w).max(0.0);
+                    if matches!(style.box_model.width, SizeValue::FitContent(Some(_))) {
+                        if let SizeValue::FitContent(Some(lp)) = &style.box_model.width {
+                            let lim = lp.resolve_px(space.containing_block_width, &eval).max(0.0);
+                            sz = sz.min(lim);
+                        }
+                    } else if matches!(style.box_model.width, SizeValue::FitContent(None)) {
+                        sz = sz.min(avail_c);
+                    }
+                }
+                if let Some(mx) = max_col {
+                    sz = sz.min(mx);
+                }
+                if let Some(mn) = min_col {
+                    sz = sz.max(mn);
+                }
+                sz.max(0.0)
+            };
+
+            let has_pct_cols = ct.iter().any(|t| track_has_percentage(&t.raw))
+                || fg.is_some_and(|f| f.column_gap.has_percentage());
+            if def_col.is_none() && has_pct_cols && fcs > 0.0 {
+                col_gap = fg.map_or(0.0, |f| resolve_gap(&f.column_gap, Some(fcs)));
+                for t in &mut ct {
+                    t.refresh_fns(Some(fcs), &eval);
+                }
+                resolve_tracks(
+                    &mut ct,
+                    &col_sizing_items,
+                    true,
+                    Some(fcs),
+                    min_col,
+                    max_col,
+                    col_gap,
+                    justify_content,
+                    SizingConstraint::Definite(0),
+                );
+            }
+            (ct, None, None, fcs)
+        };
+
+    // 3. Track Sizing Pass 2: Rows (block axis) using resolved column track sizes
+    let (mut row_tracks, sub_row_cssom_tracks, sub_row_starts, final_row_size) =
+        if let Some(ref sr) = sub_row_ctx {
+            let (it, ct, st, rsz, eg) = build_subgrid_tracks(sr, row_gap);
+            row_gap = eg;
+            (it, Some(ct), Some(st), rsz)
+        } else {
+            let mut rt = build_axis_tracks(
+                &exp_rows,
+                auto_rows,
+                placed.row_min_idx,
+                placed.row_total,
+                def_row,
+                &eval,
+            );
+            mark_empty_auto_fit_tracks(&mut rt, &placed.items, false);
+
+            for it in &mut placed.items {
+                let (mc, min_c, max_c) = compute_item_contributions(
+                    ctx,
+                    it,
+                    false,
+                    axes,
+                    &rt,
+                    Some(&col_tracks),
+                    col_gap,
+                    space,
+                );
+                it.min_contrib = mc;
+                it.min_content_contrib = min_c;
+                it.max_content_contrib = max_c;
+            }
+            apply_baseline_shims_to_items(
+                ctx,
+                &mut placed.items,
+                false,
+                axes,
+                align_items,
+                Some(&col_tracks),
+                col_gap,
+                space,
+            );
+            let row_sizing_items = collect_subgrid_sizing_items(
+                ctx,
+                &placed.items,
+                false,
+                axes,
+                &rt,
+                Some(&col_tracks),
+                col_gap,
+                &exp_rows,
+                placed.row_min_idx,
+                space,
+                0,
+            );
+            let row_sizing_constraint = if def_row.is_some() {
+                SizingConstraint::Definite(0)
+            } else {
+                SizingConstraint::Indefinite
+            };
+            resolve_tracks(
+                &mut rt,
+                &row_sizing_items,
+                false,
+                def_row,
+                min_row,
+                max_row,
+                row_gap,
+                align_content,
+                row_sizing_constraint,
+            );
+
+            let used_rows_sum: f32 = rt.iter().map(|t| t.base_size).sum::<f32>()
+                + active_gaps_in_range(&rt, 0, rt.len(), row_gap);
+            let frs = if let Some(dr) = def_row {
+                dr
+            } else {
+                let mut sz = used_rows_sum;
+                if let Some(mx) = max_row {
+                    sz = sz.min(mx);
+                }
+                if let Some(mn) = min_row {
+                    sz = sz.max(mn);
+                }
+                sz.max(0.0)
+            };
+
+            let has_pct_rows = rt.iter().any(|t| track_has_percentage(&t.raw))
+                || fg.is_some_and(|f| f.row_gap.has_percentage());
+            if def_row.is_none() && has_pct_rows && frs > 0.0 {
+                row_gap = fg.map_or(0.0, |f| resolve_gap(&f.row_gap, Some(frs)));
+                for t in &mut rt {
+                    t.refresh_fns(Some(frs), &eval);
+                }
+                resolve_tracks(
+                    &mut rt,
+                    &row_sizing_items,
+                    false,
+                    Some(frs),
+                    min_row,
+                    max_row,
+                    row_gap,
+                    align_content,
+                    SizingConstraint::Definite(0),
+                );
+            }
+            (rt, None, None, frs)
+        };
+
+    // 4. Content Alignment (§10.2–§10.3; ignored on subgridded axes per CSS Grid L2 §2.6)
+    let col_starts = if let Some(st) = sub_col_starts {
+        st
+    } else {
+        compute_track_positions(
+            &col_tracks,
+            col_gap,
+            final_col_size,
+            justify_content,
+            axes.col_is_x,
+            axes.col_reversed,
+        )
+        .0
+    };
+    let row_starts = if let Some(st) = sub_row_starts {
+        st
+    } else {
+        compute_track_positions(
+            &row_tracks,
+            row_gap,
+            final_row_size,
+            align_content,
+            !axes.col_is_x,
+            axes.row_reversed,
+        )
+        .0
+    };
+    let _ = (&mut col_tracks, &mut row_tracks);
 
     let (content_w, content_h) = axes.to_physical(final_col_size, final_row_size);
     let border_w = content_w + pb_w;
@@ -1215,20 +1637,32 @@ pub fn layout_grid_container(
             item_style.text.writing_mode,
             item_style.text.direction,
         );
-        let (j_align, j_safe) = resolve_self_align(
+        let (mut j_align, j_safe) = resolve_self_align(
             js_eff,
             axes.col_is_x,
             axes.col_reversed,
             item_col_rev,
             is_replaced,
         );
-        let (a_align, a_safe) = resolve_self_align(
+        let (mut a_align, a_safe) = resolve_self_align(
             as_eff,
             !axes.col_is_x,
             axes.row_reversed,
             item_row_rev,
             is_replaced,
         );
+
+        // CSS Grid L2 §2.6: Subgrids always stretch across their spanned parent tracks on
+        // subgridded axes regardless of specified `justify-self`/`align-self`.
+        let parallel_wm = item_style.text.writing_mode.is_vertical() == !axes.col_is_x;
+        let item_sub_col = parallel_wm && is_subgrid_on_axis(&item_style, true);
+        let item_sub_row = parallel_wm && is_subgrid_on_axis(&item_style, false);
+        if item_sub_col {
+            j_align = ResolvedSelfAlign::Stretch;
+        }
+        if item_sub_row {
+            a_align = ResolvedSelfAlign::Stretch;
+        }
 
         let mut area_space = space.with_available(area_w, Some(area_h));
         if !axes.col_is_x {
@@ -1322,7 +1756,85 @@ pub fn layout_grid_container(
         let _ = i_bb;
 
         let item_oof_start = ctx.pending_oof.len();
-        let mut frag = layout_box(ctx, it.box_id, child_space);
+        let mut frag = if item_sub_col || item_sub_row {
+            let child_sub_col = if item_sub_col {
+                let (s_bp, e_bp, s_m, e_m) =
+                    logical_axis_bp_and_margin(&im, &item_style, axes, true);
+                let border_span = (area_col_sz - s_m - e_m).max(0.0);
+                let track_sizes: Vec<f32> = col_tracks[it.col_start..it.col_end]
+                    .iter()
+                    .map(|t| t.base_size)
+                    .collect();
+                let track_starts: Vec<f32> = col_starts[it.col_start..it.col_end]
+                    .iter()
+                    .map(|&st| st - c_start - s_m)
+                    .collect();
+                let eff_parent_gap = if track_starts.len() >= 2 {
+                    (track_starts[1] - (track_starts[0] + track_sizes[0])).max(0.0)
+                } else {
+                    col_gap
+                };
+                Some(SubgridAxisContext {
+                    track_sizes,
+                    track_starts,
+                    parent_gap: eff_parent_gap,
+                    parent_line_names: slice_parent_line_names(
+                        &exp_cols,
+                        placed.col_min_idx,
+                        it.col_start,
+                        it.col_end,
+                    ),
+                    start_bp: s_bp,
+                    end_bp: e_bp,
+                    border_span,
+                })
+            } else {
+                None
+            };
+            let child_sub_row = if item_sub_row {
+                let (s_bp, e_bp, s_m, e_m) =
+                    logical_axis_bp_and_margin(&im, &item_style, axes, false);
+                let border_span = (area_row_sz - s_m - e_m).max(0.0);
+                let track_sizes: Vec<f32> = row_tracks[it.row_start..it.row_end]
+                    .iter()
+                    .map(|t| t.base_size)
+                    .collect();
+                let track_starts: Vec<f32> = row_starts[it.row_start..it.row_end]
+                    .iter()
+                    .map(|&st| st - r_start - s_m)
+                    .collect();
+                let eff_parent_gap = if track_starts.len() >= 2 {
+                    (track_starts[1] - (track_starts[0] + track_sizes[0])).max(0.0)
+                } else {
+                    row_gap
+                };
+                Some(SubgridAxisContext {
+                    track_sizes,
+                    track_starts,
+                    parent_gap: eff_parent_gap,
+                    parent_line_names: slice_parent_line_names(
+                        &exp_rows,
+                        placed.row_min_idx,
+                        it.row_start,
+                        it.row_end,
+                    ),
+                    start_bp: s_bp,
+                    end_bp: e_bp,
+                    border_span,
+                })
+            } else {
+                None
+            };
+            layout_grid_container_with_subgrid(
+                ctx,
+                it.box_id,
+                child_space,
+                child_sub_col,
+                child_sub_row,
+            )
+        } else {
+            layout_box(ctx, it.box_id, child_space)
+        };
 
         // Enforce stretched border-box dimensions for non-replaced items (in case child returned smaller).
         if stretch_x {
@@ -1794,10 +2306,12 @@ pub fn layout_grid_container(
         &mut children_frags,
     );
 
-    // 8. Format §7.2.6 resolved track listings for `getComputedStyle()`.
+    // 8. Format §7.2.6 / L2 §2.7 resolved track listings for `getComputedStyle()`.
+    let col_tracks_for_cssom = sub_col_cssom_tracks.as_deref().unwrap_or(&col_tracks);
+    let row_tracks_for_cssom = sub_row_cssom_tracks.as_deref().unwrap_or(&row_tracks);
     let resolved_tracks = Arc::new(ResolvedGridTracks {
-        columns: format_resolved_tracks(&col_tracks, &exp_cols, placed.col_min_idx),
-        rows: format_resolved_tracks(&row_tracks, &exp_rows, placed.row_min_idx),
+        columns: format_resolved_tracks(col_tracks_for_cssom, &exp_cols, placed.col_min_idx),
+        rows: format_resolved_tracks(row_tracks_for_cssom, &exp_rows, placed.row_min_idx),
     });
 
     let _ = is_bb;

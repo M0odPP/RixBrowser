@@ -195,3 +195,104 @@ fn grid_template_areas_uses_auto_tracks_and_abspos_non_cb_ignores_grid_lines() {
     );
     assert_eq!(res, "15|15|15|40");
 }
+
+#[test]
+fn subgrid_inherits_parent_tracks_content_distribution_and_mbp() {
+    let html = r#"<!doctype html>
+    <style>
+      body { margin: 0; font-size: 0; }
+      #g {
+        position: relative;
+        display: grid;
+        width: 400px;
+        grid-template-columns: 100px 100px 100px;
+        grid-auto-rows: 20px;
+        gap: 10px;
+        justify-content: space-between;
+      }
+      #sg {
+        display: grid;
+        grid-template-columns: subgrid;
+        grid-column: 1 / -1;
+      }
+      #g2 {
+        display: inline-grid;
+        grid-template-columns: 100px;
+        grid-auto-rows: 100px;
+      }
+      #sg2 {
+        display: grid;
+        grid-template: subgrid / subgrid;
+        margin: 10px;
+        border: 10px solid black;
+        padding: 10px;
+        align-self: start;
+        justify-self: start;
+      }
+    </style>
+    <div id="g">
+      <div id="sg"><div id="s1"></div><div id="s2"></div><div id="s3"></div></div>
+    </div>
+    <div id="g2">
+      <div id="sg2"><div id="inner"></div></div>
+    </div>"#;
+    let res = run_script(
+        html,
+        r#"
+        const s1 = document.getElementById('s1');
+        const s2 = document.getElementById('s2');
+        const s3 = document.getElementById('s3');
+        const inner = document.getElementById('inner');
+        const sgCs = getComputedStyle(document.getElementById('sg'));
+        [s1.offsetLeft, s2.offsetLeft, s3.offsetLeft, inner.offsetWidth, inner.offsetHeight, sgCs.gridTemplateColumns].join('|')
+        "#,
+    );
+    assert_eq!(res, "0|150|300|40|40|100px 100px 100px");
+}
+
+#[test]
+fn grid_lanes_packs_items_and_supports_direction_reversals() {
+    let html = r#"<!doctype html>
+    <style>
+      body { margin: 0; }
+      #gl {
+        display: grid-lanes;
+        position: relative;
+        fit-tolerance: 0;
+        grid-template-columns: repeat(3, 50px);
+      }
+      #gl2 {
+        display: grid-lanes;
+        position: relative;
+        fit-tolerance: 0;
+        grid-template-columns: repeat(3, 50px);
+        grid-lanes-direction: column fill-reverse;
+      }
+    </style>
+    <div id="gl">
+      <div id="a" style="height: 40px;"></div>
+      <div id="b" style="height: 20px;"></div>
+      <div id="c" style="height: 30px;"></div>
+      <div id="d" style="height: 60px;"></div>
+      <div id="e" style="height: 30px;"></div>
+    </div>
+    <div id="gl2">
+      <div id="a2" style="height: 40px;"></div>
+      <div id="b2" style="height: 20px;"></div>
+      <div id="c2" style="height: 30px;"></div>
+      <div id="d2" style="height: 60px;"></div>
+      <div id="e2" style="height: 30px;"></div>
+    </div>"#;
+    let res = run_script(
+        html,
+        r#"
+        const d = document.getElementById('d');
+        const e = document.getElementById('e');
+        const a2 = document.getElementById('a2');
+        const d2 = document.getElementById('d2');
+        const cs = getComputedStyle(document.getElementById('gl'));
+        [d.offsetLeft, d.offsetTop, e.offsetLeft, e.offsetTop, a2.offsetTop, d2.offsetTop, cs.gridTemplateColumns, cs.gridTemplateRows].join('|')
+        "#,
+    );
+    assert_eq!(res, "50|20|100|30|40|0|50px 50px 50px|none");
+}
