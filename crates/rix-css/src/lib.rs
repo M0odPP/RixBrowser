@@ -4,6 +4,7 @@
 
 pub mod cascade;
 pub mod computed;
+pub mod cssom_decl;
 pub mod properties;
 pub mod rule_index;
 pub mod selector;
@@ -13,14 +14,18 @@ pub mod values;
 
 pub use cascade::{RestyleReport, StyleContext, StyleMemo};
 pub use computed::{
-    apply_declaration, resolve_element_style, resolve_var_tokens, BoxModelStyle, ComputedStyle,
-    CustomPropertyMap, EffectsStyle, FlexGridStyle, InheritedTextStyle, VisualStyle,
+    apply_declaration, resolve_element_style, resolve_element_style_full, resolve_var_tokens,
+    BoxModelStyle, ComputedStyle, CustomPropertyMap, EffectsStyle, FlexGridStyle,
+    InheritedTextStyle, VisualStyle,
+};
+pub use cssom_decl::{
+    parse_and_expand_declaration, parse_and_serialize_declaration, strip_outer_css_comments,
 };
 pub use properties::{
-    compile_declaration_block, is_logical_property, parse_and_serialize_declaration,
-    parse_inline_style, parse_property_from_tokens, resolve_logical_to_physical,
-    serialize_css_tokens, CssToken, GlobalKeyword, MissingCssFeature, MissingCssKind,
-    PropertyIdKind, PropertyValue, SpecifiedDeclaration, COMPUTED_STYLE_LONGHANDS,
+    compile_declaration_block, is_logical_property, parse_inline_style, parse_property_from_tokens,
+    resolve_logical_to_physical, serialize_css_tokens, tokenize_custom_value_str, CssToken,
+    GlobalKeyword, MissingCssFeature, MissingCssKind, PropertyIdKind, PropertyValue,
+    SpecifiedDeclaration, COMPUTED_STYLE_LONGHANDS,
 };
 pub use rule_index::{InvalidationMap, InvalidationScope, RuleBucketEntry, RuleIndex};
 pub use selector::{
@@ -36,7 +41,7 @@ pub use stylesheet::{
     evaluate_supports, evaluate_supports_condition_str, parse_cssom_rules, parse_single_cssom_rule,
     parse_single_cssom_rule_with_namespaces, CascadeOrigin, CompiledRule, CssomRuleKind,
     FontFaceRule, FontFaceSource, KeyframeStep, KeyframesRule, LayerId, MediaContext,
-    MediaTypeKind, Stylesheet,
+    MediaTypeKind, RegisteredProperty, Stylesheet,
 };
 pub use ua::{default_ua_stylesheet, UA_CSS};
 pub use values::{

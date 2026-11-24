@@ -305,7 +305,7 @@ pub fn evaluate_supports(cond: &SupportsCondition<'_>) -> bool {
         SupportsCondition::And(list) => list.iter().all(evaluate_supports),
         SupportsCondition::Or(list) => list.iter().any(evaluate_supports),
         SupportsCondition::Declaration { property_id, value } => {
-            crate::properties::parse_and_serialize_declaration(property_id.name(), value.as_ref())
+            crate::cssom_decl::parse_and_serialize_declaration(property_id.name(), value.as_ref())
                 .is_some()
         }
         SupportsCondition::Selector(sel) => {
@@ -392,8 +392,19 @@ pub struct CompiledRule {
     pub declarations: Arc<[SpecifiedDeclaration]>,
 }
 
+/// Compiled `@property` / `CSS.registerProperty` custom property registration
+/// (CSS Properties and Values API Level 1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegisteredProperty {
+    pub name: InternedStr,
+    pub syntax: String,
+    pub inherits: bool,
+    pub initial_value: Option<Vec<crate::properties::CssToken>>,
+    pub layer_id: LayerId,
+}
+
 /// Compiled CSS stylesheet with flattened nesting, evaluated conditions,
-/// registered `@layer` ordering, `@font-face`, `@keyframes`, and deduplicated telemetry.
+/// registered `@layer` ordering, `@font-face`, `@keyframes`, `@property`, and telemetry.
 #[derive(Debug, Clone)]
 pub struct Stylesheet {
     pub origin: CascadeOrigin,
@@ -401,6 +412,7 @@ pub struct Stylesheet {
     pub layers: Vec<InternedStr>,
     pub font_faces: Vec<FontFaceRule>,
     pub keyframes: Vec<KeyframesRule>,
+    pub registered_properties: Vec<RegisteredProperty>,
     pub imports: Vec<String>,
     pub missing_features: Vec<MissingCssFeature>,
 }
@@ -429,13 +441,14 @@ impl Stylesheet {
     /// Parses and compiles a CSS stylesheet against the given origin and media environment.
     #[must_use]
     pub fn parse(css: &str, origin: CascadeOrigin, media: &MediaContext) -> Self {
+        let rewritten = crate::properties::rewrite_dynamic_var_names(css);
         let opts = ParserOptions {
             error_recovery: true,
             ..ParserOptions::default()
         };
         let mut compiler = StylesheetCompiler::new(origin, *media);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Ok(sheet) = StyleSheet::parse(css, opts) {
+            if let Ok(sheet) = StyleSheet::parse(&rewritten, opts) {
                 compiler.compile_rule_list(&sheet.rules, None, LayerId::UNLAYERED, None);
             }
         }));
@@ -507,6 +520,7 @@ struct StylesheetCompiler {
     anon_layer_counter: u32,
     font_faces: Vec<FontFaceRule>,
     keyframes: Vec<KeyframesRule>,
+    registered_properties: Vec<RegisteredProperty>,
     imports: Vec<String>,
     missing_seen: HashSet<MissingCssFeature>,
     missing_features: Vec<MissingCssFeature>,
@@ -526,6 +540,7 @@ impl StylesheetCompiler {
             anon_layer_counter: 0,
             font_faces: Vec::new(),
             keyframes: Vec::new(),
+            registered_properties: Vec::new(),
             imports: Vec::new(),
             missing_seen: HashSet::new(),
             missing_features: Vec::new(),
@@ -632,6 +647,7 @@ impl StylesheetCompiler {
                 }
                 CssRule::FontFace(ff) => self.compile_font_face(ff),
                 CssRule::Keyframes(kf) => self.compile_keyframes(kf),
+                CssRule::Property(pr) => self.compile_property_rule(pr, current_layer),
                 CssRule::Import(imp) => {
                     if self.media.matches_media_list(&imp.media) {
                         let url = imp.url.as_ref().trim();
@@ -857,6 +873,26 @@ impl StylesheetCompiler {
         self.keyframes.push(KeyframesRule { name, steps });
     }
 
+    fn compile_property_rule(
+        &mut self,
+        pr: &lightningcss::rules::property::PropertyRule<'_>,
+        layer_id: LayerId,
+    ) {
+        let name = intern_str(pr.name.as_ref());
+        let syntax = lightning_to_css_string(&pr.syntax);
+        let initial_value = pr.initial_value.as_ref().map(|iv| {
+            let s = lightning_to_css_string(iv);
+            crate::properties::tokenize_custom_value_str(&s)
+        });
+        self.registered_properties.push(RegisteredProperty {
+            name,
+            syntax,
+            inherits: pr.inherits,
+            initial_value,
+            layer_id,
+        });
+    }
+
     fn finish(self) -> Stylesheet {
         Stylesheet {
             origin: self.origin,
@@ -864,6 +900,7 @@ impl StylesheetCompiler {
             layers: self.layers,
             font_faces: self.font_faces,
             keyframes: self.keyframes,
+            registered_properties: self.registered_properties,
             imports: self.imports,
             missing_features: self.missing_features,
         }

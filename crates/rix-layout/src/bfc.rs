@@ -237,6 +237,22 @@ pub fn layout_block_box(
                 (false, false) => (metrics.margin.left, metrics.margin.right),
             };
             (cw, ml, mr)
+        } else if matches!(
+            style.box_model.width,
+            rix_css::SizeValue::MinContent | rix_css::SizeValue::MaxContent
+        ) {
+            let (min_b, max_b) = measure_intrinsic_widths(ctx, box_id, space);
+            let target_b = if matches!(style.box_model.width, rix_css::SizeValue::MinContent) {
+                min_b
+            } else {
+                max_b
+            };
+            let target_c = (target_b - pb_w).max(0.0);
+            (
+                metrics.clamp_content_width(target_c),
+                metrics.margin.left,
+                metrics.margin.right,
+            )
         } else if shrink_to_fit {
             let (min_b, max_b) = measure_intrinsic_widths(ctx, box_id, space);
             let min_c = (min_b - pb_w).max(0.0);

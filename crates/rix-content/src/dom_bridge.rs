@@ -13,8 +13,9 @@ use std::sync::Arc;
 use rix_core::{Point, Rect, Size};
 use rix_css::{
     matches_element_with_scope, parse_selector_list_strict, query_selector_all_in_subtree,
-    query_selector_in_subtree, CascadeOrigin, ComputedStyle, MediaContext, RixPseudoElement,
-    StyleContext, Stylesheet,
+    query_selector_in_subtree, tokenize_custom_value_str, CascadeOrigin, ComputedStyle,
+    DisplayMode, LayerId, MediaContext, RegisteredProperty, RixPseudoElement, StyleContext,
+    Stylesheet,
 };
 use rix_dom::{
     is_valid_custom_element_name, is_valid_shadow_host_name, Document, NodeData, NodeId,
@@ -24,7 +25,7 @@ use rix_js::promise::{alloc_promise, resolve_promise};
 use rix_js::{
     GcHeap, HeapHandle, JsException, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs, WeakTable,
 };
-use rix_layout::{Fragment, FragmentTree, LayoutEngine};
+use rix_layout::{EdgeInsets, Fragment, FragmentTree, LayoutEngine};
 use rix_text::FontDatabase;
 
 /// Structural/attribute/text mutation emitted by DOM operations (consumed by `MutationObserver`).
@@ -470,6 +471,15 @@ impl HostState {
             ..MediaContext::default()
         };
         let mut ctx = StyleContext::new(media);
+        for (name, (syntax, inherits, init)) in &self.registered_properties {
+            ctx.register_property(RegisteredProperty {
+                name: rix_core::intern_str(name),
+                syntax: syntax.clone(),
+                inherits: *inherits,
+                initial_value: init.as_deref().map(tokenize_custom_value_str),
+                layer_id: LayerId::UNLAYERED,
+            });
+        }
         for ext in &self.external_stylesheets {
             ctx.add_stylesheet(Arc::clone(ext));
         }
@@ -524,6 +534,35 @@ impl HostState {
         let tree = self.ensure_layout()?;
         let root = tree.root.as_ref()?;
         find_fragment_rects(root, Point::ZERO, node)
+    }
+
+    /// Returns layout-resolved box metrics (`content_size`, `border_size`, `margin`, `padding`)
+    /// for CSSOM View §7.1 `getComputedStyle` resolved values (`width`, `height`, `margin-*`, `padding-*`).
+    pub fn resolved_layout_box_for_node(&mut self, node: NodeId) -> Option<ResolvedLayoutBox> {
+        let tree = self.ensure_layout()?;
+        let root = tree.root.as_ref()?;
+        find_fragment_metrics(root, node)
+    }
+
+    /// Returns `true` if `node`'s parent element has `display: flex | inline-flex | grid | inline-grid`.
+    pub fn parent_is_flex_or_grid(&mut self, node: NodeId) -> bool {
+        let parent_id = {
+            let doc = self.document.borrow();
+            doc.parent(node)
+        };
+        let Some(pid) = parent_id else {
+            return false;
+        };
+        let ctx = self.ensure_styles();
+        ctx.style_for(pid).is_some_and(|ps| {
+            matches!(
+                ps.display,
+                DisplayMode::Flex
+                    | DisplayMode::InlineFlex
+                    | DisplayMode::Grid
+                    | DisplayMode::InlineGrid
+            )
+        })
     }
 
     /// Returns the cached `ComputedStyle` for `node`, running dirty-checked cascade if needed.
@@ -617,6 +656,32 @@ impl HostState {
             ))
         })
     }
+}
+
+/// Layout-resolved box geometry for CSSOM View §7.1 `getComputedStyle` resolved values.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedLayoutBox {
+    pub content_size: Size,
+    pub border_size: Size,
+    pub padding: EdgeInsets,
+    pub margin: EdgeInsets,
+}
+
+fn find_fragment_metrics(frag: &Fragment, target: NodeId) -> Option<ResolvedLayoutBox> {
+    if frag.dom_node == Some(target) {
+        return Some(ResolvedLayoutBox {
+            content_size: frag.content_rect.size,
+            border_size: frag.border_rect.size,
+            padding: frag.padding,
+            margin: frag.margin,
+        });
+    }
+    for child in frag.children.iter() {
+        if let Some(found) = find_fragment_metrics(child, target) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn find_fragment_rects(

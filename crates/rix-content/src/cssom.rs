@@ -7,16 +7,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use rix_css::{
-    evaluate_supports_condition_str, parse_and_serialize_declaration, parse_cssom_rules,
-    parse_pseudo_element_str, parse_selector_list_with_namespaces,
-    parse_single_cssom_rule_with_namespaces, serialize_css_tokens, serialize_selector_list,
-    AlignValue, BorderCollapseMode, BoxSizingMode, ClearMode, ColorRgba, ComputedStyle, CssAtom,
-    CssColor, CssomRuleKind, CursorKind, DirectionMode, DisplayMode, FlexDirectionMode,
-    FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode, LengthPercentage,
-    LengthPercentageAuto, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
-    PointerEventsMode, PositionMode, PropertyIdKind, SelectorNamespaceMap, SizeValue,
-    TableLayoutMode, TextAlignMode, TextOverflowMode, TextTransformMode, UserSelectMode,
-    VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, ZIndexValue,
+    evaluate_supports_condition_str, is_logical_property, parse_and_expand_declaration,
+    parse_and_serialize_declaration, parse_cssom_rules, parse_pseudo_element_str,
+    parse_selector_list_with_namespaces, parse_single_cssom_rule_with_namespaces,
+    resolve_logical_to_physical, serialize_css_tokens, serialize_selector_list,
+    strip_outer_css_comments, AlignValue, BorderCollapseMode, BoxSizingMode, CalcExpr, ClearMode,
+    ColorRgba, ComputedStyle, CssAtom, CssColor, CssomRuleKind, CursorKind, DirectionMode,
+    DisplayMode, EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
+    GridAutoFlowMode, LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle,
+    MixBlendMode, OverflowMode, PointerEventsMode, PositionMode, PropertyIdKind, RixPseudoElement,
+    SelectorNamespaceMap, SizeValue, TableLayoutMode, TextAlignMode, TextOverflowMode,
+    TextTransformMode, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
+    WordBreakMode, ZIndexValue, COMPUTED_STYLE_LONGHANDS,
 };
 use rix_dom::{NodeData, NodeId};
 use rix_js::promise::{alloc_promise, resolve_promise};
@@ -24,7 +26,7 @@ use rix_js::{HeapHandle, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs};
 
 use crate::dom_bridge::{
     arg, define_global, define_host_accessor, define_host_method, get_attr_string, require_node,
-    set_element_attr, wrap_node, SharedHost,
+    set_element_attr, wrap_node, ResolvedLayoutBox, SharedHost,
 };
 use crate::web_apis::create_dom_exception;
 
@@ -757,17 +759,26 @@ fn wrap_css_rule(
     });
     define_host_accessor(vm, obj, "selectorText", Some(g_sel), Some(s_sel));
 
-    // `style` (`CSSStyleDeclaration` backed by this rule's declarations)
+    // `style` (`CSSStyleDeclaration` with `[PutForwards=cssText]` per CSSOM §6.4.3)
     if is_style {
         let style_decl = create_rule_style_proxy(vm, host, Rc::clone(&state), rule_path.clone());
-        let k_style = vm.heap.intern_key("style");
-        vm.heap.object_define_data(
-            obj,
-            k_style,
-            style_decl,
-            PropertyAttrs::DEFAULT,
-            &mut vm.shapes,
-        );
+        let g_style = vm.alloc_host_fn("get style", move |_, _, _| Ok(style_decl));
+        let st_rs = Rc::clone(&state);
+        let h_rs = Rc::clone(host);
+        let p_rs = rule_path.clone();
+        let s_style = vm.alloc_host_fn("set style", move |vm, _, args| {
+            let val = vm.value_to_rust_string(arg(args, 0));
+            let validated = canonicalize_css_decls(&val);
+            if let Some(CssomRuleKind::Style {
+                declarations_text, ..
+            }) = st_rs.borrow_mut().rule_at_mut(&p_rs)
+            {
+                *declarations_text = serialize_style_decls_with_priority(&validated);
+            }
+            sync_sheet_to_dom(&h_rs, &st_rs);
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, obj, "style", Some(g_style), Some(s_style));
     }
 
     // `CSSGroupingRule` (`@media`, `@supports`, `@layer`, `@scope`): live `cssRules`, `insertRule`, `deleteRule`
@@ -857,12 +868,47 @@ fn create_rule_style_proxy(
             }) => declarations_text.clone(),
             _ => String::new(),
         };
-        let val = parse_style_decls_with_priority(&raw)
-            .into_iter()
-            .find(|(k, _, _)| k == &prop)
-            .map(|(_, v, _)| v)
-            .unwrap_or_default();
+        let decls = parse_style_decls_with_priority(&raw);
+        let val = lookup_decl_or_shorthand(&decls, &prop);
         Ok(JsValue::from_string(vm.heap.alloc_string(val)))
+    });
+    let st_prio = Rc::clone(&state);
+    let p_prio = rule_path.clone();
+    define_host_method(vm, target, "getPropertyPriority", move |vm, _, args| {
+        let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
+        let raw = match st_prio.borrow().rule_at(&p_prio) {
+            Some(CssomRuleKind::Style {
+                declarations_text, ..
+            }) => declarations_text.clone(),
+            _ => String::new(),
+        };
+        let decls = parse_style_decls_with_priority(&raw);
+        let imp = decls
+            .iter()
+            .find(|(k, _, _)| k == &prop)
+            .is_some_and(|(_, _, i)| *i);
+        let s = if imp { "important" } else { "" };
+        Ok(JsValue::from_string(vm.heap.alloc_string(s)))
+    });
+    let st_item = Rc::clone(&state);
+    let p_item = rule_path.clone();
+    define_host_method(vm, target, "item", move |vm, _, args| {
+        let idx = vm.to_number(arg(args, 0)).unwrap_or(-1.0);
+        if idx < 0.0 || !idx.is_finite() {
+            return Ok(JsValue::from_string(vm.heap.alloc_string("")));
+        }
+        let raw = match st_item.borrow().rule_at(&p_item) {
+            Some(CssomRuleKind::Style {
+                declarations_text, ..
+            }) => declarations_text.clone(),
+            _ => String::new(),
+        };
+        let decls = parse_style_decls_with_priority(&raw);
+        let name = decls
+            .get(idx as usize)
+            .map(|(k, _, _)| k.as_str())
+            .unwrap_or("");
+        Ok(JsValue::from_string(vm.heap.alloc_string(name)))
     });
     let st2 = Rc::clone(&state);
     let h2 = Rc::clone(host);
@@ -895,16 +941,7 @@ fn create_rule_style_proxy(
             _ => return Ok(JsValue::UNDEFINED),
         };
         let mut decls = parse_style_decls_with_priority(&cur);
-        if raw_val.is_empty() {
-            decls.retain(|(k, _, _)| k != &prop);
-        } else if let Some(canon) = parse_and_serialize_declaration(&prop, &raw_val) {
-            if let Some(existing) = decls.iter_mut().find(|(k, _, _)| k == &prop) {
-                existing.1 = canon;
-                existing.2 = important;
-            } else {
-                decls.push((prop, canon, important));
-            }
-        } else {
+        if !set_decl_expanded(&mut decls, &prop, &raw_val, important, false) {
             return Ok(JsValue::UNDEFINED);
         }
         if let Some(CssomRuleKind::Style {
@@ -928,12 +965,7 @@ fn create_rule_style_proxy(
             _ => String::new(),
         };
         let mut decls = parse_style_decls_with_priority(&cur);
-        let old = decls
-            .iter()
-            .find(|(k, _, _)| k == &prop)
-            .map(|(_, v, _)| v.clone())
-            .unwrap_or_default();
-        decls.retain(|(k, _, _)| k != &prop);
+        let old = remove_decl_or_shorthand(&mut decls, &prop);
         if let Some(CssomRuleKind::Style {
             declarations_text, ..
         }) = st3.borrow_mut().rule_at_mut(&p3)
@@ -961,19 +993,21 @@ fn create_rule_style_proxy(
             }) => declarations_text.clone(),
             _ => String::new(),
         };
-        if prop == "cssText" {
-            return Ok(JsValue::from_string(vm.heap.alloc_string(raw)));
-        }
         let decls = parse_style_decls_with_priority(&raw);
+        if prop == "cssText" {
+            let txt = serialize_style_decls_with_priority(&decls);
+            return Ok(JsValue::from_string(vm.heap.alloc_string(txt)));
+        }
         if prop == "length" {
             return Ok(JsValue::from_i32(decls.len() as i32));
         }
+        if let Ok(idx) = prop.parse::<usize>() {
+            return Ok(decls.get(idx).map_or(JsValue::UNDEFINED, |(name, _, _)| {
+                JsValue::from_string(vm.heap.alloc_string(name))
+            }));
+        }
         let css_key = camel_to_kebab(&prop);
-        let val = decls
-            .into_iter()
-            .find(|(k, _, _)| k == &css_key)
-            .map(|(_, v, _)| v)
-            .unwrap_or_default();
+        let val = lookup_decl_or_shorthand(&decls, &css_key);
         Ok(JsValue::from_string(vm.heap.alloc_string(val)))
     });
     let st_set = Rc::clone(&state);
@@ -983,11 +1017,12 @@ fn create_rule_style_proxy(
         let prop = vm.value_to_rust_string(arg(args, 1));
         let raw_val = vm.value_to_rust_string(arg(args, 2));
         if prop == "cssText" {
+            let validated = canonicalize_css_decls(&raw_val);
             if let Some(CssomRuleKind::Style {
                 declarations_text, ..
             }) = st_set.borrow_mut().rule_at_mut(&p_set)
             {
-                *declarations_text = raw_val;
+                *declarations_text = serialize_style_decls_with_priority(&validated);
             }
             sync_sheet_to_dom(&h_set, &st_set);
             return Ok(JsValue::TRUE);
@@ -1000,16 +1035,7 @@ fn create_rule_style_proxy(
             _ => return Ok(JsValue::TRUE),
         };
         let mut decls = parse_style_decls_with_priority(&cur);
-        if raw_val.is_empty() {
-            decls.retain(|(k, _, _)| k != &css_key);
-        } else if let Some(canon) = parse_and_serialize_declaration(&css_key, &raw_val) {
-            if let Some(existing) = decls.iter_mut().find(|(k, _, _)| k == &css_key) {
-                existing.1 = canon;
-                existing.2 = false;
-            } else {
-                decls.push((css_key, canon, false));
-            }
-        } else {
+        if !set_decl_expanded(&mut decls, &css_key, &raw_val, false, false) {
             return Ok(JsValue::TRUE);
         }
         if let Some(CssomRuleKind::Style {
@@ -1178,11 +1204,7 @@ fn install_get_computed_style(vm: &mut JsVm, host: &SharedHost) {
         } else {
             None
         };
-        let style = h
-            .borrow_mut()
-            .computed_style_for_node_pseudo(nid, pseudo)
-            .unwrap_or_else(|| Arc::new(ComputedStyle::default()));
-        Ok(create_computed_style_proxy(vm, style))
+        Ok(create_computed_style_proxy(vm, Rc::clone(&h), nid, pseudo))
     });
     define_global(vm, "getComputedStyle", JsValue::from_object(gcs));
 }
@@ -1207,33 +1229,113 @@ fn camel_to_kebab(input: &str) -> String {
 }
 
 fn normalize_css_prop_name(input: &str) -> String {
-    let trimmed = input.trim();
-    if trimmed.starts_with("--") {
-        trimmed.to_string()
+    if input.starts_with("--") {
+        // CSSOM §6.7.2: custom property names are case-sensitive and must NOT be trimmed
+        // (so `setProperty("--foo ", "bar")` is rejected as invalid).
+        input.to_string()
     } else {
-        trimmed.to_ascii_lowercase()
+        input.trim().to_ascii_lowercase()
     }
 }
 
-fn parse_style_decls_with_priority(raw: &str) -> Vec<(String, String, bool)> {
+fn parse_raw_style_decls(raw: &str) -> Vec<(String, String, bool)> {
     let mut out: Vec<(String, String, bool)> = Vec::new();
     for part in split_css_declarations(raw) {
         if let Some((k, v)) = part.split_once(':') {
-            let key = normalize_css_prop_name(k);
-            let mut val = v.trim().to_string();
+            let k_clean = strip_outer_css_comments(k).trim();
+            let key = if k_clean.starts_with("--") {
+                k_clean.to_string()
+            } else {
+                k_clean.to_ascii_lowercase()
+            };
+            if key.is_empty() {
+                continue;
+            }
+            let is_custom = key.starts_with("--");
+            let v_clean = strip_outer_css_comments(v);
+            let mut val = if is_custom {
+                if v_clean.is_empty() || v_clean.bytes().all(|b| b.is_ascii_whitespace()) {
+                    " ".to_string()
+                } else {
+                    v_clean
+                        .trim_matches(|c: char| c.is_ascii_whitespace())
+                        .to_string()
+                }
+            } else {
+                v_clean.trim().to_string()
+            };
             let mut important = false;
             if let Some(stripped) = strip_important(&val) {
-                val = stripped;
+                val = if is_custom
+                    && (stripped.is_empty() || stripped.bytes().all(|b| b.is_ascii_whitespace()))
+                {
+                    " ".to_string()
+                } else {
+                    stripped.trim().to_string()
+                };
                 important = true;
             }
-            if !key.is_empty() && (!val.is_empty() || key.starts_with("--")) {
-                if let Some(existing) = out.iter_mut().find(|(ek, _, _)| ek == &key) {
-                    existing.1 = val;
-                    existing.2 = important;
-                } else {
-                    out.push((key, val, important));
-                }
+            if !val.is_empty() || is_custom {
+                out.push((key, val, important));
             }
+        }
+    }
+    out
+}
+
+fn canonicalize_css_decls(raw: &str) -> Vec<(String, String, bool)> {
+    let mut validated: Vec<(String, String, bool)> = Vec::new();
+    for (k, v, imp) in parse_raw_style_decls(raw) {
+        let _ = set_decl_expanded(&mut validated, &k, &v, imp, true);
+    }
+    validated
+}
+
+fn parse_style_decls_with_priority(raw: &str) -> Vec<(String, String, bool)> {
+    // Fast path for already-serialized inline style strings containing pending empty longhands (`margin-right: ;`),
+    // while still validating raw HTML `style="..."` attributes cleanly.
+    let mut out: Vec<(String, String, bool)> = Vec::new();
+    for part in split_css_declarations(raw) {
+        if let Some((k, v)) = part.split_once(':') {
+            let k_clean = strip_outer_css_comments(k).trim();
+            let key = if k_clean.starts_with("--") {
+                k_clean.to_string()
+            } else {
+                k_clean.to_ascii_lowercase()
+            };
+            if key.is_empty() {
+                continue;
+            }
+            let is_custom = key.starts_with("--");
+            let v_clean = strip_outer_css_comments(v);
+            let mut important = false;
+            let mut val = if is_custom {
+                if v_clean.is_empty() || v_clean.bytes().all(|b| b.is_ascii_whitespace()) {
+                    " ".to_string()
+                } else {
+                    v_clean
+                        .trim_matches(|c: char| c.is_ascii_whitespace())
+                        .to_string()
+                }
+            } else {
+                v_clean.trim().to_string()
+            };
+            if let Some(stripped) = strip_important(&val) {
+                val = if is_custom
+                    && (stripped.is_empty() || stripped.bytes().all(|b| b.is_ascii_whitespace()))
+                {
+                    " ".to_string()
+                } else {
+                    stripped.trim().to_string()
+                };
+                important = true;
+            }
+            if !is_custom && val.is_empty() {
+                // Pending-substitution placeholder longhand (`margin-right: ;`)
+                upsert_decl(&mut out, key, String::new(), important, true);
+                continue;
+            }
+            let _ = set_decl_expanded(&mut out, &key, &val, important, true);
         }
     }
     out
@@ -1298,25 +1400,287 @@ fn serialize_style_decls_with_priority(decls: &[(String, String, bool)]) -> Stri
     decls
         .iter()
         .map(|(k, v, imp)| {
-            if *imp {
-                format!("{k}: {v} !important;")
+            let sep = if k.starts_with("--") && v.starts_with(' ') {
+                ":"
             } else {
-                format!("{k}: {v};")
+                ": "
+            };
+            if *imp {
+                if v.is_empty() {
+                    format!("{k}{sep}!important;")
+                } else {
+                    format!("{k}{sep}{v} !important;")
+                }
+            } else {
+                format!("{k}{sep}{v};")
             }
         })
         .collect::<Vec<_>>()
         .join(" ")
 }
 
+fn upsert_decl(
+    decls: &mut Vec<(String, String, bool)>,
+    k: String,
+    v: String,
+    important: bool,
+    respect_important_cascade: bool,
+) {
+    if let Some(existing) = decls.iter_mut().find(|(ek, _, _)| ek == &k) {
+        if respect_important_cascade && existing.2 && !important {
+            return;
+        }
+        existing.1 = v;
+        existing.2 = important;
+    } else {
+        decls.push((k, v, important));
+    }
+}
+
+fn collapse_2_sides_str(a: &str, b: &str) -> String {
+    if a == b {
+        a.to_string()
+    } else {
+        format!("{a} {b}")
+    }
+}
+
+fn collapse_4_sides_str(t: &str, r: &str, b: &str, l: &str) -> String {
+    if t == r && r == b && b == l {
+        t.to_string()
+    } else if t == b && r == l {
+        format!("{t} {r}")
+    } else if r == l {
+        format!("{t} {r} {b}")
+    } else {
+        format!("{t} {r} {b} {l}")
+    }
+}
+
+fn format_border_triple(w: &str, s: &str, c: &str) -> String {
+    let mut parts = Vec::with_capacity(3);
+    if !w.is_empty() && w != "medium" {
+        parts.push(w);
+    }
+    if !s.is_empty() && s != "none" {
+        parts.push(s);
+    }
+    if !c.is_empty() && c != "currentcolor" {
+        parts.push(c);
+    }
+    if parts.is_empty() {
+        parts.push("none");
+    }
+    parts.join(" ")
+}
+
+fn has_var_ref_ci(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower.contains("var(") || lower.contains("env(")
+}
+
+fn lookup_decl_or_shorthand(decls: &[(String, String, bool)], prop: &str) -> String {
+    if let Some((_, v, _)) = decls.iter().find(|(k, _, _)| k == prop) {
+        return v.clone();
+    }
+    let get = |name: &str| -> Option<(&str, bool)> {
+        decls
+            .iter()
+            .find(|(k, _, _)| k == name)
+            .and_then(|(_, v, imp)| {
+                (!v.is_empty() && !has_var_ref_ci(v)).then_some((v.as_str(), *imp))
+            })
+    };
+    let get_pair = |a: &str, b: &str| -> Option<String> {
+        let (va, ia) = get(a)?;
+        let (vb, ib) = get(b)?;
+        if ia != ib {
+            return None;
+        }
+        Some(collapse_2_sides_str(va, vb))
+    };
+    let get_quad = |t: &str, r: &str, b: &str, l: &str| -> Option<String> {
+        let (vt, it) = get(t)?;
+        let (vr, ir) = get(r)?;
+        let (vb, ib) = get(b)?;
+        let (vl, il) = get(l)?;
+        if it != ir || ir != ib || ib != il {
+            return None;
+        }
+        Some(collapse_4_sides_str(vt, vr, vb, vl))
+    };
+    let get_border_side = |prefix: &str| -> Option<String> {
+        let (w, iw) = get(&format!("{prefix}-width"))?;
+        let (s, is_) = get(&format!("{prefix}-style"))?;
+        let (c, ic) = get(&format!("{prefix}-color"))?;
+        if iw != is_ || is_ != ic {
+            return None;
+        }
+        Some(format_border_triple(w, s, c))
+    };
+    let res = match prop {
+        "margin" => get_quad("margin-top", "margin-right", "margin-bottom", "margin-left"),
+        "margin-block" => get_pair("margin-block-start", "margin-block-end"),
+        "margin-inline" => get_pair("margin-inline-start", "margin-inline-end"),
+        "padding" => get_quad(
+            "padding-top",
+            "padding-right",
+            "padding-bottom",
+            "padding-left",
+        ),
+        "padding-block" => get_pair("padding-block-start", "padding-block-end"),
+        "padding-inline" => get_pair("padding-inline-start", "padding-inline-end"),
+        "inset" => get_quad("top", "right", "bottom", "left"),
+        "inset-block" => get_pair("inset-block-start", "inset-block-end"),
+        "inset-inline" => get_pair("inset-inline-start", "inset-inline-end"),
+        "border-width" => get_quad(
+            "border-top-width",
+            "border-right-width",
+            "border-bottom-width",
+            "border-left-width",
+        ),
+        "border-block-width" => get_pair("border-block-start-width", "border-block-end-width"),
+        "border-inline-width" => get_pair("border-inline-start-width", "border-inline-end-width"),
+        "border-style" => get_quad(
+            "border-top-style",
+            "border-right-style",
+            "border-bottom-style",
+            "border-left-style",
+        ),
+        "border-block-style" => get_pair("border-block-start-style", "border-block-end-style"),
+        "border-inline-style" => get_pair("border-inline-start-style", "border-inline-end-style"),
+        "border-color" => get_quad(
+            "border-top-color",
+            "border-right-color",
+            "border-bottom-color",
+            "border-left-color",
+        ),
+        "border-block-color" => get_pair("border-block-start-color", "border-block-end-color"),
+        "border-inline-color" => get_pair("border-inline-start-color", "border-inline-end-color"),
+        "border-top" => get_border_side("border-top"),
+        "border-right" => get_border_side("border-right"),
+        "border-bottom" => get_border_side("border-bottom"),
+        "border-left" => get_border_side("border-left"),
+        "border-block-start" => get_border_side("border-block-start"),
+        "border-block-end" => get_border_side("border-block-end"),
+        "border-inline-start" => get_border_side("border-inline-start"),
+        "border-inline-end" => get_border_side("border-inline-end"),
+        "border-block" => get_border_side("border-block-start").and_then(|s| {
+            let e = get_border_side("border-block-end")?;
+            (s == e).then_some(s)
+        }),
+        "border-inline" => get_border_side("border-inline-start").and_then(|s| {
+            let e = get_border_side("border-inline-end")?;
+            (s == e).then_some(s)
+        }),
+        "border" => get_border_side("border-top").and_then(|t| {
+            let r = get_border_side("border-right")?;
+            let b = get_border_side("border-bottom")?;
+            let l = get_border_side("border-left")?;
+            (t == r && r == b && b == l).then_some(t)
+        }),
+        "border-radius" => get_quad(
+            "border-top-left-radius",
+            "border-top-right-radius",
+            "border-bottom-right-radius",
+            "border-bottom-left-radius",
+        ),
+        _ => None,
+    };
+    res.unwrap_or_default()
+}
+
+fn remove_decl_or_shorthand(decls: &mut Vec<(String, String, bool)>, prop: &str) -> String {
+    let old = lookup_decl_or_shorthand(decls, prop);
+    if let Some(kind) = PropertyIdKind::from_name(prop) {
+        let longhands = kind.shorthand_longhands();
+        if longhands.len() > 1 {
+            let names: Vec<&str> = longhands.iter().map(|k| k.css_name()).collect();
+            decls.retain(|(k, _, _)| k != prop && !names.contains(&k.as_str()));
+            return old;
+        }
+    }
+    decls.retain(|(k, _, _)| k != prop);
+    old
+}
+
+fn set_decl_expanded(
+    decls: &mut Vec<(String, String, bool)>,
+    prop: &str,
+    raw_val: &str,
+    important: bool,
+    respect_important_cascade: bool,
+) -> bool {
+    if raw_val.is_empty() {
+        remove_decl_or_shorthand(decls, prop);
+        return true;
+    }
+    let Some(pairs) = parse_and_expand_declaration(prop, raw_val) else {
+        return false;
+    };
+    if let Some(kind) = PropertyIdKind::from_name(prop) {
+        let longhands = kind.shorthand_longhands();
+        if longhands.len() > 1 {
+            if pairs.len() > 1 {
+                // Shorthand expanding to concrete longhands: clear any prior shorthand entry
+                // unless it is `!important` and we are cascading a non-important declaration.
+                let blocked = respect_important_cascade
+                    && !important
+                    && decls.iter().any(|(k, _, i)| k == prop && *i);
+                if blocked {
+                    return true;
+                }
+                decls.retain(|(k, _, _)| k != prop);
+            } else {
+                // Shorthand kept unexpanded (`var(...)` or `background: green`): remove constituent
+                // longhands unless protected by `!important` during parsing.
+                let names: Vec<&str> = longhands.iter().map(|k| k.css_name()).collect();
+                decls.retain(|(k, _, i)| {
+                    !names.contains(&k.as_str()) || (respect_important_cascade && !important && *i)
+                });
+            }
+        } else if !prop.starts_with("--") {
+            // Setting a longhand when a parent shorthand currently holds a pending `var()` value
+            // (CSS Variables L1 §3): either blocked by `!important`, or splits the shorthand into
+            // empty pending-substitution entries for its other longhands.
+            let mut split_shorthand: Option<(usize, Vec<String>, bool)> = None;
+            for (idx, (dk, dv, dimp)) in decls.iter().enumerate() {
+                if has_var_ref_ci(dv) {
+                    if let Some(sh_kind) = PropertyIdKind::from_name(dk) {
+                        let sh_lhs = sh_kind.shorthand_longhands();
+                        if sh_lhs.len() > 1 && sh_lhs.contains(&kind) {
+                            if respect_important_cascade && *dimp && !important {
+                                return true;
+                            }
+                            let others = sh_lhs
+                                .into_iter()
+                                .filter(|&lh| lh != kind)
+                                .map(|lh| lh.css_name().to_string())
+                                .collect();
+                            split_shorthand = Some((idx, others, *dimp));
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some((idx, others, sh_imp)) = split_shorthand {
+                decls.remove(idx);
+                for other in others {
+                    upsert_decl(decls, other, String::new(), sh_imp, false);
+                }
+            }
+        }
+    }
+    for (k, v) in pairs {
+        upsert_decl(decls, k, v, important, respect_important_cascade);
+    }
+    true
+}
+
 /// Parses and validates inline `cssText`, updating the element's `style` attribute.
 /// Used by both `el.style.cssText = ...` and `el.style = ...` (`[PutForwards=cssText]`).
 pub(crate) fn set_inline_style_css_text(vm: &mut JsVm, host: &SharedHost, nid: NodeId, val: &str) {
-    let validated: Vec<(String, String, bool)> = parse_style_decls_with_priority(val)
-        .into_iter()
-        .filter_map(|(k, v, imp)| {
-            parse_and_serialize_declaration(&k, &v).map(|canon| (k, canon, imp))
-        })
-        .collect();
+    let validated = canonicalize_css_decls(val);
     set_element_attr(
         vm,
         host,
@@ -1333,21 +1697,29 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
     define_host_method(vm, target, "getPropertyValue", move |vm, _, args| {
         let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
         let raw = get_attr_string(&h, nid, "style").unwrap_or_default();
-        let val = parse_style_decls_with_priority(&raw)
-            .into_iter()
-            .find(|(k, _, _)| k == &prop)
-            .map(|(_, v, _)| v)
-            .unwrap_or_default();
+        let decls = parse_style_decls_with_priority(&raw);
+        let val = lookup_decl_or_shorthand(&decls, &prop);
         Ok(JsValue::from_string(vm.heap.alloc_string(val)))
     });
     let h = Rc::clone(host);
     define_host_method(vm, target, "getPropertyPriority", move |vm, _, args| {
         let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
         let raw = get_attr_string(&h, nid, "style").unwrap_or_default();
-        let imp = parse_style_decls_with_priority(&raw)
-            .into_iter()
-            .find(|(k, _, _)| k == &prop)
-            .is_some_and(|(_, _, i)| i);
+        let decls = parse_style_decls_with_priority(&raw);
+        let imp = if let Some((_, _, i)) = decls.iter().find(|(k, _, _)| k == &prop) {
+            *i
+        } else if let Some(kind) = PropertyIdKind::from_name(&prop) {
+            let lh = kind.shorthand_longhands();
+            lh.len() > 1
+                && lh.iter().all(|l| {
+                    decls
+                        .iter()
+                        .find(|(k, _, _)| k == l.css_name())
+                        .is_some_and(|(_, _, i)| *i)
+                })
+        } else {
+            false
+        };
         let s = if imp { "important" } else { "" };
         Ok(JsValue::from_string(vm.heap.alloc_string(s)))
     });
@@ -1375,16 +1747,7 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
         };
         let raw = get_attr_string(&h, nid, "style").unwrap_or_default();
         let mut decls = parse_style_decls_with_priority(&raw);
-        if raw_val.is_empty() {
-            decls.retain(|(k, _, _)| k != &prop);
-        } else if let Some(canon) = parse_and_serialize_declaration(&prop, &raw_val) {
-            if let Some(existing) = decls.iter_mut().find(|(k, _, _)| k == &prop) {
-                existing.1 = canon;
-                existing.2 = important;
-            } else {
-                decls.push((prop, canon, important));
-            }
-        } else {
+        if !set_decl_expanded(&mut decls, &prop, &raw_val, important, false) {
             // Invalid CSS value: ignore per CSSOM §6.7.2!
             return Ok(JsValue::UNDEFINED);
         }
@@ -1402,12 +1765,7 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
         let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
         let raw = get_attr_string(&h, nid, "style").unwrap_or_default();
         let mut decls = parse_style_decls_with_priority(&raw);
-        let old = decls
-            .iter()
-            .find(|(k, _, _)| k == &prop)
-            .map(|(_, v, _)| v.clone())
-            .unwrap_or_default();
-        decls.retain(|(k, _, _)| k != &prop);
+        let old = remove_decl_or_shorthand(&mut decls, &prop);
         set_element_attr(
             vm,
             &h,
@@ -1461,7 +1819,9 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
         let prop_name = vm.value_to_rust_string(arg(args, 1));
         if prop_name == "cssText" {
             let raw = get_attr_string(&h_get, nid, "style").unwrap_or_default();
-            return Ok(JsValue::from_string(vm.heap.alloc_string(raw)));
+            let decls = parse_style_decls_with_priority(&raw);
+            let canon = serialize_style_decls_with_priority(&decls);
+            return Ok(JsValue::from_string(vm.heap.alloc_string(canon)));
         }
         let k = vm.heap.intern_key(&prop_name);
         if let Some(t_h) = arg(args, 0).as_object() {
@@ -1480,11 +1840,7 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
             }));
         }
         let css_key = camel_to_kebab(&prop_name);
-        let val = decls
-            .into_iter()
-            .find(|(k, _, _)| k == &css_key)
-            .map(|(_, v, _)| v)
-            .unwrap_or_default();
+        let val = lookup_decl_or_shorthand(&decls, &css_key);
         Ok(JsValue::from_string(vm.heap.alloc_string(val)))
     });
     let h_set = Rc::clone(host);
@@ -1503,17 +1859,7 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
         let css_key = camel_to_kebab(&prop_name);
         let raw = get_attr_string(&h_set, nid, "style").unwrap_or_default();
         let mut decls = parse_style_decls_with_priority(&raw);
-        if val.is_empty() {
-            decls.retain(|(k, _, _)| k != &css_key);
-        } else if let Some(canon) = parse_and_serialize_declaration(&css_key, &val) {
-            if let Some(existing) = decls.iter_mut().find(|(k, _, _)| k == &css_key) {
-                existing.1 = canon;
-                existing.2 = false;
-            } else {
-                decls.push((css_key, canon, false));
-            }
-        } else {
-            // Invalid CSS value: ignore per CSSOM!
+        if !set_decl_expanded(&mut decls, &css_key, &val, false, false) {
             return Ok(JsValue::TRUE);
         }
         set_element_attr(
@@ -1537,16 +1883,137 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
     JsValue::from_object(proxy)
 }
 
-pub(crate) fn create_computed_style_proxy(vm: &mut JsVm, style: Arc<ComputedStyle>) -> JsValue {
+fn kebab_to_camel(kebab: &str) -> String {
+    let mut out = String::with_capacity(kebab.len());
+    let mut upper_next = false;
+    for ch in kebab.chars() {
+        if ch == '-' {
+            upper_next = true;
+        } else if upper_next {
+            out.push(ch.to_ascii_uppercase());
+            upper_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn computed_custom_keys(style: &ComputedStyle) -> Vec<String> {
+    let mut keys: Vec<String> = style
+        .custom_properties
+        .entries
+        .keys()
+        .map(|k| k.as_str().to_string())
+        .collect();
+    keys.sort();
+    keys
+}
+
+fn live_style_for(
+    host: &SharedHost,
+    nid: NodeId,
+    pseudo: Option<RixPseudoElement>,
+) -> Arc<ComputedStyle> {
+    host.borrow_mut()
+        .computed_style_for_node_pseudo(nid, pseudo)
+        .unwrap_or_else(|| Arc::new(ComputedStyle::default()))
+}
+
+fn prop_needs_layout_resolution(prop: &str) -> bool {
+    let lower = prop.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "width"
+            | "height"
+            | "inline-size"
+            | "block-size"
+            | "margin"
+            | "margin-top"
+            | "margin-right"
+            | "margin-bottom"
+            | "margin-left"
+            | "margin-block"
+            | "margin-block-start"
+            | "margin-block-end"
+            | "margin-inline"
+            | "margin-inline-start"
+            | "margin-inline-end"
+            | "padding"
+            | "padding-top"
+            | "padding-right"
+            | "padding-bottom"
+            | "padding-left"
+            | "padding-block"
+            | "padding-block-start"
+            | "padding-block-end"
+            | "padding-inline"
+            | "padding-inline-start"
+            | "padding-inline-end"
+    )
+}
+
+fn prop_needs_parent_flex_check(prop: &str) -> bool {
+    let lower = prop.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "min-width" | "min-height" | "min-inline-size" | "min-block-size"
+    )
+}
+
+fn live_computed_property(
+    host: &SharedHost,
+    nid: NodeId,
+    pseudo: Option<RixPseudoElement>,
+    prop: &str,
+) -> String {
+    let style = live_style_for(host, nid, pseudo);
+    let layout_box = if pseudo.is_none() && prop_needs_layout_resolution(prop) {
+        host.borrow_mut().resolved_layout_box_for_node(nid)
+    } else {
+        None
+    };
+    let parent_flex_grid = if pseudo.is_none() && prop_needs_parent_flex_check(prop) {
+        host.borrow_mut().parent_is_flex_or_grid(nid)
+    } else {
+        false
+    };
+    format_computed_property_resolved(&style, prop, layout_box, parent_flex_grid)
+}
+
+pub(crate) fn create_computed_style_proxy(
+    vm: &mut JsVm,
+    host: SharedHost,
+    nid: NodeId,
+    pseudo: Option<RixPseudoElement>,
+) -> JsValue {
     let target = vm.alloc_ordinary_object();
-    let s1 = Arc::clone(&style);
+    let h1 = Rc::clone(&host);
     define_host_method(vm, target, "getPropertyValue", move |vm, _, args| {
         let prop = vm.value_to_rust_string(arg(args, 0));
-        let val = format_computed_property(&s1, &prop);
+        let val = live_computed_property(&h1, nid, pseudo, &prop);
         Ok(JsValue::from_string(vm.heap.alloc_string(val)))
     });
     define_host_method(vm, target, "getPropertyPriority", move |vm, _, _| {
         Ok(JsValue::from_string(vm.heap.alloc_string("")))
+    });
+    let h_item = Rc::clone(&host);
+    define_host_method(vm, target, "item", move |vm, _, args| {
+        let idx = vm.to_number(arg(args, 0)).unwrap_or(-1.0);
+        if idx < 0.0 || !idx.is_finite() {
+            return Ok(JsValue::from_string(vm.heap.alloc_string("")));
+        }
+        let i = idx as usize;
+        if let Some(&name) = COMPUTED_STYLE_LONGHANDS.get(i) {
+            return Ok(JsValue::from_string(vm.heap.alloc_string(name)));
+        }
+        let style = live_style_for(&h_item, nid, pseudo);
+        let custom = computed_custom_keys(&style);
+        let name = custom
+            .get(i - COMPUTED_STYLE_LONGHANDS.len())
+            .map(String::as_str)
+            .unwrap_or("");
+        Ok(JsValue::from_string(vm.heap.alloc_string(name)))
     });
     define_host_method(vm, target, "setProperty", move |vm, _, _| {
         Err(create_dom_exception(
@@ -1564,6 +2031,7 @@ pub(crate) fn create_computed_style_proxy(vm: &mut JsVm, style: Arc<ComputedStyl
     });
 
     let handler = vm.alloc_ordinary_object();
+    let h_has = Rc::clone(&host);
     define_host_method(vm, handler, "has", move |vm, _, args| {
         let prop = vm.value_to_rust_string(arg(args, 1));
         if matches!(
@@ -1579,15 +2047,132 @@ pub(crate) fn create_computed_style_proxy(vm: &mut JsVm, style: Arc<ComputedStyl
         ) {
             return Ok(JsValue::TRUE);
         }
+        if let Ok(idx) = prop.parse::<usize>() {
+            let style = live_style_for(&h_has, nid, pseudo);
+            let total = COMPUTED_STYLE_LONGHANDS.len() + style.custom_properties.entries.len();
+            return Ok(JsValue::from_bool(idx < total));
+        }
         let css_key = camel_to_kebab(&prop);
         Ok(JsValue::from_bool(
             PropertyIdKind::from_name(&css_key).is_some(),
         ))
     });
 
-    let s2 = style;
+    let h_desc = Rc::clone(&host);
+    define_host_method(
+        vm,
+        handler,
+        "getOwnPropertyDescriptor",
+        move |vm, _, args| {
+            let prop = vm.value_to_rust_string(arg(args, 1));
+            let val = if prop == "length" {
+                let style = live_style_for(&h_desc, nid, pseudo);
+                let total = COMPUTED_STYLE_LONGHANDS.len() + style.custom_properties.entries.len();
+                Some(JsValue::from_i32(total as i32))
+            } else if let Ok(idx) = prop.parse::<usize>() {
+                if let Some(&name) = COMPUTED_STYLE_LONGHANDS.get(idx) {
+                    Some(JsValue::from_string(vm.heap.alloc_string(name)))
+                } else {
+                    let style = live_style_for(&h_desc, nid, pseudo);
+                    let custom = computed_custom_keys(&style);
+                    custom
+                        .get(idx - COMPUTED_STYLE_LONGHANDS.len())
+                        .map(|n| JsValue::from_string(vm.heap.alloc_string(n.as_str())))
+                }
+            } else {
+                let css_key = camel_to_kebab(&prop);
+                if PropertyIdKind::from_name(&css_key).is_some() {
+                    let v = live_computed_property(&h_desc, nid, pseudo, &css_key);
+                    Some(JsValue::from_string(vm.heap.alloc_string(v)))
+                } else {
+                    let k = vm.heap.intern_key(&prop);
+                    arg(args, 0).as_object().and_then(|t_h| {
+                        vm.heap
+                            .object_get_own(t_h, k, &vm.shapes)
+                            .and_then(|_| vm.get_property_by_key(t_h, k).ok())
+                    })
+                }
+            };
+            let Some(v) = val else {
+                return Ok(JsValue::UNDEFINED);
+            };
+            let desc = vm.alloc_ordinary_object();
+            let kv = vm.heap.intern_key("value");
+            let kw = vm.heap.intern_key("writable");
+            let ke = vm.heap.intern_key("enumerable");
+            let kc = vm.heap.intern_key("configurable");
+            vm.heap
+                .object_define_data(desc, kv, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
+            vm.heap.object_define_data(
+                desc,
+                kw,
+                JsValue::TRUE,
+                PropertyAttrs::DEFAULT,
+                &mut vm.shapes,
+            );
+            vm.heap.object_define_data(
+                desc,
+                ke,
+                JsValue::TRUE,
+                PropertyAttrs::DEFAULT,
+                &mut vm.shapes,
+            );
+            vm.heap.object_define_data(
+                desc,
+                kc,
+                JsValue::TRUE,
+                PropertyAttrs::DEFAULT,
+                &mut vm.shapes,
+            );
+            Ok(JsValue::from_object(desc))
+        },
+    );
+
+    let h_keys = Rc::clone(&host);
+    define_host_method(vm, handler, "ownKeys", move |vm, _, _| {
+        let arr = vm.alloc_array();
+        let style = live_style_for(&h_keys, nid, pseudo);
+        let custom = computed_custom_keys(&style);
+        let total = COMPUTED_STYLE_LONGHANDS.len() + custom.len();
+        for i in 0..total {
+            let s = vm.heap.alloc_string(i.to_string());
+            vm.heap.object_push_element(arr, JsValue::from_string(s));
+        }
+        for &name in COMPUTED_STYLE_LONGHANDS {
+            let k1 = vm.heap.alloc_string(name);
+            vm.heap.object_push_element(arr, JsValue::from_string(k1));
+            if name.contains('-') {
+                let camel = kebab_to_camel(name);
+                let k2 = vm.heap.alloc_string(camel);
+                vm.heap.object_push_element(arr, JsValue::from_string(k2));
+            }
+        }
+        for name in custom {
+            let s = vm.heap.alloc_string(name);
+            vm.heap.object_push_element(arr, JsValue::from_string(s));
+        }
+        Ok(JsValue::from_object(arr))
+    });
+
+    let h_get = host;
     define_host_method(vm, handler, "get", move |vm, _, args| {
         let prop = vm.value_to_rust_string(arg(args, 1));
+        if prop == "length" {
+            let style = live_style_for(&h_get, nid, pseudo);
+            let total = COMPUTED_STYLE_LONGHANDS.len() + style.custom_properties.entries.len();
+            return Ok(JsValue::from_i32(total as i32));
+        }
+        if let Ok(idx) = prop.parse::<usize>() {
+            if let Some(&name) = COMPUTED_STYLE_LONGHANDS.get(idx) {
+                return Ok(JsValue::from_string(vm.heap.alloc_string(name)));
+            }
+            let style = live_style_for(&h_get, nid, pseudo);
+            let custom = computed_custom_keys(&style);
+            if let Some(name) = custom.get(idx - COMPUTED_STYLE_LONGHANDS.len()) {
+                return Ok(JsValue::from_string(vm.heap.alloc_string(name.as_str())));
+            }
+            return Ok(JsValue::UNDEFINED);
+        }
         let k = vm.heap.intern_key(&prop);
         if let Some(t_h) = arg(args, 0).as_object() {
             if vm.heap.object_get_own(t_h, k, &vm.shapes).is_some() {
@@ -1595,7 +2180,7 @@ pub(crate) fn create_computed_style_proxy(vm: &mut JsVm, style: Arc<ComputedStyl
             }
         }
         let css_key = camel_to_kebab(&prop);
-        let val = format_computed_property(&s2, &css_key);
+        let val = live_computed_property(&h_get, nid, pseudo, &css_key);
         Ok(JsValue::from_string(vm.heap.alloc_string(val)))
     });
     let proxy = vm.heap.alloc_object(JsObject::with_kind(
@@ -1639,7 +2224,64 @@ fn format_px(v: f32) -> String {
     format!("{}px", format_num(v))
 }
 
-fn format_size(s: &SizeValue) -> String {
+fn eval_ctx_for_style(style: &ComputedStyle) -> EvalContext {
+    EvalContext {
+        font_size_px: style.text.font_size_px,
+        root_font_size_px: 16.0,
+        viewport_width_px: 800.0,
+        viewport_height_px: 600.0,
+        ..EvalContext::default()
+    }
+}
+
+fn decompose_linear_calc(expr: &CalcExpr, eval: &EvalContext) -> Option<(f32, f32)> {
+    match expr {
+        CalcExpr::Length(v, unit) => Some((unit.resolve_px(*v, eval), 0.0)),
+        CalcExpr::Percent(p) => Some((0.0, *p)),
+        CalcExpr::Number(n) => Some((*n, 0.0)),
+        CalcExpr::Sum(a, b) => {
+            let (ax, ap) = decompose_linear_calc(a, eval)?;
+            let (bx, bp) = decompose_linear_calc(b, eval)?;
+            Some((ax + bx, ap + bp))
+        }
+        CalcExpr::Product(k, a) => {
+            let (ax, ap) = decompose_linear_calc(a, eval)?;
+            Some((*k * ax, *k * ap))
+        }
+        _ => None,
+    }
+}
+
+fn format_lp_opts(lp: &LengthPercentage, eval: &EvalContext, nonneg: bool) -> String {
+    match lp {
+        LengthPercentage::Zero => "0px".into(),
+        LengthPercentage::Length(_, _) => {
+            let px = lp.resolve_px(0.0, eval);
+            format_px(if nonneg { px.max(0.0) } else { px })
+        }
+        LengthPercentage::Percent(p) => format!("{}%", format_num(*p * 100.0)),
+        LengthPercentage::Calc(expr) => {
+            if let Some((px, pct)) = decompose_linear_calc(expr, eval) {
+                if pct.abs() < 1e-6 {
+                    return format_px(if nonneg { px.max(0.0) } else { px });
+                }
+                if px.abs() < 1e-4 {
+                    return format!("{}%", format_num(pct * 100.0));
+                }
+                let pct_str = format!("{}%", format_num(pct * 100.0));
+                return if px < 0.0 {
+                    format!("calc({pct_str} - {})", format_px(-px))
+                } else {
+                    format!("calc({pct_str} + {})", format_px(px))
+                };
+            }
+            let px = lp.resolve_px(0.0, eval);
+            format_px(if nonneg { px.max(0.0) } else { px })
+        }
+    }
+}
+
+fn format_size_opts(s: &SizeValue, eval: &EvalContext, nonneg: bool) -> String {
     match s {
         SizeValue::Auto => "auto".into(),
         SizeValue::None => "none".into(),
@@ -1647,23 +2289,28 @@ fn format_size(s: &SizeValue) -> String {
         SizeValue::MaxContent => "max-content".into(),
         SizeValue::FitContent(_) => "fit-content".into(),
         SizeValue::Stretch => "stretch".into(),
-        SizeValue::Length(lp) => format_lp(lp),
+        SizeValue::Length(lp) => format_lp_opts(lp, eval, nonneg),
     }
 }
 
-fn format_lp(lp: &LengthPercentage) -> String {
-    match lp {
-        LengthPercentage::Zero => "0px".into(),
-        LengthPercentage::Length(v, _) => format_px(*v),
-        LengthPercentage::Percent(p) => format!("{}%", format_num(*p)),
-        LengthPercentage::Calc(_) => "0px".into(),
-    }
+fn format_lp(lp: &LengthPercentage, eval: &EvalContext) -> String {
+    format_lp_opts(lp, eval, false)
 }
 
-fn format_lpa(v: &LengthPercentageAuto) -> String {
+fn format_lpa(v: &LengthPercentageAuto, eval: &EvalContext) -> String {
     match v {
         LengthPercentageAuto::Auto => "auto".into(),
-        LengthPercentageAuto::Value(lp) => format_lp(lp),
+        LengthPercentageAuto::Value(lp) => format_lp_opts(lp, eval, false),
+    }
+}
+
+fn format_corner_radius(cr: &rix_css::CornerRadius, eval: &EvalContext) -> String {
+    let x = format_lp_opts(&cr.x, eval, true);
+    let y = format_lp_opts(&cr.y, eval, true);
+    if x == y {
+        x
+    } else {
+        format!("{x} {y}")
     }
 }
 
@@ -1712,6 +2359,15 @@ fn format_align(a: AlignValue) -> &'static str {
 /// Serializes any computed CSS property from [`ComputedStyle`] according to CSSOM.
 #[must_use]
 pub fn format_computed_property(style: &ComputedStyle, prop: &str) -> String {
+    format_computed_property_resolved(style, prop, None, false)
+}
+
+fn format_computed_property_resolved(
+    style: &ComputedStyle,
+    prop: &str,
+    layout_box: Option<ResolvedLayoutBox>,
+    parent_flex_grid: bool,
+) -> String {
     if prop.starts_with("--") {
         let key = rix_core::intern_str(prop);
         if let Some(tokens) = style.custom_properties.get(&key) {
@@ -1719,9 +2375,141 @@ pub fn format_computed_property(style: &ComputedStyle, prop: &str) -> String {
         }
         return String::new();
     }
+    let lower = prop.to_ascii_lowercase();
+    let effective: &str = match PropertyIdKind::from_name(&lower) {
+        Some(kind) if is_logical_property(kind) => {
+            resolve_logical_to_physical(kind, style.text.writing_mode, style.text.direction)
+                .css_name()
+        }
+        _ => lower.as_str(),
+    };
     let cc = style.text.color;
     let dark = style.color_scheme_dark;
-    match prop.to_ascii_lowercase().as_str() {
+    let eval = eval_ctx_for_style(style);
+
+    // Computed shorthand serialization (both logical and physical)
+    let fmt_pair = |a: &str, b: &str| -> String {
+        let va = format_computed_property_resolved(style, a, layout_box, parent_flex_grid);
+        let vb = format_computed_property_resolved(style, b, layout_box, parent_flex_grid);
+        collapse_2_sides_str(&va, &vb)
+    };
+    let fmt_quad = |t: &str, r: &str, b: &str, l: &str| -> String {
+        let vt = format_computed_property_resolved(style, t, layout_box, parent_flex_grid);
+        let vr = format_computed_property_resolved(style, r, layout_box, parent_flex_grid);
+        let vb = format_computed_property_resolved(style, b, layout_box, parent_flex_grid);
+        let vl = format_computed_property_resolved(style, l, layout_box, parent_flex_grid);
+        collapse_4_sides_str(&vt, &vr, &vb, &vl)
+    };
+    let fmt_border_side = |prefix: &str| -> String {
+        let w = format_computed_property_resolved(
+            style,
+            &format!("{prefix}-width"),
+            layout_box,
+            parent_flex_grid,
+        );
+        let s = format_computed_property_resolved(
+            style,
+            &format!("{prefix}-style"),
+            layout_box,
+            parent_flex_grid,
+        );
+        let c = format_computed_property_resolved(
+            style,
+            &format!("{prefix}-color"),
+            layout_box,
+            parent_flex_grid,
+        );
+        format!("{w} {s} {c}")
+    };
+
+    match effective {
+        "margin" => fmt_quad("margin-top", "margin-right", "margin-bottom", "margin-left"),
+        "margin-block" => fmt_pair("margin-block-start", "margin-block-end"),
+        "margin-inline" => fmt_pair("margin-inline-start", "margin-inline-end"),
+        "padding" => fmt_quad(
+            "padding-top",
+            "padding-right",
+            "padding-bottom",
+            "padding-left",
+        ),
+        "padding-block" => fmt_pair("padding-block-start", "padding-block-end"),
+        "padding-inline" => fmt_pair("padding-inline-start", "padding-inline-end"),
+        "inset" => fmt_quad("top", "right", "bottom", "left"),
+        "inset-block" => fmt_pair("inset-block-start", "inset-block-end"),
+        "inset-inline" => fmt_pair("inset-inline-start", "inset-inline-end"),
+        "border-width" => fmt_quad(
+            "border-top-width",
+            "border-right-width",
+            "border-bottom-width",
+            "border-left-width",
+        ),
+        "border-block-width" => fmt_pair("border-block-start-width", "border-block-end-width"),
+        "border-inline-width" => fmt_pair("border-inline-start-width", "border-inline-end-width"),
+        "border-style" => fmt_quad(
+            "border-top-style",
+            "border-right-style",
+            "border-bottom-style",
+            "border-left-style",
+        ),
+        "border-block-style" => fmt_pair("border-block-start-style", "border-block-end-style"),
+        "border-inline-style" => fmt_pair("border-inline-start-style", "border-inline-end-style"),
+        "border-color" => fmt_quad(
+            "border-top-color",
+            "border-right-color",
+            "border-bottom-color",
+            "border-left-color",
+        ),
+        "border-block-color" => fmt_pair("border-block-start-color", "border-block-end-color"),
+        "border-inline-color" => fmt_pair("border-inline-start-color", "border-inline-end-color"),
+        "border-top" => fmt_border_side("border-top"),
+        "border-right" => fmt_border_side("border-right"),
+        "border-bottom" => fmt_border_side("border-bottom"),
+        "border-left" => fmt_border_side("border-left"),
+        "border-block-start" => fmt_border_side("border-block-start"),
+        "border-block-end" => fmt_border_side("border-block-end"),
+        "border-inline-start" => fmt_border_side("border-inline-start"),
+        "border-inline-end" => fmt_border_side("border-inline-end"),
+        "border-block" => {
+            let s = fmt_border_side("border-block-start");
+            let e = fmt_border_side("border-block-end");
+            if s == e {
+                s
+            } else {
+                String::new()
+            }
+        }
+        "border-inline" => {
+            let s = fmt_border_side("border-inline-start");
+            let e = fmt_border_side("border-inline-end");
+            if s == e {
+                s
+            } else {
+                String::new()
+            }
+        }
+        "border" => {
+            let t = fmt_border_side("border-top");
+            let r = fmt_border_side("border-right");
+            let b = fmt_border_side("border-bottom");
+            let l = fmt_border_side("border-left");
+            if t == r && r == b && b == l {
+                t
+            } else {
+                String::new()
+            }
+        }
+        "border-radius" => fmt_quad(
+            "border-top-left-radius",
+            "border-top-right-radius",
+            "border-bottom-right-radius",
+            "border-bottom-left-radius",
+        ),
+        "overscroll-behavior" => fmt_pair("overscroll-behavior-x", "overscroll-behavior-y"),
+        "writing-mode" => style.text.writing_mode.as_css_str().into(),
+        "caption-side" => style.text.caption_side.as_css_str().into(),
+        "resize" => style.visual.resize.as_css_str().into(),
+        "overscroll-behavior-x" => style.visual.overscroll_behavior_x.as_css_str().into(),
+        "overscroll-behavior-y" => style.visual.overscroll_behavior_y.as_css_str().into(),
         "display" => match style.display {
             DisplayMode::None => "none",
             DisplayMode::Block => "block",
@@ -1841,13 +2629,14 @@ pub fn format_computed_property(style: &ComputedStyle, prop: &str) -> String {
         "line-height" => match style.text.line_height {
             LineHeightValue::Normal => "normal".into(),
             LineHeightValue::Number(n) => format_px(n * style.text.font_size_px),
-            LineHeightValue::Length(ref lp) => format_lp(lp),
+            LineHeightValue::Length(ref lp) => format_lp(lp, &eval),
         },
         "letter-spacing" => match style.text.letter_spacing {
             LengthPercentage::Zero => "normal".into(),
-            ref lp => format_lp(lp),
+            ref lp => format_lp(lp, &eval),
         },
-        "word-spacing" => format_lp(&style.text.word_spacing),
+        "word-spacing" => format_lp(&style.text.word_spacing, &eval),
+        "text-indent" => format_lp(&style.text.text_indent, &eval),
         "text-align" => match style.text.text_align {
             TextAlignMode::Start => "start",
             TextAlignMode::End => "end",
@@ -1900,24 +2689,78 @@ pub fn format_computed_property(style: &ComputedStyle, prop: &str) -> String {
             UserSelectMode::Contain => "contain",
         }
         .into(),
-        "width" | "inline-size" => format_size(&style.box_model.width),
-        "height" | "block-size" => format_size(&style.box_model.height),
-        "min-width" | "min-inline-size" => format_size(&style.box_model.min_width),
-        "min-height" | "min-block-size" => format_size(&style.box_model.min_height),
-        "max-width" | "max-inline-size" => format_size(&style.box_model.max_width),
-        "max-height" | "max-block-size" => format_size(&style.box_model.max_height),
-        "margin-top" | "margin-block-start" => format_lpa(&style.box_model.margin.top),
-        "margin-right" | "margin-inline-end" => format_lpa(&style.box_model.margin.right),
-        "margin-bottom" | "margin-block-end" => format_lpa(&style.box_model.margin.bottom),
-        "margin-left" | "margin-inline-start" => format_lpa(&style.box_model.margin.left),
-        "padding-top" | "padding-block-start" => format_lp(&style.box_model.padding.top),
-        "padding-right" | "padding-inline-end" => format_lp(&style.box_model.padding.right),
-        "padding-bottom" | "padding-block-end" => format_lp(&style.box_model.padding.bottom),
-        "padding-left" | "padding-inline-start" => format_lp(&style.box_model.padding.left),
-        "top" | "inset-block-start" => format_lpa(&style.box_model.inset.top),
-        "right" | "inset-inline-end" => format_lpa(&style.box_model.inset.right),
-        "bottom" | "inset-block-end" => format_lpa(&style.box_model.inset.bottom),
-        "left" | "inset-inline-start" => format_lpa(&style.box_model.inset.left),
+        "width" => {
+            if let Some(lb) = layout_box {
+                if style.display != DisplayMode::Inline {
+                    let w = if style.box_sizing == BoxSizingMode::BorderBox {
+                        lb.border_size.width
+                    } else {
+                        lb.content_size.width
+                    };
+                    return format_px(w.max(0.0));
+                }
+            }
+            format_size_opts(&style.box_model.width, &eval, true)
+        }
+        "height" => {
+            if let Some(lb) = layout_box {
+                if style.display != DisplayMode::Inline {
+                    let h = if style.box_sizing == BoxSizingMode::BorderBox {
+                        lb.border_size.height
+                    } else {
+                        lb.content_size.height
+                    };
+                    return format_px(h.max(0.0));
+                }
+            }
+            format_size_opts(&style.box_model.height, &eval, true)
+        }
+        "min-width" => match &style.box_model.min_width {
+            SizeValue::Auto if !parent_flex_grid => "0px".into(),
+            other => format_size_opts(other, &eval, true),
+        },
+        "min-height" => match &style.box_model.min_height {
+            SizeValue::Auto if !parent_flex_grid => "0px".into(),
+            other => format_size_opts(other, &eval, true),
+        },
+        "max-width" => format_size_opts(&style.box_model.max_width, &eval, true),
+        "max-height" => format_size_opts(&style.box_model.max_height, &eval, true),
+        "margin-top" => layout_box.map_or_else(
+            || format_lpa(&style.box_model.margin.top, &eval),
+            |lb| format_px(lb.margin.top),
+        ),
+        "margin-right" => layout_box.map_or_else(
+            || format_lpa(&style.box_model.margin.right, &eval),
+            |lb| format_px(lb.margin.right),
+        ),
+        "margin-bottom" => layout_box.map_or_else(
+            || format_lpa(&style.box_model.margin.bottom, &eval),
+            |lb| format_px(lb.margin.bottom),
+        ),
+        "margin-left" => layout_box.map_or_else(
+            || format_lpa(&style.box_model.margin.left, &eval),
+            |lb| format_px(lb.margin.left),
+        ),
+        "padding-top" => layout_box.map_or_else(
+            || format_lp_opts(&style.box_model.padding.top, &eval, true),
+            |lb| format_px(lb.padding.top.max(0.0)),
+        ),
+        "padding-right" => layout_box.map_or_else(
+            || format_lp_opts(&style.box_model.padding.right, &eval, true),
+            |lb| format_px(lb.padding.right.max(0.0)),
+        ),
+        "padding-bottom" => layout_box.map_or_else(
+            || format_lp_opts(&style.box_model.padding.bottom, &eval, true),
+            |lb| format_px(lb.padding.bottom.max(0.0)),
+        ),
+        "padding-left" => layout_box.map_or_else(
+            || format_lp_opts(&style.box_model.padding.left, &eval, true),
+            |lb| format_px(lb.padding.left.max(0.0)),
+        ),
+        "top" => format_lpa(&style.box_model.inset.top, &eval),
+        "right" => format_lpa(&style.box_model.inset.right, &eval),
+        "bottom" => format_lpa(&style.box_model.inset.bottom, &eval),
+        "left" => format_lpa(&style.box_model.inset.left, &eval),
         "border-top-width" => format_px(style.box_model.border_width.top),
         "border-right-width" => format_px(style.box_model.border_width.right),
         "border-bottom-width" => format_px(style.box_model.border_width.bottom),
@@ -1930,14 +2773,22 @@ pub fn format_computed_property(style: &ComputedStyle, prop: &str) -> String {
         "border-right-color" => format_css_color(style.visual.border_color.right, cc, dark),
         "border-bottom-color" => format_css_color(style.visual.border_color.bottom, cc, dark),
         "border-left-color" => format_css_color(style.visual.border_color.left, cc, dark),
-        "border-top-left-radius" => format_lp(&style.visual.border_radius.top_left.x),
-        "border-top-right-radius" => format_lp(&style.visual.border_radius.top_right.x),
-        "border-bottom-right-radius" => format_lp(&style.visual.border_radius.bottom_right.x),
-        "border-bottom-left-radius" => format_lp(&style.visual.border_radius.bottom_left.x),
+        "border-top-left-radius" => {
+            format_corner_radius(&style.visual.border_radius.top_left, &eval)
+        }
+        "border-top-right-radius" => {
+            format_corner_radius(&style.visual.border_radius.top_right, &eval)
+        }
+        "border-bottom-right-radius" => {
+            format_corner_radius(&style.visual.border_radius.bottom_right, &eval)
+        }
+        "border-bottom-left-radius" => {
+            format_corner_radius(&style.visual.border_radius.bottom_left, &eval)
+        }
         "outline-color" => format_css_color(style.visual.outline_color, cc, dark),
         "outline-style" => format_line_style(style.visual.outline_style).into(),
         "outline-width" => format_px(style.visual.outline_width),
-        "outline-offset" => format_lp(&style.visual.outline_offset),
+        "outline-offset" => format_lp(&style.visual.outline_offset, &eval),
         "vertical-align" => match style.box_model.vertical_align {
             VerticalAlignMode::Baseline => "baseline".into(),
             VerticalAlignMode::Top => "top".into(),
@@ -1959,6 +2810,60 @@ pub fn format_computed_property(style: &ComputedStyle, prop: &str) -> String {
             BorderCollapseMode::Collapse => "collapse",
         }
         .into(),
+        "border-spacing" => {
+            let x = format_lp_opts(&style.box_model.border_spacing_x, &eval, true);
+            let y = format_lp_opts(&style.box_model.border_spacing_y, &eval, true);
+            collapse_2_sides_str(&x, &y)
+        }
+        "box-shadow" => match style.effects.as_ref().map(|e| e.box_shadow.as_slice()) {
+            Some(list) if !list.is_empty() => list
+                .iter()
+                .map(|sh| {
+                    let c = format_css_color(sh.color, cc, dark);
+                    let ox = format_lp(&sh.offset_x, &eval);
+                    let oy = format_lp(&sh.offset_y, &eval);
+                    let bl = format_lp_opts(&sh.blur, &eval, true);
+                    let sp = format_lp(&sh.spread, &eval);
+                    if sh.inset {
+                        format!("{c} {ox} {oy} {bl} {sp} inset")
+                    } else {
+                        format!("{c} {ox} {oy} {bl} {sp}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => "none".into(),
+        },
+        "filter" => match style.effects.as_ref().map(|e| e.filter.as_slice()) {
+            Some(list) if !list.is_empty() => list
+                .iter()
+                .map(|op| match op {
+                    FilterOp::Blur(r) => format!("blur({})", format_lp_opts(r, &eval, true)),
+                    FilterOp::Brightness(v) => format!("brightness({})", format_num(*v)),
+                    FilterOp::Contrast(v) => format!("contrast({})", format_num(*v)),
+                    FilterOp::Grayscale(v) => format!("grayscale({})", format_num(*v)),
+                    FilterOp::Opacity(v) => format!("opacity({})", format_num(*v)),
+                    FilterOp::Saturate(v) => format!("saturate({})", format_num(*v)),
+                    FilterOp::Invert(v) => format!("invert({})", format_num(*v)),
+                    FilterOp::Sepia(v) => format!("sepia({})", format_num(*v)),
+                    FilterOp::HueRotateDeg(d) => format!("hue-rotate({}deg)", format_num(*d)),
+                    FilterOp::DropShadow {
+                        offset_x,
+                        offset_y,
+                        blur,
+                        color,
+                    } => format!(
+                        "drop-shadow({} {} {} {})",
+                        format_css_color(*color, cc, dark),
+                        format_lp(offset_x, &eval),
+                        format_lp(offset_y, &eval),
+                        format_lp_opts(blur, &eval, true),
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => "none".into(),
+        },
         "table-layout" => match style.box_model.table_layout {
             TableLayoutMode::Auto => "auto",
             TableLayoutMode::Fixed => "fixed",
@@ -1986,7 +2891,7 @@ pub fn format_computed_property(style: &ComputedStyle, prop: &str) -> String {
         "flex-basis" => style
             .flex_grid
             .as_ref()
-            .map_or_else(|| "auto".into(), |f| format_lpa(&f.flex_basis)),
+            .map_or_else(|| "auto".into(), |f| format_lpa(&f.flex_basis, &eval)),
         "order" => style.flex_grid.as_ref().map_or(0, |f| f.order).to_string(),
         "align-items" => format_align(
             style
@@ -2033,11 +2938,11 @@ pub fn format_computed_property(style: &ComputedStyle, prop: &str) -> String {
         "row-gap" => style
             .flex_grid
             .as_ref()
-            .map_or_else(|| "normal".into(), |f| format_lp(&f.row_gap)),
+            .map_or_else(|| "normal".into(), |f| format_lp(&f.row_gap, &eval)),
         "column-gap" => style
             .flex_grid
             .as_ref()
-            .map_or_else(|| "normal".into(), |f| format_lp(&f.column_gap)),
+            .map_or_else(|| "normal".into(), |f| format_lp(&f.column_gap, &eval)),
         "grid-auto-flow" => match style.flex_grid.as_ref().map(|f| f.grid_auto_flow) {
             Some(GridAutoFlowMode::Column) => "column",
             Some(GridAutoFlowMode::RowDense) => "row dense",
@@ -2070,6 +2975,62 @@ pub fn format_computed_property(style: &ComputedStyle, prop: &str) -> String {
             "normal"
         }
         .into(),
+        "transition-property" => match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
+            Some(list) if !list.is_empty() => list
+                .iter()
+                .map(|t| t.property.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => "all".into(),
+        },
+        "transition-duration" => match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
+            Some(list) if !list.is_empty() => list
+                .iter()
+                .map(|t| format!("{}s", format_num(t.duration_ms / 1000.0)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => "0s".into(),
+        },
+        "transition-delay" => match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
+            Some(list) if !list.is_empty() => list
+                .iter()
+                .map(|t| format!("{}s", format_num(t.delay_ms / 1000.0)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => "0s".into(),
+        },
+        "transition-timing-function" => {
+            match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
+                Some(list) if !list.is_empty() => list
+                    .iter()
+                    .map(|t| match t.timing {
+                        rix_css::TimingFunction::Linear => "linear".to_string(),
+                        rix_css::TimingFunction::Ease => "ease".to_string(),
+                        rix_css::TimingFunction::EaseIn => "ease-in".to_string(),
+                        rix_css::TimingFunction::EaseOut => "ease-out".to_string(),
+                        rix_css::TimingFunction::EaseInOut => "ease-in-out".to_string(),
+                        rix_css::TimingFunction::CubicBezier(a, b, c, d) => {
+                            format!(
+                                "cubic-bezier({}, {}, {}, {})",
+                                format_num(a),
+                                format_num(b),
+                                format_num(c),
+                                format_num(d)
+                            )
+                        }
+                        rix_css::TimingFunction::Steps(n, start) => {
+                            if start {
+                                format!("steps({n}, start)")
+                            } else {
+                                format!("steps({n})")
+                            }
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => "ease".into(),
+            }
+        }
         _ => String::new(),
     }
 }
