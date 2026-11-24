@@ -14,11 +14,16 @@ use selectors::context::SelectorCaches;
 use selectors::Element as _;
 use smallvec::SmallVec;
 
-use crate::computed::{resolve_element_style_full, ComputedStyle};
+use crate::computed::{resolve_element_style_scoped, ComputedStyle, MatchedRule};
 use crate::properties::{parse_inline_style, MissingCssFeature, SpecifiedDeclaration};
 use crate::rule_index::{InvalidationMap, InvalidationScope, RuleIndex};
-use crate::selector::{matches_single_selector, DomElement, RixPseudoElement};
-use crate::stylesheet::{CompiledRule, MediaContext, RegisteredProperty, Stylesheet};
+use crate::selector::{
+    matches_selector_list_with_scope, matches_single_selector, matches_single_selector_with_scope,
+    DomElement, RixPseudoElement,
+};
+use crate::stylesheet::{
+    CompiledRule, CompiledScope, MediaContext, RegisteredProperty, Stylesheet,
+};
 use crate::ua::default_ua_stylesheet;
 
 const PARALLEL_CHILD_THRESHOLD: usize = 32;
@@ -282,9 +287,14 @@ impl StyleContext {
         self.media = media;
     }
 
-    /// Looks up the latest `@keyframes <name>` rule across author & UA stylesheets.
+    /// Looks up the winning `@keyframes <name>` rule across author & UA stylesheets
+    /// respecting CSS Cascade Level 5 `@layer` precedence.
     #[must_use]
     pub fn keyframes(&self, name: &str) -> Option<&crate::stylesheet::KeyframesRule> {
+        let key = rix_core::intern_str(name);
+        if let Some(kf) = self.rule_index.keyframes.get(&key) {
+            return Some(kf);
+        }
         for sheet in self.author_sheets.iter().rev() {
             if let Some(kf) = sheet
                 .keyframes
@@ -961,10 +971,16 @@ fn compute_single_element_style(
 
     let dom_el = DomElement::new(doc, node);
     let mut matched_indices = SmallVec::<[u32; 16]>::new();
+    let mut matched_prox = SmallVec::<[u32; 16]>::new();
+    let mut any_scoped = false;
     for &idx in &candidate_indices {
         let rule = &rule_index.rules[idx as usize];
-        if matches_single_selector(&rule.selector, &dom_el, bloom, caches, None) {
+        if let Some(prox) = match_rule_with_scopes(doc, node, &dom_el, rule, bloom, caches) {
             matched_indices.push(idx);
+            matched_prox.push(prox);
+            if prox != u32::MAX {
+                any_scoped = true;
+            }
         }
     }
 
@@ -975,7 +991,7 @@ fn compute_single_element_style(
         .map(|(_, v)| v.as_str());
     let has_pres_hints = has_presentational_hint_attrs(elem);
 
-    if inline_attr.is_none() && !has_pres_hints {
+    if inline_attr.is_none() && !has_pres_hints && !any_scoped {
         if let Some(cached) = memo.lookup(parent_ptr, &matched_indices) {
             if let Some(p_node) = sibling_parent {
                 memo.insert_sibling(p_node, elem, Arc::clone(&cached));
@@ -995,12 +1011,16 @@ fn compute_single_element_style(
         _ => Vec::new(),
     };
 
-    let matched_refs: SmallVec<[&CompiledRule; 16]> = matched_indices
+    let matched_refs: SmallVec<[MatchedRule<'_>; 16]> = matched_indices
         .iter()
-        .map(|&idx| &rule_index.rules[idx as usize])
+        .zip(matched_prox.iter())
+        .map(|(&idx, &scope_proximity)| MatchedRule {
+            rule: &rule_index.rules[idx as usize],
+            scope_proximity,
+        })
         .collect();
 
-    let resolved = Arc::new(resolve_element_style_full(
+    let resolved = Arc::new(resolve_element_style_scoped(
         &matched_refs,
         &pres_decls,
         &inline_decls,
@@ -1010,13 +1030,145 @@ fn compute_single_element_style(
         Some(&rule_index.registered_properties),
     ));
 
-    if inline_attr.is_none() && !has_pres_hints {
+    if inline_attr.is_none() && !has_pres_hints && !any_scoped {
         memo.insert(parent_ptr, &matched_indices, Arc::clone(&resolved));
         if let Some(p_node) = sibling_parent {
             memo.insert_sibling(p_node, elem, Arc::clone(&resolved));
         }
     }
     (resolved, false)
+}
+
+/// Evaluates `rule` against `dom_el`, enforcing any enclosing `@scope` boundaries and
+/// returning the closest scoping proximity (`0` = scoping root itself, `u32::MAX` = unscoped).
+fn match_rule_with_scopes(
+    doc: &Document,
+    node: NodeId,
+    dom_el: &DomElement<'_>,
+    rule: &CompiledRule,
+    bloom: Option<&BloomFilter>,
+    caches: &mut SelectorCaches,
+) -> Option<u32> {
+    let Some(ref scopes) = rule.scopes else {
+        return matches_single_selector(&rule.selector, dom_el, bloom, caches, None)
+            .then_some(u32::MAX);
+    };
+    let mut chain = SmallVec::<[NodeId; 16]>::new();
+    let mut cur = Some(node);
+    while let Some(id) = cur {
+        if matches!(doc.get(id), Some(NodeData::Element(_))) {
+            chain.push(id);
+        }
+        cur = doc.parent(id);
+    }
+    if chain.is_empty() {
+        return None;
+    }
+    eval_nested_scopes(
+        doc,
+        &chain,
+        0,
+        scopes,
+        chain.len() - 1,
+        None,
+        dom_el,
+        rule,
+        bloom,
+        caches,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_nested_scopes(
+    doc: &Document,
+    chain: &[NodeId],
+    scope_idx: usize,
+    scopes: &[CompiledScope],
+    max_root_idx: usize,
+    outer_scope_opaque: Option<selectors::OpaqueElement>,
+    dom_el: &DomElement<'_>,
+    rule: &CompiledRule,
+    bloom: Option<&BloomFilter>,
+    caches: &mut SelectorCaches,
+) -> Option<u32> {
+    let sc = &scopes[scope_idx];
+    let mut best_prox: Option<u32> = None;
+
+    for r_idx in 0..=max_root_idx {
+        let root_id = chain[r_idx];
+        let root_el = DomElement::new(doc, root_id);
+        let is_root = if let Some(ref start_list) = sc.start {
+            matches_selector_list_with_scope(
+                start_list,
+                &root_el,
+                outer_scope_opaque,
+                None,
+                caches,
+                None,
+            )
+        } else if let Some(imp) = sc.implicit_root {
+            imp == root_id
+        } else {
+            // Constructed / adopted stylesheet without an owner `<style>` element:
+            // CSS Cascade L6 §2.1 scopes implicitly to the document root element.
+            r_idx == chain.len() - 1
+        };
+        if !is_root {
+            continue;
+        }
+        let root_opaque = root_el.opaque();
+        // CSS Cascade L6 §2.5: `<scope-end>` excludes any element on the path from
+        // subject `chain[0]` up to scoping root `chain[r_idx]` inclusive.
+        if let Some(ref end_list) = sc.end {
+            let mut excluded = false;
+            for &path_id in &chain[..=r_idx] {
+                let path_el = DomElement::new(doc, path_id);
+                if matches_selector_list_with_scope(
+                    end_list,
+                    &path_el,
+                    Some(root_opaque),
+                    None,
+                    caches,
+                    None,
+                ) {
+                    excluded = true;
+                    break;
+                }
+            }
+            if excluded {
+                continue;
+            }
+        }
+        let candidate_prox = if scope_idx + 1 < scopes.len() {
+            eval_nested_scopes(
+                doc,
+                chain,
+                scope_idx + 1,
+                scopes,
+                r_idx,
+                Some(root_opaque),
+                dom_el,
+                rule,
+                bloom,
+                caches,
+            )
+        } else if matches_single_selector_with_scope(
+            &rule.selector,
+            dom_el,
+            Some(root_opaque),
+            bloom,
+            caches,
+            None,
+        ) {
+            Some(r_idx as u32)
+        } else {
+            None
+        };
+        if let Some(p) = candidate_prox {
+            best_prox = Some(best_prox.map_or(p, |cur| cur.min(p)));
+        }
+    }
+    best_prox
 }
 
 fn has_presentational_hint_attrs(elem: &ElementData) -> bool {
@@ -1178,15 +1330,20 @@ fn collect_pseudo_element_styles(
             continue;
         }
         let pseudo_el = DomElement::with_pseudo(doc, node, pseudo);
-        let mut matched: SmallVec<[&CompiledRule; 8]> = SmallVec::new();
+        let mut matched: SmallVec<[MatchedRule<'_>; 8]> = SmallVec::new();
         for &idx in &cands {
             let rule = &rule_index.rules[idx as usize];
-            if matches_single_selector(&rule.selector, &pseudo_el, bloom, caches, None) {
-                matched.push(rule);
+            if let Some(scope_proximity) =
+                match_rule_with_scopes(doc, node, &pseudo_el, rule, bloom, caches)
+            {
+                matched.push(MatchedRule {
+                    rule,
+                    scope_proximity,
+                });
             }
         }
         if !matched.is_empty() {
-            let style = Arc::new(resolve_element_style_full(
+            let style = Arc::new(resolve_element_style_scoped(
                 &matched,
                 &[],
                 &[],

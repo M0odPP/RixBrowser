@@ -260,7 +260,7 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
     function test(fn, name) {
         const t = new TestObj(name);
         try {
-            fn(t);
+            fn.call(t, t);
             if (!t._done) t.done();
         } catch (e) {
             t._fail(e);
@@ -272,7 +272,7 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
         t._isAsync = true;
         pendingAsync++;
         if (fn) {
-            try { fn(t); } catch (e) { t._fail(e); }
+            try { fn.call(t, t); } catch (e) { t._fail(e); }
         }
         return t;
     }
@@ -281,7 +281,7 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
         t._isAsync = true;
         pendingAsync++;
         try {
-            Promise.resolve(fn(t)).then(
+            Promise.resolve(fn.call(t, t)).then(
                 function() { t.done(); },
                 function(e) { t._fail(e); }
             );

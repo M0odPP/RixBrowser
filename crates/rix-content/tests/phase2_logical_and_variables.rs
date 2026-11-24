@@ -155,3 +155,49 @@ fn at_property_dynamic_var_names_and_token_boundaries() {
         .expect("script should succeed");
     assert_eq!(rt.vm.value_to_rust_string(res), "ok");
 }
+
+#[test]
+fn cascade_l5_layers_scope_revert_rule_and_nesting_cssom() {
+    let mut rt = make_runtime();
+    let html = r#"<!doctype html>
+    <style id="s">
+      @layer a.b, a;
+      @layer a { #t { color: green; background-color: navy !important; } }
+      @layer a.b { #t { color: red; background-color: lime !important; } }
+      @scope (.outer) to (.limit) { z-index: 1; .item { z-index: 2; } }
+      @scope (.inner) { .item { z-index: 3; } }
+      #rr { color: green; }
+      #rr { color: revert-rule; }
+    </style>
+    <div id="t"></div>
+    <div class="outer"><div class="inner"><div id="inItem" class="item"></div></div>
+      <div class="limit"><div id="limItem" class="item"></div></div></div>
+    <div id="rr"></div>"#;
+    let errs = rt.load_document_with_external_scripts(html, &HashMap::new());
+    assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+    let res = rt
+        .eval_script(
+            r#"(function() {
+                if (getComputedStyle(t).color !== "rgb(0, 128, 0)") return "layer-norm";
+                if (getComputedStyle(t).backgroundColor !== "rgb(0, 255, 0)") return "layer-imp";
+                if (getComputedStyle(document.querySelector(".outer")).zIndex !== "1") return "scope-decl";
+                if (getComputedStyle(inItem).zIndex !== "3") return "scope-prox";
+                if (getComputedStyle(limItem).zIndex !== "auto") return "scope-limit";
+                if (getComputedStyle(rr).color !== "rgb(0, 128, 0)") return "revert-rule";
+                if (CSSStyleRule.__proto__ !== CSSGroupingRule) return "proto";
+                const sheet = document.getElementById("s").sheet;
+                const idx = sheet.insertRule(".a { color: red; }", sheet.cssRules.length);
+                const parent = sheet.cssRules[idx];
+                parent.insertRule("& .b { color: hotpink; }", 0);
+                if (parent.cssRules[0].parentRule !== parent) return "parentRule";
+                if (parent.cssRules[0].cssText !== "& .b { color: hotpink; }") return "color:" + parent.cssRules[0].cssText;
+                let caught = "";
+                try { parent.insertRule("@font-face {}", 0); } catch (e) { caught = e.name; }
+                if (caught !== "HierarchyRequestError") return "hier:" + caught;
+                return "ok";
+            })()"#,
+        )
+        .expect("script should succeed");
+    assert_eq!(rt.vm.value_to_rust_string(res), "ok");
+}

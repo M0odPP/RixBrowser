@@ -81,6 +81,7 @@ pub enum GlobalKeyword {
     Unset,
     Revert,
     RevertLayer,
+    RevertRule,
 }
 
 impl GlobalKeyword {
@@ -92,6 +93,7 @@ impl GlobalKeyword {
             "unset" => Some(Self::Unset),
             "revert" => Some(Self::Revert),
             "revert-layer" => Some(Self::RevertLayer),
+            "revert-rule" => Some(Self::RevertRule),
             _ => None,
         }
     }
@@ -581,6 +583,8 @@ pub enum PropertyIdKind {
     BorderStartEndRadius,
     BorderEndStartRadius,
     BorderEndEndRadius,
+    // CSS Cascade L5 `all` shorthand
+    All,
     // Custom property (`--*`)
     Custom,
 }
@@ -797,6 +801,7 @@ impl PropertyIdKind {
             "table-layout" => Self::TableLayout,
             "color-scheme" => Self::ColorScheme,
             "content" => Self::Content,
+            "all" => Self::All,
             _ => return None,
         })
     }
@@ -1008,6 +1013,7 @@ impl PropertyIdKind {
             Self::BorderStartEndRadius => "border-start-end-radius",
             Self::BorderEndStartRadius => "border-end-start-radius",
             Self::BorderEndEndRadius => "border-end-end-radius",
+            Self::All => "all",
             Self::Custom => "--custom",
         }
     }
@@ -1384,6 +1390,136 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "z-index",
 ];
 
+/// All physical CSS longhand properties reset by the CSS Cascade Level 5 `all` shorthand
+/// (excludes `direction`, `unicode-bidi`, and custom properties per §3.1).
+pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
+    PropertyIdKind::Display,
+    PropertyIdKind::Position,
+    PropertyIdKind::Float,
+    PropertyIdKind::Clear,
+    PropertyIdKind::BoxSizing,
+    PropertyIdKind::OverflowX,
+    PropertyIdKind::OverflowY,
+    PropertyIdKind::Visibility,
+    PropertyIdKind::PointerEvents,
+    PropertyIdKind::Cursor,
+    PropertyIdKind::ZIndex,
+    PropertyIdKind::Opacity,
+    PropertyIdKind::Width,
+    PropertyIdKind::Height,
+    PropertyIdKind::MinWidth,
+    PropertyIdKind::MinHeight,
+    PropertyIdKind::MaxWidth,
+    PropertyIdKind::MaxHeight,
+    PropertyIdKind::MarginTop,
+    PropertyIdKind::MarginRight,
+    PropertyIdKind::MarginBottom,
+    PropertyIdKind::MarginLeft,
+    PropertyIdKind::PaddingTop,
+    PropertyIdKind::PaddingRight,
+    PropertyIdKind::PaddingBottom,
+    PropertyIdKind::PaddingLeft,
+    PropertyIdKind::Top,
+    PropertyIdKind::Right,
+    PropertyIdKind::Bottom,
+    PropertyIdKind::Left,
+    PropertyIdKind::BorderTopWidth,
+    PropertyIdKind::BorderRightWidth,
+    PropertyIdKind::BorderBottomWidth,
+    PropertyIdKind::BorderLeftWidth,
+    PropertyIdKind::BorderTopStyle,
+    PropertyIdKind::BorderRightStyle,
+    PropertyIdKind::BorderBottomStyle,
+    PropertyIdKind::BorderLeftStyle,
+    PropertyIdKind::BorderTopColor,
+    PropertyIdKind::BorderRightColor,
+    PropertyIdKind::BorderBottomColor,
+    PropertyIdKind::BorderLeftColor,
+    PropertyIdKind::BorderTopLeftRadius,
+    PropertyIdKind::BorderTopRightRadius,
+    PropertyIdKind::BorderBottomRightRadius,
+    PropertyIdKind::BorderBottomLeftRadius,
+    PropertyIdKind::OutlineColor,
+    PropertyIdKind::OutlineStyle,
+    PropertyIdKind::OutlineWidth,
+    PropertyIdKind::OutlineOffset,
+    PropertyIdKind::Color,
+    PropertyIdKind::BackgroundColor,
+    PropertyIdKind::BackgroundLayers,
+    PropertyIdKind::BoxShadow,
+    PropertyIdKind::Transform,
+    PropertyIdKind::TransformOrigin,
+    PropertyIdKind::Filter,
+    PropertyIdKind::ClipPath,
+    PropertyIdKind::MixBlendMode,
+    PropertyIdKind::Transition,
+    PropertyIdKind::TransitionProperty,
+    PropertyIdKind::TransitionDuration,
+    PropertyIdKind::TransitionDelay,
+    PropertyIdKind::TransitionTimingFunction,
+    PropertyIdKind::Animation,
+    PropertyIdKind::AnimationName,
+    PropertyIdKind::AnimationDuration,
+    PropertyIdKind::AnimationDelay,
+    PropertyIdKind::AnimationTimingFunction,
+    PropertyIdKind::AnimationIterationCount,
+    PropertyIdKind::AnimationDirection,
+    PropertyIdKind::AnimationFillMode,
+    PropertyIdKind::AnimationPlayState,
+    PropertyIdKind::FontSize,
+    PropertyIdKind::FontWeight,
+    PropertyIdKind::FontStyle,
+    PropertyIdKind::FontFamily,
+    PropertyIdKind::LineHeight,
+    PropertyIdKind::LetterSpacing,
+    PropertyIdKind::WordSpacing,
+    PropertyIdKind::TextIndent,
+    PropertyIdKind::TextAlign,
+    PropertyIdKind::TextDecorationLine,
+    PropertyIdKind::TextDecorationColor,
+    PropertyIdKind::TextTransform,
+    PropertyIdKind::WhiteSpace,
+    PropertyIdKind::WordBreak,
+    PropertyIdKind::OverflowWrap,
+    PropertyIdKind::UserSelect,
+    PropertyIdKind::FlexDirection,
+    PropertyIdKind::FlexWrap,
+    PropertyIdKind::FlexGrow,
+    PropertyIdKind::FlexShrink,
+    PropertyIdKind::FlexBasis,
+    PropertyIdKind::Order,
+    PropertyIdKind::AlignItems,
+    PropertyIdKind::AlignSelf,
+    PropertyIdKind::AlignContent,
+    PropertyIdKind::JustifyContent,
+    PropertyIdKind::JustifyItems,
+    PropertyIdKind::JustifySelf,
+    PropertyIdKind::RowGap,
+    PropertyIdKind::ColumnGap,
+    PropertyIdKind::GridTemplateColumns,
+    PropertyIdKind::GridTemplateRows,
+    PropertyIdKind::GridTemplateAreas,
+    PropertyIdKind::GridAutoColumns,
+    PropertyIdKind::GridAutoRows,
+    PropertyIdKind::GridAutoFlow,
+    PropertyIdKind::GridRowStart,
+    PropertyIdKind::GridRowEnd,
+    PropertyIdKind::GridColumnStart,
+    PropertyIdKind::GridColumnEnd,
+    PropertyIdKind::VerticalAlign,
+    PropertyIdKind::TextOverflow,
+    PropertyIdKind::BorderCollapse,
+    PropertyIdKind::BorderSpacing,
+    PropertyIdKind::TableLayout,
+    PropertyIdKind::ColorScheme,
+    PropertyIdKind::Content,
+    PropertyIdKind::WritingMode,
+    PropertyIdKind::Resize,
+    PropertyIdKind::CaptionSide,
+    PropertyIdKind::OverscrollBehaviorX,
+    PropertyIdKind::OverscrollBehaviorY,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PhysicalSide {
     Top,
@@ -1738,18 +1874,23 @@ pub fn compile_declaration_block(
 }
 
 /// Rewrites CSS Variables L2 dynamic `var(...)` name arguments (`var(var(--x))`, `var({--x})`)
-/// into forms accepted by `lightningcss`'s L1 `Variable::parse`, preserving exact L2 semantics.
-/// Zero allocation fast-path when no dynamic `var(` occurs.
+/// and CSS Cascade L5 `revert-rule` declaration values into forms accepted by `lightningcss`,
+/// preserving exact spec semantics. Zero-allocation fast path when neither occurs.
 #[must_use]
 pub(crate) fn rewrite_dynamic_var_names(css: &str) -> std::borrow::Cow<'_, str> {
-    if !css.contains("var(") && !css.contains("VAR(") && !css.contains("Var(") {
+    let bytes = css.as_bytes();
+    let has_var = bytes.windows(4).any(|w| w.eq_ignore_ascii_case(b"var("));
+    let has_rr = bytes
+        .windows(11)
+        .any(|w| w.eq_ignore_ascii_case(b"revert-rule"));
+    if !has_var && !has_rr {
         return std::borrow::Cow::Borrowed(css);
     }
-    let bytes = css.as_bytes();
     let mut out: Option<String> = None;
     let mut last = 0usize;
     let mut i = 0usize;
     let mut in_str: Option<u8> = None;
+    let mut paren_depth = 0usize;
     while i < bytes.len() {
         let b = bytes[i];
         if let Some(q) = in_str {
@@ -1772,7 +1913,46 @@ pub(crate) fn rewrite_dynamic_var_names(css: &str) -> std::borrow::Cow<'_, str> 
             i += 1;
             continue;
         }
-        if i + 4 <= bytes.len()
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if b == b'(' {
+            paren_depth += 1;
+        } else if b == b')' {
+            paren_depth = paren_depth.saturating_sub(1);
+        }
+        if has_rr
+            && paren_depth == 0
+            && i + 11 <= bytes.len()
+            && bytes[i..i + 11].eq_ignore_ascii_case(b"revert-rule")
+        {
+            // Rewrite standalone declaration value `: revert-rule` (before `;`, `}`, `!`, or EOF).
+            let mut p = i;
+            while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+                p -= 1;
+            }
+            let after_colon = p > 0 && bytes[p - 1] == b':';
+            let mut q = i + 11;
+            while q < bytes.len() && bytes[q].is_ascii_whitespace() {
+                q += 1;
+            }
+            let before_end = q == bytes.len() || matches!(bytes[q], b';' | b'}' | b'!');
+            if after_colon && before_end {
+                let buf = out.get_or_insert_with(|| String::with_capacity(css.len() + 24));
+                buf.push_str(&css[last..i]);
+                buf.push_str("var(--__rix_revert_rule__)");
+                i += 11;
+                last = i;
+                continue;
+            }
+        }
+        if has_var
+            && i + 4 <= bytes.len()
             && bytes[i..i + 4].eq_ignore_ascii_case(b"var(")
             && (i == 0
                 || !(bytes[i - 1].is_ascii_alphanumeric()
@@ -1818,6 +1998,16 @@ pub(crate) fn rewrite_dynamic_var_names(css: &str) -> std::borrow::Cow<'_, str> 
             std::borrow::Cow::Owned(buf)
         }
         None => std::borrow::Cow::Borrowed(css),
+    }
+}
+
+/// Restores internal `var(--__rix_revert_rule__)` sentinel back to `revert-rule` for CSSOM text.
+#[must_use]
+pub(crate) fn restore_revert_rule_sentinel(text: &str) -> String {
+    if text.contains("--__rix_revert_rule__") {
+        text.replace("var(--__rix_revert_rule__)", "revert-rule")
+    } else {
+        text.to_string()
     }
 }
 
@@ -4340,6 +4530,22 @@ fn compile_property(
                 imp,
             );
         }
+        Property::All(kw) => {
+            let gk = match kw {
+                lightningcss::properties::CSSWideKeyword::Initial => GlobalKeyword::Initial,
+                lightningcss::properties::CSSWideKeyword::Inherit => GlobalKeyword::Inherit,
+                lightningcss::properties::CSSWideKeyword::Unset => GlobalKeyword::Unset,
+                lightningcss::properties::CSSWideKeyword::Revert => GlobalKeyword::Revert,
+                lightningcss::properties::CSSWideKeyword::RevertLayer => GlobalKeyword::RevertLayer,
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::All,
+                PropertyValue::Global(gk),
+                imp,
+            );
+        }
         Property::Unparsed(u) => {
             let Some(kind) = PropertyIdKind::from_name(u.property_id.name()) else {
                 missing.push(MissingCssFeature::new(
@@ -4355,10 +4561,15 @@ fn compile_property(
                     .filter(|t| !matches!(t, CssToken::Space))
                     .collect();
                 if non_ws.len() == 1 {
-                    if let CssToken::Ident(id) = non_ws[0] {
-                        GlobalKeyword::from_ident(id.as_str())
-                    } else {
-                        None
+                    match non_ws[0] {
+                        CssToken::Ident(id) => GlobalKeyword::from_ident(id.as_str()),
+                        CssToken::Var {
+                            name,
+                            fallback: None,
+                        } if name.as_str() == "--__rix_revert_rule__" => {
+                            Some(GlobalKeyword::RevertRule)
+                        }
+                        _ => None,
                     }
                 } else {
                     None
@@ -4402,6 +4613,15 @@ fn compile_property(
                     let mut iter = tokens.iter().filter(|t| !matches!(t, CssToken::Space));
                     match (iter.next(), iter.next()) {
                         (Some(CssToken::Ident(id)), None) => GlobalKeyword::from_ident(id.as_str()),
+                        (
+                            Some(CssToken::Var {
+                                name,
+                                fallback: None,
+                            }),
+                            None,
+                        ) if name.as_str() == "--__rix_revert_rule__" => {
+                            Some(GlobalKeyword::RevertRule)
+                        }
                         _ => None,
                     }
                 };
