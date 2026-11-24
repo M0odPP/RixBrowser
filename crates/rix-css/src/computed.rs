@@ -148,9 +148,15 @@ pub struct InheritedTextStyle {
     pub letter_spacing: LengthPercentage,
     pub word_spacing: LengthPercentage,
     pub text_indent: LengthPercentage,
+    pub text_indent_hanging: bool,
+    pub text_indent_each_line: bool,
     pub text_align: TextAlignMode,
     pub text_transform: TextTransformMode,
+    pub text_transform_flags: crate::text_css::TextTransformFlags,
     pub white_space: WhiteSpaceMode,
+    pub white_space_collapse: crate::text_css::WhiteSpaceCollapseMode,
+    pub text_wrap_mode: crate::text_css::TextWrapMode,
+    pub text_wrap_style: crate::text_css::TextWrapStyle,
     pub word_break: WordBreakMode,
     pub overflow_wrap: OverflowWrapMode,
     pub direction: DirectionMode,
@@ -169,6 +175,15 @@ pub struct InheritedTextStyle {
     pub text_align_last: TextAlignLastMode,
     pub hyphenate_character: Option<InternedStr>,
     pub hyphenate_limit_lines: Option<i32>,
+    pub hyphenate_limit_chars: crate::text_css::HyphenateLimitChars,
+    pub hyphens: crate::text_css::HyphensMode,
+    pub line_break: crate::text_css::LineBreakMode,
+    pub text_autospace: crate::text_css::TextAutospaceValue,
+    pub text_autospace_size: f32,
+    pub text_spacing_trim: crate::text_css::TextSpacingTrimMode,
+    pub hanging_punctuation: crate::text_css::HangingPunctuation,
+    pub text_fit: crate::text_css::TextFitValue,
+    pub word_space_transform: crate::text_css::WordSpaceTransformMode,
     pub interpolate_size: InterpolateSizeMode,
     /// Full CSS Values L4/L5 evaluation context snapshot for this element (`em`/`rem`/`lh`/`rlh`/viewport/container/sibling).
     pub eval_ctx: EvalContext,
@@ -188,9 +203,15 @@ impl Default for InheritedTextStyle {
             letter_spacing: LengthPercentage::Zero,
             word_spacing: LengthPercentage::Zero,
             text_indent: LengthPercentage::Zero,
+            text_indent_hanging: false,
+            text_indent_each_line: false,
             text_align: TextAlignMode::Start,
             text_transform: TextTransformMode::None,
+            text_transform_flags: crate::text_css::TextTransformFlags::NONE,
             white_space: WhiteSpaceMode::Normal,
+            white_space_collapse: crate::text_css::WhiteSpaceCollapseMode::Collapse,
+            text_wrap_mode: crate::text_css::TextWrapMode::Wrap,
+            text_wrap_style: crate::text_css::TextWrapStyle::Auto,
             word_break: WordBreakMode::Normal,
             overflow_wrap: OverflowWrapMode::Normal,
             direction: DirectionMode::Ltr,
@@ -209,6 +230,15 @@ impl Default for InheritedTextStyle {
             text_align_last: TextAlignLastMode::Auto,
             hyphenate_character: None,
             hyphenate_limit_lines: None,
+            hyphenate_limit_chars: crate::text_css::HyphenateLimitChars::default(),
+            hyphens: crate::text_css::HyphensMode::Manual,
+            line_break: crate::text_css::LineBreakMode::Auto,
+            text_autospace: crate::text_css::TextAutospaceValue::Normal,
+            text_autospace_size: 0.125,
+            text_spacing_trim: crate::text_css::TextSpacingTrimMode::Normal,
+            hanging_punctuation: crate::text_css::HangingPunctuation::NONE,
+            text_fit: crate::text_css::TextFitValue::None,
+            word_space_transform: crate::text_css::WordSpaceTransformMode::None,
             interpolate_size: InterpolateSizeMode::NumericOnly,
             eval_ctx: EvalContext::default(),
         }
@@ -227,9 +257,15 @@ impl InheritedTextStyle {
             && self.letter_spacing == other.letter_spacing
             && self.word_spacing == other.word_spacing
             && self.text_indent == other.text_indent
+            && self.text_indent_hanging == other.text_indent_hanging
+            && self.text_indent_each_line == other.text_indent_each_line
             && self.text_align == other.text_align
             && self.text_transform == other.text_transform
+            && self.text_transform_flags == other.text_transform_flags
             && self.white_space == other.white_space
+            && self.white_space_collapse == other.white_space_collapse
+            && self.text_wrap_mode == other.text_wrap_mode
+            && self.text_wrap_style == other.text_wrap_style
             && self.word_break == other.word_break
             && self.overflow_wrap == other.overflow_wrap
             && self.direction == other.direction
@@ -243,6 +279,15 @@ impl InheritedTextStyle {
             && self.text_align_last == other.text_align_last
             && self.hyphenate_character == other.hyphenate_character
             && self.hyphenate_limit_lines == other.hyphenate_limit_lines
+            && self.hyphenate_limit_chars == other.hyphenate_limit_chars
+            && self.hyphens == other.hyphens
+            && self.line_break == other.line_break
+            && self.text_autospace == other.text_autospace
+            && self.text_autospace_size == other.text_autospace_size
+            && self.text_spacing_trim == other.text_spacing_trim
+            && self.hanging_punctuation == other.hanging_punctuation
+            && self.text_fit == other.text_fit
+            && self.word_space_transform == other.word_space_transform
     }
 }
 
@@ -410,6 +455,9 @@ pub struct ComputedStyle {
     pub pointer_events: PointerEventsMode,
     pub cursor: CursorKind,
     pub overlay: OverlayMode,
+    pub white_space_trim: crate::text_css::WhiteSpaceTrim,
+    pub wrap_inside: crate::text_css::WrapInsideMode,
+    pub text_group_align: crate::text_css::TextGroupAlignMode,
     pub z_index: ZIndexValue,
     pub opacity: f32,
     pub color_scheme_dark: bool,
@@ -434,6 +482,9 @@ impl Default for ComputedStyle {
             pointer_events: PointerEventsMode::Auto,
             cursor: CursorKind::Auto,
             overlay: OverlayMode::None,
+            white_space_trim: crate::text_css::WhiteSpaceTrim::NONE,
+            wrap_inside: crate::text_css::WrapInsideMode::Auto,
+            text_group_align: crate::text_css::TextGroupAlignMode::None,
             z_index: ZIndexValue::Auto,
             opacity: 1.0,
             color_scheme_dark: false,
@@ -462,6 +513,9 @@ impl ComputedStyle {
             pointer_events: parent.pointer_events,
             cursor: parent.cursor,
             overlay: OverlayMode::None,
+            white_space_trim: crate::text_css::WhiteSpaceTrim::NONE,
+            wrap_inside: crate::text_css::WrapInsideMode::Auto,
+            text_group_align: crate::text_css::TextGroupAlignMode::None,
             z_index: ZIndexValue::Auto,
             opacity: 1.0,
             color_scheme_dark: parent.color_scheme_dark,
@@ -487,6 +541,9 @@ impl ComputedStyle {
             || self.clear_mode != other.clear_mode
             || self.box_sizing != other.box_sizing
             || self.overflow != other.overflow
+            || self.white_space_trim != other.white_space_trim
+            || self.wrap_inside != other.wrap_inside
+            || self.text_group_align != other.text_group_align
         {
             return false;
         }
@@ -2314,16 +2371,97 @@ pub fn apply_declaration(
             Arc::make_mut(&mut style.text).word_spacing = l.clone();
         }
         (PropertyIdKind::TextIndent, PropertyValue::Length(l)) => {
-            Arc::make_mut(&mut style.text).text_indent = l.clone();
+            let txt = Arc::make_mut(&mut style.text);
+            txt.text_indent = l.clone();
+            txt.text_indent_hanging = false;
+            txt.text_indent_each_line = false;
         }
-        (PropertyIdKind::TextAlign, PropertyValue::TextAlign(ta)) => {
-            Arc::make_mut(&mut style.text).text_align = *ta;
+        (PropertyIdKind::TextIndent, PropertyValue::TextIndentFull(l, hanging, each_line)) => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.text_indent = l.clone();
+            txt.text_indent_hanging = *hanging;
+            txt.text_indent_each_line = *each_line;
+        }
+        (
+            PropertyIdKind::TextAlign | PropertyIdKind::TextAlignAll,
+            PropertyValue::TextAlign(ta),
+        ) => {
+            let resolved = if *ta == TextAlignMode::MatchParent {
+                match parent {
+                    Some(p) => match p.text.text_align {
+                        TextAlignMode::Start => {
+                            if p.text.direction == DirectionMode::Rtl {
+                                TextAlignMode::Right
+                            } else {
+                                TextAlignMode::Left
+                            }
+                        }
+                        TextAlignMode::End => {
+                            if p.text.direction == DirectionMode::Rtl {
+                                TextAlignMode::Left
+                            } else {
+                                TextAlignMode::Right
+                            }
+                        }
+                        other => other,
+                    },
+                    None => TextAlignMode::Start,
+                }
+            } else {
+                *ta
+            };
+            Arc::make_mut(&mut style.text).text_align = resolved;
         }
         (PropertyIdKind::TextTransform, PropertyValue::TextTransform(tt)) => {
-            Arc::make_mut(&mut style.text).text_transform = *tt;
+            let txt = Arc::make_mut(&mut style.text);
+            txt.text_transform = *tt;
+            txt.text_transform_flags = match tt {
+                TextTransformMode::None => crate::text_css::TextTransformFlags::NONE,
+                TextTransformMode::Capitalize => crate::text_css::TextTransformFlags(
+                    crate::text_css::TextTransformFlags::CAPITALIZE,
+                ),
+                TextTransformMode::Uppercase => crate::text_css::TextTransformFlags(
+                    crate::text_css::TextTransformFlags::UPPERCASE,
+                ),
+                TextTransformMode::Lowercase => crate::text_css::TextTransformFlags(
+                    crate::text_css::TextTransformFlags::LOWERCASE,
+                ),
+            };
+        }
+        (PropertyIdKind::TextTransform, PropertyValue::TextTransformFlags(f)) => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.text_transform_flags = *f;
+            txt.text_transform = match f.case_bits() {
+                crate::text_css::TextTransformFlags::CAPITALIZE => TextTransformMode::Capitalize,
+                crate::text_css::TextTransformFlags::UPPERCASE => TextTransformMode::Uppercase,
+                crate::text_css::TextTransformFlags::LOWERCASE => TextTransformMode::Lowercase,
+                _ => TextTransformMode::None,
+            };
         }
         (PropertyIdKind::WhiteSpace, PropertyValue::WhiteSpace(ws)) => {
-            Arc::make_mut(&mut style.text).white_space = *ws;
+            let (c, w) = crate::text_css::decompose_legacy_white_space(*ws);
+            let txt = Arc::make_mut(&mut style.text);
+            txt.white_space = *ws;
+            txt.white_space_collapse = c;
+            txt.text_wrap_mode = w;
+            style.white_space_trim = crate::text_css::WhiteSpaceTrim::NONE;
+        }
+        (PropertyIdKind::WhiteSpaceCollapse, PropertyValue::WhiteSpaceCollapse(c)) => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.white_space_collapse = *c;
+            txt.white_space = crate::text_css::derive_white_space_mode(*c, txt.text_wrap_mode);
+        }
+        (PropertyIdKind::TextWrapMode, PropertyValue::TextWrapMode(w)) => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.text_wrap_mode = *w;
+            txt.white_space =
+                crate::text_css::derive_white_space_mode(txt.white_space_collapse, *w);
+        }
+        (PropertyIdKind::TextWrapStyle, PropertyValue::TextWrapStyle(s)) => {
+            Arc::make_mut(&mut style.text).text_wrap_style = *s;
+        }
+        (PropertyIdKind::WhiteSpaceTrim, PropertyValue::WhiteSpaceTrim(t)) => {
+            style.white_space_trim = *t;
         }
         (PropertyIdKind::WordBreak, PropertyValue::WordBreak(wb)) => {
             Arc::make_mut(&mut style.text).word_break = *wb;
@@ -2953,6 +3091,42 @@ pub fn apply_declaration(
         (PropertyIdKind::HyphenateLimitLines, PropertyValue::HyphenateLimitLines(v)) => {
             Arc::make_mut(&mut style.text).hyphenate_limit_lines = *v;
         }
+        (PropertyIdKind::HyphenateLimitChars, PropertyValue::HyphenateLimitChars(v)) => {
+            Arc::make_mut(&mut style.text).hyphenate_limit_chars = *v;
+        }
+        (PropertyIdKind::Hyphens, PropertyValue::Hyphens(v)) => {
+            Arc::make_mut(&mut style.text).hyphens = *v;
+        }
+        (PropertyIdKind::LineBreak, PropertyValue::LineBreak(v)) => {
+            Arc::make_mut(&mut style.text).line_break = *v;
+        }
+        (PropertyIdKind::TextAutospace, PropertyValue::TextAutospace(v)) => {
+            Arc::make_mut(&mut style.text).text_autospace = *v;
+        }
+        (PropertyIdKind::TextAutospaceSize, PropertyValue::MathVal(node)) => {
+            let v = node.eval_scalar(eval, None);
+            if v.is_finite() {
+                Arc::make_mut(&mut style.text).text_autospace_size = v as f32;
+            }
+        }
+        (PropertyIdKind::TextSpacingTrim, PropertyValue::TextSpacingTrim(v)) => {
+            Arc::make_mut(&mut style.text).text_spacing_trim = *v;
+        }
+        (PropertyIdKind::HangingPunctuation, PropertyValue::HangingPunctuation(v)) => {
+            Arc::make_mut(&mut style.text).hanging_punctuation = *v;
+        }
+        (PropertyIdKind::TextFit, PropertyValue::TextFit(v)) => {
+            Arc::make_mut(&mut style.text).text_fit = *v;
+        }
+        (PropertyIdKind::TextGroupAlign, PropertyValue::TextGroupAlign(v)) => {
+            style.text_group_align = *v;
+        }
+        (PropertyIdKind::WordSpaceTransform, PropertyValue::WordSpaceTransform(v)) => {
+            Arc::make_mut(&mut style.text).word_space_transform = *v;
+        }
+        (PropertyIdKind::WrapInside, PropertyValue::WrapInside(v)) => {
+            style.wrap_inside = *v;
+        }
         (PropertyIdKind::Contain, PropertyValue::Contain(bits)) => {
             style.effects_mut().contain = *bits;
         }
@@ -3003,11 +3177,99 @@ fn copy_property_from_parent(
         PropertyIdKind::LineHeight => {
             Arc::make_mut(&mut style.text).line_height = parent.text.line_height.clone();
         }
-        PropertyIdKind::TextAlign => {
+        PropertyIdKind::LetterSpacing => {
+            Arc::make_mut(&mut style.text).letter_spacing = parent.text.letter_spacing.clone();
+        }
+        PropertyIdKind::WordSpacing => {
+            Arc::make_mut(&mut style.text).word_spacing = parent.text.word_spacing.clone();
+        }
+        PropertyIdKind::TextIndent => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.text_indent = parent.text.text_indent.clone();
+            txt.text_indent_hanging = parent.text.text_indent_hanging;
+            txt.text_indent_each_line = parent.text.text_indent_each_line;
+        }
+        PropertyIdKind::TabSize => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.tab_size_num = parent.text.tab_size_num;
+            txt.tab_size_len = parent.text.tab_size_len.clone();
+        }
+        PropertyIdKind::TextTransform => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.text_transform = parent.text.text_transform;
+            txt.text_transform_flags = parent.text.text_transform_flags;
+        }
+        PropertyIdKind::WordBreak => {
+            Arc::make_mut(&mut style.text).word_break = parent.text.word_break;
+        }
+        PropertyIdKind::OverflowWrap => {
+            Arc::make_mut(&mut style.text).overflow_wrap = parent.text.overflow_wrap;
+        }
+        PropertyIdKind::TextAlign | PropertyIdKind::TextAlignAll => {
             Arc::make_mut(&mut style.text).text_align = parent.text.text_align;
         }
         PropertyIdKind::WhiteSpace => {
-            Arc::make_mut(&mut style.text).white_space = parent.text.white_space;
+            let txt = Arc::make_mut(&mut style.text);
+            txt.white_space = parent.text.white_space;
+            txt.white_space_collapse = parent.text.white_space_collapse;
+            txt.text_wrap_mode = parent.text.text_wrap_mode;
+            style.white_space_trim = parent.white_space_trim;
+        }
+        PropertyIdKind::WhiteSpaceCollapse => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.white_space_collapse = parent.text.white_space_collapse;
+            txt.white_space = crate::text_css::derive_white_space_mode(
+                txt.white_space_collapse,
+                txt.text_wrap_mode,
+            );
+        }
+        PropertyIdKind::TextWrapMode => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.text_wrap_mode = parent.text.text_wrap_mode;
+            txt.white_space = crate::text_css::derive_white_space_mode(
+                txt.white_space_collapse,
+                txt.text_wrap_mode,
+            );
+        }
+        PropertyIdKind::TextWrapStyle => {
+            Arc::make_mut(&mut style.text).text_wrap_style = parent.text.text_wrap_style;
+        }
+        PropertyIdKind::WhiteSpaceTrim => {
+            style.white_space_trim = parent.white_space_trim;
+        }
+        PropertyIdKind::TextAutospace => {
+            Arc::make_mut(&mut style.text).text_autospace = parent.text.text_autospace;
+        }
+        PropertyIdKind::TextAutospaceSize => {
+            Arc::make_mut(&mut style.text).text_autospace_size = parent.text.text_autospace_size;
+        }
+        PropertyIdKind::TextSpacingTrim => {
+            Arc::make_mut(&mut style.text).text_spacing_trim = parent.text.text_spacing_trim;
+        }
+        PropertyIdKind::HangingPunctuation => {
+            Arc::make_mut(&mut style.text).hanging_punctuation = parent.text.hanging_punctuation;
+        }
+        PropertyIdKind::Hyphens => {
+            Arc::make_mut(&mut style.text).hyphens = parent.text.hyphens;
+        }
+        PropertyIdKind::HyphenateLimitChars => {
+            Arc::make_mut(&mut style.text).hyphenate_limit_chars =
+                parent.text.hyphenate_limit_chars;
+        }
+        PropertyIdKind::LineBreak => {
+            Arc::make_mut(&mut style.text).line_break = parent.text.line_break;
+        }
+        PropertyIdKind::TextFit => {
+            Arc::make_mut(&mut style.text).text_fit = parent.text.text_fit;
+        }
+        PropertyIdKind::TextGroupAlign => {
+            style.text_group_align = parent.text_group_align;
+        }
+        PropertyIdKind::WordSpaceTransform => {
+            Arc::make_mut(&mut style.text).word_space_transform = parent.text.word_space_transform;
+        }
+        PropertyIdKind::WrapInside => {
+            style.wrap_inside = parent.wrap_inside;
         }
         PropertyIdKind::Direction => {
             Arc::make_mut(&mut style.text).direction = parent.text.direction;
@@ -3434,16 +3696,85 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
             Arc::make_mut(&mut style.text).word_spacing = init.text.word_spacing.clone();
         }
         PropertyIdKind::TextIndent => {
-            Arc::make_mut(&mut style.text).text_indent = init.text.text_indent.clone();
+            let txt = Arc::make_mut(&mut style.text);
+            txt.text_indent = init.text.text_indent.clone();
+            txt.text_indent_hanging = false;
+            txt.text_indent_each_line = false;
         }
-        PropertyIdKind::TextAlign => {
+        PropertyIdKind::TextAlign | PropertyIdKind::TextAlignAll => {
             Arc::make_mut(&mut style.text).text_align = init.text.text_align;
         }
         PropertyIdKind::TextTransform => {
-            Arc::make_mut(&mut style.text).text_transform = init.text.text_transform;
+            let txt = Arc::make_mut(&mut style.text);
+            txt.text_transform = init.text.text_transform;
+            txt.text_transform_flags = crate::text_css::TextTransformFlags::NONE;
         }
         PropertyIdKind::WhiteSpace => {
-            Arc::make_mut(&mut style.text).white_space = init.text.white_space;
+            let txt = Arc::make_mut(&mut style.text);
+            txt.white_space = init.text.white_space;
+            txt.white_space_collapse = crate::text_css::WhiteSpaceCollapseMode::Collapse;
+            txt.text_wrap_mode = crate::text_css::TextWrapMode::Wrap;
+            style.white_space_trim = crate::text_css::WhiteSpaceTrim::NONE;
+        }
+        PropertyIdKind::WhiteSpaceCollapse => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.white_space_collapse = crate::text_css::WhiteSpaceCollapseMode::Collapse;
+            txt.white_space = crate::text_css::derive_white_space_mode(
+                txt.white_space_collapse,
+                txt.text_wrap_mode,
+            );
+        }
+        PropertyIdKind::TextWrapMode => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.text_wrap_mode = crate::text_css::TextWrapMode::Wrap;
+            txt.white_space = crate::text_css::derive_white_space_mode(
+                txt.white_space_collapse,
+                txt.text_wrap_mode,
+            );
+        }
+        PropertyIdKind::TextWrapStyle => {
+            Arc::make_mut(&mut style.text).text_wrap_style = crate::text_css::TextWrapStyle::Auto;
+        }
+        PropertyIdKind::WhiteSpaceTrim => {
+            style.white_space_trim = crate::text_css::WhiteSpaceTrim::NONE;
+        }
+        PropertyIdKind::TextAutospace => {
+            Arc::make_mut(&mut style.text).text_autospace =
+                crate::text_css::TextAutospaceValue::Normal;
+        }
+        PropertyIdKind::TextAutospaceSize => {
+            Arc::make_mut(&mut style.text).text_autospace_size = 0.125;
+        }
+        PropertyIdKind::TextSpacingTrim => {
+            Arc::make_mut(&mut style.text).text_spacing_trim =
+                crate::text_css::TextSpacingTrimMode::Normal;
+        }
+        PropertyIdKind::HangingPunctuation => {
+            Arc::make_mut(&mut style.text).hanging_punctuation =
+                crate::text_css::HangingPunctuation::NONE;
+        }
+        PropertyIdKind::Hyphens => {
+            Arc::make_mut(&mut style.text).hyphens = crate::text_css::HyphensMode::Manual;
+        }
+        PropertyIdKind::HyphenateLimitChars => {
+            Arc::make_mut(&mut style.text).hyphenate_limit_chars =
+                crate::text_css::HyphenateLimitChars::default();
+        }
+        PropertyIdKind::LineBreak => {
+            Arc::make_mut(&mut style.text).line_break = crate::text_css::LineBreakMode::Auto;
+        }
+        PropertyIdKind::TextFit => {
+            Arc::make_mut(&mut style.text).text_fit = crate::text_css::TextFitValue::None;
+        }
+        PropertyIdKind::TextGroupAlign => {
+            style.text_group_align = crate::text_css::TextGroupAlignMode::None;
+        }
+        PropertyIdKind::WordSpaceTransform => {
+            Arc::make_mut(&mut style.text).word_space_transform =
+                crate::text_css::WordSpaceTransformMode::None;
+        }
+        PropertyIdKind::WrapInside => {
+            style.wrap_inside = crate::text_css::WrapInsideMode::Auto;
         }
         PropertyIdKind::WordBreak => {
             Arc::make_mut(&mut style.text).word_break = init.text.word_break;

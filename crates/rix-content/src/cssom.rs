@@ -17,8 +17,8 @@ use rix_css::{
     GridAutoFlowMode, LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle,
     MixBlendMode, OverflowMode, PointerEventsMode, PositionMode, PropertyIdKind, RixPseudoElement,
     SelectorNamespaceMap, SizeValue, TableLayoutMode, TextAlignMode, TextOverflowMode,
-    TextTransformMode, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
-    WordBreakMode, ZIndexValue, COMPUTED_STYLE_LONGHANDS,
+    UserSelectMode, VerticalAlignMode, VisibilityMode, WordBreakMode, ZIndexValue,
+    COMPUTED_STYLE_LONGHANDS,
 };
 use rix_dom::{NodeData, NodeId};
 use rix_js::promise::{alloc_promise, resolve_promise};
@@ -2007,6 +2007,11 @@ fn has_var_ref_ci(s: &str) -> bool {
 }
 
 fn lookup_decl_or_shorthand(decls: &[(String, String, bool)], prop: &str) -> String {
+    let prop = if prop == "word-wrap" {
+        "overflow-wrap"
+    } else {
+        prop
+    };
     if let Some((_, v, _)) = decls.iter().find(|(k, _, _)| k == prop) {
         return v.clone();
     }
@@ -2222,12 +2227,58 @@ fn lookup_decl_or_shorthand(decls: &[(String, String, bool)], prop: &str) -> Str
             let pd = rix_css::grid_css::parse_grid_lanes_direction(d)?;
             rix_css::grid_css::serialize_grid_lanes_from_values(&pc, &pr, &pa, pd, None)
         })(),
+        "white-space" => (|| {
+            let (c, ic) = get("white-space-collapse")?;
+            let (w, iw) = get("text-wrap-mode")?;
+            let (t, it) = get("white-space-trim")?;
+            if ic != iw || iw != it {
+                return None;
+            }
+            if c == w && w == t && rix_css::GlobalKeyword::from_ident(c).is_some() {
+                return Some(c.to_string());
+            }
+            let pc = rix_css::WhiteSpaceCollapseMode::parse(c)?;
+            let pw = rix_css::TextWrapMode::parse(w)?;
+            let pt = rix_css::WhiteSpaceTrim::parse(t)?;
+            Some(rix_css::text_css::serialize_white_space(pc, pw, pt))
+        })(),
+        "text-wrap" => (|| {
+            let (m, im) = get("text-wrap-mode")?;
+            let (s, is_) = get("text-wrap-style")?;
+            if im != is_ {
+                return None;
+            }
+            if m == s && rix_css::GlobalKeyword::from_ident(m).is_some() {
+                return Some(m.to_string());
+            }
+            let pm = rix_css::TextWrapMode::parse(m)?;
+            let ps = rix_css::TextWrapStyle::parse(s)?;
+            Some(rix_css::text_css::serialize_text_wrap(pm, ps))
+        })(),
+        "text-spacing" => (|| {
+            let (t, it) = get("text-spacing-trim")?;
+            let (a, ia) = get("text-autospace")?;
+            if it != ia {
+                return None;
+            }
+            if t == a && rix_css::GlobalKeyword::from_ident(t).is_some() {
+                return Some(t.to_string());
+            }
+            let pt = rix_css::TextSpacingTrimMode::parse(t)?;
+            let pa = rix_css::TextAutospaceValue::parse(a)?;
+            Some(rix_css::text_css::serialize_text_spacing(pt, pa))
+        })(),
         _ => None,
     };
     res.unwrap_or_default()
 }
 
 fn remove_decl_or_shorthand(decls: &mut Vec<(String, String, bool)>, prop: &str) -> String {
+    let prop = if prop == "word-wrap" {
+        "overflow-wrap"
+    } else {
+        prop
+    };
     let old = lookup_decl_or_shorthand(decls, prop);
     if let Some(kind) = PropertyIdKind::from_name(prop) {
         let longhands = kind.shorthand_longhands();
@@ -3288,6 +3339,31 @@ fn format_computed_property_resolved(
             Some(n) => n.to_string(),
             None => "no-limit".into(),
         },
+        "hyphenate-limit-chars" => style.text.hyphenate_limit_chars.serialize(),
+        "hyphens" => style.text.hyphens.as_str().into(),
+        "line-break" => style.text.line_break.as_str().into(),
+        "white-space-collapse" => style.text.white_space_collapse.as_str().into(),
+        "white-space-trim" => style.white_space_trim.serialize(),
+        "text-wrap" => rix_css::text_css::serialize_text_wrap(
+            style.text.text_wrap_mode,
+            style.text.text_wrap_style,
+        ),
+        "text-wrap-mode" => style.text.text_wrap_mode.as_str().into(),
+        "text-wrap-style" => style.text.text_wrap_style.as_str().into(),
+        "text-spacing" => rix_css::text_css::serialize_text_spacing(
+            style.text.text_spacing_trim,
+            style.text.text_autospace,
+        ),
+        "text-spacing-trim" => style.text.text_spacing_trim.as_str().into(),
+        "text-autospace" => style.text.text_autospace.serialize(),
+        "text-autospace-size" => {
+            rix_css::values_math::format_math_f64(f64::from(style.text.text_autospace_size))
+        }
+        "hanging-punctuation" => style.text.hanging_punctuation.serialize_canonical(),
+        "text-fit" => style.text.text_fit.serialize_computed(),
+        "text-group-align" => style.text_group_align.as_str().into(),
+        "word-space-transform" => style.text.word_space_transform.as_str().into(),
+        "wrap-inside" => style.wrap_inside.as_str().into(),
         "contain" => {
             let bits = style.effects.as_ref().map_or(0, |e| e.contain);
             if bits == 0 {
@@ -3460,13 +3536,26 @@ fn format_computed_property_resolved(
                 })
             }
         },
-        "letter-spacing" => match style.text.letter_spacing {
-            LengthPercentage::Zero => "normal".into(),
-            ref lp => format_lp(lp, &eval),
-        },
+        "letter-spacing" => {
+            let s = format_lp(&style.text.letter_spacing, &eval);
+            if s == "0px" {
+                "normal".into()
+            } else {
+                s
+            }
+        }
         "word-spacing" => format_lp(&style.text.word_spacing, &eval),
-        "text-indent" => format_lp(&style.text.text_indent, &eval),
-        "text-align" => match style.text.text_align {
+        "text-indent" => {
+            let mut s = format_lp(&style.text.text_indent, &eval);
+            if style.text.text_indent_hanging {
+                s.push_str(" hanging");
+            }
+            if style.text.text_indent_each_line {
+                s.push_str(" each-line");
+            }
+            s
+        }
+        "text-align" | "text-align-all" => match style.text.text_align {
             TextAlignMode::Start => "start",
             TextAlignMode::End => "end",
             TextAlignMode::Left => "left",
@@ -3476,26 +3565,18 @@ fn format_computed_property_resolved(
             TextAlignMode::MatchParent => "match-parent",
         }
         .into(),
-        "text-transform" => match style.text.text_transform {
-            TextTransformMode::None => "none",
-            TextTransformMode::Uppercase => "uppercase",
-            TextTransformMode::Lowercase => "lowercase",
-            TextTransformMode::Capitalize => "capitalize",
-        }
-        .into(),
-        "white-space" => match style.text.white_space {
-            WhiteSpaceMode::Normal => "normal",
-            WhiteSpaceMode::Nowrap => "nowrap",
-            WhiteSpaceMode::Pre => "pre",
-            WhiteSpaceMode::PreWrap => "pre-wrap",
-            WhiteSpaceMode::PreLine => "pre-line",
-            WhiteSpaceMode::BreakSpaces => "break-spaces",
-        }
-        .into(),
+        "text-transform" => style.text.text_transform_flags.serialize(),
+        "white-space" => rix_css::text_css::serialize_white_space(
+            style.text.white_space_collapse,
+            style.text.text_wrap_mode,
+            style.white_space_trim,
+        ),
         "word-break" => match style.text.word_break {
             WordBreakMode::Normal => "normal",
             WordBreakMode::BreakAll => "break-all",
             WordBreakMode::KeepAll => "keep-all",
+            WordBreakMode::Manual => "manual",
+            WordBreakMode::AutoPhrase => "auto-phrase",
             WordBreakMode::BreakWord => "break-word",
         }
         .into(),

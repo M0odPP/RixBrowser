@@ -401,9 +401,15 @@ fn collect_transition_candidates(before: &ComputedStyle, after: &ComputedStyle, 
         if before.position != after.position { all_p.push(P::Position); }
         if before.overlay != after.overlay { all_p.push(P::Overlay); }
         if before.opacity != after.opacity { all_p.push(P::Opacity); }
+        if before.white_space_trim != after.white_space_trim { all_p.push(P::WhiteSpaceTrim); }
+        if before.wrap_inside != after.wrap_inside { all_p.push(P::WrapInside); }
+        if before.text_group_align != after.text_group_align { all_p.push(P::TextGroupAlign); }
         if !Arc::ptr_eq(&before.text, &after.text) && before.text != after.text {
             all_p.extend_from_slice(&[P::Color, P::FontSize, P::FontWeight, P::LineHeight, P::LetterSpacing, P::WordSpacing,
-                P::TextIndent, P::Orphans, P::Widows, P::TabSize, P::TextJustify, P::TextAlignLast,
+                P::TextIndent, P::TextAlign, P::TextAlignAll, P::TextTransform, P::WordBreak, P::OverflowWrap,
+                P::WhiteSpaceCollapse, P::TextWrapMode, P::TextWrapStyle, P::TextAutospace, P::TextAutospaceSize,
+                P::TextSpacingTrim, P::HangingPunctuation, P::Hyphens, P::HyphenateLimitChars, P::LineBreak,
+                P::TextFit, P::WordSpaceTransform, P::Orphans, P::Widows, P::TabSize, P::TextJustify, P::TextAlignLast,
                 P::HyphenateCharacter, P::HyphenateLimitLines, P::BorderSpacing, P::BorderCollapse, P::EmptyCells, P::CaptionSide]);
         }
         if before.z_index != after.z_index { all_p.push(P::ZIndex); }
@@ -436,7 +442,27 @@ fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind,
         P::Opacity => a.opacity != b.opacity, P::FontSize => a.text.font_size_px != b.text.font_size_px,
         P::FontWeight => a.text.font_weight != b.text.font_weight, P::LineHeight => a.text.line_height != b.text.line_height,
         P::LetterSpacing => a.text.letter_spacing != b.text.letter_spacing, P::WordSpacing => a.text.word_spacing != b.text.word_spacing,
-        P::TextIndent => a.text.text_indent != b.text.text_indent, P::ZIndex => a.z_index != b.z_index,
+        P::TextIndent => a.text.text_indent != b.text.text_indent || a.text.text_indent_hanging != b.text.text_indent_hanging || a.text.text_indent_each_line != b.text.text_indent_each_line,
+        P::TextAlign | P::TextAlignAll => a.text.text_align != b.text.text_align,
+        P::TextTransform => a.text.text_transform_flags != b.text.text_transform_flags,
+        P::WordBreak => a.text.word_break != b.text.word_break,
+        P::OverflowWrap => a.text.overflow_wrap != b.text.overflow_wrap,
+        P::WhiteSpaceCollapse => a.text.white_space_collapse != b.text.white_space_collapse,
+        P::WhiteSpaceTrim => a.white_space_trim != b.white_space_trim,
+        P::TextWrapMode => a.text.text_wrap_mode != b.text.text_wrap_mode,
+        P::TextWrapStyle => a.text.text_wrap_style != b.text.text_wrap_style,
+        P::TextAutospace => a.text.text_autospace != b.text.text_autospace,
+        P::TextAutospaceSize => a.text.text_autospace_size != b.text.text_autospace_size,
+        P::TextSpacingTrim => a.text.text_spacing_trim != b.text.text_spacing_trim,
+        P::HangingPunctuation => a.text.hanging_punctuation != b.text.hanging_punctuation,
+        P::Hyphens => a.text.hyphens != b.text.hyphens,
+        P::HyphenateLimitChars => a.text.hyphenate_limit_chars != b.text.hyphenate_limit_chars,
+        P::LineBreak => a.text.line_break != b.text.line_break,
+        P::TextFit => a.text.text_fit != b.text.text_fit,
+        P::TextGroupAlign => a.text_group_align != b.text_group_align,
+        P::WordSpaceTransform => a.text.word_space_transform != b.text.word_space_transform,
+        P::WrapInside => a.wrap_inside != b.wrap_inside,
+        P::ZIndex => a.z_index != b.z_index,
         P::Orphans => a.text.orphans != b.text.orphans, P::Widows => a.text.widows != b.text.widows,
         P::Display => a.display != b.display,
         P::Position => a.position != b.position,
@@ -531,7 +557,31 @@ fn compose_property(
         P::PaddingRight => Arc::make_mut(&mut kf.box_model).padding.right = compose_lp(&underlying.box_model.padding.right, &kf.box_model.padding.right, eval, true),
         P::PaddingTop => Arc::make_mut(&mut kf.box_model).padding.top = compose_lp(&underlying.box_model.padding.top, &kf.box_model.padding.top, eval, true),
         P::PaddingBottom => Arc::make_mut(&mut kf.box_model).padding.bottom = compose_lp(&underlying.box_model.padding.bottom, &kf.box_model.padding.bottom, eval, true),
-        P::TextIndent => Arc::make_mut(&mut kf.text).text_indent = compose_lp(&underlying.text.text_indent, &kf.text.text_indent, eval, false),
+        P::TextIndent => {
+            if underlying.text.text_indent_hanging == kf.text.text_indent_hanging
+                && underlying.text.text_indent_each_line == kf.text.text_indent_each_line
+            {
+                Arc::make_mut(&mut kf.text).text_indent =
+                    compose_lp(&underlying.text.text_indent, &kf.text.text_indent, eval, false);
+            }
+        }
+        P::TextAutospaceSize => {
+            Arc::make_mut(&mut kf.text).text_autospace_size =
+                underlying.text.text_autospace_size + kf.text.text_autospace_size;
+        }
+        P::HyphenateLimitChars => {
+            let (u, k) = (underlying.text.hyphenate_limit_chars, kf.text.hyphenate_limit_chars);
+            let add_opt = |a: Option<i32>, b: Option<i32>| -> Option<Option<i32>> {
+                match (a, b) {
+                    (None, None) => Some(None),
+                    (Some(av), Some(bv)) => Some(Some(av.saturating_add(bv))),
+                    _ => None,
+                }
+            };
+            if let (Some(w), Some(b), Some(a)) = (add_opt(u.word, k.word), add_opt(u.before, k.before), add_opt(u.after, k.after)) {
+                Arc::make_mut(&mut kf.text).hyphenate_limit_chars = crate::text_css::HyphenateLimitChars { word: w, before: b, after: a };
+            }
+        }
         P::LetterSpacing => Arc::make_mut(&mut kf.text).letter_spacing = compose_lp(&underlying.text.letter_spacing, &kf.text.letter_spacing, eval, false),
         P::WordSpacing => Arc::make_mut(&mut kf.text).word_spacing = compose_lp(&underlying.text.word_spacing, &kf.text.word_spacing, eval, false),
         P::BorderSpacing => {
@@ -574,7 +624,7 @@ fn compose_property(
             }
         }
         P::ZIndex => if let (ZIndexValue::Integer(u), ZIndexValue::Integer(k)) = (underlying.z_index, kf.z_index) { kf.z_index = ZIndexValue::Integer(u.saturating_add(k)); },
-        P::HyphenateLimitLines => if let (Some(u), Some(k)) = (underlying.text.hyphenate_limit_lines, kf.text.hyphenate_limit_lines) { Arc::make_mut(&mut kf.text).hyphenate_limit_lines = Some(u.saturating_add(k).max(1)); },
+        P::HyphenateLimitLines => if let (Some(u), Some(k)) = (underlying.text.hyphenate_limit_lines, kf.text.hyphenate_limit_lines) { Arc::make_mut(&mut kf.text).hyphenate_limit_lines = Some(u.saturating_add(k).max(0)); },
         P::ReadingOrder => {
             let u = underlying.effects.as_ref().map_or(0, |e| e.reading_order);
             let k = kf.effects.as_ref().map_or(0, |e| e.reading_order);
@@ -643,11 +693,11 @@ fn interpolate_property_into(
             let bm = Arc::make_mut(&mut target.box_model);
             match prop { P::Left => bm.inset.left = res, P::Right => bm.inset.right = res, P::Top => bm.inset.top = res, P::Bottom => bm.inset.bottom = res, P::MarginLeft => bm.margin.left = res, P::MarginRight => bm.margin.right = res, P::MarginTop => bm.margin.top = res, _ => bm.margin.bottom = res }
         }
-        P::PaddingTop | P::PaddingRight | P::PaddingBottom | P::PaddingLeft | P::TextIndent | P::LetterSpacing | P::WordSpacing => {
+        P::PaddingTop | P::PaddingRight | P::PaddingBottom | P::PaddingLeft | P::LetterSpacing | P::WordSpacing => {
             let (fv, tv) = match prop {
                 P::PaddingTop => (&from.box_model.padding.top, &to.box_model.padding.top), P::PaddingRight => (&from.box_model.padding.right, &to.box_model.padding.right),
                 P::PaddingBottom => (&from.box_model.padding.bottom, &to.box_model.padding.bottom), P::PaddingLeft => (&from.box_model.padding.left, &to.box_model.padding.left),
-                P::TextIndent => (&from.text.text_indent, &to.text.text_indent), P::LetterSpacing => (&from.text.letter_spacing, &to.text.letter_spacing),
+                P::LetterSpacing => (&from.text.letter_spacing, &to.text.letter_spacing),
                 _ => (&from.text.word_spacing, &to.text.word_spacing),
             };
             let mut res = interpolate_lp(fv, tv, p, eval, is_transition);
@@ -657,8 +707,23 @@ fn interpolate_property_into(
             match prop {
                 P::PaddingTop => Arc::make_mut(&mut target.box_model).padding.top = res, P::PaddingRight => Arc::make_mut(&mut target.box_model).padding.right = res,
                 P::PaddingBottom => Arc::make_mut(&mut target.box_model).padding.bottom = res, P::PaddingLeft => Arc::make_mut(&mut target.box_model).padding.left = res,
-                P::TextIndent => Arc::make_mut(&mut target.text).text_indent = res, P::LetterSpacing => Arc::make_mut(&mut target.text).letter_spacing = res,
+                P::LetterSpacing => Arc::make_mut(&mut target.text).letter_spacing = res,
                 _ => Arc::make_mut(&mut target.text).word_spacing = res,
+            }
+        }
+        P::TextIndent => {
+            let t = Arc::make_mut(&mut target.text);
+            if from.text.text_indent_hanging == to.text.text_indent_hanging
+                && from.text.text_indent_each_line == to.text.text_indent_each_line
+            {
+                t.text_indent = interpolate_lp(&from.text.text_indent, &to.text.text_indent, p, eval, is_transition);
+                t.text_indent_hanging = from.text.text_indent_hanging;
+                t.text_indent_each_line = from.text.text_indent_each_line;
+            } else {
+                let src = if use_from_disc { &from.text } else { &to.text };
+                t.text_indent = src.text_indent.clone();
+                t.text_indent_hanging = src.text_indent_hanging;
+                t.text_indent_each_line = src.text_indent_each_line;
             }
         }
         P::Display => {
@@ -721,9 +786,41 @@ fn interpolate_property_into(
         P::TextAlignLast => Arc::make_mut(&mut target.text).text_align_last = if use_from_disc { from.text.text_align_last } else { to.text.text_align_last },
         P::HyphenateCharacter => Arc::make_mut(&mut target.text).hyphenate_character = if use_from_disc { from.text.hyphenate_character.clone() } else { to.text.hyphenate_character.clone() },
         P::HyphenateLimitLines => Arc::make_mut(&mut target.text).hyphenate_limit_lines = match (from.text.hyphenate_limit_lines, to.text.hyphenate_limit_lines) {
-            (Some(a), Some(b)) => Some((((f64::from(a) * (1.0 - p) + f64::from(b) * p) + 0.5).floor() as i32).max(1)),
+            (Some(a), Some(b)) => Some((((f64::from(a) * (1.0 - p) + f64::from(b) * p) + 0.5).floor() as i32).max(0)),
             _ => if use_from_disc { from.text.hyphenate_limit_lines } else { to.text.hyphenate_limit_lines },
         },
+        P::HyphenateLimitChars => Arc::make_mut(&mut target.text).hyphenate_limit_chars = from.text.hyphenate_limit_chars.interpolate(to.text.hyphenate_limit_chars, p, use_from_disc),
+        P::Hyphens => Arc::make_mut(&mut target.text).hyphens = if use_from_disc { from.text.hyphens } else { to.text.hyphens },
+        P::LineBreak => Arc::make_mut(&mut target.text).line_break = if use_from_disc { from.text.line_break } else { to.text.line_break },
+        P::TextAlign | P::TextAlignAll => Arc::make_mut(&mut target.text).text_align = if use_from_disc { from.text.text_align } else { to.text.text_align },
+        P::TextTransform => {
+            let src = if use_from_disc { &from.text } else { &to.text };
+            let t = Arc::make_mut(&mut target.text);
+            t.text_transform = src.text_transform;
+            t.text_transform_flags = src.text_transform_flags;
+        }
+        P::WordBreak => Arc::make_mut(&mut target.text).word_break = if use_from_disc { from.text.word_break } else { to.text.word_break },
+        P::OverflowWrap => Arc::make_mut(&mut target.text).overflow_wrap = if use_from_disc { from.text.overflow_wrap } else { to.text.overflow_wrap },
+        P::WhiteSpaceCollapse => {
+            let t = Arc::make_mut(&mut target.text);
+            t.white_space_collapse = if use_from_disc { from.text.white_space_collapse } else { to.text.white_space_collapse };
+            t.white_space = crate::text_css::derive_white_space_mode(t.white_space_collapse, t.text_wrap_mode);
+        }
+        P::TextWrapMode => {
+            let t = Arc::make_mut(&mut target.text);
+            t.text_wrap_mode = if use_from_disc { from.text.text_wrap_mode } else { to.text.text_wrap_mode };
+            t.white_space = crate::text_css::derive_white_space_mode(t.white_space_collapse, t.text_wrap_mode);
+        }
+        P::TextWrapStyle => Arc::make_mut(&mut target.text).text_wrap_style = if use_from_disc { from.text.text_wrap_style } else { to.text.text_wrap_style },
+        P::WhiteSpaceTrim => target.white_space_trim = if use_from_disc { from.white_space_trim } else { to.white_space_trim },
+        P::TextAutospace => Arc::make_mut(&mut target.text).text_autospace = if use_from_disc { from.text.text_autospace } else { to.text.text_autospace },
+        P::TextAutospaceSize => Arc::make_mut(&mut target.text).text_autospace_size = (f64::from(from.text.text_autospace_size) * (1.0 - p) + f64::from(to.text.text_autospace_size) * p) as f32,
+        P::TextSpacingTrim => Arc::make_mut(&mut target.text).text_spacing_trim = if use_from_disc { from.text.text_spacing_trim } else { to.text.text_spacing_trim },
+        P::HangingPunctuation => Arc::make_mut(&mut target.text).hanging_punctuation = if use_from_disc { from.text.hanging_punctuation } else { to.text.hanging_punctuation },
+        P::TextFit => Arc::make_mut(&mut target.text).text_fit = if use_from_disc { from.text.text_fit } else { to.text.text_fit },
+        P::TextGroupAlign => target.text_group_align = if use_from_disc { from.text_group_align } else { to.text_group_align },
+        P::WordSpaceTransform => Arc::make_mut(&mut target.text).word_space_transform = if use_from_disc { from.text.word_space_transform } else { to.text.word_space_transform },
+        P::WrapInside => target.wrap_inside = if use_from_disc { from.wrap_inside } else { to.wrap_inside },
         P::ReadingFlow => target.effects_mut().reading_flow = if use_from_disc { from.effects.as_ref().map_or_else(Default::default, |e| e.reading_flow) } else { to.effects.as_ref().map_or_else(Default::default, |e| e.reading_flow) },
         P::ReadingOrder => {
             let (a, b) = (from.effects.as_ref().map_or(0, |e| e.reading_order), to.effects.as_ref().map_or(0, |e| e.reading_order));

@@ -133,6 +133,18 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
             crate::grid_css::serialize_grid_lanes_from_values(&c, &r, &a, d, None)
         });
     }
+    if prop_kind == PropertyIdKind::WhiteSpace {
+        return crate::text_css::parse_white_space_shorthand(trimmed)
+            .map(|(c, w, t)| crate::text_css::serialize_white_space(c, w, t));
+    }
+    if prop_kind == PropertyIdKind::TextWrap {
+        return crate::text_css::parse_text_wrap_shorthand(trimmed)
+            .map(|(m, s)| crate::text_css::serialize_text_wrap(m, s));
+    }
+    if prop_kind == PropertyIdKind::TextSpacing {
+        return crate::text_css::parse_text_spacing_shorthand(trimmed)
+            .map(|(t, a)| crate::text_css::serialize_text_spacing(t, a));
+    }
     if prop_kind == PropertyIdKind::ViewTransitionName {
         if lower_val == "none" {
             return Some("none".to_string());
@@ -215,16 +227,17 @@ pub fn parse_and_expand_declaration(name: &str, value: &str) -> Option<Vec<(Stri
     let canonical = parse_and_serialize_declaration(name, value)?;
     let lower_name = name.to_ascii_lowercase();
     if lower_name.starts_with("--") || contains_var_or_env_ci(&canonical) {
-        return Some(vec![(
-            if lower_name.starts_with("--") {
-                name.to_string()
-            } else {
-                lower_name
-            },
-            canonical,
-        )]);
+        let out_name = if lower_name.starts_with("--") {
+            name.to_string()
+        } else if let Some(kind) = PropertyIdKind::from_name(&lower_name) {
+            kind.css_name().to_string()
+        } else {
+            lower_name
+        };
+        return Some(vec![(out_name, canonical)]);
     }
     let prop_kind = PropertyIdKind::from_name(&lower_name)?;
+    let canonical_prop = prop_kind.css_name().to_string();
     let lower_val = canonical.to_ascii_lowercase();
     if GlobalKeyword::from_ident(&lower_val).is_some() {
         let longhands = prop_kind.shorthand_longhands();
@@ -236,7 +249,7 @@ pub fn parse_and_expand_declaration(name: &str, value: &str) -> Option<Vec<(Stri
                     .collect(),
             );
         }
-        return Some(vec![(lower_name, lower_val)]);
+        return Some(vec![(canonical_prop, lower_val)]);
     }
     let cleaned = strip_outer_css_comments(value);
     if prop_kind == PropertyIdKind::GridRow {
@@ -353,11 +366,33 @@ pub fn parse_and_expand_declaration(name: &str, value: &str) -> Option<Vec<(Stri
             ),
         ]);
     }
+    if prop_kind == PropertyIdKind::WhiteSpace {
+        let (c, w, t) = crate::text_css::parse_white_space_shorthand(cleaned.trim())?;
+        return Some(vec![
+            ("white-space-collapse".to_string(), c.as_str().to_string()),
+            ("text-wrap-mode".to_string(), w.as_str().to_string()),
+            ("white-space-trim".to_string(), t.serialize()),
+        ]);
+    }
+    if prop_kind == PropertyIdKind::TextWrap {
+        let (m, s) = crate::text_css::parse_text_wrap_shorthand(cleaned.trim())?;
+        return Some(vec![
+            ("text-wrap-mode".to_string(), m.as_str().to_string()),
+            ("text-wrap-style".to_string(), s.as_str().to_string()),
+        ]);
+    }
+    if prop_kind == PropertyIdKind::TextSpacing {
+        let (t, a) = crate::text_css::parse_text_spacing_shorthand(cleaned.trim())?;
+        return Some(vec![
+            ("text-spacing-trim".to_string(), t.as_str().to_string()),
+            ("text-autospace".to_string(), a.serialize()),
+        ]);
+    }
     if is_color_longhand(prop_kind)
         || prop_kind == PropertyIdKind::Opacity
         || crate::properties::should_use_values4_parser(prop_kind, &canonical)
     {
-        return Some(vec![(lower_name, canonical)]);
+        return Some(vec![(canonical_prop, canonical)]);
     }
     if prop_kind == PropertyIdKind::Flex {
         let (g, s, b) = parse_flex_shorthand_cssom(cleaned.trim())?;
@@ -386,7 +421,7 @@ pub fn parse_and_expand_declaration(name: &str, value: &str) -> Option<Vec<(Stri
     if let Some(pairs) = expanded {
         return Some(pairs);
     }
-    Some(vec![(lower_name, canonical)])
+    Some(vec![(canonical_prop, canonical)])
 }
 
 /// Parses W3C CSS Flexbox L1 `flex` shorthand (`none | [ <flex-grow> <flex-shrink>? || <flex-basis> ]`)
@@ -617,6 +652,8 @@ fn prop_disallows_unitless_nonzero(kind: PropertyIdKind) -> bool {
                 | "gap"
                 | "border-spacing"
                 | "text-indent"
+                | "letter-spacing"
+                | "word-spacing"
                 | "flex-basis"
         )
 }

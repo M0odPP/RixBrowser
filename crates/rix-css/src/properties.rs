@@ -519,8 +519,26 @@ pub enum PropertyIdKind {
     ReadingOrder,
     TextJustify,
     TextAlignLast,
+    TextAlignAll,
     HyphenateCharacter,
     HyphenateLimitLines,
+    HyphenateLimitChars,
+    Hyphens,
+    LineBreak,
+    WhiteSpaceCollapse,
+    WhiteSpaceTrim,
+    TextWrap,
+    TextWrapMode,
+    TextWrapStyle,
+    TextAutospace,
+    TextAutospaceSize,
+    TextSpacing,
+    TextSpacingTrim,
+    HangingPunctuation,
+    TextFit,
+    TextGroupAlign,
+    WordSpaceTransform,
+    WrapInside,
     Contain,
     // Typography
     FontSize,
@@ -854,8 +872,26 @@ impl PropertyIdKind {
             "reading-order" => Self::ReadingOrder,
             "text-justify" => Self::TextJustify,
             "text-align-last" => Self::TextAlignLast,
+            "text-align-all" => Self::TextAlignAll,
             "hyphenate-character" => Self::HyphenateCharacter,
             "hyphenate-limit-lines" => Self::HyphenateLimitLines,
+            "hyphenate-limit-chars" => Self::HyphenateLimitChars,
+            "hyphens" => Self::Hyphens,
+            "line-break" => Self::LineBreak,
+            "white-space-collapse" => Self::WhiteSpaceCollapse,
+            "white-space-trim" => Self::WhiteSpaceTrim,
+            "text-wrap" => Self::TextWrap,
+            "text-wrap-mode" => Self::TextWrapMode,
+            "text-wrap-style" => Self::TextWrapStyle,
+            "text-autospace" => Self::TextAutospace,
+            "text-autospace-size" => Self::TextAutospaceSize,
+            "text-spacing" => Self::TextSpacing,
+            "text-spacing-trim" => Self::TextSpacingTrim,
+            "hanging-punctuation" => Self::HangingPunctuation,
+            "text-fit" => Self::TextFit,
+            "text-group-align" => Self::TextGroupAlign,
+            "word-space-transform" => Self::WordSpaceTransform,
+            "wrap-inside" => Self::WrapInside,
             "contain" => Self::Contain,
             "font-size" => Self::FontSize,
             "font-weight" => Self::FontWeight,
@@ -1060,8 +1096,26 @@ impl PropertyIdKind {
             Self::ReadingOrder => "reading-order",
             Self::TextJustify => "text-justify",
             Self::TextAlignLast => "text-align-last",
+            Self::TextAlignAll => "text-align-all",
             Self::HyphenateCharacter => "hyphenate-character",
             Self::HyphenateLimitLines => "hyphenate-limit-lines",
+            Self::HyphenateLimitChars => "hyphenate-limit-chars",
+            Self::Hyphens => "hyphens",
+            Self::LineBreak => "line-break",
+            Self::WhiteSpaceCollapse => "white-space-collapse",
+            Self::WhiteSpaceTrim => "white-space-trim",
+            Self::TextWrap => "text-wrap",
+            Self::TextWrapMode => "text-wrap-mode",
+            Self::TextWrapStyle => "text-wrap-style",
+            Self::TextAutospace => "text-autospace",
+            Self::TextAutospaceSize => "text-autospace-size",
+            Self::TextSpacing => "text-spacing",
+            Self::TextSpacingTrim => "text-spacing-trim",
+            Self::HangingPunctuation => "hanging-punctuation",
+            Self::TextFit => "text-fit",
+            Self::TextGroupAlign => "text-group-align",
+            Self::WordSpaceTransform => "word-space-transform",
+            Self::WrapInside => "wrap-inside",
             Self::Contain => "contain",
             Self::FontSize => "font-size",
             Self::FontWeight => "font-weight",
@@ -1242,8 +1296,23 @@ impl PropertyIdKind {
                 | Self::InterpolateSize
                 | Self::TextJustify
                 | Self::TextAlignLast
+                | Self::TextAlignAll
                 | Self::HyphenateCharacter
                 | Self::HyphenateLimitLines
+                | Self::HyphenateLimitChars
+                | Self::Hyphens
+                | Self::LineBreak
+                | Self::WhiteSpaceCollapse
+                | Self::TextWrap
+                | Self::TextWrapMode
+                | Self::TextWrapStyle
+                | Self::TextAutospace
+                | Self::TextAutospaceSize
+                | Self::TextSpacing
+                | Self::TextSpacingTrim
+                | Self::HangingPunctuation
+                | Self::TextFit
+                | Self::WordSpaceTransform
                 | Self::BorderCollapse
                 | Self::BorderSpacing
                 | Self::EmptyCells
@@ -1446,6 +1515,15 @@ impl PropertyIdKind {
             Self::TextDecoration => {
                 SmallVec::from_slice(&[Self::TextDecorationLine, Self::TextDecorationColor])
             }
+            Self::WhiteSpace => SmallVec::from_slice(&[
+                Self::WhiteSpaceCollapse,
+                Self::TextWrapMode,
+                Self::WhiteSpaceTrim,
+            ]),
+            Self::TextWrap => SmallVec::from_slice(&[Self::TextWrapMode, Self::TextWrapStyle]),
+            Self::TextSpacing => {
+                SmallVec::from_slice(&[Self::TextSpacingTrim, Self::TextAutospace])
+            }
             Self::Transition => SmallVec::from_slice(&[
                 Self::TransitionProperty,
                 Self::TransitionDuration,
@@ -1577,8 +1655,24 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "reading-order",
     "text-justify",
     "text-align-last",
+    "text-align-all",
     "hyphenate-character",
     "hyphenate-limit-lines",
+    "hyphenate-limit-chars",
+    "hyphens",
+    "line-break",
+    "white-space-collapse",
+    "white-space-trim",
+    "text-wrap-mode",
+    "text-wrap-style",
+    "text-autospace",
+    "text-autospace-size",
+    "text-spacing-trim",
+    "hanging-punctuation",
+    "text-fit",
+    "text-group-align",
+    "word-space-transform",
+    "wrap-inside",
     "justify-content",
     "justify-items",
     "justify-self",
@@ -1774,8 +1868,24 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::ReadingOrder,
     PropertyIdKind::TextJustify,
     PropertyIdKind::TextAlignLast,
+    PropertyIdKind::TextAlignAll,
     PropertyIdKind::HyphenateCharacter,
     PropertyIdKind::HyphenateLimitLines,
+    PropertyIdKind::HyphenateLimitChars,
+    PropertyIdKind::Hyphens,
+    PropertyIdKind::LineBreak,
+    PropertyIdKind::WhiteSpaceCollapse,
+    PropertyIdKind::WhiteSpaceTrim,
+    PropertyIdKind::TextWrapMode,
+    PropertyIdKind::TextWrapStyle,
+    PropertyIdKind::TextAutospace,
+    PropertyIdKind::TextAutospaceSize,
+    PropertyIdKind::TextSpacingTrim,
+    PropertyIdKind::HangingPunctuation,
+    PropertyIdKind::TextFit,
+    PropertyIdKind::TextGroupAlign,
+    PropertyIdKind::WordSpaceTransform,
+    PropertyIdKind::WrapInside,
     PropertyIdKind::Contain,
     PropertyIdKind::FontSize,
     PropertyIdKind::FontWeight,
@@ -2174,6 +2284,22 @@ pub enum PropertyValue {
     TextAlignLast(TextAlignLastMode),
     HyphenateChar(Option<InternedStr>),
     HyphenateLimitLines(Option<i32>),
+    HyphenateLimitChars(crate::text_css::HyphenateLimitChars),
+    Hyphens(crate::text_css::HyphensMode),
+    LineBreak(crate::text_css::LineBreakMode),
+    WhiteSpaceCollapse(crate::text_css::WhiteSpaceCollapseMode),
+    WhiteSpaceTrim(crate::text_css::WhiteSpaceTrim),
+    TextWrapMode(crate::text_css::TextWrapMode),
+    TextWrapStyle(crate::text_css::TextWrapStyle),
+    TextAutospace(crate::text_css::TextAutospaceValue),
+    TextSpacingTrim(crate::text_css::TextSpacingTrimMode),
+    HangingPunctuation(crate::text_css::HangingPunctuation),
+    TextTransformFlags(crate::text_css::TextTransformFlags),
+    TextIndentFull(LengthPercentage, bool, bool),
+    TextFit(crate::text_css::TextFitValue),
+    TextGroupAlign(crate::text_css::TextGroupAlignMode),
+    WordSpaceTransform(crate::text_css::WordSpaceTransformMode),
+    WrapInside(crate::text_css::WrapInsideMode),
     Contain(u8),
     BackgroundImageRaw(String),
     FontStyleObliqueMath(Box<crate::values_math::MathNode>),
@@ -2516,8 +2642,32 @@ pub fn is_values4_native_property(prop: PropertyIdKind) -> bool {
             | PropertyIdKind::ReadingOrder
             | PropertyIdKind::TextJustify
             | PropertyIdKind::TextAlignLast
+            | PropertyIdKind::TextAlignAll
             | PropertyIdKind::HyphenateCharacter
             | PropertyIdKind::HyphenateLimitLines
+            | PropertyIdKind::HyphenateLimitChars
+            | PropertyIdKind::Hyphens
+            | PropertyIdKind::LineBreak
+            | PropertyIdKind::WhiteSpace
+            | PropertyIdKind::WhiteSpaceCollapse
+            | PropertyIdKind::WhiteSpaceTrim
+            | PropertyIdKind::TextWrap
+            | PropertyIdKind::TextWrapMode
+            | PropertyIdKind::TextWrapStyle
+            | PropertyIdKind::TextAutospace
+            | PropertyIdKind::TextAutospaceSize
+            | PropertyIdKind::TextSpacing
+            | PropertyIdKind::TextSpacingTrim
+            | PropertyIdKind::HangingPunctuation
+            | PropertyIdKind::TextFit
+            | PropertyIdKind::TextGroupAlign
+            | PropertyIdKind::WordSpaceTransform
+            | PropertyIdKind::WrapInside
+            | PropertyIdKind::TextIndent
+            | PropertyIdKind::LetterSpacing
+            | PropertyIdKind::WordSpacing
+            | PropertyIdKind::TextTransform
+            | PropertyIdKind::WordBreak
             | PropertyIdKind::Contain
             | PropertyIdKind::Display
             | PropertyIdKind::GridTemplateColumns
@@ -2887,17 +3037,8 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
             return Some((PropertyValue::MathVal(Box::new(pm.node)), s));
         }
         PropertyIdKind::TextJustify => {
-            let mode = match trimmed.to_ascii_lowercase().as_str() {
-                "auto" => TextJustifyMode::Auto,
-                "none" => TextJustifyMode::None,
-                "inter-word" => TextJustifyMode::InterWord,
-                "inter-character" => TextJustifyMode::InterCharacter,
-                _ => return None,
-            };
-            return Some((
-                PropertyValue::TextJustify(mode),
-                trimmed.to_ascii_lowercase(),
-            ));
+            let (mode, s) = crate::text_css::parse_text_justify(trimmed)?;
+            return Some((PropertyValue::TextJustify(mode), s.to_string()));
         }
         PropertyIdKind::TextAlignLast => {
             let mode = match trimmed.to_ascii_lowercase().as_str() {
@@ -2915,6 +3056,19 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
                 PropertyValue::TextAlignLast(mode),
                 trimmed.to_ascii_lowercase(),
             ));
+        }
+        PropertyIdKind::TextAlignAll => {
+            let mode = match trimmed.to_ascii_lowercase().as_str() {
+                "start" => TextAlignMode::Start,
+                "end" => TextAlignMode::End,
+                "left" => TextAlignMode::Left,
+                "right" => TextAlignMode::Right,
+                "center" => TextAlignMode::Center,
+                "justify" => TextAlignMode::Justify,
+                "match-parent" => TextAlignMode::MatchParent,
+                _ => return None,
+            };
+            return Some((PropertyValue::TextAlign(mode), trimmed.to_ascii_lowercase()));
         }
         PropertyIdKind::HyphenateCharacter => {
             if trimmed.eq_ignore_ascii_case("auto") {
@@ -2940,12 +3094,93 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
             let v = pm
                 .node
                 .eval_scalar(&crate::values::EvalContext::default(), None);
-            if !v.is_finite() || (!pm.was_math_fn && v < 1.0) {
+            if !v.is_finite() || (!pm.was_math_fn && v < 0.0) {
                 return None;
             }
-            let n = (v + 0.5).floor().max(1.0) as i32;
+            let n = (v + 0.5).floor().max(0.0) as i32;
             let s = pm.node.serialize_specified(pm.was_math_fn);
             return Some((PropertyValue::HyphenateLimitLines(Some(n)), s));
+        }
+        PropertyIdKind::HyphenateLimitChars => {
+            let v = crate::text_css::HyphenateLimitChars::parse(trimmed)?;
+            let s = v.serialize();
+            return Some((PropertyValue::HyphenateLimitChars(v), s));
+        }
+        PropertyIdKind::Hyphens => {
+            let v = crate::text_css::HyphensMode::parse(trimmed)?;
+            return Some((PropertyValue::Hyphens(v), v.as_str().to_string()));
+        }
+        PropertyIdKind::LineBreak => {
+            let v = crate::text_css::LineBreakMode::parse(trimmed)?;
+            return Some((PropertyValue::LineBreak(v), v.as_str().to_string()));
+        }
+        PropertyIdKind::WhiteSpaceCollapse => {
+            let v = crate::text_css::WhiteSpaceCollapseMode::parse(trimmed)?;
+            return Some((PropertyValue::WhiteSpaceCollapse(v), v.as_str().to_string()));
+        }
+        PropertyIdKind::WhiteSpaceTrim => {
+            let v = crate::text_css::WhiteSpaceTrim::parse(trimmed)?;
+            let s = v.serialize();
+            return Some((PropertyValue::WhiteSpaceTrim(v), s));
+        }
+        PropertyIdKind::TextWrapMode => {
+            let v = crate::text_css::TextWrapMode::parse(trimmed)?;
+            return Some((PropertyValue::TextWrapMode(v), v.as_str().to_string()));
+        }
+        PropertyIdKind::TextWrapStyle => {
+            let v = crate::text_css::TextWrapStyle::parse(trimmed)?;
+            return Some((PropertyValue::TextWrapStyle(v), v.as_str().to_string()));
+        }
+        PropertyIdKind::TextAutospace => {
+            let v = crate::text_css::TextAutospaceValue::parse(trimmed)?;
+            let s = v.serialize();
+            return Some((PropertyValue::TextAutospace(v), s));
+        }
+        PropertyIdKind::TextAutospaceSize => {
+            let pm = parse_math_value(trimmed, ValueKind::Number)?;
+            let s = pm.node.serialize_specified(pm.was_math_fn);
+            return Some((PropertyValue::MathVal(Box::new(pm.node)), s));
+        }
+        PropertyIdKind::TextSpacingTrim => {
+            let v = crate::text_css::TextSpacingTrimMode::parse(trimmed)?;
+            return Some((PropertyValue::TextSpacingTrim(v), v.as_str().to_string()));
+        }
+        PropertyIdKind::HangingPunctuation => {
+            let (v, s) = crate::text_css::HangingPunctuation::parse_with_specified(trimmed)?;
+            return Some((PropertyValue::HangingPunctuation(v), s));
+        }
+        PropertyIdKind::TextFit => {
+            let (v, s) = crate::text_css::TextFitValue::parse_with_specified(trimmed)?;
+            return Some((PropertyValue::TextFit(v), s));
+        }
+        PropertyIdKind::TextGroupAlign => {
+            let v = crate::text_css::TextGroupAlignMode::parse(trimmed)?;
+            return Some((PropertyValue::TextGroupAlign(v), v.as_str().to_string()));
+        }
+        PropertyIdKind::WordSpaceTransform => {
+            let (v, s) = crate::text_css::WordSpaceTransformMode::parse_with_specified(trimmed)?;
+            return Some((PropertyValue::WordSpaceTransform(v), s));
+        }
+        PropertyIdKind::WrapInside => {
+            let v = crate::text_css::WrapInsideMode::parse(trimmed)?;
+            return Some((PropertyValue::WrapInside(v), v.as_str().to_string()));
+        }
+        PropertyIdKind::TextTransform => {
+            let v = crate::text_css::TextTransformFlags::parse(trimmed)?;
+            let s = v.serialize();
+            return Some((PropertyValue::TextTransformFlags(v), s));
+        }
+        PropertyIdKind::WordBreak => {
+            let (v, s) = crate::text_css::parse_word_break(trimmed)?;
+            return Some((PropertyValue::WordBreak(v), s.to_string()));
+        }
+        PropertyIdKind::TextIndent => {
+            let (lp, hanging, each_line, s) = crate::text_css::parse_text_indent(trimmed)?;
+            return Some((PropertyValue::TextIndentFull(lp, hanging, each_line), s));
+        }
+        PropertyIdKind::LetterSpacing | PropertyIdKind::WordSpacing => {
+            let (lp, s) = crate::text_css::parse_spacing_value(trimmed)?;
+            return Some((PropertyValue::Length(lp), s));
         }
         PropertyIdKind::Contain => {
             let lower = trimmed.to_ascii_lowercase();
@@ -6967,6 +7202,73 @@ fn parse_values4_property_decls(
                     ord,
                     PropertyIdKind::GridLanesDirection,
                     PropertyValue::GridLanesDirection(d),
+                    imp,
+                );
+                return true;
+            }
+            false
+        }
+        PropertyIdKind::WhiteSpace => {
+            if let Some((c, w, t)) = crate::text_css::parse_white_space_shorthand(raw) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::WhiteSpaceCollapse,
+                    PropertyValue::WhiteSpaceCollapse(c),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::TextWrapMode,
+                    PropertyValue::TextWrapMode(w),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::WhiteSpaceTrim,
+                    PropertyValue::WhiteSpaceTrim(t),
+                    imp,
+                );
+                return true;
+            }
+            false
+        }
+        PropertyIdKind::TextWrap => {
+            if let Some((m, s)) = crate::text_css::parse_text_wrap_shorthand(raw) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::TextWrapMode,
+                    PropertyValue::TextWrapMode(m),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::TextWrapStyle,
+                    PropertyValue::TextWrapStyle(s),
+                    imp,
+                );
+                return true;
+            }
+            false
+        }
+        PropertyIdKind::TextSpacing => {
+            if let Some((t, a)) = crate::text_css::parse_text_spacing_shorthand(raw) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::TextSpacingTrim,
+                    PropertyValue::TextSpacingTrim(t),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::TextAutospace,
+                    PropertyValue::TextAutospace(a),
                     imp,
                 );
                 return true;
