@@ -158,17 +158,24 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
         if (!threw) fail((desc ? desc + ": " : "") + "did not throw");
     }
     function assert_throws_dom(type, fnOrCtor, maybeFn, desc) {
-        const fn = typeof fnOrCtor === "function" ? fnOrCtor : maybeFn;
+        const fn = typeof maybeFn === "function" ? maybeFn : fnOrCtor;
+        const message = typeof maybeFn === "function" ? desc : maybeFn;
+        const expectedCode =
+            typeof type === "string" &&
+            typeof DOMException !== "undefined" &&
+            typeof DOMException[type] === "number"
+                ? DOMException[type]
+                : null;
         let threw = false;
         try { fn(); } catch (e) {
             threw = true;
-            if (typeof type === "string" && e && e.name && e.name !== type && e.code !== type) {
-                fail((desc ? desc + ": " : "") + "expected DOMException " + type + " got " + e.name);
+            if (typeof type === "string" && e && e.name && e.name !== type && e.code !== type && (expectedCode === null || e.code !== expectedCode)) {
+                fail((message ? message + ": " : "") + "expected DOMException " + type + " got " + e.name);
             } else if (typeof type === "number" && e && e.code !== type) {
-                fail((desc ? desc + ": " : "") + "expected DOMException code " + type + " got " + (e.code !== undefined ? e.code : e.name));
+                fail((message ? message + ": " : "") + "expected DOMException code " + type + " got " + (e.code !== undefined ? e.code : e.name));
             }
         }
-        if (!threw) fail((desc ? desc + ": " : "") + "did not throw DOMException " + type);
+        if (!threw) fail((message ? message + ": " : "") + "did not throw DOMException " + type);
     }
     function assert_throws_exactly(expected, fn, desc) {
         let threw = false;

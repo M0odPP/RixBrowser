@@ -68,6 +68,10 @@ pub struct RuleIndex {
     pseudo_by_kind: HashMap<RixPseudoElement, Vec<RuleBucketEntry>>,
     /// Global flag indicating whether any rule contains a `:has(...)` selector.
     pub has_relative_selectors: bool,
+    /// True when any rule contains a `:has(...)` selector in a non-subject compound
+    /// (e.g. `.parent:has(.a) .child` or `:has(.a) ~ .b`), requiring ancestor subtree
+    /// invalidation on DOM tree mutations.
+    pub has_non_subject_has: bool,
     /// True when no rule uses sibling combinators, `:nth-*` / `:empty`, or `:has()`,
     /// enabling O(1) Stylo-style sibling style sharing for attribute-free siblings.
     pub allows_sibling_sharing: bool,
@@ -86,6 +90,7 @@ impl RuleIndex {
             universal: Vec::new(),
             pseudo_by_kind: HashMap::new(),
             has_relative_selectors: false,
+            has_non_subject_has: false,
             allows_sibling_sharing: true,
         };
         let mut inv = InvalidationMap::default();
@@ -106,9 +111,13 @@ impl RuleIndex {
                 if selector_prevents_sibling_sharing(&compiled.selector) {
                     index.allows_sibling_sharing = false;
                 }
-                if inv.record_selector(&compiled.selector) {
+                let (has_rel, has_non_subject) = inv.record_selector(&compiled.selector);
+                if has_rel {
                     index.has_relative_selectors = true;
                     index.allows_sibling_sharing = false;
+                }
+                if has_non_subject {
+                    index.has_non_subject_has = true;
                 }
                 index.rules.push(compiled);
             }
@@ -278,11 +287,14 @@ bitflags::bitflags! {
     /// Scoped set of DOM elements that must be invalidated when a dependency mutates.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     pub struct InvalidationScope: u8 {
-        const SELF                     = 1 << 0;
-        const DESCENDANTS              = 1 << 1;
-        const LATER_SIBLINGS           = 1 << 2;
+        const SELF                      = 1 << 0;
+        const DESCENDANTS               = 1 << 1;
+        const LATER_SIBLINGS            = 1 << 2;
         const LATER_SIBLING_DESCENDANTS = 1 << 3;
-        const ANCESTORS                = 1 << 4;
+        const ANCESTORS                 = 1 << 4;
+        const EARLIER_SIBLINGS          = 1 << 5;
+        const ANCESTOR_EARLIER_SIBLINGS = 1 << 6;
+        const ANCESTOR_SUBTREES         = 1 << 7;
     }
 }
 
@@ -345,8 +357,8 @@ impl InvalidationMap {
         out
     }
 
-    /// Records all selector dependencies; returns `true` if `:has(...)` was encountered.
-    fn record_selector(&mut self, selector: &Selector<RixSelectorImpl>) -> bool {
+    /// Records all selector dependencies; returns `(has_relative, has_non_subject_has)`.
+    fn record_selector(&mut self, selector: &Selector<RixSelectorImpl>) -> (bool, bool) {
         self.record_selector_with_scope(selector, InvalidationScope::SELF)
     }
 
@@ -354,55 +366,56 @@ impl InvalidationMap {
         &mut self,
         selector: &Selector<RixSelectorImpl>,
         initial_scope: InvalidationScope,
-    ) -> bool {
+    ) -> (bool, bool) {
         let mut iter = selector.iter();
         let mut scope = initial_scope;
         let mut has_relative = false;
+        let mut has_non_subject = false;
 
         loop {
             for comp in iter.by_ref() {
-                if self.record_component(comp, scope) {
-                    has_relative = true;
-                }
+                let (rel, non_sub) = self.record_component(comp, scope);
+                has_relative |= rel;
+                has_non_subject |= non_sub;
             }
             let Some(comb) = iter.next_sequence() else {
                 break;
             };
             scope = advance_scope(scope, comb);
         }
-        has_relative
+        (has_relative, has_non_subject)
     }
 
     fn record_component(
         &mut self,
         comp: &Component<RixSelectorImpl>,
         scope: InvalidationScope,
-    ) -> bool {
+    ) -> (bool, bool) {
         match comp {
             Component::ID(id) => {
                 *self.id_deps.entry(id.hash64).or_default() |= scope;
-                false
+                (false, false)
             }
             Component::Class(cls) => {
                 *self.class_deps.entry(cls.hash64).or_default() |= scope;
-                false
+                (false, false)
             }
             Component::AttributeInNoNamespace { local_name, .. } => {
                 *self.attr_deps.entry(local_name.hash64).or_default() |= scope;
-                false
+                (false, false)
             }
             Component::AttributeInNoNamespaceExists {
                 local_name_lower, ..
             } => {
                 *self.attr_deps.entry(local_name_lower.hash64).or_default() |= scope;
-                false
+                (false, false)
             }
             Component::AttributeOther(attr) => {
                 *self
                     .attr_deps
                     .entry(attr.local_name_lower.hash64)
                     .or_default() |= scope;
-                false
+                (false, false)
             }
             Component::NonTSPseudoClass(pc) => {
                 if let Some(state) = pseudo_to_element_state(pc) {
@@ -420,6 +433,9 @@ impl InvalidationMap {
                         | RixPseudoClass::Link
                         | RixPseudoClass::AnyLink
                         | RixPseudoClass::PlaceholderShown
+                        | RixPseudoClass::Open
+                        | RixPseudoClass::Dir(_)
+                        | RixPseudoClass::Lang(_)
                 ) {
                     let attr = match pc {
                         RixPseudoClass::Disabled | RixPseudoClass::Enabled => "disabled",
@@ -427,44 +443,82 @@ impl InvalidationMap {
                         RixPseudoClass::ReadOnly | RixPseudoClass::ReadWrite => "readonly",
                         RixPseudoClass::Required | RixPseudoClass::Optional => "required",
                         RixPseudoClass::Link | RixPseudoClass::AnyLink => "href",
+                        RixPseudoClass::Open => "open",
+                        RixPseudoClass::Dir(_) => "dir",
+                        RixPseudoClass::Lang(_) => "lang",
                         _ => "placeholder",
                     };
+                    let attr_scope =
+                        if matches!(pc, RixPseudoClass::Dir(_) | RixPseudoClass::Lang(_)) {
+                            scope | InvalidationScope::DESCENDANTS
+                        } else {
+                            scope
+                        };
                     *self
                         .attr_deps
                         .entry(hash_ident_ascii_lower(attr))
-                        .or_default() |= scope;
+                        .or_default() |= attr_scope;
+                    if matches!(pc, RixPseudoClass::Dir(_)) {
+                        // `<input type="tel">` and `<input dir="auto" value="...">` affect `:dir()`.
+                        *self
+                            .attr_deps
+                            .entry(hash_ident_ascii_lower("type"))
+                            .or_default() |= scope;
+                        *self
+                            .attr_deps
+                            .entry(hash_ident_ascii_lower("value"))
+                            .or_default() |= scope;
+                    }
                 }
-                false
+                (false, false)
             }
             Component::Is(list) | Component::Where(list) | Component::Negation(list) => {
                 let mut rel = false;
+                let mut non_sub = false;
                 for sel in list.slice() {
-                    if self.record_selector_with_scope(sel, scope) {
-                        rel = true;
-                    }
+                    let (r, ns) = self.record_selector_with_scope(sel, scope);
+                    rel |= r;
+                    non_sub |= ns;
                 }
-                rel
+                (rel, non_sub)
             }
             Component::Has(rel_list) => {
-                let has_scope = InvalidationScope::ANCESTORS | InvalidationScope::SELF;
+                let mut has_scope = InvalidationScope::ANCESTORS
+                    | InvalidationScope::EARLIER_SIBLINGS
+                    | InvalidationScope::ANCESTOR_EARLIER_SIBLINGS
+                    | InvalidationScope::SELF;
+                let is_non_subject = scope.intersects(
+                    InvalidationScope::DESCENDANTS
+                        | InvalidationScope::LATER_SIBLINGS
+                        | InvalidationScope::LATER_SIBLING_DESCENDANTS,
+                );
+                // When `:has(...)` appears in a non-subject compound (e.g. `.p:has(.a) .c`
+                // or `:has(.a) ~ .b`), invalidating the `:has` subject must also invalidate
+                // its descendants / later siblings!
+                if is_non_subject {
+                    has_scope |= InvalidationScope::ANCESTOR_SUBTREES;
+                }
                 for rel in rel_list.iter() {
                     let _ = self.record_selector_with_scope(&rel.selector, has_scope);
                 }
-                true
+                (true, is_non_subject)
             }
             Component::Host(Some(sel)) | Component::Slotted(sel) => {
                 self.record_selector_with_scope(sel, scope)
             }
-            _ => false,
+            _ => (false, false),
         }
     }
 }
 
 fn advance_scope(current: InvalidationScope, combinator: Combinator) -> InvalidationScope {
     let mut next = InvalidationScope::empty();
-    if current.contains(InvalidationScope::ANCESTORS) {
-        next |= InvalidationScope::ANCESTORS;
-    }
+    let carry = current
+        & (InvalidationScope::ANCESTORS
+            | InvalidationScope::EARLIER_SIBLINGS
+            | InvalidationScope::ANCESTOR_EARLIER_SIBLINGS
+            | InvalidationScope::ANCESTOR_SUBTREES);
+    next |= carry;
     match combinator {
         Combinator::Child | Combinator::Descendant => {
             if current.intersects(
@@ -503,6 +557,16 @@ fn pseudo_to_element_state(pc: &RixPseudoClass) -> Option<ElementState> {
         RixPseudoClass::Checked => Some(ElementState::CHECKED),
         RixPseudoClass::Indeterminate => Some(ElementState::INDETERMINATE),
         RixPseudoClass::Visited | RixPseudoClass::Link => Some(ElementState::VISITED),
+        RixPseudoClass::Defined => Some(ElementState::DEFINED),
+        RixPseudoClass::Target => Some(ElementState::TARGET),
+        RixPseudoClass::Modal => Some(ElementState::MODAL),
+        RixPseudoClass::PopoverOpen => Some(ElementState::POPOVER_OPEN),
+        RixPseudoClass::Open => Some(ElementState::OPEN),
+        RixPseudoClass::Fullscreen => Some(ElementState::FULLSCREEN),
+        RixPseudoClass::Valid | RixPseudoClass::Invalid => Some(ElementState::INVALID),
+        RixPseudoClass::UserValid => Some(ElementState::USER_VALID),
+        RixPseudoClass::UserInvalid => Some(ElementState::USER_INVALID),
+        RixPseudoClass::Autofill => Some(ElementState::AUTOFILL),
         _ => None,
     }
 }

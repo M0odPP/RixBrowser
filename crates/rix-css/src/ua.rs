@@ -122,6 +122,12 @@ button, input[type="submit"], input[type="button"], input[type="reset"] {
 img, svg, canvas, video {
     display: inline-block;
 }
+:dir(rtl) {
+    direction: rtl;
+}
+:dir(ltr) {
+    direction: ltr;
+}
 "#;
 
 /// Returns the cached compiled HTML5 User-Agent [`Stylesheet`].

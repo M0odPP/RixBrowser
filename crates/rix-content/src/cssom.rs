@@ -8,14 +8,15 @@ use std::sync::Arc;
 
 use rix_css::{
     evaluate_supports_condition_str, parse_and_serialize_declaration, parse_cssom_rules,
-    parse_pseudo_element_str, parse_selector_list_strict, parse_single_cssom_rule,
-    serialize_css_tokens, serialize_selector_list, AlignValue, BorderCollapseMode, BoxSizingMode,
-    ClearMode, ColorRgba, ComputedStyle, CssColor, CssomRuleKind, CursorKind, DirectionMode,
-    DisplayMode, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
-    LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
-    PointerEventsMode, PositionMode, PropertyIdKind, SizeValue, TableLayoutMode, TextAlignMode,
-    TextOverflowMode, TextTransformMode, UserSelectMode, VerticalAlignMode, VisibilityMode,
-    WhiteSpaceMode, WordBreakMode, ZIndexValue,
+    parse_pseudo_element_str, parse_selector_list_with_namespaces,
+    parse_single_cssom_rule_with_namespaces, serialize_css_tokens, serialize_selector_list,
+    AlignValue, BorderCollapseMode, BoxSizingMode, ClearMode, ColorRgba, ComputedStyle, CssAtom,
+    CssColor, CssomRuleKind, CursorKind, DirectionMode, DisplayMode, FlexDirectionMode,
+    FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode, LengthPercentage,
+    LengthPercentageAuto, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
+    PointerEventsMode, PositionMode, PropertyIdKind, SelectorNamespaceMap, SizeValue,
+    TableLayoutMode, TextAlignMode, TextOverflowMode, TextTransformMode, UserSelectMode,
+    VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, ZIndexValue,
 };
 use rix_dom::{NodeData, NodeId};
 use rix_js::promise::{alloc_promise, resolve_promise};
@@ -70,6 +71,50 @@ impl CssStyleSheetState {
             out.push_str(&r.to_css_text());
         }
         out
+    }
+
+    #[must_use]
+    pub fn rule_list(&self, path: &[usize]) -> Option<&[CssomRuleKind]> {
+        let mut cur: &[CssomRuleKind] = &self.rules;
+        for &idx in path {
+            cur = cur.get(idx)?.child_rules()?;
+        }
+        Some(cur)
+    }
+
+    pub fn rule_list_mut(&mut self, path: &[usize]) -> Option<&mut Vec<CssomRuleKind>> {
+        let mut cur: &mut Vec<CssomRuleKind> = &mut self.rules;
+        for &idx in path {
+            cur = cur.get_mut(idx)?.child_rules_mut()?;
+        }
+        Some(cur)
+    }
+
+    #[must_use]
+    pub fn rule_at(&self, path: &[usize]) -> Option<&CssomRuleKind> {
+        let (&last, prefix) = path.split_last()?;
+        self.rule_list(prefix)?.get(last)
+    }
+
+    pub fn rule_at_mut(&mut self, path: &[usize]) -> Option<&mut CssomRuleKind> {
+        let (&last, prefix) = path.split_last()?;
+        self.rule_list_mut(prefix)?.get_mut(last)
+    }
+
+    #[must_use]
+    pub fn active_namespaces(&self) -> SelectorNamespaceMap {
+        let mut ns = SelectorNamespaceMap::default();
+        for r in &self.rules {
+            if let CssomRuleKind::Namespace { prefix, url } = r {
+                let atom = CssAtom::new(url);
+                if let Some(p) = prefix {
+                    ns.prefixes.insert(p.clone(), atom);
+                } else {
+                    ns.default_namespace = Some(atom);
+                }
+            }
+        }
+        ns
     }
 }
 
@@ -361,7 +406,7 @@ pub(crate) fn wrap_stylesheet(
         .insert(obj, Rc::clone(&state));
 
     // Live `cssRules` / `rules` Proxy so `const {cssRules} = sheet; sheet.insertRule(...)` stays live!
-    let live_rules = create_live_css_rule_list(vm, host, Rc::clone(&state), obj);
+    let live_rules = create_live_css_rule_list(vm, host, Rc::clone(&state), obj, Vec::new());
     let k_rules = vm.heap.intern_key("cssRules");
     let k_rules_alias = vm.heap.intern_key("rules");
     vm.heap.object_define_data(
@@ -415,75 +460,8 @@ pub(crate) fn wrap_stylesheet(
     });
     define_host_accessor(vm, obj, "disabled", Some(g_dis), Some(s_dis));
 
-    // `insertRule(rule, index = 0)`
-    let st_ins = Rc::clone(&state);
-    let h_ins = Rc::clone(host);
-    define_host_method(vm, obj, "insertRule", move |vm, _, args| {
-        if args.is_empty() {
-            return Err(vm.type_error("CSSStyleSheet.insertRule requires at least 1 argument"));
-        }
-        let rule_str = vm.value_to_rust_string(arg(args, 0));
-        let index = if args.len() >= 2 && !arg(args, 1).is_undefined() {
-            let n = vm.to_number(arg(args, 1))?;
-            if !n.is_finite() || n < 0.0 {
-                return Err(create_dom_exception(
-                    vm,
-                    "IndexSizeError",
-                    "Invalid rule index",
-                ));
-            }
-            n as usize
-        } else {
-            0usize
-        };
-        let parsed = parse_single_cssom_rule(&rule_str)
-            .map_err(|e| create_dom_exception(vm, "SyntaxError", &e))?;
-        {
-            let mut st = st_ins.borrow_mut();
-            if index > st.rules.len() {
-                return Err(create_dom_exception(
-                    vm,
-                    "IndexSizeError",
-                    "Rule index exceeds cssRules.length",
-                ));
-            }
-            st.rules.insert(index, parsed);
-        }
-        sync_sheet_to_dom(&h_ins, &st_ins);
-        Ok(JsValue::from_i32(index as i32))
-    });
-
-    // `deleteRule(index)`
-    let st_del = Rc::clone(&state);
-    let h_del = Rc::clone(host);
-    define_host_method(vm, obj, "deleteRule", move |vm, _, args| {
-        if args.is_empty() {
-            return Err(vm.type_error("CSSStyleSheet.deleteRule requires 1 argument"));
-        }
-        let n = vm.to_number(arg(args, 0))?;
-        let index = if n.is_finite() && n >= 0.0 {
-            n as usize
-        } else {
-            return Err(create_dom_exception(
-                vm,
-                "IndexSizeError",
-                "Invalid rule index",
-            ));
-        };
-        {
-            let mut st = st_del.borrow_mut();
-            if index >= st.rules.len() {
-                return Err(create_dom_exception(
-                    vm,
-                    "IndexSizeError",
-                    "Rule index out of bounds",
-                ));
-            }
-            st.rules.remove(index);
-        }
-        sync_sheet_to_dom(&h_del, &st_del);
-        Ok(JsValue::UNDEFINED)
-    });
+    // `insertRule(rule, index = 0)` and `deleteRule(index)`
+    attach_rule_list_mutators(vm, obj, host, Rc::clone(&state), Vec::new());
 
     // `replaceSync(text)` & `replace(text)`
     let st_rs = Rc::clone(&state);
@@ -517,29 +495,131 @@ pub(crate) fn wrap_stylesheet(
     obj
 }
 
+fn attach_rule_list_mutators(
+    vm: &mut JsVm,
+    target_obj: HeapHandle,
+    host: &SharedHost,
+    state: SharedStyleSheet,
+    list_path: Vec<usize>,
+) {
+    let st_ins = Rc::clone(&state);
+    let h_ins = Rc::clone(host);
+    let p_ins = list_path.clone();
+    define_host_method(vm, target_obj, "insertRule", move |vm, _, args| {
+        if args.is_empty() {
+            return Err(vm.type_error("insertRule requires at least 1 argument"));
+        }
+        let rule_str = vm.value_to_rust_string(arg(args, 0));
+        let index = if args.len() >= 2 && !arg(args, 1).is_undefined() {
+            let n = vm.to_number(arg(args, 1))?;
+            if !n.is_finite() || n < 0.0 {
+                return Err(create_dom_exception(
+                    vm,
+                    "IndexSizeError",
+                    "Invalid rule index",
+                ));
+            }
+            n as usize
+        } else {
+            0usize
+        };
+        let ns = st_ins.borrow().active_namespaces();
+        let ns_opt = (!ns.is_empty()).then_some(&ns);
+        let parsed = parse_single_cssom_rule_with_namespaces(&rule_str, ns_opt)
+            .map_err(|e| create_dom_exception(vm, "SyntaxError", &e))?;
+        {
+            let mut st = st_ins.borrow_mut();
+            let Some(list) = st.rule_list_mut(&p_ins) else {
+                return Err(create_dom_exception(
+                    vm,
+                    "IndexSizeError",
+                    "Parent grouping rule no longer exists",
+                ));
+            };
+            if index > list.len() {
+                return Err(create_dom_exception(
+                    vm,
+                    "IndexSizeError",
+                    "Rule index exceeds cssRules.length",
+                ));
+            }
+            list.insert(index, parsed);
+        }
+        sync_sheet_to_dom(&h_ins, &st_ins);
+        Ok(JsValue::from_i32(index as i32))
+    });
+
+    let st_del = Rc::clone(&state);
+    let h_del = Rc::clone(host);
+    let p_del = list_path;
+    define_host_method(vm, target_obj, "deleteRule", move |vm, _, args| {
+        if args.is_empty() {
+            return Err(vm.type_error("deleteRule requires 1 argument"));
+        }
+        let n = vm.to_number(arg(args, 0))?;
+        let index = if n.is_finite() && n >= 0.0 {
+            n as usize
+        } else {
+            return Err(create_dom_exception(
+                vm,
+                "IndexSizeError",
+                "Invalid rule index",
+            ));
+        };
+        {
+            let mut st = st_del.borrow_mut();
+            let Some(list) = st.rule_list_mut(&p_del) else {
+                return Err(create_dom_exception(
+                    vm,
+                    "IndexSizeError",
+                    "Parent grouping rule no longer exists",
+                ));
+            };
+            if index >= list.len() {
+                return Err(create_dom_exception(
+                    vm,
+                    "IndexSizeError",
+                    "Rule index out of bounds",
+                ));
+            }
+            list.remove(index);
+        }
+        sync_sheet_to_dom(&h_del, &st_del);
+        Ok(JsValue::UNDEFINED)
+    });
+}
+
 fn create_live_css_rule_list(
     vm: &mut JsVm,
     host: &SharedHost,
     state: SharedStyleSheet,
     parent_sheet: HeapHandle,
+    list_path: Vec<usize>,
 ) -> JsValue {
     let target = vm.alloc_ordinary_object();
     let st_item = Rc::clone(&state);
     let h_item = Rc::clone(host);
+    let p_item = list_path.clone();
     define_host_method(vm, target, "item", move |vm, _, args| {
         let idx = vm.to_number(arg(args, 0)).unwrap_or(-1.0);
         if idx < 0.0 || !idx.is_finite() {
             return Ok(JsValue::NULL);
         }
         let i = idx as usize;
-        if i >= st_item.borrow().rules.len() {
+        let len = st_item
+            .borrow()
+            .rule_list(&p_item)
+            .map_or(0, <[CssomRuleKind]>::len);
+        if i >= len {
             return Ok(JsValue::NULL);
         }
+        let mut child_path = p_item.clone();
+        child_path.push(i);
         Ok(JsValue::from_object(wrap_css_rule(
             vm,
             &h_item,
             Rc::clone(&st_item),
-            i,
+            child_path,
             parent_sheet,
         )))
     });
@@ -547,18 +627,29 @@ fn create_live_css_rule_list(
     let handler = vm.alloc_ordinary_object();
     let st_get = Rc::clone(&state);
     let h_get = Rc::clone(host);
+    let p_get = list_path;
     define_host_method(vm, handler, "get", move |vm, _, args| {
         let prop = vm.value_to_rust_string(arg(args, 1));
         if prop == "length" {
-            return Ok(JsValue::from_i32(st_get.borrow().rules.len() as i32));
+            let len = st_get
+                .borrow()
+                .rule_list(&p_get)
+                .map_or(0, <[CssomRuleKind]>::len);
+            return Ok(JsValue::from_i32(len as i32));
         }
         if let Ok(idx) = prop.parse::<usize>() {
-            if idx < st_get.borrow().rules.len() {
+            let len = st_get
+                .borrow()
+                .rule_list(&p_get)
+                .map_or(0, <[CssomRuleKind]>::len);
+            if idx < len {
+                let mut child_path = p_get.clone();
+                child_path.push(idx);
                 return Ok(JsValue::from_object(wrap_css_rule(
                     vm,
                     &h_get,
                     Rc::clone(&st_get),
-                    idx,
+                    child_path,
                     parent_sheet,
                 )));
             }
@@ -588,16 +679,23 @@ fn wrap_css_rule(
     vm: &mut JsVm,
     host: &SharedHost,
     state: SharedStyleSheet,
-    index: usize,
+    rule_path: Vec<usize>,
     parent_sheet: HeapHandle,
 ) -> HeapHandle {
     let obj = vm.alloc_ordinary_object();
-    let rule_type: i32 = match state.borrow().rules.get(index) {
-        Some(CssomRuleKind::Style { .. }) => 1,
-        Some(CssomRuleKind::Media { .. }) => 4,
-        Some(CssomRuleKind::Keyframes { .. }) => 7,
-        Some(CssomRuleKind::Supports { .. }) => 12,
-        _ => 0,
+    let (rule_type, is_style, is_grouping) = {
+        let st = state.borrow();
+        match st.rule_at(&rule_path) {
+            Some(CssomRuleKind::Style { .. }) => (1i32, true, false),
+            Some(CssomRuleKind::Media { .. }) => (4, false, true),
+            Some(CssomRuleKind::Keyframes { .. }) => (7, false, false),
+            Some(CssomRuleKind::Namespace { .. }) => (10, false, false),
+            Some(CssomRuleKind::Supports { .. }) => (12, false, true),
+            Some(CssomRuleKind::LayerBlock { .. } | CssomRuleKind::Scope { .. }) => {
+                (0, false, true)
+            }
+            _ => (0, false, false),
+        }
     };
     let k_type = vm.heap.intern_key("type");
     vm.heap.object_define_data(
@@ -618,11 +716,11 @@ fn wrap_css_rule(
 
     // `cssText`
     let st_ct = Rc::clone(&state);
+    let p_ct = rule_path.clone();
     let g_ct = vm.alloc_host_fn("get cssText", move |vm, _, _| {
         let text = st_ct
             .borrow()
-            .rules
-            .get(index)
+            .rule_at(&p_ct)
             .map(CssomRuleKind::to_css_text)
             .unwrap_or_default();
         Ok(JsValue::from_string(vm.heap.alloc_string(text)))
@@ -631,8 +729,9 @@ fn wrap_css_rule(
 
     // `selectorText` (for CSSStyleRule)
     let st_s1 = Rc::clone(&state);
+    let p_s1 = rule_path.clone();
     let g_sel = vm.alloc_host_fn("get selectorText", move |vm, _, _| {
-        let sel = match st_s1.borrow().rules.get(index) {
+        let sel = match st_s1.borrow().rule_at(&p_s1) {
             Some(CssomRuleKind::Style { selector_text, .. }) => selector_text.clone(),
             _ => String::new(),
         };
@@ -640,12 +739,15 @@ fn wrap_css_rule(
     });
     let st_s2 = Rc::clone(&state);
     let h_s2 = Rc::clone(host);
+    let p_s2 = rule_path.clone();
     let s_sel = vm.alloc_host_fn("set selectorText", move |vm, _, args| {
         let raw = vm.value_to_rust_string(arg(args, 0));
-        if let Ok(parsed) = parse_selector_list_strict(&raw) {
+        let ns = st_s2.borrow().active_namespaces();
+        let ns_opt = (!ns.is_empty()).then_some(&ns);
+        if let Ok(parsed) = parse_selector_list_with_namespaces(&raw, ns_opt) {
             let canonical = serialize_selector_list(&parsed);
             if let Some(CssomRuleKind::Style { selector_text, .. }) =
-                st_s2.borrow_mut().rules.get_mut(index)
+                st_s2.borrow_mut().rule_at_mut(&p_s2)
             {
                 *selector_text = canonical;
             }
@@ -656,11 +758,8 @@ fn wrap_css_rule(
     define_host_accessor(vm, obj, "selectorText", Some(g_sel), Some(s_sel));
 
     // `style` (`CSSStyleDeclaration` backed by this rule's declarations)
-    if matches!(
-        state.borrow().rules.get(index),
-        Some(CssomRuleKind::Style { .. })
-    ) {
-        let style_decl = create_rule_style_proxy(vm, host, Rc::clone(&state), index);
+    if is_style {
+        let style_decl = create_rule_style_proxy(vm, host, Rc::clone(&state), rule_path.clone());
         let k_style = vm.heap.intern_key("style");
         vm.heap.object_define_data(
             obj,
@@ -671,10 +770,26 @@ fn wrap_css_rule(
         );
     }
 
-    // `conditionText` / `name` for grouping/at rules
+    // `CSSGroupingRule` (`@media`, `@supports`, `@layer`, `@scope`): live `cssRules`, `insertRule`, `deleteRule`
+    if is_grouping {
+        let live_child_rules =
+            create_live_css_rule_list(vm, host, Rc::clone(&state), parent_sheet, rule_path.clone());
+        let k_cr = vm.heap.intern_key("cssRules");
+        vm.heap.object_define_data(
+            obj,
+            k_cr,
+            live_child_rules,
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+        attach_rule_list_mutators(vm, obj, host, Rc::clone(&state), rule_path.clone());
+    }
+
+    // `conditionText` / `name` / `namespaceURI` / `prefix`
     let st_cond = Rc::clone(&state);
+    let p_cond = rule_path.clone();
     let g_cond = vm.alloc_host_fn("get conditionText", move |vm, _, _| {
-        let txt = match st_cond.borrow().rules.get(index) {
+        let txt = match st_cond.borrow().rule_at(&p_cond) {
             Some(
                 CssomRuleKind::Media { condition_text, .. }
                 | CssomRuleKind::Supports { condition_text, .. },
@@ -686,8 +801,9 @@ fn wrap_css_rule(
     define_host_accessor(vm, obj, "conditionText", Some(g_cond), None);
 
     let st_name = Rc::clone(&state);
+    let p_name = rule_path.clone();
     let g_name = vm.alloc_host_fn("get name", move |vm, _, _| {
-        let txt = match st_name.borrow().rules.get(index) {
+        let txt = match st_name.borrow().rule_at(&p_name) {
             Some(
                 CssomRuleKind::LayerBlock { name, .. }
                 | CssomRuleKind::Keyframes { name, .. }
@@ -699,6 +815,28 @@ fn wrap_css_rule(
     });
     define_host_accessor(vm, obj, "name", Some(g_name), None);
 
+    let st_ns = Rc::clone(&state);
+    let p_ns = rule_path.clone();
+    let g_ns = vm.alloc_host_fn("get namespaceURI", move |vm, _, _| {
+        let txt = match st_ns.borrow().rule_at(&p_ns) {
+            Some(CssomRuleKind::Namespace { url, .. }) => url.clone(),
+            _ => String::new(),
+        };
+        Ok(JsValue::from_string(vm.heap.alloc_string(txt)))
+    });
+    define_host_accessor(vm, obj, "namespaceURI", Some(g_ns), None);
+
+    let st_pref = Rc::clone(&state);
+    let p_pref = rule_path;
+    let g_pref = vm.alloc_host_fn("get prefix", move |vm, _, _| {
+        let txt = match st_pref.borrow().rule_at(&p_pref) {
+            Some(CssomRuleKind::Namespace { prefix, .. }) => prefix.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+        Ok(JsValue::from_string(vm.heap.alloc_string(txt)))
+    });
+    define_host_accessor(vm, obj, "prefix", Some(g_pref), None);
+
     obj
 }
 
@@ -706,13 +844,14 @@ fn create_rule_style_proxy(
     vm: &mut JsVm,
     host: &SharedHost,
     state: SharedStyleSheet,
-    index: usize,
+    rule_path: Vec<usize>,
 ) -> JsValue {
     let target = vm.alloc_ordinary_object();
     let st1 = Rc::clone(&state);
+    let p1 = rule_path.clone();
     define_host_method(vm, target, "getPropertyValue", move |vm, _, args| {
         let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
-        let raw = match st1.borrow().rules.get(index) {
+        let raw = match st1.borrow().rule_at(&p1) {
             Some(CssomRuleKind::Style {
                 declarations_text, ..
             }) => declarations_text.clone(),
@@ -727,6 +866,7 @@ fn create_rule_style_proxy(
     });
     let st2 = Rc::clone(&state);
     let h2 = Rc::clone(host);
+    let p2 = rule_path.clone();
     define_host_method(vm, target, "setProperty", move |vm, _, args| {
         let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
         let val_arg = arg(args, 1);
@@ -748,7 +888,7 @@ fn create_rule_style_proxy(
         } else {
             return Ok(JsValue::UNDEFINED);
         };
-        let cur = match st2.borrow().rules.get(index) {
+        let cur = match st2.borrow().rule_at(&p2) {
             Some(CssomRuleKind::Style {
                 declarations_text, ..
             }) => declarations_text.clone(),
@@ -769,7 +909,7 @@ fn create_rule_style_proxy(
         }
         if let Some(CssomRuleKind::Style {
             declarations_text, ..
-        }) = st2.borrow_mut().rules.get_mut(index)
+        }) = st2.borrow_mut().rule_at_mut(&p2)
         {
             *declarations_text = serialize_style_decls_with_priority(&decls);
         }
@@ -778,9 +918,10 @@ fn create_rule_style_proxy(
     });
     let st3 = Rc::clone(&state);
     let h3 = Rc::clone(host);
+    let p3 = rule_path.clone();
     define_host_method(vm, target, "removeProperty", move |vm, _, args| {
         let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
-        let cur = match st3.borrow().rules.get(index) {
+        let cur = match st3.borrow().rule_at(&p3) {
             Some(CssomRuleKind::Style {
                 declarations_text, ..
             }) => declarations_text.clone(),
@@ -795,7 +936,7 @@ fn create_rule_style_proxy(
         decls.retain(|(k, _, _)| k != &prop);
         if let Some(CssomRuleKind::Style {
             declarations_text, ..
-        }) = st3.borrow_mut().rules.get_mut(index)
+        }) = st3.borrow_mut().rule_at_mut(&p3)
         {
             *declarations_text = serialize_style_decls_with_priority(&decls);
         }
@@ -805,6 +946,7 @@ fn create_rule_style_proxy(
 
     let handler = vm.alloc_ordinary_object();
     let st_get = Rc::clone(&state);
+    let p_get = rule_path.clone();
     define_host_method(vm, handler, "get", move |vm, _, args| {
         let prop = vm.value_to_rust_string(arg(args, 1));
         let k = vm.heap.intern_key(&prop);
@@ -813,7 +955,7 @@ fn create_rule_style_proxy(
                 return vm.get_property_by_key(t_h, k);
             }
         }
-        let raw = match st_get.borrow().rules.get(index) {
+        let raw = match st_get.borrow().rule_at(&p_get) {
             Some(CssomRuleKind::Style {
                 declarations_text, ..
             }) => declarations_text.clone(),
@@ -836,13 +978,14 @@ fn create_rule_style_proxy(
     });
     let st_set = Rc::clone(&state);
     let h_set = Rc::clone(host);
+    let p_set = rule_path;
     define_host_method(vm, handler, "set", move |vm, _, args| {
         let prop = vm.value_to_rust_string(arg(args, 1));
         let raw_val = vm.value_to_rust_string(arg(args, 2));
         if prop == "cssText" {
             if let Some(CssomRuleKind::Style {
                 declarations_text, ..
-            }) = st_set.borrow_mut().rules.get_mut(index)
+            }) = st_set.borrow_mut().rule_at_mut(&p_set)
             {
                 *declarations_text = raw_val;
             }
@@ -850,7 +993,7 @@ fn create_rule_style_proxy(
             return Ok(JsValue::TRUE);
         }
         let css_key = camel_to_kebab(&prop);
-        let cur = match st_set.borrow().rules.get(index) {
+        let cur = match st_set.borrow().rule_at(&p_set) {
             Some(CssomRuleKind::Style {
                 declarations_text, ..
             }) => declarations_text.clone(),
@@ -871,7 +1014,7 @@ fn create_rule_style_proxy(
         }
         if let Some(CssomRuleKind::Style {
             declarations_text, ..
-        }) = st_set.borrow_mut().rules.get_mut(index)
+        }) = st_set.borrow_mut().rule_at_mut(&p_set)
         {
             *declarations_text = serialize_style_decls_with_priority(&decls);
         }
@@ -1165,6 +1308,24 @@ fn serialize_style_decls_with_priority(decls: &[(String, String, bool)]) -> Stri
         .join(" ")
 }
 
+/// Parses and validates inline `cssText`, updating the element's `style` attribute.
+/// Used by both `el.style.cssText = ...` and `el.style = ...` (`[PutForwards=cssText]`).
+pub(crate) fn set_inline_style_css_text(vm: &mut JsVm, host: &SharedHost, nid: NodeId, val: &str) {
+    let validated: Vec<(String, String, bool)> = parse_style_decls_with_priority(val)
+        .into_iter()
+        .filter_map(|(k, v, imp)| {
+            parse_and_serialize_declaration(&k, &v).map(|canon| (k, canon, imp))
+        })
+        .collect();
+    set_element_attr(
+        vm,
+        host,
+        nid,
+        "style",
+        &serialize_style_decls_with_priority(&validated),
+    );
+}
+
 /// Creates a CSSOM-validated inline `CSSStyleDeclaration` Proxy for `element.style`.
 pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: NodeId) -> JsValue {
     let target = vm.alloc_ordinary_object();
@@ -1336,20 +1497,7 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
             vm.value_to_rust_string(val_arg)
         };
         if prop_name == "cssText" {
-            // Re-validate each declaration on cssText assignment.
-            let validated: Vec<(String, String, bool)> = parse_style_decls_with_priority(&val)
-                .into_iter()
-                .filter_map(|(k, v, imp)| {
-                    parse_and_serialize_declaration(&k, &v).map(|canon| (k, canon, imp))
-                })
-                .collect();
-            set_element_attr(
-                vm,
-                &h_set,
-                nid,
-                "style",
-                &serialize_style_decls_with_priority(&validated),
-            );
+            set_inline_style_css_text(vm, &h_set, nid, &val);
             return Ok(JsValue::TRUE);
         }
         let css_key = camel_to_kebab(&prop_name);
