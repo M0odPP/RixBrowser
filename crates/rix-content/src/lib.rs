@@ -9,6 +9,7 @@
 pub mod canvas2d;
 pub mod cssom;
 pub mod dom_bridge;
+pub mod dom_collections;
 pub mod dom_interfaces;
 pub mod event_loop;
 pub mod events;

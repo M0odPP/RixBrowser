@@ -900,7 +900,7 @@ pub fn install_all_dom_interfaces(vm: &mut JsVm, host: &SharedHost) {
     install_document_type_prototype(vm, host);
     install_dom_implementation_prototype(vm, host);
     install_extra_node_methods(vm, host);
-    // Collections & traversal prototypes are installed once `dom_collections` lands in Part 6B-2.
+    crate::dom_collections::install_collections_and_traversal(vm, host);
 }
 
 // ---------------------------------------------------------------------------
