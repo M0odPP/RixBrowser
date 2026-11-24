@@ -18,7 +18,7 @@ use crate::animations::{
     apply_animations_and_transitions, ActiveTransition, AnimationStateSnapshot, WebAnimationSpec,
 };
 use crate::color::CssColorExpr;
-use crate::computed::{resolve_element_style_with_siblings, ComputedStyle, MatchedRule};
+use crate::computed::{resolve_element_style_with_context, ComputedStyle, MatchedRule};
 use crate::properties::{
     parse_inline_style, MissingCssFeature, PropertyIdKind, PropertyValue, SpecifiedDeclaration,
 };
@@ -223,9 +223,20 @@ pub struct StyleContext {
     active_transitions: FastMap<NodeId, Vec<ActiveTransition>>,
     web_animations: FastMap<NodeId, Vec<WebAnimationSpec>>,
     animation_clock_ms: f32,
+    random_doc_seed: u64,
     missing_seen: HashSet<MissingCssFeature>,
     missing_features: Vec<MissingCssFeature>,
     index_dirty: bool,
+}
+
+fn next_random_doc_seed() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let mut x = NEXT
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
 }
 
 impl StyleContext {
@@ -247,6 +258,7 @@ impl StyleContext {
             active_transitions: FastMap::default(),
             web_animations: FastMap::default(),
             animation_clock_ms: 0.0,
+            random_doc_seed: next_random_doc_seed(),
             missing_seen: HashSet::new(),
             missing_features: Vec::new(),
             index_dirty: true,
@@ -276,6 +288,7 @@ impl StyleContext {
             active_transitions: FastMap::default(),
             web_animations: FastMap::default(),
             animation_clock_ms: 0.0,
+            random_doc_seed: next_random_doc_seed(),
             missing_seen: HashSet::new(),
             missing_features: Vec::new(),
             index_dirty: true,
@@ -288,6 +301,7 @@ impl StyleContext {
             before_change: self.before_change_styles.drain().collect(),
             active_transitions: self.active_transitions.drain().collect(),
             web_animations: self.web_animations.drain().collect(),
+            random_doc_seed: Some(self.random_doc_seed),
         }
     }
 
@@ -296,6 +310,10 @@ impl StyleContext {
         self.before_change_styles.extend(snap.before_change);
         self.active_transitions.extend(snap.active_transitions);
         self.web_animations.extend(snap.web_animations);
+        if let Some(seed) = snap.random_doc_seed {
+            self.random_doc_seed = seed;
+            self.rule_index.random_doc_seed = seed;
+        }
     }
 
     /// Attaches a Web Animation (`Element.prototype.animate`) to `node`.
@@ -317,6 +335,21 @@ impl StyleContext {
             }
         }
         false
+    }
+
+    /// Returns all active (non-cancelled) Web Animations attached across the document.
+    #[must_use]
+    pub fn all_web_animations(&self) -> Vec<(NodeId, WebAnimationSpec)> {
+        let mut out = Vec::new();
+        for (&node, list) in &self.web_animations {
+            for a in list {
+                if !a.cancelled {
+                    out.push((node, a.clone()));
+                }
+            }
+        }
+        out.sort_by_key(|(_, a)| a.id);
+        out
     }
 
     /// Returns the current document animation clock in milliseconds.
@@ -424,6 +457,7 @@ impl StyleContext {
         }
         all.extend(self.author_sheets.iter().cloned());
         let (mut index, inv) = RuleIndex::build(&all);
+        index.random_doc_seed = self.random_doc_seed;
         for rp in &self.js_registered_properties {
             index
                 .registered_properties
@@ -1201,7 +1235,7 @@ fn compute_single_element_style(
     } else {
         (1, 1)
     };
-    let resolved = Arc::new(resolve_element_style_with_siblings(
+    let resolved = Arc::new(resolve_element_style_with_context(
         &matched_refs,
         &pres_decls,
         &inline_decls,
@@ -1211,6 +1245,8 @@ fn compute_single_element_style(
         Some(&rule_index.registered_properties),
         sib_idx,
         sib_cnt,
+        usize::from(node) as u64,
+        rule_index.random_doc_seed,
     ));
 
     if inline_attr.is_none() && !has_pres_hints && !any_scoped && !any_sibling_math {
@@ -1557,7 +1593,8 @@ fn collect_pseudo_element_styles(
             } else {
                 (1, 1)
             };
-            let style = Arc::new(resolve_element_style_with_siblings(
+            let pseudo_nid = (usize::from(node) as u64) ^ (((pseudo as u64) + 1) << 48);
+            let style = Arc::new(resolve_element_style_with_context(
                 &matched,
                 &[],
                 &[],
@@ -1567,6 +1604,8 @@ fn collect_pseudo_element_styles(
                 Some(&rule_index.registered_properties),
                 si,
                 sc,
+                pseudo_nid,
+                rule_index.random_doc_seed,
             ));
             out_pseudos.push(((node, pseudo), style));
         }

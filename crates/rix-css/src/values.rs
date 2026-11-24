@@ -253,7 +253,8 @@ impl LengthUnit {
             Self::Px => value,
             Self::Rem => value * ctx.root_font_size_px,
             Self::Em => value * ctx.font_size_px,
-            Self::Ex | Self::Ch => value * ctx.font_size_px * 0.5,
+            Self::Ex => value * ctx.font_size_px * 0.5,
+            Self::Ch => value * ctx.ch_px.unwrap_or(ctx.font_size_px * 0.5),
             Self::Rex | Self::Rch => value * ctx.root_font_size_px * 0.5,
             Self::Cap => value * ctx.font_size_px * 0.7,
             Self::Rcap => value * ctx.root_font_size_px * 0.7,
@@ -292,7 +293,7 @@ impl LengthUnit {
 }
 
 /// Evaluation environment for resolving relative CSS units and `calc()` expressions.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct EvalContext {
     pub font_size_px: f32,
     pub root_font_size_px: f32,
@@ -302,8 +303,27 @@ pub struct EvalContext {
     pub viewport_height_px: f32,
     pub container_width_px: f32,
     pub container_height_px: f32,
+    pub ch_px: Option<f32>,
     pub sibling_index: u32,
     pub sibling_count: u32,
+    pub random_node_id: u64,
+    pub random_doc_seed: u64,
+}
+
+impl PartialEq for EvalContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.font_size_px == other.font_size_px
+            && self.root_font_size_px == other.root_font_size_px
+            && self.line_height_px == other.line_height_px
+            && self.root_line_height_px == other.root_line_height_px
+            && self.viewport_width_px == other.viewport_width_px
+            && self.viewport_height_px == other.viewport_height_px
+            && self.container_width_px == other.container_width_px
+            && self.container_height_px == other.container_height_px
+            && self.ch_px == other.ch_px
+            && self.sibling_index == other.sibling_index
+            && self.sibling_count == other.sibling_count
+    }
 }
 
 impl Default for EvalContext {
@@ -317,8 +337,11 @@ impl Default for EvalContext {
             viewport_height_px: 720.0,
             container_width_px: 1280.0,
             container_height_px: 720.0,
+            ch_px: None,
             sibling_index: 1,
             sibling_count: 1,
+            random_node_id: 0,
+            random_doc_seed: 0x517c_c1b7_2722_0a95,
         }
     }
 }

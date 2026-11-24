@@ -2166,7 +2166,10 @@ fn sync_inline_color_expr(host: &SharedHost, nid: NodeId, prop: &str, raw_val: &
             let expr = if raw_val.trim().is_empty() {
                 None
             } else {
-                rix_css::parse_css_color(raw_val.trim())
+                rix_css::parse_css_color(raw_val.trim()).map(|mut e| {
+                    e.bind_random_property(kind.css_name());
+                    e
+                })
             };
             host.borrow_mut().set_inline_color_expr(nid, kind, expr);
         }
@@ -2440,6 +2443,17 @@ fn prop_needs_layout_resolution(prop: &str) -> bool {
             | "padding-inline"
             | "padding-inline-start"
             | "padding-inline-end"
+            | "top"
+            | "right"
+            | "bottom"
+            | "left"
+            | "inset"
+            | "inset-block"
+            | "inset-block-start"
+            | "inset-block-end"
+            | "inset-inline"
+            | "inset-inline-start"
+            | "inset-inline-end"
     )
 }
 
@@ -2468,7 +2482,8 @@ fn live_computed_property(
     } else {
         false
     };
-    format_computed_property_resolved(&style, prop, layout_box, parent_flex_grid)
+    let ch_px = Some(host.borrow_mut().ch_advance_px(&style));
+    format_computed_property_resolved(&style, prop, layout_box, parent_flex_grid, ch_px)
 }
 
 pub(crate) fn create_computed_style_proxy(
@@ -2883,7 +2898,7 @@ fn format_align(a: AlignValue) -> &'static str {
 /// Serializes any computed CSS property from [`ComputedStyle`] according to CSSOM.
 #[must_use]
 pub fn format_computed_property(style: &ComputedStyle, prop: &str) -> String {
-    format_computed_property_resolved(style, prop, None, false)
+    format_computed_property_resolved(style, prop, None, false, None)
 }
 
 fn format_computed_property_resolved(
@@ -2891,6 +2906,7 @@ fn format_computed_property_resolved(
     prop: &str,
     layout_box: Option<ResolvedLayoutBox>,
     parent_flex_grid: bool,
+    ch_px: Option<f32>,
 ) -> String {
     if prop.starts_with("--") {
         let key = rix_core::intern_str(prop);
@@ -2913,7 +2929,10 @@ fn format_computed_property_resolved(
         2 => true,
         _ => style.color_scheme_dark,
     };
-    let eval = eval_ctx_for_style(style);
+    let mut eval = eval_ctx_for_style(style);
+    if ch_px.is_some() {
+        eval.ch_px = ch_px;
+    }
     let cc_resolved = style.text.color_computed.as_deref().map_or_else(
         || rix_css::ResolvedColor::from_rgba(cc),
         |e| e.resolve(rix_css::ResolvedColor::from_rgba(cc), dark, &eval),
@@ -2921,15 +2940,15 @@ fn format_computed_property_resolved(
 
     // Computed shorthand serialization (both logical and physical)
     let fmt_pair = |a: &str, b: &str| -> String {
-        let va = format_computed_property_resolved(style, a, layout_box, parent_flex_grid);
-        let vb = format_computed_property_resolved(style, b, layout_box, parent_flex_grid);
+        let va = format_computed_property_resolved(style, a, layout_box, parent_flex_grid, ch_px);
+        let vb = format_computed_property_resolved(style, b, layout_box, parent_flex_grid, ch_px);
         collapse_2_sides_str(&va, &vb)
     };
     let fmt_quad = |t: &str, r: &str, b: &str, l: &str| -> String {
-        let vt = format_computed_property_resolved(style, t, layout_box, parent_flex_grid);
-        let vr = format_computed_property_resolved(style, r, layout_box, parent_flex_grid);
-        let vb = format_computed_property_resolved(style, b, layout_box, parent_flex_grid);
-        let vl = format_computed_property_resolved(style, l, layout_box, parent_flex_grid);
+        let vt = format_computed_property_resolved(style, t, layout_box, parent_flex_grid, ch_px);
+        let vr = format_computed_property_resolved(style, r, layout_box, parent_flex_grid, ch_px);
+        let vb = format_computed_property_resolved(style, b, layout_box, parent_flex_grid, ch_px);
+        let vl = format_computed_property_resolved(style, l, layout_box, parent_flex_grid, ch_px);
         collapse_4_sides_str(&vt, &vr, &vb, &vl)
     };
     let fmt_border_side = |prefix: &str| -> String {
@@ -2938,18 +2957,21 @@ fn format_computed_property_resolved(
             &format!("{prefix}-width"),
             layout_box,
             parent_flex_grid,
+            ch_px,
         );
         let s = format_computed_property_resolved(
             style,
             &format!("{prefix}-style"),
             layout_box,
             parent_flex_grid,
+            ch_px,
         );
         let c = format_computed_property_resolved(
             style,
             &format!("{prefix}-color"),
             layout_box,
             parent_flex_grid,
+            ch_px,
         );
         format!("{w} {s} {c}")
     };
@@ -3847,6 +3869,89 @@ fn format_computed_property_resolved(
             format_lp(&style.visual.background_position.0, &eval),
             format_lp(&style.visual.background_position.1, &eval),
         ),
+        "object-position" => style.visual.object_position.as_deref().map_or_else(
+            || "50% 50%".to_string(),
+            |pos| pos.serialize_computed(&eval, style.text.writing_mode, style.text.direction),
+        ),
+        "aspect-ratio" => style
+            .effects
+            .as_ref()
+            .and_then(|e| e.aspect_ratio_math.as_ref())
+            .map_or_else(
+                || "auto".to_string(),
+                |(a, b)| {
+                    let sa = a.serialize_computed(
+                        &eval,
+                        None,
+                        rix_css::values_math::ValueKind::Number,
+                        Some(0.0),
+                        None,
+                    );
+                    match b {
+                        Some(bn) => format!(
+                            "{sa} / {}",
+                            bn.serialize_computed(
+                                &eval,
+                                None,
+                                rix_css::values_math::ValueKind::Number,
+                                Some(0.0),
+                                None,
+                            )
+                        ),
+                        None => format!("{sa} / 1"),
+                    }
+                },
+            ),
+        "offset-distance"
+        | "shape-margin"
+        | "stroke-width"
+        | "stroke-dashoffset"
+        | "stroke-dasharray"
+        | "background-position-x"
+        | "background-position-y"
+        | "scroll-padding-top"
+        | "scroll-padding-right"
+        | "scroll-padding-bottom"
+        | "scroll-padding-left"
+        | "cx"
+        | "cy"
+        | "rx"
+        | "ry"
+        | "x"
+        | "y"
+        | "border-image-slice" => {
+            if let Some(kind) = PropertyIdKind::from_name(effective) {
+                if let Some(node) = style
+                    .effects
+                    .as_ref()
+                    .and_then(|e| e.extra_math_props.get(&kind))
+                {
+                    if let Some((vk, nonneg)) = rix_css::properties::values4_property_kind(kind) {
+                        return node.serialize_computed(
+                            &eval,
+                            None,
+                            vk,
+                            nonneg.then_some(0.0),
+                            None,
+                        );
+                    }
+                }
+            }
+            match effective {
+                "stroke-width" => "1px",
+                "stroke-dasharray" => "none",
+                "background-position-x" | "background-position-y" => "0%",
+                "scroll-padding-top"
+                | "scroll-padding-right"
+                | "scroll-padding-bottom"
+                | "scroll-padding-left"
+                | "rx"
+                | "ry" => "auto",
+                "border-image-slice" => "100%",
+                _ => "0px",
+            }
+            .into()
+        }
         "transform" => {
             if let Some(raw) = style
                 .effects
@@ -3985,6 +4090,44 @@ fn format_transform_ops_matrix(ops: &[rix_css::TransformOp], eval: &EvalContext)
 
 fn install_web_animations_and_typed_om(vm: &mut JsVm, host: &SharedHost) {
     let elem_proto = host.borrow().prototypes.element_proto;
+    let doc_proto = host.borrow().prototypes.document_proto;
+
+    let unit_proto = vm.alloc_ordinary_object();
+    let unit_ctor = vm.alloc_host_fn("CSSUnitValue", move |vm, _, args| {
+        let obj = vm.alloc_ordinary_object();
+        vm.heap
+            .object_set_prototype(obj, Some(unit_proto), &mut vm.shapes);
+        let v = arg(args, 0).to_number_f64().unwrap_or(0.0);
+        let u = vm.value_to_rust_string(arg(args, 1));
+        let kv = vm.heap.intern_key("value");
+        vm.heap.object_define_data(
+            obj,
+            kv,
+            JsValue::from_f64(v),
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+        let ku = vm.heap.intern_key("unit");
+        let us = vm.heap.alloc_string(u);
+        vm.heap.object_define_data(
+            obj,
+            ku,
+            JsValue::from_string(us),
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+        Ok(JsValue::from_object(obj))
+    });
+    let k_proto = vm.heap.intern_key("prototype");
+    vm.heap.object_define_data(
+        unit_ctor,
+        k_proto,
+        JsValue::from_object(unit_proto),
+        PropertyAttrs::empty(),
+        &mut vm.shapes,
+    );
+    define_global(vm, "CSSUnitValue", JsValue::from_object(unit_ctor));
+
     let h_anim = Rc::clone(host);
     define_host_method(vm, elem_proto, "animate", move |vm, this, args| {
         let node = require_node(vm, &h_anim, this)?;
@@ -3994,6 +4137,18 @@ fn install_web_animations_and_typed_om(vm: &mut JsVm, host: &SharedHost) {
         Ok(JsValue::from_object(create_js_animation_handle(
             vm, &h_anim, node, anim_id, spec,
         )))
+    });
+    let h_get_anims = Rc::clone(host);
+    define_host_method(vm, doc_proto, "getAnimations", move |vm, _, _| {
+        let anims = h_get_anims.borrow().all_web_animations();
+        let arr = vm.alloc_array();
+        for (n, sp) in anims {
+            let id = sp.id;
+            let handle = create_js_animation_handle(vm, &h_get_anims, n, id, sp);
+            vm.heap
+                .object_push_element(arr, JsValue::from_object(handle));
+        }
+        Ok(JsValue::from_object(arr))
     });
     let h_map = Rc::clone(host);
     define_host_method(vm, elem_proto, "computedStyleMap", move |vm, this, _| {
@@ -4012,11 +4167,33 @@ fn install_web_animations_and_typed_om(vm: &mut JsVm, host: &SharedHost) {
             let Some(style) = style else {
                 return Ok(JsValue::null());
             };
-            let val_str = format_computed_property_resolved(&style, &prop, None, pfg);
+            let ch_px = Some(h_get.borrow_mut().ch_advance_px(&style));
+            let val_str = format_computed_property_resolved(&style, &prop, None, pfg, ch_px);
             if val_str.is_empty() {
                 return Ok(JsValue::null());
             }
             let css_val = vm.alloc_ordinary_object();
+            if let Some((num, unit)) = split_css_unit_value(&val_str) {
+                vm.heap
+                    .object_set_prototype(css_val, Some(unit_proto), &mut vm.shapes);
+                let kv = vm.heap.intern_key("value");
+                vm.heap.object_define_data(
+                    css_val,
+                    kv,
+                    JsValue::from_f64(num),
+                    PropertyAttrs::DEFAULT,
+                    &mut vm.shapes,
+                );
+                let ku = vm.heap.intern_key("unit");
+                let us = vm.heap.alloc_string(unit);
+                vm.heap.object_define_data(
+                    css_val,
+                    ku,
+                    JsValue::from_string(us),
+                    PropertyAttrs::DEFAULT,
+                    &mut vm.shapes,
+                );
+            }
             define_host_method(vm, css_val, "toString", move |vm, _, _| {
                 Ok(JsValue::from_string(vm.heap.alloc_string(val_str.clone())))
             });
@@ -4024,6 +4201,23 @@ fn install_web_animations_and_typed_om(vm: &mut JsVm, host: &SharedHost) {
         });
         Ok(JsValue::from_object(map_obj))
     });
+}
+
+fn split_css_unit_value(s: &str) -> Option<(f64, String)> {
+    let t = s.trim();
+    if t.is_empty() || t.contains(char::is_whitespace) || t.contains('(') {
+        return None;
+    }
+    let idx = t
+        .find(|c: char| !matches!(c, '0'..='9' | '.' | '+' | '-' | 'e' | 'E'))
+        .unwrap_or(t.len());
+    let num = t[..idx].parse::<f64>().ok()?;
+    let unit = match &t[idx..] {
+        "" => "number".to_string(),
+        "%" => "percent".to_string(),
+        other => other.to_string(),
+    };
+    Some((num, unit))
 }
 
 fn parse_js_composite(s: &str) -> Option<rix_css::AnimationCompositionMode> {

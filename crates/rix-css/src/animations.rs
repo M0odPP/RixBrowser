@@ -72,6 +72,7 @@ pub struct AnimationStateSnapshot {
     pub before_change: HashMap<NodeId, Arc<ComputedStyle>>,
     pub active_transitions: HashMap<NodeId, Vec<ActiveTransition>>,
     pub web_animations: HashMap<NodeId, Vec<WebAnimationSpec>>,
+    pub random_doc_seed: Option<u64>,
 }
 
 #[must_use]
@@ -339,7 +340,11 @@ fn apply_custom_prop_tokens(
     if let Some(reg) = registered_props.get(cname) {
         let (syn, vk) = registered_syntax_kind(reg);
         let eval_str = if let Some(kind) = vk {
-            crate::values_math::parse_math_value(trimmed, kind).map(|pm| pm.node.serialize_computed(eval, None, kind, None, None))
+            crate::values_math::parse_math_value(trimmed, kind).map(|mut pm| {
+                let mut rc = 0u32;
+                pm.node.bind_random_property(cname.as_str(), &mut rc);
+                pm.node.serialize_computed(eval, None, kind, None, None)
+            })
         } else if syn == "<color>" {
             crate::color::parse_css_color(trimmed).map(|c| c.resolve(ResolvedColor::from_rgba(style.text.color), false, eval).to_computed_css_string())
         } else { None };
@@ -731,6 +736,14 @@ fn interpolate_custom_property(
         let (syn, vk) = registered_syntax_kind(reg);
         if let Some(kind) = vk {
             if let (Some(pa), Some(pb)) = (crate::values_math::parse_math_value(f_str.trim(), kind), crate::values_math::parse_math_value(t_str.trim(), kind)) {
+                if kind == ValueKind::LengthPercentage {
+                    let combined = MathNode::Sum(vec![
+                        scale_math_for_interp(pa.node, 1.0 - p),
+                        scale_math_for_interp(pb.node, p),
+                    ]);
+                    let s = combined.serialize_computed(eval, None, kind, None, None);
+                    return Some(crate::properties::tokenize_custom_value_str(&s));
+                }
                 let (va, vb) = (pa.node.eval_scalar(eval, None), pb.node.eval_scalar(eval, None));
                 if va.is_finite() && vb.is_finite() {
                     let v = va * (1.0 - p) + vb * p;

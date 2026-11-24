@@ -78,6 +78,8 @@ pub struct RuleIndex {
     /// True when no rule uses sibling combinators, `:nth-*` / `:empty`, `:has()`, or `@scope`,
     /// enabling O(1) Stylo-style sibling style sharing for attribute-free siblings.
     pub allows_sibling_sharing: bool,
+    /// Per-document deterministic seed for CSS Values L5 `random()`.
+    pub random_doc_seed: u64,
     /// True when any rule is enclosed in an `@scope` block.
     pub has_scope_rules: bool,
     /// Merged `@property` / `CSS.registerProperty` custom property registrations (layer-ordered).
@@ -125,6 +127,7 @@ impl RuleIndex {
             has_relative_selectors: false,
             has_non_subject_has: false,
             allows_sibling_sharing: true,
+            random_doc_seed: crate::values::EvalContext::default().random_doc_seed,
             has_scope_rules: false,
             registered_properties: HashMap::new(),
             keyframes: HashMap::new(),

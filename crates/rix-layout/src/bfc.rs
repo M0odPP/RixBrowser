@@ -213,7 +213,8 @@ pub fn layout_block_box(
 ) -> Fragment {
     let b = ctx.tree.get(box_id);
     let style = Arc::clone(&b.style);
-    let metrics = BoxMetrics::resolve(&style, &space);
+    let eval = ctx.eval_context_for(&style, &space);
+    let metrics = BoxMetrics::resolve_with_eval(&style, &space, eval);
     let pb_w = metrics.padding.horizontal() + metrics.border.horizontal();
     let pb_h = metrics.padding.vertical() + metrics.border.vertical();
 
@@ -224,7 +225,6 @@ pub fn layout_block_box(
     let shrink_to_fit = b.is_float
         || (b.is_out_of_flow && !oof_both_h_insets)
         || matches!(b.kind, BoxKind::InlineBlock { .. });
-    let eval = space.eval_context_for(&style);
     let is_bb = style.box_sizing == rix_css::BoxSizingMode::BorderBox;
     let avail_c = (space.available_width - metrics.margin.horizontal() - pb_w).max(0.0);
 

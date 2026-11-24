@@ -73,8 +73,33 @@ pub fn resolve_line_height_px(style: &ComputedStyle, eval: EvalContext) -> f32 {
     let font_size = style.text.font_size_px.max(1.0);
     match &style.text.line_height {
         LineHeightValue::Normal => font_size * 1.2,
-        LineHeightValue::Number(n) => (font_size * *n).max(font_size * 0.5),
-        LineHeightValue::Length(lp) => lp.resolve_px(font_size, &eval).max(1.0),
+        LineHeightValue::Number(n) => (font_size * *n).max(0.0),
+        LineHeightValue::Length(lp) => lp.resolve_px(font_size, &eval).max(0.0),
+    }
+}
+
+fn line_box_metrics(
+    font_db: &FontDatabase,
+    font_id: FontId,
+    style: &ComputedStyle,
+    eval: EvalContext,
+) -> (f32, f32, f32) {
+    let font_size = style.text.font_size_px.max(1.0);
+    let (raw_asc, raw_desc) = font_ascent_descent(font_db, font_id, font_size);
+    let lh = match &style.text.line_height {
+        LineHeightValue::Normal => font_db
+            .get_font(font_id)
+            .map(|f| f.metrics.line_height_px(font_size))
+            .filter(|h| *h > 0.0)
+            .unwrap_or(font_size * 1.2),
+        _ => resolve_line_height_px(style, eval),
+    };
+    if matches!(style.text.line_height, LineHeightValue::Normal) {
+        (raw_asc, raw_desc, lh)
+    } else {
+        // CSS 2.1 §10.8.1: leading = line-height - (ascent + descent), split equally top/bottom.
+        let half = (lh - (raw_asc + raw_desc)) * 0.5;
+        ((raw_asc + half).max(0.0), (raw_desc + half).max(0.0), lh)
     }
 }
 
@@ -207,14 +232,10 @@ pub fn layout_ifc(
 ) -> IfcLayoutOutput {
     let container_style = Arc::clone(&ctx.tree.get(container_id).style);
     let container_width = space.available_width.max(0.0);
-    let eval = space.eval_context(container_style.text.font_size_px);
-    let strut_line_h = resolve_line_height_px(&container_style, eval);
+    let eval = ctx.eval_context_for(&container_style, &space);
     let strut_font_id = ctx.resolve_font(&container_style);
-    let (strut_ascent, strut_descent) = font_ascent_descent(
-        ctx.font_db,
-        strut_font_id,
-        container_style.text.font_size_px,
-    );
+    let (strut_ascent, strut_descent, strut_line_h) =
+        line_box_metrics(ctx.font_db, strut_font_id, &container_style, eval);
 
     let items = collect_inline_items(ctx, container_id, space);
     if items.is_empty() {
@@ -301,8 +322,8 @@ pub fn layout_ifc(
                 let font_id = ctx.resolve_font(&style);
                 let font_size = style.text.font_size_px.max(1.0);
                 let (glyphs, width) = shape_word_glyphs(ctx, &text, font_id, font_size, &style);
-                let (asc, desc) = font_ascent_descent(ctx.font_db, font_id, font_size);
-                let lh = resolve_line_height_px(&style, space.eval_context(font_size));
+                let word_eval = ctx.eval_context_for(&style, &space);
+                let (asc, desc, lh) = line_box_metrics(ctx.font_db, font_id, &style, word_eval);
 
                 let band_w = (band_right - band_left).max(0.0);
                 let wrap_here = allow_wrap

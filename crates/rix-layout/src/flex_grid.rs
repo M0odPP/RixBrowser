@@ -97,10 +97,47 @@ pub fn layout_flex_grid_container(
     in_flow_items.sort_by_key(|&(order, idx, _)| (order, idx));
     let ordered_items: Vec<BoxId> = in_flow_items.into_iter().map(|(_, _, cid)| cid).collect();
 
-    let eval = space.eval_context_for(&container_style);
+    let eval = ctx.eval_context_for(&container_style, &space);
     let root_taffy_style = to_taffy_container_style(&container_style, fc, &space, &eval);
+    let container_metrics = BoxMetrics::resolve_with_eval(&container_style, &space, eval);
+    let c_pb_w = container_metrics.padding.horizontal() + container_metrics.border.horizontal();
+    let c_pb_h = container_metrics.padding.vertical() + container_metrics.border.vertical();
+    let c_avail_w = container_metrics.specified_width.unwrap_or(
+        (space.available_width - container_metrics.margin.horizontal() - c_pb_w).max(0.0),
+    );
+    let c_avail_h = container_metrics.specified_height.or_else(|| {
+        space
+            .available_height
+            .map(|ah| (ah - container_metrics.margin.vertical() - c_pb_h).max(0.0))
+    });
+    let is_flex = fc == FormattingContextKind::Flex;
+    let is_row = container_style.flex_grid.as_ref().is_none_or(|fg| {
+        matches!(
+            fg.flex_direction,
+            FlexDirectionMode::Row | FlexDirectionMode::RowReverse
+        )
+    });
+    let mut item_evals = Vec::with_capacity(ordered_items.len());
+    let mut item_special_basis: Vec<Option<(f32, f32)>> = Vec::with_capacity(ordered_items.len());
+    for &cid in &ordered_items {
+        let cs = Arc::clone(&ctx.tree.get(cid).style);
+        let ie = ctx.eval_context_for(&cs, &space);
+        let sb = if is_flex {
+            resolve_flex_item_special_basis(
+                ctx, cid, &cs, is_row, c_avail_w, c_avail_h, &space, &ie,
+            )
+        } else {
+            None
+        };
+        item_evals.push(ie);
+        item_special_basis.push(sb);
+    }
     let root_style_hash = Arc::as_ptr(&container_style) as usize as u64
-        ^ (u64::from(space.available_width.to_bits()) << 32);
+        ^ (u64::from(space.available_width.to_bits()) << 32)
+        ^ item_special_basis.iter().fold(0u64, |acc, b| {
+            acc.rotate_left(7)
+                ^ u64::from(b.map_or(0u32, |(v, m)| v.to_bits() ^ m.to_bits().rotate_left(3)))
+        });
 
     // Take the retained container out of `LayoutCache` temporarily so the measure closure can
     // borrow `ctx` mutably (including `LayoutCache` fragment cache for leaf subtrees!).
@@ -120,6 +157,9 @@ pub fn layout_flex_grid_container(
         &mut retained,
         ctx.tree,
         &ordered_items,
+        &item_evals,
+        &item_special_basis,
+        is_row,
         root_taffy_style,
         root_style_hash,
         &space,
@@ -283,10 +323,14 @@ pub fn layout_flex_grid_container(
     fragment
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_retained_tree(
     retained: &mut RetainedTaffyContainer,
     tree: &crate::box_tree::BoxTree,
     ordered_items: &[BoxId],
+    item_evals: &[EvalContext],
+    item_special_basis: &[Option<(f32, f32)>],
+    is_row: bool,
     root_style: tp::Style,
     root_hash: u64,
     space: &ConstraintSpace,
@@ -310,7 +354,12 @@ fn reconcile_retained_tree(
 
     if same_structure {
         // Fast incremental path: preserve Taffy node IDs and only mark mutated items dirty!
-        for (entry, &cid) in retained.children.iter_mut().zip(ordered_items.iter()) {
+        for (i, (entry, &cid)) in retained
+            .children
+            .iter_mut()
+            .zip(ordered_items.iter())
+            .enumerate()
+        {
             let child_box = tree.get(cid);
             if let Some(leaf_ctx) = retained.taffy.get_node_context_mut(entry.taffy_node) {
                 leaf_ctx.box_id = cid;
@@ -319,8 +368,14 @@ fn reconcile_retained_tree(
                 || child_box.subtree_dirty
                 || entry.subtree_hash != child_box.subtree_hash
             {
-                let eval = space.eval_context_for(&child_box.style);
-                let item_style = to_taffy_item_style(&child_box.style, space, &eval, parent_areas);
+                let item_style = to_taffy_item_style(
+                    &child_box.style,
+                    space,
+                    &item_evals[i],
+                    parent_areas,
+                    item_special_basis[i],
+                    is_row,
+                );
                 let _ = retained.taffy.set_style(entry.taffy_node, item_style);
                 let _ = retained.taffy.mark_dirty(entry.taffy_node);
                 entry.subtree_hash = child_box.subtree_hash;
@@ -334,10 +389,16 @@ fn reconcile_retained_tree(
         let _ = retained.taffy.remove(old.taffy_node);
     }
     let mut taffy_kids = Vec::with_capacity(ordered_items.len());
-    for &cid in ordered_items {
+    for (i, &cid) in ordered_items.iter().enumerate() {
         let child_box = tree.get(cid);
-        let eval = space.eval_context_for(&child_box.style);
-        let item_style = to_taffy_item_style(&child_box.style, space, &eval, parent_areas);
+        let item_style = to_taffy_item_style(
+            &child_box.style,
+            space,
+            &item_evals[i],
+            parent_areas,
+            item_special_basis[i],
+            is_row,
+        );
         let node = retained
             .taffy
             .new_leaf_with_context(item_style, TaffyLeafCtx { box_id: cid })
@@ -350,6 +411,103 @@ fn reconcile_retained_tree(
         });
     }
     let _ = retained.taffy.set_children(retained.root, &taffy_kids);
+}
+
+#[allow(clippy::too_many_arguments)]
+#[rustfmt::skip]
+fn resolve_flex_item_special_basis(
+    ctx: &mut LayoutContext<'_>, cid: BoxId, style: &ComputedStyle,
+    is_row: bool, c_avail_w: f32, c_avail_h: Option<f32>,
+    space: &ConstraintSpace, eval: &EvalContext,
+) -> Option<(f32, f32)> {
+    use crate::fragment::{measure_content_intrinsic_widths, resolve_size_with_intrinsic, size_value_needs_intrinsic};
+    use rix_css::values_math::CalcSizeBasis;
+    let fg = style.flex_grid.as_deref();
+    let fb_size = fg.and_then(|f| f.flex_basis_size.as_ref());
+    let main_sz = if is_row { &style.box_model.width } else { &style.box_model.height };
+    let fb_is_auto = fg.is_none_or(|f| matches!(f.flex_basis, LengthPercentageAuto::Auto));
+    if fb_size.is_none() && !(fb_is_auto && (size_value_needs_intrinsic(main_sz) || matches!(main_sz, SizeValue::Stretch))) {
+        return None;
+    }
+    let metrics = BoxMetrics::resolve_with_eval(style, space, *eval);
+    let is_bb = style.box_sizing == BoxSizingMode::BorderBox;
+    let (pb_m, margin_m, main_avail) = if is_row {
+        (metrics.padding.horizontal() + metrics.border.horizontal(), metrics.margin.horizontal(), Some(c_avail_w))
+    } else {
+        (metrics.padding.vertical() + metrics.border.vertical(), metrics.margin.vertical(), c_avail_h)
+    };
+    let (min_c, max_c) = if is_row {
+        measure_content_intrinsic_widths(ctx, cid, space.with_available(c_avail_w, c_avail_h))
+    } else {
+        let h = measure_content_intrinsic_height(ctx, cid, space.with_available(c_avail_w, None));
+        (h, h)
+    };
+    let avail_c = main_avail.map_or(max_c, |a| (a - margin_m - pb_m).max(0.0));
+    let stf_c = max_c.min(avail_c).max(min_c);
+    let resolve_main_auto = || -> f32 {
+        let m_intr = |b: &CalcSizeBasis| match b {
+            CalcSizeBasis::MinContent => min_c,
+            CalcSizeBasis::MaxContent | CalcSizeBasis::Content => max_c,
+            CalcSizeBasis::FitContent => stf_c,
+            CalcSizeBasis::Stretch => avail_c,
+            _ => max_c,
+        };
+        resolve_size_with_intrinsic(main_sz, main_avail, pb_m, margin_m, is_bb, eval, m_intr).unwrap_or(max_c)
+    };
+    let content_px = if let Some(sz) = fb_size {
+        match sz {
+            SizeValue::Content => Some(max_c),
+            other => resolve_size_with_intrinsic(other, main_avail, pb_m, margin_m, is_bb, eval, |b| match b {
+                CalcSizeBasis::MinContent => min_c,
+                CalcSizeBasis::MaxContent | CalcSizeBasis::Content => max_c,
+                CalcSizeBasis::FitContent => stf_c,
+                CalcSizeBasis::Stretch => avail_c,
+                CalcSizeBasis::Auto => resolve_main_auto(),
+                _ => max_c,
+            }),
+        }
+    } else {
+        Some(resolve_main_auto())
+    }?;
+    let basis = if is_bb { content_px + pb_m } else { content_px }.max(0.0);
+    let main_ov = if is_row { style.overflow.x } else { style.overflow.y };
+    let auto_min = if main_ov == OverflowMode::Visible {
+        let spec_c = if is_row { metrics.specified_width } else { metrics.specified_height };
+        let c_min = spec_c.map_or(min_c, |s| min_c.min(s));
+        if is_bb { c_min + pb_m } else { c_min }.max(0.0)
+    } else {
+        0.0
+    };
+    Some((basis, auto_min))
+}
+
+fn measure_content_intrinsic_height(
+    ctx: &mut LayoutContext<'_>,
+    box_id: BoxId,
+    space: ConstraintSpace,
+) -> f32 {
+    let b = ctx.tree.get(box_id);
+    if b.children.is_empty() {
+        return 0.0;
+    }
+    let has_block = b
+        .children
+        .iter()
+        .any(|&c| ctx.tree.get(c).is_block_level() || ctx.tree.get(c).is_float);
+    if has_block {
+        let mut h = 0.0f32;
+        for cid in b.children.clone() {
+            if ctx.tree.get(cid).is_out_of_flow {
+                continue;
+            }
+            let frag = layout_box(ctx, cid, space);
+            h += frag.border_rect.size.height + frag.margin.vertical();
+        }
+        h
+    } else {
+        let floats = crate::bfc::FloatContext::new();
+        crate::ifc::layout_ifc(ctx, box_id, space, &floats, Point::ZERO).height
+    }
 }
 
 #[inline]
@@ -417,7 +575,7 @@ fn to_taffy_container_style(
     space: &ConstraintSpace,
     eval: &EvalContext,
 ) -> tp::Style {
-    let mut ts = to_taffy_item_style(style, space, eval, None);
+    let mut ts = to_taffy_item_style(style, space, eval, None, None, true);
     ts.display = match fc {
         FormattingContextKind::Grid => tp::Display::Grid,
         _ => tp::Display::Flex,
@@ -497,9 +655,11 @@ fn to_taffy_item_style(
     space: &ConstraintSpace,
     eval: &EvalContext,
     parent_areas: Option<&GridTemplateAreasValue>,
+    special_flex_basis: Option<(f32, f32)>,
+    is_row: bool,
 ) -> tp::Style {
     let bm = &style.box_model;
-    let metrics = BoxMetrics::resolve(style, space);
+    let metrics = BoxMetrics::resolve_with_eval(style, space, *eval);
     let mut ts = tp::Style {
         box_sizing: match style.box_sizing {
             BoxSizingMode::BorderBox => tp::BoxSizing::BorderBox,
@@ -565,6 +725,20 @@ fn to_taffy_item_style(
             start: col_start,
             end: col_end,
         };
+    }
+    if let Some((sb, auto_min)) = special_flex_basis {
+        ts.flex_basis = tp::length(sb);
+        if is_row {
+            ts.size.width = tp::auto();
+            if matches!(bm.min_width, SizeValue::Auto) {
+                ts.min_size.width = tp::length(auto_min);
+            }
+        } else {
+            ts.size.height = tp::auto();
+            if matches!(bm.min_height, SizeValue::Auto) {
+                ts.min_size.height = tp::length(auto_min);
+            }
+        }
     }
     ts
 }

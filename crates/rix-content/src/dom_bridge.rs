@@ -568,6 +568,11 @@ impl HostState {
         find_fragment_metrics(root, root.content_rect.size, node)
     }
 
+    /// Resolves the CSS Values L3 §5.1.1 `1ch` advance measure (`"0"` glyph width) for `style`.
+    pub fn ch_advance_px(&mut self, style: &ComputedStyle) -> f32 {
+        self.layout_engine.ch_advance_px(style, &self.font_db)
+    }
+
     /// Returns `true` if `node`'s parent element has `display: flex | inline-flex | grid | inline-grid`.
     pub fn parent_is_flex_or_grid(&mut self, node: NodeId) -> bool {
         let parent_id = {
@@ -626,6 +631,12 @@ impl HostState {
             self.mark_node_style_dirty(node);
         }
         changed
+    }
+
+    /// Lists all active Web Animations in creation order (`document.getAnimations()`).
+    #[must_use]
+    pub fn all_web_animations(&self) -> Vec<(NodeId, rix_css::WebAnimationSpec)> {
+        self.style_ctx.all_web_animations()
     }
 
     /// Marks `node` and its ancestors dirty for style/layout recalculation.
