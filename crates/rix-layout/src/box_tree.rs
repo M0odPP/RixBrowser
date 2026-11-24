@@ -326,7 +326,7 @@ impl<'a> BoxTreeBuilder<'a> {
             return Vec::new();
         };
         match data {
-            NodeData::Text(text) => {
+            NodeData::Text(text) | NodeData::CDataSection(text) => {
                 if text.is_empty() {
                     return Vec::new();
                 }

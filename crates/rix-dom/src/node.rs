@@ -22,6 +22,7 @@ pub enum NodeData {
     },
     Element(ElementData),
     Text(String),
+    CDataSection(String),
     Comment(String),
     ProcessingInstruction {
         target: String,
@@ -252,6 +253,69 @@ impl ElementData {
             DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::SELF_LAYOUT_DIRTY | DirtyFlags::PAINT_DIRTY;
         self.sync_cached_attrs();
         Some(removed)
+    }
+
+    /// WHATWG DOM §4.9: returns the first attribute matching `qualified_name` (exact case).
+    pub fn get_attribute_by_qname(&self, qualified_name: &str) -> Option<(usize, &str)> {
+        for (idx, (name, value)) in self.attributes.iter().enumerate() {
+            let matches = match &name.prefix {
+                Some(p) if !p.is_empty() => {
+                    let ps: &str = p;
+                    let ls: &str = &name.local;
+                    qualified_name.len() == ps.len() + 1 + ls.len()
+                        && qualified_name.starts_with(ps)
+                        && qualified_name.as_bytes().get(ps.len()) == Some(&b':')
+                        && qualified_name.ends_with(ls)
+                }
+                _ => &*name.local == qualified_name,
+            };
+            if matches {
+                return Some((idx, value.as_str()));
+            }
+        }
+        None
+    }
+
+    /// WHATWG DOM §4.9: sets an attribute by exact `qualified_name` (already lowercased if HTML-in-HTML),
+    /// returning `(old_value, namespace_uri, local_name)`.
+    pub fn set_attribute_by_qname(
+        &mut self,
+        qualified_name: &str,
+        value: &str,
+    ) -> (Option<String>, String, String) {
+        if let Some((idx, _)) = self.get_attribute_by_qname(qualified_name) {
+            let (qname, current) = &mut self.attributes[idx];
+            let ns = qname.ns.to_string();
+            let local = qname.local.to_string();
+            let old = std::mem::replace(current, value.to_string());
+            self.dirty_flags |= DirtyFlags::SELF_STYLE_DIRTY
+                | DirtyFlags::SELF_LAYOUT_DIRTY
+                | DirtyFlags::PAINT_DIRTY;
+            self.sync_cached_attrs();
+            return (Some(old), ns, local);
+        }
+        let qname = QualName::new(None, Namespace::from(""), LocalName::from(qualified_name));
+        self.attributes.push((qname, value.to_string()));
+        self.dirty_flags |=
+            DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::SELF_LAYOUT_DIRTY | DirtyFlags::PAINT_DIRTY;
+        self.sync_cached_attrs();
+        (None, String::new(), qualified_name.to_string())
+    }
+
+    /// WHATWG DOM §4.9: removes the first attribute matching exact `qualified_name`,
+    /// returning `(old_value, namespace_uri, local_name)` if found.
+    pub fn remove_attribute_by_qname(
+        &mut self,
+        qualified_name: &str,
+    ) -> Option<(String, String, String)> {
+        let (idx, _) = self.get_attribute_by_qname(qualified_name)?;
+        let (qname, old) = self.attributes.remove(idx);
+        let ns = qname.ns.to_string();
+        let local = qname.local.to_string();
+        self.dirty_flags |=
+            DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::SELF_LAYOUT_DIRTY | DirtyFlags::PAINT_DIRTY;
+        self.sync_cached_attrs();
+        Some((old, ns, local))
     }
 
     pub fn id(&self) -> Option<&str> {

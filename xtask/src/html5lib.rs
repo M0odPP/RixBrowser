@@ -229,7 +229,7 @@ fn serialize_node(doc: &Document, node: NodeId, depth: usize, out: &mut Vec<Stri
                 ));
             }
         }
-        NodeData::Text(text) => {
+        NodeData::Text(text) | NodeData::CDataSection(text) => {
             out.push(format!("| {indent}\"{text}\""));
         }
         NodeData::Comment(text) => {

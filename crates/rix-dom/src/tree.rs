@@ -99,7 +99,11 @@ impl Document {
     }
 
     pub fn document_element(&self) -> Option<NodeId> {
-        self.children(self.root)
+        self.document_element_of(self.root)
+    }
+
+    pub fn document_element_of(&self, doc_root: NodeId) -> Option<NodeId> {
+        self.children(doc_root)
             .find(|child| matches!(self.get(*child), Some(NodeData::Element(_))))
     }
 
@@ -119,7 +123,7 @@ impl Document {
             }
         }
         let mut map = HashMap::new();
-        for node in self.descendants_with_shadow_roots(self.root) {
+        for node in self.descendants(self.root) {
             if let Some(NodeData::Element(element)) = self.get(node) {
                 if let Some(id) = element.get_attribute("id") {
                     map.entry(id.to_string()).or_insert(node);
@@ -131,6 +135,23 @@ impl Document {
             *writer = Some((self.revision, map));
         }
         result
+    }
+
+    pub fn get_element_by_id_in(&self, doc_root: NodeId, target_id: &str) -> Option<NodeId> {
+        if target_id.is_empty() {
+            return None;
+        }
+        if doc_root == self.root {
+            return self.get_element_by_id(target_id);
+        }
+        for node in self.descendants(doc_root) {
+            if let Some(NodeData::Element(element)) = self.get(node) {
+                if element.get_attribute("id") == Some(target_id) {
+                    return Some(node);
+                }
+            }
+        }
+        None
     }
 
     pub fn revision(&self) -> u64 {
@@ -580,6 +601,11 @@ impl Document {
     pub fn create_text(&mut self, text: &str) -> NodeId {
         let data = NodeData::Text(text.to_string());
         self.arena.new_node(data)
+    }
+
+    pub fn create_cdata_section(&mut self, data: &str) -> NodeId {
+        self.arena
+            .new_node(NodeData::CDataSection(data.to_string()))
     }
 
     pub fn create_comment(&mut self, comment: &str) -> NodeId {
@@ -1058,7 +1084,7 @@ impl Document {
     pub fn inner_text(&self, id: NodeId) -> String {
         let mut result = String::new();
         for desc in self.descendants(id) {
-            if let Some(NodeData::Text(t)) = self.get(desc) {
+            if let Some(NodeData::Text(t) | NodeData::CDataSection(t)) = self.get(desc) {
                 result.push_str(t);
             }
         }
@@ -1153,7 +1179,7 @@ impl Document {
                                 child_container = fragment;
                             }
                         }
-                        Some(NodeData::Text(text)) => {
+                        Some(NodeData::Text(text) | NodeData::CDataSection(text)) => {
                             let raw = self.parent(node).and_then(|parent| self.get(parent)).is_some_and(|parent|
                             matches!(parent, NodeData::Element(element) if &*element.name.ns == "http://www.w3.org/1999/xhtml" && matches!(&*element.name.local,
                                 "style" | "script" | "xmp" | "iframe" | "noembed" | "noframes" | "plaintext" | "noscript")));
