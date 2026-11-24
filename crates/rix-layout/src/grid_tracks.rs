@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Pure-Rust W3C CSS Grid Level 1 track expansion, line resolution, auto-placement,
 //! §11 Track Sizing Algorithm, §9 abspos geometry, and CSS Box Alignment L3 helpers.
 //!

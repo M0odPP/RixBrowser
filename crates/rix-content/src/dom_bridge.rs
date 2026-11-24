@@ -980,13 +980,14 @@ impl HostState {
 }
 
 /// Layout-resolved box geometry for CSSOM View §7.1 `getComputedStyle` resolved values.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ResolvedLayoutBox {
     pub content_size: Size,
     pub border_size: Size,
     pub padding: EdgeInsets,
     pub margin: EdgeInsets,
     pub parent_content_size: Size,
+    pub resolved_grid_tracks: Option<Arc<rix_layout::ResolvedGridTracks>>,
 }
 
 fn find_fragment_metrics(
@@ -1001,6 +1002,7 @@ fn find_fragment_metrics(
             padding: frag.padding,
             margin: frag.margin,
             parent_content_size,
+            resolved_grid_tracks: frag.resolved_grid_tracks.clone(),
         });
     }
     let next_parent = frag.content_rect.size;

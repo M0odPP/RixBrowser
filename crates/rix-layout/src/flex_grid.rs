@@ -275,6 +275,7 @@ pub fn layout_flex_grid_container(
             ),
             is_fixed,
             flex_hint: None,
+            grid_hint: None,
         });
     }
     crate::position::resolve_oof_for_container(
@@ -315,6 +316,7 @@ pub fn layout_flex_grid_container(
         is_out_of_flow: ctx.tree.get(container_id).is_out_of_flow,
         collapsed_margin_top: metrics.margin.top,
         collapsed_margin_bottom: metrics.margin.bottom,
+        resolved_grid_tracks: None,
     };
     fragment.compute_overflow_rect();
     fragment

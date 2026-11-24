@@ -273,6 +273,7 @@ pub fn layout_table(
             is_out_of_flow: ctx.tree.get(table_id).is_out_of_flow,
             collapsed_margin_top: metrics.margin.top,
             collapsed_margin_bottom: metrics.margin.bottom,
+            resolved_grid_tracks: None,
         };
     }
 
@@ -442,6 +443,7 @@ pub fn layout_table(
             is_out_of_flow: false,
             collapsed_margin_top: 0.0,
             collapsed_margin_bottom: 0.0,
+            resolved_grid_tracks: None,
         };
         row_frag.compute_overflow_rect();
         placed_rows.push(row_frag);
@@ -512,6 +514,7 @@ pub fn layout_table(
         is_out_of_flow: ctx.tree.get(table_id).is_out_of_flow,
         collapsed_margin_top: metrics.margin.top,
         collapsed_margin_bottom: metrics.margin.bottom,
+        resolved_grid_tracks: None,
     };
     table_frag.compute_overflow_rect();
     table_frag

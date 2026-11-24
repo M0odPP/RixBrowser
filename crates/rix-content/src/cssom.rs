@@ -2643,18 +2643,30 @@ fn live_computed_property(
         return String::new();
     }
     let style = live_style_for(host, nid, pseudo);
-    let layout_box = if pseudo.is_none() && prop_needs_layout_resolution(prop) {
-        host.borrow_mut().resolved_layout_box_for_node(nid)
-    } else {
-        None
-    };
+    let needs_grid_layout = matches!(
+        style.display,
+        DisplayMode::Grid
+            | DisplayMode::InlineGrid
+            | DisplayMode::GridLanes
+            | DisplayMode::InlineGridLanes
+            | DisplayMode::InlineGridLanesMulti
+    ) && matches!(
+        prop.to_ascii_lowercase().as_str(),
+        "grid-template-columns" | "grid-template-rows"
+    );
+    let layout_box =
+        if pseudo.is_none() && (prop_needs_layout_resolution(prop) || needs_grid_layout) {
+            host.borrow_mut().resolved_layout_box_for_node(nid)
+        } else {
+            None
+        };
     let parent_flex_grid = if pseudo.is_none() && prop_needs_parent_flex_check(prop) {
         host.borrow_mut().parent_is_flex_or_grid(nid)
     } else {
         false
     };
     let ch_px = Some(host.borrow_mut().ch_advance_px(&style));
-    format_computed_property_resolved(&style, prop, layout_box, parent_flex_grid, ch_px)
+    format_computed_property_resolved(&style, prop, layout_box.as_ref(), parent_flex_grid, ch_px)
 }
 
 pub(crate) fn create_computed_style_proxy(
@@ -3062,7 +3074,7 @@ pub fn format_computed_property(style: &ComputedStyle, prop: &str) -> String {
 fn format_computed_property_resolved(
     style: &ComputedStyle,
     prop: &str,
-    layout_box: Option<ResolvedLayoutBox>,
+    layout_box: Option<&ResolvedLayoutBox>,
     parent_flex_grid: bool,
     ch_px: Option<f32>,
 ) -> String {
@@ -4410,45 +4422,64 @@ fn format_computed_property_resolved(
             Some(n) => n.to_string(),
             None => "auto".into(),
         },
-        "grid-template-rows" => style.flex_grid.as_ref().map_or_else(
-            || "none".into(),
-            |f| {
-                let is_grid = matches!(
-                    style.display,
-                    DisplayMode::Grid
-                        | DisplayMode::InlineGrid
-                        | DisplayMode::GridLanes
-                        | DisplayMode::InlineGridLanes
-                        | DisplayMode::InlineGridLanesMulti
-                );
-                if !is_grid && f.grid_template_rows_list.has_intrinsic_auto_repeat() {
-                    "none".into()
-                } else {
-                    rix_css::grid_css::serialize_track_list(&f.grid_template_rows_list, Some(&eval))
-                }
-            },
-        ),
-        "grid-template-columns" => style.flex_grid.as_ref().map_or_else(
-            || "none".into(),
-            |f| {
-                let is_grid = matches!(
-                    style.display,
-                    DisplayMode::Grid
-                        | DisplayMode::InlineGrid
-                        | DisplayMode::GridLanes
-                        | DisplayMode::InlineGridLanes
-                        | DisplayMode::InlineGridLanesMulti
-                );
-                if !is_grid && f.grid_template_columns_list.has_intrinsic_auto_repeat() {
-                    "none".into()
-                } else {
-                    rix_css::grid_css::serialize_track_list(
-                        &f.grid_template_columns_list,
-                        Some(&eval),
-                    )
-                }
-            },
-        ),
+        "grid-template-rows" => {
+            if let Some(rgt) = layout_box
+                .as_ref()
+                .and_then(|lb| lb.resolved_grid_tracks.as_ref())
+            {
+                return rgt.rows.clone();
+            }
+            style.flex_grid.as_ref().map_or_else(
+                || "none".into(),
+                |f| {
+                    let is_grid = matches!(
+                        style.display,
+                        DisplayMode::Grid
+                            | DisplayMode::InlineGrid
+                            | DisplayMode::GridLanes
+                            | DisplayMode::InlineGridLanes
+                            | DisplayMode::InlineGridLanesMulti
+                    );
+                    if !is_grid && f.grid_template_rows_list.has_intrinsic_auto_repeat() {
+                        "none".into()
+                    } else {
+                        rix_css::grid_css::serialize_track_list(
+                            &f.grid_template_rows_list,
+                            Some(&eval),
+                        )
+                    }
+                },
+            )
+        }
+        "grid-template-columns" => {
+            if let Some(rgt) = layout_box
+                .as_ref()
+                .and_then(|lb| lb.resolved_grid_tracks.as_ref())
+            {
+                return rgt.columns.clone();
+            }
+            style.flex_grid.as_ref().map_or_else(
+                || "none".into(),
+                |f| {
+                    let is_grid = matches!(
+                        style.display,
+                        DisplayMode::Grid
+                            | DisplayMode::InlineGrid
+                            | DisplayMode::GridLanes
+                            | DisplayMode::InlineGridLanes
+                            | DisplayMode::InlineGridLanesMulti
+                    );
+                    if !is_grid && f.grid_template_columns_list.has_intrinsic_auto_repeat() {
+                        "none".into()
+                    } else {
+                        rix_css::grid_css::serialize_track_list(
+                            &f.grid_template_columns_list,
+                            Some(&eval),
+                        )
+                    }
+                },
+            )
+        }
         "grid-template-areas" => style.flex_grid.as_ref().map_or_else(
             || "none".into(),
             |f| rix_css::grid_css::serialize_grid_areas(&f.grid_template_areas),

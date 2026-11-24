@@ -848,6 +848,8 @@ pub fn layout_flex_container(
         containing_block_height: definite_h.unwrap_or(space.containing_block_height),
         viewport_size: space.viewport_size,
         root_font_size_px: space.root_font_size_px,
+        cb_inline_size: None,
+        definite_width_override: None,
         definite_height_override: None,
         ignore_specified_height: false,
     };
@@ -2165,6 +2167,7 @@ pub fn layout_flex_container(
                 align_items,
                 align_self: oof_align_self,
             }),
+            grid_hint: None,
         });
     }
 
@@ -2218,6 +2221,7 @@ pub fn layout_flex_container(
         is_out_of_flow: ctx.tree.get(container_id).is_out_of_flow,
         collapsed_margin_top: metrics.margin.top,
         collapsed_margin_bottom: metrics.margin.bottom,
+        resolved_grid_tracks: None,
     };
     fragment.compute_overflow_rect();
     fragment
