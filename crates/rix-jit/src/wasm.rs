@@ -95,6 +95,13 @@ struct ExnEntry {
     stack: Option<String>,
 }
 
+/// Per-module W3C JS String Builtins compile options (`{ builtins, importedStringConstants }`).
+#[derive(Debug, Clone, Default)]
+struct CompileOptions {
+    js_string_builtins: bool,
+    imported_string_constants: Option<String>,
+}
+
 /// Store user data carrying temporary active `JsVm` pointer during synchronous Wasm -> JS
 /// imported function calls, stashing any JS exception thrown inside an imported callback,
 /// and sharing memory bridge metadata across `Send + Sync` Wasm host closures.
@@ -115,7 +122,7 @@ pub struct WasmHost {
     store: RefCell<Store<WasmStoreData>>,
     /// Pointer to stack-pinned `StoreContextMut` when inside a re-entrant Wasm -> JS host callback.
     active_ctx_ptr: Cell<usize>,
-    modules: RefCell<Vec<(Module, Vec<u8>)>>,
+    modules: RefCell<Vec<(Module, Vec<u8>, CompileOptions)>>,
     instances: RefCell<Vec<Instance>>,
     memories: Arc<Mutex<Vec<MemoryBridge>>>,
     tables: RefCell<Vec<TableEntry>>,
@@ -137,6 +144,7 @@ pub struct WasmHost {
     global_proto: HeapHandle,
     tag_proto: HeapHandle,
     exception_proto: HeapHandle,
+    function_proto: HeapHandle,
     compile_error_proto: HeapHandle,
     link_error_proto: HeapHandle,
     runtime_error_proto: HeapHandle,
@@ -297,13 +305,55 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
     let obj_proto = vm.object_proto;
     let err_proto = vm.error_proto;
 
-    let module_proto = alloc_ordinary(vm, Some(obj_proto));
+    // TC39 Source Phase Imports `%AbstractModuleSource%` intrinsic (not exposed on globalThis).
+    let abstract_module_source_proto = alloc_ordinary(vm, Some(obj_proto));
+    let ams_to_string_tag_get =
+        alloc_host_fn_len(vm, "get [Symbol.toStringTag]", 0, |vm, this, _| {
+            if read_hidden_id(vm, this, MODULE_ID_KEY).is_some() {
+                Ok(JsValue::from_string(
+                    vm.heap.alloc_string("WebAssembly.Module"),
+                ))
+            } else {
+                Ok(JsValue::UNDEFINED)
+            }
+        });
+    let k_sym_tag = vm.key_symbol_to_string_tag;
+    vm.heap.object_define_accessor(
+        abstract_module_source_proto,
+        k_sym_tag,
+        Some(ams_to_string_tag_get),
+        None,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+    let abstract_module_source_ctor =
+        alloc_host_fn_len(vm, "AbstractModuleSource", 0, |vm, _this, _args| {
+            Err(vm.type_error("AbstractModuleSource is an abstract constructor"))
+        });
+    vm.mark_constructor(abstract_module_source_ctor);
+    define_prop(
+        vm,
+        abstract_module_source_ctor,
+        "prototype",
+        JsValue::from_object(abstract_module_source_proto),
+        PropertyAttrs::empty(),
+    );
+    define_prop(
+        vm,
+        abstract_module_source_proto,
+        "constructor",
+        JsValue::from_object(abstract_module_source_ctor),
+        PropertyAttrs::METHOD,
+    );
+
+    let module_proto = alloc_ordinary(vm, Some(abstract_module_source_proto));
     let instance_proto = alloc_ordinary(vm, Some(obj_proto));
     let memory_proto = alloc_ordinary(vm, Some(obj_proto));
     let table_proto = alloc_ordinary(vm, Some(obj_proto));
     let global_proto = alloc_ordinary(vm, Some(obj_proto));
     let tag_proto = alloc_ordinary(vm, Some(obj_proto));
     let exception_proto = alloc_ordinary(vm, Some(obj_proto));
+    let function_proto = alloc_ordinary(vm, Some(vm.function_proto));
 
     set_to_string_tag(vm, module_proto, "WebAssembly.Module");
     set_to_string_tag(vm, instance_proto, "WebAssembly.Instance");
@@ -312,6 +362,7 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
     set_to_string_tag(vm, global_proto, "WebAssembly.Global");
     set_to_string_tag(vm, tag_proto, "WebAssembly.Tag");
     set_to_string_tag(vm, exception_proto, "WebAssembly.Exception");
+    set_to_string_tag(vm, function_proto, "WebAssembly.Function");
 
     let compile_error_proto = alloc_wasm_error_proto(vm, err_proto, "CompileError");
     let link_error_proto = alloc_wasm_error_proto(vm, err_proto, "LinkError");
@@ -341,6 +392,7 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
         global_proto,
         tag_proto,
         exception_proto,
+        function_proto,
         compile_error_proto,
         link_error_proto,
         runtime_error_proto,
@@ -353,6 +405,7 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
     install_global_prototype(vm, &host);
     install_tag_prototype(vm, &host);
     install_exception_prototype(vm, &host);
+    install_function_prototype(vm, &host);
 
     // Build `WebAssembly` namespace object.
     let wasm_ns = alloc_ordinary(vm, Some(obj_proto));
@@ -398,8 +451,12 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
             let proto = require_construct_proto(vm, h.module_proto, "Module")?;
             let bytes =
                 extract_buffer_source(vm, args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
-            compile_module_object_with_proto(vm, &h, bytes, proto)
+            let compile_opts =
+                parse_compile_options(vm, args.get(1).copied().unwrap_or(JsValue::UNDEFINED))?;
+            compile_module_object_with_proto(vm, &h, bytes, compile_opts, proto)
         });
+        vm.heap
+            .object_set_prototype(ctor, Some(abstract_module_source_ctor), &mut vm.shapes);
         define_prop(
             vm,
             ctor,
@@ -424,7 +481,7 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
             )
             .ok_or_else(|| vm.type_error("Argument 0 must be a WebAssembly.Module"))?;
             let modules = h_exp.modules.borrow();
-            let (module, _) = modules
+            let (module, _, _) = modules
                 .get(mod_id)
                 .ok_or_else(|| vm.type_error("Invalid WebAssembly.Module"))?;
             let entries: Vec<(String, &'static str)> = module
@@ -460,11 +517,12 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
             )
             .ok_or_else(|| vm.type_error("Argument 0 must be a WebAssembly.Module"))?;
             let modules = h_imp.modules.borrow();
-            let (module, _) = modules
+            let (module, _, compile_opts) = modules
                 .get(mod_id)
                 .ok_or_else(|| vm.type_error("Invalid WebAssembly.Module"))?;
             let entries: Vec<(String, String, &'static str)> = module
                 .imports()
+                .filter(|i| !is_suppressed_builtin_import(i.module(), compile_opts))
                 .map(|i| {
                     (
                         i.module().to_string(),
@@ -505,7 +563,7 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
             let target_name = vm.to_js_string(args[1])?;
             let sections: Vec<Vec<u8>> = {
                 let modules = h_cs.modules.borrow();
-                let (_, raw_bytes) = modules
+                let (_, raw_bytes, _) = modules
                     .get(mod_id)
                     .ok_or_else(|| vm.type_error("Invalid WebAssembly.Module"))?;
                 parse_custom_sections(raw_bytes, &target_name)
@@ -1017,6 +1075,97 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
     );
     vm.mark_constructor(exn_ctor);
 
+    // `WebAssembly.Function` constructor (JS Type Reflection proposal).
+    let fn_ctor = {
+        let h = Rc::clone(&host);
+        let ctor = alloc_host_fn_len(vm, "Function", 2, move |vm, _this, args| {
+            let proto = require_construct_proto(vm, h.function_proto, "Function")?;
+            if args.len() < 2 {
+                return Err(vm.type_error("WebAssembly.Function requires descriptor and function"));
+            }
+            let Some(desc_h) = args[0].as_object() else {
+                return Err(vm.type_error("WebAssembly.Function descriptor must be an object"));
+            };
+            let k_params = vm.heap.intern_key("parameters");
+            let params_v = vm.get_property_by_key(desc_h, k_params)?;
+            if params_v.is_undefined() || params_v.is_null() {
+                return Err(vm.type_error("WebAssembly.Function descriptor requires 'parameters'"));
+            }
+            let param_items = vm.collect_iterable(params_v)?;
+            let mut param_tys = Vec::with_capacity(param_items.len());
+            for item in param_items {
+                if !item.is_string() {
+                    return Err(
+                        vm.type_error("WebAssembly.Function parameter type must be a string")
+                    );
+                }
+                let s = vm.to_js_string(item)?;
+                param_tys.push(parse_js_val_type(vm, &s, false)?);
+            }
+            let k_results = vm.heap.intern_key("results");
+            let results_v = vm.get_property_by_key(desc_h, k_results)?;
+            if results_v.is_undefined() || results_v.is_null() {
+                return Err(vm.type_error("WebAssembly.Function descriptor requires 'results'"));
+            }
+            let result_items = vm.collect_iterable(results_v)?;
+            let mut result_tys = Vec::with_capacity(result_items.len());
+            for item in result_items {
+                if !item.is_string() {
+                    return Err(vm.type_error("WebAssembly.Function result type must be a string"));
+                }
+                let s = vm.to_js_string(item)?;
+                result_tys.push(parse_js_val_type(vm, &s, false)?);
+            }
+            let target = args[1];
+            if !target
+                .as_object()
+                .is_some_and(|th| vm.is_callable_handle(th))
+            {
+                return Err(vm.type_error("WebAssembly.Function second argument must be callable"));
+            }
+            root_js_value(vm, &h, target);
+            let func_ty = FuncType::new(&h.engine, param_tys, result_tys);
+            let wasm_func = wrap_js_fn_as_wasm_import(&h, target, func_ty);
+            let wrapper = wrap_exported_func_with_proto(vm, &h, "", wasm_func, proto);
+            Ok(JsValue::from_object(wrapper))
+        });
+        define_prop(
+            vm,
+            ctor,
+            "prototype",
+            JsValue::from_object(function_proto),
+            PropertyAttrs::empty(),
+        );
+        define_prop(
+            vm,
+            function_proto,
+            "constructor",
+            JsValue::from_object(ctor),
+            PropertyAttrs::METHOD,
+        );
+        let h_ft = Rc::clone(&host);
+        let static_type = alloc_host_fn_len(vm, "type", 1, move |vm, _this, args| {
+            let fn_arg = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+            wasm_function_type_obj(vm, &h_ft, fn_arg)
+        });
+        define_prop(
+            vm,
+            ctor,
+            "type",
+            JsValue::from_object(static_type),
+            PropertyAttrs::DEFAULT,
+        );
+        ctor
+    };
+    define_prop(
+        vm,
+        wasm_ns,
+        "Function",
+        JsValue::from_object(fn_ctor),
+        PropertyAttrs::METHOD,
+    );
+    vm.mark_constructor(fn_ctor);
+
     // `WebAssembly.validate(bytes)`
     let validate_fn = {
         let h = Rc::clone(&host);
@@ -1050,12 +1199,24 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
                     return Ok(JsValue::from_object(p));
                 }
             };
+            let compile_opts =
+                match parse_compile_options(vm, args.get(1).copied().unwrap_or(JsValue::UNDEFINED))
+                {
+                    Ok(o) => o,
+                    Err(exc) => {
+                        let p = alloc_promise(vm);
+                        reject_promise(vm, p, exc.value);
+                        return Ok(JsValue::from_object(p));
+                    }
+                };
             let tick = promise_resolve_value(vm, JsValue::UNDEFINED);
             let h_mod = Rc::clone(&h);
             let bytes_cell = RefCell::new(Some(bytes));
+            let opts_cell = RefCell::new(Some(compile_opts));
             let on_tick = vm.alloc_host_fn("wasmCompileTask", move |vm, _this, _a| {
                 let raw = bytes_cell.borrow_mut().take().unwrap_or_default();
-                compile_module_object_with_proto(vm, &h_mod, raw, h_mod.module_proto)
+                let opts = opts_cell.borrow_mut().take().unwrap_or_default();
+                compile_module_object_with_proto(vm, &h_mod, raw, opts, h_mod.module_proto)
             });
             let chained = promise_then(vm, tick, Some(on_tick), None);
             Ok(JsValue::from_object(chained))
@@ -1104,18 +1265,32 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
                     reject_promise(vm, p, exc.value);
                     return Ok(JsValue::from_object(p));
                 }
+                let compile_opts = match parse_compile_options(
+                    vm,
+                    args.get(2).copied().unwrap_or(JsValue::UNDEFINED),
+                ) {
+                    Ok(o) => o,
+                    Err(exc) => {
+                        let p = alloc_promise(vm);
+                        reject_promise(vm, p, exc.value);
+                        return Ok(JsValue::from_object(p));
+                    }
+                };
                 let tick = promise_resolve_value(vm, JsValue::UNDEFINED);
                 let h_inst = Rc::clone(&h);
                 let bytes_cell = RefCell::new(Some(bytes));
+                let opts_cell = RefCell::new(Some(compile_opts));
                 let on_tick = vm.alloc_host_fn_rooted(
                     "wasmInstantiateBytesTask",
                     &[imports],
                     move |vm, _t, _a| {
                         let raw = bytes_cell.borrow_mut().take().unwrap_or_default();
+                        let opts = opts_cell.borrow_mut().take().unwrap_or_default();
                         let mod_val = compile_module_object_with_proto(
                             vm,
                             &h_inst,
                             raw,
+                            opts,
                             h_inst.module_proto,
                         )?;
                         let inst_val = instantiate_module_object_with_proto(
@@ -1257,7 +1432,13 @@ fn compile_streaming_impl(vm: &mut JsVm, host: &SharedWasmHost, source: JsValue)
         let on_buf = vm.alloc_host_fn("wasmCompileStreamingBytes", move |vm, _this, bargs| {
             let bytes =
                 extract_buffer_source(vm, bargs.first().copied().unwrap_or(JsValue::UNDEFINED))?;
-            compile_module_object_with_proto(vm, &h_mod, bytes, h_mod.module_proto)
+            compile_module_object_with_proto(
+                vm,
+                &h_mod,
+                bytes,
+                CompileOptions::default(),
+                h_mod.module_proto,
+            )
         });
         Ok(JsValue::from_object(promise_then(
             vm,
@@ -1271,24 +1452,455 @@ fn compile_streaming_impl(vm: &mut JsVm, host: &SharedWasmHost, source: JsValue)
 
 // --- Module Compilation & Instantiation ---
 
+fn parse_compile_options(vm: &mut JsVm, val: JsValue) -> Result<CompileOptions, JsException> {
+    if val.is_undefined() || val.is_null() {
+        return Ok(CompileOptions::default());
+    }
+    let Some(obj) = val.as_object() else {
+        return Err(vm.type_error("WebAssembly compile options must be an object"));
+    };
+    let mut opts = CompileOptions::default();
+    let k_builtins = vm.heap.intern_key("builtins");
+    let builtins_v = vm.get_property_by_key(obj, k_builtins)?;
+    if !builtins_v.is_undefined() {
+        for item in vm.collect_iterable(builtins_v)? {
+            let s = vm.to_js_string(item)?;
+            if s == "js-string" {
+                opts.js_string_builtins = true;
+            }
+        }
+    }
+    let k_isc = vm.heap.intern_key("importedStringConstants");
+    let isc_v = vm.get_property_by_key(obj, k_isc)?;
+    if !isc_v.is_undefined() {
+        opts.imported_string_constants = Some(vm.to_js_string(isc_v)?);
+    }
+    Ok(opts)
+}
+
+fn is_suppressed_builtin_import(imp_mod: &str, opts: &CompileOptions) -> bool {
+    if opts.js_string_builtins && imp_mod == "wasm:js-string" {
+        return true;
+    }
+    if opts
+        .imported_string_constants
+        .as_deref()
+        .is_some_and(|ns| ns == imp_mod)
+    {
+        return true;
+    }
+    false
+}
+
 fn compile_module_object_with_proto(
     vm: &mut JsVm,
     host: &SharedWasmHost,
     bytes: Vec<u8>,
+    compile_opts: CompileOptions,
     proto: HeapHandle,
 ) -> Result<JsValue, JsException> {
     let module = Module::new(&host.engine, &bytes).map_err(|e| {
         make_wasm_error(vm, host.compile_error_proto, "CompileError", e.to_string())
     })?;
+    // W3C JS String Builtins: validate imported string constants and `wasm:js-string` signatures at compile time.
+    if let Some(ref isc_ns) = compile_opts.imported_string_constants {
+        for imp in module.imports() {
+            if imp.module() == isc_ns.as_str() {
+                let valid = matches!(
+                    imp.ty(),
+                    ExternType::Global(ref gt)
+                        if gt.mutability() == Mutability::Const
+                            && matches!(
+                                gt.content(),
+                                ValType::Ref(rt) if matches!(rt.heap_type(), HeapType::Extern)
+                            )
+                );
+                if !valid {
+                    return Err(make_wasm_error(
+                        vm,
+                        host.compile_error_proto,
+                        "CompileError",
+                        format!(
+                            "Imported string constant '{}.{}' must be an immutable externref global",
+                            imp.module(),
+                            imp.name()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    if compile_opts.js_string_builtins {
+        for imp in module.imports() {
+            if imp.module() == "wasm:js-string" {
+                let ok_sig = match imp.ty() {
+                    ExternType::Func(ref ft) => is_valid_js_string_builtin_sig(imp.name(), ft),
+                    _ => false,
+                };
+                if !ok_sig {
+                    return Err(make_wasm_error(
+                        vm,
+                        host.compile_error_proto,
+                        "CompileError",
+                        format!("Invalid wasm:js-string builtin import '{}'", imp.name()),
+                    ));
+                }
+            }
+        }
+    }
     let mod_id = {
         let mut mods = host.modules.borrow_mut();
         let id = mods.len();
-        mods.push((module, bytes));
+        mods.push((module, bytes, compile_opts));
         id
     };
     let obj = alloc_ordinary(vm, Some(proto));
     define_hidden_id(vm, obj, MODULE_ID_KEY, mod_id);
     Ok(JsValue::from_object(obj))
+}
+
+fn is_valid_js_string_builtin_sig(name: &str, ft: &FuncType) -> bool {
+    let params: Vec<ValType> = ft.params().collect();
+    let results: Vec<ValType> = ft.results().collect();
+    let is_i32 = |t: &ValType| matches!(t, ValType::I32);
+    let is_one_i32 = |v: &[ValType]| v.len() == 1 && is_i32(&v[0]);
+    let is_ext =
+        |t: &ValType| matches!(t, ValType::Ref(rt) if matches!(rt.heap_type(), HeapType::Extern));
+    let is_ext_nn = |t: &ValType| matches!(t, ValType::Ref(rt) if !rt.is_nullable() && matches!(rt.heap_type(), HeapType::Extern));
+    let is_arr = |t: &ValType| matches!(t, ValType::Ref(rt) if matches!(rt.heap_type(), HeapType::ConcreteArray(_) | HeapType::Array));
+    match name {
+        "test" | "length" => params.len() == 1 && is_ext(&params[0]) && is_one_i32(&results),
+        "cast" => {
+            params.len() == 1 && is_ext(&params[0]) && results.len() == 1 && is_ext_nn(&results[0])
+        }
+        "fromCharCode" | "fromCodePoint" => {
+            is_one_i32(&params) && results.len() == 1 && is_ext_nn(&results[0])
+        }
+        "charCodeAt" | "codePointAt" => {
+            params.len() == 2 && is_ext(&params[0]) && is_i32(&params[1]) && is_one_i32(&results)
+        }
+        "concat" => {
+            params.len() == 2
+                && is_ext(&params[0])
+                && is_ext(&params[1])
+                && results.len() == 1
+                && is_ext_nn(&results[0])
+        }
+        "substring" => {
+            params.len() == 3
+                && is_ext(&params[0])
+                && is_i32(&params[1])
+                && is_i32(&params[2])
+                && results.len() == 1
+                && is_ext_nn(&results[0])
+        }
+        "equals" | "compare" => {
+            params.len() == 2 && is_ext(&params[0]) && is_ext(&params[1]) && is_one_i32(&results)
+        }
+        "fromCharCodeArray" => {
+            params.len() == 3
+                && is_arr(&params[0])
+                && is_i32(&params[1])
+                && is_i32(&params[2])
+                && results.len() == 1
+                && is_ext_nn(&results[0])
+        }
+        "intoCharCodeArray" => {
+            params.len() == 3
+                && is_ext(&params[0])
+                && is_arr(&params[1])
+                && is_i32(&params[2])
+                && is_one_i32(&results)
+        }
+        _ => false,
+    }
+}
+
+fn make_js_string_builtin_func(host: &SharedWasmHost, name: &str, func_ty: FuncType) -> Func {
+    let op = name.to_string();
+    host.with_store_mut(|mut store| {
+        Func::new(
+            &mut store,
+            func_ty,
+            move |mut caller: Caller<'_, WasmStoreData>, params, results| {
+                let vm_addr = caller.data().vm_addr;
+                let host_addr = caller.data().host_addr;
+                if vm_addr == 0 || host_addr == 0 {
+                    return Err(wasmtime::Error::msg(
+                        "No active JsVm during js-string builtin",
+                    ));
+                }
+                // SAFETY: `VmPtrGuard` guarantees `vm_addr` and `host_addr` are valid synchronously.
+                let vm = unsafe { &mut *(vm_addr as *mut JsVm) };
+                // SAFETY: `host_addr` points to live `WasmHost`.
+                let host_ref = unsafe { &*(host_addr as *const WasmHost) };
+
+                let extract_extern_js = |c: &Caller<'_, WasmStoreData>, v: &Val| -> JsValue {
+                    match v {
+                        Val::ExternRef(Some(er)) => er
+                            .data(c)
+                            .ok()
+                            .flatten()
+                            .and_then(|d| d.downcast_ref::<JsExternVal>())
+                            .map_or(JsValue::UNDEFINED, |x| JsValue::from_raw(x.0)),
+                        _ => JsValue::NULL,
+                    }
+                };
+                let require_js_str = |vm: &mut JsVm, v: JsValue| -> Result<Vec<u16>, JsException> {
+                    let Some(sh) = v.as_string() else {
+                        return Err(make_wasm_error(
+                            vm,
+                            host_ref.runtime_error_proto,
+                            "RuntimeError",
+                            "Expected JS string in wasm:js-string builtin",
+                        ));
+                    };
+                    let s = vm.heap.materialize_string(sh).unwrap_or_default();
+                    Ok(s.encode_utf16().collect())
+                };
+                let box_str = |vm: &mut JsVm,
+                               c: &mut Caller<'_, WasmStoreData>,
+                               units: &[u16]|
+                 -> Result<Val, wasmtime::Error> {
+                    let s = String::from_utf16_lossy(units);
+                    let jv = JsValue::from_string(vm.heap.alloc_string(s));
+                    root_js_value(vm, host_ref, jv);
+                    let er = ExternRef::new(c.as_context_mut(), JsExternVal(jv.to_raw()))?;
+                    Ok(Val::ExternRef(Some(er)))
+                };
+
+                let trap_js = |caller: &mut Caller<'_, WasmStoreData>, exc: JsException| {
+                    caller.data_mut().pending_js_exception = Some(exc);
+                    wasmtime::Error::msg("__rix_js_exception__")
+                };
+
+                match op.as_str() {
+                    "test" => {
+                        let jv = extract_extern_js(&caller, &params[0]);
+                        results[0] = Val::I32(i32::from(jv.is_string()));
+                    }
+                    "cast" => {
+                        let jv = extract_extern_js(&caller, &params[0]);
+                        if !jv.is_string() {
+                            let exc = make_wasm_error(
+                                vm,
+                                host_ref.runtime_error_proto,
+                                "RuntimeError",
+                                "wasm:js-string.cast argument is not a string",
+                            );
+                            return Err(trap_js(&mut caller, exc));
+                        }
+                        results[0] = params[0];
+                    }
+                    "fromCharCode" => {
+                        let code = params[0].unwrap_i32() as u16;
+                        results[0] = box_str(vm, &mut caller, &[code])?;
+                    }
+                    "fromCodePoint" => {
+                        let cp = params[0].unwrap_i32() as u32;
+                        let Some(ch) = char::from_u32(cp) else {
+                            let exc = make_wasm_error(
+                                vm,
+                                host_ref.runtime_error_proto,
+                                "RuntimeError",
+                                "Invalid Unicode code point",
+                            );
+                            return Err(trap_js(&mut caller, exc));
+                        };
+                        let mut buf = [0u16; 2];
+                        let slice = ch.encode_utf16(&mut buf);
+                        results[0] = box_str(vm, &mut caller, slice)?;
+                    }
+                    "charCodeAt" => {
+                        let jv = extract_extern_js(&caller, &params[0]);
+                        let units = require_js_str(vm, jv).map_err(|e| trap_js(&mut caller, e))?;
+                        let idx = params[1].unwrap_i32() as u32 as usize;
+                        if idx >= units.len() {
+                            let exc = make_wasm_error(
+                                vm,
+                                host_ref.runtime_error_proto,
+                                "RuntimeError",
+                                "String index out of bounds",
+                            );
+                            return Err(trap_js(&mut caller, exc));
+                        }
+                        results[0] = Val::I32(i32::from(units[idx]));
+                    }
+                    "codePointAt" => {
+                        let jv = extract_extern_js(&caller, &params[0]);
+                        let units = require_js_str(vm, jv).map_err(|e| trap_js(&mut caller, e))?;
+                        let idx = params[1].unwrap_i32() as u32 as usize;
+                        if idx >= units.len() {
+                            let exc = make_wasm_error(
+                                vm,
+                                host_ref.runtime_error_proto,
+                                "RuntimeError",
+                                "String index out of bounds",
+                            );
+                            return Err(trap_js(&mut caller, exc));
+                        }
+                        let first = units[idx] as u32;
+                        let cp = if (0xD800..=0xDBFF).contains(&first) && idx + 1 < units.len() {
+                            let second = units[idx + 1] as u32;
+                            if (0xDC00..=0xDFFF).contains(&second) {
+                                0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00)
+                            } else {
+                                first
+                            }
+                        } else {
+                            first
+                        };
+                        results[0] = Val::I32(cp as i32);
+                    }
+                    "length" => {
+                        let jv = extract_extern_js(&caller, &params[0]);
+                        let units = require_js_str(vm, jv).map_err(|e| trap_js(&mut caller, e))?;
+                        results[0] = Val::I32(units.len() as i32);
+                    }
+                    "concat" => {
+                        let a = extract_extern_js(&caller, &params[0]);
+                        let b = extract_extern_js(&caller, &params[1]);
+                        let mut ua = require_js_str(vm, a).map_err(|e| trap_js(&mut caller, e))?;
+                        let ub = require_js_str(vm, b).map_err(|e| trap_js(&mut caller, e))?;
+                        ua.extend_from_slice(&ub);
+                        results[0] = box_str(vm, &mut caller, &ua)?;
+                    }
+                    "substring" => {
+                        let jv = extract_extern_js(&caller, &params[0]);
+                        let units = require_js_str(vm, jv).map_err(|e| trap_js(&mut caller, e))?;
+                        let start = (params[1].unwrap_i32() as u32 as usize).min(units.len());
+                        let end = (params[2].unwrap_i32() as u32 as usize).min(units.len());
+                        let slice = if end <= start {
+                            &[]
+                        } else {
+                            &units[start..end]
+                        };
+                        results[0] = box_str(vm, &mut caller, slice)?;
+                    }
+                    "equals" => {
+                        let a = extract_extern_js(&caller, &params[0]);
+                        let b = extract_extern_js(&caller, &params[1]);
+                        if a.is_null() && b.is_null() {
+                            results[0] = Val::I32(1);
+                        } else if a.is_null() || b.is_null() {
+                            let non_null = if a.is_null() { b } else { a };
+                            if !non_null.is_string() {
+                                let exc = make_wasm_error(
+                                    vm,
+                                    host_ref.runtime_error_proto,
+                                    "RuntimeError",
+                                    "Expected string or null",
+                                );
+                                return Err(trap_js(&mut caller, exc));
+                            }
+                            results[0] = Val::I32(0);
+                        } else {
+                            let ua = require_js_str(vm, a).map_err(|e| trap_js(&mut caller, e))?;
+                            let ub = require_js_str(vm, b).map_err(|e| trap_js(&mut caller, e))?;
+                            results[0] = Val::I32(i32::from(ua == ub));
+                        }
+                    }
+                    "compare" => {
+                        let a = extract_extern_js(&caller, &params[0]);
+                        let b = extract_extern_js(&caller, &params[1]);
+                        let ua = require_js_str(vm, a).map_err(|e| trap_js(&mut caller, e))?;
+                        let ub = require_js_str(vm, b).map_err(|e| trap_js(&mut caller, e))?;
+                        let cmp = match ua.cmp(&ub) {
+                            std::cmp::Ordering::Less => -1,
+                            std::cmp::Ordering::Equal => 0,
+                            std::cmp::Ordering::Greater => 1,
+                        };
+                        results[0] = Val::I32(cmp);
+                    }
+                    "fromCharCodeArray" => {
+                        let Val::AnyRef(Some(ar)) = params[0] else {
+                            let exc = make_wasm_error(
+                                vm,
+                                host_ref.runtime_error_proto,
+                                "RuntimeError",
+                                "Null array in fromCharCodeArray",
+                            );
+                            return Err(trap_js(&mut caller, exc));
+                        };
+                        let Some(arr) = ar.as_array(&caller)? else {
+                            let exc = make_wasm_error(
+                                vm,
+                                host_ref.runtime_error_proto,
+                                "RuntimeError",
+                                "Expected array in fromCharCodeArray",
+                            );
+                            return Err(trap_js(&mut caller, exc));
+                        };
+                        let start = params[1].unwrap_i32() as u32;
+                        let count = params[2].unwrap_i32() as u32;
+                        let len = arr.len(&caller)?;
+                        if u64::from(start) + u64::from(count) > u64::from(len) {
+                            let exc = make_wasm_error(
+                                vm,
+                                host_ref.runtime_error_proto,
+                                "RuntimeError",
+                                "fromCharCodeArray bounds out of range",
+                            );
+                            return Err(trap_js(&mut caller, exc));
+                        }
+                        let mut units = Vec::with_capacity(count as usize);
+                        for i in 0..count {
+                            let elem = arr.get(caller.as_context_mut(), start + i)?;
+                            units.push(elem.unwrap_i32() as u16);
+                        }
+                        results[0] = box_str(vm, &mut caller, &units)?;
+                    }
+                    "intoCharCodeArray" => {
+                        let jv = extract_extern_js(&caller, &params[0]);
+                        let units = require_js_str(vm, jv).map_err(|e| trap_js(&mut caller, e))?;
+                        let Val::AnyRef(Some(ar)) = params[1] else {
+                            let exc = make_wasm_error(
+                                vm,
+                                host_ref.runtime_error_proto,
+                                "RuntimeError",
+                                "Null array in intoCharCodeArray",
+                            );
+                            return Err(trap_js(&mut caller, exc));
+                        };
+                        let Some(arr) = ar.as_array(&caller)? else {
+                            let exc = make_wasm_error(
+                                vm,
+                                host_ref.runtime_error_proto,
+                                "RuntimeError",
+                                "Expected array in intoCharCodeArray",
+                            );
+                            return Err(trap_js(&mut caller, exc));
+                        };
+                        let start = params[2].unwrap_i32() as u32;
+                        let len = arr.len(&caller)?;
+                        if u64::from(start) + (units.len() as u64) > u64::from(len) {
+                            let exc = make_wasm_error(
+                                vm,
+                                host_ref.runtime_error_proto,
+                                "RuntimeError",
+                                "intoCharCodeArray bounds out of range",
+                            );
+                            return Err(trap_js(&mut caller, exc));
+                        }
+                        for (i, &u) in units.iter().enumerate() {
+                            arr.set(
+                                caller.as_context_mut(),
+                                start + i as u32,
+                                Val::I32(i32::from(u)),
+                            )?;
+                        }
+                        results[0] = Val::I32(units.len() as i32);
+                    }
+                    _ => {
+                        return Err(wasmtime::Error::msg(format!(
+                            "Unknown wasm:js-string builtin '{op}'"
+                        )));
+                    }
+                }
+                Ok(())
+            },
+        )
+    })
 }
 
 fn instantiate_module_object_with_proto(
@@ -1303,10 +1915,10 @@ fn instantiate_module_object_with_proto(
     if !import_obj.is_undefined() && !import_obj.is_object() {
         return Err(vm.type_error("importObject must be an object or undefined"));
     }
-    let (module, raw_bytes) = {
+    let (module, raw_bytes, compile_opts) = {
         let mods = host.modules.borrow();
         mods.get(mod_id)
-            .map(|(m, b)| (m.clone(), b.clone()))
+            .map(|(m, b, o)| (m.clone(), b.clone(), o.clone()))
             .ok_or_else(|| vm.type_error("Invalid WebAssembly.Module"))?
     };
 
@@ -1315,7 +1927,10 @@ fn instantiate_module_object_with_proto(
         .map(|i| (i.module().to_string(), i.name().to_string(), i.ty()))
         .collect();
 
-    if !import_specs.is_empty() && !import_obj.is_object() {
+    let has_user_imports = import_specs
+        .iter()
+        .any(|(m, _, _)| !is_suppressed_builtin_import(m, &compile_opts));
+    if has_user_imports && !import_obj.is_object() {
         return Err(vm.type_error("importObject must be an object when module has imports"));
     }
 
@@ -1328,6 +1943,38 @@ fn instantiate_module_object_with_proto(
     let mut imported_tag_ids: Vec<usize> = Vec::new();
 
     for (imp_mod, imp_name, imp_ty) in import_specs {
+        // W3C JS String Builtins: auto-resolve imported string constants and `wasm:js-string` functions.
+        if compile_opts
+            .imported_string_constants
+            .as_deref()
+            .is_some_and(|ns| ns == imp_mod)
+        {
+            if let ExternType::Global(g_ty) = imp_ty {
+                let s_val = JsValue::from_string(vm.heap.alloc_string(&imp_name));
+                root_js_value(vm, host, s_val);
+                let g = host.with_store_mut(|mut store| {
+                    let er =
+                        ExternRef::new(&mut store, JsExternVal(s_val.to_raw())).map_err(|e| {
+                            make_wasm_error(vm, host.link_error_proto, "LinkError", e.to_string())
+                        })?;
+                    Global::new(&mut store, g_ty, Val::ExternRef(Some(er))).map_err(|e| {
+                        make_wasm_error(vm, host.link_error_proto, "LinkError", e.to_string())
+                    })
+                })?;
+                imported_global_ids.push(None);
+                resolved_imports.push(Extern::Global(g));
+                continue;
+            }
+        }
+        if compile_opts.js_string_builtins && imp_mod == "wasm:js-string" {
+            if let ExternType::Func(func_ty) = imp_ty {
+                let bf = make_js_string_builtin_func(host, &imp_name, func_ty);
+                imported_func_wrappers.push(None);
+                resolved_imports.push(Extern::Func(bf));
+                continue;
+            }
+        }
+
         let mod_h = import_obj
             .as_object()
             .ok_or_else(|| vm.type_error(format!("Missing import namespace '{imp_mod}'")))?;
@@ -1735,7 +2382,7 @@ fn get_or_wrap_exported_func(
         return cached;
     }
 
-    let wrapper = wrap_exported_func_with_proto(vm, host, name, func, vm.function_proto);
+    let wrapper = wrap_exported_func_with_proto(vm, host, name, func, host.function_proto);
     host.func_wrappers.borrow_mut().insert(raw_key, wrapper);
     wrapper
 }
@@ -2624,6 +3271,8 @@ fn install_table_prototype(vm: &mut JsVm, host: &SharedWasmHost) {
             let max_v = wasm_index_to_js(vm, ms, is_64);
             define_prop(vm, obj, "maximum", max_v, PropertyAttrs::DEFAULT);
         }
+        let addr_v = JsValue::from_string(vm.heap.alloc_string(if is_64 { "i64" } else { "i32" }));
+        define_prop(vm, obj, "address", addr_v, PropertyAttrs::DEFAULT);
         Ok(JsValue::from_object(obj))
     });
     define_prop(
@@ -2943,6 +3592,72 @@ fn install_exception_prototype(vm: &mut JsVm, host: &SharedWasmHost) {
     );
 }
 
+fn wasm_function_type_obj(
+    vm: &mut JsVm,
+    host: &WasmHost,
+    fn_val: JsValue,
+) -> Result<JsValue, JsException> {
+    let fid = read_hidden_id(vm, fn_val, FUNC_ID_KEY)
+        .ok_or_else(|| vm.type_error("Expected a WebAssembly exported function"))?;
+    let (params, results) = host.with_store(|store| {
+        let func = *host
+            .funcs
+            .borrow()
+            .get(fid)
+            .ok_or_else(|| vm.type_error("Invalid WebAssembly function"))?;
+        let ty = func.ty(&store);
+        Ok((
+            ty.params()
+                .map(|t| val_type_js_name(&t))
+                .collect::<Vec<_>>(),
+            ty.results()
+                .map(|t| val_type_js_name(&t))
+                .collect::<Vec<_>>(),
+        ))
+    })?;
+    let p_arr = vm.alloc_array();
+    for p in params {
+        let s = JsValue::from_string(vm.heap.alloc_string(p));
+        vm.heap.object_push_element(p_arr, s);
+    }
+    let r_arr = vm.alloc_array();
+    for r in results {
+        let s = JsValue::from_string(vm.heap.alloc_string(r));
+        vm.heap.object_push_element(r_arr, s);
+    }
+    let obj = alloc_ordinary(vm, Some(vm.object_proto));
+    define_prop(
+        vm,
+        obj,
+        "parameters",
+        JsValue::from_object(p_arr),
+        PropertyAttrs::DEFAULT,
+    );
+    define_prop(
+        vm,
+        obj,
+        "results",
+        JsValue::from_object(r_arr),
+        PropertyAttrs::DEFAULT,
+    );
+    Ok(JsValue::from_object(obj))
+}
+
+fn install_function_prototype(vm: &mut JsVm, host: &SharedWasmHost) {
+    let proto = host.function_proto;
+    let h_ty = Rc::clone(host);
+    let type_fn = alloc_host_fn_len(vm, "type", 0, move |vm, this, _args| {
+        wasm_function_type_obj(vm, &h_ty, this)
+    });
+    define_prop(
+        vm,
+        proto,
+        "type",
+        JsValue::from_object(type_fn),
+        PropertyAttrs::DEFAULT,
+    );
+}
+
 fn wrap_memory_object_with_proto(
     vm: &mut JsVm,
     host: &SharedWasmHost,
@@ -3142,7 +3857,10 @@ fn js_to_wasm_ref_with_ctx(
         });
     }
     match rt.heap_type() {
-        HeapType::Func | HeapType::ConcreteFunc(_) => {
+        HeapType::NoFunc | HeapType::NoExtern | HeapType::NoExn | HeapType::None => {
+            Err(vm.type_error("Bottom WebAssembly reference type only accepts null"))
+        }
+        HeapType::Func => {
             if let Some(fid) = read_hidden_id(vm, val, FUNC_ID_KEY) {
                 let f = *host
                     .funcs
@@ -3152,6 +3870,22 @@ fn js_to_wasm_ref_with_ctx(
                 Ok(Ref::Func(Some(f)))
             } else {
                 Err(vm.type_error("Expected exported WebAssembly function or null for funcref"))
+            }
+        }
+        HeapType::ConcreteFunc(expected_ty) => {
+            if let Some(fid) = read_hidden_id(vm, val, FUNC_ID_KEY) {
+                let f = *host
+                    .funcs
+                    .borrow()
+                    .get(fid)
+                    .ok_or_else(|| vm.type_error("Invalid Wasm function reference"))?;
+                if f.ty(&ctx).matches(expected_ty) {
+                    Ok(Ref::Func(Some(f)))
+                } else {
+                    Err(vm.type_error("WebAssembly function signature mismatch"))
+                }
+            } else {
+                Err(vm.type_error("Expected exported WebAssembly function for typed funcref"))
             }
         }
         HeapType::Extern => {
@@ -3171,7 +3905,7 @@ fn js_to_wasm_ref_with_ctx(
                 Err(vm.type_error("Expected WebAssembly.Exception or null for exnref"))
             }
         }
-        _ => {
+        HeapType::Any => {
             if let Some(aid) = read_hidden_id(vm, val, ANYREF_ID_KEY) {
                 let anyrefs = host.anyrefs.borrow();
                 let owned = anyrefs
@@ -3181,6 +3915,7 @@ fn js_to_wasm_ref_with_ctx(
             } else if let Some(i31) = js_val_to_i31(val) {
                 Ok(Ref::Any(Some(AnyRef::from_i31(&mut ctx, i31))))
             } else {
+                // W3C WebAssembly GC JS-API: any other JS value converts via externref -> any.convert_extern.
                 root_js_value(vm, host, val);
                 let er = ExternRef::new(&mut ctx, JsExternVal(val.to_raw()))
                     .map_err(|e| vm.type_error(format!("Failed to box JS value as anyref: {e}")))?;
@@ -3190,6 +3925,106 @@ fn js_to_wasm_ref_with_ctx(
                 Ok(Ref::Any(Some(ar)))
             }
         }
+        HeapType::Eq => {
+            if let Some(aid) = read_hidden_id(vm, val, ANYREF_ID_KEY) {
+                let anyrefs = host.anyrefs.borrow();
+                let owned = anyrefs
+                    .get(aid)
+                    .ok_or_else(|| vm.type_error("Invalid WebAssembly GC reference"))?;
+                let rooted = owned.to_rooted(&mut ctx);
+                if rooted.is_eqref(&ctx).unwrap_or(false) {
+                    Ok(Ref::Any(Some(rooted)))
+                } else {
+                    Err(vm.type_error("Expected eqref-compatible WebAssembly GC value"))
+                }
+            } else if let Some(i31) = js_val_to_i31(val) {
+                Ok(Ref::Any(Some(AnyRef::from_i31(&mut ctx, i31))))
+            } else {
+                Err(vm.type_error("Unsupported JS value for WebAssembly eqref"))
+            }
+        }
+        HeapType::I31 => {
+            if let Some(i31) = js_val_to_i31(val) {
+                Ok(Ref::Any(Some(AnyRef::from_i31(&mut ctx, i31))))
+            } else {
+                Err(vm.type_error("Expected 31-bit signed integer for WebAssembly i31ref"))
+            }
+        }
+        HeapType::Struct => {
+            if let Some(aid) = read_hidden_id(vm, val, ANYREF_ID_KEY) {
+                let anyrefs = host.anyrefs.borrow();
+                let owned = anyrefs
+                    .get(aid)
+                    .ok_or_else(|| vm.type_error("Invalid WebAssembly GC reference"))?;
+                let rooted = owned.to_rooted(&mut ctx);
+                if rooted.is_struct(&ctx).unwrap_or(false) {
+                    Ok(Ref::Any(Some(rooted)))
+                } else {
+                    Err(vm.type_error("Expected WebAssembly struct reference"))
+                }
+            } else {
+                Err(vm.type_error("Expected WebAssembly struct reference"))
+            }
+        }
+        HeapType::ConcreteStruct(expected_sty) => {
+            if let Some(aid) = read_hidden_id(vm, val, ANYREF_ID_KEY) {
+                let anyrefs = host.anyrefs.borrow();
+                let owned = anyrefs
+                    .get(aid)
+                    .ok_or_else(|| vm.type_error("Invalid WebAssembly GC reference"))?;
+                let rooted = owned.to_rooted(&mut ctx);
+                let matched = rooted
+                    .as_struct(&ctx)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|sr| sr.matches_ty(&ctx, expected_sty).unwrap_or(false));
+                if matched {
+                    Ok(Ref::Any(Some(rooted)))
+                } else {
+                    Err(vm.type_error("WebAssembly concrete struct type mismatch"))
+                }
+            } else {
+                Err(vm.type_error("Expected WebAssembly struct reference"))
+            }
+        }
+        HeapType::Array => {
+            if let Some(aid) = read_hidden_id(vm, val, ANYREF_ID_KEY) {
+                let anyrefs = host.anyrefs.borrow();
+                let owned = anyrefs
+                    .get(aid)
+                    .ok_or_else(|| vm.type_error("Invalid WebAssembly GC reference"))?;
+                let rooted = owned.to_rooted(&mut ctx);
+                if rooted.is_array(&ctx).unwrap_or(false) {
+                    Ok(Ref::Any(Some(rooted)))
+                } else {
+                    Err(vm.type_error("Expected WebAssembly array reference"))
+                }
+            } else {
+                Err(vm.type_error("Expected WebAssembly array reference"))
+            }
+        }
+        HeapType::ConcreteArray(expected_aty) => {
+            if let Some(aid) = read_hidden_id(vm, val, ANYREF_ID_KEY) {
+                let anyrefs = host.anyrefs.borrow();
+                let owned = anyrefs
+                    .get(aid)
+                    .ok_or_else(|| vm.type_error("Invalid WebAssembly GC reference"))?;
+                let rooted = owned.to_rooted(&mut ctx);
+                let matched = rooted
+                    .as_array(&ctx)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|ar| ar.matches_ty(&ctx, expected_aty).unwrap_or(false));
+                if matched {
+                    Ok(Ref::Any(Some(rooted)))
+                } else {
+                    Err(vm.type_error("WebAssembly concrete array type mismatch"))
+                }
+            } else {
+                Err(vm.type_error("Expected WebAssembly array reference"))
+            }
+        }
+        _ => Err(vm.type_error("Unsupported WebAssembly reference type")),
     }
 }
 
@@ -3202,6 +4037,7 @@ fn wrap_wasm_gc_anyref(
     if let Ok(Some(i31)) = ar.as_i31(&ctx) {
         return Ok(JsValue::from_i32(i31.get_i32()));
     }
+    // If this `anyref` wraps a host `externref` (from `any.convert_extern`), unwrap back to the exact JS value!
     if !ar.is_eqref(&ctx).unwrap_or(false) {
         if let Ok(er) = ExternRef::convert_any(&mut ctx, ar) {
             if let Some(raw) = er
