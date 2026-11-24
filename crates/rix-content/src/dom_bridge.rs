@@ -417,6 +417,19 @@ impl HostState {
         if let Some(sel) = self.selection.selection_handle {
             out.push(JsValue::from_object(sel));
         }
+        if let Some(sr) = self.selection.selected_range {
+            out.push(JsValue::from_object(sr));
+        }
+        for p in [
+            self.selection.abstract_range_proto,
+            self.selection.range_proto,
+            self.selection.static_range_proto,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.push(JsValue::from_object(p));
+        }
         for entry in self.traversals.values() {
             if let Some(f) = entry.filter {
                 out.push(JsValue::from_object(f));
