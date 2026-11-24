@@ -464,3 +464,141 @@ fn async_compile_instantiate_and_streaming_apis() {
     );
     assert_eq!(summary, "55|144|610|TypeError|TypeError");
 }
+
+#[test]
+fn phase5_wasm2_memory64_shared_exceptions_function_gc_and_reentrancy() {
+    let mut vm = vm_with_wasm();
+
+    // Re-entrant JS -> Wasm -> JS -> Wasm module + StackOverflow module.
+    bind_wat_bytes(
+        &mut vm,
+        "REENTRANT_WASM",
+        r#"
+        (module
+            (import "env" "callback" (func $cb (param i32) (result i32)))
+            (func (export "outer") (param i32) (result i32)
+                (call $cb (i32.add (local.get 0) (i32.const 1))))
+            (func (export "inner") (param i32) (result i32)
+                (i32.mul (local.get 0) (i32.const 3)))
+            (func $inf (export "overflow") (param i64) (result i64)
+                (i64.add (i64.const 1) (call $inf (local.get 0)))))
+        "#,
+    );
+
+    // Wasm GC struct + i31 module.
+    bind_wat_bytes(
+        &mut vm,
+        "GC_WASM",
+        r#"
+        (module
+            (type $box (struct (field i32)))
+            (func (export "makeStruct") (result (ref $box))
+                (struct.new $box (i32.const 77)))
+            (func (export "getI31") (param (ref i31)) (result i32)
+                (i31.get_s (local.get 0)))
+            (func (export "acceptAny") (param anyref) (result anyref)
+                (local.get 0)))
+        "#,
+    );
+
+    // W3C JS String Builtins + importedStringConstants module.
+    bind_wat_bytes(
+        &mut vm,
+        "JS_STR_WASM",
+        r#"
+        (module
+            (import "'" "hello" (global $hello (ref extern)))
+            (import "wasm:js-string" "length" (func $str_len (param externref) (result i32)))
+            (import "wasm:js-string" "concat" (func $str_cat (param externref externref) (result (ref extern))))
+            (func (export "greet") (param externref) (result (ref extern))
+                (call $str_cat (global.get $hello) (local.get 0)))
+            (func (export "len") (param externref) (result i32)
+                (call $str_len (local.get 0))))
+        "#,
+    );
+
+    let out = eval_str(
+        &mut vm,
+        r#"
+        // 1. Memory64 + Table64 + SharedMemory fixed/resizable buffers
+        const m64 = new WebAssembly.Memory({ initial: 1n, maximum: 4n, address: "i64" });
+        const m64Prev = m64.grow(1n);
+        const m64Type = m64.type();
+        const t64 = new WebAssembly.Table({ initial: 2n, maximum: 5n, element: "funcref", address: "i64" });
+        const t64Prev = t64.grow(1n);
+        const t64Type = t64.type();
+
+        const sharedMem = new WebAssembly.Memory({ initial: 1, maximum: 3, shared: true });
+        const oldSab = sharedMem.buffer;
+        sharedMem.grow(1);
+        const newSab = sharedMem.buffer;
+        const sabFixedOk = oldSab !== newSab && oldSab.byteLength === 65536 && newSab.byteLength === 131072;
+        const resSab = sharedMem.toResizableBuffer();
+        let badSabGrowThrew = false;
+        try { resSab.grow(131072 + 1); } catch (e) { badSabGrowThrew = e instanceof RangeError; }
+
+        // 2. WebAssembly.Tag & WebAssembly.Exception
+        const tag = new WebAssembly.Tag({ parameters: ["i32", "i64"] });
+        const exn = new WebAssembly.Exception(tag, [42, 900n], { traceStack: true });
+        let exnRangeThrew = false;
+        try { exn.getArg(tag, -1); } catch (e) { exnRangeThrew = e instanceof RangeError; }
+        const exnOk = exn.is(tag) && exn.getArg(tag, 0) === 42 && exn.getArg(tag, 1) === 900n && typeof exn.stack === "string" && exnRangeThrew;
+
+        // 3. WebAssembly.Function + AbstractModuleSource
+        const wf = new WebAssembly.Function({ parameters: ["i32", "i32"], results: ["i32"] }, (a, b) => a + b);
+        const wfOk = (wf instanceof WebAssembly.Function) && wf(10, 25) === 35 && wf.type().parameters.length === 2;
+        const tRef = new WebAssembly.Table({ initial: 1, element: "funcref" });
+        tRef.set(0, wf);
+        const tableIdentityOk = tRef.get(0) === wf;
+
+        const ams = Object.getPrototypeOf(WebAssembly.Module);
+        const mod = new WebAssembly.Module(REENTRANT_WASM);
+        const tagGetter = Object.getOwnPropertyDescriptor(ams.prototype, Symbol.toStringTag).get;
+        const amsOk = typeof AbstractModuleSource === "undefined" && ams.name === "AbstractModuleSource" && tagGetter.call(mod) === "WebAssembly.Module" && tagGetter.call({}) === undefined;
+
+        // 4. Re-entrant JS -> Wasm -> JS -> Wasm + StackOverflow -> RangeError
+        let inst;
+        inst = new WebAssembly.Instance(mod, {
+            env: {
+                callback(x) { return inst.exports.inner(x); }
+            }
+        });
+        const reentrantVal = inst.exports.outer(13); // (13 + 1) * 3 = 42
+        let overflowRange = false;
+        try { inst.exports.overflow(1n); } catch (e) { overflowRange = e instanceof RangeError; }
+
+        // 5. Wasm GC i31 + exotic non-strict object traps + anyref host roundtrip
+        const gcInst = new WebAssembly.Instance(new WebAssembly.Module(GC_WASM));
+        const st = gcInst.exports.makeStruct();
+        let nonStrictSetThrew = false;
+        try { st.foo = 1; } catch (e) { nonStrictSetThrew = e instanceof TypeError; }
+        let preventExtThrew = false;
+        try { Object.preventExtensions(st); } catch (e) { preventExtThrew = e instanceof TypeError; }
+        const hostObj = { k: 1 };
+        const gcOk = gcInst.exports.getI31(-42) === -42 && gcInst.exports.acceptAny(hostObj) === hostObj && nonStrictSetThrew && preventExtThrew;
+
+        // 6. JS String Builtins + importedStringConstants
+        const strMod = new WebAssembly.Module(JS_STR_WASM, {
+            builtins: ["js-string"],
+            importedStringConstants: "'"
+        });
+        const strImportsSuppressed = WebAssembly.Module.imports(strMod).length === 0;
+        const strInst = new WebAssembly.Instance(strMod);
+        const strOk = strImportsSuppressed && strInst.exports.greet(" world") === "hello world" && strInst.exports.len("rix") === 3;
+
+        [
+            m64Prev === 1n && m64Type.address === "i64",
+            t64Prev === 2n && t64Type.address === "i64",
+            sabFixedOk && badSabGrowThrew,
+            exnOk,
+            wfOk && tableIdentityOk,
+            amsOk,
+            reentrantVal === 42 && overflowRange,
+            gcOk,
+            strOk,
+        ].join("|");
+        "#,
+    );
+
+    assert_eq!(out, "true|true|true|true|true|true|true|true|true");
+}
