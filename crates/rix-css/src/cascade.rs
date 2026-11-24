@@ -866,7 +866,10 @@ fn next_layout_parent_flex_grid(style: &ComputedStyle, inherited: bool) -> bool 
         crate::values::DisplayMode::Flex
         | crate::values::DisplayMode::InlineFlex
         | crate::values::DisplayMode::Grid
-        | crate::values::DisplayMode::InlineGrid => true,
+        | crate::values::DisplayMode::InlineGrid
+        | crate::values::DisplayMode::GridLanes
+        | crate::values::DisplayMode::InlineGridLanes
+        | crate::values::DisplayMode::InlineGridLanesMulti => true,
         _ => false,
     }
 }
@@ -1102,6 +1105,9 @@ fn restyle_dirty_walk(
                         | crate::values::DisplayMode::InlineFlex
                         | crate::values::DisplayMode::Grid
                         | crate::values::DisplayMode::InlineGrid
+                        | crate::values::DisplayMode::GridLanes
+                        | crate::values::DisplayMode::InlineGridLanes
+                        | crate::values::DisplayMode::InlineGridLanesMulti
                         | crate::values::DisplayMode::Contents
                 ) || matches!(
                     new_style.display,
@@ -1109,6 +1115,9 @@ fn restyle_dirty_walk(
                         | crate::values::DisplayMode::InlineFlex
                         | crate::values::DisplayMode::Grid
                         | crate::values::DisplayMode::InlineGrid
+                        | crate::values::DisplayMode::GridLanes
+                        | crate::values::DisplayMode::InlineGridLanes
+                        | crate::values::DisplayMode::InlineGridLanesMulti
                         | crate::values::DisplayMode::Contents
                 ));
             propagate_inherited =

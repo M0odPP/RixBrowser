@@ -7,6 +7,7 @@ pub mod cascade;
 pub mod color;
 pub mod computed;
 pub mod cssom_decl;
+pub mod grid_css;
 pub mod properties;
 pub mod rule_index;
 pub mod selector;
@@ -31,6 +32,10 @@ pub use computed::{
 };
 pub use cssom_decl::{
     parse_and_expand_declaration, parse_and_serialize_declaration, strip_outer_css_comments,
+};
+pub use grid_css::{
+    FitToleranceValue, GridLanesDirectionMode, GridLanesPackMode, GridRepeatCount,
+    GridSubgridLineItem, GridTemplateTrackList, GridTrackListEntry,
 };
 pub use properties::{
     compile_declaration_block, is_logical_property, is_sizing_property, parse_inline_style,
