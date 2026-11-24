@@ -1996,6 +1996,109 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
     });
     define_host_accessor(vm, ep, "prefix", Some(g), None);
 
+    // WHATWG DOM §4.9: `Element.prototype.attributes` (NamedNodeMap-like collection)
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get attributes", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let attrs: Vec<(String, String, String)> = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            match doc.get(nid) {
+                Some(NodeData::Element(e)) => e
+                    .attributes
+                    .iter()
+                    .map(|(q, v)| {
+                        let local = q.local.to_string();
+                        let name = match &q.prefix {
+                            Some(p) if !p.is_empty() => format!("{p}:{local}"),
+                            _ => local.clone(),
+                        };
+                        (name, local, v.clone())
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        let map = vm.alloc_ordinary_object();
+        let len = attrs.len();
+        for (idx, (name, local, val)) in attrs.into_iter().enumerate() {
+            let attr_obj = vm.alloc_ordinary_object();
+            let s_name = JsValue::from_string(vm.heap.alloc_string(name.clone()));
+            let s_local = JsValue::from_string(vm.heap.alloc_string(local));
+            let s_val = JsValue::from_string(vm.heap.alloc_string(val));
+            for (k_str, v) in [
+                ("name", s_name),
+                ("nodeName", s_name),
+                ("localName", s_local),
+                ("value", s_val),
+                ("nodeValue", s_val),
+                ("textContent", s_val),
+                ("specified", JsValue::from_bool(true)),
+                ("nodeType", JsValue::from_f64(2.0)),
+            ] {
+                let k = vm.heap.intern_key(k_str);
+                vm.heap
+                    .object_define_data(attr_obj, k, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
+            }
+            let attr_val = JsValue::from_object(attr_obj);
+            let k_idx = vm.heap.intern_key(&idx.to_string());
+            vm.heap.object_define_data(
+                map,
+                k_idx,
+                attr_val,
+                PropertyAttrs::DEFAULT,
+                &mut vm.shapes,
+            );
+            let k_name = vm.heap.intern_key(&name);
+            if vm.heap.object_get_own(map, k_name, &vm.shapes).is_none() {
+                vm.heap.object_define_data(
+                    map,
+                    k_name,
+                    attr_val,
+                    PropertyAttrs::DEFAULT,
+                    &mut vm.shapes,
+                );
+            }
+        }
+        let k_len = vm.heap.intern_key("length");
+        vm.heap.object_define_data(
+            map,
+            k_len,
+            JsValue::from_f64(len as f64),
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+        define_host_method(vm, map, "item", move |vm, this_v, args| {
+            let i = vm.to_number(arg(args, 0))?;
+            if !i.is_finite() || i < 0.0 {
+                return Ok(JsValue::NULL);
+            }
+            if let Some(mh) = this_v.as_object() {
+                let k = vm.heap.intern_key(&(i as usize).to_string());
+                if let Ok(val) = vm.get_property_by_key(mh, k) {
+                    if !val.is_undefined() {
+                        return Ok(val);
+                    }
+                }
+            }
+            Ok(JsValue::NULL)
+        });
+        define_host_method(vm, map, "getNamedItem", move |vm, this_v, args| {
+            let key = vm.value_to_rust_string(arg(args, 0));
+            if let Some(mh) = this_v.as_object() {
+                let k = vm.heap.intern_key(&key);
+                if let Ok(val) = vm.get_property_by_key(mh, k) {
+                    if !val.is_undefined() {
+                        return Ok(val);
+                    }
+                }
+            }
+            Ok(JsValue::NULL)
+        });
+        Ok(JsValue::from_object(map))
+    });
+    define_host_accessor(vm, ep, "attributes", Some(g), None);
+
     // Attribute methods
     let h = Rc::clone(host);
     define_host_method(vm, ep, "getAttribute", move |vm, t, args| {

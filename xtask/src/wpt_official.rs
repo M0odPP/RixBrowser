@@ -247,6 +247,10 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
         const self = this;
         return setTimeout(function() { self.step(fn); }, timeout || 0);
     };
+    globalThis.step_timeout = function(fn, timeout) {
+        var args = Array.prototype.slice.call(arguments, 2);
+        return setTimeout(function() { fn.apply(globalThis, args); }, timeout || 0);
+    };
     TestObj.prototype._fail = function(e) {
         if (this._done) return;
         this._done = true;

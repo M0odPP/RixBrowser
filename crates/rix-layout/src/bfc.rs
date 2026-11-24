@@ -348,52 +348,63 @@ pub fn layout_block_box(
     let oof_both_v_insets = b.is_out_of_flow
         && matches!(style.box_model.inset.top, LengthPercentageAuto::Value(_))
         && matches!(style.box_model.inset.bottom, LengthPercentageAuto::Value(_));
+    let is_table_cell = matches!(
+        ctx.tree.get(box_id).kind,
+        BoxKind::TableCell { .. } | BoxKind::AnonymousTableCell
+    );
+    // WHATWG Quirks Mode §3.3: The table cell height box sizing quirk treats CSS `height` on
+    // `table-cell` elements as `border-box` in Quirks Mode regardless of `box-sizing`.
+    let cell_spec_h = if is_table_cell
+        && ctx.tree.quirks_mode == 2
+        && style.box_sizing == rix_css::BoxSizingMode::ContentBox
+    {
+        metrics.specified_height.map(|h| (h - pb_h).max(0.0))
+    } else {
+        metrics.specified_height
+    };
     let definite_height = if space.ignore_specified_height {
         None
     } else {
-        space
-            .definite_height_override
-            .or(metrics.specified_height)
-            .or_else(|| {
-                if oof_both_v_insets && matches!(style.box_model.height, rix_css::SizeValue::Auto) {
-                    space.available_height.map(|ah| {
-                        (ah - metrics.margin.vertical() - pb_h)
-                            .max(0.0)
-                            .min(metrics.max_height)
-                            .max(metrics.min_height)
-                    })
-                } else if resolved_spec_w.is_some()
-                    && matches!(style.box_model.height, rix_css::SizeValue::Auto)
-                {
-                    style
-                        .effects
-                        .as_ref()
-                        .and_then(|e| e.aspect_ratio_math.as_ref())
-                        .and_then(|(num, den)| {
-                            let n = num.eval_scalar(&eval, None);
-                            let d = den.as_ref().map_or(1.0, |x| x.eval_scalar(&eval, None));
-                            let ratio = n / d;
-                            if ratio.is_finite() && ratio > 0.0 {
-                                let box_w = if is_bb {
-                                    content_width + pb_w
-                                } else {
-                                    content_width
-                                };
-                                let box_h = box_w / ratio as f32;
-                                let ch = if is_bb {
-                                    (box_h - pb_h).max(0.0)
-                                } else {
-                                    box_h
-                                };
-                                Some(ch.min(metrics.max_height).max(metrics.min_height).max(0.0))
+        space.definite_height_override.or(cell_spec_h).or_else(|| {
+            if oof_both_v_insets && matches!(style.box_model.height, rix_css::SizeValue::Auto) {
+                space.available_height.map(|ah| {
+                    (ah - metrics.margin.vertical() - pb_h)
+                        .max(0.0)
+                        .min(metrics.max_height)
+                        .max(metrics.min_height)
+                })
+            } else if resolved_spec_w.is_some()
+                && matches!(style.box_model.height, rix_css::SizeValue::Auto)
+            {
+                style
+                    .effects
+                    .as_ref()
+                    .and_then(|e| e.aspect_ratio_math.as_ref())
+                    .and_then(|(num, den)| {
+                        let n = num.eval_scalar(&eval, None);
+                        let d = den.as_ref().map_or(1.0, |x| x.eval_scalar(&eval, None));
+                        let ratio = n / d;
+                        if ratio.is_finite() && ratio > 0.0 {
+                            let box_w = if is_bb {
+                                content_width + pb_w
                             } else {
-                                None
-                            }
-                        })
-                } else {
-                    None
-                }
-            })
+                                content_width
+                            };
+                            let box_h = box_w / ratio as f32;
+                            let ch = if is_bb {
+                                (box_h - pb_h).max(0.0)
+                            } else {
+                                box_h
+                            };
+                            Some(ch.min(metrics.max_height).max(metrics.min_height).max(0.0))
+                        } else {
+                            None
+                        }
+                    })
+            } else {
+                None
+            }
+        })
     };
     let child_space = space.with_available(content_width, definite_height);
 
@@ -655,12 +666,13 @@ pub fn layout_block_box(
             _ => content_height,
         }
     };
+    let is_bb_h = is_bb || (is_table_cell && ctx.tree.quirks_mode == 2);
     let eff_min_h = resolve_size_with_intrinsic(
         &style.box_model.min_height,
         space.available_height,
         pb_h,
         metrics.margin.vertical(),
-        is_bb,
+        is_bb_h,
         &eval,
         intr_h_fn,
     )
@@ -670,7 +682,7 @@ pub fn layout_block_box(
         space.available_height,
         pb_h,
         metrics.margin.vertical(),
-        is_bb,
+        is_bb_h,
         &eval,
         intr_h_fn,
     )
@@ -681,7 +693,7 @@ pub fn layout_block_box(
             space.available_height,
             pb_h,
             metrics.margin.vertical(),
-            is_bb,
+            is_bb_h,
             &eval,
             intr_h_fn,
         )
@@ -689,6 +701,13 @@ pub fn layout_block_box(
     });
     let final_content_height = if space.ignore_specified_height {
         content_height.max(0.0)
+    } else if is_table_cell {
+        // CSS Tables L3: `height` on a `table-cell` acts as a minimum height for its content.
+        raw_content_h
+            .min(eff_max_h)
+            .max(eff_min_h)
+            .max(content_height)
+            .max(0.0)
     } else {
         raw_content_h.min(eff_max_h).max(eff_min_h).max(0.0)
     };

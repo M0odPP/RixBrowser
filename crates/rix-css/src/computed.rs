@@ -16,16 +16,16 @@ use crate::values::{
     AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
     AnimationPlayStateMode, AnimationSpec, BackgroundLayerValue, BorderCollapseMode,
     BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue, ColorRgba,
-    CornerRadii, CssColor, CursorKind, DirectionMode, DisplayMode, EdgeValues, EvalContext,
-    FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
-    GridPlacementValue, GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode,
-    LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
-    OverflowPair, OverflowWrapMode, OverlayMode, OverscrollBehaviorMode, PointerEventsMode,
-    PositionMode, ReadingFlowMode, ResizeMode, SizeValue, TableLayoutMode, TextAlignLastMode,
-    TextAlignMode, TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode,
-    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode,
-    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
-    WordBreakMode, WritingMode, ZIndexValue,
+    CornerRadii, CssColor, CursorKind, DirectionMode, DisplayMode, EdgeValues, EmptyCellsMode,
+    EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
+    GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
+    InterpolateSizeMode, LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle,
+    MixBlendMode, OverflowMode, OverflowPair, OverflowWrapMode, OverlayMode,
+    OverscrollBehaviorMode, PointerEventsMode, PositionMode, ReadingFlowMode, ResizeMode,
+    SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode, TextDecorationLine,
+    TextJustifyMode, TextOrientationMode, TextOverflowMode, TextTransformMode, TimingFunction,
+    TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec, UserSelectMode,
+    VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode, ZIndexValue,
 };
 
 const MAX_VAR_DEPTH: u8 = 64;
@@ -47,9 +47,6 @@ pub struct BoxModelStyle {
     pub border_width: EdgeValues<f32>,
     pub vertical_align: VerticalAlignMode,
     pub text_overflow: TextOverflowMode,
-    pub border_collapse: BorderCollapseMode,
-    pub border_spacing_x: LengthPercentage,
-    pub border_spacing_y: LengthPercentage,
     pub table_layout: TableLayoutMode,
     pub content: Option<InternedStr>,
     pub column_count: Option<i32>,
@@ -70,9 +67,6 @@ impl Default for BoxModelStyle {
             border_width: EdgeValues::all(0.0),
             vertical_align: VerticalAlignMode::Baseline,
             text_overflow: TextOverflowMode::Clip,
-            border_collapse: BorderCollapseMode::Separate,
-            border_spacing_x: LengthPercentage::Zero,
-            border_spacing_y: LengthPercentage::Zero,
             table_layout: TableLayoutMode::Auto,
             content: None,
             column_count: None,
@@ -163,6 +157,10 @@ pub struct InheritedTextStyle {
     pub writing_mode: WritingMode,
     pub text_orientation: TextOrientationMode,
     pub caption_side: CaptionSideMode,
+    pub border_collapse: BorderCollapseMode,
+    pub border_spacing_x: LengthPercentage,
+    pub border_spacing_y: LengthPercentage,
+    pub empty_cells: EmptyCellsMode,
     pub orphans: i32,
     pub widows: i32,
     pub tab_size_num: f32,
@@ -199,6 +197,10 @@ impl Default for InheritedTextStyle {
             writing_mode: WritingMode::HorizontalTb,
             text_orientation: TextOrientationMode::Mixed,
             caption_side: CaptionSideMode::Top,
+            border_collapse: BorderCollapseMode::Separate,
+            border_spacing_x: LengthPercentage::Zero,
+            border_spacing_y: LengthPercentage::Zero,
+            empty_cells: EmptyCellsMode::Show,
             orphans: 2,
             widows: 2,
             tab_size_num: 8.0,
@@ -234,6 +236,9 @@ impl InheritedTextStyle {
             && self.writing_mode == other.writing_mode
             && self.text_orientation == other.text_orientation
             && self.caption_side == other.caption_side
+            && self.border_collapse == other.border_collapse
+            && self.border_spacing_x == other.border_spacing_x
+            && self.border_spacing_y == other.border_spacing_y
             && self.text_justify == other.text_justify
             && self.text_align_last == other.text_align_last
             && self.hyphenate_character == other.hyphenate_character
@@ -2890,12 +2895,15 @@ pub fn apply_declaration(
             Arc::make_mut(&mut style.box_model).text_overflow = *v;
         }
         (PropertyIdKind::BorderCollapse, PropertyValue::BorderCollapse(v)) => {
-            Arc::make_mut(&mut style.box_model).border_collapse = *v;
+            Arc::make_mut(&mut style.text).border_collapse = *v;
         }
         (PropertyIdKind::BorderSpacing, PropertyValue::BorderSpacing(x, y)) => {
-            let bm = Arc::make_mut(&mut style.box_model);
-            bm.border_spacing_x = x.clone();
-            bm.border_spacing_y = y.clone();
+            let txt = Arc::make_mut(&mut style.text);
+            txt.border_spacing_x = x.clone();
+            txt.border_spacing_y = y.clone();
+        }
+        (PropertyIdKind::EmptyCells, PropertyValue::EmptyCells(v)) => {
+            Arc::make_mut(&mut style.text).empty_cells = *v;
         }
         (PropertyIdKind::TableLayout, PropertyValue::TableLayout(v)) => {
             Arc::make_mut(&mut style.box_model).table_layout = *v;
@@ -3013,6 +3021,23 @@ fn copy_property_from_parent(
         PropertyIdKind::CaptionSide => {
             Arc::make_mut(&mut style.text).caption_side = parent.text.caption_side;
         }
+        PropertyIdKind::BorderCollapse => {
+            Arc::make_mut(&mut style.text).border_collapse = parent.text.border_collapse;
+        }
+        PropertyIdKind::BorderSpacing => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.border_spacing_x = parent.text.border_spacing_x.clone();
+            txt.border_spacing_y = parent.text.border_spacing_y.clone();
+        }
+        PropertyIdKind::EmptyCells => {
+            Arc::make_mut(&mut style.text).empty_cells = parent.text.empty_cells;
+        }
+        PropertyIdKind::TableLayout => {
+            Arc::make_mut(&mut style.box_model).table_layout = parent.box_model.table_layout;
+        }
+        PropertyIdKind::VerticalAlign => {
+            Arc::make_mut(&mut style.box_model).vertical_align = parent.box_model.vertical_align;
+        }
         PropertyIdKind::InterpolateSize => {
             Arc::make_mut(&mut style.text).interpolate_size = parent.text.interpolate_size;
         }
@@ -3117,17 +3142,24 @@ fn copy_property_from_parent(
             Arc::make_mut(&mut style.visual).border_style.left = parent.visual.border_style.left;
         }
         PropertyIdKind::BorderTopColor => {
-            Arc::make_mut(&mut style.visual).border_color.top = parent.visual.border_color.top;
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.border_color.top = parent.visual.border_color.top;
+            vis.border_color_computed[0] = parent.visual.border_color_computed[0].clone();
         }
         PropertyIdKind::BorderRightColor => {
-            Arc::make_mut(&mut style.visual).border_color.right = parent.visual.border_color.right;
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.border_color.right = parent.visual.border_color.right;
+            vis.border_color_computed[1] = parent.visual.border_color_computed[1].clone();
         }
         PropertyIdKind::BorderBottomColor => {
-            Arc::make_mut(&mut style.visual).border_color.bottom =
-                parent.visual.border_color.bottom;
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.border_color.bottom = parent.visual.border_color.bottom;
+            vis.border_color_computed[2] = parent.visual.border_color_computed[2].clone();
         }
         PropertyIdKind::BorderLeftColor => {
-            Arc::make_mut(&mut style.visual).border_color.left = parent.visual.border_color.left;
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.border_color.left = parent.visual.border_color.left;
+            vis.border_color_computed[3] = parent.visual.border_color_computed[3].clone();
         }
         PropertyIdKind::BorderTopLeftRadius => {
             Arc::make_mut(&mut style.visual).border_radius.top_left =
@@ -3420,12 +3452,15 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
             Arc::make_mut(&mut style.text).overflow_wrap = init.text.overflow_wrap;
         }
         PropertyIdKind::BorderCollapse => {
-            Arc::make_mut(&mut style.box_model).border_collapse = init.box_model.border_collapse;
+            Arc::make_mut(&mut style.text).border_collapse = BorderCollapseMode::Separate;
         }
         PropertyIdKind::BorderSpacing => {
-            let bm = Arc::make_mut(&mut style.box_model);
-            bm.border_spacing_x = init.box_model.border_spacing_x.clone();
-            bm.border_spacing_y = init.box_model.border_spacing_y.clone();
+            let txt = Arc::make_mut(&mut style.text);
+            txt.border_spacing_x = LengthPercentage::Zero;
+            txt.border_spacing_y = LengthPercentage::Zero;
+        }
+        PropertyIdKind::EmptyCells => {
+            Arc::make_mut(&mut style.text).empty_cells = EmptyCellsMode::Show;
         }
         PropertyIdKind::Direction => {
             Arc::make_mut(&mut style.text).direction = DirectionMode::Ltr;

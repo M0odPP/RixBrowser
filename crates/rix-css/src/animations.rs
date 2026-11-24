@@ -392,7 +392,7 @@ fn collect_transition_candidates(before: &ComputedStyle, after: &ComputedStyle, 
         if !Arc::ptr_eq(&before.box_model, &after.box_model) && before.box_model != after.box_model {
             all_p.extend_from_slice(&[P::Width, P::Height, P::MinWidth, P::MinHeight, P::MaxWidth, P::MaxHeight,
                 P::MarginTop, P::MarginRight, P::MarginBottom, P::MarginLeft, P::PaddingTop, P::PaddingRight,
-                P::PaddingBottom, P::PaddingLeft, P::Top, P::Right, P::Bottom, P::Left, P::ColumnCount, P::BorderSpacing]);
+                P::PaddingBottom, P::PaddingLeft, P::Top, P::Right, P::Bottom, P::Left, P::ColumnCount]);
         }
         if !Arc::ptr_eq(&before.visual, &after.visual) && before.visual != after.visual {
             all_p.extend_from_slice(&[P::BackgroundColor, P::BorderTopColor, P::BorderRightColor, P::BorderBottomColor, P::BorderLeftColor, P::OutlineColor]);
@@ -404,7 +404,7 @@ fn collect_transition_candidates(before: &ComputedStyle, after: &ComputedStyle, 
         if !Arc::ptr_eq(&before.text, &after.text) && before.text != after.text {
             all_p.extend_from_slice(&[P::Color, P::FontSize, P::FontWeight, P::LineHeight, P::LetterSpacing, P::WordSpacing,
                 P::TextIndent, P::Orphans, P::Widows, P::TabSize, P::TextJustify, P::TextAlignLast,
-                P::HyphenateCharacter, P::HyphenateLimitLines]);
+                P::HyphenateCharacter, P::HyphenateLimitLines, P::BorderSpacing, P::BorderCollapse, P::EmptyCells, P::CaptionSide]);
         }
         if before.z_index != after.z_index { all_p.push(P::ZIndex); }
         if before.flex_grid != after.flex_grid { all_p.extend_from_slice(&[P::FlexGrow, P::FlexShrink, P::FlexBasis, P::Order, P::FlexDirection, P::FlexWrap, P::AlignItems, P::AlignSelf, P::AlignContent, P::JustifyContent, P::JustifyItems, P::JustifySelf, P::GridTemplateColumns, P::GridTemplateRows, P::GridTemplateAreas, P::GridAutoColumns, P::GridAutoRows, P::GridAutoFlow, P::GridRowStart, P::GridRowEnd, P::GridColumnStart, P::GridColumnEnd, P::FitTolerance, P::GridLanesDirection, P::GridLanesPack]); }
@@ -442,7 +442,9 @@ fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind,
         P::Position => a.position != b.position,
         P::Overlay => a.overlay != b.overlay,
         P::ColumnCount => a.box_model.column_count != b.box_model.column_count,
-        P::BorderSpacing => a.box_model.border_spacing_x != b.box_model.border_spacing_x || a.box_model.border_spacing_y != b.box_model.border_spacing_y,
+        P::BorderSpacing => a.text.border_spacing_x != b.text.border_spacing_x || a.text.border_spacing_y != b.text.border_spacing_y,
+        P::BorderCollapse => a.text.border_collapse != b.text.border_collapse,
+        P::EmptyCells => a.text.empty_cells != b.text.empty_cells,
         P::TabSize => a.text.tab_size_num != b.text.tab_size_num || a.text.tab_size_len != b.text.tab_size_len,
         P::TextJustify => a.text.text_justify != b.text.text_justify,
         P::TextAlignLast => a.text.text_align_last != b.text.text_align_last,
@@ -533,9 +535,9 @@ fn compose_property(
         P::LetterSpacing => Arc::make_mut(&mut kf.text).letter_spacing = compose_lp(&underlying.text.letter_spacing, &kf.text.letter_spacing, eval, false),
         P::WordSpacing => Arc::make_mut(&mut kf.text).word_spacing = compose_lp(&underlying.text.word_spacing, &kf.text.word_spacing, eval, false),
         P::BorderSpacing => {
-            let x = compose_lp(&underlying.box_model.border_spacing_x, &kf.box_model.border_spacing_x, eval, true);
-            let y = compose_lp(&underlying.box_model.border_spacing_y, &kf.box_model.border_spacing_y, eval, true);
-            let bm = Arc::make_mut(&mut kf.box_model); bm.border_spacing_x = x; bm.border_spacing_y = y;
+            let x = compose_lp(&underlying.text.border_spacing_x, &kf.text.border_spacing_x, eval, true);
+            let y = compose_lp(&underlying.text.border_spacing_y, &kf.text.border_spacing_y, eval, true);
+            let txt = Arc::make_mut(&mut kf.text); txt.border_spacing_x = x; txt.border_spacing_y = y;
         }
         P::TabSize => {
             match (&underlying.text.tab_size_len, &kf.text.tab_size_len) {
@@ -697,10 +699,12 @@ fn interpolate_property_into(
             target.flex_grid_mut().flex_shrink = (f64::from(a) * (1.0 - p) + f64::from(b) * p).max(0.0) as f32;
         }
         P::BorderSpacing => {
-            let x = clamp_lp_non_neg(interpolate_lp(&from.box_model.border_spacing_x, &to.box_model.border_spacing_x, p, eval, is_transition));
-            let y = clamp_lp_non_neg(interpolate_lp(&from.box_model.border_spacing_y, &to.box_model.border_spacing_y, p, eval, is_transition));
-            let bm = Arc::make_mut(&mut target.box_model); bm.border_spacing_x = x; bm.border_spacing_y = y;
+            let x = clamp_lp_non_neg(interpolate_lp(&from.text.border_spacing_x, &to.text.border_spacing_x, p, eval, is_transition));
+            let y = clamp_lp_non_neg(interpolate_lp(&from.text.border_spacing_y, &to.text.border_spacing_y, p, eval, is_transition));
+            let txt = Arc::make_mut(&mut target.text); txt.border_spacing_x = x; txt.border_spacing_y = y;
         }
+        P::BorderCollapse => Arc::make_mut(&mut target.text).border_collapse = if use_from_disc { from.text.border_collapse } else { to.text.border_collapse },
+        P::EmptyCells => Arc::make_mut(&mut target.text).empty_cells = if use_from_disc { from.text.empty_cells } else { to.text.empty_cells },
         P::TabSize => {
             let t = Arc::make_mut(&mut target.text);
             match (&from.text.tab_size_len, &to.text.tab_size_len) {

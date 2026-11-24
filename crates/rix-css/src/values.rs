@@ -1404,6 +1404,14 @@ pub enum TableLayoutMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum EmptyCellsMode {
+    #[default]
+    Show,
+    Hide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct EdgeValues<T> {
     pub top: T,
     pub right: T,

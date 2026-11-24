@@ -128,7 +128,7 @@ fn collect_table_rows(ctx: &LayoutContext<'_>, container: BoxId, out: &mut Vec<B
     for cid in children {
         match ctx.tree.get(cid).kind {
             BoxKind::TableRow | BoxKind::AnonymousTableRow => out.push(cid),
-            BoxKind::TableRowGroup => collect_table_rows(ctx, cid, out),
+            BoxKind::TableRowGroup { .. } => collect_table_rows(ctx, cid, out),
             _ => {}
         }
     }
@@ -193,12 +193,12 @@ pub fn measure_table_intrinsic_widths(
     let style = Arc::clone(&ctx.tree.get(table_id).style);
     let metrics = BoxMetrics::resolve(&style, &space);
     let eval = space.eval_context(style.text.font_size_px);
-    let collapsed = style.box_model.border_collapse == BorderCollapseMode::Collapse;
+    let collapsed = style.text.border_collapse == BorderCollapseMode::Collapse;
     let h_spacing = if collapsed {
         0.0
     } else {
         style
-            .box_model
+            .text
             .border_spacing_x
             .resolve_px(space.available_width, &eval)
             .max(0.0)
@@ -224,12 +224,12 @@ pub fn layout_table(
     let pb_w = metrics.padding.horizontal() + metrics.border.horizontal();
     let pb_h = metrics.padding.vertical() + metrics.border.vertical();
 
-    let collapsed = style.box_model.border_collapse == BorderCollapseMode::Collapse;
+    let collapsed = style.text.border_collapse == BorderCollapseMode::Collapse;
     let h_spacing = if collapsed {
         0.0
     } else {
         style
-            .box_model
+            .text
             .border_spacing_x
             .resolve_px(space.available_width, &eval)
             .max(0.0)
@@ -238,7 +238,7 @@ pub fn layout_table(
         0.0
     } else {
         style
-            .box_model
+            .text
             .border_spacing_y
             .resolve_px(space.available_width, &eval)
             .max(0.0)
