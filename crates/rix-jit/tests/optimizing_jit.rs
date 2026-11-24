@@ -654,3 +654,133 @@ fn test262_suite_reaches_100pct_with_identical_results_across_all_three_tiers() 
     assert!(t3_compiled >= files.len() as u64);
     assert!(t3_entries >= files.len() as u64);
 }
+
+#[test]
+fn phase5_jit_parity_bigint_inc_strict_and_proto_isolation() {
+    let cases = [
+        // 1. ECMA-262 UpdateExpression (`++`/`--`) uses ToNumeric, NOT `+` string concat, and works on BigInt.
+        r#"
+            function incCases() {
+                var o = { foo: "bar", s: "1", b: 10n };
+                o.foo++;
+                var r1 = Number.isNaN(o.foo);
+                var pre = ++o.s;
+                var post = o.s++;
+                var bp = ++o.b;
+                var bd = --o.b;
+                return [r1, pre, post, o.s, bp, bd, o.b].join(",");
+            }
+            var out = "";
+            for (var i = 0; i < 6; i++) out = incCases();
+            out;
+        "#,
+        // 2. ECMA-262 BigInt `/` and `%` including division-by-zero RangeError.
+        r#"
+            function bigDivRem(a, b) {
+                var q = a / b;
+                var r = a % b;
+                var threwRange = false;
+                try { a / 0n; } catch (e) { threwRange = (e instanceof RangeError); }
+                var threwRem = false;
+                try { a % 0n; } catch (e) { threwRem = (e instanceof RangeError); }
+                return q + ":" + r + ":" + threwRange + ":" + threwRem;
+            }
+            var out = "";
+            for (var i = 0; i < 6; i++) out = bigDivRem(100n, 7n);
+            out;
+        "#,
+        // 3. Strict-mode SetElem / SetProp on non-writable & frozen objects vs sloppy-mode primitives.
+        r#"
+            function strictSetCases() {
+                "use strict";
+                var r1 = false, r2 = false, r3 = false;
+                try {
+                    class C { static ["prototype"] = 42; }
+                    void C;
+                } catch (e) { r1 = (e instanceof TypeError); }
+                var frozen = Object.freeze({ x: 1 });
+                try { frozen["y"] = 2; } catch (e) { r2 = (e instanceof TypeError); }
+                var arr = Object.freeze([1, 2, 3]);
+                try { arr[0] = 99; } catch (e) { r3 = (e instanceof TypeError); }
+                return [r1, r2, r3, arr[0]].join(",");
+            }
+            function sloppyPrimSet() {
+                var n = 42;
+                n.foo = 1;
+                n["bar"] = 2;
+                return n;
+            }
+            var out = "";
+            for (var i = 0; i < 6; i++) out = strictSetCases() + "|" + sloppyPrimSet();
+            out;
+        "#,
+        // 4. Tier-3 prototype-chain IC must guard receiver [[Prototype]], not just ShapeId
+        //    (e.g. Int8Array vs Float64Array or distinct Object.create prototypes sharing ShapeId::ROOT).
+        r#"
+            function getCtorName(x) {
+                return x.constructor.name;
+            }
+            var a = new Float64Array(2);
+            var b = new Int8Array(2);
+            var c = new BigInt64Array(2);
+            var res = [];
+            for (var i = 0; i < 8; i++) {
+                res.push(getCtorName(a));
+                res.push(getCtorName(b));
+                res.push(getCtorName(c));
+            }
+            var p1 = { tag: "A" };
+            var p2 = { tag: "B" };
+            function readTag(o) { return o.tag; }
+            var o1 = Object.create(p1);
+            var o2 = Object.create(p2);
+            var tags = [];
+            for (var j = 0; j < 8; j++) {
+                tags.push(readTag(o1));
+                tags.push(readTag(o2));
+            }
+            res.slice(-3).join(",") + "|" + tags.slice(-2).join(",");
+        "#,
+        // 5. Holey array writes must NOT bypass prototype Proxy/setter traps or defined own index descriptors.
+        r#"
+            function holeyProxyAndDefinedIndex() {
+                var trapCalled = 0;
+                var proxy = new Proxy({}, {
+                    set(t, p, v, r) { trapCalled++; return true; }
+                });
+                var arr = new Array(1);
+                Object.setPrototypeOf(arr, proxy);
+                arr[0] = 42;
+
+                var a = [1];
+                a.constructor = {};
+                a.constructor[Symbol.species] = function() {
+                    var q = new Array(0);
+                    Object.defineProperty(q, 0, {
+                        value: 0, writable: false, configurable: true, enumerable: false
+                    });
+                    return q;
+                };
+                var r = a.filter(function() { return true; });
+                r[0] = 99;
+                delete r[0];
+                return trapCalled + ":" + Object.prototype.hasOwnProperty.call(r, 0);
+            }
+            var out = "";
+            for (var i = 0; i < 6; i++) out = holeyProxyAndDefinedIndex();
+            out;
+        "#,
+    ];
+
+    for (idx, src) in cases.iter().enumerate() {
+        let expected = eval_t1(src);
+        let (t2, _) = eval_t3(src, 1, 1, u32::MAX);
+        let (t3, _) = eval_t3(src, 1, 1, 2);
+        assert_eq!(t2, expected, "Tier-2 parity mismatch on case #{idx}");
+        assert_eq!(t3, expected, "Tier-3 parity mismatch on case #{idx}");
+        assert!(
+            expected.is_ok(),
+            "Case #{idx} failed on Tier-1: {expected:?}"
+        );
+    }
+}

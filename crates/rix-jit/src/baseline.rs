@@ -1479,25 +1479,9 @@ impl Emitter<'_, '_> {
         self.builder.ins().jump(merge_blk, &[boxed.into()]);
 
         self.builder.switch_to_block(slow_blk);
-        let one = self
-            .builder
-            .ins()
-            .iconst(types::I64, JsValue::from_i32(1).to_raw() as i64);
-        self.flush_all_regs();
-        let fn_addr = if is_inc {
-            rt_add_slow as *const () as usize
-        } else {
-            rt_sub_slow as *const () as usize
-        };
-        let pc_v = self.builder.ins().iconst(types::I32, i64::from(pc));
-        let res = self.call_trampoline_4(
-            fn_addr,
-            self.sigs.ptr_i64_i64_u32_to_i64,
-            &[self.vm_ptr, src, one, pc_v],
-        );
-        self.check_exception(res);
-        self.reload_regs_ptr_and_maybe_all();
-        self.builder.ins().jump(merge_blk, &[res.into()]);
+        self.emit_generic_step(pc);
+        let reloaded = self.read_reg(dst);
+        self.builder.ins().jump(merge_blk, &[reloaded.into()]);
 
         self.builder.switch_to_block(merge_blk);
         let out = self.builder.block_params(merge_blk)[0];

@@ -706,28 +706,30 @@ pub fn compile_optimizing_function(
                             handled = true;
                         } else if let Some(holder_h) = entry.holder {
                             if !entry.is_accessor && entry.proto_epoch == current_proto_epoch {
-                                // 4. Speculative prototype-chain epoch guard!
+                                // 4. Speculative prototype-chain epoch + receiver prototype guard!
                                 let obj_v = emitter.read_reg(b);
-                                let shape_v = emitter
-                                    .builder
-                                    .ins()
-                                    .iconst(types::I32, i64::from(entry.shape.0));
+                                let packed_so =
+                                    ((u64::from(entry.shape.0)) << 32) | u64::from(entry.offset);
+                                let packed_v =
+                                    emitter.builder.ins().iconst(types::I64, packed_so as i64);
+                                let proto_raw =
+                                    entry.receiver_proto.map_or(JsValue::NULL.to_raw(), |p| {
+                                        JsValue::from_object(p).to_raw()
+                                    });
+                                let proto_v =
+                                    emitter.builder.ins().iconst(types::I64, proto_raw as i64);
                                 let holder_v = emitter.builder.ins().iconst(
                                     types::I64,
                                     JsValue::from_object(holder_h).to_raw() as i64,
                                 );
-                                let off_v = emitter
-                                    .builder
-                                    .ins()
-                                    .iconst(types::I32, i64::from(entry.offset));
                                 let epoch_v = emitter
                                     .builder
                                     .ins()
                                     .iconst(types::I64, entry.proto_epoch as i64);
                                 let res = emitter.call_trampoline_6(
                                     rt_guard_proto_prop as *const () as usize,
-                                    emitter.sigs.ptr_i64_u32_i64_u32_i64_to_i64,
-                                    &[emitter.vm_ptr, obj_v, shape_v, holder_v, off_v, epoch_v],
+                                    emitter.sigs.ptr_i64_i64_i64_i64_i64_to_i64,
+                                    &[emitter.vm_ptr, obj_v, packed_v, proto_v, holder_v, epoch_v],
                                 );
                                 let is_miss = emitter.builder.ins().icmp_imm_s(
                                     IntCC::Equal,
@@ -1251,7 +1253,7 @@ struct OptTrampolineSigs {
     ptr_i64_u32_u32_u32_to_i64: cranelift_codegen::ir::SigRef,
     ptr_i64_u32_u32_u32_to_ptr: cranelift_codegen::ir::SigRef,
     ptr_i64_u32_ptr_to_ptr: cranelift_codegen::ir::SigRef,
-    ptr_i64_u32_i64_u32_i64_to_i64: cranelift_codegen::ir::SigRef,
+    ptr_i64_i64_i64_i64_i64_to_i64: cranelift_codegen::ir::SigRef,
     ptr_i64_u32_u32_u32_u32_to_i64: cranelift_codegen::ir::SigRef,
     ptr_i64_i64_i64_u32_to_i64: cranelift_codegen::ir::SigRef,
     ptr_i64_i64_i64_i64_u32_to_i64: cranelift_codegen::ir::SigRef,
@@ -1311,14 +1313,14 @@ impl OptTrampolineSigs {
                 ptr,
             ),
             ptr_i64_u32_ptr_to_ptr: mk(builder, &[ptr, types::I64, types::I32, ptr], ptr),
-            ptr_i64_u32_i64_u32_i64_to_i64: mk(
+            ptr_i64_i64_i64_i64_i64_to_i64: mk(
                 builder,
                 &[
                     ptr,
                     types::I64,
-                    types::I32,
                     types::I64,
-                    types::I32,
+                    types::I64,
+                    types::I64,
                     types::I64,
                 ],
                 types::I64,
@@ -2519,25 +2521,9 @@ impl OptEmitter<'_, '_> {
         self.builder.ins().jump(merge_blk, &[bn.into()]);
 
         self.builder.switch_to_block(slow_blk);
-        self.flush_all_regs();
-        let one = self
-            .builder
-            .ins()
-            .iconst(types::I64, JsValue::from_i32(1).to_raw() as i64);
-        let pc_v = self.builder.ins().iconst(types::I32, i64::from(pc));
-        let fn_addr = if is_inc {
-            rt_add_slow as *const () as usize
-        } else {
-            rt_sub_slow as *const () as usize
-        };
-        let res = self.call_trampoline_4(
-            fn_addr,
-            self.sigs.ptr_i64_i64_u32_to_i64,
-            &[self.vm_ptr, src, one, pc_v],
-        );
-        self.check_exception(res);
-        self.reload_regs_ptr_and_maybe_all();
-        self.builder.ins().jump(merge_blk, &[res.into()]);
+        self.emit_generic_step(pc);
+        let reloaded = self.read_reg(dst);
+        self.builder.ins().jump(merge_blk, &[reloaded.into()]);
 
         self.builder.switch_to_block(merge_blk);
         let out = self.builder.block_params(merge_blk)[0];
