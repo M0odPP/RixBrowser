@@ -481,6 +481,83 @@ fn resolve_wpt_path(wpt_root: &Path, doc_path: &Path, href: &str) -> PathBuf {
     }
 }
 
+/// Extracts static ES module specifiers from `import ... from "..."`, `export ... from "..."`,
+/// and bare `import "..."` statements so offline WPT tests can preload local modules.
+fn extract_es_module_specifiers(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = code.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    while i < len {
+        // Skip line comments
+        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Skip block comments
+        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        // Match `from` or `import` followed by whitespace and string literal
+        let matched_kw = if code[i..].starts_with("from")
+            && (i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric()
+                    || bytes[i - 1] == b'_'
+                    || bytes[i - 1] == b'$'))
+            && i + 4 < len
+            && (bytes[i + 4].is_ascii_whitespace() || bytes[i + 4] == b'"' || bytes[i + 4] == b'\'')
+        {
+            Some(4usize)
+        } else if code[i..].starts_with("import")
+            && (i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric()
+                    || bytes[i - 1] == b'_'
+                    || bytes[i - 1] == b'$'))
+            && i + 6 < len
+            && (bytes[i + 6].is_ascii_whitespace() || bytes[i + 6] == b'"' || bytes[i + 6] == b'\'')
+        {
+            Some(6usize)
+        } else {
+            None
+        };
+        if let Some(kw_len) = matched_kw {
+            let mut j = i + kw_len;
+            while j < len && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < len && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                let q = bytes[j];
+                let start = j + 1;
+                let mut end = start;
+                while end < len && bytes[end] != q && bytes[end] != b'\n' {
+                    if bytes[end] == b'\\' {
+                        end += 2;
+                    } else {
+                        end += 1;
+                    }
+                }
+                if end < len && bytes[end] == q {
+                    let spec = &code[start..end];
+                    if !spec.is_empty() {
+                        out.push(spec.to_string());
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 enum ClassifiedTest {
     Reftest { is_match: bool, ref_path: PathBuf },
     Testharness,
@@ -641,11 +718,15 @@ fn run_wpt_testharness_file(wpt_root: &Path, path: &Path, html: &str) -> ScriptR
     let ext_sheets = collect_local_stylesheets(wpt_root, path, &parsed, &media);
 
     let mut ext_scripts: HashMap<String, String> = HashMap::new();
+    let mut module_scan_queue: Vec<(PathBuf, String)> = Vec::new();
     for node in parsed.descendants(parsed.root()) {
         let Some(NodeData::Element(elem)) = parsed.get(node) else {
             continue;
         };
         if &*elem.name.local == "script" {
+            let is_module = elem
+                .get_attribute("type")
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("module"));
             if let Some(src) = elem.get_attribute("src") {
                 if src.contains("testharnessreport.js") {
                     ext_scripts.insert(src.to_string(), String::new());
@@ -654,9 +735,49 @@ fn run_wpt_testharness_file(wpt_root: &Path, path: &Path, html: &str) -> ScriptR
                 } else {
                     let js_path = resolve_wpt_path(wpt_root, path, src);
                     if let Ok(code) = fs::read_to_string(&js_path) {
+                        if is_module {
+                            module_scan_queue.push((js_path, code.clone()));
+                        }
                         ext_scripts.insert(src.to_string(), code);
                     }
                 }
+            } else if is_module {
+                let inline_code = parsed.inner_text(node);
+                if !inline_code.trim().is_empty() {
+                    module_scan_queue.push((path.to_path_buf(), inline_code));
+                }
+            }
+        }
+    }
+    // Recursively preload static ES module imports (`import ... from "..."`, `export ... from "..."`)
+    // from the local WPT tree so `<script type="module">` tests work offline without a live server.
+    let mut visited_modules: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    while let Some((cur_file, code)) = module_scan_queue.pop() {
+        for spec in extract_es_module_specifiers(&code) {
+            if spec.starts_with("http://") || spec.starts_with("https://") {
+                continue;
+            }
+            let dep_path = resolve_wpt_path(wpt_root, &cur_file, &spec);
+            let canonical = fs::canonicalize(&dep_path).unwrap_or_else(|_| dep_path.clone());
+            if !visited_modules.insert(canonical.clone()) {
+                continue;
+            }
+            if let Ok(dep_code) = fs::read_to_string(&dep_path) {
+                if let Ok(rel_dep) = canonical.strip_prefix(wpt_root) {
+                    let abs_url = format!(
+                        "http://web-platform.test:8000/{}",
+                        rel_dep.to_string_lossy().replace('\\', "/")
+                    );
+                    ext_scripts.insert(abs_url, dep_code.clone());
+                } else if let Ok(rel_dep) = dep_path.strip_prefix(wpt_root) {
+                    let abs_url = format!(
+                        "http://web-platform.test:8000/{}",
+                        rel_dep.to_string_lossy().replace('\\', "/")
+                    );
+                    ext_scripts.insert(abs_url, dep_code.clone());
+                }
+                ext_scripts.insert(spec, dep_code.clone());
+                module_scan_queue.push((dep_path, dep_code));
             }
         }
     }

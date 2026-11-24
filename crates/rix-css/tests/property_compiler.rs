@@ -44,7 +44,7 @@ fn compiles_shorthands_into_typed_longhands() {
     );
     assert_eq!(
         find(PropertyIdKind::BorderTopWidth).value,
-        PropertyValue::Number(2.0)
+        PropertyValue::Length(LengthPercentage::px(2.0))
     );
     assert_eq!(
         find(PropertyIdKind::BorderTopStyle).value,
@@ -166,7 +166,7 @@ fn compiles_custom_properties_global_keywords_and_token_reparsing() {
     );
     assert!(border_reparsed.iter().any(|d| {
         d.property == PropertyIdKind::BorderTopWidth
-            && d.value == PropertyValue::Number(3.0)
+            && d.value == PropertyValue::Length(LengthPercentage::px(3.0))
             && d.important
     }));
     assert!(border_reparsed.iter().any(|d| {

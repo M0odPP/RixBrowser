@@ -21,12 +21,12 @@ use crate::values::{
     angle_to_deg, convert_align_content, convert_align_items, convert_align_self, convert_alpha,
     convert_animation, convert_animation_direction, convert_animation_fill,
     convert_animation_iteration, convert_animation_name, convert_animation_play_state,
-    convert_background_layer, convert_blend_mode, convert_border_width, convert_box_shadow,
-    convert_clip_path, convert_color, convert_corner_radius, convert_cursor, convert_direction,
-    convert_display, convert_easing, convert_filter, convert_flex_direction, convert_flex_wrap,
-    convert_font_family_name, convert_font_size, convert_font_style, convert_font_weight,
-    convert_grid_auto_flow, convert_image, convert_justify_content, convert_justify_items,
-    convert_justify_self, convert_length, convert_length_percentage,
+    convert_background_layer, convert_blend_mode, convert_border_width, convert_border_width_lp,
+    convert_box_shadow, convert_clip_path, convert_color, convert_corner_radius, convert_cursor,
+    convert_direction, convert_display, convert_easing, convert_filter, convert_flex_direction,
+    convert_flex_wrap, convert_font_family_name, convert_font_size, convert_font_style,
+    convert_font_weight, convert_grid_auto_flow, convert_image, convert_justify_content,
+    convert_justify_items, convert_justify_self, convert_length, convert_length_percentage,
     convert_length_percentage_or_auto, convert_length_value, convert_line_height,
     convert_line_style, convert_max_size, convert_overflow, convert_overflow_wrap,
     convert_position, convert_size, convert_spacing, convert_text_align,
@@ -35,14 +35,15 @@ use crate::values::{
     convert_visibility, convert_white_space, convert_word_break, convert_z_index, time_to_ms,
     AlignValue, AnimationDirectionMode, AnimationFillModeKind, AnimationPlayStateMode,
     AnimationSpec, BackgroundImageValue, BackgroundLayerValue, BorderCollapseMode, BoxShadowValue,
-    BoxSizingMode, ClearMode, ClipPathValue, CornerRadius, CssColor, CursorKind, DirectionMode,
-    DisplayMode, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
-    GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize, LengthPercentage,
-    LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
-    OverflowWrapMode, PointerEventsMode, PositionMode, SizeValue, TableLayoutMode, TextAlignMode,
-    TextDecorationLine, TextOverflowMode, TextTransformMode, TimingFunction, TransformOp,
-    TransformOrigin, TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode,
-    WhiteSpaceMode, WordBreakMode, ZIndexValue,
+    BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue, CornerRadius, CssColor, CursorKind,
+    DirectionMode, DisplayMode, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode,
+    FontStyleMode, GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
+    LengthPercentage, LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, MixBlendMode,
+    OverflowMode, OverflowWrapMode, OverscrollBehaviorMode, PointerEventsMode, PositionMode,
+    ResizeMode, SizeValue, TableLayoutMode, TextAlignMode, TextDecorationLine, TextOverflowMode,
+    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionSpec,
+    UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode,
+    ZIndexValue,
 };
 
 /// Category of an unsupported CSS feature recorded during compilation.
@@ -620,6 +621,67 @@ pub enum PropertyIdKind {
     TableLayout,
     ColorScheme,
     Content,
+    // CSS Writing Modes & Logical Properties Level 1
+    WritingMode,
+    Resize,
+    CaptionSide,
+    OverscrollBehaviorX,
+    OverscrollBehaviorY,
+    OverscrollBehaviorInline,
+    OverscrollBehaviorBlock,
+    OverscrollBehavior,
+    InlineSize,
+    BlockSize,
+    MinInlineSize,
+    MinBlockSize,
+    MaxInlineSize,
+    MaxBlockSize,
+    MarginBlockStart,
+    MarginBlockEnd,
+    MarginInlineStart,
+    MarginInlineEnd,
+    MarginBlock,
+    MarginInline,
+    PaddingBlockStart,
+    PaddingBlockEnd,
+    PaddingInlineStart,
+    PaddingInlineEnd,
+    PaddingBlock,
+    PaddingInline,
+    InsetBlockStart,
+    InsetBlockEnd,
+    InsetInlineStart,
+    InsetInlineEnd,
+    InsetBlock,
+    InsetInline,
+    BorderBlockStartWidth,
+    BorderBlockEndWidth,
+    BorderInlineStartWidth,
+    BorderInlineEndWidth,
+    BorderBlockWidth,
+    BorderInlineWidth,
+    BorderBlockStartStyle,
+    BorderBlockEndStyle,
+    BorderInlineStartStyle,
+    BorderInlineEndStyle,
+    BorderBlockStyle,
+    BorderInlineStyle,
+    BorderBlockStartColor,
+    BorderBlockEndColor,
+    BorderInlineStartColor,
+    BorderInlineEndColor,
+    BorderBlockColor,
+    BorderInlineColor,
+    BorderBlock,
+    BorderBlockStart,
+    BorderBlockEnd,
+    BorderInline,
+    BorderInlineStart,
+    BorderInlineEnd,
+    BorderStartStartRadius,
+    BorderStartEndRadius,
+    BorderEndStartRadius,
+    BorderEndEndRadius,
     // Custom property (`--*`)
     Custom,
 }
@@ -643,24 +705,85 @@ impl PropertyIdKind {
             "cursor" => Self::Cursor,
             "z-index" => Self::ZIndex,
             "opacity" => Self::Opacity,
-            "width" | "inline-size" => Self::Width,
-            "height" | "block-size" => Self::Height,
-            "min-width" | "min-inline-size" => Self::MinWidth,
-            "min-height" | "min-block-size" => Self::MinHeight,
-            "max-width" | "max-inline-size" => Self::MaxWidth,
-            "max-height" | "max-block-size" => Self::MaxHeight,
-            "margin-top" | "margin-block-start" => Self::MarginTop,
-            "margin-right" | "margin-inline-end" => Self::MarginRight,
-            "margin-bottom" | "margin-block-end" => Self::MarginBottom,
-            "margin-left" | "margin-inline-start" => Self::MarginLeft,
-            "padding-top" | "padding-block-start" => Self::PaddingTop,
-            "padding-right" | "padding-inline-end" => Self::PaddingRight,
-            "padding-bottom" | "padding-block-end" => Self::PaddingBottom,
-            "padding-left" | "padding-inline-start" => Self::PaddingLeft,
-            "top" | "inset-block-start" => Self::Top,
-            "right" | "inset-inline-end" => Self::Right,
-            "bottom" | "inset-block-end" => Self::Bottom,
-            "left" | "inset-inline-start" => Self::Left,
+            "width" => Self::Width,
+            "height" => Self::Height,
+            "min-width" => Self::MinWidth,
+            "min-height" => Self::MinHeight,
+            "max-width" => Self::MaxWidth,
+            "max-height" => Self::MaxHeight,
+            "margin-top" => Self::MarginTop,
+            "margin-right" => Self::MarginRight,
+            "margin-bottom" => Self::MarginBottom,
+            "margin-left" => Self::MarginLeft,
+            "padding-top" => Self::PaddingTop,
+            "padding-right" => Self::PaddingRight,
+            "padding-bottom" => Self::PaddingBottom,
+            "padding-left" => Self::PaddingLeft,
+            "top" => Self::Top,
+            "right" => Self::Right,
+            "bottom" => Self::Bottom,
+            "left" => Self::Left,
+            // CSS Logical Properties Level 1 & Writing Modes
+            "writing-mode" => Self::WritingMode,
+            "resize" => Self::Resize,
+            "caption-side" => Self::CaptionSide,
+            "overscroll-behavior-x" => Self::OverscrollBehaviorX,
+            "overscroll-behavior-y" => Self::OverscrollBehaviorY,
+            "overscroll-behavior-inline" => Self::OverscrollBehaviorInline,
+            "overscroll-behavior-block" => Self::OverscrollBehaviorBlock,
+            "overscroll-behavior" => Self::OverscrollBehavior,
+            "inline-size" => Self::InlineSize,
+            "block-size" => Self::BlockSize,
+            "min-inline-size" => Self::MinInlineSize,
+            "min-block-size" => Self::MinBlockSize,
+            "max-inline-size" => Self::MaxInlineSize,
+            "max-block-size" => Self::MaxBlockSize,
+            "margin-block-start" => Self::MarginBlockStart,
+            "margin-block-end" => Self::MarginBlockEnd,
+            "margin-inline-start" => Self::MarginInlineStart,
+            "margin-inline-end" => Self::MarginInlineEnd,
+            "margin-block" => Self::MarginBlock,
+            "margin-inline" => Self::MarginInline,
+            "padding-block-start" => Self::PaddingBlockStart,
+            "padding-block-end" => Self::PaddingBlockEnd,
+            "padding-inline-start" => Self::PaddingInlineStart,
+            "padding-inline-end" => Self::PaddingInlineEnd,
+            "padding-block" => Self::PaddingBlock,
+            "padding-inline" => Self::PaddingInline,
+            "inset-block-start" => Self::InsetBlockStart,
+            "inset-block-end" => Self::InsetBlockEnd,
+            "inset-inline-start" => Self::InsetInlineStart,
+            "inset-inline-end" => Self::InsetInlineEnd,
+            "inset-block" => Self::InsetBlock,
+            "inset-inline" => Self::InsetInline,
+            "border-block-start-width" => Self::BorderBlockStartWidth,
+            "border-block-end-width" => Self::BorderBlockEndWidth,
+            "border-inline-start-width" => Self::BorderInlineStartWidth,
+            "border-inline-end-width" => Self::BorderInlineEndWidth,
+            "border-block-width" => Self::BorderBlockWidth,
+            "border-inline-width" => Self::BorderInlineWidth,
+            "border-block-start-style" => Self::BorderBlockStartStyle,
+            "border-block-end-style" => Self::BorderBlockEndStyle,
+            "border-inline-start-style" => Self::BorderInlineStartStyle,
+            "border-inline-end-style" => Self::BorderInlineEndStyle,
+            "border-block-style" => Self::BorderBlockStyle,
+            "border-inline-style" => Self::BorderInlineStyle,
+            "border-block-start-color" => Self::BorderBlockStartColor,
+            "border-block-end-color" => Self::BorderBlockEndColor,
+            "border-inline-start-color" => Self::BorderInlineStartColor,
+            "border-inline-end-color" => Self::BorderInlineEndColor,
+            "border-block-color" => Self::BorderBlockColor,
+            "border-inline-color" => Self::BorderInlineColor,
+            "border-block" => Self::BorderBlock,
+            "border-block-start" => Self::BorderBlockStart,
+            "border-block-end" => Self::BorderBlockEnd,
+            "border-inline" => Self::BorderInline,
+            "border-inline-start" => Self::BorderInlineStart,
+            "border-inline-end" => Self::BorderInlineEnd,
+            "border-start-start-radius" => Self::BorderStartStartRadius,
+            "border-start-end-radius" => Self::BorderStartEndRadius,
+            "border-end-start-radius" => Self::BorderEndStartRadius,
+            "border-end-end-radius" => Self::BorderEndEndRadius,
             "border-top-width" => Self::BorderTopWidth,
             "border-right-width" => Self::BorderRightWidth,
             "border-bottom-width" => Self::BorderBottomWidth,
@@ -924,6 +1047,66 @@ impl PropertyIdKind {
             Self::TableLayout => "table-layout",
             Self::ColorScheme => "color-scheme",
             Self::Content => "content",
+            Self::WritingMode => "writing-mode",
+            Self::Resize => "resize",
+            Self::CaptionSide => "caption-side",
+            Self::OverscrollBehaviorX => "overscroll-behavior-x",
+            Self::OverscrollBehaviorY => "overscroll-behavior-y",
+            Self::OverscrollBehaviorInline => "overscroll-behavior-inline",
+            Self::OverscrollBehaviorBlock => "overscroll-behavior-block",
+            Self::OverscrollBehavior => "overscroll-behavior",
+            Self::InlineSize => "inline-size",
+            Self::BlockSize => "block-size",
+            Self::MinInlineSize => "min-inline-size",
+            Self::MinBlockSize => "min-block-size",
+            Self::MaxInlineSize => "max-inline-size",
+            Self::MaxBlockSize => "max-block-size",
+            Self::MarginBlockStart => "margin-block-start",
+            Self::MarginBlockEnd => "margin-block-end",
+            Self::MarginInlineStart => "margin-inline-start",
+            Self::MarginInlineEnd => "margin-inline-end",
+            Self::MarginBlock => "margin-block",
+            Self::MarginInline => "margin-inline",
+            Self::PaddingBlockStart => "padding-block-start",
+            Self::PaddingBlockEnd => "padding-block-end",
+            Self::PaddingInlineStart => "padding-inline-start",
+            Self::PaddingInlineEnd => "padding-inline-end",
+            Self::PaddingBlock => "padding-block",
+            Self::PaddingInline => "padding-inline",
+            Self::InsetBlockStart => "inset-block-start",
+            Self::InsetBlockEnd => "inset-block-end",
+            Self::InsetInlineStart => "inset-inline-start",
+            Self::InsetInlineEnd => "inset-inline-end",
+            Self::InsetBlock => "inset-block",
+            Self::InsetInline => "inset-inline",
+            Self::BorderBlockStartWidth => "border-block-start-width",
+            Self::BorderBlockEndWidth => "border-block-end-width",
+            Self::BorderInlineStartWidth => "border-inline-start-width",
+            Self::BorderInlineEndWidth => "border-inline-end-width",
+            Self::BorderBlockWidth => "border-block-width",
+            Self::BorderInlineWidth => "border-inline-width",
+            Self::BorderBlockStartStyle => "border-block-start-style",
+            Self::BorderBlockEndStyle => "border-block-end-style",
+            Self::BorderInlineStartStyle => "border-inline-start-style",
+            Self::BorderInlineEndStyle => "border-inline-end-style",
+            Self::BorderBlockStyle => "border-block-style",
+            Self::BorderInlineStyle => "border-inline-style",
+            Self::BorderBlockStartColor => "border-block-start-color",
+            Self::BorderBlockEndColor => "border-block-end-color",
+            Self::BorderInlineStartColor => "border-inline-start-color",
+            Self::BorderInlineEndColor => "border-inline-end-color",
+            Self::BorderBlockColor => "border-block-color",
+            Self::BorderInlineColor => "border-inline-color",
+            Self::BorderBlock => "border-block",
+            Self::BorderBlockStart => "border-block-start",
+            Self::BorderBlockEnd => "border-block-end",
+            Self::BorderInline => "border-inline",
+            Self::BorderInlineStart => "border-inline-start",
+            Self::BorderInlineEnd => "border-inline-end",
+            Self::BorderStartStartRadius => "border-start-start-radius",
+            Self::BorderStartEndRadius => "border-start-end-radius",
+            Self::BorderEndStartRadius => "border-end-start-radius",
+            Self::BorderEndEndRadius => "border-end-end-radius",
             Self::Custom => "--custom",
         }
     }
@@ -950,6 +1133,10 @@ impl PropertyIdKind {
                 | Self::WordBreak
                 | Self::OverflowWrap
                 | Self::Direction
+                | Self::WritingMode
+                | Self::CaptionSide
+                | Self::BorderCollapse
+                | Self::BorderSpacing
                 | Self::Custom
         )
     }
@@ -964,14 +1151,30 @@ impl PropertyIdKind {
                 Self::MarginBottom,
                 Self::MarginLeft,
             ]),
+            Self::MarginBlock => {
+                SmallVec::from_slice(&[Self::MarginBlockStart, Self::MarginBlockEnd])
+            }
+            Self::MarginInline => {
+                SmallVec::from_slice(&[Self::MarginInlineStart, Self::MarginInlineEnd])
+            }
             Self::Padding => SmallVec::from_slice(&[
                 Self::PaddingTop,
                 Self::PaddingRight,
                 Self::PaddingBottom,
                 Self::PaddingLeft,
             ]),
+            Self::PaddingBlock => {
+                SmallVec::from_slice(&[Self::PaddingBlockStart, Self::PaddingBlockEnd])
+            }
+            Self::PaddingInline => {
+                SmallVec::from_slice(&[Self::PaddingInlineStart, Self::PaddingInlineEnd])
+            }
             Self::Inset => {
                 SmallVec::from_slice(&[Self::Top, Self::Right, Self::Bottom, Self::Left])
+            }
+            Self::InsetBlock => SmallVec::from_slice(&[Self::InsetBlockStart, Self::InsetBlockEnd]),
+            Self::InsetInline => {
+                SmallVec::from_slice(&[Self::InsetInlineStart, Self::InsetInlineEnd])
             }
             Self::BorderWidth => SmallVec::from_slice(&[
                 Self::BorderTopWidth,
@@ -979,18 +1182,36 @@ impl PropertyIdKind {
                 Self::BorderBottomWidth,
                 Self::BorderLeftWidth,
             ]),
+            Self::BorderBlockWidth => {
+                SmallVec::from_slice(&[Self::BorderBlockStartWidth, Self::BorderBlockEndWidth])
+            }
+            Self::BorderInlineWidth => {
+                SmallVec::from_slice(&[Self::BorderInlineStartWidth, Self::BorderInlineEndWidth])
+            }
             Self::BorderStyle => SmallVec::from_slice(&[
                 Self::BorderTopStyle,
                 Self::BorderRightStyle,
                 Self::BorderBottomStyle,
                 Self::BorderLeftStyle,
             ]),
+            Self::BorderBlockStyle => {
+                SmallVec::from_slice(&[Self::BorderBlockStartStyle, Self::BorderBlockEndStyle])
+            }
+            Self::BorderInlineStyle => {
+                SmallVec::from_slice(&[Self::BorderInlineStartStyle, Self::BorderInlineEndStyle])
+            }
             Self::BorderColor => SmallVec::from_slice(&[
                 Self::BorderTopColor,
                 Self::BorderRightColor,
                 Self::BorderBottomColor,
                 Self::BorderLeftColor,
             ]),
+            Self::BorderBlockColor => {
+                SmallVec::from_slice(&[Self::BorderBlockStartColor, Self::BorderBlockEndColor])
+            }
+            Self::BorderInlineColor => {
+                SmallVec::from_slice(&[Self::BorderInlineStartColor, Self::BorderInlineEndColor])
+            }
             Self::BorderTop => SmallVec::from_slice(&[
                 Self::BorderTopWidth,
                 Self::BorderTopStyle,
@@ -1010,6 +1231,42 @@ impl PropertyIdKind {
                 Self::BorderLeftWidth,
                 Self::BorderLeftStyle,
                 Self::BorderLeftColor,
+            ]),
+            Self::BorderBlockStart => SmallVec::from_slice(&[
+                Self::BorderBlockStartWidth,
+                Self::BorderBlockStartStyle,
+                Self::BorderBlockStartColor,
+            ]),
+            Self::BorderBlockEnd => SmallVec::from_slice(&[
+                Self::BorderBlockEndWidth,
+                Self::BorderBlockEndStyle,
+                Self::BorderBlockEndColor,
+            ]),
+            Self::BorderInlineStart => SmallVec::from_slice(&[
+                Self::BorderInlineStartWidth,
+                Self::BorderInlineStartStyle,
+                Self::BorderInlineStartColor,
+            ]),
+            Self::BorderInlineEnd => SmallVec::from_slice(&[
+                Self::BorderInlineEndWidth,
+                Self::BorderInlineEndStyle,
+                Self::BorderInlineEndColor,
+            ]),
+            Self::BorderBlock => SmallVec::from_slice(&[
+                Self::BorderBlockStartWidth,
+                Self::BorderBlockEndWidth,
+                Self::BorderBlockStartStyle,
+                Self::BorderBlockEndStyle,
+                Self::BorderBlockStartColor,
+                Self::BorderBlockEndColor,
+            ]),
+            Self::BorderInline => SmallVec::from_slice(&[
+                Self::BorderInlineStartWidth,
+                Self::BorderInlineEndWidth,
+                Self::BorderInlineStartStyle,
+                Self::BorderInlineEndStyle,
+                Self::BorderInlineStartColor,
+                Self::BorderInlineEndColor,
             ]),
             Self::Border => SmallVec::from_slice(&[
                 Self::BorderTopWidth,
@@ -1031,6 +1288,9 @@ impl PropertyIdKind {
                 Self::BorderBottomRightRadius,
                 Self::BorderBottomLeftRadius,
             ]),
+            Self::OverscrollBehavior => {
+                SmallVec::from_slice(&[Self::OverscrollBehaviorX, Self::OverscrollBehaviorY])
+            }
             Self::Flex => {
                 SmallVec::from_slice(&[Self::FlexGrow, Self::FlexShrink, Self::FlexBasis])
             }
@@ -1055,6 +1315,410 @@ impl PropertyIdKind {
                 v
             }
         }
+    }
+}
+
+/// Complete list of supported CSS longhand property names exposed by `getComputedStyle(el)`
+/// (`length`, `item(i)`, `ownKeys`, `getOwnPropertyDescriptor`).
+pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
+    "align-content",
+    "align-items",
+    "align-self",
+    "animation-delay",
+    "animation-direction",
+    "animation-duration",
+    "animation-fill-mode",
+    "animation-iteration-count",
+    "animation-name",
+    "animation-play-state",
+    "animation-timing-function",
+    "background-color",
+    "background-image",
+    "block-size",
+    "border-block-end-color",
+    "border-block-end-style",
+    "border-block-end-width",
+    "border-block-start-color",
+    "border-block-start-style",
+    "border-block-start-width",
+    "border-bottom-color",
+    "border-bottom-left-radius",
+    "border-bottom-right-radius",
+    "border-bottom-style",
+    "border-bottom-width",
+    "border-collapse",
+    "border-end-end-radius",
+    "border-end-start-radius",
+    "border-inline-end-color",
+    "border-inline-end-style",
+    "border-inline-end-width",
+    "border-inline-start-color",
+    "border-inline-start-style",
+    "border-inline-start-width",
+    "border-left-color",
+    "border-left-style",
+    "border-left-width",
+    "border-right-color",
+    "border-right-style",
+    "border-right-width",
+    "border-spacing",
+    "border-start-end-radius",
+    "border-start-start-radius",
+    "border-top-color",
+    "border-top-left-radius",
+    "border-top-right-radius",
+    "border-top-style",
+    "border-top-width",
+    "bottom",
+    "box-shadow",
+    "box-sizing",
+    "caption-side",
+    "clear",
+    "clip-path",
+    "color",
+    "color-scheme",
+    "column-gap",
+    "content",
+    "cursor",
+    "direction",
+    "display",
+    "filter",
+    "flex-basis",
+    "flex-direction",
+    "flex-grow",
+    "flex-shrink",
+    "flex-wrap",
+    "float",
+    "font-family",
+    "font-size",
+    "font-style",
+    "font-weight",
+    "grid-auto-columns",
+    "grid-auto-flow",
+    "grid-auto-rows",
+    "grid-column-end",
+    "grid-column-start",
+    "grid-row-end",
+    "grid-row-start",
+    "grid-template-areas",
+    "grid-template-columns",
+    "grid-template-rows",
+    "height",
+    "inline-size",
+    "inset-block-end",
+    "inset-block-start",
+    "inset-inline-end",
+    "inset-inline-start",
+    "justify-content",
+    "justify-items",
+    "justify-self",
+    "left",
+    "letter-spacing",
+    "line-height",
+    "margin-block-end",
+    "margin-block-start",
+    "margin-bottom",
+    "margin-inline-end",
+    "margin-inline-start",
+    "margin-left",
+    "margin-right",
+    "margin-top",
+    "max-block-size",
+    "max-height",
+    "max-inline-size",
+    "max-width",
+    "min-block-size",
+    "min-height",
+    "min-inline-size",
+    "min-width",
+    "mix-blend-mode",
+    "opacity",
+    "order",
+    "outline-color",
+    "outline-offset",
+    "outline-style",
+    "outline-width",
+    "overflow-wrap",
+    "overflow-x",
+    "overflow-y",
+    "overscroll-behavior-block",
+    "overscroll-behavior-inline",
+    "overscroll-behavior-x",
+    "overscroll-behavior-y",
+    "padding-block-end",
+    "padding-block-start",
+    "padding-bottom",
+    "padding-inline-end",
+    "padding-inline-start",
+    "padding-left",
+    "padding-right",
+    "padding-top",
+    "pointer-events",
+    "position",
+    "resize",
+    "right",
+    "row-gap",
+    "table-layout",
+    "text-align",
+    "text-decoration-color",
+    "text-decoration-line",
+    "text-overflow",
+    "text-transform",
+    "top",
+    "transform",
+    "transform-origin",
+    "transition-delay",
+    "transition-duration",
+    "transition-property",
+    "transition-timing-function",
+    "user-select",
+    "vertical-align",
+    "visibility",
+    "white-space",
+    "width",
+    "word-break",
+    "word-spacing",
+    "writing-mode",
+    "z-index",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhysicalSide {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhysicalCorner {
+    TopLeft,
+    TopRight,
+    BottomRight,
+    BottomLeft,
+}
+
+/// Exact CSS Writing Modes L4 / CSS Logical Properties L1 side mapping for all
+/// `(WritingMode, DirectionMode)` pairs: returns `(block_start, block_end, inline_start, inline_end)`.
+const fn logical_sides(
+    wm: WritingMode,
+    dir: DirectionMode,
+) -> (PhysicalSide, PhysicalSide, PhysicalSide, PhysicalSide) {
+    use DirectionMode::{Ltr, Rtl};
+    use PhysicalSide::{Bottom, Left, Right, Top};
+    use WritingMode::{HorizontalTb, SidewaysLr, SidewaysRl, VerticalLr, VerticalRl};
+    match (wm, dir) {
+        (HorizontalTb, Ltr) => (Top, Bottom, Left, Right),
+        (HorizontalTb, Rtl) => (Top, Bottom, Right, Left),
+        (VerticalRl | SidewaysRl, Ltr) => (Right, Left, Top, Bottom),
+        (VerticalRl | SidewaysRl, Rtl) => (Right, Left, Bottom, Top),
+        (VerticalLr, Ltr) => (Left, Right, Top, Bottom),
+        (VerticalLr, Rtl) => (Left, Right, Bottom, Top),
+        (SidewaysLr, Ltr) => (Left, Right, Bottom, Top),
+        (SidewaysLr, Rtl) => (Left, Right, Top, Bottom),
+    }
+}
+
+const fn combine_sides_to_corner(a: PhysicalSide, b: PhysicalSide) -> PhysicalCorner {
+    use PhysicalCorner::{BottomLeft, BottomRight, TopLeft, TopRight};
+    use PhysicalSide::{Bottom, Left, Right, Top};
+    match (a, b) {
+        (Top, Left) | (Left, Top) => TopLeft,
+        (Top, Right) | (Right, Top) => TopRight,
+        (Bottom, Right) | (Right, Bottom) => BottomRight,
+        _ => BottomLeft,
+    }
+}
+
+/// Returns `true` if `prop` is a flow-relative logical longhand property.
+#[must_use]
+pub const fn is_logical_property(prop: PropertyIdKind) -> bool {
+    matches!(
+        prop,
+        PropertyIdKind::InlineSize
+            | PropertyIdKind::BlockSize
+            | PropertyIdKind::MinInlineSize
+            | PropertyIdKind::MinBlockSize
+            | PropertyIdKind::MaxInlineSize
+            | PropertyIdKind::MaxBlockSize
+            | PropertyIdKind::MarginBlockStart
+            | PropertyIdKind::MarginBlockEnd
+            | PropertyIdKind::MarginInlineStart
+            | PropertyIdKind::MarginInlineEnd
+            | PropertyIdKind::PaddingBlockStart
+            | PropertyIdKind::PaddingBlockEnd
+            | PropertyIdKind::PaddingInlineStart
+            | PropertyIdKind::PaddingInlineEnd
+            | PropertyIdKind::InsetBlockStart
+            | PropertyIdKind::InsetBlockEnd
+            | PropertyIdKind::InsetInlineStart
+            | PropertyIdKind::InsetInlineEnd
+            | PropertyIdKind::BorderBlockStartWidth
+            | PropertyIdKind::BorderBlockEndWidth
+            | PropertyIdKind::BorderInlineStartWidth
+            | PropertyIdKind::BorderInlineEndWidth
+            | PropertyIdKind::BorderBlockStartStyle
+            | PropertyIdKind::BorderBlockEndStyle
+            | PropertyIdKind::BorderInlineStartStyle
+            | PropertyIdKind::BorderInlineEndStyle
+            | PropertyIdKind::BorderBlockStartColor
+            | PropertyIdKind::BorderBlockEndColor
+            | PropertyIdKind::BorderInlineStartColor
+            | PropertyIdKind::BorderInlineEndColor
+            | PropertyIdKind::BorderStartStartRadius
+            | PropertyIdKind::BorderStartEndRadius
+            | PropertyIdKind::BorderEndStartRadius
+            | PropertyIdKind::BorderEndEndRadius
+            | PropertyIdKind::OverscrollBehaviorInline
+            | PropertyIdKind::OverscrollBehaviorBlock
+    )
+}
+
+const fn pick_side(side: PhysicalSide, tblr: [PropertyIdKind; 4]) -> PropertyIdKind {
+    match side {
+        PhysicalSide::Top => tblr[0],
+        PhysicalSide::Right => tblr[1],
+        PhysicalSide::Bottom => tblr[2],
+        PhysicalSide::Left => tblr[3],
+    }
+}
+
+/// Resolves any CSS Logical Properties Level 1 longhand to its corresponding physical
+/// [`PropertyIdKind`] given the element's computed `writing-mode` and `direction`.
+#[must_use]
+pub const fn resolve_logical_to_physical(
+    prop: PropertyIdKind,
+    wm: WritingMode,
+    dir: DirectionMode,
+) -> PropertyIdKind {
+    use PropertyIdKind as P;
+    let (bs, be, is, ie) = logical_sides(wm, dir);
+    let vert = wm.is_vertical();
+    const M: [P; 4] = [P::MarginTop, P::MarginRight, P::MarginBottom, P::MarginLeft];
+    const PA: [P; 4] = [
+        P::PaddingTop,
+        P::PaddingRight,
+        P::PaddingBottom,
+        P::PaddingLeft,
+    ];
+    const IN: [P; 4] = [P::Top, P::Right, P::Bottom, P::Left];
+    const BW: [P; 4] = [
+        P::BorderTopWidth,
+        P::BorderRightWidth,
+        P::BorderBottomWidth,
+        P::BorderLeftWidth,
+    ];
+    const BS: [P; 4] = [
+        P::BorderTopStyle,
+        P::BorderRightStyle,
+        P::BorderBottomStyle,
+        P::BorderLeftStyle,
+    ];
+    const BC: [P; 4] = [
+        P::BorderTopColor,
+        P::BorderRightColor,
+        P::BorderBottomColor,
+        P::BorderLeftColor,
+    ];
+    match prop {
+        P::InlineSize => {
+            if vert {
+                P::Height
+            } else {
+                P::Width
+            }
+        }
+        P::BlockSize => {
+            if vert {
+                P::Width
+            } else {
+                P::Height
+            }
+        }
+        P::MinInlineSize => {
+            if vert {
+                P::MinHeight
+            } else {
+                P::MinWidth
+            }
+        }
+        P::MinBlockSize => {
+            if vert {
+                P::MinWidth
+            } else {
+                P::MinHeight
+            }
+        }
+        P::MaxInlineSize => {
+            if vert {
+                P::MaxHeight
+            } else {
+                P::MaxWidth
+            }
+        }
+        P::MaxBlockSize => {
+            if vert {
+                P::MaxWidth
+            } else {
+                P::MaxHeight
+            }
+        }
+        P::OverscrollBehaviorInline => {
+            if vert {
+                P::OverscrollBehaviorY
+            } else {
+                P::OverscrollBehaviorX
+            }
+        }
+        P::OverscrollBehaviorBlock => {
+            if vert {
+                P::OverscrollBehaviorX
+            } else {
+                P::OverscrollBehaviorY
+            }
+        }
+        P::MarginBlockStart => pick_side(bs, M),
+        P::MarginBlockEnd => pick_side(be, M),
+        P::MarginInlineStart => pick_side(is, M),
+        P::MarginInlineEnd => pick_side(ie, M),
+        P::PaddingBlockStart => pick_side(bs, PA),
+        P::PaddingBlockEnd => pick_side(be, PA),
+        P::PaddingInlineStart => pick_side(is, PA),
+        P::PaddingInlineEnd => pick_side(ie, PA),
+        P::InsetBlockStart => pick_side(bs, IN),
+        P::InsetBlockEnd => pick_side(be, IN),
+        P::InsetInlineStart => pick_side(is, IN),
+        P::InsetInlineEnd => pick_side(ie, IN),
+        P::BorderBlockStartWidth => pick_side(bs, BW),
+        P::BorderBlockEndWidth => pick_side(be, BW),
+        P::BorderInlineStartWidth => pick_side(is, BW),
+        P::BorderInlineEndWidth => pick_side(ie, BW),
+        P::BorderBlockStartStyle => pick_side(bs, BS),
+        P::BorderBlockEndStyle => pick_side(be, BS),
+        P::BorderInlineStartStyle => pick_side(is, BS),
+        P::BorderInlineEndStyle => pick_side(ie, BS),
+        P::BorderBlockStartColor => pick_side(bs, BC),
+        P::BorderBlockEndColor => pick_side(be, BC),
+        P::BorderInlineStartColor => pick_side(is, BC),
+        P::BorderInlineEndColor => pick_side(ie, BC),
+        P::BorderStartStartRadius
+        | P::BorderStartEndRadius
+        | P::BorderEndStartRadius
+        | P::BorderEndEndRadius => {
+            let corner = match prop {
+                P::BorderStartStartRadius => combine_sides_to_corner(bs, is),
+                P::BorderStartEndRadius => combine_sides_to_corner(bs, ie),
+                P::BorderEndStartRadius => combine_sides_to_corner(be, is),
+                _ => combine_sides_to_corner(be, ie),
+            };
+            match corner {
+                PhysicalCorner::TopLeft => P::BorderTopLeftRadius,
+                PhysicalCorner::TopRight => P::BorderTopRightRadius,
+                PhysicalCorner::BottomRight => P::BorderBottomRightRadius,
+                PhysicalCorner::BottomLeft => P::BorderBottomLeftRadius,
+            }
+        }
+        other => other,
     }
 }
 
@@ -1122,6 +1786,10 @@ pub enum PropertyValue {
     BorderSpacing(LengthPercentage, LengthPercentage),
     TableLayout(TableLayoutMode),
     Content(Option<InternedStr>),
+    WritingMode(WritingMode),
+    Resize(ResizeMode),
+    CaptionSide(CaptionSideMode),
+    OverscrollBehavior(OverscrollBehaviorMode),
 }
 
 /// A compiled single-property CSS declaration.
@@ -1205,13 +1873,17 @@ pub fn parse_property_from_tokens(
     if non_ws.len() == 1 {
         if let CssToken::Ident(id) = non_ws[0] {
             if let Some(kw) = GlobalKeyword::from_ident(id.as_str()) {
-                return vec![SpecifiedDeclaration {
-                    property: prop,
-                    custom_name: None,
-                    value: PropertyValue::Global(kw),
-                    important,
-                    order: 0,
-                }];
+                return prop
+                    .shorthand_longhands()
+                    .into_iter()
+                    .map(|target| SpecifiedDeclaration {
+                        property: target,
+                        custom_name: None,
+                        value: PropertyValue::Global(kw),
+                        important,
+                        order: 0,
+                    })
+                    .collect();
             }
         }
         // Fast path for single-token resolved color/length/number without string re-parsing.
@@ -1260,6 +1932,10 @@ fn fast_parse_single_token(prop: PropertyIdKind, tok: &CssToken) -> Option<Prope
         | PropertyIdKind::BorderRightColor
         | PropertyIdKind::BorderBottomColor
         | PropertyIdKind::BorderLeftColor
+        | PropertyIdKind::BorderBlockStartColor
+        | PropertyIdKind::BorderBlockEndColor
+        | PropertyIdKind::BorderInlineStartColor
+        | PropertyIdKind::BorderInlineEndColor
         | PropertyIdKind::OutlineColor
         | PropertyIdKind::TextDecorationColor => match tok {
             CssToken::Color(c) => Some(PropertyValue::Color(*c)),
@@ -1276,11 +1952,19 @@ fn fast_parse_single_token(prop: PropertyIdKind, tok: &CssToken) -> Option<Prope
         | PropertyIdKind::MinWidth
         | PropertyIdKind::MinHeight
         | PropertyIdKind::MaxWidth
-        | PropertyIdKind::MaxHeight => match tok {
-            CssToken::Dimension(v, u) => LengthUnit::from_unit_str(u.as_str()).map(|unit| {
-                PropertyValue::Size(SizeValue::Length(LengthPercentage::Length(*v, unit)))
-            }),
-            CssToken::Percentage(p) => Some(PropertyValue::Size(SizeValue::Length(
+        | PropertyIdKind::MaxHeight
+        | PropertyIdKind::InlineSize
+        | PropertyIdKind::BlockSize
+        | PropertyIdKind::MinInlineSize
+        | PropertyIdKind::MinBlockSize
+        | PropertyIdKind::MaxInlineSize
+        | PropertyIdKind::MaxBlockSize => match tok {
+            CssToken::Dimension(v, u) if *v >= 0.0 => {
+                LengthUnit::from_unit_str(u.as_str()).map(|unit| {
+                    PropertyValue::Size(SizeValue::Length(LengthPercentage::Length(*v, unit)))
+                })
+            }
+            CssToken::Percentage(p) if *p >= 0.0 => Some(PropertyValue::Size(SizeValue::Length(
                 LengthPercentage::Percent(*p),
             ))),
             _ => None,
@@ -1290,14 +1974,91 @@ fn fast_parse_single_token(prop: PropertyIdKind, tok: &CssToken) -> Option<Prope
         | PropertyIdKind::PaddingRight
         | PropertyIdKind::PaddingBottom
         | PropertyIdKind::PaddingLeft
+        | PropertyIdKind::PaddingBlockStart
+        | PropertyIdKind::PaddingBlockEnd
+        | PropertyIdKind::PaddingInlineStart
+        | PropertyIdKind::PaddingInlineEnd
         | PropertyIdKind::RowGap
         | PropertyIdKind::ColumnGap => match tok {
-            CssToken::Dimension(v, u) => LengthUnit::from_unit_str(u.as_str())
+            CssToken::Dimension(v, u) if *v >= 0.0 => LengthUnit::from_unit_str(u.as_str())
                 .map(|unit| PropertyValue::Length(LengthPercentage::Length(*v, unit))),
-            CssToken::Percentage(p) => Some(PropertyValue::Length(LengthPercentage::Percent(*p))),
+            CssToken::Percentage(p) if *p >= 0.0 => {
+                Some(PropertyValue::Length(LengthPercentage::Percent(*p)))
+            }
             _ => None,
         },
         _ => None,
+    }
+}
+
+pub(crate) fn property_has_disallowed_value(prop: &Property<'_>) -> bool {
+    use lightningcss::properties::border::BorderSideWidth as BSW;
+    use lightningcss::properties::size::{MaxSize, Size};
+    use lightningcss::values::length::{
+        Length, LengthPercentage as LP, LengthPercentageOrAuto as LPA,
+    };
+    let lp_neg = |lp: &LP| match lp {
+        LP::Dimension(lv) => convert_length_value(lv).is_negative_literal(),
+        LP::Percentage(p) => p.0 < 0.0,
+        LP::Calc(_) => false,
+    };
+    let pad_bad = |v: &LPA| match v {
+        LPA::Auto => true, // CSS Box Model L3: padding-* never accepts `auto`.
+        LPA::LengthPercentage(lp) => lp_neg(lp),
+    };
+    let bw_neg = |w: &BSW| match w {
+        BSW::Length(Length::Value(lv)) => convert_length_value(lv).is_negative_literal(),
+        _ => false,
+    };
+    match prop {
+        Property::Width(s)
+        | Property::Height(s)
+        | Property::InlineSize(s)
+        | Property::BlockSize(s)
+        | Property::MinWidth(s)
+        | Property::MinHeight(s)
+        | Property::MinInlineSize(s)
+        | Property::MinBlockSize(s) => matches!(s, Size::LengthPercentage(lp) if lp_neg(lp)),
+        Property::MaxWidth(s)
+        | Property::MaxHeight(s)
+        | Property::MaxInlineSize(s)
+        | Property::MaxBlockSize(s) => matches!(s, MaxSize::LengthPercentage(lp) if lp_neg(lp)),
+        Property::PaddingTop(v)
+        | Property::PaddingRight(v)
+        | Property::PaddingBottom(v)
+        | Property::PaddingLeft(v)
+        | Property::PaddingBlockStart(v)
+        | Property::PaddingBlockEnd(v)
+        | Property::PaddingInlineStart(v)
+        | Property::PaddingInlineEnd(v) => pad_bad(v),
+        Property::Padding(p) => {
+            pad_bad(&p.top) || pad_bad(&p.right) || pad_bad(&p.bottom) || pad_bad(&p.left)
+        }
+        Property::PaddingBlock(p) => pad_bad(&p.block_start) || pad_bad(&p.block_end),
+        Property::PaddingInline(p) => pad_bad(&p.inline_start) || pad_bad(&p.inline_end),
+        Property::BorderTopWidth(w)
+        | Property::BorderRightWidth(w)
+        | Property::BorderBottomWidth(w)
+        | Property::BorderLeftWidth(w)
+        | Property::BorderBlockStartWidth(w)
+        | Property::BorderBlockEndWidth(w)
+        | Property::BorderInlineStartWidth(w)
+        | Property::BorderInlineEndWidth(w)
+        | Property::OutlineWidth(w) => bw_neg(w),
+        Property::BorderWidth(b) => {
+            bw_neg(&b.top) || bw_neg(&b.right) || bw_neg(&b.bottom) || bw_neg(&b.left)
+        }
+        Property::BorderBlockWidth(b) => bw_neg(&b.start) || bw_neg(&b.end),
+        Property::BorderInlineWidth(b) => bw_neg(&b.start) || bw_neg(&b.end),
+        Property::BorderTopLeftRadius(r, _)
+        | Property::BorderTopRightRadius(r, _)
+        | Property::BorderBottomRightRadius(r, _)
+        | Property::BorderBottomLeftRadius(r, _)
+        | Property::BorderStartStartRadius(r)
+        | Property::BorderStartEndRadius(r)
+        | Property::BorderEndStartRadius(r)
+        | Property::BorderEndEndRadius(r) => lp_neg(&r.0) || lp_neg(&r.1),
+        _ => false,
     }
 }
 
@@ -1308,6 +2069,9 @@ fn compile_property(
     out: &mut Vec<SpecifiedDeclaration>,
     missing: &mut Vec<MissingCssFeature>,
 ) {
+    if property_has_disallowed_value(prop) {
+        return;
+    }
     match prop {
         Property::Display(d) => {
             push_decl(
@@ -1479,7 +2243,7 @@ fn compile_property(
                 imp,
             );
         }
-        Property::Width(s) | Property::InlineSize(s) => {
+        Property::Width(s) => {
             push_decl(
                 out,
                 ord,
@@ -1488,7 +2252,16 @@ fn compile_property(
                 imp,
             );
         }
-        Property::Height(s) | Property::BlockSize(s) => {
+        Property::InlineSize(s) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::InlineSize,
+                PropertyValue::Size(convert_size(s)),
+                imp,
+            );
+        }
+        Property::Height(s) => {
             push_decl(
                 out,
                 ord,
@@ -1497,7 +2270,16 @@ fn compile_property(
                 imp,
             );
         }
-        Property::MinWidth(s) | Property::MinInlineSize(s) => {
+        Property::BlockSize(s) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BlockSize,
+                PropertyValue::Size(convert_size(s)),
+                imp,
+            );
+        }
+        Property::MinWidth(s) => {
             push_decl(
                 out,
                 ord,
@@ -1506,7 +2288,16 @@ fn compile_property(
                 imp,
             );
         }
-        Property::MinHeight(s) | Property::MinBlockSize(s) => {
+        Property::MinInlineSize(s) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::MinInlineSize,
+                PropertyValue::Size(convert_size(s)),
+                imp,
+            );
+        }
+        Property::MinHeight(s) => {
             push_decl(
                 out,
                 ord,
@@ -1515,7 +2306,16 @@ fn compile_property(
                 imp,
             );
         }
-        Property::MaxWidth(s) | Property::MaxInlineSize(s) => {
+        Property::MinBlockSize(s) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::MinBlockSize,
+                PropertyValue::Size(convert_size(s)),
+                imp,
+            );
+        }
+        Property::MaxWidth(s) => {
             push_decl(
                 out,
                 ord,
@@ -1524,7 +2324,16 @@ fn compile_property(
                 imp,
             );
         }
-        Property::MaxHeight(s) | Property::MaxBlockSize(s) => {
+        Property::MaxInlineSize(s) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::MaxInlineSize,
+                PropertyValue::Size(convert_max_size(s)),
+                imp,
+            );
+        }
+        Property::MaxHeight(s) => {
             push_decl(
                 out,
                 ord,
@@ -1533,42 +2342,71 @@ fn compile_property(
                 imp,
             );
         }
-        Property::MarginTop(v) | Property::MarginBlockStart(v) => {
+        Property::MaxBlockSize(s) => {
             push_decl(
                 out,
                 ord,
-                PropertyIdKind::MarginTop,
-                PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+                PropertyIdKind::MaxBlockSize,
+                PropertyValue::Size(convert_max_size(s)),
                 imp,
             );
         }
-        Property::MarginRight(v) | Property::MarginInlineEnd(v) => {
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::MarginRight,
-                PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
-                imp,
-            );
-        }
-        Property::MarginBottom(v) | Property::MarginBlockEnd(v) => {
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::MarginBottom,
-                PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
-                imp,
-            );
-        }
-        Property::MarginLeft(v) | Property::MarginInlineStart(v) => {
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::MarginLeft,
-                PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
-                imp,
-            );
-        }
+        Property::MarginTop(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::MarginTop,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::MarginRight(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::MarginRight,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::MarginBottom(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::MarginBottom,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::MarginLeft(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::MarginLeft,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::MarginBlockStart(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::MarginBlockStart,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::MarginBlockEnd(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::MarginBlockEnd,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::MarginInlineStart(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::MarginInlineStart,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::MarginInlineEnd(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::MarginInlineEnd,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
         Property::Margin(m) => {
             push_decl(
                 out,
@@ -1603,14 +2441,14 @@ fn compile_property(
             push_decl(
                 out,
                 ord,
-                PropertyIdKind::MarginTop,
+                PropertyIdKind::MarginBlockStart,
                 PropertyValue::LengthAuto(convert_length_percentage_or_auto(&m.block_start)),
                 imp,
             );
             push_decl(
                 out,
                 ord,
-                PropertyIdKind::MarginBottom,
+                PropertyIdKind::MarginBlockEnd,
                 PropertyValue::LengthAuto(convert_length_percentage_or_auto(&m.block_end)),
                 imp,
             );
@@ -1619,54 +2457,74 @@ fn compile_property(
             push_decl(
                 out,
                 ord,
-                PropertyIdKind::MarginLeft,
+                PropertyIdKind::MarginInlineStart,
                 PropertyValue::LengthAuto(convert_length_percentage_or_auto(&m.inline_start)),
                 imp,
             );
             push_decl(
                 out,
                 ord,
-                PropertyIdKind::MarginRight,
+                PropertyIdKind::MarginInlineEnd,
                 PropertyValue::LengthAuto(convert_length_percentage_or_auto(&m.inline_end)),
                 imp,
             );
         }
-        Property::PaddingTop(v) | Property::PaddingBlockStart(v) => {
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::PaddingTop,
-                PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
-                imp,
-            );
-        }
-        Property::PaddingRight(v) | Property::PaddingInlineEnd(v) => {
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::PaddingRight,
-                PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
-                imp,
-            );
-        }
-        Property::PaddingBottom(v) | Property::PaddingBlockEnd(v) => {
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::PaddingBottom,
-                PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
-                imp,
-            );
-        }
-        Property::PaddingLeft(v) | Property::PaddingInlineStart(v) => {
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::PaddingLeft,
-                PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
-                imp,
-            );
-        }
+        Property::PaddingTop(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::PaddingTop,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::PaddingRight(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::PaddingRight,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::PaddingBottom(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::PaddingBottom,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::PaddingLeft(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::PaddingLeft,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::PaddingBlockStart(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::PaddingBlockStart,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::PaddingBlockEnd(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::PaddingBlockEnd,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::PaddingInlineStart(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::PaddingInlineStart,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::PaddingInlineEnd(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::PaddingInlineEnd,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
         Property::Padding(p) => {
             push_decl(
                 out,
@@ -1701,14 +2559,14 @@ fn compile_property(
             push_decl(
                 out,
                 ord,
-                PropertyIdKind::PaddingTop,
+                PropertyIdKind::PaddingBlockStart,
                 PropertyValue::LengthAuto(convert_length_percentage_or_auto(&p.block_start)),
                 imp,
             );
             push_decl(
                 out,
                 ord,
-                PropertyIdKind::PaddingBottom,
+                PropertyIdKind::PaddingBlockEnd,
                 PropertyValue::LengthAuto(convert_length_percentage_or_auto(&p.block_end)),
                 imp,
             );
@@ -1717,54 +2575,74 @@ fn compile_property(
             push_decl(
                 out,
                 ord,
-                PropertyIdKind::PaddingLeft,
+                PropertyIdKind::PaddingInlineStart,
                 PropertyValue::LengthAuto(convert_length_percentage_or_auto(&p.inline_start)),
                 imp,
             );
             push_decl(
                 out,
                 ord,
-                PropertyIdKind::PaddingRight,
+                PropertyIdKind::PaddingInlineEnd,
                 PropertyValue::LengthAuto(convert_length_percentage_or_auto(&p.inline_end)),
                 imp,
             );
         }
-        Property::Top(v) | Property::InsetBlockStart(v) => {
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::Top,
-                PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
-                imp,
-            );
-        }
-        Property::Right(v) | Property::InsetInlineEnd(v) => {
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::Right,
-                PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
-                imp,
-            );
-        }
-        Property::Bottom(v) | Property::InsetBlockEnd(v) => {
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::Bottom,
-                PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
-                imp,
-            );
-        }
-        Property::Left(v) | Property::InsetInlineStart(v) => {
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::Left,
-                PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
-                imp,
-            );
-        }
+        Property::Top(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::Top,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::Right(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::Right,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::Bottom(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::Bottom,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::Left(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::Left,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::InsetBlockStart(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::InsetBlockStart,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::InsetBlockEnd(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::InsetBlockEnd,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::InsetInlineStart(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::InsetInlineStart,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
+        Property::InsetInlineEnd(v) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::InsetInlineEnd,
+            PropertyValue::LengthAuto(convert_length_percentage_or_auto(v)),
+            imp,
+        ),
         Property::Inset(i) => {
             push_decl(
                 out,
@@ -1795,32 +2673,92 @@ fn compile_property(
                 imp,
             );
         }
+        Property::InsetBlock(i) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::InsetBlockStart,
+                PropertyValue::LengthAuto(convert_length_percentage_or_auto(&i.block_start)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::InsetBlockEnd,
+                PropertyValue::LengthAuto(convert_length_percentage_or_auto(&i.block_end)),
+                imp,
+            );
+        }
+        Property::InsetInline(i) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::InsetInlineStart,
+                PropertyValue::LengthAuto(convert_length_percentage_or_auto(&i.inline_start)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::InsetInlineEnd,
+                PropertyValue::LengthAuto(convert_length_percentage_or_auto(&i.inline_end)),
+                imp,
+            );
+        }
         Property::BorderTopWidth(w) => push_decl(
             out,
             ord,
             PropertyIdKind::BorderTopWidth,
-            PropertyValue::Number(convert_border_width(w)),
+            PropertyValue::Length(convert_border_width_lp(w)),
             imp,
         ),
         Property::BorderRightWidth(w) => push_decl(
             out,
             ord,
             PropertyIdKind::BorderRightWidth,
-            PropertyValue::Number(convert_border_width(w)),
+            PropertyValue::Length(convert_border_width_lp(w)),
             imp,
         ),
         Property::BorderBottomWidth(w) => push_decl(
             out,
             ord,
             PropertyIdKind::BorderBottomWidth,
-            PropertyValue::Number(convert_border_width(w)),
+            PropertyValue::Length(convert_border_width_lp(w)),
             imp,
         ),
         Property::BorderLeftWidth(w) => push_decl(
             out,
             ord,
             PropertyIdKind::BorderLeftWidth,
-            PropertyValue::Number(convert_border_width(w)),
+            PropertyValue::Length(convert_border_width_lp(w)),
+            imp,
+        ),
+        Property::BorderBlockStartWidth(w) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::BorderBlockStartWidth,
+            PropertyValue::Length(convert_border_width_lp(w)),
+            imp,
+        ),
+        Property::BorderBlockEndWidth(w) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::BorderBlockEndWidth,
+            PropertyValue::Length(convert_border_width_lp(w)),
+            imp,
+        ),
+        Property::BorderInlineStartWidth(w) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::BorderInlineStartWidth,
+            PropertyValue::Length(convert_border_width_lp(w)),
+            imp,
+        ),
+        Property::BorderInlineEndWidth(w) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::BorderInlineEndWidth,
+            PropertyValue::Length(convert_border_width_lp(w)),
             imp,
         ),
         Property::BorderWidth(bw) => {
@@ -1828,28 +2766,60 @@ fn compile_property(
                 out,
                 ord,
                 PropertyIdKind::BorderTopWidth,
-                PropertyValue::Number(convert_border_width(&bw.top)),
+                PropertyValue::Length(convert_border_width_lp(&bw.top)),
                 imp,
             );
             push_decl(
                 out,
                 ord,
                 PropertyIdKind::BorderRightWidth,
-                PropertyValue::Number(convert_border_width(&bw.right)),
+                PropertyValue::Length(convert_border_width_lp(&bw.right)),
                 imp,
             );
             push_decl(
                 out,
                 ord,
                 PropertyIdKind::BorderBottomWidth,
-                PropertyValue::Number(convert_border_width(&bw.bottom)),
+                PropertyValue::Length(convert_border_width_lp(&bw.bottom)),
                 imp,
             );
             push_decl(
                 out,
                 ord,
                 PropertyIdKind::BorderLeftWidth,
-                PropertyValue::Number(convert_border_width(&bw.left)),
+                PropertyValue::Length(convert_border_width_lp(&bw.left)),
+                imp,
+            );
+        }
+        Property::BorderBlockWidth(bw) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderBlockStartWidth,
+                PropertyValue::Length(convert_border_width_lp(&bw.start)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderBlockEndWidth,
+                PropertyValue::Length(convert_border_width_lp(&bw.end)),
+                imp,
+            );
+        }
+        Property::BorderInlineWidth(bw) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderInlineStartWidth,
+                PropertyValue::Length(convert_border_width_lp(&bw.start)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderInlineEndWidth,
+                PropertyValue::Length(convert_border_width_lp(&bw.end)),
                 imp,
             );
         }
@@ -1994,7 +2964,7 @@ fn compile_property(
             }
         }
         Property::Border(b) => {
-            let w = convert_border_width(&b.width);
+            let w = convert_border_width_lp(&b.width);
             let s = convert_line_style(&b.style);
             let c = convert_color(&b.color).unwrap_or(CssColor::CurrentColor);
             for (wk, sk, ck) in [
@@ -2019,7 +2989,7 @@ fn compile_property(
                     PropertyIdKind::BorderLeftColor,
                 ),
             ] {
-                push_decl(out, ord, wk, PropertyValue::Number(w), imp);
+                push_decl(out, ord, wk, PropertyValue::Length(w.clone()), imp);
                 push_decl(out, ord, sk, PropertyValue::LineStyle(s), imp);
                 push_decl(out, ord, ck, PropertyValue::Color(c), imp);
             }
@@ -2029,7 +2999,7 @@ fn compile_property(
                 out,
                 ord,
                 PropertyIdKind::BorderTopWidth,
-                PropertyValue::Number(convert_border_width(&b.width)),
+                PropertyValue::Length(convert_border_width_lp(&b.width)),
                 imp,
             );
             push_decl(
@@ -2054,7 +3024,7 @@ fn compile_property(
                 out,
                 ord,
                 PropertyIdKind::BorderRightWidth,
-                PropertyValue::Number(convert_border_width(&b.width)),
+                PropertyValue::Length(convert_border_width_lp(&b.width)),
                 imp,
             );
             push_decl(
@@ -2079,7 +3049,7 @@ fn compile_property(
                 out,
                 ord,
                 PropertyIdKind::BorderBottomWidth,
-                PropertyValue::Number(convert_border_width(&b.width)),
+                PropertyValue::Length(convert_border_width_lp(&b.width)),
                 imp,
             );
             push_decl(
@@ -2104,7 +3074,7 @@ fn compile_property(
                 out,
                 ord,
                 PropertyIdKind::BorderLeftWidth,
-                PropertyValue::Number(convert_border_width(&b.width)),
+                PropertyValue::Length(convert_border_width_lp(&b.width)),
                 imp,
             );
             push_decl(
@@ -2123,6 +3093,342 @@ fn compile_property(
                     imp,
                 );
             }
+        }
+        Property::BorderBlockStartStyle(s) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::BorderBlockStartStyle,
+            PropertyValue::LineStyle(convert_line_style(s)),
+            imp,
+        ),
+        Property::BorderBlockEndStyle(s) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::BorderBlockEndStyle,
+            PropertyValue::LineStyle(convert_line_style(s)),
+            imp,
+        ),
+        Property::BorderInlineStartStyle(s) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::BorderInlineStartStyle,
+            PropertyValue::LineStyle(convert_line_style(s)),
+            imp,
+        ),
+        Property::BorderInlineEndStyle(s) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::BorderInlineEndStyle,
+            PropertyValue::LineStyle(convert_line_style(s)),
+            imp,
+        ),
+        Property::BorderBlockStyle(bs) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderBlockStartStyle,
+                PropertyValue::LineStyle(convert_line_style(&bs.start)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderBlockEndStyle,
+                PropertyValue::LineStyle(convert_line_style(&bs.end)),
+                imp,
+            );
+        }
+        Property::BorderInlineStyle(bs) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderInlineStartStyle,
+                PropertyValue::LineStyle(convert_line_style(&bs.start)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderInlineEndStyle,
+                PropertyValue::LineStyle(convert_line_style(&bs.end)),
+                imp,
+            );
+        }
+        Property::BorderBlockStartColor(c) => {
+            if let Some(v) = convert_color(c) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::BorderBlockStartColor,
+                    PropertyValue::Color(v),
+                    imp,
+                );
+            }
+        }
+        Property::BorderBlockEndColor(c) => {
+            if let Some(v) = convert_color(c) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::BorderBlockEndColor,
+                    PropertyValue::Color(v),
+                    imp,
+                );
+            }
+        }
+        Property::BorderInlineStartColor(c) => {
+            if let Some(v) = convert_color(c) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::BorderInlineStartColor,
+                    PropertyValue::Color(v),
+                    imp,
+                );
+            }
+        }
+        Property::BorderInlineEndColor(c) => {
+            if let Some(v) = convert_color(c) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::BorderInlineEndColor,
+                    PropertyValue::Color(v),
+                    imp,
+                );
+            }
+        }
+        Property::BorderBlockColor(bc) => {
+            if let Some(v) = convert_color(&bc.start) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::BorderBlockStartColor,
+                    PropertyValue::Color(v),
+                    imp,
+                );
+            }
+            if let Some(v) = convert_color(&bc.end) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::BorderBlockEndColor,
+                    PropertyValue::Color(v),
+                    imp,
+                );
+            }
+        }
+        Property::BorderInlineColor(bc) => {
+            if let Some(v) = convert_color(&bc.start) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::BorderInlineStartColor,
+                    PropertyValue::Color(v),
+                    imp,
+                );
+            }
+            if let Some(v) = convert_color(&bc.end) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::BorderInlineEndColor,
+                    PropertyValue::Color(v),
+                    imp,
+                );
+            }
+        }
+        Property::BorderBlockStart(b) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderBlockStartWidth,
+                PropertyValue::Length(convert_border_width_lp(&b.width)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderBlockStartStyle,
+                PropertyValue::LineStyle(convert_line_style(&b.style)),
+                imp,
+            );
+            if let Some(c) = convert_color(&b.color) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::BorderBlockStartColor,
+                    PropertyValue::Color(c),
+                    imp,
+                );
+            }
+        }
+        Property::BorderBlockEnd(b) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderBlockEndWidth,
+                PropertyValue::Length(convert_border_width_lp(&b.width)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderBlockEndStyle,
+                PropertyValue::LineStyle(convert_line_style(&b.style)),
+                imp,
+            );
+            if let Some(c) = convert_color(&b.color) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::BorderBlockEndColor,
+                    PropertyValue::Color(c),
+                    imp,
+                );
+            }
+        }
+        Property::BorderInlineStart(b) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderInlineStartWidth,
+                PropertyValue::Length(convert_border_width_lp(&b.width)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderInlineStartStyle,
+                PropertyValue::LineStyle(convert_line_style(&b.style)),
+                imp,
+            );
+            if let Some(c) = convert_color(&b.color) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::BorderInlineStartColor,
+                    PropertyValue::Color(c),
+                    imp,
+                );
+            }
+        }
+        Property::BorderInlineEnd(b) => {
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderInlineEndWidth,
+                PropertyValue::Length(convert_border_width_lp(&b.width)),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderInlineEndStyle,
+                PropertyValue::LineStyle(convert_line_style(&b.style)),
+                imp,
+            );
+            if let Some(c) = convert_color(&b.color) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::BorderInlineEndColor,
+                    PropertyValue::Color(c),
+                    imp,
+                );
+            }
+        }
+        Property::BorderBlock(b) => {
+            let w = convert_border_width_lp(&b.width);
+            let s = convert_line_style(&b.style);
+            let c = convert_color(&b.color);
+            for (wk, sk, ck) in [
+                (
+                    PropertyIdKind::BorderBlockStartWidth,
+                    PropertyIdKind::BorderBlockStartStyle,
+                    PropertyIdKind::BorderBlockStartColor,
+                ),
+                (
+                    PropertyIdKind::BorderBlockEndWidth,
+                    PropertyIdKind::BorderBlockEndStyle,
+                    PropertyIdKind::BorderBlockEndColor,
+                ),
+            ] {
+                push_decl(out, ord, wk, PropertyValue::Length(w.clone()), imp);
+                push_decl(out, ord, sk, PropertyValue::LineStyle(s), imp);
+                if let Some(col) = c {
+                    push_decl(out, ord, ck, PropertyValue::Color(col), imp);
+                }
+            }
+        }
+        Property::BorderInline(b) => {
+            let w = convert_border_width_lp(&b.width);
+            let s = convert_line_style(&b.style);
+            let c = convert_color(&b.color);
+            for (wk, sk, ck) in [
+                (
+                    PropertyIdKind::BorderInlineStartWidth,
+                    PropertyIdKind::BorderInlineStartStyle,
+                    PropertyIdKind::BorderInlineStartColor,
+                ),
+                (
+                    PropertyIdKind::BorderInlineEndWidth,
+                    PropertyIdKind::BorderInlineEndStyle,
+                    PropertyIdKind::BorderInlineEndColor,
+                ),
+            ] {
+                push_decl(out, ord, wk, PropertyValue::Length(w.clone()), imp);
+                push_decl(out, ord, sk, PropertyValue::LineStyle(s), imp);
+                if let Some(col) = c {
+                    push_decl(out, ord, ck, PropertyValue::Color(col), imp);
+                }
+            }
+        }
+        Property::BorderStartStartRadius(r) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::BorderStartStartRadius,
+            PropertyValue::CornerRadius(convert_corner_radius(r)),
+            imp,
+        ),
+        Property::BorderStartEndRadius(r) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::BorderStartEndRadius,
+            PropertyValue::CornerRadius(convert_corner_radius(r)),
+            imp,
+        ),
+        Property::BorderEndStartRadius(r) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::BorderEndStartRadius,
+            PropertyValue::CornerRadius(convert_corner_radius(r)),
+            imp,
+        ),
+        Property::BorderEndEndRadius(r) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::BorderEndEndRadius,
+            PropertyValue::CornerRadius(convert_corner_radius(r)),
+            imp,
+        ),
+        Property::Resize(r) => {
+            use lightningcss::properties::ui::Resize as LR;
+            let mode = match r {
+                LR::None => ResizeMode::None,
+                LR::Both => ResizeMode::Both,
+                LR::Horizontal => ResizeMode::Horizontal,
+                LR::Vertical => ResizeMode::Vertical,
+                LR::Block => ResizeMode::Block,
+                LR::Inline => ResizeMode::Inline,
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::Resize,
+                PropertyValue::Resize(mode),
+                imp,
+            );
         }
         Property::BorderTopLeftRadius(r, _) => push_decl(
             out,
@@ -3065,7 +4371,9 @@ fn compile_property(
                 }
             };
             if let Some(kw) = global_kw {
-                push_decl(out, ord, kind, PropertyValue::Global(kw), imp);
+                for target in kind.shorthand_longhands() {
+                    push_decl(out, ord, target, PropertyValue::Global(kw), imp);
+                }
                 return;
             }
             push_decl(out, ord, kind, PropertyValue::Unresolved(tokens), imp);
@@ -3074,7 +4382,12 @@ fn compile_property(
             CustomPropertyName::Custom(dashed) => {
                 let idx = *ord;
                 *ord = ord.saturating_add(1);
-                let tokens = convert_token_list(&custom.value);
+                let mut tokens = convert_token_list(&custom.value);
+                if tokens.is_empty() {
+                    // CSS Custom Properties L1 §2: `--empty: ;` has a single-space token value (" "),
+                    // distinct from an absent/guaranteed-invalid custom property ("").
+                    tokens.push(CssToken::Space);
+                }
                 let global_kw = {
                     let mut iter = tokens.iter().filter(|t| !matches!(t, CssToken::Space));
                     match (iter.next(), iter.next()) {
@@ -3158,6 +4471,23 @@ fn convert_grid_line(line: &lightningcss::properties::grid::GridLine<'_>) -> Gri
     }
 }
 
+fn css_token_has_var(tok: &CssToken) -> bool {
+    match tok {
+        CssToken::Var { .. } => true,
+        CssToken::Function { args, .. } => args.iter().any(css_token_has_var),
+        _ => false,
+    }
+}
+
+fn parse_overscroll_mode(ident: &str) -> Option<OverscrollBehaviorMode> {
+    match ident.to_ascii_lowercase().as_str() {
+        "auto" => Some(OverscrollBehaviorMode::Auto),
+        "contain" => Some(OverscrollBehaviorMode::Contain),
+        "none" => Some(OverscrollBehaviorMode::None),
+        _ => None,
+    }
+}
+
 fn compile_extra_standard_property(
     name: &str,
     tokens: &TokenList<'_>,
@@ -3168,26 +4498,122 @@ fn compile_extra_standard_property(
 ) {
     let lower = name.to_ascii_lowercase();
     let owned = convert_token_list(tokens);
-    let first_ident = owned.iter().find_map(|t| match t {
-        CssToken::Ident(s) => Some(s.as_str()),
-        _ => None,
-    });
-    if let Some(id) = first_ident {
+    if owned.iter().any(css_token_has_var) {
+        if let Some(kind) = PropertyIdKind::from_name(&lower) {
+            push_decl(out, ord, kind, PropertyValue::Unresolved(owned), imp);
+            return;
+        }
+    }
+    let non_ws: SmallVec<[&CssToken; 4]> = owned
+        .iter()
+        .filter(|t| !matches!(t, CssToken::Space))
+        .collect();
+    let single_ident = if non_ws.len() == 1 {
+        match non_ws[0] {
+            CssToken::Ident(s) => Some(s.as_str()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(id) = single_ident {
         if let Some(kw) = GlobalKeyword::from_ident(id) {
             if let Some(kind) = PropertyIdKind::from_name(&lower) {
-                push_decl(out, ord, kind, PropertyValue::Global(kw), imp);
+                for target in kind.shorthand_longhands() {
+                    push_decl(out, ord, target, PropertyValue::Global(kw), imp);
+                }
                 return;
             }
         }
     }
     match lower.as_str() {
+        "writing-mode" => {
+            let Some(mode) = single_ident.and_then(|s| match s.to_ascii_lowercase().as_str() {
+                "horizontal-tb" => Some(WritingMode::HorizontalTb),
+                "vertical-rl" => Some(WritingMode::VerticalRl),
+                "vertical-lr" => Some(WritingMode::VerticalLr),
+                "sideways-rl" => Some(WritingMode::SidewaysRl),
+                "sideways-lr" => Some(WritingMode::SidewaysLr),
+                _ => None,
+            }) else {
+                return;
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::WritingMode,
+                PropertyValue::WritingMode(mode),
+                imp,
+            );
+        }
+        "caption-side" => {
+            let Some(mode) = single_ident.and_then(|s| match s.to_ascii_lowercase().as_str() {
+                "top" => Some(CaptionSideMode::Top),
+                "bottom" => Some(CaptionSideMode::Bottom),
+                "block-start" => Some(CaptionSideMode::BlockStart),
+                "block-end" => Some(CaptionSideMode::BlockEnd),
+                "inline-start" => Some(CaptionSideMode::InlineStart),
+                "inline-end" => Some(CaptionSideMode::InlineEnd),
+                _ => None,
+            }) else {
+                return;
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::CaptionSide,
+                PropertyValue::CaptionSide(mode),
+                imp,
+            );
+        }
+        "overscroll-behavior-x"
+        | "overscroll-behavior-y"
+        | "overscroll-behavior-inline"
+        | "overscroll-behavior-block" => {
+            let Some(mode) = single_ident.and_then(parse_overscroll_mode) else {
+                return;
+            };
+            let kind = PropertyIdKind::from_name(&lower).unwrap();
+            push_decl(out, ord, kind, PropertyValue::OverscrollBehavior(mode), imp);
+        }
+        "overscroll-behavior" => {
+            let idents: SmallVec<[OverscrollBehaviorMode; 2]> = non_ws
+                .iter()
+                .filter_map(|t| match t {
+                    CssToken::Ident(s) => parse_overscroll_mode(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if idents.is_empty() || idents.len() != non_ws.len() || idents.len() > 2 {
+                return;
+            }
+            let x = idents[0];
+            let y = *idents.get(1).unwrap_or(&x);
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::OverscrollBehaviorX,
+                PropertyValue::OverscrollBehavior(x),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::OverscrollBehaviorY,
+                PropertyValue::OverscrollBehavior(y),
+                imp,
+            );
+        }
         "float" => {
-            let mode = match first_ident.map(str::to_ascii_lowercase).as_deref() {
-                Some("left") => FloatMode::Left,
-                Some("right") => FloatMode::Right,
-                Some("inline-start") => FloatMode::InlineStart,
-                Some("inline-end") => FloatMode::InlineEnd,
-                _ => FloatMode::None,
+            let Some(mode) = single_ident.and_then(|s| match s.to_ascii_lowercase().as_str() {
+                "none" => Some(FloatMode::None),
+                "left" => Some(FloatMode::Left),
+                "right" => Some(FloatMode::Right),
+                "inline-start" => Some(FloatMode::InlineStart),
+                "inline-end" => Some(FloatMode::InlineEnd),
+                _ => None,
+            }) else {
+                return;
             };
             push_decl(
                 out,
@@ -3198,13 +4624,16 @@ fn compile_extra_standard_property(
             );
         }
         "clear" => {
-            let mode = match first_ident.map(str::to_ascii_lowercase).as_deref() {
-                Some("left") => ClearMode::Left,
-                Some("right") => ClearMode::Right,
-                Some("both") => ClearMode::Both,
-                Some("inline-start") => ClearMode::InlineStart,
-                Some("inline-end") => ClearMode::InlineEnd,
-                _ => ClearMode::None,
+            let Some(mode) = single_ident.and_then(|s| match s.to_ascii_lowercase().as_str() {
+                "none" => Some(ClearMode::None),
+                "left" => Some(ClearMode::Left),
+                "right" => Some(ClearMode::Right),
+                "both" => Some(ClearMode::Both),
+                "inline-start" => Some(ClearMode::InlineStart),
+                "inline-end" => Some(ClearMode::InlineEnd),
+                _ => None,
+            }) else {
+                return;
             };
             push_decl(
                 out,
@@ -3215,9 +4644,13 @@ fn compile_extra_standard_property(
             );
         }
         "pointer-events" => {
-            let mode = match first_ident.map(str::to_ascii_lowercase).as_deref() {
-                Some("none") => PointerEventsMode::None,
-                _ => PointerEventsMode::Auto,
+            let Some(mode) = single_ident.and_then(|s| match s.to_ascii_lowercase().as_str() {
+                "none" => Some(PointerEventsMode::None),
+                "auto" | "all" | "visiblepainted" | "visiblefill" | "visiblestroke" | "visible"
+                | "painted" | "fill" | "stroke" => Some(PointerEventsMode::Auto),
+                _ => None,
+            }) else {
+                return;
             };
             push_decl(
                 out,
@@ -3245,9 +4678,12 @@ fn compile_extra_standard_property(
             );
         }
         "border-collapse" => {
-            let mode = match first_ident.map(str::to_ascii_lowercase).as_deref() {
-                Some("collapse") => BorderCollapseMode::Collapse,
-                _ => BorderCollapseMode::Separate,
+            let Some(mode) = single_ident.and_then(|s| match s.to_ascii_lowercase().as_str() {
+                "collapse" => Some(BorderCollapseMode::Collapse),
+                "separate" => Some(BorderCollapseMode::Separate),
+                _ => None,
+            }) else {
+                return;
             };
             push_decl(
                 out,
@@ -3258,9 +4694,12 @@ fn compile_extra_standard_property(
             );
         }
         "table-layout" => {
-            let mode = match first_ident.map(str::to_ascii_lowercase).as_deref() {
-                Some("fixed") => TableLayoutMode::Fixed,
-                _ => TableLayoutMode::Auto,
+            let Some(mode) = single_ident.and_then(|s| match s.to_ascii_lowercase().as_str() {
+                "fixed" => Some(TableLayoutMode::Fixed),
+                "auto" => Some(TableLayoutMode::Auto),
+                _ => None,
+            }) else {
+                return;
             };
             push_decl(
                 out,
