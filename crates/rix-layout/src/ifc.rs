@@ -10,7 +10,7 @@ use rix_core::{Point, Rect};
 use rix_css::{
     ComputedStyle, DirectionMode, EvalContext, FontStyleMode, LineBreakMode, LineHeightValue,
     OverflowMode, OverflowWrapMode, TextAlignMode, TextOverflowMode, TextWrapMode,
-    VerticalAlignMode, WhiteSpaceCollapseMode, WordBreakMode,
+    VerticalAlignMode, WhiteSpaceCollapseMode, WhiteSpaceTrim, WordBreakMode,
 };
 use rix_text::{FontDatabase, FontDescriptor, FontFaceSet, FontId, FontStyle, FontWeight};
 
@@ -122,7 +122,10 @@ enum InlineItem {
         style: Arc<ComputedStyle>,
         box_id: BoxId,
         is_space: bool,
+        is_preserved_space: bool,
+        is_tab: bool,
         can_break_before: bool,
+        can_emergency_break_before: bool,
         inline_stack: Vec<ActiveInline>,
     },
     HardBreak,
@@ -143,7 +146,10 @@ struct LinePiece {
     descent: f32,
     vertical_align: VerticalAlignMode,
     is_space: bool,
+    is_preserved_space: bool,
+    hangs_at_line_end: bool,
     can_break_before: bool,
+    can_emergency_break_before: bool,
     inline_stack: Vec<ActiveInline>,
     payload: LinePiecePayload,
 }
@@ -297,6 +303,8 @@ pub fn measure_ifc_inline_min_max(
     container_id: BoxId,
     space: ConstraintSpace,
 ) -> (f32, f32) {
+    let container_overflow_anywhere =
+        ctx.tree.get(container_id).style.text.overflow_wrap == OverflowWrapMode::Anywhere;
     let items = collect_inline_items(ctx, container_id, space);
     let mut min_w = 0.0f32;
     let mut max_w = 0.0f32;
@@ -323,14 +331,58 @@ pub fn measure_ifc_inline_min_max(
                 text,
                 style,
                 is_space,
+                is_preserved_space,
+                is_tab,
                 can_break_before,
+                can_emergency_break_before,
                 ..
             } => {
                 let font_id = ctx.resolve_font(style);
                 let font_size = style.text.font_size_px.max(1.0);
-                let w = measure_shaped_width(ctx, text, font_id, font_size, style);
+                let w = if *is_tab {
+                    let w_eval = ctx.eval_context_for(style, &space);
+                    compute_tab_advance(ctx, font_id, font_size, style, w_eval, current_line_w)
+                } else {
+                    measure_shaped_width(ctx, text, font_id, font_size, style)
+                };
+                let breaks_min_content = *can_break_before
+                    || (*can_emergency_break_before
+                        && (container_overflow_anywhere
+                            || style.text.overflow_wrap == OverflowWrapMode::Anywhere));
                 if *is_space {
-                    if seen_non_space {
+                    if *is_preserved_space {
+                        let hangs = style.text.white_space_collapse
+                            == WhiteSpaceCollapseMode::Preserve
+                            && style.text.text_wrap_mode == TextWrapMode::Wrap;
+                        if hangs {
+                            // `pre-wrap`: preserved spaces hang at line end (not counted in min-content
+                            // or trailing max-content), but count between non-space tokens.
+                            if seen_non_space {
+                                pending_space_w += w;
+                            }
+                            current_unbreakable_w = 0.0;
+                        } else {
+                            // `pre` (`preserve nowrap`) or `break-spaces`: preserved spaces do NOT hang.
+                            current_line_w += pending_space_w + w;
+                            pending_space_w = 0.0;
+                            seen_non_space = true;
+                            max_w = max_w.max(current_line_w);
+                            if style.text.text_wrap_mode == TextWrapMode::Nowrap {
+                                current_unbreakable_w += w;
+                                min_w = min_w.max(current_unbreakable_w);
+                            } else {
+                                // `break-spaces`: each space may wrap after itself, contributing at least
+                                // one space advance to `min-content` (CSS Text L4 §3).
+                                if breaks_min_content {
+                                    current_unbreakable_w = w;
+                                } else {
+                                    current_unbreakable_w += w;
+                                }
+                                min_w = min_w.max(current_unbreakable_w);
+                                current_unbreakable_w = 0.0;
+                            }
+                        }
+                    } else if seen_non_space {
                         pending_space_w += w;
                         if style.text.text_wrap_mode == TextWrapMode::Nowrap {
                             current_unbreakable_w += w;
@@ -339,7 +391,7 @@ pub fn measure_ifc_inline_min_max(
                         }
                     }
                 } else {
-                    if *can_break_before {
+                    if breaks_min_content {
                         current_unbreakable_w = w;
                     } else {
                         current_unbreakable_w += w;
@@ -497,36 +549,51 @@ pub fn layout_ifc(
                 style,
                 box_id,
                 is_space,
+                is_preserved_space,
+                is_tab,
                 can_break_before,
+                can_emergency_break_before,
                 inline_stack,
             } => {
                 // Skip leading collapsible spaces at line start.
-                if is_space
-                    && cur_pieces.is_empty()
-                    && matches!(
-                        style.text.white_space_collapse,
-                        WhiteSpaceCollapseMode::Collapse
-                            | WhiteSpaceCollapseMode::PreserveBreaks
-                            | WhiteSpaceCollapseMode::Discard
-                    )
-                {
+                if is_space && !is_preserved_space && cur_pieces.is_empty() {
                     continue;
                 }
 
                 let font_id = ctx.resolve_font(&style);
                 let font_size = style.text.font_size_px.max(1.0);
-                let (glyphs, width) = shape_word_glyphs(ctx, &text, font_id, font_size, &style);
                 let word_eval = ctx.eval_context_for(&style, &space);
+                let (glyphs, width) = if is_tab {
+                    let adv = compute_tab_advance(
+                        ctx,
+                        font_id,
+                        font_size,
+                        &style,
+                        word_eval,
+                        cur_x + pending_left_edge,
+                    );
+                    (Vec::new(), adv)
+                } else {
+                    shape_word_glyphs(ctx, &text, font_id, font_size, &style)
+                };
                 let (asc, desc, lh) = line_box_metrics(ctx.font_db, font_id, &style, word_eval);
 
+                let hangs_at_line_end = is_space
+                    && is_preserved_space
+                    && style.text.white_space_collapse == WhiteSpaceCollapseMode::Preserve
+                    && style.text.text_wrap_mode == TextWrapMode::Wrap;
                 let band_w = (band_right - band_left).max(0.0);
                 let item_allows_wrap =
                     allow_wrap || style.text.text_wrap_mode == TextWrapMode::Wrap;
-                let overflows = !is_space
+                // Preserved `break-spaces` can wrap when overflowing; collapsible and hanging
+                // `pre-wrap` spaces do not trigger a wrap before themselves.
+                let triggers_overflow_wrap = (!is_space
+                    || (is_preserved_space
+                        && style.text.white_space_collapse == WhiteSpaceCollapseMode::BreakSpaces))
                     && !cur_pieces.is_empty()
                     && cur_x + pending_left_edge + width > band_w + 0.05;
 
-                if item_allows_wrap && overflows {
+                if item_allows_wrap && triggers_overflow_wrap {
                     if can_break_before {
                         let line = finish_line(
                             ctx,
@@ -583,10 +650,63 @@ pub fn layout_ifc(
                             .last()
                             .map_or(wrapped_line_indent, |p| p.x + p.width);
                         cur_pieces = carried;
+                    } else if can_emergency_break_before {
+                        // Emergency break between `nowrap` spans under `overflow-wrap: break-word`
+                        // only after confirming no earlier normal soft-wrap opportunity exists.
+                        let line = finish_line(
+                            ctx,
+                            &mut cur_pieces,
+                            band_left,
+                            band_right,
+                            cursor_y,
+                            strut_ascent,
+                            strut_descent,
+                            strut_line_h,
+                            &container_style,
+                            false,
+                            want_ellipsis,
+                            &mut seen_inline_starts,
+                        );
+                        cursor_y += line.height;
+                        lines.push(line);
+                        let (bl, br) = floats.available_band(cursor_y, lh, container_width);
+                        band_left = bl;
+                        band_right = br;
+                        cur_x = wrapped_line_indent;
+                    } else if let Some(split_idx) = cur_pieces
+                        .iter()
+                        .rposition(|p| p.can_emergency_break_before)
+                        .filter(|&i| i > 0)
+                    {
+                        let mut carried = cur_pieces.split_off(split_idx);
+                        let line = finish_line(
+                            ctx,
+                            &mut cur_pieces,
+                            band_left,
+                            band_right,
+                            cursor_y,
+                            strut_ascent,
+                            strut_descent,
+                            strut_line_h,
+                            &container_style,
+                            false,
+                            want_ellipsis,
+                            &mut seen_inline_starts,
+                        );
+                        cursor_y += line.height;
+                        lines.push(line);
+                        let (bl, br) = floats.available_band(cursor_y, lh, container_width);
+                        band_left = bl;
+                        band_right = br;
+                        let shift = carried.first().map_or(0.0, |p| p.x) - wrapped_line_indent;
+                        for cp in &mut carried {
+                            cp.x -= shift;
+                        }
+                        cur_x = carried
+                            .last()
+                            .map_or(wrapped_line_indent, |p| p.x + p.width);
+                        cur_pieces = carried;
                     } else if matches!(
-                        container_style.text.overflow_wrap,
-                        OverflowWrapMode::BreakWord | OverflowWrapMode::Anywhere
-                    ) || matches!(
                         style.text.overflow_wrap,
                         OverflowWrapMode::BreakWord | OverflowWrapMode::Anywhere
                     ) || style.text.line_break == LineBreakMode::Anywhere
@@ -649,7 +769,10 @@ pub fn layout_ifc(
                             descent: desc,
                             vertical_align: text_va,
                             is_space: false,
+                            is_preserved_space: false,
+                            hangs_at_line_end: false,
                             can_break_before: ci > 0 || can_break_before,
+                            can_emergency_break_before: false,
                             inline_stack: inline_stack.clone(),
                             payload: LinePiecePayload::Text {
                                 font_id,
@@ -681,7 +804,7 @@ pub fn layout_ifc(
                             let (bl, br) = floats.available_band(cursor_y, lh, container_width);
                             band_left = bl;
                             band_right = br;
-                            cur_x = 0.0;
+                            cur_x = wrapped_line_indent;
                         }
                     }
                     continue;
@@ -706,7 +829,10 @@ pub fn layout_ifc(
                     descent: desc,
                     vertical_align: text_va,
                     is_space,
+                    is_preserved_space,
+                    hangs_at_line_end,
                     can_break_before,
+                    can_emergency_break_before,
                     inline_stack,
                     payload: LinePiecePayload::Text {
                         font_id,
@@ -799,7 +925,10 @@ pub fn layout_ifc(
                     descent: desc,
                     vertical_align: style.box_model.vertical_align,
                     is_space: false,
+                    is_preserved_space: false,
+                    hangs_at_line_end: false,
                     can_break_before,
+                    can_emergency_break_before: false,
                     inline_stack,
                     payload: LinePiecePayload::Atomic(Box::new(frag)),
                 });
@@ -894,8 +1023,17 @@ fn finish_line(
     want_ellipsis: bool,
     seen_inline_starts: &mut Vec<BoxId>,
 ) -> FinishedLine {
-    // Trim trailing collapsible whitespace.
-    while pieces.last().is_some_and(|p| p.is_space) {
+    // Trim trailing collapsible whitespace (never preserved spaces in `pre`/`break-spaces`).
+    while pieces
+        .last()
+        .is_some_and(|p| p.is_space && !p.is_preserved_space)
+    {
+        pieces.pop();
+    }
+    // CSS Text L3 §4.1.3: preserved trailing spaces under `pre-wrap` hang at end of line
+    // without contributing to line content width or scrollable overflow, while still
+    // preserving a non-empty line box height (`strut_line_h`) if they were the only content.
+    while pieces.last().is_some_and(|p| p.hangs_at_line_end) {
         pieces.pop();
     }
 
@@ -910,6 +1048,15 @@ fn finish_line(
     }
 
     let content_width = pieces.last().map_or(0.0, |p| (p.x + p.width).max(0.0));
+
+    // UAX #9 / CSS Writing Modes L3: reorder visual horizontal placement of pieces on RTL lines.
+    if container_style.text.direction == DirectionMode::Rtl && pieces.len() > 1 {
+        let mut cursor_rtl = content_width;
+        for p in pieces.iter_mut() {
+            cursor_rtl -= p.width;
+            p.x = cursor_rtl.max(0.0);
+        }
+    }
 
     // Horizontal alignment (`text-align`).
     let extra_space = (band_width - content_width).max(0.0);
@@ -1237,7 +1384,10 @@ fn apply_ellipsis_truncation(
                         descent: piece.descent,
                         vertical_align: piece.vertical_align,
                         is_space: false,
+                        is_preserved_space: false,
+                        hangs_at_line_end: false,
                         can_break_before: piece.can_break_before,
+                        can_emergency_break_before: piece.can_emergency_break_before,
                         inline_stack: piece.inline_stack,
                         payload: LinePiecePayload::Text {
                             font_id,
@@ -1265,7 +1415,10 @@ fn apply_ellipsis_truncation(
         descent: desc,
         vertical_align: VerticalAlignMode::Baseline,
         is_space: false,
+        is_preserved_space: false,
+        hangs_at_line_end: false,
         can_break_before: false,
+        can_emergency_break_before: false,
         inline_stack: Vec::new(),
         payload: LinePiecePayload::Text {
             font_id: ell_font,
@@ -1280,6 +1433,8 @@ fn apply_ellipsis_truncation(
 
 struct InlineCollectState {
     prev_char: Option<char>,
+    prev_non_bidi: Option<char>,
+    prev_ended_with_space: bool,
     prev_nowrap_box: Option<BoxId>,
     container_style: Arc<ComputedStyle>,
 }
@@ -1294,22 +1449,224 @@ fn collect_inline_items(
     let container_style = Arc::clone(&ctx.tree.get(container_id).style);
     let mut state = InlineCollectState {
         prev_char: None,
+        prev_non_bidi: None,
+        prev_ended_with_space: false,
         prev_nowrap_box: None,
         container_style,
     };
     let children = ctx.tree.get(container_id).children.clone();
-    for cid in children {
-        collect_inline_recursive(ctx, cid, space, &mut stack, &mut state, &mut items);
+    // Pre-collect the first visible non-bidi, non-ASCII-space character following each text box
+    // (ignoring inline box boundaries and out-of-flow elements) for CSS Text L4 §4.1.2.
+    let mut text_order: Vec<(BoxId, Option<char>)> = Vec::new();
+    collect_text_first_chars(ctx, &children, &mut text_order);
+    let mut next_char_map: std::collections::HashMap<BoxId, Option<char>> =
+        std::collections::HashMap::with_capacity(text_order.len());
+    for i in 0..text_order.len() {
+        let next_ch = text_order[i + 1..].iter().find_map(|&(_, ch)| ch);
+        next_char_map.insert(text_order[i].0, next_ch);
     }
+
+    for cid in children {
+        collect_inline_recursive(
+            ctx,
+            cid,
+            space,
+            &mut stack,
+            &mut state,
+            &next_char_map,
+            &mut items,
+        );
+    }
+    apply_white_space_trim(&mut items);
     items
 }
 
+fn collect_text_first_chars(
+    ctx: &LayoutContext<'_>,
+    ids: &[BoxId],
+    out: &mut Vec<(BoxId, Option<char>)>,
+) {
+    for &cid in ids {
+        let b = ctx.tree.get(cid);
+        if b.is_out_of_flow || b.is_float {
+            continue;
+        }
+        match &b.kind {
+            BoxKind::Inline => collect_text_first_chars(ctx, &b.children, out),
+            BoxKind::Text(raw) => {
+                let first = raw.chars().find(|&c| {
+                    !is_ascii_collapsible_ws(c) && !crate::line_break::is_bidi_control(c)
+                });
+                out.push((cid, first));
+            }
+            BoxKind::Replaced(ReplacedKind::LineBreak) => {
+                out.push((cid, Some('\n')));
+            }
+            BoxKind::InlineBlock { .. }
+            | BoxKind::Replaced(_)
+            | BoxKind::Block { .. }
+            | BoxKind::Table
+            | BoxKind::AnonymousTable
+            | BoxKind::AnonymousBlock => {
+                out.push((cid, Some('\u{FFFC}')));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Applies CSS Text L4 §3.4 `white-space-trim` (`discard-before | discard-after | discard-inner`)
+/// on collected inline items, merging surrounding break opportunities when a space is discarded.
+fn apply_white_space_trim(items: &mut Vec<InlineItem>) {
+    let mut trim_map: std::collections::HashMap<BoxId, WhiteSpaceTrim> =
+        std::collections::HashMap::new();
+    for item in items.iter() {
+        if let InlineItem::PushInline(info) = item {
+            if !info.style.white_space_trim.is_none() {
+                trim_map.insert(info.box_id, info.style.white_space_trim);
+            }
+        }
+    }
+    if trim_map.is_empty() {
+        return;
+    }
+
+    let mut remove = vec![false; items.len()];
+    let mut clear_break = vec![false; items.len()];
+
+    for i in 0..items.len() {
+        match &items[i] {
+            InlineItem::PushInline(info) => {
+                let trim = info.style.white_space_trim;
+                if trim.0 & WhiteSpaceTrim::DISCARD_BEFORE != 0 {
+                    // Remove immediately preceding collapsible space(s) before this box.
+                    let mut j = i;
+                    let mut removed_any = false;
+                    while j > 0 {
+                        j -= 1;
+                        match &items[j] {
+                            InlineItem::PushInline(_)
+                            | InlineItem::PopInline(_)
+                            | InlineItem::OutOfFlow(_) => {}
+                            InlineItem::Word {
+                                is_space: true,
+                                is_preserved_space: false,
+                                ..
+                            } => {
+                                remove[j] = true;
+                                removed_any = true;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if removed_any {
+                        // Also remove soft-wrap opportunity at the first non-space word inside/after.
+                        for (k, it) in items.iter().enumerate().skip(i + 1) {
+                            match it {
+                                InlineItem::PushInline(_)
+                                | InlineItem::PopInline(_)
+                                | InlineItem::OutOfFlow(_) => {}
+                                InlineItem::Word {
+                                    is_space: false, ..
+                                } => {
+                                    clear_break[k] = true;
+                                    break;
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                }
+                if trim.0 & WhiteSpaceTrim::DISCARD_INNER != 0 {
+                    for (k, it) in items.iter().enumerate().skip(i + 1) {
+                        match it {
+                            InlineItem::Word {
+                                is_space: true,
+                                is_preserved_space: false,
+                                ..
+                            } => remove[k] = true,
+                            InlineItem::PushInline(_) | InlineItem::OutOfFlow(_) => {}
+                            _ => break,
+                        }
+                    }
+                }
+            }
+            InlineItem::PopInline(bid) => {
+                if let Some(&trim) = trim_map.get(bid) {
+                    if trim.0 & WhiteSpaceTrim::DISCARD_INNER != 0 {
+                        let mut j = i;
+                        while j > 0 {
+                            j -= 1;
+                            match &items[j] {
+                                InlineItem::Word {
+                                    is_space: true,
+                                    is_preserved_space: false,
+                                    ..
+                                } => remove[j] = true,
+                                InlineItem::PopInline(_) | InlineItem::OutOfFlow(_) => {}
+                                _ => break,
+                            }
+                        }
+                    }
+                    if trim.0 & WhiteSpaceTrim::DISCARD_AFTER != 0 {
+                        let mut removed_any = false;
+                        for (k, it) in items.iter().enumerate().skip(i + 1) {
+                            match it {
+                                InlineItem::PushInline(_)
+                                | InlineItem::PopInline(_)
+                                | InlineItem::OutOfFlow(_) => {}
+                                InlineItem::Word {
+                                    is_space: true,
+                                    is_preserved_space: false,
+                                    ..
+                                } => {
+                                    remove[k] = true;
+                                    removed_any = true;
+                                }
+                                InlineItem::Word {
+                                    is_space: false, ..
+                                } => {
+                                    if removed_any {
+                                        clear_break[k] = true;
+                                    }
+                                    break;
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (i, item) in items.iter_mut().enumerate() {
+        if clear_break[i] {
+            if let InlineItem::Word {
+                can_break_before, ..
+            } = item
+            {
+                *can_break_before = false;
+            }
+        }
+    }
+    let mut idx = 0usize;
+    items.retain(|_| {
+        let keep = !remove[idx];
+        idx += 1;
+        keep
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 fn collect_inline_recursive(
     ctx: &LayoutContext<'_>,
     box_id: BoxId,
     space: ConstraintSpace,
     stack: &mut Vec<ActiveInline>,
     state: &mut InlineCollectState,
+    next_char_map: &std::collections::HashMap<BoxId, Option<char>>,
     out: &mut Vec<InlineItem>,
 ) {
     let b = ctx.tree.get(box_id);
@@ -1334,7 +1691,7 @@ fn collect_inline_recursive(
             out.push(InlineItem::PushInline(active.clone()));
             stack.push(active);
             for &cid in &b.children {
-                collect_inline_recursive(ctx, cid, space, stack, state, out);
+                collect_inline_recursive(ctx, cid, space, stack, state, next_char_map, out);
             }
             stack.pop();
             out.push(InlineItem::PopInline(box_id));
@@ -1356,6 +1713,7 @@ fn collect_inline_recursive(
             } else {
                 None
             };
+            let next_non_bidi = next_char_map.get(&box_id).copied().flatten();
             tokenize_text(
                 &transformed,
                 &b.style,
@@ -1364,11 +1722,14 @@ fn collect_inline_recursive(
                 stack,
                 state,
                 cur_nowrap_box,
+                next_non_bidi,
                 out,
             );
         }
         BoxKind::Replaced(ReplacedKind::LineBreak) => {
             state.prev_char = None;
+            state.prev_non_bidi = None;
+            state.prev_ended_with_space = false;
             state.prev_nowrap_box = None;
             out.push(InlineItem::HardBreak);
         }
@@ -1381,6 +1742,8 @@ fn collect_inline_recursive(
             let can_break = state.container_style.text.text_wrap_mode == TextWrapMode::Wrap
                 && b.style.text.text_wrap_mode == TextWrapMode::Wrap;
             state.prev_char = Some('\u{FFFC}');
+            state.prev_non_bidi = Some('\u{FFFC}');
+            state.prev_ended_with_space = false;
             state.prev_nowrap_box = None;
             out.push(InlineItem::Atomic {
                 box_id,
@@ -1407,6 +1770,7 @@ fn tokenize_text(
     stack: &[ActiveInline],
     state: &mut InlineCollectState,
     cur_nowrap_box: Option<BoxId>,
+    next_non_bidi: Option<char>,
     out: &mut Vec<InlineItem>,
 ) {
     let collapse = style.text.white_space_collapse;
@@ -1424,169 +1788,153 @@ fn tokenize_text(
             | WhiteSpaceCollapseMode::BreakSpaces
     );
 
-    let boundary_can_break = |first_ch: char, st: &InlineCollectState| -> bool {
+    // Returns `(can_break_before, can_emergency_break_before)` at the start of this text node.
+    let boundary_breaks = |first_ch: char, st: &InlineCollectState| -> (bool, bool) {
         let Some(prev_ch) = st.prev_char else {
-            return false;
+            return (false, false);
         };
         if prev_ch == '\u{FFFC}' {
-            return st.container_style.text.text_wrap_mode == TextWrapMode::Wrap;
+            let can = st.container_style.text.text_wrap_mode == TextWrapMode::Wrap;
+            return (can, false);
         }
         if wrap_mode == TextWrapMode::Nowrap {
-            // CSS Text L3 §5.1: the boundary between two distinct `nowrap` inline boxes is
-            // governed by their enclosing container's `text-wrap-mode` / `overflow-wrap`.
+            // CSS Text L3 §5.1 & §5.5: the boundary between two distinct `nowrap` inline boxes
+            // is governed by their enclosing container:
+            // - `overflow-wrap: anywhere` creates a soft-wrap opportunity for both layout and min-content
+            //   only when overflowing, while normal UAX #14 breaks apply if container allows wrapping.
+            // - `overflow-wrap: break-word` creates an EMERGENCY break ONLY (NOT for min-content!).
             if st.container_style.text.text_wrap_mode == TextWrapMode::Wrap
                 && cur_nowrap_box != st.prev_nowrap_box
             {
-                return matches!(
-                    st.container_style.text.overflow_wrap,
-                    OverflowWrapMode::BreakWord | OverflowWrapMode::Anywhere
-                ) || crate::line_break::can_break_between(
+                if is_ascii_collapsible_ws(prev_ch) {
+                    return (true, false);
+                }
+                let uax = crate::line_break::can_break_between(
                     prev_ch,
                     first_ch,
                     &st.container_style,
                     lang,
                 );
+                if uax {
+                    return (true, false);
+                }
+                let emerg = matches!(
+                    st.container_style.text.overflow_wrap,
+                    OverflowWrapMode::BreakWord | OverflowWrapMode::Anywhere
+                );
+                return (false, emerg);
             }
-            return false;
+            return (false, false);
         }
         if is_ascii_collapsible_ws(prev_ch) {
-            return true;
+            return (true, false);
         }
-        crate::line_break::can_break_between(prev_ch, first_ch, style, lang)
+        (
+            crate::line_break::can_break_between(prev_ch, first_ch, style, lang),
+            false,
+        )
     };
 
     if preserve_spaces {
-        let tab_spaces = style.text.tab_size_num.round().clamp(0.0, 64.0) as usize;
         let is_break_spaces = collapse == WhiteSpaceCollapseMode::BreakSpaces;
         for (line_idx, raw_seg) in text.split('\n').enumerate() {
             if line_idx > 0 {
                 out.push(InlineItem::HardBreak);
                 state.prev_char = None;
+                state.prev_non_bidi = None;
+                state.prev_ended_with_space = false;
                 state.prev_nowrap_box = None;
             }
             if raw_seg.is_empty() {
                 continue;
             }
-            // Expand tabs cleanly to `tab-size` spaces when `tab_size_len` is not set.
-            let expanded: std::borrow::Cow<'_, str> = if raw_seg.contains('\t') {
-                let mut s = String::with_capacity(raw_seg.len());
-                for ch in raw_seg.chars() {
-                    if ch == '\t' {
-                        for _ in 0..tab_spaces {
-                            s.push(' ');
-                        }
-                    } else {
-                        s.push(ch);
-                    }
+            // Split around `\t` characters so CSS Text L3 §4.2 tab-stop layout computes
+            // exact horizontal advance relative to the line's current x position.
+            let mut part_start = 0usize;
+            let mut is_first_piece = true;
+            for (tab_idx, _) in raw_seg.match_indices('\t') {
+                if tab_idx > part_start {
+                    emit_preserved_segment(
+                        &raw_seg[part_start..tab_idx],
+                        style,
+                        lang,
+                        box_id,
+                        stack,
+                        state,
+                        cur_nowrap_box,
+                        wrap_mode,
+                        is_break_spaces,
+                        is_first_piece,
+                        &boundary_breaks,
+                        out,
+                    );
+                    is_first_piece = false;
                 }
-                std::borrow::Cow::Owned(s)
-            } else {
-                std::borrow::Cow::Borrowed(raw_seg)
-            };
-
-            let seg = expanded.as_ref();
-            if wrap_mode == TextWrapMode::Nowrap {
-                let first_ch = seg.chars().next().unwrap_or(' ');
-                let can_brk = boundary_can_break(first_ch, state);
-                let all_sp = seg.chars().all(|c| c == ' ');
+                let (can_b, can_eb) = if is_first_piece {
+                    boundary_breaks('\t', state)
+                } else {
+                    (wrap_mode == TextWrapMode::Wrap && is_break_spaces, false)
+                };
                 out.push(InlineItem::Word {
-                    text: seg.to_string(),
+                    text: "\t".to_string(),
                     style: Arc::clone(style),
                     box_id,
-                    is_space: all_sp,
-                    can_break_before: can_brk,
+                    is_space: true,
+                    is_preserved_space: true,
+                    is_tab: true,
+                    can_break_before: can_b,
+                    can_emergency_break_before: can_eb,
                     inline_stack: stack.to_vec(),
                 });
-            } else {
-                let mut breaks = crate::line_break::line_break_offsets(seg, style, lang);
-                if is_break_spaces {
-                    // CSS Text L3 §3: `break-spaces` allows wrapping after every preserved space.
-                    for (idx, ch) in seg.char_indices() {
-                        if ch == ' ' {
-                            let after = idx + 1;
-                            if after < seg.len() {
-                                if let Err(pos) = breaks.binary_search(&after) {
-                                    breaks.insert(pos, after);
-                                }
-                            }
-                        }
-                    }
-                }
-                let mut start = 0usize;
-                let mut seg_i = 0usize;
-                for &brk in breaks.iter().chain(std::iter::once(&seg.len())) {
-                    if brk <= start {
-                        continue;
-                    }
-                    let slice = &seg[start..brk];
-                    let can_brk = if seg_i == 0 {
-                        slice
-                            .chars()
-                            .next()
-                            .is_some_and(|c| boundary_can_break(c, state))
-                    } else {
-                        true
-                    };
-                    let all_sp = slice.chars().all(|c| c == ' ');
-                    out.push(InlineItem::Word {
-                        text: slice.to_string(),
-                        style: Arc::clone(style),
-                        box_id,
-                        is_space: all_sp,
-                        can_break_before: can_brk,
-                        inline_stack: stack.to_vec(),
-                    });
-                    start = brk;
-                    seg_i += 1;
-                }
+                state.prev_char = Some('\t');
+                state.prev_ended_with_space = true;
+                state.prev_nowrap_box = cur_nowrap_box;
+                is_first_piece = false;
+                part_start = tab_idx + 1;
             }
-            state.prev_char = seg.chars().last();
-            state.prev_nowrap_box = cur_nowrap_box;
+            if part_start < raw_seg.len() {
+                emit_preserved_segment(
+                    &raw_seg[part_start..],
+                    style,
+                    lang,
+                    box_id,
+                    stack,
+                    state,
+                    cur_nowrap_box,
+                    wrap_mode,
+                    is_break_spaces,
+                    is_first_piece,
+                    &boundary_breaks,
+                    out,
+                );
+            }
         }
         return;
     }
 
-    // Collapsible whitespace (`collapse`, `preserve-breaks`, `discard`).
-    // Per CSS Text L3 §4.1, only ASCII spaces/tabs/segment-breaks collapse; Unicode
-    // spaces (U+00A0 NBSP, U+1680, U+2000..U+200A, U+3000) are preserved for UAX #14.
+    // Collapsible whitespace (`collapse`, `preserve-breaks`, `discard`) per CSS Text L3/L4 §4.1.
     let discard_ws = collapse == WhiteSpaceCollapseMode::Discard;
-    let mut normalized_lines: Vec<String> = Vec::new();
-    let mut cur_line = String::with_capacity(text.len());
-    let mut in_ascii_ws = state.prev_char.is_some_and(is_ascii_collapsible_ws);
-
-    for ch in text.chars() {
-        if preserve_breaks && ch == '\n' {
-            // Trim collapsible space immediately before a preserved segment break.
-            while cur_line.ends_with(' ') {
-                cur_line.pop();
-            }
-            normalized_lines.push(std::mem::take(&mut cur_line));
-            in_ascii_ws = false;
-            continue;
-        }
-        if is_ascii_collapsible_ws(ch) {
-            if !discard_ws && !in_ascii_ws {
-                cur_line.push(' ');
-            }
-            in_ascii_ws = true;
-        } else {
-            cur_line.push(ch);
-            in_ascii_ws = false;
-        }
-    }
-    normalized_lines.push(cur_line);
+    let normalized_lines = crate::line_break::collapse_whitespace_l4(
+        text,
+        preserve_breaks,
+        discard_ws,
+        state.prev_non_bidi,
+        next_non_bidi,
+        state.prev_ended_with_space,
+    );
 
     for (line_idx, norm) in normalized_lines.into_iter().enumerate() {
         if line_idx > 0 {
             out.push(InlineItem::HardBreak);
             state.prev_char = None;
+            state.prev_non_bidi = None;
+            state.prev_ended_with_space = false;
             state.prev_nowrap_box = None;
         }
         if norm.is_empty() {
             continue;
         }
 
-        // Split leading space, interior UAX #14 segments, and trailing spaces cleanly.
         let mut cursor = 0usize;
         let mut emitted_any = false;
         if norm.starts_with(' ') {
@@ -1595,10 +1943,14 @@ fn tokenize_text(
                 style: Arc::clone(style),
                 box_id,
                 is_space: true,
+                is_preserved_space: false,
+                is_tab: false,
                 can_break_before: false,
+                can_emergency_break_before: false,
                 inline_stack: stack.to_vec(),
             });
             state.prev_char = Some(' ');
+            state.prev_ended_with_space = true;
             state.prev_nowrap_box = cur_nowrap_box;
             cursor = 1;
             emitted_any = true;
@@ -1624,22 +1976,33 @@ fn tokenize_text(
                     raw_piece
                 };
                 if !core.is_empty() {
-                    let can_brk = if !emitted_any {
+                    let (can_brk, can_ebrk) = if !emitted_any {
                         core.chars()
                             .next()
-                            .is_some_and(|c| boundary_can_break(c, state))
+                            .map_or((false, false), |c| boundary_breaks(c, state))
                     } else {
-                        wrap_mode == TextWrapMode::Wrap
+                        (wrap_mode == TextWrapMode::Wrap, false)
                     };
                     out.push(InlineItem::Word {
                         text: core.to_string(),
                         style: Arc::clone(style),
                         box_id,
                         is_space: false,
+                        is_preserved_space: false,
+                        is_tab: false,
                         can_break_before: can_brk,
+                        can_emergency_break_before: can_ebrk,
                         inline_stack: stack.to_vec(),
                     });
                     state.prev_char = core.chars().last();
+                    if let Some(nb) = core
+                        .chars()
+                        .rev()
+                        .find(|&c| !crate::line_break::is_bidi_control(c))
+                    {
+                        state.prev_non_bidi = Some(nb);
+                    }
+                    state.prev_ended_with_space = false;
                     state.prev_nowrap_box = cur_nowrap_box;
                     emitted_any = true;
                 }
@@ -1649,16 +2012,162 @@ fn tokenize_text(
                         style: Arc::clone(style),
                         box_id,
                         is_space: true,
+                        is_preserved_space: false,
+                        is_tab: false,
                         can_break_before: false,
+                        can_emergency_break_before: false,
                         inline_stack: stack.to_vec(),
                     });
                     state.prev_char = Some(' ');
+                    state.prev_ended_with_space = true;
                     state.prev_nowrap_box = cur_nowrap_box;
                     emitted_any = true;
                 }
                 seg_start = brk;
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_preserved_segment<F>(
+    seg: &str,
+    style: &Arc<ComputedStyle>,
+    lang: Option<&str>,
+    box_id: BoxId,
+    stack: &[ActiveInline],
+    state: &mut InlineCollectState,
+    cur_nowrap_box: Option<BoxId>,
+    wrap_mode: TextWrapMode,
+    is_break_spaces: bool,
+    is_first_piece: bool,
+    boundary_breaks: &F,
+    out: &mut Vec<InlineItem>,
+) where
+    F: Fn(char, &InlineCollectState) -> (bool, bool),
+{
+    if wrap_mode == TextWrapMode::Nowrap {
+        let first_ch = seg.chars().next().unwrap_or(' ');
+        let (can_b, can_eb) = if is_first_piece {
+            boundary_breaks(first_ch, state)
+        } else {
+            (false, false)
+        };
+        let all_sp = seg.chars().all(|c| c == ' ');
+        out.push(InlineItem::Word {
+            text: seg.to_string(),
+            style: Arc::clone(style),
+            box_id,
+            is_space: all_sp,
+            is_preserved_space: all_sp,
+            is_tab: false,
+            can_break_before: can_b,
+            can_emergency_break_before: can_eb,
+            inline_stack: stack.to_vec(),
+        });
+    } else {
+        let mut breaks = crate::line_break::line_break_offsets(seg, style, lang);
+        if is_break_spaces {
+            for (idx, ch) in seg.char_indices() {
+                if ch == ' ' {
+                    let after = idx + 1;
+                    if after < seg.len() {
+                        if let Err(pos) = breaks.binary_search(&after) {
+                            breaks.insert(pos, after);
+                        }
+                    }
+                }
+            }
+        }
+        let mut start = 0usize;
+        let mut seg_i = 0usize;
+        for &brk in breaks.iter().chain(std::iter::once(&seg.len())) {
+            if brk <= start {
+                continue;
+            }
+            let slice = &seg[start..brk];
+            // Separate trailing ASCII spaces so `pre-wrap` can hang them cleanly at line end.
+            let non_sp_len = slice.trim_end_matches(' ').len();
+            let (core, trail_sp) = slice.split_at(non_sp_len);
+            if !core.is_empty() {
+                let (can_b, can_eb) = if seg_i == 0 && is_first_piece {
+                    core.chars()
+                        .next()
+                        .map_or((false, false), |c| boundary_breaks(c, state))
+                } else {
+                    (true, false)
+                };
+                out.push(InlineItem::Word {
+                    text: core.to_string(),
+                    style: Arc::clone(style),
+                    box_id,
+                    is_space: false,
+                    is_preserved_space: false,
+                    is_tab: false,
+                    can_break_before: can_b,
+                    can_emergency_break_before: can_eb,
+                    inline_stack: stack.to_vec(),
+                });
+                seg_i += 1;
+            }
+            if !trail_sp.is_empty() {
+                let (can_b, can_eb) = if seg_i == 0 && is_first_piece {
+                    boundary_breaks(' ', state)
+                } else {
+                    (is_break_spaces, false)
+                };
+                out.push(InlineItem::Word {
+                    text: trail_sp.to_string(),
+                    style: Arc::clone(style),
+                    box_id,
+                    is_space: true,
+                    is_preserved_space: true,
+                    is_tab: false,
+                    can_break_before: can_b,
+                    can_emergency_break_before: can_eb,
+                    inline_stack: stack.to_vec(),
+                });
+                seg_i += 1;
+            }
+            start = brk;
+        }
+    }
+    state.prev_char = seg.chars().last();
+    if let Some(nb) = seg
+        .chars()
+        .rev()
+        .find(|&c| !crate::line_break::is_bidi_control(c))
+    {
+        state.prev_non_bidi = Some(nb);
+    }
+    state.prev_ended_with_space = seg.ends_with(' ');
+    state.prev_nowrap_box = cur_nowrap_box;
+}
+
+/// Computes the CSS Text L3 §4.2 tab-stop advance for a single U+0009 TAB character
+/// positioned at `current_x` along the line.
+fn compute_tab_advance(
+    ctx: &LayoutContext<'_>,
+    font_id: FontId,
+    font_size: f32,
+    style: &ComputedStyle,
+    eval: EvalContext,
+    current_x: f32,
+) -> f32 {
+    let tab_stop = if let Some(ref lp) = style.text.tab_size_len {
+        lp.resolve_px(font_size, &eval).max(0.0)
+    } else {
+        let sp_w = measure_shaped_width(ctx, " ", font_id, font_size, style);
+        (style.text.tab_size_num * sp_w).max(0.0)
+    };
+    if tab_stop <= 1e-4 {
+        return 0.0;
+    }
+    let rem = current_x.rem_euclid(tab_stop);
+    if rem < 1e-4 {
+        tab_stop
+    } else {
+        tab_stop - rem
     }
 }
 
@@ -1686,10 +2195,26 @@ fn shape_word_glyphs(
         return (Vec::new(), 0.0);
     }
 
-    let runs = ctx.shaper.shape_text(text, font_id, font_size);
+    // Strip zero-width default-ignorable format/bidi controls so fonts without glyphs for
+    // U+200B / U+202E / U+202C / U+2060 do not contribute tofu advance widths.
+    let shaped_input: std::borrow::Cow<'_, str> =
+        if text.chars().any(crate::line_break::is_zero_width_ignorable) {
+            std::borrow::Cow::Owned(
+                text.chars()
+                    .filter(|&c| !crate::line_break::is_zero_width_ignorable(c))
+                    .collect(),
+            )
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        };
+    if shaped_input.is_empty() {
+        return (Vec::new(), 0.0);
+    }
+
+    let runs = ctx.shaper.shape_text(&shaped_input, font_id, font_size);
     if runs.is_empty() {
         // Deterministic fallback width when running in an environment with no system fonts installed.
-        let approx = text.chars().count() as f32 * (font_size * 0.56) + word_sp;
+        let approx = shaped_input.chars().count() as f32 * (font_size * 0.56) + word_sp;
         return (Vec::new(), approx);
     }
 

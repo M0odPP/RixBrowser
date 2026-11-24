@@ -6,6 +6,8 @@
 //! tailoring.
 
 use icu::locale::LanguageIdentifier;
+use icu::properties::props::EastAsianWidth;
+use icu::properties::CodePointMapData;
 use icu::segmenter::options::{LineBreakOptions, LineBreakStrictness, LineBreakWordOption};
 use icu::segmenter::LineSegmenter;
 use rix_css::{ComputedStyle, LineBreakMode, WordBreakMode};
@@ -301,6 +303,218 @@ const fn is_cjk_ideograph(c: char) -> bool {
             | '\u{F900}'..='\u{FAFF}'
             | '\u{20000}'..='\u{2FA1F}'
     )
+}
+
+/// Returns `true` for Unicode bidi formatting control characters ignored during
+/// CSS Text L3/L4 §4.1.1 whitespace collapsing around segment breaks.
+#[inline]
+#[must_use]
+pub const fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Returns `true` for Unicode default-ignorable zero-width format/control characters
+/// that must not render as visible tofu boxes or add horizontal advance during shaping.
+#[inline]
+#[must_use]
+pub const fn is_zero_width_ignorable(c: char) -> bool {
+    is_bidi_control(c)
+        || matches!(
+            c,
+            '\u{00AD}' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'
+        )
+}
+
+/// Returns `true` for Hangul syllables, Jamo, and halfwidth Hangul Jamo.
+#[inline]
+const fn is_hangul(c: char) -> bool {
+    matches!(
+        c,
+        '\u{1100}'..='\u{11FF}'
+            | '\u{3130}'..='\u{318F}'
+            | '\u{A960}'..='\u{A97F}'
+            | '\u{AC00}'..='\u{D7FF}'
+            | '\u{FFA0}'..='\u{FFDC}'
+    )
+}
+
+/// Returns `true` if `c` has Unicode East Asian Width `F`, `W`, or `H` and is NOT Hangul
+/// (CSS Text L4 §4.1.2 Segment Break Transformation Rules).
+#[inline]
+fn is_eaw_fwh_non_hangul(c: char) -> bool {
+    if is_hangul(c) {
+        return false;
+    }
+    matches!(
+        CodePointMapData::<EastAsianWidth>::new().get(c),
+        EastAsianWidth::Fullwidth | EastAsianWidth::Wide | EastAsianWidth::Halfwidth
+    )
+}
+
+/// Returns `true` if a collapsible segment break between `before` and `after`
+/// (ignoring intervening bidi controls) should be removed instead of replaced
+/// by a space per CSS Text L4 §4.1.2.
+#[must_use]
+pub fn should_remove_segment_break(before: Option<char>, after: Option<char>) -> bool {
+    if before == Some('\u{200B}') || after == Some('\u{200B}') {
+        return true;
+    }
+    match (before, after) {
+        (Some(b), Some(a)) => is_eaw_fwh_non_hangul(b) && is_eaw_fwh_non_hangul(a),
+        _ => false,
+    }
+}
+
+/// Transforms collapsible ASCII whitespace and segment breaks in `text` per
+/// CSS Text Level 3/4 §4.1.1 & §4.1.2:
+/// - Normalizes `\r\n` / `\r` to `\n`.
+/// - Removes ASCII spaces/tabs immediately preceding or following a segment break
+///   while ignoring Unicode bidi control characters.
+/// - When `!preserve_breaks`, removes segment breaks adjacent to `U+200B` ZWSP or
+///   between non-Hangul East Asian Width `F`/`W`/`H` characters, and converts all
+///   other segment breaks to `' '`.
+/// - Collapses consecutive ASCII spaces/tabs (ignoring intervening bidi controls)
+///   into a single `' '` (or discards all ASCII whitespace when `discard_ws`).
+#[must_use]
+pub fn collapse_whitespace_l4(
+    text: &str,
+    preserve_breaks: bool,
+    discard_ws: bool,
+    prev_non_bidi: Option<char>,
+    next_non_bidi: Option<char>,
+    prev_ended_with_space: bool,
+) -> Vec<String> {
+    // Normalize CRLF and bare CR into LF.
+    let mut chars: Vec<char> = Vec::with_capacity(text.len());
+    let mut iter = text.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c == '\r' {
+            if iter.peek() == Some(&'\n') {
+                iter.next();
+            }
+            chars.push('\n');
+        } else {
+            chars.push(c);
+        }
+    }
+
+    let is_sp_tab = |c: char| matches!(c, ' ' | '\t' | '\x0C');
+    let n = chars.len();
+
+    // Pass 1: mark spaces/tabs adjacent to segment breaks (ignoring bidi controls) for removal.
+    let mut removed = vec![false; n];
+    for i in 0..n {
+        if chars[i] == '\n' {
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                if is_bidi_control(chars[j]) {
+                    continue;
+                }
+                if is_sp_tab(chars[j]) {
+                    removed[j] = true;
+                } else {
+                    break;
+                }
+            }
+            let mut k = i + 1;
+            while k < n {
+                if is_bidi_control(chars[k]) {
+                    k += 1;
+                    continue;
+                }
+                if is_sp_tab(chars[k]) {
+                    removed[k] = true;
+                    k += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Pass 2: build output lines, transforming segment breaks and collapsing spaces
+    // (ignoring intervening bidi control characters).
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::with_capacity(text.len());
+    let mut in_space = prev_ended_with_space;
+    let mut i = 0usize;
+    while i < n {
+        if removed[i] {
+            i += 1;
+            continue;
+        }
+        let c = chars[i];
+        if c == '\n' {
+            if preserve_breaks {
+                lines.push(std::mem::take(&mut cur));
+                in_space = false;
+                i += 1;
+                continue;
+            }
+            // Collapse consecutive segment breaks (and intervening bidi controls / removed spaces)
+            // as a single segment-break sequence.
+            let mut end = i + 1;
+            let mut held_bidi = Vec::new();
+            while end < n {
+                if removed[end] || chars[end] == '\n' {
+                    end += 1;
+                } else if is_bidi_control(chars[end]) {
+                    held_bidi.push(chars[end]);
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+            // Find last non-bidi char before `i` (falling back to `prev_non_bidi`).
+            let before = (0..i)
+                .rev()
+                .find(|&idx| !removed[idx] && chars[idx] != '\n' && !is_bidi_control(chars[idx]))
+                .map(|idx| chars[idx])
+                .or(prev_non_bidi);
+            // Find first non-bidi char at/after `end` (falling back to `next_non_bidi`).
+            let after = (end..n)
+                .find(|&idx| !removed[idx] && chars[idx] != '\n' && !is_bidi_control(chars[idx]))
+                .map(|idx| chars[idx])
+                .or(next_non_bidi);
+
+            if !discard_ws && !should_remove_segment_break(before, after) && !in_space {
+                cur.push(' ');
+                in_space = true;
+            }
+            for bc in held_bidi {
+                cur.push(bc);
+            }
+            i = end;
+            continue;
+        }
+        if is_sp_tab(c) {
+            if !discard_ws && !in_space {
+                cur.push(' ');
+                in_space = true;
+            }
+            i += 1;
+            continue;
+        }
+        if is_bidi_control(c) {
+            // Bidi controls pass through without resetting `in_space`.
+            cur.push(c);
+            i += 1;
+            continue;
+        }
+        cur.push(c);
+        in_space = false;
+        i += 1;
+    }
+    lines.push(cur);
+    lines
 }
 
 #[cfg(test)]

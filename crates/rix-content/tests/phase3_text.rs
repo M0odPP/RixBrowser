@@ -197,3 +197,35 @@ fn uax14_line_break_strictness_and_atomic_nowrap_min_content() {
     );
     assert_eq!(res, "true|true|100");
 }
+
+#[test]
+fn segment_break_transformation_bidi_trim_tab_size_and_overflow_wrap_conform() {
+    let html = r#"<!doctype html>
+    <html><body>
+      <span id="cjkBreak">日本語
+中国话</span>
+      <span id="cjkRef">日本語中国话</span>
+      <span id="rlo">RLO  &#x202E; 
+level&#x202C;</span>
+      <span id="rloRef">RLO level</span>
+      <span id="trimBefore" style="display:inline-block;width:max-content;">a <span style="white-space-trim:discard-before">b</span></span>
+      <span id="trimRef" style="display:inline-block;width:max-content;">a<span>b</span></span>
+      <pre id="tabPx" style="tab-size: 60px;">&#x09;<span id="tabSpan">x</span></pre>
+      <div id="bwMin" style="display:inline-block;width:min-content;overflow-wrap:break-word;font-size:20px;"><span style="white-space:nowrap">AAAA</span><span style="white-space:nowrap">BBBB</span></div>
+      <div id="awMin" style="display:inline-block;width:min-content;overflow-wrap:anywhere;font-size:20px;"><span style="white-space:nowrap">AAAA</span><span style="white-space:nowrap">BBBB</span></div>
+      <div id="rtlBox" style="direction:rtl;width:200px;"><span id="rtlA">AAA</span> <span id="rtlB">BBB</span></div>
+    </body></html>"#;
+    let res = run_script(
+        html,
+        r#"(() => {
+          const cjkEq = document.getElementById('cjkBreak').offsetWidth === document.getElementById('cjkRef').offsetWidth;
+          const rloEq = document.getElementById('rlo').offsetWidth === document.getElementById('rloRef').offsetWidth;
+          const trimEq = document.getElementById('trimBefore').offsetWidth === document.getElementById('trimRef').offsetWidth;
+          const tabX = Math.round(document.getElementById('tabSpan').getBoundingClientRect().left - document.getElementById('tabPx').getBoundingClientRect().left);
+          const bwGtAw = document.getElementById('bwMin').offsetWidth > document.getElementById('awMin').offsetWidth;
+          const rtlOrder = document.getElementById('rtlA').getBoundingClientRect().left > document.getElementById('rtlB').getBoundingClientRect().left;
+          return [cjkEq, rloEq, trimEq, tabX, bwGtAw, rtlOrder].join('|');
+        })()"#,
+    );
+    assert_eq!(res, "true|true|true|60|true|true");
+}
