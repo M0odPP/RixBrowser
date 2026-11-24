@@ -585,6 +585,21 @@ impl HostState {
         })
     }
 
+    /// Preserves an unquantized CSS Color 4/5 AST for an inline `element.style` declaration.
+    pub fn set_inline_color_expr(
+        &mut self,
+        node: NodeId,
+        prop: rix_css::PropertyIdKind,
+        expr: Option<rix_css::CssColorExpr>,
+    ) {
+        self.style_ctx.set_inline_color_expr(node, prop, expr);
+    }
+
+    /// Clears all preserved unquantized inline color expressions for `node`.
+    pub fn clear_inline_color_exprs(&mut self, node: NodeId) {
+        self.style_ctx.clear_inline_color_exprs(node);
+    }
+
     /// Returns the cached `ComputedStyle` for `node`, running dirty-checked cascade if needed.
     pub fn computed_style_for_node(&mut self, node: NodeId) -> Option<Arc<ComputedStyle>> {
         let ctx = self.ensure_styles();

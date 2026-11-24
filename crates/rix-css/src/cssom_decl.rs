@@ -60,6 +60,16 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
         return None;
     }
 
+    // CSS Color Level 4 & 5: parse and serialize color longhands via our native Color 4/5
+    // engine so wide-gamut spaces, `none`, `color-mix()`, relative colors, `alpha()`,
+    // `contrast-color()`, `light-dark()`, and system colors follow W3C spec strictly.
+    if is_color_longhand(prop_kind) {
+        return crate::color::parse_and_serialize_color_specified(trimmed);
+    }
+    if prop_kind == PropertyIdKind::Opacity {
+        return crate::color::parse_and_serialize_opacity_specified(trimmed);
+    }
+
     // CSS Standards Mode & Logical Properties: reject bare non-zero unitless numbers on lengths.
     if prop_disallows_unitless_nonzero(prop_kind) && has_top_level_unitless_nonzero(trimmed) {
         return None;
@@ -129,6 +139,9 @@ pub fn parse_and_expand_declaration(name: &str, value: &str) -> Option<Vec<(Stri
         )]);
     }
     let prop_kind = PropertyIdKind::from_name(&lower_name)?;
+    if is_color_longhand(prop_kind) || prop_kind == PropertyIdKind::Opacity {
+        return Some(vec![(lower_name, canonical)]);
+    }
     let lower_val = canonical.to_ascii_lowercase();
     if GlobalKeyword::from_ident(&lower_val).is_some() {
         let longhands = prop_kind.shorthand_longhands();
@@ -211,6 +224,25 @@ fn is_inside_string(s: &str, target: usize) -> bool {
         i += 1;
     }
     in_str.is_some()
+}
+
+#[must_use]
+pub fn is_color_longhand(kind: PropertyIdKind) -> bool {
+    matches!(
+        kind,
+        PropertyIdKind::Color
+            | PropertyIdKind::BackgroundColor
+            | PropertyIdKind::BorderTopColor
+            | PropertyIdKind::BorderRightColor
+            | PropertyIdKind::BorderBottomColor
+            | PropertyIdKind::BorderLeftColor
+            | PropertyIdKind::BorderBlockStartColor
+            | PropertyIdKind::BorderBlockEndColor
+            | PropertyIdKind::BorderInlineStartColor
+            | PropertyIdKind::BorderInlineEndColor
+            | PropertyIdKind::OutlineColor
+            | PropertyIdKind::TextDecorationColor
+    )
 }
 
 pub(crate) fn contains_var_or_env_ci(s: &str) -> bool {
@@ -459,16 +491,9 @@ pub(crate) fn format_cssom_color(
         }
     }
     if let lightningcss::values::color::CssColor::RGBA(rgba) = color {
-        if rgba.alpha == 255 {
-            return format!("rgb({}, {}, {})", rgba.red, rgba.green, rgba.blue);
-        }
-        let a = if rgba.alpha == 0 {
-            "0".to_string()
-        } else {
-            let rounded = (f64::from(rgba.alpha) / 255.0 * 1000.0).round() / 1000.0;
-            format!("{rounded}")
-        };
-        return format!("rgba({}, {}, {}, {a})", rgba.red, rgba.green, rgba.blue);
+        return crate::color::format_legacy_rgba(crate::values::ColorRgba::rgba(
+            rgba.red, rgba.green, rgba.blue, rgba.alpha,
+        ));
     }
     use lightningcss::traits::ToCss as _;
     let mut s = String::new();

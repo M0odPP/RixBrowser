@@ -14,8 +14,11 @@ use selectors::context::SelectorCaches;
 use selectors::Element as _;
 use smallvec::SmallVec;
 
+use crate::color::CssColorExpr;
 use crate::computed::{resolve_element_style_scoped, ComputedStyle, MatchedRule};
-use crate::properties::{parse_inline_style, MissingCssFeature, SpecifiedDeclaration};
+use crate::properties::{
+    parse_inline_style, MissingCssFeature, PropertyIdKind, PropertyValue, SpecifiedDeclaration,
+};
 use crate::rule_index::{InvalidationMap, InvalidationScope, RuleIndex};
 use crate::selector::{
     matches_selector_list_with_scope, matches_single_selector, matches_single_selector_with_scope,
@@ -212,6 +215,7 @@ pub struct StyleContext {
     invalidation_map: InvalidationMap,
     styles: FastMap<NodeId, Arc<ComputedStyle>>,
     pseudo_styles: FastMap<(NodeId, RixPseudoElement), Arc<ComputedStyle>>,
+    inline_color_exprs: FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
     missing_seen: HashSet<MissingCssFeature>,
     missing_features: Vec<MissingCssFeature>,
     index_dirty: bool,
@@ -231,6 +235,7 @@ impl StyleContext {
             invalidation_map: InvalidationMap::default(),
             styles: FastMap::default(),
             pseudo_styles: FastMap::default(),
+            inline_color_exprs: FastMap::default(),
             missing_seen: HashSet::new(),
             missing_features: Vec::new(),
             index_dirty: true,
@@ -255,6 +260,7 @@ impl StyleContext {
             invalidation_map: InvalidationMap::default(),
             styles: FastMap::default(),
             pseudo_styles: FastMap::default(),
+            inline_color_exprs: FastMap::default(),
             missing_seen: HashSet::new(),
             missing_features: Vec::new(),
             index_dirty: true,
@@ -500,6 +506,25 @@ impl StyleContext {
         }
     }
 
+    /// Preserves an unquantized CSS Color 4/5 AST for an inline `element.style` declaration.
+    pub fn set_inline_color_expr(
+        &mut self,
+        node: NodeId,
+        prop: PropertyIdKind,
+        expr: Option<CssColorExpr>,
+    ) {
+        if let Some(e) = expr {
+            self.inline_color_exprs.insert((node, prop), Arc::new(e));
+        } else {
+            self.inline_color_exprs.remove(&(node, prop));
+        }
+    }
+
+    /// Clears all preserved unquantized inline color expressions for `node`.
+    pub fn clear_inline_color_exprs(&mut self, node: NodeId) {
+        self.inline_color_exprs.retain(|&(n, _), _| n != node);
+    }
+
     /// Performs a full parallel top-down cascade over the entire document.
     pub fn cascade_full(&mut self, doc: &mut Document) -> RestyleReport {
         self.ensure_index();
@@ -528,6 +553,7 @@ impl StyleContext {
                 16.0,
                 true,
                 &self.rule_index,
+                &self.inline_color_exprs,
                 &self.media,
                 &mut bloom,
                 &mut caches,
@@ -607,6 +633,7 @@ impl StyleContext {
                 root_font_size,
                 false,
                 &self.rule_index,
+                &self.inline_color_exprs,
                 &self.media,
                 &mut bloom,
                 &mut caches,
@@ -654,6 +681,7 @@ fn cascade_subtree_par(
     root_font_size: f32,
     allow_parallel: bool,
     rule_index: &RuleIndex,
+    inline_color_exprs: &FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
     media: &MediaContext,
     bloom: &mut BloomFilter,
     caches: &mut SelectorCaches,
@@ -674,6 +702,7 @@ fn cascade_subtree_par(
         parent_style,
         root_font_size,
         rule_index,
+        inline_color_exprs,
         media,
         Some(bloom),
         caches,
@@ -743,6 +772,7 @@ fn cascade_subtree_par(
                         next_root_font,
                         false,
                         rule_index,
+                        inline_color_exprs,
                         media,
                         &mut local_bloom,
                         &mut local_caches,
@@ -773,6 +803,7 @@ fn cascade_subtree_par(
                 next_root_font,
                 allow_parallel,
                 rule_index,
+                inline_color_exprs,
                 media,
                 bloom,
                 caches,
@@ -797,6 +828,7 @@ fn restyle_dirty_walk(
     root_font_size: f32,
     force_inherit_restyle: bool,
     rule_index: &RuleIndex,
+    inline_color_exprs: &FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
     media: &MediaContext,
     bloom: &mut BloomFilter,
     caches: &mut SelectorCaches,
@@ -829,6 +861,7 @@ fn restyle_dirty_walk(
             parent_style,
             root_font_size,
             rule_index,
+            inline_color_exprs,
             media,
             Some(bloom),
             caches,
@@ -920,6 +953,7 @@ fn restyle_dirty_walk(
                 next_root_font,
                 propagate_inherited,
                 rule_index,
+                inline_color_exprs,
                 media,
                 bloom,
                 caches,
@@ -945,6 +979,7 @@ fn compute_single_element_style(
     parent_style: Option<&Arc<ComputedStyle>>,
     root_font_size: f32,
     rule_index: &RuleIndex,
+    inline_color_exprs: &FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
     media: &MediaContext,
     bloom: Option<&BloomFilter>,
     caches: &mut SelectorCaches,
@@ -1006,10 +1041,17 @@ fn compute_single_element_style(
         Vec::new()
     };
 
-    let inline_decls: Vec<SpecifiedDeclaration> = match inline_attr {
+    let mut inline_decls: Vec<SpecifiedDeclaration> = match inline_attr {
         Some(attr) if !attr.trim().is_empty() => parse_inline_style(attr, missing_out),
         _ => Vec::new(),
     };
+    if !inline_color_exprs.is_empty() && !inline_decls.is_empty() {
+        for decl in &mut inline_decls {
+            if let Some(expr) = inline_color_exprs.get(&(node, decl.property)) {
+                decl.value = PropertyValue::Color4(Box::new((**expr).clone()));
+            }
+        }
+    }
 
     let matched_refs: SmallVec<[MatchedRule<'_>; 16]> = matched_indices
         .iter()

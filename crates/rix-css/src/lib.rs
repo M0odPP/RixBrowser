@@ -3,6 +3,7 @@
 //! `Arc`-grouped `ComputedStyle` for RixBrowser.
 
 pub mod cascade;
+pub mod color;
 pub mod computed;
 pub mod cssom_decl;
 pub mod properties;
@@ -13,6 +14,10 @@ pub mod ua;
 pub mod values;
 
 pub use cascade::{RestyleReport, StyleContext, StyleMemo};
+pub use color::{
+    format_legacy_rgba, parse_and_serialize_color_specified, parse_css_color, ColorSpace,
+    CssColorExpr, HueMethod, ResolvedColor, SystemColor,
+};
 pub use computed::{
     apply_declaration, resolve_element_style, resolve_element_style_full,
     resolve_element_style_scoped, resolve_var_tokens, BoxModelStyle, ComputedStyle,

@@ -101,6 +101,14 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
             assert_equals(actual[i], expected[i], (desc ? desc + " " : "") + "at index " + i);
         }
     }
+    function assert_array_approx_equals(actual, expected, epsilon, desc) {
+        if (!actual || actual.length !== expected.length) {
+            fail((desc ? desc + ": " : "") + "lengths differ: " + (actual ? actual.length : "null") + " vs " + expected.length);
+        }
+        for (let i = 0; i < expected.length; i++) {
+            assert_approx_equals(actual[i], expected[i], epsilon, (desc ? desc + " " : "") + "at index " + i);
+        }
+    }
     function assert_object_equals(actual, expected, desc) {
         if (actual === expected) return;
         if (!actual || !expected || typeof actual !== "object" || typeof expected !== "object") {
@@ -348,6 +356,7 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
     global.assert_less_than_equal = assert_less_than_equal;
     global.assert_greater_than_equal = assert_greater_than_equal;
     global.assert_array_equals = assert_array_equals;
+    global.assert_array_approx_equals = assert_array_approx_equals;
     global.assert_object_equals = assert_object_equals;
     global.assert_in_array = assert_in_array;
     global.assert_own_property = assert_own_property;
