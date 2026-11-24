@@ -22,8 +22,11 @@ use rix_dom::{Document, NodeData};
 use rix_html::parse_html;
 use rix_ipc::PipelineId;
 use rix_layout::LayoutEngine;
+use rix_net::{FetchEngine, HttpClient};
 use rix_render::{encode_display_list, EncodeOptions, ResourceRegistry, VelloRenderer};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use vello::peniko::Color;
 use vello::Scene;
 
@@ -93,6 +96,16 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
     }
     function assert_greater_than_equal(a, b, desc) {
         if (!(a >= b)) fail((desc ? desc + ": " : "") + "expected " + format_value(a) + " >= " + format_value(b));
+    }
+    function assert_between_exclusive(actual, lower, upper, desc) {
+        if (!(actual > lower && actual < upper)) {
+            fail((desc ? desc + ": " : "") + "expected " + format_value(actual) + " strictly between " + format_value(lower) + " and " + format_value(upper));
+        }
+    }
+    function assert_between_inclusive(actual, lower, upper, desc) {
+        if (!(actual >= lower && actual <= upper)) {
+            fail((desc ? desc + ": " : "") + "expected " + format_value(actual) + " between " + format_value(lower) + " and " + format_value(upper));
+        }
     }
     function assert_array_equals(actual, expected, desc) {
         if (!actual || actual.length !== expected.length) {
@@ -294,18 +307,29 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
         }
         return t;
     }
+    let promiseChain = Promise.resolve();
     function promise_test(fn, name) {
         const t = new TestObj(name);
         t._isAsync = true;
         pendingAsync++;
-        try {
-            Promise.resolve(fn.call(t, t)).then(
-                function() { t.done(); },
-                function(e) { t._fail(e); }
-            );
-        } catch (e) {
-            t._fail(e);
-        }
+        promiseChain = promiseChain.then(function() {
+            try {
+                return Promise.resolve(fn.call(t, t)).then(
+                    function() { t.done(); },
+                    function(e) { t._fail(e); }
+                );
+            } catch (e) {
+                t._fail(e);
+            }
+        });
+    }
+    function promise_setup(fn, props) {
+        promiseChain = promiseChain.then(function() {
+            return Promise.resolve().then(fn);
+        }).catch(function(e) {
+            harnessStatus = 1;
+            harnessErrors.push(String(e));
+        });
     }
     function promise_rejects_js(t, ctor, promise, desc) {
         return promise.then(
@@ -317,12 +341,26 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
             }
         );
     }
-    function promise_rejects_dom(t, type, promise, desc) {
+    function promise_rejects_dom(t, type, ctorOrPromise, maybePromise, maybeDesc) {
+        let promise = ctorOrPromise;
+        let desc = maybePromise;
+        if (maybePromise && typeof maybePromise.then === "function") {
+            promise = maybePromise;
+            desc = maybeDesc;
+        }
+        const expectedCode =
+            typeof type === "string" &&
+            typeof DOMException !== "undefined" &&
+            typeof DOMException[type] === "number"
+                ? DOMException[type]
+                : null;
         return promise.then(
             function() { assert_unreached((desc ? desc + ": " : "") + "promise fulfilled instead of rejecting"); },
             function(e) {
-                if (typeof type === "string" && e && e.name && e.name !== type) {
+                if (typeof type === "string" && e && e.name && e.name !== type && e.code !== type && (expectedCode === null || e.code !== expectedCode)) {
                     fail((desc ? desc + ": " : "") + "expected DOMException " + type + " got " + e.name);
+                } else if (typeof type === "number" && e && e.code !== type) {
+                    fail((desc ? desc + ": " : "") + "expected DOMException code " + type + " got " + (e.code !== undefined ? e.code : e.name));
                 }
             }
         );
@@ -334,6 +372,34 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
                 assert_equals(e, expected, desc);
             }
         );
+    }
+    function on_event(obj, event, cb) {
+        obj.addEventListener(event, cb, false);
+    }
+    function EventWatcher(testObj, watchedNode, eventTypes) {
+        if (typeof eventTypes === "string") eventTypes = [eventTypes];
+        const waitingFor = [];
+        const handler = function(evt) {
+            if (waitingFor.length === 0) return;
+            const waiter = waitingFor.shift();
+            if (waiter.types.indexOf(evt.type) === -1) {
+                waiter.reject(new AssertionError("Unexpected event " + evt.type));
+            } else {
+                waiter.resolve(evt);
+            }
+        };
+        for (const ty of eventTypes) watchedNode.addEventListener(ty, handler);
+        if (testObj && typeof testObj.add_cleanup === "function") {
+            testObj.add_cleanup(function() {
+                for (const ty of eventTypes) watchedNode.removeEventListener(ty, handler);
+            });
+        }
+        this.wait_for = function(types) {
+            if (typeof types === "string") types = [types];
+            return new Promise(function(resolve, reject) {
+                waitingFor.push({ types: types, resolve: resolve, reject: reject });
+            });
+        };
     }
     function generate_tests(fn, params) {
         if (!Array.isArray(params)) return;
@@ -350,18 +416,23 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
         }
     }
     function done() {}
+    function add_start_callback(fn) { try { fn(); } catch (_) {} }
     function add_completion_callback() {}
     function add_result_callback() {}
 
     global.test = test;
     global.async_test = async_test;
     global.promise_test = promise_test;
+    global.promise_setup = promise_setup;
     global.generate_tests = generate_tests;
     global.promise_rejects_js = promise_rejects_js;
     global.promise_rejects_dom = promise_rejects_dom;
     global.promise_rejects_exactly = promise_rejects_exactly;
+    global.on_event = on_event;
+    global.EventWatcher = EventWatcher;
     global.setup = setup;
     global.done = done;
+    global.add_start_callback = add_start_callback;
     global.add_completion_callback = add_completion_callback;
     global.add_result_callback = add_result_callback;
     global.format_value = format_value;
@@ -374,6 +445,8 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
     global.assert_greater_than = assert_greater_than;
     global.assert_less_than_equal = assert_less_than_equal;
     global.assert_greater_than_equal = assert_greater_than_equal;
+    global.assert_between_exclusive = assert_between_exclusive;
+    global.assert_between_inclusive = assert_between_inclusive;
     global.assert_array_equals = assert_array_equals;
     global.assert_array_approx_equals = assert_array_approx_equals;
     global.assert_object_equals = assert_object_equals;
@@ -391,6 +464,12 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
     global.assert_throws_exactly = assert_throws_exactly;
     global.assert_implements = assert_implements;
     global.assert_implements_optional = assert_implements_optional;
+    global.GLOBAL = {
+        isWindow: function() { return true; },
+        isWorker: function() { return false; },
+        isShadowRealm: function() { return false; }
+    };
+    global.__rix_wpt_pending = function() { return pendingAsync; };
     global.__rix_wpt_summary = function() {
         let passed = 0, failed = 0, firstErr = "";
         for (let i = 0; i < results.length; i++) {
@@ -572,6 +651,9 @@ fn synthesize_wpt_js_html(path: &Path, js_src: &str) -> Option<String> {
 
 fn resolve_wpt_path(wpt_root: &Path, doc_path: &Path, href: &str) -> PathBuf {
     let clean = href.split(['?', '#']).next().unwrap_or(href).trim();
+    if clean == "/resources/WebIDLParser.js" {
+        return wpt_root.join("resources/webidl2/lib/webidl2.js");
+    }
     if let Some(rel) = clean.strip_prefix('/') {
         wpt_root.join(rel)
     } else {
@@ -603,8 +685,9 @@ fn extract_es_module_specifiers(code: &str) -> Vec<String> {
             i += 2;
             continue;
         }
-        // Match `from` or `import` followed by whitespace and string literal
-        let matched_kw = if code[i..].starts_with("from")
+        // Match `from` or `import` followed by whitespace and string literal (pure byte slicing
+        // so non-ASCII UTF-8 bytes never panic on char boundary checks).
+        let matched_kw = if bytes[i..].starts_with(b"from")
             && (i == 0
                 || !(bytes[i - 1].is_ascii_alphanumeric()
                     || bytes[i - 1] == b'_'
@@ -613,7 +696,7 @@ fn extract_es_module_specifiers(code: &str) -> Vec<String> {
             && (bytes[i + 4].is_ascii_whitespace() || bytes[i + 4] == b'"' || bytes[i + 4] == b'\'')
         {
             Some(4usize)
-        } else if code[i..].starts_with("import")
+        } else if bytes[i..].starts_with(b"import")
             && (i == 0
                 || !(bytes[i - 1].is_ascii_alphanumeric()
                     || bytes[i - 1] == b'_'
@@ -901,7 +984,177 @@ fn wpt_font_db(wpt_root: &Path) -> Arc<rix_text::FontDatabase> {
     }))
 }
 
-fn run_wpt_testharness_file(wpt_root: &Path, path: &Path, html: &str) -> ScriptRunOutcome {
+/// Lightweight local loopback HTTP/1.1 server exposing `wpt_root` over `127.0.0.1:<port>`
+/// so WPT `fetch()`, `<iframe src>`, and `idl_test` exercise the real `rix-net` FetchEngine.
+struct LocalWptServer {
+    rt: tokio::runtime::Runtime,
+    port: u16,
+    fetch_engine: Arc<FetchEngine>,
+}
+
+fn wpt_mime_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("html" | "htm") => "text/html",
+        Some("xhtml" | "xht") => "application/xhtml+xml",
+        Some("xml") => "application/xml",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        Some("json") => "application/json",
+        Some("css") => "text/css; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("wasm") => "application/wasm",
+        Some("idl" | "txt" | "vtt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn percent_decode_path(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .context("build local WPT tokio runtime")?;
+    let (listener, port) = rt.block_on(async {
+        let l = TcpListener::bind("127.0.0.1:0").await?;
+        let p = l.local_addr()?.port();
+        Ok::<_, anyhow::Error>((l, p))
+    })?;
+    let root_arc = Arc::new(wpt_root);
+    rt.spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let root = Arc::clone(&root_arc);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                let Ok(Ok(n)) =
+                    tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await
+                else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req_str.lines().next().unwrap_or("");
+                let mut parts = first_line.split_whitespace();
+                let _method = parts.next().unwrap_or("GET");
+                let raw_target = parts.next().unwrap_or("/");
+                let path_only = raw_target.split(['?', '#']).next().unwrap_or("/");
+                let decoded = percent_decode_path(path_only);
+                let rel = decoded.trim_start_matches('/');
+                if rel.split('/').any(|seg| seg == "..") {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    return;
+                }
+                let mut file_path = if rel == "resources/WebIDLParser.js" {
+                    root.join("resources/webidl2/lib/webidl2.js")
+                } else {
+                    root.join(rel)
+                };
+                if file_path.is_dir() {
+                    file_path = file_path.join("index.html");
+                }
+                let Ok(mut body) = tokio::fs::read(&file_path).await else {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    return;
+                };
+                let fname = file_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                if fname.contains(".sub.") {
+                    if let Ok(txt) = String::from_utf8(body.clone()) {
+                        let port_s = port.to_string();
+                        let sub = txt
+                            .replace("{{host}}", "127.0.0.1")
+                            .replace("{{domains[]}}", "127.0.0.1")
+                            .replace("{{ports[http][0]}}", &port_s)
+                            .replace("{{ports[https][0]}}", &port_s)
+                            .replace("{{ports[ws][0]}}", &port_s)
+                            .replace("{{ports[wss][0]}}", &port_s);
+                        body = sub.into_bytes();
+                    }
+                }
+                let mut content_type = wpt_mime_type(&file_path).to_string();
+                let mut extra_headers = Vec::new();
+                let headers_sidecar = PathBuf::from(format!("{}.headers", file_path.display()));
+                if let Ok(hdr_txt) = tokio::fs::read_to_string(&headers_sidecar).await {
+                    for line in hdr_txt.lines() {
+                        let line = line.trim();
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.trim().eq_ignore_ascii_case("content-type") {
+                                content_type = v.trim().to_string();
+                            } else {
+                                extra_headers.push(format!("{}: {}", k.trim(), v.trim()));
+                            }
+                        }
+                    }
+                }
+                let mut resp_head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    body.len()
+                );
+                for h in extra_headers {
+                    resp_head.push_str(&h);
+                    resp_head.push_str("\r\n");
+                }
+                resp_head.push_str("\r\n");
+                let _ = stream.write_all(resp_head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    let client = HttpClient::new(None).context("init WPT loopback HttpClient")?;
+    let fetch_engine = Arc::new(FetchEngine::new(client));
+    Ok(LocalWptServer {
+        rt,
+        port,
+        fetch_engine,
+    })
+}
+
+fn run_wpt_testharness_file(
+    wpt_root: &Path,
+    path: &Path,
+    html: &str,
+    server: &LocalWptServer,
+) -> ScriptRunOutcome {
+    let _enter = server.rt.enter();
     let font_db = wpt_font_db(wpt_root);
 
     let parsed = parse_html(html);
@@ -945,8 +1198,9 @@ fn run_wpt_testharness_file(wpt_root: &Path, path: &Path, html: &str) -> ScriptR
             }
         }
     }
+    let origin_base = format!("http://127.0.0.1:{}", server.port);
     // Recursively preload static ES module imports (`import ... from "..."`, `export ... from "..."`)
-    // from the local WPT tree so `<script type="module">` tests work offline without a live server.
+    // from the local WPT tree so `<script type="module">` tests work offline cleanly.
     let mut visited_modules: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     while let Some((cur_file, code)) = module_scan_queue.pop() {
         for spec in extract_es_module_specifiers(&code) {
@@ -961,13 +1215,13 @@ fn run_wpt_testharness_file(wpt_root: &Path, path: &Path, html: &str) -> ScriptR
             if let Ok(dep_code) = fs::read_to_string(&dep_path) {
                 if let Ok(rel_dep) = canonical.strip_prefix(wpt_root) {
                     let abs_url = format!(
-                        "http://web-platform.test:8000/{}",
+                        "{origin_base}/{}",
                         rel_dep.to_string_lossy().replace('\\', "/")
                     );
                     ext_scripts.insert(abs_url, dep_code.clone());
                 } else if let Ok(rel_dep) = dep_path.strip_prefix(wpt_root) {
                     let abs_url = format!(
-                        "http://web-platform.test:8000/{}",
+                        "{origin_base}/{}",
                         rel_dep.to_string_lossy().replace('\\', "/")
                     );
                     ext_scripts.insert(abs_url, dep_code.clone());
@@ -978,8 +1232,16 @@ fn run_wpt_testharness_file(wpt_root: &Path, path: &Path, html: &str) -> ScriptR
         }
     }
 
+    let rel = path.strip_prefix(wpt_root).unwrap_or(path);
+    let doc_url = format!("{origin_base}/{}", rel.to_string_lossy().replace('\\', "/"));
     let doc = Rc::new(RefCell::new(Document::new()));
-    let mut rt = ContentRuntime::new(doc, viewport, font_db);
+    let mut rt = ContentRuntime::with_fetch_engine(
+        doc,
+        viewport,
+        font_db,
+        &doc_url,
+        Arc::clone(&server.fetch_engine),
+    );
     rt.vm.max_loop_iterations = Some(2_500_000);
     rt.event_loop.borrow_mut().enable_virtual_clock();
     rt.host.borrow_mut().set_external_stylesheets(ext_sheets);
@@ -989,13 +1251,40 @@ fn run_wpt_testharness_file(wpt_root: &Path, path: &Path, html: &str) -> ScriptR
         &parsed,
         &mut rt.host.borrow_mut().layout_engine.assets,
     );
-    let rel = path.strip_prefix(wpt_root).unwrap_or(path);
-    rt.set_document_url(&format!("http://web-platform.test:8000/{}", rel.display()));
 
     let script_errors = rt.load_document_with_external_scripts(html, &ext_scripts);
-    // Drive timers + microtasks + rAF briefly so async_test / promise_test can settle.
-    for tick in 0..8 {
+    let has_pending = |rt: &mut ContentRuntime| -> bool {
+        rt.eval_script("typeof __rix_wpt_pending === 'function' ? __rix_wpt_pending() : 0")
+            .ok()
+            .and_then(|v| v.as_number())
+            .is_some_and(|n| n > 0.0)
+    };
+    // Drive async network/worker events, timers, microtasks, and VSync/layout observers
+    // until all async/promise subtests settle (exiting immediately when pending == 0).
+    for tick in 0..80u32 {
         rt.advance_and_drain(Duration::from_millis(if tick == 0 { 0 } else { 10 }));
+        if !has_pending(&mut rt) {
+            break;
+        }
+        rt.fire_vsync(f64::from(tick + 1) * 16.0);
+        if !has_pending(&mut rt) {
+            break;
+        }
+        let settled =
+            server
+                .rt
+                .handle()
+                .block_on(rt.drive_async_until(Duration::from_millis(40), |rt| {
+                    !rt.eval_script(
+                        "typeof __rix_wpt_pending === 'function' ? __rix_wpt_pending() : 0",
+                    )
+                    .ok()
+                    .and_then(|v| v.as_number())
+                    .is_some_and(|n| n > 0.0)
+                }));
+        if settled {
+            break;
+        }
     }
 
     let summary_json = match rt
@@ -1124,8 +1413,9 @@ pub fn run_official_wpt_suite(opts: &OfficialWptOptions) -> Result<OfficialWptRe
     };
     let mut reasons: HashMap<String, usize> = HashMap::new();
 
-    // Execute script tests in parallel with 8 MiB stacks and panic isolation.
+    // Execute script tests in parallel with 8 MiB stacks, local loopback WPT server, and panic isolation.
     let wpt_root = opts.wpt_dir.clone();
+    let local_server = start_local_wpt_server(wpt_root.clone())?;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(4)
         .stack_size(8 * 1024 * 1024)
@@ -1137,7 +1427,7 @@ pub fn run_official_wpt_suite(opts: &OfficialWptOptions) -> Result<OfficialWptRe
                 .par_iter()
                 .map(|(path, html)| {
                     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_wpt_testharness_file(&wpt_root, path, html)
+                        run_wpt_testharness_file(&wpt_root, path, html, &local_server)
                     }))
                     .map_err(|payload| {
                         let msg = payload

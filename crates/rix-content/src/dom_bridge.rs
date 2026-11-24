@@ -68,6 +68,10 @@ pub struct DomPrototypes {
     pub html_element_proto: HeapHandle,
     pub html_canvas_element_proto: HeapHandle,
     pub html_iframe_element_proto: HeapHandle,
+    pub html_anchor_element_proto: HeapHandle,
+    pub html_area_element_proto: HeapHandle,
+    pub html_base_element_proto: HeapHandle,
+    pub html_form_element_proto: HeapHandle,
     pub html_media_element_proto: HeapHandle,
     pub html_video_element_proto: HeapHandle,
     pub html_audio_element_proto: HeapHandle,
@@ -86,6 +90,10 @@ impl DomPrototypes {
             self.html_element_proto,
             self.html_canvas_element_proto,
             self.html_iframe_element_proto,
+            self.html_anchor_element_proto,
+            self.html_area_element_proto,
+            self.html_base_element_proto,
+            self.html_form_element_proto,
             self.html_media_element_proto,
             self.html_video_element_proto,
             self.html_audio_element_proto,
@@ -1193,6 +1201,14 @@ pub fn wrap_node(vm: &mut JsVm, host: &SharedHost, node_id: NodeId) -> JsValue {
                         h.prototypes.html_canvas_element_proto
                     } else if el.name.local.as_str().eq_ignore_ascii_case("iframe") {
                         h.prototypes.html_iframe_element_proto
+                    } else if el.name.local.as_str().eq_ignore_ascii_case("a") {
+                        h.prototypes.html_anchor_element_proto
+                    } else if el.name.local.as_str().eq_ignore_ascii_case("area") {
+                        h.prototypes.html_area_element_proto
+                    } else if el.name.local.as_str().eq_ignore_ascii_case("base") {
+                        h.prototypes.html_base_element_proto
+                    } else if el.name.local.as_str().eq_ignore_ascii_case("form") {
+                        h.prototypes.html_form_element_proto
                     } else if el.name.local.as_str().eq_ignore_ascii_case("video") {
                         h.prototypes.html_video_element_proto
                     } else if el.name.local.as_str().eq_ignore_ascii_case("audio") {
@@ -1250,6 +1266,10 @@ pub fn install_dom_bridge(
     let html_element_proto = make_proto(vm, element_proto);
     let html_canvas_element_proto = make_proto(vm, html_element_proto);
     let html_iframe_element_proto = make_proto(vm, html_element_proto);
+    let html_anchor_element_proto = make_proto(vm, html_element_proto);
+    let html_area_element_proto = make_proto(vm, html_element_proto);
+    let html_base_element_proto = make_proto(vm, html_element_proto);
+    let html_form_element_proto = make_proto(vm, html_element_proto);
     let html_media_element_proto = make_proto(vm, html_element_proto);
     let html_video_element_proto = make_proto(vm, html_media_element_proto);
     let html_audio_element_proto = make_proto(vm, html_media_element_proto);
@@ -1265,6 +1285,10 @@ pub fn install_dom_bridge(
         html_element_proto,
         html_canvas_element_proto,
         html_iframe_element_proto,
+        html_anchor_element_proto,
+        html_area_element_proto,
+        html_base_element_proto,
+        html_form_element_proto,
         html_media_element_proto,
         html_video_element_proto,
         html_audio_element_proto,
@@ -2285,7 +2309,8 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         let new_el = require_node(vm, &h, el_val)?;
         match pos.as_str() {
             "beforebegin" => {
-                if let Some(p) = h.borrow().document.borrow().parent(nid) {
+                let parent_opt = h.borrow().document.borrow().parent(nid);
+                if let Some(p) = parent_opt {
                     insert_node_into_parent(vm, &h, p, new_el, Some(nid))?;
                     return Ok(el_val);
                 }
@@ -2327,7 +2352,8 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         let txt = h.borrow().document.borrow_mut().create_text(&data);
         match pos.as_str() {
             "beforebegin" => {
-                if let Some(p) = h.borrow().document.borrow().parent(nid) {
+                let parent_opt = h.borrow().document.borrow().parent(nid);
+                if let Some(p) = parent_opt {
                     insert_node_into_parent(vm, &h, p, txt, Some(nid))?;
                 }
             }
@@ -4169,6 +4195,10 @@ fn install_window_and_cssom(vm: &mut JsVm, host: &SharedHost) {
         ("Element", protos.element_proto),
         ("HTMLElement", protos.html_element_proto),
         ("HTMLIFrameElement", protos.html_iframe_element_proto),
+        ("HTMLAnchorElement", protos.html_anchor_element_proto),
+        ("HTMLAreaElement", protos.html_area_element_proto),
+        ("HTMLBaseElement", protos.html_base_element_proto),
+        ("HTMLFormElement", protos.html_form_element_proto),
         ("Document", protos.document_proto),
         ("ShadowRoot", protos.shadow_root_proto),
     ] {
