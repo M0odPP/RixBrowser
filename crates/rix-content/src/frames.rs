@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rix_dom::{NodeData, NodeId};
-use rix_html::parse_html;
+use rix_html::{decode_html_bytes, parse_html};
 use rix_ipc::{ContentToBrowser, MessagePortId, PipelineId, SurfaceId};
 use rix_js::heap::{TypedArrayKind, TypedArrayObject};
 use rix_js::{
@@ -24,8 +24,10 @@ use crate::event_loop::{SharedEventLoop, TaskPriority};
 use crate::events::{fire_object_event_with_proto, register_constructed_event, SharedEvents};
 use crate::fetch_ws::SharedNetBridge;
 use crate::web_apis::{
-    alloc_array_buffer, arg, create_dom_exception, define_global, define_host_accessor,
-    define_host_getter, define_host_method, origin_of_url, structured_clone_inner, SharedWebApis,
+    alloc_array_buffer, apply_url_host_setter, apply_url_port_setter, arg, create_dom_exception,
+    define_global, define_host_accessor, define_host_getter, define_host_method,
+    form_urlencode_pairs_with_charset, origin_of_url, parse_url_with_charset, strip_ascii_tab_lf,
+    structured_clone_inner, SharedWebApis,
 };
 
 #[inline]
@@ -1007,16 +1009,104 @@ fn alloc_message_port(
 // Same-origin child Document / Window & Cross-origin WindowProxy builders
 // ---------------------------------------------------------------------------
 
+fn data_attr_to_camel(attr_name: &str) -> String {
+    let mut out = String::with_capacity(attr_name.len());
+    let mut upper_next = false;
+    for ch in attr_name.chars() {
+        if ch == '-' {
+            upper_next = true;
+        } else if upper_next && ch.is_ascii_lowercase() {
+            out.push(ch.to_ascii_uppercase());
+            upper_next = false;
+        } else {
+            if upper_next {
+                out.push('-');
+                upper_next = false;
+            }
+            out.push(ch);
+        }
+    }
+    if upper_next {
+        out.push('-');
+    }
+    out
+}
+
+fn build_sub_document_element(
+    vm: &mut JsVm,
+    parsed_doc: &rix_dom::Document,
+    nid: NodeId,
+) -> HeapHandle {
+    let el_obj = vm.alloc_ordinary_object();
+    let Some(NodeData::Element(el)) = parsed_doc.get(nid) else {
+        return el_obj;
+    };
+    let tag_upper = el.name.local.as_str().to_ascii_uppercase();
+    let id = el.get_attribute("id").unwrap_or("").to_string();
+    let text = parsed_doc.inner_text(nid);
+    let dataset_obj = vm.alloc_ordinary_object();
+    let attrs_map = vm.alloc_ordinary_object();
+    for (qn, val) in &el.attributes {
+        let local = qn.local.as_str();
+        let ak = vm.heap.intern_key(local);
+        let av = JsValue::from_string(vm.heap.alloc_string(val));
+        vm.heap
+            .object_define_data(attrs_map, ak, av, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        if let Some(rest) = local.strip_prefix("data-") {
+            let dk = vm.heap.intern_key(&data_attr_to_camel(rest));
+            vm.heap
+                .object_define_data(dataset_obj, dk, av, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        }
+    }
+    let k_id = vm.heap.intern_key("id");
+    let k_tag = vm.heap.intern_key("tagName");
+    let k_nn = vm.heap.intern_key("nodeName");
+    let k_tc = vm.heap.intern_key("textContent");
+    let k_ih = vm.heap.intern_key("innerHTML");
+    let k_ds = vm.heap.intern_key("dataset");
+    let v_id = JsValue::from_string(vm.heap.alloc_string(&id));
+    let v_tag = JsValue::from_string(vm.heap.alloc_string(&tag_upper));
+    let v_txt = JsValue::from_string(vm.heap.alloc_string(&text));
+    vm.heap
+        .object_define_data(el_obj, k_id, v_id, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    vm.heap
+        .object_define_data(el_obj, k_tag, v_tag, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    vm.heap
+        .object_define_data(el_obj, k_nn, v_tag, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    vm.heap
+        .object_define_data(el_obj, k_tc, v_txt, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    vm.heap
+        .object_define_data(el_obj, k_ih, v_txt, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    vm.heap.object_define_data(
+        el_obj,
+        k_ds,
+        JsValue::from_object(dataset_obj),
+        PropertyAttrs::DEFAULT,
+        &mut vm.shapes,
+    );
+    define_host_method(vm, el_obj, "getAttribute", move |vm, _, args| {
+        let name = vm.value_to_rust_string(arg(args, 0)).to_ascii_lowercase();
+        let k = vm.heap.intern_key(&name);
+        match vm.get_property_by_key(attrs_map, k) {
+            Ok(v) if !v.is_undefined() => Ok(v),
+            _ => Ok(JsValue::NULL),
+        }
+    });
+    el_obj
+}
+
 fn build_sub_document(
     vm: &mut JsVm,
     url: &str,
     html: &str,
+    charset: &str,
     window_proxy: HeapHandle,
 ) -> (HeapHandle, String, Vec<String>) {
-    let parsed_doc = parse_html(html);
+    let mut parsed_doc = parse_html(html);
+    parsed_doc.set_character_set(charset);
     let mut title = String::new();
     let mut body_text = String::new();
-    let mut elements_by_id: Vec<(String, String, String)> = Vec::new();
+    let mut elements_by_id: Vec<(String, NodeId)> = Vec::new();
     let mut inline_scripts: Vec<String> = Vec::new();
 
     for nid in parsed_doc.descendants(parsed_doc.root()) {
@@ -1033,11 +1123,7 @@ fn build_sub_document(
                 }
             }
             if let Some(id) = el.get_attribute("id") {
-                elements_by_id.push((
-                    id.to_string(),
-                    tag.to_ascii_uppercase(),
-                    parsed_doc.inner_text(nid),
-                ));
+                elements_by_id.push((id.to_string(), nid));
             }
         }
     }
@@ -1045,23 +1131,8 @@ fn build_sub_document(
     let doc_obj = vm.alloc_ordinary_object();
     let body_obj = vm.alloc_ordinary_object();
     let id_map_obj = vm.alloc_ordinary_object();
-    for (id, tag, text) in elements_by_id {
-        let el_obj = vm.alloc_ordinary_object();
-        let k_id = vm.heap.intern_key("id");
-        let k_tag = vm.heap.intern_key("tagName");
-        let k_tc = vm.heap.intern_key("textContent");
-        let k_ih = vm.heap.intern_key("innerHTML");
-        let v_id = JsValue::from_string(vm.heap.alloc_string(&id));
-        let v_tag = JsValue::from_string(vm.heap.alloc_string(&tag));
-        let v_txt = JsValue::from_string(vm.heap.alloc_string(&text));
-        vm.heap
-            .object_define_data(el_obj, k_id, v_id, PropertyAttrs::DEFAULT, &mut vm.shapes);
-        vm.heap
-            .object_define_data(el_obj, k_tag, v_tag, PropertyAttrs::DEFAULT, &mut vm.shapes);
-        vm.heap
-            .object_define_data(el_obj, k_tc, v_txt, PropertyAttrs::DEFAULT, &mut vm.shapes);
-        vm.heap
-            .object_define_data(el_obj, k_ih, v_txt, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    for (id, nid) in elements_by_id {
+        let el_obj = build_sub_document_element(vm, &parsed_doc, nid);
         let mk = vm.heap.intern_key(&id);
         vm.heap.object_define_data(
             id_map_obj,
@@ -1090,9 +1161,13 @@ fn build_sub_document(
         &mut vm.shapes,
     );
 
+    let cs_val = JsValue::from_string(vm.heap.alloc_string(charset));
     for (name, val) in [
         ("title", JsValue::from_string(vm.heap.alloc_string(&title))),
         ("URL", JsValue::from_string(vm.heap.alloc_string(url))),
+        ("characterSet", cs_val),
+        ("charset", cs_val),
+        ("inputEncoding", cs_val),
         (
             "readyState",
             JsValue::from_string(vm.heap.alloc_string("complete")),
@@ -1112,6 +1187,58 @@ fn build_sub_document(
             _ => Ok(JsValue::NULL),
         }
     });
+    let doc_rc = Rc::new(parsed_doc);
+    {
+        let doc_qsa = Rc::clone(&doc_rc);
+        define_host_method(vm, doc_obj, "querySelectorAll", move |vm, _, args| {
+            let sel = vm.value_to_rust_string(arg(args, 0));
+            let list = rix_css::parse_selector_list_strict(&sel).map_err(|_| {
+                create_dom_exception(vm, "SyntaxError", &format!("Invalid selector: {sel}"))
+            })?;
+            let matches =
+                rix_css::query_selector_all_in_subtree(&doc_qsa, doc_qsa.root(), &list, None, None);
+            let arr = vm.alloc_array();
+            for nid in matches {
+                let el = build_sub_document_element(vm, &doc_qsa, nid);
+                vm.heap.object_push_element(arr, JsValue::from_object(el));
+            }
+            Ok(JsValue::from_object(arr))
+        });
+    }
+    {
+        let doc_qs = Rc::clone(&doc_rc);
+        define_host_method(vm, doc_obj, "querySelector", move |vm, _, args| {
+            let sel = vm.value_to_rust_string(arg(args, 0));
+            let list = rix_css::parse_selector_list_strict(&sel).map_err(|_| {
+                create_dom_exception(vm, "SyntaxError", &format!("Invalid selector: {sel}"))
+            })?;
+            if let Some(nid) =
+                rix_css::query_selector_in_subtree(&doc_qs, doc_qs.root(), &list, None, None)
+            {
+                let el = build_sub_document_element(vm, &doc_qs, nid);
+                Ok(JsValue::from_object(el))
+            } else {
+                Ok(JsValue::NULL)
+            }
+        });
+    }
+    {
+        let doc_tag = Rc::clone(&doc_rc);
+        define_host_method(vm, doc_obj, "getElementsByTagName", move |vm, _, args| {
+            let tag_q = vm.value_to_rust_string(arg(args, 0));
+            let arr = vm.alloc_array();
+            for nid in doc_tag.descendants(doc_tag.root()) {
+                if let Some(NodeData::Element(el)) = doc_tag.get(nid) {
+                    if tag_q == "*" || el.name.local.as_str().eq_ignore_ascii_case(&tag_q) {
+                        let wrapped = build_sub_document_element(vm, &doc_tag, nid);
+                        vm.heap
+                            .object_push_element(arr, JsValue::from_object(wrapped));
+                    }
+                }
+            }
+            Ok(JsValue::from_object(arr))
+        });
+    }
     define_host_method(vm, doc_obj, "write", move |vm, _, args| {
         let txt = vm.value_to_rust_string(arg(args, 0));
         let k = vm.heap.intern_key("innerHTML");
@@ -1130,6 +1257,69 @@ fn build_sub_document(
     (doc_obj, title, inline_scripts)
 }
 
+fn read_proxy_url(
+    vm: &mut JsVm,
+    fr: &SharedFrames,
+    wa: &SharedWebApis,
+    proxy_h: HeapHandle,
+) -> Result<String, JsException> {
+    let caller = fr.borrow().effective_origin(wa);
+    let fs = fr.borrow();
+    match fs.proxies.get(&proxy_h) {
+        Some(WindowProxyKind::SameOriginChild { url, .. }) => Ok(url.clone()),
+        Some(WindowProxyKind::Auxiliary {
+            is_cross_origin: false,
+            url,
+            ..
+        }) => Ok(url.clone()),
+        Some(WindowProxyKind::CrossOriginRemote { origin, .. })
+        | Some(WindowProxyKind::Auxiliary {
+            is_cross_origin: true,
+            origin,
+            ..
+        }) => Err(security_error(vm, &caller, origin)),
+        None => Ok("about:blank".to_string()),
+    }
+}
+
+fn set_proxy_url(
+    vm: &mut JsVm,
+    fr: &SharedFrames,
+    wa: &SharedWebApis,
+    proxy_h: HeapHandle,
+    new_url: String,
+) -> Result<(), JsException> {
+    let cur_url = {
+        let fs = fr.borrow();
+        match fs.proxies.get(&proxy_h) {
+            Some(
+                WindowProxyKind::SameOriginChild { url, .. }
+                | WindowProxyKind::CrossOriginRemote { url, .. }
+                | WindowProxyKind::Auxiliary { url, .. },
+            ) => url.clone(),
+            None => wa.borrow().current_href(),
+        }
+    };
+    let base = Url::parse(&cur_url)
+        .ok()
+        .filter(|u| !u.cannot_be_a_base())
+        .unwrap_or_else(|| wa.borrow().location_url.clone());
+    let resolved = base
+        .join(&new_url)
+        .map_err(|_| create_dom_exception(vm, "SyntaxError", &format!("Invalid URL: {new_url}")))?;
+    let mut fs = fr.borrow_mut();
+    if let Some(proxy) = fs.proxies.get_mut(&proxy_h) {
+        match proxy {
+            WindowProxyKind::SameOriginChild { url, .. }
+            | WindowProxyKind::CrossOriginRemote { url, .. }
+            | WindowProxyKind::Auxiliary { url, .. } => {
+                *url = resolved.to_string();
+            }
+        }
+    }
+    Ok(())
+}
+
 fn attach_proxy_location(
     vm: &mut JsVm,
     web_apis: &SharedWebApis,
@@ -1144,52 +1334,97 @@ fn attach_proxy_location(
         loc_obj,
         "href",
         move |vm, _, _| {
-            let caller = fr.borrow().effective_origin(&wa);
-            let fs = fr.borrow();
-            match fs.proxies.get(&proxy_h) {
-                Some(WindowProxyKind::SameOriginChild { url, .. }) => {
-                    Ok(JsValue::from_string(vm.heap.alloc_string(url)))
-                }
-                Some(WindowProxyKind::Auxiliary {
-                    is_cross_origin: false,
-                    url,
-                    ..
-                }) => Ok(JsValue::from_string(vm.heap.alloc_string(url))),
-                Some(WindowProxyKind::CrossOriginRemote { origin, .. })
-                | Some(WindowProxyKind::Auxiliary {
-                    is_cross_origin: true,
-                    origin,
-                    ..
-                }) => Err(security_error(vm, &caller, origin)),
-                None => Ok(JsValue::from_string(vm.heap.alloc_string("about:blank"))),
-            }
+            let url = read_proxy_url(vm, &fr, &wa, proxy_h)?;
+            Ok(JsValue::from_string(vm.heap.alloc_string(&url)))
         },
         {
             let fr = Rc::clone(frames);
+            let wa = Rc::clone(web_apis);
             move |vm, _, args| {
                 let new_url = vm.value_to_rust_string(arg(args, 0));
-                let mut fs = fr.borrow_mut();
-                if let Some(proxy) = fs.proxies.get_mut(&proxy_h) {
-                    match proxy {
-                        WindowProxyKind::SameOriginChild { url, .. }
-                        | WindowProxyKind::CrossOriginRemote { url, .. }
-                        | WindowProxyKind::Auxiliary { url, .. } => {
-                            *url = new_url;
-                        }
-                    }
-                }
+                set_proxy_url(vm, &fr, &wa, proxy_h, new_url)?;
                 Ok(JsValue::UNDEFINED)
             }
         },
     );
+    for (prop, part) in [
+        ("origin", 0u8),
+        ("protocol", 1),
+        ("host", 2),
+        ("hostname", 3),
+        ("port", 4),
+        ("pathname", 5),
+        ("search", 6),
+        ("hash", 7),
+    ] {
+        let fr_p = Rc::clone(frames);
+        let wa_p = Rc::clone(web_apis);
+        define_host_getter(vm, loc_obj, prop, move |vm, _, _| {
+            let url_str = read_proxy_url(vm, &fr_p, &wa_p, proxy_h)?;
+            let out = Url::parse(&url_str)
+                .map(|u| match part {
+                    0 => origin_of_url(&u),
+                    1 => format!("{}:", u.scheme()),
+                    2 => match (u.host_str(), u.port()) {
+                        (Some(h), Some(p)) => format!("{h}:{p}"),
+                        (Some(h), None) => h.to_string(),
+                        _ => String::new(),
+                    },
+                    3 => u.host_str().unwrap_or("").to_string(),
+                    4 => u.port().map(|p| p.to_string()).unwrap_or_default(),
+                    5 => u.path().to_string(),
+                    6 => u
+                        .query()
+                        .filter(|q| !q.is_empty())
+                        .map(|q| format!("?{q}"))
+                        .unwrap_or_default(),
+                    _ => u
+                        .fragment()
+                        .filter(|f| !f.is_empty())
+                        .map(|f| format!("#{f}"))
+                        .unwrap_or_default(),
+                })
+                .unwrap_or_default();
+            Ok(JsValue::from_string(vm.heap.alloc_string(&out)))
+        });
+    }
+    {
+        let fr_ts = Rc::clone(frames);
+        let wa_ts = Rc::clone(web_apis);
+        define_host_method(vm, loc_obj, "toString", move |vm, _, _| {
+            let url_str = read_proxy_url(vm, &fr_ts, &wa_ts, proxy_h)?;
+            Ok(JsValue::from_string(vm.heap.alloc_string(&url_str)))
+        });
+    }
+    // HTML §7.2.4 `[PutForwards=href]`: setting `window.location = url` forwards to `location.href`.
+    // Root `loc_obj` via `alloc_host_fn_rooted` so GC never collects it while `proxy_h` is live.
+    let fr_loc = Rc::clone(frames);
+    let wa_loc = Rc::clone(web_apis);
     let k_loc = vm.heap.intern_key("location");
-    vm.heap.object_define_data(
+    let loc_getter = vm.alloc_host_fn_rooted(
+        "get location",
+        &[JsValue::from_object(loc_obj)],
+        move |_, _, _| Ok(JsValue::from_object(loc_obj)),
+    );
+    let loc_setter = vm.alloc_host_fn("set location", move |vm, _, args| {
+        let new_url = vm.value_to_rust_string(arg(args, 0));
+        set_proxy_url(vm, &fr_loc, &wa_loc, proxy_h, new_url)?;
+        Ok(JsValue::UNDEFINED)
+    });
+    vm.heap.object_define_accessor(
         proxy_h,
         k_loc,
-        JsValue::from_object(loc_obj),
+        Some(loc_getter),
+        Some(loc_setter),
         PropertyAttrs::CONFIGURABLE,
         &mut vm.shapes,
     );
+    // Expose `DOMException` constructor on same-origin WindowProxy so cross-frame tests work.
+    let k_de = vm.heap.intern_key("DOMException");
+    if let Ok(de_val) = vm.get_property_by_key(vm.global, k_de) {
+        vm.heap
+            .object_define_data(proxy_h, k_de, de_val, PropertyAttrs::METHOD, &mut vm.shapes);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1441,12 +1676,14 @@ pub(crate) fn sync_iframe_node(
 
     let was_existing = frames.borrow().iframes.contains_key(&node_id);
     if is_same_origin {
-        let html_content = if let Some(ref sd) = srcdoc_attr {
-            sd.clone()
+        let (html_content, child_charset) = if let Some(ref sd) = srcdoc_attr {
+            let cs = rix_html::detect_html_charset(sd.as_bytes());
+            (sd.clone(), cs)
         } else if resolved_url.starts_with("http://") || resolved_url.starts_with("https://") {
-            fetch_iframe_url_sync(net, &resolved_url, &parent_origin).unwrap_or_default()
+            fetch_iframe_url_sync(net, &resolved_url, &parent_origin)
+                .unwrap_or_else(|| (String::new(), "UTF-8"))
         } else {
-            String::new()
+            (String::new(), "UTF-8")
         };
 
         let proxy_h = alloc_window_proxy(
@@ -1463,7 +1700,7 @@ pub(crate) fn sync_iframe_node(
             },
         );
         let (child_doc, _title, inline_scripts) =
-            build_sub_document(vm, &resolved_url, &html_content, proxy_h);
+            build_sub_document(vm, &resolved_url, &html_content, child_charset, proxy_h);
         if let Some(WindowProxyKind::SameOriginChild {
             child_doc: slot, ..
         }) = frames.borrow_mut().proxies.get_mut(&proxy_h)
@@ -1590,7 +1827,30 @@ pub(crate) fn sync_iframe_node(
     }
 }
 
-fn fetch_iframe_url_sync(net: &SharedNetBridge, url: &str, origin: &str) -> Option<String> {
+fn extract_content_type_charset(headers: &HashMap<String, String>) -> Option<String> {
+    let ct = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.as_str())?;
+    for part in ct.split(';').skip(1) {
+        let trimmed = part.trim();
+        if let Some((k, v)) = trimmed.split_once('=') {
+            if k.trim().eq_ignore_ascii_case("charset") {
+                let val = v.trim().trim_matches('"').trim_matches('\'');
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn fetch_iframe_url_sync(
+    net: &SharedNetBridge,
+    url: &str,
+    origin: &str,
+) -> Option<(String, &'static str)> {
     let engine = std::sync::Arc::clone(&net.borrow().fetch_engine);
     let req = rix_net::FetchRequest {
         url: url.to_string(),
@@ -1605,8 +1865,6 @@ fn fetch_iframe_url_sync(net: &SharedNetBridge, url: &str, origin: &str) -> Opti
     };
     let res = if let Ok(handle) = tokio::runtime::Handle::try_current() {
         if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-            // Avoid panicking on `block_in_place` inside current-thread tokio runtimes by
-            // running the HTTP fetch on a dedicated helper thread with its own tiny runtime.
             std::thread::spawn(move || {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1627,7 +1885,10 @@ fn fetch_iframe_url_sync(net: &SharedNetBridge, url: &str, origin: &str) -> Opti
             .ok()
             .and_then(|rt| rt.block_on(engine.fetch(req)).ok())
     };
-    res.map(|r| String::from_utf8_lossy(&r.body).into_owned())
+    res.map(|r| {
+        let http_cs = extract_content_type_charset(&r.headers);
+        decode_html_bytes(&r.body, http_cs.as_deref())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1853,6 +2114,7 @@ pub fn install_frame_and_messaging_apis(
     install_window_proxy_proto(vm, host, events, event_loop, web_apis, &frames);
     install_window_browsing_context(vm, host, events, event_loop, web_apis, &frames);
     install_html_iframe_element_proto(vm, host, events, event_loop, web_apis, net, &frames);
+    install_hyperlink_and_form_protos(vm, host, events, event_loop, web_apis, net, &frames);
 
     frames
 }
@@ -2649,12 +2911,17 @@ fn install_window_browsing_context(
             let resolved_url = if raw_url.is_empty() || raw_url.eq_ignore_ascii_case("about:blank")
             {
                 "about:blank".to_string()
-            } else if let Ok(base) = Url::parse(&parent_href) {
-                base.join(&raw_url)
-                    .map(|u| u.to_string())
-                    .unwrap_or_else(|_| raw_url.clone())
             } else {
-                raw_url.clone()
+                let base = Url::parse(&parent_href).map_err(|_| {
+                    create_dom_exception(
+                        vm,
+                        "SyntaxError",
+                        &format!("Invalid base URL: {parent_href}"),
+                    )
+                })?;
+                base.join(&raw_url).map(|u| u.to_string()).map_err(|_| {
+                    create_dom_exception(vm, "SyntaxError", &format!("Invalid URL: {raw_url}"))
+                })?
             };
 
             let target_origin = if resolved_url == "about:blank" {
@@ -2731,7 +2998,7 @@ fn install_window_browsing_context(
                 },
             );
             if !is_cross_origin {
-                let (doc_h, _, _) = build_sub_document(vm, &resolved_url, "", proxy_h);
+                let (doc_h, _, _) = build_sub_document(vm, &resolved_url, "", "UTF-8", proxy_h);
                 if let Some(WindowProxyKind::Auxiliary { doc, .. }) =
                     fr.borrow_mut().proxies.get_mut(&proxy_h)
                 {
@@ -3044,6 +3311,432 @@ fn install_html_iframe_element_proto(
                 }
                 _ => Ok(JsValue::NULL),
             }
+        });
+    }
+}
+
+fn document_base_url(h: &SharedHost, wa: &SharedWebApis) -> Url {
+    let fallback = wa.borrow().location_url.clone();
+    let doc_rc = Rc::clone(&h.borrow().document);
+    let doc = doc_rc.borrow();
+    for nid in doc.descendants(doc.root()) {
+        if let Some(NodeData::Element(el)) = doc.get(nid) {
+            if el.name.local.as_str().eq_ignore_ascii_case("base") {
+                if let Some(href) = el.get_attribute("href") {
+                    if let Ok(resolved) = fallback.join(href) {
+                        return resolved;
+                    }
+                }
+            }
+        }
+    }
+    fallback
+}
+
+fn resolve_hyperlink_url(
+    vm: &JsVm,
+    h: &SharedHost,
+    wa: &SharedWebApis,
+    this_val: JsValue,
+) -> Option<(NodeId, Option<Url>, String)> {
+    let obj_h = this_val.as_object()?;
+    let nid = h.borrow().node_for_handle(vm, obj_h)?;
+    let (raw_opt, charset) = {
+        let doc_rc = Rc::clone(&h.borrow().document);
+        let doc = doc_rc.borrow();
+        let raw = match doc.get(nid) {
+            Some(NodeData::Element(el)) => el.get_attribute("href").map(str::to_string),
+            _ => None,
+        };
+        (raw, doc.character_set().to_string())
+    };
+    let raw = match raw_opt {
+        Some(r) => r,
+        None => return Some((nid, None, String::new())),
+    };
+    let base = document_base_url(h, wa);
+    let parsed = parse_url_with_charset(&raw, &base, &charset);
+    Some((nid, parsed, raw))
+}
+
+/// Installs WHATWG `HTMLHyperlinkElementUtils` on `HTMLAnchorElement.prototype` (`<a>`) and
+/// `HTMLAreaElement.prototype` (`<area>`), plus `HTMLFormElement.prototype` (`<form>`) submission.
+#[allow(clippy::too_many_arguments)]
+fn install_hyperlink_and_form_protos(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
+    net: &SharedNetBridge,
+    frames: &SharedFrames,
+) {
+    let protos = host.borrow().prototypes;
+
+    // HTMLBaseElement (`<base>`): reflect `href` and `target` attributes (HTML §4.2.3).
+    {
+        let bp = protos.html_base_element_proto;
+        let hg = Rc::clone(host);
+        let wag = Rc::clone(web_apis);
+        let hs = Rc::clone(host);
+        define_host_accessor(
+            vm,
+            bp,
+            "href",
+            move |vm, this_val, _| {
+                let Some(nid) = this_val
+                    .as_object()
+                    .and_then(|oh| hg.borrow().node_for_handle(vm, oh))
+                else {
+                    return Ok(JsValue::from_string(vm.heap.alloc_string("")));
+                };
+                let raw_opt = {
+                    let doc_rc = Rc::clone(&hg.borrow().document);
+                    let doc = doc_rc.borrow();
+                    match doc.get(nid) {
+                        Some(NodeData::Element(el)) => el.get_attribute("href").map(str::to_string),
+                        _ => None,
+                    }
+                };
+                let fallback = wag.borrow().location_url.clone();
+                let out = match raw_opt {
+                    Some(r) => fallback.join(&r).map(|u| u.to_string()).unwrap_or(r),
+                    None => fallback.to_string(),
+                };
+                Ok(JsValue::from_string(vm.heap.alloc_string(&out)))
+            },
+            move |vm, this_val, args| {
+                if let Some(nid) = this_val
+                    .as_object()
+                    .and_then(|oh| hs.borrow().node_for_handle(vm, oh))
+                {
+                    let val = vm.value_to_rust_string(arg(args, 0));
+                    set_element_attr(vm, &hs, nid, "href", &val);
+                }
+                Ok(JsValue::UNDEFINED)
+            },
+        );
+    }
+
+    for proto in [
+        protos.html_anchor_element_proto,
+        protos.html_area_element_proto,
+    ] {
+        // href (getter + setter)
+        {
+            let hg = Rc::clone(host);
+            let wag = Rc::clone(web_apis);
+            let hs = Rc::clone(host);
+            define_host_accessor(
+                vm,
+                proto,
+                "href",
+                move |vm, this_val, _| {
+                    let Some((_, parsed, raw)) = resolve_hyperlink_url(vm, &hg, &wag, this_val)
+                    else {
+                        return Ok(JsValue::from_string(vm.heap.alloc_string("")));
+                    };
+                    let out = parsed.map_or(raw, |u| u.as_str().to_string());
+                    Ok(JsValue::from_string(vm.heap.alloc_string(&out)))
+                },
+                move |vm, this_val, args| {
+                    if let Some(nid) = this_val
+                        .as_object()
+                        .and_then(|oh| hs.borrow().node_for_handle(vm, oh))
+                    {
+                        let val = vm.value_to_rust_string(arg(args, 0));
+                        set_element_attr(vm, &hs, nid, "href", &val);
+                    }
+                    Ok(JsValue::UNDEFINED)
+                },
+            );
+        }
+
+        // toString() mirrors href
+        {
+            let hg = Rc::clone(host);
+            let wag = Rc::clone(web_apis);
+            define_host_method(vm, proto, "toString", move |vm, this_val, _| {
+                let Some((_, parsed, raw)) = resolve_hyperlink_url(vm, &hg, &wag, this_val) else {
+                    return Ok(JsValue::from_string(vm.heap.alloc_string("")));
+                };
+                let out = parsed.map_or(raw, |u| u.as_str().to_string());
+                Ok(JsValue::from_string(vm.heap.alloc_string(&out)))
+            });
+        }
+
+        // origin (readonly)
+        {
+            let hg = Rc::clone(host);
+            let wag = Rc::clone(web_apis);
+            define_host_getter(vm, proto, "origin", move |vm, this_val, _| {
+                let out = resolve_hyperlink_url(vm, &hg, &wag, this_val)
+                    .and_then(|(_, parsed, _)| parsed)
+                    .map(|u| origin_of_url(&u))
+                    .unwrap_or_default();
+                Ok(JsValue::from_string(vm.heap.alloc_string(&out)))
+            });
+        }
+
+        // Mutable URL component accessors (`protocol`, `username`, `password`, `host`, `hostname`, `port`, `pathname`, `search`, `hash`)
+        for (prop, kind) in [
+            ("protocol", 0u8),
+            ("username", 1),
+            ("password", 2),
+            ("host", 3),
+            ("hostname", 4),
+            ("port", 5),
+            ("pathname", 6),
+            ("search", 7),
+            ("hash", 8),
+        ] {
+            let hg = Rc::clone(host);
+            let wag = Rc::clone(web_apis);
+            let hs = Rc::clone(host);
+            let was = Rc::clone(web_apis);
+            define_host_accessor(
+                vm,
+                proto,
+                prop,
+                move |vm, this_val, _| {
+                    let out = resolve_hyperlink_url(vm, &hg, &wag, this_val)
+                        .and_then(|(_, parsed, _)| parsed)
+                        .map(|u| match kind {
+                            0 => format!("{}:", u.scheme()),
+                            1 => u.username().to_string(),
+                            2 => u.password().unwrap_or("").to_string(),
+                            3 => match (u.host_str(), u.port()) {
+                                (Some(h), Some(p)) => format!("{h}:{p}"),
+                                (Some(h), None) => h.to_string(),
+                                _ => String::new(),
+                            },
+                            4 => u.host_str().unwrap_or("").to_string(),
+                            5 => u.port().map(|p| p.to_string()).unwrap_or_default(),
+                            6 => u.path().to_string(),
+                            7 => u
+                                .query()
+                                .filter(|q| !q.is_empty())
+                                .map(|q| format!("?{q}"))
+                                .unwrap_or_default(),
+                            _ => u
+                                .fragment()
+                                .filter(|f| !f.is_empty())
+                                .map(|f| format!("#{f}"))
+                                .unwrap_or_default(),
+                        })
+                        .unwrap_or_else(|| {
+                            if kind == 0 {
+                                ":".to_string()
+                            } else {
+                                String::new()
+                            }
+                        });
+                    Ok(JsValue::from_string(vm.heap.alloc_string(&out)))
+                },
+                move |vm, this_val, args| {
+                    let Some((nid, Some(mut u), _)) =
+                        resolve_hyperlink_url(vm, &hs, &was, this_val)
+                    else {
+                        return Ok(JsValue::UNDEFINED);
+                    };
+                    let val = vm.value_to_rust_string(arg(args, 0));
+                    match kind {
+                        0 => {
+                            let cleaned = strip_ascii_tab_lf(&val);
+                            let scheme = cleaned.split(':').next().unwrap_or("");
+                            if !scheme.is_empty() {
+                                let _ = u.set_scheme(scheme);
+                            }
+                        }
+                        1 => {
+                            if !u.cannot_be_a_base()
+                                && u.host_str().is_some()
+                                && u.scheme() != "file"
+                            {
+                                let _ = u.set_username(&val);
+                            }
+                        }
+                        2 => {
+                            if !u.cannot_be_a_base()
+                                && u.host_str().is_some()
+                                && u.scheme() != "file"
+                            {
+                                let _ =
+                                    u.set_password(if val.is_empty() { None } else { Some(&val) });
+                            }
+                        }
+                        3 => apply_url_host_setter(&mut u, &val, true),
+                        4 => apply_url_host_setter(&mut u, &val, false),
+                        5 => apply_url_port_setter(&mut u, &val),
+                        6 => {
+                            if !u.cannot_be_a_base() {
+                                let cleaned = strip_ascii_tab_lf(&val);
+                                u.set_path(&cleaned);
+                            }
+                        }
+                        7 => {
+                            let trimmed = val.strip_prefix('?').unwrap_or(&val);
+                            let cleaned = strip_ascii_tab_lf(trimmed);
+                            if val.is_empty() {
+                                u.set_query(None);
+                            } else if trimmed.is_empty() {
+                                u.set_query(Some(""));
+                            } else {
+                                u.set_query(Some(&cleaned));
+                            }
+                        }
+                        _ => {
+                            let trimmed = val.strip_prefix('#').unwrap_or(&val);
+                            let cleaned = strip_ascii_tab_lf(trimmed);
+                            if val.is_empty() {
+                                u.set_fragment(None);
+                            } else {
+                                u.set_fragment(Some(&cleaned));
+                            }
+                        }
+                    }
+                    set_element_attr(vm, &hs, nid, "href", u.as_str());
+                    Ok(JsValue::UNDEFINED)
+                },
+            );
+        }
+    }
+
+    // --- HTMLFormElement (`<form>`) ---
+    let fp = protos.html_form_element_proto;
+    for (prop, attr) in [
+        ("action", "action"),
+        ("method", "method"),
+        ("target", "target"),
+        ("acceptCharset", "accept-charset"),
+        ("enctype", "enctype"),
+        ("name", "name"),
+    ] {
+        let hg = Rc::clone(host);
+        let hs = Rc::clone(host);
+        let attr_g = attr.to_string();
+        let attr_s = attr.to_string();
+        define_host_accessor(
+            vm,
+            fp,
+            prop,
+            move |vm, this_val, _| {
+                let Some(nid) = this_val
+                    .as_object()
+                    .and_then(|oh| hg.borrow().node_for_handle(vm, oh))
+                else {
+                    return Ok(JsValue::from_string(vm.heap.alloc_string("")));
+                };
+                let val = {
+                    let doc_rc = Rc::clone(&hg.borrow().document);
+                    let doc = doc_rc.borrow();
+                    match doc.get(nid) {
+                        Some(NodeData::Element(el)) => {
+                            el.get_attribute(&attr_g).unwrap_or("").to_string()
+                        }
+                        _ => String::new(),
+                    }
+                };
+                Ok(JsValue::from_string(vm.heap.alloc_string(&val)))
+            },
+            move |vm, this_val, args| {
+                if let Some(nid) = this_val
+                    .as_object()
+                    .and_then(|oh| hs.borrow().node_for_handle(vm, oh))
+                {
+                    let val = vm.value_to_rust_string(arg(args, 0));
+                    set_element_attr(vm, &hs, nid, &attr_s, &val);
+                }
+                Ok(JsValue::UNDEFINED)
+            },
+        );
+    }
+
+    // form.submit(): WHATWG HTML §4.10.21.3 GET/target-iframe form submission with charset encoding
+    {
+        let h = Rc::clone(host);
+        let ev = Rc::clone(events);
+        let el = Rc::clone(event_loop);
+        let wa = Rc::clone(web_apis);
+        let net_r = Rc::clone(net);
+        let fr = Rc::clone(frames);
+        define_host_method(vm, fp, "submit", move |vm, this_val, _| {
+            let Some(form_nid) = this_val
+                .as_object()
+                .and_then(|oh| h.borrow().node_for_handle(vm, oh))
+            else {
+                return Ok(JsValue::UNDEFINED);
+            };
+            let (action, method, target, charset, pairs, target_iframe) = {
+                let doc_rc = Rc::clone(&h.borrow().document);
+                let doc = doc_rc.borrow();
+                let Some(NodeData::Element(form_el)) = doc.get(form_nid) else {
+                    return Ok(JsValue::UNDEFINED);
+                };
+                let action = form_el.get_attribute("action").unwrap_or("").to_string();
+                let method = form_el
+                    .get_attribute("method")
+                    .unwrap_or("get")
+                    .to_ascii_lowercase();
+                let target = form_el.get_attribute("target").unwrap_or("").to_string();
+                let accept_cs = form_el
+                    .get_attribute("accept-charset")
+                    .and_then(|s| s.split_ascii_whitespace().next())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| doc.character_set().to_string());
+                let mut pairs = Vec::new();
+                for desc in doc.descendants(form_nid) {
+                    if let Some(NodeData::Element(ctrl)) = doc.get(desc) {
+                        let tag = ctrl.name.local.as_str();
+                        if matches!(tag, "input" | "textarea" | "select")
+                            && !ctrl.has_attribute("disabled")
+                        {
+                            if let Some(name) = ctrl.get_attribute("name").filter(|n| !n.is_empty())
+                            {
+                                let val = ctrl.get_attribute("value").unwrap_or("").to_string();
+                                pairs.push((name.to_string(), val));
+                            }
+                        }
+                    }
+                }
+                let target_iframe = if !target.is_empty() {
+                    doc.descendants(doc.root()).find(|&n| {
+                        matches!(doc.get(n), Some(NodeData::Element(e))
+                            if e.name.local.as_str().eq_ignore_ascii_case("iframe")
+                                && (e.get_attribute("name") == Some(target.as_str())
+                                    || e.get_attribute("id") == Some(target.as_str())))
+                    })
+                } else {
+                    None
+                };
+                (action, method, target, accept_cs, pairs, target_iframe)
+            };
+            let _ = target;
+            if method == "get" || method.is_empty() {
+                let encoded = form_urlencode_pairs_with_charset(&pairs, &charset);
+                let base = wa.borrow().location_url.clone();
+                let mut dest = if action.is_empty() {
+                    base
+                } else {
+                    base.join(&action).unwrap_or(base)
+                };
+                dest.set_query(if encoded.is_empty() {
+                    None
+                } else {
+                    Some(&encoded)
+                });
+                let dest_str = dest.as_str().to_string();
+                if let Some(iframe_nid) = target_iframe {
+                    // Force re-navigation even if src matches previous submission.
+                    if let Some(rec) = fr.borrow_mut().iframes.get_mut(&iframe_nid) {
+                        rec.last_src.clear();
+                    }
+                    set_element_attr(vm, &h, iframe_nid, "src", &dest_str);
+                    sync_iframe_node(vm, &h, &ev, &el, &wa, &net_r, &fr, iframe_nid);
+                }
+            }
+            Ok(JsValue::UNDEFINED)
         });
     }
 }

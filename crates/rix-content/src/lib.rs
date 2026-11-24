@@ -136,6 +136,27 @@ impl ContentRuntime {
         Self::with_origin_and_storage(document, viewport, font_db, DEFAULT_DOCUMENT_URL, storage)
     }
 
+    /// Creates a runtime configured with an explicit origin URL and shared [`FetchEngine`]
+    /// over in-memory storage.
+    #[must_use]
+    pub fn with_fetch_engine(
+        document: Rc<RefCell<Document>>,
+        viewport: Size,
+        font_db: Arc<FontDatabase>,
+        origin_url: &str,
+        fetch_engine: Arc<FetchEngine>,
+    ) -> Self {
+        let storage = StorageEngine::in_memory().expect("in-memory StorageEngine");
+        Self::with_full_config(
+            document,
+            viewport,
+            font_db,
+            origin_url,
+            storage,
+            Some(fetch_engine),
+        )
+    }
+
     /// Creates a runtime configured with an explicit document origin URL and persistent or
     /// in-memory [`StorageEngine`].
     #[must_use]

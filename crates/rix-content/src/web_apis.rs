@@ -791,7 +791,6 @@ pub(crate) fn output_encoding_for_charset(charset: &str) -> &'static Encoding {
 
 /// Percent-encodes a URL query string using `charset` per WHATWG URL §4.3 ("query state") and
 /// Encoding §4.2 (HTML error mode: unmappable scalar values become `%26%23<decimal>%3B`).
-#[allow(dead_code)]
 pub(crate) fn percent_encode_query_with_charset(
     query: &str,
     charset: &str,
@@ -839,7 +838,6 @@ pub(crate) fn percent_encode_query_with_charset(
 
 /// Encodes `(name, value)` pairs as `application/x-www-form-urlencoded` using `charset`
 /// (WHATWG URL §5.2 & HTML §4.10.21.5).
-#[allow(dead_code)]
 pub(crate) fn form_urlencode_pairs_with_charset(
     pairs: &[(String, String)],
     charset: &str,
@@ -936,7 +934,6 @@ fn normalize_file_drive_pipe(mut u: Url) -> Url {
     u
 }
 
-#[allow(dead_code)]
 pub(crate) fn parse_url_with_charset(raw: &str, base: &Url, charset: &str) -> Option<Url> {
     let cleaned = strip_ascii_tab_lf(raw);
     let trimmed = cleaned.trim_matches(|c: char| (c as u32) <= 0x20);
