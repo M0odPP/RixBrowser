@@ -477,26 +477,32 @@ pub unsafe extern "C" fn rt_guard_object_slots(
     }
 }
 
-/// Tier-3 prototype-chain guard: verifies `shapes.prototype_epoch() == expected_epoch` and
-/// receiver `shape_id == expected_shape`, returning the holder slot value or [`JIT_MISS_SENTINEL`].
+/// Tier-3 prototype-chain guard: verifies `shapes.prototype_epoch() == expected_epoch`,
+/// receiver `shape_id == expected_shape`, and receiver `[[Prototype]] == expected_proto`,
+/// returning the holder slot value or [`JIT_MISS_SENTINEL`].
+///
+/// `packed_shape_offset` packs `((expected_shape as u64) << 32) | (offset as u64)`.
 ///
 /// # Safety
 /// `vm` must be a valid pointer to the active [`JsVm`].
 pub unsafe extern "C" fn rt_guard_proto_prop(
     vm: *mut JsVm,
     obj_bits: u64,
-    expected_shape: u32,
+    packed_shape_offset: u64,
+    expected_proto_bits: u64,
     holder_bits: u64,
-    offset: u32,
     expected_epoch: u64,
 ) -> u64 {
     // SAFETY: Valid active `JsVm` pointer passed from Tier-3 JIT code.
     let vm = unsafe { &*vm };
+    let expected_shape = (packed_shape_offset >> 32) as u32;
+    let offset = (packed_shape_offset & 0xFFFF_FFFF) as usize;
     match vm.jit_guard_proto_prop(
         JsValue::from_raw(obj_bits),
         expected_shape,
+        JsValue::from_raw(expected_proto_bits),
         JsValue::from_raw(holder_bits),
-        offset as usize,
+        offset,
         expected_epoch,
     ) {
         Some(v) => v.to_raw(),

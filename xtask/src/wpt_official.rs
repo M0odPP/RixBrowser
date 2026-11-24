@@ -42,6 +42,7 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
         if (val === undefined) return "undefined";
         if (typeof val === "string") return JSON.stringify(val);
         if (typeof val === "number") return Object.is(val, -0) ? "-0" : String(val);
+        if (typeof val === "bigint") return String(val) + "n";
         if (typeof val === "symbol") return String(val);
         try { return String(val); } catch (_) { return "<object>"; }
     }
@@ -125,7 +126,12 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
     }
     function assert_own_property(obj, prop, desc) {
         if (!Object.prototype.hasOwnProperty.call(obj, prop)) {
-            fail((desc ? desc + ": " : "") + "missing own property " + prop);
+            fail((desc ? desc + ": " : "") + "missing own property " + format_value(prop));
+        }
+    }
+    function assert_not_own_property(obj, prop, desc) {
+        if (Object.prototype.hasOwnProperty.call(obj, prop)) {
+            fail((desc ? desc + ": " : "") + "unexpected own property " + format_value(prop));
         }
     }
     function assert_inherits(obj, prop, desc) {
@@ -321,6 +327,14 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
             }
         );
     }
+    function promise_rejects_exactly(t, expected, promise, desc) {
+        return promise.then(
+            function() { assert_unreached((desc ? desc + ": " : "") + "promise fulfilled instead of rejecting"); },
+            function(e) {
+                assert_equals(e, expected, desc);
+            }
+        );
+    }
     function generate_tests(fn, params) {
         if (!Array.isArray(params)) return;
         for (let i = 0; i < params.length; i++) {
@@ -345,6 +359,7 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
     global.generate_tests = generate_tests;
     global.promise_rejects_js = promise_rejects_js;
     global.promise_rejects_dom = promise_rejects_dom;
+    global.promise_rejects_exactly = promise_rejects_exactly;
     global.setup = setup;
     global.done = done;
     global.add_completion_callback = add_completion_callback;
@@ -364,6 +379,7 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
     global.assert_object_equals = assert_object_equals;
     global.assert_in_array = assert_in_array;
     global.assert_own_property = assert_own_property;
+    global.assert_not_own_property = assert_not_own_property;
     global.assert_inherits = assert_inherits;
     global.assert_idl_attribute = assert_idl_attribute;
     global.assert_readonly = assert_readonly;
@@ -476,17 +492,82 @@ fn collect_wpt_html_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
                 continue;
             }
             collect_wpt_html_files(&path, out)?;
-        } else if (name.ends_with(".html") || name.ends_with(".htm"))
+        } else if ((name.ends_with(".html") || name.ends_with(".htm"))
             && !name.ends_with("-ref.html")
             && !name.ends_with("-ref.htm")
             && !name.ends_with("-notref.html")
             && !name.ends_with("-manual.html")
-            && !name.contains("manual.")
+            && !name.contains("manual."))
+            || name.ends_with(".any.js")
+            || name.ends_with(".window.js")
         {
             out.push(path);
         }
     }
     Ok(())
+}
+
+/// Synthesizes a standard WPT testharness HTML wrapper for `*.any.js` and `*.window.js` tests,
+/// honoring `// META: global=...` and `// META: script=...` directives per WPT test specification.
+/// Returns `None` if `// META: global=...` excludes the `window` global.
+fn synthesize_wpt_js_html(path: &Path, js_src: &str) -> Option<String> {
+    let fname = path.file_name().and_then(|n| n.to_str())?;
+    let is_any = fname.ends_with(".any.js");
+    let is_window = fname.ends_with(".window.js");
+    if !is_any && !is_window {
+        return None;
+    }
+
+    let mut scripts: Vec<String> = Vec::new();
+    let mut globals_spec: Option<String> = None;
+    for line in js_src.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("// META:") else {
+            // WPT metadata comments appear only at the top of the file.
+            if !trimmed.starts_with("//") {
+                break;
+            }
+            continue;
+        };
+        let meta = rest.trim();
+        if let Some(val) = meta.strip_prefix("global=") {
+            globals_spec = Some(val.trim().to_string());
+        } else if let Some(val) = meta.strip_prefix("script=") {
+            let s = val.trim();
+            if !s.is_empty() {
+                scripts.push(s.to_string());
+            }
+        }
+    }
+
+    if is_any {
+        if let Some(ref g) = globals_spec {
+            let tokens: Vec<&str> = g
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            let includes_window = tokens.iter().any(|t| *t == "window" || *t == "default")
+                || (tokens.iter().all(|t| t.starts_with('!')) && !tokens.contains(&"!window"));
+            if !includes_window {
+                return None;
+            }
+        }
+    }
+
+    let mut html = String::from(
+        "<!doctype html><meta charset=utf-8>\n\
+         <script src=\"/resources/testharness.js\"></script>\n\
+         <script src=\"/resources/testharnessreport.js\"></script>\n",
+    );
+    for s in scripts {
+        html.push_str(&format!("<script src=\"{s}\"></script>\n"));
+    }
+    html.push_str(&format!("<script src=\"{fname}\"></script>\n"));
+    Some(html)
 }
 
 fn resolve_wpt_path(wpt_root: &Path, doc_path: &Path, href: &str) -> PathBuf {
@@ -899,7 +980,7 @@ fn run_wpt_testharness_file(wpt_root: &Path, path: &Path, html: &str) -> ScriptR
 
     let doc = Rc::new(RefCell::new(Document::new()));
     let mut rt = ContentRuntime::new(doc, viewport, font_db);
-    rt.vm.max_loop_iterations = Some(250_000);
+    rt.vm.max_loop_iterations = Some(2_500_000);
     rt.event_loop.borrow_mut().enable_virtual_clock();
     rt.host.borrow_mut().set_external_stylesheets(ext_sheets);
     preload_local_wpt_images(
@@ -996,24 +1077,39 @@ pub fn run_official_wpt_suite(opts: &OfficialWptOptions) -> Result<OfficialWptRe
     let mut reftest_jobs: Vec<(PathBuf, String, bool, PathBuf)> = Vec::new();
 
     for path in files {
-        let Ok(html) = fs::read_to_string(&path) else {
+        let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        match classify_wpt_file(&opts.wpt_dir, &path, &html) {
-            ClassifiedTest::Reftest { is_match, ref_path }
-                if matches!(opts.kind, OfficialWptKind::All | OfficialWptKind::Reftest) =>
-            {
-                reftest_jobs.push((path, html, is_match, ref_path));
+        let is_js_test = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".any.js") || n.ends_with(".window.js"));
+        if is_js_test {
+            if matches!(
+                opts.kind,
+                OfficialWptKind::All | OfficialWptKind::Testharness
+            ) {
+                if let Some(synth_html) = synthesize_wpt_js_html(&path, &raw) {
+                    testharness_jobs.push((path, synth_html));
+                }
             }
-            ClassifiedTest::Testharness
-                if matches!(
-                    opts.kind,
-                    OfficialWptKind::All | OfficialWptKind::Testharness
-                ) =>
-            {
-                testharness_jobs.push((path, html));
+        } else {
+            match classify_wpt_file(&opts.wpt_dir, &path, &raw) {
+                ClassifiedTest::Reftest { is_match, ref_path }
+                    if matches!(opts.kind, OfficialWptKind::All | OfficialWptKind::Reftest) =>
+                {
+                    reftest_jobs.push((path, raw, is_match, ref_path));
+                }
+                ClassifiedTest::Testharness
+                    if matches!(
+                        opts.kind,
+                        OfficialWptKind::All | OfficialWptKind::Testharness
+                    ) =>
+                {
+                    testharness_jobs.push((path, raw));
+                }
+                _ => {}
             }
-            _ => {}
         }
         if let Some(lim) = opts.limit {
             if testharness_jobs.len() + reftest_jobs.len() >= lim {

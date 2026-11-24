@@ -6329,7 +6329,11 @@ impl JsVm {
         }
         let mut wrote = false;
         if let Some(o) = self.heap.get_object_mut(obj) {
-            if matches!(o.kind, ObjectKind::Array) && (idx as u32) < o.elements.len() {
+            if matches!(o.kind, ObjectKind::Array)
+                && o.extensible
+                && o.rare.is_none()
+                && o.elements.has(idx as u32)
+            {
                 o.elements.set(idx as u32, val);
                 wrote = true;
             }
@@ -6390,7 +6394,11 @@ impl JsVm {
         let p = prog_id as usize;
         let f = func_idx as usize;
         let Some(obj) = obj_val.as_object() else {
-            return Err(self.type_error("Cannot set property on non-object"));
+            let is_strict = self.programs[p].functions[f].is_strict;
+            if obj_val.is_null() || obj_val.is_undefined() || is_strict {
+                return Err(self.type_error("Cannot set property on non-object"));
+            }
+            return Ok(());
         };
         // Ultra-fast monomorphic in-place slot write when shape already matches!
         if let Some(crate::ic::IcState::Monomorphic(entry)) = self
@@ -6456,11 +6464,27 @@ impl JsVm {
         key_val: JsValue,
         val: JsValue,
     ) -> Result<(), JsException> {
+        let is_strict = self.frames.last().is_some_and(|fr| {
+            self.programs[fr.program_id as usize].functions[fr.func_idx as usize].is_strict
+        });
+        if obj_val.is_null() || obj_val.is_undefined() {
+            return Err(self.type_error("Cannot set element on null or undefined"));
+        }
+        if !obj_val.is_object() {
+            if is_strict {
+                return Err(self.type_error("Cannot set property on primitive value"));
+            }
+            return Ok(());
+        }
         if let (Some(obj), Some(idx)) = (obj_val.as_object(), key_val.as_i32()) {
             if idx >= 0 {
                 let mut wrote = false;
                 if let Some(o) = self.heap.get_object_mut(obj) {
-                    if matches!(o.kind, ObjectKind::Array) && (idx as u32) < o.elements.len() {
+                    if matches!(o.kind, ObjectKind::Array)
+                        && o.extensible
+                        && o.rare.is_none()
+                        && o.elements.has(idx as u32)
+                    {
                         o.elements.set(idx as u32, val);
                         wrote = true;
                     }
@@ -6471,7 +6495,11 @@ impl JsVm {
                 }
             }
         }
-        self.set_elem(obj_val, key_val, val)
+        let ok = self.set_elem_checked(obj_val, key_val, val)?;
+        if !ok && is_strict {
+            return Err(self.type_error("Cannot assign to read-only or non-extensible property"));
+        }
+        Ok(())
     }
 
     /// Arithmetic & comparison slow paths delegating to exact ES2024 VM semantics.
@@ -6485,14 +6513,10 @@ impl JsVm {
         self.op_mul(a, b)
     }
     pub fn jit_div(&mut self, a: JsValue, b: JsValue) -> Result<JsValue, JsException> {
-        Ok(JsValue::from_number(
-            self.to_number(a)? / self.to_number(b)?,
-        ))
+        self.op_numeric_bin(a, b, Opcode::Div)
     }
     pub fn jit_rem(&mut self, a: JsValue, b: JsValue) -> Result<JsValue, JsException> {
-        Ok(JsValue::from_number(
-            self.to_number(a)? % self.to_number(b)?,
-        ))
+        self.op_numeric_bin(a, b, Opcode::Rem)
     }
     pub fn jit_lt(&mut self, a: JsValue, b: JsValue) -> Result<JsValue, JsException> {
         Ok(JsValue::from_bool(self.op_lt(a, b)?))
@@ -6628,14 +6652,15 @@ impl JsVm {
         Some(o.slots.as_mut_slice())
     }
 
-    /// Validates a prototype-chain load guard (`prototype_epoch` + receiver `ShapeId`) and reads
-    /// the cached holder's slot directly. Returns `None` (deopt) if the prototype chain mutated
-    /// or the receiver shape changed.
+    /// Validates a prototype-chain load guard (`prototype_epoch` + receiver `ShapeId` + receiver `[[Prototype]]`)
+    /// and reads the cached holder's slot directly. Returns `None` (deopt) if the prototype chain mutated,
+    /// the receiver shape changed, or the receiver has a distinct prototype (e.g. `Int8Array` vs `Float64Array`).
     #[inline]
     pub fn jit_guard_proto_prop(
         &self,
         obj_val: JsValue,
         expected_shape: u32,
+        expected_proto_val: JsValue,
         holder_val: JsValue,
         offset: usize,
         expected_epoch: u64,
@@ -6645,7 +6670,10 @@ impl JsVm {
         }
         let obj = obj_val.as_object()?;
         let o = self.heap.get_object(obj)?;
-        if matches!(o.kind, ObjectKind::Proxy(_)) || o.shape_id != expected_shape {
+        if matches!(o.kind, ObjectKind::Proxy(_))
+            || o.shape_id != expected_shape
+            || o.prototype != expected_proto_val.as_object()
+        {
             return None;
         }
         let holder = holder_val.as_object()?;
@@ -6659,7 +6687,7 @@ impl JsVm {
     pub fn jit_guard_packed_i32(&mut self, obj_val: JsValue) -> Option<&mut [i32]> {
         let obj = obj_val.as_object()?;
         let o = self.heap.get_object_mut(obj)?;
-        if !matches!(o.kind, ObjectKind::Array) {
+        if !matches!(o.kind, ObjectKind::Array) || !o.extensible || o.rare.is_some() {
             return None;
         }
         match &mut o.elements {
@@ -6673,7 +6701,7 @@ impl JsVm {
     pub fn jit_guard_packed_f64(&mut self, obj_val: JsValue) -> Option<&mut [f64]> {
         let obj = obj_val.as_object()?;
         let o = self.heap.get_object_mut(obj)?;
-        if !matches!(o.kind, ObjectKind::Array) {
+        if !matches!(o.kind, ObjectKind::Array) || !o.extensible || o.rare.is_some() {
             return None;
         }
         match &mut o.elements {
@@ -6687,7 +6715,7 @@ impl JsVm {
     pub fn jit_guard_packed_values(&mut self, obj_val: JsValue) -> Option<&mut [JsValue]> {
         let obj = obj_val.as_object()?;
         let o = self.heap.get_object_mut(obj)?;
-        if !matches!(o.kind, ObjectKind::Array) {
+        if !matches!(o.kind, ObjectKind::Array) || !o.extensible || o.rare.is_some() {
             return None;
         }
         match &mut o.elements {
