@@ -92,3 +92,141 @@ fn table_box_tree_fixup_suppresses_col_children_and_replaced_table_display() {
     );
     assert_eq!(res, "0|0|true");
 }
+
+#[test]
+fn table_auto_and_fixed_column_width_distribution_matches_css_tables_l3() {
+    let html = r#"<!doctype html>
+    <html><head><style>
+      table { border-collapse: collapse; }
+      td { padding: 0; }
+    </style></head><body>
+      <table id="t-auto" style="width:400px">
+        <tr>
+          <td id="a1">&nbsp;</td>
+          <td id="a2" style="width:50px; min-width:150px">&nbsp;</td>
+        </tr>
+      </table>
+      <table id="t-fixed" style="table-layout:fixed; width:300px">
+        <tr>
+          <td id="f1" style="width:20px"></td>
+          <td id="f2" style="width:10px"></td>
+          <td id="f3" style="width:10%"></td>
+        </tr>
+      </table>
+      <table id="t-calc" style="width:200px">
+        <col style="width:calc(20% + 80px)">
+        <tr><td id="c1"></td><td id="c2"></td></tr>
+      </table>
+      <table id="t-merge" style="width:400px; border-collapse:separate; border:10px solid gray; border-spacing:20px;">
+        <tr><td id="m1" colspan="10" style="width:50px"></td><td id="m2" style="width:50px"></td></tr>
+      </table>
+    </body></html>"#;
+    let res = run_script(
+        html,
+        r#"(() => {
+          const w = id => document.getElementById(id).offsetWidth;
+          return [w('a1'), w('a2'), w('f1'), w('f2'), w('f3'), w('c1'), w('c2'), w('m1'), w('m2')].join('|');
+        })()"#,
+    );
+    assert_eq!(res, "250|150|180|90|30|100|100|270|50");
+}
+
+#[test]
+fn table_section_ordering_rowspan_zero_and_tbody_percentage_height() {
+    let html = r#"<!doctype html>
+    <html><head><style>
+      table { border-collapse: collapse; }
+      td { padding: 0; }
+    </style></head><body>
+      <table id="t-order">
+        <tfoot><tr id="rf"><td><div style="height:20px"></div></td></tr></tfoot>
+        <tbody><tr id="rb"><td><div style="height:30px"></div></td></tr></tbody>
+        <thead><tr id="rh"><td><div style="height:10px"></div></td></tr></thead>
+      </table>
+      <table id="t-pct" style="height:100px; width:100px">
+        <tbody id="b1" style="height:40%"><tr><td>x</td></tr></tbody>
+        <tbody id="b2"><tr><td>x</td></tr></tbody>
+      </table>
+      <table id="t-rs0">
+        <tbody>
+          <tr><td id="rs0" rowspan="0">span</td><td><div style="height:25px"></div></td></tr>
+          <tr><td><div style="height:35px"></div></td></tr>
+          <tr><td><div style="height:40px"></div></td></tr>
+        </tbody>
+      </table>
+    </body></html>"#;
+    let res = run_script(
+        html,
+        r#"(() => {
+          const top = id => Math.round(document.getElementById(id).getBoundingClientRect().top);
+          const h = id => document.getElementById(id).offsetHeight;
+          const ordered = top('rh') < top('rb') && top('rb') < top('rf');
+          return `${ordered}|${h('b1')}|${h('b2')}|${h('rs0')}`;
+        })()"#,
+    );
+    assert_eq!(res, "true|40|60|100");
+}
+
+#[test]
+fn table_visibility_collapse_preserves_orthogonal_dimension() {
+    let html = r#"<!doctype html>
+    <html><head><style>
+      table { border-collapse: collapse; }
+      td { padding: 0; }
+    </style></head><body>
+      <table id="t-ref">
+        <tr><td><div style="width:80px;height:20px"></div></td><td><div style="width:60px;height:20px"></div></td></tr>
+        <tr><td><div style="width:80px;height:30px"></div></td><td><div style="width:60px;height:30px"></div></td></tr>
+      </table>
+      <table id="t-row-col">
+        <tr><td><div style="width:80px;height:20px"></div></td><td><div style="width:60px;height:20px"></div></td></tr>
+        <tr id="r-col" style="visibility:collapse"><td><div style="width:80px;height:30px"></div></td><td><div style="width:60px;height:30px"></div></td></tr>
+      </table>
+      <table id="t-col-col">
+        <col><col style="visibility:collapse">
+        <tr><td><div style="width:80px;height:20px"></div></td><td><div style="width:60px;height:20px"></div></td></tr>
+        <tr><td><div style="width:80px;height:30px"></div></td><td><div style="width:60px;height:30px"></div></td></tr>
+      </table>
+    </body></html>"#;
+    let res = run_script(
+        html,
+        r#"(() => {
+          const ref = document.getElementById('t-ref');
+          const trc = document.getElementById('t-row-col');
+          const tcc = document.getElementById('t-col-col');
+          const rcol = document.getElementById('r-col');
+          return [
+            trc.offsetWidth === ref.offsetWidth,
+            trc.offsetHeight,
+            rcol.offsetHeight,
+            tcc.offsetHeight === ref.offsetHeight,
+            tcc.offsetWidth,
+          ].join('|');
+        })()"#,
+    );
+    assert_eq!(res, "true|20|0|true|80");
+}
+
+#[test]
+fn table_multiple_captions_and_vertical_align_baseline_mapping() {
+    let html = r#"<!doctype html>
+    <html><head><style>
+      table { border-collapse: collapse; position: relative; }
+      td { padding: 0; }
+    </style></head><body>
+      <table id="t-cap">
+        <caption id="c-top1" style="line-height:20px">top1</caption>
+        <caption id="c-top2" style="line-height:20px">top2</caption>
+        <caption id="c-bot1" style="caption-side:bottom;line-height:20px">bot1</caption>
+        <tr><td id="cell" style="line-height:30px">body</td></tr>
+      </table>
+    </body></html>"#;
+    let res = run_script(
+        html,
+        r#"(() => {
+          const y = id => document.getElementById(id).offsetTop;
+          return [y('c-top1'), y('c-top2'), y('cell'), y('c-bot1')].join('|');
+        })()"#,
+    );
+    assert_eq!(res, "0|20|40|70");
+}

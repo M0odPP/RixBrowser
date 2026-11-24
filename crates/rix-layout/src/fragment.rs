@@ -1057,6 +1057,20 @@ fn measure_intrinsic_widths_uncached(
     space: ConstraintSpace,
 ) -> (f32, f32) {
     let b = ctx.tree.get(box_id);
+    // CSS Tables L3: Tables always compute intrinsic widths via the table algorithm because a
+    // table's specified `width` is a minimum (never shrinks below grid min-content width) and
+    // `min-width`/`max-width` apply in the table's own `box-sizing`.
+    if matches!(
+        b.kind,
+        BoxKind::Table
+            | BoxKind::AnonymousTable
+            | BoxKind::InlineBlock {
+                formatting_context: FormattingContextKind::Table
+            }
+    ) {
+        return crate::table::measure_table_intrinsic_widths(ctx, box_id, space);
+    }
+
     let metrics = BoxMetrics::resolve(&b.style, &space);
     let pb_w = metrics.padding.horizontal() + metrics.border.horizontal();
 
@@ -1077,14 +1091,17 @@ fn measure_intrinsic_widths_uncached(
     match &b.kind {
         BoxKind::Replaced(replaced) => {
             let frag = layout_replaced(b, replaced, space);
-            (frag.border_rect.size.width, frag.border_rect.size.width)
+            if is_percent_width {
+                // CSS Sizing L3 / CSS Tables L3: a replaced element with a percentage width
+                // contributes `0` (plus border/padding) to min-content width during table sizing.
+                (pb_w, frag.border_rect.size.width)
+            } else {
+                (frag.border_rect.size.width, frag.border_rect.size.width)
+            }
         }
         BoxKind::Text(text) => {
             let (min_w, max_w) = measure_text_intrinsic(ctx, text, &b.style);
             (min_w, max_w)
-        }
-        BoxKind::Table | BoxKind::AnonymousTable => {
-            crate::table::measure_table_intrinsic_widths(ctx, box_id, space)
         }
         BoxKind::Block {
             formatting_context: FormattingContextKind::Flex,
@@ -1168,38 +1185,46 @@ fn measure_text_intrinsic(
 ) -> (f32, f32) {
     let font_id = ctx.resolve_font(style);
     let font_size = style.text.font_size_px.max(1.0);
-    let space_w: f32 = ctx
-        .shaper
-        .shape_text(" ", font_id, font_size)
-        .iter()
-        .map(|r| r.width)
-        .sum();
+    let shape_w = |ctx: &mut LayoutContext<'_>, s: &str| -> f32 {
+        ctx.shaper
+            .shape_text(s, font_id, font_size)
+            .iter()
+            .map(|r| r.width)
+            .sum()
+    };
+
+    if style.text.white_space == rix_css::WhiteSpaceMode::Pre {
+        let mut max_line = 0.0f32;
+        for line in text.split('\n') {
+            max_line = max_line.max(shape_w(ctx, line));
+        }
+        let w = max_line.ceil();
+        return (w, w);
+    }
+
+    let is_css_ws = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c');
+    let space_w = shape_w(ctx, " ");
     let mut min_w = 0.0f32;
     let mut words_sum = 0.0f32;
     let mut word_count = 0usize;
-    for word in text.split_whitespace() {
-        let w: f32 = ctx
-            .shaper
-            .shape_text(word, font_id, font_size)
-            .iter()
-            .map(|r| r.width)
-            .sum();
+    let mut parts: Vec<&str> = Vec::new();
+    for word in text.split(is_css_ws).filter(|w| !w.is_empty()) {
+        let w = shape_w(ctx, word);
         min_w = min_w.max(w);
         words_sum += w;
         word_count += 1;
+        parts.push(word);
     }
     if word_count > 1 {
         words_sum += space_w * (word_count - 1) as f32;
     }
-    let normalized: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let joined_w: f32 = ctx
-        .shaper
-        .shape_text(&normalized, font_id, font_size)
-        .iter()
-        .map(|r| r.width)
-        .sum();
-    let min_ceil = min_w.ceil();
+    let normalized = parts.join(" ");
+    let joined_w = shape_w(ctx, &normalized);
     let max_ceil = joined_w.max(words_sum).max(min_w).ceil();
+    if style.text.white_space == rix_css::WhiteSpaceMode::Nowrap {
+        return (max_ceil, max_ceil);
+    }
+    let min_ceil = min_w.ceil();
     (min_ceil, max_ceil)
 }
 

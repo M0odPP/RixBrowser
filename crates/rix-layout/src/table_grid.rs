@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! W3C CSS Tables Level 3 grid construction, collapsed border resolution,
 //! column width constraint solvers, and row height distribution algorithms.
 
