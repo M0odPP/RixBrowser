@@ -413,6 +413,14 @@ pub fn parse_html(html: &str) -> Document {
 }
 
 pub fn parse_html_with_scripting(html: &str, scripting_enabled: bool) -> Document {
+    parse_html_with_options(html, scripting_enabled, true)
+}
+
+pub fn parse_html_with_options(
+    html: &str,
+    scripting_enabled: bool,
+    allow_declarative_shadow: bool,
+) -> Document {
     let sink = DomTreeSink::with_source_pi_scan(html, scripting_enabled);
     let opts = ParseOpts {
         tree_builder: html5ever::tree_builder::TreeBuilderOpts {
@@ -423,18 +431,29 @@ pub fn parse_html_with_scripting(html: &str, scripting_enabled: bool) -> Documen
     };
     let mut doc = parse_document(sink, opts).one(html);
     doc.set_character_set(detect_html_charset(html.as_bytes()));
-    attach_declarative_shadow_roots(&mut doc);
+    if allow_declarative_shadow {
+        attach_declarative_shadow_roots(&mut doc);
+    }
     doc
 }
 
 pub fn parse_html_fragment(html: &str, context: Option<&QualName>) -> (Document, Vec<NodeId>) {
-    parse_html_fragment_with_scripting(html, context, true)
+    parse_html_fragment_with_options(html, context, true, false)
 }
 
 pub fn parse_html_fragment_with_scripting(
     html: &str,
     context: Option<&QualName>,
     scripting_enabled: bool,
+) -> (Document, Vec<NodeId>) {
+    parse_html_fragment_with_options(html, context, scripting_enabled, false)
+}
+
+pub fn parse_html_fragment_with_options(
+    html: &str,
+    context: Option<&QualName>,
+    scripting_enabled: bool,
+    allow_declarative_shadow: bool,
 ) -> (Document, Vec<NodeId>) {
     let sink = DomTreeSink::with_source_pi_scan(html, scripting_enabled);
     let opts = ParseOpts {
@@ -453,7 +472,9 @@ pub fn parse_html_fragment_with_scripting(
         ),
     };
     let mut doc = parse_fragment(sink, opts, context_name, Vec::new(), true).one(html);
-    attach_declarative_shadow_roots(&mut doc);
+    if allow_declarative_shadow {
+        attach_declarative_shadow_roots(&mut doc);
+    }
     // Per html5ever `parse_fragment`, parsed fragment nodes live as children of the synthetic
     // root `<html>` wrapper element (plus any trailing sibling nodes like comments after `</html>`).
     let mut fragment_nodes = Vec::new();
@@ -492,8 +513,9 @@ fn attach_declarative_shadow_roots_in_subtree(doc: &mut Document, root: NodeId) 
                     if mode_lower == "open" || mode_lower == "closed" {
                         let delegates_focus = elem.has_attribute("shadowrootdelegatesfocus");
                         let clonable = elem.has_attribute("shadowrootclonable");
+                        let serializable = elem.has_attribute("shadowrootserializable");
                         let frag = elem.template_contents.unwrap_or(child);
-                        Some((mode_lower, delegates_focus, clonable, frag))
+                        Some((mode_lower, delegates_focus, clonable, serializable, frag))
                     } else {
                         None
                     }
@@ -507,7 +529,7 @@ fn attach_declarative_shadow_roots_in_subtree(doc: &mut Document, root: NodeId) 
             None
         };
 
-        if let Some((mode_lower, delegates_focus, clonable, frag)) = template_info {
+        if let Some((mode_lower, delegates_focus, clonable, serializable, frag)) = template_info {
             let parent = doc.parent(child);
             if let Some(parent) = parent {
                 if can_attach_declarative_shadow(doc, parent) {
@@ -516,6 +538,7 @@ fn attach_declarative_shadow_roots_in_subtree(doc: &mut Document, root: NodeId) 
                         mode: mode_lower,
                         delegates_focus,
                         clonable,
+                        serializable,
                     });
                     if let Some(NodeData::Element(parent_elem)) = doc.get_mut(parent) {
                         parent_elem.shadow_root = Some(shadow_root);

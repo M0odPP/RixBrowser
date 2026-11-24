@@ -6,7 +6,7 @@
 //! Reference: Spec 05 §2.2, Spec 06 §3 & Issue #16.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -205,6 +205,8 @@ pub struct HostState {
     pub active_element: Option<NodeId>,
     pub next_web_anim_id: u64,
     pub selection: crate::selection::SelectionState,
+    pub(crate) dom_parser_proto: Option<HeapHandle>,
+    pub(crate) contextual_scripts: HashSet<NodeId>,
     pub(crate) iframe_connect_hook: Option<IframeConnectHook>,
     pub(crate) body_attr_handler_hook: Option<BodyAttrHandlerHook>,
 }
@@ -292,6 +294,8 @@ impl HostState {
             active_element: None,
             next_web_anim_id: 1,
             selection: crate::selection::SelectionState::default(),
+            dom_parser_proto: None,
+            contextual_scripts: HashSet::new(),
             iframe_connect_hook: None,
             body_attr_handler_hook: None,
         }
@@ -404,6 +408,9 @@ impl HostState {
             if let Some(dv) = meta.default_view {
                 out.push(JsValue::from_object(dv));
             }
+        }
+        if let Some(dpp) = self.dom_parser_proto {
+            out.push(JsValue::from_object(dpp));
         }
         self.prototypes.collect_roots(out);
         for &proto in self.interface_protos.values() {
@@ -1581,6 +1588,10 @@ pub(crate) fn define_host_accessor(
     );
 }
 
+pub(crate) fn extract_node(vm: &JsVm, host: &SharedHost, val: JsValue) -> Option<NodeId> {
+    host.borrow().node_for_value(vm, val)
+}
+
 pub(crate) fn require_node(
     vm: &mut JsVm,
     host: &SharedHost,
@@ -2167,6 +2178,41 @@ pub(crate) fn insert_node_into_parent(
         let iframe_hook = host.borrow().iframe_connect_hook.clone();
         for n in to_insert {
             notify_custom_element_subtree(vm, host, n, true);
+            // Execute any `<script>` nodes created by `Range.prototype.createContextualFragment()`.
+            let scripts_to_run: Vec<(NodeId, String)> = {
+                let mut hb = host.borrow_mut();
+                if hb.contextual_scripts.is_empty() {
+                    Vec::new()
+                } else {
+                    let doc_rc = Rc::clone(&hb.document);
+                    let doc = doc_rc.borrow();
+                    let found: Vec<(NodeId, String)> = doc
+                        .descendants(n)
+                        .filter(|id| hb.contextual_scripts.contains(id))
+                        .map(|id| {
+                            let mut code = String::new();
+                            for c in doc.descendants(id) {
+                                if let Some(NodeData::Text(t)) = doc.get(c) {
+                                    code.push_str(t);
+                                }
+                            }
+                            (id, code)
+                        })
+                        .collect();
+                    for (id, _) in &found {
+                        hb.contextual_scripts.remove(id);
+                    }
+                    found
+                }
+            };
+            for (sid, code) in scripts_to_run {
+                if !code.trim().is_empty() {
+                    let prev = host.borrow().current_script;
+                    host.borrow_mut().current_script = Some(sid);
+                    let _ = vm.eval_script(&code);
+                    host.borrow_mut().current_script = prev;
+                }
+            }
             if let Some(ref hook) = iframe_hook {
                 let iframes: Vec<NodeId> = {
                     let doc_rc = Rc::clone(&host.borrow().document);
@@ -3024,6 +3070,18 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         if mode != "open" && mode != "closed" {
             return Err(vm.type_error("ShadowRoot mode must be 'open' or 'closed'"));
         }
+        let k_df = vm.heap.intern_key("delegatesFocus");
+        let delegates_focus = vm
+            .get_property_by_key(opts_h, k_df)
+            .is_ok_and(|v| vm.to_boolean(v));
+        let k_cl = vm.heap.intern_key("clonable");
+        let clonable = vm
+            .get_property_by_key(opts_h, k_cl)
+            .is_ok_and(|v| vm.to_boolean(v));
+        let k_ser = vm.heap.intern_key("serializable");
+        let serializable = vm
+            .get_property_by_key(opts_h, k_ser)
+            .is_ok_and(|v| vm.to_boolean(v));
         let sr_id = {
             let _doc_rc = Rc::clone(&h.borrow().document);
             let mut doc = _doc_rc.borrow_mut();
@@ -3043,8 +3101,9 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
             let sr = doc.new_node(NodeData::ShadowRoot {
                 host: host_id,
                 mode,
-                delegates_focus: false,
-                clonable: false,
+                delegates_focus,
+                clonable,
+                serializable,
             });
             if let Some(NodeData::Element(e)) = doc.get_mut(host_id) {
                 e.shadow_root = Some(sr);
@@ -3269,7 +3328,13 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
 /// `<template>.content`, `<dialog>`, `<details>`, `<form>` / Constraint Validation API,
 /// `<select>`/`<option>`/`<label>`, Popover API, and standard boolean/string attribute reflections.
 fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHandle) {
-    // `<template>.content` -> inert `DocumentFragment`
+    // `<template>.content` -> inert `DocumentFragment` (HTMLTemplateElement only, not SVG `<template>`)
+    let template_proto = host
+        .borrow()
+        .interface_protos
+        .get("HTMLTemplateElement")
+        .copied()
+        .unwrap_or(ep);
     let h = Rc::clone(host);
     let g = vm.alloc_host_fn("get content", move |vm, t, _| {
         let nid = require_node(vm, &h, t)?;
@@ -3283,7 +3348,7 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
         };
         Ok(frag.map_or(JsValue::UNDEFINED, |f| wrap_node(vm, &h, f)))
     });
-    define_host_accessor(vm, ep, "content", Some(g), None);
+    define_host_accessor(vm, template_proto, "content", Some(g), None);
 
     // Reflected boolean attributes (`open`, `hidden`, `disabled`, `required`, `readOnly`,
     // `checked`, `multiple`, `noValidate`, `selected`).
@@ -4269,8 +4334,16 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
     define_host_accessor(vm, dp, "title", Some(g), Some(s));
 
     let h = Rc::clone(host);
-    let g = vm.alloc_host_fn("get readyState", move |vm, _, _| {
-        let rs = h.borrow().ready_state.clone();
+    let g = vm.alloc_host_fn("get readyState", move |vm, t, _| {
+        let doc_id = require_node(vm, &h, t)?;
+        let rs = {
+            let hb = h.borrow();
+            if doc_id == hb.document.borrow().root() {
+                hb.ready_state.clone()
+            } else {
+                "complete".to_string()
+            }
+        };
         Ok(JsValue::from_string(vm.heap.alloc_string(rs)))
     });
     define_host_accessor(vm, dp, "readyState", Some(g), None);
@@ -4971,6 +5044,45 @@ fn install_shadow_root_prototype(vm: &mut JsVm, host: &SharedHost) {
     });
     define_host_accessor(vm, sp, "mode", Some(g), None);
 
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get delegatesFocus", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let v = matches!(
+            h.borrow().document.borrow().get(nid),
+            Some(NodeData::ShadowRoot {
+                delegates_focus: true,
+                ..
+            })
+        );
+        Ok(JsValue::from_bool(v))
+    });
+    define_host_accessor(vm, sp, "delegatesFocus", Some(g), None);
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get clonable", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let v = matches!(
+            h.borrow().document.borrow().get(nid),
+            Some(NodeData::ShadowRoot { clonable: true, .. })
+        );
+        Ok(JsValue::from_bool(v))
+    });
+    define_host_accessor(vm, sp, "clonable", Some(g), None);
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get serializable", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let v = matches!(
+            h.borrow().document.borrow().get(nid),
+            Some(NodeData::ShadowRoot {
+                serializable: true,
+                ..
+            })
+        );
+        Ok(JsValue::from_bool(v))
+    });
+    define_host_accessor(vm, sp, "serializable", Some(g), None);
+
     let h1 = Rc::clone(host);
     let g = vm.alloc_host_fn("get innerHTML", move |vm, t, _| {
         let nid = require_node(vm, &h1, t)?;
@@ -5445,7 +5557,12 @@ fn upgrade_if_custom_element(vm: &mut JsVm, host: &SharedHost, nid: NodeId, tag:
     }
 }
 
-fn notify_custom_element_subtree(vm: &mut JsVm, host: &SharedHost, root: NodeId, connected: bool) {
+pub(crate) fn notify_custom_element_subtree(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    root: NodeId,
+    connected: bool,
+) {
     if host.borrow().custom_elements.is_empty() {
         return;
     }

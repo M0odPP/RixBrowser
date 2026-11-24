@@ -640,7 +640,8 @@ fn synthesize_wpt_js_html(path: &Path, js_src: &str) -> Option<String> {
     let mut html = String::from(
         "<!doctype html><meta charset=utf-8>\n\
          <script src=\"/resources/testharness.js\"></script>\n\
-         <script src=\"/resources/testharnessreport.js\"></script>\n",
+         <script src=\"/resources/testharnessreport.js\"></script>\n\
+         <div id=log></div>\n",
     );
     for s in scripts {
         html.push_str(&format!("<script src=\"{s}\"></script>\n"));

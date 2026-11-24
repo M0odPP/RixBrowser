@@ -793,6 +793,9 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
     bind_ctor_proto(vm, ts_ctor, tsp);
     define_global(vm, "TransformStream", JsValue::from_object(ts_ctor));
 
+    // --- TextDecoderStream & TextEncoderStream (WHATWG Encoding §8.5) ---
+    install_text_encoding_streams(vm, &streams, web_apis, rsp, wsp);
+
     // Attach `Blob.prototype.stream()` cleanly once streams are installed.
     if let Some(bp) = web_apis.borrow().protos.blob_proto {
         let wa = Rc::clone(web_apis);
@@ -964,4 +967,189 @@ fn pump_pipe_step(
         Ok(JsValue::UNDEFINED)
     });
     let _ = promise_then(vm, read_p, Some(on_read), Some(on_err));
+}
+
+fn install_text_encoding_streams(
+    vm: &mut JsVm,
+    streams: &SharedStreams,
+    web_apis: &SharedWebApis,
+    rsp: HeapHandle,
+    wsp: HeapHandle,
+) {
+    // TextDecoderStream
+    let tdsp = vm.alloc_ordinary_object();
+    vm.heap.get_object_mut(tdsp).unwrap().is_prototype = true;
+    let ss_d = Rc::clone(streams);
+    let wa_d = Rc::clone(web_apis);
+    let tds_ctor = vm.alloc_host_fn("TextDecoderStream", move |vm, _, args| {
+        let label = if args.is_empty() || arg(args, 0).is_undefined() {
+            "utf-8".to_string()
+        } else {
+            vm.value_to_rust_string(arg(args, 0))
+        };
+        let enc = encoding_rs::Encoding::for_label(label.trim().as_bytes())
+            .ok_or_else(|| vm.range_error(format!("Unsupported encoding label: {label}")))?;
+        let mut fatal = false;
+        let mut ignore_bom = false;
+        if let Some(oh) = arg(args, 1).as_object() {
+            let kf = vm.heap.intern_key("fatal");
+            if let Ok(v) = vm.get_property_by_key(oh, kf) {
+                fatal = vm.to_boolean(v);
+            }
+            let kb = vm.heap.intern_key("ignoreBOM");
+            if let Ok(v) = vm.get_property_by_key(oh, kb) {
+                ignore_bom = vm.to_boolean(v);
+            }
+        }
+        let decoder = Rc::new(RefCell::new(if ignore_bom {
+            enc.new_decoder_without_bom_handling()
+        } else {
+            enc.new_decoder_with_bom_removal()
+        }));
+        let readable = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(rsp)));
+        ss_d.borrow_mut()
+            .readable
+            .insert(readable, ReadableStreamState::new());
+        let writable = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(wsp)));
+
+        let ss_w = Rc::clone(&ss_d);
+        let wa_w = Rc::clone(&wa_d);
+        let dec_w = Rc::clone(&decoder);
+        let write_fn = vm.alloc_host_fn("tds_write", move |vm, _, args| {
+            let chunk = arg(args, 0);
+            let bytes = crate::web_apis::extract_bytes_from_js(vm, &wa_w, chunk)?;
+            let mut dec = dec_w.borrow_mut();
+            let mut out = String::with_capacity(
+                dec.max_utf8_buffer_length(bytes.len())
+                    .unwrap_or(bytes.len() * 4),
+            );
+            let (_res, _read, had_err) = dec.decode_to_string(&bytes, &mut out, false);
+            if fatal && had_err {
+                return Err(vm.type_error("The encoded data was not valid for encoding"));
+            }
+            if !out.is_empty() {
+                let s = JsValue::from_string(vm.heap.alloc_string(out));
+                readable_enqueue(vm, &ss_w, readable, s);
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+
+        let ss_c = Rc::clone(&ss_d);
+        let dec_c = Rc::clone(&decoder);
+        let close_fn = vm.alloc_host_fn("tds_close", move |vm, _, _| {
+            let mut dec = dec_c.borrow_mut();
+            let mut out = String::with_capacity(16);
+            let (_res, _read, had_err) = dec.decode_to_string(&[], &mut out, true);
+            if fatal && had_err {
+                return Err(vm.type_error("The encoded data was not valid for encoding"));
+            }
+            if !out.is_empty() {
+                let s = JsValue::from_string(vm.heap.alloc_string(out));
+                readable_enqueue(vm, &ss_c, readable, s);
+            }
+            readable_close(vm, &ss_c, readable);
+            Ok(JsValue::UNDEFINED)
+        });
+
+        ss_d.borrow_mut().writable.insert(
+            writable,
+            WritableStreamState {
+                closed: false,
+                errored: None,
+                locked: false,
+                write_fn: Some(write_fn),
+                close_fn: Some(close_fn),
+                abort_fn: None,
+                sink_obj: None,
+            },
+        );
+        let inst = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(tdsp)));
+        let kr = vm.heap.intern_key("readable");
+        let kw = vm.heap.intern_key("writable");
+        let ke = vm.heap.intern_key("encoding");
+        let kf = vm.heap.intern_key("fatal");
+        let kb = vm.heap.intern_key("ignoreBOM");
+        let enc_name = JsValue::from_string(vm.heap.alloc_string(enc.name().to_ascii_lowercase()));
+        for (k, v) in [
+            (kr, JsValue::from_object(readable)),
+            (kw, JsValue::from_object(writable)),
+            (ke, enc_name),
+            (kf, JsValue::from_bool(fatal)),
+            (kb, JsValue::from_bool(ignore_bom)),
+        ] {
+            vm.heap
+                .object_define_data(inst, k, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        }
+        Ok(JsValue::from_object(inst))
+    });
+    bind_ctor_proto(vm, tds_ctor, tdsp);
+    define_global(vm, "TextDecoderStream", JsValue::from_object(tds_ctor));
+
+    // TextEncoderStream
+    let tesp = vm.alloc_ordinary_object();
+    vm.heap.get_object_mut(tesp).unwrap().is_prototype = true;
+    let ss_e = Rc::clone(streams);
+    let tes_ctor = vm.alloc_host_fn("TextEncoderStream", move |vm, _, _| {
+        let readable = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(rsp)));
+        ss_e.borrow_mut()
+            .readable
+            .insert(readable, ReadableStreamState::new());
+        let writable = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(wsp)));
+
+        let ss_w = Rc::clone(&ss_e);
+        let write_fn = vm.alloc_host_fn("tes_write", move |vm, _, args| {
+            let text = vm.to_js_string(arg(args, 0))?;
+            let bytes = text.into_bytes();
+            if !bytes.is_empty() {
+                let u8arr = alloc_uint8_array(vm, bytes);
+                readable_enqueue(vm, &ss_w, readable, JsValue::from_object(u8arr));
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+        let ss_c = Rc::clone(&ss_e);
+        let close_fn = vm.alloc_host_fn("tes_close", move |vm, _, _| {
+            readable_close(vm, &ss_c, readable);
+            Ok(JsValue::UNDEFINED)
+        });
+        ss_e.borrow_mut().writable.insert(
+            writable,
+            WritableStreamState {
+                closed: false,
+                errored: None,
+                locked: false,
+                write_fn: Some(write_fn),
+                close_fn: Some(close_fn),
+                abort_fn: None,
+                sink_obj: None,
+            },
+        );
+        let inst = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(tesp)));
+        let kr = vm.heap.intern_key("readable");
+        let kw = vm.heap.intern_key("writable");
+        let ke = vm.heap.intern_key("encoding");
+        let enc_name = JsValue::from_string(vm.heap.alloc_string("utf-8"));
+        for (k, v) in [
+            (kr, JsValue::from_object(readable)),
+            (kw, JsValue::from_object(writable)),
+            (ke, enc_name),
+        ] {
+            vm.heap
+                .object_define_data(inst, k, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        }
+        Ok(JsValue::from_object(inst))
+    });
+    bind_ctor_proto(vm, tes_ctor, tesp);
+    define_global(vm, "TextEncoderStream", JsValue::from_object(tes_ctor));
 }

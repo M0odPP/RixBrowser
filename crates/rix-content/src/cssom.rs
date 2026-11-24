@@ -1593,11 +1593,13 @@ fn install_document_stylesheets(vm: &mut JsVm, host: &SharedHost) {
 
     // `document.styleSheets`
     let h = Rc::clone(host);
-    let g = vm.alloc_host_fn("get styleSheets", move |vm, _, _| {
+    let g = vm.alloc_host_fn("get styleSheets", move |vm, this_val, _| {
+        let doc_root = crate::dom_bridge::extract_node(vm, &h, this_val)
+            .unwrap_or_else(|| h.borrow().document.borrow().root());
         let style_nodes: Vec<NodeId> = {
             let doc_rc = Rc::clone(&h.borrow().document);
             let doc = doc_rc.borrow();
-            doc.descendants(doc.root())
+            doc.descendants(doc_root)
                 .filter(|&n| {
                     matches!(
                         doc.get(n),

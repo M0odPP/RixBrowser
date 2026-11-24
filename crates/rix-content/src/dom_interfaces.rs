@@ -1900,11 +1900,43 @@ fn install_extra_node_methods(vm: &mut JsVm, host: &SharedHost) {
         Ok(wrap_node(vm, &h, root))
     });
 
-    // baseURI
+    // baseURI (WHATWG HTML §2.5.3: document base URL honoring first `<base href>`)
     let h = Rc::clone(host);
     let g_base = vm.alloc_host_fn("get baseURI", move |vm, t, _| {
         let nid = require_node(vm, &h, t)?;
-        let url = h.borrow().doc_url_for_node(nid);
+        let url = {
+            let hb = h.borrow();
+            let doc_id = {
+                let doc = hb.document.borrow();
+                if matches!(doc.get(nid), Some(NodeData::Document)) {
+                    nid
+                } else {
+                    hb.owner_doc_of(nid)
+                }
+            };
+            let doc_url = hb.doc_url_for_node(doc_id);
+            let base_href = {
+                let doc = hb.document.borrow();
+                let found = doc.descendants(doc_id).find_map(|d| {
+                    if let Some(NodeData::Element(el)) = doc.get(d) {
+                        if &*el.name.ns == HTML_NS && el.name.local.as_str() == "base" {
+                            return el.get_attribute("href").map(ToString::to_string);
+                        }
+                    }
+                    None
+                });
+                found
+            };
+            if let Some(href) = base_href {
+                url::Url::parse(&doc_url)
+                    .ok()
+                    .and_then(|base| base.join(&href).ok())
+                    .map(|u| u.to_string())
+                    .unwrap_or(doc_url)
+            } else {
+                doc_url
+            }
+        };
         Ok(JsValue::from_string(vm.heap.alloc_string(url)))
     });
     define_host_accessor(vm, np, "baseURI", Some(g_base), None);
@@ -2332,15 +2364,38 @@ type XmlElementFrame = (NodeId, String, Vec<XmlNsDecl>);
 
 /// Parses an XML 1.0 + Namespaces string into `parent_doc` inside `doc`.
 /// Enforces well-formedness (matching start/end tags, valid names, quoted attributes,
-/// declared namespace prefixes, single root element, lone-surrogate sanitization)
-/// and returns `Err(msg)` on any XML syntax/namespace error.
+/// declared namespace prefixes, single root element, internal DTD `<!ENTITY>`,
+/// valid XML 1.0 Char production) and returns `Err(msg)` on any XML syntax/namespace error.
 pub fn parse_xml_into_document(
     doc: &mut Document,
     parent_doc: NodeId,
     raw_xml: &str,
 ) -> Result<(), String> {
-    // Replace any lone UTF-16 surrogates (if present via WTF-8/lossy input) and normalize CRLF -> LF.
+    parse_xml_internal(doc, parent_doc, raw_xml, false, &[])
+}
+
+/// Parses an XML 1.0 + Namespaces fragment into `parent_node` inside `doc`,
+/// inheriting `initial_ns` bindings from the context element's ancestor chain.
+pub fn parse_xml_fragment_into_node(
+    doc: &mut Document,
+    parent_node: NodeId,
+    raw_xml: &str,
+    initial_ns: &[XmlNsDecl],
+) -> Result<(), String> {
+    parse_xml_internal(doc, parent_node, raw_xml, true, initial_ns)
+}
+
+fn parse_xml_internal(
+    doc: &mut Document,
+    parent_doc: NodeId,
+    raw_xml: &str,
+    is_fragment: bool,
+    initial_ns: &[XmlNsDecl],
+) -> Result<(), String> {
     let xml = raw_xml.replace("\r\n", "\n").replace('\r', "\n");
+    if xml.chars().any(|c| !is_valid_xml_char(c)) {
+        return Err("Invalid XML 1.0 character in input".to_string());
+    }
     let bytes = xml.as_bytes();
     let len = bytes.len();
     let mut pos = 0usize;
@@ -2351,6 +2406,7 @@ pub fn parse_xml_into_document(
     }
 
     let mut stack: Vec<XmlElementFrame> = Vec::new();
+    let mut entities: HashMap<String, String> = HashMap::new();
     let mut root_elem_seen = false;
     let mut doctype_seen = false;
 
@@ -2360,7 +2416,7 @@ pub fn parse_xml_into_document(
             let next_lt = rest.find('<').map_or(len, |i| pos + i);
             let raw_text = &xml[pos..next_lt];
             pos = next_lt;
-            if stack.is_empty() {
+            if stack.is_empty() && !is_fragment {
                 if raw_text
                     .bytes()
                     .any(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
@@ -2372,8 +2428,8 @@ pub fn parse_xml_into_document(
             if raw_text.contains("]]>") {
                 return Err("']]>' is not allowed in XML text content".to_string());
             }
-            let decoded = decode_xml_entities(raw_text)?;
-            let parent = stack.last().unwrap().0;
+            let decoded = decode_xml_entities(raw_text, &entities)?;
+            let parent = stack.last().map_or(parent_doc, |s| s.0);
             let tn = doc.create_text(&decoded);
             doc.append_child(parent, tn);
             continue;
@@ -2397,14 +2453,14 @@ pub fn parse_xml_into_document(
 
         // CDATA: <![CDATA[ ... ]]>
         if let Some(after) = rest.strip_prefix("<![CDATA[") {
-            if stack.is_empty() {
+            if stack.is_empty() && !is_fragment {
                 return Err("CDATA section outside root element".to_string());
             }
             let Some(end_rel) = after.find("]]>") else {
                 return Err("Unterminated CDATA section".to_string());
             };
             let body = &after[..end_rel];
-            let parent = stack.last().unwrap().0;
+            let parent = stack.last().map_or(parent_doc, |s| s.0);
             let cn = doc.create_cdata_section(body);
             doc.append_child(parent, cn);
             pos += 9 + end_rel + 3;
@@ -2413,12 +2469,14 @@ pub fn parse_xml_into_document(
 
         // DOCTYPE: <!DOCTYPE ...>
         if rest.starts_with("<!DOCTYPE") {
-            if root_elem_seen || doctype_seen || !stack.is_empty() {
+            if is_fragment || root_elem_seen || doctype_seen || !stack.is_empty() {
                 return Err("Misplaced or duplicate DOCTYPE declaration".to_string());
             }
             doctype_seen = true;
             pos += 9;
-            skip_xml_ws(bytes, &mut pos);
+            if !skip_xml_ws(bytes, &mut pos) {
+                return Err("Expected whitespace after <!DOCTYPE".to_string());
+            }
             let name_start = pos;
             while pos < len && !is_xml_ws_byte(bytes[pos]) && !matches!(bytes[pos], b'>' | b'[') {
                 pos += 1;
@@ -2427,24 +2485,31 @@ pub fn parse_xml_into_document(
             if dt_name.is_empty() || !is_valid_xml_name(&dt_name) {
                 return Err("Invalid DOCTYPE name".to_string());
             }
-            skip_xml_ws(bytes, &mut pos);
+            let had_ws_after_name = skip_xml_ws(bytes, &mut pos);
             let mut public_id = String::new();
             let mut system_id = String::new();
-            if xml[pos..].starts_with("PUBLIC") {
+            if had_ws_after_name && xml[pos..].starts_with("PUBLIC") {
                 pos += 6;
-                skip_xml_ws(bytes, &mut pos);
+                if !skip_xml_ws(bytes, &mut pos) {
+                    return Err("Expected whitespace after PUBLIC".to_string());
+                }
                 public_id = read_xml_quoted(&xml, &mut pos)?;
-                skip_xml_ws(bytes, &mut pos);
+                if !skip_xml_ws(bytes, &mut pos) {
+                    return Err("Expected system literal after PUBLIC literal".to_string());
+                }
                 system_id = read_xml_quoted(&xml, &mut pos)?;
-            } else if xml[pos..].starts_with("SYSTEM") {
+            } else if had_ws_after_name && xml[pos..].starts_with("SYSTEM") {
                 pos += 6;
-                skip_xml_ws(bytes, &mut pos);
+                if !skip_xml_ws(bytes, &mut pos) {
+                    return Err("Expected whitespace after SYSTEM".to_string());
+                }
                 system_id = read_xml_quoted(&xml, &mut pos)?;
             }
             skip_xml_ws(bytes, &mut pos);
-            // Optional internal subset `[ ... ]`
+            // Optional internal subset `[ ... ]` with `<!ENTITY name "value">` parsing
             if pos < len && bytes[pos] == b'[' {
                 pos += 1;
+                let subset_start = pos;
                 let mut depth = 1usize;
                 while pos < len && depth > 0 {
                     match bytes[pos] {
@@ -2469,6 +2534,11 @@ pub fn parse_xml_into_document(
                         _ => pos += 1,
                     }
                 }
+                if depth != 0 {
+                    return Err("Unterminated DOCTYPE internal subset".to_string());
+                }
+                let subset_body = &xml[subset_start..pos - 1];
+                parse_dtd_internal_entities(subset_body, &mut entities);
                 skip_xml_ws(bytes, &mut pos);
             }
             if pos >= len || bytes[pos] != b'>' {
@@ -2498,7 +2568,8 @@ pub fn parse_xml_into_document(
                 return Err("Invalid processing instruction target".to_string());
             }
             if target.eq_ignore_ascii_case("xml") {
-                if target != "xml" || pos > 3 || !stack.is_empty() || root_elem_seen {
+                if is_fragment || target != "xml" || pos > 3 || !stack.is_empty() || root_elem_seen
+                {
                     return Err("Invalid XML declaration placement".to_string());
                 }
                 // XML declaration does not create a DOM ProcessingInstruction node.
@@ -2551,7 +2622,7 @@ pub fn parse_xml_into_document(
         if qname.is_empty() || !is_valid_xml_qname(&qname) {
             return Err(format!("Invalid XML element name: {qname}"));
         }
-        if stack.is_empty() {
+        if stack.is_empty() && !is_fragment {
             if root_elem_seen {
                 return Err("Multiple root elements in XML document".to_string());
             }
@@ -2604,7 +2675,7 @@ pub fn parse_xml_into_document(
             if raw_val.contains('<') {
                 return Err("Unescaped '<' in XML attribute value".to_string());
             }
-            let attr_val = decode_xml_entities(&raw_val)?;
+            let attr_val = decode_xml_entities(&raw_val, &entities)?;
             if attr_qname == "xmlns" {
                 if attr_val == XMLNS_NS {
                     return Err("Cannot bind default namespace to XMLNS namespace".to_string());
@@ -2622,14 +2693,14 @@ pub fn parse_xml_into_document(
             raw_attrs.push((attr_qname, attr_val));
         }
 
-        // Resolve element namespace from `ns_decls` + ancestor stack.
+        // Resolve element namespace from `ns_decls` + ancestor stack + `initial_ns`.
         let (el_prefix, el_local) = split_qname(&qname);
         let el_ns = match el_prefix {
             Some("xml") => XML_NS.to_string(),
             Some("xmlns") => return Err("Element prefix cannot be 'xmlns'".to_string()),
-            Some(pfx) => resolve_xml_ns(&stack, &ns_decls, Some(pfx))
+            Some(pfx) => resolve_xml_ns(&stack, &ns_decls, initial_ns, Some(pfx))
                 .ok_or_else(|| format!("Undeclared XML namespace prefix: {pfx}"))?,
-            None => resolve_xml_ns(&stack, &ns_decls, None).unwrap_or_default(),
+            None => resolve_xml_ns(&stack, &ns_decls, initial_ns, None).unwrap_or_default(),
         };
 
         let mut el_data = rix_dom::ElementData::new(rix_dom::QualName::new(
@@ -2649,7 +2720,7 @@ pub fn parse_xml_into_document(
                     None => String::new(),
                     Some("xml") => XML_NS.to_string(),
                     Some("xmlns") => XMLNS_NS.to_string(),
-                    Some(pfx) => resolve_xml_ns(&stack, &ns_decls, Some(pfx))
+                    Some(pfx) => resolve_xml_ns(&stack, &ns_decls, initial_ns, Some(pfx))
                         .ok_or_else(|| format!("Undeclared XML attribute prefix: {pfx}"))?,
                 };
                 (p, l, ns)
@@ -2677,10 +2748,52 @@ pub fn parse_xml_into_document(
             stack.last().unwrap().1
         ));
     }
-    if !root_elem_seen {
+    if !is_fragment && !root_elem_seen {
         return Err("XML document has no root element".to_string());
     }
     Ok(())
+}
+
+/// XML 1.0 Fifth Edition `Char` production:
+/// `#x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]`.
+#[inline]
+pub fn is_valid_xml_char(c: char) -> bool {
+    let cp = c as u32;
+    matches!(
+        cp,
+        0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
+    )
+}
+
+fn parse_dtd_internal_entities(subset: &str, out: &mut HashMap<String, String>) {
+    let bytes = subset.as_bytes();
+    let len = bytes.len();
+    let mut pos = 0usize;
+    while pos < len {
+        let Some(rel) = subset[pos..].find("<!ENTITY") else {
+            break;
+        };
+        pos += rel + 8;
+        if !skip_xml_ws(bytes, &mut pos) {
+            continue;
+        }
+        // Skip parameter entities (`% name ...`).
+        if pos < len && bytes[pos] == b'%' {
+            continue;
+        }
+        let name_start = pos;
+        while pos < len && !is_xml_ws_byte(bytes[pos]) && bytes[pos] != b'>' {
+            pos += 1;
+        }
+        let ent_name = subset[name_start..pos].to_string();
+        if ent_name.is_empty() {
+            continue;
+        }
+        skip_xml_ws(bytes, &mut pos);
+        if let Ok(ent_val) = read_xml_quoted(subset, &mut pos) {
+            out.entry(ent_name).or_insert(ent_val);
+        }
+    }
 }
 
 #[inline]
@@ -2730,6 +2843,7 @@ fn split_qname(qname: &str) -> (Option<&str>, &str) {
 fn resolve_xml_ns(
     stack: &[XmlElementFrame],
     local_decls: &[XmlNsDecl],
+    initial_ns: &[XmlNsDecl],
     prefix: Option<&str>,
 ) -> Option<String> {
     for (p, uri) in local_decls.iter().rev() {
@@ -2750,6 +2864,15 @@ fn resolve_xml_ns(
                     Some(uri.clone())
                 };
             }
+        }
+    }
+    for (p, uri) in initial_ns.iter().rev() {
+        if p.as_deref() == prefix {
+            return if uri.is_empty() {
+                None
+            } else {
+                Some(uri.clone())
+            };
         }
     }
     None
@@ -2774,7 +2897,7 @@ fn read_xml_quoted(xml: &str, pos: &mut usize) -> Result<String, String> {
     Ok(val)
 }
 
-fn decode_xml_entities(input: &str) -> Result<String, String> {
+fn decode_xml_entities(input: &str, entities: &HashMap<String, String>) -> Result<String, String> {
     if !input.contains('&') {
         return Ok(input.to_string());
     }
@@ -2797,6 +2920,7 @@ fn decode_xml_entities(input: &str) -> Result<String, String> {
                 let code = u32::from_str_radix(&ent[2..], 16)
                     .map_err(|_| format!("Invalid hex character reference: &{ent};"))?;
                 let ch = char::from_u32(code)
+                    .filter(|&c| is_valid_xml_char(c))
                     .ok_or_else(|| format!("Invalid XML Unicode scalar: &{ent};"))?;
                 out.push(ch);
             }
@@ -2805,10 +2929,17 @@ fn decode_xml_entities(input: &str) -> Result<String, String> {
                     .parse()
                     .map_err(|_| format!("Invalid decimal character reference: &{ent};"))?;
                 let ch = char::from_u32(code)
+                    .filter(|&c| is_valid_xml_char(c))
                     .ok_or_else(|| format!("Invalid XML Unicode scalar: &{ent};"))?;
                 out.push(ch);
             }
-            _ => return Err(format!("Unknown XML entity reference: &{ent};")),
+            _ => {
+                if let Some(val) = entities.get(ent) {
+                    out.push_str(val);
+                } else {
+                    return Err(format!("Unknown XML entity reference: &{ent};"));
+                }
+            }
         }
         rest = &after[semi + 1..];
     }
