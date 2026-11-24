@@ -1,6 +1,6 @@
-//! WebAssembly Runtime & Standard W3C `WebAssembly` JS-API Integration (powered by `wasmtime`).
+//! WebAssembly 2.0 + Modern Proposals & W3C `WebAssembly` JS-API Integration (powered by `wasmtime`).
 //!
-//! Reference: Spec 05 §5 & Issue #21.
+//! Reference: Spec 05 §5, W3C WebAssembly Core 2.0 + JS-API, Issues #21 & #154.
 //!
 //! Exposes the full standard `WebAssembly` namespace on any [`rix_js::JsVm`] realm:
 //! - `WebAssembly.validate(bytes)`
@@ -8,45 +8,91 @@
 //! - `WebAssembly.instantiate(bytesOrModule, importObject?)`
 //! - `WebAssembly.instantiateStreaming(source, importObject?)`
 //! - `WebAssembly.Module` (`.exports()`, `.imports()`, `.customSections()`)
-//! - `WebAssembly.Instance` (`.exports`)
-//! - `WebAssembly.Memory` (`.buffer` bridged seamlessly to JS `ArrayBuffer`/`TypedArray`, `.grow()`)
-//! - `WebAssembly.Table` (`.length`, `.get()`, `.set()`, `.grow()`)
-//! - `WebAssembly.Global` (`.value` getter/setter respecting mutability, `i32`/`i64` BigInt/`f32`/`f64`)
+//! - `WebAssembly.Instance` (prototype `.exports` getter, frozen null-proto exports, canonical wrapper caching)
+//! - `WebAssembly.Memory` (32-bit & `memory64` `address: "i64"`, `shared`, `.buffer`, `.grow()`, `.type()`, `.toResizableBuffer()`, `.toFixedLengthBuffer()`)
+//! - `WebAssembly.Table` (32-bit & `table64` `address: "i64"`, `funcref`/`externref`/`anyref`/`eqref`/`exnref`, `.length`, `.get()`, `.set()`, `.grow()`, `.type()`)
+//! - `WebAssembly.Global` (`.value` getter/setter, `.valueOf()`, `.type()`, numeric & reference types)
+//! - `WebAssembly.Tag` (`.type()`) & `WebAssembly.Exception` (`.is()`, `.getArg()`, `.stack`)
 //! - `WebAssembly.CompileError`, `WebAssembly.LinkError`, `WebAssembly.RuntimeError`
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use rix_js::promise::{
-    alloc_promise, promise_resolve_value, promise_then, reject_promise, resolve_promise,
-};
+use rix_js::builtins_atomics::{ab_is_shared, to_bigint_i64};
+use rix_js::heap::SharedBufferBacking;
+use rix_js::promise::{alloc_promise, promise_resolve_value, promise_then, reject_promise};
 use rix_js::{
     HeapHandle, JsBigInt, JsException, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs,
 };
 use wasmtime::{
-    AsContext, AsContextMut, Caller, Config, Engine, Extern, ExternType, Func, Global, GlobalType,
-    Instance, Memory, MemoryType, Module, Mutability, Ref, RefType, Store, Table, TableType, Val,
-    ValType,
+    AnyRef, AsContext, AsContextMut, Caller, Config, Engine, ExnRef, ExnRefPre, ExnType, Extern,
+    ExternRef, ExternType, Func, FuncType, Global, GlobalType, HeapType, Instance, Memory,
+    MemoryType, Module, Mutability, OwnedRooted, Ref, RefType, SharedMemory, Store, StoreLimits,
+    StoreLimitsBuilder, Table, TableType, Tag, TagType, Trap, Val, ValType, I31,
 };
 
 /// Internal hidden slot keys stored on JS wrapper objects.
 const MODULE_ID_KEY: &str = "__rix_wasm_module_id";
 const INSTANCE_ID_KEY: &str = "__rix_wasm_instance_id";
+const INSTANCE_EXPORTS_KEY: &str = "__rix_wasm_instance_exports";
 const MEMORY_ID_KEY: &str = "__rix_wasm_memory_id";
 const TABLE_ID_KEY: &str = "__rix_wasm_table_id";
 const GLOBAL_ID_KEY: &str = "__rix_wasm_global_id";
+const TAG_ID_KEY: &str = "__rix_wasm_tag_id";
+const EXN_ID_KEY: &str = "__rix_wasm_exn_id";
 const FUNC_ID_KEY: &str = "__rix_wasm_func_id";
+const ANYREF_ID_KEY: &str = "__rix_wasm_anyref_id";
+const ROOTS_KEY: &str = "__rix_wasm_roots";
 
 /// Maximum WebAssembly 32-bit linear memory pages (64 KiB each = 4 GiB spec ceiling).
 const MAX_WASM32_PAGES: u64 = 65_536;
+/// Maximum WebAssembly 64-bit linear memory pages (2^48 bytes / 64 KiB).
+const MAX_WASM64_PAGES: u64 = 1u64 << 32;
+/// WebAssembly page size in bytes.
+const WASM_PAGE_SIZE: usize = 65_536;
 
-/// Shared memory synchronization record bridging `wasmtime::Memory` <-> JS `ArrayBuffer`.
+/// Opaque payload stored inside `wasmtime::ExternRef` carrying a GC-rooted `JsValue` raw bit pattern.
+#[derive(Debug, Clone, Copy)]
+struct JsExternVal(u64);
+
+/// Backing kind for a `WebAssembly.Memory` (either unshared `Memory` or threads `SharedMemory`).
+enum WasmMemKind {
+    Unshared(Memory),
+    Shared(SharedMemory),
+}
+
+/// Shared memory synchronization record bridging `wasmtime::Memory` / `SharedMemory` <-> JS `ArrayBuffer`/`SharedArrayBuffer`.
 struct MemoryBridge {
-    memory: Memory,
+    kind: WasmMemKind,
     js_buffer: HeapHandle,
+    shared_backing: Option<Arc<SharedBufferBacking>>,
     last_byte_len: usize,
+    is_resizable: bool,
+    is_64: bool,
+    max_pages: Option<u64>,
+    js_wrapper: Option<HeapHandle>,
+}
+
+struct TableEntry {
+    table: Table,
+    js_wrapper: Option<HeapHandle>,
+}
+
+struct GlobalEntry {
+    global: Global,
+    js_wrapper: Option<HeapHandle>,
+}
+
+struct TagEntry {
+    tag: Tag,
+    js_wrapper: Option<HeapHandle>,
+}
+
+struct ExnEntry {
+    exn: OwnedRooted<ExnRef>,
+    stack: Option<String>,
 }
 
 /// Store user data carrying temporary active `JsVm` pointer during synchronous Wasm -> JS
@@ -56,24 +102,41 @@ struct WasmStoreData {
     vm_addr: usize,
     pending_js_exception: Option<JsException>,
     memories: Arc<Mutex<Vec<MemoryBridge>>>,
+    /// Shared handle to `WasmHost` raw pointer valid during active JS->Wasm invocations so
+    /// host-import closures can wrap/unwrap `funcref`/`externref`/`anyref`/`exnref`.
+    host_addr: usize,
+    /// Wasmtime resource limits so huge `table.grow` / `memory.grow` return `-1` instead of OOM trapping.
+    limits: StoreLimits,
 }
 
 /// Shared WebAssembly runtime state owned by a single [`JsVm`] realm.
 pub struct WasmHost {
     engine: Engine,
     store: RefCell<Store<WasmStoreData>>,
+    /// Pointer to stack-pinned `StoreContextMut` when inside a re-entrant Wasm -> JS host callback.
+    active_ctx_ptr: Cell<usize>,
     modules: RefCell<Vec<(Module, Vec<u8>)>>,
     instances: RefCell<Vec<Instance>>,
     memories: Arc<Mutex<Vec<MemoryBridge>>>,
-    tables: RefCell<Vec<Table>>,
-    globals: RefCell<Vec<Global>>,
+    tables: RefCell<Vec<TableEntry>>,
+    globals: RefCell<Vec<GlobalEntry>>,
+    tags: RefCell<Vec<TagEntry>>,
+    exceptions: RefCell<Vec<ExnEntry>>,
     funcs: RefCell<Vec<Func>>,
+    /// Canonical exported JS function wrapper keyed by `Func::to_raw(&mut store) as usize`.
+    func_wrappers: RefCell<HashMap<usize, HeapHandle>>,
+    /// GC-rooted `AnyRef` objects exposed to JS as opaque objects.
+    anyrefs: RefCell<Vec<OwnedRooted<wasmtime::AnyRef>>>,
+    /// Hidden JS Array attached to `globalThis.WebAssembly` rooting JS values referenced by Wasm.
+    roots_arr: HeapHandle,
     /// Prototypes & error constructors installed in this realm.
     module_proto: HeapHandle,
     instance_proto: HeapHandle,
     memory_proto: HeapHandle,
     table_proto: HeapHandle,
     global_proto: HeapHandle,
+    tag_proto: HeapHandle,
+    exception_proto: HeapHandle,
     compile_error_proto: HeapHandle,
     link_error_proto: HeapHandle,
     runtime_error_proto: HeapHandle,
@@ -82,24 +145,111 @@ pub struct WasmHost {
 /// Handle to a realm's installed WebAssembly subsystem.
 pub type SharedWasmHost = Rc<WasmHost>;
 
-/// RAII guard restoring `WasmStoreData::vm_addr` even on panic/early return.
-struct VmPtrGuard<'a> {
-    store: &'a mut Store<WasmStoreData>,
+/// RAII guard restoring `WasmHost::active_ctx_ptr` on drop.
+struct ActiveCtxGuard<'a> {
+    host: &'a WasmHost,
     prev: usize,
 }
 
+impl Drop for ActiveCtxGuard<'_> {
+    fn drop(&mut self) {
+        self.host.active_ctx_ptr.set(self.prev);
+    }
+}
+
+impl WasmHost {
+    /// Exposes an active Wasm `Caller`'s `StoreContextMut` across a synchronous JS callback
+    /// so re-entrant JS -> Wasm calls reuse the borrowed store cleanly without `RefCell` panic.
+    fn enter_reentrant_ctx<'a, R>(
+        &self,
+        mut ctx: wasmtime::StoreContextMut<'a, WasmStoreData>,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let prev = self.active_ctx_ptr.get();
+        let ptr = (&mut ctx as *mut wasmtime::StoreContextMut<'a, WasmStoreData>) as usize;
+        self.active_ctx_ptr.set(ptr);
+        let _guard = ActiveCtxGuard { host: self, prev };
+        f()
+    }
+
+    /// Runs `f` with shared `StoreContext` access, transparently supporting re-entrant JS -> Wasm calls.
+    fn with_store<R>(&self, f: impl FnOnce(wasmtime::StoreContext<'_, WasmStoreData>) -> R) -> R {
+        let ptr = self.active_ctx_ptr.get();
+        if ptr != 0 {
+            self.active_ctx_ptr.set(0);
+            let _guard = ActiveCtxGuard {
+                host: self,
+                prev: ptr,
+            };
+            // SAFETY: `enter_reentrant_ctx` pins the `StoreContextMut` on this thread's stack for the
+            // exact duration `active_ctx_ptr == ptr`, and clearing it prevents aliasing mutable borrows.
+            let ctx_ref = unsafe { &*(ptr as *const wasmtime::StoreContextMut<'_, WasmStoreData>) };
+            f(ctx_ref.as_context())
+        } else {
+            let store = self.store.borrow();
+            f(store.as_context())
+        }
+    }
+
+    /// Runs `f` with exclusive `StoreContextMut` access, transparently supporting re-entrant JS -> Wasm calls.
+    fn with_store_mut<R>(
+        &self,
+        f: impl FnOnce(wasmtime::StoreContextMut<'_, WasmStoreData>) -> R,
+    ) -> R {
+        let ptr = self.active_ctx_ptr.get();
+        if ptr != 0 {
+            self.active_ctx_ptr.set(0);
+            let _guard = ActiveCtxGuard {
+                host: self,
+                prev: ptr,
+            };
+            // SAFETY: `enter_reentrant_ctx` pins the `StoreContextMut` on this thread's stack for the
+            // exact duration `active_ctx_ptr == ptr`, and clearing it guarantees strict LIFO exclusive access.
+            let ctx_ref =
+                unsafe { &mut *(ptr as *mut wasmtime::StoreContextMut<'_, WasmStoreData>) };
+            f(ctx_ref.as_context_mut())
+        } else {
+            let mut store = self.store.borrow_mut();
+            f(store.as_context_mut())
+        }
+    }
+}
+
+/// RAII guard restoring `WasmStoreData::vm_addr`, `host_addr`, and `pending_js_exception` on drop.
+struct VmPtrGuard<'a> {
+    store: wasmtime::StoreContextMut<'a, WasmStoreData>,
+    prev_vm: usize,
+    prev_host: usize,
+    prev_pending_exc: Option<JsException>,
+}
+
 impl<'a> VmPtrGuard<'a> {
-    fn enter(store: &'a mut Store<WasmStoreData>, vm: &mut JsVm) -> Self {
-        let prev = store.data().vm_addr;
+    fn enter(
+        mut store: wasmtime::StoreContextMut<'a, WasmStoreData>,
+        vm: &mut JsVm,
+        host: &WasmHost,
+    ) -> Self {
+        let prev_vm = store.data().vm_addr;
+        let prev_host = store.data().host_addr;
+        let prev_pending_exc = store.data_mut().pending_js_exception.take();
         store.data_mut().vm_addr = std::ptr::from_mut(vm) as usize;
-        store.data_mut().pending_js_exception = None;
-        Self { store, prev }
+        store.data_mut().host_addr = std::ptr::from_ref(host) as usize;
+        Self {
+            store,
+            prev_vm,
+            prev_host,
+            prev_pending_exc,
+        }
     }
 }
 
 impl Drop for VmPtrGuard<'_> {
     fn drop(&mut self) {
-        self.store.data_mut().vm_addr = self.prev;
+        self.store.data_mut().vm_addr = self.prev_vm;
+        self.store.data_mut().host_addr = self.prev_host;
+        if self.store.data().pending_js_exception.is_none() {
+            self.store.data_mut().pending_js_exception = self.prev_pending_exc.take();
+        }
     }
 }
 
@@ -107,20 +257,42 @@ impl Drop for VmPtrGuard<'_> {
 pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
     let mut config = Config::new();
     config.cranelift_opt_level(wasmtime::OptLevel::Speed);
+    // Enable full W3C WebAssembly 2.0 + modern standardized proposals.
+    config.wasm_simd(true);
+    config.wasm_relaxed_simd(true);
+    config.wasm_bulk_memory(true);
+    config.wasm_multi_value(true);
+    config.wasm_multi_memory(true);
+    config.wasm_reference_types(true);
+    config.wasm_function_references(true);
+    config.wasm_tail_call(true);
+    config.wasm_extended_const(true);
+    config.wasm_memory64(true);
+    config.wasm_exceptions(true);
+    config.wasm_gc(true);
+    config.wasm_threads(true);
+    config.shared_memory(true);
     // Keep Wasm virtual address reservations compact so sandboxed Content Processes
     // with strict `RLIMIT_AS` budgets (2 GiB) instantiate Wasm modules cleanly.
     config.memory_reservation(64 * 1024 * 1024);
     config.memory_guard_size(64 * 1024);
     let engine = Engine::new(&config).expect("initialize wasmtime Cranelift engine");
     let memories = Arc::new(Mutex::new(Vec::new()));
-    let store = Store::new(
+    let limits = StoreLimitsBuilder::new()
+        .table_elements(10_000_000)
+        .trap_on_grow_failure(false)
+        .build();
+    let mut store = Store::new(
         &engine,
         WasmStoreData {
             vm_addr: 0,
             pending_js_exception: None,
             memories: Arc::clone(&memories),
+            host_addr: 0,
+            limits,
         },
     );
+    store.limiter(|data| &mut data.limits);
 
     let obj_proto = vm.object_proto;
     let err_proto = vm.error_proto;
@@ -130,37 +302,68 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
     let memory_proto = alloc_ordinary(vm, Some(obj_proto));
     let table_proto = alloc_ordinary(vm, Some(obj_proto));
     let global_proto = alloc_ordinary(vm, Some(obj_proto));
+    let tag_proto = alloc_ordinary(vm, Some(obj_proto));
+    let exception_proto = alloc_ordinary(vm, Some(obj_proto));
+
+    set_to_string_tag(vm, module_proto, "WebAssembly.Module");
+    set_to_string_tag(vm, instance_proto, "WebAssembly.Instance");
+    set_to_string_tag(vm, memory_proto, "WebAssembly.Memory");
+    set_to_string_tag(vm, table_proto, "WebAssembly.Table");
+    set_to_string_tag(vm, global_proto, "WebAssembly.Global");
+    set_to_string_tag(vm, tag_proto, "WebAssembly.Tag");
+    set_to_string_tag(vm, exception_proto, "WebAssembly.Exception");
 
     let compile_error_proto = alloc_wasm_error_proto(vm, err_proto, "CompileError");
     let link_error_proto = alloc_wasm_error_proto(vm, err_proto, "LinkError");
     let runtime_error_proto = alloc_wasm_error_proto(vm, err_proto, "RuntimeError");
 
+    let roots_arr = vm.alloc_array();
+
     let host = Rc::new(WasmHost {
         engine,
         store: RefCell::new(store),
+        active_ctx_ptr: Cell::new(0),
         modules: RefCell::new(Vec::new()),
         instances: RefCell::new(Vec::new()),
         memories,
         tables: RefCell::new(Vec::new()),
         globals: RefCell::new(Vec::new()),
+        tags: RefCell::new(Vec::new()),
+        exceptions: RefCell::new(Vec::new()),
         funcs: RefCell::new(Vec::new()),
+        func_wrappers: RefCell::new(HashMap::new()),
+        anyrefs: RefCell::new(Vec::new()),
+        roots_arr,
         module_proto,
         instance_proto,
         memory_proto,
         table_proto,
         global_proto,
+        tag_proto,
+        exception_proto,
         compile_error_proto,
         link_error_proto,
         runtime_error_proto,
     });
 
-    // Install prototype accessors & methods for Memory, Table, and Global.
+    // Install prototype accessors & methods.
+    install_instance_prototype(vm, &host);
     install_memory_prototype(vm, &host);
     install_table_prototype(vm, &host);
     install_global_prototype(vm, &host);
+    install_tag_prototype(vm, &host);
+    install_exception_prototype(vm, &host);
 
     // Build `WebAssembly` namespace object.
     let wasm_ns = alloc_ordinary(vm, Some(obj_proto));
+    set_to_string_tag(vm, wasm_ns, "WebAssembly");
+    define_prop(
+        vm,
+        wasm_ns,
+        ROOTS_KEY,
+        JsValue::from_object(roots_arr),
+        PropertyAttrs::empty(),
+    );
 
     // Error constructors (`CompileError`, `LinkError`, `RuntimeError`).
     let ce_ctor = make_wasm_error_ctor(vm, "CompileError", compile_error_proto);
@@ -191,10 +394,11 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
     // `WebAssembly.Module` constructor + static `.exports()`, `.imports()`, `.customSections()`.
     let mod_ctor = {
         let h = Rc::clone(&host);
-        let ctor = vm.alloc_host_fn("Module", move |vm, _this, args| {
+        let ctor = alloc_host_fn_len(vm, "Module", 1, move |vm, _this, args| {
+            let proto = require_construct_proto(vm, h.module_proto, "Module")?;
             let bytes =
                 extract_buffer_source(vm, args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
-            compile_module_object(vm, &h, bytes)
+            compile_module_object_with_proto(vm, &h, bytes, proto)
         });
         define_prop(
             vm,
@@ -212,7 +416,7 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
         );
 
         let h_exp = Rc::clone(&host);
-        let exports_fn = vm.alloc_host_fn("exports", move |vm, _this, args| {
+        let exports_fn = alloc_host_fn_len(vm, "exports", 1, move |vm, _this, args| {
             let mod_id = read_hidden_id(
                 vm,
                 args.first().copied().unwrap_or(JsValue::UNDEFINED),
@@ -244,11 +448,11 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
             ctor,
             "exports",
             JsValue::from_object(exports_fn),
-            PropertyAttrs::METHOD,
+            PropertyAttrs::DEFAULT,
         );
 
         let h_imp = Rc::clone(&host);
-        let imports_fn = vm.alloc_host_fn("imports", move |vm, _this, args| {
+        let imports_fn = alloc_host_fn_len(vm, "imports", 1, move |vm, _this, args| {
             let mod_id = read_hidden_id(
                 vm,
                 args.first().copied().unwrap_or(JsValue::UNDEFINED),
@@ -288,19 +492,17 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
             ctor,
             "imports",
             JsValue::from_object(imports_fn),
-            PropertyAttrs::METHOD,
+            PropertyAttrs::DEFAULT,
         );
 
         let h_cs = Rc::clone(&host);
-        let custom_fn = vm.alloc_host_fn("customSections", move |vm, _this, args| {
-            let mod_id = read_hidden_id(
-                vm,
-                args.first().copied().unwrap_or(JsValue::UNDEFINED),
-                MODULE_ID_KEY,
-            )
-            .ok_or_else(|| vm.type_error("Argument 0 must be a WebAssembly.Module"))?;
-            let target_name =
-                vm.value_to_rust_string(args.get(1).copied().unwrap_or(JsValue::UNDEFINED));
+        let custom_fn = alloc_host_fn_len(vm, "customSections", 2, move |vm, _this, args| {
+            if args.len() < 2 {
+                return Err(vm.type_error("WebAssembly.Module.customSections requires 2 arguments"));
+            }
+            let mod_id = read_hidden_id(vm, args[0], MODULE_ID_KEY)
+                .ok_or_else(|| vm.type_error("Argument 0 must be a WebAssembly.Module"))?;
+            let target_name = vm.to_js_string(args[1])?;
             let sections: Vec<Vec<u8>> = {
                 let modules = h_cs.modules.borrow();
                 let (_, raw_bytes) = modules
@@ -310,7 +512,7 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
             };
             let arr = vm.alloc_array();
             for sec in sections {
-                let ab = alloc_array_buffer(vm, sec);
+                let ab = alloc_array_buffer(vm, sec, None, false);
                 vm.heap.object_push_element(arr, JsValue::from_object(ab));
             }
             Ok(JsValue::from_object(arr))
@@ -320,7 +522,7 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
             ctor,
             "customSections",
             JsValue::from_object(custom_fn),
-            PropertyAttrs::METHOD,
+            PropertyAttrs::DEFAULT,
         );
         ctor
     };
@@ -336,10 +538,11 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
     // `WebAssembly.Instance` constructor.
     let inst_ctor = {
         let h = Rc::clone(&host);
-        let ctor = vm.alloc_host_fn("Instance", move |vm, _this, args| {
+        let ctor = alloc_host_fn_len(vm, "Instance", 1, move |vm, _this, args| {
+            let proto = require_construct_proto(vm, h.instance_proto, "Instance")?;
             let mod_val = args.first().copied().unwrap_or(JsValue::UNDEFINED);
             let import_obj = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
-            instantiate_module_object(vm, &h, mod_val, import_obj)
+            instantiate_module_object_with_proto(vm, &h, mod_val, import_obj, proto)
         });
         define_prop(
             vm,
@@ -369,40 +572,111 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
     // `WebAssembly.Memory` constructor.
     let mem_ctor = {
         let h = Rc::clone(&host);
-        let ctor = vm.alloc_host_fn("Memory", move |vm, _this, args| {
+        let ctor = alloc_host_fn_len(vm, "Memory", 1, move |vm, _this, args| {
+            let proto = require_construct_proto(vm, h.memory_proto, "Memory")?;
             let desc = args.first().copied().unwrap_or(JsValue::UNDEFINED);
             let Some(desc_h) = desc.as_object() else {
                 return Err(vm.type_error("WebAssembly.Memory descriptor must be an object"));
             };
+
+            // WebIDL dictionary member access in alphabetical order:
+            // address, initial, maximum, minimum, shared
+            let k_addr = vm.heap.intern_key("address");
+            let addr_v = vm.get_property_by_key(desc_h, k_addr)?;
+            let is_64 = parse_address_type(vm, addr_v)?;
+
             let k_init = vm.heap.intern_key("initial");
             let init_v = vm.get_property_by_key(desc_h, k_init)?;
-            let initial = to_wasm_u32_limit(vm, init_v, "initial")?;
+            let initial_opt = if init_v.is_undefined() {
+                None
+            } else {
+                Some(to_wasm_index_limit(vm, init_v, is_64, "initial")?)
+            };
+
             let k_max = vm.heap.intern_key("maximum");
             let max_v = vm.get_property_by_key(desc_h, k_max)?;
             let maximum = if max_v.is_undefined() {
                 None
             } else {
-                let m = to_wasm_u32_limit(vm, max_v, "maximum")?;
+                Some(to_wasm_index_limit(vm, max_v, is_64, "maximum")?)
+            };
+
+            let k_min = vm.heap.intern_key("minimum");
+            let min_v = vm.get_property_by_key(desc_h, k_min)?;
+            let minimum_opt = if min_v.is_undefined() {
+                None
+            } else {
+                Some(to_wasm_index_limit(vm, min_v, is_64, "minimum")?)
+            };
+
+            let k_shared = vm.heap.intern_key("shared");
+            let shared_v = vm.get_property_by_key(desc_h, k_shared)?;
+            let is_shared = is_js_truthy(vm, shared_v);
+
+            let initial = match (initial_opt, minimum_opt) {
+                (Some(_), Some(_)) => {
+                    return Err(vm.type_error(
+                        "WebAssembly.Memory descriptor cannot specify both 'initial' and 'minimum'",
+                    ));
+                }
+                (None, None) => {
+                    return Err(vm.type_error(
+                        "WebAssembly.Memory descriptor requires 'initial' (or 'minimum')",
+                    ));
+                }
+                (Some(v), None) | (None, Some(v)) => v,
+            };
+
+            let page_ceiling = if is_64 {
+                MAX_WASM64_PAGES
+            } else {
+                MAX_WASM32_PAGES
+            };
+            if initial > page_ceiling {
+                return Err(vm.range_error("Memory initial exceeds maximum page limit"));
+            }
+            if let Some(m) = maximum {
                 if m < initial {
                     return Err(vm.range_error("Memory maximum pages cannot be less than initial"));
                 }
-                if u64::from(m) > MAX_WASM32_PAGES {
-                    return Err(vm.range_error("Memory maximum exceeds 65536 pages"));
+                if m > page_ceiling {
+                    return Err(vm.range_error("Memory maximum exceeds maximum page limit"));
                 }
-                Some(m)
-            };
-            if u64::from(initial) > MAX_WASM32_PAGES {
-                return Err(vm.range_error("Memory initial exceeds 65536 pages"));
             }
-            let mem_ty = MemoryType::new(initial, maximum);
-            let mem = {
-                let mut store = h.store.borrow_mut();
-                Memory::new(&mut *store, mem_ty).map_err(|e| {
-                    vm.range_error(format!("Failed to allocate WebAssembly.Memory: {e}"))
-                })?
+            if is_shared && maximum.is_none() {
+                return Err(vm.type_error("Shared WebAssembly.Memory requires a 'maximum' limit"));
+            }
+
+            let mem_id = if is_shared {
+                let max_p = maximum.unwrap_or(initial);
+                let mut builder = wasmtime::MemoryTypeBuilder::new();
+                builder.min(initial).max(Some(max_p)).shared(true);
+                if is_64 {
+                    builder.memory64(true);
+                }
+                let mem_ty = builder.build().map_err(|e| {
+                    vm.range_error(format!("Invalid shared WebAssembly.Memory type: {e}"))
+                })?;
+                let smem = SharedMemory::new(&h.engine, mem_ty).map_err(|e| {
+                    vm.range_error(format!("Failed to allocate shared WebAssembly.Memory: {e}"))
+                })?;
+                register_shared_memory(vm, &h, smem, is_64, maximum)
+            } else {
+                let mem_ty = if is_64 {
+                    MemoryType::new64(initial, maximum)
+                } else {
+                    MemoryType::new(initial as u32, maximum.map(|m| m as u32))
+                };
+                let mem = h.with_store_mut(|mut store| {
+                    Memory::new(&mut store, mem_ty).map_err(|e| {
+                        vm.range_error(format!("Failed to allocate WebAssembly.Memory: {e}"))
+                    })
+                })?;
+                register_memory(vm, &h, mem)
             };
-            let mem_id = register_memory(vm, &h, mem);
-            Ok(JsValue::from_object(wrap_memory_object(vm, &h, mem_id)))
+
+            let wrapper = wrap_memory_object_with_proto(vm, &h, mem_id, proto);
+            Ok(JsValue::from_object(wrapper))
         });
         define_prop(
             vm,
@@ -432,53 +706,88 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
     // `WebAssembly.Table` constructor.
     let table_ctor = {
         let h = Rc::clone(&host);
-        let ctor = vm.alloc_host_fn("Table", move |vm, _this, args| {
+        let ctor = alloc_host_fn_len(vm, "Table", 1, move |vm, _this, args| {
+            let proto = require_construct_proto(vm, h.table_proto, "Table")?;
             let desc = args.first().copied().unwrap_or(JsValue::UNDEFINED);
             let Some(desc_h) = desc.as_object() else {
                 return Err(vm.type_error("WebAssembly.Table descriptor must be an object"));
             };
+
+            // WebIDL dictionary order: address, element, initial, maximum, minimum
+            let k_addr = vm.heap.intern_key("address");
+            let addr_v = vm.get_property_by_key(desc_h, k_addr)?;
+            let is_64 = parse_address_type(vm, addr_v)?;
+
             let k_elem = vm.heap.intern_key("element");
             let elem_v = vm.get_property_by_key(desc_h, k_elem)?;
-            let elem_s = vm.value_to_rust_string(elem_v);
-            let (ref_ty, init_ref) = match elem_s.as_str() {
-                "anyfunc" | "funcref" => (RefType::FUNCREF, Ref::Func(None)),
-                "externref" => (RefType::EXTERNREF, Ref::Extern(None)),
-                _ => {
-                    return Err(vm.type_error(format!(
-                        "Unsupported WebAssembly.Table element type '{elem_s}'"
-                    )));
-                }
-            };
+            if elem_v.is_undefined() {
+                return Err(vm.type_error("WebAssembly.Table descriptor requires 'element'"));
+            }
+            let elem_s = vm.to_js_string(elem_v)?;
+            let ref_ty = parse_table_ref_type(vm, &elem_s)?;
+
             let k_init = vm.heap.intern_key("initial");
             let init_v = vm.get_property_by_key(desc_h, k_init)?;
-            let initial = to_wasm_u32_limit(vm, init_v, "initial")?;
+            let initial_opt = if init_v.is_undefined() {
+                None
+            } else {
+                Some(to_wasm_index_limit(vm, init_v, is_64, "initial")?)
+            };
+
             let k_max = vm.heap.intern_key("maximum");
             let max_v = vm.get_property_by_key(desc_h, k_max)?;
             let maximum = if max_v.is_undefined() {
                 None
             } else {
-                let m = to_wasm_u32_limit(vm, max_v, "maximum")?;
+                Some(to_wasm_index_limit(vm, max_v, is_64, "maximum")?)
+            };
+
+            let k_min = vm.heap.intern_key("minimum");
+            let min_v = vm.get_property_by_key(desc_h, k_min)?;
+            let minimum_opt = if min_v.is_undefined() {
+                None
+            } else {
+                Some(to_wasm_index_limit(vm, min_v, is_64, "minimum")?)
+            };
+
+            let initial = match (initial_opt, minimum_opt) {
+                (Some(_), Some(_)) => {
+                    return Err(vm.type_error(
+                        "WebAssembly.Table descriptor cannot specify both 'initial' and 'minimum'",
+                    ));
+                }
+                (None, None) => {
+                    return Err(vm.type_error(
+                        "WebAssembly.Table descriptor requires 'initial' (or 'minimum')",
+                    ));
+                }
+                (Some(v), None) | (None, Some(v)) => v,
+            };
+
+            if let Some(m) = maximum {
                 if m < initial {
                     return Err(vm.range_error("Table maximum cannot be less than initial"));
                 }
-                Some(m)
+            }
+
+            let init_ref = if args.len() < 2 {
+                default_wasm_ref(vm, &h, &ref_ty)
+            } else {
+                js_to_wasm_ref(vm, &h, args[1], &ref_ty)?
             };
-            let table = {
-                let mut store = h.store.borrow_mut();
-                Table::new(
-                    &mut *store,
-                    TableType::new(ref_ty, initial, maximum),
-                    init_ref,
-                )
-                .map_err(|e| vm.range_error(format!("Failed to create WebAssembly.Table: {e}")))?
+
+            let table_ty = if is_64 {
+                TableType::new64(ref_ty, initial, maximum)
+            } else {
+                TableType::new(ref_ty, initial as u32, maximum.map(|m| m as u32))
             };
-            let tid = {
-                let mut tables = h.tables.borrow_mut();
-                let id = tables.len();
-                tables.push(table);
-                id
-            };
-            Ok(JsValue::from_object(wrap_table_object(vm, &h, tid)))
+            let table = h.with_store_mut(|mut store| {
+                Table::new(&mut store, table_ty, init_ref)
+                    .map_err(|e| vm.range_error(format!("Failed to create WebAssembly.Table: {e}")))
+            })?;
+            let tid = register_table(&h, table);
+            let wrapper = wrap_table_object_with_proto(vm, &h, tid, proto);
+            Ok(JsValue::from_object(wrapper))
         });
         define_prop(
             vm,
@@ -508,25 +817,13 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
     // `WebAssembly.Global` constructor.
     let global_ctor = {
         let h = Rc::clone(&host);
-        let ctor = vm.alloc_host_fn("Global", move |vm, _this, args| {
+        let ctor = alloc_host_fn_len(vm, "Global", 1, move |vm, _this, args| {
+            let proto = require_construct_proto(vm, h.global_proto, "Global")?;
             let desc = args.first().copied().unwrap_or(JsValue::UNDEFINED);
             let Some(desc_h) = desc.as_object() else {
                 return Err(vm.type_error("WebAssembly.Global descriptor must be an object"));
             };
-            let k_val = vm.heap.intern_key("value");
-            let ty_val = vm.get_property_by_key(desc_h, k_val)?;
-            let ty_str = vm.value_to_rust_string(ty_val);
-            let val_ty = match ty_str.as_str() {
-                "i32" => ValType::I32,
-                "i64" => ValType::I64,
-                "f32" => ValType::F32,
-                "f64" => ValType::F64,
-                _ => {
-                    return Err(vm.type_error(format!(
-                        "Unsupported WebAssembly.Global value type '{ty_str}'"
-                    )));
-                }
-            };
+            // WebIDL dictionary order: mutable, then value!
             let k_mut = vm.heap.intern_key("mutable");
             let mut_v = vm.get_property_by_key(desc_h, k_mut)?;
             let mutability = if is_js_truthy(vm, mut_v) {
@@ -534,25 +831,25 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
             } else {
                 Mutability::Const
             };
-            let init_js = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
-            let init_val = if init_js.is_undefined() {
-                default_wasm_val(&val_ty)
+            let k_val = vm.heap.intern_key("value");
+            let ty_val = vm.get_property_by_key(desc_h, k_val)?;
+            if ty_val.is_undefined() {
+                return Err(vm.type_error("WebAssembly.Global descriptor requires 'value'"));
+            }
+            let ty_str = vm.to_js_string(ty_val)?;
+            let val_ty = parse_js_val_type(vm, &ty_str, false)?;
+            let init_val = if args.len() < 2 || args[1].is_undefined() {
+                default_wasm_val_js(vm, &h, &val_ty)
             } else {
-                js_to_wasm_val(vm, init_js, &val_ty)?
+                js_to_wasm_val(vm, &h, args[1], &val_ty)?
             };
-            let global = {
-                let mut store = h.store.borrow_mut();
-                Global::new(&mut *store, GlobalType::new(val_ty, mutability), init_val).map_err(
-                    |e| vm.type_error(format!("Failed to create WebAssembly.Global: {e}")),
-                )?
-            };
-            let gid = {
-                let mut globals = h.globals.borrow_mut();
-                let id = globals.len();
-                globals.push(global);
-                id
-            };
-            Ok(JsValue::from_object(wrap_global_object(vm, &h, gid)))
+            let global = h.with_store_mut(|mut store| {
+                Global::new(&mut store, GlobalType::new(val_ty, mutability), init_val)
+                    .map_err(|e| vm.type_error(format!("Failed to create WebAssembly.Global: {e}")))
+            })?;
+            let gid = register_global(&h, global);
+            let wrapper = wrap_global_object_with_proto(vm, &h, gid, proto);
+            Ok(JsValue::from_object(wrapper))
         });
         define_prop(
             vm,
@@ -579,10 +876,151 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
     );
     vm.mark_constructor(global_ctor);
 
+    // `WebAssembly.Tag` constructor.
+    let tag_ctor = {
+        let h = Rc::clone(&host);
+        let ctor = alloc_host_fn_len(vm, "Tag", 1, move |vm, _this, args| {
+            let proto = require_construct_proto(vm, h.tag_proto, "Tag")?;
+            let desc = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+            let Some(desc_h) = desc.as_object() else {
+                return Err(vm.type_error("WebAssembly.Tag descriptor must be an object"));
+            };
+            let k_params = vm.heap.intern_key("parameters");
+            let params_v = vm.get_property_by_key(desc_h, k_params)?;
+            if params_v.is_undefined() || params_v.is_null() {
+                return Err(vm.type_error("WebAssembly.Tag descriptor requires 'parameters'"));
+            }
+            let items = vm.collect_iterable(params_v)?;
+            let mut param_tys = Vec::with_capacity(items.len());
+            for item in items {
+                let s = vm.to_js_string(item)?;
+                param_tys.push(parse_js_val_type(vm, &s, true)?);
+            }
+            let tag_ty = TagType::new(FuncType::new(&h.engine, param_tys, []));
+            let tag = h.with_store_mut(|mut store| {
+                Tag::new(&mut store, &tag_ty)
+                    .map_err(|e| vm.type_error(format!("Failed to create WebAssembly.Tag: {e}")))
+            })?;
+            let tid = register_tag(&h, tag);
+            let wrapper = wrap_tag_object_with_proto(vm, &h, tid, proto);
+            Ok(JsValue::from_object(wrapper))
+        });
+        define_prop(
+            vm,
+            ctor,
+            "prototype",
+            JsValue::from_object(tag_proto),
+            PropertyAttrs::empty(),
+        );
+        define_prop(
+            vm,
+            tag_proto,
+            "constructor",
+            JsValue::from_object(ctor),
+            PropertyAttrs::METHOD,
+        );
+        ctor
+    };
+    define_prop(
+        vm,
+        wasm_ns,
+        "Tag",
+        JsValue::from_object(tag_ctor),
+        PropertyAttrs::METHOD,
+    );
+    vm.mark_constructor(tag_ctor);
+
+    // `WebAssembly.Exception` constructor.
+    let exn_ctor = {
+        let h = Rc::clone(&host);
+        let ctor = alloc_host_fn_len(vm, "Exception", 2, move |vm, _this, args| {
+            let proto = require_construct_proto(vm, h.exception_proto, "Exception")?;
+            if args.len() < 2 {
+                return Err(vm.type_error("WebAssembly.Exception requires tag and payload"));
+            }
+            let tag_id = read_hidden_id(vm, args[0], TAG_ID_KEY)
+                .ok_or_else(|| vm.type_error("Argument 0 must be a WebAssembly.Tag"))?;
+            let (tag, param_tys) = {
+                let tags = h.tags.borrow();
+                let t = tags
+                    .get(tag_id)
+                    .ok_or_else(|| vm.type_error("Invalid WebAssembly.Tag"))?
+                    .tag;
+                let tys: Vec<ValType> = h.with_store(|store| t.ty(&store).ty().params().collect());
+                (t, tys)
+            };
+            let payload_items = vm.collect_iterable(args[1])?;
+            if payload_items.len() != param_tys.len() {
+                return Err(vm.type_error("WebAssembly.Exception payload length mismatch"));
+            }
+            let mut wasm_fields = Vec::with_capacity(param_tys.len());
+            for (val, ty) in payload_items.into_iter().zip(param_tys.iter()) {
+                if matches!(ty, ValType::V128) {
+                    return Err(vm.type_error("Cannot construct WebAssembly.Exception with v128"));
+                }
+                wasm_fields.push(js_to_wasm_val(vm, &h, val, ty)?);
+            }
+
+            let trace_stack = if let Some(opts) = args.get(2).copied() {
+                if opts.is_undefined() || opts.is_null() {
+                    false
+                } else if let Some(oh) = opts.as_object() {
+                    let k_ts = vm.heap.intern_key("traceStack");
+                    let v = vm.get_property_by_key(oh, k_ts)?;
+                    is_js_truthy(vm, v)
+                } else {
+                    return Err(vm.type_error("WebAssembly.Exception options must be an object"));
+                }
+            } else {
+                false
+            };
+
+            let exn_ty = ExnType::new(&h.engine, param_tys)
+                .map_err(|e| vm.type_error(format!("Invalid exception type: {e}")))?;
+            let owned = h.with_store_mut(|mut store| {
+                let pre = ExnRefPre::new(&mut store, exn_ty);
+                let rooted = ExnRef::new(&mut store, &pre, &tag, &wasm_fields).map_err(|e| {
+                    vm.type_error(format!("Failed to create WebAssembly.Exception: {e}"))
+                })?;
+                rooted
+                    .to_owned_rooted(&mut store)
+                    .map_err(|e| vm.type_error(format!("Failed to root exception: {e}")))
+            })?;
+            let stack = trace_stack.then(|| "WebAssembly.Exception".to_string());
+            let eid = register_exception(&h, owned, stack);
+            let obj = alloc_ordinary(vm, Some(proto));
+            define_hidden_id(vm, obj, EXN_ID_KEY, eid);
+            Ok(JsValue::from_object(obj))
+        });
+        define_prop(
+            vm,
+            ctor,
+            "prototype",
+            JsValue::from_object(exception_proto),
+            PropertyAttrs::empty(),
+        );
+        define_prop(
+            vm,
+            exception_proto,
+            "constructor",
+            JsValue::from_object(ctor),
+            PropertyAttrs::METHOD,
+        );
+        ctor
+    };
+    define_prop(
+        vm,
+        wasm_ns,
+        "Exception",
+        JsValue::from_object(exn_ctor),
+        PropertyAttrs::METHOD,
+    );
+    vm.mark_constructor(exn_ctor);
+
     // `WebAssembly.validate(bytes)`
     let validate_fn = {
         let h = Rc::clone(&host);
-        vm.alloc_host_fn("validate", move |vm, _this, args| {
+        alloc_host_fn_len(vm, "validate", 1, move |vm, _this, args| {
             let bytes =
                 extract_buffer_source(vm, args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
             let valid = Module::validate(&h.engine, &bytes).is_ok();
@@ -594,21 +1032,33 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
         wasm_ns,
         "validate",
         JsValue::from_object(validate_fn),
-        PropertyAttrs::METHOD,
+        PropertyAttrs::DEFAULT,
     );
 
-    // `WebAssembly.compile(bytes) -> Promise<Module>`
+    // `WebAssembly.compile(bytes, options?) -> Promise<Module>`
     let compile_fn = {
         let h = Rc::clone(&host);
-        vm.alloc_host_fn("compile", move |vm, _this, args| {
-            let p = alloc_promise(vm);
-            match extract_buffer_source(vm, args.first().copied().unwrap_or(JsValue::UNDEFINED))
-                .and_then(|bytes| compile_module_object(vm, &h, bytes))
-            {
-                Ok(mod_val) => resolve_promise(vm, p, mod_val),
-                Err(exc) => reject_promise(vm, p, exc.value),
-            }
-            Ok(JsValue::from_object(p))
+        alloc_host_fn_len(vm, "compile", 1, move |vm, _this, args| {
+            let bytes = match extract_buffer_source(
+                vm,
+                args.first().copied().unwrap_or(JsValue::UNDEFINED),
+            ) {
+                Ok(b) => b,
+                Err(exc) => {
+                    let p = alloc_promise(vm);
+                    reject_promise(vm, p, exc.value);
+                    return Ok(JsValue::from_object(p));
+                }
+            };
+            let tick = promise_resolve_value(vm, JsValue::UNDEFINED);
+            let h_mod = Rc::clone(&h);
+            let bytes_cell = RefCell::new(Some(bytes));
+            let on_tick = vm.alloc_host_fn("wasmCompileTask", move |vm, _this, _a| {
+                let raw = bytes_cell.borrow_mut().take().unwrap_or_default();
+                compile_module_object_with_proto(vm, &h_mod, raw, h_mod.module_proto)
+            });
+            let chained = promise_then(vm, tick, Some(on_tick), None);
+            Ok(JsValue::from_object(chained))
         })
     };
     define_prop(
@@ -616,37 +1066,74 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
         wasm_ns,
         "compile",
         JsValue::from_object(compile_fn),
-        PropertyAttrs::METHOD,
+        PropertyAttrs::DEFAULT,
     );
 
-    // `WebAssembly.instantiate(bytesOrModule, importObject?) -> Promise<{module, instance} | Instance>`
+    // `WebAssembly.instantiate(bytesOrModule, importObject?, options?) -> Promise<{module, instance} | Instance>`
     let instantiate_fn = {
         let h = Rc::clone(&host);
-        vm.alloc_host_fn("instantiate", move |vm, _this, args| {
-            let p = alloc_promise(vm);
+        alloc_host_fn_len(vm, "instantiate", 1, move |vm, _this, args| {
             let first = args.first().copied().unwrap_or(JsValue::UNDEFINED);
             let imports = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
             if read_hidden_id(vm, first, MODULE_ID_KEY).is_some() {
-                match instantiate_module_object(vm, &h, first, imports) {
-                    Ok(inst) => resolve_promise(vm, p, inst),
-                    Err(exc) => reject_promise(vm, p, exc.value),
+                // W3C JS-API: `WebAssembly.instantiate(module, imports)` reads `imports` synchronously!
+                let p = alloc_promise(vm);
+                match instantiate_module_object_with_proto(vm, &h, first, imports, h.instance_proto)
+                {
+                    Ok(inst_val) => {
+                        let resolved = promise_resolve_value(vm, inst_val);
+                        Ok(JsValue::from_object(resolved))
+                    }
+                    Err(exc) => {
+                        reject_promise(vm, p, exc.value);
+                        Ok(JsValue::from_object(p))
+                    }
                 }
             } else {
-                let res = extract_buffer_source(vm, first)
-                    .and_then(|bytes| compile_module_object(vm, &h, bytes))
-                    .and_then(|mod_val| {
-                        let inst_val = instantiate_module_object(vm, &h, mod_val, imports)?;
+                let bytes = match extract_buffer_source(vm, first) {
+                    Ok(b) => b,
+                    Err(exc) => {
+                        let p = alloc_promise(vm);
+                        reject_promise(vm, p, exc.value);
+                        return Ok(JsValue::from_object(p));
+                    }
+                };
+                if !imports.is_undefined() && !imports.is_object() {
+                    let p = alloc_promise(vm);
+                    let exc = vm.type_error("importObject must be an object or undefined");
+                    reject_promise(vm, p, exc.value);
+                    return Ok(JsValue::from_object(p));
+                }
+                let tick = promise_resolve_value(vm, JsValue::UNDEFINED);
+                let h_inst = Rc::clone(&h);
+                let bytes_cell = RefCell::new(Some(bytes));
+                let on_tick = vm.alloc_host_fn_rooted(
+                    "wasmInstantiateBytesTask",
+                    &[imports],
+                    move |vm, _t, _a| {
+                        let raw = bytes_cell.borrow_mut().take().unwrap_or_default();
+                        let mod_val = compile_module_object_with_proto(
+                            vm,
+                            &h_inst,
+                            raw,
+                            h_inst.module_proto,
+                        )?;
+                        let inst_val = instantiate_module_object_with_proto(
+                            vm,
+                            &h_inst,
+                            mod_val,
+                            imports,
+                            h_inst.instance_proto,
+                        )?;
                         let pair = alloc_ordinary(vm, Some(vm.object_proto));
                         define_prop(vm, pair, "module", mod_val, PropertyAttrs::DEFAULT);
                         define_prop(vm, pair, "instance", inst_val, PropertyAttrs::DEFAULT);
                         Ok(JsValue::from_object(pair))
-                    });
-                match res {
-                    Ok(v) => resolve_promise(vm, p, v),
-                    Err(exc) => reject_promise(vm, p, exc.value),
-                }
+                    },
+                );
+                let chained = promise_then(vm, tick, Some(on_tick), None);
+                Ok(JsValue::from_object(chained))
             }
-            Ok(JsValue::from_object(p))
         })
     };
     define_prop(
@@ -654,13 +1141,13 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
         wasm_ns,
         "instantiate",
         JsValue::from_object(instantiate_fn),
-        PropertyAttrs::METHOD,
+        PropertyAttrs::DEFAULT,
     );
 
     // `WebAssembly.compileStreaming(source) -> Promise<Module>`
     let compile_streaming_fn = {
         let h = Rc::clone(&host);
-        vm.alloc_host_fn("compileStreaming", move |vm, _this, args| {
+        alloc_host_fn_len(vm, "compileStreaming", 1, move |vm, _this, args| {
             let source = args.first().copied().unwrap_or(JsValue::UNDEFINED);
             Ok(JsValue::from_object(compile_streaming_impl(vm, &h, source)))
         })
@@ -670,26 +1157,35 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
         wasm_ns,
         "compileStreaming",
         JsValue::from_object(compile_streaming_fn),
-        PropertyAttrs::METHOD,
+        PropertyAttrs::DEFAULT,
     );
 
     // `WebAssembly.instantiateStreaming(source, importObject?) -> Promise<{module, instance}>`
     let instantiate_streaming_fn = {
         let h = Rc::clone(&host);
-        vm.alloc_host_fn("instantiateStreaming", move |vm, _this, args| {
+        alloc_host_fn_len(vm, "instantiateStreaming", 1, move |vm, _this, args| {
             let source = args.first().copied().unwrap_or(JsValue::UNDEFINED);
             let import_obj = args.get(1).copied().unwrap_or(JsValue::UNDEFINED);
             let mod_promise = compile_streaming_impl(vm, &h, source);
             let h_inst = Rc::clone(&h);
-            let on_mod =
-                vm.alloc_host_fn("wasmInstantiateStreamingThen", move |vm, _this, margs| {
+            let on_mod = vm.alloc_host_fn_rooted(
+                "wasmInstantiateStreamingThen",
+                &[import_obj],
+                move |vm, _this, margs| {
                     let mod_val = margs.first().copied().unwrap_or(JsValue::UNDEFINED);
-                    let inst_val = instantiate_module_object(vm, &h_inst, mod_val, import_obj)?;
+                    let inst_val = instantiate_module_object_with_proto(
+                        vm,
+                        &h_inst,
+                        mod_val,
+                        import_obj,
+                        h_inst.instance_proto,
+                    )?;
                     let pair = alloc_ordinary(vm, Some(vm.object_proto));
                     define_prop(vm, pair, "module", mod_val, PropertyAttrs::DEFAULT);
                     define_prop(vm, pair, "instance", inst_val, PropertyAttrs::DEFAULT);
                     Ok(JsValue::from_object(pair))
-                });
+                },
+            );
             let chained = promise_then(vm, mod_promise, Some(on_mod), None);
             Ok(JsValue::from_object(chained))
         })
@@ -699,7 +1195,7 @@ pub fn install_webassembly(vm: &mut JsVm) -> SharedWasmHost {
         wasm_ns,
         "instantiateStreaming",
         JsValue::from_object(instantiate_streaming_fn),
-        PropertyAttrs::METHOD,
+        PropertyAttrs::DEFAULT,
     );
 
     // Attach `WebAssembly` onto global object.
@@ -740,7 +1236,7 @@ fn compile_streaming_impl(vm: &mut JsVm, host: &SharedWasmHost, source: JsValue)
                 let ct_key = JsValue::from_string(vm.heap.alloc_string("content-type"));
                 let ct_v = vm.call_value(get_fn, headers_v, &[ct_key])?;
                 if !ct_v.is_null() && !ct_v.is_undefined() {
-                    let ct = vm.value_to_rust_string(ct_v).to_ascii_lowercase();
+                    let ct = vm.to_js_string(ct_v)?.to_ascii_lowercase();
                     let mime = ct.split(';').next().unwrap_or("").trim();
                     if !mime.is_empty() && mime != "application/wasm" {
                         return Err(vm.type_error(format!(
@@ -761,7 +1257,7 @@ fn compile_streaming_impl(vm: &mut JsVm, host: &SharedWasmHost, source: JsValue)
         let on_buf = vm.alloc_host_fn("wasmCompileStreamingBytes", move |vm, _this, bargs| {
             let bytes =
                 extract_buffer_source(vm, bargs.first().copied().unwrap_or(JsValue::UNDEFINED))?;
-            compile_module_object(vm, &h_mod, bytes)
+            compile_module_object_with_proto(vm, &h_mod, bytes, h_mod.module_proto)
         });
         Ok(JsValue::from_object(promise_then(
             vm,
@@ -775,10 +1271,11 @@ fn compile_streaming_impl(vm: &mut JsVm, host: &SharedWasmHost, source: JsValue)
 
 // --- Module Compilation & Instantiation ---
 
-fn compile_module_object(
+fn compile_module_object_with_proto(
     vm: &mut JsVm,
     host: &SharedWasmHost,
     bytes: Vec<u8>,
+    proto: HeapHandle,
 ) -> Result<JsValue, JsException> {
     let module = Module::new(&host.engine, &bytes).map_err(|e| {
         make_wasm_error(vm, host.compile_error_proto, "CompileError", e.to_string())
@@ -789,23 +1286,27 @@ fn compile_module_object(
         mods.push((module, bytes));
         id
     };
-    let obj = alloc_ordinary(vm, Some(host.module_proto));
+    let obj = alloc_ordinary(vm, Some(proto));
     define_hidden_id(vm, obj, MODULE_ID_KEY, mod_id);
     Ok(JsValue::from_object(obj))
 }
 
-fn instantiate_module_object(
+fn instantiate_module_object_with_proto(
     vm: &mut JsVm,
     host: &SharedWasmHost,
     mod_val: JsValue,
     import_obj: JsValue,
+    proto: HeapHandle,
 ) -> Result<JsValue, JsException> {
     let mod_id = read_hidden_id(vm, mod_val, MODULE_ID_KEY)
         .ok_or_else(|| vm.type_error("Argument 0 must be a WebAssembly.Module"))?;
-    let module = {
+    if !import_obj.is_undefined() && !import_obj.is_object() {
+        return Err(vm.type_error("importObject must be an object or undefined"));
+    }
+    let (module, raw_bytes) = {
         let mods = host.modules.borrow();
         mods.get(mod_id)
-            .map(|(m, _)| m.clone())
+            .map(|(m, b)| (m.clone(), b.clone()))
             .ok_or_else(|| vm.type_error("Invalid WebAssembly.Module"))?
     };
 
@@ -818,9 +1319,14 @@ fn instantiate_module_object(
         return Err(vm.type_error("importObject must be an object when module has imports"));
     }
 
-    // Resolve every declared import in module declaration order.
+    // Track imported entity IDs in index order so re-exports preserve exact JS object identity.
     let mut resolved_imports: Vec<Extern> = Vec::with_capacity(import_specs.len());
-    let mut imported_mem_ids: Vec<(usize, Memory)> = Vec::new();
+    let mut imported_func_wrappers: Vec<Option<HeapHandle>> = Vec::new();
+    let mut imported_mem_ids: Vec<usize> = Vec::new();
+    let mut imported_table_ids: Vec<usize> = Vec::new();
+    let mut imported_global_ids: Vec<Option<usize>> = Vec::new();
+    let mut imported_tag_ids: Vec<usize> = Vec::new();
+
     for (imp_mod, imp_name, imp_ty) in import_specs {
         let mod_h = import_obj
             .as_object()
@@ -844,9 +1350,15 @@ fn instantiate_module_object(
                             "Invalid Wasm function import",
                         )
                     })?;
+                    imported_func_wrappers.push(item_val.as_object());
                     resolved_imports.push(Extern::Func(f));
-                } else if item_val.is_object() {
+                } else if item_val
+                    .as_object()
+                    .is_some_and(|h| vm.is_callable_handle(h))
+                {
+                    root_js_value(vm, host, item_val);
                     let host_func = wrap_js_fn_as_wasm_import(host, item_val, func_ty);
+                    imported_func_wrappers.push(None);
                     resolved_imports.push(Extern::Func(host_func));
                 } else {
                     return Err(make_wasm_error(
@@ -866,22 +1378,23 @@ fn instantiate_module_object(
                         format!("Import '{imp_mod}.{imp_name}' must be a WebAssembly.Memory"),
                     ));
                 };
-                let mem = host
-                    .memories
-                    .lock()
-                    .expect("wasm memories lock")
-                    .get(mid)
-                    .map(|b| b.memory)
-                    .ok_or_else(|| {
-                        make_wasm_error(
-                            vm,
-                            host.link_error_proto,
-                            "LinkError",
-                            "Invalid Memory import",
-                        )
-                    })?;
-                imported_mem_ids.push((mid, mem));
-                resolved_imports.push(Extern::Memory(mem));
+                let ext = {
+                    let mems = host.memories.lock().expect("wasm memories lock");
+                    match mems.get(mid).map(|b| &b.kind) {
+                        Some(WasmMemKind::Unshared(m)) => Extern::Memory(*m),
+                        Some(WasmMemKind::Shared(sm)) => Extern::SharedMemory(sm.clone()),
+                        None => {
+                            return Err(make_wasm_error(
+                                vm,
+                                host.link_error_proto,
+                                "LinkError",
+                                "Invalid Memory import",
+                            ));
+                        }
+                    }
+                };
+                imported_mem_ids.push(mid);
+                resolved_imports.push(ext);
             }
             ExternType::Table(_) => {
                 let Some(tid) = read_hidden_id(vm, item_val, TABLE_ID_KEY) else {
@@ -892,62 +1405,75 @@ fn instantiate_module_object(
                         format!("Import '{imp_mod}.{imp_name}' must be a WebAssembly.Table"),
                     ));
                 };
-                let tbl = *host.tables.borrow().get(tid).ok_or_else(|| {
-                    make_wasm_error(
-                        vm,
-                        host.link_error_proto,
-                        "LinkError",
-                        "Invalid Table import",
-                    )
-                })?;
+                let tbl = host
+                    .tables
+                    .borrow()
+                    .get(tid)
+                    .map(|e| e.table)
+                    .ok_or_else(|| {
+                        make_wasm_error(
+                            vm,
+                            host.link_error_proto,
+                            "LinkError",
+                            "Invalid Table import",
+                        )
+                    })?;
+                imported_table_ids.push(tid);
                 resolved_imports.push(Extern::Table(tbl));
             }
             ExternType::Global(g_ty) => {
                 if let Some(gid) = read_hidden_id(vm, item_val, GLOBAL_ID_KEY) {
-                    let g = *host.globals.borrow().get(gid).ok_or_else(|| {
-                        make_wasm_error(
-                            vm,
-                            host.link_error_proto,
-                            "LinkError",
-                            "Invalid Global import",
-                        )
-                    })?;
+                    let g = host
+                        .globals
+                        .borrow()
+                        .get(gid)
+                        .map(|e| e.global)
+                        .ok_or_else(|| {
+                            make_wasm_error(
+                                vm,
+                                host.link_error_proto,
+                                "LinkError",
+                                "Invalid Global import",
+                            )
+                        })?;
+                    imported_global_ids.push(Some(gid));
                     resolved_imports.push(Extern::Global(g));
                 } else if g_ty.mutability() == Mutability::Const {
-                    // W3C JS-API allows importing a plain JS Number/BigInt for immutable globals!
-                    let val = js_to_wasm_val(vm, item_val, g_ty.content()).map_err(|_| {
-                        make_wasm_error(
-                            vm,
-                            host.link_error_proto,
-                            "LinkError",
-                            format!(
-                                "Invalid value for immutable global import '{imp_mod}.{imp_name}'"
-                            ),
-                        )
-                    })?;
-                    let g = {
-                        let mut store = host.store.borrow_mut();
-                        Global::new(&mut *store, g_ty, val).map_err(|e| {
+                    // W3C JS-API: immutable global imports accept plain JS Number / BigInt / Ref,
+                    // throwing LinkError on mismatched primitive type.
+                    let val = js_to_wasm_import_global(vm, host, item_val, g_ty.content())?;
+                    let g = host.with_store_mut(|mut store| {
+                        Global::new(&mut store, g_ty, val).map_err(|e| {
                             make_wasm_error(vm, host.link_error_proto, "LinkError", e.to_string())
-                        })?
-                    };
+                        })
+                    })?;
+                    imported_global_ids.push(None);
                     resolved_imports.push(Extern::Global(g));
                 } else {
                     return Err(make_wasm_error(
                         vm,
                         host.link_error_proto,
                         "LinkError",
-                        format!("Mutable global import '{imp_mod}.{imp_name}' must be a WebAssembly.Global"),
+                        format!(
+                            "Mutable global import '{imp_mod}.{imp_name}' must be a WebAssembly.Global"
+                        ),
                     ));
                 }
             }
             ExternType::Tag(_) => {
-                return Err(make_wasm_error(
-                    vm,
-                    host.link_error_proto,
-                    "LinkError",
-                    format!("Unsupported tag import '{imp_mod}.{imp_name}'"),
-                ));
+                let Some(tid) = read_hidden_id(vm, item_val, TAG_ID_KEY) else {
+                    return Err(make_wasm_error(
+                        vm,
+                        host.link_error_proto,
+                        "LinkError",
+                        format!("Import '{imp_mod}.{imp_name}' must be a WebAssembly.Tag"),
+                    ));
+                };
+                let tag = host.tags.borrow().get(tid).map(|e| e.tag).ok_or_else(|| {
+                    make_wasm_error(vm, host.link_error_proto, "LinkError", "Invalid Tag import")
+                })?;
+                imported_tag_ids.push(tid);
+                resolved_imports.push(Extern::Tag(tag));
             }
         }
     }
@@ -955,36 +1481,30 @@ fn instantiate_module_object(
     // Sync any imported JS memory buffers into Wasmtime BEFORE start-function / data segment init.
     sync_all_js_to_wasm(vm, host);
 
-    let inst_result = {
-        let mut store = host.store.borrow_mut();
-        let guard = VmPtrGuard::enter(&mut store, vm);
-        let res = Instance::new(&mut *guard.store, &module, &resolved_imports);
+    let inst_result = host.with_store_mut(|store| {
+        let mut guard = VmPtrGuard::enter(store, vm, host);
+        let res = Instance::new(&mut guard.store, &module, &resolved_imports);
         let js_exc = guard.store.data_mut().pending_js_exception.take();
-        (res, js_exc)
-    };
+        let wasm_exn = guard
+            .store
+            .take_pending_exception()
+            .and_then(|r| r.to_owned_rooted(&mut guard.store).ok());
+        (res, js_exc, wasm_exn)
+    });
 
     let instance = match inst_result {
-        (Ok(inst), _) => inst,
-        (Err(_err), Some(js_exc)) => {
+        (Ok(inst), _, _) => inst,
+        (Err(_), Some(js_exc), _) => {
             sync_all_wasm_to_js(vm, host);
             return Err(js_exc);
         }
-        (Err(err), None) => {
+        (Err(_), None, Some(wasm_exn)) => {
             sync_all_wasm_to_js(vm, host);
-            let msg = err.to_string();
-            // Classify start-function traps as `RuntimeError`, linking/type mismatches as `LinkError`.
-            if msg.contains("wasm trap")
-                || msg.contains("unreachable")
-                || msg.contains("out of bounds")
-            {
-                return Err(make_wasm_error(
-                    vm,
-                    host.runtime_error_proto,
-                    "RuntimeError",
-                    msg,
-                ));
-            }
-            return Err(make_wasm_error(vm, host.link_error_proto, "LinkError", msg));
+            return Err(wrap_thrown_wasm_exception(vm, host, wasm_exn));
+        }
+        (Err(err), None, None) => {
+            sync_all_wasm_to_js(vm, host);
+            return Err(classify_instantiation_error(vm, host, err));
         }
     };
 
@@ -998,250 +1518,570 @@ fn instantiate_module_object(
         id
     };
 
-    // Build `instance.exports` namespace object.
+    // Parse binary export section to map each export name to its exact `(kind, index)` for
+    // W3C JS-API exported function `.name` (stringified index) and canonical re-export identity.
+    let export_indices = parse_export_indices(&raw_bytes);
+
     let exports_obj = alloc_ordinary(vm, None);
-    let export_items: Vec<(String, Extern)> = {
-        let mut store = host.store.borrow_mut();
+    let export_items: Vec<(String, Extern)> = host.with_store_mut(|mut store| {
         module
             .exports()
             .filter_map(|e| {
                 let name = e.name().to_string();
-                instance.get_export(&mut *store, &name).map(|ex| (name, ex))
+                instance.get_export(&mut store, &name).map(|ex| (name, ex))
             })
             .collect()
-    };
+    });
 
-    let mut mem_index_by_ptr: HashMap<usize, usize> = HashMap::new();
-    {
-        let store = host.store.borrow();
-        for &(mid, mem) in &imported_mem_ids {
-            mem_index_by_ptr.insert(mem.data(&*store).as_ptr() as usize, mid);
-        }
-    }
+    // Track local (module-defined) entity indices so multiple exports of the same internal item
+    // share the exact same JS wrapper object.
+    let mut local_func_wrappers: HashMap<u32, HeapHandle> = HashMap::new();
+    let mut local_mem_ids: HashMap<u32, usize> = HashMap::new();
+    let mut local_table_ids: HashMap<u32, usize> = HashMap::new();
+    let mut local_global_ids: HashMap<u32, usize> = HashMap::new();
+    let mut local_tag_ids: HashMap<u32, usize> = HashMap::new();
 
     for (name, ext) in export_items {
+        let idx_opt = export_indices.get(&name).map(|&(_, idx)| idx);
         let js_val = match ext {
-            Extern::Func(f) => JsValue::from_object(wrap_exported_func(vm, host, &name, f)),
-            Extern::Memory(mem) => {
-                let ptr_key = {
-                    let store = host.store.borrow();
-                    mem.data(&*store).as_ptr() as usize
-                };
-                let mid = if let Some(&existing_mid) = mem_index_by_ptr.get(&ptr_key) {
-                    existing_mid
+            Extern::Func(f) => {
+                let wrapper = if let Some(idx) = idx_opt {
+                    if let Some(&Some(imp_w)) = imported_func_wrappers.get(idx as usize) {
+                        imp_w
+                    } else if let Some(&loc_w) = local_func_wrappers.get(&idx) {
+                        loc_w
+                    } else {
+                        let fn_name = idx.to_string();
+                        let w = get_or_wrap_exported_func(vm, host, &fn_name, f);
+                        local_func_wrappers.insert(idx, w);
+                        w
+                    }
                 } else {
-                    let new_id = register_memory(vm, host, mem);
-                    mem_index_by_ptr.insert(ptr_key, new_id);
-                    new_id
+                    get_or_wrap_exported_func(vm, host, &name, f)
                 };
-                JsValue::from_object(wrap_memory_object(vm, host, mid))
+                JsValue::from_object(wrapper)
+            }
+            Extern::Memory(mem) => {
+                let mid = if let Some(idx) = idx_opt {
+                    if let Some(&imp_id) = imported_mem_ids.get(idx as usize) {
+                        imp_id
+                    } else if let Some(&loc_id) = local_mem_ids.get(&idx) {
+                        loc_id
+                    } else {
+                        let new_id = register_memory(vm, host, mem);
+                        local_mem_ids.insert(idx, new_id);
+                        new_id
+                    }
+                } else {
+                    register_memory(vm, host, mem)
+                };
+                JsValue::from_object(get_or_wrap_memory_object(vm, host, mid))
+            }
+            Extern::SharedMemory(smem) => {
+                let mid = if let Some(idx) = idx_opt {
+                    if let Some(&imp_id) = imported_mem_ids.get(idx as usize) {
+                        imp_id
+                    } else if let Some(&loc_id) = local_mem_ids.get(&idx) {
+                        loc_id
+                    } else {
+                        let ty = smem.ty();
+                        let new_id =
+                            register_shared_memory(vm, host, smem, ty.is_64(), ty.maximum());
+                        local_mem_ids.insert(idx, new_id);
+                        new_id
+                    }
+                } else {
+                    let ty = smem.ty();
+                    register_shared_memory(vm, host, smem, ty.is_64(), ty.maximum())
+                };
+                JsValue::from_object(get_or_wrap_memory_object(vm, host, mid))
             }
             Extern::Table(tbl) => {
-                let tid = {
-                    let mut tables = host.tables.borrow_mut();
-                    let id = tables.len();
-                    tables.push(tbl);
-                    id
+                let tid = if let Some(idx) = idx_opt {
+                    if let Some(&imp_id) = imported_table_ids.get(idx as usize) {
+                        imp_id
+                    } else if let Some(&loc_id) = local_table_ids.get(&idx) {
+                        loc_id
+                    } else {
+                        let new_id = register_table(host, tbl);
+                        local_table_ids.insert(idx, new_id);
+                        new_id
+                    }
+                } else {
+                    register_table(host, tbl)
                 };
-                JsValue::from_object(wrap_table_object(vm, host, tid))
+                JsValue::from_object(get_or_wrap_table_object(vm, host, tid))
             }
             Extern::Global(g) => {
-                let gid = {
-                    let mut globals = host.globals.borrow_mut();
-                    let id = globals.len();
-                    globals.push(g);
-                    id
+                let gid = if let Some(idx) = idx_opt {
+                    if let Some(&Some(imp_id)) = imported_global_ids.get(idx as usize) {
+                        imp_id
+                    } else if let Some(&loc_id) = local_global_ids.get(&idx) {
+                        loc_id
+                    } else {
+                        let new_id = register_global(host, g);
+                        local_global_ids.insert(idx, new_id);
+                        new_id
+                    }
+                } else {
+                    register_global(host, g)
                 };
-                JsValue::from_object(wrap_global_object(vm, host, gid))
+                JsValue::from_object(get_or_wrap_global_object(vm, host, gid))
             }
-            Extern::Tag(_) | Extern::SharedMemory(_) => JsValue::UNDEFINED,
+            Extern::Tag(t) => {
+                let tid = if let Some(idx) = idx_opt {
+                    if let Some(&imp_id) = imported_tag_ids.get(idx as usize) {
+                        imp_id
+                    } else if let Some(&loc_id) = local_tag_ids.get(&idx) {
+                        loc_id
+                    } else {
+                        let new_id = register_tag(host, t);
+                        local_tag_ids.insert(idx, new_id);
+                        new_id
+                    }
+                } else {
+                    register_tag(host, t)
+                };
+                JsValue::from_object(get_or_wrap_tag_object(vm, host, tid))
+            }
         };
         define_prop(vm, exports_obj, &name, js_val, PropertyAttrs::READONLY);
     }
 
-    let inst_obj = alloc_ordinary(vm, Some(host.instance_proto));
+    // W3C JS-API: `instance.exports` is a frozen (non-extensible) null-prototype object.
+    if let Some(o) = vm.heap.get_object_mut(exports_obj) {
+        o.extensible = false;
+    }
+
+    let inst_obj = alloc_ordinary(vm, Some(proto));
     define_hidden_id(vm, inst_obj, INSTANCE_ID_KEY, inst_id);
     define_prop(
         vm,
         inst_obj,
-        "exports",
+        INSTANCE_EXPORTS_KEY,
         JsValue::from_object(exports_obj),
-        PropertyAttrs::READONLY,
+        PropertyAttrs::empty(),
     );
     Ok(JsValue::from_object(inst_obj))
 }
 
+fn classify_instantiation_error(
+    vm: &mut JsVm,
+    host: &WasmHost,
+    err: wasmtime::Error,
+) -> JsException {
+    if let Some(trap) = err.downcast_ref::<Trap>() {
+        if *trap == Trap::StackOverflow {
+            return vm.range_error("Maximum call stack size exceeded");
+        }
+        return make_wasm_error(
+            vm,
+            host.runtime_error_proto,
+            "RuntimeError",
+            err.to_string(),
+        );
+    }
+    let msg = err.to_string();
+    if msg.contains("wasm trap")
+        || msg.contains("unreachable")
+        || msg.contains("out of bounds")
+        || msg.contains("call stack exhausted")
+    {
+        if msg.contains("call stack exhausted") {
+            return vm.range_error("Maximum call stack size exceeded");
+        }
+        return make_wasm_error(vm, host.runtime_error_proto, "RuntimeError", msg);
+    }
+    make_wasm_error(vm, host.link_error_proto, "LinkError", msg)
+}
+
+fn classify_trap_error(vm: &mut JsVm, host: &WasmHost, err: wasmtime::Error) -> JsException {
+    if let Some(trap) = err.downcast_ref::<Trap>() {
+        if *trap == Trap::StackOverflow {
+            return vm.range_error("Maximum call stack size exceeded");
+        }
+    }
+    let msg = err.to_string();
+    if msg.contains("call stack exhausted") {
+        return vm.range_error("Maximum call stack size exceeded");
+    }
+    make_wasm_error(vm, host.runtime_error_proto, "RuntimeError", msg)
+}
+
+fn wrap_thrown_wasm_exception(
+    vm: &mut JsVm,
+    host: &WasmHost,
+    exn: OwnedRooted<ExnRef>,
+) -> JsException {
+    let eid = register_exception(host, exn, None);
+    let obj = alloc_ordinary(vm, Some(host.exception_proto));
+    define_hidden_id(vm, obj, EXN_ID_KEY, eid);
+    JsException {
+        value: JsValue::from_object(obj),
+        message: "WebAssembly.Exception".to_string(),
+    }
+}
+
 // --- Exported Wasm Function Wrapper & Imported JS Function Bridge ---
 
-fn wrap_exported_func(vm: &mut JsVm, host: &SharedWasmHost, name: &str, func: Func) -> HeapHandle {
-    let fid = {
+fn get_or_wrap_exported_func(
+    vm: &mut JsVm,
+    host: &SharedWasmHost,
+    name: &str,
+    func: Func,
+) -> HeapHandle {
+    let raw_key = host.with_store_mut(|mut store| func.to_raw(&mut store) as usize);
+    if let Some(&cached) = host.func_wrappers.borrow().get(&raw_key) {
+        return cached;
+    }
+
+    let wrapper = wrap_exported_func_with_proto(vm, host, name, func, vm.function_proto);
+    host.func_wrappers.borrow_mut().insert(raw_key, wrapper);
+    wrapper
+}
+
+fn wrap_exported_func_with_proto(
+    vm: &mut JsVm,
+    host: &SharedWasmHost,
+    name: &str,
+    func: Func,
+    proto: HeapHandle,
+) -> HeapHandle {
+    let raw_key = host.with_store_mut(|mut store| func.to_raw(&mut store) as usize);
+    let (param_len, fid) = {
+        let plen = host.with_store(|store| func.ty(&store).params().len() as i32);
         let mut funcs = host.funcs.borrow_mut();
         let id = funcs.len();
         funcs.push(func);
-        id
+        (plen, id)
     };
+
     let h = Rc::clone(host);
-    let wrapper = vm.alloc_host_fn(name, move |vm, _this, args| {
-        let (param_tys, result_tys) = {
-            let store = h.store.borrow();
-            let ty = func.ty(&*store);
+    let wrapper = alloc_host_fn_len(vm, name, param_len, move |vm, _this, args| {
+        let (param_tys, result_tys) = h.with_store(|store| {
+            let ty = func.ty(&store);
             (
                 ty.params().collect::<Vec<_>>(),
                 ty.results().collect::<Vec<_>>(),
             )
-        };
+        });
+
+        // W3C JS-API: calling a Wasm function with v128 param or result throws TypeError.
+        if param_tys.iter().any(|t| matches!(t, ValType::V128))
+            || result_tys.iter().any(|t| matches!(t, ValType::V128))
+        {
+            return Err(vm.type_error("Cannot pass or return v128 across JS/Wasm boundary"));
+        }
 
         let mut wasm_args = Vec::with_capacity(param_tys.len());
         for (i, pty) in param_tys.iter().enumerate() {
             let jv = args.get(i).copied().unwrap_or(JsValue::UNDEFINED);
-            wasm_args.push(js_to_wasm_val(vm, jv, pty)?);
+            wasm_args.push(js_to_wasm_val(vm, &h, jv, pty)?);
         }
-        let mut wasm_results: Vec<Val> = result_tys.iter().map(default_wasm_val).collect();
+        let mut wasm_results: Vec<Val> = result_tys.iter().map(default_wasm_val_raw).collect();
 
         // Sync JS `ArrayBuffer` edits into Wasm linear memories before calling Wasm.
         sync_all_js_to_wasm(vm, &h);
 
-        let call_outcome = {
-            let mut store = h.store.borrow_mut();
-            let guard = VmPtrGuard::enter(&mut store, vm);
-            let res = func.call(&mut *guard.store, &wasm_args, &mut wasm_results);
+        let call_outcome = h.with_store_mut(|store| {
+            let mut guard = VmPtrGuard::enter(store, vm, &h);
+            let res = func.call(&mut guard.store, &wasm_args, &mut wasm_results);
             let js_exc = guard.store.data_mut().pending_js_exception.take();
-            (res, js_exc)
-        };
+            let wasm_exn = guard
+                .store
+                .take_pending_exception()
+                .and_then(|r| r.to_owned_rooted(&mut guard.store).ok());
+            (res, js_exc, wasm_exn)
+        });
 
         // Always sync Wasm linear memory mutations (and any `memory.grow`) back to JS!
         sync_all_wasm_to_js(vm, &h);
 
         match call_outcome {
-            (Ok(()), _) => match wasm_results.len() {
+            (Ok(()), _, _) => match wasm_results.len() {
                 0 => Ok(JsValue::UNDEFINED),
-                1 => Ok(wasm_to_js_val(vm, &wasm_results[0])),
+                1 => wasm_to_js_val(vm, &h, &wasm_results[0]),
                 _ => {
                     let arr = vm.alloc_array();
                     for r in &wasm_results {
-                        let jv = wasm_to_js_val(vm, r);
+                        let jv = wasm_to_js_val(vm, &h, r)?;
                         vm.heap.object_push_element(arr, jv);
                     }
                     Ok(JsValue::from_object(arr))
                 }
             },
-            (Err(_), Some(js_exc)) => Err(js_exc),
-            (Err(trap), None) => Err(make_wasm_error(
-                vm,
-                h.runtime_error_proto,
-                "RuntimeError",
-                trap.to_string(),
-            )),
+            (Err(_), Some(js_exc), _) => Err(js_exc),
+            (Err(_), None, Some(wasm_exn)) => Err(wrap_thrown_wasm_exception(vm, &h, wasm_exn)),
+            (Err(trap), None, None) => Err(classify_trap_error(vm, &h, trap)),
         }
     });
+    if proto != vm.function_proto {
+        vm.heap
+            .object_set_prototype(wrapper, Some(proto), &mut vm.shapes);
+    }
     define_hidden_id(vm, wrapper, FUNC_ID_KEY, fid);
+    root_js_value(vm, host, JsValue::from_object(wrapper));
+    host.func_wrappers.borrow_mut().insert(raw_key, wrapper);
     wrapper
 }
 
-fn wrap_js_fn_as_wasm_import(
-    host: &SharedWasmHost,
-    js_fn: JsValue,
-    func_ty: wasmtime::FuncType,
-) -> Func {
-    let mut store = host.store.borrow_mut();
+fn wrap_js_fn_as_wasm_import(host: &SharedWasmHost, js_fn: JsValue, func_ty: FuncType) -> Func {
+    let param_tys: Vec<ValType> = func_ty.params().collect();
     let result_tys: Vec<ValType> = func_ty.results().collect();
     let js_fn_raw = js_fn.to_raw();
-    Func::new(
-        &mut *store,
-        func_ty,
-        move |mut caller: Caller<'_, WasmStoreData>, params, results| {
-            let vm_addr = caller.data().vm_addr;
-            if vm_addr == 0 {
-                return Err(wasmtime::Error::msg(
-                    "No active JsVm during Wasm host import call",
-                ));
-            }
-            let memories = Arc::clone(&caller.data().memories);
-            // SAFETY: `VmPtrGuard` guarantees `vm_addr` is a valid exclusive `&mut JsVm` pointer
-            // for the exact synchronous duration of `func.call` / `Instance::new` on this thread.
-            let vm = unsafe { &mut *(vm_addr as *mut JsVm) };
+    host.with_store_mut(|mut store| {
+        Func::new(
+            &mut store,
+            func_ty,
+            move |mut caller: Caller<'_, WasmStoreData>, params, results| {
+                let vm_addr = caller.data().vm_addr;
+                let host_addr = caller.data().host_addr;
+                if vm_addr == 0 || host_addr == 0 {
+                    return Err(wasmtime::Error::msg(
+                        "No active JsVm during Wasm host import call",
+                    ));
+                }
+                let memories = Arc::clone(&caller.data().memories);
+                // SAFETY: `VmPtrGuard` guarantees `vm_addr` and `host_addr` are valid for the exact
+                // synchronous duration of `func.call` / `Instance::new` on this thread.
+                let vm = unsafe { &mut *(vm_addr as *mut JsVm) };
+                // SAFETY: `host_addr` points to the live `WasmHost` whose `store` is currently borrowed
+                // via `caller`; we only read non-`store` fields or pass `caller.as_context_mut()` explicitly.
+                let host_ref = unsafe { &*(host_addr as *const WasmHost) };
 
-            // Sync Wasm linear memory -> JS ArrayBuffer before invoking JS import!
-            sync_memories_with_ctx_to_js(vm, &memories, caller.as_context());
+                if param_tys.iter().any(|t| matches!(t, ValType::V128))
+                    || result_tys.iter().any(|t| matches!(t, ValType::V128))
+                {
+                    let exc = vm.type_error("Cannot pass or return v128 across JS/Wasm boundary");
+                    caller.data_mut().pending_js_exception = Some(exc);
+                    return Err(wasmtime::Error::msg("__rix_js_exception__"));
+                }
 
-            let js_args: Vec<JsValue> = params.iter().map(|p| wasm_to_js_val(vm, p)).collect();
-            let call_res =
-                vm.call_value(JsValue::from_raw(js_fn_raw), JsValue::UNDEFINED, &js_args);
+                // Sync Wasm linear memory -> JS ArrayBuffer before invoking JS import!
+                sync_memories_with_ctx_to_js(vm, &memories, caller.as_context());
 
-            // Sync any JS ArrayBuffer writes made by the import callback back to Wasm!
-            sync_memories_with_ctx_from_js(vm, &memories, caller.as_context_mut());
-
-            match call_res {
-                Ok(ret_val) => {
-                    match result_tys.len() {
-                        0 => {}
-                        1 => {
-                            let wv =
-                                js_to_wasm_val(vm, ret_val, &result_tys[0]).map_err(|exc| {
-                                    caller.data_mut().pending_js_exception = Some(exc);
-                                    wasmtime::Error::msg("__rix_js_exception__")
-                                })?;
-                            results[0] = wv;
-                        }
-                        n => {
-                            let Some(arr_h) = ret_val.as_object() else {
-                                let exc =
-                                    vm.type_error("Multi-value Wasm import must return an array");
-                                caller.data_mut().pending_js_exception = Some(exc);
-                                return Err(wasmtime::Error::msg("__rix_js_exception__"));
-                            };
-                            for (i, rty) in result_tys.iter().enumerate().take(n) {
-                                let elem = vm
-                                    .heap
-                                    .get_object(arr_h)
-                                    .and_then(|o| o.elements.get(i as u32))
-                                    .unwrap_or(JsValue::UNDEFINED);
-                                let wv = js_to_wasm_val(vm, elem, rty).map_err(|exc| {
-                                    caller.data_mut().pending_js_exception = Some(exc);
-                                    wasmtime::Error::msg("__rix_js_exception__")
-                                })?;
-                                results[i] = wv;
-                            }
+                let mut js_args = Vec::with_capacity(params.len());
+                for p in params {
+                    match wasm_to_js_val_with_ctx(vm, host_ref, caller.as_context_mut(), p) {
+                        Ok(v) => js_args.push(v),
+                        Err(exc) => {
+                            caller.data_mut().pending_js_exception = Some(exc);
+                            return Err(wasmtime::Error::msg("__rix_js_exception__"));
                         }
                     }
-                    Ok(())
                 }
-                Err(exc) => {
-                    caller.data_mut().pending_js_exception = Some(exc);
-                    Err(wasmtime::Error::msg("__rix_js_exception__"))
+
+                let call_res = host_ref.enter_reentrant_ctx(caller.as_context_mut(), || {
+                    vm.call_value(JsValue::from_raw(js_fn_raw), JsValue::UNDEFINED, &js_args)
+                });
+
+                // Sync any JS ArrayBuffer writes made by the import callback back to Wasm!
+                sync_memories_with_ctx_from_js(vm, &memories, caller.as_context_mut());
+
+                match call_res {
+                    Ok(ret_val) => {
+                        match result_tys.len() {
+                            0 => {}
+                            1 => {
+                                let wv = host_ref
+                                    .enter_reentrant_ctx(caller.as_context_mut(), || {
+                                        js_to_wasm_val(vm, host_ref, ret_val, &result_tys[0])
+                                    })
+                                    .map_err(|exc| {
+                                        caller.data_mut().pending_js_exception = Some(exc);
+                                        wasmtime::Error::msg("__rix_js_exception__")
+                                    })?;
+                                results[0] = wv;
+                            }
+                            n => {
+                                let items = host_ref
+                                    .enter_reentrant_ctx(caller.as_context_mut(), || {
+                                        vm.collect_iterable(ret_val)
+                                    })
+                                    .map_err(|exc| {
+                                        caller.data_mut().pending_js_exception = Some(exc);
+                                        wasmtime::Error::msg("__rix_js_exception__")
+                                    })?;
+                                if items.len() != n {
+                                    let exc = vm.type_error(format!(
+                                        "Multi-value Wasm import expected {n} values, got {}",
+                                        items.len()
+                                    ));
+                                    caller.data_mut().pending_js_exception = Some(exc);
+                                    return Err(wasmtime::Error::msg("__rix_js_exception__"));
+                                }
+                                for (i, (elem, rty)) in
+                                    items.into_iter().zip(result_tys.iter()).enumerate()
+                                {
+                                    let wv = host_ref
+                                        .enter_reentrant_ctx(caller.as_context_mut(), || {
+                                            js_to_wasm_val(vm, host_ref, elem, rty)
+                                        })
+                                        .map_err(|exc| {
+                                            caller.data_mut().pending_js_exception = Some(exc);
+                                            wasmtime::Error::msg("__rix_js_exception__")
+                                        })?;
+                                    results[i] = wv;
+                                }
+                            }
+                        }
+                        Ok(())
+                    }
+                    Err(exc) => {
+                        // If JS threw a `WebAssembly.Exception`, rethrow it into Wasm so `catch`/`try_table` handles it!
+                        if let Some(eid) = read_hidden_id(vm, exc.value, EXN_ID_KEY) {
+                            let rooted_opt = host_ref
+                                .exceptions
+                                .borrow()
+                                .get(eid)
+                                .map(|e| e.exn.to_rooted(caller.as_context_mut()));
+                            if let Some(rooted) = rooted_opt {
+                                return caller.as_context_mut().throw(rooted);
+                            }
+                        }
+                        caller.data_mut().pending_js_exception = Some(exc);
+                        Err(wasmtime::Error::msg("__rix_js_exception__"))
+                    }
                 }
-            }
-        },
-    )
+            },
+        )
+    })
 }
 
-// --- Memory, Table, Global Prototypes & Linear Memory <-> ArrayBuffer Bridge ---
+// --- Instance, Memory, Table, Global, Tag, Exception Prototypes ---
+
+fn install_instance_prototype(vm: &mut JsVm, host: &SharedWasmHost) {
+    let proto = host.instance_proto;
+    let get_exports = alloc_host_fn_len(vm, "get exports", 0, move |vm, this, _args| {
+        if read_hidden_id(vm, this, INSTANCE_ID_KEY).is_none() {
+            return Err(vm.type_error("Instance.prototype.exports called on incompatible receiver"));
+        }
+        let h = this
+            .as_object()
+            .ok_or_else(|| vm.type_error("Invalid WebAssembly.Instance"))?;
+        let k = vm.heap.intern_key(INSTANCE_EXPORTS_KEY);
+        vm.get_property_by_key(h, k)
+    });
+    let k_exp = vm.heap.intern_key("exports");
+    vm.heap.object_define_accessor(
+        proto,
+        k_exp,
+        Some(get_exports),
+        None,
+        PropertyAttrs::CONFIGURABLE | PropertyAttrs::ENUMERABLE,
+        &mut vm.shapes,
+    );
+}
 
 fn register_memory(vm: &mut JsVm, host: &SharedWasmHost, memory: Memory) -> usize {
-    let bytes = {
-        let store = host.store.borrow();
-        memory.data(&*store).to_vec()
-    };
+    let (bytes, is_64, max_pages) = host.with_store(|store| {
+        let ty = memory.ty(&store);
+        (memory.data(&store).to_vec(), ty.is_64(), ty.maximum())
+    });
     let byte_len = bytes.len();
-    let js_buffer = alloc_array_buffer(vm, bytes);
+    let js_buffer = alloc_array_buffer(vm, bytes, None, true);
+    root_js_value(vm, host, JsValue::from_object(js_buffer));
     let mut mems = host.memories.lock().expect("wasm memories lock");
     let id = mems.len();
     mems.push(MemoryBridge {
-        memory,
+        kind: WasmMemKind::Unshared(memory),
         js_buffer,
+        shared_backing: None,
         last_byte_len: byte_len,
+        is_resizable: false,
+        is_64,
+        max_pages,
+        js_wrapper: None,
     });
     id
 }
 
+fn register_shared_memory(
+    vm: &mut JsVm,
+    host: &SharedWasmHost,
+    memory: SharedMemory,
+    is_64: bool,
+    max_pages: Option<u64>,
+) -> usize {
+    let byte_len = memory.data_size();
+    let max_bytes = max_pages.and_then(|m| {
+        usize::try_from(m)
+            .ok()
+            .and_then(|p| p.checked_mul(WASM_PAGE_SIZE))
+    });
+    let backing = Arc::new(SharedBufferBacking::new(vec![0u8; byte_len], max_bytes));
+    let js_buffer = vm.alloc_shared_array_buffer_from_backing(Arc::clone(&backing));
+    if let Some(o) = vm.heap.get_object_mut(js_buffer) {
+        // Shared WebAssembly.Memory buffer is non-extensible (frozen) per W3C JS-API tests.
+        o.extensible = false;
+        let r = o.rare_mut();
+        r.ab_max_byte_length = None;
+        r.ab_fixed_byte_len = Some(byte_len);
+        r.ab_wasm_memory = true;
+    }
+    root_js_value(vm, host, JsValue::from_object(js_buffer));
+    let mut mems = host.memories.lock().expect("wasm memories lock");
+    let id = mems.len();
+    mems.push(MemoryBridge {
+        kind: WasmMemKind::Shared(memory),
+        js_buffer,
+        shared_backing: Some(backing),
+        last_byte_len: byte_len,
+        is_resizable: false,
+        is_64,
+        max_pages,
+        js_wrapper: None,
+    });
+    id
+}
+
+fn register_table(host: &WasmHost, table: Table) -> usize {
+    let mut tables = host.tables.borrow_mut();
+    let id = tables.len();
+    tables.push(TableEntry {
+        table,
+        js_wrapper: None,
+    });
+    id
+}
+
+fn register_global(host: &WasmHost, global: Global) -> usize {
+    let mut globals = host.globals.borrow_mut();
+    let id = globals.len();
+    globals.push(GlobalEntry {
+        global,
+        js_wrapper: None,
+    });
+    id
+}
+
+fn register_tag(host: &WasmHost, tag: Tag) -> usize {
+    let mut tags = host.tags.borrow_mut();
+    let id = tags.len();
+    tags.push(TagEntry {
+        tag,
+        js_wrapper: None,
+    });
+    id
+}
+
+fn register_exception(host: &WasmHost, exn: OwnedRooted<ExnRef>, stack: Option<String>) -> usize {
+    let mut exns = host.exceptions.borrow_mut();
+    let id = exns.len();
+    exns.push(ExnEntry { exn, stack });
+    id
+}
+
 fn sync_all_js_to_wasm(vm: &JsVm, host: &SharedWasmHost) {
-    let mut store = host.store.borrow_mut();
-    sync_memories_with_ctx_from_js(vm, &host.memories, store.as_context_mut());
+    host.with_store_mut(|store| {
+        sync_memories_with_ctx_from_js(vm, &host.memories, store);
+    });
 }
 
 fn sync_all_wasm_to_js(vm: &mut JsVm, host: &SharedWasmHost) {
-    let store = host.store.borrow();
-    sync_memories_with_ctx_to_js(vm, &host.memories, store.as_context());
+    host.with_store(|store| {
+        sync_memories_with_ctx_to_js(vm, &host.memories, store);
+    });
 }
 
 fn sync_memories_with_ctx_from_js(
@@ -1249,14 +2089,22 @@ fn sync_memories_with_ctx_from_js(
     memories: &Arc<Mutex<Vec<MemoryBridge>>>,
     mut ctx: wasmtime::StoreContextMut<'_, WasmStoreData>,
 ) {
-    let mems = memories.lock().expect("wasm memories lock");
-    for bridge in mems.iter() {
-        if let Some(ObjectKind::ArrayBuffer(js_bytes)) =
-            vm.heap.get_object(bridge.js_buffer).map(|o| &o.kind)
-        {
-            let dst = bridge.memory.data_mut(&mut ctx);
-            if js_bytes.len() == dst.len() {
-                dst.copy_from_slice(js_bytes);
+    let mut mems = memories.lock().expect("wasm memories lock");
+    for bridge in mems.iter_mut() {
+        if let WasmMemKind::Unshared(mem) = &bridge.kind {
+            if let Some(ObjectKind::ArrayBuffer(js_bytes)) =
+                vm.heap.get_object(bridge.js_buffer).map(|o| &o.kind)
+            {
+                let cur_wasm_len = mem.data(&ctx).len();
+                if js_bytes.len() > cur_wasm_len && js_bytes.len() % WASM_PAGE_SIZE == 0 {
+                    let delta = ((js_bytes.len() - cur_wasm_len) / WASM_PAGE_SIZE) as u64;
+                    let _ = mem.grow(&mut ctx, delta);
+                    bridge.last_byte_len = js_bytes.len();
+                }
+                let dst = mem.data_mut(&mut ctx);
+                if js_bytes.len() == dst.len() {
+                    dst.copy_from_slice(js_bytes);
+                }
             }
         }
     }
@@ -1269,17 +2117,26 @@ fn sync_memories_with_ctx_to_js(
 ) {
     let mut mems = memories.lock().expect("wasm memories lock");
     for bridge in mems.iter_mut() {
-        let src = bridge.memory.data(&ctx);
+        let WasmMemKind::Unshared(mem) = &bridge.kind else {
+            continue;
+        };
+        let src = mem.data(&ctx);
         if src.len() != bridge.last_byte_len {
-            if let Some(ObjectKind::ArrayBuffer(old_buf)) = vm
-                .heap
-                .get_object_mut(bridge.js_buffer)
-                .map(|o| &mut o.kind)
-            {
-                old_buf.clear();
+            if bridge.is_resizable {
+                if let Some(ObjectKind::ArrayBuffer(dst)) = vm
+                    .heap
+                    .get_object_mut(bridge.js_buffer)
+                    .map(|o| &mut o.kind)
+                {
+                    dst.resize(src.len(), 0);
+                    dst.copy_from_slice(src);
+                }
+                bridge.last_byte_len = src.len();
+            } else {
+                let _ = vm.detach_array_buffer(bridge.js_buffer);
+                bridge.js_buffer = alloc_array_buffer(vm, src.to_vec(), None, true);
+                bridge.last_byte_len = src.len();
             }
-            bridge.js_buffer = alloc_array_buffer(vm, src.to_vec());
-            bridge.last_byte_len = src.len();
         } else if let Some(ObjectKind::ArrayBuffer(dst)) = vm
             .heap
             .get_object_mut(bridge.js_buffer)
@@ -1297,27 +2154,34 @@ fn install_memory_prototype(vm: &mut JsVm, host: &SharedWasmHost) {
 
     // `get Memory.prototype.buffer`
     let h_buf = Rc::clone(host);
-    let get_buffer = vm.alloc_host_fn("get buffer", move |vm, this, _args| {
+    let get_buffer = alloc_host_fn_len(vm, "get buffer", 0, move |vm, this, _args| {
         let mid = read_hidden_id(vm, this, MEMORY_ID_KEY).ok_or_else(|| {
             vm.type_error("Memory.prototype.buffer called on incompatible receiver")
         })?;
-        if let Ok(store) = h_buf.store.try_borrow() {
+        h_buf.with_store(|store| {
             let mut mems = h_buf.memories.lock().expect("wasm memories lock");
             if let Some(bridge) = mems.get_mut(mid) {
-                let src = bridge.memory.data(&*store);
-                if src.len() != bridge.last_byte_len {
-                    if let Some(ObjectKind::ArrayBuffer(old_buf)) = vm
-                        .heap
-                        .get_object_mut(bridge.js_buffer)
-                        .map(|o| &mut o.kind)
-                    {
-                        old_buf.clear();
+                if let WasmMemKind::Unshared(mem) = &bridge.kind {
+                    let src = mem.data(&store);
+                    if src.len() != bridge.last_byte_len {
+                        if bridge.is_resizable {
+                            if let Some(ObjectKind::ArrayBuffer(dst)) = vm
+                                .heap
+                                .get_object_mut(bridge.js_buffer)
+                                .map(|o| &mut o.kind)
+                            {
+                                dst.resize(src.len(), 0);
+                                dst.copy_from_slice(src);
+                            }
+                        } else {
+                            let _ = vm.detach_array_buffer(bridge.js_buffer);
+                            bridge.js_buffer = alloc_array_buffer(vm, src.to_vec(), None, true);
+                        }
+                        bridge.last_byte_len = src.len();
                     }
-                    bridge.js_buffer = alloc_array_buffer(vm, src.to_vec());
-                    bridge.last_byte_len = src.len();
                 }
             }
-        }
+        });
         let ab = h_buf
             .memories
             .lock()
@@ -1339,56 +2203,256 @@ fn install_memory_prototype(vm: &mut JsVm, host: &SharedWasmHost) {
 
     // `Memory.prototype.grow(delta)`
     let h_grow = Rc::clone(host);
-    let grow_fn = vm.alloc_host_fn("grow", move |vm, this, args| {
+    let grow_fn = alloc_host_fn_len(vm, "grow", 1, move |vm, this, args| {
+        // Brand check MUST happen before touching `delta`.
         let mid = read_hidden_id(vm, this, MEMORY_ID_KEY).ok_or_else(|| {
             vm.type_error("Memory.prototype.grow called on incompatible receiver")
         })?;
-        let delta = to_wasm_u32_limit(
-            vm,
-            args.first().copied().unwrap_or(JsValue::UNDEFINED),
-            "delta",
-        )?;
+        let is_64 = h_grow
+            .memories
+            .lock()
+            .expect("wasm memories lock")
+            .get(mid)
+            .map(|b| b.is_64)
+            .ok_or_else(|| vm.type_error("Invalid WebAssembly.Memory"))?;
+        if args.is_empty() {
+            return Err(vm.type_error("Memory.prototype.grow requires 1 argument"));
+        }
+        let delta = to_wasm_index_limit(vm, args[0], is_64, "delta")?;
 
         sync_all_js_to_wasm(vm, &h_grow);
 
-        let (prev_pages, new_bytes) = {
-            let mut store = h_grow.store.borrow_mut();
-            let mem = h_grow
-                .memories
-                .lock()
-                .expect("wasm memories lock")
+        let (prev_pages, new_bytes_opt, new_byte_len) = h_grow.with_store_mut(|mut store| {
+            let mems = h_grow.memories.lock().expect("wasm memories lock");
+            let bridge = mems
                 .get(mid)
-                .map(|b| b.memory)
                 .ok_or_else(|| vm.type_error("Invalid WebAssembly.Memory"))?;
-            let prev = mem
-                .grow(&mut *store, u64::from(delta))
-                .map_err(|e| vm.range_error(format!("WebAssembly.Memory.grow failed: {e}")))?;
-            let bytes = mem.data(&*store).to_vec();
-            (prev, bytes)
-        };
+            match &bridge.kind {
+                WasmMemKind::Unshared(mem) => {
+                    let prev = mem.grow(&mut store, delta).map_err(|e| {
+                        vm.range_error(format!("WebAssembly.Memory.grow failed: {e}"))
+                    })?;
+                    let bytes = mem.data(&store).to_vec();
+                    let len = bytes.len();
+                    Ok((prev, Some(bytes), len))
+                }
+                WasmMemKind::Shared(smem) => {
+                    let prev = smem.grow(delta).map_err(|e| {
+                        vm.range_error(format!("WebAssembly.Memory.grow failed: {e}"))
+                    })?;
+                    Ok((prev, None, smem.data_size()))
+                }
+            }
+        })?;
 
-        let new_len = new_bytes.len();
-        let new_ab = alloc_array_buffer(vm, new_bytes);
         let mut mems = h_grow.memories.lock().expect("wasm memories lock");
         if let Some(bridge) = mems.get_mut(mid) {
-            if let Some(ObjectKind::ArrayBuffer(old_buf)) = vm
-                .heap
-                .get_object_mut(bridge.js_buffer)
-                .map(|o| &mut o.kind)
-            {
-                old_buf.clear();
+            if let Some(new_bytes) = new_bytes_opt {
+                if bridge.is_resizable {
+                    if let Some(ObjectKind::ArrayBuffer(buf)) = vm
+                        .heap
+                        .get_object_mut(bridge.js_buffer)
+                        .map(|o| &mut o.kind)
+                    {
+                        buf.resize(new_byte_len, 0);
+                        buf.copy_from_slice(&new_bytes);
+                    }
+                    bridge.last_byte_len = new_byte_len;
+                } else {
+                    let _ = vm.detach_array_buffer(bridge.js_buffer);
+                    let new_ab = alloc_array_buffer(vm, new_bytes, None, true);
+                    root_js_value(vm, &h_grow, JsValue::from_object(new_ab));
+                    bridge.js_buffer = new_ab;
+                    bridge.last_byte_len = new_byte_len;
+                }
+            } else if let Some(ref backing) = bridge.shared_backing {
+                let _ = backing.grow(new_byte_len);
+                if !bridge.is_resizable {
+                    // W3C JS-API: growing fixed-length shared Memory returns a fresh SharedArrayBuffer
+                    // wrapper without detaching the previous buffer.
+                    let new_sab = vm.alloc_shared_array_buffer_from_backing(Arc::clone(backing));
+                    if let Some(o) = vm.heap.get_object_mut(new_sab) {
+                        o.extensible = false;
+                        let r = o.rare_mut();
+                        r.ab_max_byte_length = None;
+                        r.ab_fixed_byte_len = Some(new_byte_len);
+                        r.ab_wasm_memory = true;
+                    }
+                    root_js_value(vm, &h_grow, JsValue::from_object(new_sab));
+                    bridge.js_buffer = new_sab;
+                }
+                bridge.last_byte_len = new_byte_len;
             }
-            bridge.js_buffer = new_ab;
-            bridge.last_byte_len = new_len;
         }
-        Ok(JsValue::from_number(prev_pages as f64))
+        Ok(wasm_index_to_js(vm, prev_pages, is_64))
     });
     define_prop(
         vm,
         proto,
         "grow",
         JsValue::from_object(grow_fn),
-        PropertyAttrs::METHOD,
+        PropertyAttrs::DEFAULT,
+    );
+
+    // `Memory.prototype.toResizableBuffer()`
+    let h_res = Rc::clone(host);
+    let to_res_fn = alloc_host_fn_len(vm, "toResizableBuffer", 0, move |vm, this, _args| {
+        let mid = read_hidden_id(vm, this, MEMORY_ID_KEY).ok_or_else(|| {
+            vm.type_error("Memory.prototype.toResizableBuffer called on incompatible receiver")
+        })?;
+        sync_all_js_to_wasm(vm, &h_res);
+        let mut mems = h_res.memories.lock().expect("wasm memories lock");
+        let bridge = mems
+            .get_mut(mid)
+            .ok_or_else(|| vm.type_error("Invalid WebAssembly.Memory"))?;
+        if bridge.is_resizable {
+            return Ok(JsValue::from_object(bridge.js_buffer));
+        }
+        let max_pages = bridge.max_pages.ok_or_else(|| {
+            vm.type_error("Cannot create resizable buffer for Memory without maximum")
+        })?;
+        let max_bytes = usize::try_from(max_pages)
+            .ok()
+            .and_then(|p| p.checked_mul(WASM_PAGE_SIZE))
+            .unwrap_or(usize::MAX);
+        match &bridge.kind {
+            WasmMemKind::Unshared(mem) => {
+                let bytes = h_res.with_store(|store| mem.data(&store).to_vec());
+                let _ = vm.detach_array_buffer(bridge.js_buffer);
+                let new_ab = alloc_array_buffer(vm, bytes, Some(max_bytes), true);
+                root_js_value(vm, &h_res, JsValue::from_object(new_ab));
+                bridge.js_buffer = new_ab;
+                bridge.is_resizable = true;
+                Ok(JsValue::from_object(new_ab))
+            }
+            WasmMemKind::Shared(_) => {
+                if let Some(ref backing) = bridge.shared_backing {
+                    let new_sab = vm.alloc_shared_array_buffer_from_backing(Arc::clone(backing));
+                    if let Some(o) = vm.heap.get_object_mut(new_sab) {
+                        o.extensible = false;
+                        let r = o.rare_mut();
+                        r.ab_max_byte_length = Some(max_bytes);
+                        r.ab_fixed_byte_len = None;
+                        r.ab_wasm_memory = true;
+                    }
+                    root_js_value(vm, &h_res, JsValue::from_object(new_sab));
+                    bridge.js_buffer = new_sab;
+                    bridge.is_resizable = true;
+                    Ok(JsValue::from_object(new_sab))
+                } else {
+                    Err(vm.type_error("Invalid shared WebAssembly.Memory"))
+                }
+            }
+        }
+    });
+    define_prop(
+        vm,
+        proto,
+        "toResizableBuffer",
+        JsValue::from_object(to_res_fn),
+        PropertyAttrs::DEFAULT,
+    );
+
+    // `Memory.prototype.toFixedLengthBuffer()`
+    let h_fix = Rc::clone(host);
+    let to_fix_fn = alloc_host_fn_len(vm, "toFixedLengthBuffer", 0, move |vm, this, _args| {
+        let mid = read_hidden_id(vm, this, MEMORY_ID_KEY).ok_or_else(|| {
+            vm.type_error("Memory.prototype.toFixedLengthBuffer called on incompatible receiver")
+        })?;
+        sync_all_js_to_wasm(vm, &h_fix);
+        let mut mems = h_fix.memories.lock().expect("wasm memories lock");
+        let bridge = mems
+            .get_mut(mid)
+            .ok_or_else(|| vm.type_error("Invalid WebAssembly.Memory"))?;
+        if !bridge.is_resizable {
+            return Ok(JsValue::from_object(bridge.js_buffer));
+        }
+        match &bridge.kind {
+            WasmMemKind::Unshared(mem) => {
+                let bytes = h_fix.with_store(|store| mem.data(&store).to_vec());
+                let _ = vm.detach_array_buffer(bridge.js_buffer);
+                let new_ab = alloc_array_buffer(vm, bytes, None, true);
+                root_js_value(vm, &h_fix, JsValue::from_object(new_ab));
+                bridge.js_buffer = new_ab;
+                bridge.is_resizable = false;
+                Ok(JsValue::from_object(new_ab))
+            }
+            WasmMemKind::Shared(_) => {
+                if let Some(ref backing) = bridge.shared_backing {
+                    let cur_len = backing.byte_len();
+                    let new_sab = vm.alloc_shared_array_buffer_from_backing(Arc::clone(backing));
+                    if let Some(o) = vm.heap.get_object_mut(new_sab) {
+                        o.extensible = false;
+                        let r = o.rare_mut();
+                        r.ab_max_byte_length = None;
+                        r.ab_fixed_byte_len = Some(cur_len);
+                        r.ab_wasm_memory = true;
+                    }
+                    root_js_value(vm, &h_fix, JsValue::from_object(new_sab));
+                    bridge.js_buffer = new_sab;
+                    bridge.is_resizable = false;
+                    Ok(JsValue::from_object(new_sab))
+                } else {
+                    Err(vm.type_error("Invalid shared WebAssembly.Memory"))
+                }
+            }
+        }
+    });
+    define_prop(
+        vm,
+        proto,
+        "toFixedLengthBuffer",
+        JsValue::from_object(to_fix_fn),
+        PropertyAttrs::DEFAULT,
+    );
+
+    // `Memory.prototype.type()`
+    let h_ty = Rc::clone(host);
+    let type_fn = alloc_host_fn_len(vm, "type", 0, move |vm, this, _args| {
+        let mid = read_hidden_id(vm, this, MEMORY_ID_KEY).ok_or_else(|| {
+            vm.type_error("Memory.prototype.type called on incompatible receiver")
+        })?;
+        let (min_p, max_p, is_shared, is_64) = h_ty.with_store(|store| {
+            let mems = h_ty.memories.lock().expect("wasm memories lock");
+            let bridge = mems
+                .get(mid)
+                .ok_or_else(|| vm.type_error("Invalid WebAssembly.Memory"))?;
+            Ok(match &bridge.kind {
+                WasmMemKind::Unshared(m) => {
+                    let ty = m.ty(&store);
+                    (ty.minimum(), ty.maximum(), false, ty.is_64())
+                }
+                WasmMemKind::Shared(sm) => {
+                    let ty = sm.ty();
+                    (ty.minimum(), ty.maximum(), true, ty.is_64())
+                }
+            })
+        })?;
+        let obj = alloc_ordinary(vm, Some(vm.object_proto));
+        let min_v = wasm_index_to_js(vm, min_p, is_64);
+        define_prop(vm, obj, "minimum", min_v, PropertyAttrs::DEFAULT);
+        if let Some(mp) = max_p {
+            let max_v = wasm_index_to_js(vm, mp, is_64);
+            define_prop(vm, obj, "maximum", max_v, PropertyAttrs::DEFAULT);
+        }
+        define_prop(
+            vm,
+            obj,
+            "shared",
+            JsValue::from_bool(is_shared),
+            PropertyAttrs::DEFAULT,
+        );
+        let addr_str = if is_64 { "i64" } else { "i32" };
+        let addr_v = JsValue::from_string(vm.heap.alloc_string(addr_str));
+        define_prop(vm, obj, "address", addr_v, PropertyAttrs::DEFAULT);
+        Ok(JsValue::from_object(obj))
+    });
+    define_prop(
+        vm,
+        proto,
+        "type",
+        JsValue::from_object(type_fn),
+        PropertyAttrs::DEFAULT,
     );
 }
 
@@ -1397,17 +2461,20 @@ fn install_table_prototype(vm: &mut JsVm, host: &SharedWasmHost) {
 
     // `get Table.prototype.length`
     let h_len = Rc::clone(host);
-    let get_len = vm.alloc_host_fn("get length", move |vm, this, _args| {
+    let get_len = alloc_host_fn_len(vm, "get length", 0, move |vm, this, _args| {
         let tid = read_hidden_id(vm, this, TABLE_ID_KEY).ok_or_else(|| {
             vm.type_error("Table.prototype.length called on incompatible receiver")
         })?;
-        let store = h_len.store.borrow();
-        let tbl = *h_len
-            .tables
-            .borrow()
-            .get(tid)
-            .ok_or_else(|| vm.type_error("Invalid WebAssembly.Table"))?;
-        Ok(JsValue::from_number(tbl.size(&*store) as f64))
+        let (sz, is_64) = h_len.with_store(|store| {
+            let tbl = h_len
+                .tables
+                .borrow()
+                .get(tid)
+                .map(|e| e.table)
+                .ok_or_else(|| vm.type_error("Invalid WebAssembly.Table"))?;
+            Ok((tbl.size(&store), tbl.ty(&store).is_64()))
+        })?;
+        Ok(wasm_index_to_js(vm, sz, is_64))
     });
     let k_len = vm.heap.intern_key("length");
     vm.heap.object_define_accessor(
@@ -1421,71 +2488,65 @@ fn install_table_prototype(vm: &mut JsVm, host: &SharedWasmHost) {
 
     // `Table.prototype.get(index)`
     let h_get = Rc::clone(host);
-    let get_fn = vm.alloc_host_fn("get", move |vm, this, args| {
+    let get_fn = alloc_host_fn_len(vm, "get", 1, move |vm, this, args| {
         let tid = read_hidden_id(vm, this, TABLE_ID_KEY)
             .ok_or_else(|| vm.type_error("Table.prototype.get called on incompatible receiver"))?;
-        let idx = to_wasm_u32_limit(
-            vm,
-            args.first().copied().unwrap_or(JsValue::UNDEFINED),
-            "index",
-        )?;
-        let elem = {
-            let mut store = h_get.store.borrow_mut();
-            let tbl = *h_get
+        let (tbl, is_64) = h_get.with_store(|store| {
+            let tbl = h_get
                 .tables
                 .borrow()
                 .get(tid)
+                .map(|e| e.table)
                 .ok_or_else(|| vm.type_error("Invalid WebAssembly.Table"))?;
-            tbl.get(&mut *store, u64::from(idx))
-                .ok_or_else(|| vm.range_error("WebAssembly.Table.get index out of bounds"))?
-        };
-        match elem {
-            Ref::Func(Some(f)) => Ok(JsValue::from_object(wrap_exported_func(vm, &h_get, "", f))),
-            Ref::Func(None) | Ref::Extern(None) => Ok(JsValue::NULL),
-            _ => Ok(JsValue::UNDEFINED),
+            Ok((tbl, tbl.ty(&store).is_64()))
+        })?;
+        if args.is_empty() {
+            return Err(vm.type_error("Table.prototype.get requires 1 argument"));
         }
+        let idx = to_wasm_index_limit(vm, args[0], is_64, "index")?;
+        let elem = h_get.with_store_mut(|mut store| {
+            tbl.get(&mut store, idx)
+                .ok_or_else(|| vm.range_error("WebAssembly.Table.get index out of bounds"))
+        })?;
+        wasm_ref_to_js(vm, &h_get, &elem)
     });
     define_prop(
         vm,
         proto,
         "get",
         JsValue::from_object(get_fn),
-        PropertyAttrs::METHOD,
+        PropertyAttrs::DEFAULT,
     );
 
-    // `Table.prototype.set(index, value)`
+    // `Table.prototype.set(index, value?)`
     let h_set = Rc::clone(host);
-    let set_fn = vm.alloc_host_fn("set", move |vm, this, args| {
+    let set_fn = alloc_host_fn_len(vm, "set", 1, move |vm, this, args| {
         let tid = read_hidden_id(vm, this, TABLE_ID_KEY)
             .ok_or_else(|| vm.type_error("Table.prototype.set called on incompatible receiver"))?;
-        let idx = to_wasm_u32_limit(
-            vm,
-            args.first().copied().unwrap_or(JsValue::UNDEFINED),
-            "index",
-        )?;
-        let val = args.get(1).copied().unwrap_or(JsValue::NULL);
-        let ref_val = if val.is_null() || val.is_undefined() {
-            Ref::Func(None)
-        } else if let Some(fid) = read_hidden_id(vm, val, FUNC_ID_KEY) {
-            let f = *h_set
-                .funcs
+        let (tbl, is_64, elem_ty) = h_set.with_store(|store| {
+            let tbl = h_set
+                .tables
                 .borrow()
-                .get(fid)
-                .ok_or_else(|| vm.type_error("Invalid Wasm function reference"))?;
-            Ref::Func(Some(f))
+                .get(tid)
+                .map(|e| e.table)
+                .ok_or_else(|| vm.type_error("Invalid WebAssembly.Table"))?;
+            let tty = tbl.ty(&store);
+            Ok((tbl, tty.is_64(), tty.element().clone()))
+        })?;
+        if args.is_empty() {
+            return Err(vm.type_error("Table.prototype.set requires at least 1 argument"));
+        }
+        // Convert index BEFORE converting value per WebIDL order.
+        let idx = to_wasm_index_limit(vm, args[0], is_64, "index")?;
+        let ref_val = if args.len() < 2 {
+            default_wasm_ref(vm, &h_set, &elem_ty)
         } else {
-            return Err(
-                vm.type_error("WebAssembly.Table.set value must be a Wasm function or null")
-            );
+            js_to_wasm_ref(vm, &h_set, args[1], &elem_ty)?
         };
-        let mut store = h_set.store.borrow_mut();
-        let tbl = *h_set
-            .tables
-            .borrow()
-            .get(tid)
-            .ok_or_else(|| vm.type_error("Invalid WebAssembly.Table"))?;
-        tbl.set(&mut *store, u64::from(idx), ref_val)
-            .map_err(|e| vm.range_error(format!("WebAssembly.Table.set failed: {e}")))?;
+        h_set.with_store_mut(|mut store| {
+            tbl.set(&mut store, idx, ref_val)
+                .map_err(|e| vm.range_error(format!("WebAssembly.Table.set failed: {e}")))
+        })?;
         Ok(JsValue::UNDEFINED)
     });
     define_prop(
@@ -1493,51 +2554,84 @@ fn install_table_prototype(vm: &mut JsVm, host: &SharedWasmHost) {
         proto,
         "set",
         JsValue::from_object(set_fn),
-        PropertyAttrs::METHOD,
+        PropertyAttrs::DEFAULT,
     );
 
     // `Table.prototype.grow(delta, value?)`
     let h_grow = Rc::clone(host);
-    let grow_fn = vm.alloc_host_fn("grow", move |vm, this, args| {
+    let grow_fn = alloc_host_fn_len(vm, "grow", 1, move |vm, this, args| {
         let tid = read_hidden_id(vm, this, TABLE_ID_KEY)
             .ok_or_else(|| vm.type_error("Table.prototype.grow called on incompatible receiver"))?;
-        let delta = to_wasm_u32_limit(
-            vm,
-            args.first().copied().unwrap_or(JsValue::UNDEFINED),
-            "delta",
-        )?;
-        let init_v = args.get(1).copied().unwrap_or(JsValue::NULL);
-        let init_ref = if init_v.is_null() || init_v.is_undefined() {
-            Ref::Func(None)
-        } else if let Some(fid) = read_hidden_id(vm, init_v, FUNC_ID_KEY) {
-            let f = *h_grow
-                .funcs
+        let (tbl, is_64, elem_ty) = h_grow.with_store(|store| {
+            let tbl = h_grow
+                .tables
                 .borrow()
-                .get(fid)
-                .ok_or_else(|| vm.type_error("Invalid Wasm function reference"))?;
-            Ref::Func(Some(f))
+                .get(tid)
+                .map(|e| e.table)
+                .ok_or_else(|| vm.type_error("Invalid WebAssembly.Table"))?;
+            let tty = tbl.ty(&store);
+            Ok((tbl, tty.is_64(), tty.element().clone()))
+        })?;
+        if args.is_empty() {
+            return Err(vm.type_error("Table.prototype.grow requires at least 1 argument"));
+        }
+        let delta = to_wasm_index_limit(vm, args[0], is_64, "delta")?;
+        let init_ref = if args.len() < 2 {
+            default_wasm_ref(vm, &h_grow, &elem_ty)
         } else {
-            return Err(
-                vm.type_error("WebAssembly.Table.grow init value must be a Wasm function or null")
-            );
+            js_to_wasm_ref(vm, &h_grow, args[1], &elem_ty)?
         };
-        let mut store = h_grow.store.borrow_mut();
-        let tbl = *h_grow
-            .tables
-            .borrow()
-            .get(tid)
-            .ok_or_else(|| vm.type_error("Invalid WebAssembly.Table"))?;
-        let prev = tbl
-            .grow(&mut *store, u64::from(delta), init_ref)
-            .map_err(|e| vm.range_error(format!("WebAssembly.Table.grow failed: {e}")))?;
-        Ok(JsValue::from_number(prev as f64))
+        let prev = h_grow.with_store_mut(|mut store| {
+            tbl.grow(&mut store, delta, init_ref)
+                .map_err(|e| vm.range_error(format!("WebAssembly.Table.grow failed: {e}")))
+        })?;
+        Ok(wasm_index_to_js(vm, prev, is_64))
     });
     define_prop(
         vm,
         proto,
         "grow",
         JsValue::from_object(grow_fn),
-        PropertyAttrs::METHOD,
+        PropertyAttrs::DEFAULT,
+    );
+
+    // `Table.prototype.type()`
+    let h_ty = Rc::clone(host);
+    let type_fn = alloc_host_fn_len(vm, "type", 0, move |vm, this, _args| {
+        let tid = read_hidden_id(vm, this, TABLE_ID_KEY)
+            .ok_or_else(|| vm.type_error("Table.prototype.type called on incompatible receiver"))?;
+        let (min_s, max_s, elem_name, is_64) = h_ty.with_store(|store| {
+            let tbl = h_ty
+                .tables
+                .borrow()
+                .get(tid)
+                .map(|e| e.table)
+                .ok_or_else(|| vm.type_error("Invalid WebAssembly.Table"))?;
+            let tty = tbl.ty(&store);
+            Ok((
+                tty.minimum(),
+                tty.maximum(),
+                ref_type_js_name(tty.element()),
+                tty.is_64(),
+            ))
+        })?;
+        let obj = alloc_ordinary(vm, Some(vm.object_proto));
+        let elem_v = JsValue::from_string(vm.heap.alloc_string(elem_name));
+        define_prop(vm, obj, "element", elem_v, PropertyAttrs::DEFAULT);
+        let min_v = wasm_index_to_js(vm, min_s, is_64);
+        define_prop(vm, obj, "minimum", min_v, PropertyAttrs::DEFAULT);
+        if let Some(ms) = max_s {
+            let max_v = wasm_index_to_js(vm, ms, is_64);
+            define_prop(vm, obj, "maximum", max_v, PropertyAttrs::DEFAULT);
+        }
+        Ok(JsValue::from_object(obj))
+    });
+    define_prop(
+        vm,
+        proto,
+        "type",
+        JsValue::from_object(type_fn),
+        PropertyAttrs::DEFAULT,
     );
 }
 
@@ -1545,50 +2639,60 @@ fn install_global_prototype(vm: &mut JsVm, host: &SharedWasmHost) {
     let proto = host.global_proto;
 
     let h_get = Rc::clone(host);
-    let getter = vm.alloc_host_fn("get value", move |vm, this, _args| {
+    let getter = alloc_host_fn_len(vm, "get value", 0, move |vm, this, _args| {
         let gid = read_hidden_id(vm, this, GLOBAL_ID_KEY).ok_or_else(|| {
             vm.type_error("Global.prototype.value called on incompatible receiver")
         })?;
-        let wv = {
-            let mut store = h_get.store.borrow_mut();
-            let g = *h_get
+        let (wv, is_v128) = h_get.with_store_mut(|mut store| {
+            let g = h_get
                 .globals
                 .borrow()
                 .get(gid)
+                .map(|e| e.global)
                 .ok_or_else(|| vm.type_error("Invalid WebAssembly.Global"))?;
-            g.get(&mut *store)
-        };
-        Ok(wasm_to_js_val(vm, &wv))
+            let is_v128 = matches!(g.ty(&store).content(), ValType::V128);
+            Ok((g.get(&mut store), is_v128))
+        })?;
+        if is_v128 {
+            return Err(vm.type_error("Cannot read v128 WebAssembly.Global from JS"));
+        }
+        wasm_to_js_val(vm, &h_get, &wv)
     });
 
     let h_set = Rc::clone(host);
-    let setter = vm.alloc_host_fn("set value", move |vm, this, args| {
+    let setter = alloc_host_fn_len(vm, "set value", 1, move |vm, this, args| {
         let gid = read_hidden_id(vm, this, GLOBAL_ID_KEY).ok_or_else(|| {
             vm.type_error("Global.prototype.value called on incompatible receiver")
         })?;
-        let val_ty = {
-            let store = h_set.store.borrow();
-            let g = *h_set
+        // Check mutability BEFORE converting argument so immutable set has no ToNumber side effects.
+        let val_ty = h_set.with_store(|store| {
+            let g = h_set
                 .globals
                 .borrow()
                 .get(gid)
+                .map(|e| e.global)
                 .ok_or_else(|| vm.type_error("Invalid WebAssembly.Global"))?;
-            let ty = g.ty(&*store);
+            let ty = g.ty(&store);
             if ty.mutability() != Mutability::Var {
                 return Err(vm.type_error("Cannot modify immutable WebAssembly.Global"));
             }
-            ty.content().clone()
-        };
+            if matches!(ty.content(), ValType::V128) {
+                return Err(vm.type_error("Cannot modify v128 WebAssembly.Global from JS"));
+            }
+            Ok(ty.content().clone())
+        })?;
         let jv = args.first().copied().unwrap_or(JsValue::UNDEFINED);
-        let wv = js_to_wasm_val(vm, jv, &val_ty)?;
-        let mut store = h_set.store.borrow_mut();
-        let g = *h_set
-            .globals
-            .borrow()
-            .get(gid)
-            .ok_or_else(|| vm.type_error("Invalid WebAssembly.Global"))?;
-        g.set(&mut *store, wv)
-            .map_err(|e| vm.type_error(format!("WebAssembly.Global.value set failed: {e}")))?;
+        let wv = js_to_wasm_val(vm, &h_set, jv, &val_ty)?;
+        h_set.with_store_mut(|mut store| {
+            let g = h_set
+                .globals
+                .borrow()
+                .get(gid)
+                .map(|e| e.global)
+                .ok_or_else(|| vm.type_error("Invalid WebAssembly.Global"))?;
+            g.set(&mut store, wv)
+                .map_err(|e| vm.type_error(format!("WebAssembly.Global.value set failed: {e}")))
+        })?;
         Ok(JsValue::UNDEFINED)
     });
 
@@ -1604,140 +2708,783 @@ fn install_global_prototype(vm: &mut JsVm, host: &SharedWasmHost) {
 
     // `Global.prototype.valueOf()`
     let h_vo = Rc::clone(host);
-    let value_of = vm.alloc_host_fn("valueOf", move |vm, this, _args| {
+    let value_of = alloc_host_fn_len(vm, "valueOf", 0, move |vm, this, _args| {
         let gid = read_hidden_id(vm, this, GLOBAL_ID_KEY).ok_or_else(|| {
             vm.type_error("Global.prototype.valueOf called on incompatible receiver")
         })?;
-        let wv = {
-            let mut store = h_vo.store.borrow_mut();
-            let g = *h_vo
+        let (wv, is_v128) = h_vo.with_store_mut(|mut store| {
+            let g = h_vo
                 .globals
                 .borrow()
                 .get(gid)
+                .map(|e| e.global)
                 .ok_or_else(|| vm.type_error("Invalid WebAssembly.Global"))?;
-            g.get(&mut *store)
-        };
-        Ok(wasm_to_js_val(vm, &wv))
+            let is_v128 = matches!(g.ty(&store).content(), ValType::V128);
+            Ok((g.get(&mut store), is_v128))
+        })?;
+        if is_v128 {
+            return Err(vm.type_error("Cannot read v128 WebAssembly.Global from JS"));
+        }
+        wasm_to_js_val(vm, &h_vo, &wv)
     });
     define_prop(
         vm,
         proto,
         "valueOf",
         JsValue::from_object(value_of),
-        PropertyAttrs::METHOD,
+        PropertyAttrs::DEFAULT,
+    );
+
+    // `Global.prototype.type()`
+    let h_ty = Rc::clone(host);
+    let type_fn = alloc_host_fn_len(vm, "type", 0, move |vm, this, _args| {
+        let gid = read_hidden_id(vm, this, GLOBAL_ID_KEY).ok_or_else(|| {
+            vm.type_error("Global.prototype.type called on incompatible receiver")
+        })?;
+        let (val_name, is_mut) = h_ty.with_store(|store| {
+            let g = h_ty
+                .globals
+                .borrow()
+                .get(gid)
+                .map(|e| e.global)
+                .ok_or_else(|| vm.type_error("Invalid WebAssembly.Global"))?;
+            let ty = g.ty(&store);
+            Ok((
+                val_type_js_name(ty.content()),
+                ty.mutability() == Mutability::Var,
+            ))
+        })?;
+        let obj = alloc_ordinary(vm, Some(vm.object_proto));
+        define_prop(
+            vm,
+            obj,
+            "mutable",
+            JsValue::from_bool(is_mut),
+            PropertyAttrs::DEFAULT,
+        );
+        let v_str = JsValue::from_string(vm.heap.alloc_string(val_name));
+        define_prop(vm, obj, "value", v_str, PropertyAttrs::DEFAULT);
+        Ok(JsValue::from_object(obj))
+    });
+    define_prop(
+        vm,
+        proto,
+        "type",
+        JsValue::from_object(type_fn),
+        PropertyAttrs::DEFAULT,
     );
 }
 
-fn wrap_memory_object(vm: &mut JsVm, host: &SharedWasmHost, mem_id: usize) -> HeapHandle {
-    let obj = alloc_ordinary(vm, Some(host.memory_proto));
+fn install_tag_prototype(vm: &mut JsVm, host: &SharedWasmHost) {
+    let proto = host.tag_proto;
+    let h_ty = Rc::clone(host);
+    let type_fn = alloc_host_fn_len(vm, "type", 0, move |vm, this, _args| {
+        let tid = read_hidden_id(vm, this, TAG_ID_KEY)
+            .ok_or_else(|| vm.type_error("Tag.prototype.type called on incompatible receiver"))?;
+        let param_names: Vec<&'static str> = h_ty.with_store(|store| {
+            let tag = h_ty
+                .tags
+                .borrow()
+                .get(tid)
+                .map(|e| e.tag)
+                .ok_or_else(|| vm.type_error("Invalid WebAssembly.Tag"))?;
+            Ok(tag
+                .ty(&store)
+                .ty()
+                .params()
+                .map(|t| val_type_js_name(&t))
+                .collect())
+        })?;
+        let arr = vm.alloc_array();
+        for name in param_names {
+            let s = JsValue::from_string(vm.heap.alloc_string(name));
+            vm.heap.object_push_element(arr, s);
+        }
+        let obj = alloc_ordinary(vm, Some(vm.object_proto));
+        define_prop(
+            vm,
+            obj,
+            "parameters",
+            JsValue::from_object(arr),
+            PropertyAttrs::DEFAULT,
+        );
+        Ok(JsValue::from_object(obj))
+    });
+    define_prop(
+        vm,
+        proto,
+        "type",
+        JsValue::from_object(type_fn),
+        PropertyAttrs::DEFAULT,
+    );
+}
+
+fn install_exception_prototype(vm: &mut JsVm, host: &SharedWasmHost) {
+    let proto = host.exception_proto;
+
+    // `Exception.prototype.is(tag)`
+    let h_is = Rc::clone(host);
+    let is_fn = alloc_host_fn_len(vm, "is", 1, move |vm, this, args| {
+        let eid = read_hidden_id(vm, this, EXN_ID_KEY).ok_or_else(|| {
+            vm.type_error("Exception.prototype.is called on incompatible receiver")
+        })?;
+        let tag_arg = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+        let tid = read_hidden_id(vm, tag_arg, TAG_ID_KEY)
+            .ok_or_else(|| vm.type_error("Argument 0 must be a WebAssembly.Tag"))?;
+        let tag = h_is
+            .tags
+            .borrow()
+            .get(tid)
+            .map(|e| e.tag)
+            .ok_or_else(|| vm.type_error("Invalid WebAssembly.Tag"))?;
+        let exns = h_is.exceptions.borrow();
+        let entry = exns
+            .get(eid)
+            .ok_or_else(|| vm.type_error("Invalid WebAssembly.Exception"))?;
+        let eq = h_is.with_store_mut(|mut store| {
+            let rooted = entry.exn.to_rooted(&mut store);
+            let exn_tag = rooted
+                .tag(&mut store)
+                .map_err(|e| vm.type_error(format!("Failed to inspect exception tag: {e}")))?;
+            Ok(Tag::eq(&exn_tag, &tag, &store))
+        })?;
+        Ok(JsValue::from_bool(eq))
+    });
+    define_prop(
+        vm,
+        proto,
+        "is",
+        JsValue::from_object(is_fn),
+        PropertyAttrs::DEFAULT,
+    );
+
+    // `Exception.prototype.getArg(tag, index)`
+    let h_arg = Rc::clone(host);
+    let get_arg_fn = alloc_host_fn_len(vm, "getArg", 2, move |vm, this, args| {
+        let eid = read_hidden_id(vm, this, EXN_ID_KEY).ok_or_else(|| {
+            vm.type_error("Exception.prototype.getArg called on incompatible receiver")
+        })?;
+        if args.len() < 2 {
+            return Err(vm.type_error("Exception.prototype.getArg requires 2 arguments"));
+        }
+        let tid = read_hidden_id(vm, args[0], TAG_ID_KEY)
+            .ok_or_else(|| vm.type_error("Argument 0 must be a WebAssembly.Tag"))?;
+        let idx_num = vm.to_number(args[1])?;
+        if !idx_num.is_finite() || idx_num < 0.0 || idx_num > f64::from(u32::MAX) {
+            return Err(vm.range_error("WebAssembly.Exception getArg index out of range"));
+        }
+        let index = idx_num.trunc() as usize;
+        let tag = h_arg
+            .tags
+            .borrow()
+            .get(tid)
+            .map(|e| e.tag)
+            .ok_or_else(|| vm.type_error("Invalid WebAssembly.Tag"))?;
+        let val = {
+            let exns = h_arg.exceptions.borrow();
+            let entry = exns
+                .get(eid)
+                .ok_or_else(|| vm.type_error("Invalid WebAssembly.Exception"))?;
+            h_arg.with_store_mut(|mut store| {
+                let rooted = entry.exn.to_rooted(&mut store);
+                let exn_tag = rooted
+                    .tag(&mut store)
+                    .map_err(|e| vm.type_error(format!("Failed to inspect exception tag: {e}")))?;
+                if !Tag::eq(&exn_tag, &tag, &store) {
+                    return Err(vm.type_error("WebAssembly.Exception tag mismatch"));
+                }
+                let param_count = tag.ty(&store).ty().params().len();
+                if index >= param_count {
+                    return Err(vm.range_error("WebAssembly.Exception getArg index out of range"));
+                }
+                let field_val = rooted
+                    .field(&mut store, index)
+                    .map_err(|e| vm.range_error(format!("Failed to read exception field: {e}")))?;
+                if matches!(field_val, Val::V128(_)) {
+                    return Err(vm.type_error("Cannot read v128 exception payload from JS"));
+                }
+                Ok(field_val)
+            })?
+        };
+        wasm_to_js_val(vm, &h_arg, &val)
+    });
+    define_prop(
+        vm,
+        proto,
+        "getArg",
+        JsValue::from_object(get_arg_fn),
+        PropertyAttrs::DEFAULT,
+    );
+
+    // `get Exception.prototype.stack`
+    let h_st = Rc::clone(host);
+    let get_stack = alloc_host_fn_len(vm, "get stack", 0, move |vm, this, _args| {
+        let eid = read_hidden_id(vm, this, EXN_ID_KEY).ok_or_else(|| {
+            vm.type_error("Exception.prototype.stack called on incompatible receiver")
+        })?;
+        let stack = h_st
+            .exceptions
+            .borrow()
+            .get(eid)
+            .and_then(|e| e.stack.clone());
+        Ok(match stack {
+            Some(s) => JsValue::from_string(vm.heap.alloc_string(s)),
+            None => JsValue::UNDEFINED,
+        })
+    });
+    let k_stack = vm.heap.intern_key("stack");
+    vm.heap.object_define_accessor(
+        proto,
+        k_stack,
+        Some(get_stack),
+        None,
+        PropertyAttrs::CONFIGURABLE | PropertyAttrs::ENUMERABLE,
+        &mut vm.shapes,
+    );
+}
+
+fn wrap_memory_object_with_proto(
+    vm: &mut JsVm,
+    host: &SharedWasmHost,
+    mem_id: usize,
+    proto: HeapHandle,
+) -> HeapHandle {
+    let obj = alloc_ordinary(vm, Some(proto));
     define_hidden_id(vm, obj, MEMORY_ID_KEY, mem_id);
+    root_js_value(vm, host, JsValue::from_object(obj));
+    if let Some(b) = host
+        .memories
+        .lock()
+        .expect("wasm memories lock")
+        .get_mut(mem_id)
+    {
+        if b.js_wrapper.is_none() {
+            b.js_wrapper = Some(obj);
+        }
+    }
     obj
 }
 
-fn wrap_table_object(vm: &mut JsVm, host: &SharedWasmHost, tid: usize) -> HeapHandle {
-    let obj = alloc_ordinary(vm, Some(host.table_proto));
+fn get_or_wrap_memory_object(vm: &mut JsVm, host: &SharedWasmHost, mem_id: usize) -> HeapHandle {
+    if let Some(existing) = host
+        .memories
+        .lock()
+        .expect("wasm memories lock")
+        .get(mem_id)
+        .and_then(|b| b.js_wrapper)
+    {
+        return existing;
+    }
+    wrap_memory_object_with_proto(vm, host, mem_id, host.memory_proto)
+}
+
+fn wrap_table_object_with_proto(
+    vm: &mut JsVm,
+    host: &SharedWasmHost,
+    tid: usize,
+    proto: HeapHandle,
+) -> HeapHandle {
+    let obj = alloc_ordinary(vm, Some(proto));
     define_hidden_id(vm, obj, TABLE_ID_KEY, tid);
+    root_js_value(vm, host, JsValue::from_object(obj));
+    if let Some(e) = host.tables.borrow_mut().get_mut(tid) {
+        if e.js_wrapper.is_none() {
+            e.js_wrapper = Some(obj);
+        }
+    }
     obj
 }
 
-fn wrap_global_object(vm: &mut JsVm, host: &SharedWasmHost, gid: usize) -> HeapHandle {
-    let obj = alloc_ordinary(vm, Some(host.global_proto));
+fn get_or_wrap_table_object(vm: &mut JsVm, host: &SharedWasmHost, tid: usize) -> HeapHandle {
+    if let Some(existing) = host.tables.borrow().get(tid).and_then(|e| e.js_wrapper) {
+        return existing;
+    }
+    wrap_table_object_with_proto(vm, host, tid, host.table_proto)
+}
+
+fn wrap_global_object_with_proto(
+    vm: &mut JsVm,
+    host: &SharedWasmHost,
+    gid: usize,
+    proto: HeapHandle,
+) -> HeapHandle {
+    let obj = alloc_ordinary(vm, Some(proto));
     define_hidden_id(vm, obj, GLOBAL_ID_KEY, gid);
+    root_js_value(vm, host, JsValue::from_object(obj));
+    if let Some(e) = host.globals.borrow_mut().get_mut(gid) {
+        if e.js_wrapper.is_none() {
+            e.js_wrapper = Some(obj);
+        }
+    }
     obj
 }
 
-// --- JS <-> Wasm Value Conversion & Binary Helpers ---
+fn get_or_wrap_global_object(vm: &mut JsVm, host: &SharedWasmHost, gid: usize) -> HeapHandle {
+    if let Some(existing) = host.globals.borrow().get(gid).and_then(|e| e.js_wrapper) {
+        return existing;
+    }
+    wrap_global_object_with_proto(vm, host, gid, host.global_proto)
+}
 
-fn default_wasm_val(ty: &ValType) -> Val {
+fn wrap_tag_object_with_proto(
+    vm: &mut JsVm,
+    host: &SharedWasmHost,
+    tid: usize,
+    proto: HeapHandle,
+) -> HeapHandle {
+    let obj = alloc_ordinary(vm, Some(proto));
+    define_hidden_id(vm, obj, TAG_ID_KEY, tid);
+    root_js_value(vm, host, JsValue::from_object(obj));
+    if let Some(e) = host.tags.borrow_mut().get_mut(tid) {
+        if e.js_wrapper.is_none() {
+            e.js_wrapper = Some(obj);
+        }
+    }
+    obj
+}
+
+fn get_or_wrap_tag_object(vm: &mut JsVm, host: &SharedWasmHost, tid: usize) -> HeapHandle {
+    if let Some(existing) = host.tags.borrow().get(tid).and_then(|e| e.js_wrapper) {
+        return existing;
+    }
+    wrap_tag_object_with_proto(vm, host, tid, host.tag_proto)
+}
+
+// --- JS <-> Wasm Value & Reference Conversions ---
+
+fn default_wasm_val_raw(ty: &ValType) -> Val {
     match ty {
         ValType::I32 => Val::I32(0),
         ValType::I64 => Val::I64(0),
         ValType::F32 => Val::F32(0),
         ValType::F64 => Val::F64(0),
-        _ => Val::I32(0),
+        ValType::V128 => Val::V128(0u128.into()),
+        ValType::Ref(rt) => match rt.heap_type() {
+            HeapType::Func | HeapType::ConcreteFunc(_) | HeapType::NoFunc => Val::FuncRef(None),
+            HeapType::Extern | HeapType::NoExtern => Val::ExternRef(None),
+            HeapType::Exn | HeapType::NoExn => Val::ExnRef(None),
+            _ => Val::AnyRef(None),
+        },
     }
 }
 
-fn js_to_wasm_val(vm: &mut JsVm, val: JsValue, ty: &ValType) -> Result<Val, JsException> {
+fn default_wasm_val_js(vm: &mut JsVm, host: &SharedWasmHost, ty: &ValType) -> Val {
+    match ty {
+        ValType::Ref(rt) => {
+            let r = default_wasm_ref(vm, host, rt);
+            ref_to_val(r)
+        }
+        _ => default_wasm_val_raw(ty),
+    }
+}
+
+fn default_wasm_ref(_vm: &mut JsVm, host: &WasmHost, rt: &RefType) -> Ref {
+    match rt.heap_type() {
+        HeapType::Func | HeapType::ConcreteFunc(_) | HeapType::NoFunc => Ref::Func(None),
+        HeapType::Extern | HeapType::NoExtern => {
+            // W3C JS-API: omitted JS externref value defaults to boxed `undefined`.
+            let er = host.with_store_mut(|mut store| {
+                ExternRef::new(&mut store, JsExternVal(JsValue::UNDEFINED.to_raw())).ok()
+            });
+            Ref::Extern(er)
+        }
+        HeapType::Exn | HeapType::NoExn => Ref::Exn(None),
+        _ => Ref::Any(None),
+    }
+}
+
+fn js_val_to_i31(val: JsValue) -> Option<I31> {
+    if let Some(i) = val.as_i32() {
+        return I31::new_i32(i);
+    }
+    if let Some(f) = val.as_f64() {
+        if f.is_finite() && f.fract() == 0.0 && (-1_073_741_824.0..=1_073_741_823.0).contains(&f) {
+            return I31::new_i32(f as i32);
+        }
+    }
+    None
+}
+
+fn ref_to_val(r: Ref) -> Val {
+    match r {
+        Ref::Func(f) => Val::FuncRef(f),
+        Ref::Extern(e) => Val::ExternRef(e),
+        Ref::Any(a) => Val::AnyRef(a),
+        Ref::Exn(e) => Val::ExnRef(e),
+    }
+}
+
+fn js_to_wasm_ref(
+    vm: &mut JsVm,
+    host: &WasmHost,
+    val: JsValue,
+    rt: &RefType,
+) -> Result<Ref, JsException> {
+    host.with_store_mut(|store| js_to_wasm_ref_with_ctx(vm, host, store, val, rt))
+}
+
+fn js_to_wasm_ref_with_ctx(
+    vm: &mut JsVm,
+    host: &WasmHost,
+    mut ctx: wasmtime::StoreContextMut<'_, WasmStoreData>,
+    val: JsValue,
+    rt: &RefType,
+) -> Result<Ref, JsException> {
+    if val.is_null() {
+        if !rt.is_nullable() {
+            return Err(vm.type_error("Cannot convert null to non-nullable WebAssembly reference"));
+        }
+        return Ok(match rt.heap_type() {
+            HeapType::Func | HeapType::ConcreteFunc(_) | HeapType::NoFunc => Ref::Func(None),
+            HeapType::Extern | HeapType::NoExtern => Ref::Extern(None),
+            HeapType::Exn | HeapType::NoExn => Ref::Exn(None),
+            _ => Ref::Any(None),
+        });
+    }
+    match rt.heap_type() {
+        HeapType::Func | HeapType::ConcreteFunc(_) => {
+            if let Some(fid) = read_hidden_id(vm, val, FUNC_ID_KEY) {
+                let f = *host
+                    .funcs
+                    .borrow()
+                    .get(fid)
+                    .ok_or_else(|| vm.type_error("Invalid Wasm function reference"))?;
+                Ok(Ref::Func(Some(f)))
+            } else {
+                Err(vm.type_error("Expected exported WebAssembly function or null for funcref"))
+            }
+        }
+        HeapType::Extern => {
+            root_js_value(vm, host, val);
+            let er = ExternRef::new(&mut ctx, JsExternVal(val.to_raw()))
+                .map_err(|e| vm.type_error(format!("Failed to allocate externref: {e}")))?;
+            Ok(Ref::Extern(Some(er)))
+        }
+        HeapType::Exn => {
+            if let Some(eid) = read_hidden_id(vm, val, EXN_ID_KEY) {
+                let exns = host.exceptions.borrow();
+                let entry = exns
+                    .get(eid)
+                    .ok_or_else(|| vm.type_error("Invalid WebAssembly.Exception"))?;
+                Ok(Ref::Exn(Some(entry.exn.to_rooted(&mut ctx))))
+            } else {
+                Err(vm.type_error("Expected WebAssembly.Exception or null for exnref"))
+            }
+        }
+        _ => {
+            if let Some(aid) = read_hidden_id(vm, val, ANYREF_ID_KEY) {
+                let anyrefs = host.anyrefs.borrow();
+                let owned = anyrefs
+                    .get(aid)
+                    .ok_or_else(|| vm.type_error("Invalid WebAssembly GC reference"))?;
+                Ok(Ref::Any(Some(owned.to_rooted(&mut ctx))))
+            } else if let Some(i31) = js_val_to_i31(val) {
+                Ok(Ref::Any(Some(AnyRef::from_i31(&mut ctx, i31))))
+            } else {
+                root_js_value(vm, host, val);
+                let er = ExternRef::new(&mut ctx, JsExternVal(val.to_raw()))
+                    .map_err(|e| vm.type_error(format!("Failed to box JS value as anyref: {e}")))?;
+                let ar = AnyRef::convert_extern(&mut ctx, er).map_err(|e| {
+                    vm.type_error(format!("Failed to convert externref to anyref: {e}"))
+                })?;
+                Ok(Ref::Any(Some(ar)))
+            }
+        }
+    }
+}
+
+fn wrap_wasm_gc_anyref(
+    vm: &mut JsVm,
+    host: &WasmHost,
+    mut ctx: wasmtime::StoreContextMut<'_, WasmStoreData>,
+    ar: wasmtime::Rooted<AnyRef>,
+) -> Result<JsValue, JsException> {
+    if let Ok(Some(i31)) = ar.as_i31(&ctx) {
+        return Ok(JsValue::from_i32(i31.get_i32()));
+    }
+    if !ar.is_eqref(&ctx).unwrap_or(false) {
+        if let Ok(er) = ExternRef::convert_any(&mut ctx, ar) {
+            if let Some(raw) = er
+                .data(&ctx)
+                .ok()
+                .flatten()
+                .and_then(|d| d.downcast_ref::<JsExternVal>())
+                .map(|v| v.0)
+            {
+                return Ok(JsValue::from_raw(raw));
+            }
+        }
+    }
+    let owned = ar
+        .to_owned_rooted(&mut ctx)
+        .map_err(|e| vm.type_error(format!("Failed to root anyref: {e}")))?;
+    let aid = {
+        let mut list = host.anyrefs.borrow_mut();
+        let id = list.len();
+        list.push(owned);
+        id
+    };
+    let obj = alloc_ordinary(vm, None);
+    define_hidden_id(vm, obj, ANYREF_ID_KEY, aid);
+    if let Some(o) = vm.heap.get_object_mut(obj) {
+        o.extensible = false;
+        o.rare_mut().wasm_gc_object = true;
+    }
+    Ok(JsValue::from_object(obj))
+}
+
+fn wasm_ref_to_js(vm: &mut JsVm, host: &SharedWasmHost, r: &Ref) -> Result<JsValue, JsException> {
+    match r {
+        Ref::Func(None) | Ref::Extern(None) | Ref::Any(None) | Ref::Exn(None) => Ok(JsValue::NULL),
+        Ref::Func(Some(f)) => Ok(JsValue::from_object(get_or_wrap_exported_func(
+            vm, host, "", *f,
+        ))),
+        Ref::Extern(Some(er)) => host.with_store_mut(|mut store| {
+            if let Some(raw) = er
+                .data(&store)
+                .ok()
+                .flatten()
+                .and_then(|d| d.downcast_ref::<JsExternVal>())
+                .map(|v| v.0)
+            {
+                return Ok(JsValue::from_raw(raw));
+            }
+            // Externalized Wasm GC object (`extern.convert_any`): unwrap through `AnyRef` so i31/struct/array export cleanly!
+            if let Ok(ar) = AnyRef::convert_extern(&mut store, *er) {
+                return wrap_wasm_gc_anyref(vm, host, store, ar);
+            }
+            Ok(JsValue::UNDEFINED)
+        }),
+        Ref::Any(Some(ar)) => {
+            host.with_store_mut(|store| wrap_wasm_gc_anyref(vm, host, store, *ar))
+        }
+        Ref::Exn(Some(er)) => {
+            let owned = host.with_store_mut(|mut store| {
+                er.to_owned_rooted(&mut store)
+                    .map_err(|e| vm.type_error(format!("Failed to root exnref: {e}")))
+            })?;
+            let eid = register_exception(host, owned, None);
+            let obj = alloc_ordinary(vm, Some(host.exception_proto));
+            define_hidden_id(vm, obj, EXN_ID_KEY, eid);
+            Ok(JsValue::from_object(obj))
+        }
+    }
+}
+
+fn js_to_wasm_val(
+    vm: &mut JsVm,
+    host: &WasmHost,
+    val: JsValue,
+    ty: &ValType,
+) -> Result<Val, JsException> {
     match ty {
         ValType::I32 => {
-            if val.is_bigint() {
-                return Err(vm.type_error("Cannot convert BigInt to WebAssembly i32"));
-            }
-            let n = js_to_f64(vm, val)?;
+            let n = vm.to_number(val)?;
             let i = if !n.is_finite() || n == 0.0 {
                 0i32
             } else {
-                (n.trunc() as i64) as i32
+                // ECMA-262 ToInt32
+                let int = n.trunc().rem_euclid(4_294_967_296.0);
+                (int as u32) as i32
             };
             Ok(Val::I32(i))
         }
         ValType::I64 => {
-            if let Some(bh) = val.as_bigint() {
-                let bi = vm
-                    .heap
-                    .get_bigint(bh)
-                    .cloned()
-                    .unwrap_or_else(|| JsBigInt::from_i64(0));
-                Ok(Val::I64(bi.to_i64_lossy()))
-            } else {
-                Err(vm.type_error("Cannot convert non-BigInt value to WebAssembly i64"))
-            }
+            let i = to_bigint_i64(vm, val)?;
+            Ok(Val::I64(i))
         }
         ValType::F32 => {
-            if val.is_bigint() {
-                return Err(vm.type_error("Cannot convert BigInt to WebAssembly f32"));
-            }
-            let n = js_to_f64(vm, val)? as f32;
+            let n = vm.to_number(val)? as f32;
             Ok(Val::F32(n.to_bits()))
         }
         ValType::F64 => {
-            if val.is_bigint() {
-                return Err(vm.type_error("Cannot convert BigInt to WebAssembly f64"));
-            }
-            let n = js_to_f64(vm, val)?;
+            let n = vm.to_number(val)?;
             Ok(Val::F64(n.to_bits()))
         }
-        _ => Err(vm.type_error(format!("Unsupported WebAssembly value type: {ty}"))),
+        ValType::V128 => Err(vm.type_error("Cannot convert JS value to WebAssembly v128")),
+        ValType::Ref(rt) => Ok(ref_to_val(js_to_wasm_ref(vm, host, val, rt)?)),
     }
 }
 
-fn wasm_to_js_val(vm: &mut JsVm, val: &Val) -> JsValue {
+/// Strict JS-API conversion for plain-value immutable global imports (throws `LinkError` on wrong type).
+fn js_to_wasm_import_global(
+    vm: &mut JsVm,
+    host: &WasmHost,
+    val: JsValue,
+    ty: &ValType,
+) -> Result<Val, JsException> {
+    match ty {
+        ValType::I32 | ValType::F32 | ValType::F64 => {
+            if !val.is_number() {
+                return Err(make_wasm_error(
+                    vm,
+                    host.link_error_proto,
+                    "LinkError",
+                    format!("Immutable global import of type {ty} must be a Number"),
+                ));
+            }
+            js_to_wasm_val(vm, host, val, ty)
+        }
+        ValType::I64 => {
+            if !val.is_bigint() {
+                return Err(make_wasm_error(
+                    vm,
+                    host.link_error_proto,
+                    "LinkError",
+                    "Immutable global import of type i64 must be a BigInt",
+                ));
+            }
+            js_to_wasm_val(vm, host, val, ty)
+        }
+        ValType::V128 => Err(make_wasm_error(
+            vm,
+            host.link_error_proto,
+            "LinkError",
+            "Cannot import non-Global value for v128 global",
+        )),
+        ValType::Ref(rt) => js_to_wasm_ref(vm, host, val, rt)
+            .map(ref_to_val)
+            .map_err(|e| make_wasm_error(vm, host.link_error_proto, "LinkError", e.message)),
+    }
+}
+
+fn wasm_to_js_val(vm: &mut JsVm, host: &SharedWasmHost, val: &Val) -> Result<JsValue, JsException> {
     match val {
-        Val::I32(i) => JsValue::from_i32(*i),
-        Val::I64(i) => JsValue::from_bigint(vm.heap.alloc_bigint(JsBigInt::from_i64(*i))),
-        Val::F32(bits) => JsValue::from_number(f64::from(f32::from_bits(*bits))),
-        Val::F64(bits) => JsValue::from_number(f64::from_bits(*bits)),
-        _ => JsValue::UNDEFINED,
+        Val::I32(i) => Ok(JsValue::from_i32(*i)),
+        Val::I64(i) => Ok(JsValue::from_bigint(
+            vm.heap.alloc_bigint(JsBigInt::from_i64(*i)),
+        )),
+        Val::F32(bits) => Ok(JsValue::from_number(f64::from(f32::from_bits(*bits)))),
+        Val::F64(bits) => Ok(JsValue::from_number(f64::from_bits(*bits))),
+        Val::V128(_) => Err(vm.type_error("Cannot convert WebAssembly v128 to JS value")),
+        Val::FuncRef(f) => wasm_ref_to_js(vm, host, &Ref::Func(*f)),
+        Val::ExternRef(e) => wasm_ref_to_js(vm, host, &Ref::Extern(*e)),
+        Val::AnyRef(a) => wasm_ref_to_js(vm, host, &Ref::Any(*a)),
+        Val::ExnRef(e) => wasm_ref_to_js(vm, host, &Ref::Exn(*e)),
+        Val::ContRef(_) => Ok(JsValue::UNDEFINED),
     }
 }
 
-fn js_to_f64(vm: &mut JsVm, val: JsValue) -> Result<f64, JsException> {
-    if let Some(n) = val.as_number() {
-        return Ok(n);
+fn wasm_to_js_val_with_ctx(
+    vm: &mut JsVm,
+    host: &WasmHost,
+    mut ctx: wasmtime::StoreContextMut<'_, WasmStoreData>,
+    val: &Val,
+) -> Result<JsValue, JsException> {
+    match val {
+        Val::I32(i) => Ok(JsValue::from_i32(*i)),
+        Val::I64(i) => Ok(JsValue::from_bigint(
+            vm.heap.alloc_bigint(JsBigInt::from_i64(*i)),
+        )),
+        Val::F32(bits) => Ok(JsValue::from_number(f64::from(f32::from_bits(*bits)))),
+        Val::F64(bits) => Ok(JsValue::from_number(f64::from_bits(*bits))),
+        Val::V128(_) => Err(vm.type_error("Cannot convert WebAssembly v128 to JS value")),
+        Val::FuncRef(None) | Val::ExternRef(None) | Val::AnyRef(None) | Val::ExnRef(None) => {
+            Ok(JsValue::NULL)
+        }
+        Val::FuncRef(Some(f)) => {
+            let raw_key = f.to_raw(&mut ctx) as usize;
+            if let Some(&cached) = host.func_wrappers.borrow().get(&raw_key) {
+                Ok(JsValue::from_object(cached))
+            } else {
+                // Return a non-null placeholder function handle if not yet exported.
+                Ok(JsValue::NULL)
+            }
+        }
+        Val::ExternRef(Some(er)) => {
+            if let Some(raw) = er
+                .data(&ctx)
+                .ok()
+                .flatten()
+                .and_then(|d| d.downcast_ref::<JsExternVal>())
+                .map(|v| v.0)
+            {
+                return Ok(JsValue::from_raw(raw));
+            }
+            if let Ok(ar) = AnyRef::convert_extern(&mut ctx, *er) {
+                return wrap_wasm_gc_anyref(vm, host, ctx, ar);
+            }
+            Ok(JsValue::UNDEFINED)
+        }
+        Val::AnyRef(Some(ar)) => wrap_wasm_gc_anyref(vm, host, ctx, *ar),
+        Val::ExnRef(Some(er)) => {
+            let owned = er
+                .to_owned_rooted(&mut ctx)
+                .map_err(|e| vm.type_error(format!("Failed to root exnref: {e}")))?;
+            let eid = register_exception(host, owned, None);
+            let obj = alloc_ordinary(vm, Some(host.exception_proto));
+            define_hidden_id(vm, obj, EXN_ID_KEY, eid);
+            Ok(JsValue::from_object(obj))
+        }
+        Val::ContRef(_) => Ok(JsValue::UNDEFINED),
     }
+}
+
+// --- WebIDL Type & Index Helpers ---
+
+fn parse_address_type(vm: &mut JsVm, val: JsValue) -> Result<bool, JsException> {
     if val.is_undefined() {
-        return Ok(f64::NAN);
+        return Ok(false);
     }
-    if val.is_null() {
-        return Ok(0.0);
+    let s = vm.to_js_string(val)?;
+    match s.as_str() {
+        "i32" => Ok(false),
+        "i64" => Ok(true),
+        _ => Err(vm.type_error(format!("Invalid WebAssembly address type '{s}'"))),
     }
-    if let Some(b) = val.as_bool() {
-        return Ok(if b { 1.0 } else { 0.0 });
+}
+
+fn parse_table_ref_type(vm: &mut JsVm, s: &str) -> Result<RefType, JsException> {
+    match s {
+        "anyfunc" | "funcref" => Ok(RefType::FUNCREF),
+        "externref" => Ok(RefType::EXTERNREF),
+        "anyref" => Ok(RefType::ANYREF),
+        "eqref" => Ok(RefType::EQREF),
+        "exnref" => Ok(RefType::EXNREF),
+        _ => Err(vm.type_error(format!("Unsupported WebAssembly.Table element type '{s}'"))),
     }
-    if val.is_symbol() || val.is_bigint() {
-        return Err(vm.type_error("Cannot convert Symbol or BigInt to number"));
+}
+
+fn parse_js_val_type(vm: &mut JsVm, s: &str, allow_v128: bool) -> Result<ValType, JsException> {
+    match s {
+        "i32" => Ok(ValType::I32),
+        "i64" => Ok(ValType::I64),
+        "f32" => Ok(ValType::F32),
+        "f64" => Ok(ValType::F64),
+        "v128" if allow_v128 => Ok(ValType::V128),
+        "anyfunc" | "funcref" => Ok(ValType::FUNCREF),
+        "externref" => Ok(ValType::EXTERNREF),
+        "anyref" => Ok(ValType::ANYREF),
+        "eqref" => Ok(ValType::EQREF),
+        "exnref" => Ok(ValType::EXNREF),
+        _ => Err(vm.type_error(format!("Unsupported WebAssembly value type '{s}'"))),
     }
-    let s = vm.value_to_rust_string(val);
-    let t = s.trim();
-    if t.is_empty() {
-        return Ok(0.0);
+}
+
+fn ref_type_js_name(rt: &RefType) -> &'static str {
+    match rt.heap_type() {
+        HeapType::Func | HeapType::ConcreteFunc(_) | HeapType::NoFunc => "funcref",
+        HeapType::Extern | HeapType::NoExtern => "externref",
+        HeapType::Exn | HeapType::NoExn => "exnref",
+        HeapType::Eq => "eqref",
+        _ => "anyref",
     }
-    Ok(t.parse::<f64>().unwrap_or(f64::NAN))
+}
+
+fn val_type_js_name(vt: &ValType) -> &'static str {
+    match vt {
+        ValType::I32 => "i32",
+        ValType::I64 => "i64",
+        ValType::F32 => "f32",
+        ValType::F64 => "f64",
+        ValType::V128 => "v128",
+        ValType::Ref(rt) => ref_type_js_name(rt),
+    }
 }
 
 fn to_wasm_u32_limit(vm: &mut JsVm, val: JsValue, field: &str) -> Result<u32, JsException> {
-    let n = js_to_f64(vm, val)?;
+    // WebIDL [EnforceRange] unsigned long
+    let n = vm.to_number(val)?;
     if !n.is_finite() || n < 0.0 || n > f64::from(u32::MAX) {
         return Err(vm.type_error(format!(
             "WebAssembly '{field}' must be a non-negative 32-bit integer"
@@ -1746,14 +3493,69 @@ fn to_wasm_u32_limit(vm: &mut JsVm, val: JsValue, field: &str) -> Result<u32, Js
     Ok(n.trunc() as u32)
 }
 
+fn to_wasm_u64_limit(vm: &mut JsVm, val: JsValue, field: &str) -> Result<u64, JsException> {
+    // WebIDL [EnforceRange] unsigned long long for i64 AddressType: requires BigInt!
+    let Some(bh) = val.as_bigint() else {
+        return Err(vm.type_error(format!("WebAssembly 64-bit '{field}' must be a BigInt")));
+    };
+    let bi = vm
+        .heap
+        .get_bigint(bh)
+        .cloned()
+        .unwrap_or_else(|| JsBigInt::from_i64(0));
+    let s = bi.to_string();
+    if s.starts_with('-') {
+        return Err(vm.type_error(format!(
+            "WebAssembly 64-bit '{field}' must be a non-negative BigInt"
+        )));
+    }
+    s.parse::<u64>().map_err(|_| {
+        vm.type_error(format!(
+            "WebAssembly 64-bit '{field}' exceeds 64-bit unsigned range"
+        ))
+    })
+}
+
+fn to_wasm_index_limit(
+    vm: &mut JsVm,
+    val: JsValue,
+    is_64: bool,
+    field: &str,
+) -> Result<u64, JsException> {
+    if is_64 {
+        to_wasm_u64_limit(vm, val, field)
+    } else {
+        Ok(u64::from(to_wasm_u32_limit(vm, val, field)?))
+    }
+}
+
+fn wasm_index_to_js(vm: &mut JsVm, val: u64, is_64: bool) -> JsValue {
+    if is_64 {
+        let bi = JsBigInt::parse_str(&val.to_string()).unwrap_or_else(|| JsBigInt::from_i64(0));
+        JsValue::from_bigint(vm.heap.alloc_bigint(bi))
+    } else {
+        JsValue::from_number(val as f64)
+    }
+}
+
 fn extract_buffer_source(vm: &mut JsVm, val: JsValue) -> Result<Vec<u8>, JsException> {
     let Some(h) = val.as_object() else {
         return Err(vm.type_error("Expected BufferSource (ArrayBuffer, TypedArray, or DataView)"));
     };
     match vm.heap.get_object(h).map(|o| &o.kind) {
-        Some(ObjectKind::ArrayBuffer(b)) => Ok((**b).clone()),
+        Some(ObjectKind::ArrayBuffer(b)) => {
+            if ab_is_shared(vm, h) {
+                return Err(vm.type_error("WebAssembly BufferSource cannot be a SharedArrayBuffer"));
+            }
+            Ok((**b).clone())
+        }
         Some(ObjectKind::TypedArray(ta)) => {
             let buf_h = ta.buffer;
+            if ab_is_shared(vm, buf_h) {
+                return Err(
+                    vm.type_error("WebAssembly BufferSource cannot view a SharedArrayBuffer")
+                );
+            }
             let off = ta.byte_offset as usize;
             let len = (ta.length as usize).saturating_mul(ta.kind.bytes_per_element());
             if let Some(ObjectKind::ArrayBuffer(b)) = vm.heap.get_object(buf_h).map(|o| &o.kind) {
@@ -1765,6 +3567,11 @@ fn extract_buffer_source(vm: &mut JsVm, val: JsValue) -> Result<Vec<u8>, JsExcep
         }
         Some(ObjectKind::DataView(dv)) => {
             let buf_h = dv.buffer;
+            if ab_is_shared(vm, buf_h) {
+                return Err(
+                    vm.type_error("WebAssembly BufferSource cannot view a SharedArrayBuffer")
+                );
+            }
             let off = dv.byte_offset as usize;
             let len = dv.byte_length as usize;
             if let Some(ObjectKind::ArrayBuffer(b)) = vm.heap.get_object(buf_h).map(|o| &o.kind) {
@@ -1778,16 +3585,84 @@ fn extract_buffer_source(vm: &mut JsVm, val: JsValue) -> Result<Vec<u8>, JsExcep
     }
 }
 
+// --- Object Allocation, Prototype, Descriptor & Binary Section Helpers ---
+
+fn root_js_value(vm: &mut JsVm, host: &WasmHost, val: JsValue) {
+    if val.is_object() || val.is_string() || val.is_bigint() {
+        vm.heap.object_push_element(host.roots_arr, val);
+    }
+}
+
+fn alloc_host_fn_len(
+    vm: &mut JsVm,
+    name: &str,
+    length: i32,
+    f: impl Fn(&mut JsVm, JsValue, &[JsValue]) -> Result<JsValue, JsException> + 'static,
+) -> HeapHandle {
+    let h = vm.alloc_host_fn(name, f);
+    let k_len = vm.key_length;
+    vm.heap.object_define_data(
+        h,
+        k_len,
+        JsValue::from_i32(length),
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+    h
+}
+
+fn require_construct_proto(
+    vm: &mut JsVm,
+    default_proto: HeapHandle,
+    name: &str,
+) -> Result<HeapHandle, JsException> {
+    let nt = vm.native_new_target;
+    if !nt.is_object() {
+        return Err(vm.type_error(format!(
+            "WebAssembly.{name} constructor cannot be invoked without 'new'"
+        )));
+    }
+    let proto = nt
+        .as_object()
+        .and_then(|nt_h| {
+            let k_proto = vm.heap.intern_key("prototype");
+            vm.get_property_by_key(nt_h, k_proto).ok()
+        })
+        .and_then(|v| v.as_object())
+        .unwrap_or(default_proto);
+    Ok(proto)
+}
+
+fn set_to_string_tag(vm: &mut JsVm, obj: HeapHandle, tag: &str) {
+    let k_tag = vm.key_symbol_to_string_tag;
+    let v = JsValue::from_string(vm.heap.alloc_string(tag));
+    vm.heap
+        .object_define_data(obj, k_tag, v, PropertyAttrs::CONFIGURABLE, &mut vm.shapes);
+}
+
 fn alloc_ordinary(vm: &mut JsVm, proto: Option<HeapHandle>) -> HeapHandle {
     vm.heap
         .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, proto))
 }
 
-fn alloc_array_buffer(vm: &mut JsVm, bytes: Vec<u8>) -> HeapHandle {
-    vm.heap.alloc_object(JsObject::with_kind(
+fn alloc_array_buffer(
+    vm: &mut JsVm,
+    bytes: Vec<u8>,
+    max_byte_length: Option<usize>,
+    is_wasm_memory: bool,
+) -> HeapHandle {
+    let h = vm.heap.alloc_object(JsObject::with_kind(
         ObjectKind::ArrayBuffer(Box::new(bytes)),
         Some(vm.array_buffer_proto),
-    ))
+    ));
+    if max_byte_length.is_some() || is_wasm_memory {
+        if let Some(o) = vm.heap.get_object_mut(h) {
+            let r = o.rare_mut();
+            r.ab_max_byte_length = max_byte_length;
+            r.ab_wasm_memory = is_wasm_memory;
+        }
+    }
+    h
 }
 
 fn alloc_wasm_error_proto(vm: &mut JsVm, err_proto: HeapHandle, name: &str) -> HeapHandle {
@@ -1800,14 +3675,27 @@ fn alloc_wasm_error_proto(vm: &mut JsVm, err_proto: HeapHandle, name: &str) -> H
 }
 
 fn make_wasm_error_ctor(vm: &mut JsVm, name: &'static str, proto: HeapHandle) -> HeapHandle {
-    let ctor = vm.alloc_host_fn(name, move |vm, _this, args| {
+    let ctor = alloc_host_fn_len(vm, name, 1, move |vm, _this, args| {
+        let target_proto = vm
+            .native_new_target
+            .as_object()
+            .and_then(|nt| {
+                let k_p = vm.heap.intern_key("prototype");
+                vm.get_property_by_key(nt, k_p).ok()
+            })
+            .and_then(|v| v.as_object())
+            .unwrap_or(proto);
         let msg = args
             .first()
             .copied()
             .filter(|v| !v.is_undefined())
-            .map(|v| vm.value_to_rust_string(v))
+            .map(|v| vm.to_js_string(v))
+            .transpose()?
             .unwrap_or_default();
-        let obj = alloc_ordinary(vm, Some(proto));
+        let obj = alloc_ordinary(vm, Some(target_proto));
+        if let Some(o) = vm.heap.get_object_mut(obj) {
+            o.rare_mut().is_error_data = true;
+        }
         let n = JsValue::from_string(vm.heap.alloc_string(name));
         let m = JsValue::from_string(vm.heap.alloc_string(msg));
         define_prop(vm, obj, "name", n, PropertyAttrs::METHOD);
@@ -1840,6 +3728,9 @@ fn make_wasm_error(
 ) -> JsException {
     let msg = msg.into();
     let obj = alloc_ordinary(vm, Some(proto));
+    if let Some(o) = vm.heap.get_object_mut(obj) {
+        o.rare_mut().is_error_data = true;
+    }
     let n = JsValue::from_string(vm.heap.alloc_string(name));
     let m = JsValue::from_string(vm.heap.alloc_string(msg.clone()));
     define_prop(vm, obj, "name", n, PropertyAttrs::METHOD);
@@ -1858,6 +3749,57 @@ fn extern_kind_name(ty: &ExternType) -> &'static str {
         ExternType::Global(_) => "global",
         ExternType::Tag(_) => "tag",
     }
+}
+
+/// Parses WebAssembly binary export section (section ID `7`) mapping `export_name -> (kind, index)`.
+fn parse_export_indices(bytes: &[u8]) -> HashMap<String, (u8, u32)> {
+    let mut out = HashMap::new();
+    if bytes.len() < 8 || &bytes[0..4] != b"\0asm" {
+        return out;
+    }
+    let mut pos = 8usize;
+    while pos < bytes.len() {
+        let sec_id = bytes[pos];
+        pos += 1;
+        let Some((sec_len, consumed)) = read_leb128_u32(&bytes[pos..]) else {
+            break;
+        };
+        pos += consumed;
+        let sec_end = pos.saturating_add(sec_len as usize);
+        if sec_end > bytes.len() {
+            break;
+        }
+        if sec_id == 7 {
+            let mut p = pos;
+            if let Some((count, c)) = read_leb128_u32(&bytes[p..sec_end]) {
+                p += c;
+                for _ in 0..count {
+                    let Some((name_len, nc)) = read_leb128_u32(&bytes[p..sec_end]) else {
+                        break;
+                    };
+                    p += nc;
+                    let name_end = p.saturating_add(name_len as usize);
+                    if name_end >= sec_end {
+                        break;
+                    }
+                    let name = std::str::from_utf8(&bytes[p..name_end])
+                        .unwrap_or("")
+                        .to_string();
+                    p = name_end;
+                    let kind = bytes[p];
+                    p += 1;
+                    let Some((idx, ic)) = read_leb128_u32(&bytes[p..sec_end]) else {
+                        break;
+                    };
+                    p += ic;
+                    out.insert(name, (kind, idx));
+                }
+            }
+            break;
+        }
+        pos = sec_end;
+    }
+    out
 }
 
 /// Parses WebAssembly binary custom sections (section ID `0`) matching `target_name`.
