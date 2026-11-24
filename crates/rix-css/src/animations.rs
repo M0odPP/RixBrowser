@@ -407,7 +407,7 @@ fn collect_transition_candidates(before: &ComputedStyle, after: &ComputedStyle, 
                 P::HyphenateCharacter, P::HyphenateLimitLines]);
         }
         if before.z_index != after.z_index { all_p.push(P::ZIndex); }
-        if before.flex_grid != after.flex_grid { all_p.extend_from_slice(&[P::FlexGrow, P::FlexShrink, P::FlexBasis, P::Order]); }
+        if before.flex_grid != after.flex_grid { all_p.extend_from_slice(&[P::FlexGrow, P::FlexShrink, P::FlexBasis, P::Order, P::FlexDirection, P::FlexWrap, P::AlignItems, P::AlignSelf, P::AlignContent, P::JustifyContent, P::JustifyItems, P::JustifySelf]); }
         if before.effects != after.effects { all_p.extend_from_slice(&[P::Scale, P::Rotate, P::Translate, P::Transform, P::ReadingFlow, P::ReadingOrder]); }
         for pk in all_p {
             if let Some(sp) = find_matching_transition_spec(specs, pk, None, after) {
@@ -452,6 +452,14 @@ fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind,
         P::FlexGrow => a.flex_grid.as_ref().map_or(0.0, |f| f.flex_grow) != b.flex_grid.as_ref().map_or(0.0, |f| f.flex_grow),
         P::FlexShrink => a.flex_grid.as_ref().map_or(1.0, |f| f.flex_shrink) != b.flex_grid.as_ref().map_or(1.0, |f| f.flex_shrink),
         P::FlexBasis => a.flex_grid.as_ref().map(|f| (&f.flex_basis, &f.flex_basis_size)) != b.flex_grid.as_ref().map(|f| (&f.flex_basis, &f.flex_basis_size)),
+        P::FlexDirection => a.flex_grid.as_ref().map(|f| f.flex_direction) != b.flex_grid.as_ref().map(|f| f.flex_direction),
+        P::FlexWrap => a.flex_grid.as_ref().map(|f| f.flex_wrap) != b.flex_grid.as_ref().map(|f| f.flex_wrap),
+        P::AlignItems => a.flex_grid.as_ref().map(|f| f.align_items) != b.flex_grid.as_ref().map(|f| f.align_items),
+        P::AlignSelf => a.flex_grid.as_ref().map(|f| f.align_self) != b.flex_grid.as_ref().map(|f| f.align_self),
+        P::AlignContent => a.flex_grid.as_ref().map(|f| f.align_content) != b.flex_grid.as_ref().map(|f| f.align_content),
+        P::JustifyContent => a.flex_grid.as_ref().map(|f| f.justify_content) != b.flex_grid.as_ref().map(|f| f.justify_content),
+        P::JustifyItems => a.flex_grid.as_ref().map(|f| f.justify_items) != b.flex_grid.as_ref().map(|f| f.justify_items),
+        P::JustifySelf => a.flex_grid.as_ref().map(|f| f.justify_self) != b.flex_grid.as_ref().map(|f| f.justify_self),
         P::ReadingFlow => a.effects.as_ref().map(|e| e.reading_flow) != b.effects.as_ref().map(|e| e.reading_flow),
         P::ReadingOrder => a.effects.as_ref().map_or(0, |e| e.reading_order) != b.effects.as_ref().map_or(0, |e| e.reading_order),
         P::Custom => cname.and_then(|n| a.custom_properties.get(n)) != cname.and_then(|n| b.custom_properties.get(n)),
@@ -537,6 +545,18 @@ fn compose_property(
             let u = underlying.flex_grid.as_ref().map_or(1.0, |f| f.flex_shrink);
             let k = kf.flex_grid.as_ref().map_or(1.0, |f| f.flex_shrink);
             kf.flex_grid_mut().flex_shrink = (u + k).max(0.0);
+        }
+        P::FlexBasis => {
+            let get_fb = |st: &ComputedStyle| st.flex_grid.as_ref().and_then(|f| f.flex_basis_size.clone()).unwrap_or_else(|| match st.flex_grid.as_ref().map(|f| &f.flex_basis) {
+                Some(LengthPercentageAuto::Value(lp)) => SizeValue::Length(lp.clone()), _ => SizeValue::Auto,
+            });
+            let res = compose_size_value(&get_fb(underlying), &get_fb(kf), mode, allow_kw, eval);
+            let fg = kf.flex_grid_mut();
+            match &res {
+                SizeValue::Length(lp) => { fg.flex_basis = LengthPercentageAuto::Value(lp.clone()); fg.flex_basis_size = None; }
+                SizeValue::Auto => { fg.flex_basis = LengthPercentageAuto::Auto; fg.flex_basis_size = None; }
+                _ => { fg.flex_basis = LengthPercentageAuto::Auto; fg.flex_basis_size = Some(res); }
+            }
         }
         P::ZIndex => if let (ZIndexValue::Integer(u), ZIndexValue::Integer(k)) = (underlying.z_index, kf.z_index) { kf.z_index = ZIndexValue::Integer(u.saturating_add(k)); },
         P::HyphenateLimitLines => if let (Some(u), Some(k)) = (underlying.text.hyphenate_limit_lines, kf.text.hyphenate_limit_lines) { Arc::make_mut(&mut kf.text).hyphenate_limit_lines = Some(u.saturating_add(k).max(1)); },
@@ -732,10 +752,50 @@ fn interpolate_property_into(
             let res = interpolate_size_value(&fs, &ts, p, allow_kw, eval, is_transition).unwrap_or(if use_from_disc { fs } else { ts });
             let fg = target.flex_grid_mut();
             match &res {
-                SizeValue::Length(lp) => { fg.flex_basis = LengthPercentageAuto::Value(lp.clone()); fg.flex_basis_size = None; }
+                SizeValue::Length(lp) => {
+                    let clamped = match lp {
+                        LengthPercentage::Length(v, u) => LengthPercentage::Length(v.max(0.0), *u),
+                        LengthPercentage::Percent(v) => LengthPercentage::Percent(v.max(0.0)),
+                        other => other.clone(),
+                    };
+                    fg.flex_basis = LengthPercentageAuto::Value(clamped);
+                    fg.flex_basis_size = None;
+                }
                 SizeValue::Auto => { fg.flex_basis = LengthPercentageAuto::Auto; fg.flex_basis_size = None; }
                 _ => { fg.flex_basis = LengthPercentageAuto::Auto; fg.flex_basis_size = Some(res); }
             }
+        }
+        P::FlexDirection => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().flex_direction = src.flex_grid.as_ref().map_or_else(Default::default, |f| f.flex_direction);
+        }
+        P::FlexWrap => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().flex_wrap = src.flex_grid.as_ref().map_or_else(Default::default, |f| f.flex_wrap);
+        }
+        P::AlignItems => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().align_items = src.flex_grid.as_ref().map_or_else(Default::default, |f| f.align_items);
+        }
+        P::AlignSelf => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().align_self = src.flex_grid.as_ref().map_or(crate::values::AlignValue::Auto, |f| f.align_self);
+        }
+        P::AlignContent => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().align_content = src.flex_grid.as_ref().map_or_else(Default::default, |f| f.align_content);
+        }
+        P::JustifyContent => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().justify_content = src.flex_grid.as_ref().map_or_else(Default::default, |f| f.justify_content);
+        }
+        P::JustifyItems => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().justify_items = src.flex_grid.as_ref().map_or_else(Default::default, |f| f.justify_items);
+        }
+        P::JustifySelf => {
+            let src = if use_from_disc { from } else { to };
+            target.flex_grid_mut().justify_self = src.flex_grid.as_ref().map_or(crate::values::AlignValue::Auto, |f| f.justify_self);
         }
         _ => {}
     }

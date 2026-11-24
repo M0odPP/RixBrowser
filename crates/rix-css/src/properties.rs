@@ -2445,7 +2445,7 @@ pub fn should_use_values4_parser(prop: PropertyIdKind, raw: &str) -> bool {
         return true;
     }
     if lower.starts_with("fit-content(") {
-        return false;
+        return prop == PropertyIdKind::FlexBasis;
     }
     if prop == PropertyIdKind::BackgroundLayers
         && (lower.starts_with("image-set(")
@@ -2674,6 +2674,31 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
             return Some((
                 PropertyValue::Size(SizeValue::Stretch),
                 "stretch".to_string(),
+            ));
+        }
+        PropertyIdKind::FlexBasis if trimmed.to_ascii_lowercase().starts_with("fit-content(") => {
+            let low = trimmed.to_ascii_lowercase();
+            let inner = low
+                .strip_prefix("fit-content(")
+                .and_then(|s| s.strip_suffix(')'))?
+                .trim();
+            if inner.is_empty() || inner.eq_ignore_ascii_case("auto") {
+                return None;
+            }
+            let pm = parse_math_value(inner, ValueKind::LengthPercentage)?;
+            if !pm.was_math_fn {
+                let v = pm
+                    .node
+                    .eval_scalar(&crate::values::EvalContext::default(), None);
+                if !v.is_finite() || v < 0.0 {
+                    return None;
+                }
+            }
+            let spec_inner = pm.node.serialize_specified(pm.was_math_fn);
+            let lp = LengthPercentage::Calc(Box::new(CalcExpr::Math(Box::new(pm.node))));
+            return Some((
+                PropertyValue::Size(SizeValue::FitContent(Some(lp))),
+                format!("fit-content({spec_inner})"),
             ));
         }
         PropertyIdKind::FlexBasis

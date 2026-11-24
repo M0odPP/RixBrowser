@@ -1127,11 +1127,134 @@ pub enum AlignValue {
     End,
     FlexStart,
     FlexEnd,
+    SelfStart,
+    SelfEnd,
+    Left,
+    Right,
     Center,
     Baseline,
+    LastBaseline,
     SpaceBetween,
     SpaceAround,
     SpaceEvenly,
+    SafeStart,
+    SafeEnd,
+    SafeFlexStart,
+    SafeFlexEnd,
+    SafeSelfStart,
+    SafeSelfEnd,
+    SafeLeft,
+    SafeRight,
+    SafeCenter,
+    UnsafeStart,
+    UnsafeEnd,
+    UnsafeFlexStart,
+    UnsafeFlexEnd,
+    UnsafeSelfStart,
+    UnsafeSelfEnd,
+    UnsafeLeft,
+    UnsafeRight,
+    UnsafeCenter,
+}
+
+impl AlignValue {
+    #[must_use]
+    #[rustfmt::skip]
+    pub const fn with_overflow(self, safe: bool, is_unsafe: bool) -> Self {
+        if safe {
+            match self {
+                Self::Start => Self::SafeStart, Self::End => Self::SafeEnd,
+                Self::FlexStart => Self::SafeFlexStart, Self::FlexEnd => Self::SafeFlexEnd,
+                Self::SelfStart => Self::SafeSelfStart, Self::SelfEnd => Self::SafeSelfEnd,
+                Self::Left => Self::SafeLeft, Self::Right => Self::SafeRight,
+                Self::Center => Self::SafeCenter, other => other,
+            }
+        } else if is_unsafe {
+            match self {
+                Self::Start => Self::UnsafeStart, Self::End => Self::UnsafeEnd,
+                Self::FlexStart => Self::UnsafeFlexStart, Self::FlexEnd => Self::UnsafeFlexEnd,
+                Self::SelfStart => Self::UnsafeSelfStart, Self::SelfEnd => Self::UnsafeSelfEnd,
+                Self::Left => Self::UnsafeLeft, Self::Right => Self::UnsafeRight,
+                Self::Center => Self::UnsafeCenter, other => other,
+            }
+        } else {
+            self
+        }
+    }
+
+    #[must_use]
+    #[rustfmt::skip]
+    pub const fn base(self) -> Self {
+        match self {
+            Self::SafeStart | Self::UnsafeStart => Self::Start,
+            Self::SafeEnd | Self::UnsafeEnd => Self::End,
+            Self::SafeFlexStart | Self::UnsafeFlexStart => Self::FlexStart,
+            Self::SafeFlexEnd | Self::UnsafeFlexEnd => Self::FlexEnd,
+            Self::SafeSelfStart | Self::UnsafeSelfStart => Self::SelfStart,
+            Self::SafeSelfEnd | Self::UnsafeSelfEnd => Self::SelfEnd,
+            Self::SafeLeft | Self::UnsafeLeft => Self::Left,
+            Self::SafeRight | Self::UnsafeRight => Self::Right,
+            Self::SafeCenter | Self::UnsafeCenter => Self::Center,
+            other => other,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_safe(self) -> bool {
+        matches!(
+            self,
+            Self::SafeStart
+                | Self::SafeEnd
+                | Self::SafeFlexStart
+                | Self::SafeFlexEnd
+                | Self::SafeSelfStart
+                | Self::SafeSelfEnd
+                | Self::SafeLeft
+                | Self::SafeRight
+                | Self::SafeCenter
+        )
+    }
+
+    #[must_use]
+    pub const fn is_unsafe(self) -> bool {
+        matches!(
+            self,
+            Self::UnsafeStart
+                | Self::UnsafeEnd
+                | Self::UnsafeFlexStart
+                | Self::UnsafeFlexEnd
+                | Self::UnsafeSelfStart
+                | Self::UnsafeSelfEnd
+                | Self::UnsafeLeft
+                | Self::UnsafeRight
+                | Self::UnsafeCenter
+        )
+    }
+
+    #[must_use]
+    #[rustfmt::skip]
+    pub const fn as_css_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto", Self::Normal => "normal", Self::Stretch => "stretch",
+            Self::Start => "start", Self::End => "end",
+            Self::FlexStart => "flex-start", Self::FlexEnd => "flex-end",
+            Self::SelfStart => "self-start", Self::SelfEnd => "self-end",
+            Self::Left => "left", Self::Right => "right", Self::Center => "center",
+            Self::Baseline => "baseline", Self::LastBaseline => "last baseline",
+            Self::SpaceBetween => "space-between", Self::SpaceAround => "space-around",
+            Self::SpaceEvenly => "space-evenly",
+            Self::SafeStart => "safe start", Self::SafeEnd => "safe end",
+            Self::SafeFlexStart => "safe flex-start", Self::SafeFlexEnd => "safe flex-end",
+            Self::SafeSelfStart => "safe self-start", Self::SafeSelfEnd => "safe self-end",
+            Self::SafeLeft => "safe left", Self::SafeRight => "safe right",
+            Self::SafeCenter => "safe center",
+            Self::UnsafeStart => "unsafe start", Self::UnsafeEnd => "unsafe end",
+            Self::UnsafeFlexStart => "unsafe flex-start", Self::UnsafeFlexEnd => "unsafe flex-end",
+            Self::UnsafeSelfStart => "unsafe self-start", Self::UnsafeSelfEnd => "unsafe self-end",
+            Self::UnsafeLeft => "unsafe left", Self::UnsafeRight => "unsafe right",
+            Self::UnsafeCenter => "unsafe center",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -2114,6 +2237,28 @@ pub fn convert_flex_wrap(fw: &FlexWrap) -> FlexWrapMode {
     }
 }
 
+fn apply_overflow_pos(
+    val: AlignValue,
+    overflow: Option<&lightningcss::properties::align::OverflowPosition>,
+) -> AlignValue {
+    match overflow {
+        Some(lightningcss::properties::align::OverflowPosition::Safe) => {
+            val.with_overflow(true, false)
+        }
+        Some(lightningcss::properties::align::OverflowPosition::Unsafe) => {
+            val.with_overflow(false, true)
+        }
+        None => val,
+    }
+}
+
+fn convert_baseline_pos(bp: &lightningcss::properties::align::BaselinePosition) -> AlignValue {
+    match bp {
+        lightningcss::properties::align::BaselinePosition::Last => AlignValue::LastBaseline,
+        lightningcss::properties::align::BaselinePosition::First => AlignValue::Baseline,
+    }
+}
+
 fn convert_content_position(cp: &ContentPosition) -> AlignValue {
     match cp {
         ContentPosition::Center => AlignValue::Center,
@@ -2136,8 +2281,10 @@ fn convert_content_dist(cd: &ContentDistribution) -> AlignValue {
 fn convert_self_position(sp: &SelfPosition) -> AlignValue {
     match sp {
         SelfPosition::Center => AlignValue::Center,
-        SelfPosition::Start | SelfPosition::SelfStart => AlignValue::Start,
-        SelfPosition::End | SelfPosition::SelfEnd => AlignValue::End,
+        SelfPosition::Start => AlignValue::Start,
+        SelfPosition::SelfStart => AlignValue::SelfStart,
+        SelfPosition::End => AlignValue::End,
+        SelfPosition::SelfEnd => AlignValue::SelfEnd,
         SelfPosition::FlexStart => AlignValue::FlexStart,
         SelfPosition::FlexEnd => AlignValue::FlexEnd,
     }
@@ -2147,9 +2294,11 @@ fn convert_self_position(sp: &SelfPosition) -> AlignValue {
 pub fn convert_align_content(ac: &AlignContent) -> AlignValue {
     match ac {
         AlignContent::Normal => AlignValue::Normal,
-        AlignContent::BaselinePosition(_) => AlignValue::Baseline,
+        AlignContent::BaselinePosition(bp) => convert_baseline_pos(bp),
         AlignContent::ContentDistribution(d) => convert_content_dist(d),
-        AlignContent::ContentPosition { value, .. } => convert_content_position(value),
+        AlignContent::ContentPosition { value, overflow } => {
+            apply_overflow_pos(convert_content_position(value), overflow.as_ref())
+        }
     }
 }
 
@@ -2158,9 +2307,15 @@ pub fn convert_justify_content(jc: &JustifyContent) -> AlignValue {
     match jc {
         JustifyContent::Normal => AlignValue::Normal,
         JustifyContent::ContentDistribution(d) => convert_content_dist(d),
-        JustifyContent::ContentPosition { value, .. } => convert_content_position(value),
-        JustifyContent::Left { .. } => AlignValue::Start,
-        JustifyContent::Right { .. } => AlignValue::End,
+        JustifyContent::ContentPosition { value, overflow } => {
+            apply_overflow_pos(convert_content_position(value), overflow.as_ref())
+        }
+        JustifyContent::Left { overflow } => {
+            apply_overflow_pos(AlignValue::Left, overflow.as_ref())
+        }
+        JustifyContent::Right { overflow } => {
+            apply_overflow_pos(AlignValue::Right, overflow.as_ref())
+        }
     }
 }
 
@@ -2169,8 +2324,10 @@ pub fn convert_align_items(ai: &AlignItems) -> AlignValue {
     match ai {
         AlignItems::Normal => AlignValue::Normal,
         AlignItems::Stretch => AlignValue::Stretch,
-        AlignItems::BaselinePosition(_) => AlignValue::Baseline,
-        AlignItems::SelfPosition { value, .. } => convert_self_position(value),
+        AlignItems::BaselinePosition(bp) => convert_baseline_pos(bp),
+        AlignItems::SelfPosition { value, overflow } => {
+            apply_overflow_pos(convert_self_position(value), overflow.as_ref())
+        }
     }
 }
 
@@ -2180,8 +2337,10 @@ pub fn convert_align_self(as_: &AlignSelf) -> AlignValue {
         AlignSelf::Auto => AlignValue::Auto,
         AlignSelf::Normal => AlignValue::Normal,
         AlignSelf::Stretch => AlignValue::Stretch,
-        AlignSelf::BaselinePosition(_) => AlignValue::Baseline,
-        AlignSelf::SelfPosition { value, .. } => convert_self_position(value),
+        AlignSelf::BaselinePosition(bp) => convert_baseline_pos(bp),
+        AlignSelf::SelfPosition { value, overflow } => {
+            apply_overflow_pos(convert_self_position(value), overflow.as_ref())
+        }
     }
 }
 
@@ -2190,10 +2349,14 @@ pub fn convert_justify_items(ji: &JustifyItems) -> AlignValue {
     match ji {
         JustifyItems::Normal => AlignValue::Normal,
         JustifyItems::Stretch => AlignValue::Stretch,
-        JustifyItems::BaselinePosition(_) => AlignValue::Baseline,
-        JustifyItems::SelfPosition { value, .. } => convert_self_position(value),
-        JustifyItems::Left { .. } => AlignValue::Start,
-        JustifyItems::Right { .. } => AlignValue::End,
+        JustifyItems::BaselinePosition(bp) => convert_baseline_pos(bp),
+        JustifyItems::SelfPosition { value, overflow } => {
+            apply_overflow_pos(convert_self_position(value), overflow.as_ref())
+        }
+        JustifyItems::Left { overflow } => apply_overflow_pos(AlignValue::Left, overflow.as_ref()),
+        JustifyItems::Right { overflow } => {
+            apply_overflow_pos(AlignValue::Right, overflow.as_ref())
+        }
         JustifyItems::Legacy(_) => AlignValue::Normal,
     }
 }
@@ -2204,10 +2367,12 @@ pub fn convert_justify_self(js: &JustifySelf) -> AlignValue {
         JustifySelf::Auto => AlignValue::Auto,
         JustifySelf::Normal => AlignValue::Normal,
         JustifySelf::Stretch => AlignValue::Stretch,
-        JustifySelf::BaselinePosition(_) => AlignValue::Baseline,
-        JustifySelf::SelfPosition { value, .. } => convert_self_position(value),
-        JustifySelf::Left { .. } => AlignValue::Start,
-        JustifySelf::Right { .. } => AlignValue::End,
+        JustifySelf::BaselinePosition(bp) => convert_baseline_pos(bp),
+        JustifySelf::SelfPosition { value, overflow } => {
+            apply_overflow_pos(convert_self_position(value), overflow.as_ref())
+        }
+        JustifySelf::Left { overflow } => apply_overflow_pos(AlignValue::Left, overflow.as_ref()),
+        JustifySelf::Right { overflow } => apply_overflow_pos(AlignValue::Right, overflow.as_ref()),
     }
 }
 
