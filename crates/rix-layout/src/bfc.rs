@@ -343,46 +343,53 @@ pub fn layout_block_box(
     let oof_both_v_insets = b.is_out_of_flow
         && matches!(style.box_model.inset.top, LengthPercentageAuto::Value(_))
         && matches!(style.box_model.inset.bottom, LengthPercentageAuto::Value(_));
-    let definite_height = metrics.specified_height.or_else(|| {
-        if oof_both_v_insets && matches!(style.box_model.height, rix_css::SizeValue::Auto) {
-            space.available_height.map(|ah| {
-                (ah - metrics.margin.vertical() - pb_h)
-                    .max(0.0)
-                    .min(metrics.max_height)
-                    .max(metrics.min_height)
+    let definite_height = if space.ignore_specified_height {
+        None
+    } else {
+        space
+            .definite_height_override
+            .or(metrics.specified_height)
+            .or_else(|| {
+                if oof_both_v_insets && matches!(style.box_model.height, rix_css::SizeValue::Auto) {
+                    space.available_height.map(|ah| {
+                        (ah - metrics.margin.vertical() - pb_h)
+                            .max(0.0)
+                            .min(metrics.max_height)
+                            .max(metrics.min_height)
+                    })
+                } else if resolved_spec_w.is_some()
+                    && matches!(style.box_model.height, rix_css::SizeValue::Auto)
+                {
+                    style
+                        .effects
+                        .as_ref()
+                        .and_then(|e| e.aspect_ratio_math.as_ref())
+                        .and_then(|(num, den)| {
+                            let n = num.eval_scalar(&eval, None);
+                            let d = den.as_ref().map_or(1.0, |x| x.eval_scalar(&eval, None));
+                            let ratio = n / d;
+                            if ratio.is_finite() && ratio > 0.0 {
+                                let box_w = if is_bb {
+                                    content_width + pb_w
+                                } else {
+                                    content_width
+                                };
+                                let box_h = box_w / ratio as f32;
+                                let ch = if is_bb {
+                                    (box_h - pb_h).max(0.0)
+                                } else {
+                                    box_h
+                                };
+                                Some(ch.min(metrics.max_height).max(metrics.min_height).max(0.0))
+                            } else {
+                                None
+                            }
+                        })
+                } else {
+                    None
+                }
             })
-        } else if resolved_spec_w.is_some()
-            && matches!(style.box_model.height, rix_css::SizeValue::Auto)
-        {
-            style
-                .effects
-                .as_ref()
-                .and_then(|e| e.aspect_ratio_math.as_ref())
-                .and_then(|(num, den)| {
-                    let n = num.eval_scalar(&eval, None);
-                    let d = den.as_ref().map_or(1.0, |x| x.eval_scalar(&eval, None));
-                    let ratio = n / d;
-                    if ratio.is_finite() && ratio > 0.0 {
-                        let box_w = if is_bb {
-                            content_width + pb_w
-                        } else {
-                            content_width
-                        };
-                        let box_h = box_w / ratio as f32;
-                        let ch = if is_bb {
-                            (box_h - pb_h).max(0.0)
-                        } else {
-                            box_h
-                        };
-                        Some(ch.min(metrics.max_height).max(metrics.min_height).max(0.0))
-                    } else {
-                        None
-                    }
-                })
-        } else {
-            None
-        }
-    });
+    };
     let child_space = space.with_available(content_width, definite_height);
 
     let children_ids = ctx.tree.get(box_id).children.clone();
@@ -439,6 +446,7 @@ pub fn layout_block_box(
                     box_id: cid,
                     static_pos: Point::new(content_origin_x, static_y),
                     is_fixed: child_box.style.position == PositionMode::Fixed,
+                    flex_hint: None,
                 });
                 continue;
             }
@@ -637,7 +645,11 @@ pub fn layout_block_box(
         )
         .unwrap_or(content_height)
     });
-    let final_content_height = raw_content_h.min(eff_max_h).max(eff_min_h).max(0.0);
+    let final_content_height = if space.ignore_specified_height {
+        content_height.max(0.0)
+    } else {
+        raw_content_h.min(eff_max_h).max(eff_min_h).max(0.0)
+    };
     let border_w = content_width + pb_w;
     let border_h = final_content_height + pb_h;
 
@@ -660,12 +672,87 @@ pub fn layout_block_box(
         &mut placed_children,
     );
 
-    let first_baseline = placed_children.iter().find_map(|c| {
-        if c.is_out_of_flow || c.is_float {
-            return None;
-        }
-        c.baseline.map(|b_y| c.border_rect.origin.y + b_y)
-    });
+    let is_vert_wm = style.text.writing_mode != rix_css::WritingMode::HorizontalTb;
+    let is_scroll_box = style.overflow.x != rix_css::OverflowMode::Visible
+        || style.overflow.y != rix_css::OverflowMode::Visible;
+    let (first_baseline, last_baseline) = if is_vert_wm {
+        let bs_pb = if style.text.writing_mode == rix_css::WritingMode::VerticalRl {
+            metrics.border.right + metrics.padding.right
+        } else {
+            metrics.border.left + metrics.padding.left
+        };
+        let fb = placed_children.iter().find_map(|c| {
+            if c.is_out_of_flow || c.is_float {
+                return None;
+            }
+            if c.style.text.writing_mode != rix_css::WritingMode::HorizontalTb
+                && !c.children.is_empty()
+            {
+                let child_bs = if style.text.writing_mode == rix_css::WritingMode::VerticalRl {
+                    border_w - (c.border_rect.origin.x + c.border_rect.size.width)
+                } else {
+                    c.border_rect.origin.x
+                };
+                c.baseline.map(|b| child_bs + b)
+            } else {
+                Some(bs_pb + c.border_rect.size.width * 0.5)
+            }
+        });
+        let lb = placed_children.iter().rev().find_map(|c| {
+            if c.is_out_of_flow || c.is_float {
+                return None;
+            }
+            if c.style.text.writing_mode != rix_css::WritingMode::HorizontalTb
+                && !c.children.is_empty()
+            {
+                let child_bs = if style.text.writing_mode == rix_css::WritingMode::VerticalRl {
+                    border_w - (c.border_rect.origin.x + c.border_rect.size.width)
+                } else {
+                    c.border_rect.origin.x
+                };
+                c.last_baseline.or(c.baseline).map(|b| child_bs + b)
+            } else {
+                Some(bs_pb + c.border_rect.size.width * 0.5)
+            }
+        });
+        let clamp_v = |v: f32| {
+            if is_scroll_box {
+                v.clamp(0.0, border_w)
+            } else {
+                v
+            }
+        };
+        (
+            Some(clamp_v(fb.unwrap_or(border_w * 0.5))),
+            Some(clamp_v(lb.or(fb).unwrap_or(border_w * 0.5))),
+        )
+    } else {
+        let fb = placed_children.iter().find_map(|c| {
+            if c.is_out_of_flow || c.is_float {
+                return None;
+            }
+            c.baseline.map(|b_y| c.border_rect.origin.y + b_y)
+        });
+        let lb = placed_children.iter().rev().find_map(|c| {
+            if c.is_out_of_flow || c.is_float {
+                return None;
+            }
+            c.last_baseline
+                .or(c.baseline)
+                .map(|b_y| c.border_rect.origin.y + b_y)
+        });
+        let clamp_h = |v: f32| {
+            if is_scroll_box {
+                v.clamp(0.0, border_h)
+            } else {
+                v
+            }
+        };
+        (
+            Some(clamp_h(fb.unwrap_or(border_h))),
+            Some(clamp_h(lb.or(fb).unwrap_or(border_h))),
+        )
+    };
 
     let mut fragment = Fragment {
         box_id,
@@ -681,7 +768,8 @@ pub fn layout_block_box(
             content_width,
             final_content_height,
         ),
-        baseline: first_baseline.or(Some(border_h)),
+        baseline: first_baseline,
+        last_baseline,
         overflow_rect: Rect::new(0.0, 0.0, border_w, border_h),
         kind: FragmentKind::Box,
         children: Arc::new(placed_children),

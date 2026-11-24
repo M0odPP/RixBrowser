@@ -61,6 +61,14 @@ pub struct ConstraintSpace {
     pub containing_block_height: f32,
     pub viewport_size: Size,
     pub root_font_size_px: f32,
+    /// Optional forced definite content height imposed by a parent formatting context
+    /// (e.g. stretched or flexed height on a CSS Flex item per Flexbox L1 §9.8).
+    /// Cleared by [`Self::with_available`] so it applies only to the direct child box.
+    pub definite_height_override: Option<f32>,
+    /// When `true`, measures raw intrinsic content height of the direct child box ignoring
+    /// its own `height`/`min-height`/`max-height` (used for `flex-basis: min-content|max-content|content`
+    /// and automatic minimum height probing in column flex containers). Cleared by [`Self::with_available`].
+    pub ignore_specified_height: bool,
 }
 
 impl ConstraintSpace {
@@ -73,6 +81,8 @@ impl ConstraintSpace {
             containing_block_height: viewport.height,
             viewport_size: viewport,
             root_font_size_px: 16.0,
+            definite_height_override: None,
+            ignore_specified_height: false,
         }
     }
 
@@ -110,6 +120,8 @@ impl ConstraintSpace {
             containing_block_height: height.unwrap_or(self.containing_block_height).max(0.0),
             viewport_size: self.viewport_size,
             root_font_size_px: self.root_font_size_px,
+            definite_height_override: None,
+            ignore_specified_height: false,
         }
     }
 }
@@ -423,6 +435,7 @@ pub struct Fragment {
     pub margin: EdgeInsets,
     pub content_rect: Rect,
     pub baseline: Option<f32>,
+    pub last_baseline: Option<f32>,
     pub overflow_rect: Rect,
     pub kind: FragmentKind,
     pub children: Arc<Vec<Fragment>>,
@@ -664,7 +677,7 @@ pub struct LayoutContext<'a> {
     pub shaper: TextShaper<'a>,
     pub cache: &'a mut LayoutCache,
     /// Per-pass memo for `measure_intrinsic_widths` eliminating exponential recursion in nested Flex/Grid/Tables.
-    pub(crate) pass_intrinsic_memo: HashMap<(BoxId, u32), (f32, f32)>,
+    pub(crate) pass_intrinsic_memo: HashMap<(BoxId, u32, u32), (f32, f32)>,
     /// Per-pass memo for `layout_box` keyed by `(box_id, avail_w_q, avail_h_q)` (active even on initial dirty passes!).
     pub(crate) pass_fragment_memo: HashMap<(BoxId, u32, u32), Fragment>,
     /// Out-of-flow (`position: absolute | fixed`) boxes propagating upward to their true CSS containing block.
@@ -843,7 +856,9 @@ pub fn layout_box(ctx: &mut LayoutContext<'_>, box_id: BoxId, space: ConstraintS
     let b = ctx.tree.get(box_id);
     // Only reuse cached fragments for boxes that establish an independent formatting context
     // or have no incoming external floats (BFC roots, Flex, Grid, Table, Replaced).
-    let cacheable = b.establishes_bfc || matches!(b.kind, BoxKind::Block { .. } | BoxKind::Table);
+    let cacheable = space.definite_height_override.is_none()
+        && !space.ignore_specified_height
+        && (b.establishes_bfc || matches!(b.kind, BoxKind::Block { .. } | BoxKind::Table));
     let pass_key = (
         box_id,
         LayoutContext::quantize_px(space.available_width),
@@ -863,10 +878,16 @@ pub fn layout_box(ctx: &mut LayoutContext<'_>, box_id: BoxId, space: ConstraintS
         BoxKind::Replaced(replaced) => layout_replaced(b, replaced, space),
         BoxKind::Table | BoxKind::AnonymousTable => layout_table(ctx, box_id, space),
         BoxKind::Block {
-            formatting_context: FormattingContextKind::Flex | FormattingContextKind::Grid,
+            formatting_context: FormattingContextKind::Flex,
         }
         | BoxKind::InlineBlock {
-            formatting_context: FormattingContextKind::Flex | FormattingContextKind::Grid,
+            formatting_context: FormattingContextKind::Flex,
+        } => crate::flex::layout_flex_container(ctx, box_id, space),
+        BoxKind::Block {
+            formatting_context: FormattingContextKind::Grid,
+        }
+        | BoxKind::InlineBlock {
+            formatting_context: FormattingContextKind::Grid,
         } => layout_flex_grid_container(ctx, box_id, space),
         BoxKind::InlineBlock {
             formatting_context: FormattingContextKind::Table,
@@ -894,7 +915,11 @@ pub fn measure_intrinsic_widths(
     box_id: BoxId,
     space: ConstraintSpace,
 ) -> (f32, f32) {
-    let memo_key = (box_id, LayoutContext::quantize_px(space.available_width));
+    let memo_key = (
+        box_id,
+        LayoutContext::quantize_px(space.available_width),
+        LayoutContext::quantize_opt_px(space.available_height),
+    );
     if let Some(&hit) = ctx.pass_intrinsic_memo.get(&memo_key) {
         return hit;
     }
@@ -972,14 +997,30 @@ pub(crate) fn measure_content_intrinsic_widths(
         if has_block {
             let mut min_w = 0.0f32;
             let mut max_w = 0.0f32;
+            let mut float_run_max = 0.0f32;
             for &cid in &b.children {
-                if ctx.tree.get(cid).is_out_of_flow {
+                let cbox = ctx.tree.get(cid);
+                if cbox.is_out_of_flow {
                     continue;
                 }
-                let cm = BoxMetrics::resolve(&ctx.tree.get(cid).style, &space);
+                let is_float = cbox.is_float;
+                let has_clear = cbox.style.clear_mode != rix_css::ClearMode::None;
+                let cm = BoxMetrics::resolve(&cbox.style, &space);
                 let (cmin, cmax) = measure_intrinsic_widths(ctx, cid, space);
-                min_w = min_w.max(cmin + cm.margin.horizontal());
-                max_w = max_w.max(cmax + cm.margin.horizontal());
+                let item_min = cmin + cm.margin.horizontal();
+                let item_max = cmax + cm.margin.horizontal();
+                min_w = min_w.max(item_min);
+                if is_float {
+                    if has_clear {
+                        float_run_max = item_max;
+                    } else {
+                        float_run_max += item_max;
+                    }
+                    max_w = max_w.max(float_run_max);
+                } else {
+                    float_run_max = 0.0;
+                    max_w = max_w.max(item_max);
+                }
             }
             (min_w, max_w)
         } else {
@@ -1023,6 +1064,12 @@ fn measure_intrinsic_widths_uncached(
         BoxKind::Table | BoxKind::AnonymousTable => {
             crate::table::measure_table_intrinsic_widths(ctx, box_id, space)
         }
+        BoxKind::Block {
+            formatting_context: FormattingContextKind::Flex,
+        }
+        | BoxKind::InlineBlock {
+            formatting_context: FormattingContextKind::Flex,
+        } => crate::flex::measure_flex_intrinsic_widths(ctx, box_id, space),
         _ => {
             let (content_min, content_max) = measure_content_intrinsic_widths(ctx, box_id, space);
             let b = ctx.tree.get(box_id);
@@ -1251,6 +1298,7 @@ pub fn layout_replaced(
             content_h,
         ),
         baseline,
+        last_baseline: baseline,
         overflow_rect: Rect::new(0.0, 0.0, border_w, border_h),
         kind,
         children: Arc::new(Vec::new()),

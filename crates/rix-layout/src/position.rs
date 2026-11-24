@@ -31,6 +31,8 @@ pub struct PendingOof {
     /// Hypothetical static position relative to the current ancestor's border-box origin.
     pub static_pos: Point,
     pub is_fixed: bool,
+    /// Optional CSS Flexbox L1 §4.1 static-position alignment hint when direct child of a flex container.
+    pub flex_hint: Option<crate::flex::FlexAbsposHint>,
 }
 
 /// Containing block geometry passed to [`layout_out_of_flow_box`].
@@ -74,6 +76,10 @@ pub fn offset_pending_oof(pending: &mut [PendingOof], start_idx: usize, dx: f32,
     for entry in &mut pending[start_idx..] {
         entry.static_pos.x += dx;
         entry.static_pos.y += dy;
+        if let Some(ref mut fh) = entry.flex_hint {
+            fh.content_rect.origin.x += dx;
+            fh.content_rect.origin.y += dy;
+        }
     }
 }
 
@@ -152,7 +158,7 @@ enum ResolvedAlign {
 /// Maps CSS `AlignValue` to physical start/end/center/stretch along a physical axis,
 /// accounting for whether the logical start edge corresponds to the physical max edge (`flipped`).
 fn resolve_axis_align(val: AlignValue, flipped: bool) -> (ResolvedAlign, bool) {
-    match val {
+    match val.base() {
         AlignValue::Auto | AlignValue::Normal => (
             if flipped {
                 ResolvedAlign::End
@@ -162,7 +168,7 @@ fn resolve_axis_align(val: AlignValue, flipped: bool) -> (ResolvedAlign, bool) {
             true,
         ),
         AlignValue::Stretch => (ResolvedAlign::Stretch, true),
-        AlignValue::Start | AlignValue::FlexStart => (
+        AlignValue::Start | AlignValue::FlexStart | AlignValue::SelfStart => (
             if flipped {
                 ResolvedAlign::End
             } else {
@@ -170,7 +176,7 @@ fn resolve_axis_align(val: AlignValue, flipped: bool) -> (ResolvedAlign, bool) {
             },
             false,
         ),
-        AlignValue::End | AlignValue::FlexEnd => (
+        AlignValue::End | AlignValue::FlexEnd | AlignValue::SelfEnd => (
             if flipped {
                 ResolvedAlign::Start
             } else {
@@ -178,6 +184,8 @@ fn resolve_axis_align(val: AlignValue, flipped: bool) -> (ResolvedAlign, bool) {
             },
             false,
         ),
+        AlignValue::Left => (ResolvedAlign::Start, false),
+        AlignValue::Right => (ResolvedAlign::End, false),
         AlignValue::Center => (ResolvedAlign::Center, false),
         _ => (
             if flipped {
@@ -518,8 +526,46 @@ pub fn layout_out_of_flow_box(
         frag.content_rect.size.height = ch;
     }
 
+    // CSS Flexbox L1 §4.1: If this out-of-flow box is a direct child of a flex container,
+    // refine its static position using its laid-out outer margin-box size and the flex container's
+    // content box + `justify-content` / `align-self` alignment!
+    let mut final_imcb_x = imcb_x;
+    let mut final_imcb_y = imcb_y;
+    if let Some(fh) = entry.flex_hint {
+        let ml_stat = if m_left_auto {
+            0.0
+        } else {
+            metrics.margin.left
+        };
+        let mr_stat = if m_right_auto {
+            0.0
+        } else {
+            metrics.margin.right
+        };
+        let mt_stat = if m_top_auto { 0.0 } else { metrics.margin.top };
+        let mb_stat = if m_bottom_auto {
+            0.0
+        } else {
+            metrics.margin.bottom
+        };
+        let outer_w = frag.border_rect.size.width + ml_stat + mr_stat;
+        let outer_h = frag.border_rect.size.height + mt_stat + mb_stat;
+        let flex_static = fh.compute_static_pos(
+            outer_w,
+            outer_h,
+            style.text.writing_mode,
+            style.text.direction,
+        );
+        if matches!(final_imcb_x.anchor, AxisAnchor::Static(_)) {
+            final_imcb_x.anchor = AxisAnchor::Static(flex_static.x - cb.rect.origin.x);
+        }
+        if matches!(final_imcb_y.anchor, AxisAnchor::Static(_)) {
+            final_imcb_y.anchor = AxisAnchor::Static(flex_static.y - cb.rect.origin.y);
+        }
+    }
+
     let (x_rel, ml, mr) = solve_axis_position(
-        imcb_x,
+        final_imcb_x,
         frag.border_rect.size.width,
         m_left_auto,
         m_right_auto,
@@ -530,7 +576,7 @@ pub fn layout_out_of_flow_box(
         x_flipped,
     );
     let (y_rel, mt, mb) = solve_axis_position(
-        imcb_y,
+        final_imcb_y,
         frag.border_rect.size.height,
         m_top_auto,
         m_bottom_auto,

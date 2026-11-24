@@ -289,6 +289,7 @@ pub fn layout_ifc(
                         content_origin.y + cursor_y,
                     ),
                     is_fixed,
+                    flex_hint: None,
                 });
             }
             InlineItem::HardBreak => {
@@ -583,6 +584,7 @@ pub fn layout_ifc(
             margin: EdgeInsets::ZERO,
             content_rect: Rect::new(0.0, 0.0, line.width, line.height),
             baseline: Some(line.baseline),
+            last_baseline: Some(line.baseline),
             overflow_rect: Rect::new(0.0, 0.0, line.width, line.height),
             kind: FragmentKind::LineBox {
                 baseline: line.baseline,
@@ -796,6 +798,7 @@ fn finish_line(
                     margin: EdgeInsets::ZERO,
                     content_rect: Rect::new(0.0, 0.0, piece.width, piece.height),
                     baseline: Some(local_baseline),
+                    last_baseline: Some(local_baseline),
                     overflow_rect: Rect::new(0.0, 0.0, piece.width, piece.height),
                     kind: FragmentKind::TextRun(run),
                     children: Arc::new(Vec::new()),
@@ -858,6 +861,7 @@ fn finish_line(
                 (span.max_y - span.min_y).max(0.0),
             ),
             baseline: Some(baseline - by),
+            last_baseline: Some(baseline - by),
             overflow_rect: Rect::new(0.0, 0.0, bw, bh),
             kind: FragmentKind::InlineBox {
                 is_first,
