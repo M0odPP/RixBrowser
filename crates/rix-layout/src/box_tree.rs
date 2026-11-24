@@ -1244,7 +1244,11 @@ impl<'a> BoxTreeBuilder<'a> {
     }
 
     fn is_whitespace_only(&self, id: BoxId) -> bool {
-        matches!(&self.tree.get(id).kind, BoxKind::Text(t) if t.trim().is_empty())
+        matches!(
+            &self.tree.get(id).kind,
+            BoxKind::Text(t)
+                if t.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C))
+        )
     }
 
     fn alloc_anonymous(

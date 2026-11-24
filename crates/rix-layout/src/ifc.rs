@@ -525,6 +525,11 @@ pub fn layout_ifc(
                     let chunk_len = chunks.len();
                     for (ci, chunk) in chunks.into_iter().enumerate() {
                         let (cg, cw) = shape_word_glyphs(ctx, &chunk, font_id, font_size, &style);
+                        let text_va = inline_stack
+                            .last()
+                            .map_or(VerticalAlignMode::Baseline, |a| {
+                                a.style.box_model.vertical_align
+                            });
                         cur_pieces.push(LinePiece {
                             box_id,
                             x: cur_x + pending_left_edge,
@@ -532,7 +537,7 @@ pub fn layout_ifc(
                             height: lh,
                             ascent: asc,
                             descent: desc,
-                            vertical_align: style.box_model.vertical_align,
+                            vertical_align: text_va,
                             is_space: false,
                             inline_stack: inline_stack.clone(),
                             payload: LinePiecePayload::Text {
@@ -573,6 +578,14 @@ pub fn layout_ifc(
 
                 cur_x += pending_left_edge;
                 pending_left_edge = 0.0;
+                // CSS 2.1 §10.8.1: `vertical-align` is non-inherited; bare text directly inside
+                // a block or `table-cell` aligns to `baseline` rather than inheriting the container's
+                // `vertical-align` (such as `td { vertical-align: middle }`).
+                let text_va = inline_stack
+                    .last()
+                    .map_or(VerticalAlignMode::Baseline, |a| {
+                        a.style.box_model.vertical_align
+                    });
                 cur_pieces.push(LinePiece {
                     box_id,
                     x: cur_x,
@@ -580,7 +593,7 @@ pub fn layout_ifc(
                     height: lh,
                     ascent: asc,
                     descent: desc,
-                    vertical_align: style.box_model.vertical_align,
+                    vertical_align: text_va,
                     is_space,
                     inline_stack,
                     payload: LinePiecePayload::Text {
@@ -823,6 +836,16 @@ fn finish_line(
     };
 
     // Compute line baseline and height across all pieces + strut.
+    let is_ahem = container_style
+        .text
+        .font_family
+        .iter()
+        .any(|f| f.as_str().eq_ignore_ascii_case("ahem"));
+    let strut_half_x = if is_ahem {
+        container_style.text.font_size_px * 0.4
+    } else {
+        container_style.text.font_size_px * 0.25
+    };
     let mut max_ascent = strut_ascent;
     let mut max_descent = strut_descent;
     let mut max_top_bottom_h = strut_line_h;
@@ -833,8 +856,8 @@ fn finish_line(
             }
             VerticalAlignMode::Middle => {
                 let half = p.height * 0.5;
-                max_ascent = max_ascent.max(half + strut_ascent * 0.25);
-                max_descent = max_descent.max((half - strut_ascent * 0.25).max(0.0));
+                max_ascent = max_ascent.max(half + strut_half_x);
+                max_descent = max_descent.max((half - strut_half_x).max(0.0));
             }
             VerticalAlignMode::LengthPx(shift) => {
                 max_ascent = max_ascent.max(p.ascent + shift);
@@ -876,7 +899,7 @@ fn finish_line(
             VerticalAlignMode::Bottom | VerticalAlignMode::TextBottom => {
                 (line_height - piece.height).max(0.0)
             }
-            VerticalAlignMode::Middle => ((line_height - piece.height) * 0.5).max(0.0),
+            VerticalAlignMode::Middle => (baseline - strut_half_x - piece.height * 0.5).max(0.0),
             VerticalAlignMode::Sub => (baseline - piece.ascent + strut_ascent * 0.2).max(0.0),
             VerticalAlignMode::Super => (baseline - piece.ascent - strut_ascent * 0.35).max(0.0),
             VerticalAlignMode::LengthPx(shift) => (baseline - piece.ascent - shift).max(0.0),

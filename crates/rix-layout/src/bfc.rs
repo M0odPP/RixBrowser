@@ -788,14 +788,24 @@ pub fn layout_block_box(
             Some(clamp_v(lb.or(fb).unwrap_or(border_w * 0.5))),
         )
     } else {
+        // CSS Tables L3 / `baseline-table.html`: a block-level `table` or anonymous table
+        // inside an `inline-block` does not contribute a baseline to the enclosing `inline-block`.
+        let self_is_inline_block = matches!(ctx.tree.get(box_id).kind, BoxKind::InlineBlock { .. });
+        let skip_for_ib = |c: &Fragment| -> bool {
+            self_is_inline_block
+                && matches!(
+                    ctx.tree.get(c.box_id).kind,
+                    BoxKind::Table | BoxKind::AnonymousTable
+                )
+        };
         let fb = placed_children.iter().find_map(|c| {
-            if c.is_out_of_flow || c.is_float {
+            if c.is_out_of_flow || c.is_float || skip_for_ib(c) {
                 return None;
             }
             c.baseline.map(|b_y| c.border_rect.origin.y + b_y)
         });
         let lb = placed_children.iter().rev().find_map(|c| {
-            if c.is_out_of_flow || c.is_float {
+            if c.is_out_of_flow || c.is_float || skip_for_ib(c) {
                 return None;
             }
             c.last_baseline
