@@ -167,6 +167,36 @@ pub fn install_cssom(vm: &mut JsVm, host: &SharedHost) {
     install_style_element_sheet_accessor(vm, host);
     install_document_stylesheets(vm, host);
     install_get_computed_style(vm, host);
+    install_web_animations_and_typed_om(vm, host);
+    install_document_fonts(vm, host);
+}
+
+fn install_document_fonts(vm: &mut JsVm, host: &SharedHost) {
+    let dp = host.borrow().prototypes.document_proto;
+    let g_fonts = vm.alloc_host_fn("get fonts", move |vm, _, _| {
+        let fonts_obj = vm.alloc_ordinary_object();
+        let ready_p = alloc_promise(vm);
+        resolve_promise(vm, ready_p, JsValue::from_object(fonts_obj));
+        let k_ready = vm.heap.intern_key("ready");
+        vm.heap.object_define_data(
+            fonts_obj,
+            k_ready,
+            JsValue::from_object(ready_p),
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+        let k_status = vm.heap.intern_key("status");
+        let loaded_s = vm.heap.alloc_string("loaded".to_string());
+        vm.heap.object_define_data(
+            fonts_obj,
+            k_status,
+            JsValue::from_string(loaded_s),
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+        Ok(JsValue::from_object(fonts_obj))
+    });
+    define_host_accessor(vm, dp, "fonts", Some(g_fonts), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -2781,6 +2811,8 @@ fn format_size_opts(s: &SizeValue, eval: &EvalContext, nonneg: bool) -> String {
         SizeValue::MaxContent => "max-content".into(),
         SizeValue::FitContent(_) => "fit-content".into(),
         SizeValue::Stretch => "stretch".into(),
+        SizeValue::Content => "content".into(),
+        SizeValue::CalcSize(cs) => cs.serialize_computed(eval),
         SizeValue::Length(lp) => format_lp_opts(lp, eval, nonneg),
     }
 }
@@ -3343,10 +3375,46 @@ fn format_computed_property_resolved(
                 .unwrap_or_else(|| format_px(lb.padding.left.max(0.0)))
             },
         ),
-        "top" => format_lpa(&style.box_model.inset.top, &eval),
-        "right" => format_lpa(&style.box_model.inset.right, &eval),
-        "bottom" => format_lpa(&style.box_model.inset.bottom, &eval),
-        "left" => format_lpa(&style.box_model.inset.left, &eval),
+        "top" => match (&style.box_model.inset.top, layout_box) {
+            (LengthPercentageAuto::Value(lp), Some(lb))
+                if style.position != PositionMode::Static =>
+            {
+                format_lp_used(lp, &eval, false, lb.parent_content_size.height).unwrap_or_else(
+                    || format_px(lp.resolve_px(lb.parent_content_size.height, &eval)),
+                )
+            }
+            (v, _) => format_lpa(v, &eval),
+        },
+        "right" => match (&style.box_model.inset.right, layout_box) {
+            (LengthPercentageAuto::Value(lp), Some(lb))
+                if style.position != PositionMode::Static =>
+            {
+                format_lp_used(lp, &eval, false, lb.parent_content_size.width).unwrap_or_else(
+                    || format_px(lp.resolve_px(lb.parent_content_size.width, &eval)),
+                )
+            }
+            (v, _) => format_lpa(v, &eval),
+        },
+        "bottom" => match (&style.box_model.inset.bottom, layout_box) {
+            (LengthPercentageAuto::Value(lp), Some(lb))
+                if style.position != PositionMode::Static =>
+            {
+                format_lp_used(lp, &eval, false, lb.parent_content_size.height).unwrap_or_else(
+                    || format_px(lp.resolve_px(lb.parent_content_size.height, &eval)),
+                )
+            }
+            (v, _) => format_lpa(v, &eval),
+        },
+        "left" => match (&style.box_model.inset.left, layout_box) {
+            (LengthPercentageAuto::Value(lp), Some(lb))
+                if style.position != PositionMode::Static =>
+            {
+                format_lp_used(lp, &eval, false, lb.parent_content_size.width).unwrap_or_else(
+                    || format_px(lp.resolve_px(lb.parent_content_size.width, &eval)),
+                )
+            }
+            (v, _) => format_lpa(v, &eval),
+        },
         "border-top-width" => format_px(style.box_model.border_width.top),
         "border-right-width" => format_px(style.box_model.border_width.right),
         "border-bottom-width" => format_px(style.box_model.border_width.bottom),
@@ -3497,10 +3565,15 @@ fn format_computed_property_resolved(
         .into(),
         "flex-grow" => format_num(style.flex_grid.as_ref().map_or(0.0, |f| f.flex_grow)),
         "flex-shrink" => format_num(style.flex_grid.as_ref().map_or(1.0, |f| f.flex_shrink)),
-        "flex-basis" => style
-            .flex_grid
-            .as_ref()
-            .map_or_else(|| "auto".into(), |f| format_lpa(&f.flex_basis, &eval)),
+        "flex-basis" => style.flex_grid.as_ref().map_or_else(
+            || "auto".into(),
+            |f| {
+                f.flex_basis_size.as_ref().map_or_else(
+                    || format_lpa(&f.flex_basis, &eval),
+                    |s| format_size_opts(s, &eval, true),
+                )
+            },
+        ),
         "order" => style.flex_grid.as_ref().map_or(0, |f| f.order).to_string(),
         "align-items" => format_align(
             style
@@ -3584,6 +3657,34 @@ fn format_computed_property_resolved(
             "normal"
         }
         .into(),
+        "interpolate-size" => match style.text.interpolate_size {
+            rix_css::InterpolateSizeMode::NumericOnly => "numeric-only",
+            rix_css::InterpolateSizeMode::AllowKeywords => "allow-keywords",
+        }
+        .into(),
+        "transition-behavior" => match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
+            Some(list) if !list.is_empty() => list
+                .iter()
+                .map(|t| match t.behavior {
+                    rix_css::TransitionBehaviorMode::Normal => "normal",
+                    rix_css::TransitionBehaviorMode::AllowDiscrete => "allow-discrete",
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => "normal".into(),
+        },
+        "animation-composition" => match style.effects.as_ref().map(|e| e.animations.as_slice()) {
+            Some(list) if !list.is_empty() => list
+                .iter()
+                .map(|a| match a.composition {
+                    rix_css::AnimationCompositionMode::Replace => "replace",
+                    rix_css::AnimationCompositionMode::Add => "add",
+                    rix_css::AnimationCompositionMode::Accumulate => "accumulate",
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => "replace".into(),
+        },
         "transition-property" => match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
             Some(list) if !list.is_empty() => list
                 .iter()
@@ -3797,12 +3898,13 @@ fn format_computed_property_resolved(
                         rix_css::TimingFunction::EaseOut => "ease-out".to_string(),
                         rix_css::TimingFunction::EaseInOut => "ease-in-out".to_string(),
                         rix_css::TimingFunction::CubicBezier(a, b, c, d) => {
+                            use rix_css::values_math::format_math_f64;
                             format!(
                                 "cubic-bezier({}, {}, {}, {})",
-                                format_num(a),
-                                format_num(b),
-                                format_num(c),
-                                format_num(d)
+                                format_math_f64(a),
+                                format_math_f64(b),
+                                format_math_f64(c),
+                                format_math_f64(d)
                             )
                         }
                         rix_css::TimingFunction::Steps(n, start) => {
@@ -3875,4 +3977,286 @@ fn format_transform_ops_matrix(ops: &[rix_css::TransformOp], eval: &EvalContext)
         format_math_f64(clean(m[2])), format_math_f64(clean(m[3])),
         format_math_f64(clean(m[4])), format_math_f64(clean(m[5])),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Web Animations Level 1 (`Element.prototype.animate`) & CSS Typed OM (`computedStyleMap`)
+// ---------------------------------------------------------------------------
+
+fn install_web_animations_and_typed_om(vm: &mut JsVm, host: &SharedHost) {
+    let elem_proto = host.borrow().prototypes.element_proto;
+    let h_anim = Rc::clone(host);
+    define_host_method(vm, elem_proto, "animate", move |vm, this, args| {
+        let node = require_node(vm, &h_anim, this)?;
+        let mut spec = parse_js_animation_options(vm, arg(args, 1));
+        spec.keyframes = parse_js_keyframes(vm, arg(args, 0));
+        let anim_id = h_anim.borrow_mut().add_web_animation(node, spec.clone());
+        Ok(JsValue::from_object(create_js_animation_handle(
+            vm, &h_anim, node, anim_id, spec,
+        )))
+    });
+    let h_map = Rc::clone(host);
+    define_host_method(vm, elem_proto, "computedStyleMap", move |vm, this, _| {
+        let node = require_node(vm, &h_map, this)?;
+        let map_obj = vm.alloc_ordinary_object();
+        let h_get = Rc::clone(&h_map);
+        define_host_method(vm, map_obj, "get", move |vm, _, args| {
+            let prop = vm.value_to_rust_string(arg(args, 0));
+            let (style, pfg) = {
+                let mut h = h_get.borrow_mut();
+                (
+                    h.computed_style_for_node(node),
+                    h.parent_is_flex_or_grid(node),
+                )
+            };
+            let Some(style) = style else {
+                return Ok(JsValue::null());
+            };
+            let val_str = format_computed_property_resolved(&style, &prop, None, pfg);
+            if val_str.is_empty() {
+                return Ok(JsValue::null());
+            }
+            let css_val = vm.alloc_ordinary_object();
+            define_host_method(vm, css_val, "toString", move |vm, _, _| {
+                Ok(JsValue::from_string(vm.heap.alloc_string(val_str.clone())))
+            });
+            Ok(JsValue::from_object(css_val))
+        });
+        Ok(JsValue::from_object(map_obj))
+    });
+}
+
+fn parse_js_composite(s: &str) -> Option<rix_css::AnimationCompositionMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "replace" => Some(rix_css::AnimationCompositionMode::Replace),
+        "add" => Some(rix_css::AnimationCompositionMode::Add),
+        "accumulate" => Some(rix_css::AnimationCompositionMode::Accumulate),
+        _ => None,
+    }
+}
+
+fn js_keyframe_prop_to_css(key: &str) -> String {
+    match key {
+        k if k.starts_with("--") => k.to_string(),
+        "cssFloat" => "float".to_string(),
+        "cssOffset" => "offset".to_string(),
+        other => camel_to_kebab(other),
+    }
+}
+
+fn read_js_array_elems(vm: &mut JsVm, obj_h: HeapHandle) -> Option<Vec<JsValue>> {
+    let k_len = vm.heap.intern_key("length");
+    let len_v = vm.get_property_by_key(obj_h, k_len).ok()?;
+    if len_v.is_undefined() {
+        return None;
+    }
+    let len = (len_v.to_number_f64().unwrap_or(0.0).max(0.0) as usize).min(64);
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let ki = vm.heap.intern_key(&i.to_string());
+        if let Ok(iv) = vm.get_property_by_key(obj_h, ki) {
+            out.push(iv);
+        }
+    }
+    Some(out)
+}
+
+fn parse_js_keyframes(vm: &mut JsVm, val: JsValue) -> Vec<rix_css::WebAnimationKeyframe> {
+    let Some(obj_h) = val.as_object() else {
+        return Vec::new();
+    };
+    if let Some(items) = read_js_array_elems(vm, obj_h) {
+        return items
+            .into_iter()
+            .filter_map(|iv| iv.as_object().map(|h| parse_single_js_keyframe(vm, h)))
+            .collect();
+    }
+    let mut cols: Vec<(String, Vec<String>)> = Vec::new();
+    let mut max_n = 0usize;
+    for k in vm.own_enumerable_keys_including_elements(obj_h) {
+        if matches!(k.as_str(), "offset" | "easing" | "composite") {
+            continue;
+        }
+        let pk = vm.heap.intern_key(&k);
+        let Ok(v) = vm.get_property_by_key(obj_h, pk) else {
+            continue;
+        };
+        let vals: Vec<String> = v
+            .as_object()
+            .and_then(|vh| read_js_array_elems(vm, vh))
+            .map(|xs| xs.into_iter().map(|e| vm.value_to_rust_string(e)).collect())
+            .unwrap_or_else(|| {
+                if v.is_undefined() {
+                    Vec::new()
+                } else {
+                    vec![vm.value_to_rust_string(v)]
+                }
+            });
+        max_n = max_n.max(vals.len());
+        cols.push((js_keyframe_prop_to_css(&k), vals));
+    }
+    (0..max_n)
+        .map(|idx| {
+            let (mut declarations, mut missing) = (Vec::new(), Vec::new());
+            for (prop, vals) in &cols {
+                if let Some(vs) = vals.get(idx) {
+                    declarations.extend(rix_css::parse_inline_style(
+                        &format!("{prop}: {vs}"),
+                        &mut missing,
+                    ));
+                }
+            }
+            rix_css::WebAnimationKeyframe {
+                offset: None,
+                composite: None,
+                easing: None,
+                declarations,
+            }
+        })
+        .collect()
+}
+
+fn parse_single_js_keyframe(vm: &mut JsVm, item_h: HeapHandle) -> rix_css::WebAnimationKeyframe {
+    let (mut offset, mut composite, mut easing) = (None, None, None);
+    let (mut declarations, mut missing) = (Vec::new(), Vec::new());
+    for k in vm.own_enumerable_keys_including_elements(item_h) {
+        let pk = vm.heap.intern_key(&k);
+        let Ok(v) = vm.get_property_by_key(item_h, pk) else {
+            continue;
+        };
+        if v.is_undefined() || v.is_null() {
+            continue;
+        }
+        match k.as_str() {
+            "offset" => {
+                offset = v
+                    .to_number_f64()
+                    .filter(|n| n.is_finite())
+                    .map(|n| n as f32)
+            }
+            "composite" => composite = parse_js_composite(&vm.value_to_rust_string(v)),
+            "easing" => {
+                let s = vm.value_to_rust_string(v);
+                easing = rix_css::parse_single_timing_function(&s).map(|(tf, _)| tf);
+            }
+            other => {
+                let val_str = vm.value_to_rust_string(v);
+                if !val_str.is_empty() {
+                    let css_prop = js_keyframe_prop_to_css(other);
+                    declarations.extend(rix_css::parse_inline_style(
+                        &format!("{css_prop}: {val_str}"),
+                        &mut missing,
+                    ));
+                }
+            }
+        }
+    }
+    rix_css::WebAnimationKeyframe {
+        offset,
+        composite,
+        easing,
+        declarations,
+    }
+}
+
+#[rustfmt::skip]
+fn parse_js_animation_options(vm: &mut JsVm, opts_val: JsValue) -> rix_css::WebAnimationSpec {
+    let mut spec = rix_css::WebAnimationSpec {
+        id: 0, keyframes: Vec::new(), duration_ms: 0.0, delay_ms: 0.0,
+        timing: rix_css::TimingFunction::Linear, iteration_count: 1.0,
+        direction: rix_css::AnimationDirectionMode::Normal,
+        fill_mode: rix_css::AnimationFillModeKind::None,
+        play_state: rix_css::AnimationPlayStateMode::Running,
+        composite: rix_css::AnimationCompositionMode::Replace,
+        current_time_ms: Some(0.0), cancelled: false,
+    };
+    if let Some(n) = opts_val.to_number_f64() {
+        if n.is_finite() && n >= 0.0 { spec.duration_ms = n as f32; }
+        return spec;
+    }
+    let Some(oh) = opts_val.as_object() else { return spec; };
+    let get = |vm: &mut JsVm, name: &str| {
+        let k = vm.heap.intern_key(name);
+        vm.get_property_by_key(oh, k).ok().filter(|v| !v.is_undefined() && !v.is_null())
+    };
+    if let Some(n) = get(vm, "duration").and_then(|v| v.to_number_f64()).filter(|n| n.is_finite() && *n >= 0.0) { spec.duration_ms = n as f32; }
+    if let Some(n) = get(vm, "delay").and_then(|v| v.to_number_f64()).filter(|n| n.is_finite()) { spec.delay_ms = n as f32; }
+    if let Some(n) = get(vm, "iterations").and_then(|v| v.to_number_f64()).filter(|n| *n >= 0.0) { spec.iteration_count = n as f32; }
+    if let Some(v) = get(vm, "easing") {
+        if let Some((tf, _)) = rix_css::parse_single_timing_function(&vm.value_to_rust_string(v)) { spec.timing = tf; }
+    }
+    if let Some(v) = get(vm, "fill") {
+        spec.fill_mode = match vm.value_to_rust_string(v).to_ascii_lowercase().as_str() {
+            "forwards" => rix_css::AnimationFillModeKind::Forwards,
+            "backwards" => rix_css::AnimationFillModeKind::Backwards,
+            "both" => rix_css::AnimationFillModeKind::Both,
+            _ => rix_css::AnimationFillModeKind::None,
+        };
+    }
+    if let Some(v) = get(vm, "direction") {
+        spec.direction = match vm.value_to_rust_string(v).to_ascii_lowercase().as_str() {
+            "reverse" => rix_css::AnimationDirectionMode::Reverse,
+            "alternate" => rix_css::AnimationDirectionMode::Alternate,
+            "alternate-reverse" => rix_css::AnimationDirectionMode::AlternateReverse,
+            _ => rix_css::AnimationDirectionMode::Normal,
+        };
+    }
+    if let Some(v) = get(vm, "composite") {
+        if let Some(c) = parse_js_composite(&vm.value_to_rust_string(v)) { spec.composite = c; }
+    }
+    spec
+}
+
+#[rustfmt::skip]
+fn create_js_animation_handle(
+    vm: &mut JsVm, host: &SharedHost, node: NodeId, anim_id: u64, initial: rix_css::WebAnimationSpec,
+) -> HeapHandle {
+    let anim_obj = vm.alloc_ordinary_object();
+    let state = Rc::new(RefCell::new((
+        initial.current_time_ms.unwrap_or(0.0), initial.play_state,
+        initial.cancelled, initial.duration_ms, initial.iteration_count,
+    )));
+    let (h1, s1) = (Rc::clone(host), Rc::clone(&state));
+    define_host_method(vm, anim_obj, "pause", move |_, _, _| {
+        s1.borrow_mut().1 = rix_css::AnimationPlayStateMode::Paused;
+        h1.borrow_mut().update_web_animation(node, anim_id, |a| a.play_state = rix_css::AnimationPlayStateMode::Paused);
+        Ok(JsValue::undefined())
+    });
+    let (h2, s2) = (Rc::clone(host), Rc::clone(&state));
+    define_host_method(vm, anim_obj, "play", move |_, _, _| {
+        { let mut st = s2.borrow_mut(); st.1 = rix_css::AnimationPlayStateMode::Running; st.2 = false; }
+        h2.borrow_mut().update_web_animation(node, anim_id, |a| { a.play_state = rix_css::AnimationPlayStateMode::Running; a.cancelled = false; });
+        Ok(JsValue::undefined())
+    });
+    let (h3, s3) = (Rc::clone(host), Rc::clone(&state));
+    define_host_method(vm, anim_obj, "cancel", move |_, _, _| {
+        s3.borrow_mut().2 = true;
+        h3.borrow_mut().update_web_animation(node, anim_id, |a| a.cancelled = true);
+        Ok(JsValue::undefined())
+    });
+    let (h4, s4) = (Rc::clone(host), Rc::clone(&state));
+    define_host_method(vm, anim_obj, "finish", move |_, _, _| {
+        let t = { let mut st = s4.borrow_mut(); let t = if st.4.is_finite() { st.3 * st.4 } else { st.3 }; st.0 = t; t };
+        h4.borrow_mut().update_web_animation(node, anim_id, |a| a.current_time_ms = Some(t));
+        Ok(JsValue::undefined())
+    });
+    let s_get = Rc::clone(&state);
+    let g_ct = vm.alloc_host_fn("get currentTime", move |_, _, _| Ok(JsValue::from_f64(f64::from(s_get.borrow().0))));
+    let (h_set, s_set) = (Rc::clone(host), Rc::clone(&state));
+    let s_ct = vm.alloc_host_fn("set currentTime", move |_, _, args| {
+        if let Some(n) = arg(args, 0).to_number_f64().filter(|n| n.is_finite()) {
+            s_set.borrow_mut().0 = n as f32;
+            h_set.borrow_mut().update_web_animation(node, anim_id, |a| a.current_time_ms = Some(n as f32));
+        }
+        Ok(JsValue::undefined())
+    });
+    define_host_accessor(vm, anim_obj, "currentTime", Some(g_ct), Some(s_ct));
+    let s_ps = Rc::clone(&state);
+    let g_ps = vm.alloc_host_fn("get playState", move |vm, _, _| {
+        let st = s_ps.borrow();
+        let label = if st.2 { "idle" } else if st.1 == rix_css::AnimationPlayStateMode::Paused { "paused" } else { "running" };
+        Ok(JsValue::from_string(vm.heap.alloc_string(label.to_string())))
+    });
+    define_host_accessor(vm, anim_obj, "playState", Some(g_ps), None);
+    anim_obj
 }

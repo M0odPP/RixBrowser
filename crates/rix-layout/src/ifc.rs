@@ -140,18 +140,21 @@ pub fn measure_ifc_min_max_content(
     let mut min_w = 0.0f32;
     let mut max_w = 0.0f32;
     let mut current_line_w = 0.0f32;
-    let mut inline_edge_extra = 0.0f32;
+    let mut pending_space_w = 0.0f32;
+    let mut seen_non_space = false;
 
     for item in &items {
         match item {
             InlineItem::PushInline(info) => {
                 let left = info.border.left + info.padding.left + info.margin.left;
-                current_line_w += left;
-                inline_edge_extra += left;
+                if left > 0.0 {
+                    current_line_w += pending_space_w + left;
+                    pending_space_w = 0.0;
+                    seen_non_space = true;
+                    max_w = max_w.max(current_line_w);
+                }
             }
-            InlineItem::PopInline(_) => {
-                // Right edge accounted for in max-content below via stack or word tracking.
-            }
+            InlineItem::PopInline(_) => {}
             InlineItem::Word {
                 text,
                 style,
@@ -161,27 +164,36 @@ pub fn measure_ifc_min_max_content(
                 let font_id = ctx.resolve_font(style);
                 let font_size = style.text.font_size_px.max(1.0);
                 let w = measure_shaped_width(ctx, text, font_id, font_size, style);
-                if !is_space {
+                if *is_space {
+                    if seen_non_space {
+                        pending_space_w += w;
+                    }
+                } else {
                     min_w = min_w.max(w);
+                    current_line_w += pending_space_w + w;
+                    pending_space_w = 0.0;
+                    seen_non_space = true;
+                    max_w = max_w.max(current_line_w);
                 }
-                current_line_w += w;
-                max_w = max_w.max(current_line_w);
             }
             InlineItem::HardBreak => {
                 max_w = max_w.max(current_line_w);
                 current_line_w = 0.0;
+                pending_space_w = 0.0;
+                seen_non_space = false;
             }
             InlineItem::Atomic { box_id, .. } => {
                 let b = ctx.tree.get(*box_id);
                 let m = BoxMetrics::resolve(&b.style, &space);
                 let (cmin, cmax) = measure_intrinsic_widths(ctx, *box_id, space);
                 min_w = min_w.max(cmin + m.margin.horizontal());
-                current_line_w += cmax + m.margin.horizontal();
+                current_line_w += pending_space_w + cmax + m.margin.horizontal();
+                pending_space_w = 0.0;
+                seen_non_space = true;
                 max_w = max_w.max(current_line_w);
             }
         }
     }
-    let _ = inline_edge_extra;
     (min_w, max_w.max(min_w))
 }
 

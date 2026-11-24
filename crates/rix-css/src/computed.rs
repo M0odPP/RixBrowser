@@ -14,17 +14,18 @@ use crate::properties::{
 };
 use crate::stylesheet::{CascadeOrigin, CompiledRule, LayerId, MediaContext, RegisteredProperty};
 use crate::values::{
-    AlignValue, AnimationDirectionMode, AnimationFillModeKind, AnimationPlayStateMode,
-    AnimationSpec, BackgroundLayerValue, BorderCollapseMode, BoxShadowValue, BoxSizingMode,
-    CaptionSideMode, ClearMode, ClipPathValue, ColorRgba, CornerRadii, CssColor, CursorKind,
-    DirectionMode, DisplayMode, EdgeValues, EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode,
-    FloatMode, FontStyleMode, GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue,
-    GridTrackSize, LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle,
-    MixBlendMode, OverflowMode, OverflowPair, OverflowWrapMode, OverscrollBehaviorMode,
-    PointerEventsMode, PositionMode, ResizeMode, SizeValue, TableLayoutMode, TextAlignMode,
-    TextDecorationLine, TextOverflowMode, TextTransformMode, TimingFunction, TransformOp,
-    TransformOrigin, TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode,
-    WhiteSpaceMode, WordBreakMode, WritingMode, ZIndexValue,
+    AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
+    AnimationPlayStateMode, AnimationSpec, BackgroundLayerValue, BorderCollapseMode,
+    BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue, ColorRgba,
+    CornerRadii, CssColor, CursorKind, DirectionMode, DisplayMode, EdgeValues, EvalContext,
+    FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
+    GridPlacementValue, GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode,
+    LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
+    OverflowPair, OverflowWrapMode, OverscrollBehaviorMode, PointerEventsMode, PositionMode,
+    ResizeMode, SizeValue, TableLayoutMode, TextAlignMode, TextDecorationLine, TextOverflowMode,
+    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode,
+    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
+    WordBreakMode, WritingMode, ZIndexValue,
 };
 
 const MAX_VAR_DEPTH: u8 = 64;
@@ -161,6 +162,7 @@ pub struct InheritedTextStyle {
     pub widows: i32,
     pub tab_size_num: f32,
     pub tab_size_len: Option<LengthPercentage>,
+    pub interpolate_size: InterpolateSizeMode,
     /// Full CSS Values L4/L5 evaluation context snapshot for this element (`em`/`rem`/`lh`/`rlh`/viewport/container/sibling).
     pub eval_ctx: EvalContext,
 }
@@ -191,6 +193,7 @@ impl Default for InheritedTextStyle {
             widows: 2,
             tab_size_num: 8.0,
             tab_size_len: None,
+            interpolate_size: InterpolateSizeMode::NumericOnly,
             eval_ctx: EvalContext::default(),
         }
     }
@@ -227,6 +230,7 @@ pub struct FlexGridStyle {
     pub flex_grow: f32,
     pub flex_shrink: f32,
     pub flex_basis: LengthPercentageAuto,
+    pub flex_basis_size: Option<SizeValue>,
     pub order: i32,
     pub align_items: AlignValue,
     pub align_self: AlignValue,
@@ -256,6 +260,7 @@ impl Default for FlexGridStyle {
             flex_grow: 0.0,
             flex_shrink: 1.0,
             flex_basis: LengthPercentageAuto::Auto,
+            flex_basis_size: None,
             order: 0,
             align_items: AlignValue::Normal,
             align_self: AlignValue::Auto,
@@ -448,14 +453,14 @@ impl ComputedStyle {
         }
     }
 
-    fn flex_grid_mut(&mut self) -> &mut FlexGridStyle {
+    pub(crate) fn flex_grid_mut(&mut self) -> &mut FlexGridStyle {
         let arc = self
             .flex_grid
             .get_or_insert_with(|| Arc::new(FlexGridStyle::default()));
         Arc::make_mut(arc)
     }
 
-    fn effects_mut(&mut self) -> &mut EffectsStyle {
+    pub(crate) fn effects_mut(&mut self) -> &mut EffectsStyle {
         let arc = self
             .effects
             .get_or_insert_with(|| Arc::new(EffectsStyle::default()));
@@ -2353,7 +2358,17 @@ pub fn apply_declaration(
             style.flex_grid_mut().flex_shrink = v.max(0.0);
         }
         (PropertyIdKind::FlexBasis, PropertyValue::LengthAuto(v)) => {
-            style.flex_grid_mut().flex_basis = v.clone();
+            let fg = style.flex_grid_mut();
+            fg.flex_basis = v.clone();
+            fg.flex_basis_size = None;
+        }
+        (PropertyIdKind::FlexBasis, PropertyValue::Size(v)) => {
+            let fg = style.flex_grid_mut();
+            fg.flex_basis_size = Some(v.clone());
+            fg.flex_basis = match v {
+                SizeValue::Length(lp) => LengthPercentageAuto::Value(lp.clone()),
+                _ => LengthPercentageAuto::Auto,
+            };
         }
         (PropertyIdKind::Order, PropertyValue::Integer(v)) => {
             style.flex_grid_mut().order = *v;
@@ -2576,19 +2591,67 @@ pub fn apply_declaration(
             }
         }
         (PropertyIdKind::TransitionDelay, PropertyValue::MathVal(n)) => {
-            style.effects_mut().transition_delay_math = Some((**n).clone());
+            let ms = (n.eval_scalar(eval, None) * 1000.0) as f32;
+            let eff = style.effects_mut();
+            eff.transition_delay_math = Some((**n).clone());
+            if eff.transitions.is_empty() {
+                eff.transitions.push(default_transition_spec());
+            }
+            if ms.is_finite() {
+                for slot in &mut eff.transitions {
+                    slot.delay_ms = ms;
+                }
+            }
         }
         (PropertyIdKind::TransitionDuration, PropertyValue::MathVal(n)) => {
-            style.effects_mut().transition_duration_math = Some((**n).clone());
+            let ms = (n.eval_scalar(eval, None) * 1000.0).max(0.0) as f32;
+            let eff = style.effects_mut();
+            eff.transition_duration_math = Some((**n).clone());
+            if eff.transitions.is_empty() {
+                eff.transitions.push(default_transition_spec());
+            }
+            if ms.is_finite() {
+                for slot in &mut eff.transitions {
+                    slot.duration_ms = ms;
+                }
+            }
         }
         (PropertyIdKind::AnimationDelay, PropertyValue::MathVal(n)) => {
-            style.effects_mut().animation_delay_math = Some((**n).clone());
+            let ms = (n.eval_scalar(eval, None) * 1000.0) as f32;
+            let eff = style.effects_mut();
+            eff.animation_delay_math = Some((**n).clone());
+            if eff.animations.is_empty() {
+                eff.animations.push(default_animation_spec());
+            }
+            if ms.is_finite() {
+                for slot in &mut eff.animations {
+                    slot.delay_ms = ms;
+                }
+            }
         }
         (PropertyIdKind::AnimationDuration, PropertyValue::MathVal(n)) => {
-            style.effects_mut().animation_duration_math = Some((**n).clone());
+            let ms = (n.eval_scalar(eval, None) * 1000.0).max(0.0) as f32;
+            let eff = style.effects_mut();
+            eff.animation_duration_math = Some((**n).clone());
+            if eff.animations.is_empty() {
+                eff.animations.push(default_animation_spec());
+            }
+            if ms.is_finite() {
+                for slot in &mut eff.animations {
+                    slot.duration_ms = ms;
+                }
+            }
         }
         (PropertyIdKind::AnimationIterationCount, PropertyValue::MathVal(n)) => {
-            style.effects_mut().animation_iteration_count_math = Some((**n).clone());
+            let cnt = n.eval_scalar(eval, None).max(0.0) as f32;
+            let eff = style.effects_mut();
+            eff.animation_iteration_count_math = Some((**n).clone());
+            if eff.animations.is_empty() {
+                eff.animations.push(default_animation_spec());
+            }
+            for slot in &mut eff.animations {
+                slot.iteration_count = cnt;
+            }
         }
         (PropertyIdKind::TransformOrigin, PropertyValue::TransformOrigin(v)) => {
             style.effects_mut().transform_origin = v.clone();
@@ -2602,18 +2665,18 @@ pub fn apply_declaration(
         (PropertyIdKind::MixBlendMode, PropertyValue::MixBlendMode(v)) => {
             style.effects_mut().mix_blend_mode = *v;
         }
+        (PropertyIdKind::InterpolateSize, PropertyValue::InterpolateSize(mode)) => {
+            Arc::make_mut(&mut style.text).interpolate_size = *mode;
+        }
         (PropertyIdKind::Transition, PropertyValue::Transitions(v)) => {
             style.effects_mut().transitions = v.clone();
         }
         (PropertyIdKind::TransitionProperty, PropertyValue::NameList(names)) => {
             let trs = &mut style.effects_mut().transitions;
             if trs.len() < names.len() {
-                trs.resize_with(names.len(), || TransitionSpec {
-                    property: rix_core::intern_str("all"),
-                    duration_ms: 0.0,
-                    delay_ms: 0.0,
-                    timing: TimingFunction::Ease,
-                });
+                trs.resize_with(names.len(), default_transition_spec);
+            } else if !names.is_empty() && trs.len() > names.len() {
+                trs.truncate(names.len());
             }
             for (slot, name) in trs.iter_mut().zip(names.iter()) {
                 slot.property = name.clone();
@@ -2624,12 +2687,7 @@ pub fn apply_declaration(
             eff.transition_duration_math = None;
             let trs = &mut eff.transitions;
             if trs.is_empty() && !ms.is_empty() {
-                trs.resize_with(ms.len(), || TransitionSpec {
-                    property: rix_core::intern_str("all"),
-                    duration_ms: 0.0,
-                    delay_ms: 0.0,
-                    timing: TimingFunction::Ease,
-                });
+                trs.resize_with(ms.len(), default_transition_spec);
             }
             for (i, slot) in trs.iter_mut().enumerate() {
                 if !ms.is_empty() {
@@ -2642,12 +2700,7 @@ pub fn apply_declaration(
             eff.transition_delay_math = None;
             let trs = &mut eff.transitions;
             if trs.is_empty() && !ms.is_empty() {
-                trs.resize_with(ms.len(), || TransitionSpec {
-                    property: rix_core::intern_str("all"),
-                    duration_ms: 0.0,
-                    delay_ms: 0.0,
-                    timing: TimingFunction::Ease,
-                });
+                trs.resize_with(ms.len(), default_transition_spec);
             }
             for (i, slot) in trs.iter_mut().enumerate() {
                 if !ms.is_empty() {
@@ -2657,9 +2710,23 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::TransitionTimingFunction, PropertyValue::TimingList(fns)) => {
             let trs = &mut style.effects_mut().transitions;
+            if trs.is_empty() && !fns.is_empty() {
+                trs.resize_with(fns.len(), default_transition_spec);
+            }
             for (i, slot) in trs.iter_mut().enumerate() {
                 if !fns.is_empty() {
                     slot.timing = fns[i % fns.len()];
+                }
+            }
+        }
+        (PropertyIdKind::TransitionBehavior, PropertyValue::TransitionBehaviorList(modes)) => {
+            let trs = &mut style.effects_mut().transitions;
+            if trs.is_empty() && !modes.is_empty() {
+                trs.resize_with(modes.len(), default_transition_spec);
+            }
+            for (i, slot) in trs.iter_mut().enumerate() {
+                if !modes.is_empty() {
+                    slot.behavior = modes[i % modes.len()];
                 }
             }
         }
@@ -2668,16 +2735,11 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::AnimationName, PropertyValue::NameList(names)) => {
             let anims = &mut style.effects_mut().animations;
-            anims.resize_with(names.len(), || AnimationSpec {
-                name: rix_core::intern_str("none"),
-                duration_ms: 0.0,
-                delay_ms: 0.0,
-                timing: TimingFunction::Ease,
-                iteration_count: 1.0,
-                direction: AnimationDirectionMode::Normal,
-                fill_mode: AnimationFillModeKind::None,
-                play_state: AnimationPlayStateMode::Running,
-            });
+            if anims.len() < names.len() {
+                anims.resize_with(names.len(), default_animation_spec);
+            } else if !names.is_empty() && anims.len() > names.len() {
+                anims.truncate(names.len());
+            }
             for (slot, name) in anims.iter_mut().zip(names.iter()) {
                 slot.name = name.clone();
             }
@@ -2687,16 +2749,7 @@ pub fn apply_declaration(
             eff.animation_duration_math = None;
             let anims = &mut eff.animations;
             if anims.is_empty() && !ms.is_empty() {
-                anims.resize_with(ms.len(), || AnimationSpec {
-                    name: rix_core::intern_str("none"),
-                    duration_ms: 0.0,
-                    delay_ms: 0.0,
-                    timing: TimingFunction::Ease,
-                    iteration_count: 1.0,
-                    direction: AnimationDirectionMode::Normal,
-                    fill_mode: AnimationFillModeKind::None,
-                    play_state: AnimationPlayStateMode::Running,
-                });
+                anims.resize_with(ms.len(), default_animation_spec);
             }
             for (i, slot) in anims.iter_mut().enumerate() {
                 if !ms.is_empty() {
@@ -2709,16 +2762,7 @@ pub fn apply_declaration(
             eff.animation_delay_math = None;
             let anims = &mut eff.animations;
             if anims.is_empty() && !ms.is_empty() {
-                anims.resize_with(ms.len(), || AnimationSpec {
-                    name: rix_core::intern_str("none"),
-                    duration_ms: 0.0,
-                    delay_ms: 0.0,
-                    timing: TimingFunction::Ease,
-                    iteration_count: 1.0,
-                    direction: AnimationDirectionMode::Normal,
-                    fill_mode: AnimationFillModeKind::None,
-                    play_state: AnimationPlayStateMode::Running,
-                });
+                anims.resize_with(ms.len(), default_animation_spec);
             }
             for (i, slot) in anims.iter_mut().enumerate() {
                 if !ms.is_empty() {
@@ -2728,6 +2772,9 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::AnimationTimingFunction, PropertyValue::TimingList(fns)) => {
             let anims = &mut style.effects_mut().animations;
+            if anims.is_empty() && !fns.is_empty() {
+                anims.resize_with(fns.len(), default_animation_spec);
+            }
             for (i, slot) in anims.iter_mut().enumerate() {
                 if !fns.is_empty() {
                     slot.timing = fns[i % fns.len()];
@@ -2739,16 +2786,7 @@ pub fn apply_declaration(
             eff.animation_iteration_count_math = None;
             let anims = &mut eff.animations;
             if anims.is_empty() && !vals.is_empty() {
-                anims.resize_with(vals.len(), || AnimationSpec {
-                    name: rix_core::intern_str("none"),
-                    duration_ms: 0.0,
-                    delay_ms: 0.0,
-                    timing: TimingFunction::Ease,
-                    iteration_count: 1.0,
-                    direction: AnimationDirectionMode::Normal,
-                    fill_mode: AnimationFillModeKind::None,
-                    play_state: AnimationPlayStateMode::Running,
-                });
+                anims.resize_with(vals.len(), default_animation_spec);
             }
             for (i, slot) in anims.iter_mut().enumerate() {
                 if !vals.is_empty() {
@@ -2758,6 +2796,9 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::AnimationDirection, PropertyValue::DirectionList(dirs)) => {
             let anims = &mut style.effects_mut().animations;
+            if anims.is_empty() && !dirs.is_empty() {
+                anims.resize_with(dirs.len(), default_animation_spec);
+            }
             for (i, slot) in anims.iter_mut().enumerate() {
                 if !dirs.is_empty() {
                     slot.direction = dirs[i % dirs.len()];
@@ -2766,6 +2807,9 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::AnimationFillMode, PropertyValue::FillModeList(fills)) => {
             let anims = &mut style.effects_mut().animations;
+            if anims.is_empty() && !fills.is_empty() {
+                anims.resize_with(fills.len(), default_animation_spec);
+            }
             for (i, slot) in anims.iter_mut().enumerate() {
                 if !fills.is_empty() {
                     slot.fill_mode = fills[i % fills.len()];
@@ -2774,9 +2818,23 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::AnimationPlayState, PropertyValue::PlayStateList(states)) => {
             let anims = &mut style.effects_mut().animations;
+            if anims.is_empty() && !states.is_empty() {
+                anims.resize_with(states.len(), default_animation_spec);
+            }
             for (i, slot) in anims.iter_mut().enumerate() {
                 if !states.is_empty() {
                     slot.play_state = states[i % states.len()];
+                }
+            }
+        }
+        (PropertyIdKind::AnimationComposition, PropertyValue::AnimationCompositionList(modes)) => {
+            let anims = &mut style.effects_mut().animations;
+            if anims.is_empty() && !modes.is_empty() {
+                anims.resize_with(modes.len(), default_animation_spec);
+            }
+            for (i, slot) in anims.iter_mut().enumerate() {
+                if !modes.is_empty() {
+                    slot.composition = modes[i % modes.len()];
                 }
             }
         }
@@ -2876,6 +2934,9 @@ fn copy_property_from_parent(
         }
         PropertyIdKind::CaptionSide => {
             Arc::make_mut(&mut style.text).caption_side = parent.text.caption_side;
+        }
+        PropertyIdKind::InterpolateSize => {
+            Arc::make_mut(&mut style.text).interpolate_size = parent.text.interpolate_size;
         }
         PropertyIdKind::Resize => {
             Arc::make_mut(&mut style.visual).resize = parent.visual.resize;
@@ -3223,6 +3284,24 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
                 LengthPercentage::Percent(0.0),
             );
         }
+        PropertyIdKind::InterpolateSize => {
+            Arc::make_mut(&mut style.text).interpolate_size = InterpolateSizeMode::NumericOnly;
+        }
+        PropertyIdKind::TransitionBehavior => {
+            for tr in &mut style.effects_mut().transitions {
+                tr.behavior = TransitionBehaviorMode::Normal;
+            }
+        }
+        PropertyIdKind::AnimationComposition => {
+            for a in &mut style.effects_mut().animations {
+                a.composition = AnimationCompositionMode::Replace;
+            }
+        }
+        PropertyIdKind::FlexBasis => {
+            let fg = style.flex_grid_mut();
+            fg.flex_basis = LengthPercentageAuto::Auto;
+            fg.flex_basis_size = None;
+        }
         PropertyIdKind::TransitionDelay => style.effects_mut().transition_delay_math = None,
         PropertyIdKind::TransitionDuration => style.effects_mut().transition_duration_math = None,
         PropertyIdKind::AnimationDelay => style.effects_mut().animation_delay_math = None,
@@ -3239,5 +3318,29 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         }
         PropertyIdKind::ColumnCount => Arc::make_mut(&mut style.box_model).column_count = None,
         _ => {}
+    }
+}
+
+fn default_transition_spec() -> TransitionSpec {
+    TransitionSpec {
+        property: rix_core::intern_str("all"),
+        duration_ms: 0.0,
+        delay_ms: 0.0,
+        timing: TimingFunction::Ease,
+        behavior: TransitionBehaviorMode::Normal,
+    }
+}
+
+fn default_animation_spec() -> AnimationSpec {
+    AnimationSpec {
+        name: rix_core::intern_str("none"),
+        duration_ms: 0.0,
+        delay_ms: 0.0,
+        timing: TimingFunction::Ease,
+        iteration_count: 1.0,
+        direction: AnimationDirectionMode::Normal,
+        fill_mode: AnimationFillModeKind::None,
+        play_state: AnimationPlayStateMode::Running,
+        composition: AnimationCompositionMode::Replace,
     }
 }

@@ -33,17 +33,18 @@ use crate::values::{
     convert_text_decoration_line, convert_text_transform, convert_track_size, convert_track_sizing,
     convert_transform, convert_transform_origin, convert_transition, convert_user_select,
     convert_visibility, convert_white_space, convert_word_break, convert_z_index, time_to_ms,
-    AlignValue, AnimationDirectionMode, AnimationFillModeKind, AnimationPlayStateMode,
-    AnimationSpec, BackgroundImageValue, BackgroundLayerValue, BorderCollapseMode, BoxShadowValue,
-    BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue, CornerRadius, CssColor, CursorKind,
-    DirectionMode, DisplayMode, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode,
-    FontStyleMode, GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
-    LengthPercentage, LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, MixBlendMode,
-    OverflowMode, OverflowWrapMode, OverscrollBehaviorMode, PointerEventsMode, PositionMode,
-    ResizeMode, SizeValue, TableLayoutMode, TextAlignMode, TextDecorationLine, TextOverflowMode,
-    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionSpec,
-    UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode,
-    ZIndexValue,
+    AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
+    AnimationPlayStateMode, AnimationSpec, BackgroundImageValue, BackgroundLayerValue,
+    BorderCollapseMode, BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue,
+    CornerRadius, CssColor, CursorKind, DirectionMode, DisplayMode, FilterOp, FlexDirectionMode,
+    FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode, GridPlacementValue,
+    GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode, LengthPercentage,
+    LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
+    OverflowWrapMode, OverscrollBehaviorMode, PointerEventsMode, PositionMode, ResizeMode,
+    SizeValue, TableLayoutMode, TextAlignMode, TextDecorationLine, TextOverflowMode,
+    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode,
+    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
+    WordBreakMode, WritingMode, ZIndexValue,
 };
 
 /// Category of an unsupported CSS feature recorded during compilation.
@@ -448,6 +449,7 @@ pub enum PropertyIdKind {
     TransitionDuration,
     TransitionDelay,
     TransitionTimingFunction,
+    TransitionBehavior,
     Animation,
     AnimationName,
     AnimationDuration,
@@ -457,6 +459,8 @@ pub enum PropertyIdKind {
     AnimationDirection,
     AnimationFillMode,
     AnimationPlayState,
+    AnimationComposition,
+    InterpolateSize,
     // Typography
     FontSize,
     FontWeight,
@@ -739,6 +743,7 @@ impl PropertyIdKind {
             "transition-duration" => Self::TransitionDuration,
             "transition-delay" => Self::TransitionDelay,
             "transition-timing-function" => Self::TransitionTimingFunction,
+            "transition-behavior" => Self::TransitionBehavior,
             "animation" => Self::Animation,
             "animation-name" => Self::AnimationName,
             "animation-duration" => Self::AnimationDuration,
@@ -748,6 +753,8 @@ impl PropertyIdKind {
             "animation-direction" => Self::AnimationDirection,
             "animation-fill-mode" => Self::AnimationFillMode,
             "animation-play-state" => Self::AnimationPlayState,
+            "animation-composition" => Self::AnimationComposition,
+            "interpolate-size" => Self::InterpolateSize,
             "font-size" => Self::FontSize,
             "font-weight" => Self::FontWeight,
             "font-style" => Self::FontStyle,
@@ -900,6 +907,7 @@ impl PropertyIdKind {
             Self::TransitionDuration => "transition-duration",
             Self::TransitionDelay => "transition-delay",
             Self::TransitionTimingFunction => "transition-timing-function",
+            Self::TransitionBehavior => "transition-behavior",
             Self::Animation => "animation",
             Self::AnimationName => "animation-name",
             Self::AnimationDuration => "animation-duration",
@@ -909,6 +917,8 @@ impl PropertyIdKind {
             Self::AnimationDirection => "animation-direction",
             Self::AnimationFillMode => "animation-fill-mode",
             Self::AnimationPlayState => "animation-play-state",
+            Self::AnimationComposition => "animation-composition",
+            Self::InterpolateSize => "interpolate-size",
             Self::FontSize => "font-size",
             Self::FontWeight => "font-weight",
             Self::FontStyle => "font-style",
@@ -1073,6 +1083,7 @@ impl PropertyIdKind {
                 | Self::Orphans
                 | Self::Widows
                 | Self::TabSize
+                | Self::InterpolateSize
                 | Self::BorderCollapse
                 | Self::BorderSpacing
                 | Self::Custom
@@ -1247,6 +1258,23 @@ impl PropertyIdKind {
             Self::TextDecoration => {
                 SmallVec::from_slice(&[Self::TextDecorationLine, Self::TextDecorationColor])
             }
+            Self::Transition => SmallVec::from_slice(&[
+                Self::TransitionProperty,
+                Self::TransitionDuration,
+                Self::TransitionTimingFunction,
+                Self::TransitionDelay,
+                Self::TransitionBehavior,
+            ]),
+            Self::Animation => SmallVec::from_slice(&[
+                Self::AnimationName,
+                Self::AnimationDuration,
+                Self::AnimationTimingFunction,
+                Self::AnimationDelay,
+                Self::AnimationIterationCount,
+                Self::AnimationDirection,
+                Self::AnimationFillMode,
+                Self::AnimationPlayState,
+            ]),
             other => {
                 let mut v = SmallVec::new();
                 v.push(other);
@@ -1262,6 +1290,7 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "align-content",
     "align-items",
     "align-self",
+    "animation-composition",
     "animation-delay",
     "animation-direction",
     "animation-duration",
@@ -1350,6 +1379,7 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "inset-block-start",
     "inset-inline-end",
     "inset-inline-start",
+    "interpolate-size",
     "justify-content",
     "justify-items",
     "justify-self",
@@ -1413,6 +1443,7 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "top",
     "transform",
     "transform-origin",
+    "transition-behavior",
     "transition-delay",
     "transition-duration",
     "transition-property",
@@ -1506,6 +1537,7 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::TransitionDuration,
     PropertyIdKind::TransitionDelay,
     PropertyIdKind::TransitionTimingFunction,
+    PropertyIdKind::TransitionBehavior,
     PropertyIdKind::Animation,
     PropertyIdKind::AnimationName,
     PropertyIdKind::AnimationDuration,
@@ -1515,6 +1547,8 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::AnimationDirection,
     PropertyIdKind::AnimationFillMode,
     PropertyIdKind::AnimationPlayState,
+    PropertyIdKind::AnimationComposition,
+    PropertyIdKind::InterpolateSize,
     PropertyIdKind::FontSize,
     PropertyIdKind::FontWeight,
     PropertyIdKind::FontStyle,
@@ -1884,6 +1918,9 @@ pub enum PropertyValue {
     Translate(crate::values_math::TranslateSpec),
     TransformRaw(String),
     BgPosition(LengthPercentage, LengthPercentage),
+    InterpolateSize(InterpolateSizeMode),
+    TransitionBehaviorList(Vec<TransitionBehaviorMode>),
+    AnimationCompositionList(Vec<AnimationCompositionMode>),
 }
 
 impl PropertyValue {
@@ -1901,6 +1938,7 @@ impl PropertyValue {
             Self::Length(lp)
             | Self::LengthAuto(LengthPercentageAuto::Value(lp))
             | Self::Size(SizeValue::Length(lp)) => lp_has(lp),
+            Self::Size(SizeValue::CalcSize(cs)) => cs.contains_sibling_fn(),
             Self::CornerRadius(cr) => lp_has(&cr.x) || lp_has(&cr.y),
             Self::BgPosition(x, y) => lp_has(x) || lp_has(y),
             Self::Scale(crate::values_math::ScaleSpec::Values(v)) => v
@@ -2119,6 +2157,27 @@ pub(crate) fn rewrite_dynamic_var_names(css: &str) -> std::borrow::Cow<'_, str> 
     }
 }
 
+/// Returns `true` for CSS sizing properties supporting `calc-size()` and `stretch`.
+#[must_use]
+pub const fn is_sizing_property(prop: PropertyIdKind) -> bool {
+    matches!(
+        prop,
+        PropertyIdKind::Width
+            | PropertyIdKind::Height
+            | PropertyIdKind::MinWidth
+            | PropertyIdKind::MinHeight
+            | PropertyIdKind::MaxWidth
+            | PropertyIdKind::MaxHeight
+            | PropertyIdKind::InlineSize
+            | PropertyIdKind::BlockSize
+            | PropertyIdKind::MinInlineSize
+            | PropertyIdKind::MinBlockSize
+            | PropertyIdKind::MaxInlineSize
+            | PropertyIdKind::MaxBlockSize
+            | PropertyIdKind::FlexBasis
+    )
+}
+
 /// Returns `true` for CSS properties parsed natively by our CSS Values L4/L5 engine.
 #[must_use]
 pub fn is_values4_native_property(prop: PropertyIdKind) -> bool {
@@ -2133,7 +2192,49 @@ pub fn is_values4_native_property(prop: PropertyIdKind) -> bool {
             | PropertyIdKind::Widows
             | PropertyIdKind::TabSize
             | PropertyIdKind::ColumnCount
+            | PropertyIdKind::InterpolateSize
+            | PropertyIdKind::TransitionBehavior
+            | PropertyIdKind::AnimationComposition
+            | PropertyIdKind::TransitionProperty
+            | PropertyIdKind::TransitionTimingFunction
+            | PropertyIdKind::AnimationTimingFunction
     )
+}
+
+/// Returns `true` if `prop: raw` should be handled by `parse_values4_property` instead of `lightningcss`.
+#[must_use]
+pub fn should_use_values4_parser(prop: PropertyIdKind, raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || GlobalKeyword::from_ident(&trimmed.to_ascii_lowercase()).is_some() {
+        return false;
+    }
+    if is_values4_native_property(prop) {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("fit-content(") {
+        return false;
+    }
+    if is_sizing_property(prop)
+        && (lower.starts_with("calc-size(")
+            || lower == "stretch"
+            || (prop == PropertyIdKind::FlexBasis && lower == "content"))
+    {
+        return true;
+    }
+    if prop == PropertyIdKind::Transition
+        && (lower.contains("allow-discrete")
+            || lower.contains("block-size")
+            || lower.contains("inline-size")
+            || lower.contains("interpolate-size")
+            || lower.contains("--"))
+    {
+        return true;
+    }
+    if prop == PropertyIdKind::Animation && lower.contains("--") {
+        return true;
+    }
+    supports_values4_math(prop) && crate::values_math::has_values4_syntax(trimmed)
 }
 
 /// Returns `(ValueKind, non_negative)` for single-value CSS properties supporting
@@ -2197,6 +2298,137 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
     };
     let trimmed = raw.trim();
     match prop {
+        PropertyIdKind::InterpolateSize => {
+            let mode = match trimmed.to_ascii_lowercase().as_str() {
+                "numeric-only" => InterpolateSizeMode::NumericOnly,
+                "allow-keywords" => InterpolateSizeMode::AllowKeywords,
+                _ => return None,
+            };
+            let s = match mode {
+                InterpolateSizeMode::NumericOnly => "numeric-only",
+                InterpolateSizeMode::AllowKeywords => "allow-keywords",
+            };
+            return Some((PropertyValue::InterpolateSize(mode), s.to_string()));
+        }
+        PropertyIdKind::TransitionBehavior => {
+            let mut list = Vec::new();
+            let mut texts = Vec::new();
+            for part in trimmed.split(',') {
+                let p = part.trim().to_ascii_lowercase();
+                let m = match p.as_str() {
+                    "normal" => TransitionBehaviorMode::Normal,
+                    "allow-discrete" => TransitionBehaviorMode::AllowDiscrete,
+                    _ => return None,
+                };
+                list.push(m);
+                texts.push(p);
+            }
+            if list.is_empty() {
+                return None;
+            }
+            return Some((
+                PropertyValue::TransitionBehaviorList(list),
+                texts.join(", "),
+            ));
+        }
+        PropertyIdKind::AnimationComposition => {
+            let mut list = Vec::new();
+            let mut texts = Vec::new();
+            for part in trimmed.split(',') {
+                let p = part.trim().to_ascii_lowercase();
+                let m = match p.as_str() {
+                    "replace" => AnimationCompositionMode::Replace,
+                    "add" => AnimationCompositionMode::Add,
+                    "accumulate" => AnimationCompositionMode::Accumulate,
+                    _ => return None,
+                };
+                list.push(m);
+                texts.push(p);
+            }
+            if list.is_empty() {
+                return None;
+            }
+            return Some((
+                PropertyValue::AnimationCompositionList(list),
+                texts.join(", "),
+            ));
+        }
+        PropertyIdKind::TransitionProperty => {
+            let mut names = Vec::new();
+            let mut texts = Vec::new();
+            let parts: Vec<&str> = trimmed.split(',').collect();
+            for part in &parts {
+                let p = part.trim();
+                if p.is_empty() || p.chars().any(char::is_whitespace) {
+                    return None;
+                }
+                let lower = p.to_ascii_lowercase();
+                if GlobalKeyword::from_ident(&lower).is_some() {
+                    return None;
+                }
+                if lower == "none" && parts.len() > 1 {
+                    return None;
+                }
+                if !p.starts_with("--")
+                    && !p
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                {
+                    return None;
+                }
+                let stored = if p.starts_with("--") {
+                    p.to_string()
+                } else {
+                    lower
+                };
+                names.push(intern_str(&stored));
+                texts.push(stored);
+            }
+            if names.is_empty() {
+                return None;
+            }
+            return Some((PropertyValue::NameList(names), texts.join(", ")));
+        }
+        PropertyIdKind::TransitionTimingFunction | PropertyIdKind::AnimationTimingFunction => {
+            let (fns, spec) = parse_timing_function_list(trimmed)?;
+            return Some((PropertyValue::TimingList(fns), spec));
+        }
+        PropertyIdKind::Transition => {
+            let (specs, spec) = parse_transition_shorthand(trimmed)?;
+            return Some((PropertyValue::Transitions(specs), spec));
+        }
+        PropertyIdKind::Animation => {
+            let (specs, spec) = parse_animation_shorthand(trimmed)?;
+            return Some((PropertyValue::Animations(specs), spec));
+        }
+        p if is_sizing_property(p) && trimmed.to_ascii_lowercase().starts_with("calc-size(") => {
+            let allow_auto = !matches!(
+                p,
+                PropertyIdKind::MaxWidth
+                    | PropertyIdKind::MaxHeight
+                    | PropertyIdKind::MaxInlineSize
+                    | PropertyIdKind::MaxBlockSize
+            );
+            let allow_content = p == PropertyIdKind::FlexBasis;
+            let (expr, spec) =
+                crate::values_math::parse_calc_size(trimmed, allow_auto, allow_content)?;
+            return Some((
+                PropertyValue::Size(SizeValue::CalcSize(Box::new(expr))),
+                spec,
+            ));
+        }
+        p if is_sizing_property(p) && trimmed.eq_ignore_ascii_case("stretch") => {
+            return Some((
+                PropertyValue::Size(SizeValue::Stretch),
+                "stretch".to_string(),
+            ));
+        }
+        PropertyIdKind::FlexBasis if trimmed.eq_ignore_ascii_case("content") => {
+            return Some((
+                PropertyValue::Size(SizeValue::Content),
+                "content".to_string(),
+            ));
+        }
         PropertyIdKind::Scale => {
             let (spec, s) = ScaleSpec::parse(trimmed)?;
             return Some((PropertyValue::Scale(spec), s));
@@ -2411,6 +2643,233 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
     Some((val, spec))
 }
 
+/// Parses a single CSS Easing Level 1/2 `<easing-function>` (`linear`, `ease*`, `step-*`, `steps()`, `cubic-bezier()`).
+#[must_use]
+#[rustfmt::skip]
+pub fn parse_single_timing_function(input: &str) -> Option<(TimingFunction, String)> {
+    let mut pi = cssparser::ParserInput::new(input);
+    let mut p = cssparser::Parser::new(&mut pi);
+    let tf = parse_timing_fn_from_parser(&mut p)?;
+    p.is_exhausted().then_some(tf)
+}
+
+#[rustfmt::skip]
+fn parse_timing_fn_from_parser<'i, 't>(p: &mut cssparser::Parser<'i, 't>) -> Option<(TimingFunction, String)> {
+    let st = p.state();
+    match p.next().ok()?.clone() {
+        cssparser::Token::Ident(id) => match id.to_ascii_lowercase().as_str() {
+            "linear" => Some((TimingFunction::Linear, "linear".to_string())),
+            "ease" => Some((TimingFunction::Ease, "ease".to_string())),
+            "ease-in" => Some((TimingFunction::EaseIn, "ease-in".to_string())),
+            "ease-out" => Some((TimingFunction::EaseOut, "ease-out".to_string())),
+            "ease-in-out" => Some((TimingFunction::EaseInOut, "ease-in-out".to_string())),
+            "step-start" => Some((TimingFunction::Steps(1, true), "steps(1, start)".to_string())),
+            "step-end" => Some((TimingFunction::Steps(1, false), "steps(1, end)".to_string())),
+            _ => { p.reset(&st); None }
+        },
+        cssparser::Token::Function(ref fname) if fname.eq_ignore_ascii_case("cubic-bezier") => {
+            let res = p.parse_nested_block(|n| -> Result<(TimingFunction, String), cssparser::ParseError<'i, ()>> {
+                let next_f64 = |n: &mut cssparser::Parser<'i, '_>| -> Result<f64, cssparser::ParseError<'i, ()>> {
+                    let s = n.position();
+                    let fb = n.expect_number()?;
+                    Ok(n.slice_from(s).trim().parse::<f64>().unwrap_or(f64::from(fb)))
+                };
+                let x1 = next_f64(n)?; n.expect_comma()?;
+                let y1 = next_f64(n)?; n.expect_comma()?;
+                let x2 = next_f64(n)?; n.expect_comma()?;
+                let y2 = next_f64(n)?;
+                if !n.is_exhausted() || !(0.0..=1.0).contains(&x1) || !(0.0..=1.0).contains(&x2)
+                    || !y1.is_finite() || !y2.is_finite() {
+                    return Err(n.new_custom_error(()));
+                }
+                let fmt = |v: f64| crate::values_math::format_math_f64(v);
+                Ok((TimingFunction::CubicBezier(x1, y1, x2, y2), format!("cubic-bezier({}, {}, {}, {})", fmt(x1), fmt(y1), fmt(x2), fmt(y2))))
+            }).ok();
+            if res.is_none() { p.reset(&st); }
+            res
+        }
+        cssparser::Token::Function(ref fname) if fname.eq_ignore_ascii_case("steps") => {
+            let res = p.parse_nested_block(|n| -> Result<(TimingFunction, String), cssparser::ParseError<'i, ()>> {
+                let cnt = n.expect_integer()?;
+                if cnt < 1 { return Err(n.new_custom_error(())); }
+                let (jump_start, pos_s) = if n.try_parse(cssparser::Parser::expect_comma).is_ok() {
+                    let pos = n.expect_ident()?.to_ascii_lowercase();
+                    match pos.as_str() {
+                        "start" | "jump-start" | "jump-both" => (true, pos),
+                        "end" | "jump-end" | "jump-none" => (false, pos),
+                        _ => return Err(n.new_custom_error(())),
+                    }
+                } else { (false, "end".to_string()) };
+                if !n.is_exhausted() { return Err(n.new_custom_error(())); }
+                let spec = if pos_s == "end" || pos_s == "jump-end" { format!("steps({cnt})") } else { format!("steps({cnt}, {pos_s})") };
+                Ok((TimingFunction::Steps(cnt as u32, jump_start), spec))
+            }).ok();
+            if res.is_none() { p.reset(&st); }
+            res
+        }
+        _ => { p.reset(&st); None }
+    }
+}
+
+fn parse_timing_function_list(input: &str) -> Option<(Vec<TimingFunction>, String)> {
+    let mut pi = cssparser::ParserInput::new(input);
+    let mut p = cssparser::Parser::new(&mut pi);
+    let mut fns = Vec::new();
+    let mut texts = Vec::new();
+    loop {
+        let (tf, s) = parse_timing_fn_from_parser(&mut p)?;
+        fns.push(tf);
+        texts.push(s);
+        if p.try_parse(cssparser::Parser::expect_comma).is_err() {
+            break;
+        }
+    }
+    (!fns.is_empty() && p.is_exhausted()).then(|| (fns, texts.join(", ")))
+}
+
+#[rustfmt::skip]
+fn parse_time_ms_from_parser<'i, 't>(p: &mut cssparser::Parser<'i, 't>) -> Option<f32> {
+    let st = p.state();
+    match p.next().ok()?.clone() {
+        cssparser::Token::Dimension { value, unit, .. } => {
+            match unit.to_ascii_lowercase().as_str() {
+                "s" => Some(value * 1000.0),
+                "ms" => Some(value),
+                _ => { p.reset(&st); None }
+            }
+        }
+        _ => { p.reset(&st); None }
+    }
+}
+
+#[rustfmt::skip]
+fn parse_transition_shorthand(input: &str) -> Option<(Vec<TransitionSpec>, String)> {
+    let mut pi = cssparser::ParserInput::new(input);
+    let mut p = cssparser::Parser::new(&mut pi);
+    let mut out = Vec::new();
+    loop {
+        let (mut prop, mut dur, mut del, mut timing, mut behavior) = (None, None, None, None, None);
+        let mut any = false;
+        while !p.is_exhausted() {
+            let st = p.state();
+            if matches!(p.next(), Ok(cssparser::Token::Comma)) { p.reset(&st); break; }
+            p.reset(&st);
+            if let Some(ms) = parse_time_ms_from_parser(&mut p) {
+                if dur.is_none() { if ms < 0.0 { return None; } dur = Some(ms); }
+                else if del.is_none() { del = Some(ms); }
+                else { return None; }
+                any = true; continue;
+            }
+            if timing.is_none() {
+                if let Some((tf, _)) = parse_timing_fn_from_parser(&mut p) { timing = Some(tf); any = true; continue; }
+            }
+            if let Ok(ident) = p.try_parse(|p| p.expect_ident().map(|s| s.to_string())) {
+                let lower = ident.to_ascii_lowercase();
+                if behavior.is_none() && (lower == "normal" || lower == "allow-discrete") {
+                    behavior = Some(if lower == "allow-discrete" { TransitionBehaviorMode::AllowDiscrete } else { TransitionBehaviorMode::Normal });
+                    any = true; continue;
+                }
+                if prop.is_none() && GlobalKeyword::from_ident(&lower).is_none() {
+                    prop = Some(intern_str(if ident.starts_with("--") { &ident } else { &lower }));
+                    any = true; continue;
+                }
+                return None;
+            }
+            return None;
+        }
+        if !any { return None; }
+        out.push(TransitionSpec {
+            property: prop.unwrap_or_else(|| intern_str("all")),
+            duration_ms: dur.unwrap_or(0.0),
+            delay_ms: del.unwrap_or(0.0),
+            timing: timing.unwrap_or(TimingFunction::Ease),
+            behavior: behavior.unwrap_or(TransitionBehaviorMode::Normal),
+        });
+        if p.try_parse(cssparser::Parser::expect_comma).is_err() { break; }
+    }
+    (!out.is_empty() && p.is_exhausted()).then(|| (out, input.trim().to_string()))
+}
+
+#[rustfmt::skip]
+fn parse_animation_shorthand(input: &str) -> Option<(Vec<AnimationSpec>, String)> {
+    let mut pi = cssparser::ParserInput::new(input);
+    let mut p = cssparser::Parser::new(&mut pi);
+    let mut out = Vec::new();
+    loop {
+        let (mut name, mut dur, mut del, mut timing, mut iter, mut dir, mut fill, mut state, mut comp) =
+            (None, None, None, None, None, None, None, None, None);
+        let mut any = false;
+        while !p.is_exhausted() {
+            let st = p.state();
+            if matches!(p.next(), Ok(cssparser::Token::Comma)) { p.reset(&st); break; }
+            p.reset(&st);
+            if let Some(ms) = parse_time_ms_from_parser(&mut p) {
+                if dur.is_none() { if ms < 0.0 { return None; } dur = Some(ms); }
+                else if del.is_none() { del = Some(ms); }
+                else { return None; }
+                any = true; continue;
+            }
+            if timing.is_none() {
+                if let Some((tf, _)) = parse_timing_fn_from_parser(&mut p) { timing = Some(tf); any = true; continue; }
+            }
+            if iter.is_none() {
+                if let Ok(n) = p.try_parse(cssparser::Parser::expect_number) {
+                    if n < 0.0 { return None; }
+                    iter = Some(n); any = true; continue;
+                }
+            }
+            if let Ok(ident) = p.try_parse(|p| p.expect_ident().map(|s| s.to_string())) {
+                let lower = ident.to_ascii_lowercase();
+                if iter.is_none() && lower == "infinite" { iter = Some(f32::INFINITY); any = true; continue; }
+                if dir.is_none() {
+                    let d = match lower.as_str() {
+                        "normal" => Some(AnimationDirectionMode::Normal),
+                        "reverse" => Some(AnimationDirectionMode::Reverse),
+                        "alternate" => Some(AnimationDirectionMode::Alternate),
+                        "alternate-reverse" => Some(AnimationDirectionMode::AlternateReverse),
+                        _ => None,
+                    };
+                    if let Some(d) = d { dir = Some(d); any = true; continue; }
+                }
+                if fill.is_none() {
+                    let f = match lower.as_str() {
+                        "forwards" => Some(AnimationFillModeKind::Forwards),
+                        "backwards" => Some(AnimationFillModeKind::Backwards),
+                        "both" => Some(AnimationFillModeKind::Both),
+                        _ => None,
+                    };
+                    if let Some(f) = f { fill = Some(f); any = true; continue; }
+                }
+                if state.is_none() && (lower == "running" || lower == "paused") {
+                    state = Some(if lower == "paused" { AnimationPlayStateMode::Paused } else { AnimationPlayStateMode::Running });
+                    any = true; continue;
+                }
+                if comp.is_none() && matches!(lower.as_str(), "replace" | "add" | "accumulate") {
+                    comp = Some(match lower.as_str() { "add" => AnimationCompositionMode::Add, "accumulate" => AnimationCompositionMode::Accumulate, _ => AnimationCompositionMode::Replace });
+                    any = true; continue;
+                }
+                if name.is_none() { name = Some(intern_str(&ident)); any = true; continue; }
+                return None;
+            }
+            return None;
+        }
+        if !any { return None; }
+        out.push(AnimationSpec {
+            name: name.unwrap_or_else(|| intern_str("none")),
+            duration_ms: dur.unwrap_or(0.0),
+            delay_ms: del.unwrap_or(0.0),
+            timing: timing.unwrap_or(TimingFunction::Ease),
+            iteration_count: iter.unwrap_or(1.0),
+            direction: dir.unwrap_or(AnimationDirectionMode::Normal),
+            fill_mode: fill.unwrap_or(AnimationFillModeKind::None),
+            play_state: state.unwrap_or(AnimationPlayStateMode::Running),
+            composition: comp.unwrap_or(AnimationCompositionMode::Replace),
+        });
+        if p.try_parse(cssparser::Parser::expect_comma).is_err() { break; }
+    }
+    (!out.is_empty() && p.is_exhausted()).then(|| (out, input.trim().to_string()))
+}
+
 /// Wraps CSS Color 4/5 functional & system-color longhand declarations into an opaque
 /// quoted sentinel `var(--__rix_color4__, "...")` and CSS Values L4/L5 math/unit/transform
 /// declarations into `var(--__rix_val4__, "...")` so `lightningcss` never drops or corrupts them.
@@ -2473,7 +2932,10 @@ fn wrap_color4_declarations(css: &str) -> std::borrow::Cow<'_, str> {
             let prop_name = &css[p..name_end];
             let prop_kind = PropertyIdKind::from_name(&prop_name.to_ascii_lowercase());
             let is_color_prop = prop_kind.is_some_and(crate::cssom_decl::is_color_longhand);
-            let is_val4_prop = prop_kind.is_some_and(supports_values4_math);
+            let is_val4_prop = prop_kind.is_some_and(|pk| {
+                supports_values4_math(pk)
+                    || matches!(pk, PropertyIdKind::Transition | PropertyIdKind::Animation)
+            });
             if is_color_prop || is_val4_prop {
                 // Scan value to top-level `;`, `}`, `!`, or EOF (abort if `{` -> selector).
                 let val_start = i + 1;
@@ -2539,10 +3001,7 @@ fn wrap_color4_declarations(css: &str) -> std::borrow::Cow<'_, str> {
                             {
                                 Some("--__rix_color4__")
                             } else if is_val4_prop
-                                && GlobalKeyword::from_ident(&raw.to_ascii_lowercase()).is_none()
-                                && !raw.to_ascii_lowercase().starts_with("fit-content(")
-                                && (prop_kind.is_some_and(is_values4_native_property)
-                                    || crate::values_math::has_values4_syntax(raw))
+                                && prop_kind.is_some_and(|pk| should_use_values4_parser(pk, raw))
                             {
                                 Some("--__rix_val4__")
                             } else {

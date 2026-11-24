@@ -77,11 +77,7 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
     {
         return crate::values_math::parse_image_set_resolution_specified(trimmed);
     }
-    if crate::properties::is_values4_native_property(prop_kind)
-        || (crate::properties::supports_values4_math(prop_kind)
-            && crate::values_math::has_values4_syntax(trimmed)
-            && !lower_val.starts_with("fit-content("))
-    {
+    if crate::properties::should_use_values4_parser(prop_kind, trimmed) {
         return crate::properties::parse_values4_property(prop_kind, trimmed).map(|(_, s)| s);
     }
 
@@ -156,9 +152,7 @@ pub fn parse_and_expand_declaration(name: &str, value: &str) -> Option<Vec<(Stri
     let prop_kind = PropertyIdKind::from_name(&lower_name)?;
     if is_color_longhand(prop_kind)
         || prop_kind == PropertyIdKind::Opacity
-        || crate::properties::is_values4_native_property(prop_kind)
-        || (crate::properties::supports_values4_math(prop_kind)
-            && crate::values_math::has_values4_syntax(&canonical))
+        || crate::properties::should_use_values4_parser(prop_kind, &canonical)
     {
         return Some(vec![(lower_name, canonical)]);
     }

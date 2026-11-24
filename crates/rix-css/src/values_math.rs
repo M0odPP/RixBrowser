@@ -203,12 +203,13 @@ impl RoundStrategy {
     }
 }
 
-/// W3C CSS Values L4 canonical calculation tree node.
+/// W3C CSS Values L4/L5 canonical calculation tree node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MathNode {
     Number(f64),
     Percent(f64),
     Dimension(f64, MathUnit),
+    SizeKeyword,
     SiblingIndex,
     SiblingCount,
     Sum(Vec<MathNode>),
@@ -259,6 +260,7 @@ impl MathNode {
             Self::Number(_) | Self::SiblingIndex | Self::SiblingCount => Some(CalcType::NUMBER),
             Self::Percent(_) => Some(CalcType::PERCENT),
             Self::Dimension(_, u) => Some(CalcType::base(u.base_dim())),
+            Self::SizeKeyword => Some(CalcType::base(BaseDim::Length)),
             Self::Negate(a) | Self::Abs(a) => a.calc_type(),
             Self::Invert(a) => CalcType::div_types(CalcType::NUMBER, a.calc_type()?),
             Self::Sum(items) | Self::Min(items) | Self::Max(items) | Self::Hypot(items) => {
@@ -328,6 +330,7 @@ impl MathNode {
                 ctx.map_or(Self::Dimension(*v, MathUnit::Length(*lu)), |c| Self::Dimension(resolve_length_unit_f64(*lu, *v, c), MathUnit::Length(LengthUnit::Px)))
             }
             Self::Dimension(v, u) => Self::Dimension(*v, *u),
+            Self::SizeKeyword => Self::SizeKeyword,
             Self::SiblingIndex => ctx.map_or(Self::SiblingIndex, |c| Self::Number(f64::from(c.sibling_index.max(1)))),
             Self::SiblingCount => ctx.map_or(Self::SiblingCount, |c| Self::Number(f64::from(c.sibling_count.max(1)))),
             Self::Negate(a) => simplify_negate(s(a)), Self::Invert(a) => simplify_invert(s(a)),
@@ -340,7 +343,7 @@ impl MathNode {
             Self::Sin(a) => simplify_trig(0, s(a)), Self::Cos(a) => simplify_trig(1, s(a)), Self::Tan(a) => simplify_trig(2, s(a)),
             Self::Asin(a) => simplify_inv_trig(0, s(a)), Self::Acos(a) => simplify_inv_trig(1, s(a)), Self::Atan(a) => simplify_inv_trig(2, s(a)),
             Self::Atan2(y, x) => simplify_atan2(s(y), s(x)),
-            Self::Pow(a, b) => simplify_binary_num(s(a), s(b), f64::powf, |x, y| Self::Pow(Box::new(x), Box::new(y))),
+            Self::Pow(a, b) => simplify_binary_num(s(a), s(b), css_pow_f64, |x, y| Self::Pow(Box::new(x), Box::new(y))),
             Self::Sqrt(a) => simplify_unary_num(s(a), f64::sqrt, |x| Self::Sqrt(Box::new(x))),
             Self::Exp(a) => simplify_unary_num(s(a), f64::exp, |x| Self::Exp(Box::new(x))),
             Self::Log(a, b) => simplify_log(s(a), b.as_deref().map(s)),
@@ -424,6 +427,7 @@ enum LeafUnit {
     Num,
     Pct,
     Dim(MathUnit),
+    Size,
 }
 
 #[rustfmt::skip]
@@ -433,7 +437,21 @@ fn leaf_parts(n: &MathNode) -> Option<(f64, LeafUnit)> {
 
 #[rustfmt::skip]
 fn make_leaf(v: f64, u: LeafUnit) -> MathNode {
-    match u { LeafUnit::Num => MathNode::Number(v), LeafUnit::Pct => MathNode::Percent(v), LeafUnit::Dim(mu) => MathNode::Dimension(v, mu) }
+    match u {
+        LeafUnit::Num => MathNode::Number(v),
+        LeafUnit::Pct => MathNode::Percent(v),
+        LeafUnit::Dim(mu) => MathNode::Dimension(v, mu),
+        LeafUnit::Size => if (v - 1.0).abs() == 0.0 { MathNode::SizeKeyword } else { MathNode::Product(vec![MathNode::Number(v), MathNode::SizeKeyword]) },
+    }
+}
+
+#[rustfmt::skip]
+fn css_pow_f64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() || (a.abs() == 1.0 && b.is_infinite()) {
+        f64::NAN
+    } else {
+        a.powf(b)
+    }
 }
 
 #[rustfmt::skip]
@@ -525,6 +543,9 @@ fn simplify_product(raw: Vec<MathNode>) -> MathNode {
 
 #[rustfmt::skip]
 fn product_monomial(n: &MathNode) -> Option<(f64, Vec<LeafUnit>, Vec<LeafUnit>)> {
+    if matches!(n, MathNode::SizeKeyword) {
+        return Some((1.0, vec![LeafUnit::Size], Vec::new()));
+    }
     let MathNode::Product(items) = n else { return None; };
     let (mut scalar, mut nums, mut dens) = (1.0_f64, Vec::new(), Vec::new());
     for it in items {
@@ -532,10 +553,12 @@ fn product_monomial(n: &MathNode) -> Option<(f64, Vec<LeafUnit>, Vec<LeafUnit>)>
             MathNode::Number(v) => scalar *= *v,
             MathNode::Percent(v) => { scalar *= *v; nums.push(LeafUnit::Pct); }
             MathNode::Dimension(v, u) => { scalar *= *v; nums.push(LeafUnit::Dim(*u)); }
+            MathNode::SizeKeyword => { nums.push(LeafUnit::Size); }
             MathNode::Invert(inner) => match inner.as_ref() {
                 MathNode::Number(v) => scalar /= *v,
                 MathNode::Percent(v) => { scalar /= *v; dens.push(LeafUnit::Pct); }
                 MathNode::Dimension(v, u) => { scalar /= *v; dens.push(LeafUnit::Dim(*u)); }
+                MathNode::SizeKeyword => { dens.push(LeafUnit::Size); }
                 _ => return None,
             },
             _ => return None,
@@ -912,6 +935,7 @@ fn serialize_inner(n: &MathNode, parens: bool) -> String {
         MathNode::Number(v) => serialize_leaf_calc(*v, None),
         MathNode::Percent(v) => serialize_leaf_calc(*v, Some("%")),
         MathNode::Dimension(v, u) => serialize_leaf_calc(*v, Some(u.as_str())),
+        MathNode::SizeKeyword => "size".to_string(),
         MathNode::SiblingIndex => "sibling-index()".to_string(),
         MathNode::SiblingCount => "sibling-count()".to_string(),
         MathNode::Negate(a) => wrap(format!("-1 * {}", serialize_inner(a, true))),
@@ -919,14 +943,15 @@ fn serialize_inner(n: &MathNode, parens: bool) -> String {
         MathNode::Sum(items) => {
             let mut out = String::new();
             for (i, item) in items.iter().enumerate() {
-                if i == 0 { out.push_str(&serialize_inner(item, matches!(item, MathNode::Sum(_)))); }
+                let need_p = matches!(item, MathNode::Sum(_) | MathNode::Product(_));
+                if i == 0 { out.push_str(&serialize_inner(item, need_p)); }
                 else {
                     match item {
                         MathNode::Number(v) if v.is_finite() && *v < 0.0 => { out.push_str(" - "); out.push_str(&format_math_f64(-*v)); }
                         MathNode::Percent(v) if v.is_finite() && *v < 0.0 => { out.push_str(" - "); out.push_str(&format!("{}%", format_math_f64(-*v))); }
                         MathNode::Dimension(v, u) if v.is_finite() && *v < 0.0 => { out.push_str(" - "); out.push_str(&format!("{}{}", format_math_f64(-*v), u.as_str())); }
                         MathNode::Negate(inner) => { out.push_str(" - "); out.push_str(&serialize_inner(inner, true)); }
-                        other => { out.push_str(" + "); out.push_str(&serialize_inner(other, matches!(other, MathNode::Sum(_)))); }
+                        other => { out.push_str(" + "); out.push_str(&serialize_inner(other, need_p)); }
                     }
                 }
             }
@@ -1030,29 +1055,35 @@ fn exact_f64(slice: &str, suffix_len: usize, fallback: f64) -> f64 {
 }
 
 pub(crate) fn parse_math_fn_hinted<'i, 't>(name: &str, p: &mut Parser<'i, 't>) -> Option<MathNode> {
-    p.parse_nested_block(|n| parse_math_fn(name, n).ok_or_else(|| n.new_custom_error::<_, ()>(())))
-        .ok()
+    p.parse_nested_block(|n| {
+        parse_math_fn_opt(name, n, false).ok_or_else(|| n.new_custom_error::<_, ()>(()))
+    })
+    .ok()
+}
+
+fn parse_math_fn<'i, 't>(name: &str, p: &mut Parser<'i, 't>) -> Option<MathNode> {
+    parse_math_fn_opt(name, p, false)
 }
 
 #[rustfmt::skip]
-fn parse_math_fn<'i, 't>(name: &str, p: &mut Parser<'i, 't>) -> Option<MathNode> {
+fn parse_math_fn_opt<'i, 't>(name: &str, p: &mut Parser<'i, 't>, allow_size: bool) -> Option<MathNode> {
     match name {
         "sibling-index" => p.is_exhausted().then_some(MathNode::SiblingIndex),
         "sibling-count" => p.is_exhausted().then_some(MathNode::SiblingCount),
-        "calc" => { let e = parse_sum(p)?; p.is_exhausted().then_some(e) }
+        "calc" => { let e = parse_sum_opt(p, allow_size)?; p.is_exhausted().then_some(e) }
         "clamp" => {
-            let lo = if p.try_parse(|p| p.expect_ident_matching("none")).is_ok() { None } else { Some(Box::new(parse_sum(p)?)) };
+            let lo = if p.try_parse(|p| p.expect_ident_matching("none")).is_ok() { None } else { Some(Box::new(parse_sum_opt(p, allow_size)?)) };
             p.expect_comma().ok()?;
-            let mid = Box::new(parse_sum(p)?);
+            let mid = Box::new(parse_sum_opt(p, allow_size)?);
             p.expect_comma().ok()?;
-            let hi = if p.try_parse(|p| p.expect_ident_matching("none")).is_ok() { None } else { Some(Box::new(parse_sum(p)?)) };
+            let hi = if p.try_parse(|p| p.expect_ident_matching("none")).is_ok() { None } else { Some(Box::new(parse_sum_opt(p, allow_size)?)) };
             p.is_exhausted().then_some(MathNode::Clamp(lo, mid, hi))
         }
         "progress" => {
             let nc = p.try_parse(|p| p.expect_ident_matching("no-clamp")).is_ok();
-            let v = Box::new(parse_sum(p)?); p.expect_comma().ok()?;
-            let s = Box::new(parse_sum(p)?); p.expect_comma().ok()?;
-            let e = Box::new(parse_sum(p)?);
+            let v = Box::new(parse_sum_opt(p, allow_size)?); p.expect_comma().ok()?;
+            let s = Box::new(parse_sum_opt(p, allow_size)?); p.expect_comma().ok()?;
+            let e = Box::new(parse_sum_opt(p, allow_size)?);
             p.is_exhausted().then_some(MathNode::Progress(nc, v, s, e))
         }
         "round" => {
@@ -1064,13 +1095,13 @@ fn parse_math_fn<'i, 't>(name: &str, p: &mut Parser<'i, 't>) -> Option<MathNode>
                 };
                 p.expect_comma()?; Ok(st)
             }).unwrap_or(RoundStrategy::Nearest);
-            let a = parse_sum(p)?;
-            let b = if p.try_parse(Parser::expect_comma).is_ok() { Some(Box::new(parse_sum(p)?)) } else { None };
+            let a = parse_sum_opt(p, allow_size)?;
+            let b = if p.try_parse(Parser::expect_comma).is_ok() { Some(Box::new(parse_sum_opt(p, allow_size)?)) } else { None };
             p.is_exhausted().then_some(MathNode::Round(strat, Box::new(a), b))
         }
         _ => {
             let mut args = Vec::new();
-            loop { args.push(parse_sum(p)?); if p.try_parse(Parser::expect_comma).is_err() { break; } }
+            loop { args.push(parse_sum_opt(p, allow_size)?); if p.try_parse(Parser::expect_comma).is_err() { break; } }
             if !p.is_exhausted() { return None; }
             build_math_fn(name, args)
         }
@@ -1104,8 +1135,8 @@ fn build_math_fn(name: &str, mut args: Vec<MathNode>) -> Option<MathNode> {
 }
 
 #[rustfmt::skip]
-fn parse_sum<'i, 't>(p: &mut Parser<'i, 't>) -> Option<MathNode> {
-    let mut terms = vec![parse_product(p)?];
+fn parse_sum_opt<'i, 't>(p: &mut Parser<'i, 't>, allow_size: bool) -> Option<MathNode> {
+    let mut terms = vec![parse_product_opt(p, allow_size)?];
     loop {
         let st = p.state();
         let mut saw_ws = false;
@@ -1119,20 +1150,20 @@ fn parse_sum<'i, 't>(p: &mut Parser<'i, 't>) -> Option<MathNode> {
         };
         let Some(is_add) = op else { break };
         if !matches!(p.next_including_whitespace(), Ok(Token::WhiteSpace(_))) { p.reset(&st); return None; }
-        let rhs = parse_product(p)?;
+        let rhs = parse_product_opt(p, allow_size)?;
         terms.push(if is_add { rhs } else { MathNode::Negate(Box::new(rhs)) });
     }
     if terms.len() == 1 { terms.pop() } else { Some(MathNode::Sum(terms)) }
 }
 
 #[rustfmt::skip]
-fn parse_product<'i, 't>(p: &mut Parser<'i, 't>) -> Option<MathNode> {
-    let mut factors = vec![parse_value(p)?];
+fn parse_product_opt<'i, 't>(p: &mut Parser<'i, 't>, allow_size: bool) -> Option<MathNode> {
+    let mut factors = vec![parse_value_opt(p, allow_size)?];
     loop {
         let st = p.state();
         match p.next() {
-            Ok(Token::Delim('*')) => factors.push(parse_value(p)?),
-            Ok(Token::Delim('/')) => factors.push(MathNode::Invert(Box::new(parse_value(p)?))),
+            Ok(Token::Delim('*')) => factors.push(parse_value_opt(p, allow_size)?),
+            Ok(Token::Delim('/')) => factors.push(MathNode::Invert(Box::new(parse_value_opt(p, allow_size)?))),
             _ => { p.reset(&st); break; }
         }
     }
@@ -1140,7 +1171,7 @@ fn parse_product<'i, 't>(p: &mut Parser<'i, 't>) -> Option<MathNode> {
 }
 
 #[rustfmt::skip]
-fn parse_value<'i, 't>(p: &mut Parser<'i, 't>) -> Option<MathNode> {
+fn parse_value_opt<'i, 't>(p: &mut Parser<'i, 't>, allow_size: bool) -> Option<MathNode> {
     let start = p.position();
     match p.next().ok()?.clone() {
         Token::Number { value, .. } => Some(MathNode::Number(exact_f64(p.slice_from(start), 0, f64::from(value)))),
@@ -1153,16 +1184,18 @@ fn parse_value<'i, 't>(p: &mut Parser<'i, 't>) -> Option<MathNode> {
         Token::Ident(id) => match id.to_ascii_lowercase().as_str() {
             "pi" => Some(MathNode::Number(std::f64::consts::PI)), "e" => Some(MathNode::Number(std::f64::consts::E)),
             "infinity" => Some(MathNode::Number(f64::INFINITY)), "-infinity" => Some(MathNode::Number(f64::NEG_INFINITY)),
-            "nan" => Some(MathNode::Number(f64::NAN)), _ => None,
+            "nan" => Some(MathNode::Number(f64::NAN)),
+            "size" if allow_size => Some(MathNode::SizeKeyword),
+            _ => None,
         },
         Token::ParenthesisBlock => p.parse_nested_block(|n| {
-            let inner = parse_sum(n).ok_or_else(|| n.new_custom_error::<_, ()>(()))?;
+            let inner = parse_sum_opt(n, allow_size).ok_or_else(|| n.new_custom_error::<_, ()>(()))?;
             if !n.is_exhausted() { return Err(n.new_custom_error(())); }
             Ok(inner)
         }).ok(),
         Token::Function(ref fname) if is_css_math_fn(fname.as_ref()) => {
             let lower = fname.to_ascii_lowercase();
-            p.parse_nested_block(|n| parse_math_fn(&lower, n).ok_or_else(|| n.new_custom_error::<_, ()>(()))).ok()
+            p.parse_nested_block(|n| parse_math_fn_opt(&lower, n, allow_size).ok_or_else(|| n.new_custom_error::<_, ()>(()))).ok()
         }
         _ => None,
     }
@@ -1284,7 +1317,9 @@ impl RotateSpec {
             None => deg_s,
             Some([x, y, z]) => {
                 let (xv, yv, zv) = (x.eval_scalar(ctx, None), y.eval_scalar(ctx, None), z.eval_scalar(ctx, None));
-                if xv == 0.0 && yv == 0.0 && zv != 0.0 { deg_s }
+                if xv == 0.0 && yv == 0.0 && zv > 0.0 { deg_s }
+                else if xv > 0.0 && yv == 0.0 && zv == 0.0 { format!("x {deg_s}") }
+                else if xv == 0.0 && yv > 0.0 && zv == 0.0 { format!("y {deg_s}") }
                 else { format!("{} {} {} {deg_s}", format_math_f64(xv), format_math_f64(yv), format_math_f64(zv)) }
             }
         }
@@ -1553,7 +1588,7 @@ impl MathNode {
     pub fn contains_sibling_fn(&self) -> bool {
         match self {
             Self::SiblingIndex | Self::SiblingCount => true,
-            Self::Number(_) | Self::Percent(_) | Self::Dimension(_, _) => false,
+            Self::Number(_) | Self::Percent(_) | Self::Dimension(_, _) | Self::SizeKeyword => false,
             Self::Negate(a) | Self::Invert(a) | Self::Sin(a) | Self::Cos(a) | Self::Tan(a) | Self::Asin(a) | Self::Acos(a) | Self::Atan(a) | Self::Sqrt(a) | Self::Exp(a) | Self::Abs(a) | Self::Sign(a) => a.contains_sibling_fn(),
             Self::Mod(a, b) | Self::Rem(a, b) | Self::Atan2(a, b) | Self::Pow(a, b) => a.contains_sibling_fn() || b.contains_sibling_fn(),
             Self::Round(_, a, b) | Self::Log(a, b) => a.contains_sibling_fn() || b.as_deref().is_some_and(Self::contains_sibling_fn),
@@ -1569,7 +1604,7 @@ impl MathNode {
 pub fn has_values4_syntax(raw: &str) -> bool {
     if raw.contains('(') {
         let lower = raw.to_ascii_lowercase();
-        for fn_pfx in ["calc(", "min(", "max(", "clamp(", "round(", "mod(", "rem(", "sin(", "cos(", "tan(", "asin(", "acos(", "atan(", "atan2(", "pow(", "sqrt(", "hypot(", "log(", "exp(", "abs(", "sign(", "progress(", "sibling-index(", "sibling-count("] {
+        for fn_pfx in ["calc(", "calc-size(", "min(", "max(", "clamp(", "round(", "mod(", "rem(", "sin(", "cos(", "tan(", "asin(", "acos(", "atan(", "atan2(", "pow(", "sqrt(", "hypot(", "log(", "exp(", "abs(", "sign(", "progress(", "sibling-index(", "sibling-count("] {
             if lower.contains(fn_pfx) { return true; }
         }
     }
@@ -1642,4 +1677,393 @@ pub fn format_grid_tracks_computed(tracks: &[crate::values::GridTrackSize], ctx:
         },
         GridTrackSize::MinMax(a, b) => format!("minmax({}, {})", format_grid_tracks_computed(&[(**a).clone()], ctx), format_grid_tracks_computed(&[(**b).clone()], ctx)),
     }).collect::<Vec<_>>().join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// W3C CSS Values L5 §10.10 `calc-size()` & Tree Utilities
+// ---------------------------------------------------------------------------
+
+/// Basis of a CSS Values L5 `calc-size(<calc-size-basis>, <calc-size-calculation>)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CalcSizeBasis {
+    Auto,
+    MinContent,
+    MaxContent,
+    FitContent,
+    Stretch,
+    Content,
+    Any,
+    Length(Box<MathNode>),
+    Nested(Box<CalcSizeExpr>),
+}
+
+/// Parsed CSS Values L5 `calc-size(basis, calculation)` expression.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalcSizeExpr {
+    pub basis: CalcSizeBasis,
+    pub calculation: Box<MathNode>,
+}
+
+#[rustfmt::skip]
+impl MathNode {
+    #[must_use]
+    pub fn has_percentage(&self) -> bool {
+        match self {
+            Self::Percent(_) => true,
+            Self::Number(_) | Self::Dimension(_, _) | Self::SizeKeyword | Self::SiblingIndex | Self::SiblingCount => false,
+            Self::Negate(a) | Self::Invert(a) | Self::Sin(a) | Self::Cos(a) | Self::Tan(a) | Self::Asin(a) | Self::Acos(a) | Self::Atan(a) | Self::Sqrt(a) | Self::Exp(a) | Self::Abs(a) | Self::Sign(a) => a.has_percentage(),
+            Self::Mod(a, b) | Self::Rem(a, b) | Self::Atan2(a, b) | Self::Pow(a, b) => a.has_percentage() || b.has_percentage(),
+            Self::Log(a, b) | Self::Round(_, a, b) => a.has_percentage() || b.as_deref().is_some_and(Self::has_percentage),
+            Self::Clamp(a, b, c) => a.as_deref().is_some_and(Self::has_percentage) || b.has_percentage() || c.as_deref().is_some_and(Self::has_percentage),
+            Self::Progress(_, v, s, e) => v.has_percentage() || s.has_percentage() || e.has_percentage(),
+            Self::Sum(v) | Self::Product(v) | Self::Min(v) | Self::Max(v) | Self::Hypot(v) => v.iter().any(Self::has_percentage),
+        }
+    }
+
+    #[must_use]
+    pub fn contains_size_keyword(&self) -> bool {
+        match self {
+            Self::SizeKeyword => true,
+            Self::Number(_) | Self::Percent(_) | Self::Dimension(_, _) | Self::SiblingIndex | Self::SiblingCount => false,
+            Self::Negate(a) | Self::Invert(a) | Self::Sin(a) | Self::Cos(a) | Self::Tan(a) | Self::Asin(a) | Self::Acos(a) | Self::Atan(a) | Self::Sqrt(a) | Self::Exp(a) | Self::Abs(a) | Self::Sign(a) => a.contains_size_keyword(),
+            Self::Mod(a, b) | Self::Rem(a, b) | Self::Atan2(a, b) | Self::Pow(a, b) => a.contains_size_keyword() || b.contains_size_keyword(),
+            Self::Log(a, b) | Self::Round(_, a, b) => a.contains_size_keyword() || b.as_deref().is_some_and(Self::contains_size_keyword),
+            Self::Clamp(a, b, c) => a.as_deref().is_some_and(Self::contains_size_keyword) || b.contains_size_keyword() || c.as_deref().is_some_and(Self::contains_size_keyword),
+            Self::Progress(_, v, s, e) => v.contains_size_keyword() || s.contains_size_keyword() || e.contains_size_keyword(),
+            Self::Sum(v) | Self::Product(v) | Self::Min(v) | Self::Max(v) | Self::Hypot(v) => v.iter().any(Self::contains_size_keyword),
+        }
+    }
+
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        match self {
+            Self::Number(_) | Self::Percent(_) | Self::Dimension(_, _) | Self::SizeKeyword | Self::SiblingIndex | Self::SiblingCount => 1,
+            Self::Negate(a) | Self::Invert(a) | Self::Sin(a) | Self::Cos(a) | Self::Tan(a) | Self::Asin(a) | Self::Acos(a) | Self::Atan(a) | Self::Sqrt(a) | Self::Exp(a) | Self::Abs(a) | Self::Sign(a) => 1 + a.node_count(),
+            Self::Mod(a, b) | Self::Rem(a, b) | Self::Atan2(a, b) | Self::Pow(a, b) => 1 + a.node_count() + b.node_count(),
+            Self::Log(a, b) | Self::Round(_, a, b) => 1 + a.node_count() + b.as_deref().map_or(0, Self::node_count),
+            Self::Clamp(a, b, c) => 1 + a.as_deref().map_or(0, Self::node_count) + b.node_count() + c.as_deref().map_or(0, Self::node_count),
+            Self::Progress(_, v, s, e) => 1 + v.node_count() + s.node_count() + e.node_count(),
+            Self::Sum(v) | Self::Product(v) | Self::Min(v) | Self::Max(v) | Self::Hypot(v) => 1 + v.iter().map(Self::node_count).sum::<usize>(),
+        }
+    }
+
+    /// Substitutes every `SizeKeyword` with `replacement`, returning `None` if expanded AST exceeds `budget`.
+    #[must_use]
+    pub fn substitute_size(&self, replacement: &Self, budget: &mut usize) -> Option<Self> {
+        if *budget == 0 { return None; }
+        *budget -= 1;
+        let sub = |n: &Self, b: &mut usize| n.substitute_size(replacement, b);
+        let sub_vec = |v: &[Self], b: &mut usize| v.iter().map(|x| sub(x, b)).collect::<Option<Vec<_>>>();
+        Some(match self {
+            Self::SizeKeyword => {
+                let cost = replacement.node_count();
+                if cost > *budget + 1 { return None; }
+                *budget = (*budget + 1).saturating_sub(cost);
+                replacement.clone()
+            }
+            Self::Number(_) | Self::Percent(_) | Self::Dimension(_, _) | Self::SiblingIndex | Self::SiblingCount => self.clone(),
+            Self::Negate(a) => Self::Negate(Box::new(sub(a, budget)?)),
+            Self::Invert(a) => Self::Invert(Box::new(sub(a, budget)?)),
+            Self::Sum(v) => Self::Sum(sub_vec(v, budget)?),
+            Self::Product(v) => Self::Product(sub_vec(v, budget)?),
+            Self::Min(v) => Self::Min(sub_vec(v, budget)?),
+            Self::Max(v) => Self::Max(sub_vec(v, budget)?),
+            Self::Hypot(v) => Self::Hypot(sub_vec(v, budget)?),
+            Self::Clamp(a, m, c) => Self::Clamp(
+                match a { Some(x) => Some(Box::new(sub(x, budget)?)), None => None },
+                Box::new(sub(m, budget)?),
+                match c { Some(x) => Some(Box::new(sub(x, budget)?)), None => None },
+            ),
+            Self::Round(st, a, b) => Self::Round(
+                *st,
+                Box::new(sub(a, budget)?),
+                match b { Some(x) => Some(Box::new(sub(x, budget)?)), None => None },
+            ),
+            Self::Mod(a, b) => Self::Mod(Box::new(sub(a, budget)?), Box::new(sub(b, budget)?)),
+            Self::Rem(a, b) => Self::Rem(Box::new(sub(a, budget)?), Box::new(sub(b, budget)?)),
+            Self::Sin(a) => Self::Sin(Box::new(sub(a, budget)?)),
+            Self::Cos(a) => Self::Cos(Box::new(sub(a, budget)?)),
+            Self::Tan(a) => Self::Tan(Box::new(sub(a, budget)?)),
+            Self::Asin(a) => Self::Asin(Box::new(sub(a, budget)?)),
+            Self::Acos(a) => Self::Acos(Box::new(sub(a, budget)?)),
+            Self::Atan(a) => Self::Atan(Box::new(sub(a, budget)?)),
+            Self::Atan2(a, b) => Self::Atan2(Box::new(sub(a, budget)?), Box::new(sub(b, budget)?)),
+            Self::Pow(a, b) => Self::Pow(Box::new(sub(a, budget)?), Box::new(sub(b, budget)?)),
+            Self::Sqrt(a) => Self::Sqrt(Box::new(sub(a, budget)?)),
+            Self::Log(a, b) => Self::Log(
+                Box::new(sub(a, budget)?),
+                match b { Some(x) => Some(Box::new(sub(x, budget)?)), None => None },
+            ),
+            Self::Exp(a) => Self::Exp(Box::new(sub(a, budget)?)),
+            Self::Abs(a) => Self::Abs(Box::new(sub(a, budget)?)),
+            Self::Sign(a) => Self::Sign(Box::new(sub(a, budget)?)),
+            Self::Progress(nc, v, s, e) => Self::Progress(*nc, Box::new(sub(v, budget)?), Box::new(sub(s, budget)?), Box::new(sub(e, budget)?)),
+        })
+    }
+
+    /// Replaces `Percent(p)` with `(p / 100) * SizeKeyword` for normalizing `%` `calc-size` bases to `100%`.
+    #[must_use]
+    pub fn replace_percent_with_size(&self) -> Self {
+        let r = |n: &Self| n.replace_percent_with_size();
+        let rv = |v: &[Self]| v.iter().map(r).collect::<Vec<_>>();
+        match self {
+            Self::Percent(p) => Self::Product(vec![Self::Number(*p / 100.0), Self::SizeKeyword]),
+            Self::Number(_) | Self::Dimension(_, _) | Self::SizeKeyword | Self::SiblingIndex | Self::SiblingCount => self.clone(),
+            Self::Negate(a) => Self::Negate(Box::new(r(a))),
+            Self::Invert(a) => Self::Invert(Box::new(r(a))),
+            Self::Sum(v) => Self::Sum(rv(v)),
+            Self::Product(v) => Self::Product(rv(v)),
+            Self::Min(v) => Self::Min(rv(v)),
+            Self::Max(v) => Self::Max(rv(v)),
+            Self::Hypot(v) => Self::Hypot(rv(v)),
+            Self::Clamp(a, m, c) => Self::Clamp(a.as_deref().map(|x| Box::new(r(x))), Box::new(r(m)), c.as_deref().map(|x| Box::new(r(x)))),
+            Self::Round(st, a, b) => Self::Round(*st, Box::new(r(a)), b.as_deref().map(|x| Box::new(r(x)))),
+            Self::Mod(a, b) => Self::Mod(Box::new(r(a)), Box::new(r(b))),
+            Self::Rem(a, b) => Self::Rem(Box::new(r(a)), Box::new(r(b))),
+            Self::Sin(a) => Self::Sin(Box::new(r(a))),
+            Self::Cos(a) => Self::Cos(Box::new(r(a))),
+            Self::Tan(a) => Self::Tan(Box::new(r(a))),
+            Self::Asin(a) => Self::Asin(Box::new(r(a))),
+            Self::Acos(a) => Self::Acos(Box::new(r(a))),
+            Self::Atan(a) => Self::Atan(Box::new(r(a))),
+            Self::Atan2(a, b) => Self::Atan2(Box::new(r(a)), Box::new(r(b))),
+            Self::Pow(a, b) => Self::Pow(Box::new(r(a)), Box::new(r(b))),
+            Self::Sqrt(a) => Self::Sqrt(Box::new(r(a))),
+            Self::Log(a, b) => Self::Log(Box::new(r(a)), b.as_deref().map(|x| Box::new(r(x)))),
+            Self::Exp(a) => Self::Exp(Box::new(r(a))),
+            Self::Abs(a) => Self::Abs(Box::new(r(a))),
+            Self::Sign(a) => Self::Sign(Box::new(r(a))),
+            Self::Progress(nc, v, s, e) => Self::Progress(*nc, Box::new(r(v)), Box::new(r(s)), Box::new(r(e))),
+        }
+    }
+
+    /// Evaluates this math expression with `size` bound to `size_px` (in CSS px).
+    #[must_use]
+    pub fn eval_with_size(&self, size_px: f64, ctx: &EvalContext, pct_basis: Option<(f64, bool)>) -> f64 {
+        let mut budget = 4096usize;
+        let repl = Self::Dimension(size_px, MathUnit::Length(LengthUnit::Px));
+        let substituted = self.substitute_size(&repl, &mut budget).unwrap_or_else(|| self.clone());
+        substituted.eval_scalar(ctx, pct_basis)
+    }
+
+    /// Serializes a simplified calculation tree without outer `calc(...)` wrapper.
+    #[must_use]
+    pub fn serialize_bare(&self) -> String {
+        serialize_inner(self, false)
+    }
+}
+
+#[rustfmt::skip]
+impl CalcSizeBasis {
+    #[must_use]
+    pub fn serialize_specified(&self) -> String {
+        match self {
+            Self::Auto => "auto".to_string(),
+            Self::MinContent => "min-content".to_string(),
+            Self::MaxContent => "max-content".to_string(),
+            Self::FitContent => "fit-content".to_string(),
+            Self::Stretch => "stretch".to_string(),
+            Self::Content => "content".to_string(),
+            Self::Any => "any".to_string(),
+            Self::Length(n) => serialize_inner(&n.simplify(None, None), false),
+            Self::Nested(inner) => inner.serialize_specified(),
+        }
+    }
+
+    #[must_use]
+    pub fn serialize_computed(&self, ctx: &EvalContext) -> String {
+        match self {
+            Self::Auto => "auto".to_string(),
+            Self::MinContent => "min-content".to_string(),
+            Self::MaxContent => "max-content".to_string(),
+            Self::FitContent => "fit-content".to_string(),
+            Self::Stretch => "stretch".to_string(),
+            Self::Content => "content".to_string(),
+            Self::Any => "any".to_string(),
+            Self::Length(n) => serialize_inner(&n.simplify(Some(ctx), None), false),
+            Self::Nested(inner) => inner.serialize_computed(ctx),
+        }
+    }
+
+    #[must_use]
+    pub fn contains_sibling_fn(&self) -> bool {
+        match self {
+            Self::Length(n) => n.contains_sibling_fn(),
+            Self::Nested(inner) => inner.contains_sibling_fn(),
+            _ => false,
+        }
+    }
+
+    #[must_use]
+    pub fn has_percent_basis(&self) -> bool {
+        match self {
+            Self::Length(n) => n.has_percentage(),
+            Self::Nested(inner) => inner.basis.has_percent_basis(),
+            _ => false,
+        }
+    }
+
+    #[must_use]
+    pub fn is_definite(&self, parent_definite: bool) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Stretch => parent_definite,
+            Self::Length(n) => !n.has_percentage() || parent_definite,
+            Self::Nested(inner) => inner.basis.is_definite(parent_definite),
+            Self::Auto | Self::MinContent | Self::MaxContent | Self::FitContent | Self::Content => false,
+        }
+    }
+}
+
+#[rustfmt::skip]
+impl CalcSizeExpr {
+    #[must_use]
+    pub fn serialize_specified(&self) -> String {
+        format!("calc-size({}, {})", self.basis.serialize_specified(), serialize_inner(&self.calculation.simplify(None, None), false))
+    }
+
+    #[must_use]
+    pub fn serialize_computed(&self, ctx: &EvalContext) -> String {
+        format!("calc-size({}, {})", self.basis.serialize_computed(ctx), serialize_inner(&self.calculation.simplify(Some(ctx), None), false))
+    }
+
+    #[must_use]
+    pub fn contains_sibling_fn(&self) -> bool {
+        self.basis.contains_sibling_fn() || self.calculation.contains_sibling_fn()
+    }
+
+    #[must_use]
+    pub fn is_definite(&self, parent_definite: bool) -> bool {
+        self.basis.is_definite(parent_definite)
+    }
+
+    /// Evaluates `calc-size()` to CSS pixels (clamped to `>= 0.0`).
+    ///
+    /// Per CSS Values L5 §10.10.2:
+    /// - If the basis contains a percentage and `avail_opt` is `None` (indefinite), the entire
+    ///   `calc-size()` behaves as `auto` (`intrinsic(CalcSizeBasis::Auto)`).
+    /// - Percentages inside `calculation` resolve against `avail_opt.unwrap_or(0.0)`.
+    #[must_use]
+    pub fn eval_px<F>(&self, avail_opt: Option<f32>, eval: &EvalContext, intrinsic: &F) -> f32
+    where
+        F: Fn(&CalcSizeBasis) -> f32,
+    {
+        if avail_opt.is_none() && self.basis.has_percent_basis() {
+            return intrinsic(&CalcSizeBasis::Auto).max(0.0);
+        }
+        let basis_px = match &self.basis {
+            CalcSizeBasis::Any => 0.0,
+            CalcSizeBasis::Length(node) => {
+                let v = node.eval_scalar(eval, Some((f64::from(avail_opt.unwrap_or(0.0)), false)));
+                if v.is_nan() { 0.0 } else { v.clamp(-MAX_CSS_PX, MAX_CSS_PX) }
+            }
+            CalcSizeBasis::Nested(inner) => f64::from(inner.eval_px(avail_opt, eval, intrinsic)),
+            kw => f64::from(intrinsic(kw)),
+        };
+        let pct_basis = f64::from(avail_opt.unwrap_or(0.0));
+        let v = self.calculation.eval_with_size(basis_px, eval, Some((pct_basis, false)));
+        if v.is_nan() { 0.0 } else { v.clamp(0.0, MAX_CSS_PX) as f32 }
+    }
+
+    /// Flattens nested `calc-size()` and normalizes `<length-percentage>` bases for interpolation
+    /// per CSS Values L5 §10.10.3, enforcing nesting depth & `max_nodes` expansion caps (CSSWG #10369).
+    #[must_use]
+    pub fn normalize_for_interpolation(&self, ctx: &EvalContext, max_nodes: usize) -> Option<(CalcSizeBasis, MathNode)> {
+        self.normalize_for_interpolation_depth(ctx, max_nodes, 0)
+    }
+
+    fn normalize_for_interpolation_depth(&self, ctx: &EvalContext, max_nodes: usize, depth: usize) -> Option<(CalcSizeBasis, MathNode)> {
+        if depth > 16 { return None; }
+        let calc_simp = self.calculation.simplify(Some(ctx), None);
+        match &self.basis {
+            CalcSizeBasis::Nested(inner) => {
+                let (ib, ic) = inner.normalize_for_interpolation_depth(ctx, max_nodes, depth + 1)?;
+                let mut budget = max_nodes;
+                let sub = calc_simp.substitute_size(&ic, &mut budget)?;
+                let simp = sub.simplify(Some(ctx), None);
+                if simp.node_count() > max_nodes { return None; }
+                Some((ib, simp))
+            }
+            CalcSizeBasis::Length(bnode) => {
+                let bs = bnode.simplify(Some(ctx), None);
+                if !bs.has_percentage() {
+                    let mut budget = max_nodes;
+                    let sub = calc_simp.substitute_size(&bs, &mut budget)?;
+                    let simp = sub.simplify(Some(ctx), None);
+                    if simp.node_count() > max_nodes { return None; }
+                    Some((CalcSizeBasis::Any, simp))
+                } else {
+                    let bs_as_size = bs.replace_percent_with_size().simplify(Some(ctx), None);
+                    let mut budget = max_nodes;
+                    let sub = calc_simp.substitute_size(&bs_as_size, &mut budget)?;
+                    let simp = sub.simplify(Some(ctx), None);
+                    if simp.node_count() > max_nodes { return None; }
+                    Some((CalcSizeBasis::Length(Box::new(MathNode::Percent(100.0))), simp))
+                }
+            }
+            other => Some((other.clone(), calc_simp)),
+        }
+    }
+}
+
+/// Strictly parses CSS Values L5 `calc-size(<calc-size-basis>, <calc-size-calculation>)`.
+#[must_use]
+pub fn parse_calc_size(
+    input: &str,
+    allow_auto: bool,
+    allow_content: bool,
+) -> Option<(CalcSizeExpr, String)> {
+    let mut pi = ParserInput::new(input);
+    let mut p = Parser::new(&mut pi);
+    let expr = parse_calc_size_from_parser(&mut p, allow_auto, allow_content)?;
+    if !p.is_exhausted() {
+        return None;
+    }
+    let spec = expr.serialize_specified();
+    Some((expr, spec))
+}
+
+#[rustfmt::skip]
+fn parse_calc_size_from_parser<'i, 't>(p: &mut Parser<'i, 't>, allow_auto: bool, allow_content: bool) -> Option<CalcSizeExpr> {
+    let state = p.state();
+    let Token::Function(fname) = p.next().ok()?.clone() else { p.reset(&state); return None; };
+    if !fname.eq_ignore_ascii_case("calc-size") { p.reset(&state); return None; }
+    let res = p.parse_nested_block(|n| -> Result<CalcSizeExpr, cssparser::ParseError<'i, ()>> {
+        let Some(basis) = parse_calc_size_basis(n, allow_auto, allow_content) else { return Err(n.new_custom_error(())); };
+        n.expect_comma()?;
+        let allow_size = !matches!(basis, CalcSizeBasis::Any);
+        let Some(calc_node) = parse_sum_opt(n, allow_size) else { return Err(n.new_custom_error(())); };
+        if !n.is_exhausted() { return Err(n.new_custom_error(())); }
+        let Some(ct) = calc_node.calc_type() else { return Err(n.new_custom_error(())); };
+        if !ct.matches_target(ValueKind::LengthPercentage) { return Err(n.new_custom_error(())); }
+        Ok(CalcSizeExpr { basis, calculation: Box::new(calc_node.simplify(None, None)) })
+    }).ok();
+    if res.is_none() { p.reset(&state); }
+    res
+}
+
+#[rustfmt::skip]
+fn parse_calc_size_basis<'i, 't>(p: &mut Parser<'i, 't>, allow_auto: bool, allow_content: bool) -> Option<CalcSizeBasis> {
+    let st = p.state();
+    if let Ok(ident) = p.try_parse(|p| p.expect_ident().map(|s| s.to_ascii_lowercase())) {
+        let kw = match ident.as_str() {
+            "any" => Some(CalcSizeBasis::Any),
+            "auto" if allow_auto => Some(CalcSizeBasis::Auto),
+            "min-content" => Some(CalcSizeBasis::MinContent),
+            "max-content" => Some(CalcSizeBasis::MaxContent),
+            "fit-content" => Some(CalcSizeBasis::FitContent),
+            "stretch" => Some(CalcSizeBasis::Stretch),
+            "content" if allow_content => Some(CalcSizeBasis::Content),
+            _ => None,
+        };
+        if let Some(b) = kw { return Some(b); }
+        p.reset(&st);
+    }
+    if let Some(nested) = parse_calc_size_from_parser(p, allow_auto, allow_content) {
+        return Some(CalcSizeBasis::Nested(Box::new(nested)));
+    }
+    let node = parse_sum_opt(p, false)?;
+    let ct = node.calc_type()?;
+    if !ct.matches_target(ValueKind::LengthPercentage) { p.reset(&st); return None; }
+    Some(CalcSizeBasis::Length(Box::new(node.simplify(None, None))))
 }
