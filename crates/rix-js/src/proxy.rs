@@ -426,6 +426,14 @@ pub fn mop_prevent_extensions(vm: &mut JsVm, obj: HeapHandle) -> Result<bool, Js
         }
         return Ok(res);
     }
+    if vm
+        .heap
+        .get_object(obj)
+        .and_then(|o| o.rare.as_ref())
+        .is_some_and(|r| r.wasm_gc_object)
+    {
+        return Ok(false);
+    }
     if let Some(o) = vm.heap.get_object_mut(obj) {
         o.extensible = false;
     }

@@ -184,6 +184,7 @@ enum IteratorState {
     },
     Custom {
         iter_obj: HeapHandle,
+        next_fn: JsValue,
         exhausted: bool,
     },
     AsyncCustom {
@@ -800,8 +801,13 @@ impl JsVm {
             roots.push(JsValue::from_object(iter_h));
             match state {
                 IteratorState::Array { arr, .. } => roots.push(JsValue::from_object(*arr)),
-                IteratorState::Custom { iter_obj, .. }
-                | IteratorState::AsyncCustom { iter_obj } => {
+                IteratorState::Custom {
+                    iter_obj, next_fn, ..
+                } => {
+                    roots.push(JsValue::from_object(*iter_obj));
+                    roots.push(*next_fn);
+                }
+                IteratorState::AsyncCustom { iter_obj } => {
                     roots.push(JsValue::from_object(*iter_obj))
                 }
                 IteratorState::String { .. } | IteratorState::Keys { .. } => {}
@@ -992,6 +998,26 @@ impl JsVm {
             PropertyAttrs::CONFIGURABLE,
             &mut self.shapes,
         );
+        obj
+    }
+
+    /// Registers a closure-backed native host callback with GC-traced `roots` kept alive
+    /// for the exact lifetime of the returned function object.
+    pub fn alloc_host_fn_rooted(
+        &mut self,
+        name: &str,
+        roots: &[JsValue],
+        f: impl Fn(&mut JsVm, JsValue, &[JsValue]) -> Result<JsValue, JsException> + 'static,
+    ) -> HeapHandle {
+        let obj = self.alloc_host_fn(name, f);
+        if !roots.is_empty() {
+            if let Some(o) = self.heap.get_object_mut(obj) {
+                o.rare_mut().host_roots.extend_from_slice(roots);
+            }
+            for &val in roots {
+                self.heap.write_barrier(obj, val);
+            }
+        }
         obj
     }
 
@@ -3015,6 +3041,7 @@ impl JsVm {
                     if let Some(IteratorState::Custom {
                         iter_obj,
                         exhausted: false,
+                        ..
                     }) = self.iterators.remove(&h)
                     {
                         self.iterator_close_custom(iter_obj, abrupt)?;
@@ -3521,11 +3548,12 @@ impl JsVm {
         key: PropertyKey,
         val: JsValue,
     ) -> Result<(), JsException> {
-        let Some((is_array, is_proxy, shape, is_proto, extensible)) =
+        let Some((is_array, is_proxy, is_wasm_gc, shape, is_proto, extensible)) =
             self.heap.get_object(obj).map(|o| {
                 (
                     matches!(o.kind, ObjectKind::Array),
                     matches!(o.kind, ObjectKind::Proxy(_)),
+                    o.rare.as_ref().is_some_and(|r| r.wasm_gc_object),
                     o.shape(),
                     o.is_prototype,
                     o.extensible,
@@ -3534,6 +3562,9 @@ impl JsVm {
         else {
             return Err(self.type_error("Dead object handle"));
         };
+        if is_wasm_gc {
+            return Err(self.type_error("Cannot set property on WebAssembly GC object"));
+        }
 
         if is_array && key == self.key_length {
             let is_strict = self.programs[prog_id].functions[func_idx].is_strict;
@@ -3876,6 +3907,14 @@ impl JsVm {
         key: PropertyKey,
         val: JsValue,
     ) -> Result<bool, JsException> {
+        if self
+            .heap
+            .get_object(obj)
+            .and_then(|o| o.rare.as_ref())
+            .is_some_and(|r| r.wasm_gc_object)
+        {
+            return Err(self.type_error("Cannot set property on WebAssembly GC object"));
+        }
         if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
             return crate::proxy::proxy_set_trap(self, p, key, val, JsValue::from_object(obj));
         }
@@ -3971,6 +4010,14 @@ impl JsVm {
         obj: HeapHandle,
         key: PropertyKey,
     ) -> Result<bool, JsException> {
+        if self
+            .heap
+            .get_object(obj)
+            .and_then(|o| o.rare.as_ref())
+            .is_some_and(|r| r.wasm_gc_object)
+        {
+            return Err(self.type_error("Cannot delete property on WebAssembly GC object"));
+        }
         if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
             return crate::proxy::proxy_delete_trap(self, p, key);
         }
@@ -4099,6 +4146,14 @@ impl JsVm {
         let Some(obj) = obj_val.as_object() else {
             return Err(self.type_error("Cannot set element on non-object"));
         };
+        if self
+            .heap
+            .get_object(obj)
+            .and_then(|o| o.rare.as_ref())
+            .is_some_and(|r| r.wasm_gc_object)
+        {
+            return Err(self.type_error("Cannot set property on WebAssembly GC object"));
+        }
         let key_val = if key_val.is_object() {
             let ks = self.to_property_key(key_val)?;
             JsValue::from_string(self.heap.alloc_string(ks))
@@ -4181,6 +4236,14 @@ impl JsVm {
         let Some(obj) = obj_val.as_object() else {
             return Ok(true);
         };
+        if self
+            .heap
+            .get_object(obj)
+            .and_then(|o| o.rare.as_ref())
+            .is_some_and(|r| r.wasm_gc_object)
+        {
+            return Err(self.type_error("Cannot delete property on WebAssembly GC object"));
+        }
         let key_val = if key_val.is_object() {
             let ks = self.to_property_key(key_val)?;
             JsValue::from_string(self.heap.alloc_string(ks))
@@ -4760,11 +4823,14 @@ impl JsVm {
             let Some(iter_obj) = iter_res.as_object() else {
                 return Err(self.type_error("Result of Symbol.iterator method is not an object"));
             };
+            // ECMA-262 §7.4.1 GetIterator: cache `next` method once at iterator creation time.
+            let next_fn = self.get_property_by_key(iter_obj, self.key_next)?;
             let h = self.alloc_ordinary_object();
             self.iterators.insert(
                 h,
                 IteratorState::Custom {
                     iter_obj,
+                    next_fn,
                     exhausted: false,
                 },
             );
@@ -4827,12 +4893,12 @@ impl JsVm {
             }
             Some(IteratorState::Custom {
                 iter_obj,
+                next_fn,
                 exhausted,
             }) => {
                 if exhausted {
                     return Ok((JsValue::UNDEFINED, true));
                 }
-                let next_fn = self.get_property_by_key(iter_obj, self.key_next)?;
                 let res = self.call_value(next_fn, JsValue::from_object(iter_obj), &[])?;
                 let Some(res_h) = res.as_object() else {
                     return Err(self.type_error("Iterator result is not an object"));

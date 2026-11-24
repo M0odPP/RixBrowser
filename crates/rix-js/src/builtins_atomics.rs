@@ -97,6 +97,14 @@ pub fn ab_byte_len(vm: &JsVm, buf_h: HeapHandle) -> usize {
         return 0;
     }
     if let Some(shared) = ab_shared_backing(vm, buf_h) {
+        if let Some(fixed) = vm
+            .heap
+            .get_object(buf_h)
+            .and_then(|o| o.rare.as_ref())
+            .and_then(|r| r.ab_fixed_byte_len)
+        {
+            return fixed;
+        }
         return shared.byte_len();
     }
     match vm.heap.get_object(buf_h).map(|o| &o.kind) {

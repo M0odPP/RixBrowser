@@ -469,6 +469,14 @@ pub struct RareObjectData {
     pub ab_detached: bool,
     /// `true` for immutable `ArrayBuffer` (`transferToImmutable` / `sliceToImmutable`).
     pub ab_immutable: bool,
+    /// `true` for `ArrayBuffer` backing a `WebAssembly.Memory` (disallows JS `transfer()`, enforces 64 KiB monotonic `resize()`).
+    pub ab_wasm_memory: bool,
+    /// Fixed snapshot byte length for non-growable `SharedArrayBuffer` views of `WebAssembly.Memory`.
+    pub ab_fixed_byte_len: Option<usize>,
+    /// `true` for opaque exported WebAssembly GC struct/array objects (exotic `[[Set]]`/`[[Delete]]`/`[[PreventExtensions]]`).
+    pub wasm_gc_object: bool,
+    /// GC-traced strong roots owned by a host closure (`NativeFunction`) for its exact lifetime.
+    pub host_roots: Vec<JsValue>,
     /// Shared cross-thread backing for `SharedArrayBuffer`.
     pub shared_mem: Option<std::sync::Arc<SharedBufferBacking>>,
     /// `true` when a `DataView` or `TypedArray` is length-tracking over a resizable/growable buffer.
@@ -718,6 +726,11 @@ impl JsObject {
                 }
             }
             for &val in rare.weak_sym_map.values() {
+                if let Some(h) = val.as_heap_handle() {
+                    visit(h);
+                }
+            }
+            for &val in &rare.host_roots {
                 if let Some(h) = val.as_heap_handle() {
                     visit(h);
                 }

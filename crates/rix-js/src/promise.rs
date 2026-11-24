@@ -260,7 +260,8 @@ pub fn alloc_promise(vm: &mut JsVm) -> HeapHandle {
 pub fn create_resolving_functions(vm: &mut JsVm, promise: HeapHandle) -> (HeapHandle, HeapHandle) {
     let settled = Rc::new(Cell::new(false));
     let s1 = Rc::clone(&settled);
-    let resolve_fn = vm.alloc_host_fn("", move |vm, _this, args| {
+    let p_root = [JsValue::from_object(promise)];
+    let resolve_fn = vm.alloc_host_fn_rooted("", &p_root, move |vm, _this, args| {
         if s1.replace(true) {
             return Ok(JsValue::UNDEFINED);
         }
@@ -269,7 +270,7 @@ pub fn create_resolving_functions(vm: &mut JsVm, promise: HeapHandle) -> (HeapHa
     });
     vm.set_fn_length(resolve_fn, 1);
     let s2 = settled;
-    let reject_fn = vm.alloc_host_fn("", move |vm, _this, args| {
+    let reject_fn = vm.alloc_host_fn_rooted("", &p_root, move |vm, _this, args| {
         if s2.replace(true) {
             return Ok(JsValue::UNDEFINED);
         }
@@ -768,7 +769,15 @@ fn perform_promise_then_cap(
     }
     let cap_res = cap.resolve;
     let cap_rej = cap.reject;
-    let wrapped_ful = vm.alloc_host_fn("", move |vm, _this, args| {
+    let mut ful_roots = vec![
+        cap.promise,
+        JsValue::from_object(cap_res),
+        JsValue::from_object(cap_rej),
+    ];
+    if let Some(fh) = on_ful {
+        ful_roots.push(JsValue::from_object(fh));
+    }
+    let wrapped_ful = vm.alloc_host_fn_rooted("", &ful_roots, move |vm, _this, args| {
         let v = arg(args, 0);
         if let Some(fh) = on_ful {
             match vm.call_value(JsValue::from_object(fh), JsValue::UNDEFINED, &[v]) {
@@ -788,7 +797,15 @@ fn perform_promise_then_cap(
         }
         Ok(JsValue::UNDEFINED)
     });
-    let wrapped_rej = vm.alloc_host_fn("", move |vm, _this, args| {
+    let mut rej_roots = vec![
+        cap.promise,
+        JsValue::from_object(cap_res),
+        JsValue::from_object(cap_rej),
+    ];
+    if let Some(rh) = on_rej {
+        rej_roots.push(JsValue::from_object(rh));
+    }
+    let wrapped_rej = vm.alloc_host_fn_rooted("", &rej_roots, move |vm, _this, args| {
         let r = arg(args, 0);
         if let Some(rh) = on_rej {
             match vm.call_value(JsValue::from_object(rh), JsValue::UNDEFINED, &[r]) {
@@ -878,20 +895,21 @@ fn install_promise(vm: &mut JsVm) {
         let Some(fin_h) = on_finally.as_object().filter(|&h| vm.is_callable_handle(h)) else {
             return invoke_then(vm, this_val, on_finally, on_finally);
         };
-        let on_ful = vm.alloc_host_fn("", move |vm, _this, fargs| {
+        let fin_roots = [c, JsValue::from_object(fin_h)];
+        let on_ful = vm.alloc_host_fn_rooted("", &fin_roots, move |vm, _this, fargs| {
             let val = arg(fargs, 0);
             let res = vm.call_value(JsValue::from_object(fin_h), JsValue::UNDEFINED, &[])?;
             let p = promise_resolve_with_ctor(vm, c, res)?;
-            let ret_val = vm.alloc_host_fn("", move |_vm, _, _| Ok(val));
+            let ret_val = vm.alloc_host_fn_rooted("", &[val], move |_vm, _, _| Ok(val));
             vm.set_fn_length(ret_val, 0);
             invoke_then(vm, p, JsValue::from_object(ret_val), JsValue::UNDEFINED)
         });
         vm.set_fn_length(on_ful, 1);
-        let on_rej = vm.alloc_host_fn("", move |vm, _this, fargs| {
+        let on_rej = vm.alloc_host_fn_rooted("", &fin_roots, move |vm, _this, fargs| {
             let reason = arg(fargs, 0);
             let res = vm.call_value(JsValue::from_object(fin_h), JsValue::UNDEFINED, &[])?;
             let p = promise_resolve_with_ctor(vm, c, res)?;
-            let rethrow = vm.alloc_host_fn("", move |vm, _, _| {
+            let rethrow = vm.alloc_host_fn_rooted("", &[reason], move |vm, _, _| {
                 let msg = vm.format_exception_public(reason);
                 Err(JsException {
                     value: reason,
@@ -1062,67 +1080,81 @@ fn promise_all_fn(
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
     let cap = new_promise_capability(vm, this_val)?;
+    let root_mark = vm.temp_roots.len();
+    vm.temp_roots.push(cap.promise);
+    vm.temp_roots.push(JsValue::from_object(cap.resolve));
+    vm.temp_roots.push(JsValue::from_object(cap.reject));
     let promise_resolve = match get_promise_resolve(vm, this_val) {
         Ok(r) => r,
-        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+        Err(e) => {
+            vm.temp_roots.truncate(root_mark);
+            return reject_cap_and_return(vm, &cap, e.value);
+        }
     };
+    vm.temp_roots.push(promise_resolve);
     let iter = match vm.create_iterator_public(arg(args, 0)) {
         Ok(it) => it,
-        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+        Err(e) => {
+            vm.temp_roots.truncate(root_mark);
+            return reject_cap_and_return(vm, &cap, e.value);
+        }
     };
-    let values = Rc::new(RefCell::new(Vec::<JsValue>::new()));
+    let values_arr = vm.alloc_array();
+    vm.temp_roots.push(JsValue::from_object(values_arr));
     let remaining = Rc::new(Cell::new(1usize));
-    let mut index = 0usize;
-    loop {
+    let mut index = 0u32;
+    let res = loop {
         let (next_val, done) = match vm.step_iterator_public(JsValue::from_object(iter)) {
             Ok(pair) => pair,
-            Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+            Err(e) => break reject_cap_and_return(vm, &cap, e.value),
         };
         if done {
             let left = remaining.get().saturating_sub(1);
             remaining.set(left);
             if left == 0 {
-                let arr = vm.alloc_array();
-                for &v in values.borrow().iter() {
-                    vm.heap.object_push_element(arr, v);
-                }
-                vm.call_value(
+                if let Err(e) = vm.call_value(
                     JsValue::from_object(cap.resolve),
                     JsValue::UNDEFINED,
-                    &[JsValue::from_object(arr)],
-                )?;
+                    &[JsValue::from_object(values_arr)],
+                ) {
+                    break Err(e);
+                }
             }
-            return Ok(cap.promise);
+            break Ok(cap.promise);
         }
-        values.borrow_mut().push(JsValue::UNDEFINED);
+        vm.heap.object_push_element(values_arr, JsValue::UNDEFINED);
         let next_p = match vm.call_value(promise_resolve, this_val, &[next_val]) {
             Ok(p) => p,
             Err(e) => {
                 let _ = vm.iterator_close_handle(iter, true);
-                return reject_cap_and_return(vm, &cap, e.value);
+                break reject_cap_and_return(vm, &cap, e.value);
             }
         };
         let already_called = Rc::new(Cell::new(false));
-        let vals_c = Rc::clone(&values);
         let rem_c = Rc::clone(&remaining);
         let cap_res = cap.resolve;
         let idx = index;
-        let on_ful = vm.alloc_host_fn("", move |vm, _this, fargs| {
+        let roots = [
+            cap.promise,
+            JsValue::from_object(cap_res),
+            JsValue::from_object(values_arr),
+        ];
+        let on_ful = vm.alloc_host_fn_rooted("", &roots, move |vm, _this, fargs| {
             if already_called.replace(true) {
                 return Ok(JsValue::UNDEFINED);
             }
-            vals_c.borrow_mut()[idx] = arg(fargs, 0);
+            let val = arg(fargs, 0);
+            if let Some(o) = vm.heap.get_object_mut(values_arr) {
+                o.elements.set(idx, val);
+            }
+            vm.heap.write_barrier(values_arr, val);
             let left = rem_c.get().saturating_sub(1);
             rem_c.set(left);
             if left == 0 {
-                let arr = vm.alloc_array();
-                for &v in vals_c.borrow().iter() {
-                    vm.heap.object_push_element(arr, v);
-                }
                 vm.call_value(
                     JsValue::from_object(cap_res),
                     JsValue::UNDEFINED,
-                    &[JsValue::from_object(arr)],
+                    &[JsValue::from_object(values_arr)],
                 )?;
             }
             Ok(JsValue::UNDEFINED)
@@ -1136,10 +1168,12 @@ fn promise_all_fn(
             JsValue::from_object(cap.reject),
         ) {
             let _ = vm.iterator_close_handle(iter, true);
-            return reject_cap_and_return(vm, &cap, e.value);
+            break reject_cap_and_return(vm, &cap, e.value);
         }
         index += 1;
-    }
+    };
+    vm.temp_roots.truncate(root_mark);
+    res
 }
 
 fn promise_race_fn(
@@ -1189,53 +1223,67 @@ fn promise_all_settled_fn(
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
     let cap = new_promise_capability(vm, this_val)?;
+    let root_mark = vm.temp_roots.len();
+    vm.temp_roots.push(cap.promise);
+    vm.temp_roots.push(JsValue::from_object(cap.resolve));
+    vm.temp_roots.push(JsValue::from_object(cap.reject));
     let promise_resolve = match get_promise_resolve(vm, this_val) {
         Ok(r) => r,
-        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+        Err(e) => {
+            vm.temp_roots.truncate(root_mark);
+            return reject_cap_and_return(vm, &cap, e.value);
+        }
     };
+    vm.temp_roots.push(promise_resolve);
     let iter = match vm.create_iterator_public(arg(args, 0)) {
         Ok(it) => it,
-        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+        Err(e) => {
+            vm.temp_roots.truncate(root_mark);
+            return reject_cap_and_return(vm, &cap, e.value);
+        }
     };
-    let values = Rc::new(RefCell::new(Vec::<JsValue>::new()));
+    let values_arr = vm.alloc_array();
+    vm.temp_roots.push(JsValue::from_object(values_arr));
     let remaining = Rc::new(Cell::new(1usize));
-    let mut index = 0usize;
-    loop {
+    let mut index = 0u32;
+    let res = loop {
         let (next_val, done) = match vm.step_iterator_public(JsValue::from_object(iter)) {
             Ok(pair) => pair,
-            Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+            Err(e) => break reject_cap_and_return(vm, &cap, e.value),
         };
         if done {
             let left = remaining.get().saturating_sub(1);
             remaining.set(left);
             if left == 0 {
-                let arr = vm.alloc_array();
-                for &v in values.borrow().iter() {
-                    vm.heap.object_push_element(arr, v);
-                }
-                vm.call_value(
+                if let Err(e) = vm.call_value(
                     JsValue::from_object(cap.resolve),
                     JsValue::UNDEFINED,
-                    &[JsValue::from_object(arr)],
-                )?;
+                    &[JsValue::from_object(values_arr)],
+                ) {
+                    break Err(e);
+                }
             }
-            return Ok(cap.promise);
+            break Ok(cap.promise);
         }
-        values.borrow_mut().push(JsValue::UNDEFINED);
+        vm.heap.object_push_element(values_arr, JsValue::UNDEFINED);
         let next_p = match vm.call_value(promise_resolve, this_val, &[next_val]) {
             Ok(p) => p,
             Err(e) => {
                 let _ = vm.iterator_close_handle(iter, true);
-                return reject_cap_and_return(vm, &cap, e.value);
+                break reject_cap_and_return(vm, &cap, e.value);
             }
         };
         let already_called = Rc::new(Cell::new(false));
         let ac1 = Rc::clone(&already_called);
-        let vals1 = Rc::clone(&values);
         let rem1 = Rc::clone(&remaining);
         let cap_res1 = cap.resolve;
         let idx = index;
-        let on_ful = vm.alloc_host_fn("", move |vm, _this, fargs| {
+        let roots = [
+            cap.promise,
+            JsValue::from_object(cap_res1),
+            JsValue::from_object(values_arr),
+        ];
+        let on_ful = vm.alloc_host_fn_rooted("", &roots, move |vm, _this, fargs| {
             if ac1.replace(true) {
                 return Ok(JsValue::UNDEFINED);
             }
@@ -1256,18 +1304,18 @@ fn promise_all_settled_fn(
                 PropertyAttrs::DEFAULT,
                 &mut vm.shapes,
             );
-            vals1.borrow_mut()[idx] = JsValue::from_object(entry);
+            let entry_val = JsValue::from_object(entry);
+            if let Some(o) = vm.heap.get_object_mut(values_arr) {
+                o.elements.set(idx, entry_val);
+            }
+            vm.heap.write_barrier(values_arr, entry_val);
             let left = rem1.get().saturating_sub(1);
             rem1.set(left);
             if left == 0 {
-                let arr = vm.alloc_array();
-                for &v in vals1.borrow().iter() {
-                    vm.heap.object_push_element(arr, v);
-                }
                 vm.call_value(
                     JsValue::from_object(cap_res1),
                     JsValue::UNDEFINED,
-                    &[JsValue::from_object(arr)],
+                    &[JsValue::from_object(values_arr)],
                 )?;
             }
             Ok(JsValue::UNDEFINED)
@@ -1275,10 +1323,9 @@ fn promise_all_settled_fn(
         vm.set_fn_length(on_ful, 1);
 
         let ac2 = already_called;
-        let vals2 = Rc::clone(&values);
         let rem2 = Rc::clone(&remaining);
         let cap_res2 = cap.resolve;
-        let on_rej = vm.alloc_host_fn("", move |vm, _this, fargs| {
+        let on_rej = vm.alloc_host_fn_rooted("", &roots, move |vm, _this, fargs| {
             if ac2.replace(true) {
                 return Ok(JsValue::UNDEFINED);
             }
@@ -1300,18 +1347,18 @@ fn promise_all_settled_fn(
                 PropertyAttrs::DEFAULT,
                 &mut vm.shapes,
             );
-            vals2.borrow_mut()[idx] = JsValue::from_object(entry);
+            let entry_val = JsValue::from_object(entry);
+            if let Some(o) = vm.heap.get_object_mut(values_arr) {
+                o.elements.set(idx, entry_val);
+            }
+            vm.heap.write_barrier(values_arr, entry_val);
             let left = rem2.get().saturating_sub(1);
             rem2.set(left);
             if left == 0 {
-                let arr = vm.alloc_array();
-                for &v in vals2.borrow().iter() {
-                    vm.heap.object_push_element(arr, v);
-                }
                 vm.call_value(
                     JsValue::from_object(cap_res2),
                     JsValue::UNDEFINED,
-                    &[JsValue::from_object(arr)],
+                    &[JsValue::from_object(values_arr)],
                 )?;
             }
             Ok(JsValue::UNDEFINED)
@@ -1326,10 +1373,12 @@ fn promise_all_settled_fn(
             JsValue::from_object(on_rej),
         ) {
             let _ = vm.iterator_close_handle(iter, true);
-            return reject_cap_and_return(vm, &cap, e.value);
+            break reject_cap_and_return(vm, &cap, e.value);
         }
         index += 1;
-    }
+    };
+    vm.temp_roots.truncate(root_mark);
+    res
 }
 
 fn make_aggregate_error_val(vm: &mut JsVm, errs: &[JsValue]) -> JsValue {
@@ -1369,53 +1418,95 @@ fn promise_any_fn(
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
     let cap = new_promise_capability(vm, this_val)?;
+    let root_mark = vm.temp_roots.len();
+    vm.temp_roots.push(cap.promise);
+    vm.temp_roots.push(JsValue::from_object(cap.resolve));
+    vm.temp_roots.push(JsValue::from_object(cap.reject));
     let promise_resolve = match get_promise_resolve(vm, this_val) {
         Ok(r) => r,
-        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+        Err(e) => {
+            vm.temp_roots.truncate(root_mark);
+            return reject_cap_and_return(vm, &cap, e.value);
+        }
     };
+    vm.temp_roots.push(promise_resolve);
     let iter = match vm.create_iterator_public(arg(args, 0)) {
         Ok(it) => it,
-        Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+        Err(e) => {
+            vm.temp_roots.truncate(root_mark);
+            return reject_cap_and_return(vm, &cap, e.value);
+        }
     };
-    let errors = Rc::new(RefCell::new(Vec::<JsValue>::new()));
+    let errors_arr = vm.alloc_array();
+    vm.temp_roots.push(JsValue::from_object(errors_arr));
     let remaining = Rc::new(Cell::new(1usize));
-    let mut index = 0usize;
-    loop {
+    let mut index = 0u32;
+    let res = loop {
         let (next_val, done) = match vm.step_iterator_public(JsValue::from_object(iter)) {
             Ok(pair) => pair,
-            Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+            Err(e) => break reject_cap_and_return(vm, &cap, e.value),
         };
         if done {
             let left = remaining.get().saturating_sub(1);
             remaining.set(left);
             if left == 0 {
-                let agg = make_aggregate_error_val(vm, &errors.borrow());
-                vm.call_value(JsValue::from_object(cap.reject), JsValue::UNDEFINED, &[agg])?;
+                let errs = vm
+                    .heap
+                    .get_object(errors_arr)
+                    .map(|o| {
+                        (0..o.elements.len())
+                            .map(|i| o.elements.get(i).unwrap_or(JsValue::UNDEFINED))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let agg = make_aggregate_error_val(vm, &errs);
+                if let Err(e) =
+                    vm.call_value(JsValue::from_object(cap.reject), JsValue::UNDEFINED, &[agg])
+                {
+                    break Err(e);
+                }
             }
-            return Ok(cap.promise);
+            break Ok(cap.promise);
         }
-        errors.borrow_mut().push(JsValue::UNDEFINED);
+        vm.heap.object_push_element(errors_arr, JsValue::UNDEFINED);
         let next_p = match vm.call_value(promise_resolve, this_val, &[next_val]) {
             Ok(p) => p,
             Err(e) => {
                 let _ = vm.iterator_close_handle(iter, true);
-                return reject_cap_and_return(vm, &cap, e.value);
+                break reject_cap_and_return(vm, &cap, e.value);
             }
         };
         let already_called = Rc::new(Cell::new(false));
-        let errs_c = Rc::clone(&errors);
         let rem_c = Rc::clone(&remaining);
         let cap_rej = cap.reject;
         let idx = index;
-        let on_rej = vm.alloc_host_fn("", move |vm, _this, fargs| {
+        let roots = [
+            cap.promise,
+            JsValue::from_object(cap_rej),
+            JsValue::from_object(errors_arr),
+        ];
+        let on_rej = vm.alloc_host_fn_rooted("", &roots, move |vm, _this, fargs| {
             if already_called.replace(true) {
                 return Ok(JsValue::UNDEFINED);
             }
-            errs_c.borrow_mut()[idx] = arg(fargs, 0);
+            let val = arg(fargs, 0);
+            if let Some(o) = vm.heap.get_object_mut(errors_arr) {
+                o.elements.set(idx, val);
+            }
+            vm.heap.write_barrier(errors_arr, val);
             let left = rem_c.get().saturating_sub(1);
             rem_c.set(left);
             if left == 0 {
-                let agg = make_aggregate_error_val(vm, &errs_c.borrow());
+                let errs = vm
+                    .heap
+                    .get_object(errors_arr)
+                    .map(|o| {
+                        (0..o.elements.len())
+                            .map(|i| o.elements.get(i).unwrap_or(JsValue::UNDEFINED))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let agg = make_aggregate_error_val(vm, &errs);
                 vm.call_value(JsValue::from_object(cap_rej), JsValue::UNDEFINED, &[agg])?;
             }
             Ok(JsValue::UNDEFINED)
@@ -1429,10 +1520,12 @@ fn promise_any_fn(
             JsValue::from_object(on_rej),
         ) {
             let _ = vm.iterator_close_handle(iter, true);
-            return reject_cap_and_return(vm, &cap, e.value);
+            break reject_cap_and_return(vm, &cap, e.value);
         }
         index += 1;
-    }
+    };
+    vm.temp_roots.truncate(root_mark);
+    res
 }
 
 /// Returns `obj.[[OwnPropertyKeys]]()` as `(JsValue key, PropertyKey)` honoring Proxy `ownKeys`.
@@ -1494,36 +1587,54 @@ fn promise_all_keyed_impl(
     };
 
     let keys = Rc::new(RefCell::new(Vec::<crate::PropertyKey>::new()));
-    let values = Rc::new(RefCell::new(Vec::<JsValue>::new()));
+    let values_arr = vm.alloc_array();
     let remaining = Rc::new(Cell::new(1usize));
+    let root_mark = vm.temp_roots.len();
+    vm.temp_roots.push(cap.promise);
+    vm.temp_roots.push(JsValue::from_object(cap.resolve));
+    vm.temp_roots.push(JsValue::from_object(cap.reject));
+    vm.temp_roots.push(JsValue::from_object(values_arr));
 
     for (key_val, pk) in all_keys {
         let is_enum = match is_own_prop_enumerable(vm, promises_h, key_val, pk) {
             Ok(b) => b,
-            Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+            Err(e) => {
+                vm.temp_roots.truncate(root_mark);
+                return reject_cap_and_return(vm, &cap, e.value);
+            }
         };
         if !is_enum {
             continue;
         }
         let prop_val = match vm.get_elem(promises_val, key_val) {
             Ok(v) => v,
-            Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+            Err(e) => {
+                vm.temp_roots.truncate(root_mark);
+                return reject_cap_and_return(vm, &cap, e.value);
+            }
         };
         let next_p = match vm.call_value(promise_resolve, this_val, &[prop_val]) {
             Ok(p) => p,
-            Err(e) => return reject_cap_and_return(vm, &cap, e.value),
+            Err(e) => {
+                vm.temp_roots.truncate(root_mark);
+                return reject_cap_and_return(vm, &cap, e.value);
+            }
         };
-        let idx = keys.borrow().len();
+        let idx = keys.borrow().len() as u32;
         keys.borrow_mut().push(pk);
-        values.borrow_mut().push(JsValue::UNDEFINED);
+        vm.heap.object_push_element(values_arr, JsValue::UNDEFINED);
 
         let already_called = Rc::new(Cell::new(false));
         let ac1 = Rc::clone(&already_called);
         let keys1 = Rc::clone(&keys);
-        let vals1 = Rc::clone(&values);
         let rem1 = Rc::clone(&remaining);
         let cap_res1 = cap.resolve;
-        let on_ful = vm.alloc_host_fn("", move |vm, _this, fargs| {
+        let roots = [
+            cap.promise,
+            JsValue::from_object(cap_res1),
+            JsValue::from_object(values_arr),
+        ];
+        let on_ful = vm.alloc_host_fn_rooted("", &roots, move |vm, _this, fargs| {
             if ac1.replace(true) {
                 return Ok(JsValue::UNDEFINED);
             }
@@ -1549,11 +1660,23 @@ fn promise_all_keyed_impl(
             } else {
                 arg(fargs, 0)
             };
-            vals1.borrow_mut()[idx] = stored;
+            if let Some(o) = vm.heap.get_object_mut(values_arr) {
+                o.elements.set(idx, stored);
+            }
+            vm.heap.write_barrier(values_arr, stored);
             let left = rem1.get().saturating_sub(1);
             rem1.set(left);
             if left == 0 {
-                let obj = build_keyed_result_object(vm, &keys1.borrow(), &vals1.borrow());
+                let vals = vm
+                    .heap
+                    .get_object(values_arr)
+                    .map(|o| {
+                        (0..o.elements.len())
+                            .map(|i| o.elements.get(i).unwrap_or(JsValue::UNDEFINED))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let obj = build_keyed_result_object(vm, &keys1.borrow(), &vals);
                 vm.call_value(JsValue::from_object(cap_res1), JsValue::UNDEFINED, &[obj])?;
             }
             Ok(JsValue::UNDEFINED)
@@ -1563,10 +1686,9 @@ fn promise_all_keyed_impl(
         let rej_handler = if all_settled {
             let ac2 = already_called;
             let keys2 = Rc::clone(&keys);
-            let vals2 = Rc::clone(&values);
             let rem2 = Rc::clone(&remaining);
             let cap_res2 = cap.resolve;
-            let on_rej = vm.alloc_host_fn("", move |vm, _this, fargs| {
+            let on_rej = vm.alloc_host_fn_rooted("", &roots, move |vm, _this, fargs| {
                 if ac2.replace(true) {
                     return Ok(JsValue::UNDEFINED);
                 }
@@ -1588,11 +1710,24 @@ fn promise_all_keyed_impl(
                     PropertyAttrs::DEFAULT,
                     &mut vm.shapes,
                 );
-                vals2.borrow_mut()[idx] = JsValue::from_object(entry);
+                let ev = JsValue::from_object(entry);
+                if let Some(o) = vm.heap.get_object_mut(values_arr) {
+                    o.elements.set(idx, ev);
+                }
+                vm.heap.write_barrier(values_arr, ev);
                 let left = rem2.get().saturating_sub(1);
                 rem2.set(left);
                 if left == 0 {
-                    let obj = build_keyed_result_object(vm, &keys2.borrow(), &vals2.borrow());
+                    let vals = vm
+                        .heap
+                        .get_object(values_arr)
+                        .map(|o| {
+                            (0..o.elements.len())
+                                .map(|i| o.elements.get(i).unwrap_or(JsValue::UNDEFINED))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let obj = build_keyed_result_object(vm, &keys2.borrow(), &vals);
                     vm.call_value(JsValue::from_object(cap_res2), JsValue::UNDEFINED, &[obj])?;
                 }
                 Ok(JsValue::UNDEFINED)
@@ -1605,6 +1740,7 @@ fn promise_all_keyed_impl(
 
         remaining.set(remaining.get() + 1);
         if let Err(e) = invoke_then(vm, next_p, JsValue::from_object(on_ful), rej_handler) {
+            vm.temp_roots.truncate(root_mark);
             return reject_cap_and_return(vm, &cap, e.value);
         }
     }
@@ -1612,13 +1748,23 @@ fn promise_all_keyed_impl(
     let left = remaining.get().saturating_sub(1);
     remaining.set(left);
     if left == 0 {
-        let obj = build_keyed_result_object(vm, &keys.borrow(), &values.borrow());
+        let vals = vm
+            .heap
+            .get_object(values_arr)
+            .map(|o| {
+                (0..o.elements.len())
+                    .map(|i| o.elements.get(i).unwrap_or(JsValue::UNDEFINED))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let obj = build_keyed_result_object(vm, &keys.borrow(), &vals);
         vm.call_value(
             JsValue::from_object(cap.resolve),
             JsValue::UNDEFINED,
             &[obj],
         )?;
     }
+    vm.temp_roots.truncate(root_mark);
     Ok(cap.promise)
 }
 
