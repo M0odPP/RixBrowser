@@ -649,7 +649,8 @@ impl HostState {
         (info.abs_padding.size.width, info.abs_padding.size.height)
     }
 
-    /// Computes CSSOM View `scrollWidth` and `scrollHeight`.
+    /// Computes CSSOM View `scrollWidth` and `scrollHeight` (including end-edge padding
+    /// and reversed scroll-origin negative overflow per CSS Overflow L3 §2.2).
     pub fn scroll_size_for_node(&mut self, node: NodeId) -> (f32, f32) {
         let Some(info) = self.element_geometry_for_node(node) else {
             return (0.0, 0.0);
@@ -659,18 +660,34 @@ impl HostState {
             let sh = info.overflow_rect.max_y().max(self.viewport.height);
             return (sw, sh);
         }
-        let child_max_x = (info.overflow_rect.max_x() - info.border.left).max(0.0);
-        let child_max_y = (info.overflow_rect.max_y() - info.border.top).max(0.0);
-        let sw = if child_max_x > info.abs_padding.size.width + 0.01 {
-            child_max_x + info.padding.right
+        let pad_lo_x = info.border.left;
+        let pad_hi_x = info.border.left + info.abs_padding.size.width;
+        let pad_lo_y = info.border.top;
+        let pad_hi_y = info.border.top + info.abs_padding.size.height;
+        let (eff_lo_x, eff_hi_x) = if info.has_children {
+            let lo = if info.scroll_neg_x {
+                pad_lo_x.min(info.children_bounds.origin.x - info.padding.left)
+            } else {
+                pad_lo_x
+            };
+            let hi = pad_hi_x.max(info.children_bounds.max_x() + info.padding.right);
+            (lo, hi)
         } else {
-            info.abs_padding.size.width
+            (pad_lo_x, pad_hi_x)
         };
-        let sh = if child_max_y > info.abs_padding.size.height + 0.01 {
-            child_max_y + info.padding.bottom
+        let (eff_lo_y, eff_hi_y) = if info.has_children {
+            let lo = if info.scroll_neg_y {
+                pad_lo_y.min(info.children_bounds.origin.y - info.padding.top)
+            } else {
+                pad_lo_y
+            };
+            let hi = pad_hi_y.max(info.children_bounds.max_y() + info.padding.bottom);
+            (lo, hi)
         } else {
-            info.abs_padding.size.height
+            (pad_lo_y, pad_hi_y)
         };
+        let sw = (eff_hi_x - eff_lo_x).max(info.abs_padding.size.width);
+        let sh = (eff_hi_y - eff_lo_y).max(info.abs_padding.size.height);
         (sw, sh)
     }
 
@@ -1001,6 +1018,10 @@ pub struct ElementGeometryInfo {
     pub border: EdgeInsets,
     pub padding: EdgeInsets,
     pub overflow_rect: Rect,
+    pub children_bounds: Rect,
+    pub has_children: bool,
+    pub scroll_neg_x: bool,
+    pub scroll_neg_y: bool,
     pub ancestor_scroll: Point,
     pub is_root_elem: bool,
     pub is_inline_non_replaced: bool,
@@ -1038,6 +1059,69 @@ fn find_element_geometry(
         );
         let is_inline_non_replaced =
             matches!(frag.kind, rix_layout::FragmentKind::InlineBox { .. });
+        let (has_children, children_bounds) = if frag.children.is_empty() {
+            (false, Rect::ZERO)
+        } else {
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+            for ch in frag.children.iter() {
+                let cx = ch.border_rect.origin.x;
+                let cy = ch.border_rect.origin.y;
+                min_x = min_x.min(cx + ch.overflow_rect.origin.x);
+                min_y = min_y.min(cy + ch.overflow_rect.origin.y);
+                max_x = max_x.max(cx + ch.overflow_rect.max_x());
+                max_y = max_y.max(cy + ch.overflow_rect.max_y());
+            }
+            (
+                true,
+                Rect::new(
+                    min_x,
+                    min_y,
+                    (max_x - min_x).max(0.0),
+                    (max_y - min_y).max(0.0),
+                ),
+            )
+        };
+        let (scroll_neg_x, scroll_neg_y) = if matches!(
+            frag.style.display,
+            DisplayMode::Flex | DisplayMode::InlineFlex
+        ) {
+            let fg = frag.style.flex_grid.as_deref();
+            let fdir = fg.map_or(rix_css::FlexDirectionMode::Row, |f| f.flex_direction);
+            let fwrap = fg.map_or(rix_css::FlexWrapMode::NoWrap, |f| f.flex_wrap);
+            let axes = rix_layout::FlexAxes::compute(
+                frag.style.text.writing_mode,
+                frag.style.text.direction,
+                fdir,
+                fwrap,
+            );
+            let nx = if axes.main_is_x {
+                axes.main_reversed
+            } else {
+                axes.cross_reversed
+            };
+            let ny = if axes.main_is_x {
+                axes.cross_reversed
+            } else {
+                axes.main_reversed
+            };
+            (nx, ny)
+        } else {
+            let wm = frag.style.text.writing_mode;
+            let is_rtl = frag.style.text.direction == rix_css::DirectionMode::Rtl;
+            let nx = (wm == rix_css::WritingMode::HorizontalTb && is_rtl)
+                || matches!(
+                    wm,
+                    rix_css::WritingMode::VerticalRl | rix_css::WritingMode::SidewaysRl
+                );
+            let ny = (wm == rix_css::WritingMode::SidewaysLr && !is_rtl)
+                || (wm != rix_css::WritingMode::HorizontalTb
+                    && wm != rix_css::WritingMode::SidewaysLr
+                    && is_rtl);
+            (nx, ny)
+        };
         return Some(ElementGeometryInfo {
             abs_border,
             abs_padding,
@@ -1045,6 +1129,10 @@ fn find_element_geometry(
             border: frag.border,
             padding: frag.padding,
             overflow_rect: frag.overflow_rect,
+            children_bounds,
+            has_children,
+            scroll_neg_x,
+            scroll_neg_y,
             ancestor_scroll: eff_scroll,
             is_root_elem: is_root,
             is_inline_non_replaced,

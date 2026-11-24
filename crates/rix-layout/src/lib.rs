@@ -6,6 +6,7 @@ pub mod assets;
 pub mod bfc;
 pub mod box_tree;
 pub mod engine;
+pub mod flex;
 pub mod flex_grid;
 pub mod fragment;
 pub mod ifc;
@@ -24,6 +25,7 @@ pub use box_tree::{
     LayoutBox, ReplacedKind, SvgPathEntry,
 };
 pub use engine::{hit_test, LayoutEngine, LayoutFrame, LayoutMetrics};
+pub use flex::{layout_flex_container, measure_flex_intrinsic_widths, FlexAbsposHint, FlexAxes};
 pub use flex_grid::layout_flex_grid_container;
 pub use fragment::{
     layout_box, layout_replaced, layout_tree, layout_tree_with_scroll, measure_intrinsic_widths,

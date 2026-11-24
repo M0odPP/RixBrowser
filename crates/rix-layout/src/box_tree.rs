@@ -388,7 +388,9 @@ impl<'a> BoxTreeBuilder<'a> {
         let is_out_of_flow = matches!(style.position, PositionMode::Absolute | PositionMode::Fixed);
         let is_float = !is_out_of_flow && style.float_mode != FloatMode::None;
         let kind = classify_element_box_kind(tag, elem, &style, is_float, is_out_of_flow);
-        let establishes_bfc = box_establishes_bfc(&kind, &style, is_float, is_out_of_flow);
+        // CSS 2.2 §9.4.1: The root element of the document establishes a block formatting context.
+        let establishes_bfc =
+            parent_style.is_none() || box_establishes_bfc(&kind, &style, is_float, is_out_of_flow);
 
         let mut raw_children = Vec::new();
 

@@ -274,6 +274,7 @@ pub fn layout_flex_grid_container(
                 metrics.border.top + metrics.padding.top,
             ),
             is_fixed,
+            flex_hint: None,
         });
     }
     crate::position::resolve_oof_for_container(
@@ -306,6 +307,7 @@ pub fn layout_flex_grid_container(
             (border_h - pb_h).max(0.0),
         ),
         baseline: Some(border_h),
+        last_baseline: Some(border_h),
         overflow_rect: Rect::new(0.0, 0.0, border_w, border_h),
         kind: FragmentKind::Box,
         children: Arc::new(placed_children),
