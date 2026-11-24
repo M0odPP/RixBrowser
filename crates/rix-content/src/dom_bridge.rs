@@ -58,6 +58,7 @@ pub type MutationSink = Rc<RefCell<Box<dyn FnMut(&DomMutation)>>>;
 pub struct CustomElementDef {
     pub constructor: HeapHandle,
     pub observed_attributes: Vec<String>,
+    pub extends: Option<String>,
 }
 
 /// DOM prototype handles installed inside a [`JsVm`] realm.
@@ -206,7 +207,11 @@ pub struct HostState {
     pub next_web_anim_id: u64,
     pub selection: crate::selection::SelectionState,
     pub(crate) dom_parser_proto: Option<HeapHandle>,
+    pub(crate) sanitizer_proto: Option<HeapHandle>,
+    pub(crate) sanitizers: HashMap<HeapHandle, crate::dom_sanitizer::SanitizerConfig>,
     pub(crate) contextual_scripts: HashSet<NodeId>,
+    pub(crate) upgraded_custom_elements: HashSet<NodeId>,
+    pub(crate) pending_ce_upgrade_node: Option<NodeId>,
     pub(crate) iframe_connect_hook: Option<IframeConnectHook>,
     pub(crate) body_attr_handler_hook: Option<BodyAttrHandlerHook>,
 }
@@ -295,7 +300,11 @@ impl HostState {
             next_web_anim_id: 1,
             selection: crate::selection::SelectionState::default(),
             dom_parser_proto: None,
+            sanitizer_proto: None,
+            sanitizers: HashMap::new(),
             contextual_scripts: HashSet::new(),
+            upgraded_custom_elements: HashSet::new(),
+            pending_ce_upgrade_node: None,
             iframe_connect_hook: None,
             body_attr_handler_hook: None,
         }
@@ -411,6 +420,9 @@ impl HostState {
         }
         if let Some(dpp) = self.dom_parser_proto {
             out.push(JsValue::from_object(dpp));
+        }
+        if let Some(sp) = self.sanitizer_proto {
+            out.push(JsValue::from_object(sp));
         }
         self.prototypes.collect_roots(out);
         for &proto in self.interface_protos.values() {
@@ -4487,15 +4499,32 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         } else {
             ""
         };
-        let nid = h
-            .borrow()
-            .document
-            .borrow_mut()
-            .create_element_ns(ns, None, &local);
+        let is_opt: Option<String> = arg(args, 1).as_object().and_then(|oh| {
+            let k_is = vm.heap.intern_key("is");
+            vm.get_property_by_key(oh, k_is).ok().and_then(|v| {
+                if v.is_undefined() {
+                    None
+                } else {
+                    Some(vm.value_to_rust_string(v))
+                }
+            })
+        });
+        let nid = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            let n = doc.create_element_ns(ns, None, &local);
+            if let Some(ref is_val) = is_opt {
+                if let Some(NodeData::Element(el)) = doc.get_mut(n) {
+                    el.set_attribute("is", is_val);
+                }
+            }
+            n
+        };
         h.borrow_mut().set_owner_doc(nid, doc_id);
         let wrapper = wrap_node(vm, &h, nid);
         if ns == crate::dom_interfaces::HTML_NS {
-            upgrade_if_custom_element(vm, &h, nid, &local);
+            let ce_key = is_opt.as_deref().unwrap_or(&local);
+            upgrade_if_custom_element(vm, &h, nid, ce_key, &local);
         }
         Ok(wrapper)
     });
@@ -4523,7 +4552,7 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         h.borrow_mut().set_owner_doc(nid, doc_id);
         let wrapper = wrap_node(vm, &h, nid);
         if ns == crate::dom_interfaces::HTML_NS {
-            upgrade_if_custom_element(vm, &h, nid, &local);
+            upgrade_if_custom_element(vm, &h, nid, &local, &local);
         }
         Ok(wrapper)
     });
@@ -5210,6 +5239,17 @@ fn install_window_and_cssom(vm: &mut JsVm, host: &SharedHost) {
                 }
             }
         }
+        // Read optional `{ extends: "..." }` third argument for customized built-in elements.
+        let extends_opt: Option<String> = arg(args, 2).as_object().and_then(|oh| {
+            let k_ext = vm.heap.intern_key("extends");
+            vm.get_property_by_key(oh, k_ext).ok().and_then(|v| {
+                if v.is_undefined() {
+                    None
+                } else {
+                    Some(vm.value_to_rust_string(v).to_ascii_lowercase())
+                }
+            })
+        });
         let waiters = {
             let mut hs = h.borrow_mut();
             hs.custom_elements.insert(
@@ -5217,6 +5257,7 @@ fn install_window_and_cssom(vm: &mut JsVm, host: &SharedHost) {
                 CustomElementDef {
                     constructor: ctor,
                     observed_attributes,
+                    extends: extends_opt.clone(),
                 },
             );
             hs.when_defined_waiters.remove(&name).unwrap_or_default()
@@ -5226,10 +5267,23 @@ fn install_window_and_cssom(vm: &mut JsVm, host: &SharedHost) {
         }
         // Upgrade any already-connected matching elements in the document.
         let root = h.borrow().document.borrow().root();
-        let matching = find_elements_by_tag(&h, root, &name);
+        let search_tag = extends_opt.as_deref().unwrap_or(&name);
+        let matching = find_elements_by_tag(&h, root, search_tag);
         for nid in matching {
-            upgrade_if_custom_element(vm, &h, nid, &name);
-            invoke_custom_element_lifecycle(vm, &h, nid, "connectedCallback", &[]);
+            let matches_ce = if extends_opt.is_some() {
+                let doc_rc = Rc::clone(&h.borrow().document);
+                let doc = doc_rc.borrow();
+                matches!(
+                    doc.get(nid),
+                    Some(NodeData::Element(e)) if e.get_attribute("is") == Some(name.as_str())
+                )
+            } else {
+                true
+            };
+            if matches_ce {
+                upgrade_if_custom_element(vm, &h, nid, &name, search_tag);
+                invoke_custom_element_lifecycle(vm, &h, nid, "connectedCallback", &[]);
+            }
         }
         Ok(JsValue::UNDEFINED)
     });
@@ -5533,11 +5587,33 @@ fn install_parent_node_mixin(vm: &mut JsVm, host: &SharedHost, proto: HeapHandle
     });
 }
 
-fn upgrade_if_custom_element(vm: &mut JsVm, host: &SharedHost, nid: NodeId, tag: &str) {
-    let def_opt = host.borrow().custom_elements.get(tag).cloned();
+pub(crate) fn upgrade_if_custom_element(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    nid: NodeId,
+    ce_name: &str,
+    local_tag: &str,
+) {
+    if host.borrow().upgraded_custom_elements.contains(&nid) {
+        return;
+    }
+    let def_opt = host.borrow().custom_elements.get(ce_name).cloned();
     let Some(def) = def_opt else {
         return;
     };
+    // Verify autonomous vs customized built-in match.
+    match &def.extends {
+        Some(ext) => {
+            if !ext.eq_ignore_ascii_case(local_tag) {
+                return;
+            }
+        }
+        None => {
+            if !ce_name.eq_ignore_ascii_case(local_tag) {
+                return;
+            }
+        }
+    }
     {
         let doc_rc = Rc::clone(&host.borrow().document);
         let mut doc = doc_rc.borrow_mut();
@@ -5545,8 +5621,12 @@ fn upgrade_if_custom_element(vm: &mut JsVm, host: &SharedHost, nid: NodeId, tag:
             e.pseudo_state.insert(rix_dom::ElementState::DEFINED);
         }
     }
-    host.borrow_mut()
-        .invalidate_element_state(nid, rix_dom::ElementState::DEFINED);
+    {
+        let mut hb = host.borrow_mut();
+        hb.upgraded_custom_elements.insert(nid);
+        hb.invalidate_element_state(nid, rix_dom::ElementState::DEFINED);
+        hb.pending_ce_upgrade_node = Some(nid);
+    }
     let wrapper = wrap_node(vm, host, nid);
     if let Some(wh) = wrapper.as_object() {
         if let Ok(ctor_proto) = vm.get_property_by_key(def.constructor, vm.key_prototype) {
@@ -5555,6 +5635,9 @@ fn upgrade_if_custom_element(vm: &mut JsVm, host: &SharedHost, nid: NodeId, tag:
             }
         }
     }
+    let ctor_val = JsValue::from_object(def.constructor);
+    let _ = vm.construct_value(ctor_val, &[], ctor_val);
+    host.borrow_mut().pending_ce_upgrade_node = None;
 }
 
 pub(crate) fn notify_custom_element_subtree(
@@ -5566,15 +5649,28 @@ pub(crate) fn notify_custom_element_subtree(
     if host.borrow().custom_elements.is_empty() {
         return;
     }
-    let nodes: Vec<(NodeId, String)> = {
-        let _doc_rc = Rc::clone(&host.borrow().document);
-        let doc = _doc_rc.borrow();
+    let nodes: Vec<(NodeId, String, String)> = {
+        let hb = host.borrow();
+        let doc = hb.document.borrow();
         let mut out = Vec::new();
         for n in doc.descendants(root) {
             if let Some(NodeData::Element(e)) = doc.get(n) {
+                if &*e.name.ns != crate::dom_interfaces::HTML_NS {
+                    continue;
+                }
                 let tag = e.name.local.as_str().to_ascii_lowercase();
-                if host.borrow().custom_elements.contains_key(&tag) {
-                    out.push((n, tag));
+                if let Some(def) = hb.custom_elements.get(&tag) {
+                    if def.extends.is_none() {
+                        out.push((n, tag.clone(), tag));
+                        continue;
+                    }
+                }
+                if let Some(is_val) = e.get_attribute("is") {
+                    if let Some(def) = hb.custom_elements.get(is_val) {
+                        if def.extends.as_deref() == Some(tag.as_str()) {
+                            out.push((n, is_val.to_string(), tag));
+                        }
+                    }
                 }
             }
         }
@@ -5585,9 +5681,9 @@ pub(crate) fn notify_custom_element_subtree(
     } else {
         "disconnectedCallback"
     };
-    for (nid, tag) in nodes {
+    for (nid, ce_name, tag) in nodes {
         if connected {
-            upgrade_if_custom_element(vm, host, nid, &tag);
+            upgrade_if_custom_element(vm, host, nid, &ce_name, &tag);
         }
         invoke_custom_element_lifecycle(vm, host, nid, cb_name, &[]);
     }

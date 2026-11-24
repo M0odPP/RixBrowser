@@ -189,6 +189,109 @@ impl HtmlParserStream {
     }
 }
 
+/// Incremental WHATWG HTML fragment parser backed by `html5ever::parse_fragment`,
+/// supporting chunked `write()`/`close()` streaming (WHATWG HTML §8.4 streaming methods).
+pub struct HtmlFragmentParserStream {
+    parser: Parser<DomTreeSink>,
+    document: Rc<RefCell<Document>>,
+    finished: bool,
+}
+
+impl HtmlFragmentParserStream {
+    #[must_use]
+    pub fn new(context: Option<&QualName>, scripting_enabled: bool) -> Self {
+        let document = Rc::new(RefCell::new(Document::new()));
+        let sink = DomTreeSink::with_document(Rc::clone(&document));
+        let opts = ParseOpts {
+            tree_builder: html5ever::tree_builder::TreeBuilderOpts {
+                scripting_enabled,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let context_name = match context {
+            Some(qname) => qname.clone(),
+            None => QualName::new(
+                None,
+                markup5ever::ns!(html),
+                markup5ever::local_name!("body"),
+            ),
+        };
+        let parser = parse_fragment(sink, opts, context_name, Vec::new(), true);
+        Self {
+            parser,
+            document,
+            finished: false,
+        }
+    }
+
+    #[must_use]
+    pub fn document(&self) -> Rc<RefCell<Document>> {
+        Rc::clone(&self.document)
+    }
+
+    /// Feeds `chunk` into the tokenizer buffer without advancing yet.
+    pub fn push_chunk(&mut self, chunk: &str) {
+        if !self.finished && !chunk.is_empty() {
+            self.parser
+                .input_buffer
+                .push_back(StrTendril::from_slice(chunk));
+        }
+    }
+
+    /// Advances the tokenizer until the next closed `<script>` element or buffer exhaustion.
+    pub fn step(&mut self) -> ParserStreamStep {
+        if self.finished {
+            return ParserStreamStep::Done;
+        }
+        loop {
+            match self.parser.tokenizer.feed(&self.parser.input_buffer) {
+                TokenizerResult::Script(node_id) => return ParserStreamStep::Script(node_id),
+                TokenizerResult::Done => return ParserStreamStep::Done,
+                TokenizerResult::EncodingIndicator(_) => continue,
+            }
+        }
+    }
+
+    /// Signals EOF to the tokenizer/tree builder, flushing pending text and open elements.
+    pub fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        loop {
+            match self.parser.tokenizer.feed(&self.parser.input_buffer) {
+                TokenizerResult::Done => break,
+                TokenizerResult::Script(_) | TokenizerResult::EncodingIndicator(_) => continue,
+            }
+        }
+        self.parser.tokenizer.end();
+        self.finished = true;
+    }
+
+    /// Returns the top-level parsed fragment nodes inside the synthetic `<html>` wrapper.
+    #[must_use]
+    pub fn fragment_roots(&self) -> Vec<NodeId> {
+        let doc = self.document.borrow();
+        let mut fragment_nodes = Vec::new();
+        let mut found_html_wrapper = false;
+        for child in doc.children(doc.root()) {
+            if !found_html_wrapper {
+                if let Some(NodeData::Element(elem)) = doc.get(child) {
+                    if &*elem.name.local == "html" {
+                        found_html_wrapper = true;
+                        for node in doc.children(child) {
+                            fragment_nodes.push(node);
+                        }
+                        continue;
+                    }
+                }
+            }
+            fragment_nodes.push(child);
+        }
+        fragment_nodes
+    }
+}
+
 pub fn is_blocking_classic_script(doc: &Document, node: NodeId) -> bool {
     let Some(NodeData::Element(elem)) = doc.get(node) else {
         return false;

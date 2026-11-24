@@ -2013,7 +2013,7 @@ fn extract_content_type_charset(headers: &HashMap<String, String>) -> Option<Str
     None
 }
 
-fn fetch_iframe_url_sync(
+pub(crate) fn fetch_iframe_url_sync(
     net: &SharedNetBridge,
     url: &str,
     origin: &str,

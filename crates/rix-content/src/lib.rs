@@ -12,6 +12,7 @@ pub mod dom_bridge;
 pub mod dom_collections;
 pub mod dom_interfaces;
 pub mod dom_parsing;
+pub mod dom_sanitizer;
 pub mod event_loop;
 pub mod events;
 pub mod fetch_ws;
@@ -197,6 +198,14 @@ impl ContentRuntime {
         cssom::install_cssom(&mut vm, &host);
         let streams = install_streams(&mut vm, &web_apis);
         let net = install_fetch_and_websocket(&mut vm, &host, &web_apis, &streams, fetch_engine);
+        dom_sanitizer::install_dom_sanitizer_and_streaming(
+            &mut vm,
+            &host,
+            &event_loop,
+            &web_apis,
+            &streams,
+            &net,
+        );
         let canvas2d = install_canvas2d(&mut vm, &host, &web_apis);
         let frames =
             install_frame_and_messaging_apis(&mut vm, &host, &events, &event_loop, &web_apis, &net);
