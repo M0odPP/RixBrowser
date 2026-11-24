@@ -156,8 +156,143 @@ enum LinePiecePayload {
     Atomic(Box<Fragment>),
 }
 
+/// Computes `(block_thickness_width, max_inline_advance_height)` for a vertical writing-mode
+/// inline formatting context constrained to `inline_avail` along its vertical inline axis.
+pub fn measure_vertical_ifc_dims(
+    ctx: &mut LayoutContext<'_>,
+    container_id: BoxId,
+    space: ConstraintSpace,
+    inline_avail: f32,
+) -> (f32, f32) {
+    let container_style = Arc::clone(&ctx.tree.get(container_id).style);
+    let eval = ctx.eval_context_for(&container_style, &space);
+    let strut_font_id = ctx.resolve_font(&container_style);
+    let (_, _, strut_line_h) = line_box_metrics(ctx.font_db, strut_font_id, &container_style, eval);
+    let allow_wrap = !matches!(
+        container_style.text.white_space,
+        WhiteSpaceMode::Nowrap | WhiteSpaceMode::Pre
+    );
+
+    let items = collect_inline_items(ctx, container_id, space);
+    if items.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let mut total_block = 0.0f32;
+    let mut max_inline = 0.0f32;
+    let mut cur_inline = 0.0f32;
+    let mut cur_line_block = 0.0f32;
+    let mut pending_space = 0.0f32;
+    let mut has_content = false;
+
+    for item in &items {
+        match item {
+            InlineItem::PushInline(info) => {
+                let lead = info.border.top + info.padding.top + info.margin.top;
+                if lead > 0.0 {
+                    cur_inline += pending_space + lead;
+                    pending_space = 0.0;
+                    has_content = true;
+                    cur_line_block = cur_line_block.max(strut_line_h);
+                }
+            }
+            InlineItem::PopInline(_) | InlineItem::OutOfFlow(_) => {}
+            InlineItem::Word {
+                text,
+                style,
+                is_space,
+                ..
+            } => {
+                let font_id = ctx.resolve_font(style);
+                let font_size = style.text.font_size_px.max(1.0);
+                let adv = measure_shaped_width(ctx, text, font_id, font_size, style);
+                let w_eval = ctx.eval_context_for(style, &space);
+                let (_, _, lh) = line_box_metrics(ctx.font_db, font_id, style, w_eval);
+                if *is_space {
+                    if has_content {
+                        pending_space += adv;
+                    }
+                } else {
+                    if allow_wrap
+                        && has_content
+                        && inline_avail.is_finite()
+                        && cur_inline + pending_space + adv > inline_avail + 0.05
+                    {
+                        total_block += cur_line_block.max(strut_line_h);
+                        max_inline = max_inline.max(cur_inline);
+                        cur_inline = 0.0;
+                        cur_line_block = 0.0;
+                        pending_space = 0.0;
+                    }
+                    cur_inline += pending_space + adv;
+                    pending_space = 0.0;
+                    has_content = true;
+                    cur_line_block = cur_line_block.max(lh.max(strut_line_h));
+                }
+            }
+            InlineItem::HardBreak => {
+                total_block += cur_line_block.max(strut_line_h);
+                max_inline = max_inline.max(cur_inline);
+                cur_inline = 0.0;
+                cur_line_block = 0.0;
+                pending_space = 0.0;
+                has_content = false;
+            }
+            InlineItem::Atomic { box_id, .. } => {
+                let saved = ctx.pending_oof.len();
+                let frag = layout_box(ctx, *box_id, space);
+                ctx.pending_oof.truncate(saved);
+                let adv = frag.border_rect.size.height + frag.margin.vertical();
+                let blk = frag.border_rect.size.width + frag.margin.horizontal();
+                if allow_wrap
+                    && has_content
+                    && inline_avail.is_finite()
+                    && cur_inline + pending_space + adv > inline_avail + 0.05
+                {
+                    total_block += cur_line_block.max(strut_line_h);
+                    max_inline = max_inline.max(cur_inline);
+                    cur_inline = 0.0;
+                    cur_line_block = 0.0;
+                    pending_space = 0.0;
+                }
+                cur_inline += pending_space + adv;
+                pending_space = 0.0;
+                has_content = true;
+                cur_line_block = cur_line_block.max(blk.max(strut_line_h));
+            }
+        }
+    }
+    if has_content {
+        total_block += cur_line_block.max(strut_line_h);
+        max_inline = max_inline.max(cur_inline);
+    }
+    (total_block, max_inline)
+}
+
 /// Computes `(min_content_width, max_content_width)` of the inline content inside `container_id`.
+/// For vertical writing modes, physical width is the block axis (summed wrapped line thickness).
 pub fn measure_ifc_min_max_content(
+    ctx: &mut LayoutContext<'_>,
+    container_id: BoxId,
+    space: ConstraintSpace,
+) -> (f32, f32) {
+    if ctx
+        .tree
+        .get(container_id)
+        .style
+        .text
+        .writing_mode
+        .is_vertical()
+    {
+        let inline_avail = space.available_height.unwrap_or(f32::INFINITY);
+        let (blk_w, _) = measure_vertical_ifc_dims(ctx, container_id, space, inline_avail);
+        return (blk_w, blk_w);
+    }
+    measure_ifc_inline_min_max(ctx, container_id, space)
+}
+
+/// Computes `(min_content_inline, max_content_inline)` along the text's own inline progression axis.
+pub fn measure_ifc_inline_min_max(
     ctx: &mut LayoutContext<'_>,
     container_id: BoxId,
     space: ConstraintSpace,
@@ -290,6 +425,7 @@ pub fn layout_ifc(
                     ),
                     is_fixed,
                     flex_hint: None,
+                    grid_hint: None,
                 });
             }
             InlineItem::HardBreak => {
@@ -594,6 +730,7 @@ pub fn layout_ifc(
             is_out_of_flow: false,
             collapsed_margin_top: 0.0,
             collapsed_margin_bottom: 0.0,
+            resolved_grid_tracks: None,
         };
         line_frag.compute_overflow_rect();
         fragments.push(line_frag);
@@ -806,6 +943,7 @@ fn finish_line(
                     is_out_of_flow: false,
                     collapsed_margin_top: 0.0,
                     collapsed_margin_bottom: 0.0,
+                    resolved_grid_tracks: None,
                 });
             }
             LinePiecePayload::Atomic(mut frag) => {
@@ -872,6 +1010,7 @@ fn finish_line(
             is_out_of_flow: false,
             collapsed_margin_top: 0.0,
             collapsed_margin_bottom: 0.0,
+            resolved_grid_tracks: None,
         });
     }
     children.extend(emitted_pieces);

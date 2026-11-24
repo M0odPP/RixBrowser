@@ -18,7 +18,7 @@ use crate::bfc::layout_bfc_root;
 use crate::box_tree::{
     BoxId, BoxKind, BoxTree, FormControlKind, FormattingContextKind, ReplacedKind, SvgPathEntry,
 };
-use crate::flex_grid::{layout_flex_grid_container, RetainedTaffyContainer};
+use crate::flex_grid::RetainedTaffyContainer;
 use crate::ifc::{measure_ifc_min_max_content, resolve_line_height_px};
 use crate::table::layout_table;
 
@@ -61,6 +61,14 @@ pub struct ConstraintSpace {
     pub containing_block_height: f32,
     pub viewport_size: Size,
     pub root_font_size_px: f32,
+    /// Optional containing-block inline size for resolving percentage `margin`/`padding`
+    /// when the containing block has a vertical `writing-mode` (CSS Box Model L3 / Writing Modes L3 §7.1).
+    /// When `None`, defaults to `containing_block_width`. Cleared by [`Self::with_available`].
+    pub cb_inline_size: Option<f32>,
+    /// Optional forced definite content width imposed by a parent formatting context
+    /// (e.g. stretched inset-modified width on an out-of-flow box per CSS Position L3 §5.1).
+    /// Cleared by [`Self::with_available`] so it applies only to the direct child box.
+    pub definite_width_override: Option<f32>,
     /// Optional forced definite content height imposed by a parent formatting context
     /// (e.g. stretched or flexed height on a CSS Flex item per Flexbox L1 §9.8).
     /// Cleared by [`Self::with_available`] so it applies only to the direct child box.
@@ -81,6 +89,8 @@ impl ConstraintSpace {
             containing_block_height: viewport.height,
             viewport_size: viewport,
             root_font_size_px: 16.0,
+            cb_inline_size: None,
+            definite_width_override: None,
             definite_height_override: None,
             ignore_specified_height: false,
         }
@@ -120,6 +130,8 @@ impl ConstraintSpace {
             containing_block_height: height.unwrap_or(self.containing_block_height).max(0.0),
             viewport_size: self.viewport_size,
             root_font_size_px: self.root_font_size_px,
+            cb_inline_size: None,
+            definite_width_override: None,
             definite_height_override: None,
             ignore_specified_height: false,
         }
@@ -156,13 +168,14 @@ impl BoxMetrics {
     ) -> Self {
         let cb_w = space.containing_block_width;
         let cb_h = space.containing_block_height;
+        let cb_inline = space.cb_inline_size.unwrap_or(cb_w);
         let bm = &style.box_model;
 
         let padding = EdgeInsets {
-            top: bm.padding.top.resolve_px(cb_w, &eval).max(0.0),
-            right: bm.padding.right.resolve_px(cb_w, &eval).max(0.0),
-            bottom: bm.padding.bottom.resolve_px(cb_w, &eval).max(0.0),
-            left: bm.padding.left.resolve_px(cb_w, &eval).max(0.0),
+            top: bm.padding.top.resolve_px(cb_inline, &eval).max(0.0),
+            right: bm.padding.right.resolve_px(cb_inline, &eval).max(0.0),
+            bottom: bm.padding.bottom.resolve_px(cb_inline, &eval).max(0.0),
+            left: bm.padding.left.resolve_px(cb_inline, &eval).max(0.0),
         };
         let border = EdgeInsets {
             top: resolve_border_side(bm.border_width.top, style.visual.border_style.top),
@@ -173,10 +186,10 @@ impl BoxMetrics {
         let margin_left_auto = matches!(bm.margin.left, LengthPercentageAuto::Auto);
         let margin_right_auto = matches!(bm.margin.right, LengthPercentageAuto::Auto);
         let margin = EdgeInsets {
-            top: resolve_lpa(&bm.margin.top, cb_w, &eval),
-            right: resolve_lpa(&bm.margin.right, cb_w, &eval),
-            bottom: resolve_lpa(&bm.margin.bottom, cb_w, &eval),
-            left: resolve_lpa(&bm.margin.left, cb_w, &eval),
+            top: resolve_lpa(&bm.margin.top, cb_inline, &eval),
+            right: resolve_lpa(&bm.margin.right, cb_inline, &eval),
+            bottom: resolve_lpa(&bm.margin.bottom, cb_inline, &eval),
+            left: resolve_lpa(&bm.margin.left, cb_inline, &eval),
         };
 
         let pb_w = padding.horizontal() + border.horizontal();
@@ -421,6 +434,14 @@ pub enum FragmentKind {
     },
 }
 
+/// Resolved CSS Grid track listings for CSS Grid L1 §7.2.6 `getComputedStyle()`
+/// (`grid-template-columns`, `grid-template-rows`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGridTracks {
+    pub columns: String,
+    pub rows: String,
+}
+
 /// Immutable positioned layout output fragment.
 ///
 /// `border_rect.origin` is always relative to the parent fragment's border-box origin.
@@ -443,6 +464,7 @@ pub struct Fragment {
     pub is_out_of_flow: bool,
     pub collapsed_margin_top: f32,
     pub collapsed_margin_bottom: f32,
+    pub resolved_grid_tracks: Option<Arc<ResolvedGridTracks>>,
 }
 
 impl Fragment {
@@ -888,7 +910,7 @@ pub fn layout_box(ctx: &mut LayoutContext<'_>, box_id: BoxId, space: ConstraintS
         }
         | BoxKind::InlineBlock {
             formatting_context: FormattingContextKind::Grid,
-        } => layout_flex_grid_container(ctx, box_id, space),
+        } => crate::grid::layout_grid_container(ctx, box_id, space),
         BoxKind::InlineBlock {
             formatting_context: FormattingContextKind::Table,
         } => layout_table(ctx, box_id, space),
@@ -1070,6 +1092,12 @@ fn measure_intrinsic_widths_uncached(
         | BoxKind::InlineBlock {
             formatting_context: FormattingContextKind::Flex,
         } => crate::flex::measure_flex_intrinsic_widths(ctx, box_id, space),
+        BoxKind::Block {
+            formatting_context: FormattingContextKind::Grid,
+        }
+        | BoxKind::InlineBlock {
+            formatting_context: FormattingContextKind::Grid,
+        } => crate::grid::measure_grid_intrinsic_widths(ctx, box_id, space),
         _ => {
             let (content_min, content_max) = measure_content_intrinsic_widths(ctx, box_id, space);
             let b = ctx.tree.get(box_id);
@@ -1306,6 +1334,7 @@ pub fn layout_replaced(
         is_out_of_flow: b.is_out_of_flow,
         collapsed_margin_top: metrics.margin.top,
         collapsed_margin_bottom: metrics.margin.bottom,
+        resolved_grid_tracks: None,
     }
 }
 

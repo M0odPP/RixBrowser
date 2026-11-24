@@ -9,6 +9,7 @@ pub mod engine;
 pub mod flex;
 pub mod flex_grid;
 pub mod fragment;
+pub mod grid;
 pub mod grid_tracks;
 pub mod ifc;
 pub mod paint;
@@ -31,8 +32,9 @@ pub use flex_grid::layout_flex_grid_container;
 pub use fragment::{
     layout_box, layout_replaced, layout_tree, layout_tree_with_scroll, measure_intrinsic_widths,
     BoxMetrics, ConstraintSpace, EdgeInsets, Fragment, FragmentKind, FragmentTree, LayoutCache,
-    LayoutContext, PositionedGlyph, ShapedTextFragment,
+    LayoutContext, PositionedGlyph, ResolvedGridTracks, ShapedTextFragment,
 };
+pub use grid::{layout_grid_container, measure_grid_intrinsic_widths, GridAbsposHint, GridAxes};
 pub use ifc::{
     layout_ifc, measure_ifc_min_max_content, resolve_font_for_style, resolve_line_height_px,
 };

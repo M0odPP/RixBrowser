@@ -33,6 +33,8 @@ pub struct PendingOof {
     pub is_fixed: bool,
     /// Optional CSS Flexbox L1 §4.1 static-position alignment hint when direct child of a flex container.
     pub flex_hint: Option<crate::flex::FlexAbsposHint>,
+    /// Optional CSS Grid L1 §9 grid-area CB & static-position hint when direct child of a grid container.
+    pub grid_hint: Option<crate::grid::GridAbsposHint>,
 }
 
 /// Containing block geometry passed to [`layout_out_of_flow_box`].
@@ -79,6 +81,13 @@ pub fn offset_pending_oof(pending: &mut [PendingOof], start_idx: usize, dx: f32,
         if let Some(ref mut fh) = entry.flex_hint {
             fh.content_rect.origin.x += dx;
             fh.content_rect.origin.y += dy;
+        }
+        if let Some(ref mut gh) = entry.grid_hint {
+            gh.is_direct_child = false;
+            gh.grid_area_cb.origin.x += dx;
+            gh.grid_area_cb.origin.y += dy;
+            gh.content_box_rect.origin.x += dx;
+            gh.content_box_rect.origin.y += dy;
         }
     }
 }
@@ -329,9 +338,16 @@ fn solve_axis_position(
 pub fn layout_out_of_flow_box(
     ctx: &mut LayoutContext<'_>,
     entry: PendingOof,
-    cb: ContainingBlockInfo,
+    mut cb: ContainingBlockInfo,
     parent_space: ConstraintSpace,
 ) -> Fragment {
+    // CSS Grid L1 §9.1: When a grid container IS the containing block for an abspos grid child,
+    // the item's containing block is the resolved grid area between its specified lines/padding edges.
+    if let Some(gh) = entry.grid_hint {
+        if gh.is_direct_child {
+            cb.rect = gh.grid_area_cb;
+        }
+    }
     let oof_box = ctx.tree.get(entry.box_id);
     let style = Arc::clone(&oof_box.style);
     let is_replaced = matches!(oof_box.kind, BoxKind::Replaced(_));
@@ -344,6 +360,11 @@ pub fn layout_out_of_flow_box(
     cb_space.available_height = Some(cb_h);
     cb_space.containing_block_width = cb_w;
     cb_space.containing_block_height = cb_h;
+    cb_space.cb_inline_size = if cb.writing_mode.is_vertical() {
+        Some(cb_h)
+    } else {
+        None
+    };
 
     let eval = ctx.eval_context_for(&style, &cb_space);
     let metrics = BoxMetrics::resolve_with_eval(&style, &cb_space, eval);
@@ -497,6 +518,21 @@ pub fn layout_out_of_flow_box(
     sub_space.available_height = sub_avail_h;
     sub_space.containing_block_width = cb_w;
     sub_space.containing_block_height = cb_h;
+    sub_space.definite_width_override = if stretch_w {
+        Some((imcb_avail_w - pb_w).max(0.0).min(eff_max_w).max(eff_min_w))
+    } else {
+        None
+    };
+    sub_space.definite_height_override = if stretch_h {
+        Some(
+            (imcb_avail_h - pb_h)
+                .max(0.0)
+                .min(metrics.max_height)
+                .max(metrics.min_height),
+        )
+    } else {
+        None
+    };
 
     let mut frag = layout_box(ctx, entry.box_id, sub_space);
 
@@ -561,6 +597,37 @@ pub fn layout_out_of_flow_box(
         }
         if matches!(final_imcb_y.anchor, AxisAnchor::Static(_)) {
             final_imcb_y.anchor = AxisAnchor::Static(flex_static.y - cb.rect.origin.y);
+        }
+    } else if let Some(gh) = entry.grid_hint {
+        let ml_stat = if m_left_auto {
+            0.0
+        } else {
+            metrics.margin.left
+        };
+        let mr_stat = if m_right_auto {
+            0.0
+        } else {
+            metrics.margin.right
+        };
+        let mt_stat = if m_top_auto { 0.0 } else { metrics.margin.top };
+        let mb_stat = if m_bottom_auto {
+            0.0
+        } else {
+            metrics.margin.bottom
+        };
+        let outer_w = frag.border_rect.size.width + ml_stat + mr_stat;
+        let outer_h = frag.border_rect.size.height + mt_stat + mb_stat;
+        let grid_static = gh.compute_static_pos(
+            outer_w,
+            outer_h,
+            style.text.writing_mode,
+            style.text.direction,
+        );
+        if matches!(final_imcb_x.anchor, AxisAnchor::Static(_)) {
+            final_imcb_x.anchor = AxisAnchor::Static(grid_static.x - cb.rect.origin.x);
+        }
+        if matches!(final_imcb_y.anchor, AxisAnchor::Static(_)) {
+            final_imcb_y.anchor = AxisAnchor::Static(grid_static.y - cb.rect.origin.y);
         }
     }
 

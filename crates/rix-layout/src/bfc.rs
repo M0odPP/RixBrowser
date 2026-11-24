@@ -223,9 +223,11 @@ pub fn layout_block_box(
     let oof_both_h_insets = b.is_out_of_flow
         && matches!(style.box_model.inset.left, LengthPercentageAuto::Value(_))
         && matches!(style.box_model.inset.right, LengthPercentageAuto::Value(_));
+    let is_vert_box = style.text.writing_mode.is_vertical();
     let shrink_to_fit = b.is_float
         || (b.is_out_of_flow && !oof_both_h_insets)
-        || matches!(b.kind, BoxKind::InlineBlock { .. });
+        || matches!(b.kind, BoxKind::InlineBlock { .. })
+        || (is_vert_box && space.definite_width_override.is_none());
     let is_bb = style.box_sizing == rix_css::BoxSizingMode::BorderBox;
     let avail_c = (space.available_width - metrics.margin.horizontal() - pb_w).max(0.0);
 
@@ -276,19 +278,22 @@ pub fn layout_block_box(
     .unwrap_or(metrics.max_width);
     let clamp_w = |w: f32| w.min(eff_max_w).max(eff_min_w).max(0.0);
 
-    let resolved_spec_w = metrics.specified_width.or_else(|| {
-        resolve_size_with_intrinsic(
-            &style.box_model.width,
-            Some(space.containing_block_width),
-            pb_w,
-            metrics.margin.horizontal(),
-            is_bb,
-            &eval,
-            intr_w_fn,
-        )
-    });
+    let resolved_spec_w = space
+        .definite_width_override
+        .or(metrics.specified_width)
+        .or_else(|| {
+            resolve_size_with_intrinsic(
+                &style.box_model.width,
+                Some(space.containing_block_width),
+                pb_w,
+                metrics.margin.horizontal(),
+                is_bb,
+                &eval,
+                intr_w_fn,
+            )
+        });
 
-    let (content_width, resolved_margin_left, resolved_margin_right) =
+    let (mut content_width, resolved_margin_left, resolved_margin_right) =
         if let Some(spec_w) = resolved_spec_w {
             let cw = clamp_w(spec_w);
             let remaining = (space.available_width - cw - pb_w).max(0.0);
@@ -417,15 +422,51 @@ pub fn layout_block_box(
     } else if !has_in_flow_blocks {
         // Pure Inline Formatting Context inside this block container!
         // `layout_ifc` records exact static positions for both direct and inline-nested OOF boxes.
-        let ifc_result = layout_ifc(
-            ctx,
-            box_id,
-            child_space,
-            &local_floats,
-            Point::new(content_origin_x, content_origin_y),
-        );
-        placed_children.extend(ifc_result.fragments);
-        ifc_result.height
+        if is_vert_box {
+            let inline_avail = definite_height
+                .or_else(|| {
+                    space
+                        .available_height
+                        .map(|ah| (ah - metrics.margin.vertical() - pb_h).max(0.0))
+                })
+                .unwrap_or(f32::INFINITY);
+            let (vert_blk_w, vert_inline_h) =
+                crate::ifc::measure_vertical_ifc_dims(ctx, box_id, child_space, inline_avail);
+            let ifc_space = child_space.with_available(vert_inline_h.max(1.0), None);
+            let mut ifc_result = layout_ifc(
+                ctx,
+                box_id,
+                ifc_space,
+                &local_floats,
+                Point::new(content_origin_x, content_origin_y),
+            );
+            if resolved_spec_w.is_none() {
+                content_width = clamp_w(vert_blk_w);
+            }
+            for lf in &mut ifc_result.fragments {
+                lf.border_rect.size.width = vert_blk_w.min(content_width.max(vert_blk_w));
+                lf.border_rect.size.height = vert_inline_h;
+                lf.content_rect.size = lf.border_rect.size;
+                lf.overflow_rect = Rect::new(
+                    0.0,
+                    0.0,
+                    lf.border_rect.size.width,
+                    lf.border_rect.size.height,
+                );
+            }
+            placed_children.extend(ifc_result.fragments);
+            vert_inline_h
+        } else {
+            let ifc_result = layout_ifc(
+                ctx,
+                box_id,
+                child_space,
+                &local_floats,
+                Point::new(content_origin_x, content_origin_y),
+            );
+            placed_children.extend(ifc_result.fragments);
+            ifc_result.height
+        }
     } else {
         let can_collapse_top_with_first =
             !establishes_bfc && metrics.border.top == 0.0 && metrics.padding.top == 0.0;
@@ -447,6 +488,7 @@ pub fn layout_block_box(
                     static_pos: Point::new(content_origin_x, static_y),
                     is_fixed: child_box.style.position == PositionMode::Fixed,
                     flex_hint: None,
+                    grid_hint: None,
                 });
                 continue;
             }
@@ -777,6 +819,7 @@ pub fn layout_block_box(
         is_out_of_flow: ctx.tree.get(box_id).is_out_of_flow,
         collapsed_margin_top: collapsed_top,
         collapsed_margin_bottom: collapsed_bottom,
+        resolved_grid_tracks: None,
     };
     fragment.compute_overflow_rect();
     fragment
