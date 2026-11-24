@@ -2682,28 +2682,19 @@ fn format_computed_color4(
 }
 
 fn format_num(v: f32) -> String {
-    if v == 0.0 {
-        return "0".to_string();
-    }
-    if (v - v.round()).abs() < 1e-4 {
-        format!("{}", v.round() as i64)
-    } else {
-        format!("{v}")
-    }
+    rix_css::values_math::format_math_f64(f64::from(v))
 }
 
 fn format_px(v: f32) -> String {
-    format!("{}px", format_num(v))
+    let lim = rix_css::values_math::MAX_CSS_PX as f32;
+    let c = if v.is_nan() { 0.0 } else { v.clamp(-lim, lim) };
+    format!("{}px", format_num(c))
 }
 
 fn eval_ctx_for_style(style: &ComputedStyle) -> EvalContext {
-    EvalContext {
-        font_size_px: style.text.font_size_px,
-        root_font_size_px: 16.0,
-        viewport_width_px: 800.0,
-        viewport_height_px: 600.0,
-        ..EvalContext::default()
-    }
+    let mut ctx = style.text.eval_ctx;
+    ctx.font_size_px = style.text.font_size_px;
+    ctx
 }
 
 fn decompose_linear_calc(expr: &CalcExpr, eval: &EvalContext) -> Option<(f32, f32)> {
@@ -2733,6 +2724,15 @@ fn format_lp_opts(lp: &LengthPercentage, eval: &EvalContext, nonneg: bool) -> St
         }
         LengthPercentage::Percent(p) => format!("{}%", format_num(*p * 100.0)),
         LengthPercentage::Calc(expr) => {
+            if let CalcExpr::Math(node) = expr.as_ref() {
+                return node.serialize_computed(
+                    eval,
+                    None,
+                    rix_css::values_math::ValueKind::LengthPercentage,
+                    nonneg.then_some(0.0),
+                    None,
+                );
+            }
             if let Some((px, pct)) = decompose_linear_calc(expr, eval) {
                 if pct.abs() < 1e-6 {
                     return format_px(if nonneg { px.max(0.0) } else { px });
@@ -2751,6 +2751,26 @@ fn format_lp_opts(lp: &LengthPercentage, eval: &EvalContext, nonneg: bool) -> St
             format_px(if nonneg { px.max(0.0) } else { px })
         }
     }
+}
+
+fn format_lp_used(
+    lp: &LengthPercentage,
+    eval: &EvalContext,
+    nonneg: bool,
+    basis_px: f32,
+) -> Option<String> {
+    if let LengthPercentage::Calc(expr) = lp {
+        if let CalcExpr::Math(node) = expr.as_ref() {
+            return Some(node.serialize_computed(
+                eval,
+                Some((f64::from(basis_px), false)),
+                rix_css::values_math::ValueKind::LengthPercentage,
+                nonneg.then_some(0.0),
+                None,
+            ));
+        }
+    }
+    None
 }
 
 fn format_size_opts(s: &SizeValue, eval: &EvalContext, nonneg: bool) -> String {
@@ -3121,7 +3141,11 @@ fn format_computed_property_resolved(
         "line-height" => match style.text.line_height {
             LineHeightValue::Normal => "normal".into(),
             LineHeightValue::Number(n) => format_px(n * style.text.font_size_px),
-            LineHeightValue::Length(ref lp) => format_lp(lp, &eval),
+            LineHeightValue::Length(ref lp) => {
+                format_lp_used(lp, &eval, true, style.text.font_size_px).unwrap_or_else(|| {
+                    format_px(lp.resolve_px(style.text.font_size_px, &eval).max(0.0))
+                })
+            }
         },
         "letter-spacing" => match style.text.letter_spacing {
             LengthPercentage::Zero => "normal".into(),
@@ -3184,6 +3208,13 @@ fn format_computed_property_resolved(
         "width" => {
             if let Some(lb) = layout_box {
                 if style.display != DisplayMode::Inline {
+                    if let SizeValue::Length(ref lp) = style.box_model.width {
+                        if let Some(s) =
+                            format_lp_used(lp, &eval, true, lb.parent_content_size.width)
+                        {
+                            return s;
+                        }
+                    }
                     let w = if style.box_sizing == BoxSizingMode::BorderBox {
                         lb.border_size.width
                     } else {
@@ -3197,6 +3228,13 @@ fn format_computed_property_resolved(
         "height" => {
             if let Some(lb) = layout_box {
                 if style.display != DisplayMode::Inline {
+                    if let SizeValue::Length(ref lp) = style.box_model.height {
+                        if let Some(s) =
+                            format_lp_used(lp, &eval, true, lb.parent_content_size.height)
+                        {
+                            return s;
+                        }
+                    }
                     let h = if style.box_sizing == BoxSizingMode::BorderBox {
                         lb.border_size.height
                     } else {
@@ -3219,35 +3257,91 @@ fn format_computed_property_resolved(
         "max-height" => format_size_opts(&style.box_model.max_height, &eval, true),
         "margin-top" => layout_box.map_or_else(
             || format_lpa(&style.box_model.margin.top, &eval),
-            |lb| format_px(lb.margin.top),
+            |lb| match &style.box_model.margin.top {
+                LengthPercentageAuto::Value(lp) => {
+                    format_lp_used(lp, &eval, false, lb.parent_content_size.width)
+                        .unwrap_or_else(|| format_px(lb.margin.top))
+                }
+                LengthPercentageAuto::Auto => format_px(lb.margin.top),
+            },
         ),
         "margin-right" => layout_box.map_or_else(
             || format_lpa(&style.box_model.margin.right, &eval),
-            |lb| format_px(lb.margin.right),
+            |lb| match &style.box_model.margin.right {
+                LengthPercentageAuto::Value(lp) => {
+                    format_lp_used(lp, &eval, false, lb.parent_content_size.width)
+                        .unwrap_or_else(|| format_px(lb.margin.right))
+                }
+                LengthPercentageAuto::Auto => format_px(lb.margin.right),
+            },
         ),
         "margin-bottom" => layout_box.map_or_else(
             || format_lpa(&style.box_model.margin.bottom, &eval),
-            |lb| format_px(lb.margin.bottom),
+            |lb| match &style.box_model.margin.bottom {
+                LengthPercentageAuto::Value(lp) => {
+                    format_lp_used(lp, &eval, false, lb.parent_content_size.width)
+                        .unwrap_or_else(|| format_px(lb.margin.bottom))
+                }
+                LengthPercentageAuto::Auto => format_px(lb.margin.bottom),
+            },
         ),
         "margin-left" => layout_box.map_or_else(
             || format_lpa(&style.box_model.margin.left, &eval),
-            |lb| format_px(lb.margin.left),
+            |lb| match &style.box_model.margin.left {
+                LengthPercentageAuto::Value(lp) => {
+                    format_lp_used(lp, &eval, false, lb.parent_content_size.width)
+                        .unwrap_or_else(|| format_px(lb.margin.left))
+                }
+                LengthPercentageAuto::Auto => format_px(lb.margin.left),
+            },
         ),
         "padding-top" => layout_box.map_or_else(
             || format_lp_opts(&style.box_model.padding.top, &eval, true),
-            |lb| format_px(lb.padding.top.max(0.0)),
+            |lb| {
+                format_lp_used(
+                    &style.box_model.padding.top,
+                    &eval,
+                    true,
+                    lb.parent_content_size.width,
+                )
+                .unwrap_or_else(|| format_px(lb.padding.top.max(0.0)))
+            },
         ),
         "padding-right" => layout_box.map_or_else(
             || format_lp_opts(&style.box_model.padding.right, &eval, true),
-            |lb| format_px(lb.padding.right.max(0.0)),
+            |lb| {
+                format_lp_used(
+                    &style.box_model.padding.right,
+                    &eval,
+                    true,
+                    lb.parent_content_size.width,
+                )
+                .unwrap_or_else(|| format_px(lb.padding.right.max(0.0)))
+            },
         ),
         "padding-bottom" => layout_box.map_or_else(
             || format_lp_opts(&style.box_model.padding.bottom, &eval, true),
-            |lb| format_px(lb.padding.bottom.max(0.0)),
+            |lb| {
+                format_lp_used(
+                    &style.box_model.padding.bottom,
+                    &eval,
+                    true,
+                    lb.parent_content_size.width,
+                )
+                .unwrap_or_else(|| format_px(lb.padding.bottom.max(0.0)))
+            },
         ),
         "padding-left" => layout_box.map_or_else(
             || format_lp_opts(&style.box_model.padding.left, &eval, true),
-            |lb| format_px(lb.padding.left.max(0.0)),
+            |lb| {
+                format_lp_used(
+                    &style.box_model.padding.left,
+                    &eval,
+                    true,
+                    lb.parent_content_size.width,
+                )
+                .unwrap_or_else(|| format_px(lb.padding.left.max(0.0)))
+            },
         ),
         "top" => format_lpa(&style.box_model.inset.top, &eval),
         "right" => format_lpa(&style.box_model.inset.right, &eval),
@@ -3498,22 +3592,200 @@ fn format_computed_property_resolved(
                 .join(", "),
             _ => "all".into(),
         },
-        "transition-duration" => match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
-            Some(list) if !list.is_empty() => list
-                .iter()
-                .map(|t| format!("{}s", format_num(t.duration_ms / 1000.0)))
-                .collect::<Vec<_>>()
-                .join(", "),
-            _ => "0s".into(),
+        "transition-duration" => {
+            if let Some(n) = style
+                .effects
+                .as_ref()
+                .and_then(|e| e.transition_duration_math.as_ref())
+            {
+                return n.serialize_computed(
+                    &eval,
+                    None,
+                    rix_css::values_math::ValueKind::Time,
+                    Some(0.0),
+                    None,
+                );
+            }
+            match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
+                Some(list) if !list.is_empty() => list
+                    .iter()
+                    .map(|t| format!("{}s", format_num(t.duration_ms / 1000.0)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => "0s".into(),
+            }
+        }
+        "transition-delay" => {
+            if let Some(n) = style
+                .effects
+                .as_ref()
+                .and_then(|e| e.transition_delay_math.as_ref())
+            {
+                return n.serialize_computed(
+                    &eval,
+                    None,
+                    rix_css::values_math::ValueKind::Time,
+                    None,
+                    None,
+                );
+            }
+            match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
+                Some(list) if !list.is_empty() => list
+                    .iter()
+                    .map(|t| format!("{}s", format_num(t.delay_ms / 1000.0)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => "0s".into(),
+            }
+        }
+        "animation-duration" => {
+            if let Some(n) = style
+                .effects
+                .as_ref()
+                .and_then(|e| e.animation_duration_math.as_ref())
+            {
+                return n.serialize_computed(
+                    &eval,
+                    None,
+                    rix_css::values_math::ValueKind::Time,
+                    Some(0.0),
+                    None,
+                );
+            }
+            match style.effects.as_ref().map(|e| e.animations.as_slice()) {
+                Some(list) if !list.is_empty() => list
+                    .iter()
+                    .map(|a| format!("{}s", format_num(a.duration_ms / 1000.0)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => "0s".into(),
+            }
+        }
+        "animation-delay" => {
+            if let Some(n) = style
+                .effects
+                .as_ref()
+                .and_then(|e| e.animation_delay_math.as_ref())
+            {
+                return n.serialize_computed(
+                    &eval,
+                    None,
+                    rix_css::values_math::ValueKind::Time,
+                    None,
+                    None,
+                );
+            }
+            match style.effects.as_ref().map(|e| e.animations.as_slice()) {
+                Some(list) if !list.is_empty() => list
+                    .iter()
+                    .map(|a| format!("{}s", format_num(a.delay_ms / 1000.0)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => "0s".into(),
+            }
+        }
+        "animation-iteration-count" => {
+            if let Some(n) = style
+                .effects
+                .as_ref()
+                .and_then(|e| e.animation_iteration_count_math.as_ref())
+            {
+                return n.serialize_computed(
+                    &eval,
+                    None,
+                    rix_css::values_math::ValueKind::Number,
+                    Some(0.0),
+                    None,
+                );
+            }
+            match style.effects.as_ref().map(|e| e.animations.as_slice()) {
+                Some(list) if !list.is_empty() => list
+                    .iter()
+                    .map(|a| {
+                        if a.iteration_count.is_infinite() {
+                            "infinite".to_string()
+                        } else {
+                            format_num(a.iteration_count)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => "1".into(),
+            }
+        }
+        "scale" => style
+            .effects
+            .as_ref()
+            .map_or_else(|| "none".into(), |e| e.scale.serialize_computed(&eval)),
+        "rotate" => style
+            .effects
+            .as_ref()
+            .map_or_else(|| "none".into(), |e| e.rotate.serialize_computed(&eval)),
+        "translate" => style
+            .effects
+            .as_ref()
+            .map_or_else(|| "none".into(), |e| e.translate.serialize_computed(&eval)),
+        "image-resolution" => style
+            .effects
+            .as_ref()
+            .and_then(|e| e.image_resolution.as_ref())
+            .map_or_else(
+                || "1dppx".into(),
+                |n| {
+                    n.serialize_computed(
+                        &eval,
+                        None,
+                        rix_css::values_math::ValueKind::Resolution,
+                        Some(0.0),
+                        None,
+                    )
+                },
+            ),
+        "background-position" => format!(
+            "{} {}",
+            format_lp(&style.visual.background_position.0, &eval),
+            format_lp(&style.visual.background_position.1, &eval),
+        ),
+        "transform" => {
+            if let Some(raw) = style
+                .effects
+                .as_ref()
+                .and_then(|e| e.transform_raw.as_ref())
+            {
+                rix_css::values_math::compute_transform_matrix_css(raw, &eval)
+                    .or_else(|| {
+                        rix_css::values_math::parse_and_serialize_transform(raw, Some(&eval))
+                    })
+                    .unwrap_or_else(|| "none".into())
+            } else if let Some(ops) = style
+                .effects
+                .as_ref()
+                .map(|e| e.transform.as_slice())
+                .filter(|s| !s.is_empty())
+            {
+                format_transform_ops_matrix(ops, &eval)
+            } else {
+                "none".into()
+            }
+        }
+        "orphans" => style.text.orphans.to_string(),
+        "widows" => style.text.widows.to_string(),
+        "tab-size" => match &style.text.tab_size_len {
+            Some(lp) => format_lp_opts(lp, &eval, true),
+            None => format_num(style.text.tab_size_num),
         },
-        "transition-delay" => match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
-            Some(list) if !list.is_empty() => list
-                .iter()
-                .map(|t| format!("{}s", format_num(t.delay_ms / 1000.0)))
-                .collect::<Vec<_>>()
-                .join(", "),
-            _ => "0s".into(),
+        "column-count" => match style.box_model.column_count {
+            Some(n) => n.to_string(),
+            None => "auto".into(),
         },
+        "grid-template-rows" => style.flex_grid.as_ref().map_or_else(
+            || "none".into(),
+            |f| rix_css::values_math::format_grid_tracks_computed(&f.grid_template_rows, &eval),
+        ),
+        "grid-template-columns" => style.flex_grid.as_ref().map_or_else(
+            || "none".into(),
+            |f| rix_css::values_math::format_grid_tracks_computed(&f.grid_template_columns, &eval),
+        ),
         "transition-timing-function" => {
             match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
                 Some(list) if !list.is_empty() => list
@@ -3548,4 +3820,59 @@ fn format_computed_property_resolved(
         }
         _ => String::new(),
     }
+}
+
+#[rustfmt::skip]
+fn format_transform_ops_matrix(ops: &[rix_css::TransformOp], eval: &EvalContext) -> String {
+    use rix_css::values_math::format_math_f64;
+    use rix_css::TransformOp as T;
+    if ops.len() == 1 {
+        if let T::Rotate3d(x, y, z, deg) = ops[0] {
+            let (x, y, z, deg) = (f64::from(x), f64::from(y), f64::from(z), f64::from(deg));
+            let len = (x * x + y * y + z * z).sqrt();
+            if len > 0.0 && deg.is_finite() {
+                let (ux, uy, uz) = (x / len, y / len, z / len);
+                let (s, c) = (deg.to_radians().sin(), deg.to_radians().cos());
+                let t = 1.0 - c;
+                let m = [
+                    t * ux * ux + c, t * ux * uy + uz * s, t * ux * uz - uy * s, 0.0,
+                    t * ux * uy - uz * s, t * uy * uy + c, t * uy * uz + ux * s, 0.0,
+                    t * ux * uz + uy * s, t * uy * uz - ux * s, t * uz * uz + c, 0.0,
+                    0.0, 0.0, 0.0, 1.0,
+                ];
+                let clean = |v: f64| if !v.is_finite() || v.abs() < 1e-6 { 0.0 } else { v };
+                let parts: Vec<String> = m.iter().map(|&v| format_math_f64(clean(v))).collect();
+                return format!("matrix3d({})", parts.join(", "));
+            }
+        }
+        if let T::Matrix3d(m) = ops[0] {
+            let clean = |v: f64| if !v.is_finite() || v.abs() < 1e-6 { 0.0 } else { v };
+            let parts: Vec<String> = m.iter().map(|&v| format_math_f64(clean(f64::from(v)))).collect();
+            return format!("matrix3d({})", parts.join(", "));
+        }
+    }
+    let mul = |a: [f64; 6], b: [f64; 6]| [
+        a[0]*b[0] + a[2]*b[1], a[1]*b[0] + a[3]*b[1],
+        a[0]*b[2] + a[2]*b[3], a[1]*b[2] + a[3]*b[3],
+        a[0]*b[4] + a[2]*b[5] + a[4], a[1]*b[4] + a[3]*b[5] + a[5],
+    ];
+    let mut m = [1.0_f64, 0.0, 0.0, 1.0, 0.0, 0.0];
+    for op in ops {
+        let step = match op {
+            T::Translate(x, y) => [1.0, 0.0, 0.0, 1.0, f64::from(x.resolve_px(0.0, eval)), f64::from(y.resolve_px(0.0, eval))],
+            T::Scale(sx, sy) => [f64::from(*sx), 0.0, 0.0, f64::from(*sy), 0.0, 0.0],
+            T::RotateDeg(d) => { let r = f64::from(*d).to_radians(); let (s, c) = (r.sin(), r.cos()); [c, s, -s, c, 0.0, 0.0] }
+            T::SkewDeg(ax, ay) => [1.0, f64::from(*ay).to_radians().tan(), f64::from(*ax).to_radians().tan(), 1.0, 0.0, 0.0],
+            T::Matrix(v) => [f64::from(v[0]), f64::from(v[1]), f64::from(v[2]), f64::from(v[3]), f64::from(v[4]), f64::from(v[5])],
+            _ => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        };
+        m = mul(m, step);
+    }
+    let clean = |v: f64| if !v.is_finite() || v.abs() < 1e-6 { 0.0 } else { v };
+    format!(
+        "matrix({}, {}, {}, {}, {}, {})",
+        format_math_f64(clean(m[0])), format_math_f64(clean(m[1])),
+        format_math_f64(clean(m[2])), format_math_f64(clean(m[3])),
+        format_math_f64(clean(m[4])), format_math_f64(clean(m[5])),
+    )
 }

@@ -20,7 +20,7 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
         if name.len() <= 2
             || name.chars().any(char::is_whitespace)
             || value.is_empty()
-            || !has_valid_css_tokens(value)
+            || !has_valid_css_tokens(value, true)
         {
             return None;
         }
@@ -36,7 +36,7 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
     }
     let cleaned = strip_outer_css_comments(value);
     let trimmed = cleaned.trim();
-    if trimmed.is_empty() || !has_valid_css_tokens(trimmed) {
+    if trimmed.is_empty() || !has_valid_css_tokens(trimmed, false) {
         return None;
     }
     let lower_name = name.to_ascii_lowercase();
@@ -67,7 +67,22 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
         return crate::color::parse_and_serialize_color_specified(trimmed);
     }
     if prop_kind == PropertyIdKind::Opacity {
-        return crate::color::parse_and_serialize_opacity_specified(trimmed);
+        return crate::color::parse_and_serialize_opacity_specified(trimmed).or_else(|| {
+            crate::properties::parse_values4_property(prop_kind, trimmed).map(|(_, s)| s)
+        });
+    }
+    if prop_kind == PropertyIdKind::BackgroundLayers
+        && lower_val.starts_with("image-set(")
+        && crate::values_math::has_values4_syntax(trimmed)
+    {
+        return crate::values_math::parse_image_set_resolution_specified(trimmed);
+    }
+    if crate::properties::is_values4_native_property(prop_kind)
+        || (crate::properties::supports_values4_math(prop_kind)
+            && crate::values_math::has_values4_syntax(trimmed)
+            && !lower_val.starts_with("fit-content("))
+    {
+        return crate::properties::parse_values4_property(prop_kind, trimmed).map(|(_, s)| s);
     }
 
     // CSS Standards Mode & Logical Properties: reject bare non-zero unitless numbers on lengths.
@@ -139,7 +154,12 @@ pub fn parse_and_expand_declaration(name: &str, value: &str) -> Option<Vec<(Stri
         )]);
     }
     let prop_kind = PropertyIdKind::from_name(&lower_name)?;
-    if is_color_longhand(prop_kind) || prop_kind == PropertyIdKind::Opacity {
+    if is_color_longhand(prop_kind)
+        || prop_kind == PropertyIdKind::Opacity
+        || crate::properties::is_values4_native_property(prop_kind)
+        || (crate::properties::supports_values4_math(prop_kind)
+            && crate::values_math::has_values4_syntax(&canonical))
+    {
         return Some(vec![(lower_name, canonical)]);
     }
     let lower_val = canonical.to_ascii_lowercase();
@@ -252,6 +272,9 @@ pub(crate) fn contains_var_or_env_ci(s: &str) -> bool {
 
 fn prop_disallows_unitless_nonzero(kind: PropertyIdKind) -> bool {
     let n = kind.css_name();
+    if matches!(n, "line-height" | "tab-size") {
+        return false;
+    }
     n.starts_with("margin")
         || n.starts_with("padding")
         || n.starts_with("inset")
@@ -934,7 +957,7 @@ fn expand_lightning_shorthand_cssom(
 }
 
 /// Validates that `input` has balanced strings/delimiters and no top-level `;` or `!`.
-fn has_valid_css_tokens(input: &str) -> bool {
+fn has_valid_css_tokens(input: &str, require_closed: bool) -> bool {
     let mut stack: SmallVec<[u8; 8]> = SmallVec::new();
     let bytes = input.as_bytes();
     let mut i = 0usize;
@@ -977,5 +1000,5 @@ fn has_valid_css_tokens(input: &str) -> bool {
         }
         i += 1;
     }
-    in_str.is_none() && stack.is_empty()
+    in_str.is_none() && (!require_closed || stack.is_empty())
 }

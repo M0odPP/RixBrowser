@@ -156,7 +156,7 @@ pub fn convert_color(color: &LightningCssColor) -> Option<CssColor> {
     }
 }
 
-/// CSS relative or absolute length unit.
+/// CSS relative or absolute length unit (W3C CSS Values & Units Level 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum LengthUnit {
@@ -164,54 +164,85 @@ pub enum LengthUnit {
     Rem,
     Em,
     Ex,
+    Rex,
     Ch,
+    Rch,
     Cap,
+    Rcap,
     Ic,
+    Ric,
     Lh,
     Rlh,
     Vw,
     Vh,
+    Vi,
+    Vb,
     Vmin,
     Vmax,
     Svw,
     Svh,
+    Svi,
+    Svb,
+    Svmin,
+    Svmax,
     Lvw,
     Lvh,
+    Lvi,
+    Lvb,
+    Lvmin,
+    Lvmax,
     Dvw,
     Dvh,
+    Dvi,
+    Dvb,
+    Dvmin,
+    Dvmax,
     Cqw,
     Cqh,
     Cqi,
     Cqb,
+    Cqmin,
+    Cqmax,
 }
 
 impl LengthUnit {
     #[must_use]
+    #[rustfmt::skip]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Px => "px", Self::Rem => "rem", Self::Em => "em", Self::Ex => "ex", Self::Rex => "rex",
+            Self::Ch => "ch", Self::Rch => "rch", Self::Cap => "cap", Self::Rcap => "rcap",
+            Self::Ic => "ic", Self::Ric => "ric", Self::Lh => "lh", Self::Rlh => "rlh",
+            Self::Vw => "vw", Self::Vh => "vh", Self::Vi => "vi", Self::Vb => "vb",
+            Self::Vmin => "vmin", Self::Vmax => "vmax", Self::Svw => "svw", Self::Svh => "svh",
+            Self::Svi => "svi", Self::Svb => "svb", Self::Svmin => "svmin", Self::Svmax => "svmax",
+            Self::Lvw => "lvw", Self::Lvh => "lvh", Self::Lvi => "lvi", Self::Lvb => "lvb",
+            Self::Lvmin => "lvmin", Self::Lvmax => "lvmax", Self::Dvw => "dvw", Self::Dvh => "dvh",
+            Self::Dvi => "dvi", Self::Dvb => "dvb", Self::Dvmin => "dvmin", Self::Dvmax => "dvmax",
+            Self::Cqw => "cqw", Self::Cqh => "cqh", Self::Cqi => "cqi", Self::Cqb => "cqb",
+            Self::Cqmin => "cqmin", Self::Cqmax => "cqmax",
+        }
+    }
+
+    #[must_use]
+    #[rustfmt::skip]
     pub fn from_unit_str(unit: &str) -> Option<Self> {
         match unit.to_ascii_lowercase().as_str() {
-            "px" => Some(Self::Px),
-            "rem" => Some(Self::Rem),
-            "em" => Some(Self::Em),
-            "ex" => Some(Self::Ex),
-            "ch" => Some(Self::Ch),
-            "cap" => Some(Self::Cap),
-            "ic" => Some(Self::Ic),
-            "lh" => Some(Self::Lh),
-            "rlh" => Some(Self::Rlh),
-            "vw" => Some(Self::Vw),
-            "vh" => Some(Self::Vh),
-            "vmin" => Some(Self::Vmin),
-            "vmax" => Some(Self::Vmax),
-            "svw" => Some(Self::Svw),
-            "svh" => Some(Self::Svh),
-            "lvw" => Some(Self::Lvw),
-            "lvh" => Some(Self::Lvh),
-            "dvw" => Some(Self::Dvw),
-            "dvh" => Some(Self::Dvh),
-            "cqw" => Some(Self::Cqw),
-            "cqh" => Some(Self::Cqh),
-            "cqi" => Some(Self::Cqi),
-            "cqb" => Some(Self::Cqb),
+            "px" => Some(Self::Px), "rem" => Some(Self::Rem), "em" => Some(Self::Em),
+            "ex" => Some(Self::Ex), "rex" => Some(Self::Rex), "ch" => Some(Self::Ch),
+            "rch" => Some(Self::Rch), "cap" => Some(Self::Cap), "rcap" => Some(Self::Rcap),
+            "ic" => Some(Self::Ic), "ric" => Some(Self::Ric), "lh" => Some(Self::Lh),
+            "rlh" => Some(Self::Rlh), "vw" => Some(Self::Vw), "vh" => Some(Self::Vh),
+            "vi" => Some(Self::Vi), "vb" => Some(Self::Vb), "vmin" => Some(Self::Vmin),
+            "vmax" => Some(Self::Vmax), "svw" => Some(Self::Svw), "svh" => Some(Self::Svh),
+            "svi" => Some(Self::Svi), "svb" => Some(Self::Svb), "svmin" => Some(Self::Svmin),
+            "svmax" => Some(Self::Svmax), "lvw" => Some(Self::Lvw), "lvh" => Some(Self::Lvh),
+            "lvi" => Some(Self::Lvi), "lvb" => Some(Self::Lvb), "lvmin" => Some(Self::Lvmin),
+            "lvmax" => Some(Self::Lvmax), "dvw" => Some(Self::Dvw), "dvh" => Some(Self::Dvh),
+            "dvi" => Some(Self::Dvi), "dvb" => Some(Self::Dvb), "dvmin" => Some(Self::Dvmin),
+            "dvmax" => Some(Self::Dvmax), "cqw" => Some(Self::Cqw), "cqh" => Some(Self::Cqh),
+            "cqi" => Some(Self::Cqi), "cqb" => Some(Self::Cqb), "cqmin" => Some(Self::Cqmin),
+            "cqmax" => Some(Self::Cqmax),
             _ => None,
         }
     }
@@ -223,16 +254,39 @@ impl LengthUnit {
             Self::Rem => value * ctx.root_font_size_px,
             Self::Em => value * ctx.font_size_px,
             Self::Ex | Self::Ch => value * ctx.font_size_px * 0.5,
+            Self::Rex | Self::Rch => value * ctx.root_font_size_px * 0.5,
             Self::Cap => value * ctx.font_size_px * 0.7,
+            Self::Rcap => value * ctx.root_font_size_px * 0.7,
             Self::Ic => value * ctx.font_size_px,
-            Self::Lh => value * ctx.font_size_px * 1.2,
-            Self::Rlh => value * ctx.root_font_size_px * 1.2,
-            Self::Vw | Self::Svw | Self::Lvw | Self::Dvw => value * ctx.viewport_width_px * 0.01,
-            Self::Vh | Self::Svh | Self::Lvh | Self::Dvh => value * ctx.viewport_height_px * 0.01,
-            Self::Vmin => value * ctx.viewport_width_px.min(ctx.viewport_height_px) * 0.01,
-            Self::Vmax => value * ctx.viewport_width_px.max(ctx.viewport_height_px) * 0.01,
+            Self::Ric => value * ctx.root_font_size_px,
+            Self::Lh => value * ctx.line_height_px,
+            Self::Rlh => value * ctx.root_line_height_px,
+            Self::Vw
+            | Self::Vi
+            | Self::Svw
+            | Self::Svi
+            | Self::Lvw
+            | Self::Lvi
+            | Self::Dvw
+            | Self::Dvi => value * ctx.viewport_width_px * 0.01,
+            Self::Vh
+            | Self::Vb
+            | Self::Svh
+            | Self::Svb
+            | Self::Lvh
+            | Self::Lvb
+            | Self::Dvh
+            | Self::Dvb => value * ctx.viewport_height_px * 0.01,
+            Self::Vmin | Self::Svmin | Self::Lvmin | Self::Dvmin => {
+                value * ctx.viewport_width_px.min(ctx.viewport_height_px) * 0.01
+            }
+            Self::Vmax | Self::Svmax | Self::Lvmax | Self::Dvmax => {
+                value * ctx.viewport_width_px.max(ctx.viewport_height_px) * 0.01
+            }
             Self::Cqw | Self::Cqi => value * ctx.container_width_px * 0.01,
             Self::Cqh | Self::Cqb => value * ctx.container_height_px * 0.01,
+            Self::Cqmin => value * ctx.container_width_px.min(ctx.container_height_px) * 0.01,
+            Self::Cqmax => value * ctx.container_width_px.max(ctx.container_height_px) * 0.01,
         }
     }
 }
@@ -242,10 +296,14 @@ impl LengthUnit {
 pub struct EvalContext {
     pub font_size_px: f32,
     pub root_font_size_px: f32,
+    pub line_height_px: f32,
+    pub root_line_height_px: f32,
     pub viewport_width_px: f32,
     pub viewport_height_px: f32,
     pub container_width_px: f32,
     pub container_height_px: f32,
+    pub sibling_index: u32,
+    pub sibling_count: u32,
 }
 
 impl Default for EvalContext {
@@ -253,15 +311,19 @@ impl Default for EvalContext {
         Self {
             font_size_px: 16.0,
             root_font_size_px: 16.0,
+            line_height_px: 19.2,
+            root_line_height_px: 19.2,
             viewport_width_px: 1280.0,
             viewport_height_px: 720.0,
             container_width_px: 1280.0,
             container_height_px: 720.0,
+            sibling_index: 1,
+            sibling_count: 1,
         }
     }
 }
 
-/// Typed CSS math expression supporting `calc()`, `min()`, `max()`, `clamp()`, `abs()`, `sign()`.
+/// Typed CSS math expression supporting full W3C CSS Values L4 calculations.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CalcExpr {
     Length(f32, LengthUnit),
@@ -276,6 +338,7 @@ pub enum CalcExpr {
     Sign(Box<CalcExpr>),
     Rem(Box<CalcExpr>, Box<CalcExpr>),
     Mod(Box<CalcExpr>, Box<CalcExpr>),
+    Math(Box<crate::values_math::MathNode>),
 }
 
 impl CalcExpr {
@@ -329,6 +392,7 @@ impl CalcExpr {
                     a.resolve_px(percent_basis, ctx).rem_euclid(bv.abs()) * bv.signum()
                 }
             }
+            Self::Math(node) => node.resolve_px(percent_basis, ctx),
         }
     }
 }
@@ -1202,6 +1266,7 @@ pub enum GridTrackSize {
     MaxContent,
     Length(LengthPercentage),
     Fr(f32),
+    FrMath(Box<crate::values_math::MathNode>),
     MinMax(Box<GridTrackSize>, Box<GridTrackSize>),
 }
 

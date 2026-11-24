@@ -15,7 +15,7 @@ use selectors::Element as _;
 use smallvec::SmallVec;
 
 use crate::color::CssColorExpr;
-use crate::computed::{resolve_element_style_scoped, ComputedStyle, MatchedRule};
+use crate::computed::{resolve_element_style_with_siblings, ComputedStyle, MatchedRule};
 use crate::properties::{
     parse_inline_style, MissingCssFeature, PropertyIdKind, PropertyValue, SpecifiedDeclaration,
 };
@@ -450,7 +450,15 @@ impl StyleContext {
         if let Some(child) = mutated_child {
             mark_subtree_style_dirty(doc, child);
         }
-        if !self.rule_index.allows_sibling_sharing || self.rule_index.has_relative_selectors {
+        let sibling_inline_math = doc.children(parent).any(|c| {
+            matches!(doc.get(c), Some(NodeData::Element(e)) if e.attributes.iter().any(|(q, v)| {
+                q.local.eq_str_ignore_ascii_case("style") && v.to_ascii_lowercase().contains("sibling-")
+            }))
+        });
+        if !self.rule_index.allows_sibling_sharing
+            || self.rule_index.has_relative_selectors
+            || sibling_inline_math
+        {
             // Structural pseudo-classes (`:first-child`, `:last-child`, `:nth-child`, `:only-child`,
             // `:empty`), sibling combinators (`+`, `~`), or `:has(...)`: invalidate siblings & subtrees.
             let children: Vec<NodeId> = doc
@@ -1026,7 +1034,15 @@ fn compute_single_element_style(
         .map(|(_, v)| v.as_str());
     let has_pres_hints = has_presentational_hint_attrs(elem);
 
-    if inline_attr.is_none() && !has_pres_hints && !any_scoped {
+    let any_sibling_math = !rule_index.allows_sibling_sharing
+        && matched_indices.iter().any(|&idx| {
+            rule_index.rules[idx as usize]
+                .declarations
+                .iter()
+                .any(|d| d.value.contains_sibling_fn())
+        });
+
+    if inline_attr.is_none() && !has_pres_hints && !any_scoped && !any_sibling_math {
         if let Some(cached) = memo.lookup(parent_ptr, &matched_indices) {
             if let Some(p_node) = sibling_parent {
                 memo.insert_sibling(p_node, elem, Arc::clone(&cached));
@@ -1062,7 +1078,13 @@ fn compute_single_element_style(
         })
         .collect();
 
-    let resolved = Arc::new(resolve_element_style_scoped(
+    let inline_uses_sibling = inline_decls.iter().any(|d| d.value.contains_sibling_fn());
+    let (sib_idx, sib_cnt) = if any_sibling_math || inline_uses_sibling {
+        element_sibling_position(doc, node)
+    } else {
+        (1, 1)
+    };
+    let resolved = Arc::new(resolve_element_style_with_siblings(
         &matched_refs,
         &pres_decls,
         &inline_decls,
@@ -1070,15 +1092,37 @@ fn compute_single_element_style(
         root_font_size,
         media,
         Some(&rule_index.registered_properties),
+        sib_idx,
+        sib_cnt,
     ));
 
-    if inline_attr.is_none() && !has_pres_hints && !any_scoped {
+    if inline_attr.is_none() && !has_pres_hints && !any_scoped && !any_sibling_math {
         memo.insert(parent_ptr, &matched_indices, Arc::clone(&resolved));
         if let Some(p_node) = sibling_parent {
             memo.insert_sibling(p_node, elem, Arc::clone(&resolved));
         }
     }
     (resolved, false)
+}
+
+fn element_sibling_position(doc: &Document, node: NodeId) -> (u32, u32) {
+    let Some(parent) = doc.parent(node) else {
+        return (1, 1);
+    };
+    let (mut idx, mut count) = (0u32, 0u32);
+    for child in doc.children(parent) {
+        if matches!(doc.get(child), Some(NodeData::Element(_))) {
+            count = count.saturating_add(1);
+            if child == node {
+                idx = count;
+            }
+        }
+    }
+    if idx == 0 {
+        (1, count.max(1))
+    } else {
+        (idx, count)
+    }
 }
 
 /// Evaluates `rule` against `dom_el`, enforcing any enclosing `@scope` boundaries and
@@ -1385,7 +1429,18 @@ fn collect_pseudo_element_styles(
             }
         }
         if !matched.is_empty() {
-            let style = Arc::new(resolve_element_style_scoped(
+            let needs_sib = matched.iter().any(|m| {
+                m.rule
+                    .declarations
+                    .iter()
+                    .any(|d| d.value.contains_sibling_fn())
+            });
+            let (si, sc) = if needs_sib {
+                element_sibling_position(doc, node)
+            } else {
+                (1, 1)
+            };
+            let style = Arc::new(resolve_element_style_with_siblings(
                 &matched,
                 &[],
                 &[],
@@ -1393,6 +1448,8 @@ fn collect_pseudo_element_styles(
                 root_font_size,
                 media,
                 Some(&rule_index.registered_properties),
+                si,
+                sc,
             ));
             out_pseudos.push(((node, pseudo), style));
         }

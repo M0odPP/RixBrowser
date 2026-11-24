@@ -12,6 +12,7 @@ pub mod selector;
 pub mod stylesheet;
 pub mod ua;
 pub mod values;
+pub mod values_math;
 
 pub use cascade::{RestyleReport, StyleContext, StyleMemo};
 pub use color::{

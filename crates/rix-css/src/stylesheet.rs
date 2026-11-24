@@ -99,6 +99,7 @@ impl MediaContext {
             viewport_height_px: self.viewport_height,
             container_width_px: self.viewport_width,
             container_height_px: self.viewport_height,
+            ..EvalContext::default()
         }
     }
 

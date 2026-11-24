@@ -568,7 +568,7 @@ fn layout_out_of_flow(
     base_y: f32,
 ) -> Fragment {
     let style = &oof_box.style;
-    let eval = parent_space.eval_context(style.text.font_size_px);
+    let eval = parent_space.eval_context_for(style);
     let inset = &style.box_model.inset;
     let left = match &inset.left {
         LengthPercentageAuto::Auto => None,
@@ -634,7 +634,7 @@ pub fn apply_relative_offset(frag: &mut Fragment, space: ConstraintSpace) {
     if frag.style.position != PositionMode::Relative {
         return;
     }
-    let eval = space.eval_context(frag.style.text.font_size_px);
+    let eval = space.eval_context_for(&frag.style);
     let inset = &frag.style.box_model.inset;
     let dx = match (&inset.left, &inset.right) {
         (LengthPercentageAuto::Value(l), _) => l.resolve_px(space.containing_block_width, &eval),

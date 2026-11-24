@@ -114,6 +114,7 @@ fn css_math_calc_min_max_clamp_resolution() {
         viewport_height_px: 500.0,
         container_width_px: 800.0,
         container_height_px: 400.0,
+        ..EvalContext::default()
     };
     let eval_width = |expr: &str, basis: f32| -> f32 {
         let Property::Width(lightningcss::properties::size::Size::LengthPercentage(lp)) =
