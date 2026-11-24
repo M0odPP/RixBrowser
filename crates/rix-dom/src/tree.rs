@@ -645,6 +645,13 @@ impl Document {
         false
     }
 
+    pub fn is_template_contents_fragment(&self, frag_id: NodeId) -> bool {
+        self.arena.iter().any(|n| {
+            !n.is_removed()
+                && matches!(n.get(), NodeData::Element(e) if e.template_contents == Some(frag_id))
+        })
+    }
+
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
         if parent == child || parent.ancestors(&self.arena).any(|a| a == child) {
             return;

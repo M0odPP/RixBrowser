@@ -1715,19 +1715,26 @@ impl Compiler {
         self.cur()
             .emit(Instruction::abc(iter_op, iter_reg, iter_reg, 0));
 
+        let mut per_iter_close_reg: Option<u8> = None;
         if let ForEachLeft::VarDecl {
             kind: var_kind, id, ..
         } = left
         {
             if *var_kind != VarKind::Var {
+                let start_reg = self.cur().next_reg;
                 self.declare_pattern_locals(id, *var_kind)?;
+                per_iter_close_reg = Some(start_reg);
             }
         }
 
         let loop_start = self.cur().code.len();
         self.cur().loops.push(LoopControl {
             label,
-            continue_target: Some(loop_start),
+            continue_target: if per_iter_close_reg.is_some() {
+                None
+            } else {
+                Some(loop_start)
+            },
             continue_jumps: Vec::new(),
             break_jumps: Vec::new(),
             is_switch: false,
@@ -1771,12 +1778,20 @@ impl Compiler {
         }
 
         self.compile_stmt(body)?;
+        let continue_pc = self.cur().code.len();
+        if let Some(close_reg) = per_iter_close_reg {
+            self.cur()
+                .emit(Instruction::abc(Opcode::CloseUpvalues, close_reg, 0, 0));
+        }
         let body_try_end = self.cur().code.len() as u32;
         self.cur().emit_loop_back(loop_start)?;
 
         let end_pc = self.cur().code.len();
         self.cur().patch_jump(jmp_done, end_pc)?;
         let ctrl = self.cur().loops.pop().expect("loop frame");
+        for j in ctrl.continue_jumps {
+            self.cur().patch_jump(j, continue_pc)?;
+        }
         for j in ctrl.break_jumps {
             self.cur().patch_jump(j, end_pc)?;
         }

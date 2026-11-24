@@ -1316,9 +1316,14 @@ fn install_response(
         Ok(bs.map_or(JsValue::NULL, JsValue::from_object))
     });
     let nb = Rc::clone(net);
+    let ss = Rc::clone(streams);
     define_host_getter(vm, rp, "bodyUsed", move |vm, this_val, _| {
         let h = require_response(vm, &nb, this_val)?;
-        let used = nb.borrow().responses.get(&h).is_some_and(|r| r.body_used);
+        let used = nb.borrow().responses.get(&h).is_some_and(|r| {
+            r.body_used
+                || r.body_stream
+                    .is_some_and(|bs| ss.borrow().is_readable_disturbed(bs))
+        });
         Ok(JsValue::from_bool(used))
     });
 

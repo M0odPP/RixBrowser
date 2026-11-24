@@ -550,7 +550,10 @@ pub const SVG_ELEMENT_INTERFACES: &[&str] = &[
     "SVGMarkerElement",
 ];
 
-/// Registers a WebIDL non-constructible interface constructor + prototype pair on `global`.
+/// Registers a WebIDL interface constructor + prototype pair on `global`.
+/// When `ce_host` is `Some(host)`, the constructor supports WHATWG §4.13.2 Custom Element
+/// `super()` calls (for both autonomous custom elements extending `HTMLElement` and customized
+/// built-ins extending `HTML*Element`).
 pub fn register_dom_interface(
     vm: &mut JsVm,
     name: &'static str,
@@ -558,8 +561,84 @@ pub fn register_dom_interface(
     parent_ctor: Option<HeapHandle>,
     allow_construct: bool,
 ) -> HeapHandle {
+    register_dom_interface_with_ce(vm, name, proto, parent_ctor, allow_construct, None)
+}
+
+fn register_dom_interface_with_ce(
+    vm: &mut JsVm,
+    name: &'static str,
+    proto: HeapHandle,
+    parent_ctor: Option<HeapHandle>,
+    allow_construct: bool,
+    ce_host: Option<&SharedHost>,
+) -> HeapHandle {
     define_to_string_tag(vm, proto, name);
-    let ctor = if allow_construct {
+    let ctor = if let Some(h_ref) = ce_host {
+        let h = Rc::clone(h_ref);
+        vm.alloc_host_fn(name, move |vm, this_val, _| {
+            // 1. Upgrade stack: `upgrade_if_custom_element` set `pending_ce_upgrade_node`.
+            let pending_nid = h.borrow_mut().pending_ce_upgrade_node.take();
+            if let Some(nid) = pending_nid {
+                let wrapper = wrap_node(vm, &h, nid);
+                if let (Some(wh), Some(nt)) =
+                    (wrapper.as_object(), vm.native_new_target.as_object())
+                {
+                    if let Ok(nt_proto) = vm.get_property_by_key(nt, vm.key_prototype) {
+                        if let Some(ph) = nt_proto.as_object() {
+                            vm.heap.object_set_prototype(wh, Some(ph), &mut vm.shapes);
+                        }
+                    }
+                }
+                return Ok(wrapper);
+            }
+            // 2. Direct `new MyCustomElement()` construction via registered constructor.
+            if let Some(nt) = vm.native_new_target.as_object() {
+                let found_def = h
+                    .borrow()
+                    .custom_elements
+                    .iter()
+                    .find(|(_, d)| d.constructor == nt)
+                    .map(|(ce_name, d)| (ce_name.clone(), d.extends.clone()));
+                if let Some((ce_name, extends)) = found_def {
+                    let (local, is_attr) = match extends {
+                        Some(ext) => (ext, Some(ce_name)),
+                        None => (ce_name, None),
+                    };
+                    let nid = {
+                        let doc_rc = Rc::clone(&h.borrow().document);
+                        let mut doc = doc_rc.borrow_mut();
+                        let n = doc.create_element_ns(HTML_NS, None, &local);
+                        if let Some(NodeData::Element(e)) = doc.get_mut(n) {
+                            if let Some(ref is_val) = is_attr {
+                                e.set_attribute("is", is_val);
+                            }
+                            e.pseudo_state.insert(rix_dom::ElementState::DEFINED);
+                        }
+                        n
+                    };
+                    {
+                        let mut hb = h.borrow_mut();
+                        let root = hb.document.borrow().root();
+                        hb.set_owner_doc(nid, root);
+                        hb.upgraded_custom_elements.insert(nid);
+                    }
+                    let wrapper = wrap_node(vm, &h, nid);
+                    if let Some(wh) = wrapper.as_object() {
+                        if let Ok(nt_proto) = vm.get_property_by_key(nt, vm.key_prototype) {
+                            if let Some(ph) = nt_proto.as_object() {
+                                vm.heap.object_set_prototype(wh, Some(ph), &mut vm.shapes);
+                            }
+                        }
+                    }
+                    return Ok(wrapper);
+                }
+            }
+            if allow_construct {
+                return Ok(this_val);
+            }
+            Err(vm.type_error(format!("Illegal constructor: {name}")))
+        })
+    } else if allow_construct {
         vm.alloc_host_fn(name, |_vm, this_val, _| Ok(this_val))
     } else {
         vm.alloc_host_fn(name, move |vm, _, _| {
@@ -645,12 +724,13 @@ pub fn install_all_dom_interfaces(vm: &mut JsVm, host: &SharedHost) {
     define_consts(vm, node_ctor);
 
     let elem_ctor = register_dom_interface(vm, "Element", p.element_proto, Some(node_ctor), false);
-    let html_elem_ctor = register_dom_interface(
+    let html_elem_ctor = register_dom_interface_with_ce(
         vm,
         "HTMLElement",
         p.html_element_proto,
         Some(elem_ctor),
         true, // Custom elements extend HTMLElement via super()
+        Some(host),
     );
     let svg_elem_ctor = register_dom_interface(
         vm,
@@ -671,7 +751,14 @@ pub fn install_all_dom_interfaces(vm: &mut JsVm, host: &SharedHost) {
     let mut media_ctor = html_elem_ctor;
     for &iface in HTML_ELEMENT_INTERFACES {
         if let Some(&proto) = host.borrow().interface_protos.get(iface) {
-            let ctor = register_dom_interface(vm, iface, proto, Some(html_elem_ctor), false);
+            let ctor = register_dom_interface_with_ce(
+                vm,
+                iface,
+                proto,
+                Some(html_elem_ctor),
+                false,
+                Some(host),
+            );
             if iface == "HTMLMediaElement" {
                 media_ctor = ctor;
             }
