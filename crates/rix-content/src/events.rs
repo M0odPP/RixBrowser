@@ -1,19 +1,23 @@
 //! Shadow-DOM-aware WHATWG `EventTarget`, `Event`, `CustomEvent`, `UIEvent`,
-//! `MouseEvent`, `PointerEvent`, `KeyboardEvent`, and `InputEvent` dispatch
-//! with capture/target/bubble phases, retargeting, `composed`, `composedPath()`,
-//! `once`/`passive` options, and `WeakTable` listener pinning.
+//! `FocusEvent`, `MouseEvent`, `WheelEvent`, `PointerEvent`, `KeyboardEvent`,
+//! `CompositionEvent`, `InputEvent`, `TextEvent`, `DragEvent`, `BeforeUnloadEvent`,
+//! `HashChangeEvent`, `StorageEvent`, `DeviceMotionEvent`, `DeviceOrientationEvent`,
+//! `Document.prototype.createEvent`, `GlobalEventHandlers`, and `WindowEventHandlers`.
 //!
-//! Reference: Spec 06 §3 & Issue #16.
+//! Reference: WHATWG DOM §2, §4.5, WHATWG HTML §8.1.7.2, Spec 06 §3 & Issue #16.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Instant;
 
 use rix_dom::{NodeData, NodeId};
 use rix_js::{HeapHandle, JsException, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs};
 
 use crate::dom_bridge::{wrap_node, SharedHost};
+use crate::dom_interfaces::define_to_string_tag;
 use crate::event_loop::{run_microtask_checkpoint, SharedEventLoop};
+use crate::web_apis::create_dom_exception;
 
 /// Unique target key supporting `window`, DOM `NodeId`s, and standalone `new EventTarget()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,7 +29,8 @@ pub enum EventTargetKey {
 
 #[derive(Debug, Clone, Copy)]
 struct ListenerEntry {
-    callback: HeapHandle,
+    /// Original JS callback function or `{ handleEvent }` listener object.
+    listener: HeapHandle,
     capture: bool,
     once: bool,
     passive: bool,
@@ -37,22 +42,34 @@ struct EventInternal {
     bubbles: bool,
     cancelable: bool,
     composed: bool,
+    is_trusted: bool,
+    initialized: bool,
+    dispatch_flag: bool,
     default_prevented: bool,
     propagation_stopped: bool,
     immediate_stopped: bool,
     in_passive_listener: bool,
     event_phase: i32,
+    time_stamp: f64,
     target: JsValue,
     current_target: JsValue,
     composed_path: Vec<JsValue>,
 }
 
-/// Shared registry of active event listeners and event internal state.
-#[derive(Default)]
+/// Shared registry of active event listeners, IDL event handlers, and event internal state.
 pub struct EventSystem {
     listeners: HashMap<(EventTargetKey, String), Vec<ListenerEntry>>,
     events: HashMap<HeapHandle, EventInternal>,
+    event_handlers: HashMap<(EventTargetKey, String), JsValue>,
     pub event_proto: Option<HeapHandle>,
+    pub event_protos: HashMap<&'static str, HeapHandle>,
+    start_instant: Instant,
+}
+
+impl Default for EventSystem {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Shared handle to [`EventSystem`].
@@ -61,18 +78,36 @@ pub type SharedEvents = Rc<RefCell<EventSystem>>;
 impl EventSystem {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            listeners: HashMap::new(),
+            events: HashMap::new(),
+            event_handlers: HashMap::new(),
+            event_proto: None,
+            event_protos: HashMap::new(),
+            start_instant: Instant::now(),
+        }
     }
 
-    /// Collects GC roots for all registered event listener callbacks.
+    #[must_use]
+    fn now_ms(&self) -> f64 {
+        self.start_instant.elapsed().as_secs_f64() * 1000.0
+    }
+
+    /// Collects GC roots for all registered event listener callbacks, handlers, and prototypes.
     pub fn collect_roots(&self, out: &mut Vec<JsValue>) {
         if let Some(ep) = self.event_proto {
             out.push(JsValue::from_object(ep));
         }
+        for &p in self.event_protos.values() {
+            out.push(JsValue::from_object(p));
+        }
         for list in self.listeners.values() {
             for entry in list {
-                out.push(JsValue::from_object(entry.callback));
+                out.push(JsValue::from_object(entry.listener));
             }
+        }
+        for &v in self.event_handlers.values() {
+            out.push(v);
         }
     }
 
@@ -85,6 +120,10 @@ impl EventSystem {
                 EventTargetKey::Window | EventTargetKey::Node(_) => true,
             };
             key_alive && !list.is_empty()
+        });
+        self.event_handlers.retain(|(k, _), _| match *k {
+            EventTargetKey::Object(h) => heap.is_alive(h),
+            EventTargetKey::Window | EventTargetKey::Node(_) => true,
         });
     }
 
@@ -137,7 +176,47 @@ fn define_host_getter(
         key,
         Some(g),
         None,
-        PropertyAttrs::CONFIGURABLE,
+        PropertyAttrs::ENUMERABLE | PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+}
+
+fn define_host_accessor(
+    vm: &mut JsVm,
+    target: HeapHandle,
+    name: &str,
+    get: impl Fn(&mut JsVm, JsValue, &[JsValue]) -> Result<JsValue, JsException> + 'static,
+    set: impl Fn(&mut JsVm, JsValue, &[JsValue]) -> Result<JsValue, JsException> + 'static,
+) {
+    let key = vm.heap.intern_key(name);
+    let g = vm.alloc_host_fn(name, get);
+    let s = vm.alloc_host_fn(name, set);
+    vm.heap.object_define_accessor(
+        target,
+        key,
+        Some(g),
+        Some(s),
+        PropertyAttrs::ENUMERABLE | PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+}
+
+/// Defines the `[LegacyUnforgeable]` own non-configurable `isTrusted` accessor on an Event instance.
+fn define_own_is_trusted(vm: &mut JsVm, events: &SharedEvents, ev_h: HeapHandle) {
+    let e = Rc::clone(events);
+    let k = vm.heap.intern_key("isTrusted");
+    let g = vm.alloc_host_fn("get isTrusted", move |_vm, t, _| {
+        let trusted = t
+            .as_object()
+            .is_some_and(|h| e.borrow().events.get(&h).is_some_and(|ev| ev.is_trusted));
+        Ok(JsValue::from_bool(trusted))
+    });
+    vm.heap.object_define_accessor(
+        ev_h,
+        k,
+        Some(g),
+        None,
+        PropertyAttrs::ENUMERABLE,
         &mut vm.shapes,
     );
 }
@@ -173,48 +252,134 @@ fn value_for_target_key(vm: &mut JsVm, host: &SharedHost, key: EventTargetKey) -
     }
 }
 
+/// WHATWG DOM §2.7 "default passive value" for `touchstart`/`touchmove`/`wheel`/`mousewheel`
+/// on `Window`, `Document`, `document.documentElement`, and `document.body`.
+fn default_passive_value(host: &SharedHost, target_key: EventTargetKey, ev_type: &str) -> bool {
+    if !matches!(ev_type, "touchstart" | "touchmove" | "wheel" | "mousewheel") {
+        return false;
+    }
+    match target_key {
+        EventTargetKey::Window => true,
+        EventTargetKey::Object(_) => false,
+        EventTargetKey::Node(nid) => {
+            let doc_rc = Rc::clone(&host.borrow().document);
+            let doc = doc_rc.borrow();
+            match doc.get(nid) {
+                Some(NodeData::Document) => true,
+                Some(NodeData::Element(e)) => {
+                    let root = host.borrow().owner_doc_of(nid);
+                    if doc.document_element_of(root) == Some(nid) {
+                        return true;
+                    }
+                    e.name.local.as_str().eq_ignore_ascii_case("body")
+                        && doc
+                            .parent(nid)
+                            .is_some_and(|p| doc.document_element_of(root) == Some(p))
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
+struct ParsedListenerOptions {
+    capture: bool,
+    once: bool,
+    passive: bool,
+    signal: Option<HeapHandle>,
+}
+
 fn parse_listener_options(
     vm: &mut JsVm,
+    host: &SharedHost,
+    target_key: EventTargetKey,
+    ev_type: &str,
     opt_val: JsValue,
-) -> Result<(bool, bool, bool), JsException> {
+) -> Result<ParsedListenerOptions, JsException> {
+    let def_passive = default_passive_value(host, target_key, ev_type);
     if opt_val.is_undefined() || opt_val.is_null() {
-        return Ok((false, false, false));
+        return Ok(ParsedListenerOptions {
+            capture: false,
+            once: false,
+            passive: def_passive,
+            signal: None,
+        });
     }
     if let Some(h) = opt_val.as_object() {
         let k_cap = vm.heap.intern_key("capture");
         let k_once = vm.heap.intern_key("once");
         let k_pas = vm.heap.intern_key("passive");
+        let k_sig = vm.heap.intern_key("signal");
         let cap = vm
             .get_property_by_key(h, k_cap)
             .is_ok_and(|v| vm.to_boolean(v));
         let once = vm
             .get_property_by_key(h, k_once)
             .is_ok_and(|v| vm.to_boolean(v));
-        let pas = vm
-            .get_property_by_key(h, k_pas)
-            .is_ok_and(|v| vm.to_boolean(v));
-        return Ok((cap, once, pas));
+        let pas_val = vm.get_property_by_key(h, k_pas)?;
+        let passive = if pas_val.is_undefined() {
+            def_passive
+        } else {
+            vm.to_boolean(pas_val)
+        };
+        let sig_val = vm.get_property_by_key(h, k_sig)?;
+        let signal = if sig_val.is_undefined() {
+            None
+        } else {
+            let Some(sh) = sig_val.as_object() else {
+                return Err(vm.type_error("addEventListener signal option must be an AbortSignal"));
+            };
+            Some(sh)
+        };
+        return Ok(ParsedListenerOptions {
+            capture: cap,
+            once,
+            passive,
+            signal,
+        });
     }
-    Ok((vm.to_boolean(opt_val), false, false))
+    Ok(ParsedListenerOptions {
+        capture: vm.to_boolean(opt_val),
+        once: false,
+        passive: def_passive,
+        signal: None,
+    })
 }
 
-fn extract_callback_handle(vm: &mut JsVm, val: JsValue) -> Result<Option<HeapHandle>, JsException> {
-    let Some(h) = val.as_object() else {
+fn extract_listener_handle(vm: &mut JsVm, val: JsValue) -> Result<Option<HeapHandle>, JsException> {
+    if val.is_null() || val.is_undefined() {
         return Ok(None);
-    };
-    if vm.is_callable_handle(h) {
-        return Ok(Some(h));
     }
-    let k_handle = vm.heap.intern_key("handleEvent");
-    if let Ok(he) = vm.get_property_by_key(h, k_handle) {
-        if let Some(hh) = he.as_object().filter(|&fh| vm.is_callable_handle(fh)) {
-            return Ok(Some(hh));
+    let Some(h) = val.as_object() else {
+        return Err(vm.type_error("Event listener must be an object or function"));
+    };
+    Ok(Some(h))
+}
+
+/// Resolves prototype for `new` / `super()` calls using `vm.native_new_target`.
+fn resolve_new_target_proto(
+    vm: &mut JsVm,
+    default_proto: HeapHandle,
+    ctor_name: &str,
+) -> Result<HeapHandle, JsException> {
+    if vm.native_new_target.is_undefined() {
+        return Err(vm.type_error(format!(
+            "Failed to construct '{ctor_name}': Please use the 'new' operator"
+        )));
+    }
+    if let Some(nt_h) = vm.native_new_target.as_object() {
+        let k_proto = vm.key_prototype;
+        if let Ok(pv) = vm.get_property_by_key(nt_h, k_proto) {
+            if let Some(ph) = pv.as_object() {
+                return Ok(ph);
+            }
         }
     }
-    Ok(None)
+    Ok(default_proto)
 }
 
-/// Installs `EventTarget.prototype` methods and all DOM Event constructors on `vm`.
+/// Installs `EventTarget.prototype` methods, all DOM Event constructors, `Document.createEvent`,
+/// `GlobalEventHandlers`, and `WindowEventHandlers` on `vm`.
 pub fn install_event_system(
     vm: &mut JsVm,
     host: &SharedHost,
@@ -253,27 +418,63 @@ pub fn install_event_system(
         let key = target_key_for_value(vm, &h, this_val)
             .map_err(|_| vm.type_error("addEventListener called on incompatible receiver"))?;
         let ev_type = vm.value_to_rust_string(arg(args, 0));
-        let Some(cb) = extract_callback_handle(vm, arg(args, 1))? else {
+        let Some(listener_h) = extract_listener_handle(vm, arg(args, 1))? else {
             return Ok(JsValue::UNDEFINED);
         };
-        let (capture, once, passive) = parse_listener_options(vm, arg(args, 2))?;
-        {
-            let mut es = evs.borrow_mut();
-            let list = es.listeners.entry((key, ev_type)).or_default();
-            if !list
-                .iter()
-                .any(|e| e.callback == cb && e.capture == capture)
+        let opts = parse_listener_options(vm, &h, key, &ev_type, arg(args, 2))?;
+        if let Some(sig_h) = opts.signal {
+            let k_ab = vm.heap.intern_key("aborted");
+            if vm
+                .get_property_by_key(sig_h, k_ab)
+                .is_ok_and(|v| vm.to_boolean(v))
             {
-                list.push(ListenerEntry {
-                    callback: cb,
-                    capture,
-                    once,
-                    passive,
-                });
+                return Ok(JsValue::UNDEFINED);
             }
         }
-        if let EventTargetKey::Node(nid) = key {
-            h.borrow_mut().wrappers.set_pinned(&nid, true);
+        let added = {
+            let mut es = evs.borrow_mut();
+            let list = es.listeners.entry((key, ev_type.clone())).or_default();
+            if !list
+                .iter()
+                .any(|e| e.listener == listener_h && e.capture == opts.capture)
+            {
+                list.push(ListenerEntry {
+                    listener: listener_h,
+                    capture: opts.capture,
+                    once: opts.once,
+                    passive: opts.passive,
+                });
+                true
+            } else {
+                false
+            }
+        };
+        if added {
+            if let Some(sig_h) = opts.signal {
+                let evs_rm = Rc::clone(&evs);
+                let ev_type_rm = ev_type;
+                let cap_rm = opts.capture;
+                let cleanup_fn = vm.alloc_host_fn("abort_remove_listener", move |_vm, _, _| {
+                    let mut es = evs_rm.borrow_mut();
+                    if let Some(list) = es.listeners.get_mut(&(key, ev_type_rm.clone())) {
+                        list.retain(|e| !(e.listener == listener_h && e.capture == cap_rm));
+                    }
+                    Ok(JsValue::UNDEFINED)
+                });
+                evs.borrow_mut()
+                    .listeners
+                    .entry((EventTargetKey::Object(sig_h), "abort".to_string()))
+                    .or_default()
+                    .push(ListenerEntry {
+                        listener: cleanup_fn,
+                        capture: false,
+                        once: true,
+                        passive: false,
+                    });
+            }
+            if let EventTargetKey::Node(nid) = key {
+                h.borrow_mut().wrappers.set_pinned(&nid, true);
+            }
         }
         Ok(JsValue::UNDEFINED)
     });
@@ -285,14 +486,23 @@ pub fn install_event_system(
         let key = target_key_for_value(vm, &h, this_val)
             .map_err(|_| vm.type_error("removeEventListener called on incompatible receiver"))?;
         let ev_type = vm.value_to_rust_string(arg(args, 0));
-        let Some(cb) = extract_callback_handle(vm, arg(args, 1))? else {
+        let Some(listener_h) = extract_listener_handle(vm, arg(args, 1))? else {
             return Ok(JsValue::UNDEFINED);
         };
-        let (capture, _, _) = parse_listener_options(vm, arg(args, 2))?;
+        let capture = {
+            let opt = arg(args, 2);
+            if let Some(oh) = opt.as_object() {
+                let k_cap = vm.heap.intern_key("capture");
+                vm.get_property_by_key(oh, k_cap)
+                    .is_ok_and(|v| vm.to_boolean(v))
+            } else {
+                vm.to_boolean(opt)
+            }
+        };
         let still_pinned = {
             let mut es = evs.borrow_mut();
             if let Some(list) = es.listeners.get_mut(&(key, ev_type)) {
-                list.retain(|e| !(e.callback == cb && e.capture == capture));
+                list.retain(|e| !(e.listener == listener_h && e.capture == capture));
             }
             match key {
                 EventTargetKey::Node(nid) => es.has_any_listeners_for_node(nid),
@@ -322,11 +532,13 @@ pub fn install_event_system(
         Ok(JsValue::from_bool(not_canceled))
     });
 
-    // Replace EventTarget constructor so `new EventTarget()` creates an EventTarget instance.
+    // Constructible `new EventTarget()` supporting ES6 subclassing (`class Sub extends EventTarget`)
+    define_to_string_tag(vm, etp, "EventTarget");
     let et_ctor = vm.alloc_host_fn("EventTarget", move |vm, _, _| {
+        let proto = resolve_new_target_proto(vm, etp, "EventTarget")?;
         let obj = vm
             .heap
-            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(etp)));
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
         Ok(JsValue::from_object(obj))
     });
     vm.mark_constructor(et_ctor);
@@ -337,9 +549,18 @@ pub fn install_event_system(
         PropertyAttrs::empty(),
         &mut vm.shapes,
     );
+    vm.heap.object_define_data(
+        etp,
+        vm.key_constructor,
+        JsValue::from_object(et_ctor),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
     define_global(vm, "EventTarget", JsValue::from_object(et_ctor));
 
     install_event_constructors(vm, &events);
+    install_document_create_event(vm, host, &events);
+    install_global_and_window_event_handlers(vm, host, &events);
     events
 }
 
@@ -348,7 +569,12 @@ fn install_event_constructors(vm: &mut JsVm, events: &SharedEvents) {
     vm.heap
         .object_set_prototype(ep, Some(vm.object_proto), &mut vm.shapes);
     vm.heap.get_object_mut(ep).unwrap().is_prototype = true;
-    events.borrow_mut().event_proto = Some(ep);
+    define_to_string_tag(vm, ep, "Event");
+    {
+        let mut es = events.borrow_mut();
+        es.event_proto = Some(ep);
+        es.event_protos.insert("Event", ep);
+    }
 
     // Event phase constants on prototype & constructor.
     let define_phase_consts = |vm: &mut JsVm, target: HeapHandle| {
@@ -370,7 +596,7 @@ fn install_event_constructors(vm: &mut JsVm, events: &SharedEvents) {
     };
     define_phase_consts(vm, ep);
 
-    // Event getters
+    // Event getters & legacy aliases
     let e = Rc::clone(events);
     define_host_getter(vm, ep, "type", move |vm, t, _| {
         let s = t
@@ -427,6 +653,14 @@ fn install_event_constructors(vm: &mut JsVm, events: &SharedEvents) {
         Ok(v)
     });
     let e = Rc::clone(events);
+    define_host_getter(vm, ep, "srcElement", move |_vm, t, _| {
+        let v = t
+            .as_object()
+            .and_then(|h| e.borrow().events.get(&h).map(|ev| ev.target))
+            .unwrap_or(JsValue::NULL);
+        Ok(v)
+    });
+    let e = Rc::clone(events);
     define_host_getter(vm, ep, "currentTarget", move |_vm, t, _| {
         let v = t
             .as_object()
@@ -434,6 +668,68 @@ fn install_event_constructors(vm: &mut JsVm, events: &SharedEvents) {
             .unwrap_or(JsValue::NULL);
         Ok(v)
     });
+    let e = Rc::clone(events);
+    define_host_getter(vm, ep, "timeStamp", move |_vm, t, _| {
+        let ts = t
+            .as_object()
+            .and_then(|h| e.borrow().events.get(&h).map(|ev| ev.time_stamp))
+            .unwrap_or(0.0);
+        Ok(JsValue::from_f64(ts))
+    });
+    let e1 = Rc::clone(events);
+    let e2 = Rc::clone(events);
+    define_host_accessor(
+        vm,
+        ep,
+        "cancelBubble",
+        move |_vm, t, _| {
+            let b = t.as_object().is_some_and(|h| {
+                e1.borrow()
+                    .events
+                    .get(&h)
+                    .is_some_and(|ev| ev.propagation_stopped)
+            });
+            Ok(JsValue::from_bool(b))
+        },
+        move |vm, t, args| {
+            if vm.to_boolean(arg(args, 0)) {
+                if let Some(h) = t.as_object() {
+                    if let Some(ev) = e2.borrow_mut().events.get_mut(&h) {
+                        ev.propagation_stopped = true;
+                    }
+                }
+            }
+            Ok(JsValue::UNDEFINED)
+        },
+    );
+    let e1 = Rc::clone(events);
+    let e2 = Rc::clone(events);
+    define_host_accessor(
+        vm,
+        ep,
+        "returnValue",
+        move |_vm, t, _| {
+            let b = t.as_object().is_some_and(|h| {
+                e1.borrow()
+                    .events
+                    .get(&h)
+                    .is_some_and(|ev| ev.default_prevented)
+            });
+            Ok(JsValue::from_bool(!b))
+        },
+        move |vm, t, args| {
+            if !vm.to_boolean(arg(args, 0)) {
+                if let Some(h) = t.as_object() {
+                    if let Some(ev) = e2.borrow_mut().events.get_mut(&h) {
+                        if ev.cancelable && !ev.in_passive_listener {
+                            ev.default_prevented = true;
+                        }
+                    }
+                }
+            }
+            Ok(JsValue::UNDEFINED)
+        },
+    );
 
     // Event methods
     let e = Rc::clone(events);
@@ -474,6 +770,7 @@ fn install_event_constructors(vm: &mut JsVm, events: &SharedEvents) {
                 .borrow()
                 .events
                 .get(&h)
+                .filter(|ev| ev.event_phase != 0)
                 .map(|ev| ev.composed_path.clone())
                 .unwrap_or_default();
             for v in path {
@@ -482,118 +779,521 @@ fn install_event_constructors(vm: &mut JsVm, events: &SharedEvents) {
         }
         Ok(JsValue::from_object(arr))
     });
+    let e = Rc::clone(events);
+    define_host_method(vm, ep, "initEvent", move |vm, t, args| {
+        if args.is_empty() {
+            return Err(vm.type_error("initEvent requires at least 1 argument"));
+        }
+        let Some(h) = t.as_object() else {
+            return Err(vm.type_error("Illegal invocation"));
+        };
+        let ev_type = vm.value_to_rust_string(arg(args, 0));
+        let bubbles = vm.to_boolean(arg(args, 1));
+        let cancelable = vm.to_boolean(arg(args, 2));
+        if let Some(ev) = e.borrow_mut().events.get_mut(&h) {
+            if ev.dispatch_flag {
+                return Ok(JsValue::UNDEFINED);
+            }
+            ev.initialized = true;
+            ev.propagation_stopped = false;
+            ev.immediate_stopped = false;
+            ev.default_prevented = false;
+            ev.is_trusted = false;
+            ev.target = JsValue::NULL;
+            ev.event_type = ev_type;
+            ev.bubbles = bubbles;
+            ev.cancelable = cancelable;
+        }
+        Ok(JsValue::UNDEFINED)
+    });
 
     // Base `Event` constructor
-    let ev_ctor = register_event_subclass(vm, events, "Event", ep, |_vm, _obj, _init| Ok(()));
+    let ev_ctor = register_event_subclass(vm, events, "Event", ep, None, |_vm, _obj, _init| Ok(()));
     define_phase_consts(vm, ev_ctor);
 
     // `CustomEvent`
-    let _ = register_event_subclass(vm, events, "CustomEvent", ep, |vm, obj, init| {
-        let detail = read_init_prop(vm, init, "detail", JsValue::NULL)?;
-        let k = vm.heap.intern_key("detail");
-        vm.heap
-            .object_define_data(obj, k, detail, PropertyAttrs::DEFAULT, &mut vm.shapes);
-        Ok(())
+    let (custom_ctor, custom_proto) = register_event_subclass_with_proto(
+        vm,
+        events,
+        "CustomEvent",
+        ep,
+        Some(ev_ctor),
+        |vm, obj, init| {
+            let detail = read_init_prop(vm, init, "detail", JsValue::NULL)?;
+            define_data(vm, obj, "detail", detail);
+            Ok(())
+        },
+    );
+    let _ = custom_ctor;
+    let e_ce = Rc::clone(events);
+    define_host_method(vm, custom_proto, "initCustomEvent", move |vm, t, args| {
+        if args.is_empty() {
+            return Err(vm.type_error("initCustomEvent requires at least 1 argument"));
+        }
+        let Some(h) = t.as_object() else {
+            return Err(vm.type_error("Illegal invocation"));
+        };
+        let ev_type = vm.value_to_rust_string(arg(args, 0));
+        let bubbles = vm.to_boolean(arg(args, 1));
+        let cancelable = vm.to_boolean(arg(args, 2));
+        let detail = if args.len() > 3 && !arg(args, 3).is_undefined() {
+            arg(args, 3)
+        } else {
+            JsValue::NULL
+        };
+        let dispatched = {
+            let mut es = e_ce.borrow_mut();
+            if let Some(ev) = es.events.get_mut(&h) {
+                if ev.dispatch_flag {
+                    true
+                } else {
+                    ev.initialized = true;
+                    ev.propagation_stopped = false;
+                    ev.immediate_stopped = false;
+                    ev.default_prevented = false;
+                    ev.is_trusted = false;
+                    ev.target = JsValue::NULL;
+                    ev.event_type = ev_type;
+                    ev.bubbles = bubbles;
+                    ev.cancelable = cancelable;
+                    false
+                }
+            } else {
+                true
+            }
+        };
+        if !dispatched {
+            define_data(vm, h, "detail", detail);
+        }
+        Ok(JsValue::UNDEFINED)
     });
 
     // `UIEvent`
-    let ui_proto = vm.heap.alloc_empty_object();
+    let (ui_ctor, ui_proto) = register_event_subclass_with_proto(
+        vm,
+        events,
+        "UIEvent",
+        ep,
+        Some(ev_ctor),
+        init_ui_event_props,
+    );
+    let e_ui = Rc::clone(events);
+    define_host_method(vm, ui_proto, "initUIEvent", move |vm, t, args| {
+        if args.is_empty() {
+            return Err(vm.type_error("initUIEvent requires at least 1 argument"));
+        }
+        let Some(h) = t.as_object() else {
+            return Err(vm.type_error("Illegal invocation"));
+        };
+        let ev_type = vm.value_to_rust_string(arg(args, 0));
+        let bubbles = vm.to_boolean(arg(args, 1));
+        let cancelable = vm.to_boolean(arg(args, 2));
+        let view = if args.len() > 3 && !arg(args, 3).is_undefined() {
+            arg(args, 3)
+        } else {
+            JsValue::NULL
+        };
+        let detail = if args.len() > 4 && !arg(args, 4).is_undefined() {
+            JsValue::from_i32(vm.to_number(arg(args, 4))? as i32)
+        } else {
+            JsValue::from_i32(0)
+        };
+        let dispatched = init_event_flags(&e_ui, h, ev_type, bubbles, cancelable);
+        if !dispatched {
+            define_data(vm, h, "view", view);
+            define_data(vm, h, "detail", detail);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    // `FocusEvent` inherits `UIEvent`
+    let _ = register_event_subclass_with_proto(
+        vm,
+        events,
+        "FocusEvent",
+        ui_proto,
+        Some(ui_ctor),
+        |vm, obj, init| {
+            init_ui_event_props(vm, obj, init)?;
+            let rt = read_init_prop(vm, init, "relatedTarget", JsValue::NULL)?;
+            define_data(vm, obj, "relatedTarget", rt);
+            Ok(())
+        },
+    );
+
+    // `MouseEvent` inherits `UIEvent`
+    let (mouse_ctor, mouse_proto) = register_event_subclass_with_proto(
+        vm,
+        events,
+        "MouseEvent",
+        ui_proto,
+        Some(ui_ctor),
+        init_mouse_event_props,
+    );
+    let e_me = Rc::clone(events);
+    define_host_method(vm, mouse_proto, "initMouseEvent", move |vm, t, args| {
+        if args.is_empty() {
+            return Err(vm.type_error("initMouseEvent requires at least 1 argument"));
+        }
+        let Some(h) = t.as_object() else {
+            return Err(vm.type_error("Illegal invocation"));
+        };
+        let ev_type = vm.value_to_rust_string(arg(args, 0));
+        let bubbles = vm.to_boolean(arg(args, 1));
+        let cancelable = vm.to_boolean(arg(args, 2));
+        let dispatched = init_event_flags(&e_me, h, ev_type, bubbles, cancelable);
+        if !dispatched {
+            let view = if args.len() > 3 && !arg(args, 3).is_undefined() {
+                arg(args, 3)
+            } else {
+                JsValue::NULL
+            };
+            let detail = JsValue::from_i32(vm.to_number(arg(args, 4)).unwrap_or(0.0) as i32);
+            let screen_x = JsValue::from_i32(vm.to_number(arg(args, 5)).unwrap_or(0.0) as i32);
+            let screen_y = JsValue::from_i32(vm.to_number(arg(args, 6)).unwrap_or(0.0) as i32);
+            let client_x = JsValue::from_i32(vm.to_number(arg(args, 7)).unwrap_or(0.0) as i32);
+            let client_y = JsValue::from_i32(vm.to_number(arg(args, 8)).unwrap_or(0.0) as i32);
+            let ctrl = JsValue::from_bool(vm.to_boolean(arg(args, 9)));
+            let alt = JsValue::from_bool(vm.to_boolean(arg(args, 10)));
+            let shift = JsValue::from_bool(vm.to_boolean(arg(args, 11)));
+            let meta = JsValue::from_bool(vm.to_boolean(arg(args, 12)));
+            let button = JsValue::from_i32(vm.to_number(arg(args, 13)).unwrap_or(0.0) as i32);
+            let rt = if args.len() > 14 && !arg(args, 14).is_undefined() {
+                arg(args, 14)
+            } else {
+                JsValue::NULL
+            };
+            define_data(vm, h, "view", view);
+            define_data(vm, h, "detail", detail);
+            define_data(vm, h, "screenX", screen_x);
+            define_data(vm, h, "screenY", screen_y);
+            define_data(vm, h, "clientX", client_x);
+            define_data(vm, h, "clientY", client_y);
+            define_data(vm, h, "ctrlKey", ctrl);
+            define_data(vm, h, "altKey", alt);
+            define_data(vm, h, "shiftKey", shift);
+            define_data(vm, h, "metaKey", meta);
+            define_data(vm, h, "button", button);
+            define_data(vm, h, "relatedTarget", rt);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    // `WheelEvent` inherits `MouseEvent`
+    let (wheel_ctor, wheel_proto) = register_event_subclass_with_proto(
+        vm,
+        events,
+        "WheelEvent",
+        mouse_proto,
+        Some(mouse_ctor),
+        |vm, obj, init| {
+            init_mouse_event_props(vm, obj, init)?;
+            for (prop, def) in [
+                ("deltaX", JsValue::from_f64(0.0)),
+                ("deltaY", JsValue::from_f64(0.0)),
+                ("deltaZ", JsValue::from_f64(0.0)),
+                ("deltaMode", JsValue::from_i32(0)),
+            ] {
+                let v = read_init_prop(vm, init, prop, def)?;
+                define_data(vm, obj, prop, v);
+            }
+            Ok(())
+        },
+    );
+    for target in [wheel_ctor, wheel_proto] {
+        for (cname, cval) in [
+            ("DOM_DELTA_PIXEL", 0),
+            ("DOM_DELTA_LINE", 1),
+            ("DOM_DELTA_PAGE", 2),
+        ] {
+            let k = vm.heap.intern_key(cname);
+            vm.heap.object_define_data(
+                target,
+                k,
+                JsValue::from_i32(cval),
+                PropertyAttrs::ENUMERABLE,
+                &mut vm.shapes,
+            );
+        }
+    }
+
+    // `PointerEvent` inherits `MouseEvent`
+    let _ = register_event_subclass_with_proto(
+        vm,
+        events,
+        "PointerEvent",
+        mouse_proto,
+        Some(mouse_ctor),
+        |vm, obj, init| {
+            init_mouse_event_props(vm, obj, init)?;
+            let pt_def = JsValue::from_string(vm.heap.alloc_string("mouse"));
+            for (prop, def) in [
+                ("pointerId", JsValue::from_i32(1)),
+                ("pointerType", pt_def),
+                ("pressure", JsValue::from_f64(0.0)),
+                ("width", JsValue::from_i32(1)),
+                ("height", JsValue::from_i32(1)),
+                ("isPrimary", JsValue::TRUE),
+            ] {
+                let v = read_init_prop(vm, init, prop, def)?;
+                define_data(vm, obj, prop, v);
+            }
+            Ok(())
+        },
+    );
+
+    // `DragEvent` inherits `MouseEvent`
+    let _ = register_event_subclass_with_proto(
+        vm,
+        events,
+        "DragEvent",
+        mouse_proto,
+        Some(mouse_ctor),
+        |vm, obj, init| {
+            init_mouse_event_props(vm, obj, init)?;
+            let dt = read_init_prop(vm, init, "dataTransfer", JsValue::NULL)?;
+            define_data(vm, obj, "dataTransfer", dt);
+            Ok(())
+        },
+    );
+
+    // `KeyboardEvent` inherits `UIEvent`
+    let _ = register_event_subclass_with_proto(
+        vm,
+        events,
+        "KeyboardEvent",
+        ui_proto,
+        Some(ui_ctor),
+        |vm, obj, init| {
+            init_ui_event_props(vm, obj, init)?;
+            let empty = JsValue::from_string(vm.heap.alloc_string(""));
+            for (prop, def) in [
+                ("key", empty),
+                ("code", empty),
+                ("location", JsValue::from_i32(0)),
+                ("repeat", JsValue::FALSE),
+                ("isComposing", JsValue::FALSE),
+                ("ctrlKey", JsValue::FALSE),
+                ("shiftKey", JsValue::FALSE),
+                ("altKey", JsValue::FALSE),
+                ("metaKey", JsValue::FALSE),
+                ("charCode", JsValue::from_i32(0)),
+                ("keyCode", JsValue::from_i32(0)),
+                ("which", JsValue::from_i32(0)),
+            ] {
+                let v = read_init_prop(vm, init, prop, def)?;
+                define_data(vm, obj, prop, v);
+            }
+            Ok(())
+        },
+    );
+
+    // `CompositionEvent` inherits `UIEvent`
+    let _ = register_event_subclass_with_proto(
+        vm,
+        events,
+        "CompositionEvent",
+        ui_proto,
+        Some(ui_ctor),
+        |vm, obj, init| {
+            init_ui_event_props(vm, obj, init)?;
+            let empty = JsValue::from_string(vm.heap.alloc_string(""));
+            let data = read_init_prop(vm, init, "data", empty)?;
+            define_data(vm, obj, "data", data);
+            Ok(())
+        },
+    );
+
+    // `InputEvent` inherits `UIEvent`
+    let _ = register_event_subclass_with_proto(
+        vm,
+        events,
+        "InputEvent",
+        ui_proto,
+        Some(ui_ctor),
+        |vm, obj, init| {
+            init_ui_event_props(vm, obj, init)?;
+            let empty = JsValue::from_string(vm.heap.alloc_string(""));
+            for (prop, def) in [
+                ("data", JsValue::NULL),
+                ("inputType", empty),
+                ("isComposing", JsValue::FALSE),
+            ] {
+                let v = read_init_prop(vm, init, prop, def)?;
+                define_data(vm, obj, prop, v);
+            }
+            Ok(())
+        },
+    );
+
+    // `TextEvent` inherits `UIEvent`
+    let _ = register_event_subclass_with_proto(
+        vm,
+        events,
+        "TextEvent",
+        ui_proto,
+        Some(ui_ctor),
+        |vm, obj, init| {
+            init_ui_event_props(vm, obj, init)?;
+            let empty = JsValue::from_string(vm.heap.alloc_string(""));
+            let data = read_init_prop(vm, init, "data", empty)?;
+            define_data(vm, obj, "data", data);
+            Ok(())
+        },
+    );
+
+    // Additional HTML / Device Event subclasses required by `Document.createEvent`
+    let _ = register_event_subclass_with_proto(
+        vm,
+        events,
+        "BeforeUnloadEvent",
+        ep,
+        Some(ev_ctor),
+        |_vm, _obj, _init| Ok(()),
+    );
+    let _ = register_event_subclass_with_proto(
+        vm,
+        events,
+        "HashChangeEvent",
+        ep,
+        Some(ev_ctor),
+        |vm, obj, init| {
+            let empty = JsValue::from_string(vm.heap.alloc_string(""));
+            for prop in ["oldURL", "newURL"] {
+                let v = read_init_prop(vm, init, prop, empty)?;
+                define_data(vm, obj, prop, v);
+            }
+            Ok(())
+        },
+    );
+    let _ = register_event_subclass_with_proto(
+        vm,
+        events,
+        "StorageEvent",
+        ep,
+        Some(ev_ctor),
+        |vm, obj, init| {
+            let empty = JsValue::from_string(vm.heap.alloc_string(""));
+            for (prop, def) in [
+                ("key", JsValue::NULL),
+                ("oldValue", JsValue::NULL),
+                ("newValue", JsValue::NULL),
+                ("url", empty),
+                ("storageArea", JsValue::NULL),
+            ] {
+                let v = read_init_prop(vm, init, prop, def)?;
+                define_data(vm, obj, prop, v);
+            }
+            Ok(())
+        },
+    );
+    let _ = register_event_subclass_with_proto(
+        vm,
+        events,
+        "DeviceMotionEvent",
+        ep,
+        Some(ev_ctor),
+        |vm, obj, init| {
+            for (prop, def) in [
+                ("acceleration", JsValue::NULL),
+                ("accelerationIncludingGravity", JsValue::NULL),
+                ("rotationRate", JsValue::NULL),
+                ("interval", JsValue::from_f64(0.0)),
+            ] {
+                let v = read_init_prop(vm, init, prop, def)?;
+                define_data(vm, obj, prop, v);
+            }
+            Ok(())
+        },
+    );
+    let _ = register_event_subclass_with_proto(
+        vm,
+        events,
+        "DeviceOrientationEvent",
+        ep,
+        Some(ev_ctor),
+        |vm, obj, init| {
+            for (prop, def) in [
+                ("alpha", JsValue::NULL),
+                ("beta", JsValue::NULL),
+                ("gamma", JsValue::NULL),
+                ("absolute", JsValue::FALSE),
+            ] {
+                let v = read_init_prop(vm, init, prop, def)?;
+                define_data(vm, obj, prop, v);
+            }
+            Ok(())
+        },
+    );
+}
+
+fn define_data(vm: &mut JsVm, obj: HeapHandle, prop: &str, val: JsValue) {
+    let k = vm.heap.intern_key(prop);
     vm.heap
-        .object_set_prototype(ui_proto, Some(ep), &mut vm.shapes);
-    vm.heap.get_object_mut(ui_proto).unwrap().is_prototype = true;
-    let _ = register_event_subclass(vm, events, "UIEvent", ep, |vm, obj, init| {
-        let detail = read_init_prop(vm, init, "detail", JsValue::from_i32(0))?;
-        let k = vm.heap.intern_key("detail");
-        vm.heap
-            .object_define_data(obj, k, detail, PropertyAttrs::DEFAULT, &mut vm.shapes);
-        Ok(())
-    });
+        .object_define_data(obj, k, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+}
 
-    // `MouseEvent`
-    let mouse_ctor = register_event_subclass(vm, events, "MouseEvent", ep, |vm, obj, init| {
-        for (prop, def) in [
-            ("clientX", JsValue::from_i32(0)),
-            ("clientY", JsValue::from_i32(0)),
-            ("screenX", JsValue::from_i32(0)),
-            ("screenY", JsValue::from_i32(0)),
-            ("button", JsValue::from_i32(0)),
-            ("buttons", JsValue::from_i32(0)),
-            ("ctrlKey", JsValue::FALSE),
-            ("shiftKey", JsValue::FALSE),
-            ("altKey", JsValue::FALSE),
-            ("metaKey", JsValue::FALSE),
-        ] {
-            let v = read_init_prop(vm, init, prop, def)?;
-            let k = vm.heap.intern_key(prop);
-            vm.heap
-                .object_define_data(obj, k, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
+fn init_event_flags(
+    events: &SharedEvents,
+    h: HeapHandle,
+    ev_type: String,
+    bubbles: bool,
+    cancelable: bool,
+) -> bool {
+    let mut es = events.borrow_mut();
+    if let Some(ev) = es.events.get_mut(&h) {
+        if ev.dispatch_flag {
+            return true;
         }
-        Ok(())
-    });
-    let mouse_proto = vm
-        .get_property_by_key(mouse_ctor, vm.key_prototype)
-        .ok()
-        .and_then(JsValue::as_object)
-        .unwrap_or(ep);
+        ev.initialized = true;
+        ev.propagation_stopped = false;
+        ev.immediate_stopped = false;
+        ev.default_prevented = false;
+        ev.is_trusted = false;
+        ev.target = JsValue::NULL;
+        ev.event_type = ev_type;
+        ev.bubbles = bubbles;
+        ev.cancelable = cancelable;
+        false
+    } else {
+        true
+    }
+}
 
-    // `PointerEvent` inherits from `MouseEvent.prototype`
-    let _ = register_event_subclass(vm, events, "PointerEvent", mouse_proto, |vm, obj, init| {
-        let pt_def = JsValue::from_string(vm.heap.alloc_string("mouse"));
-        for (prop, def) in [
-            ("clientX", JsValue::from_i32(0)),
-            ("clientY", JsValue::from_i32(0)),
-            ("button", JsValue::from_i32(0)),
-            ("buttons", JsValue::from_i32(0)),
-            ("pointerId", JsValue::from_i32(1)),
-            ("pointerType", pt_def),
-            ("pressure", JsValue::from_f64(0.0)),
-            ("width", JsValue::from_i32(1)),
-            ("height", JsValue::from_i32(1)),
-            ("isPrimary", JsValue::TRUE),
-        ] {
-            let v = read_init_prop(vm, init, prop, def)?;
-            let k = vm.heap.intern_key(prop);
-            vm.heap
-                .object_define_data(obj, k, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
-        }
-        Ok(())
-    });
+fn init_ui_event_props(vm: &mut JsVm, obj: HeapHandle, init: JsValue) -> Result<(), JsException> {
+    let view = read_init_prop(vm, init, "view", JsValue::NULL)?;
+    if !view.is_null() && !view.is_undefined() && view.as_object().is_none() {
+        return Err(vm.type_error("UIEventInit.view must be a Window or null"));
+    }
+    define_data(vm, obj, "view", view);
+    let detail = read_init_prop(vm, init, "detail", JsValue::from_i32(0))?;
+    define_data(vm, obj, "detail", detail);
+    Ok(())
+}
 
-    // `KeyboardEvent`
-    let _ = register_event_subclass(vm, events, "KeyboardEvent", ep, |vm, obj, init| {
-        let empty = JsValue::from_string(vm.heap.alloc_string(""));
-        for (prop, def) in [
-            ("key", empty),
-            ("code", empty),
-            ("repeat", JsValue::FALSE),
-            ("ctrlKey", JsValue::FALSE),
-            ("shiftKey", JsValue::FALSE),
-            ("altKey", JsValue::FALSE),
-            ("metaKey", JsValue::FALSE),
-        ] {
-            let v = read_init_prop(vm, init, prop, def)?;
-            let k = vm.heap.intern_key(prop);
-            vm.heap
-                .object_define_data(obj, k, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
-        }
-        Ok(())
-    });
-
-    // `InputEvent`
-    let _ = register_event_subclass(vm, events, "InputEvent", ep, |vm, obj, init| {
-        let empty = JsValue::from_string(vm.heap.alloc_string(""));
-        for (prop, def) in [
-            ("data", JsValue::NULL),
-            ("inputType", empty),
-            ("isComposing", JsValue::FALSE),
-        ] {
-            let v = read_init_prop(vm, init, prop, def)?;
-            let k = vm.heap.intern_key(prop);
-            vm.heap
-                .object_define_data(obj, k, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
-        }
-        Ok(())
-    });
+fn init_mouse_event_props(
+    vm: &mut JsVm,
+    obj: HeapHandle,
+    init: JsValue,
+) -> Result<(), JsException> {
+    init_ui_event_props(vm, obj, init)?;
+    for (prop, def) in [
+        ("clientX", JsValue::from_i32(0)),
+        ("clientY", JsValue::from_i32(0)),
+        ("screenX", JsValue::from_i32(0)),
+        ("screenY", JsValue::from_i32(0)),
+        ("button", JsValue::from_i32(0)),
+        ("buttons", JsValue::from_i32(0)),
+        ("ctrlKey", JsValue::FALSE),
+        ("shiftKey", JsValue::FALSE),
+        ("altKey", JsValue::FALSE),
+        ("metaKey", JsValue::FALSE),
+        ("relatedTarget", JsValue::NULL),
+    ] {
+        let v = read_init_prop(vm, init, prop, def)?;
+        define_data(vm, obj, prop, v);
+    }
+    Ok(())
 }
 
 fn read_init_prop(
@@ -615,10 +1315,22 @@ fn read_init_prop(
 fn register_event_subclass(
     vm: &mut JsVm,
     events: &SharedEvents,
-    name: &str,
+    name: &'static str,
     parent_proto: HeapHandle,
+    parent_ctor: Option<HeapHandle>,
     extra_init: impl Fn(&mut JsVm, HeapHandle, JsValue) -> Result<(), JsException> + 'static,
 ) -> HeapHandle {
+    register_event_subclass_with_proto(vm, events, name, parent_proto, parent_ctor, extra_init).0
+}
+
+fn register_event_subclass_with_proto(
+    vm: &mut JsVm,
+    events: &SharedEvents,
+    name: &'static str,
+    parent_proto: HeapHandle,
+    parent_ctor: Option<HeapHandle>,
+    extra_init: impl Fn(&mut JsVm, HeapHandle, JsValue) -> Result<(), JsException> + 'static,
+) -> (HeapHandle, HeapHandle) {
     let proto = if name == "Event" {
         parent_proto
     } else {
@@ -626,21 +1338,36 @@ fn register_event_subclass(
         vm.heap
             .object_set_prototype(p, Some(parent_proto), &mut vm.shapes);
         vm.heap.get_object_mut(p).unwrap().is_prototype = true;
+        define_to_string_tag(vm, p, name);
+        events.borrow_mut().event_protos.insert(name, p);
         p
     };
     let evs = Rc::clone(events);
     let ctor = vm.alloc_host_fn(name, move |vm, _, args| {
+        let target_proto = resolve_new_target_proto(vm, proto, name)?;
+        if args.is_empty() {
+            return Err(vm.type_error(format!(
+                "Failed to construct '{name}': 1 argument required, but only 0 present."
+            )));
+        }
         let ev_type = vm.value_to_rust_string(arg(args, 0));
         let init = arg(args, 1);
+        if !init.is_undefined() && !init.is_null() && init.as_object().is_none() {
+            return Err(vm.type_error(format!(
+                "Failed to construct '{name}': parameter 2 is not of type 'object'."
+            )));
+        }
         let b_val = read_init_prop(vm, init, "bubbles", JsValue::FALSE)?;
         let c_val = read_init_prop(vm, init, "cancelable", JsValue::FALSE)?;
         let comp_val = read_init_prop(vm, init, "composed", JsValue::FALSE)?;
         let bubbles = vm.to_boolean(b_val);
         let cancelable = vm.to_boolean(c_val);
         let composed = vm.to_boolean(comp_val);
-        let obj = vm
-            .heap
-            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+        let obj = vm.heap.alloc_object(JsObject::with_kind(
+            ObjectKind::Ordinary,
+            Some(target_proto),
+        ));
+        let ts = evs.borrow().now_ms();
         evs.borrow_mut().events.insert(
             obj,
             EventInternal {
@@ -648,20 +1375,28 @@ fn register_event_subclass(
                 bubbles,
                 cancelable,
                 composed,
+                is_trusted: false,
+                initialized: true,
+                dispatch_flag: false,
                 default_prevented: false,
                 propagation_stopped: false,
                 immediate_stopped: false,
                 in_passive_listener: false,
                 event_phase: 0,
+                time_stamp: ts,
                 target: JsValue::NULL,
                 current_target: JsValue::NULL,
                 composed_path: Vec::new(),
             },
         );
+        define_own_is_trusted(vm, &evs, obj);
         extra_init(vm, obj, init)?;
         Ok(JsValue::from_object(obj))
     });
     vm.mark_constructor(ctor);
+    if let Some(pc) = parent_ctor {
+        vm.heap.object_set_prototype(ctor, Some(pc), &mut vm.shapes);
+    }
     vm.heap.object_define_data(
         ctor,
         vm.key_prototype,
@@ -677,7 +1412,336 @@ fn register_event_subclass(
         &mut vm.shapes,
     );
     define_global(vm, name, JsValue::from_object(ctor));
-    ctor
+    (ctor, proto)
+}
+
+/// Installs `Document.prototype.createEvent(interface)` per WHATWG DOM §4.5.
+fn install_document_create_event(vm: &mut JsVm, host: &SharedHost, events: &SharedEvents) {
+    let dp = host.borrow().prototypes.document_proto;
+    let evs = Rc::clone(events);
+    define_host_method(vm, dp, "createEvent", move |vm, _, args| {
+        if args.is_empty() {
+            return Err(vm.type_error("Document.createEvent requires 1 argument"));
+        }
+        let raw = vm.value_to_rust_string(arg(args, 0));
+        let canonical = match raw.to_ascii_lowercase().as_str() {
+            "event" | "events" | "htmlevents" | "svgevents" => "Event",
+            "beforeunloadevent" => "BeforeUnloadEvent",
+            "compositionevent" => "CompositionEvent",
+            "customevent" => "CustomEvent",
+            "devicemotionevent" => "DeviceMotionEvent",
+            "deviceorientationevent" => "DeviceOrientationEvent",
+            "dragevent" => "DragEvent",
+            "focusevent" => "FocusEvent",
+            "hashchangeevent" => "HashChangeEvent",
+            "keyboardevent" => "KeyboardEvent",
+            "messageevent" => "MessageEvent",
+            "mouseevent" | "mouseevents" => "MouseEvent",
+            "storageevent" => "StorageEvent",
+            "textevent" => "TextEvent",
+            "uievent" | "uievents" => "UIEvent",
+            _ => {
+                return Err(create_dom_exception(
+                    vm,
+                    "NotSupportedError",
+                    &format!("The provided event type ('{raw}') is invalid."),
+                ));
+            }
+        };
+        let proto = if canonical == "MessageEvent" {
+            let k_me = vm.heap.intern_key("MessageEvent");
+            let k_proto = vm.key_prototype;
+            vm.get_property_by_key(vm.global, k_me)
+                .ok()
+                .and_then(JsValue::as_object)
+                .and_then(|c| vm.get_property_by_key(c, k_proto).ok())
+                .and_then(JsValue::as_object)
+                .or_else(|| evs.borrow().event_proto)
+                .unwrap_or(vm.object_proto)
+        } else {
+            evs.borrow()
+                .event_protos
+                .get(canonical)
+                .copied()
+                .or_else(|| evs.borrow().event_proto)
+                .unwrap_or(vm.object_proto)
+        };
+        let obj = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+        let ts = evs.borrow().now_ms();
+        evs.borrow_mut().events.insert(
+            obj,
+            EventInternal {
+                event_type: String::new(),
+                bubbles: false,
+                cancelable: false,
+                composed: false,
+                is_trusted: false,
+                initialized: false,
+                dispatch_flag: false,
+                default_prevented: false,
+                propagation_stopped: false,
+                immediate_stopped: false,
+                in_passive_listener: false,
+                event_phase: 0,
+                time_stamp: ts,
+                target: JsValue::NULL,
+                current_target: JsValue::NULL,
+                composed_path: Vec::new(),
+            },
+        );
+        define_own_is_trusted(vm, &evs, obj);
+        // Populate default subclass fields
+        match canonical {
+            "CustomEvent" => define_data(vm, obj, "detail", JsValue::NULL),
+            "UIEvent" => {
+                define_data(vm, obj, "view", JsValue::NULL);
+                define_data(vm, obj, "detail", JsValue::from_i32(0));
+            }
+            "FocusEvent" => {
+                define_data(vm, obj, "view", JsValue::NULL);
+                define_data(vm, obj, "detail", JsValue::from_i32(0));
+                define_data(vm, obj, "relatedTarget", JsValue::NULL);
+            }
+            "MouseEvent" | "DragEvent" => {
+                let _ = init_mouse_event_props(vm, obj, JsValue::UNDEFINED);
+                if canonical == "DragEvent" {
+                    define_data(vm, obj, "dataTransfer", JsValue::NULL);
+                }
+            }
+            "KeyboardEvent" => {
+                let empty = JsValue::from_string(vm.heap.alloc_string(""));
+                define_data(vm, obj, "view", JsValue::NULL);
+                define_data(vm, obj, "detail", JsValue::from_i32(0));
+                define_data(vm, obj, "key", empty);
+                define_data(vm, obj, "code", empty);
+                define_data(vm, obj, "location", JsValue::from_i32(0));
+                define_data(vm, obj, "repeat", JsValue::FALSE);
+                define_data(vm, obj, "isComposing", JsValue::FALSE);
+                define_data(vm, obj, "ctrlKey", JsValue::FALSE);
+                define_data(vm, obj, "shiftKey", JsValue::FALSE);
+                define_data(vm, obj, "altKey", JsValue::FALSE);
+                define_data(vm, obj, "metaKey", JsValue::FALSE);
+                define_data(vm, obj, "charCode", JsValue::from_i32(0));
+                define_data(vm, obj, "keyCode", JsValue::from_i32(0));
+                define_data(vm, obj, "which", JsValue::from_i32(0));
+            }
+            "CompositionEvent" | "TextEvent" => {
+                let empty = JsValue::from_string(vm.heap.alloc_string(""));
+                define_data(vm, obj, "view", JsValue::NULL);
+                define_data(vm, obj, "detail", JsValue::from_i32(0));
+                define_data(vm, obj, "data", empty);
+            }
+            "HashChangeEvent" => {
+                let empty = JsValue::from_string(vm.heap.alloc_string(""));
+                define_data(vm, obj, "oldURL", empty);
+                define_data(vm, obj, "newURL", empty);
+            }
+            "StorageEvent" => {
+                let empty = JsValue::from_string(vm.heap.alloc_string(""));
+                define_data(vm, obj, "key", JsValue::NULL);
+                define_data(vm, obj, "oldValue", JsValue::NULL);
+                define_data(vm, obj, "newValue", JsValue::NULL);
+                define_data(vm, obj, "url", empty);
+                define_data(vm, obj, "storageArea", JsValue::NULL);
+            }
+            "MessageEvent" => {
+                let empty = JsValue::from_string(vm.heap.alloc_string(""));
+                let ports = vm.alloc_array();
+                define_data(vm, obj, "data", JsValue::NULL);
+                define_data(vm, obj, "origin", empty);
+                define_data(vm, obj, "lastEventId", empty);
+                define_data(vm, obj, "source", JsValue::NULL);
+                define_data(vm, obj, "ports", JsValue::from_object(ports));
+            }
+            _ => {}
+        }
+        Ok(JsValue::from_object(obj))
+    });
+}
+
+/// Standard `GlobalEventHandlers` + `WindowEventHandlers` IDL event handler names (WHATWG HTML §8.1.7.2).
+const GLOBAL_EVENT_HANDLERS: &[&str] = &[
+    "onabort",
+    "onanimationend",
+    "onanimationiteration",
+    "onanimationstart",
+    "onblur",
+    "oncancel",
+    "oncanplay",
+    "onchange",
+    "onclick",
+    "onclose",
+    "oncontextmenu",
+    "ondblclick",
+    "onerror",
+    "onfocus",
+    "oninput",
+    "oninvalid",
+    "onkeydown",
+    "onkeypress",
+    "onkeyup",
+    "onload",
+    "onmousedown",
+    "onmouseenter",
+    "onmouseleave",
+    "onmousemove",
+    "onmouseout",
+    "onmouseover",
+    "onmouseup",
+    "onreset",
+    "onresize",
+    "onscroll",
+    "onselect",
+    "onsubmit",
+    "ontransitionend",
+    "onwebkitanimationend",
+    "onwebkitanimationiteration",
+    "onwebkitanimationstart",
+    "onwebkittransitionend",
+];
+
+const WINDOW_FORWARDED_HANDLERS: &[&str] = &[
+    "onblur",
+    "onerror",
+    "onfocus",
+    "onload",
+    "onresize",
+    "onscroll",
+    "onbeforeunload",
+    "onhashchange",
+    "onmessage",
+    "onmessageerror",
+    "onoffline",
+    "ononline",
+    "onpagehide",
+    "onpageshow",
+    "onpopstate",
+    "onrejectionhandled",
+    "onstorage",
+    "onunhandledrejection",
+    "onunload",
+];
+
+fn compile_inline_handler(vm: &mut JsVm, code: &str) -> JsValue {
+    let wrapped = format!("(function(event){{\n{code}\n}})");
+    vm.eval_script(&wrapped).unwrap_or(JsValue::NULL)
+}
+
+fn install_event_handler_accessor(
+    vm: &mut JsVm,
+    target_proto: HeapHandle,
+    host: &SharedHost,
+    events: &SharedEvents,
+    attr_name: &'static str,
+    forward_to_window: bool,
+) {
+    let ev_type = &attr_name[2..];
+    let h_g = Rc::clone(host);
+    let e_g = Rc::clone(events);
+    let h_s = Rc::clone(host);
+    let e_s = Rc::clone(events);
+    define_host_accessor(
+        vm,
+        target_proto,
+        attr_name,
+        move |vm, this_val, _| {
+            let key = if forward_to_window {
+                EventTargetKey::Window
+            } else {
+                target_key_for_value(vm, &h_g, this_val)?
+            };
+            if let Some(&v) = e_g.borrow().event_handlers.get(&(key, ev_type.to_string())) {
+                return Ok(v);
+            }
+            // Compile inline HTML content attribute lazily on first IDL read.
+            if let EventTargetKey::Node(nid) = target_key_for_value(vm, &h_g, this_val)? {
+                let inline = {
+                    let doc_rc = Rc::clone(&h_g.borrow().document);
+                    let doc = doc_rc.borrow();
+                    match doc.get(nid) {
+                        Some(NodeData::Element(e)) => {
+                            e.get_attribute(attr_name).map(str::to_string)
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(code) = inline {
+                    let fn_val = compile_inline_handler(vm, &code);
+                    e_g.borrow_mut()
+                        .event_handlers
+                        .insert((key, ev_type.to_string()), fn_val);
+                    return Ok(fn_val);
+                }
+            }
+            Ok(JsValue::NULL)
+        },
+        move |vm, this_val, args| {
+            let key = if forward_to_window {
+                EventTargetKey::Window
+            } else {
+                target_key_for_value(vm, &h_s, this_val)?
+            };
+            let v = arg(args, 0);
+            let stored = match v.as_object() {
+                Some(fh) if vm.is_callable_handle(fh) => v,
+                _ => JsValue::NULL,
+            };
+            let _ = &h_s;
+            e_s.borrow_mut()
+                .event_handlers
+                .insert((key, ev_type.to_string()), stored);
+            Ok(JsValue::UNDEFINED)
+        },
+    );
+}
+
+fn install_global_and_window_event_handlers(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+) {
+    let p = host.borrow().prototypes;
+    let global = vm.global;
+
+    // Install GlobalEventHandlers on Window, Document, HTMLElement, SVGElement, MathMLElement.
+    for &attr in GLOBAL_EVENT_HANDLERS {
+        install_event_handler_accessor(vm, global, host, events, attr, true);
+        install_event_handler_accessor(vm, p.document_proto, host, events, attr, false);
+        install_event_handler_accessor(vm, p.html_element_proto, host, events, attr, false);
+        install_event_handler_accessor(vm, p.svg_element_proto, host, events, attr, false);
+        install_event_handler_accessor(vm, p.mathml_element_proto, host, events, attr, false);
+    }
+    // Additional Window-only handlers on Window.
+    for &attr in WINDOW_FORWARDED_HANDLERS {
+        if !GLOBAL_EVENT_HANDLERS.contains(&attr) {
+            install_event_handler_accessor(vm, global, host, events, attr, true);
+        }
+    }
+    // Window-forwarding handlers on HTMLBodyElement & HTMLFrameSetElement (HTML §8.1.7.2).
+    let iface_protos = host.borrow().interface_protos.clone();
+    for iface in ["HTMLBodyElement", "HTMLFrameSetElement"] {
+        if let Some(&proto) = iface_protos.get(iface) {
+            for &attr in WINDOW_FORWARDED_HANDLERS {
+                install_event_handler_accessor(vm, proto, host, events, attr, true);
+            }
+        }
+    }
+    // Hook `setAttribute("on...", code)` on `<body>`/`<frameset>` so window-forwarded handlers update immediately.
+    // Use `Weak` to avoid an `Rc` cycle with `HostState`.
+    let e_hook = Rc::downgrade(events);
+    host.borrow_mut().body_attr_handler_hook = Some(Rc::new(move |vm, _nid, attr_name, code| {
+        if WINDOW_FORWARDED_HANDLERS.contains(&attr_name) {
+            if let Some(ev) = e_hook.upgrade() {
+                let fn_val = compile_inline_handler(vm, code);
+                let ev_type = attr_name[2..].to_string();
+                ev.borrow_mut()
+                    .event_handlers
+                    .insert((EventTargetKey::Window, ev_type), fn_val);
+            }
+        }
+    }));
 }
 
 /// Propagation entry storing `(current_target_key, retargeted_event_target_key)`.
@@ -762,6 +1826,13 @@ fn dispatch_event_internal(
         let Some(ev) = es.events.get(&ev_h) else {
             return Err(vm.type_error("Argument to dispatchEvent is not an Event instance"));
         };
+        if !ev.initialized || ev.dispatch_flag {
+            return Err(create_dom_exception(
+                vm,
+                "InvalidStateError",
+                "Event is either uninitialized or already being dispatched",
+            ));
+        }
         (ev.event_type.clone(), ev.bubbles, ev.composed)
     };
 
@@ -772,6 +1843,7 @@ fn dispatch_event_internal(
         .map(|e| value_for_target_key(vm, host, e.current))
         .collect();
     if let Some(ev) = events.borrow_mut().events.get_mut(&ev_h) {
+        ev.dispatch_flag = true;
         ev.composed_path = js_path;
         ev.propagation_stopped = false;
         ev.immediate_stopped = false;
@@ -783,14 +1855,14 @@ fn dispatch_event_internal(
             if is_propagation_stopped(events, ev_h) {
                 break;
             }
-            invoke_listeners_at(vm, host, events, ev_h, &ev_type, *entry, 1, Some(true))?;
+            invoke_listeners_at(vm, host, events, ev_h, &ev_type, *entry, 1, Some(true));
         }
     }
 
     // Phase 2: At Target (runs all listeners on target in registration order).
     if !is_propagation_stopped(events, ev_h) {
         if let Some(&target_entry) = path.first() {
-            invoke_listeners_at(vm, host, events, ev_h, &ev_type, target_entry, 2, None)?;
+            invoke_listeners_at(vm, host, events, ev_h, &ev_type, target_entry, 2, None);
         }
     }
 
@@ -800,17 +1872,19 @@ fn dispatch_event_internal(
             if is_propagation_stopped(events, ev_h) {
                 break;
             }
-            invoke_listeners_at(vm, host, events, ev_h, &ev_type, *entry, 3, Some(false))?;
+            invoke_listeners_at(vm, host, events, ev_h, &ev_type, *entry, 3, Some(false));
         }
     }
 
-    // Clean up phase/currentTarget after dispatch & run strict WHATWG microtask checkpoint.
+    // Clean up phase/currentTarget/dispatch_flag after dispatch & run WHATWG microtask checkpoint.
     let default_prevented = {
         let mut es = events.borrow_mut();
         if let Some(ev) = es.events.get_mut(&ev_h) {
+            ev.dispatch_flag = false;
             ev.event_phase = 0;
             ev.current_target = JsValue::NULL;
             ev.in_passive_listener = false;
+            ev.composed_path.clear();
             ev.default_prevented
         } else {
             false
@@ -838,7 +1912,7 @@ fn invoke_listeners_at(
     entry: PathEntry,
     phase: i32,
     capture_filter: Option<bool>,
-) -> Result<(), JsException> {
+) {
     let snapshot: Vec<ListenerEntry> = events
         .borrow()
         .listeners
@@ -846,7 +1920,7 @@ fn invoke_listeners_at(
         .cloned()
         .unwrap_or_default();
     if snapshot.is_empty() {
-        return Ok(());
+        return;
     }
 
     let cur_val = value_for_target_key(vm, host, entry.current);
@@ -857,6 +1931,18 @@ fn invoke_listeners_at(
             if listener.capture != want_cap {
                 continue;
             }
+        }
+        // Check if listener was removed during an earlier listener or AbortSignal.abort().
+        let still_registered = events
+            .borrow()
+            .listeners
+            .get(&(entry.current, ev_type.to_string()))
+            .is_some_and(|list| {
+                list.iter()
+                    .any(|e| e.listener == listener.listener && e.capture == listener.capture)
+            });
+        if !still_registered {
+            continue;
         }
         if events
             .borrow()
@@ -870,7 +1956,7 @@ fn invoke_listeners_at(
             let mut es = events.borrow_mut();
             if let Some(list) = es.listeners.get_mut(&(entry.current, ev_type.to_string())) {
                 list.retain(|e| {
-                    !(e.callback == listener.callback && e.capture == listener.capture)
+                    !(e.listener == listener.listener && e.capture == listener.capture)
                 });
             }
         }
@@ -880,16 +1966,31 @@ fn invoke_listeners_at(
             ev.target = tgt_val;
             ev.in_passive_listener = listener.passive;
         }
-        let _ = vm.call_value(
-            JsValue::from_object(listener.callback),
-            cur_val,
-            &[JsValue::from_object(ev_h)],
-        )?;
+        // WHATWG DOM §2.9: invoke callable directly with `this = currentTarget`, or look up
+        // `.handleEvent` dynamically on an EventListener object with `this = listener`.
+        // Exceptions thrown by listeners MUST NOT abort remaining listeners.
+        if vm.is_callable_handle(listener.listener) {
+            let _ = vm.call_value(
+                JsValue::from_object(listener.listener),
+                cur_val,
+                &[JsValue::from_object(ev_h)],
+            );
+        } else {
+            let k_he = vm.heap.intern_key("handleEvent");
+            if let Ok(he_val) = vm.get_property_by_key(listener.listener, k_he) {
+                if let Some(fh) = he_val.as_object().filter(|&h| vm.is_callable_handle(h)) {
+                    let _ = vm.call_value(
+                        JsValue::from_object(fh),
+                        JsValue::from_object(listener.listener),
+                        &[JsValue::from_object(ev_h)],
+                    );
+                }
+            }
+        }
     }
-    Ok(())
 }
 
-/// Dispatches a full W3C bubbling/cancelable DOM event on `node` (executing capture listeners,
+/// Dispatches a trusted W3C DOM event on `node` (executing capture listeners,
 /// target/bubble listeners, JS `el["on" + ev_type]` properties, and inline HTML `on<type>="..."`
 /// attributes). Returns `Ok(true)` if default action is NOT prevented, `Ok(false)` if `preventDefault()` ran.
 #[allow(clippy::too_many_arguments)]
@@ -909,6 +2010,7 @@ pub fn fire_dom_node_event(
         .heap
         .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
     let target_val = value_for_target_key(vm, host, EventTargetKey::Node(node));
+    let ts = events.borrow().now_ms();
     events.borrow_mut().events.insert(
         ev_h,
         EventInternal {
@@ -916,16 +2018,21 @@ pub fn fire_dom_node_event(
             bubbles,
             cancelable,
             composed: true,
+            is_trusted: true,
+            initialized: true,
+            dispatch_flag: false,
             default_prevented: false,
             propagation_stopped: false,
             immediate_stopped: false,
             in_passive_listener: false,
             event_phase: 2,
+            time_stamp: ts,
             target: target_val,
             current_target: target_val,
             composed_path: Vec::new(),
         },
     );
+    define_own_is_trusted(vm, events, ev_h);
     for &(name, val) in props {
         let k = vm.heap.intern_key(name);
         vm.heap
@@ -951,13 +2058,15 @@ pub fn fire_dom_node_event(
             ev.current_target = cur_val;
             ev.target = tgt_val;
         }
-        // 1. JS `element.on<type>` property handler
+        let mut invoked_idl = false;
+        // 1. JS `element.on<type>` property handler (also compiles inline attribute if GlobalEventHandler!)
         if let Some(cur_h) = cur_val.as_object() {
             if let Ok(handler_val) = vm.get_property_by_key(cur_h, prop_key) {
                 if let Some(fh) = handler_val
                     .as_object()
                     .filter(|&h| vm.is_callable_handle(h))
                 {
+                    invoked_idl = true;
                     if let Ok(ret) = vm.call_value(
                         JsValue::from_object(fh),
                         cur_val,
@@ -972,26 +2081,30 @@ pub fn fire_dom_node_event(
                 }
             }
         }
-        // 2. Inline HTML `on<type>="..."` attribute
-        if let EventTargetKey::Node(nid) = entry.current {
-            let inline_code = {
-                let doc_rc = Rc::clone(&host.borrow().document);
-                let doc = doc_rc.borrow();
-                match doc.get(nid) {
-                    Some(NodeData::Element(e)) => e.get_attribute(&attr_name).map(str::to_string),
-                    _ => None,
-                }
-            };
-            if let Some(code) = inline_code {
-                if !code.trim().is_empty() {
-                    let wrapped = format!("(function(event){{\n{code}\n}})");
-                    if let Ok(fn_val) = vm.eval_script(&wrapped) {
-                        if let Ok(ret) =
-                            vm.call_value(fn_val, cur_val, &[JsValue::from_object(ev_h)])
-                        {
-                            if ret == JsValue::FALSE && cancelable {
-                                if let Some(ev) = events.borrow_mut().events.get_mut(&ev_h) {
-                                    ev.default_prevented = true;
+        // 2. Inline HTML `on<type>="..."` attribute (for events not covered by GlobalEventHandlers)
+        if !invoked_idl {
+            if let EventTargetKey::Node(nid) = entry.current {
+                let inline_code = {
+                    let doc_rc = Rc::clone(&host.borrow().document);
+                    let doc = doc_rc.borrow();
+                    match doc.get(nid) {
+                        Some(NodeData::Element(e)) => {
+                            e.get_attribute(&attr_name).map(str::to_string)
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(code) = inline_code {
+                    if !code.trim().is_empty() {
+                        let wrapped = format!("(function(event){{\n{code}\n}})");
+                        if let Ok(fn_val) = vm.eval_script(&wrapped) {
+                            if let Ok(ret) =
+                                vm.call_value(fn_val, cur_val, &[JsValue::from_object(ev_h)])
+                            {
+                                if ret == JsValue::FALSE && cancelable {
+                                    if let Some(ev) = events.borrow_mut().events.get_mut(&ev_h) {
+                                        ev.default_prevented = true;
+                                    }
                                 }
                             }
                         }
@@ -1021,7 +2134,7 @@ pub fn fire_dom_node_event(
     )
 }
 
-/// Allocates a real `Event` instance with extra `props`, invokes `target["on" + ev_type]`
+/// Allocates a trusted `Event` instance with extra `props`, invokes `target["on" + ev_type]`
 /// if set, and dispatches through `EventTarget` listeners on `target`.
 pub fn fire_object_event(
     vm: &mut JsVm,
@@ -1036,7 +2149,7 @@ pub fn fire_object_event(
     fire_object_event_with_proto(vm, host, events, event_loop, target, ev_type, ep, props);
 }
 
-/// Allocates an `Event` inheriting from `proto` with extra `props`, invokes
+/// Allocates a trusted `Event` inheriting from `proto` with extra `props`, invokes
 /// `target["on" + ev_type]` if set, and dispatches through `EventTarget` listeners.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fire_object_event_with_proto(
@@ -1052,6 +2165,7 @@ pub(crate) fn fire_object_event_with_proto(
     let ev_h = vm
         .heap
         .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    let ts = events.borrow().now_ms();
     events.borrow_mut().events.insert(
         ev_h,
         EventInternal {
@@ -1059,16 +2173,21 @@ pub(crate) fn fire_object_event_with_proto(
             bubbles: false,
             cancelable: false,
             composed: false,
+            is_trusted: true,
+            initialized: true,
+            dispatch_flag: false,
             default_prevented: false,
             propagation_stopped: false,
             immediate_stopped: false,
             in_passive_listener: false,
             event_phase: 2,
+            time_stamp: ts,
             target: JsValue::from_object(target),
             current_target: JsValue::from_object(target),
             composed_path: vec![JsValue::from_object(target)],
         },
     );
+    define_own_is_trusted(vm, events, ev_h);
     for &(name, val) in props {
         let k = vm.heap.intern_key(name);
         vm.heap
@@ -1100,7 +2219,7 @@ pub(crate) fn fire_object_event_with_proto(
     let _ = dispatch_event_internal(vm, host, events, event_loop, target_key, ev_h);
 }
 
-/// Fires a cancelable event on `target` and returns `true` if a listener called `preventDefault()`.
+/// Fires a trusted cancelable event on `target` and returns `true` if a listener called `preventDefault()`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fire_cancelable_object_event(
     vm: &mut JsVm,
@@ -1114,6 +2233,7 @@ pub(crate) fn fire_cancelable_object_event(
     let ev_h = vm
         .heap
         .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    let ts = events.borrow().now_ms();
     events.borrow_mut().events.insert(
         ev_h,
         EventInternal {
@@ -1121,16 +2241,21 @@ pub(crate) fn fire_cancelable_object_event(
             bubbles: true,
             cancelable: true,
             composed: false,
+            is_trusted: true,
+            initialized: true,
+            dispatch_flag: false,
             default_prevented: false,
             propagation_stopped: false,
             immediate_stopped: false,
             in_passive_listener: false,
             event_phase: 2,
+            time_stamp: ts,
             target: JsValue::from_object(target),
             current_target: JsValue::from_object(target),
             composed_path: vec![JsValue::from_object(target)],
         },
     );
+    define_own_is_trusted(vm, events, ev_h);
 
     let handler_key = vm.heap.intern_key(&format!("on{ev_type}"));
     if let Ok(handler_val) = vm.get_property_by_key(target, handler_key) {
@@ -1171,6 +2296,7 @@ pub(crate) fn register_constructed_event(
     cancelable: bool,
     composed: bool,
 ) {
+    let ts = events.borrow().now_ms();
     events.borrow_mut().events.insert(
         ev_h,
         EventInternal {
@@ -1178,11 +2304,15 @@ pub(crate) fn register_constructed_event(
             bubbles,
             cancelable,
             composed,
+            is_trusted: false,
+            initialized: true,
+            dispatch_flag: false,
             default_prevented: false,
             propagation_stopped: false,
             immediate_stopped: false,
             in_passive_listener: false,
             event_phase: 0,
+            time_stamp: ts,
             target: JsValue::NULL,
             current_target: JsValue::NULL,
             composed_path: Vec::new(),

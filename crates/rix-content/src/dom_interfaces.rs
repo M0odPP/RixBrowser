@@ -2322,3 +2322,496 @@ pub fn build_element_interface_protos(
     }
     map
 }
+
+// ---------------------------------------------------------------------------
+// Pure-Rust Well-Formed XML 1.0 + Namespaces Parser (shared by iframes & DOMParser)
+// ---------------------------------------------------------------------------
+
+type XmlNsDecl = (Option<String>, String);
+type XmlElementFrame = (NodeId, String, Vec<XmlNsDecl>);
+
+/// Parses an XML 1.0 + Namespaces string into `parent_doc` inside `doc`.
+/// Enforces well-formedness (matching start/end tags, valid names, quoted attributes,
+/// declared namespace prefixes, single root element, lone-surrogate sanitization)
+/// and returns `Err(msg)` on any XML syntax/namespace error.
+pub fn parse_xml_into_document(
+    doc: &mut Document,
+    parent_doc: NodeId,
+    raw_xml: &str,
+) -> Result<(), String> {
+    // Replace any lone UTF-16 surrogates (if present via WTF-8/lossy input) and normalize CRLF -> LF.
+    let xml = raw_xml.replace("\r\n", "\n").replace('\r', "\n");
+    let bytes = xml.as_bytes();
+    let len = bytes.len();
+    let mut pos = 0usize;
+
+    // Strip optional UTF-8 BOM.
+    if xml.starts_with('\u{FEFF}') {
+        pos = 3;
+    }
+
+    let mut stack: Vec<XmlElementFrame> = Vec::new();
+    let mut root_elem_seen = false;
+    let mut doctype_seen = false;
+
+    while pos < len {
+        let rest = &xml[pos..];
+        if !rest.starts_with('<') {
+            let next_lt = rest.find('<').map_or(len, |i| pos + i);
+            let raw_text = &xml[pos..next_lt];
+            pos = next_lt;
+            if stack.is_empty() {
+                if raw_text
+                    .bytes()
+                    .any(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+                {
+                    return Err("Unexpected character data outside root element".to_string());
+                }
+                continue;
+            }
+            if raw_text.contains("]]>") {
+                return Err("']]>' is not allowed in XML text content".to_string());
+            }
+            let decoded = decode_xml_entities(raw_text)?;
+            let parent = stack.last().unwrap().0;
+            let tn = doc.create_text(&decoded);
+            doc.append_child(parent, tn);
+            continue;
+        }
+
+        // Comment: <!-- ... -->
+        if let Some(after) = rest.strip_prefix("<!--") {
+            let Some(end_rel) = after.find("-->") else {
+                return Err("Unterminated XML comment".to_string());
+            };
+            let body = &after[..end_rel];
+            if body.contains("--") || body.ends_with('-') {
+                return Err("XML comment cannot contain '--'".to_string());
+            }
+            let parent = stack.last().map_or(parent_doc, |s| s.0);
+            let cn = doc.create_comment(body);
+            doc.append_child(parent, cn);
+            pos += 4 + end_rel + 3;
+            continue;
+        }
+
+        // CDATA: <![CDATA[ ... ]]>
+        if let Some(after) = rest.strip_prefix("<![CDATA[") {
+            if stack.is_empty() {
+                return Err("CDATA section outside root element".to_string());
+            }
+            let Some(end_rel) = after.find("]]>") else {
+                return Err("Unterminated CDATA section".to_string());
+            };
+            let body = &after[..end_rel];
+            let parent = stack.last().unwrap().0;
+            let cn = doc.create_cdata_section(body);
+            doc.append_child(parent, cn);
+            pos += 9 + end_rel + 3;
+            continue;
+        }
+
+        // DOCTYPE: <!DOCTYPE ...>
+        if rest.starts_with("<!DOCTYPE") {
+            if root_elem_seen || doctype_seen || !stack.is_empty() {
+                return Err("Misplaced or duplicate DOCTYPE declaration".to_string());
+            }
+            doctype_seen = true;
+            pos += 9;
+            skip_xml_ws(bytes, &mut pos);
+            let name_start = pos;
+            while pos < len && !is_xml_ws_byte(bytes[pos]) && !matches!(bytes[pos], b'>' | b'[') {
+                pos += 1;
+            }
+            let dt_name = xml[name_start..pos].to_string();
+            if dt_name.is_empty() || !is_valid_xml_name(&dt_name) {
+                return Err("Invalid DOCTYPE name".to_string());
+            }
+            skip_xml_ws(bytes, &mut pos);
+            let mut public_id = String::new();
+            let mut system_id = String::new();
+            if xml[pos..].starts_with("PUBLIC") {
+                pos += 6;
+                skip_xml_ws(bytes, &mut pos);
+                public_id = read_xml_quoted(&xml, &mut pos)?;
+                skip_xml_ws(bytes, &mut pos);
+                system_id = read_xml_quoted(&xml, &mut pos)?;
+            } else if xml[pos..].starts_with("SYSTEM") {
+                pos += 6;
+                skip_xml_ws(bytes, &mut pos);
+                system_id = read_xml_quoted(&xml, &mut pos)?;
+            }
+            skip_xml_ws(bytes, &mut pos);
+            // Optional internal subset `[ ... ]`
+            if pos < len && bytes[pos] == b'[' {
+                pos += 1;
+                let mut depth = 1usize;
+                while pos < len && depth > 0 {
+                    match bytes[pos] {
+                        b'"' | b'\'' => {
+                            let q = bytes[pos];
+                            pos += 1;
+                            while pos < len && bytes[pos] != q {
+                                pos += 1;
+                            }
+                            if pos < len {
+                                pos += 1;
+                            }
+                        }
+                        b'[' => {
+                            depth += 1;
+                            pos += 1;
+                        }
+                        b']' => {
+                            depth -= 1;
+                            pos += 1;
+                        }
+                        _ => pos += 1,
+                    }
+                }
+                skip_xml_ws(bytes, &mut pos);
+            }
+            if pos >= len || bytes[pos] != b'>' {
+                return Err("Unterminated DOCTYPE declaration".to_string());
+            }
+            pos += 1;
+            let dn = doc.new_node(NodeData::DocumentType {
+                name: dt_name,
+                public_id,
+                system_id,
+            });
+            doc.append_child(parent_doc, dn);
+            continue;
+        }
+
+        // Processing instruction or XML declaration: <?target ...?>
+        if let Some(after) = rest.strip_prefix("<?") {
+            let Some(end_rel) = after.find("?>") else {
+                return Err("Unterminated processing instruction".to_string());
+            };
+            let content = &after[..end_rel];
+            let (target, data) = match content.find([' ', '\t', '\n', '\r']) {
+                Some(i) => (&content[..i], content[i..].trim_start()),
+                None => (content, ""),
+            };
+            if target.is_empty() || !is_valid_xml_name(target) {
+                return Err("Invalid processing instruction target".to_string());
+            }
+            if target.eq_ignore_ascii_case("xml") {
+                if target != "xml" || pos > 3 || !stack.is_empty() || root_elem_seen {
+                    return Err("Invalid XML declaration placement".to_string());
+                }
+                // XML declaration does not create a DOM ProcessingInstruction node.
+            } else {
+                let parent = stack.last().map_or(parent_doc, |s| s.0);
+                let pi = doc.new_node(NodeData::ProcessingInstruction {
+                    target: target.to_string(),
+                    data: data.to_string(),
+                });
+                doc.append_child(parent, pi);
+            }
+            pos += 2 + end_rel + 2;
+            continue;
+        }
+
+        // Closing tag: </name>
+        if rest.starts_with("</") {
+            pos += 2;
+            let name_start = pos;
+            while pos < len && !is_xml_ws_byte(bytes[pos]) && bytes[pos] != b'>' {
+                pos += 1;
+            }
+            let close_name = &xml[name_start..pos];
+            skip_xml_ws(bytes, &mut pos);
+            if pos >= len || bytes[pos] != b'>' {
+                return Err("Malformed XML closing tag".to_string());
+            }
+            pos += 1;
+            let Some((_, open_name, _)) = stack.pop() else {
+                return Err(format!("Unexpected closing tag </{close_name}>"));
+            };
+            if open_name != close_name {
+                return Err(format!(
+                    "Mismatched closing tag </{close_name}> for <{open_name}>"
+                ));
+            }
+            continue;
+        }
+
+        // Opening or self-closing tag: <name attr="val" ... /?>
+        pos += 1;
+        if pos >= len || is_xml_ws_byte(bytes[pos]) {
+            return Err("Invalid XML start tag".to_string());
+        }
+        let name_start = pos;
+        while pos < len && !is_xml_ws_byte(bytes[pos]) && !matches!(bytes[pos], b'>' | b'/') {
+            pos += 1;
+        }
+        let qname = xml[name_start..pos].to_string();
+        if qname.is_empty() || !is_valid_xml_qname(&qname) {
+            return Err(format!("Invalid XML element name: {qname}"));
+        }
+        if stack.is_empty() {
+            if root_elem_seen {
+                return Err("Multiple root elements in XML document".to_string());
+            }
+            root_elem_seen = true;
+        }
+
+        // Parse attributes
+        let mut raw_attrs: Vec<(String, String)> = Vec::new();
+        let mut ns_decls: Vec<(Option<String>, String)> = Vec::new();
+        let mut self_closing = false;
+
+        loop {
+            let had_ws = skip_xml_ws(bytes, &mut pos);
+            if pos >= len {
+                return Err("Unterminated XML start tag".to_string());
+            }
+            if bytes[pos] == b'>' {
+                pos += 1;
+                break;
+            }
+            if bytes[pos] == b'/' {
+                if pos + 1 >= len || bytes[pos + 1] != b'>' {
+                    return Err("Expected '>' after '/' in empty-element tag".to_string());
+                }
+                self_closing = true;
+                pos += 2;
+                break;
+            }
+            if !had_ws && !raw_attrs.is_empty() {
+                return Err("Missing whitespace between XML attributes".to_string());
+            }
+            let an_start = pos;
+            while pos < len
+                && !is_xml_ws_byte(bytes[pos])
+                && !matches!(bytes[pos], b'=' | b'>' | b'/')
+            {
+                pos += 1;
+            }
+            let attr_qname = xml[an_start..pos].to_string();
+            if attr_qname.is_empty() || !is_valid_xml_qname(&attr_qname) {
+                return Err(format!("Invalid XML attribute name: {attr_qname}"));
+            }
+            skip_xml_ws(bytes, &mut pos);
+            if pos >= len || bytes[pos] != b'=' {
+                return Err(format!("Missing '=' after XML attribute {attr_qname}"));
+            }
+            pos += 1;
+            skip_xml_ws(bytes, &mut pos);
+            let raw_val = read_xml_quoted(&xml, &mut pos)?;
+            if raw_val.contains('<') {
+                return Err("Unescaped '<' in XML attribute value".to_string());
+            }
+            let attr_val = decode_xml_entities(&raw_val)?;
+            if attr_qname == "xmlns" {
+                if attr_val == XMLNS_NS {
+                    return Err("Cannot bind default namespace to XMLNS namespace".to_string());
+                }
+                ns_decls.push((None, attr_val.clone()));
+            } else if let Some(pfx) = attr_qname.strip_prefix("xmlns:") {
+                if pfx.is_empty() || pfx == "xmlns" || (pfx == "xml" && attr_val != XML_NS) {
+                    return Err(format!("Invalid xmlns prefix declaration: {attr_qname}"));
+                }
+                if attr_val == XMLNS_NS || (attr_val == XML_NS && pfx != "xml") {
+                    return Err(format!("Reserved namespace binding on {attr_qname}"));
+                }
+                ns_decls.push((Some(pfx.to_string()), attr_val.clone()));
+            }
+            raw_attrs.push((attr_qname, attr_val));
+        }
+
+        // Resolve element namespace from `ns_decls` + ancestor stack.
+        let (el_prefix, el_local) = split_qname(&qname);
+        let el_ns = match el_prefix {
+            Some("xml") => XML_NS.to_string(),
+            Some("xmlns") => return Err("Element prefix cannot be 'xmlns'".to_string()),
+            Some(pfx) => resolve_xml_ns(&stack, &ns_decls, Some(pfx))
+                .ok_or_else(|| format!("Undeclared XML namespace prefix: {pfx}"))?,
+            None => resolve_xml_ns(&stack, &ns_decls, None).unwrap_or_default(),
+        };
+
+        let mut el_data = rix_dom::ElementData::new(rix_dom::QualName::new(
+            el_prefix.map(Into::into),
+            rix_dom::Namespace::from(el_ns.as_str()),
+            rix_dom::LocalName::from(el_local),
+        ));
+        let mut seen_attrs: Vec<(String, String)> = Vec::new();
+        for (aqn, aval) in raw_attrs {
+            let (apfx, alocal, ans) = if aqn == "xmlns" {
+                (None, "xmlns", XMLNS_NS.to_string())
+            } else if let Some(p) = aqn.strip_prefix("xmlns:") {
+                (Some("xmlns"), p, XMLNS_NS.to_string())
+            } else {
+                let (p, l) = split_qname(&aqn);
+                let ns = match p {
+                    None => String::new(),
+                    Some("xml") => XML_NS.to_string(),
+                    Some("xmlns") => XMLNS_NS.to_string(),
+                    Some(pfx) => resolve_xml_ns(&stack, &ns_decls, Some(pfx))
+                        .ok_or_else(|| format!("Undeclared XML attribute prefix: {pfx}"))?,
+                };
+                (p, l, ns)
+            };
+            let key = (ans.clone(), alocal.to_string());
+            if seen_attrs.contains(&key) {
+                return Err(format!("Duplicate XML attribute: {aqn}"));
+            }
+            seen_attrs.push(key);
+            el_data.set_attribute_ns(&ans, apfx, alocal, &aval);
+        }
+
+        let parent = stack.last().map_or(parent_doc, |s| s.0);
+        let el_nid = doc.new_node(NodeData::Element(el_data));
+        doc.append_child(parent, el_nid);
+
+        if !self_closing {
+            stack.push((el_nid, qname, ns_decls));
+        }
+    }
+
+    if !stack.is_empty() {
+        return Err(format!(
+            "Unclosed XML element <{}>",
+            stack.last().unwrap().1
+        ));
+    }
+    if !root_elem_seen {
+        return Err("XML document has no root element".to_string());
+    }
+    Ok(())
+}
+
+#[inline]
+fn is_xml_ws_byte(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+fn skip_xml_ws(bytes: &[u8], pos: &mut usize) -> bool {
+    let start = *pos;
+    while *pos < bytes.len() && is_xml_ws_byte(bytes[*pos]) {
+        *pos += 1;
+    }
+    *pos > start
+}
+
+fn is_valid_xml_qname(s: &str) -> bool {
+    let mut parts = s.split(':');
+    let first = parts.next().unwrap_or("");
+    if let Some(second) = parts.next() {
+        if parts.next().is_some() || first.is_empty() || second.is_empty() {
+            return false;
+        }
+        is_valid_xml_ncname(first) && is_valid_xml_ncname(second)
+    } else {
+        is_valid_xml_ncname(first)
+    }
+}
+
+fn is_valid_xml_ncname(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first == ':' || !is_xml_name_start_char(first) {
+        return false;
+    }
+    chars.all(|c| c != ':' && is_xml_name_char(c))
+}
+
+fn split_qname(qname: &str) -> (Option<&str>, &str) {
+    match qname.split_once(':') {
+        Some((p, l)) => (Some(p), l),
+        None => (None, qname),
+    }
+}
+
+fn resolve_xml_ns(
+    stack: &[XmlElementFrame],
+    local_decls: &[XmlNsDecl],
+    prefix: Option<&str>,
+) -> Option<String> {
+    for (p, uri) in local_decls.iter().rev() {
+        if p.as_deref() == prefix {
+            return if uri.is_empty() {
+                None
+            } else {
+                Some(uri.clone())
+            };
+        }
+    }
+    for (_, _, decls) in stack.iter().rev() {
+        for (p, uri) in decls.iter().rev() {
+            if p.as_deref() == prefix {
+                return if uri.is_empty() {
+                    None
+                } else {
+                    Some(uri.clone())
+                };
+            }
+        }
+    }
+    None
+}
+
+fn read_xml_quoted(xml: &str, pos: &mut usize) -> Result<String, String> {
+    let bytes = xml.as_bytes();
+    if *pos >= bytes.len() || !matches!(bytes[*pos], b'"' | b'\'') {
+        return Err("Expected quoted string in XML".to_string());
+    }
+    let q = bytes[*pos];
+    *pos += 1;
+    let start = *pos;
+    while *pos < bytes.len() && bytes[*pos] != q {
+        *pos += 1;
+    }
+    if *pos >= bytes.len() {
+        return Err("Unterminated quoted string in XML".to_string());
+    }
+    let val = xml[start..*pos].to_string();
+    *pos += 1;
+    Ok(val)
+}
+
+fn decode_xml_entities(input: &str) -> Result<String, String> {
+    if !input.contains('&') {
+        return Ok(input.to_string());
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        let Some(semi) = after.find(';') else {
+            return Err("Unterminated XML entity reference".to_string());
+        };
+        let ent = &after[..semi];
+        match ent {
+            "lt" => out.push('<'),
+            "gt" => out.push('>'),
+            "amp" => out.push('&'),
+            "quot" => out.push('"'),
+            "apos" => out.push('\''),
+            _ if ent.starts_with("#x") || ent.starts_with("#X") => {
+                let code = u32::from_str_radix(&ent[2..], 16)
+                    .map_err(|_| format!("Invalid hex character reference: &{ent};"))?;
+                let ch = char::from_u32(code)
+                    .ok_or_else(|| format!("Invalid XML Unicode scalar: &{ent};"))?;
+                out.push(ch);
+            }
+            _ if ent.starts_with('#') => {
+                let code: u32 = ent[1..]
+                    .parse()
+                    .map_err(|_| format!("Invalid decimal character reference: &{ent};"))?;
+                let ch = char::from_u32(code)
+                    .ok_or_else(|| format!("Invalid XML Unicode scalar: &{ent};"))?;
+                out.push(ch);
+            }
+            _ => return Err(format!("Unknown XML entity reference: &{ent};")),
+        }
+        rest = &after[semi + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}

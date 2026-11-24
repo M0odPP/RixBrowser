@@ -1069,13 +1069,37 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
                 let mut parts = first_line.split_whitespace();
                 let _method = parts.next().unwrap_or("GET");
                 let raw_target = parts.next().unwrap_or("/");
-                let path_only = raw_target.split(['?', '#']).next().unwrap_or("/");
+                let (path_only, query_only) = match raw_target.split_once('?') {
+                    Some((p, q)) => (p, q.split('#').next().unwrap_or("")),
+                    None => (raw_target.split('#').next().unwrap_or("/"), ""),
+                };
                 let decoded = percent_decode_path(path_only);
                 let rel = decoded.trim_start_matches('/');
                 if rel.split('/').any(|seg| seg == "..") {
                     let _ = stream
                         .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                         .await;
+                    return;
+                }
+                // WPT dynamic handler: `dom/nodes/encoding.py?label=<enc>`
+                if rel == "dom/nodes/encoding.py" {
+                    let raw_label = query_only
+                        .split('&')
+                        .find_map(|pair| pair.strip_prefix("label="))
+                        .unwrap_or("");
+                    let label = percent_decode_path(raw_label)
+                        .replace('&', "&amp;")
+                        .replace('"', "&quot;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;");
+                    let body = format!("<!doctype html><meta charset=\"{label}\">").into_bytes();
+                    let resp_head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp_head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.shutdown().await;
                     return;
                 }
                 let mut file_path = if rel == "resources/WebIDLParser.js" {
@@ -1156,6 +1180,25 @@ fn run_wpt_testharness_file(
 ) -> ScriptRunOutcome {
     let _enter = server.rt.enter();
     let font_db = wpt_font_db(wpt_root);
+
+    let sub_html;
+    let html = if path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|n| n.contains(".sub."))
+    {
+        let port_s = server.port.to_string();
+        sub_html = html
+            .replace("{{host}}", "127.0.0.1")
+            .replace("{{domains[]}}", "127.0.0.1")
+            .replace("{{ports[http][0]}}", &port_s)
+            .replace("{{ports[https][0]}}", &port_s)
+            .replace("{{ports[ws][0]}}", &port_s)
+            .replace("{{ports[wss][0]}}", &port_s);
+        sub_html.as_str()
+    } else {
+        html
+    };
 
     let parsed = parse_html(html);
     let viewport = Size::new(800.0, 600.0);
