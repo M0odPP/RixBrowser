@@ -14,7 +14,7 @@ bitflags! {
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-    pub struct ElementState: u16 {
+    pub struct ElementState: u32 {
         const HOVER         = 1 << 0;
         const ACTIVE        = 1 << 1;
         const FOCUS         = 1 << 2;
@@ -29,6 +29,14 @@ bitflags! {
         const VALID         = 1 << 11;
         const INVALID       = 1 << 12;
         const INDETERMINATE = 1 << 13;
+        const DEFINED       = 1 << 14;
+        const MODAL         = 1 << 15;
+        const POPOVER_OPEN  = 1 << 16;
+        const FULLSCREEN    = 1 << 17;
+        const OPEN          = 1 << 18;
+        const USER_VALID    = 1 << 19;
+        const USER_INVALID  = 1 << 20;
+        const AUTOFILL      = 1 << 21;
     }
 }
 

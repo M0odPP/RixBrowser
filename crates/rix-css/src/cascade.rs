@@ -403,10 +403,43 @@ impl StyleContext {
         self.ensure_index();
         if attr_name.eq_ignore_ascii_case("style") {
             mark_node_and_ancestors_dirty(doc, node);
-            return;
         }
         let scope = self.invalidation_map.scope_for_attribute(attr_name);
         apply_invalidation_scope(doc, node, scope);
+    }
+
+    /// Marks affected nodes dirty when children/text are inserted into or removed from `parent`.
+    pub fn invalidate_subtree_mutation(
+        &mut self,
+        doc: &mut Document,
+        parent: NodeId,
+        mutated_child: Option<NodeId>,
+    ) {
+        self.ensure_index();
+        mark_node_and_ancestors_dirty(doc, parent);
+        if let Some(child) = mutated_child {
+            mark_subtree_style_dirty(doc, child);
+        }
+        if !self.rule_index.allows_sibling_sharing || self.rule_index.has_relative_selectors {
+            // Structural pseudo-classes (`:first-child`, `:last-child`, `:nth-child`, `:only-child`,
+            // `:empty`), sibling combinators (`+`, `~`), or `:has(...)`: invalidate siblings & subtrees.
+            let children: Vec<NodeId> = doc
+                .children(parent)
+                .filter(|&c| matches!(doc.get(c), Some(NodeData::Element(_))))
+                .collect();
+            for c in children {
+                mark_subtree_style_dirty(doc, c);
+            }
+        }
+        if self.rule_index.has_relative_selectors {
+            let mut rel_scope = InvalidationScope::ANCESTORS
+                | InvalidationScope::EARLIER_SIBLINGS
+                | InvalidationScope::ANCESTOR_EARLIER_SIBLINGS;
+            if self.rule_index.has_non_subject_has {
+                rel_scope |= InvalidationScope::ANCESTOR_SUBTREES;
+            }
+            apply_invalidation_scope(doc, parent, rel_scope);
+        }
     }
 
     /// Marks the minimal set of DOM nodes dirty when pseudo-state bits `changed` toggle on `node`.
@@ -1195,6 +1228,47 @@ fn apply_invalidation_scope(doc: &mut Document, node: NodeId, scope: Invalidatio
             if matches!(doc.get(anc), Some(NodeData::Element(_))) {
                 mark_node_and_ancestors_dirty(doc, anc);
             }
+        }
+    }
+    if scope.contains(InvalidationScope::EARLIER_SIBLINGS) {
+        if let Some(parent) = doc.parent(node) {
+            let siblings: Vec<NodeId> = doc.children(parent).collect();
+            for sib in siblings {
+                if sib == node {
+                    break;
+                }
+                if matches!(doc.get(sib), Some(NodeData::Element(_))) {
+                    mark_node_and_ancestors_dirty(doc, sib);
+                }
+            }
+        }
+    }
+    if scope.contains(InvalidationScope::ANCESTOR_EARLIER_SIBLINGS) {
+        let ancestors: Vec<NodeId> = doc.ancestors(node).collect();
+        for anc in ancestors {
+            if let Some(parent) = doc.parent(anc) {
+                let siblings: Vec<NodeId> = doc.children(parent).collect();
+                for sib in siblings {
+                    if sib == anc {
+                        break;
+                    }
+                    if matches!(doc.get(sib), Some(NodeData::Element(_))) {
+                        mark_node_and_ancestors_dirty(doc, sib);
+                    }
+                }
+            }
+        }
+    }
+    if scope.contains(InvalidationScope::ANCESTOR_SUBTREES) {
+        let ancestors: Vec<NodeId> = doc.ancestors(node).collect();
+        if let Some(top_elem) = ancestors
+            .into_iter()
+            .rev()
+            .find(|&n| matches!(doc.get(n), Some(NodeData::Element(_))))
+        {
+            mark_subtree_style_dirty(doc, top_elem);
+        } else {
+            mark_subtree_style_dirty(doc, node);
         }
     }
 }

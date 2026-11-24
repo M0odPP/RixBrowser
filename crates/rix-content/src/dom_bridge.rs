@@ -137,6 +137,7 @@ pub struct HostState {
     pub stylesheet_handle_map: HashMap<HeapHandle, crate::cssom::SharedStyleSheet>,
     pub adopted_stylesheets: Vec<crate::cssom::SharedStyleSheet>,
     pub registered_properties: HashMap<String, (String, bool, Option<String>)>,
+    pub active_element: Option<NodeId>,
 }
 
 /// Shared handle to [`HostState`].
@@ -193,6 +194,7 @@ impl HostState {
             stylesheet_handle_map: HashMap::new(),
             adopted_stylesheets: Vec::new(),
             registered_properties: HashMap::new(),
+            active_element: None,
         }
     }
 
@@ -202,6 +204,77 @@ impl HostState {
         self.last_style_revs = None;
         self.last_layout_revs = None;
         self.last_paint_revs = None;
+    }
+
+    /// Invalidates all CSS rules affected by an attribute/class/id mutation on `nid`.
+    pub fn invalidate_attr_mutation(
+        &mut self,
+        nid: NodeId,
+        attr_name: &str,
+        old_val: Option<&str>,
+        new_val: Option<&str>,
+    ) {
+        let doc_rc = Rc::clone(&self.document);
+        let mut doc = doc_rc.borrow_mut();
+        doc.bump_style_revision_for(nid);
+        if attr_name.eq_ignore_ascii_case("class") {
+            let old_set: Vec<&str> = old_val.unwrap_or("").split_ascii_whitespace().collect();
+            let new_set: Vec<&str> = new_val.unwrap_or("").split_ascii_whitespace().collect();
+            for &cls in &old_set {
+                if !new_set.contains(&cls) {
+                    self.style_ctx.invalidate_class_change(&mut doc, nid, cls);
+                }
+            }
+            for &cls in &new_set {
+                if !old_set.contains(&cls) {
+                    self.style_ctx.invalidate_class_change(&mut doc, nid, cls);
+                }
+            }
+        } else if attr_name.eq_ignore_ascii_case("id") {
+            self.style_ctx
+                .invalidate_id_change(&mut doc, nid, old_val, new_val);
+        }
+        self.style_ctx
+            .invalidate_attribute_change(&mut doc, nid, attr_name);
+    }
+
+    /// Invalidates CSS rules affected by structural DOM mutations under `parent`.
+    pub fn invalidate_dom_mutation(&mut self, parent: NodeId, child: Option<NodeId>) {
+        let doc_rc = Rc::clone(&self.document);
+        let touches_style = {
+            let mut doc = doc_rc.borrow_mut();
+            doc.bump_style_revision_for(parent);
+            self.style_ctx
+                .invalidate_subtree_mutation(&mut doc, parent, child);
+            let is_style = |nid: NodeId| {
+                matches!(
+                    doc.get(nid),
+                    Some(NodeData::Element(e)) if e.name.local.as_str().eq_ignore_ascii_case("style")
+                )
+            };
+            is_style(parent) || child.is_some_and(is_style)
+        };
+        if touches_style {
+            self.mark_sheets_dirty();
+        }
+    }
+
+    /// Updates focus (`:focus`, `:focus-within`, `:focus-visible`, `document.activeElement`).
+    pub fn set_focused_element(&mut self, target: Option<NodeId>, visible: bool) {
+        self.active_element = target;
+        let doc_rc = Rc::clone(&self.document);
+        let mut doc = doc_rc.borrow_mut();
+        self.style_ctx.set_focused(&mut doc, target, visible);
+        doc.bump_style_revision();
+    }
+
+    /// Invalidates CSS rules affected by a pseudo-state bit change on `nid`.
+    pub fn invalidate_element_state(&mut self, nid: NodeId, changed: rix_dom::ElementState) {
+        let doc_rc = Rc::clone(&self.document);
+        let mut doc = doc_rc.borrow_mut();
+        doc.bump_style_revision_for(nid);
+        self.style_ctx
+            .invalidate_state_change(&mut doc, nid, changed);
     }
 
     /// Resolves a JS wrapper's `host_tag` back to its `NodeId`.
@@ -681,6 +754,7 @@ pub fn install_dom_bridge(
     install_document_prototype(vm, &host);
     install_shadow_root_prototype(vm, &host);
     install_fragment_prototype(vm, &host);
+    install_text_prototype(vm, &host);
     install_window_and_cssom(vm, &host);
 
     // Pin root document wrapper on global `document`.
@@ -988,18 +1062,23 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
             Some(NodeData::Text(_) | NodeData::Comment(_) | NodeData::ProcessingInstruction { .. })
         );
         if is_text {
-            let old = {
+            let (old, parent_opt) = {
                 let _doc_rc = Rc::clone(&h2.borrow().document);
                 let mut doc = _doc_rc.borrow_mut();
-                match doc.get_mut(nid) {
+                let parent_opt = doc.parent(nid);
+                let old = match doc.get_mut(nid) {
                     Some(
                         NodeData::Text(s)
                         | NodeData::Comment(s)
                         | NodeData::ProcessingInstruction { data: s, .. },
                     ) => std::mem::replace(s, new_text),
                     _ => String::new(),
-                }
+                };
+                (old, parent_opt)
             };
+            if let Some(parent) = parent_opt {
+                h2.borrow_mut().invalidate_dom_mutation(parent, None);
+            }
             h2.borrow().emit_mutation(DomMutation::CharacterData {
                 target: nid,
                 old_value: old,
@@ -1020,6 +1099,7 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
                 }
                 (removed, added)
             };
+            h2.borrow_mut().invalidate_dom_mutation(nid, None);
             h2.borrow().emit_mutation(DomMutation::ChildList {
                 target: nid,
                 added,
@@ -1081,6 +1161,7 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
             )
         };
         h.borrow().document.borrow_mut().remove_child(child);
+        h.borrow_mut().invalidate_dom_mutation(parent, None);
         h.borrow().emit_mutation(DomMutation::ChildList {
             target: parent,
             added: Vec::new(),
@@ -1103,6 +1184,8 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
         let old_child = require_node(vm, &h, old_val)?;
         insert_node_into_parent(vm, &h, parent, new_child, Some(old_child))?;
         h.borrow().document.borrow_mut().remove_child(old_child);
+        h.borrow_mut()
+            .invalidate_dom_mutation(parent, Some(new_child));
         h.borrow().emit_mutation(DomMutation::ChildList {
             target: parent,
             added: Vec::new(),
@@ -1191,6 +1274,8 @@ fn insert_node_into_parent(
         }
         (prev, before)
     };
+    host.borrow_mut()
+        .invalidate_dom_mutation(parent, to_insert.first().copied());
     host.borrow().emit_mutation(DomMutation::ChildList {
         target: parent,
         added: to_insert.clone(),
@@ -1265,13 +1350,66 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
     });
     define_host_accessor(vm, ep, "classList", Some(g), None);
 
-    // style (live CSSStyleDeclaration Proxy)
+    // style (live CSSStyleDeclaration Proxy + [PutForwards=cssText] setter)
     let h = Rc::clone(host);
     let g = vm.alloc_host_fn("get style", move |vm, t, _| {
         let nid = require_node(vm, &h, t)?;
         Ok(crate::cssom::create_inline_style_proxy(vm, &h, nid))
     });
-    define_host_accessor(vm, ep, "style", Some(g), None);
+    let h2 = Rc::clone(host);
+    let s = vm.alloc_host_fn("set style", move |vm, t, args| {
+        let nid = require_node(vm, &h2, t)?;
+        let raw = if arg(args, 0).is_null() || arg(args, 0).is_undefined() {
+            String::new()
+        } else {
+            vm.value_to_rust_string(arg(args, 0))
+        };
+        crate::cssom::set_inline_style_css_text(vm, &h2, nid, &raw);
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_accessor(vm, ep, "style", Some(g), Some(s));
+
+    // innerText (getter + setter, HTML §4.4 / CSSOM View)
+    let h1 = Rc::clone(host);
+    let g_it = vm.alloc_host_fn("get innerText", move |vm, t, _| {
+        let nid = require_node(vm, &h1, t)?;
+        let txt = h1.borrow().document.borrow().inner_text(nid);
+        Ok(JsValue::from_string(vm.heap.alloc_string(txt)))
+    });
+    let h2 = Rc::clone(host);
+    let s_it = vm.alloc_host_fn("set innerText", move |vm, t, args| {
+        let nid = require_node(vm, &h2, t)?;
+        let new_text = if arg(args, 0).is_null() || arg(args, 0).is_undefined() {
+            String::new()
+        } else {
+            vm.value_to_rust_string(arg(args, 0))
+        };
+        let (removed, added) = {
+            let doc_rc = Rc::clone(&h2.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            let removed: Vec<NodeId> = doc.children(nid).collect();
+            for &child in &removed {
+                doc.remove_child(child);
+            }
+            let mut added = Vec::new();
+            if !new_text.is_empty() {
+                let tn = doc.create_text(&new_text);
+                doc.append_child(nid, tn);
+                added.push(tn);
+            }
+            (removed, added)
+        };
+        h2.borrow_mut().invalidate_dom_mutation(nid, None);
+        h2.borrow().emit_mutation(DomMutation::ChildList {
+            target: nid,
+            added,
+            removed,
+            previous_sibling: None,
+            next_sibling: None,
+        });
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_accessor(vm, ep, "innerText", Some(g_it), Some(s_it));
 
     // dataset (live Proxy over `data-*` attributes)
     let h = Rc::clone(host);
@@ -1367,6 +1505,112 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         ))
     });
     let h = Rc::clone(host);
+    define_host_method(vm, ep, "getAttributeNS", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let ns_arg = arg(args, 0);
+        let ns = if ns_arg.is_null() || ns_arg.is_undefined() {
+            String::new()
+        } else {
+            vm.value_to_rust_string(ns_arg)
+        };
+        let local = vm.value_to_rust_string(arg(args, 1));
+        let val = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            match doc.get(nid) {
+                Some(NodeData::Element(e)) => e.get_attribute_ns(&ns, &local).map(str::to_string),
+                _ => None,
+            }
+        };
+        Ok(match val {
+            Some(v) => JsValue::from_string(vm.heap.alloc_string(v)),
+            None => JsValue::NULL,
+        })
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "setAttributeNS", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let ns_arg = arg(args, 0);
+        let ns = if ns_arg.is_null() || ns_arg.is_undefined() {
+            String::new()
+        } else {
+            vm.value_to_rust_string(ns_arg)
+        };
+        let qname = vm.value_to_rust_string(arg(args, 1));
+        let val = vm.value_to_rust_string(arg(args, 2));
+        let (prefix, local) = match qname.split_once(':') {
+            Some((p, l)) => (Some(p), l),
+            None => (None, qname.as_str()),
+        };
+        let old_val = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            match doc.get_mut(nid) {
+                Some(NodeData::Element(e)) => e
+                    .set_attribute_ns(&ns, prefix, local, &val)
+                    .map(|(old, _)| old),
+                _ => return Ok(JsValue::UNDEFINED),
+            }
+        };
+        h.borrow_mut()
+            .invalidate_attr_mutation(nid, local, old_val.as_deref(), Some(&val));
+        h.borrow().emit_mutation(DomMutation::Attributes {
+            target: nid,
+            attribute_name: local.to_string(),
+            old_value: old_val,
+        });
+        Ok(JsValue::UNDEFINED)
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "removeAttributeNS", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let ns_arg = arg(args, 0);
+        let ns = if ns_arg.is_null() || ns_arg.is_undefined() {
+            String::new()
+        } else {
+            vm.value_to_rust_string(ns_arg)
+        };
+        let local = vm.value_to_rust_string(arg(args, 1));
+        let old_val = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            match doc.get_mut(nid) {
+                Some(NodeData::Element(e)) => e.remove_attribute_ns(&ns, &local),
+                _ => None,
+            }
+        };
+        h.borrow_mut()
+            .invalidate_attr_mutation(nid, &local, old_val.as_deref(), None);
+        if old_val.is_some() {
+            h.borrow().emit_mutation(DomMutation::Attributes {
+                target: nid,
+                attribute_name: local,
+                old_value: old_val,
+            });
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "hasAttributeNS", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let ns_arg = arg(args, 0);
+        let ns = if ns_arg.is_null() || ns_arg.is_undefined() {
+            String::new()
+        } else {
+            vm.value_to_rust_string(ns_arg)
+        };
+        let local = vm.value_to_rust_string(arg(args, 1));
+        let has = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            match doc.get(nid) {
+                Some(NodeData::Element(e)) => e.get_attribute_ns(&ns, &local).is_some(),
+                _ => false,
+            }
+        };
+        Ok(JsValue::from_bool(has))
+    });
+    let h = Rc::clone(host);
     define_host_method(vm, ep, "toggleAttribute", move |vm, t, args| {
         let nid = require_node(vm, &h, t)?;
         let name = vm.value_to_rust_string(arg(args, 0));
@@ -1396,8 +1640,126 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         insert_adjacent_html(vm, &h, nid, &pos, &html);
         Ok(JsValue::UNDEFINED)
     });
-    define_host_method(vm, ep, "focus", |_, _, _| Ok(JsValue::UNDEFINED));
-    define_host_method(vm, ep, "blur", |_, _, _| Ok(JsValue::UNDEFINED));
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "insertAdjacentElement", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let pos = vm.value_to_rust_string(arg(args, 0)).to_ascii_lowercase();
+        let el_val = arg(args, 1);
+        let new_el = require_node(vm, &h, el_val)?;
+        match pos.as_str() {
+            "beforebegin" => {
+                if let Some(p) = h.borrow().document.borrow().parent(nid) {
+                    insert_node_into_parent(vm, &h, p, new_el, Some(nid))?;
+                    return Ok(el_val);
+                }
+                Ok(JsValue::NULL)
+            }
+            "afterbegin" => {
+                let first = h.borrow().document.borrow().first_child(nid);
+                insert_node_into_parent(vm, &h, nid, new_el, first)?;
+                Ok(el_val)
+            }
+            "beforeend" => {
+                insert_node_into_parent(vm, &h, nid, new_el, None)?;
+                Ok(el_val)
+            }
+            "afterend" => {
+                let info = {
+                    let doc_rc = Rc::clone(&h.borrow().document);
+                    let doc = doc_rc.borrow();
+                    doc.parent(nid).map(|p| (p, doc.next_sibling(nid)))
+                };
+                if let Some((p, next)) = info {
+                    insert_node_into_parent(vm, &h, p, new_el, next)?;
+                    return Ok(el_val);
+                }
+                Ok(JsValue::NULL)
+            }
+            _ => Err(crate::web_apis::create_dom_exception(
+                vm,
+                "SyntaxError",
+                "Invalid insertAdjacentElement position",
+            )),
+        }
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "insertAdjacentText", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let pos = vm.value_to_rust_string(arg(args, 0)).to_ascii_lowercase();
+        let data = vm.value_to_rust_string(arg(args, 1));
+        let txt = h.borrow().document.borrow_mut().create_text(&data);
+        match pos.as_str() {
+            "beforebegin" => {
+                if let Some(p) = h.borrow().document.borrow().parent(nid) {
+                    insert_node_into_parent(vm, &h, p, txt, Some(nid))?;
+                }
+            }
+            "afterbegin" => {
+                let first = h.borrow().document.borrow().first_child(nid);
+                insert_node_into_parent(vm, &h, nid, txt, first)?;
+            }
+            "beforeend" => {
+                insert_node_into_parent(vm, &h, nid, txt, None)?;
+            }
+            "afterend" => {
+                let info = {
+                    let doc_rc = Rc::clone(&h.borrow().document);
+                    let doc = doc_rc.borrow();
+                    doc.parent(nid).map(|p| (p, doc.next_sibling(nid)))
+                };
+                if let Some((p, next)) = info {
+                    insert_node_into_parent(vm, &h, p, txt, next)?;
+                }
+            }
+            _ => {
+                return Err(crate::web_apis::create_dom_exception(
+                    vm,
+                    "SyntaxError",
+                    "Invalid insertAdjacentText position",
+                ));
+            }
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "focus", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let can_focus = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            match doc.get(nid) {
+                Some(NodeData::Element(e)) => {
+                    let tag = e.name.local.as_str();
+                    doc.is_connected(nid)
+                        && !e.has_attribute("disabled")
+                        && (e.has_attribute("tabindex")
+                            || e.has_attribute("contenteditable")
+                            || matches!(
+                                tag,
+                                "a" | "area"
+                                    | "button"
+                                    | "input"
+                                    | "select"
+                                    | "textarea"
+                                    | "iframe"
+                            ))
+                }
+                _ => false,
+            }
+        };
+        if can_focus {
+            h.borrow_mut().set_focused_element(Some(nid), true);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, ep, "blur", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        if h.borrow().active_element == Some(nid) {
+            h.borrow_mut().set_focused_element(None, false);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
     define_host_method(vm, ep, "scrollIntoView", |_, _, _| Ok(JsValue::UNDEFINED));
 
     // Element traversal getters
@@ -1556,58 +1918,9 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
     });
     define_host_accessor(vm, ep, "outerHTML", Some(g), None);
 
-    // Modern DOM convenience methods: remove(), append(...), prepend(...)
-    let h = Rc::clone(host);
-    define_host_method(vm, ep, "remove", move |vm, t, _| {
-        let nid = require_node(vm, &h, t)?;
-        let info = {
-            let _doc_rc = Rc::clone(&h.borrow().document);
-            let doc = _doc_rc.borrow();
-            doc.parent(nid).map(|p| {
-                (
-                    p,
-                    doc.is_connected(nid),
-                    doc.previous_sibling(nid),
-                    doc.next_sibling(nid),
-                )
-            })
-        };
-        if let Some((parent, was_conn, prev, next)) = info {
-            h.borrow().document.borrow_mut().remove_child(nid);
-            h.borrow().emit_mutation(DomMutation::ChildList {
-                target: parent,
-                added: Vec::new(),
-                removed: vec![nid],
-                previous_sibling: prev,
-                next_sibling: next,
-            });
-            if was_conn {
-                notify_custom_element_subtree(vm, &h, nid, false);
-            }
-        }
-        Ok(JsValue::UNDEFINED)
-    });
-
-    let h = Rc::clone(host);
-    define_host_method(vm, ep, "append", move |vm, t, args| {
-        let parent = require_node(vm, &h, t)?;
-        for &a in args {
-            let child = coerce_node_or_text(vm, &h, a);
-            insert_node_into_parent(vm, &h, parent, child, None)?;
-        }
-        Ok(JsValue::UNDEFINED)
-    });
-
-    let h = Rc::clone(host);
-    define_host_method(vm, ep, "prepend", move |vm, t, args| {
-        let parent = require_node(vm, &h, t)?;
-        let first = h.borrow().document.borrow().first_child(parent);
-        for &a in args {
-            let child = coerce_node_or_text(vm, &h, a);
-            insert_node_into_parent(vm, &h, parent, child, first)?;
-        }
-        Ok(JsValue::UNDEFINED)
-    });
+    // Modern DOM ChildNode & ParentNode mixins: remove(), before(), after(), replaceWith(), append(), prepend(), replaceChildren()
+    install_child_node_mixin(vm, host, ep);
+    install_parent_node_mixin(vm, host, ep);
 
     // Shadow DOM: attachShadow({ mode }) & shadowRoot getter
     let h = Rc::clone(host);
@@ -2388,6 +2701,7 @@ fn set_inner_html(vm: &mut JsVm, host: &SharedHost, nid: NodeId, html: &str) {
         let is_conn = doc.is_connected(nid);
         (removed, added, is_conn)
     };
+    host.borrow_mut().invalidate_dom_mutation(nid, None);
     host.borrow().emit_mutation(DomMutation::ChildList {
         target: nid,
         added: added.clone(),
@@ -2467,6 +2781,8 @@ fn insert_adjacent_html(vm: &mut JsVm, host: &SharedHost, nid: NodeId, pos: &str
             _ => return,
         }
     };
+    host.borrow_mut()
+        .invalidate_dom_mutation(parent_target, None);
     host.borrow().emit_mutation(DomMutation::ChildList {
         target: parent_target,
         added: added.clone(),
@@ -2824,6 +3140,22 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         Ok(JsValue::from_object(imp))
     });
     define_host_accessor(vm, dp, "implementation", Some(g), None);
+
+    // Document.activeElement
+    let h = Rc::clone(host);
+    let g_ae = vm.alloc_host_fn("get activeElement", move |vm, _, _| {
+        let active = h.borrow().active_element;
+        if let Some(nid) = active {
+            if h.borrow().document.borrow().is_connected(nid) {
+                return Ok(wrap_node(vm, &h, nid));
+            }
+        }
+        let root = h.borrow().document.borrow().root();
+        let body = find_elements_by_tag(&h, root, "body").into_iter().next();
+        Ok(body.map_or(JsValue::NULL, |b| wrap_node(vm, &h, b)))
+    });
+    define_host_accessor(vm, dp, "activeElement", Some(g_ae), None);
+    install_parent_node_mixin(vm, host, dp);
 
     // Document queries
     let h = Rc::clone(host);
@@ -3234,6 +3566,9 @@ fn find_window_named_elements(doc: &Document, name: &str) -> Vec<NodeId> {
 
 fn install_fragment_prototype(vm: &mut JsVm, host: &SharedHost) {
     let fp = host.borrow().prototypes.fragment_proto;
+    install_parent_node_mixin(vm, host, fp);
+    let sp = host.borrow().prototypes.shadow_root_proto;
+    install_parent_node_mixin(vm, host, sp);
     let h = Rc::clone(host);
     define_host_method(vm, fp, "querySelector", move |vm, t, args| {
         let nid = require_node(vm, &h, t)?;
@@ -3276,11 +3611,227 @@ fn install_fragment_prototype(vm: &mut JsVm, host: &SharedHost) {
     });
 }
 
+fn install_child_node_mixin(vm: &mut JsVm, host: &SharedHost, proto: HeapHandle) {
+    let h = Rc::clone(host);
+    define_host_method(vm, proto, "remove", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let info = {
+            let _doc_rc = Rc::clone(&h.borrow().document);
+            let doc = _doc_rc.borrow();
+            doc.parent(nid).map(|p| {
+                (
+                    p,
+                    doc.is_connected(nid),
+                    doc.previous_sibling(nid),
+                    doc.next_sibling(nid),
+                )
+            })
+        };
+        if let Some((parent, was_conn, prev, next)) = info {
+            h.borrow().document.borrow_mut().remove_child(nid);
+            h.borrow_mut().invalidate_dom_mutation(parent, None);
+            h.borrow().emit_mutation(DomMutation::ChildList {
+                target: parent,
+                added: Vec::new(),
+                removed: vec![nid],
+                previous_sibling: prev,
+                next_sibling: next,
+            });
+            if was_conn {
+                notify_custom_element_subtree(vm, &h, nid, false);
+            }
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    let h = Rc::clone(host);
+    define_host_method(vm, proto, "before", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let Some(parent) = h.borrow().document.borrow().parent(nid) else {
+            return Ok(JsValue::UNDEFINED);
+        };
+        for &a in args {
+            let child = coerce_node_or_text(vm, &h, a);
+            insert_node_into_parent(vm, &h, parent, child, Some(nid))?;
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    let h = Rc::clone(host);
+    define_host_method(vm, proto, "after", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let info = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            doc.parent(nid).map(|p| (p, doc.next_sibling(nid)))
+        };
+        let Some((parent, next_sib)) = info else {
+            return Ok(JsValue::UNDEFINED);
+        };
+        for &a in args {
+            let child = coerce_node_or_text(vm, &h, a);
+            insert_node_into_parent(vm, &h, parent, child, next_sib)?;
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    let h = Rc::clone(host);
+    define_host_method(vm, proto, "replaceWith", move |vm, t, args| {
+        let nid = require_node(vm, &h, t)?;
+        let info = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            doc.parent(nid)
+                .map(|p| (p, doc.is_connected(nid), doc.next_sibling(nid)))
+        };
+        let Some((parent, was_conn, next_sib)) = info else {
+            return Ok(JsValue::UNDEFINED);
+        };
+        for &a in args {
+            let child = coerce_node_or_text(vm, &h, a);
+            insert_node_into_parent(vm, &h, parent, child, next_sib)?;
+        }
+        h.borrow().document.borrow_mut().remove_child(nid);
+        h.borrow_mut().invalidate_dom_mutation(parent, None);
+        if was_conn {
+            notify_custom_element_subtree(vm, &h, nid, false);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+}
+
+fn install_parent_node_mixin(vm: &mut JsVm, host: &SharedHost, proto: HeapHandle) {
+    let h = Rc::clone(host);
+    define_host_method(vm, proto, "append", move |vm, t, args| {
+        let parent = require_node(vm, &h, t)?;
+        for &a in args {
+            let child = coerce_node_or_text(vm, &h, a);
+            insert_node_into_parent(vm, &h, parent, child, None)?;
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    let h = Rc::clone(host);
+    define_host_method(vm, proto, "prepend", move |vm, t, args| {
+        let parent = require_node(vm, &h, t)?;
+        let first = h.borrow().document.borrow().first_child(parent);
+        for &a in args {
+            let child = coerce_node_or_text(vm, &h, a);
+            insert_node_into_parent(vm, &h, parent, child, first)?;
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    let h = Rc::clone(host);
+    define_host_method(vm, proto, "replaceChildren", move |vm, t, args| {
+        let parent = require_node(vm, &h, t)?;
+        let removed: Vec<NodeId> = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            let kids: Vec<NodeId> = doc.children(parent).collect();
+            for &c in &kids {
+                doc.remove_child(c);
+            }
+            kids
+        };
+        if !removed.is_empty() {
+            h.borrow_mut().invalidate_dom_mutation(parent, None);
+            h.borrow().emit_mutation(DomMutation::ChildList {
+                target: parent,
+                added: Vec::new(),
+                removed,
+                previous_sibling: None,
+                next_sibling: None,
+            });
+        }
+        for &a in args {
+            let child = coerce_node_or_text(vm, &h, a);
+            insert_node_into_parent(vm, &h, parent, child, None)?;
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+}
+
+fn install_text_prototype(vm: &mut JsVm, host: &SharedHost) {
+    let tp = host.borrow().prototypes.text_proto;
+    install_child_node_mixin(vm, host, tp);
+
+    let h1 = Rc::clone(host);
+    let g_data = vm.alloc_host_fn("get data", move |vm, t, _| {
+        let nid = require_node(vm, &h1, t)?;
+        let text = match h1.borrow().document.borrow().get(nid) {
+            Some(
+                NodeData::Text(s)
+                | NodeData::Comment(s)
+                | NodeData::ProcessingInstruction { data: s, .. },
+            ) => s.clone(),
+            _ => String::new(),
+        };
+        Ok(JsValue::from_string(vm.heap.alloc_string(text)))
+    });
+    let h2 = Rc::clone(host);
+    let s_data = vm.alloc_host_fn("set data", move |vm, t, args| {
+        let nid = require_node(vm, &h2, t)?;
+        let new_val = if arg(args, 0).is_null() {
+            String::new()
+        } else {
+            vm.value_to_rust_string(arg(args, 0))
+        };
+        let (old, parent_opt) = {
+            let doc_rc = Rc::clone(&h2.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            let parent_opt = doc.parent(nid);
+            let old = match doc.get_mut(nid) {
+                Some(
+                    NodeData::Text(s)
+                    | NodeData::Comment(s)
+                    | NodeData::ProcessingInstruction { data: s, .. },
+                ) => std::mem::replace(s, new_val),
+                _ => String::new(),
+            };
+            (old, parent_opt)
+        };
+        if let Some(parent) = parent_opt {
+            h2.borrow_mut().invalidate_dom_mutation(parent, None);
+        }
+        h2.borrow().emit_mutation(DomMutation::CharacterData {
+            target: nid,
+            old_value: old,
+        });
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_accessor(vm, tp, "data", Some(g_data), Some(s_data));
+
+    let h_len = Rc::clone(host);
+    let g_len = vm.alloc_host_fn("get length", move |vm, t, _| {
+        let nid = require_node(vm, &h_len, t)?;
+        let len = match h_len.borrow().document.borrow().get(nid) {
+            Some(
+                NodeData::Text(s)
+                | NodeData::Comment(s)
+                | NodeData::ProcessingInstruction { data: s, .. },
+            ) => s.encode_utf16().count(),
+            _ => 0,
+        };
+        Ok(JsValue::from_i32(len as i32))
+    });
+    define_host_accessor(vm, tp, "length", Some(g_len), None);
+}
+
 fn upgrade_if_custom_element(vm: &mut JsVm, host: &SharedHost, nid: NodeId, tag: &str) {
     let def_opt = host.borrow().custom_elements.get(tag).cloned();
     let Some(def) = def_opt else {
         return;
     };
+    {
+        let doc_rc = Rc::clone(&host.borrow().document);
+        let mut doc = doc_rc.borrow_mut();
+        if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
+            e.pseudo_state.insert(rix_dom::ElementState::DEFINED);
+        }
+    }
+    host.borrow_mut()
+        .invalidate_element_state(nid, rix_dom::ElementState::DEFINED);
     let wrapper = wrap_node(vm, host, nid);
     if let Some(wh) = wrapper.as_object() {
         if let Ok(ctor_proto) = vm.get_property_by_key(def.constructor, vm.key_prototype) {
@@ -3361,21 +3912,31 @@ pub(crate) fn set_element_attr(
     name: &str,
     val: &str,
 ) {
-    let (old_val, tag_lower) = {
+    let (old_val, tag_lower, attr_name) = {
         let _doc_rc = Rc::clone(&host.borrow().document);
         let mut doc = _doc_rc.borrow_mut();
-        let (old, tag) = match doc.get_mut(nid) {
+        match doc.get_mut(nid) {
             Some(NodeData::Element(e)) => {
-                let old = e.get_attribute(name).map(str::to_string);
+                // Per WHATWG DOM §4.9 setAttribute: HTML elements in HTML documents lowercase the name.
+                let effective_name: std::borrow::Cow<'_, str> = if &*e.name.ns
+                    == "http://www.w3.org/1999/xhtml"
+                    && name.bytes().any(|b| b.is_ascii_uppercase())
+                {
+                    std::borrow::Cow::Owned(name.to_ascii_lowercase())
+                } else {
+                    std::borrow::Cow::Borrowed(name)
+                };
+                let old = e.get_attribute(&effective_name).map(str::to_string);
                 let tag = e.name.local.as_str().to_ascii_lowercase();
-                e.set_attribute(name, val);
-                (old, tag)
+                e.set_attribute(&effective_name, val);
+                (old, tag, effective_name.into_owned())
             }
             _ => return,
-        };
-        doc.bump_style_revision_for(nid);
-        (old, tag)
+        }
     };
+    let name = attr_name.as_str();
+    host.borrow_mut()
+        .invalidate_attr_mutation(nid, name, old_val.as_deref(), Some(val));
     host.borrow().emit_mutation(DomMutation::Attributes {
         target: nid,
         attribute_name: name.to_string(),
@@ -3406,7 +3967,7 @@ fn remove_element_attr(vm: &mut JsVm, host: &SharedHost, nid: NodeId, name: &str
     let (old_val, tag_lower) = {
         let _doc_rc = Rc::clone(&host.borrow().document);
         let mut doc = _doc_rc.borrow_mut();
-        let (old, tag) = match doc.get_mut(nid) {
+        match doc.get_mut(nid) {
             Some(NodeData::Element(e)) => {
                 let old = e.get_attribute(name).map(str::to_string);
                 let tag = e.name.local.as_str().to_ascii_lowercase();
@@ -3414,10 +3975,10 @@ fn remove_element_attr(vm: &mut JsVm, host: &SharedHost, nid: NodeId, name: &str
                 (old, tag)
             }
             _ => return,
-        };
-        doc.bump_style_revision_for(nid);
-        (old, tag)
+        }
     };
+    host.borrow_mut()
+        .invalidate_attr_mutation(nid, name, old_val.as_deref(), None);
     if old_val.is_some() {
         host.borrow().emit_mutation(DomMutation::Attributes {
             target: nid,

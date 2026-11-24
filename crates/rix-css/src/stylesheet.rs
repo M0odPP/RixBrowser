@@ -27,8 +27,9 @@ use crate::properties::{
     SpecifiedDeclaration,
 };
 use crate::selector::{
-    compile_lightning_selector_list, parse_selector_list, parse_selector_list_strict,
-    serialize_selector_list, RixSelectorImpl,
+    compile_lightning_selector_list_with_namespaces, parse_selector_list_strict,
+    parse_selector_list_with_namespaces, serialize_selector_list, CssAtom, RixSelectorImpl,
+    SelectorNamespaceMap,
 };
 use crate::values::{convert_font_family_name, convert_length, BackgroundImageValue, EvalContext};
 
@@ -308,7 +309,7 @@ pub fn evaluate_supports(cond: &SupportsCondition<'_>) -> bool {
                 .is_some()
         }
         SupportsCondition::Selector(sel) => {
-            crate::selector::parse_selector_list_strict(sel.as_ref()).is_ok()
+            crate::selector::parse_selector_list_non_forgiving(sel.as_ref()).is_ok()
         }
         SupportsCondition::Unknown(_) => false,
     }
@@ -511,6 +512,7 @@ struct StylesheetCompiler {
     missing_features: Vec<MissingCssFeature>,
     next_source_order: u32,
     selector_scratch: String,
+    namespaces: SelectorNamespaceMap,
 }
 
 impl StylesheetCompiler {
@@ -529,6 +531,7 @@ impl StylesheetCompiler {
             missing_features: Vec::new(),
             next_source_order: 0,
             selector_scratch: String::with_capacity(128),
+            namespaces: SelectorNamespaceMap::default(),
         }
     }
 
@@ -637,7 +640,17 @@ impl StylesheetCompiler {
                         }
                     }
                 }
-                CssRule::Namespace(_) | CssRule::Ignored => {}
+                CssRule::Namespace(ns) => {
+                    let url = CssAtom::new(ns.url.as_ref());
+                    if let Some(ref pref) = ns.prefix {
+                        self.namespaces
+                            .prefixes
+                            .insert(pref.as_ref().to_string(), url);
+                    } else {
+                        self.namespaces.default_namespace = Some(url);
+                    }
+                }
+                CssRule::Ignored => {}
                 CssRule::Container(_) => {
                     self.record_missing(MissingCssFeature::new(
                         MissingCssKind::AtRule,
@@ -691,9 +704,12 @@ impl StylesheetCompiler {
             || !style.declarations.important_declarations.is_empty()
         {
             if parent_selector.is_none() {
-                if let Some(parsed) =
-                    compile_lightning_selector_list(&style.selectors, &mut self.selector_scratch)
-                {
+                let ns_opt = (!self.namespaces.is_empty()).then_some(&self.namespaces);
+                if let Some(parsed) = compile_lightning_selector_list_with_namespaces(
+                    &style.selectors,
+                    &mut self.selector_scratch,
+                    ns_opt,
+                ) {
                     self.emit_compiled_selectors(parsed.slice(), &style.declarations, layer);
                 } else {
                     self.record_missing(MissingCssFeature::new(
@@ -717,7 +733,8 @@ impl StylesheetCompiler {
         block: &lightningcss::declaration::DeclarationBlock<'_>,
         layer: LayerId,
     ) {
-        if let Some(parsed) = parse_selector_list(selector_str) {
+        let ns_opt = (!self.namespaces.is_empty()).then_some(&self.namespaces);
+        if let Ok(parsed) = parse_selector_list_with_namespaces(selector_str, ns_opt) {
             self.emit_compiled_selectors(parsed.slice(), block, layer);
         } else {
             self.record_missing(MissingCssFeature::new(
@@ -894,22 +911,26 @@ pub enum CssomRuleKind {
     },
     Media {
         condition_text: String,
-        body_text: String,
+        rules: Vec<CssomRuleKind>,
     },
     Supports {
         condition_text: String,
-        body_text: String,
+        rules: Vec<CssomRuleKind>,
     },
     LayerBlock {
         name: String,
-        body_text: String,
+        rules: Vec<CssomRuleKind>,
     },
     LayerStatement {
         names: Vec<String>,
     },
     Scope {
         prelude: String,
-        body_text: String,
+        rules: Vec<CssomRuleKind>,
+    },
+    Namespace {
+        prefix: Option<String>,
+        url: String,
     },
     Keyframes {
         name: String,
@@ -924,7 +945,41 @@ pub enum CssomRuleKind {
     },
 }
 
+fn join_cssom_rules(rules: &[CssomRuleKind]) -> String {
+    let mut out = String::new();
+    for (i, r) in rules.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(&r.to_css_text());
+    }
+    out
+}
+
 impl CssomRuleKind {
+    /// Returns child rules if this is a `CSSGroupingRule` (`@media`, `@supports`, `@layer`, `@scope`).
+    #[must_use]
+    pub fn child_rules(&self) -> Option<&[CssomRuleKind]> {
+        match self {
+            Self::Media { rules, .. }
+            | Self::Supports { rules, .. }
+            | Self::LayerBlock { rules, .. }
+            | Self::Scope { rules, .. } => Some(rules),
+            _ => None,
+        }
+    }
+
+    /// Returns mutable child rules if this is a `CSSGroupingRule`.
+    pub fn child_rules_mut(&mut self) -> Option<&mut Vec<CssomRuleKind>> {
+        match self {
+            Self::Media { rules, .. }
+            | Self::Supports { rules, .. }
+            | Self::LayerBlock { rules, .. }
+            | Self::Scope { rules, .. } => Some(rules),
+            _ => None,
+        }
+    }
+
     /// Serializes this CSSOM rule back into valid CSS text.
     #[must_use]
     pub fn to_css_text(&self) -> String {
@@ -941,25 +996,37 @@ impl CssomRuleKind {
             }
             Self::Media {
                 condition_text,
-                body_text,
-            } => format!("@media {condition_text} {{ {body_text} }}"),
+                rules,
+            } => format!("@media {condition_text} {{ {} }}", join_cssom_rules(rules)),
             Self::Supports {
                 condition_text,
-                body_text,
-            } => format!("@supports {condition_text} {{ {body_text} }}"),
-            Self::LayerBlock { name, body_text } => {
+                rules,
+            } => format!(
+                "@supports {condition_text} {{ {} }}",
+                join_cssom_rules(rules)
+            ),
+            Self::LayerBlock { name, rules } => {
+                let body = join_cssom_rules(rules);
                 if name.is_empty() {
-                    format!("@layer {{ {body_text} }}")
+                    format!("@layer {{ {body} }}")
                 } else {
-                    format!("@layer {name} {{ {body_text} }}")
+                    format!("@layer {name} {{ {body} }}")
                 }
             }
             Self::LayerStatement { names } => format!("@layer {};", names.join(", ")),
-            Self::Scope { prelude, body_text } => {
+            Self::Scope { prelude, rules } => {
+                let body = join_cssom_rules(rules);
                 if prelude.is_empty() {
-                    format!("@scope {{ {body_text} }}")
+                    format!("@scope {{ {body} }}")
                 } else {
-                    format!("@scope {prelude} {{ {body_text} }}")
+                    format!("@scope {prelude} {{ {body} }}")
+                }
+            }
+            Self::Namespace { prefix, url } => {
+                let escaped = url.replace('\\', "\\\\").replace('"', "\\\"");
+                match prefix {
+                    Some(p) if !p.is_empty() => format!("@namespace {p} url(\"{escaped}\");"),
+                    _ => format!("@namespace url(\"{escaped}\");"),
                 }
             }
             Self::Keyframes { name, body_text } => format!("@keyframes {name} {{ {body_text} }}"),
@@ -975,22 +1042,39 @@ fn lightning_to_css_string<T: LightningToCss>(val: &T) -> String {
     out
 }
 
+fn convert_lightning_rule_list_to_cssom(
+    list: &CssRuleList<'_>,
+    namespaces: &mut SelectorNamespaceMap,
+) -> Vec<CssomRuleKind> {
+    list.0
+        .iter()
+        .filter_map(|r| convert_lightning_rule_to_cssom(r, false, namespaces).ok())
+        .collect()
+}
+
 fn convert_lightning_rule_to_cssom(
     rule: &CssRule<'_>,
-    strict: bool,
+    _strict: bool,
+    namespaces: &mut SelectorNamespaceMap,
 ) -> Result<CssomRuleKind, String> {
     match rule {
+        CssRule::Namespace(ns) => {
+            let url = ns.url.as_ref().to_string();
+            let prefix = ns.prefix.as_ref().map(|p| p.as_ref().to_string());
+            let atom = CssAtom::new(&url);
+            if let Some(ref p) = prefix {
+                namespaces.prefixes.insert(p.clone(), atom);
+            } else {
+                namespaces.default_namespace = Some(atom);
+            }
+            Ok(CssomRuleKind::Namespace { prefix, url })
+        }
         CssRule::Style(sr) => {
             let raw_sel = lightning_to_css_string(&sr.selectors);
-            let selector_text = match parse_selector_list_strict(&raw_sel) {
-                Ok(parsed) => serialize_selector_list(&parsed),
-                Err(e) => {
-                    if strict {
-                        return Err(e);
-                    }
-                    raw_sel
-                }
-            };
+            // Per CSS Syntax L3 & CSSOM, style rules with invalid selectors are always dropped.
+            let ns_opt = (!namespaces.is_empty()).then_some(&*namespaces);
+            let parsed = parse_selector_list_with_namespaces(&raw_sel, ns_opt)?;
+            let selector_text = serialize_selector_list(&parsed);
             let declarations_text = lightning_to_css_string(&sr.declarations);
             Ok(CssomRuleKind::Style {
                 selector_text,
@@ -999,15 +1083,15 @@ fn convert_lightning_rule_to_cssom(
         }
         CssRule::Media(mr) => Ok(CssomRuleKind::Media {
             condition_text: lightning_to_css_string(&mr.query),
-            body_text: lightning_to_css_string(&mr.rules),
+            rules: convert_lightning_rule_list_to_cssom(&mr.rules, namespaces),
         }),
         CssRule::Supports(sr) => Ok(CssomRuleKind::Supports {
             condition_text: lightning_to_css_string(&sr.condition),
-            body_text: lightning_to_css_string(&sr.rules),
+            rules: convert_lightning_rule_list_to_cssom(&sr.rules, namespaces),
         }),
         CssRule::LayerBlock(lb) => Ok(CssomRuleKind::LayerBlock {
             name: lb.name.as_ref().map(join_layer_name).unwrap_or_default(),
-            body_text: lightning_to_css_string(&lb.rules),
+            rules: convert_lightning_rule_list_to_cssom(&lb.rules, namespaces),
         }),
         CssRule::LayerStatement(ls) => Ok(CssomRuleKind::LayerStatement {
             names: ls.names.iter().map(join_layer_name).collect(),
@@ -1029,7 +1113,7 @@ fn convert_lightning_rule_to_cssom(
             }
             Ok(CssomRuleKind::Scope {
                 prelude,
-                body_text: lightning_to_css_string(&sc.rules),
+                rules: convert_lightning_rule_list_to_cssom(&sc.rules, namespaces),
             })
         }
         CssRule::Keyframes(kf) => {
@@ -1057,6 +1141,18 @@ fn convert_lightning_rule_to_cssom(
 /// Parses a CSS stylesheet into top-level [`CssomRuleKind`] items (error-recovering).
 #[must_use]
 pub fn parse_cssom_rules(css: &str) -> Vec<CssomRuleKind> {
+    let trimmed = css.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    // Fast path for a single top-level style rule so canonical selector serialization
+    // (`:nth-child(n)`, `:is(:is(div))`, etc.) is not simplified by `lightningcss`.
+    if !trimmed.starts_with('@') && split_single_style_rule(trimmed).is_some() {
+        return match parse_single_cssom_rule(trimmed) {
+            Ok(rule) => vec![rule],
+            Err(_) => Vec::new(),
+        };
+    }
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let opts = ParserOptions {
             error_recovery: true,
@@ -1065,21 +1161,59 @@ pub fn parse_cssom_rules(css: &str) -> Vec<CssomRuleKind> {
         let Ok(parsed) = StyleSheet::parse(css, opts) else {
             return Vec::new();
         };
-        parsed
-            .rules
-            .0
-            .iter()
-            .filter_map(|r| convert_lightning_rule_to_cssom(r, false).ok())
-            .collect()
+        let mut namespaces = SelectorNamespaceMap::default();
+        convert_lightning_rule_list_to_cssom(&parsed.rules, &mut namespaces)
     }))
     .unwrap_or_default()
 }
 
 /// Strictly parses a single CSS rule for `CSSStyleSheet.insertRule(rule, index)`.
 pub fn parse_single_cssom_rule(rule_css: &str) -> Result<CssomRuleKind, String> {
+    parse_single_cssom_rule_with_namespaces(rule_css, None)
+}
+
+/// Strictly parses a single CSS rule with optional active stylesheet `@namespace` declarations.
+pub fn parse_single_cssom_rule_with_namespaces(
+    rule_css: &str,
+    namespaces: Option<&SelectorNamespaceMap>,
+) -> Result<CssomRuleKind, String> {
     let trimmed = rule_css.trim();
     if trimmed.is_empty() {
         return Err("Empty CSS rule".to_string());
+    }
+    // For standard style rules (not starting with `@`), parse the selector prelude directly
+    // through Servo `selectors` BEFORE `lightningcss` so canonical forms like `:is(:is(div))`,
+    // `a:is(:not(:hover))`, and forgiving `:has(:is(:has(*)))` are preserved verbatim without
+    // minification/rewriting!
+    if !trimmed.starts_with('@') {
+        if let Some((raw_sel, raw_body)) = split_single_style_rule(trimmed) {
+            let parsed_sel = if let Some(ns) = namespaces {
+                parse_selector_list_with_namespaces(raw_sel, Some(ns))?
+            } else {
+                parse_selector_list_strict(raw_sel)?
+            };
+            let selector_text = serialize_selector_list(&parsed_sel);
+            // Validate declaration block syntax via lightningcss (empty blocks are valid).
+            let body_trimmed = raw_body.trim();
+            let declarations_text = if body_trimmed.is_empty() {
+                String::new()
+            } else {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let opts = ParserOptions {
+                        error_recovery: true,
+                        ..ParserOptions::default()
+                    };
+                    lightningcss::declaration::DeclarationBlock::parse_string(body_trimmed, opts)
+                        .map(|b| lightning_to_css_string(&b))
+                        .unwrap_or_else(|_| body_trimmed.to_string())
+                }))
+                .unwrap_or_else(|_| body_trimmed.to_string())
+            };
+            return Ok(CssomRuleKind::Style {
+                selector_text,
+                declarations_text,
+            });
+        }
     }
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let opts = ParserOptions {
@@ -1094,7 +1228,99 @@ pub fn parse_single_cssom_rule(rule_css: &str) -> Result<CssomRuleKind, String> 
                 parsed.rules.0.len()
             ));
         }
-        convert_lightning_rule_to_cssom(&parsed.rules.0[0], true)
+        let mut ns = namespaces.cloned().unwrap_or_default();
+        convert_lightning_rule_to_cssom(&parsed.rules.0[0], true, &mut ns)
     }))
     .unwrap_or_else(|_| Err(format!("Internal CSS parser rejected rule '{trimmed}'")))
+}
+
+/// Splits a single top-level CSS style rule `<selector> { <decls> }` if balanced and containing
+/// no trailing tokens or nested rules.
+fn split_single_style_rule(input: &str) -> Option<(&str, &str)> {
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    let mut in_str: Option<u8> = None;
+    let mut paren_depth = 0usize;
+    let mut open_brace = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'"' | b'\'' => in_str = Some(b),
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            b'(' | b'[' => paren_depth += 1,
+            b')' | b']' => paren_depth = paren_depth.saturating_sub(1),
+            b'{' if paren_depth == 0 => {
+                open_brace = Some(i);
+                break;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let start_brace = open_brace?;
+    let mut depth = 0usize;
+    let mut j = start_brace;
+    in_str = None;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                j += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            j += 1;
+            continue;
+        }
+        match b {
+            b'\\' => {
+                j += 2;
+                continue;
+            }
+            b'"' | b'\'' => in_str = Some(b),
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    // Must have no trailing non-whitespace/comment tokens after closing `}`.
+                    if !input[j + 1..].trim().is_empty() {
+                        return None;
+                    }
+                    let body = &input[start_brace + 1..j];
+                    // If body contains nested `{`, delegate to lightningcss nesting parser.
+                    if body.contains('{') {
+                        return None;
+                    }
+                    return Some((input[..start_brace].trim(), body));
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
 }

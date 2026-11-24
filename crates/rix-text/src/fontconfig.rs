@@ -20,6 +20,7 @@ impl FamilyAliases {
     pub fn from_system() -> Self {
         let root = std::env::var_os("FONTCONFIG_FILE")
             .map(PathBuf::from)
+            .filter(|p| p.is_file())
             .unwrap_or_else(|| PathBuf::from("/etc/fonts/fonts.conf"));
         Self::from_config_file(&root)
     }
