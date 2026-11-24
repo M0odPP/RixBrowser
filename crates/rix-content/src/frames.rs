@@ -21,7 +21,9 @@ use url::Url;
 
 use crate::dom_bridge::{set_element_attr, wrap_node, SharedHost};
 use crate::event_loop::{SharedEventLoop, TaskPriority};
-use crate::events::{fire_object_event_with_proto, register_constructed_event, SharedEvents};
+use crate::events::{
+    fire_dom_node_event, fire_object_event_with_proto, register_constructed_event, SharedEvents,
+};
 use crate::fetch_ws::SharedNetBridge;
 use crate::web_apis::{
     alloc_array_buffer, apply_url_host_setter, apply_url_port_setter, arg, create_dom_exception,
@@ -1009,252 +1011,338 @@ fn alloc_message_port(
 // Same-origin child Document / Window & Cross-origin WindowProxy builders
 // ---------------------------------------------------------------------------
 
-fn data_attr_to_camel(attr_name: &str) -> String {
-    let mut out = String::with_capacity(attr_name.len());
-    let mut upper_next = false;
-    for ch in attr_name.chars() {
-        if ch == '-' {
-            upper_next = true;
-        } else if upper_next && ch.is_ascii_lowercase() {
-            out.push(ch.to_ascii_uppercase());
-            upper_next = false;
-        } else {
-            if upper_next {
-                out.push('-');
-                upper_next = false;
-            }
-            out.push(ch);
-        }
+fn is_xml_mime_or_url(content_type: &str, url: &str) -> bool {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(
+        ct.as_str(),
+        "text/xml" | "application/xml" | "application/xhtml+xml" | "image/svg+xml"
+    ) || ct.ends_with("+xml")
+    {
+        return true;
     }
-    if upper_next {
-        out.push('-');
-    }
-    out
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.ends_with(".xml") || path.ends_with(".xhtml") || path.ends_with(".svg")
 }
 
-fn build_sub_document_element(
-    vm: &mut JsVm,
-    parsed_doc: &rix_dom::Document,
-    nid: NodeId,
-) -> HeapHandle {
-    let el_obj = vm.alloc_ordinary_object();
-    let Some(NodeData::Element(el)) = parsed_doc.get(nid) else {
-        return el_obj;
-    };
-    let tag_upper = el.name.local.as_str().to_ascii_uppercase();
-    let id = el.get_attribute("id").unwrap_or("").to_string();
-    let text = parsed_doc.inner_text(nid);
-    let dataset_obj = vm.alloc_ordinary_object();
-    let attrs_map = vm.alloc_ordinary_object();
-    for (qn, val) in &el.attributes {
-        let local = qn.local.as_str();
-        let ak = vm.heap.intern_key(local);
-        let av = JsValue::from_string(vm.heap.alloc_string(val));
-        vm.heap
-            .object_define_data(attrs_map, ak, av, PropertyAttrs::DEFAULT, &mut vm.shapes);
-        if let Some(rest) = local.strip_prefix("data-") {
-            let dk = vm.heap.intern_key(&data_attr_to_camel(rest));
-            vm.heap
-                .object_define_data(dataset_obj, dk, av, PropertyAttrs::DEFAULT, &mut vm.shapes);
-        }
+fn normalized_xml_mime(content_type: &str, url: &str) -> String {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(
+        ct.as_str(),
+        "text/xml" | "application/xml" | "application/xhtml+xml" | "image/svg+xml"
+    ) || ct.ends_with("+xml")
+    {
+        return ct;
     }
-    let k_id = vm.heap.intern_key("id");
-    let k_tag = vm.heap.intern_key("tagName");
-    let k_nn = vm.heap.intern_key("nodeName");
-    let k_tc = vm.heap.intern_key("textContent");
-    let k_ih = vm.heap.intern_key("innerHTML");
-    let k_ds = vm.heap.intern_key("dataset");
-    let v_id = JsValue::from_string(vm.heap.alloc_string(&id));
-    let v_tag = JsValue::from_string(vm.heap.alloc_string(&tag_upper));
-    let v_txt = JsValue::from_string(vm.heap.alloc_string(&text));
-    vm.heap
-        .object_define_data(el_obj, k_id, v_id, PropertyAttrs::DEFAULT, &mut vm.shapes);
-    vm.heap
-        .object_define_data(el_obj, k_tag, v_tag, PropertyAttrs::DEFAULT, &mut vm.shapes);
-    vm.heap
-        .object_define_data(el_obj, k_nn, v_tag, PropertyAttrs::DEFAULT, &mut vm.shapes);
-    vm.heap
-        .object_define_data(el_obj, k_tc, v_txt, PropertyAttrs::DEFAULT, &mut vm.shapes);
-    vm.heap
-        .object_define_data(el_obj, k_ih, v_txt, PropertyAttrs::DEFAULT, &mut vm.shapes);
-    vm.heap.object_define_data(
-        el_obj,
-        k_ds,
-        JsValue::from_object(dataset_obj),
-        PropertyAttrs::DEFAULT,
-        &mut vm.shapes,
-    );
-    define_host_method(vm, el_obj, "getAttribute", move |vm, _, args| {
-        let name = vm.value_to_rust_string(arg(args, 0)).to_ascii_lowercase();
-        let k = vm.heap.intern_key(&name);
-        match vm.get_property_by_key(attrs_map, k) {
-            Ok(v) if !v.is_undefined() => Ok(v),
-            _ => Ok(JsValue::NULL),
-        }
-    });
-    el_obj
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    if path.ends_with(".xhtml") {
+        "application/xhtml+xml".to_string()
+    } else if path.ends_with(".svg") {
+        "image/svg+xml".to_string()
+    } else {
+        "application/xml".to_string()
+    }
 }
 
+enum SubdocScript {
+    Inline(String),
+    External(String),
+}
+
+/// Creates a REAL `NodeData::Document` subtree inside `host.document` for a same-origin
+/// `<iframe>` or `window.open()` browsing context, with full `Document.prototype` / `XMLDocument.prototype`,
+/// `DocumentMeta`, `ownerDocument` adoption, and ordered inline/external script extraction.
 fn build_sub_document(
     vm: &mut JsVm,
+    host: &SharedHost,
     url: &str,
-    html: &str,
+    content: &str,
     charset: &str,
+    content_type: &str,
     window_proxy: HeapHandle,
-) -> (HeapHandle, String, Vec<String>) {
-    let mut parsed_doc = parse_html(html);
-    parsed_doc.set_character_set(charset);
-    let mut title = String::new();
-    let mut body_text = String::new();
-    let mut elements_by_id: Vec<(String, NodeId)> = Vec::new();
-    let mut inline_scripts: Vec<String> = Vec::new();
+) -> (HeapHandle, String, Vec<SubdocScript>) {
+    let is_xml = is_xml_mime_or_url(content_type, url);
+    let (sub_doc_id, title, scripts) = if is_xml {
+        let mime = normalized_xml_mime(content_type, url);
+        let sub_id = {
+            let doc_rc = Rc::clone(&host.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            let sid = doc.new_node(NodeData::Document);
+            if let Err(err_msg) =
+                crate::dom_interfaces::parse_xml_into_document(&mut doc, sid, content)
+            {
+                // Remove partial children and insert standard parsererror element.
+                let partial: Vec<NodeId> = doc.children(sid).collect();
+                for p in partial {
+                    doc.remove_child(p);
+                }
+                let err_el = doc.new_node(NodeData::Element(rix_dom::ElementData::new(
+                    rix_dom::QualName::new(
+                        None,
+                        rix_dom::Namespace::from(
+                            "http://www.mozilla.org/newlayout/xml/parsererror.xml",
+                        ),
+                        rix_dom::LocalName::from("parsererror"),
+                    ),
+                )));
+                let err_txt = doc.create_text(&err_msg);
+                doc.append_child(err_el, err_txt);
+                doc.append_child(sid, err_el);
+            }
+            sid
+        };
+        let mut meta = crate::dom_interfaces::DocumentMeta::xml_document(mime, url);
+        meta.character_set = charset.to_string();
+        meta.default_view = Some(window_proxy);
+        {
+            let mut hb = host.borrow_mut();
+            hb.doc_meta.insert(sub_id, meta);
+            hb.adopt_subtree(sub_id, sub_id);
+        }
+        let (title, scripts) = collect_subdoc_title_and_scripts(host, sub_id);
+        (sub_id, title, scripts)
+    } else {
+        let mut parsed_doc = parse_html(content);
+        parsed_doc.set_character_set(charset);
+        let sub_id = {
+            let doc_rc = Rc::clone(&host.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            let sid = doc.new_node(NodeData::Document);
+            let pr = parsed_doc.root();
+            for child in parsed_doc.children(pr) {
+                let cloned = doc.clone_subtree_from(&parsed_doc, child);
+                doc.append_child(sid, cloned);
+            }
+            sid
+        };
+        let mut meta = crate::dom_interfaces::DocumentMeta::html(url);
+        meta.character_set = charset.to_string();
+        meta.default_view = Some(window_proxy);
+        {
+            let mut hb = host.borrow_mut();
+            hb.doc_meta.insert(sub_id, meta);
+            hb.adopt_subtree(sub_id, sub_id);
+        }
+        let (title, scripts) = collect_subdoc_title_and_scripts(host, sub_id);
+        (sub_id, title, scripts)
+    };
+    let wrapped = wrap_node(vm, host, sub_doc_id)
+        .as_object()
+        .unwrap_or_else(|| vm.alloc_ordinary_object());
+    (wrapped, title, scripts)
+}
 
-    for nid in parsed_doc.descendants(parsed_doc.root()) {
-        if let Some(NodeData::Element(el)) = parsed_doc.get(nid) {
+fn collect_subdoc_title_and_scripts(
+    host: &SharedHost,
+    sub_doc_id: NodeId,
+) -> (String, Vec<SubdocScript>) {
+    let doc_rc = Rc::clone(&host.borrow().document);
+    let doc = doc_rc.borrow();
+    let mut title = String::new();
+    let mut scripts = Vec::new();
+    for nid in doc.descendants(sub_doc_id) {
+        if let Some(NodeData::Element(el)) = doc.get(nid) {
             let tag = el.name.local.as_str();
             if tag.eq_ignore_ascii_case("title") && title.is_empty() {
-                title = parsed_doc.inner_text(nid);
-            } else if tag.eq_ignore_ascii_case("body") && body_text.is_empty() {
-                body_text = parsed_doc.inner_text(nid);
-            } else if tag.eq_ignore_ascii_case("script") && !el.has_attribute("src") {
-                let code = parsed_doc.inner_text(nid);
-                if !code.trim().is_empty() {
-                    inline_scripts.push(code);
-                }
-            }
-            if let Some(id) = el.get_attribute("id") {
-                elements_by_id.push((id.to_string(), nid));
-            }
-        }
-    }
-
-    let doc_obj = vm.alloc_ordinary_object();
-    let body_obj = vm.alloc_ordinary_object();
-    let id_map_obj = vm.alloc_ordinary_object();
-    for (id, nid) in elements_by_id {
-        let el_obj = build_sub_document_element(vm, &parsed_doc, nid);
-        let mk = vm.heap.intern_key(&id);
-        vm.heap.object_define_data(
-            id_map_obj,
-            mk,
-            JsValue::from_object(el_obj),
-            PropertyAttrs::DEFAULT,
-            &mut vm.shapes,
-        );
-    }
-
-    let k_tc = vm.heap.intern_key("textContent");
-    let k_ih = vm.heap.intern_key("innerHTML");
-    let v_body = JsValue::from_string(vm.heap.alloc_string(&body_text));
-    vm.heap.object_define_data(
-        body_obj,
-        k_tc,
-        v_body,
-        PropertyAttrs::DEFAULT,
-        &mut vm.shapes,
-    );
-    vm.heap.object_define_data(
-        body_obj,
-        k_ih,
-        v_body,
-        PropertyAttrs::DEFAULT,
-        &mut vm.shapes,
-    );
-
-    let cs_val = JsValue::from_string(vm.heap.alloc_string(charset));
-    for (name, val) in [
-        ("title", JsValue::from_string(vm.heap.alloc_string(&title))),
-        ("URL", JsValue::from_string(vm.heap.alloc_string(url))),
-        ("characterSet", cs_val),
-        ("charset", cs_val),
-        ("inputEncoding", cs_val),
-        (
-            "readyState",
-            JsValue::from_string(vm.heap.alloc_string("complete")),
-        ),
-        ("body", JsValue::from_object(body_obj)),
-        ("defaultView", JsValue::from_object(window_proxy)),
-    ] {
-        let k = vm.heap.intern_key(name);
-        vm.heap
-            .object_define_data(doc_obj, k, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
-    }
-    define_host_method(vm, doc_obj, "getElementById", move |vm, _, args| {
-        let id = vm.value_to_rust_string(arg(args, 0));
-        let k = vm.heap.intern_key(&id);
-        match vm.get_property_by_key(id_map_obj, k) {
-            Ok(v) if !v.is_undefined() => Ok(v),
-            _ => Ok(JsValue::NULL),
-        }
-    });
-    let doc_rc = Rc::new(parsed_doc);
-    {
-        let doc_qsa = Rc::clone(&doc_rc);
-        define_host_method(vm, doc_obj, "querySelectorAll", move |vm, _, args| {
-            let sel = vm.value_to_rust_string(arg(args, 0));
-            let list = rix_css::parse_selector_list_strict(&sel).map_err(|_| {
-                create_dom_exception(vm, "SyntaxError", &format!("Invalid selector: {sel}"))
-            })?;
-            let matches =
-                rix_css::query_selector_all_in_subtree(&doc_qsa, doc_qsa.root(), &list, None, None);
-            let arr = vm.alloc_array();
-            for nid in matches {
-                let el = build_sub_document_element(vm, &doc_qsa, nid);
-                vm.heap.object_push_element(arr, JsValue::from_object(el));
-            }
-            Ok(JsValue::from_object(arr))
-        });
-    }
-    {
-        let doc_qs = Rc::clone(&doc_rc);
-        define_host_method(vm, doc_obj, "querySelector", move |vm, _, args| {
-            let sel = vm.value_to_rust_string(arg(args, 0));
-            let list = rix_css::parse_selector_list_strict(&sel).map_err(|_| {
-                create_dom_exception(vm, "SyntaxError", &format!("Invalid selector: {sel}"))
-            })?;
-            if let Some(nid) =
-                rix_css::query_selector_in_subtree(&doc_qs, doc_qs.root(), &list, None, None)
-            {
-                let el = build_sub_document_element(vm, &doc_qs, nid);
-                Ok(JsValue::from_object(el))
-            } else {
-                Ok(JsValue::NULL)
-            }
-        });
-    }
-    {
-        let doc_tag = Rc::clone(&doc_rc);
-        define_host_method(vm, doc_obj, "getElementsByTagName", move |vm, _, args| {
-            let tag_q = vm.value_to_rust_string(arg(args, 0));
-            let arr = vm.alloc_array();
-            for nid in doc_tag.descendants(doc_tag.root()) {
-                if let Some(NodeData::Element(el)) = doc_tag.get(nid) {
-                    if tag_q == "*" || el.name.local.as_str().eq_ignore_ascii_case(&tag_q) {
-                        let wrapped = build_sub_document_element(vm, &doc_tag, nid);
-                        vm.heap
-                            .object_push_element(arr, JsValue::from_object(wrapped));
+                title = doc.inner_text(nid);
+            } else if tag.eq_ignore_ascii_case("script") {
+                if let Some(src) = el.get_attribute("src") {
+                    let trimmed = src.trim();
+                    if !trimmed.is_empty() {
+                        scripts.push(SubdocScript::External(trimmed.to_string()));
+                    }
+                } else {
+                    let code = doc.inner_text(nid);
+                    if !code.trim().is_empty() {
+                        scripts.push(SubdocScript::Inline(code));
                     }
                 }
             }
-            Ok(JsValue::from_object(arr))
-        });
+        }
     }
-    define_host_method(vm, doc_obj, "write", move |vm, _, args| {
-        let txt = vm.value_to_rust_string(arg(args, 0));
-        let k = vm.heap.intern_key("innerHTML");
-        let prev = vm
-            .get_property_by_key(body_obj, k)
-            .map(|v| vm.value_to_rust_string(v))
-            .unwrap_or_default();
-        let next = JsValue::from_string(vm.heap.alloc_string(format!("{prev}{txt}")));
+    (title, scripts)
+}
+
+/// Copies immutable JS/DOM intrinsic bindings onto a same-origin child `WindowProxy`
+/// so child scripts execute in an isolated global environment without polluting parent `window`.
+fn install_same_origin_child_globals(
+    vm: &mut JsVm,
+    proxy_h: HeapHandle,
+    child_doc: HeapHandle,
+    parent_global: HeapHandle,
+    top_val: JsValue,
+    iframe_el: JsValue,
+) {
+    let intrinsics = [
+        "Object",
+        "Function",
+        "Array",
+        "String",
+        "Number",
+        "Boolean",
+        "Symbol",
+        "BigInt",
+        "Math",
+        "Date",
+        "RegExp",
+        "Error",
+        "TypeError",
+        "RangeError",
+        "SyntaxError",
+        "ReferenceError",
+        "URIError",
+        "EvalError",
+        "Map",
+        "Set",
+        "WeakMap",
+        "WeakSet",
+        "Promise",
+        "Proxy",
+        "Reflect",
+        "JSON",
+        "ArrayBuffer",
+        "Uint8Array",
+        "Int32Array",
+        "Float64Array",
+        "DataView",
+        "eval",
+        "isNaN",
+        "isFinite",
+        "parseInt",
+        "parseFloat",
+        "encodeURI",
+        "decodeURI",
+        "encodeURIComponent",
+        "decodeURIComponent",
+        "undefined",
+        "NaN",
+        "Infinity",
+        "console",
+        "DOMException",
+        "EventTarget",
+        "Event",
+        "CustomEvent",
+        "UIEvent",
+        "MouseEvent",
+        "KeyboardEvent",
+        "MessageEvent",
+        "Node",
+        "Element",
+        "HTMLElement",
+        "SVGElement",
+        "MathMLElement",
+        "Document",
+        "HTMLDocument",
+        "XMLDocument",
+        "DocumentFragment",
+        "DocumentType",
+        "CharacterData",
+        "Text",
+        "CDATASection",
+        "Comment",
+        "ProcessingInstruction",
+        "Attr",
+        "Range",
+        "StaticRange",
+        "AbstractRange",
+        "NodeFilter",
+        "DOMParser",
+        "XMLSerializer",
+        "URL",
+        "URLSearchParams",
+        "AbortController",
+        "AbortSignal",
+        "setTimeout",
+        "clearTimeout",
+        "queueMicrotask",
+    ];
+    for name in intrinsics {
+        let k = vm.heap.intern_key(name);
+        if vm.heap.object_get_own(proxy_h, k, &vm.shapes).is_none() {
+            if let Ok(v) = vm.get_property_by_key(parent_global, k) {
+                vm.heap
+                    .object_define_data(proxy_h, k, v, PropertyAttrs::METHOD, &mut vm.shapes);
+            }
+        }
+    }
+    for (name, val) in [
+        ("window", JsValue::from_object(proxy_h)),
+        ("self", JsValue::from_object(proxy_h)),
+        ("globalThis", JsValue::from_object(proxy_h)),
+        ("document", JsValue::from_object(child_doc)),
+        ("parent", JsValue::from_object(parent_global)),
+        ("top", top_val),
+        ("frameElement", iframe_el),
+    ] {
+        let k = vm.heap.intern_key(name);
         vm.heap
-            .object_define_data(body_obj, k, next, PropertyAttrs::DEFAULT, &mut vm.shapes);
-        let kt = vm.heap.intern_key("textContent");
-        vm.heap
-            .object_define_data(body_obj, kt, next, PropertyAttrs::DEFAULT, &mut vm.shapes);
-        Ok(JsValue::UNDEFINED)
-    });
-    (doc_obj, title, inline_scripts)
+            .object_define_data(proxy_h, k, val, PropertyAttrs::CONFIGURABLE, &mut vm.shapes);
+    }
+}
+
+/// Wraps any own JS functions newly declared on a same-origin child `WindowProxy`
+/// so cross-frame calls (e.g. `iframe.contentWindow.run()`) bind `vm.global` to the child frame.
+fn bind_child_frame_functions(
+    vm: &mut JsVm,
+    proxy_h: HeapHandle,
+    pre_keys: &HashSet<rix_js::PropertyKey>,
+) {
+    let own_keys: Vec<(rix_js::PropertyKey, JsValue)> = vm
+        .heap
+        .get_object(proxy_h)
+        .map(|o| {
+            let mut out = Vec::new();
+            if let Some(rare) = &o.rare {
+                for (&k, prop) in &rare.dict_props {
+                    if !pre_keys.contains(&k) && !prop.attrs.contains(PropertyAttrs::ACCESSOR) {
+                        out.push((k, prop.value));
+                    }
+                }
+            } else if let Some(shape) = vm.shapes.get(rix_js::ShapeId(o.shape_id)) {
+                for &k in shape.keys() {
+                    if !pre_keys.contains(&k) {
+                        if let Some(slot) = shape.lookup(k) {
+                            if let Some(&v) = o.slots.get(slot.offset as usize) {
+                                out.push((k, v));
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+    for (k, val) in own_keys {
+        if let Some(fh) = val.as_object().filter(|&h| vm.is_callable_handle(h)) {
+            let wrapped = vm.alloc_host_fn_rooted(
+                "frame_fn",
+                &[JsValue::from_object(proxy_h), JsValue::from_object(fh)],
+                move |vm, this_val, args| {
+                    let prev_global = vm.global;
+                    vm.global = proxy_h;
+                    let res = vm.call_value(JsValue::from_object(fh), this_val, args);
+                    vm.global = prev_global;
+                    res
+                },
+            );
+            vm.heap.object_define_data(
+                proxy_h,
+                k,
+                JsValue::from_object(wrapped),
+                PropertyAttrs::DEFAULT,
+                &mut vm.shapes,
+            );
+        }
+    }
 }
 
 fn read_proxy_url(
@@ -1419,11 +1507,28 @@ fn attach_proxy_location(
         PropertyAttrs::CONFIGURABLE,
         &mut vm.shapes,
     );
-    // Expose `DOMException` constructor on same-origin WindowProxy so cross-frame tests work.
-    let k_de = vm.heap.intern_key("DOMException");
-    if let Ok(de_val) = vm.get_property_by_key(vm.global, k_de) {
-        vm.heap
-            .object_define_data(proxy_h, k_de, de_val, PropertyAttrs::METHOD, &mut vm.shapes);
+    // Expose core DOM/JS constructors on same-origin WindowProxy so cross-frame tests work.
+    for ctor_name in [
+        "DOMException",
+        "Node",
+        "Element",
+        "Document",
+        "XMLDocument",
+        "Range",
+        "Event",
+        "EventTarget",
+        "Error",
+        "TypeError",
+        "Object",
+        "Array",
+    ] {
+        let k = vm.heap.intern_key(ctor_name);
+        if let Ok(v) = vm.get_property_by_key(vm.global, k) {
+            if !v.is_undefined() {
+                vm.heap
+                    .object_define_data(proxy_h, k, v, PropertyAttrs::METHOD, &mut vm.shapes);
+            }
+        }
     }
 }
 
@@ -1637,6 +1742,10 @@ pub(crate) fn sync_iframe_node(
         (src, srcdoc, sandbox, name, w, h)
     };
 
+    if !host.borrow().document.borrow().is_connected(node_id) {
+        return;
+    }
+
     // Skip redundant re-sync if attributes have not changed since last sync.
     if let Some(existing) = frames.borrow().iframes.get(&node_id) {
         if existing.last_src == src_attr
@@ -1676,14 +1785,14 @@ pub(crate) fn sync_iframe_node(
 
     let was_existing = frames.borrow().iframes.contains_key(&node_id);
     if is_same_origin {
-        let (html_content, child_charset) = if let Some(ref sd) = srcdoc_attr {
+        let (html_content, child_charset, child_ct) = if let Some(ref sd) = srcdoc_attr {
             let cs = rix_html::detect_html_charset(sd.as_bytes());
-            (sd.clone(), cs)
+            (sd.clone(), cs, "text/html".to_string())
         } else if resolved_url.starts_with("http://") || resolved_url.starts_with("https://") {
             fetch_iframe_url_sync(net, &resolved_url, &parent_origin)
-                .unwrap_or_else(|| (String::new(), "UTF-8"))
+                .unwrap_or_else(|| (String::new(), "UTF-8", "text/html".to_string()))
         } else {
-            (String::new(), "UTF-8")
+            (String::new(), "UTF-8", "text/html".to_string())
         };
 
         let proxy_h = alloc_window_proxy(
@@ -1699,8 +1808,15 @@ pub(crate) fn sync_iframe_node(
                 closed: false,
             },
         );
-        let (child_doc, _title, inline_scripts) =
-            build_sub_document(vm, &resolved_url, &html_content, child_charset, proxy_h);
+        let (child_doc, _title, inline_scripts) = build_sub_document(
+            vm,
+            host,
+            &resolved_url,
+            &html_content,
+            child_charset,
+            &child_ct,
+            proxy_h,
+        );
         if let Some(WindowProxyKind::SameOriginChild {
             child_doc: slot, ..
         }) = frames.borrow_mut().proxies.get_mut(&proxy_h)
@@ -1728,43 +1844,67 @@ pub(crate) fn sync_iframe_node(
             );
         }
 
-        // Execute inline scripts inside the same-origin child iframe if sandbox allows scripts.
-        if sandbox.scripts_allowed() {
-            for code in inline_scripts {
-                let wrapped = format!(
-                    "(function(window, self, document, parent, top, frameElement) {{ {code}\n }})"
-                );
-                if let Ok(fn_val) = vm.eval_script(&wrapped) {
-                    let iframe_el = wrap_node(vm, host, node_id);
-                    let top_val = frames.borrow().top_window;
-                    let _ = vm.call_value(
-                        fn_val,
-                        JsValue::from_object(proxy_h),
-                        &[
-                            JsValue::from_object(proxy_h),
-                            JsValue::from_object(proxy_h),
-                            JsValue::from_object(child_doc),
-                            JsValue::from_object(vm.global),
-                            top_val,
-                            iframe_el,
-                        ],
-                    );
+        // Execute external & inline scripts inside the same-origin child iframe's isolated global.
+        if sandbox.scripts_allowed() && !inline_scripts.is_empty() {
+            let saved_global = vm.global;
+            let iframe_el = wrap_node(vm, host, node_id);
+            let top_val = frames.borrow().top_window;
+            install_same_origin_child_globals(
+                vm,
+                proxy_h,
+                child_doc,
+                saved_global,
+                top_val,
+                iframe_el,
+            );
+            let pre_keys: HashSet<rix_js::PropertyKey> = vm
+                .heap
+                .get_object(proxy_h)
+                .map(|o| {
+                    if let Some(rare) = &o.rare {
+                        rare.dict_props.keys().copied().collect()
+                    } else if let Some(shape) = vm.shapes.get(rix_js::ShapeId(o.shape_id)) {
+                        shape.keys().iter().copied().collect()
+                    } else {
+                        HashSet::new()
+                    }
+                })
+                .unwrap_or_default();
+            let base_url = Url::parse(&resolved_url).ok();
+            for script in inline_scripts {
+                let code = match script {
+                    SubdocScript::Inline(c) => Some(c),
+                    SubdocScript::External(src) => {
+                        let script_url = base_url
+                            .as_ref()
+                            .and_then(|b| b.join(&src).ok())
+                            .map(|u| u.to_string())
+                            .unwrap_or(src);
+                        if script_url.starts_with("http://") || script_url.starts_with("https://") {
+                            fetch_iframe_url_sync(net, &script_url, &effective_child_origin)
+                                .map(|(body, _, _)| body)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(code) = code {
+                    vm.global = proxy_h;
+                    let _ = vm.eval_script(&code);
+                    vm.global = saved_global;
                 }
             }
+            bind_child_frame_functions(vm, proxy_h, &pre_keys);
         }
 
-        // Fire async `load` event on the `<iframe>` element.
+        // Fire async `load` event on the `<iframe>` element (supports both `.onload` and inline `onload="..."`).
         let h = Rc::clone(host);
         let ev = Rc::clone(events);
         let el = Rc::clone(event_loop);
         event_loop
             .borrow_mut()
             .post_host_task(TaskPriority::Networking, move |vm| {
-                let iframe_val = wrap_node(vm, &h, node_id);
-                if let Some(ih) = iframe_val.as_object() {
-                    let ep = ev.borrow().event_proto.unwrap_or(vm.object_proto);
-                    fire_object_event_with_proto(vm, &h, &ev, &el, ih, "load", ep, &[]);
-                }
+                let _ = fire_dom_node_event(vm, &h, &ev, &el, node_id, "load", false, false, &[]);
             });
     } else {
         // Cross-origin OOPIF (or opaque sandbox): allocate restricted WindowProxy + emit IPC.
@@ -1850,7 +1990,7 @@ fn fetch_iframe_url_sync(
     net: &SharedNetBridge,
     url: &str,
     origin: &str,
-) -> Option<(String, &'static str)> {
+) -> Option<(String, &'static str, String)> {
     let engine = std::sync::Arc::clone(&net.borrow().fetch_engine);
     let req = rix_net::FetchRequest {
         url: url.to_string(),
@@ -1886,8 +2026,15 @@ fn fetch_iframe_url_sync(
             .and_then(|rt| rt.block_on(engine.fetch(req)).ok())
     };
     res.map(|r| {
+        let ct = r
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| "text/html".to_string());
         let http_cs = extract_content_type_charset(&r.headers);
-        decode_html_bytes(&r.body, http_cs.as_deref())
+        let (decoded, cs) = decode_html_bytes(&r.body, http_cs.as_deref());
+        (decoded, cs, ct)
     })
 }
 
@@ -2864,6 +3011,7 @@ fn install_window_browsing_context(
 
     // window.open(url?, target?, features?)
     {
+        let h_open = Rc::clone(host);
         let wa = Rc::clone(web_apis);
         let fr = Rc::clone(frames);
         define_host_method(vm, g, "open", move |vm, _, args| {
@@ -2998,7 +3146,15 @@ fn install_window_browsing_context(
                 },
             );
             if !is_cross_origin {
-                let (doc_h, _, _) = build_sub_document(vm, &resolved_url, "", "UTF-8", proxy_h);
+                let (doc_h, _, _) = build_sub_document(
+                    vm,
+                    &h_open,
+                    &resolved_url,
+                    "",
+                    "UTF-8",
+                    "text/html",
+                    proxy_h,
+                );
                 if let Some(WindowProxyKind::Auxiliary { doc, .. }) =
                     fr.borrow_mut().proxies.get_mut(&proxy_h)
                 {
@@ -3156,6 +3312,30 @@ fn install_html_iframe_element_proto(
     frames: &SharedFrames,
 ) {
     let ip = host.borrow().prototypes.html_iframe_element_proto;
+
+    // Register dynamic connect hook so `document.body.appendChild(iframe)` immediately
+    // loads the child browsing context and queues its async `load` event.
+    // Use `Weak` references to avoid an `Rc` cycle with `HostState`.
+    {
+        let h_hook = Rc::downgrade(host);
+        let ev_hook = Rc::downgrade(events);
+        let el_hook = Rc::downgrade(event_loop);
+        let wa_hook = Rc::downgrade(web_apis);
+        let net_hook = Rc::downgrade(net);
+        let fr_hook = Rc::downgrade(frames);
+        host.borrow_mut().iframe_connect_hook = Some(Rc::new(move |vm, nid| {
+            if let (Some(h), Some(ev), Some(el), Some(wa), Some(net), Some(fr)) = (
+                h_hook.upgrade(),
+                ev_hook.upgrade(),
+                el_hook.upgrade(),
+                wa_hook.upgrade(),
+                net_hook.upgrade(),
+                fr_hook.upgrade(),
+            ) {
+                sync_iframe_node(vm, &h, &ev, &el, &wa, &net, &fr, nid);
+            }
+        }));
+    }
 
     // Reflected string attributes that trigger iframe re-sync on mutation (`src`, `srcdoc`).
     // Note: `HTMLIFrameElement.prototype.sandbox` is a `[PutForwards=value] DOMTokenList`

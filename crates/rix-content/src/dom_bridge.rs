@@ -205,7 +205,15 @@ pub struct HostState {
     pub active_element: Option<NodeId>,
     pub next_web_anim_id: u64,
     pub selection: crate::selection::SelectionState,
+    pub(crate) iframe_connect_hook: Option<IframeConnectHook>,
+    pub(crate) body_attr_handler_hook: Option<BodyAttrHandlerHook>,
 }
+
+/// Callback invoked when an `<iframe>` element is connected into a live document.
+pub(crate) type IframeConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
+
+/// Callback invoked when an `on*` attribute is set on `<body>`/`<frameset>`.
+pub(crate) type BodyAttrHandlerHook = Rc<dyn Fn(&mut JsVm, NodeId, &str, &str)>;
 
 /// Shared handle to [`HostState`].
 pub type SharedHost = Rc<RefCell<HostState>>;
@@ -284,6 +292,8 @@ impl HostState {
             active_element: None,
             next_web_anim_id: 1,
             selection: crate::selection::SelectionState::default(),
+            iframe_connect_hook: None,
+            body_attr_handler_hook: None,
         }
     }
 
@@ -1904,6 +1914,22 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
         {
             let doc_rc = Rc::clone(&h.borrow().document);
             let doc = doc_rc.borrow();
+            // WHATWG DOM §4.2.4 "replace": step 1 checks parent type BEFORE checking whether oldChild is a child of parent.
+            if !matches!(
+                doc.get(parent),
+                Some(
+                    NodeData::Document
+                        | NodeData::DocumentFragment
+                        | NodeData::ShadowRoot { .. }
+                        | NodeData::Element(_)
+                )
+            ) {
+                return Err(crate::web_apis::create_dom_exception(
+                    vm,
+                    "HierarchyRequestError",
+                    "Parent node cannot have children",
+                ));
+            }
             if doc.parent(old_child) != Some(parent) {
                 return Err(crate::web_apis::create_dom_exception(
                     vm,
@@ -2138,8 +2164,27 @@ pub(crate) fn insert_node_into_parent(
         next_sibling: next_sib,
     });
     if parent_connected {
+        let iframe_hook = host.borrow().iframe_connect_hook.clone();
         for n in to_insert {
             notify_custom_element_subtree(vm, host, n, true);
+            if let Some(ref hook) = iframe_hook {
+                let iframes: Vec<NodeId> = {
+                    let doc_rc = Rc::clone(&host.borrow().document);
+                    let doc = doc_rc.borrow();
+                    doc.descendants(n)
+                        .filter(|&id| {
+                            matches!(
+                                doc.get(id),
+                                Some(NodeData::Element(e))
+                                    if e.name.local.as_str().eq_ignore_ascii_case("iframe")
+                            )
+                        })
+                        .collect()
+                };
+                for fid in iframes {
+                    hook(vm, fid);
+                }
+            }
         }
     }
     Ok(())
@@ -4845,16 +4890,44 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         ))
     });
 
-    // document.write(...) / document.writeln(...) -> injects into paused HtmlParserStream!
+    // document.write(...) / document.writeln(...) -> injects into paused HtmlParserStream
+    // or appends parsed fragment into sub-document's body when called outside active parse.
     let h = Rc::clone(host);
-    define_host_method(vm, dp, "write", move |vm, _, args| {
+    define_host_method(vm, dp, "write", move |vm, t, args| {
         let mut html = String::new();
         for &a in args {
             html.push_str(&vm.value_to_rust_string(a));
         }
-        let parser_opt = h.borrow().active_parser.clone();
+        let doc_id = require_node(vm, &h, t).ok();
+        let main_root = h.borrow().document.borrow().root();
+        let parser_opt = if doc_id == Some(main_root) {
+            h.borrow().active_parser.clone()
+        } else {
+            None
+        };
         if let Some(parser) = parser_opt {
             parser.borrow_mut().insert_document_write(&html);
+        } else if let Some(did) = doc_id {
+            let body = find_elements_by_tag(&h, did, "body")
+                .into_iter()
+                .next()
+                .or_else(|| h.borrow().document.borrow().document_element_of(did));
+            if let Some(target_el) = body {
+                let (frag_doc, roots) = parse_html_fragment(&html, None);
+                let mut added = Vec::new();
+                {
+                    let doc_rc = Rc::clone(&h.borrow().document);
+                    let mut doc = doc_rc.borrow_mut();
+                    for c in roots {
+                        let cloned = doc.clone_subtree_from(&frag_doc, c);
+                        doc.append_child(target_el, cloned);
+                        added.push(cloned);
+                    }
+                }
+                for &n in &added {
+                    h.borrow_mut().adopt_subtree(n, did);
+                }
+            }
         }
         Ok(JsValue::UNDEFINED)
     });
@@ -5473,6 +5546,15 @@ pub(crate) fn set_element_attr(
     };
     host.borrow_mut()
         .invalidate_attr_mutation(nid, &attr_local, old_val.as_deref(), Some(val));
+    if matches!(tag_lower.as_str(), "body" | "frameset")
+        && attr_local.starts_with("on")
+        && attr_ns.is_empty()
+    {
+        let hook = host.borrow().body_attr_handler_hook.clone();
+        if let Some(f) = hook {
+            f(vm, nid, &attr_local, val);
+        }
+    }
     host.borrow().emit_mutation(DomMutation::Attributes {
         target: nid,
         attribute_name: attr_local.clone(),

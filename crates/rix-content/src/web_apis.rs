@@ -44,6 +44,7 @@ pub(crate) struct AbortSignalEntry {
     pub aborted: bool,
     pub reason: JsValue,
     pub handle: AbortHandle,
+    pub dependent_signals: Vec<HeapHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +252,9 @@ impl WebApiState {
         }
         for s in self.abort_signals.values() {
             out.push(s.reason);
+            for &dep in &s.dependent_signals {
+                out.push(JsValue::from_object(dep));
+            }
         }
         for u in self.url_objects.values() {
             out.push(JsValue::from_object(u.search_params));
@@ -274,6 +278,9 @@ impl WebApiState {
     pub fn sweep_dead(&mut self, heap: &rix_js::GcHeap) {
         self.blobs.retain(|&h, _| heap.is_alive(h));
         self.abort_signals.retain(|&h, _| heap.is_alive(h));
+        for s in self.abort_signals.values_mut() {
+            s.dependent_signals.retain(|&h| heap.is_alive(h));
+        }
         self.url_objects.retain(|&h, _| heap.is_alive(h));
         self.search_params.retain(|&h, _| heap.is_alive(h));
         self.text_decoders.retain(|&h, _| heap.is_alive(h));
@@ -3229,17 +3236,37 @@ fn trigger_abort_signal(
     } else {
         reason_arg
     };
-    let handle = {
+    // Per WHATWG DOM §3.1.2 "signal abort": mark this signal AND all non-aborted dependent
+    // signals as aborted BEFORE firing any `abort` events!
+    let mut to_notify: Vec<HeapHandle> = Vec::new();
+    let mut handles_to_abort: Vec<AbortHandle> = Vec::new();
+    {
         let mut st = web_apis.borrow_mut();
-        let Some(entry) = st.abort_signals.get_mut(&sig_h) else {
-            return;
-        };
-        entry.aborted = true;
-        entry.reason = reason;
-        entry.handle.clone()
-    };
-    handle.abort();
-    fire_object_event(vm, host, events, event_loop, sig_h, "abort", &[]);
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(sig_h);
+        while let Some(cur) = queue.pop_front() {
+            let Some(entry) = st.abort_signals.get_mut(&cur) else {
+                continue;
+            };
+            if entry.aborted {
+                continue;
+            }
+            entry.aborted = true;
+            entry.reason = reason;
+            handles_to_abort.push(entry.handle.clone());
+            to_notify.push(cur);
+            let deps = entry.dependent_signals.clone();
+            for dep in deps {
+                queue.push_back(dep);
+            }
+        }
+    }
+    for h in handles_to_abort {
+        h.abort();
+    }
+    for s in to_notify {
+        fire_object_event(vm, host, events, event_loop, s, "abort", &[]);
+    }
 }
 
 fn install_abort_controller(
@@ -3313,9 +3340,97 @@ fn install_abort_controller(
                 aborted: true,
                 reason,
                 handle,
+                dependent_signals: Vec::new(),
             },
         );
         Ok(JsValue::from_object(sig))
+    });
+
+    // AbortSignal.any(signals) — WHATWG DOM §3.1.2
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, sig_ctor, "any", move |vm, _, args| {
+        let iter_arg = arg(args, 0);
+        let Some(iter_h) = iter_arg.as_object() else {
+            return Err(
+                vm.type_error("AbortSignal.any requires an iterable of AbortSignal objects")
+            );
+        };
+        let mut input_signals: Vec<HeapHandle> = Vec::new();
+        let sym_iter = vm.key_symbol_iterator;
+        let iter_method = vm.get_property_by_key(iter_h, sym_iter)?;
+        if !iter_method
+            .as_object()
+            .is_some_and(|fh| vm.is_callable_handle(fh))
+        {
+            return Err(vm.type_error("AbortSignal.any argument is not iterable"));
+        }
+        let iterator = vm.call_value(iter_method, iter_arg, &[])?;
+        let Some(it_h) = iterator.as_object() else {
+            return Err(vm.type_error("Iterator must be an object"));
+        };
+        let k_next = vm.heap.intern_key("next");
+        let k_done = vm.heap.intern_key("done");
+        let k_value = vm.heap.intern_key("value");
+        let next_fn = vm.get_property_by_key(it_h, k_next)?;
+        for _ in 0..100_000 {
+            let step = vm.call_value(next_fn, iterator, &[])?;
+            let Some(sh) = step.as_object() else {
+                return Err(vm.type_error("Iterator result is not an object"));
+            };
+            let done = vm.get_property_by_key(sh, k_done)?;
+            if vm.to_boolean(done) {
+                break;
+            }
+            let item = vm.get_property_by_key(sh, k_value)?;
+            let sig_h = require_abort_signal(vm, &wa, item)?;
+            input_signals.push(sig_h);
+        }
+
+        let result_sig = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(sp)));
+        // Check if any source signal is already aborted (using the first aborted signal's reason).
+        let first_aborted_reason = {
+            let st = wa.borrow();
+            input_signals.iter().find_map(|sh| {
+                st.abort_signals
+                    .get(sh)
+                    .and_then(|e| e.aborted.then_some(e.reason))
+            })
+        };
+        if let Some(reason) = first_aborted_reason {
+            let handle = AbortHandle::new();
+            handle.abort();
+            wa.borrow_mut().abort_signals.insert(
+                result_sig,
+                AbortSignalEntry {
+                    aborted: true,
+                    reason,
+                    handle,
+                    dependent_signals: Vec::new(),
+                },
+            );
+            return Ok(JsValue::from_object(result_sig));
+        }
+
+        let mut st = wa.borrow_mut();
+        st.abort_signals.insert(
+            result_sig,
+            AbortSignalEntry {
+                aborted: false,
+                reason: JsValue::UNDEFINED,
+                handle: AbortHandle::new(),
+                dependent_signals: Vec::new(),
+            },
+        );
+        for src in input_signals {
+            if let Some(entry) = st.abort_signals.get_mut(&src) {
+                if !entry.dependent_signals.contains(&result_sig) {
+                    entry.dependent_signals.push(result_sig);
+                }
+            }
+        }
+        Ok(JsValue::from_object(result_sig))
     });
 
     let wa = Rc::clone(web_apis);
@@ -3333,17 +3448,22 @@ fn install_abort_controller(
                 aborted: false,
                 reason: JsValue::UNDEFINED,
                 handle: AbortHandle::new(),
+                dependent_signals: Vec::new(),
             },
         );
         let wa_cb = Rc::clone(&wa);
         let h_cb = Rc::clone(&h_to);
         let ev_cb = Rc::clone(&ev_to);
         let el_cb = Rc::clone(&el_to);
-        let cb = vm.alloc_host_fn("abort_timeout", move |vm, _, _| {
-            let reason = create_dom_exception(vm, "TimeoutError", "signal timed out").value;
-            trigger_abort_signal(vm, &h_cb, &ev_cb, &el_cb, &wa_cb, sig, reason);
-            Ok(JsValue::UNDEFINED)
-        });
+        let cb = vm.alloc_host_fn_rooted(
+            "abort_timeout",
+            &[JsValue::from_object(sig)],
+            move |vm, _, _| {
+                let reason = create_dom_exception(vm, "TimeoutError", "signal timed out").value;
+                trigger_abort_signal(vm, &h_cb, &ev_cb, &el_cb, &wa_cb, sig, reason);
+                Ok(JsValue::UNDEFINED)
+            },
+        );
         el_to.borrow_mut().schedule_timer(cb, ms, Vec::new(), false);
         Ok(JsValue::from_object(sig))
     });
@@ -3380,6 +3500,7 @@ fn install_abort_controller(
                 aborted: false,
                 reason: JsValue::UNDEFINED,
                 handle: AbortHandle::new(),
+                dependent_signals: Vec::new(),
             },
         );
         let ctrl = vm
