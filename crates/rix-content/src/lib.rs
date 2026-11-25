@@ -8,6 +8,7 @@
 
 pub mod canvas2d;
 pub mod cssom;
+pub mod custom_elements;
 pub mod dom_bridge;
 pub mod dom_collections;
 pub mod dom_interfaces;
@@ -216,6 +217,7 @@ impl ContentRuntime {
         let events = install_event_system(&mut vm, &host, &event_loop);
         let observers = install_observers(&mut vm, &host, &event_loop);
         shadow_dom::install_shadow_dom_apis(&mut vm, &host, &events, &event_loop);
+        custom_elements::install_custom_elements(&mut vm, &host, &events, &event_loop);
         let web_apis = install_web_apis(&mut vm, &host, &events, &event_loop, origin_url, storage);
         trusted_types::install_trusted_types(&mut vm, &host, &events);
         dom_parsing::install_dom_parsing(&mut vm, &host, &events, &event_loop, &web_apis);
@@ -410,6 +412,13 @@ impl ContentRuntime {
                     };
                     let scripts_allowed = self.frames.borrow().sandbox.scripts_allowed();
                     if scripts_allowed && is_classic && !code.trim().is_empty() {
+                        let doc_root = {
+                            let doc_cell = Rc::clone(&self.host.borrow().document);
+                            let mut doc = doc_cell.borrow_mut();
+                            attach_declarative_shadow_roots(&mut doc);
+                            doc.root()
+                        };
+                        custom_elements::upgrade_subtree(&mut self.vm, &self.host, doc_root, false);
                         self.eval_script(&code)?;
                     }
                 }
@@ -418,11 +427,13 @@ impl ContentRuntime {
         }
 
         parser.borrow_mut().finish();
-        {
+        let finished_root = {
             let doc_cell = Rc::clone(&self.host.borrow().document);
             let mut doc = doc_cell.borrow_mut();
             attach_declarative_shadow_roots(&mut doc);
-        }
+            doc.root()
+        };
+        custom_elements::upgrade_subtree(&mut self.vm, &self.host, finished_root, false);
         self.host.borrow_mut().active_parser = None;
         self.host.borrow_mut().ready_state = "complete".to_string();
         sync_all_iframes_in_document(
@@ -634,6 +645,15 @@ impl ContentRuntime {
                             is_module,
                         });
                     } else {
+                        // Attach any declarative shadow roots and upgrade parser-created
+                        // custom elements parsed prior to this inline script (HTML §13.2.6.1).
+                        let doc_root = {
+                            let doc_cell = Rc::clone(&self.host.borrow().document);
+                            let mut doc = doc_cell.borrow_mut();
+                            attach_declarative_shadow_roots(&mut doc);
+                            doc.root()
+                        };
+                        custom_elements::upgrade_subtree(&mut self.vm, &self.host, doc_root, false);
                         self.host.borrow_mut().current_script = Some(script_id);
                         let res = self.eval_script_cached(&code);
                         self.host.borrow_mut().current_script = None;
@@ -651,11 +671,13 @@ impl ContentRuntime {
         }
 
         parser.borrow_mut().finish();
-        {
+        let finished_root = {
             let doc_cell = Rc::clone(&self.host.borrow().document);
             let mut doc = doc_cell.borrow_mut();
             attach_declarative_shadow_roots(&mut doc);
-        }
+            doc.root()
+        };
+        custom_elements::upgrade_subtree(&mut self.vm, &self.host, finished_root, false);
         self.host.borrow_mut().active_parser = None;
 
         // Execute deferred classic scripts and ES modules in document order before DOMContentLoaded.

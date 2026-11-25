@@ -14,7 +14,10 @@ pub use events::{
 };
 pub use indextree::NodeId;
 pub use markup5ever::{LocalName, Namespace, QualName};
-pub use node::{is_valid_custom_element_name, is_valid_shadow_host_name, ElementData, NodeData};
+pub use node::{
+    is_valid_custom_element_name, is_valid_shadow_host_name, CustomElementState, ElementData,
+    NodeData,
+};
 pub use query::{Combinator, ComplexSelector, CompoundSelector, PseudoClass, SimpleSelector};
 pub use srcset::{parse_srcset, select_image_source, ImageCandidate};
 pub use state::{fold_hash_u32, hash_ident, hash_ident_ascii_lower, DirtyFlags, ElementState};

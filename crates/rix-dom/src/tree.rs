@@ -978,6 +978,15 @@ impl Document {
                     .map(|_| destination.new_node(NodeData::DocumentFragment));
                 element.shadow_root = None;
                 element.content_document = None;
+                element.custom_states.clear();
+                if matches!(
+                    element.custom_element_state,
+                    crate::node::CustomElementState::Custom
+                        | crate::node::CustomElementState::Precustomized
+                        | crate::node::CustomElementState::Failed
+                ) {
+                    element.set_custom_element_state(crate::node::CustomElementState::Undefined);
+                }
             }
             destination.new_node(data)
         }
@@ -1004,6 +1013,7 @@ impl Document {
                             serializable,
                             slot_assignment,
                             declarative,
+                            null_registry,
                             ..
                         }) = source_document.get(sr)
                         {
@@ -1022,6 +1032,7 @@ impl Document {
                                 } else {
                                     *declarative
                                 },
+                                *null_registry,
                             ))
                         } else {
                             None
@@ -1043,6 +1054,7 @@ impl Document {
                 serializable,
                 slot_assignment,
                 declarative,
+                null_registry,
             )) = shadow_root_info
             {
                 let copy_root = self.new_node(NodeData::ShadowRoot {
@@ -1053,6 +1065,7 @@ impl Document {
                     serializable,
                     slot_assignment,
                     declarative,
+                    null_registry,
                 });
                 if let Some(NodeData::Element(copy_elem)) = self.get_mut(parent) {
                     copy_elem.shadow_root = Some(copy_root);
@@ -1423,6 +1436,7 @@ mod tests {
             serializable: false,
             slot_assignment: "named".into(),
             declarative: false,
+            null_registry: false,
         });
         let inner = doc.new_node(NodeData::Element(ElementData::new(
             markup5ever::QualName::new(None, "http://www.w3.org/1999/xhtml".into(), "p".into()),

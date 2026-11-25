@@ -17,11 +17,8 @@ use rix_css::{
     DisplayMode, LayerId, MediaContext, RegisteredProperty, RixPseudoElement, StyleContext,
     Stylesheet,
 };
-use rix_dom::{
-    is_valid_custom_element_name, is_valid_shadow_host_name, Document, NodeData, NodeId,
-};
+use rix_dom::{is_valid_shadow_host_name, Document, NodeData, NodeId};
 use rix_html::{parse_html_fragment, HtmlParserStream};
-use rix_js::promise::{alloc_promise, resolve_promise};
 use rix_js::{
     GcHeap, HeapHandle, JsException, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs, WeakTable,
 };
@@ -212,10 +209,9 @@ pub struct HostState {
     pub(crate) trusted_types: crate::trusted_types::TrustedTypesState,
     pub(crate) doc_csp: HashMap<NodeId, crate::trusted_types::DocumentCspPolicy>,
     pub(crate) shadow_dom: RefCell<crate::shadow_dom::ShadowDomState>,
+    pub(crate) custom_elements_state: RefCell<crate::custom_elements::CustomElementsState>,
     pub(crate) contextual_scripts: HashSet<NodeId>,
     pub(crate) script_force_async: HashSet<NodeId>,
-    pub(crate) upgraded_custom_elements: HashSet<NodeId>,
-    pub(crate) pending_ce_upgrade_node: Option<NodeId>,
     pub(crate) iframe_connect_hook: Option<IframeConnectHook>,
     pub(crate) body_attr_handler_hook: Option<BodyAttrHandlerHook>,
     pub(crate) script_connect_hook: Option<ScriptConnectHook>,
@@ -313,10 +309,11 @@ impl HostState {
             trusted_types: crate::trusted_types::TrustedTypesState::default(),
             doc_csp: HashMap::new(),
             shadow_dom: RefCell::new(crate::shadow_dom::ShadowDomState::default()),
+            custom_elements_state: RefCell::new(
+                crate::custom_elements::CustomElementsState::default(),
+            ),
             contextual_scripts: HashSet::new(),
             script_force_async: HashSet::new(),
-            upgraded_custom_elements: HashSet::new(),
-            pending_ce_upgrade_node: None,
             iframe_connect_hook: None,
             body_attr_handler_hook: None,
             script_connect_hook: None,
@@ -402,6 +399,15 @@ impl HostState {
             .invalidate_state_change(&mut doc, nid, changed);
     }
 
+    /// Invalidates style & layout caches for `nid` (e.g. `:state(...)` custom state change).
+    pub fn invalidate_style_for_node(&mut self, nid: NodeId) {
+        let doc_rc = Rc::clone(&self.document);
+        let mut doc = doc_rc.borrow_mut();
+        doc.bump_style_revision_for(nid);
+        self.last_style_revs = None;
+        self.last_layout_revs = None;
+    }
+
     /// Resolves a JS wrapper's `host_tag` back to its `NodeId`.
     #[must_use]
     pub fn node_for_handle(&self, vm: &JsVm, handle: HeapHandle) -> Option<NodeId> {
@@ -438,6 +444,7 @@ impl HostState {
             out.push(JsValue::from_object(sp));
         }
         self.trusted_types.collect_roots(out);
+        self.custom_elements_state.borrow().collect_roots(out);
         self.prototypes.collect_roots(out);
         for &proto in self.interface_protos.values() {
             out.push(JsValue::from_object(proto));
@@ -2064,6 +2071,15 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
                 if let NodeData::Element(ref mut el) = data {
                     el.shadow_root = None;
                     el.content_document = None;
+                    el.custom_states.clear();
+                    if matches!(
+                        el.custom_element_state,
+                        rix_dom::CustomElementState::Custom
+                            | rix_dom::CustomElementState::Precustomized
+                            | rix_dom::CustomElementState::Failed
+                    ) {
+                        el.set_custom_element_state(rix_dom::CustomElementState::Undefined);
+                    }
                     if el.template_contents.is_some() {
                         el.template_contents = Some(doc.new_node(NodeData::DocumentFragment));
                     }
@@ -2081,6 +2097,7 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
                         serializable,
                         slot_assignment,
                         declarative: false,
+                        null_registry: false,
                     });
                     if let Some(NodeData::Element(el)) = doc.get_mut(copy) {
                         el.shadow_root = Some(copy_sr);
@@ -2095,6 +2112,10 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
         };
         if let Some(od) = owner_doc {
             h.borrow_mut().adopt_subtree(cloned, od);
+            if let Some(src_reg) = crate::custom_elements::effective_registry_for_element(&h, nid) {
+                crate::custom_elements::set_element_registry(&h, cloned, Some(src_reg));
+            }
+            crate::custom_elements::upgrade_subtree(vm, &h, cloned, true);
         } else {
             let meta_opt = h.borrow().doc_meta.get(&nid).cloned();
             if let Some(meta) = meta_opt {
@@ -2227,8 +2248,15 @@ pub(crate) fn insert_node_into_parent(
         }
     }
 
-    for &n in &to_insert {
+    let prev_docs: Vec<(NodeId, NodeId)> = to_insert
+        .iter()
+        .map(|&n| (n, host.borrow().owner_doc_of(n)))
+        .collect();
+    for &(n, old_doc) in &prev_docs {
         host.borrow_mut().adopt_subtree(n, target_doc);
+        if old_doc != target_doc {
+            crate::custom_elements::notify_subtree_adopted(vm, host, n, old_doc, target_doc);
+        }
     }
 
     let parent_connected = host.borrow().document.borrow().is_connected(parent);
@@ -2726,6 +2754,7 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
             attribute_namespace: if ns.is_empty() { None } else { Some(ns) },
             old_value: old_val,
         });
+        crate::custom_elements::drain_backup_queue(vm, &h);
         Ok(JsValue::UNDEFINED)
     });
     let h = Rc::clone(host);
@@ -2755,6 +2784,7 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
                 attribute_namespace: if ns.is_empty() { None } else { Some(ns) },
                 old_value: old_val,
             });
+            crate::custom_elements::drain_backup_queue(vm, &h);
         }
         Ok(JsValue::UNDEFINED)
     });
@@ -3187,6 +3217,16 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         let serializable = vm
             .get_property_by_key(opts_h, k_ser)
             .is_ok_and(|v| vm.to_boolean(v));
+        let host_reg = crate::custom_elements::effective_registry_for_element(&h, host_id);
+        let (has_explicit_reg, resolved_reg) =
+            crate::custom_elements::resolve_registry_option(vm, &h, opts_h, host_reg)?;
+        if crate::custom_elements::is_shadow_disabled_for_element(&h, host_id) {
+            return Err(crate::web_apis::create_dom_exception(
+                vm,
+                "NotSupportedError",
+                "Shadow root cannot be attached to this custom element (disabledFeatures includes 'shadow')",
+            ));
+        }
         let owner_doc = h.borrow().owner_doc_of(host_id);
         let sr_id = {
             let _doc_rc = Rc::clone(&h.borrow().document);
@@ -3241,6 +3281,7 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
                     serializable,
                     slot_assignment,
                     declarative: false,
+                    null_registry: has_explicit_reg && resolved_reg.is_none(),
                 });
                 if let Some(NodeData::Element(e)) = doc.get_mut(host_id) {
                     e.shadow_root = Some(sr);
@@ -3249,6 +3290,7 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
             }
         };
         h.borrow_mut().set_owner_doc(sr_id, owner_doc);
+        crate::custom_elements::set_shadow_root_registry(&h, sr_id, resolved_reg);
         crate::shadow_dom::refresh_slots_for_shadow_root(&h, sr_id);
         Ok(wrap_node(vm, &h, sr_id))
     });
@@ -4630,34 +4672,35 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         } else {
             ""
         };
-        let is_opt: Option<String> = arg(args, 1).as_object().and_then(|oh| {
+        let mut is_opt: Option<String> = None;
+        let mut explicit_reg: Option<Option<crate::custom_elements::RegistryId>> = None;
+        let opts_arg = arg(args, 1);
+        if opts_arg.is_string() {
+            is_opt = Some(vm.value_to_rust_string(opts_arg));
+        } else if let Some(oh) = opts_arg.as_object() {
             let k_is = vm.heap.intern_key("is");
-            vm.get_property_by_key(oh, k_is).ok().and_then(|v| {
-                if v.is_undefined() {
-                    None
-                } else {
-                    Some(vm.value_to_rust_string(v))
-                }
-            })
-        });
-        let nid = {
-            let doc_rc = Rc::clone(&h.borrow().document);
-            let mut doc = doc_rc.borrow_mut();
-            let n = doc.create_element_ns(ns, None, &local);
-            if let Some(ref is_val) = is_opt {
-                if let Some(NodeData::Element(el)) = doc.get_mut(n) {
-                    el.set_attribute("is", is_val);
-                }
+            let iv = vm.get_property_by_key(oh, k_is)?;
+            if !iv.is_undefined() {
+                is_opt = Some(crate::dom_parsing::to_dom_string(vm, iv)?);
             }
-            n
-        };
-        h.borrow_mut().set_owner_doc(nid, doc_id);
-        let wrapper = wrap_node(vm, &h, nid);
-        if ns == crate::dom_interfaces::HTML_NS {
-            let ce_key = is_opt.as_deref().unwrap_or(&local);
-            upgrade_if_custom_element(vm, &h, nid, ce_key, &local);
+            let default_reg = crate::custom_elements::registry_for_document(&h, doc_id);
+            let (has_reg, reg_val) =
+                crate::custom_elements::resolve_registry_option(vm, &h, oh, default_reg)?;
+            if has_reg {
+                explicit_reg = Some(reg_val);
+            }
         }
-        Ok(wrapper)
+        crate::custom_elements::create_element_with_ce(
+            vm,
+            &h,
+            doc_id,
+            ns,
+            None,
+            &local,
+            is_opt.as_deref(),
+            explicit_reg,
+            true,
+        )
     });
 
     let h = Rc::clone(host);
@@ -4675,17 +4718,35 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         let raw_qname = vm.value_to_rust_string(args[1]);
         let (ns, prefix, local) =
             crate::dom_interfaces::validate_and_extract(vm, &ns, &raw_qname, true)?;
-        let nid =
-            h.borrow()
-                .document
-                .borrow_mut()
-                .create_element_ns(&ns, prefix.as_deref(), &local);
-        h.borrow_mut().set_owner_doc(nid, doc_id);
-        let wrapper = wrap_node(vm, &h, nid);
-        if ns == crate::dom_interfaces::HTML_NS {
-            upgrade_if_custom_element(vm, &h, nid, &local, &local);
+        let mut is_opt: Option<String> = None;
+        let mut explicit_reg: Option<Option<crate::custom_elements::RegistryId>> = None;
+        let opts_arg = arg(args, 2);
+        if opts_arg.is_string() {
+            is_opt = Some(vm.value_to_rust_string(opts_arg));
+        } else if let Some(oh) = opts_arg.as_object() {
+            let k_is = vm.heap.intern_key("is");
+            let iv = vm.get_property_by_key(oh, k_is)?;
+            if !iv.is_undefined() {
+                is_opt = Some(crate::dom_parsing::to_dom_string(vm, iv)?);
+            }
+            let default_reg = crate::custom_elements::registry_for_document(&h, doc_id);
+            let (has_reg, reg_val) =
+                crate::custom_elements::resolve_registry_option(vm, &h, oh, default_reg)?;
+            if has_reg {
+                explicit_reg = Some(reg_val);
+            }
         }
-        Ok(wrapper)
+        crate::custom_elements::create_element_with_ce(
+            vm,
+            &h,
+            doc_id,
+            &ns,
+            prefix.as_deref(),
+            &local,
+            is_opt.as_deref(),
+            explicit_reg,
+            true,
+        )
     });
 
     let h = Rc::clone(host);
@@ -4881,11 +4942,18 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
             }
             _ => {}
         }
+        let old_doc = h.borrow().owner_doc_of(nid);
         let old_parent = h.borrow().document.borrow().parent(nid);
-        if let Some(op) = old_parent {
-            remove_node_from_parent(vm, &h, op, nid)?;
-        }
-        h.borrow_mut().adopt_subtree(nid, doc_id);
+        crate::custom_elements::with_ce_reactions(vm, &h, |vm| {
+            if let Some(op) = old_parent {
+                remove_node_from_parent(vm, &h, op, nid)?;
+            }
+            h.borrow_mut().adopt_subtree(nid, doc_id);
+            if old_doc != doc_id {
+                crate::custom_elements::notify_subtree_adopted(vm, &h, nid, old_doc, doc_id);
+            }
+            Ok(())
+        })?;
         Ok(node_val)
     });
 
@@ -4893,7 +4961,19 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
     define_host_method(vm, dp, "importNode", move |vm, t, args| {
         let doc_id = require_node(vm, &h, t)?;
         let node_val = arg(args, 0);
-        let deep = vm.to_boolean(arg(args, 1));
+        let opt_arg = arg(args, 1);
+        let (deep, explicit_reg) = if let Some(oh) = opt_arg.as_object() {
+            let k_self = vm.heap.intern_key("selfOnly");
+            let self_only = vm
+                .get_property_by_key(oh, k_self)
+                .is_ok_and(|v| vm.to_boolean(v));
+            let default_reg = crate::custom_elements::registry_for_document(&h, doc_id);
+            let (has_reg, reg_val) =
+                crate::custom_elements::resolve_registry_option(vm, &h, oh, default_reg)?;
+            (!self_only, if has_reg { Some(reg_val) } else { None })
+        } else {
+            (vm.to_boolean(opt_arg), None)
+        };
         if let Some(ah) = node_val.as_object() {
             let entry_opt = h.borrow().attrs.get(&ah).cloned();
             if let Some(entry) = entry_opt {
@@ -4943,12 +5023,21 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
             let mut doc = doc_rc.borrow_mut();
             if deep {
                 let snap = doc.clone();
-                doc.clone_subtree_from(&snap, nid)
+                doc.clone_subtree_with_options(&snap, nid, true)
             } else {
                 let mut data = doc.get(nid).cloned().unwrap_or(NodeData::DocumentFragment);
                 if let NodeData::Element(ref mut el) = data {
                     el.shadow_root = None;
                     el.content_document = None;
+                    el.custom_states.clear();
+                    if matches!(
+                        el.custom_element_state,
+                        rix_dom::CustomElementState::Custom
+                            | rix_dom::CustomElementState::Precustomized
+                            | rix_dom::CustomElementState::Failed
+                    ) {
+                        el.set_custom_element_state(rix_dom::CustomElementState::Undefined);
+                    }
                     if el.template_contents.is_some() {
                         el.template_contents = Some(doc.new_node(NodeData::DocumentFragment));
                     }
@@ -4957,6 +5046,21 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
             }
         };
         h.borrow_mut().adopt_subtree(cloned, doc_id);
+        let target_reg = match explicit_reg {
+            Some(r) => r,
+            None => crate::custom_elements::registry_for_document(&h, doc_id),
+        };
+        {
+            let elements = {
+                let doc_rc = Rc::clone(&h.borrow().document);
+                let doc = doc_rc.borrow();
+                crate::custom_elements::collect_shadow_including_elements(&doc, cloned, true)
+            };
+            for el in elements {
+                crate::custom_elements::set_element_registry(&h, el, target_reg);
+            }
+        }
+        crate::custom_elements::upgrade_subtree(vm, &h, cloned, true);
         Ok(wrap_node(vm, &h, cloned))
     });
 
@@ -5463,131 +5567,9 @@ fn install_shadow_root_prototype(vm: &mut JsVm, host: &SharedHost) {
 // Window: CustomElementRegistry & CSSOM (`getComputedStyle`)
 // ---------------------------------------------------------------------------
 
-fn install_window_and_cssom(vm: &mut JsVm, host: &SharedHost) {
-    // window.customElements (`CustomElementRegistry`)
-    let ce_reg_proto = crate::dom_interfaces::make_proto(vm, vm.object_proto);
-    let _ = crate::dom_interfaces::register_dom_interface(
-        vm,
-        "CustomElementRegistry",
-        ce_reg_proto,
-        None,
-        false,
-    );
-    let ce_reg = vm.heap.alloc_object(JsObject::with_kind(
-        ObjectKind::Ordinary,
-        Some(ce_reg_proto),
-    ));
-    let h = Rc::clone(host);
-    define_host_method(vm, ce_reg_proto, "define", move |vm, _, args| {
-        let name = vm.value_to_rust_string(arg(args, 0));
-        if !is_valid_custom_element_name(&name) {
-            return Err(crate::web_apis::create_dom_exception(
-                vm,
-                "SyntaxError",
-                &format!("'{name}' is not a valid custom element name"),
-            ));
-        }
-        let Some(ctor) = arg(args, 1).as_object() else {
-            return Err(vm.type_error("customElements.define requires a constructor function"));
-        };
-        if !vm.is_callable_handle(ctor) {
-            return Err(vm.type_error("customElements.define requires a constructor function"));
-        }
-        if h.borrow().custom_elements.contains_key(&name) {
-            return Err(crate::web_apis::create_dom_exception(
-                vm,
-                "NotSupportedError",
-                &format!("Custom element '{name}' is already defined"),
-            ));
-        }
-        // Read optional `static observedAttributes` array on constructor.
-        let k_obs = vm.heap.intern_key("observedAttributes");
-        let obs_val = vm
-            .get_property_by_key(ctor, k_obs)
-            .unwrap_or(JsValue::UNDEFINED);
-        let mut observed_attributes = Vec::new();
-        if obs_val.is_object() {
-            if let Ok(items) = vm.collect_iterable(obs_val) {
-                for item in items {
-                    observed_attributes.push(vm.value_to_rust_string(item));
-                }
-            }
-        }
-        // Read optional `{ extends: "..." }` third argument for customized built-in elements.
-        let extends_opt: Option<String> = arg(args, 2).as_object().and_then(|oh| {
-            let k_ext = vm.heap.intern_key("extends");
-            vm.get_property_by_key(oh, k_ext).ok().and_then(|v| {
-                if v.is_undefined() {
-                    None
-                } else {
-                    Some(vm.value_to_rust_string(v).to_ascii_lowercase())
-                }
-            })
-        });
-        let waiters = {
-            let mut hs = h.borrow_mut();
-            hs.custom_elements.insert(
-                name.clone(),
-                CustomElementDef {
-                    constructor: ctor,
-                    observed_attributes,
-                    extends: extends_opt.clone(),
-                },
-            );
-            hs.when_defined_waiters.remove(&name).unwrap_or_default()
-        };
-        for p in waiters {
-            resolve_promise(vm, p, JsValue::from_object(ctor));
-        }
-        // Upgrade any already-connected matching elements in the document.
-        let root = h.borrow().document.borrow().root();
-        let search_tag = extends_opt.as_deref().unwrap_or(&name);
-        let matching = find_elements_by_tag(&h, root, search_tag);
-        for nid in matching {
-            let matches_ce = if extends_opt.is_some() {
-                let doc_rc = Rc::clone(&h.borrow().document);
-                let doc = doc_rc.borrow();
-                matches!(
-                    doc.get(nid),
-                    Some(NodeData::Element(e)) if e.get_attribute("is") == Some(name.as_str())
-                )
-            } else {
-                true
-            };
-            if matches_ce {
-                upgrade_if_custom_element(vm, &h, nid, &name, search_tag);
-                invoke_custom_element_lifecycle(vm, &h, nid, "connectedCallback", &[]);
-            }
-        }
-        Ok(JsValue::UNDEFINED)
-    });
-
-    let h = Rc::clone(host);
-    define_host_method(vm, ce_reg_proto, "get", move |_vm, _, args| {
-        let name = _vm.value_to_rust_string(arg(args, 0));
-        Ok(h.borrow()
-            .custom_elements
-            .get(&name)
-            .map_or(JsValue::UNDEFINED, |d| JsValue::from_object(d.constructor)))
-    });
-
-    let h = Rc::clone(host);
-    define_host_method(vm, ce_reg_proto, "whenDefined", move |vm, _, args| {
-        let name = vm.value_to_rust_string(arg(args, 0));
-        let p = alloc_promise(vm);
-        let existing = h.borrow().custom_elements.get(&name).map(|d| d.constructor);
-        if let Some(ctor) = existing {
-            resolve_promise(vm, p, JsValue::from_object(ctor));
-        } else {
-            h.borrow_mut()
-                .when_defined_waiters
-                .entry(name)
-                .or_default()
-                .push(p);
-        }
-        Ok(JsValue::from_object(p))
-    });
-    define_global(vm, "customElements", JsValue::from_object(ce_reg));
+fn install_window_and_cssom(_vm: &mut JsVm, _host: &SharedHost) {
+    // `CustomElementRegistry` and `window.customElements` are installed by
+    // `crate::custom_elements::install_custom_elements`.
 }
 
 /// Installs HTML Living Standard §7.3.3.1 named access on `Window` via a `WindowProperties`
@@ -5916,125 +5898,13 @@ fn install_parent_node_mixin(vm: &mut JsVm, host: &SharedHost, proto: HeapHandle
     });
 }
 
-pub(crate) fn upgrade_if_custom_element(
-    vm: &mut JsVm,
-    host: &SharedHost,
-    nid: NodeId,
-    ce_name: &str,
-    local_tag: &str,
-) {
-    if host.borrow().upgraded_custom_elements.contains(&nid) {
-        return;
-    }
-    let def_opt = host.borrow().custom_elements.get(ce_name).cloned();
-    let Some(def) = def_opt else {
-        return;
-    };
-    // Verify autonomous vs customized built-in match.
-    match &def.extends {
-        Some(ext) => {
-            if !ext.eq_ignore_ascii_case(local_tag) {
-                return;
-            }
-        }
-        None => {
-            if !ce_name.eq_ignore_ascii_case(local_tag) {
-                return;
-            }
-        }
-    }
-    {
-        let doc_rc = Rc::clone(&host.borrow().document);
-        let mut doc = doc_rc.borrow_mut();
-        if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
-            e.pseudo_state.insert(rix_dom::ElementState::DEFINED);
-        }
-    }
-    {
-        let mut hb = host.borrow_mut();
-        hb.upgraded_custom_elements.insert(nid);
-        hb.invalidate_element_state(nid, rix_dom::ElementState::DEFINED);
-        hb.pending_ce_upgrade_node = Some(nid);
-    }
-    let wrapper = wrap_node(vm, host, nid);
-    if let Some(wh) = wrapper.as_object() {
-        if let Ok(ctor_proto) = vm.get_property_by_key(def.constructor, vm.key_prototype) {
-            if let Some(ph) = ctor_proto.as_object() {
-                vm.heap.object_set_prototype(wh, Some(ph), &mut vm.shapes);
-            }
-        }
-    }
-    let ctor_val = JsValue::from_object(def.constructor);
-    let _ = vm.construct_value(ctor_val, &[], ctor_val);
-    host.borrow_mut().pending_ce_upgrade_node = None;
-}
-
 pub(crate) fn notify_custom_element_subtree(
     vm: &mut JsVm,
     host: &SharedHost,
     root: NodeId,
     connected: bool,
 ) {
-    if host.borrow().custom_elements.is_empty() {
-        return;
-    }
-    let nodes: Vec<(NodeId, String, String)> = {
-        let hb = host.borrow();
-        let doc = hb.document.borrow();
-        let mut out = Vec::new();
-        for n in doc.descendants(root) {
-            if let Some(NodeData::Element(e)) = doc.get(n) {
-                if &*e.name.ns != crate::dom_interfaces::HTML_NS {
-                    continue;
-                }
-                let tag = e.name.local.as_str().to_ascii_lowercase();
-                if let Some(def) = hb.custom_elements.get(&tag) {
-                    if def.extends.is_none() {
-                        out.push((n, tag.clone(), tag));
-                        continue;
-                    }
-                }
-                if let Some(is_val) = e.get_attribute("is") {
-                    if let Some(def) = hb.custom_elements.get(is_val) {
-                        if def.extends.as_deref() == Some(tag.as_str()) {
-                            out.push((n, is_val.to_string(), tag));
-                        }
-                    }
-                }
-            }
-        }
-        out
-    };
-    let cb_name = if connected {
-        "connectedCallback"
-    } else {
-        "disconnectedCallback"
-    };
-    for (nid, ce_name, tag) in nodes {
-        if connected {
-            upgrade_if_custom_element(vm, host, nid, &ce_name, &tag);
-        }
-        invoke_custom_element_lifecycle(vm, host, nid, cb_name, &[]);
-    }
-}
-
-fn invoke_custom_element_lifecycle(
-    vm: &mut JsVm,
-    host: &SharedHost,
-    nid: NodeId,
-    method: &str,
-    args: &[JsValue],
-) {
-    let wrapper = wrap_node(vm, host, nid);
-    let Some(wh) = wrapper.as_object() else {
-        return;
-    };
-    let k = vm.heap.intern_key(method);
-    if let Ok(cb) = vm.get_property_by_key(wh, k) {
-        if cb.as_object().is_some_and(|h| vm.is_callable_handle(h)) {
-            let _ = vm.call_value(cb, wrapper, args);
-        }
-    }
+    crate::custom_elements::notify_subtree_connected(vm, host, root, connected);
 }
 
 // ---------------------------------------------------------------------------
@@ -6099,33 +5969,15 @@ pub(crate) fn set_element_attr(
     }
     host.borrow().emit_mutation(DomMutation::Attributes {
         target: nid,
-        attribute_name: attr_local.clone(),
+        attribute_name: attr_local,
         attribute_namespace: if attr_ns.is_empty() {
             None
         } else {
             Some(attr_ns)
         },
-        old_value: old_val.clone(),
+        old_value: old_val,
     });
-    let observed = host
-        .borrow()
-        .custom_elements
-        .get(&tag_lower)
-        .is_some_and(|d| d.observed_attributes.iter().any(|a| a == &attr_local));
-    if observed {
-        let n_val = JsValue::from_string(vm.heap.alloc_string(attr_local));
-        let o_val = old_val.map_or(JsValue::NULL, |s| {
-            JsValue::from_string(vm.heap.alloc_string(s))
-        });
-        let v_val = JsValue::from_string(vm.heap.alloc_string(val));
-        invoke_custom_element_lifecycle(
-            vm,
-            host,
-            nid,
-            "attributeChangedCallback",
-            &[n_val, o_val, v_val],
-        );
-    }
+    crate::custom_elements::drain_backup_queue(vm, host);
 }
 
 pub(crate) fn remove_element_attr(vm: &mut JsVm, host: &SharedHost, nid: NodeId, name: &str) {
@@ -6141,14 +5993,12 @@ pub(crate) fn remove_element_attr(vm: &mut JsVm, host: &SharedHost, nid: NodeId,
                 } else {
                     std::borrow::Cow::Borrowed(name)
                 };
-                let tag = e.name.local.as_str().to_ascii_lowercase();
                 e.remove_attribute_by_qname(&effective_name)
-                    .map(|(old, ns, local)| (old, ns, local, tag))
             }
             _ => return,
         }
     };
-    if let Some((old_val, ns, local, tag_lower)) = removed {
+    if let Some((old_val, ns, local)) = removed {
         {
             let mut hb = host.borrow_mut();
             if let Some(ah) = hb
@@ -6164,26 +6014,11 @@ pub(crate) fn remove_element_attr(vm: &mut JsVm, host: &SharedHost, nid: NodeId,
         }
         host.borrow().emit_mutation(DomMutation::Attributes {
             target: nid,
-            attribute_name: local.clone(),
+            attribute_name: local,
             attribute_namespace: if ns.is_empty() { None } else { Some(ns) },
-            old_value: Some(old_val.clone()),
+            old_value: Some(old_val),
         });
-        let observed = host
-            .borrow()
-            .custom_elements
-            .get(&tag_lower)
-            .is_some_and(|d| d.observed_attributes.iter().any(|a| a == &local));
-        if observed {
-            let n_val = JsValue::from_string(vm.heap.alloc_string(local));
-            let o_val = JsValue::from_string(vm.heap.alloc_string(old_val));
-            invoke_custom_element_lifecycle(
-                vm,
-                host,
-                nid,
-                "attributeChangedCallback",
-                &[n_val, o_val, JsValue::NULL],
-            );
-        }
+        crate::custom_elements::drain_backup_queue(vm, host);
     }
 }
 
