@@ -5541,7 +5541,7 @@ fn resolve_inset_computed(
     }
 }
 
-fn format_computed_property_resolved(
+pub(crate) fn format_computed_property_resolved(
     style: &ComputedStyle,
     prop: &str,
     layout_box: Option<&ResolvedLayoutBox>,
@@ -6460,11 +6460,11 @@ fn format_computed_property_resolved(
                 .map_or(AlignValue::Auto, |f| f.justify_self),
         )
         .into(),
-        "row-gap" => style
+        "row-gap" | "grid-row-gap" => style
             .flex_grid
             .as_ref()
             .map_or_else(|| "normal".into(), |f| format_lp(&f.row_gap, &eval)),
-        "column-gap" => style
+        "column-gap" | "grid-column-gap" => style
             .flex_grid
             .as_ref()
             .map_or_else(|| "normal".into(), |f| format_lp(&f.column_gap, &eval)),
@@ -6888,7 +6888,10 @@ fn format_computed_property_resolved(
                 .map(|e| e.transform.as_slice())
                 .filter(|s| !s.is_empty())
             {
-                format_transform_ops_matrix(ops, &eval)
+                let (bw, bh) = layout_box.map_or((0.0, 0.0), |lb| {
+                    (lb.border_size.width, lb.border_size.height)
+                });
+                format_transform_ops_matrix(ops, &eval, bw, bh)
             } else {
                 "none".into()
             }
@@ -7089,6 +7092,119 @@ fn format_computed_property_resolved(
                 format!("{r} {c}")
             }
         }
+        "place-content" => fmt_pair("align-content", "justify-content"),
+        "place-items" => fmt_pair("align-items", "justify-items"),
+        "place-self" => fmt_pair("align-self", "justify-self"),
+        "text-decoration" => format_computed_property_resolved(
+            style,
+            "text-decoration-line",
+            layout_box,
+            parent_flex_grid,
+            ch_px,
+        ),
+        "text-decoration-line" => {
+            let l = style.visual.text_decoration_line;
+            let mut parts = Vec::new();
+            if l.contains(rix_css::TextDecorationLine::UNDERLINE) {
+                parts.push("underline");
+            }
+            if l.contains(rix_css::TextDecorationLine::OVERLINE) {
+                parts.push("overline");
+            }
+            if l.contains(rix_css::TextDecorationLine::LINE_THROUGH) {
+                parts.push("line-through");
+            }
+            if parts.is_empty() {
+                "none".into()
+            } else {
+                parts.join(" ")
+            }
+        }
+        "text-decoration-color" => style
+            .visual
+            .text_decoration_color_computed
+            .as_deref()
+            .map_or_else(
+                || {
+                    style.visual.text_decoration_color.map_or_else(
+                        || {
+                            format_computed_color4(
+                                style.text.color_computed.as_deref(),
+                                style.text.color,
+                                cc_resolved,
+                                dark,
+                                &eval,
+                            )
+                        },
+                        |c| format_css_color(c, cc, dark),
+                    )
+                },
+                |e| e.resolve(cc_resolved, dark, &eval).to_computed_css_string(),
+            ),
+        "transform-origin" => {
+            let orig = style
+                .effects
+                .as_ref()
+                .map(|e| e.transform_origin.clone())
+                .unwrap_or_default();
+            let (bw, bh) = layout_box.map_or((0.0, 0.0), |lb| {
+                (lb.border_size.width, lb.border_size.height)
+            });
+            let xs = if layout_box.is_some() {
+                format_px(orig.x.resolve_px(bw, &eval))
+            } else {
+                format_lp(&orig.x, &eval)
+            };
+            let ys = if layout_box.is_some() {
+                format_px(orig.y.resolve_px(bh, &eval))
+            } else {
+                format_lp(&orig.y, &eval)
+            };
+            if orig.z.abs() > 1e-4 {
+                format!("{xs} {ys} {}", format_px(orig.z))
+            } else {
+                format!("{xs} {ys}")
+            }
+        }
+        "clip-path" => match style.effects.as_ref().map(|e| &e.clip_path) {
+            Some(rix_css::ClipPathValue::Inset {
+                top,
+                right,
+                bottom,
+                left,
+                ..
+            }) => format!(
+                "inset({} {} {} {})",
+                format_lp(top, &eval),
+                format_lp(right, &eval),
+                format_lp(bottom, &eval),
+                format_lp(left, &eval),
+            ),
+            Some(rix_css::ClipPathValue::Circle { radius, cx, cy }) => {
+                let rs = match radius {
+                    rix_css::ClipRadius::Length(l) => format_lp(l, &eval),
+                    rix_css::ClipRadius::ClosestSide => "closest-side".to_string(),
+                    rix_css::ClipRadius::FarthestSide => "farthest-side".to_string(),
+                };
+                format!(
+                    "circle({rs} at {} {})",
+                    format_lp(cx, &eval),
+                    format_lp(cy, &eval)
+                )
+            }
+            Some(rix_css::ClipPathValue::Polygon { fill_odd, points }) => {
+                let pts: Vec<String> = points
+                    .iter()
+                    .map(|(x, y)| format!("{} {}", format_lp(x, &eval), format_lp(y, &eval)))
+                    .collect();
+                if *fill_odd {
+                    format!("polygon(evenodd, {})", pts.join(", "))
+                } else {
+                    format!("polygon({})", pts.join(", "))
+                }
+            }
+            _ => "none".into(),
+        },
         "transition-timing-function" => {
             match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
                 Some(list) if !list.is_empty() => list
@@ -7104,67 +7220,148 @@ fn format_computed_property_resolved(
 }
 
 #[rustfmt::skip]
-fn format_transform_ops_matrix(ops: &[rix_css::TransformOp], eval: &EvalContext) -> String {
+fn format_transform_ops_matrix(ops: &[rix_css::TransformOp], eval: &EvalContext, ref_w: f32, ref_h: f32) -> String {
     use rix_css::values_math::format_math_f64;
     use rix_css::TransformOp as T;
-    if ops.len() == 1 {
-        if let T::Rotate3d(x, y, z, deg) = ops[0] {
-            let (x, y, z, deg) = (f64::from(x), f64::from(y), f64::from(z), f64::from(deg));
-            let len = (x * x + y * y + z * z).sqrt();
-            if len > 0.0 && deg.is_finite() {
-                let (ux, uy, uz) = (x / len, y / len, z / len);
-                let (s, c) = (deg.to_radians().sin(), deg.to_radians().cos());
-                let t = 1.0 - c;
-                let m = [
-                    t * ux * ux + c, t * ux * uy + uz * s, t * ux * uz - uy * s, 0.0,
-                    t * ux * uy - uz * s, t * uy * uy + c, t * uy * uz + ux * s, 0.0,
-                    t * ux * uz + uy * s, t * uy * uz - ux * s, t * uz * uz + c, 0.0,
-                    0.0, 0.0, 0.0, 1.0,
-                ];
-                let clean = |v: f64| if !v.is_finite() || v.abs() < 1e-6 { 0.0 } else { v };
-                let parts: Vec<String> = m.iter().map(|&v| format_math_f64(clean(v))).collect();
-                return format!("matrix3d({})", parts.join(", "));
+    // Column-major 4x4 matrix multiplication (CSS Transforms Level 2).
+    let mul4 = |a: [f64; 16], b: [f64; 16]| -> [f64; 16] {
+        let mut r = [0.0; 16];
+        for col in 0..4 {
+            for row in 0..4 {
+                r[col * 4 + row] = a[row] * b[col * 4]
+                    + a[4 + row] * b[col * 4 + 1]
+                    + a[8 + row] * b[col * 4 + 2]
+                    + a[12 + row] * b[col * 4 + 3];
             }
         }
-        if let T::Matrix3d(m) = ops[0] {
-            let clean = |v: f64| if !v.is_finite() || v.abs() < 1e-6 { 0.0 } else { v };
-            let parts: Vec<String> = m.iter().map(|&v| format_math_f64(clean(f64::from(v)))).collect();
-            return format!("matrix3d({})", parts.join(", "));
-        }
-    }
-    let mul = |a: [f64; 6], b: [f64; 6]| [
-        a[0]*b[0] + a[2]*b[1], a[1]*b[0] + a[3]*b[1],
-        a[0]*b[2] + a[2]*b[3], a[1]*b[2] + a[3]*b[3],
-        a[0]*b[4] + a[2]*b[5] + a[4], a[1]*b[4] + a[3]*b[5] + a[5],
+        r
+    };
+    let mut m: [f64; 16] = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
     ];
-    let mut m = [1.0_f64, 0.0, 0.0, 1.0, 0.0, 0.0];
     for op in ops {
-        let step = match op {
-            T::Translate(x, y) => [1.0, 0.0, 0.0, 1.0, f64::from(x.resolve_px(0.0, eval)), f64::from(y.resolve_px(0.0, eval))],
-            T::Scale(sx, sy) => [f64::from(*sx), 0.0, 0.0, f64::from(*sy), 0.0, 0.0],
-            T::RotateDeg(d) => { let r = f64::from(*d).to_radians(); let (s, c) = (r.sin(), r.cos()); [c, s, -s, c, 0.0, 0.0] }
-            T::SkewDeg(ax, ay) => [1.0, f64::from(*ay).to_radians().tan(), f64::from(*ax).to_radians().tan(), 1.0, 0.0, 0.0],
-            T::Matrix(v) => [f64::from(v[0]), f64::from(v[1]), f64::from(v[2]), f64::from(v[3]), f64::from(v[4]), f64::from(v[5])],
-            _ => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        let step: [f64; 16] = match op {
+            T::Translate(x, y) => [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                f64::from(x.resolve_px(ref_w, eval)), f64::from(y.resolve_px(ref_h, eval)), 0.0, 1.0,
+            ],
+            T::Translate3d(x, y, z) => [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                f64::from(x.resolve_px(ref_w, eval)), f64::from(y.resolve_px(ref_h, eval)), f64::from(*z), 1.0,
+            ],
+            T::TranslateZ(z) => [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, f64::from(*z), 1.0,
+            ],
+            T::Scale(sx, sy) => [
+                f64::from(*sx), 0.0, 0.0, 0.0,
+                0.0, f64::from(*sy), 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ],
+            T::Scale3d(sx, sy, sz) => [
+                f64::from(*sx), 0.0, 0.0, 0.0,
+                0.0, f64::from(*sy), 0.0, 0.0,
+                0.0, 0.0, f64::from(*sz), 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ],
+            T::ScaleZ(sz) => [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, f64::from(*sz), 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ],
+            T::RotateDeg(d) => {
+                let r = f64::from(*d).to_radians();
+                let (s, c) = (r.sin(), r.cos());
+                [c, s, 0.0, 0.0, -s, c, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+            }
+            T::RotateXDeg(d) => {
+                let r = f64::from(*d).to_radians();
+                let (s, c) = (r.sin(), r.cos());
+                [1.0, 0.0, 0.0, 0.0, 0.0, c, s, 0.0, 0.0, -s, c, 0.0, 0.0, 0.0, 0.0, 1.0]
+            }
+            T::RotateYDeg(d) => {
+                let r = f64::from(*d).to_radians();
+                let (s, c) = (r.sin(), r.cos());
+                [c, 0.0, -s, 0.0, 0.0, 1.0, 0.0, 0.0, s, 0.0, c, 0.0, 0.0, 0.0, 0.0, 1.0]
+            }
+            T::Rotate3d(x, y, z, deg) => {
+                let (x, y, z, deg) = (f64::from(*x), f64::from(*y), f64::from(*z), f64::from(*deg));
+                let len = (x * x + y * y + z * z).sqrt();
+                if len > 0.0 && deg.is_finite() {
+                    let (ux, uy, uz) = (x / len, y / len, z / len);
+                    let (s, c) = (deg.to_radians().sin(), deg.to_radians().cos());
+                    let t = 1.0 - c;
+                    [
+                        t * ux * ux + c, t * ux * uy + uz * s, t * ux * uz - uy * s, 0.0,
+                        t * ux * uy - uz * s, t * uy * uy + c, t * uy * uz + ux * s, 0.0,
+                        t * ux * uz + uy * s, t * uy * uz - ux * s, t * uz * uz + c, 0.0,
+                        0.0, 0.0, 0.0, 1.0,
+                    ]
+                } else {
+                    [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0]
+                }
+            }
+            T::SkewDeg(ax, ay) => [
+                1.0, f64::from(*ay).to_radians().tan(), 0.0, 0.0,
+                f64::from(*ax).to_radians().tan(), 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ],
+            T::Perspective(d) => {
+                let p = if *d > 0.0 && d.is_finite() { -1.0 / f64::from(*d) } else { 0.0 };
+                [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, p, 0.0, 0.0, 0.0, 1.0]
+            }
+            T::Matrix(v) => [
+                f64::from(v[0]), f64::from(v[1]), 0.0, 0.0,
+                f64::from(v[2]), f64::from(v[3]), 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                f64::from(v[4]), f64::from(v[5]), 0.0, 1.0,
+            ],
+            T::Matrix3d(v) => [
+                f64::from(v[0]), f64::from(v[1]), f64::from(v[2]), f64::from(v[3]),
+                f64::from(v[4]), f64::from(v[5]), f64::from(v[6]), f64::from(v[7]),
+                f64::from(v[8]), f64::from(v[9]), f64::from(v[10]), f64::from(v[11]),
+                f64::from(v[12]), f64::from(v[13]), f64::from(v[14]), f64::from(v[15]),
+            ],
         };
-        m = mul(m, step);
+        m = mul4(m, step);
     }
     let clean = |v: f64| if !v.is_finite() || v.abs() < 1e-6 { 0.0 } else { v };
-    format!(
-        "matrix({}, {}, {}, {}, {}, {})",
-        format_math_f64(clean(m[0])), format_math_f64(clean(m[1])),
-        format_math_f64(clean(m[2])), format_math_f64(clean(m[3])),
-        format_math_f64(clean(m[4])), format_math_f64(clean(m[5])),
-    )
+    let is_2d = m[2].abs() < 1e-6 && m[3].abs() < 1e-6
+        && m[6].abs() < 1e-6 && m[7].abs() < 1e-6
+        && m[8].abs() < 1e-6 && m[9].abs() < 1e-6
+        && (m[10] - 1.0).abs() < 1e-6 && m[11].abs() < 1e-6
+        && m[14].abs() < 1e-6 && (m[15] - 1.0).abs() < 1e-6;
+    if is_2d {
+        format!(
+            "matrix({}, {}, {}, {}, {}, {})",
+            format_math_f64(clean(m[0])), format_math_f64(clean(m[1])),
+            format_math_f64(clean(m[4])), format_math_f64(clean(m[5])),
+            format_math_f64(clean(m[12])), format_math_f64(clean(m[13])),
+        )
+    } else {
+        let parts: Vec<String> = m.iter().map(|&v| format_math_f64(clean(v))).collect();
+        format!("matrix3d({})", parts.join(", "))
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Web Animations Level 1 (`Element.prototype.animate`) & CSS Typed OM (`computedStyleMap`)
+// CSS Typed OM (`CSSUnitValue` & `computedStyleMap`)
 // ---------------------------------------------------------------------------
 
 fn install_web_animations_and_typed_om(vm: &mut JsVm, host: &SharedHost) {
     let elem_proto = host.borrow().prototypes.element_proto;
-    let doc_proto = host.borrow().prototypes.document_proto;
 
     let unit_proto = vm.alloc_ordinary_object();
     let unit_ctor = vm.alloc_host_fn("CSSUnitValue", move |vm, _, args| {
@@ -7202,28 +7399,70 @@ fn install_web_animations_and_typed_om(vm: &mut JsVm, host: &SharedHost) {
     );
     define_global(vm, "CSSUnitValue", JsValue::from_object(unit_ctor));
 
-    let h_anim = Rc::clone(host);
-    define_host_method(vm, elem_proto, "animate", move |vm, this, args| {
-        let node = require_node(vm, &h_anim, this)?;
-        let mut spec = parse_js_animation_options(vm, arg(args, 1));
-        spec.keyframes = parse_js_keyframes(vm, arg(args, 0));
-        let anim_id = h_anim.borrow_mut().add_web_animation(node, spec.clone());
-        Ok(JsValue::from_object(create_js_animation_handle(
-            vm, &h_anim, node, anim_id, spec,
-        )))
+    // CSS Typed OM `CSSNumericValue.parse(cssText)` (used by Web Animations CSSNumberish times).
+    let num_proto = vm.alloc_ordinary_object();
+    vm.heap
+        .object_set_prototype(unit_proto, Some(num_proto), &mut vm.shapes);
+    let num_ctor = vm.alloc_host_fn("CSSNumericValue", |vm, _, _| {
+        Err(vm.type_error("Illegal constructor"))
     });
-    let h_get_anims = Rc::clone(host);
-    define_host_method(vm, doc_proto, "getAnimations", move |vm, _, _| {
-        let anims = h_get_anims.borrow().all_web_animations();
-        let arr = vm.alloc_array();
-        for (n, sp) in anims {
-            let id = sp.id;
-            let handle = create_js_animation_handle(vm, &h_get_anims, n, id, sp);
-            vm.heap
-                .object_push_element(arr, JsValue::from_object(handle));
-        }
-        Ok(JsValue::from_object(arr))
+    let num_parse = vm.alloc_host_fn("parse", move |vm, _, args| {
+        let raw = vm.to_js_string(arg(args, 0))?;
+        let Some((val, unit)) = split_css_unit_value(&raw) else {
+            return Err(create_dom_exception(
+                vm,
+                "SyntaxError",
+                &format!("Invalid CSSNumericValue '{raw}'"),
+            ));
+        };
+        let obj = vm.alloc_ordinary_object();
+        vm.heap
+            .object_set_prototype(obj, Some(unit_proto), &mut vm.shapes);
+        let kv = vm.heap.intern_key("value");
+        vm.heap.object_define_data(
+            obj,
+            kv,
+            JsValue::from_f64(val),
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+        let ku = vm.heap.intern_key("unit");
+        let us = vm.heap.alloc_string(unit);
+        vm.heap.object_define_data(
+            obj,
+            ku,
+            JsValue::from_string(us),
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+        let km = vm.heap.intern_key("__rix_css_unit_value__");
+        vm.heap.object_define_data(
+            obj,
+            km,
+            JsValue::TRUE,
+            PropertyAttrs::empty(),
+            &mut vm.shapes,
+        );
+        Ok(JsValue::from_object(obj))
     });
+    let k_parse = vm.heap.intern_key("parse");
+    vm.heap.object_define_data(
+        num_ctor,
+        k_parse,
+        JsValue::from_object(num_parse),
+        PropertyAttrs::DEFAULT,
+        &mut vm.shapes,
+    );
+    let k_nproto = vm.heap.intern_key("prototype");
+    vm.heap.object_define_data(
+        num_ctor,
+        k_nproto,
+        JsValue::from_object(num_proto),
+        PropertyAttrs::empty(),
+        &mut vm.shapes,
+    );
+    define_global(vm, "CSSNumericValue", JsValue::from_object(num_ctor));
+
     let h_map = Rc::clone(host);
     define_host_method(vm, elem_proto, "computedStyleMap", move |vm, this, _| {
         let node = require_node(vm, &h_map, this)?;
@@ -7292,243 +7531,4 @@ fn split_css_unit_value(s: &str) -> Option<(f64, String)> {
         other => other.to_string(),
     };
     Some((num, unit))
-}
-
-fn parse_js_composite(s: &str) -> Option<rix_css::AnimationCompositionMode> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "replace" => Some(rix_css::AnimationCompositionMode::Replace),
-        "add" => Some(rix_css::AnimationCompositionMode::Add),
-        "accumulate" => Some(rix_css::AnimationCompositionMode::Accumulate),
-        _ => None,
-    }
-}
-
-fn js_keyframe_prop_to_css(key: &str) -> String {
-    match key {
-        k if k.starts_with("--") => k.to_string(),
-        "cssFloat" => "float".to_string(),
-        "cssOffset" => "offset".to_string(),
-        other => camel_to_kebab(other),
-    }
-}
-
-fn read_js_array_elems(vm: &mut JsVm, obj_h: HeapHandle) -> Option<Vec<JsValue>> {
-    let k_len = vm.heap.intern_key("length");
-    let len_v = vm.get_property_by_key(obj_h, k_len).ok()?;
-    if len_v.is_undefined() {
-        return None;
-    }
-    let len = (len_v.to_number_f64().unwrap_or(0.0).max(0.0) as usize).min(64);
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        let ki = vm.heap.intern_key(&i.to_string());
-        if let Ok(iv) = vm.get_property_by_key(obj_h, ki) {
-            out.push(iv);
-        }
-    }
-    Some(out)
-}
-
-fn parse_js_keyframes(vm: &mut JsVm, val: JsValue) -> Vec<rix_css::WebAnimationKeyframe> {
-    let Some(obj_h) = val.as_object() else {
-        return Vec::new();
-    };
-    if let Some(items) = read_js_array_elems(vm, obj_h) {
-        return items
-            .into_iter()
-            .filter_map(|iv| iv.as_object().map(|h| parse_single_js_keyframe(vm, h)))
-            .collect();
-    }
-    let mut cols: Vec<(String, Vec<String>)> = Vec::new();
-    let mut max_n = 0usize;
-    for k in vm.own_enumerable_keys_including_elements(obj_h) {
-        if matches!(k.as_str(), "offset" | "easing" | "composite") {
-            continue;
-        }
-        let pk = vm.heap.intern_key(&k);
-        let Ok(v) = vm.get_property_by_key(obj_h, pk) else {
-            continue;
-        };
-        let vals: Vec<String> = v
-            .as_object()
-            .and_then(|vh| read_js_array_elems(vm, vh))
-            .map(|xs| xs.into_iter().map(|e| vm.value_to_rust_string(e)).collect())
-            .unwrap_or_else(|| {
-                if v.is_undefined() {
-                    Vec::new()
-                } else {
-                    vec![vm.value_to_rust_string(v)]
-                }
-            });
-        max_n = max_n.max(vals.len());
-        cols.push((js_keyframe_prop_to_css(&k), vals));
-    }
-    (0..max_n)
-        .map(|idx| {
-            let (mut declarations, mut missing) = (Vec::new(), Vec::new());
-            for (prop, vals) in &cols {
-                if let Some(vs) = vals.get(idx) {
-                    declarations.extend(rix_css::parse_inline_style(
-                        &format!("{prop}: {vs}"),
-                        &mut missing,
-                    ));
-                }
-            }
-            rix_css::WebAnimationKeyframe {
-                offset: None,
-                computed_offset: f64::NAN,
-                composite: None,
-                easing: None,
-                declarations,
-            }
-        })
-        .collect()
-}
-
-fn parse_single_js_keyframe(vm: &mut JsVm, item_h: HeapHandle) -> rix_css::WebAnimationKeyframe {
-    let (mut offset, mut composite, mut easing) = (None, None, None);
-    let (mut declarations, mut missing) = (Vec::new(), Vec::new());
-    for k in vm.own_enumerable_keys_including_elements(item_h) {
-        let pk = vm.heap.intern_key(&k);
-        let Ok(v) = vm.get_property_by_key(item_h, pk) else {
-            continue;
-        };
-        if v.is_undefined() || v.is_null() {
-            continue;
-        }
-        match k.as_str() {
-            "offset" => {
-                offset = v
-                    .to_number_f64()
-                    .filter(|n| n.is_finite())
-                    .map(|n| n as f32)
-            }
-            "composite" => composite = parse_js_composite(&vm.value_to_rust_string(v)),
-            "easing" => {
-                let s = vm.value_to_rust_string(v);
-                easing = rix_css::parse_single_timing_function(&s).map(|(tf, _)| tf);
-            }
-            other => {
-                let val_str = vm.value_to_rust_string(v);
-                if !val_str.is_empty() {
-                    let css_prop = js_keyframe_prop_to_css(other);
-                    declarations.extend(rix_css::parse_inline_style(
-                        &format!("{css_prop}: {val_str}"),
-                        &mut missing,
-                    ));
-                }
-            }
-        }
-    }
-    rix_css::WebAnimationKeyframe {
-        offset,
-        computed_offset: f64::NAN,
-        composite,
-        easing,
-        declarations,
-    }
-}
-
-#[rustfmt::skip]
-fn parse_js_animation_options(vm: &mut JsVm, opts_val: JsValue) -> rix_css::WebAnimationSpec {
-    let mut spec = rix_css::WebAnimationSpec {
-        id: 0, keyframes: Vec::new(), duration_ms: 0.0, delay_ms: 0.0, end_delay_ms: 0.0,
-        iteration_start: 0.0, timing: rix_css::TimingFunction::Linear, iteration_count: 1.0,
-        direction: rix_css::AnimationDirectionMode::Normal,
-        fill_mode: rix_css::AnimationFillModeKind::None, fill_is_auto: false,
-        play_state: rix_css::AnimationPlayStateMode::Running,
-        composite: rix_css::AnimationCompositionMode::Replace,
-        iteration_composite: rix_css::AnimationCompositionMode::Replace,
-        current_time_ms: Some(0.0), playback_rate: 1.0, pseudo_element: None,
-        cancelled: false, removed: false,
-    };
-    if let Some(n) = opts_val.to_number_f64() {
-        if n.is_finite() && n >= 0.0 { spec.duration_ms = n; }
-        return spec;
-    }
-    let Some(oh) = opts_val.as_object() else { return spec; };
-    let get = |vm: &mut JsVm, name: &str| {
-        let k = vm.heap.intern_key(name);
-        vm.get_property_by_key(oh, k).ok().filter(|v| !v.is_undefined() && !v.is_null())
-    };
-    if let Some(n) = get(vm, "duration").and_then(|v| v.to_number_f64()).filter(|n| n.is_finite() && *n >= 0.0) { spec.duration_ms = n; }
-    if let Some(n) = get(vm, "delay").and_then(|v| v.to_number_f64()).filter(|n| n.is_finite()) { spec.delay_ms = n; }
-    if let Some(n) = get(vm, "iterations").and_then(|v| v.to_number_f64()).filter(|n| *n >= 0.0) { spec.iteration_count = n; }
-    if let Some(v) = get(vm, "easing") {
-        if let Some((tf, _)) = rix_css::parse_single_timing_function(&vm.value_to_rust_string(v)) { spec.timing = tf; }
-    }
-    if let Some(v) = get(vm, "fill") {
-        spec.fill_mode = match vm.value_to_rust_string(v).to_ascii_lowercase().as_str() {
-            "forwards" => rix_css::AnimationFillModeKind::Forwards,
-            "backwards" => rix_css::AnimationFillModeKind::Backwards,
-            "both" => rix_css::AnimationFillModeKind::Both,
-            _ => rix_css::AnimationFillModeKind::None,
-        };
-    }
-    if let Some(v) = get(vm, "direction") {
-        spec.direction = match vm.value_to_rust_string(v).to_ascii_lowercase().as_str() {
-            "reverse" => rix_css::AnimationDirectionMode::Reverse,
-            "alternate" => rix_css::AnimationDirectionMode::Alternate,
-            "alternate-reverse" => rix_css::AnimationDirectionMode::AlternateReverse,
-            _ => rix_css::AnimationDirectionMode::Normal,
-        };
-    }
-    if let Some(v) = get(vm, "composite") {
-        if let Some(c) = parse_js_composite(&vm.value_to_rust_string(v)) { spec.composite = c; }
-    }
-    spec
-}
-
-#[rustfmt::skip]
-fn create_js_animation_handle(
-    vm: &mut JsVm, host: &SharedHost, node: NodeId, anim_id: u64, initial: rix_css::WebAnimationSpec,
-) -> HeapHandle {
-    let anim_obj = vm.alloc_ordinary_object();
-    let state = Rc::new(RefCell::new((
-        initial.current_time_ms.unwrap_or(0.0), initial.play_state,
-        initial.cancelled, initial.duration_ms, initial.iteration_count,
-    )));
-    let (h1, s1) = (Rc::clone(host), Rc::clone(&state));
-    define_host_method(vm, anim_obj, "pause", move |_, _, _| {
-        s1.borrow_mut().1 = rix_css::AnimationPlayStateMode::Paused;
-        h1.borrow_mut().update_web_animation(node, anim_id, |a| a.play_state = rix_css::AnimationPlayStateMode::Paused);
-        Ok(JsValue::undefined())
-    });
-    let (h2, s2) = (Rc::clone(host), Rc::clone(&state));
-    define_host_method(vm, anim_obj, "play", move |_, _, _| {
-        { let mut st = s2.borrow_mut(); st.1 = rix_css::AnimationPlayStateMode::Running; st.2 = false; }
-        h2.borrow_mut().update_web_animation(node, anim_id, |a| { a.play_state = rix_css::AnimationPlayStateMode::Running; a.cancelled = false; });
-        Ok(JsValue::undefined())
-    });
-    let (h3, s3) = (Rc::clone(host), Rc::clone(&state));
-    define_host_method(vm, anim_obj, "cancel", move |_, _, _| {
-        s3.borrow_mut().2 = true;
-        h3.borrow_mut().update_web_animation(node, anim_id, |a| a.cancelled = true);
-        Ok(JsValue::undefined())
-    });
-    let (h4, s4) = (Rc::clone(host), Rc::clone(&state));
-    define_host_method(vm, anim_obj, "finish", move |_, _, _| {
-        let t = { let mut st = s4.borrow_mut(); let t = if st.4.is_finite() { st.3 * st.4 } else { st.3 }; st.0 = t; t };
-        h4.borrow_mut().update_web_animation(node, anim_id, |a| a.current_time_ms = Some(t));
-        Ok(JsValue::undefined())
-    });
-    let s_get = Rc::clone(&state);
-    let g_ct = vm.alloc_host_fn("get currentTime", move |_, _, _| Ok(JsValue::from_f64(s_get.borrow().0)));
-    let (h_set, s_set) = (Rc::clone(host), Rc::clone(&state));
-    let s_ct = vm.alloc_host_fn("set currentTime", move |_, _, args| {
-        if let Some(n) = arg(args, 0).to_number_f64().filter(|n| n.is_finite()) {
-            s_set.borrow_mut().0 = n;
-            h_set.borrow_mut().update_web_animation(node, anim_id, |a| a.current_time_ms = Some(n));
-        }
-        Ok(JsValue::undefined())
-    });
-    define_host_accessor(vm, anim_obj, "currentTime", Some(g_ct), Some(s_ct));
-    let s_ps = Rc::clone(&state);
-    let g_ps = vm.alloc_host_fn("get playState", move |vm, _, _| {
-        let st = s_ps.borrow();
-        let label = if st.2 { "idle" } else if st.1 == rix_css::AnimationPlayStateMode::Paused { "paused" } else { "running" };
-        Ok(JsValue::from_string(vm.heap.alloc_string(label.to_string())))
-    });
-    define_host_accessor(vm, anim_obj, "playState", Some(g_ps), None);
-    anim_obj
 }

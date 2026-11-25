@@ -40,9 +40,8 @@ mod streams_transform;
 mod streams_writable;
 pub(crate) mod structured_clone;
 pub mod trusted_types;
-#[allow(dead_code)]
+pub mod web_animations;
 mod web_animations_core;
-#[allow(dead_code)]
 mod web_animations_timing;
 pub mod web_apis;
 pub mod webaudio;
@@ -113,6 +112,10 @@ pub use service_worker::{
 pub use streams::{
     create_readable_stream_from_bytes, install_streams, SharedStreams, StreamSystem,
 };
+pub use web_animations::{
+    install_web_animations, update_animations_and_send_events, SharedWebAnimations,
+    WebAnimationSystem,
+};
 pub use web_apis::{install_web_apis, SharedWebApis, WebApiState, DEFAULT_DOCUMENT_URL};
 pub use webaudio::{install_webaudio, SharedWebAudio, WebAudioSystem};
 pub use webgl2::{install_webgl2, SharedWebGl2, WebGl2System};
@@ -132,6 +135,7 @@ pub struct ContentRuntime {
     pub events: SharedEvents,
     pub observers: SharedObservers,
     pub web_apis: SharedWebApis,
+    pub web_animations: SharedWebAnimations,
     pub streams: SharedStreams,
     pub net: SharedNetBridge,
     pub canvas2d: SharedCanvas2D,
@@ -257,6 +261,7 @@ impl ContentRuntime {
         trusted_types::install_trusted_types(&mut vm, &host, &events);
         dom_parsing::install_dom_parsing(&mut vm, &host, &events, &event_loop, &web_apis);
         cssom::install_cssom(&mut vm, &host);
+        let web_animations = install_web_animations(&mut vm, &host, &events);
         cssom_geometry::install_cssom_geometry(&mut vm, &host);
         cssom_view::install_cssom_view(&mut vm, &host, &events, &event_loop);
         let streams = install_streams(&mut vm, &web_apis);
@@ -329,6 +334,7 @@ impl ContentRuntime {
             let events_r = Rc::clone(&events);
             let observers_r = Rc::clone(&observers);
             let web_apis_r = Rc::clone(&web_apis);
+            let web_anims_r = Rc::clone(&web_animations);
             let streams_r = Rc::clone(&streams);
             let net_r = Rc::clone(&net);
             let canvas2d_r = Rc::clone(&canvas2d);
@@ -352,6 +358,9 @@ impl ContentRuntime {
                     g.collect_roots(roots);
                 }
                 if let Ok(g) = web_apis_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = web_anims_r.try_borrow() {
                     g.collect_roots(roots);
                 }
                 if let Ok(g) = streams_r.try_borrow() {
@@ -400,6 +409,7 @@ impl ContentRuntime {
             events,
             observers,
             web_apis,
+            web_animations,
             streams,
             net,
             canvas2d,
@@ -1058,9 +1068,18 @@ impl ContentRuntime {
         drain_ready_tasks(&self.event_loop, &mut self.vm)
     }
 
-    /// Fires a compositor VSync frame signal at `timestamp_ms`, executing rAF callbacks
-    /// followed by `ResizeObserver` and `IntersectionObserver` layout observations.
+    /// Fires a compositor VSync frame signal at `timestamp_ms`, executing W3C Web Animations
+    /// `update animations and send events`, rAF callbacks, and `ResizeObserver`/`IntersectionObserver`
+    /// layout observations in HTML §8.1.7.3 rendering order.
     pub fn fire_vsync(&mut self, timestamp_ms: f64) -> usize {
+        update_animations_and_send_events(
+            &mut self.vm,
+            &self.host,
+            &self.events,
+            &self.event_loop,
+            &self.web_animations,
+            timestamp_ms,
+        );
         let ran = fire_vsync(&self.event_loop, &mut self.vm, timestamp_ms);
         self.flush_layout_observers(timestamp_ms);
         ran
@@ -1289,6 +1308,7 @@ impl ContentRuntime {
         let stats = self.vm.heap.collect_major(&roots);
         self.events.borrow_mut().sweep_dead(&self.vm.heap);
         self.web_apis.borrow_mut().sweep_dead(&self.vm.heap);
+        self.web_animations.borrow_mut().sweep_dead(&self.vm.heap);
         self.streams.borrow_mut().sweep_dead(&self.vm.heap);
         self.net.borrow_mut().sweep_dead(&self.vm.heap);
         self.canvas2d.borrow_mut().sweep_dead(&self.vm.heap);
