@@ -4944,11 +4944,17 @@ impl JsVm {
                 if index >= len {
                     return Ok((JsValue::UNDEFINED, true));
                 }
-                let val = self
+                let fast_val = self
                     .heap
                     .get_object(arr)
-                    .and_then(|o| o.elements.get(index))
-                    .unwrap_or(JsValue::UNDEFINED);
+                    .and_then(|o| o.elements.get(index));
+                let val = match fast_val {
+                    Some(v) => v,
+                    None => self.get_elem(
+                        JsValue::from_object(arr),
+                        JsValue::from_f64(f64::from(index)),
+                    )?,
+                };
                 if let Some(IteratorState::Array { index: idx, .. }) = self.iterators.get_mut(&h) {
                     *idx += 1;
                 }

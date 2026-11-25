@@ -447,6 +447,40 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
     function add_start_callback(fn) { try { fn(); } catch (_) {} }
     function add_completion_callback() {}
     function add_result_callback() {}
+    function fetch_tests_from_worker(worker) {
+        const t = async_test("Worker tests");
+        const port = (worker && worker.port) ? worker.port : worker;
+        if (!port || typeof port.addEventListener !== "function") {
+            t.step(function() { assert_unreached("Invalid worker for fetch_tests_from_worker"); });
+            return;
+        }
+        if (typeof port.start === "function") port.start();
+        port.addEventListener("message", function(e) {
+            const data = e.data;
+            if (!data || typeof data !== "object") return;
+            if (data.type === "complete") {
+                const sub = Array.isArray(data.tests) ? data.tests : [];
+                for (let i = 0; i < sub.length; i++) {
+                    results.push({
+                        name: String(sub[i].name || "(worker subtest)"),
+                        status: sub[i].status === 0 ? 0 : 1,
+                        message: sub[i].message ? String(sub[i].message) : null
+                    });
+                }
+                if (data.status && data.status.status !== 0) {
+                    harnessStatus = 1;
+                    harnessErrors.push(String(data.status.message || "Worker harness error"));
+                }
+                t._done = true;
+                pendingAsync = Math.max(0, pendingAsync - 1);
+            }
+        });
+        if (worker && typeof worker.addEventListener === "function") {
+            worker.addEventListener("error", function(e) {
+                t._fail(new Error(e && e.message ? e.message : "Worker error"));
+            });
+        }
+    }
 
     global.test = test;
     global.async_test = async_test;
@@ -460,6 +494,7 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
     global.EventWatcher = EventWatcher;
     global.setup = setup;
     global.done = done;
+    global.fetch_tests_from_worker = fetch_tests_from_worker;
     global.add_start_callback = add_start_callback;
     global.add_completion_callback = add_completion_callback;
     global.add_result_callback = add_result_callback;
@@ -1583,16 +1618,7 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
                     .unwrap_or("");
                 if fname.contains(".sub.") {
                     if let Ok(txt) = String::from_utf8(body.clone()) {
-                        let port_s = port.to_string();
-                        let mut sub = txt
-                            .replace("{{host}}", "localhost")
-                            .replace("{{domains[]}}", "localhost")
-                            .replace("{{hosts[alt][www]}}", "127.0.0.1")
-                            .replace("{{ports[http][0]}}", &port_s)
-                            .replace("{{ports[http][1]}}", &port_s)
-                            .replace("{{ports[https][0]}}", &port_s)
-                            .replace("{{ports[ws][0]}}", &port_s)
-                            .replace("{{ports[wss][0]}}", &port_s);
+                        let mut sub = substitute_wpt_templates(&txt, port);
                         // Substitute WPT `{{GET[key]}}` template placeholders from query string.
                         let mut get_params: HashMap<String, String> = HashMap::new();
                         for pair in query_only.split('&') {
@@ -1668,6 +1694,30 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
     })
 }
 
+fn substitute_wpt_templates(input: &str, port: u16) -> String {
+    let port_s = port.to_string();
+    let host_port = format!("localhost:{port_s}");
+    input
+        .replace("{{location[scheme]}}", "http")
+        .replace("{{location[port]}}", &port_s)
+        .replace("{{location[host]}}", &host_port)
+        .replace("{{host}}", "localhost")
+        .replace("{{domains[]}}", "localhost")
+        .replace("{{domains[www]}}", "127.0.0.1")
+        .replace("{{domains[www1]}}", "127.0.0.1")
+        .replace("{{domains[www2]}}", "127.0.0.1")
+        .replace("{{domains[天気の良い日]}}", "127.0.0.1")
+        .replace("{{hosts[][]}}", "localhost")
+        .replace("{{hosts[][www]}}", "127.0.0.1")
+        .replace("{{hosts[alt][www]}}", "127.0.0.1")
+        .replace("{{hosts[alt][]}}", "127.0.0.1")
+        .replace("{{ports[http][0]}}", &port_s)
+        .replace("{{ports[http][1]}}", &port_s)
+        .replace("{{ports[https][0]}}", &port_s)
+        .replace("{{ports[ws][0]}}", &port_s)
+        .replace("{{ports[wss][0]}}", &port_s)
+}
+
 fn run_wpt_testharness_file(
     wpt_root: &Path,
     path: &Path,
@@ -1679,17 +1729,7 @@ fn run_wpt_testharness_file(
 
     let sub_html;
     let html = if html.contains("{{") {
-        let port_s = server.port.to_string();
-        sub_html = html
-            .replace("{{host}}", "localhost")
-            .replace("{{domains[]}}", "localhost")
-            .replace("{{hosts[alt][www]}}", "127.0.0.1")
-            .replace("{{hosts[alt][]}}", "127.0.0.1")
-            .replace("{{ports[http][0]}}", &port_s)
-            .replace("{{ports[http][1]}}", &port_s)
-            .replace("{{ports[https][0]}}", &port_s)
-            .replace("{{ports[ws][0]}}", &port_s)
-            .replace("{{ports[wss][0]}}", &port_s);
+        sub_html = substitute_wpt_templates(html, server.port);
         sub_html.as_str()
     } else {
         html
@@ -1727,17 +1767,7 @@ fn run_wpt_testharness_file(
                             .and_then(|s| s.to_str())
                             .is_some_and(|n| n.contains(".sub."))
                         {
-                            let port_s = server.port.to_string();
-                            code = code
-                                .replace("{{host}}", "localhost")
-                                .replace("{{domains[]}}", "localhost")
-                                .replace("{{hosts[alt][www]}}", "127.0.0.1")
-                                .replace("{{hosts[alt][]}}", "127.0.0.1")
-                                .replace("{{ports[http][0]}}", &port_s)
-                                .replace("{{ports[http][1]}}", &port_s)
-                                .replace("{{ports[https][0]}}", &port_s)
-                                .replace("{{ports[ws][0]}}", &port_s)
-                                .replace("{{ports[wss][0]}}", &port_s);
+                            code = substitute_wpt_templates(&code, server.port);
                         }
                         if is_module {
                             module_scan_queue.push((js_path, code.clone()));

@@ -50,6 +50,11 @@ fn next_global_id() -> u64 {
 #[derive(Debug)]
 enum WorkerCommand {
     PostMessage(String),
+    BroadcastMessage {
+        channel_id: u64,
+        origin: String,
+        payload_json: String,
+    },
     Terminate,
 }
 
@@ -65,6 +70,11 @@ enum SharedWorkerCommand {
     },
     PortClose {
         client_port_id: u64,
+    },
+    BroadcastMessage {
+        channel_id: u64,
+        origin: String,
+        payload_json: String,
     },
     #[allow(dead_code)]
     Terminate,
@@ -82,9 +92,58 @@ fn shared_workers_registry() -> &'static Mutex<SharedWorkerRegistry> {
     SHARED_WORKERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Clone)]
+enum BroadcastSink {
+    Async(mpsc::UnboundedSender<AsyncWorkerEvent>),
+    Dedicated(std::sync::mpsc::Sender<WorkerCommand>),
+    Shared(std::sync::mpsc::Sender<SharedWorkerCommand>),
+}
+
+impl BroadcastSink {
+    fn send_broadcast(&self, channel_id: u64, origin: String, payload_json: String) -> bool {
+        match self {
+            Self::Async(tx) => tx
+                .send(AsyncWorkerEvent::BroadcastMessage {
+                    channel_id,
+                    origin,
+                    payload_json,
+                })
+                .is_ok(),
+            Self::Dedicated(tx) => tx
+                .send(WorkerCommand::BroadcastMessage {
+                    channel_id,
+                    origin,
+                    payload_json,
+                })
+                .is_ok(),
+            Self::Shared(tx) => tx
+                .send(SharedWorkerCommand::BroadcastMessage {
+                    channel_id,
+                    origin,
+                    payload_json,
+                })
+                .is_ok(),
+        }
+    }
+}
+
 struct BroadcastSubscriber {
     id: u64,
-    tx: mpsc::UnboundedSender<AsyncWorkerEvent>,
+    sink: BroadcastSink,
+}
+
+fn broadcast_to_peers(sender_id: u64, origin: &str, name: &str, payload_json: &str) {
+    if let Ok(mut hub) = broadcast_hub().lock() {
+        if let Some(subs) = hub.get_mut(&(origin.to_string(), name.to_string())) {
+            subs.retain(|sub| {
+                if sub.id == sender_id {
+                    return true;
+                }
+                sub.sink
+                    .send_broadcast(sub.id, origin.to_string(), payload_json.to_string())
+            });
+        }
+    }
 }
 
 type BroadcastHub = HashMap<(String, String), Vec<BroadcastSubscriber>>;
@@ -602,11 +661,79 @@ fn install_worker_event_target_methods(
     }
 }
 
+struct WorkerBroadcastTable {
+    by_id: HashMap<u64, (HeapHandle, String, String, bool)>,
+    handle_to_id: HashMap<HeapHandle, u64>,
+    blobs: HashMap<HeapHandle, (Vec<u8>, String)>,
+}
+
+impl WorkerBroadcastTable {
+    fn new() -> Self {
+        Self {
+            by_id: HashMap::new(),
+            handle_to_id: HashMap::new(),
+            blobs: HashMap::new(),
+        }
+    }
+
+    fn unregister_all(&mut self) {
+        for (id, (_, origin, name, closed)) in self.by_id.iter_mut() {
+            if !*closed {
+                *closed = true;
+                unregister_broadcast_subscriber(origin, name, *id);
+            }
+        }
+    }
+}
+
+fn encode_worker_json(
+    vm: &mut JsVm,
+    blobs: &HashMap<HeapHandle, (Vec<u8>, String)>,
+    val: JsValue,
+    seen: &mut HashSet<HeapHandle>,
+) -> Result<serde_json::Value, rix_js::JsException> {
+    if let Some(h) = val.as_object() {
+        if let Some((bytes, mime)) = blobs.get(&h) {
+            return Ok(serde_json::json!({
+                "$t": "blob",
+                "m": mime,
+                "v": bytes,
+            }));
+        }
+        // Recurse into plain objects/arrays to catch nested Blobs (e.g. `{ blob: new Blob(...) }`).
+        if matches!(
+            vm.heap.get_object(h).map(|o| &o.kind),
+            Some(ObjectKind::Ordinary)
+        ) && !vm.is_callable_handle(h)
+        {
+            if !seen.insert(h) {
+                return Err(create_dom_exception(
+                    vm,
+                    "DataCloneError",
+                    "Cyclic structure",
+                ));
+            }
+            let keys = vm.own_enumerable_keys_including_elements(h);
+            let mut map = serde_json::Map::with_capacity(keys.len());
+            for name in keys {
+                let k = vm.heap.intern_key(&name);
+                let v = vm.get_property_by_key(h, k)?;
+                map.insert(name, encode_worker_json(vm, blobs, v, seen)?);
+            }
+            seen.remove(&h);
+            return Ok(serde_json::Value::Object(map));
+        }
+    }
+    encode_structured_json(vm, val, seen)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn install_common_worker_globals(
     vm: &mut JsVm,
     event_loop: &SharedEventLoop,
     listeners: &Rc<RefCell<WorkerListenerTable>>,
+    bc_table: &Rc<RefCell<WorkerBroadcastTable>>,
+    bc_sink: BroadcastSink,
     script_url: &str,
     origin: &str,
     worker_name: &str,
@@ -637,16 +764,40 @@ fn install_common_worker_globals(
     let protocol = parsed
         .as_ref()
         .map_or_else(|| "https:".to_string(), |u| format!("{}:", u.scheme()));
-    let host = parsed
+    let hostname = parsed
         .as_ref()
         .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
+    let port_str = parsed
+        .as_ref()
+        .and_then(Url::port)
+        .map(|p| p.to_string())
+        .unwrap_or_default();
+    let host = if port_str.is_empty() {
+        hostname.clone()
+    } else {
+        format!("{hostname}:{port_str}")
+    };
+    let search = parsed
+        .as_ref()
+        .and_then(Url::query)
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let hash = parsed
+        .as_ref()
+        .and_then(Url::fragment)
+        .map(|f| format!("#{f}"))
         .unwrap_or_default();
     for (k, v) in [
         ("href", script_url.to_string()),
         ("origin", loc_origin),
         ("pathname", pathname),
         ("protocol", protocol),
+        ("hostname", hostname),
+        ("port", port_str),
         ("host", host),
+        ("search", search),
+        ("hash", hash),
     ] {
         let key = vm.heap.intern_key(k);
         let val = JsValue::from_string(vm.heap.alloc_string(&v));
@@ -654,6 +805,171 @@ fn install_common_worker_globals(
             .object_define_data(loc_h, key, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
     }
     define_global(vm, "location", JsValue::from_object(loc_h));
+
+    // Worker-side `Blob` constructor (supports `new Blob(parts, opts)` + BroadcastChannel transfer).
+    {
+        let blob_proto = vm.alloc_ordinary_object();
+        let bct_s = Rc::clone(bc_table);
+        define_host_getter(vm, blob_proto, "size", move |_, this_val, _| {
+            let sz = this_val
+                .as_object()
+                .and_then(|h| bct_s.borrow().blobs.get(&h).map(|(b, _)| b.len()))
+                .unwrap_or(0);
+            Ok(JsValue::from_f64(sz as f64))
+        });
+        let bct_t = Rc::clone(bc_table);
+        define_host_getter(vm, blob_proto, "type", move |vm, this_val, _| {
+            let ty = this_val
+                .as_object()
+                .and_then(|h| bct_t.borrow().blobs.get(&h).map(|(_, m)| m.clone()))
+                .unwrap_or_default();
+            Ok(JsValue::from_string(vm.heap.alloc_string(&ty)))
+        });
+        let bct_c = Rc::clone(bc_table);
+        let blob_ctor = vm.alloc_host_fn("Blob", move |vm, _, args| {
+            let mut bytes = Vec::new();
+            let parts = arg(args, 0);
+            if parts.as_object().is_some() {
+                if let Ok(items) = vm.collect_iterable(parts) {
+                    for it in items {
+                        if let Some(bh) = it.as_object() {
+                            if let Some((b, _)) = bct_c.borrow().blobs.get(&bh) {
+                                bytes.extend_from_slice(b);
+                                continue;
+                            }
+                        }
+                        bytes.extend_from_slice(vm.value_to_rust_string(it).as_bytes());
+                    }
+                }
+            }
+            let mime = arg(args, 1)
+                .as_object()
+                .and_then(|oh| {
+                    let kt = vm.heap.intern_key("type");
+                    vm.get_property_by_key(oh, kt).ok()
+                })
+                .filter(|v| !v.is_undefined())
+                .map(|v| vm.value_to_rust_string(v).to_ascii_lowercase())
+                .unwrap_or_default();
+            let h = vm
+                .heap
+                .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(blob_proto)));
+            bct_c.borrow_mut().blobs.insert(h, (bytes, mime));
+            Ok(JsValue::from_object(h))
+        });
+        bind_ctor_proto(vm, blob_ctor, blob_proto);
+        define_global(vm, "Blob", JsValue::from_object(blob_ctor));
+    }
+
+    // Worker-side `BroadcastChannel` connected directly to the process-wide `broadcast_hub()`!
+    {
+        let bc_proto = vm.alloc_ordinary_object();
+        install_worker_event_target_methods(vm, bc_proto, listeners);
+        let bct_n = Rc::clone(bc_table);
+        define_host_getter(vm, bc_proto, "name", move |vm, this_val, _| {
+            let n = this_val
+                .as_object()
+                .and_then(|h| bct_n.borrow().handle_to_id.get(&h).copied())
+                .and_then(|id| bct_n.borrow().by_id.get(&id).map(|e| e.2.clone()))
+                .unwrap_or_default();
+            Ok(JsValue::from_string(vm.heap.alloc_string(&n)))
+        });
+        let bct_p = Rc::clone(bc_table);
+        define_host_method(vm, bc_proto, "postMessage", move |vm, this_val, args| {
+            if args.is_empty() {
+                return Err(vm.type_error("BroadcastChannel.postMessage requires 1 argument"));
+            }
+            let Some(h) = this_val.as_object() else {
+                return Err(vm.type_error("Incompatible BroadcastChannel receiver"));
+            };
+            let info = {
+                let tbl = bct_p.borrow();
+                tbl.handle_to_id.get(&h).and_then(|id| {
+                    tbl.by_id
+                        .get(id)
+                        .map(|e| (*id, e.1.clone(), e.2.clone(), e.3))
+                })
+            };
+            let Some((sender_id, bc_origin, bc_name, closed)) = info else {
+                return Err(vm.type_error("Incompatible BroadcastChannel receiver"));
+            };
+            if closed {
+                return Err(create_dom_exception(
+                    vm,
+                    "InvalidStateError",
+                    "BroadcastChannel is closed",
+                ));
+            }
+            let mut seen = HashSet::new();
+            let encoded = {
+                let blobs = bct_p.borrow().blobs.clone();
+                encode_worker_json(vm, &blobs, arg(args, 0), &mut seen)?
+            };
+            let payload_json = serde_json::to_string(&encoded).unwrap_or_else(|_| "null".into());
+            broadcast_to_peers(sender_id, &bc_origin, &bc_name, &payload_json);
+            Ok(JsValue::UNDEFINED)
+        });
+        let bct_cl = Rc::clone(bc_table);
+        define_host_method(vm, bc_proto, "close", move |_, this_val, _| {
+            if let Some(h) = this_val.as_object() {
+                let mut tbl = bct_cl.borrow_mut();
+                if let Some(&id) = tbl.handle_to_id.get(&h) {
+                    if let Some((_, o, n, closed)) = tbl.by_id.get_mut(&id) {
+                        if !*closed {
+                            *closed = true;
+                            unregister_broadcast_subscriber(o, n, id);
+                        }
+                    }
+                }
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+        let bct_c = Rc::clone(bc_table);
+        let bc_orig = origin.to_string();
+        let bc_ctor = vm.alloc_host_fn("BroadcastChannel", move |vm, _, args| {
+            if vm.native_new_target.is_undefined() {
+                return Err(vm.type_error("BroadcastChannel constructor requires 'new'"));
+            }
+            if args.is_empty() {
+                return Err(vm.type_error("BroadcastChannel constructor requires 1 argument"));
+            }
+            let name = vm.to_js_string(arg(args, 0))?;
+            let id = next_global_id();
+            let obj_h = vm
+                .heap
+                .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(bc_proto)));
+            let k_om = vm.heap.intern_key("onmessage");
+            let k_ome = vm.heap.intern_key("onmessageerror");
+            vm.heap.object_define_data(
+                obj_h,
+                k_om,
+                JsValue::NULL,
+                PropertyAttrs::DEFAULT,
+                &mut vm.shapes,
+            );
+            vm.heap.object_define_data(
+                obj_h,
+                k_ome,
+                JsValue::NULL,
+                PropertyAttrs::DEFAULT,
+                &mut vm.shapes,
+            );
+            if let Ok(mut hub) = broadcast_hub().lock() {
+                hub.entry((bc_orig.clone(), name.clone()))
+                    .or_default()
+                    .push(BroadcastSubscriber {
+                        id,
+                        sink: bc_sink.clone(),
+                    });
+            }
+            let mut tbl = bct_c.borrow_mut();
+            tbl.by_id.insert(id, (obj_h, bc_orig.clone(), name, false));
+            tbl.handle_to_id.insert(obj_h, id);
+            Ok(JsValue::from_object(obj_h))
+        });
+        bind_ctor_proto(vm, bc_ctor, bc_proto);
+        define_global(vm, "BroadcastChannel", JsValue::from_object(bc_ctor));
+    }
 
     // `structuredClone(value)`
     define_host_method(vm, global, "structuredClone", |vm, _, args| {
@@ -719,6 +1035,7 @@ fn run_dedicated_worker_thread(
     object_urls: Arc<HashMap<String, Vec<u8>>>,
     fetch_engine: Arc<FetchEngine>,
     parent_tx: mpsc::UnboundedSender<AsyncWorkerEvent>,
+    cmd_tx_self: std::sync::mpsc::Sender<WorkerCommand>,
     cmd_rx: std::sync::mpsc::Receiver<WorkerCommand>,
 ) {
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -748,12 +1065,15 @@ fn run_dedicated_worker_thread(
     let _jit = rix_jit::TieredJit::attach_to(&mut vm);
     let event_loop = Rc::new(RefCell::new(EventLoopState::new()));
     let listeners = Rc::new(RefCell::new(WorkerListenerTable::new()));
+    let bc_table = Rc::new(RefCell::new(WorkerBroadcastTable::new()));
     let closed_flag = Rc::new(RefCell::new(false));
 
     install_common_worker_globals(
         &mut vm,
         &event_loop,
         &listeners,
+        &bc_table,
+        BroadcastSink::Dedicated(cmd_tx_self),
         &script_url,
         &origin,
         &worker_name,
@@ -819,6 +1139,41 @@ fn run_dedicated_worker_thread(
                 run_microtask_checkpoint(&event_loop, &mut vm);
                 drain_ready_tasks(&event_loop, &mut vm);
             }
+            Ok(WorkerCommand::BroadcastMessage {
+                channel_id,
+                origin: msg_origin,
+                payload_json,
+            }) => {
+                let target = bc_table
+                    .borrow()
+                    .by_id
+                    .get(&channel_id)
+                    .filter(|e| !e.3)
+                    .map(|e| e.0);
+                if let Some(bc_obj) = target {
+                    let data = serde_json::from_str::<serde_json::Value>(&payload_json)
+                        .map(|jv| decode_structured_json(&mut vm, &jv))
+                        .unwrap_or(JsValue::NULL);
+                    let orig_js = JsValue::from_string(vm.heap.alloc_string(&msg_origin));
+                    let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
+                    let ports_arr = alloc_js_array(&mut vm, &[]);
+                    dispatch_worker_event(
+                        &mut vm,
+                        &listeners,
+                        bc_obj,
+                        "message",
+                        &[
+                            ("data", data),
+                            ("origin", orig_js),
+                            ("lastEventId", empty_s),
+                            ("source", JsValue::NULL),
+                            ("ports", JsValue::from_object(ports_arr)),
+                        ],
+                    );
+                    run_microtask_checkpoint(&event_loop, &mut vm);
+                    drain_ready_tasks(&event_loop, &mut vm);
+                }
+            }
             Ok(WorkerCommand::Terminate) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 break;
             }
@@ -827,6 +1182,7 @@ fn run_dedicated_worker_thread(
             }
         }
     }
+    bc_table.borrow_mut().unregister_all();
 }
 
 struct SharedWorkerSidePort {
@@ -846,6 +1202,7 @@ fn run_shared_worker_thread(
     script_src: ScriptSource,
     object_urls: Arc<HashMap<String, Vec<u8>>>,
     fetch_engine: Arc<FetchEngine>,
+    cmd_tx_self: std::sync::mpsc::Sender<SharedWorkerCommand>,
     cmd_rx: std::sync::mpsc::Receiver<SharedWorkerCommand>,
 ) {
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -863,6 +1220,7 @@ fn run_shared_worker_thread(
     let _jit = rix_jit::TieredJit::attach_to(&mut vm);
     let event_loop = Rc::new(RefCell::new(EventLoopState::new()));
     let listeners = Rc::new(RefCell::new(WorkerListenerTable::new()));
+    let bc_table = Rc::new(RefCell::new(WorkerBroadcastTable::new()));
     let closed_flag = Rc::new(RefCell::new(false));
     let ports: Rc<RefCell<HashMap<u64, SharedWorkerSidePort>>> =
         Rc::new(RefCell::new(HashMap::new()));
@@ -873,6 +1231,8 @@ fn run_shared_worker_thread(
         &mut vm,
         &event_loop,
         &listeners,
+        &bc_table,
+        BroadcastSink::Shared(cmd_tx_self),
         &script_url,
         &origin,
         &worker_name,
@@ -1066,6 +1426,41 @@ fn run_shared_worker_thread(
                     port_handle_to_id.borrow_mut().remove(&p.js_obj);
                 }
             }
+            Ok(SharedWorkerCommand::BroadcastMessage {
+                channel_id,
+                origin: msg_origin,
+                payload_json,
+            }) => {
+                let target = bc_table
+                    .borrow()
+                    .by_id
+                    .get(&channel_id)
+                    .filter(|e| !e.3)
+                    .map(|e| e.0);
+                if let Some(bc_obj) = target {
+                    let data = serde_json::from_str::<serde_json::Value>(&payload_json)
+                        .map(|jv| decode_structured_json(&mut vm, &jv))
+                        .unwrap_or(JsValue::NULL);
+                    let orig_js = JsValue::from_string(vm.heap.alloc_string(&msg_origin));
+                    let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
+                    let ports_arr = alloc_js_array(&mut vm, &[]);
+                    dispatch_worker_event(
+                        &mut vm,
+                        &listeners,
+                        bc_obj,
+                        "message",
+                        &[
+                            ("data", data),
+                            ("origin", orig_js),
+                            ("lastEventId", empty_s),
+                            ("source", JsValue::NULL),
+                            ("ports", JsValue::from_object(ports_arr)),
+                        ],
+                    );
+                    run_microtask_checkpoint(&event_loop, &mut vm);
+                    drain_ready_tasks(&event_loop, &mut vm);
+                }
+            }
             Ok(SharedWorkerCommand::Terminate)
             | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 break;
@@ -1075,6 +1470,7 @@ fn run_shared_worker_thread(
             }
         }
     }
+    bc_table.borrow_mut().unregister_all();
 }
 
 fn flush_shared_worker_side_port(
@@ -1319,6 +1715,7 @@ pub fn deliver_async_worker_event(
     host: &SharedHost,
     events: &SharedEvents,
     event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
     frames: &SharedFrames,
     workers: &SharedWorkers,
     ev: AsyncWorkerEvent,
@@ -1420,12 +1817,13 @@ pub fn deliver_async_worker_event(
             };
             let Some(target) = target else { return };
             let data = serde_json::from_str::<serde_json::Value>(&payload_json)
-                .map(|jv| decode_structured_json(vm, &jv))
+                .map(|jv| crate::frames::decode_structured_json_with_blobs(vm, web_apis, &jv))
                 .unwrap_or(JsValue::NULL);
             let origin_js = JsValue::from_string(vm.heap.alloc_string(&origin));
             let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
             let ports_arr = alloc_js_array(vm, &[]);
-            fire_object_event_with_proto(
+            crate::frames::freeze_js_array(vm, ports_arr);
+            crate::events::fire_object_event_dispatch_only(
                 vm,
                 host,
                 events,
@@ -1440,6 +1838,7 @@ pub fn deliver_async_worker_event(
                     ("source", JsValue::NULL),
                     ("ports", JsValue::from_object(ports_arr)),
                 ],
+                None,
             );
         }
         AsyncWorkerEvent::SseOpen { sse_id } => {
@@ -1605,7 +2004,7 @@ pub fn install_worker_and_sse_apis(
         frames,
         &workers,
     );
-    install_broadcast_channel(vm, event_target_proto, web_apis, &workers);
+    install_broadcast_channel(vm, event_target_proto, events, web_apis, &workers);
     install_event_source(vm, event_target_proto, web_apis, net, &workers);
 
     workers
@@ -1699,6 +2098,7 @@ fn install_dedicated_worker(
 
         let worker_id = next_global_id();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let cmd_tx_self = cmd_tx.clone();
         let parent_tx = ws.borrow().async_tx.clone();
 
         let _ = std::thread::Builder::new()
@@ -1713,6 +2113,7 @@ fn install_dedicated_worker(
                     object_urls_snapshot,
                     fetch_engine,
                     parent_tx,
+                    cmd_tx_self,
                     cmd_rx,
                 );
             });
@@ -1932,6 +2333,7 @@ fn install_shared_worker(
                 )
                 .map_err(|m| create_dom_exception(vm, "SecurityError", &m))?;
                 let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+                let cmd_tx_self = cmd_tx.clone();
                 let url_c = resolved_url.clone();
                 let origin_c = origin.clone();
                 let name_c = worker_name.clone();
@@ -1945,6 +2347,7 @@ fn install_shared_worker(
                             script_src,
                             object_urls_snapshot,
                             fetch_engine,
+                            cmd_tx_self,
                             cmd_rx,
                         );
                     });
@@ -2007,6 +2410,7 @@ fn install_shared_worker(
 fn install_broadcast_channel(
     vm: &mut JsVm,
     event_target_proto: HeapHandle,
+    events: &SharedEvents,
     web_apis: &SharedWebApis,
     workers: &SharedWorkers,
 ) {
@@ -2014,7 +2418,30 @@ fn install_broadcast_channel(
         ObjectKind::Ordinary,
         Some(event_target_proto),
     ));
+    vm.heap.get_object_mut(proto).unwrap().is_prototype = true;
+    crate::streams_common::set_to_string_tag(vm, proto, "BroadcastChannel");
     workers.borrow_mut().protos.broadcast_channel_proto = Some(proto);
+
+    // EventHandler IDL attributes (`onmessage`, `onmessageerror`) per HTML §8.1.7.1.
+    for &attr in &["onmessage", "onmessageerror"] {
+        let ws_v = Rc::clone(workers);
+        crate::events::install_object_event_handler_accessor(
+            vm,
+            proto,
+            events,
+            attr,
+            move |vm, this_val| {
+                let Some(h) = this_val.as_object() else {
+                    return Err(vm.type_error("Incompatible BroadcastChannel receiver"));
+                };
+                if ws_v.borrow().broadcast_handle_to_id.contains_key(&h) {
+                    Ok(h)
+                } else {
+                    Err(vm.type_error("Incompatible BroadcastChannel receiver"))
+                }
+            },
+        );
+    }
 
     {
         let ws = Rc::clone(workers);
@@ -2034,9 +2461,13 @@ fn install_broadcast_channel(
     }
     {
         let ws = Rc::clone(workers);
+        let wa = Rc::clone(web_apis);
         define_host_method(vm, proto, "postMessage", move |vm, this_val, args| {
+            if args.is_empty() {
+                return Err(vm.type_error("BroadcastChannel.postMessage requires 1 argument"));
+            }
             let Some(h) = this_val.as_object() else {
-                return Ok(JsValue::UNDEFINED);
+                return Err(vm.type_error("Incompatible BroadcastChannel receiver"));
             };
             let info = {
                 let state = ws.borrow();
@@ -2047,7 +2478,7 @@ fn install_broadcast_channel(
                     .map(|b| (b.id, b.origin.clone(), b.name.clone(), b.closed))
             };
             let Some((sender_id, origin, name, closed)) = info else {
-                return Ok(JsValue::UNDEFINED);
+                return Err(vm.type_error("Incompatible BroadcastChannel receiver"));
             };
             if closed {
                 return Err(create_dom_exception(
@@ -2057,25 +2488,10 @@ fn install_broadcast_channel(
                 ));
             }
             let mut seen = HashSet::new();
-            let encoded = encode_structured_json(vm, arg(args, 0), &mut seen)?;
+            let encoded =
+                crate::frames::encode_structured_json_with_blobs(vm, &wa, arg(args, 0), &mut seen)?;
             let payload_json = serde_json::to_string(&encoded).unwrap_or_else(|_| "null".into());
-
-            if let Ok(mut hub) = broadcast_hub().lock() {
-                if let Some(subs) = hub.get_mut(&(origin.clone(), name)) {
-                    subs.retain(|sub| {
-                        if sub.id == sender_id {
-                            return true;
-                        }
-                        sub.tx
-                            .send(AsyncWorkerEvent::BroadcastMessage {
-                                channel_id: sub.id,
-                                origin: origin.clone(),
-                                payload_json: payload_json.clone(),
-                            })
-                            .is_ok()
-                    });
-                }
-            }
+            broadcast_to_peers(sender_id, &origin, &name, &payload_json);
             Ok(JsValue::UNDEFINED)
         });
     }
@@ -2100,7 +2516,13 @@ fn install_broadcast_channel(
     let wa = Rc::clone(web_apis);
     let ws = Rc::clone(workers);
     let ctor = vm.alloc_host_fn("BroadcastChannel", move |vm, _, args| {
-        let name = vm.value_to_rust_string(arg(args, 0));
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("BroadcastChannel constructor requires 'new'"));
+        }
+        if args.is_empty() {
+            return Err(vm.type_error("BroadcastChannel constructor requires 1 argument"));
+        }
+        let name = vm.to_js_string(arg(args, 0))?;
         let origin = wa.borrow().current_origin();
         let id = next_global_id();
         let obj_h = vm
@@ -2110,7 +2532,10 @@ fn install_broadcast_channel(
         if let Ok(mut hub) = broadcast_hub().lock() {
             hub.entry((origin.clone(), name.clone()))
                 .or_default()
-                .push(BroadcastSubscriber { id, tx });
+                .push(BroadcastSubscriber {
+                    id,
+                    sink: BroadcastSink::Async(tx),
+                });
         }
         {
             let mut state = ws.borrow_mut();

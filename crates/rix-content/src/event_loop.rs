@@ -126,6 +126,7 @@ pub struct EventLoopState {
     pub tasks_executed: u64,
     pub checkpoints_executed: u64,
     performing_microtask_checkpoint: bool,
+    consecutive_net_tasks: u32,
     checkpoint_hooks: Vec<MicrotaskCheckpointHook>,
 }
 
@@ -155,6 +156,7 @@ impl EventLoopState {
             tasks_executed: 0,
             checkpoints_executed: 0,
             performing_microtask_checkpoint: false,
+            consecutive_net_tasks: 0,
             checkpoint_hooks: Vec::new(),
         }
     }
@@ -411,26 +413,47 @@ pub fn run_microtask_checkpoint(loop_state: &SharedEventLoop, vm: &mut JsVm) {
 }
 
 /// Executes at most one ready macrotask or due timer (strictly respecting
-/// `Input > Rendering > Networking > Timer > Idle`), followed by a strict microtask checkpoint.
+/// `Input > Rendering > Networking > Timer > Idle`, with fair anti-starvation yielding
+/// so self-reposting networking/messaging loops never starve due timers), followed by a
+/// strict microtask checkpoint.
 ///
 /// Returns `true` if a task or timer executed.
 pub fn step_event_loop_once(loop_state: &SharedEventLoop, vm: &mut JsVm) -> bool {
-    // 1. Check higher-priority macrotasks (`Input`, `Rendering`, `Networking`) before timers.
-    for prio in [
-        TaskPriority::Input,
-        TaskPriority::Rendering,
-        TaskPriority::Networking,
-    ] {
+    // 1. Highest-priority interactive/rendering tasks always run first.
+    for prio in [TaskPriority::Input, TaskPriority::Rendering] {
         let task_opt = loop_state.borrow_mut().queues[prio as usize].pop_front();
         if let Some(task) = task_opt {
+            loop_state.borrow_mut().consecutive_net_tasks = 0;
             execute_macrotask(loop_state, vm, task);
             return true;
         }
     }
 
-    // 2. Check explicit `Timer`-priority queued tasks, then due timer heap entries.
+    // 2. Fair anti-starvation check: after 4 consecutive Networking tasks, give a due Timer
+    // a turn so self-posting MessagePort/postMessage loops cannot starve `setTimeout(..., 0)`.
+    let yield_to_timer = {
+        let mut st = loop_state.borrow_mut();
+        st.consecutive_net_tasks >= 4
+            && (!st.queues[TaskPriority::Timer as usize].is_empty()
+                || st.time_until_next_timer() == Some(Duration::ZERO))
+    };
+
+    if !yield_to_timer {
+        let net_opt = loop_state.borrow_mut().queues[TaskPriority::Networking as usize].pop_front();
+        if let Some(task) = net_opt {
+            {
+                let mut st = loop_state.borrow_mut();
+                st.consecutive_net_tasks = st.consecutive_net_tasks.saturating_add(1);
+            }
+            execute_macrotask(loop_state, vm, task);
+            return true;
+        }
+    }
+
+    // 3. Check explicit `Timer`-priority queued tasks, then due timer heap entries.
     let timer_task = loop_state.borrow_mut().queues[TaskPriority::Timer as usize].pop_front();
     if let Some(task) = timer_task {
+        loop_state.borrow_mut().consecutive_net_tasks = 0;
         execute_macrotask(loop_state, vm, task);
         return true;
     }
@@ -438,6 +461,7 @@ pub fn step_event_loop_once(loop_state: &SharedEventLoop, vm: &mut JsVm) -> bool
     if let Some(timer) = due_timer {
         let prev_nesting = {
             let mut st = loop_state.borrow_mut();
+            st.consecutive_net_tasks = 0;
             let prev = st.current_timer_nesting;
             st.current_timer_nesting = timer.nesting_level;
             prev
@@ -453,9 +477,10 @@ pub fn step_event_loop_once(loop_state: &SharedEventLoop, vm: &mut JsVm) -> bool
         return true;
     }
 
-    // 3. Lowest-priority `Idle` tasks run only when nothing higher or due is pending.
-    let idle_task = loop_state.borrow_mut().pop_highest_priority_task();
-    if let Some(task) = idle_task {
+    // 4. Lowest-priority `Idle` tasks (or remaining Networking if yield didn't pop a timer).
+    let rem_task = loop_state.borrow_mut().pop_highest_priority_task();
+    if let Some(task) = rem_task {
+        loop_state.borrow_mut().consecutive_net_tasks = 0;
         execute_macrotask(loop_state, vm, task);
         return true;
     }
@@ -496,11 +521,13 @@ pub fn fire_vsync(loop_state: &SharedEventLoop, vm: &mut JsVm, timestamp_ms: f64
     count
 }
 
-/// Drains all immediately ready macrotasks, due timers, and microtasks until quiescent.
+/// Drains immediately ready macrotasks, due timers, and microtasks until quiescent
+/// (capped per turn so intentional infinite self-posting loops yield cleanly).
 pub fn drain_ready_tasks(loop_state: &SharedEventLoop, vm: &mut JsVm) -> u64 {
+    const MAX_TASKS_PER_DRAIN: u64 = 2_000;
     run_microtask_checkpoint(loop_state, vm);
     let mut ran = 0u64;
-    while step_event_loop_once(loop_state, vm) {
+    while ran < MAX_TASKS_PER_DRAIN && step_event_loop_once(loop_state, vm) {
         ran += 1;
     }
     ran

@@ -179,6 +179,7 @@ struct MessagePortState {
     started: bool,
     closed: bool,
     neutered: bool,
+    flush_scheduled: bool,
     onmessage: JsValue,
     onmessageerror: JsValue,
     pending: VecDeque<QueuedPortMessage>,
@@ -202,6 +203,7 @@ enum WindowProxyKind {
         url: String,
         closed: bool,
         crashed: bool,
+        local_global: Option<HeapHandle>,
     },
     /// Auxiliary window opened via `window.open(...)`.
     Auxiliary {
@@ -230,6 +232,7 @@ struct IframeRecord {
 /// Shared browsing-context, OOPIF, `MessageChannel`, and `postMessage` registry.
 pub struct FrameSystem {
     pub pipeline_id: PipelineId,
+    pub main_window: HeapHandle,
     pub sandbox: SandboxFlags,
     pub window_name: String,
     pub window_closed: bool,
@@ -260,6 +263,7 @@ impl FrameSystem {
         let gv = JsValue::from_object(global);
         Self {
             pipeline_id: PipelineId(1),
+            main_window: global,
             sandbox: SandboxFlags::default(),
             window_name: String::new(),
             window_closed: false,
@@ -355,7 +359,11 @@ impl FrameSystem {
                         out.push(JsValue::from_object(*d));
                     }
                 }
-                WindowProxyKind::CrossOriginRemote { .. } => {}
+                WindowProxyKind::CrossOriginRemote { local_global, .. } => {
+                    if let Some(lg) = local_global {
+                        out.push(JsValue::from_object(*lg));
+                    }
+                }
             }
         }
     }
@@ -378,10 +386,51 @@ impl FrameSystem {
 // Cross-Process Structured JSON Codec (preserves JS types cleanly over IPC)
 // ---------------------------------------------------------------------------
 
+/// Freezes a JS array (e.g. `MessageEvent.ports` `FrozenArray<MessagePort>`).
+pub(crate) fn freeze_js_array(vm: &mut JsVm, arr_h: HeapHandle) {
+    let k_obj = vm.heap.intern_key("Object");
+    let k_freeze = vm.heap.intern_key("freeze");
+    if let Ok(obj_ctor) = vm.get_property_by_key(vm.global, k_obj) {
+        if let Some(oh) = obj_ctor.as_object() {
+            if let Ok(freeze_fn) = vm.get_property_by_key(oh, k_freeze) {
+                let _ = vm.call_value(freeze_fn, obj_ctor, &[JsValue::from_object(arr_h)]);
+            }
+        }
+    }
+}
+
+/// Encodes a JS value to structured JSON, additionally preserving `Blob` instances.
+pub(crate) fn encode_structured_json_with_blobs(
+    vm: &mut JsVm,
+    web_apis: &SharedWebApis,
+    val: JsValue,
+    seen: &mut HashSet<HeapHandle>,
+) -> Result<serde_json::Value, JsException> {
+    encode_structured_json_impl(vm, Some(web_apis), val, seen)
+}
+
+/// Decodes a structured JSON payload back into live JS values, reconstructing `Blob` instances.
+pub(crate) fn decode_structured_json_with_blobs(
+    vm: &mut JsVm,
+    web_apis: &SharedWebApis,
+    jv: &serde_json::Value,
+) -> JsValue {
+    decode_structured_json_impl(vm, Some(web_apis), jv)
+}
+
 /// Serializes a JS value into a rich tagged JSON payload for cross-process IPC,
 /// rejecting non-cloneable objects (Functions, Symbols) with `DataCloneError`.
 pub(crate) fn encode_structured_json(
     vm: &mut JsVm,
+    val: JsValue,
+    seen: &mut HashSet<HeapHandle>,
+) -> Result<serde_json::Value, JsException> {
+    encode_structured_json_impl(vm, None, val, seen)
+}
+
+fn encode_structured_json_impl(
+    vm: &mut JsVm,
+    web_apis: Option<&SharedWebApis>,
     val: JsValue,
     seen: &mut HashSet<HeapHandle>,
 ) -> Result<serde_json::Value, JsException> {
@@ -447,6 +496,16 @@ pub(crate) fn encode_structured_json(
             "Cyclic structure cannot be serialized across processes",
         ));
     }
+    if let Some(wa) = web_apis {
+        if let Some(blob) = wa.borrow().blobs.get(&h).cloned() {
+            seen.remove(&h);
+            return Ok(serde_json::json!({
+                "$t": "blob",
+                "m": blob.content_type,
+                "v": blob.bytes
+            }));
+        }
+    }
     let kind_tag = vm.heap.get_object(h).map(|o| match &o.kind {
         ObjectKind::Array => 1u8,
         ObjectKind::ArrayBuffer(_) => 2,
@@ -462,7 +521,7 @@ pub(crate) fn encode_structured_json(
             let mut arr = Vec::with_capacity(len);
             for i in 0..len {
                 let elem = array_elem(vm, h, i);
-                arr.push(encode_structured_json(vm, elem, seen)?);
+                arr.push(encode_structured_json_impl(vm, web_apis, elem, seen)?);
             }
             Ok(serde_json::Value::Array(arr))
         }
@@ -511,8 +570,8 @@ pub(crate) fn encode_structured_json(
             let mut pairs = Vec::with_capacity(entries.len());
             for (k, v) in entries {
                 pairs.push(serde_json::json!([
-                    encode_structured_json(vm, k, seen)?,
-                    encode_structured_json(vm, v, seen)?
+                    encode_structured_json_impl(vm, web_apis, k, seen)?,
+                    encode_structured_json_impl(vm, web_apis, v, seen)?
                 ]));
             }
             Ok(serde_json::json!({ "$t": "map", "v": pairs }))
@@ -524,7 +583,7 @@ pub(crate) fn encode_structured_json(
             };
             let mut arr = Vec::with_capacity(items.len());
             for item in items {
-                arr.push(encode_structured_json(vm, item, seen)?);
+                arr.push(encode_structured_json_impl(vm, web_apis, item, seen)?);
             }
             Ok(serde_json::json!({ "$t": "set", "v": arr }))
         }
@@ -534,7 +593,7 @@ pub(crate) fn encode_structured_json(
             for name in keys {
                 let k = vm.heap.intern_key(&name);
                 let v = vm.get_property_by_key(h, k)?;
-                map.insert(name, encode_structured_json(vm, v, seen)?);
+                map.insert(name, encode_structured_json_impl(vm, web_apis, v, seen)?);
             }
             Ok(serde_json::Value::Object(map))
         }
@@ -545,6 +604,14 @@ pub(crate) fn encode_structured_json(
 
 /// Decodes a cross-process structured JSON payload back into live JS values on `vm`.
 pub(crate) fn decode_structured_json(vm: &mut JsVm, jv: &serde_json::Value) -> JsValue {
+    decode_structured_json_impl(vm, None, jv)
+}
+
+fn decode_structured_json_impl(
+    vm: &mut JsVm,
+    web_apis: Option<&SharedWebApis>,
+    jv: &serde_json::Value,
+) -> JsValue {
     match jv {
         serde_json::Value::Null => JsValue::NULL,
         serde_json::Value::Bool(b) => JsValue::from_bool(*b),
@@ -553,7 +620,7 @@ pub(crate) fn decode_structured_json(vm: &mut JsVm, jv: &serde_json::Value) -> J
         serde_json::Value::Array(items) => {
             let elems: Vec<JsValue> = items
                 .iter()
-                .map(|it| decode_structured_json(vm, it))
+                .map(|it| decode_structured_json_impl(vm, web_apis, it))
                 .collect();
             JsValue::from_object(alloc_array_from(vm, elems))
         }
@@ -561,6 +628,27 @@ pub(crate) fn decode_structured_json(vm: &mut JsVm, jv: &serde_json::Value) -> J
             if let Some(serde_json::Value::String(tag)) = map.get("$t") {
                 match tag.as_str() {
                     "undef" => return JsValue::UNDEFINED,
+                    "blob" => {
+                        if let Some(wa) = web_apis {
+                            let mime = map
+                                .get("m")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let bytes: Vec<u8> = map
+                                .get("v")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|x| x.as_u64().map(|n| n as u8))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            return JsValue::from_object(crate::web_apis::create_blob_object(
+                                vm, wa, bytes, mime,
+                            ));
+                        }
+                    }
                     "num" => {
                         return match map.get("v").and_then(serde_json::Value::as_str) {
                             Some("NaN") => JsValue::from_f64(f64::NAN),
@@ -642,7 +730,7 @@ pub(crate) fn decode_structured_json(vm: &mut JsVm, jv: &serde_json::Value) -> J
             let obj = vm.alloc_ordinary_object();
             for (k, v) in map {
                 let key = vm.heap.intern_key(k);
-                let val = decode_structured_json(vm, v);
+                let val = decode_structured_json_impl(vm, web_apis, v);
                 vm.heap
                     .object_define_data(obj, key, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
             }
@@ -666,31 +754,24 @@ fn parse_transfer_list(
     transfer_val: JsValue,
     disallowed_ports: &[HeapHandle],
 ) -> Result<Vec<TransferEntry>, JsException> {
-    if transfer_val.is_undefined() || transfer_val.is_null() {
+    if transfer_val.is_undefined() {
         return Ok(Vec::new());
     }
     let Some(arr_h) = transfer_val.as_object() else {
-        return Err(vm.type_error("transfer list must be an iterable array"));
+        return Err(vm.type_error("transfer list must be an iterable sequence"));
     };
-    let len = if is_js_array(vm, arr_h) {
-        array_len(vm, arr_h)
-    } else {
-        let lk = vm.heap.intern_key("length");
-        vm.get_property_by_key(arr_h, lk)
-            .ok()
-            .and_then(|v| v.as_number())
-            .map_or(0, |n| n.max(0.0) as usize)
-    };
+    let sym = vm.key_symbol_iterator;
+    let has_iter = vm
+        .get_property_by_key(arr_h, sym)?
+        .as_object()
+        .is_some_and(|f| vm.is_callable_handle(f));
+    if !has_iter {
+        return Err(vm.type_error("transfer list must be an iterable sequence"));
+    }
+    let items = vm.collect_iterable(transfer_val)?;
     let mut seen = HashSet::new();
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        let item = if is_js_array(vm, arr_h) {
-            array_elem(vm, arr_h, i)
-        } else {
-            let ik = vm.heap.intern_key(&i.to_string());
-            vm.get_property_by_key(arr_h, ik)
-                .unwrap_or(JsValue::UNDEFINED)
-        };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
         let Some(h) = item.as_object() else {
             return Err(create_dom_exception(
                 vm,
@@ -709,15 +790,15 @@ fn parse_transfer_list(
             return Err(create_dom_exception(
                 vm,
                 "DataCloneError",
-                "Cannot transfer source or target MessagePort",
+                "Cannot transfer source MessagePort",
             ));
         }
         if let Some(port) = frames.borrow().ports.get(&h) {
-            if port.neutered {
+            if port.neutered || port.closed {
                 return Err(create_dom_exception(
                     vm,
                     "DataCloneError",
-                    "MessagePort has already been neutered",
+                    "MessagePort has already been detached or closed",
                 ));
             }
             out.push(TransferEntry::Port(h));
@@ -728,7 +809,13 @@ fn parse_transfer_list(
             .get_object(h)
             .is_some_and(|o| matches!(o.kind, ObjectKind::ArrayBuffer(_)))
         {
-            if frames.borrow().detached_buffers.contains(&h) {
+            let already_detached = frames.borrow().detached_buffers.contains(&h)
+                || vm
+                    .heap
+                    .get_object(h)
+                    .and_then(|o| o.rare.as_ref())
+                    .is_some_and(|r| r.ab_detached);
+            if already_detached {
                 return Err(create_dom_exception(
                     vm,
                     "DataCloneError",
@@ -788,6 +875,7 @@ fn execute_in_process_transfer(
                             started: false,
                             closed,
                             neutered: false,
+                            flush_scheduled: false,
                             onmessage: JsValue::NULL,
                             onmessageerror: JsValue::NULL,
                             pending,
@@ -802,6 +890,9 @@ fn execute_in_process_transfer(
                     Some(ObjectKind::ArrayBuffer(b)) => std::mem::take(b.as_mut()),
                     _ => Vec::new(),
                 };
+                if let Some(o) = vm.heap.get_object_mut(old_h) {
+                    o.rare_mut().ab_detached = true;
+                }
                 frames.borrow_mut().detached_buffers.insert(old_h);
                 let new_h = alloc_array_buffer(vm, bytes);
                 memo.insert(old_h, new_h);
@@ -927,28 +1018,47 @@ fn schedule_port_flush(
     frames: &SharedFrames,
     port_h: HeapHandle,
 ) {
+    {
+        let mut fs = frames.borrow_mut();
+        let Some(port) = fs.ports.get_mut(&port_h) else {
+            return;
+        };
+        if port.flush_scheduled
+            || !port.started
+            || port.closed
+            || port.neutered
+            || port.pending.is_empty()
+        {
+            return;
+        }
+        port.flush_scheduled = true;
+    }
     let h = Rc::clone(host);
     let ev = Rc::clone(events);
     let el = Rc::clone(event_loop);
     let fr = Rc::clone(frames);
     event_loop
         .borrow_mut()
-        .post_host_task(TaskPriority::Networking, move |vm| loop {
+        .post_host_task(TaskPriority::Networking, move |vm| {
+            // WHATWG HTML §9.3.3: deliver at most ONE queued port message per macrotask
+            // so recursive `onmessage -> postMessage` loops yield fairly to timers and other tasks.
             let next_msg = {
                 let mut fs = fr.borrow_mut();
                 let Some(port) = fs.ports.get_mut(&port_h) else {
-                    break;
+                    return;
                 };
+                port.flush_scheduled = false;
                 if !port.started || port.closed || port.neutered {
-                    break;
+                    return;
                 }
                 port.pending.pop_front()
             };
             let Some(queued) = next_msg else {
-                break;
+                return;
             };
             let ports_arr =
                 alloc_array_from(vm, queued.ports.iter().map(|&ph| JsValue::from_object(ph)));
+            freeze_js_array(vm, ports_arr);
             let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
             let proto = fr
                 .borrow()
@@ -971,6 +1081,13 @@ fn schedule_port_flush(
                     ("ports", JsValue::from_object(ports_arr)),
                 ],
             );
+            let has_more =
+                fr.borrow().ports.get(&port_h).is_some_and(|p| {
+                    p.started && !p.closed && !p.neutered && !p.pending.is_empty()
+                });
+            if has_more {
+                schedule_port_flush(&h, &ev, &el, &fr, port_h);
+            }
         });
 }
 
@@ -999,6 +1116,7 @@ fn alloc_message_port(
             started: false,
             closed: false,
             neutered: false,
+            flush_scheduled: false,
             onmessage: JsValue::NULL,
             onmessageerror: JsValue::NULL,
             pending: VecDeque::new(),
@@ -1236,6 +1354,15 @@ fn install_same_origin_child_globals(
         "MouseEvent",
         "KeyboardEvent",
         "MessageEvent",
+        "MessageChannel",
+        "MessagePort",
+        "BroadcastChannel",
+        "Blob",
+        "FileReader",
+        "URL",
+        "WebSocket",
+        "WebSocketStream",
+        "WebSocketError",
         "Node",
         "Element",
         "HTMLElement",
@@ -1600,7 +1727,30 @@ fn alloc_window_proxy(
     proxy_h
 }
 
-/// Dispatches `postMessage` on `target_h` (which may be `vm.global` or any `WindowProxy`).
+/// Synchronizes indexed child browsing contexts (`window[0]`, `window[1]`, ...) on `main_window`.
+fn sync_window_indexed_frames(vm: &mut JsVm, frames: &SharedFrames) {
+    let (main_win, proxies): (HeapHandle, Vec<HeapHandle>) = {
+        let fs = frames.borrow();
+        let list = fs
+            .iframe_order
+            .iter()
+            .filter_map(|nid| fs.iframes.get(nid).map(|r| r.proxy))
+            .collect();
+        (fs.main_window, list)
+    };
+    for (idx, proxy_h) in proxies.into_iter().enumerate() {
+        let k = vm.heap.intern_key(&idx.to_string());
+        vm.heap.object_define_data(
+            main_win,
+            k,
+            JsValue::from_object(proxy_h),
+            PropertyAttrs::ENUMERABLE | PropertyAttrs::CONFIGURABLE,
+            &mut vm.shapes,
+        );
+    }
+}
+
+/// Dispatches `postMessage` on `target_h` (which may be `main_window` or any `WindowProxy`).
 #[allow(clippy::too_many_arguments)]
 fn perform_window_post_message(
     vm: &mut JsVm,
@@ -1614,7 +1764,41 @@ fn perform_window_post_message(
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
     let (msg_val, raw_target_origin, transfer_val) = parse_post_message_args(vm, args)?;
-    let caller_origin = frames.borrow().effective_origin(web_apis);
+    let main_win = frames.borrow().main_window;
+    let (caller_origin, canonical_source) = {
+        let fs = frames.borrow();
+        if let Some(sh) = source_val.as_object() {
+            if let Some(kind) = fs.proxies.get(&sh) {
+                let orig = match kind {
+                    WindowProxyKind::SameOriginChild { origin, .. }
+                    | WindowProxyKind::CrossOriginRemote { origin, .. }
+                    | WindowProxyKind::Auxiliary { origin, .. } => origin.clone(),
+                };
+                (orig, JsValue::from_object(sh))
+            } else if let Some((&proxy_h, orig)) =
+                fs.proxies.iter().find_map(|(ph, kind)| match kind {
+                    WindowProxyKind::CrossOriginRemote {
+                        local_global: Some(lg),
+                        origin,
+                        ..
+                    } if *lg == sh => Some((ph, origin.clone())),
+                    _ => None,
+                })
+            {
+                (orig, JsValue::from_object(proxy_h))
+            } else {
+                (
+                    fs.effective_origin(web_apis),
+                    JsValue::from_object(main_win),
+                )
+            }
+        } else {
+            (
+                fs.effective_origin(web_apis),
+                JsValue::from_object(main_win),
+            )
+        }
+    };
     let expected_origin = validate_target_origin(vm, &caller_origin, &raw_target_origin)?;
     let transfer_entries = parse_transfer_list(vm, frames, transfer_val, &[])?;
 
@@ -1660,15 +1844,25 @@ fn perform_window_post_message(
         return Ok(JsValue::UNDEFINED);
     }
 
-    // Case 2: In-process target (`window` itself, same-origin child iframe, or auxiliary window).
-    let (target_origin, is_closed) = if target_h == vm.global {
-        let closed = frames.borrow().window_closed;
-        (caller_origin.clone(), closed)
+    // Case 2: In-process target (`main_window`, same-origin child iframe, standalone cross-origin iframe, or auxiliary window).
+    let (delivery_target, target_origin, is_closed) = if target_h == main_win {
+        let fs = frames.borrow();
+        (main_win, fs.effective_origin(web_apis), fs.window_closed)
     } else {
         match frames.borrow().proxies.get(&target_h) {
-            Some(WindowProxyKind::SameOriginChild { origin, closed, .. })
-            | Some(WindowProxyKind::CrossOriginRemote { origin, closed, .. })
-            | Some(WindowProxyKind::Auxiliary { origin, closed, .. }) => (origin.clone(), *closed),
+            Some(WindowProxyKind::SameOriginChild { origin, closed, .. }) => {
+                (target_h, origin.clone(), *closed)
+            }
+            Some(WindowProxyKind::CrossOriginRemote {
+                origin,
+                closed,
+                local_global: Some(lg),
+                ..
+            }) => (*lg, origin.clone(), *closed),
+            Some(WindowProxyKind::CrossOriginRemote { origin, closed, .. })
+            | Some(WindowProxyKind::Auxiliary { origin, closed, .. }) => {
+                (target_h, origin.clone(), *closed)
+            }
             None => return Ok(JsValue::UNDEFINED),
         }
     };
@@ -1697,6 +1891,7 @@ fn perform_window_post_message(
                 vm,
                 transferred_ports.iter().map(|&ph| JsValue::from_object(ph)),
             );
+            freeze_js_array(vm, ports_arr);
             let origin_js = JsValue::from_string(vm.heap.alloc_string(&origin_str));
             let empty_js = JsValue::from_string(vm.heap.alloc_string(""));
             let proto = fr
@@ -1709,14 +1904,14 @@ fn perform_window_post_message(
                 &h,
                 &ev,
                 &el,
-                target_h,
+                delivery_target,
                 "message",
                 proto,
                 &[
                     ("data", cloned_data),
                     ("origin", origin_js),
                     ("lastEventId", empty_js),
-                    ("source", source_val),
+                    ("source", canonical_source),
                     ("ports", JsValue::from_object(ports_arr)),
                 ],
             );
@@ -2007,6 +2202,8 @@ pub(crate) fn sync_iframe_node(
             bind_child_frame_functions(vm, proxy_h, &pre_keys);
         }
 
+        sync_window_indexed_frames(vm, frames);
+
         // Fire async `load` event on the `<iframe>` element (supports both `.onload` and inline `onload="..."`).
         let h = Rc::clone(host);
         let ev = Rc::clone(events);
@@ -2023,57 +2220,173 @@ pub(crate) fn sync_iframe_node(
             .iframes
             .get(&node_id)
             .and_then(|r| r.remote_pipeline);
+
+        // In standalone mode (when no external OOPIF process is bound), fetch and run the child
+        // document inside a completely separate `local_global` so parent JS still receives
+        // `SecurityError` on `proxy_h`, while `postMessage` and `onload` function end-to-end.
+        let mut standalone_local_global: Option<HeapHandle> = None;
+        let fetched_standalone = if existing_remote.is_none() && sandbox.scripts_allowed() {
+            if let Some(ref sd) = srcdoc_attr {
+                let cs = rix_html::detect_html_charset(sd.as_bytes());
+                Some((sd.clone(), cs, "text/html".to_string()))
+            } else if resolved_url.starts_with("http://") || resolved_url.starts_with("https://") {
+                fetch_iframe_url_sync(net, &resolved_url, &effective_child_origin)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let proxy_h = alloc_window_proxy(
             vm,
             web_apis,
             frames,
             WindowProxyKind::CrossOriginRemote {
                 remote_pipeline: existing_remote,
-                origin: effective_child_origin,
+                origin: effective_child_origin.clone(),
                 url: resolved_url.clone(),
                 closed: false,
                 crashed: false,
+                local_global: None,
             },
         );
+
+        if let Some((html_content, child_charset, child_ct)) = fetched_standalone {
+            let wp_proto = frames
+                .borrow()
+                .window_proxy_proto
+                .unwrap_or(vm.object_proto);
+            let lg = vm
+                .heap
+                .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(wp_proto)));
+            let (child_doc, _title, inline_scripts) = build_sub_document(
+                vm,
+                host,
+                &resolved_url,
+                &html_content,
+                child_charset,
+                &child_ct,
+                lg,
+            );
+            let saved_global = vm.global;
+            let top_val = frames.borrow().top_window;
+            install_same_origin_child_globals(
+                vm,
+                lg,
+                child_doc,
+                saved_global,
+                top_val,
+                JsValue::NULL,
+            );
+            let k_orig = vm.heap.intern_key("origin");
+            let orig_v = JsValue::from_string(vm.heap.alloc_string(&effective_child_origin));
+            vm.heap
+                .object_define_data(lg, k_orig, orig_v, PropertyAttrs::DEFAULT, &mut vm.shapes);
+            if !inline_scripts.is_empty() {
+                let pre_keys: HashSet<rix_js::PropertyKey> = vm
+                    .heap
+                    .get_object(lg)
+                    .map(|o| {
+                        if let Some(rare) = &o.rare {
+                            rare.dict_props.keys().copied().collect()
+                        } else if let Some(shape) = vm.shapes.get(rix_js::ShapeId(o.shape_id)) {
+                            shape.keys().iter().copied().collect()
+                        } else {
+                            HashSet::new()
+                        }
+                    })
+                    .unwrap_or_default();
+                let base_url = Url::parse(&resolved_url).ok();
+                for script in inline_scripts {
+                    let code = match script {
+                        SubdocScript::Inline(c) => Some(c),
+                        SubdocScript::External(src) => {
+                            let script_url = base_url
+                                .as_ref()
+                                .and_then(|b| b.join(&src).ok())
+                                .map(|u| u.to_string())
+                                .unwrap_or(src);
+                            if script_url.starts_with("http://")
+                                || script_url.starts_with("https://")
+                            {
+                                fetch_iframe_url_sync(net, &script_url, &effective_child_origin)
+                                    .map(|(body, _, _)| body)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    if let Some(code) = code {
+                        vm.global = lg;
+                        let _ = vm.eval_script(&code);
+                        vm.global = saved_global;
+                    }
+                }
+                bind_child_frame_functions(vm, lg, &pre_keys);
+            }
+            if let Some(WindowProxyKind::CrossOriginRemote {
+                local_global: slot, ..
+            }) = frames.borrow_mut().proxies.get_mut(&proxy_h)
+            {
+                *slot = Some(lg);
+            }
+            standalone_local_global = Some(lg);
+        }
+
         let parent_pipeline = frames.borrow().pipeline_id;
-        let mut fs = frames.borrow_mut();
-        if !was_existing {
-            fs.iframe_order.push(node_id);
-            fs.outbound_ipc
-                .push_back(ContentToBrowser::CreateChildFrame {
-                    parent_pipeline,
-                    frame_node_id: node_id_u64(node_id),
+        {
+            let mut fs = frames.borrow_mut();
+            if !was_existing {
+                fs.iframe_order.push(node_id);
+                fs.outbound_ipc
+                    .push_back(ContentToBrowser::CreateChildFrame {
+                        parent_pipeline,
+                        frame_node_id: node_id_u64(node_id),
+                        surface_id,
+                        url: resolved_url,
+                        srcdoc: srcdoc_attr.clone(),
+                        sandbox: sandbox_attr.clone(),
+                        width,
+                        height,
+                    });
+            } else {
+                fs.outbound_ipc
+                    .push_back(ContentToBrowser::NavigateChildFrame {
+                        parent_pipeline,
+                        frame_node_id: node_id_u64(node_id),
+                        url: resolved_url,
+                        srcdoc: srcdoc_attr.clone(),
+                        sandbox: sandbox_attr.clone(),
+                    });
+            }
+            fs.iframes.insert(
+                node_id,
+                IframeRecord {
+                    node_id,
                     surface_id,
-                    url: resolved_url,
-                    srcdoc: srcdoc_attr.clone(),
-                    sandbox: sandbox_attr.clone(),
-                    width,
-                    height,
-                });
-        } else {
-            fs.outbound_ipc
-                .push_back(ContentToBrowser::NavigateChildFrame {
-                    parent_pipeline,
-                    frame_node_id: node_id_u64(node_id),
-                    url: resolved_url,
-                    srcdoc: srcdoc_attr.clone(),
-                    sandbox: sandbox_attr.clone(),
+                    proxy: proxy_h,
+                    is_cross_origin: true,
+                    remote_pipeline: existing_remote,
+                    last_src: src_attr,
+                    last_srcdoc: srcdoc_attr,
+                    last_sandbox: sandbox_attr,
+                    crashed: false,
+                },
+            );
+        }
+        sync_window_indexed_frames(vm, frames);
+        if standalone_local_global.is_some() {
+            let h = Rc::clone(host);
+            let ev = Rc::clone(events);
+            let el = Rc::clone(event_loop);
+            event_loop
+                .borrow_mut()
+                .post_host_task(TaskPriority::Networking, move |vm| {
+                    let _ =
+                        fire_dom_node_event(vm, &h, &ev, &el, node_id, "load", false, false, &[]);
                 });
         }
-        fs.iframes.insert(
-            node_id,
-            IframeRecord {
-                node_id,
-                surface_id,
-                proxy: proxy_h,
-                is_cross_origin: true,
-                remote_pipeline: existing_remote,
-                last_src: src_attr,
-                last_srcdoc: srcdoc_attr,
-                last_sandbox: sandbox_attr,
-                crashed: false,
-            },
-        );
     }
 }
 
@@ -2245,6 +2558,7 @@ pub fn deliver_ipc_post_message(
                 url: origin.to_string(),
                 closed: false,
                 crashed: false,
+                local_global: None,
             },
         );
         frames
@@ -2272,6 +2586,7 @@ pub fn deliver_ipc_post_message(
         .post_host_task(TaskPriority::Networking, move |vm| {
             let ports_arr =
                 alloc_array_from(vm, port_handles.iter().map(|&ph| JsValue::from_object(ph)));
+            freeze_js_array(vm, ports_arr);
             let origin_js = JsValue::from_string(vm.heap.alloc_string(&origin_str));
             let empty_js = JsValue::from_string(vm.heap.alloc_string(""));
             let proto = fr
@@ -2695,15 +3010,13 @@ fn install_message_channel_and_port(
                 )
             };
 
-            let mut disallowed = vec![src_h];
-            if let Some(ph) = partner_h {
-                disallowed.push(ph);
-            }
+            let disallowed = vec![src_h];
             let transfer_entries = parse_transfer_list(vm, &fr, transfer_val, &disallowed)?;
 
             if closed_or_neutered {
-                // Validate cloning even when closed? Per spec, cloning still runs before drop.
-                let mut memo = HashMap::new();
+                // Per WHATWG HTML §9.3.3: still execute transfer (detaching transferred ports & buffers)
+                // and structured clone validation before dropping the message!
+                let (_, mut memo) = execute_in_process_transfer(vm, &fr, transfer_entries);
                 let _ = structured_clone_inner(vm, &wa, msg_val, &mut memo)?;
                 return Ok(JsValue::UNDEFINED);
             }
@@ -3114,8 +3427,8 @@ fn install_window_browsing_context(
         let el = Rc::clone(event_loop);
         let wa = Rc::clone(web_apis);
         let fr = Rc::clone(frames);
-        define_host_method(vm, g, "postMessage", move |vm, _this_val, args| {
-            let target_h = vm.global;
+        define_host_method(vm, g, "postMessage", move |vm, this_val, args| {
+            let target_h = this_val.as_object().unwrap_or(g);
             let source_val = JsValue::from_object(vm.global);
             perform_window_post_message(vm, &h, &ev, &el, &wa, &fr, target_h, source_val, args)
         });

@@ -1870,9 +1870,34 @@ fn install_global_and_window_event_handlers(
             if let Some(ev) = e_hook.upgrade() {
                 let fn_val = compile_inline_handler(vm, code);
                 let ev_type = attr_name[2..].to_string();
-                ev.borrow_mut()
-                    .event_handlers
-                    .insert((EventTargetKey::Window, ev_type), fn_val);
+                let key = (EventTargetKey::Window, ev_type);
+                let needs_tramp = !ev.borrow().idl_handler_trampolines.contains_key(&key);
+                ev.borrow_mut().event_handlers.insert(key.clone(), fn_val);
+                if needs_tramp {
+                    let e_cb = Rc::clone(&ev);
+                    let key_cb = key.clone();
+                    let tramp = vm.alloc_host_fn(attr_name, move |vm, this_v, cb_args| {
+                        let cb = e_cb
+                            .borrow()
+                            .event_handlers
+                            .get(&key_cb)
+                            .copied()
+                            .unwrap_or(JsValue::NULL);
+                        if cb.as_object().is_some_and(|fh| vm.is_callable_handle(fh)) {
+                            let ev_arg = arg(cb_args, 0);
+                            let _ = vm.call_value(cb, this_v, &[ev_arg]);
+                        }
+                        Ok(JsValue::UNDEFINED)
+                    });
+                    let mut es = ev.borrow_mut();
+                    es.idl_handler_trampolines.insert(key.clone(), tramp);
+                    es.listeners.entry(key).or_default().push(ListenerEntry {
+                        listener: tramp,
+                        capture: false,
+                        once: false,
+                        passive: false,
+                    });
+                }
             }
         }
     }));
@@ -2429,20 +2454,6 @@ pub(crate) fn fire_object_event_with_proto(
             .object_define_data(ev_h, k, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
     }
 
-    let handler_key = vm.heap.intern_key(&format!("on{ev_type}"));
-    if let Ok(handler_val) = vm.get_property_by_key(target, handler_key) {
-        if let Some(h) = handler_val
-            .as_object()
-            .filter(|&fh| vm.is_callable_handle(fh))
-        {
-            let _ = vm.call_value(
-                JsValue::from_object(h),
-                JsValue::from_object(target),
-                &[JsValue::from_object(ev_h)],
-            );
-        }
-    }
-
     let target_key = if target == vm.global {
         EventTargetKey::Window
     } else if let Some(nid) = host.borrow().node_for_handle(vm, target) {
@@ -2450,6 +2461,26 @@ pub(crate) fn fire_object_event_with_proto(
     } else {
         EventTargetKey::Object(target)
     };
+
+    let has_trampoline = events
+        .borrow()
+        .idl_handler_trampolines
+        .contains_key(&(target_key, ev_type.to_string()));
+    if !has_trampoline {
+        let handler_key = vm.heap.intern_key(&format!("on{ev_type}"));
+        if let Ok(handler_val) = vm.get_property_by_key(target, handler_key) {
+            if let Some(h) = handler_val
+                .as_object()
+                .filter(|&fh| vm.is_callable_handle(fh))
+            {
+                let _ = vm.call_value(
+                    JsValue::from_object(h),
+                    JsValue::from_object(target),
+                    &[JsValue::from_object(ev_h)],
+                );
+            }
+        }
+    }
 
     let _ = dispatch_event_internal(vm, host, events, event_loop, target_key, ev_h);
 }
