@@ -1431,6 +1431,11 @@ fn install_html_reflecting_idl_properties(vm: &mut JsVm, host: &SharedHost) {
         install_uint(vm, p, "height", "height", 0);
         install_uint(vm, p, "hspace", "hspace", 0);
         install_uint(vm, p, "vspace", "vspace", 0);
+        // `HTMLImageElement.prototype.decode()` (HTML §4.8.4.3.7)
+        define_host_method(vm, p, "decode", move |vm, _, _| {
+            let p = rix_js::promise::promise_resolve_value(vm, JsValue::UNDEFINED);
+            Ok(JsValue::from_object(p))
+        });
     }
 
     // `HTMLAreaElement.prototype`

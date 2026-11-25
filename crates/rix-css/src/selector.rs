@@ -155,10 +155,9 @@ pub struct CssLocalName {
 impl CssLocalName {
     #[must_use]
     pub fn new(s: &str) -> Self {
-        let lower = s.to_ascii_lowercase();
-        let hash64 = hash_ident_ascii_lower(&lower);
+        let hash64 = hash_ident_ascii_lower(s);
         Self {
-            ident: intern_str(&lower),
+            ident: intern_str(s),
             hash64,
             hash32: fold_hash_u32(hash64),
         }

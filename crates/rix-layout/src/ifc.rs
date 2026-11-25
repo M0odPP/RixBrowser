@@ -128,7 +128,7 @@ enum InlineItem {
         can_emergency_break_before: bool,
         inline_stack: Vec<ActiveInline>,
     },
-    HardBreak,
+    HardBreak(Option<BoxId>),
     Atomic {
         box_id: BoxId,
         style: Arc<ComputedStyle>,
@@ -236,7 +236,7 @@ pub fn measure_vertical_ifc_dims(
                     cur_line_block = cur_line_block.max(lh.max(strut_line_h));
                 }
             }
-            InlineItem::HardBreak => {
+            InlineItem::HardBreak(_) => {
                 total_block += cur_line_block.max(strut_line_h);
                 max_inline = max_inline.max(cur_inline);
                 cur_inline = 0.0;
@@ -403,7 +403,7 @@ pub fn measure_ifc_inline_min_max(
                     max_w = max_w.max(current_line_w);
                 }
             }
-            InlineItem::HardBreak => {
+            InlineItem::HardBreak(_) => {
                 max_w = max_w.max(current_line_w);
                 current_line_w = 0.0;
                 current_unbreakable_w = 0.0;
@@ -532,7 +532,46 @@ pub fn layout_ifc(
                     grid_hint: None,
                 });
             }
-            InlineItem::HardBreak => {
+            InlineItem::HardBreak(br_box_id) => {
+                if let Some(bid) = br_box_id {
+                    let br_node = ctx.tree.get(bid);
+                    let br_frag = Fragment {
+                        box_id: bid,
+                        dom_node: br_node.dom_node,
+                        style: Arc::clone(&br_node.style),
+                        border_rect: Rect::new(0.0, 0.0, 0.0, strut_line_h),
+                        padding: EdgeInsets::ZERO,
+                        border: EdgeInsets::ZERO,
+                        margin: EdgeInsets::ZERO,
+                        content_rect: Rect::new(0.0, 0.0, 0.0, strut_line_h),
+                        baseline: Some(strut_ascent),
+                        last_baseline: Some(strut_ascent),
+                        overflow_rect: Rect::new(0.0, 0.0, 0.0, strut_line_h),
+                        kind: FragmentKind::Box,
+                        children: Arc::new(Vec::new()),
+                        is_float: false,
+                        is_out_of_flow: false,
+                        collapsed_margin_top: 0.0,
+                        collapsed_margin_bottom: 0.0,
+                        resolved_grid_tracks: None,
+                    };
+                    cur_pieces.push(LinePiece {
+                        box_id: bid,
+                        x: cur_x,
+                        width: 0.0,
+                        height: strut_line_h,
+                        ascent: strut_ascent,
+                        descent: strut_descent,
+                        vertical_align: VerticalAlignMode::Baseline,
+                        is_space: false,
+                        is_preserved_space: false,
+                        hangs_at_line_end: false,
+                        can_break_before: false,
+                        can_emergency_break_before: false,
+                        inline_stack: Vec::new(),
+                        payload: LinePiecePayload::Atomic(Box::new(br_frag)),
+                    });
+                }
                 let line = finish_line(
                     ctx,
                     &mut cur_pieces,
@@ -1742,7 +1781,7 @@ fn collect_inline_recursive(
             state.prev_non_bidi = None;
             state.prev_ended_with_space = false;
             state.prev_nowrap_box = None;
-            out.push(InlineItem::HardBreak);
+            out.push(InlineItem::HardBreak(Some(box_id)));
         }
         BoxKind::InlineBlock { .. }
         | BoxKind::Replaced(_)
@@ -1850,7 +1889,7 @@ fn tokenize_text(
         let is_break_spaces = collapse == WhiteSpaceCollapseMode::BreakSpaces;
         for (line_idx, raw_seg) in text.split('\n').enumerate() {
             if line_idx > 0 {
-                out.push(InlineItem::HardBreak);
+                out.push(InlineItem::HardBreak(None));
                 state.prev_char = None;
                 state.prev_non_bidi = None;
                 state.prev_ended_with_space = false;
@@ -1936,7 +1975,7 @@ fn tokenize_text(
 
     for (line_idx, norm) in normalized_lines.into_iter().enumerate() {
         if line_idx > 0 {
-            out.push(InlineItem::HardBreak);
+            out.push(InlineItem::HardBreak(None));
             state.prev_char = None;
             state.prev_non_bidi = None;
             state.prev_ended_with_space = false;

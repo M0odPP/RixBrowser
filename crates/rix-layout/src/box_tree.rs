@@ -806,19 +806,29 @@ impl<'a> BoxTreeBuilder<'a> {
                 })
             }
             "svg" => {
-                let view_box = elem.get_attribute("viewBox").and_then(SvgViewBox::parse);
+                let view_box = elem
+                    .get_attribute("viewBox")
+                    .or_else(|| elem.get_attribute("viewbox"))
+                    .and_then(SvgViewBox::parse);
                 let attr_w = elem
                     .get_attribute("width")
                     .and_then(parse_html_dimension_attr);
                 let attr_h = elem
                     .get_attribute("height")
                     .and_then(parse_html_dimension_attr);
-                let iw = attr_w
-                    .or_else(|| view_box.map(|vb| vb.width))
-                    .unwrap_or(16.0);
-                let ih = attr_h
-                    .or_else(|| view_box.map(|vb| vb.height))
-                    .unwrap_or(16.0);
+                let (iw, ih) = match (attr_w, attr_h, view_box) {
+                    (Some(w), Some(h), _) => (w, h),
+                    (Some(w), None, Some(vb)) if vb.width > 0.0 && vb.height > 0.0 => {
+                        (w, w * (vb.height / vb.width))
+                    }
+                    (None, Some(h), Some(vb)) if vb.width > 0.0 && vb.height > 0.0 => {
+                        (h * (vb.width / vb.height), h)
+                    }
+                    (w_opt, h_opt, vb_opt) => (
+                        w_opt.or_else(|| vb_opt.map(|vb| vb.width)).unwrap_or(16.0),
+                        h_opt.or_else(|| vb_opt.map(|vb| vb.height)).unwrap_or(16.0),
+                    ),
+                };
                 let mut paths = Vec::new();
                 let inherited_fill = elem
                     .get_attribute("fill")

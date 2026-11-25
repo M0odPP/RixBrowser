@@ -1381,7 +1381,8 @@ fn run_wpt_testharness_file(
             break;
         }
         let had_raf = rt.event_loop.borrow().has_pending_raf();
-        rt.fire_vsync(f64::from(tick + 1) * 16.0);
+        let now_ms = rt.event_loop.borrow().now_ms();
+        rt.fire_vsync(now_ms);
         if !has_pending(&mut rt) {
             break;
         }
