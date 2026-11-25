@@ -320,6 +320,11 @@ impl StreamSystem {
         self.readable.get(&h).is_some_and(|rs| rs.disturbed)
     }
 
+    /// Returns whether the given `ReadableStream` is currently locked to a reader.
+    pub(crate) fn is_readable_locked(&self, h: HeapHandle) -> bool {
+        self.readable.get(&h).is_some_and(|rs| rs.reader.is_some())
+    }
+
     /// Sweeps dead native entries for GC-collected stream handles.
     pub fn sweep_dead(&mut self, heap: &rix_js::GcHeap) {
         self.readable.retain(|&h, _| heap.is_alive(h));
@@ -864,11 +869,45 @@ pub(crate) fn alloc_readable_stream_internal(
 // Live Pull-on-Demand ReadableStreamDefaultTee (WHATWG Streams §4.2.4)
 // ---------------------------------------------------------------------------
 
+/// Tees a Fetch body `ReadableStream` with `cloneForBranch2 = true` (WHATWG Fetch §5.2).
+pub(crate) fn tee_readable_stream_for_fetch(
+    vm: &mut JsVm,
+    streams: &SharedStreams,
+    web_apis: &SharedWebApis,
+    src_h: HeapHandle,
+) -> Result<(HeapHandle, HeapHandle), JsException> {
+    let is_byte = streams
+        .borrow()
+        .readable
+        .get(&src_h)
+        .is_some_and(|rs| rs.is_byte_stream);
+    let arr = if is_byte {
+        readable_byte_stream_tee(vm, streams, src_h)?
+    } else {
+        readable_stream_default_tee(vm, streams, Some(web_apis), src_h)?
+    };
+    let b1 = vm
+        .heap
+        .get_object(arr)
+        .and_then(|o| o.elements.get(0))
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| vm.type_error("tee failed to create branch 1"))?;
+    let b2 = vm
+        .heap
+        .get_object(arr)
+        .and_then(|o| o.elements.get(1))
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| vm.type_error("tee failed to create branch 2"))?;
+    Ok((b1, b2))
+}
+
 fn readable_stream_default_tee(
     vm: &mut JsVm,
     streams: &SharedStreams,
+    clone_web_apis: Option<&SharedWebApis>,
     src_h: HeapHandle,
 ) -> Result<HeapHandle, JsException> {
+    let clone_wa = clone_web_apis.map(Rc::clone);
     let reader_h = acquire_default_reader(vm, streams, src_h)?;
     let reader_closed_p = streams
         .borrow()
@@ -906,6 +945,7 @@ fn readable_stream_default_tee(
     fn tee_pull(
         vm: &mut JsVm,
         streams: &SharedStreams,
+        clone_wa: &Option<SharedWebApis>,
         src_h: HeapHandle,
         shared: &Rc<RefCell<TeeShared>>,
     ) {
@@ -919,6 +959,7 @@ fn readable_stream_default_tee(
         }
         let ss_chunk = Rc::clone(streams);
         let sh_chunk = Rc::clone(shared);
+        let wa_chunk = clone_wa.clone();
         let ss_close = Rc::clone(streams);
         let sh_close = Rc::clone(shared);
         let sh_err = Rc::clone(shared);
@@ -927,6 +968,7 @@ fn readable_stream_default_tee(
                 move |vm: &mut JsVm, val: JsValue| {
                     let ss_m = Rc::clone(&ss_chunk);
                     let sh_m = Rc::clone(&sh_chunk);
+                    let wa_m = wa_chunk.clone();
                     let micro =
                         vm.alloc_host_fn_rooted("tee_chunk_micro", &[val], move |vm, _, _| {
                             let (c1, c2, b1, b2) = {
@@ -934,6 +976,41 @@ fn readable_stream_default_tee(
                                 sh.read_again = false;
                                 (sh.canceled1, sh.canceled2, sh.branch1, sh.branch2)
                             };
+                            let mut val2 = val;
+                            if !c2 {
+                                if let Some(ref wa) = wa_m {
+                                    let mut memo = HashMap::new();
+                                    match crate::web_apis::structured_clone_inner(
+                                        vm, wa, val, &mut memo,
+                                    ) {
+                                        Ok(cloned) => val2 = cloned,
+                                        Err(e) => {
+                                            if let Some(h1) = b1 {
+                                                readable_error_internal(vm, &ss_m, h1, e.value);
+                                            }
+                                            if let Some(h2) = b2 {
+                                                readable_error_internal(vm, &ss_m, h2, e.value);
+                                            }
+                                            let cp = sh_m.borrow().cancel_promise;
+                                            let res_p =
+                                                readable_cancel_internal(vm, &ss_m, src_h, e.value);
+                                            let on_ok =
+                                                vm.alloc_host_fn("tee_sc_ok", move |vm, _, _| {
+                                                    resolve_promise(vm, cp, JsValue::UNDEFINED);
+                                                    Ok(JsValue::UNDEFINED)
+                                                });
+                                            let on_err =
+                                                vm.alloc_host_fn("tee_sc_err", move |vm, _, a| {
+                                                    reject_promise(vm, cp, arg(a, 0));
+                                                    Ok(JsValue::UNDEFINED)
+                                                });
+                                            let _ =
+                                                promise_then(vm, res_p, Some(on_ok), Some(on_err));
+                                            return Ok(JsValue::UNDEFINED);
+                                        }
+                                    }
+                                }
+                            }
                             if !c1 {
                                 if let Some(h1) = b1 {
                                     let _ = readable_controller_enqueue(vm, &ss_m, h1, val);
@@ -941,7 +1018,7 @@ fn readable_stream_default_tee(
                             }
                             if !c2 {
                                 if let Some(h2) = b2 {
-                                    let _ = readable_controller_enqueue(vm, &ss_m, h2, val);
+                                    let _ = readable_controller_enqueue(vm, &ss_m, h2, val2);
                                 }
                             }
                             let again = {
@@ -950,7 +1027,7 @@ fn readable_stream_default_tee(
                                 sh.read_again
                             };
                             if again {
-                                tee_pull(vm, &ss_m, src_h, &sh_m);
+                                tee_pull(vm, &ss_m, &wa_m, src_h, &sh_m);
                             }
                             Ok(JsValue::UNDEFINED)
                         });
@@ -995,14 +1072,16 @@ fn readable_stream_default_tee(
 
     let ss_p1 = Rc::clone(streams);
     let sh_p1 = Rc::clone(&shared);
+    let wa_p1 = clone_wa.clone();
     let pull_cb1 = vm.alloc_host_fn("tee_pull1", move |vm, _, _| {
-        tee_pull(vm, &ss_p1, src_h, &sh_p1);
+        tee_pull(vm, &ss_p1, &wa_p1, src_h, &sh_p1);
         Ok(JsValue::UNDEFINED)
     });
     let ss_p2 = Rc::clone(streams);
     let sh_p2 = Rc::clone(&shared);
+    let wa_p2 = clone_wa;
     let pull_cb2 = vm.alloc_host_fn("tee_pull2", move |vm, _, _| {
-        tee_pull(vm, &ss_p2, src_h, &sh_p2);
+        tee_pull(vm, &ss_p2, &wa_p2, src_h, &sh_p2);
         Ok(JsValue::UNDEFINED)
     });
 
@@ -1838,7 +1917,7 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
         let arr = if is_byte {
             readable_byte_stream_tee(vm, &ss, src_h)?
         } else {
-            readable_stream_default_tee(vm, &ss, src_h)?
+            readable_stream_default_tee(vm, &ss, None, src_h)?
         };
         Ok(JsValue::from_object(arr))
     });

@@ -252,6 +252,7 @@ pub fn install_cache_storage(
     // Cache.prototype.put(request, response) -> Promise<undefined>
     {
         let wa = Rc::clone(web_apis);
+        let st_r = Rc::clone(streams);
         let nb = Rc::clone(net);
         let sw = Rc::clone(sw_sys);
         define_host_method(vm, cache_proto, "put", move |vm, this_val, args| {
@@ -264,13 +265,14 @@ pub fn install_cache_storage(
                 reject_promise(vm, p, err.value);
                 return Ok(JsValue::from_object(p));
             };
-            let (url, method) = match extract_request_url_and_method(vm, &wa, &nb, arg(args, 0)) {
-                Ok(v) => v,
-                Err(e) => {
-                    reject_promise(vm, p, e.value);
-                    return Ok(JsValue::from_object(p));
-                }
-            };
+            let (url, method) =
+                match extract_request_url_and_method(vm, &wa, &st_r, &nb, arg(args, 0)) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        reject_promise(vm, p, e.value);
+                        return Ok(JsValue::from_object(p));
+                    }
+                };
             if !method.eq_ignore_ascii_case("GET") {
                 let err =
                     create_dom_exception(vm, "TypeError", "Cache.put only supports GET requests");
@@ -320,7 +322,7 @@ pub fn install_cache_storage(
                 reject_promise(vm, p, err.value);
                 return Ok(JsValue::from_object(p));
             };
-            let (url, _) = match extract_request_url_and_method(vm, &wa, &nb, arg(args, 0)) {
+            let (url, _) = match extract_request_url_and_method(vm, &wa, &st_r, &nb, arg(args, 0)) {
                 Ok(v) => v,
                 Err(e) => {
                     reject_promise(vm, p, e.value);
@@ -365,7 +367,7 @@ pub fn install_cache_storage(
             let filter_url = if arg(args, 0).is_undefined() {
                 None
             } else {
-                extract_request_url_and_method(vm, &wa, &nb, arg(args, 0))
+                extract_request_url_and_method(vm, &wa, &st_r, &nb, arg(args, 0))
                     .ok()
                     .map(|(u, _)| u)
             };
@@ -396,6 +398,7 @@ pub fn install_cache_storage(
     // Cache.prototype.delete(request) -> Promise<boolean>
     {
         let wa = Rc::clone(web_apis);
+        let st_r = Rc::clone(streams);
         let nb = Rc::clone(net);
         let sw = Rc::clone(sw_sys);
         define_host_method(vm, cache_proto, "delete", move |vm, this_val, args| {
@@ -407,7 +410,7 @@ pub fn install_cache_storage(
                 resolve_promise(vm, p, JsValue::from_bool(false));
                 return Ok(JsValue::from_object(p));
             };
-            let (url, _) = match extract_request_url_and_method(vm, &wa, &nb, arg(args, 0)) {
+            let (url, _) = match extract_request_url_and_method(vm, &wa, &st_r, &nb, arg(args, 0)) {
                 Ok(v) => v,
                 Err(e) => {
                     reject_promise(vm, p, e.value);
@@ -448,7 +451,7 @@ pub fn install_cache_storage(
             let urls = storage.cache_keys(&origin, &cache_name).unwrap_or_default();
             let reqs: Vec<JsValue> = urls
                 .into_iter()
-                .map(|u| JsValue::from_object(alloc_request_from_url(vm, &nb, u)))
+                .map(|u| JsValue::from_object(alloc_request_from_url(vm, &wa, &nb, u)))
                 .collect();
             let arr = alloc_js_array(vm, &reqs);
             resolve_promise(vm, p, JsValue::from_object(arr));
@@ -459,16 +462,18 @@ pub fn install_cache_storage(
     // Cache.prototype.add(request) -> Promise<undefined>
     {
         let wa = Rc::clone(web_apis);
+        let st_r = Rc::clone(streams);
         let nb = Rc::clone(net);
         let sw = Rc::clone(sw_sys);
         define_host_method(vm, cache_proto, "add", move |vm, this_val, args| {
-            cache_add_single(vm, &wa, &nb, &sw, this_val, arg(args, 0))
+            cache_add_single(vm, &wa, &st_r, &nb, &sw, this_val, arg(args, 0))
         });
     }
 
     // Cache.prototype.addAll(requests) -> Promise<undefined>
     {
         let wa = Rc::clone(web_apis);
+        let st_r = Rc::clone(streams);
         let nb = Rc::clone(net);
         let sw = Rc::clone(sw_sys);
         define_host_method(vm, cache_proto, "addAll", move |vm, this_val, args| {
@@ -498,7 +503,7 @@ pub fn install_cache_storage(
             let remaining = Rc::new(RefCell::new(req_vals.len()));
             let failed = Rc::new(RefCell::new(false));
             for rv in req_vals {
-                let item_p_val = cache_add_single(vm, &wa, &nb, &sw, this_val, rv)?;
+                let item_p_val = cache_add_single(vm, &wa, &st_r, &nb, &sw, this_val, rv)?;
                 let item_p = promise_resolve_value(vm, item_p_val);
                 let rem_ok = Rc::clone(&remaining);
                 let fail_ok = Rc::clone(&failed);
@@ -611,7 +616,7 @@ pub fn install_cache_storage(
         let nb = Rc::clone(net);
         define_host_method(vm, cs_proto, "match", move |vm, _, args| {
             let p = alloc_promise(vm);
-            let (url, _) = match extract_request_url_and_method(vm, &wa, &nb, arg(args, 0)) {
+            let (url, _) = match extract_request_url_and_method(vm, &wa, &st_r, &nb, arg(args, 0)) {
                 Ok(v) => v,
                 Err(e) => {
                     reject_promise(vm, p, e.value);
@@ -669,6 +674,7 @@ pub fn install_cache_storage(
 fn cache_add_single(
     vm: &mut JsVm,
     web_apis: &SharedWebApis,
+    streams: &SharedStreams,
     net: &SharedNetBridge,
     sw_sys: &SharedServiceWorkers,
     this_val: JsValue,
@@ -683,7 +689,7 @@ fn cache_add_single(
         reject_promise(vm, out_p, err.value);
         return Ok(JsValue::from_object(out_p));
     };
-    let (url, method) = match extract_request_url_and_method(vm, web_apis, net, req_val) {
+    let (url, method) = match extract_request_url_and_method(vm, web_apis, streams, net, req_val) {
         Ok(v) => v,
         Err(e) => {
             reject_promise(vm, out_p, e.value);
@@ -977,6 +983,7 @@ fn run_service_worker_thread(
                         &host,
                         &events,
                         &event_loop,
+                        &web_apis,
                         &net,
                         base_ev_proto,
                         request,
@@ -1111,12 +1118,13 @@ fn handle_sw_fetch_event(
     host: &SharedHost,
     events: &SharedEvents,
     event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
     net: &SharedNetBridge,
     base_ev_proto: HeapHandle,
     request: FetchRequest,
     reply_tx: oneshot::Sender<Option<Result<FetchResponse, FetchFailure>>>,
 ) {
-    let req_h = alloc_request_from_url(vm, net, request.url.clone());
+    let req_h = alloc_request_from_url(vm, web_apis, net, request.url.clone());
     // Attach method/headers on Request object via JS Request constructor if non-GET
     let req_val = if request.method.eq_ignore_ascii_case("GET") && request.headers.is_empty() {
         JsValue::from_object(req_h)

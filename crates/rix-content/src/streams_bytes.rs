@@ -1762,6 +1762,95 @@ pub(crate) fn alloc_byte_readable_stream(
     (obj, ctrl)
 }
 
+/// Creates a WHATWG Fetch byte-oriented `ReadableStream` (`type: "bytes"`) backed by an
+/// owned byte buffer, supporting both default readers and BYOB readers (including partial
+/// offset reads and `tee()`).
+pub(crate) fn create_readable_byte_stream_from_bytes(
+    vm: &mut JsVm,
+    streams: &SharedStreams,
+    bytes: Vec<u8>,
+) -> HeapHandle {
+    if bytes.is_empty() {
+        let (obj, _) = alloc_byte_readable_stream(vm, streams, 0.0, None, None, None, None, true);
+        byte_close_stream(vm, streams, obj);
+        return obj;
+    }
+
+    let state = Rc::new(RefCell::new((bytes, 0usize)));
+    let ss_pull = Rc::clone(streams);
+    let stream_slot: Rc<RefCell<Option<HeapHandle>>> = Rc::new(RefCell::new(None));
+    let stream_slot_pull = Rc::clone(&stream_slot);
+    let pull_fn = vm.alloc_host_fn("fetch_byte_body_pull", move |vm, _, _| {
+        let Some(stream_h) = *stream_slot_pull.borrow() else {
+            return Ok(JsValue::UNDEFINED);
+        };
+        let (rem_len, pos) = {
+            let st = state.borrow();
+            (st.0.len().saturating_sub(st.1), st.1)
+        };
+        if rem_len == 0 {
+            let _ = byte_controller_close(vm, &ss_pull, stream_h);
+            return Ok(JsValue::UNDEFINED);
+        }
+
+        // If a BYOB pull-into descriptor is waiting, fill directly into its buffer view!
+        let byob_target = ss_pull
+            .borrow()
+            .readable
+            .get(&stream_h)
+            .and_then(|rs| rs.byte_controller.as_ref())
+            .and_then(|bc| bc.pending_pull_intos.front())
+            .map(|d| {
+                (
+                    d.buffer,
+                    d.byte_offset + d.bytes_filled,
+                    d.byte_length - d.bytes_filled,
+                )
+            });
+
+        if let Some((buf_h, write_off, avail)) = byob_target {
+            let n = rem_len.min(avail);
+            if n > 0 {
+                let chunk_slice = state.borrow().0[pos..pos + n].to_vec();
+                if let Some(buf_obj) = vm.heap.get_object_mut(buf_h) {
+                    if let ObjectKind::ArrayBuffer(ref mut ab) = buf_obj.kind {
+                        if write_off + n <= ab.len() {
+                            ab[write_off..write_off + n].copy_from_slice(&chunk_slice);
+                        }
+                    }
+                }
+                state.borrow_mut().1 += n;
+                let done = {
+                    let st = state.borrow();
+                    st.1 >= st.0.len()
+                };
+                byte_respond_internal(vm, &ss_pull, stream_h, n)?;
+                if done {
+                    let _ = byte_controller_close(vm, &ss_pull, stream_h);
+                }
+            }
+            return Ok(JsValue::UNDEFINED);
+        }
+
+        // Default reader: enqueue all remaining bytes as a Uint8Array and close!
+        let remaining = {
+            let mut st = state.borrow_mut();
+            let slice = st.0[st.1..].to_vec();
+            st.1 = st.0.len();
+            slice
+        };
+        let u8_h = crate::web_apis::alloc_uint8_array(vm, remaining);
+        let _ = byte_controller_enqueue(vm, &ss_pull, stream_h, JsValue::from_object(u8_h));
+        let _ = byte_controller_close(vm, &ss_pull, stream_h);
+        Ok(JsValue::UNDEFINED)
+    });
+
+    let (obj, _) =
+        alloc_byte_readable_stream(vm, streams, 0.0, None, Some(pull_fn), None, None, true);
+    *stream_slot.borrow_mut() = Some(obj);
+    obj
+}
+
 // ---------------------------------------------------------------------------
 // ReadableByteStreamTee (WHATWG Streams §4.2.4)
 // ---------------------------------------------------------------------------

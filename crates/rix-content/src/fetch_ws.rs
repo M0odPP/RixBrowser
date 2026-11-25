@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use rix_js::promise::{alloc_promise, promise_resolve_value, reject_promise, resolve_promise};
+use rix_js::promise::{alloc_promise, reject_promise, resolve_promise};
 use rix_js::{HeapHandle, JsException, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs};
 use rix_net::{
     FetchCache, FetchCredentials, FetchEngine, FetchMode, FetchRedirect, FetchRequest,
@@ -22,17 +22,24 @@ use tokio::sync::mpsc;
 use crate::dom_bridge::SharedHost;
 use crate::event_loop::{run_microtask_checkpoint, SharedEventLoop};
 use crate::events::{fire_object_event, SharedEvents};
-use crate::fetch_headers::{
-    alloc_headers_from_entry, install_headers, is_forbidden_method, is_forbidden_request_header,
-    is_valid_header_name, normalize_and_validate_header_value, normalize_method,
-    parse_headers_init, to_byte_string, HeaderIterState, HeadersEntry, HeadersGuard,
+use crate::fetch_body::{
+    body_is_used, body_to_array_buffer, body_to_blob, body_to_bytes, body_to_form_data,
+    body_to_json, body_to_text, clone_fetch_body, consume_fetch_body_promise, extract_fetch_body,
+    transfer_request_body, FetchBody,
 };
-use crate::streams::{create_readable_stream_from_bytes, SharedStreams};
+use crate::fetch_headers::{
+    alloc_headers_from_entry, fill_headers_from_init, install_headers, is_forbidden_method,
+    is_forbidden_request_header, is_valid_header_name, is_valid_status_text,
+    normalize_and_validate_header_value, normalize_method, parse_headers_init, to_byte_string,
+    HeaderIterState, HeadersEntry, HeadersGuard,
+};
+use crate::streams::SharedStreams;
+use crate::streams_bytes::create_readable_byte_stream_from_bytes;
+use crate::streams_common::{promise_reject_value, set_to_string_tag};
 use crate::web_apis::{
-    abort_info_for_signal, alloc_array_buffer, alloc_form_data_from_urlencoded, alloc_uint8_array,
-    arg, bind_ctor_proto, create_blob_object, create_dom_exception, define_global,
-    define_host_accessor, define_host_getter, define_host_method, extract_bytes_from_js,
-    SharedWebApis,
+    abort_info_for_signal, alloc_array_buffer, arg, bind_ctor_proto, create_blob_object,
+    create_dom_exception, create_internal_abort_controller, define_global, define_host_accessor,
+    define_host_getter, define_host_method, extract_bytes_from_js, SharedWebApis,
 };
 
 /// Reactive async event pushed from background network / WebSocket tokio tasks
@@ -77,17 +84,56 @@ pub enum FetchFailure {
     TypeError(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponseKind {
+    Default,
+    Basic,
+    Cors,
+    Error,
+    Opaque,
+    OpaqueRedirect,
+}
+
+impl ResponseKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Basic => "basic",
+            Self::Cors => "cors",
+            Self::Error => "error",
+            Self::Opaque => "opaque",
+            Self::OpaqueRedirect => "opaqueredirect",
+        }
+    }
+
+    fn from_net(t: FetchResponseType) -> Self {
+        match t {
+            FetchResponseType::Basic => Self::Basic,
+            FetchResponseType::Cors => Self::Cors,
+            FetchResponseType::Opaque => Self::Opaque,
+            FetchResponseType::OpaqueRedirect => Self::OpaqueRedirect,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RequestEntry {
     url: String,
     method: String,
     headers_h: HeapHandle,
-    body: Vec<u8>,
-    body_used: bool,
+    body: Option<FetchBody>,
     mode: FetchMode,
     credentials: FetchCredentials,
+    cache: String,
     redirect: FetchRedirect,
-    signal_val: JsValue,
+    referrer: String,
+    referrer_policy: String,
+    integrity: String,
+    keepalive: bool,
+    destination: String,
+    is_reload_navigation: bool,
+    is_history_navigation: bool,
+    signal_h: HeapHandle,
 }
 
 #[derive(Debug, Clone)]
@@ -95,17 +141,16 @@ struct ResponseEntry {
     url: String,
     status: u16,
     status_text: String,
-    response_type: FetchResponseType,
+    response_kind: ResponseKind,
     redirected: bool,
     headers_h: HeapHandle,
-    body: Vec<u8>,
-    body_stream: Option<HeapHandle>,
-    body_used: bool,
+    body: Option<FetchBody>,
 }
 
 struct PendingFetch {
     promise: HeapHandle,
     abort_reason: Option<JsValue>,
+    keepalive_bytes: usize,
 }
 
 struct JsWebSocketEntry {
@@ -146,6 +191,7 @@ pub struct NetworkBridge {
     pub(crate) async_rx: RefCell<Option<mpsc::UnboundedReceiver<AsyncNetEvent>>>,
     next_id: u64,
     pending_fetches: HashMap<u64, PendingFetch>,
+    keepalive_inflight_bytes: usize,
     websockets: HashMap<u64, JsWebSocketEntry>,
     ws_handle_to_id: HashMap<HeapHandle, u64>,
     pub(crate) headers: HashMap<HeapHandle, HeadersEntry>,
@@ -174,6 +220,7 @@ impl NetworkBridge {
             async_rx: RefCell::new(Some(async_rx)),
             next_id: 1,
             pending_fetches: HashMap::new(),
+            keepalive_inflight_bytes: 0,
             websockets: HashMap::new(),
             ws_handle_to_id: HashMap::new(),
             headers: HashMap::new(),
@@ -226,12 +273,15 @@ impl NetworkBridge {
         }
         for req in self.requests.values() {
             out.push(JsValue::from_object(req.headers_h));
-            out.push(req.signal_val);
+            out.push(JsValue::from_object(req.signal_h));
+            if let Some(ref b) = req.body {
+                out.push(JsValue::from_object(b.stream));
+            }
         }
         for resp in self.responses.values() {
             out.push(JsValue::from_object(resp.headers_h));
-            if let Some(bs) = resp.body_stream {
-                out.push(JsValue::from_object(bs));
+            if let Some(ref b) = resp.body {
+                out.push(JsValue::from_object(b.stream));
             }
         }
     }
@@ -264,9 +314,9 @@ pub fn install_fetch_and_websocket(
     });
     let net = Rc::new(RefCell::new(NetworkBridge::new(engine)));
     install_headers(vm, &net);
-    install_request(vm, web_apis, &net);
+    install_request(vm, web_apis, streams, &net);
     install_response(vm, web_apis, streams, &net);
-    install_fetch_fn(vm, web_apis, &net);
+    install_fetch_fn(vm, web_apis, streams, &net);
     install_websocket(vm, host, events, event_loop, web_apis, &net);
     install_xml_http_request(vm, host, web_apis, &net);
     net
@@ -286,7 +336,16 @@ pub fn deliver_async_net_event(
 ) {
     match ev {
         AsyncNetEvent::FetchDone { id, result } => {
-            let pending = net.borrow_mut().pending_fetches.remove(&id);
+            let pending = {
+                let mut nb = net.borrow_mut();
+                let pf = nb.pending_fetches.remove(&id);
+                if let Some(ref p) = pf {
+                    nb.keepalive_inflight_bytes = nb
+                        .keepalive_inflight_bytes
+                        .saturating_sub(p.keepalive_bytes);
+                }
+                pf
+            };
             let Some(pf) = pending else {
                 return;
             };
@@ -438,14 +497,15 @@ pub fn deliver_async_net_event(
 }
 
 // ---------------------------------------------------------------------------
-// Request
+// Request (WHATWG Fetch §5.4)
 // ---------------------------------------------------------------------------
 
-fn parse_mode(s: &str) -> FetchMode {
+fn parse_mode_checked(vm: &mut JsVm, s: &str) -> Result<FetchMode, JsException> {
     match s {
-        "no-cors" => FetchMode::NoCors,
-        "same-origin" => FetchMode::SameOrigin,
-        _ => FetchMode::Cors,
+        "cors" => Ok(FetchMode::Cors),
+        "no-cors" => Ok(FetchMode::NoCors),
+        "same-origin" => Ok(FetchMode::SameOrigin),
+        _ => Err(vm.type_error(format!("Invalid RequestMode: '{s}'"))),
     }
 }
 
@@ -457,11 +517,12 @@ fn mode_as_str(m: FetchMode) -> &'static str {
     }
 }
 
-fn parse_credentials(s: &str) -> FetchCredentials {
+fn parse_credentials_checked(vm: &mut JsVm, s: &str) -> Result<FetchCredentials, JsException> {
     match s {
-        "omit" => FetchCredentials::Omit,
-        "include" => FetchCredentials::Include,
-        _ => FetchCredentials::SameOrigin,
+        "omit" => Ok(FetchCredentials::Omit),
+        "same-origin" => Ok(FetchCredentials::SameOrigin),
+        "include" => Ok(FetchCredentials::Include),
+        _ => Err(vm.type_error(format!("Invalid RequestCredentials: '{s}'"))),
     }
 }
 
@@ -473,11 +534,12 @@ fn credentials_as_str(c: FetchCredentials) -> &'static str {
     }
 }
 
-fn parse_redirect(s: &str) -> FetchRedirect {
+fn parse_redirect_checked(vm: &mut JsVm, s: &str) -> Result<FetchRedirect, JsException> {
     match s {
-        "error" => FetchRedirect::Error,
-        "manual" => FetchRedirect::Manual,
-        _ => FetchRedirect::Follow,
+        "follow" => Ok(FetchRedirect::Follow),
+        "error" => Ok(FetchRedirect::Error),
+        "manual" => Ok(FetchRedirect::Manual),
+        _ => Err(vm.type_error(format!("Invalid RequestRedirect: '{s}'"))),
     }
 }
 
@@ -489,152 +551,418 @@ fn redirect_as_str(r: FetchRedirect) -> &'static str {
     }
 }
 
+fn validate_cache_mode(vm: &mut JsVm, s: &str) -> Result<String, JsException> {
+    match s {
+        "default" | "no-store" | "reload" | "no-cache" | "force-cache" | "only-if-cached" => {
+            Ok(s.to_string())
+        }
+        _ => Err(vm.type_error(format!("Invalid RequestCache: '{s}'"))),
+    }
+}
+
+fn validate_referrer_policy(vm: &mut JsVm, s: &str) -> Result<String, JsException> {
+    match s {
+        ""
+        | "no-referrer"
+        | "no-referrer-when-downgrade"
+        | "same-origin"
+        | "origin"
+        | "strict-origin"
+        | "origin-when-cross-origin"
+        | "strict-origin-when-cross-origin"
+        | "unsafe-url" => Ok(s.to_string()),
+        _ => Err(vm.type_error(format!("Invalid ReferrerPolicy: '{s}'"))),
+    }
+}
+
+fn create_fresh_abort_signal(vm: &mut JsVm, web_apis: &SharedWebApis) -> HeapHandle {
+    create_internal_abort_controller(vm, web_apis)
+        .map(|(_, sig)| sig)
+        .unwrap_or_else(|| vm.alloc_ordinary_object())
+}
+
 fn build_request_entry(
     vm: &mut JsVm,
     web_apis: &SharedWebApis,
+    streams: &SharedStreams,
     net: &SharedNetBridge,
     input: JsValue,
     init: JsValue,
 ) -> Result<RequestEntry, JsException> {
+    if !init.is_undefined() && !init.is_null() && !init.is_object() {
+        return Err(vm.type_error("RequestInit must be an object"));
+    }
     let base_url = web_apis.borrow().location_url.clone();
+
+    let mut input_req_handle: Option<HeapHandle> = None;
     let (
-        mut url,
+        url,
         mut method,
-        mut hdr_entry,
+        mut hdr_pairs,
         mut body,
         mut mode,
         mut credentials,
+        mut cache,
         mut redirect,
-        mut signal_val,
+        mut referrer,
+        mut referrer_policy,
+        mut integrity,
+        mut keepalive,
+        destination,
+        mut is_reload_navigation,
+        mut is_history_navigation,
+        mut signal_h,
     ) = if let Some(in_h) = input.as_object() {
         if let Some(existing) = net.borrow().requests.get(&in_h).cloned() {
-            let existing_hdrs = net
+            input_req_handle = Some(in_h);
+            let pairs = net
                 .borrow()
                 .headers
                 .get(&existing.headers_h)
-                .cloned()
-                .unwrap_or_else(|| HeadersEntry::with_guard(HeadersGuard::Request));
+                .map(|h| h.pairs.clone())
+                .unwrap_or_default();
             (
                 existing.url,
                 existing.method,
-                existing_hdrs,
+                pairs,
                 existing.body,
                 existing.mode,
                 existing.credentials,
+                existing.cache,
                 existing.redirect,
-                existing.signal_val,
+                existing.referrer,
+                existing.referrer_policy,
+                existing.integrity,
+                existing.keepalive,
+                existing.destination,
+                existing.is_reload_navigation,
+                existing.is_history_navigation,
+                existing.signal_h,
             )
         } else {
-            let raw = vm.value_to_rust_string(input);
+            let raw = vm.to_js_string(input)?;
             let resolved = base_url
                 .join(&raw)
                 .or_else(|_| url::Url::parse(&raw))
                 .map_err(|_| vm.type_error(format!("Invalid Request URL: {raw}")))?;
+            if !resolved.username().is_empty() || resolved.password().is_some() {
+                return Err(vm.type_error("Request URL cannot contain credentials"));
+            }
+            let sig = create_fresh_abort_signal(vm, web_apis);
             (
                 resolved.as_str().to_string(),
                 "GET".to_string(),
-                HeadersEntry::with_guard(HeadersGuard::Request),
                 Vec::new(),
+                None,
                 FetchMode::Cors,
                 FetchCredentials::SameOrigin,
+                "default".to_string(),
                 FetchRedirect::Follow,
-                JsValue::UNDEFINED,
+                "about:client".to_string(),
+                String::new(),
+                String::new(),
+                false,
+                String::new(),
+                false,
+                false,
+                sig,
             )
         }
     } else {
-        let raw = vm.value_to_rust_string(input);
+        let raw = vm.to_js_string(input)?;
         let resolved = base_url
             .join(&raw)
             .or_else(|_| url::Url::parse(&raw))
             .map_err(|_| vm.type_error(format!("Invalid Request URL: {raw}")))?;
+        if !resolved.username().is_empty() || resolved.password().is_some() {
+            return Err(vm.type_error("Request URL cannot contain credentials"));
+        }
+        let sig = create_fresh_abort_signal(vm, web_apis);
         (
             resolved.as_str().to_string(),
             "GET".to_string(),
-            HeadersEntry::with_guard(HeadersGuard::Request),
             Vec::new(),
+            None,
             FetchMode::Cors,
             FetchCredentials::SameOrigin,
+            "default".to_string(),
             FetchRedirect::Follow,
-            JsValue::UNDEFINED,
+            "about:client".to_string(),
+            String::new(),
+            String::new(),
+            false,
+            String::new(),
+            false,
+            false,
+            sig,
         )
     };
 
+    let mut init_has_body = false;
+    let mut init_body_val = JsValue::UNDEFINED;
+    let mut init_headers_val = JsValue::UNDEFINED;
+    let mut init_non_empty = false;
+    let mut init_has_duplex = false;
+
     if let Some(ih) = init.as_object() {
-        let km = vm.heap.intern_key("method");
-        if let Ok(v) = vm.get_property_by_key(ih, km) {
-            if !v.is_undefined() {
-                let raw_m = to_byte_string(vm, v)?;
-                if !is_valid_header_name(&raw_m) || is_forbidden_method(&raw_m) {
-                    return Err(vm.type_error(format!("Invalid HTTP method: '{raw_m}'")));
+        // Check `window` member (WHATWG §5.4: only `null` or `undefined` allowed).
+        let kw = vm.heap.intern_key("window");
+        let wv = vm.get_property_by_key(ih, kw)?;
+        if !wv.is_undefined() && !wv.is_null() {
+            return Err(vm.type_error("RequestInit.window can only be null"));
+        }
+
+        let kref = vm.heap.intern_key("referrer");
+        let v_ref = vm.get_property_by_key(ih, kref)?;
+        if !v_ref.is_undefined() {
+            init_non_empty = true;
+            let rs = vm.to_js_string(v_ref)?;
+            if rs.is_empty() {
+                referrer = String::new();
+            } else if rs == "about:client" {
+                referrer = "about:client".to_string();
+            } else {
+                let parsed = base_url
+                    .join(&rs)
+                    .or_else(|_| url::Url::parse(&rs))
+                    .map_err(|_| vm.type_error(format!("Invalid referrer URL: '{rs}'")))?;
+                if parsed.origin() == base_url.origin() {
+                    referrer = parsed.as_str().to_string();
+                } else {
+                    referrer = "about:client".to_string();
                 }
-                method = normalize_method(&raw_m);
             }
         }
+
+        let krp = vm.heap.intern_key("referrerPolicy");
+        let v_rp = vm.get_property_by_key(ih, krp)?;
+        if !v_rp.is_undefined() {
+            init_non_empty = true;
+            let s = vm.to_js_string(v_rp)?;
+            referrer_policy = validate_referrer_policy(vm, &s)?;
+        }
+
         let kmode = vm.heap.intern_key("mode");
-        if let Ok(v) = vm.get_property_by_key(ih, kmode) {
-            if !v.is_undefined() {
-                mode = parse_mode(&vm.value_to_rust_string(v));
-            }
+        let v_mode = vm.get_property_by_key(ih, kmode)?;
+        if !v_mode.is_undefined() {
+            init_non_empty = true;
+            let s = vm.to_js_string(v_mode)?;
+            mode = parse_mode_checked(vm, &s)?;
         }
-        let guard = if mode == FetchMode::NoCors {
-            HeadersGuard::RequestNoCors
-        } else {
-            HeadersGuard::Request
-        };
-        hdr_entry.guard = guard;
-        let kh = vm.heap.intern_key("headers");
-        if let Ok(v) = vm.get_property_by_key(ih, kh) {
-            if !v.is_undefined() {
-                hdr_entry = parse_headers_init(vm, net, v, guard)?;
-            }
-        }
-        let kb = vm.heap.intern_key("body");
-        if let Ok(v) = vm.get_property_by_key(ih, kb) {
-            if !v.is_undefined() && !v.is_null() {
-                body = extract_bytes_from_js(vm, web_apis, v)?;
-            }
-        }
+
         let kc = vm.heap.intern_key("credentials");
-        if let Ok(v) = vm.get_property_by_key(ih, kc) {
-            if !v.is_undefined() {
-                credentials = parse_credentials(&vm.value_to_rust_string(v));
-            }
+        let v_cred = vm.get_property_by_key(ih, kc)?;
+        if !v_cred.is_undefined() {
+            init_non_empty = true;
+            let s = vm.to_js_string(v_cred)?;
+            credentials = parse_credentials_checked(vm, &s)?;
         }
-        let kr = vm.heap.intern_key("redirect");
-        if let Ok(v) = vm.get_property_by_key(ih, kr) {
-            if !v.is_undefined() {
-                redirect = parse_redirect(&vm.value_to_rust_string(v));
-            }
+
+        let kcache = vm.heap.intern_key("cache");
+        let v_cache = vm.get_property_by_key(ih, kcache)?;
+        if !v_cache.is_undefined() {
+            init_non_empty = true;
+            let s = vm.to_js_string(v_cache)?;
+            cache = validate_cache_mode(vm, &s)?;
         }
+
+        let kredi = vm.heap.intern_key("redirect");
+        let v_redi = vm.get_property_by_key(ih, kredi)?;
+        if !v_redi.is_undefined() {
+            init_non_empty = true;
+            let s = vm.to_js_string(v_redi)?;
+            redirect = parse_redirect_checked(vm, &s)?;
+        }
+
+        let kint = vm.heap.intern_key("integrity");
+        let v_int = vm.get_property_by_key(ih, kint)?;
+        if !v_int.is_undefined() {
+            init_non_empty = true;
+            integrity = vm.to_js_string(v_int)?;
+        }
+
+        let kka = vm.heap.intern_key("keepalive");
+        let v_ka = vm.get_property_by_key(ih, kka)?;
+        if !v_ka.is_undefined() {
+            init_non_empty = true;
+            keepalive = vm.to_boolean(v_ka);
+        }
+
+        let km = vm.heap.intern_key("method");
+        let v_m = vm.get_property_by_key(ih, km)?;
+        if !v_m.is_undefined() {
+            init_non_empty = true;
+            let raw_m = to_byte_string(vm, v_m)?;
+            if !is_valid_header_name(&raw_m) {
+                return Err(vm.type_error(format!("Invalid HTTP method: '{raw_m}'")));
+            }
+            if is_forbidden_method(&raw_m) {
+                return Err(vm.type_error(format!("Forbidden HTTP method: '{raw_m}'")));
+            }
+            method = normalize_method(&raw_m);
+        }
+
         let ks = vm.heap.intern_key("signal");
-        if let Ok(v) = vm.get_property_by_key(ih, ks) {
-            if !v.is_undefined() && !v.is_null() {
-                signal_val = v;
+        let v_sig = vm.get_property_by_key(ih, ks)?;
+        if !v_sig.is_undefined() {
+            init_non_empty = true;
+            if v_sig.is_null() {
+                signal_h = create_fresh_abort_signal(vm, web_apis);
+            } else {
+                let Some(sh) = v_sig.as_object() else {
+                    return Err(vm.type_error("RequestInit.signal must be an AbortSignal"));
+                };
+                if !web_apis.borrow().abort_signals.contains_key(&sh) {
+                    return Err(vm.type_error("RequestInit.signal must be an AbortSignal"));
+                }
+                signal_h = sh;
             }
+        }
+
+        let kdup = vm.heap.intern_key("duplex");
+        let v_dup = vm.get_property_by_key(ih, kdup)?;
+        if !v_dup.is_undefined() {
+            init_non_empty = true;
+            init_has_duplex = true;
+            let s = vm.to_js_string(v_dup)?;
+            if s != "half" {
+                return Err(vm.type_error(format!("Invalid RequestDuplex: '{s}'")));
+            }
+        }
+
+        let kpri = vm.heap.intern_key("priority");
+        let v_pri = vm.get_property_by_key(ih, kpri)?;
+        if !v_pri.is_undefined() {
+            init_non_empty = true;
+            let s = vm.to_js_string(v_pri)?;
+            if !matches!(s.as_str(), "high" | "low" | "auto") {
+                return Err(vm.type_error(format!("Invalid RequestPriority: '{s}'")));
+            }
+        }
+
+        let kh = vm.heap.intern_key("headers");
+        let v_h = vm.get_property_by_key(ih, kh)?;
+        if !v_h.is_undefined() {
+            init_non_empty = true;
+            init_headers_val = v_h;
+        }
+
+        let kb = vm.heap.intern_key("body");
+        let v_b = vm.get_property_by_key(ih, kb)?;
+        if !v_b.is_undefined() {
+            init_non_empty = true;
+            init_has_body = true;
+            init_body_val = v_b;
         }
     }
 
-    // Ensure url stays normalized.
-    if url.is_empty() {
-        url = base_url.as_str().to_string();
+    // Cross-field invariants per WHATWG Fetch §5.4.
+    if cache == "only-if-cached" && mode != FetchMode::SameOrigin {
+        return Err(vm.type_error("cache: 'only-if-cached' requires mode: 'same-origin'"));
     }
+    if mode == FetchMode::NoCors && !matches!(method.as_str(), "GET" | "HEAD" | "POST") {
+        return Err(vm.type_error(format!(
+            "Method '{method}' is not allowed in 'no-cors' mode"
+        )));
+    }
+
+    // If `init` was non-empty on a Request input with a body that is not being overridden,
+    // check whether the input body was already disturbed or locked.
+    let mut body_ct: Option<String> = None;
+    if init_has_body {
+        if !init_body_val.is_null() && matches!(method.as_str(), "GET" | "HEAD") {
+            return Err(vm.type_error("Request with GET/HEAD method cannot have body"));
+        }
+        let body_is_stream = init_body_val
+            .as_object()
+            .is_some_and(|h| streams.borrow().readable.contains_key(&h));
+        if body_is_stream && !init_has_duplex {
+            return Err(vm.type_error(
+                "RequestInit: duplex option is required when sending a ReadableStream body",
+            ));
+        }
+        if body_is_stream && keepalive {
+            return Err(
+                vm.type_error("Request with keepalive: true cannot have a ReadableStream body")
+            );
+        }
+        body = extract_fetch_body(vm, web_apis, streams, init_body_val)?;
+        body_ct = body.as_ref().and_then(|b| b.content_type.clone());
+    } else if input_req_handle.is_some() {
+        if let Some(ref existing_body) = body {
+            if matches!(method.as_str(), "GET" | "HEAD") {
+                return Err(vm.type_error("Request with GET/HEAD method cannot have body"));
+            }
+            if keepalive && existing_body.source_bytes.is_none() {
+                return Err(
+                    vm.type_error("Request with keepalive: true cannot have a ReadableStream body")
+                );
+            }
+            // WHATWG §5.4 step 36: keep input Request's original body handle intact (marked
+            // locked & disturbed), and transfer contents into a fresh stream on the new Request.
+            let transferred = transfer_request_body(vm, web_apis, streams, existing_body)?;
+            body_ct = transferred.content_type.clone();
+            body = Some(transferred);
+        }
+    }
+
+    let guard = if mode == FetchMode::NoCors {
+        HeadersGuard::RequestNoCors
+    } else {
+        HeadersGuard::Request
+    };
+    let mut hdr_entry = HeadersEntry::with_guard(guard);
+    if init_non_empty {
+        is_reload_navigation = false;
+        is_history_navigation = false;
+    }
+    if !init_headers_val.is_undefined() {
+        fill_headers_from_init(vm, net, &mut hdr_entry, init_headers_val)?;
+    } else {
+        for (k, v) in hdr_pairs.drain(..) {
+            let _ = hdr_entry.append_checked(vm, &k, &v);
+        }
+    }
+    if let Some(ct) = body_ct {
+        if !hdr_entry.has("content-type") {
+            let _ = hdr_entry.append_checked(vm, "content-type", &ct);
+        }
+    }
+
     let headers_h = alloc_headers_from_entry(vm, net, hdr_entry);
     Ok(RequestEntry {
-        url,
+        url: if url.is_empty() {
+            base_url.as_str().to_string()
+        } else {
+            url
+        },
         method,
         headers_h,
         body,
-        body_used: false,
         mode,
         credentials,
+        cache,
         redirect,
-        signal_val,
+        referrer,
+        referrer_policy,
+        integrity,
+        keepalive,
+        destination,
+        is_reload_navigation,
+        is_history_navigation,
+        signal_h,
     })
 }
 
-fn install_request(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBridge) {
+fn install_request(
+    vm: &mut JsVm,
+    web_apis: &SharedWebApis,
+    streams: &SharedStreams,
+    net: &SharedNetBridge,
+) {
     let rp = vm.alloc_ordinary_object();
     vm.heap.get_object_mut(rp).unwrap().is_prototype = true;
+    set_to_string_tag(vm, rp, "Request");
     net.borrow_mut().protos.request_proto = Some(rp);
 
     let nb = Rc::clone(net);
@@ -666,6 +994,39 @@ fn install_request(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBridg
         Ok(JsValue::from_object(hh))
     });
     let nb = Rc::clone(net);
+    define_host_getter(vm, rp, "destination", move |vm, this_val, _| {
+        let h = require_request(vm, &nb, this_val)?;
+        let s = nb
+            .borrow()
+            .requests
+            .get(&h)
+            .map(|r| r.destination.clone())
+            .unwrap_or_default();
+        Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+    });
+    let nb = Rc::clone(net);
+    define_host_getter(vm, rp, "referrer", move |vm, this_val, _| {
+        let h = require_request(vm, &nb, this_val)?;
+        let s = nb
+            .borrow()
+            .requests
+            .get(&h)
+            .map(|r| r.referrer.clone())
+            .unwrap_or_default();
+        Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+    });
+    let nb = Rc::clone(net);
+    define_host_getter(vm, rp, "referrerPolicy", move |vm, this_val, _| {
+        let h = require_request(vm, &nb, this_val)?;
+        let s = nb
+            .borrow()
+            .requests
+            .get(&h)
+            .map(|r| r.referrer_policy.clone())
+            .unwrap_or_default();
+        Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+    });
+    let nb = Rc::clone(net);
     define_host_getter(vm, rp, "mode", move |vm, this_val, _| {
         let h = require_request(vm, &nb, this_val)?;
         let s = nb
@@ -686,6 +1047,17 @@ fn install_request(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBridg
         Ok(JsValue::from_string(vm.heap.alloc_string(s)))
     });
     let nb = Rc::clone(net);
+    define_host_getter(vm, rp, "cache", move |vm, this_val, _| {
+        let h = require_request(vm, &nb, this_val)?;
+        let s = nb
+            .borrow()
+            .requests
+            .get(&h)
+            .map(|r| r.cache.clone())
+            .unwrap_or_else(|| "default".to_string());
+        Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+    });
+    let nb = Rc::clone(net);
     define_host_getter(vm, rp, "redirect", move |vm, this_val, _| {
         let h = require_request(vm, &nb, this_val)?;
         let s = nb
@@ -696,80 +1068,208 @@ fn install_request(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBridg
         Ok(JsValue::from_string(vm.heap.alloc_string(s)))
     });
     let nb = Rc::clone(net);
+    define_host_getter(vm, rp, "integrity", move |vm, this_val, _| {
+        let h = require_request(vm, &nb, this_val)?;
+        let s = nb
+            .borrow()
+            .requests
+            .get(&h)
+            .map(|r| r.integrity.clone())
+            .unwrap_or_default();
+        Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+    });
+    let nb = Rc::clone(net);
+    define_host_getter(vm, rp, "keepalive", move |vm, this_val, _| {
+        let h = require_request(vm, &nb, this_val)?;
+        let ka = nb.borrow().requests.get(&h).is_some_and(|r| r.keepalive);
+        Ok(JsValue::from_bool(ka))
+    });
+    let nb = Rc::clone(net);
+    define_host_getter(vm, rp, "duplex", move |vm, this_val, _| {
+        let _ = require_request(vm, &nb, this_val)?;
+        Ok(JsValue::from_string(vm.heap.alloc_string("half")))
+    });
+    let nb = Rc::clone(net);
+    define_host_getter(vm, rp, "isReloadNavigation", move |vm, this_val, _| {
+        let h = require_request(vm, &nb, this_val)?;
+        let v = nb
+            .borrow()
+            .requests
+            .get(&h)
+            .is_some_and(|r| r.is_reload_navigation);
+        Ok(JsValue::from_bool(v))
+    });
+    let nb = Rc::clone(net);
+    define_host_getter(vm, rp, "isHistoryNavigation", move |vm, this_val, _| {
+        let h = require_request(vm, &nb, this_val)?;
+        let v = nb
+            .borrow()
+            .requests
+            .get(&h)
+            .is_some_and(|r| r.is_history_navigation);
+        Ok(JsValue::from_bool(v))
+    });
+    let nb = Rc::clone(net);
+    define_host_getter(vm, rp, "signal", move |vm, this_val, _| {
+        let h = require_request(vm, &nb, this_val)?;
+        let sh = nb.borrow().requests.get(&h).map(|r| r.signal_h).unwrap();
+        Ok(JsValue::from_object(sh))
+    });
+    let nb = Rc::clone(net);
+    define_host_getter(vm, rp, "body", move |vm, this_val, _| {
+        let h = require_request(vm, &nb, this_val)?;
+        let bs = nb
+            .borrow()
+            .requests
+            .get(&h)
+            .and_then(|r| r.body.as_ref().map(|b| b.stream));
+        Ok(bs.map_or(JsValue::NULL, JsValue::from_object))
+    });
+    let nb = Rc::clone(net);
+    let ss = Rc::clone(streams);
     define_host_getter(vm, rp, "bodyUsed", move |vm, this_val, _| {
         let h = require_request(vm, &nb, this_val)?;
-        let used = nb.borrow().requests.get(&h).is_some_and(|r| r.body_used);
+        let used = nb
+            .borrow()
+            .requests
+            .get(&h)
+            .is_some_and(|r| body_is_used(&ss, r.body.as_ref()));
         Ok(JsValue::from_bool(used))
     });
 
+    // Body mixin methods (always return a Promise!)
     let nb = Rc::clone(net);
+    let ss = Rc::clone(streams);
     define_host_method(vm, rp, "text", move |vm, this_val, _| {
-        let h = require_request(vm, &nb, this_val)?;
-        let bytes = consume_request_body(vm, &nb, h)?;
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        let v = JsValue::from_string(vm.heap.alloc_string(&text));
-        Ok(JsValue::from_object(promise_resolve_value(vm, v)))
+        let h = match require_request(vm, &nb, this_val) {
+            Ok(h) => h,
+            Err(e) => return Ok(JsValue::from_object(promise_reject_value(vm, e.value))),
+        };
+        let body = nb.borrow().requests.get(&h).and_then(|r| r.body.clone());
+        Ok(JsValue::from_object(consume_fetch_body_promise(
+            vm,
+            &ss,
+            body.as_ref(),
+            body_to_text,
+        )))
     });
     let nb = Rc::clone(net);
+    let ss = Rc::clone(streams);
     define_host_method(vm, rp, "json", move |vm, this_val, _| {
-        let h = require_request(vm, &nb, this_val)?;
-        let bytes = consume_request_body(vm, &nb, h)?;
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        let p = parse_json_promise(vm, &text);
-        Ok(JsValue::from_object(p))
+        let h = match require_request(vm, &nb, this_val) {
+            Ok(h) => h,
+            Err(e) => return Ok(JsValue::from_object(promise_reject_value(vm, e.value))),
+        };
+        let body = nb.borrow().requests.get(&h).and_then(|r| r.body.clone());
+        Ok(JsValue::from_object(consume_fetch_body_promise(
+            vm,
+            &ss,
+            body.as_ref(),
+            body_to_json,
+        )))
     });
     let nb = Rc::clone(net);
+    let ss = Rc::clone(streams);
     define_host_method(vm, rp, "arrayBuffer", move |vm, this_val, _| {
-        let h = require_request(vm, &nb, this_val)?;
-        let bytes = consume_request_body(vm, &nb, h)?;
-        let ab = alloc_array_buffer(vm, bytes);
-        Ok(JsValue::from_object(promise_resolve_value(
+        let h = match require_request(vm, &nb, this_val) {
+            Ok(h) => h,
+            Err(e) => return Ok(JsValue::from_object(promise_reject_value(vm, e.value))),
+        };
+        let body = nb.borrow().requests.get(&h).and_then(|r| r.body.clone());
+        Ok(JsValue::from_object(consume_fetch_body_promise(
             vm,
-            JsValue::from_object(ab),
+            &ss,
+            body.as_ref(),
+            body_to_array_buffer,
         )))
     });
     let nb = Rc::clone(net);
+    let ss = Rc::clone(streams);
     define_host_method(vm, rp, "bytes", move |vm, this_val, _| {
-        let h = require_request(vm, &nb, this_val)?;
-        let bytes = consume_request_body(vm, &nb, h)?;
-        let u8a = alloc_uint8_array(vm, bytes);
-        Ok(JsValue::from_object(promise_resolve_value(
+        let h = match require_request(vm, &nb, this_val) {
+            Ok(h) => h,
+            Err(e) => return Ok(JsValue::from_object(promise_reject_value(vm, e.value))),
+        };
+        let body = nb.borrow().requests.get(&h).and_then(|r| r.body.clone());
+        Ok(JsValue::from_object(consume_fetch_body_promise(
             vm,
-            JsValue::from_object(u8a),
+            &ss,
+            body.as_ref(),
+            body_to_bytes,
         )))
     });
     let nb = Rc::clone(net);
     let wa = Rc::clone(web_apis);
+    let ss = Rc::clone(streams);
     define_host_method(vm, rp, "blob", move |vm, this_val, _| {
-        let h = require_request(vm, &nb, this_val)?;
-        let bytes = consume_request_body(vm, &nb, h)?;
-        let blob = create_blob_object(vm, &wa, bytes, String::new());
-        Ok(JsValue::from_object(promise_resolve_value(
+        let h = match require_request(vm, &nb, this_val) {
+            Ok(h) => h,
+            Err(e) => return Ok(JsValue::from_object(promise_reject_value(vm, e.value))),
+        };
+        let (body, ct) = {
+            let st = nb.borrow();
+            let req = st.requests.get(&h);
+            let body = req.and_then(|r| r.body.clone());
+            let ct = req.and_then(|r| {
+                st.headers
+                    .get(&r.headers_h)
+                    .and_then(|he| he.get("content-type"))
+            });
+            (body, ct)
+        };
+        let wa_c = Rc::clone(&wa);
+        Ok(JsValue::from_object(consume_fetch_body_promise(
             vm,
-            JsValue::from_object(blob),
+            &ss,
+            body.as_ref(),
+            move |vm, bytes| body_to_blob(vm, &wa_c, bytes, ct),
         )))
     });
     let nb = Rc::clone(net);
     let wa = Rc::clone(web_apis);
+    let ss = Rc::clone(streams);
     define_host_method(vm, rp, "formData", move |vm, this_val, _| {
-        let h = require_request(vm, &nb, this_val)?;
-        let bytes = consume_request_body(vm, &nb, h)?;
-        let fd = alloc_form_data_from_urlencoded(vm, &wa, &bytes);
-        Ok(JsValue::from_object(promise_resolve_value(
+        let h = match require_request(vm, &nb, this_val) {
+            Ok(h) => h,
+            Err(e) => return Ok(JsValue::from_object(promise_reject_value(vm, e.value))),
+        };
+        let (body, ct) = {
+            let st = nb.borrow();
+            let req = st.requests.get(&h);
+            let body = req.and_then(|r| r.body.clone());
+            let ct = req.and_then(|r| {
+                st.headers
+                    .get(&r.headers_h)
+                    .and_then(|he| he.get("content-type"))
+            });
+            (body, ct)
+        };
+        let wa_c = Rc::clone(&wa);
+        Ok(JsValue::from_object(consume_fetch_body_promise(
             vm,
-            JsValue::from_object(fd),
+            &ss,
+            body.as_ref(),
+            move |vm, bytes| body_to_form_data(vm, &wa_c, bytes, ct),
         )))
     });
+
     let nb = Rc::clone(net);
+    let wa = Rc::clone(web_apis);
+    let ss = Rc::clone(streams);
     define_host_method(vm, rp, "clone", move |vm, this_val, _| {
         let h = require_request(vm, &nb, this_val)?;
         let mut entry = nb.borrow().requests.get(&h).cloned().unwrap();
+        let (b_orig, b_clone) = clone_fetch_body(vm, &wa, &ss, entry.body.as_ref())?;
+        if let Some(req_mut) = nb.borrow_mut().requests.get_mut(&h) {
+            req_mut.body = b_orig;
+        }
+        entry.body = b_clone;
         let hdr = nb
             .borrow()
             .headers
             .get(&entry.headers_h)
             .cloned()
-            .unwrap_or_else(|| HeadersEntry::with_guard(HeadersGuard::Request));
+            .unwrap_or_default();
         entry.headers_h = alloc_headers_from_entry(vm, &nb, hdr);
         let obj = vm
             .heap
@@ -780,8 +1280,15 @@ fn install_request(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBridg
 
     let nb = Rc::clone(net);
     let wa = Rc::clone(web_apis);
+    let ss = Rc::clone(streams);
     let ctor = vm.alloc_host_fn("Request", move |vm, _, args| {
-        let entry = build_request_entry(vm, &wa, &nb, arg(args, 0), arg(args, 1))?;
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("Request constructor requires 'new'"));
+        }
+        if args.is_empty() {
+            return Err(vm.type_error("Request constructor requires at least 1 argument"));
+        }
+        let entry = build_request_entry(vm, &wa, &ss, &nb, arg(args, 0), arg(args, 1))?;
         let obj = vm
             .heap
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(rp)));
@@ -807,26 +1314,13 @@ fn require_request(
     }
 }
 
-fn consume_request_body(
-    vm: &mut JsVm,
-    net: &SharedNetBridge,
-    h: HeapHandle,
-) -> Result<Vec<u8>, JsException> {
-    let mut nb = net.borrow_mut();
-    let req = nb
-        .requests
-        .get_mut(&h)
-        .ok_or_else(|| vm.type_error("Invalid Request"))?;
-    if req.body_used {
-        return Err(vm.type_error("Request body has already been consumed"));
-    }
-    req.body_used = true;
-    Ok(req.body.clone())
-}
+// ---------------------------------------------------------------------------
+// Response & fetch() (WHATWG Fetch §5.5)
+// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Response & fetch()
-// ---------------------------------------------------------------------------
+fn is_null_body_status(status: u16) -> bool {
+    matches!(status, 101 | 204 | 205 | 304)
+}
 
 pub(crate) fn alloc_response_from_fetch(
     vm: &mut JsVm,
@@ -839,15 +1333,17 @@ pub(crate) fn alloc_response_from_fetch(
         net,
         HeadersEntry::from_map(&resp.headers, HeadersGuard::Immutable),
     );
-    let stream_h = if resp.response_type == FetchResponseType::Opaque {
-        None
-    } else {
-        Some(create_readable_stream_from_bytes(
-            vm,
-            streams,
-            resp.body.clone(),
-        ))
-    };
+    let body =
+        if resp.response_type == FetchResponseType::Opaque || is_null_body_status(resp.status) {
+            None
+        } else {
+            let stream = create_readable_byte_stream_from_bytes(vm, streams, resp.body.clone());
+            Some(FetchBody {
+                stream,
+                source_bytes: Some(resp.body),
+                content_type: None,
+            })
+        };
     let proto = net
         .borrow()
         .protos
@@ -862,12 +1358,10 @@ pub(crate) fn alloc_response_from_fetch(
             url: resp.url,
             status: resp.status,
             status_text: resp.status_text,
-            response_type: resp.response_type,
+            response_kind: ResponseKind::from_net(resp.response_type),
             redirected: resp.redirected,
             headers_h: hdr_h,
-            body: resp.body,
-            body_stream: stream_h,
-            body_used: false,
+            body,
         },
     );
     obj
@@ -886,12 +1380,17 @@ pub(crate) fn extract_response_snapshot(
         .get(&entry.headers_h)
         .map(|h| h.pairs.clone())
         .unwrap_or_default();
+    let body = entry
+        .body
+        .as_ref()
+        .and_then(|b| b.source_bytes.clone())
+        .unwrap_or_default();
     Some(rix_storage::CachedHttpResponse {
         url: entry.url.clone(),
         status: entry.status,
         status_text: entry.status_text.clone(),
         headers,
-        body: entry.body.clone(),
+        body,
     })
 }
 
@@ -927,20 +1426,28 @@ pub(crate) fn alloc_response_from_cached(
 pub(crate) fn extract_request_url_and_method(
     vm: &mut JsVm,
     web_apis: &SharedWebApis,
+    streams: &SharedStreams,
     net: &SharedNetBridge,
     val: JsValue,
 ) -> Result<(String, String), JsException> {
-    let entry = build_request_entry(vm, web_apis, net, val, JsValue::UNDEFINED)?;
+    if let Some(h) = val.as_object() {
+        if let Some(req) = net.borrow().requests.get(&h) {
+            return Ok((req.url.clone(), req.method.clone()));
+        }
+    }
+    let entry = build_request_entry(vm, web_apis, streams, net, val, JsValue::UNDEFINED)?;
     Ok((entry.url, entry.method))
 }
 
 /// Allocates a JS `Request` object for a cached URL (used by `Cache.prototype.keys()`).
 pub(crate) fn alloc_request_from_url(
     vm: &mut JsVm,
+    web_apis: &SharedWebApis,
     net: &SharedNetBridge,
     url: String,
 ) -> HeapHandle {
     let hdr_h = alloc_headers_from_entry(vm, net, HeadersEntry::with_guard(HeadersGuard::Request));
+    let signal_h = create_fresh_abort_signal(vm, web_apis);
     let proto = net.borrow().protos.request_proto.unwrap_or(vm.object_proto);
     let obj = vm
         .heap
@@ -951,36 +1458,68 @@ pub(crate) fn alloc_request_from_url(
             url,
             method: "GET".to_string(),
             headers_h: hdr_h,
-            body: Vec::new(),
-            body_used: false,
+            body: None,
             mode: FetchMode::Cors,
             credentials: FetchCredentials::SameOrigin,
+            cache: "default".to_string(),
             redirect: FetchRedirect::Follow,
-            signal_val: JsValue::UNDEFINED,
+            referrer: "about:client".to_string(),
+            referrer_policy: String::new(),
+            integrity: String::new(),
+            keepalive: false,
+            destination: String::new(),
+            is_reload_navigation: false,
+            is_history_navigation: false,
+            signal_h,
         },
     );
     obj
 }
 
-fn parse_json_promise(vm: &mut JsVm, text: &str) -> HeapHandle {
-    let p = alloc_promise(vm);
-    let k_json = vm.heap.intern_key("JSON");
-    let k_parse = vm.heap.intern_key("parse");
-    let res = vm
-        .get_property_by_key(vm.global, k_json)
-        .and_then(|json_v| {
-            let jh = json_v
-                .as_object()
-                .ok_or_else(|| vm.type_error("JSON global unavailable"))?;
-            let parse_fn = vm.get_property_by_key(jh, k_parse)?;
-            let s_val = JsValue::from_string(vm.heap.alloc_string(text));
-            vm.call_value(parse_fn, json_v, &[s_val])
-        });
-    match res {
-        Ok(v) => resolve_promise(vm, p, v),
-        Err(e) => reject_promise(vm, p, e.value),
+fn parse_response_init(
+    vm: &mut JsVm,
+    net: &SharedNetBridge,
+    init_val: JsValue,
+) -> Result<(u16, String, HeadersEntry), JsException> {
+    let mut status = 200u16;
+    let mut status_text = String::new();
+    let mut hdr_entry = HeadersEntry::with_guard(HeadersGuard::Response);
+    if init_val.is_undefined() || init_val.is_null() {
+        return Ok((status, status_text, hdr_entry));
     }
-    p
+    let Some(ih) = init_val.as_object() else {
+        return Err(vm.type_error("ResponseInit must be an object"));
+    };
+    let ks = vm.heap.intern_key("status");
+    let v_s = vm.get_property_by_key(ih, ks)?;
+    if !v_s.is_undefined() {
+        let n = vm.to_number(v_s)?;
+        // WebIDL `unsigned short`: wrap modulo 2^16, NaN/Inf -> 0.
+        let raw_u16 = if n.is_finite() {
+            (n.trunc() as i64).rem_euclid(65536) as u16
+        } else {
+            0
+        };
+        if !(200..=599).contains(&raw_u16) {
+            return Err(vm.range_error(format!("Invalid Response status: {raw_u16}")));
+        }
+        status = raw_u16;
+    }
+    let kst = vm.heap.intern_key("statusText");
+    let v_st = vm.get_property_by_key(ih, kst)?;
+    if !v_st.is_undefined() {
+        let s = to_byte_string(vm, v_st)?;
+        if !is_valid_status_text(&s) {
+            return Err(vm.type_error(format!("Invalid Response statusText: '{s}'")));
+        }
+        status_text = s;
+    }
+    let kh = vm.heap.intern_key("headers");
+    let v_h = vm.get_property_by_key(ih, kh)?;
+    if !v_h.is_undefined() {
+        hdr_entry = parse_headers_init(vm, net, v_h, HeadersGuard::Response)?;
+    }
+    Ok((status, status_text, hdr_entry))
 }
 
 fn install_response(
@@ -991,6 +1530,7 @@ fn install_response(
 ) {
     let rp = vm.alloc_ordinary_object();
     vm.heap.get_object_mut(rp).unwrap().is_prototype = true;
+    set_to_string_tag(vm, rp, "Response");
     net.borrow_mut().protos.response_proto = Some(rp);
 
     let nb = Rc::clone(net);
@@ -1038,7 +1578,7 @@ fn install_response(
             .borrow()
             .responses
             .get(&h)
-            .map_or("default", |r| r.response_type.as_str());
+            .map_or("default", |r| r.response_kind.as_str());
         Ok(JsValue::from_string(vm.heap.alloc_string(s)))
     });
     let nb = Rc::clone(net);
@@ -1056,111 +1596,159 @@ fn install_response(
     let nb = Rc::clone(net);
     define_host_getter(vm, rp, "body", move |vm, this_val, _| {
         let h = require_response(vm, &nb, this_val)?;
-        let bs = nb.borrow().responses.get(&h).and_then(|r| r.body_stream);
+        let bs = nb
+            .borrow()
+            .responses
+            .get(&h)
+            .and_then(|r| r.body.as_ref().map(|b| b.stream));
         Ok(bs.map_or(JsValue::NULL, JsValue::from_object))
     });
     let nb = Rc::clone(net);
     let ss = Rc::clone(streams);
     define_host_getter(vm, rp, "bodyUsed", move |vm, this_val, _| {
         let h = require_response(vm, &nb, this_val)?;
-        let used = nb.borrow().responses.get(&h).is_some_and(|r| {
-            r.body_used
-                || r.body_stream
-                    .is_some_and(|bs| ss.borrow().is_readable_disturbed(bs))
-        });
+        let used = nb
+            .borrow()
+            .responses
+            .get(&h)
+            .is_some_and(|r| body_is_used(&ss, r.body.as_ref()));
         Ok(JsValue::from_bool(used))
     });
 
+    // Body mixin methods (always return Promises, backed by ReadableStream!)
     let nb = Rc::clone(net);
+    let ss = Rc::clone(streams);
     define_host_method(vm, rp, "text", move |vm, this_val, _| {
-        let h = require_response(vm, &nb, this_val)?;
-        let bytes = consume_response_body(vm, &nb, h)?;
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        let v = JsValue::from_string(vm.heap.alloc_string(&text));
-        Ok(JsValue::from_object(promise_resolve_value(vm, v)))
-    });
-    let nb = Rc::clone(net);
-    define_host_method(vm, rp, "json", move |vm, this_val, _| {
-        let h = require_response(vm, &nb, this_val)?;
-        let bytes = consume_response_body(vm, &nb, h)?;
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        let p = parse_json_promise(vm, &text);
-        Ok(JsValue::from_object(p))
-    });
-    let nb = Rc::clone(net);
-    define_host_method(vm, rp, "arrayBuffer", move |vm, this_val, _| {
-        let h = require_response(vm, &nb, this_val)?;
-        let bytes = consume_response_body(vm, &nb, h)?;
-        let ab = alloc_array_buffer(vm, bytes);
-        Ok(JsValue::from_object(promise_resolve_value(
-            vm,
-            JsValue::from_object(ab),
-        )))
-    });
-    let nb = Rc::clone(net);
-    define_host_method(vm, rp, "bytes", move |vm, this_val, _| {
-        let h = require_response(vm, &nb, this_val)?;
-        let bytes = consume_response_body(vm, &nb, h)?;
-        let u8a = alloc_uint8_array(vm, bytes);
-        Ok(JsValue::from_object(promise_resolve_value(
-            vm,
-            JsValue::from_object(u8a),
-        )))
-    });
-    let nb = Rc::clone(net);
-    let wa = Rc::clone(web_apis);
-    define_host_method(vm, rp, "blob", move |vm, this_val, _| {
-        let h = require_response(vm, &nb, this_val)?;
-        let (bytes, ct) = {
-            let bytes = consume_response_body(vm, &nb, h)?;
-            let ct = nb
-                .borrow()
-                .responses
-                .get(&h)
-                .and_then(|r| {
-                    nb.borrow()
-                        .headers
-                        .get(&r.headers_h)
-                        .and_then(|he| he.get("content-type"))
-                })
-                .unwrap_or_default();
-            (bytes, ct)
+        let h = match require_response(vm, &nb, this_val) {
+            Ok(h) => h,
+            Err(e) => return Ok(JsValue::from_object(promise_reject_value(vm, e.value))),
         };
-        let blob = create_blob_object(vm, &wa, bytes, ct);
-        Ok(JsValue::from_object(promise_resolve_value(
+        let body = nb.borrow().responses.get(&h).and_then(|r| r.body.clone());
+        Ok(JsValue::from_object(consume_fetch_body_promise(
             vm,
-            JsValue::from_object(blob),
-        )))
-    });
-    let nb = Rc::clone(net);
-    let wa = Rc::clone(web_apis);
-    define_host_method(vm, rp, "formData", move |vm, this_val, _| {
-        let h = require_response(vm, &nb, this_val)?;
-        let bytes = consume_response_body(vm, &nb, h)?;
-        let fd = alloc_form_data_from_urlencoded(vm, &wa, &bytes);
-        Ok(JsValue::from_object(promise_resolve_value(
-            vm,
-            JsValue::from_object(fd),
+            &ss,
+            body.as_ref(),
+            body_to_text,
         )))
     });
     let nb = Rc::clone(net);
     let ss = Rc::clone(streams);
+    define_host_method(vm, rp, "json", move |vm, this_val, _| {
+        let h = match require_response(vm, &nb, this_val) {
+            Ok(h) => h,
+            Err(e) => return Ok(JsValue::from_object(promise_reject_value(vm, e.value))),
+        };
+        let body = nb.borrow().responses.get(&h).and_then(|r| r.body.clone());
+        Ok(JsValue::from_object(consume_fetch_body_promise(
+            vm,
+            &ss,
+            body.as_ref(),
+            body_to_json,
+        )))
+    });
+    let nb = Rc::clone(net);
+    let ss = Rc::clone(streams);
+    define_host_method(vm, rp, "arrayBuffer", move |vm, this_val, _| {
+        let h = match require_response(vm, &nb, this_val) {
+            Ok(h) => h,
+            Err(e) => return Ok(JsValue::from_object(promise_reject_value(vm, e.value))),
+        };
+        let body = nb.borrow().responses.get(&h).and_then(|r| r.body.clone());
+        Ok(JsValue::from_object(consume_fetch_body_promise(
+            vm,
+            &ss,
+            body.as_ref(),
+            body_to_array_buffer,
+        )))
+    });
+    let nb = Rc::clone(net);
+    let ss = Rc::clone(streams);
+    define_host_method(vm, rp, "bytes", move |vm, this_val, _| {
+        let h = match require_response(vm, &nb, this_val) {
+            Ok(h) => h,
+            Err(e) => return Ok(JsValue::from_object(promise_reject_value(vm, e.value))),
+        };
+        let body = nb.borrow().responses.get(&h).and_then(|r| r.body.clone());
+        Ok(JsValue::from_object(consume_fetch_body_promise(
+            vm,
+            &ss,
+            body.as_ref(),
+            body_to_bytes,
+        )))
+    });
+    let nb = Rc::clone(net);
+    let wa = Rc::clone(web_apis);
+    let ss = Rc::clone(streams);
+    define_host_method(vm, rp, "blob", move |vm, this_val, _| {
+        let h = match require_response(vm, &nb, this_val) {
+            Ok(h) => h,
+            Err(e) => return Ok(JsValue::from_object(promise_reject_value(vm, e.value))),
+        };
+        let (body, ct) = {
+            let st = nb.borrow();
+            let resp = st.responses.get(&h);
+            let body = resp.and_then(|r| r.body.clone());
+            let ct = resp.and_then(|r| {
+                st.headers
+                    .get(&r.headers_h)
+                    .and_then(|he| he.get("content-type"))
+            });
+            (body, ct)
+        };
+        let wa_c = Rc::clone(&wa);
+        Ok(JsValue::from_object(consume_fetch_body_promise(
+            vm,
+            &ss,
+            body.as_ref(),
+            move |vm, bytes| body_to_blob(vm, &wa_c, bytes, ct),
+        )))
+    });
+    let nb = Rc::clone(net);
+    let wa = Rc::clone(web_apis);
+    let ss = Rc::clone(streams);
+    define_host_method(vm, rp, "formData", move |vm, this_val, _| {
+        let h = match require_response(vm, &nb, this_val) {
+            Ok(h) => h,
+            Err(e) => return Ok(JsValue::from_object(promise_reject_value(vm, e.value))),
+        };
+        let (body, ct) = {
+            let st = nb.borrow();
+            let resp = st.responses.get(&h);
+            let body = resp.and_then(|r| r.body.clone());
+            let ct = resp.and_then(|r| {
+                st.headers
+                    .get(&r.headers_h)
+                    .and_then(|he| he.get("content-type"))
+            });
+            (body, ct)
+        };
+        let wa_c = Rc::clone(&wa);
+        Ok(JsValue::from_object(consume_fetch_body_promise(
+            vm,
+            &ss,
+            body.as_ref(),
+            move |vm, bytes| body_to_form_data(vm, &wa_c, bytes, ct),
+        )))
+    });
+
+    let nb = Rc::clone(net);
+    let wa = Rc::clone(web_apis);
+    let ss = Rc::clone(streams);
     define_host_method(vm, rp, "clone", move |vm, this_val, _| {
         let h = require_response(vm, &nb, this_val)?;
         let mut entry = nb.borrow().responses.get(&h).cloned().unwrap();
+        let (b_orig, b_clone) = clone_fetch_body(vm, &wa, &ss, entry.body.as_ref())?;
+        if let Some(resp_mut) = nb.borrow_mut().responses.get_mut(&h) {
+            resp_mut.body = b_orig;
+        }
+        entry.body = b_clone;
         let hdr = nb
             .borrow()
             .headers
             .get(&entry.headers_h)
             .cloned()
-            .unwrap_or_else(|| HeadersEntry::with_guard(HeadersGuard::Request));
+            .unwrap_or_default();
         entry.headers_h = alloc_headers_from_entry(vm, &nb, hdr);
-        entry.body_stream = Some(create_readable_stream_from_bytes(
-            vm,
-            &ss,
-            entry.body.clone(),
-        ));
-        entry.body_used = false;
         let obj = vm
             .heap
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(rp)));
@@ -1172,36 +1760,22 @@ fn install_response(
     let wa = Rc::clone(web_apis);
     let ss = Rc::clone(streams);
     let ctor = vm.alloc_host_fn("Response", move |vm, _, args| {
-        let body = if arg(args, 0).is_undefined() || arg(args, 0).is_null() {
-            Vec::new()
-        } else {
-            extract_bytes_from_js(vm, &wa, arg(args, 0))?
-        };
-        let mut status = 200u16;
-        let mut status_text = "OK".to_string();
-        let mut hdr_entry = HeadersEntry::with_guard(HeadersGuard::Response);
-        if let Some(ih) = arg(args, 1).as_object() {
-            let ks = vm.heap.intern_key("status");
-            if let Ok(v) = vm.get_property_by_key(ih, ks) {
-                if !v.is_undefined() {
-                    status = vm.to_number(v)?.clamp(0.0, 599.0) as u16;
-                }
-            }
-            let kst = vm.heap.intern_key("statusText");
-            if let Ok(v) = vm.get_property_by_key(ih, kst) {
-                if !v.is_undefined() {
-                    status_text = vm.value_to_rust_string(v);
-                }
-            }
-            let kh = vm.heap.intern_key("headers");
-            if let Ok(v) = vm.get_property_by_key(ih, kh) {
-                if !v.is_undefined() && !v.is_null() {
-                    hdr_entry = parse_headers_init(vm, &nb, v, HeadersGuard::Response)?;
-                }
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("Response constructor requires 'new'"));
+        }
+        let body = extract_fetch_body(vm, &wa, &ss, arg(args, 0))?;
+        let (status, status_text, mut hdr_entry) = parse_response_init(vm, &nb, arg(args, 1))?;
+        if body.is_some() && is_null_body_status(status) {
+            return Err(vm.type_error(format!(
+                "Response with null body status ({status}) cannot have a body"
+            )));
+        }
+        if let Some(ct) = body.as_ref().and_then(|b| b.content_type.clone()) {
+            if !hdr_entry.has("content-type") {
+                hdr_entry.push_unchecked("content-type", ct);
             }
         }
         let hdr_h = alloc_headers_from_entry(vm, &nb, hdr_entry);
-        let stream_h = Some(create_readable_stream_from_bytes(vm, &ss, body.clone()));
         let obj = vm
             .heap
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(rp)));
@@ -1211,12 +1785,10 @@ fn install_response(
                 url: String::new(),
                 status,
                 status_text,
-                response_type: FetchResponseType::Basic,
+                response_kind: ResponseKind::Default,
                 redirected: false,
                 headers_h: hdr_h,
                 body,
-                body_stream: stream_h,
-                body_used: false,
             },
         );
         Ok(JsValue::from_object(obj))
@@ -1225,6 +1797,9 @@ fn install_response(
     let nb = Rc::clone(net);
     let ss = Rc::clone(streams);
     define_host_method(vm, ctor, "json", move |vm, _, args| {
+        if args.is_empty() {
+            return Err(vm.type_error("Response.json requires at least 1 argument"));
+        }
         let k_json = vm.heap.intern_key("JSON");
         let k_str = vm.heap.intern_key("stringify");
         let json_v = vm.get_property_by_key(vm.global, k_json)?;
@@ -1233,11 +1808,21 @@ fn install_response(
             .ok_or_else(|| vm.type_error("JSON unavailable"))?;
         let str_fn = vm.get_property_by_key(jh, k_str)?;
         let s_val = vm.call_value(str_fn, json_v, &[arg(args, 0)])?;
-        let bytes = vm.value_to_rust_string(s_val).into_bytes();
-        let mut hdr = HeadersEntry::with_guard(HeadersGuard::Response);
-        hdr.set_unchecked("content-type", "application/json".to_string());
+        if !s_val.is_string() {
+            return Err(vm.type_error("Response.json data is not JSON serializable"));
+        }
+        let bytes = vm.to_js_string(s_val)?.into_bytes();
+        let (status, status_text, mut hdr) = parse_response_init(vm, &nb, arg(args, 1))?;
+        if is_null_body_status(status) {
+            return Err(vm.type_error(format!(
+                "Response.json with null body status ({status}) is invalid"
+            )));
+        }
+        if !hdr.has("content-type") {
+            hdr.set_unchecked("content-type", "application/json".to_string());
+        }
         let hdr_h = alloc_headers_from_entry(vm, &nb, hdr);
-        let stream_h = Some(create_readable_stream_from_bytes(vm, &ss, bytes.clone()));
+        let stream = create_readable_byte_stream_from_bytes(vm, &ss, bytes.clone());
         let obj = vm
             .heap
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(rp)));
@@ -1245,14 +1830,62 @@ fn install_response(
             obj,
             ResponseEntry {
                 url: String::new(),
-                status: 200,
-                status_text: "OK".to_string(),
-                response_type: FetchResponseType::Basic,
+                status,
+                status_text,
+                response_kind: ResponseKind::Default,
                 redirected: false,
                 headers_h: hdr_h,
-                body: bytes,
-                body_stream: stream_h,
-                body_used: false,
+                body: Some(FetchBody {
+                    stream,
+                    source_bytes: Some(bytes),
+                    content_type: Some("application/json".to_string()),
+                }),
+            },
+        );
+        Ok(JsValue::from_object(obj))
+    });
+
+    let nb = Rc::clone(net);
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, ctor, "redirect", move |vm, _, args| {
+        if args.is_empty() {
+            return Err(vm.type_error("Response.redirect requires at least 1 argument"));
+        }
+        let raw_url = vm.to_js_string(arg(args, 0))?;
+        let base_url = wa.borrow().location_url.clone();
+        let parsed = base_url
+            .join(&raw_url)
+            .or_else(|_| url::Url::parse(&raw_url))
+            .map_err(|_| vm.type_error(format!("Invalid redirect URL: '{raw_url}'")))?;
+        let status = if arg(args, 1).is_undefined() {
+            302u16
+        } else {
+            let n = vm.to_number(arg(args, 1))?;
+            if n.is_finite() {
+                (n.trunc() as i64).rem_euclid(65536) as u16
+            } else {
+                0
+            }
+        };
+        if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+            return Err(vm.range_error(format!("Invalid redirect status: {status}")));
+        }
+        let mut hdr = HeadersEntry::with_guard(HeadersGuard::Immutable);
+        hdr.push_unchecked("location", parsed.as_str().to_string());
+        let hdr_h = alloc_headers_from_entry(vm, &nb, hdr);
+        let obj = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(rp)));
+        nb.borrow_mut().responses.insert(
+            obj,
+            ResponseEntry {
+                url: String::new(),
+                status,
+                status_text: String::new(),
+                response_kind: ResponseKind::Default,
+                redirected: false,
+                headers_h: hdr_h,
+                body: None,
             },
         );
         Ok(JsValue::from_object(obj))
@@ -1271,12 +1904,10 @@ fn install_response(
                 url: String::new(),
                 status: 0,
                 status_text: String::new(),
-                response_type: FetchResponseType::Opaque,
+                response_kind: ResponseKind::Error,
                 redirected: false,
                 headers_h: hdr_h,
-                body: Vec::new(),
-                body_stream: None,
-                body_used: false,
+                body: None,
             },
         );
         Ok(JsValue::from_object(obj))
@@ -1301,36 +1932,126 @@ fn require_response(
     }
 }
 
-fn consume_response_body(
-    vm: &mut JsVm,
-    net: &SharedNetBridge,
-    h: HeapHandle,
-) -> Result<Vec<u8>, JsException> {
-    let mut nb = net.borrow_mut();
-    let resp = nb
-        .responses
-        .get_mut(&h)
-        .ok_or_else(|| vm.type_error("Invalid Response"))?;
-    if resp.body_used {
-        return Err(vm.type_error("Response body has already been consumed"));
+fn parse_fetch_cache(s: &str) -> FetchCache {
+    match s {
+        "no-store" => FetchCache::NoStore,
+        "reload" => FetchCache::Reload,
+        "no-cache" => FetchCache::NoCache,
+        "force-cache" => FetchCache::ForceCache,
+        "only-if-cached" => FetchCache::OnlyIfCached,
+        _ => FetchCache::Default,
     }
-    resp.body_used = true;
-    Ok(resp.body.clone())
 }
 
-fn install_fetch_fn(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBridge) {
+/// Decodes RFC 2397 `data:` URLs per WHATWG Fetch §4.5 scheme fetch.
+fn decode_data_url(url_str: &str) -> Option<(String, Vec<u8>)> {
+    let rest = url_str.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    let meta_trimmed = meta.trim();
+    let (mime_raw, is_base64) = if let Some(prefix) = meta_trimmed.strip_suffix(";base64") {
+        (prefix, true)
+    } else if meta_trimmed.eq_ignore_ascii_case("base64") {
+        ("", true)
+    } else {
+        (meta_trimmed, false)
+    };
+    let mime = if mime_raw.is_empty() {
+        "text/plain;charset=US-ASCII".to_string()
+    } else {
+        mime_raw.to_string()
+    };
+    let raw_bytes = percent_decode_bytes(payload);
+    let body = if is_base64 {
+        forgiving_base64_decode(&raw_bytes)?
+    } else {
+        raw_bytes
+    };
+    Some((mime, body))
+}
+
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn forgiving_base64_decode(input: &[u8]) -> Option<Vec<u8>> {
+    let mut clean = Vec::with_capacity(input.len());
+    for &b in input {
+        if !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C) {
+            clean.push(b);
+        }
+    }
+    while clean.ends_with(b"=") {
+        clean.pop();
+    }
+    if clean.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits: u8 = 0;
+    for b in clean {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(val);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
+const KEEPALIVE_QUOTA_BYTES: usize = 65_536;
+
+fn install_fetch_fn(
+    vm: &mut JsVm,
+    web_apis: &SharedWebApis,
+    streams: &SharedStreams,
+    net: &SharedNetBridge,
+) {
     let wa = Rc::clone(web_apis);
+    let ss = Rc::clone(streams);
     let nb = Rc::clone(net);
     let fetch_fn = vm.alloc_host_fn("fetch", move |vm, _, args| {
         let promise = alloc_promise(vm);
-        let entry = match build_request_entry(vm, &wa, &nb, arg(args, 0), arg(args, 1)) {
+        let entry = match build_request_entry(vm, &wa, &ss, &nb, arg(args, 0), arg(args, 1)) {
             Ok(e) => e,
             Err(e) => {
                 reject_promise(vm, promise, e.value);
                 return Ok(JsValue::from_object(promise));
             }
         };
-        let abort_info = abort_info_for_signal(&wa, entry.signal_val);
+        let abort_info = abort_info_for_signal(&wa, JsValue::from_object(entry.signal_h));
         if let Some((_, true, reason)) = abort_info {
             let r = if reason.is_undefined() {
                 create_dom_exception(vm, "AbortError", "The operation was aborted.").value
@@ -1338,6 +2059,89 @@ fn install_fetch_fn(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBrid
                 reason
             };
             reject_promise(vm, promise, r);
+            return Ok(JsValue::from_object(promise));
+        }
+
+        // WHATWG Fetch §4.5 Scheme Fetch: `data:` URLs.
+        if entry.url.starts_with("data:") {
+            match decode_data_url(&entry.url) {
+                Some((mime, bytes)) => {
+                    let mut headers = HashMap::new();
+                    headers.insert("content-type".to_string(), mime);
+                    let resp_h = alloc_response_from_fetch(
+                        vm,
+                        &ss,
+                        &nb,
+                        FetchResponse {
+                            url: entry.url,
+                            status: 200,
+                            status_text: "OK".to_string(),
+                            headers,
+                            body: bytes,
+                            response_type: FetchResponseType::Basic,
+                            redirected: false,
+                        },
+                    );
+                    resolve_promise(vm, promise, JsValue::from_object(resp_h));
+                }
+                None => {
+                    let err = vm.type_error("Invalid data: URL").value;
+                    reject_promise(vm, promise, err);
+                }
+            }
+            return Ok(JsValue::from_object(promise));
+        }
+
+        // WHATWG Fetch §4.5 Scheme Fetch: `blob:` URLs (GET only).
+        if entry.url.starts_with("blob:") {
+            if !entry.method.eq_ignore_ascii_case("GET") {
+                let err = vm.type_error("blob: URLs only support GET requests").value;
+                reject_promise(vm, promise, err);
+                return Ok(JsValue::from_object(promise));
+            }
+            let lookup_url = entry
+                .url
+                .split('#')
+                .next()
+                .unwrap_or(&entry.url)
+                .to_string();
+            let found = {
+                let st = wa.borrow();
+                st.object_urls.get(&lookup_url).cloned().map(|bytes| {
+                    let ct = st
+                        .object_url_types
+                        .get(&lookup_url)
+                        .cloned()
+                        .unwrap_or_default();
+                    (bytes, ct)
+                })
+            };
+            match found {
+                Some((bytes, ct)) => {
+                    let mut headers = HashMap::new();
+                    headers.insert("content-length".to_string(), bytes.len().to_string());
+                    headers.insert("content-type".to_string(), ct);
+                    let resp_h = alloc_response_from_fetch(
+                        vm,
+                        &ss,
+                        &nb,
+                        FetchResponse {
+                            url: entry.url,
+                            status: 200,
+                            status_text: "OK".to_string(),
+                            headers,
+                            body: bytes,
+                            response_type: FetchResponseType::Basic,
+                            redirected: false,
+                        },
+                    );
+                    resolve_promise(vm, promise, JsValue::from_object(resp_h));
+                }
+                None => {
+                    let err = vm.type_error("Blob URL not found or revoked").value;
+                    reject_promise(vm, promise, err);
+                }
+            }
             return Ok(JsValue::from_object(promise));
         }
 
@@ -1350,15 +2154,36 @@ fn install_fetch_fn(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBrid
         let origin = wa.borrow().current_origin();
         let abort_signal = abort_info.as_ref().map(|(h, _, _)| h.clone());
         let abort_reason = abort_info.map(|(_, _, r)| r).filter(|r| !r.is_undefined());
+        let req_body_bytes = entry
+            .body
+            .as_ref()
+            .and_then(|b| b.source_bytes.clone())
+            .unwrap_or_default();
+
+        // WHATWG Fetch §4.3 keepalive rolling 64 KiB body quota.
+        let keepalive_bytes = if entry.keepalive {
+            let sz = req_body_bytes.len();
+            let cur = nb.borrow().keepalive_inflight_bytes;
+            if cur.saturating_add(sz) > KEEPALIVE_QUOTA_BYTES {
+                let err = vm
+                    .type_error("Keepalive request body exceeds 64 KiB quota limit")
+                    .value;
+                reject_promise(vm, promise, err);
+                return Ok(JsValue::from_object(promise));
+            }
+            sz
+        } else {
+            0
+        };
 
         let fetch_req = FetchRequest {
             url: entry.url,
             method: entry.method,
             headers: headers_map,
-            body: entry.body,
+            body: req_body_bytes,
             mode: entry.mode,
             credentials: entry.credentials,
-            cache: FetchCache::Default,
+            cache: parse_fetch_cache(&entry.cache),
             redirect: entry.redirect,
             origin,
             abort_signal,
@@ -1367,11 +2192,14 @@ fn install_fetch_fn(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBrid
         let (id, engine, tx, interceptor) = {
             let mut st = nb.borrow_mut();
             let id = st.alloc_id();
+            st.keepalive_inflight_bytes =
+                st.keepalive_inflight_bytes.saturating_add(keepalive_bytes);
             st.pending_fetches.insert(
                 id,
                 PendingFetch {
                     promise,
                     abort_reason,
+                    keepalive_bytes,
                 },
             );
             (
@@ -1384,8 +2212,6 @@ fn install_fetch_fn(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBrid
 
         // Spawn reactive async network task (zero polling!), giving any active
         // ServiceWorker covering the request scope first opportunity to intercept.
-        // Guard with `Handle::try_current()` so synchronous/offline runtimes (e.g. WPT harness)
-        // cleanly reject the Promise instead of panicking with "no reactor running".
         if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
             rt_handle.spawn(async move {
                 if let Some(intercept_fn) = interceptor {
