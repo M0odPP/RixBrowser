@@ -4255,82 +4255,7 @@ fn install_window_and_navigator(
         Ok(JsValue::from_number(f64::from(h.borrow().scroll_offset.y)))
     });
 
-    for (name, relative) in [("scrollTo", false), ("scroll", false), ("scrollBy", true)] {
-        let h = Rc::clone(host);
-        define_host_method(vm, global, name, move |vm, _, args| {
-            let first = arg(args, 0);
-            let (mut x_opt, mut y_opt) = (None, None);
-            if let Some(obj) = first.as_object() {
-                let k_top = vm.heap.intern_key("top");
-                let k_left = vm.heap.intern_key("left");
-                if let Ok(v) = vm.get_property_by_key(obj, k_left) {
-                    if !v.is_undefined() {
-                        let x = vm.to_number(v)?;
-                        if x.is_finite() {
-                            x_opt = Some(x as f32);
-                        }
-                    }
-                }
-                if let Ok(v) = vm.get_property_by_key(obj, k_top) {
-                    if !v.is_undefined() {
-                        let y = vm.to_number(v)?;
-                        if y.is_finite() {
-                            y_opt = Some(y as f32);
-                        }
-                    }
-                }
-            } else {
-                let x = vm.to_number(first)?;
-                let y = vm.to_number(arg(args, 1))?;
-                if x.is_finite() {
-                    x_opt = Some(x as f32);
-                }
-                if y.is_finite() {
-                    y_opt = Some(y as f32);
-                }
-            }
-            h.borrow_mut().set_root_scroll(x_opt, y_opt, relative);
-            Ok(JsValue::UNDEFINED)
-        });
-    }
-
-    // window.matchMedia(query)
-    let h = Rc::clone(host);
-    define_host_method(vm, global, "matchMedia", move |vm, _, args| {
-        let query = vm.value_to_rust_string(arg(args, 0));
-        let (vp, dark) = {
-            let hs = h.borrow();
-            (hs.viewport, hs.dark_mode)
-        };
-        let matches = evaluate_simple_media_query(&query, vp.width, vp.height, dark);
-        let mql = vm.alloc_ordinary_object();
-        let k_matches = vm.heap.intern_key("matches");
-        let k_media = vm.heap.intern_key("media");
-        let media_s = JsValue::from_string(vm.heap.alloc_string(&query));
-        vm.heap.object_define_data(
-            mql,
-            k_matches,
-            JsValue::from_bool(matches),
-            PropertyAttrs::DEFAULT,
-            &mut vm.shapes,
-        );
-        vm.heap.object_define_data(
-            mql,
-            k_media,
-            media_s,
-            PropertyAttrs::DEFAULT,
-            &mut vm.shapes,
-        );
-        define_host_method(vm, mql, "addEventListener", |_, _, _| {
-            Ok(JsValue::UNDEFINED)
-        });
-        define_host_method(vm, mql, "removeEventListener", |_, _, _| {
-            Ok(JsValue::UNDEFINED)
-        });
-        define_host_method(vm, mql, "addListener", |_, _, _| Ok(JsValue::UNDEFINED));
-        define_host_method(vm, mql, "removeListener", |_, _, _| Ok(JsValue::UNDEFINED));
-        Ok(JsValue::from_object(mql))
-    });
+    // `window.{scroll, scrollTo, scrollBy, matchMedia, screen}` are installed by `cssom_view::install_cssom_view`.
 
     // window.requestIdleCallback / cancelIdleCallback
     let el = Rc::clone(event_loop);
@@ -4506,48 +4431,6 @@ fn install_window_and_navigator(
         }
         Ok(JsValue::from_string(vm.heap.alloc_string(&out)))
     });
-}
-
-fn evaluate_simple_media_query(query: &str, vw: f32, vh: f32, dark_mode: bool) -> bool {
-    let lower = query.trim().to_ascii_lowercase();
-    if lower.is_empty() || lower == "all" || lower == "screen" {
-        return true;
-    }
-    if lower == "print" {
-        return false;
-    }
-    if lower.contains("prefers-color-scheme: dark") || lower.contains("prefers-color-scheme:dark") {
-        return dark_mode;
-    }
-    if lower.contains("prefers-color-scheme: light") || lower.contains("prefers-color-scheme:light")
-    {
-        return !dark_mode;
-    }
-    if lower.contains("prefers-reduced-motion: reduce") {
-        return false;
-    }
-    if let Some(px) = extract_media_px(&lower, "min-width:") {
-        return vw >= px;
-    }
-    if let Some(px) = extract_media_px(&lower, "max-width:") {
-        return vw <= px;
-    }
-    if let Some(px) = extract_media_px(&lower, "min-height:") {
-        return vh >= px;
-    }
-    if let Some(px) = extract_media_px(&lower, "max-height:") {
-        return vh <= px;
-    }
-    true
-}
-
-fn extract_media_px(haystack: &str, key: &str) -> Option<f32> {
-    let idx = haystack.find(key)?;
-    let rest = haystack[idx + key.len()..].trim_start();
-    let num_end = rest
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .unwrap_or(rest.len());
-    rest[..num_end].parse::<f32>().ok()
 }
 
 #[cfg(test)]

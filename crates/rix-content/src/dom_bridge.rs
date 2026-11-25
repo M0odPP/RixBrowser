@@ -198,6 +198,7 @@ pub struct HostState {
     pub css_rule_protos: HashMap<&'static str, HeapHandle>,
     pub subdoc_scroll_offsets: HashMap<NodeId, Point>,
     pub(crate) cssom_geometry_state: RefCell<crate::cssom_geometry::CssomGeometryState>,
+    pub(crate) cssom_view_state: RefCell<crate::cssom_view::CssomViewState>,
     pub style_element_sheets: HashMap<NodeId, crate::cssom::SharedStyleSheet>,
     pub stylesheet_handle_map: HashMap<HeapHandle, crate::cssom::SharedStyleSheet>,
     pub adopted_stylesheets: Vec<crate::cssom::SharedStyleSheet>,
@@ -301,6 +302,7 @@ impl HostState {
             css_rule_protos: HashMap::new(),
             subdoc_scroll_offsets: HashMap::new(),
             cssom_geometry_state: RefCell::new(crate::cssom_geometry::CssomGeometryState::default()),
+            cssom_view_state: RefCell::new(crate::cssom_view::CssomViewState::default()),
             style_element_sheets: HashMap::new(),
             stylesheet_handle_map: HashMap::new(),
             adopted_stylesheets: Vec::new(),
@@ -470,6 +472,7 @@ impl HostState {
         self.trusted_types.collect_roots(out);
         self.custom_elements_state.borrow().collect_roots(out);
         self.cssom_geometry_state.borrow().collect_roots(out);
+        self.cssom_view_state.borrow().collect_roots(out);
         self.prototypes.collect_roots(out);
         for &proto in self.interface_protos.values() {
             out.push(JsValue::from_object(proto));
@@ -3596,7 +3599,8 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         }
         Ok(JsValue::UNDEFINED)
     });
-    define_host_method(vm, ep, "scrollIntoView", |_, _, _| Ok(JsValue::UNDEFINED));
+    // `scrollIntoView`, `scrollTo`, `scroll`, `scrollBy` are installed by `cssom_view::install_cssom_view`
+    // with full ScrollIntoViewOptions, scroll-behavior: smooth, and Promise<{interrupted}> support.
 
     // Element traversal getters (live HTMLCollection + childElementCount)
     let h = Rc::clone(host);
@@ -4077,6 +4081,7 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
             let nid = require_node(vm, &hs_set, t)?;
             let v = vm.to_number(arg(args, 0))?;
             if v.is_finite() {
+                crate::cssom_view::interrupt_smooth_scroll_for_node(vm, &hs_set, nid);
                 if is_y {
                     hs_set.borrow_mut().set_scroll_offset_for_node(
                         nid,
@@ -4098,47 +4103,8 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         define_host_accessor(vm, ep, prop, Some(g), Some(s));
     }
 
-    for (name, relative) in [("scrollTo", false), ("scroll", false), ("scrollBy", true)] {
-        let h = Rc::clone(host);
-        define_host_method(vm, ep, name, move |vm, t, args| {
-            let nid = require_node(vm, &h, t)?;
-            let first = arg(args, 0);
-            let (mut x_opt, mut y_opt) = (None, None);
-            if let Some(obj) = first.as_object() {
-                let k_left = vm.heap.intern_key("left");
-                let k_top = vm.heap.intern_key("top");
-                if let Ok(v) = vm.get_property_by_key(obj, k_left) {
-                    if !v.is_undefined() {
-                        let n = vm.to_number(v)?;
-                        if n.is_finite() {
-                            x_opt = Some(n as f32);
-                        }
-                    }
-                }
-                if let Ok(v) = vm.get_property_by_key(obj, k_top) {
-                    if !v.is_undefined() {
-                        let n = vm.to_number(v)?;
-                        if n.is_finite() {
-                            y_opt = Some(n as f32);
-                        }
-                    }
-                }
-            } else {
-                let nx = vm.to_number(first)?;
-                let ny = vm.to_number(arg(args, 1))?;
-                if nx.is_finite() {
-                    x_opt = Some(nx as f32);
-                }
-                if ny.is_finite() {
-                    y_opt = Some(ny as f32);
-                }
-            }
-            h.borrow_mut()
-                .set_scroll_offset_for_node(nid, x_opt, y_opt, relative);
-            Ok(JsValue::UNDEFINED)
-        });
-    }
-
+    // `Element.prototype.{scroll, scrollTo, scrollBy, scrollIntoView}` are installed by
+    // `cssom_view::install_cssom_view` with full Promise<{interrupted}> and smooth-scroll support.
     install_html5_element_semantics(vm, host, ep);
 }
 
