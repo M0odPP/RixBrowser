@@ -126,6 +126,8 @@ pub(crate) struct WebApiPrototypes {
     pub blob_proto: Option<HeapHandle>,
     pub file_proto: Option<HeapHandle>,
     pub abort_signal_proto: Option<HeapHandle>,
+    pub abort_controller_ctor: Option<HeapHandle>,
+    pub abort_controller_abort_fn: Option<HeapHandle>,
     pub url_proto: Option<HeapHandle>,
     pub search_params_proto: Option<HeapHandle>,
     pub form_data_proto: Option<HeapHandle>,
@@ -240,6 +242,8 @@ impl WebApiState {
             self.protos.blob_proto,
             self.protos.file_proto,
             self.protos.abort_signal_proto,
+            self.protos.abort_controller_ctor,
+            self.protos.abort_controller_abort_fn,
             self.protos.url_proto,
             self.protos.search_params_proto,
             self.protos.form_data_proto,
@@ -3479,7 +3483,7 @@ fn install_abort_controller(
     let h_ab = Rc::clone(host);
     let ev_ab = Rc::clone(events);
     let el_ab = Rc::clone(event_loop);
-    define_host_method(vm, acp, "abort", move |vm, this_val, args| {
+    let ac_abort_fn = vm.alloc_host_fn("abort", move |vm, this_val, args| {
         let Some(ch) = this_val.as_object() else {
             return Err(vm.type_error("Incompatible AbortController receiver"));
         };
@@ -3489,6 +3493,14 @@ fn install_abort_controller(
         trigger_abort_signal(vm, &h_ab, &ev_ab, &el_ab, &wa, sig_h, arg(args, 0));
         Ok(JsValue::UNDEFINED)
     });
+    let k_abort = vm.heap.intern_key("abort");
+    vm.heap.object_define_data(
+        acp,
+        k_abort,
+        JsValue::from_object(ac_abort_fn),
+        PropertyAttrs::METHOD,
+        &mut vm.shapes,
+    );
 
     let wa = Rc::clone(web_apis);
     let ac_ctor = vm.alloc_host_fn("AbortController", move |vm, _, _| {
@@ -3519,6 +3531,44 @@ fn install_abort_controller(
     });
     bind_ctor_proto(vm, ac_ctor, acp);
     define_global(vm, "AbortController", JsValue::from_object(ac_ctor));
+    {
+        let mut st = web_apis.borrow_mut();
+        st.protos.abort_controller_ctor = Some(ac_ctor);
+        st.protos.abort_controller_abort_fn = Some(ac_abort_fn);
+    }
+}
+
+/// Constructs an internal `(AbortController, AbortSignal)` pair using the realm's saved
+/// tamper-proof native `AbortController` constructor.
+pub(crate) fn create_internal_abort_controller(
+    vm: &mut JsVm,
+    web_apis: &SharedWebApis,
+) -> Option<(HeapHandle, HeapHandle)> {
+    let ctor = web_apis.borrow().protos.abort_controller_ctor?;
+    let ac_val = vm
+        .call_value(JsValue::from_object(ctor), JsValue::UNDEFINED, &[])
+        .ok()?;
+    let ac_h = ac_val.as_object()?;
+    let k_sig = vm.heap.intern_key("signal");
+    let sig_h = vm.get_property_by_key(ac_h, k_sig).ok()?.as_object()?;
+    Some((ac_h, sig_h))
+}
+
+/// Triggers abort on an internal `AbortController` via the saved native `abort()` method.
+pub(crate) fn trigger_internal_abort(
+    vm: &mut JsVm,
+    web_apis: &SharedWebApis,
+    controller_h: HeapHandle,
+    reason: JsValue,
+) {
+    let Some(abort_fn) = web_apis.borrow().protos.abort_controller_abort_fn else {
+        return;
+    };
+    let _ = vm.call_value(
+        JsValue::from_object(abort_fn),
+        JsValue::from_object(controller_h),
+        &[reason],
+    );
 }
 
 fn require_abort_signal(

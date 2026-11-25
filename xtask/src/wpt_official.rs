@@ -1375,6 +1375,7 @@ fn run_wpt_testharness_file(
     // Drive async network/worker events, timers, microtasks, and VSync/layout observers
     // until all async/promise subtests settle (exiting immediately when pending == 0).
     let mut async_waits = 0u32;
+    let mut virtual_timer_jumps = 0u32;
     for tick in 0..1000u32 {
         rt.advance_and_drain(Duration::from_millis(if tick == 0 { 0 } else { 10 }));
         if !has_pending(&mut rt) {
@@ -1390,6 +1391,18 @@ fn run_wpt_testharness_file(
         // keep advancing VSync immediately without burning wall-clock async waits.
         if had_raf || rt.event_loop.borrow().has_pending_raf() {
             continue;
+        }
+        // When JS timers (`setTimeout` / `delay(500)`) are pending, fast-forward virtual time
+        // directly to the next timer deadline without sleeping wall-clock milliseconds.
+        let next_timer = rt.event_loop.borrow_mut().time_until_next_timer();
+        if let Some(dt) = next_timer {
+            if dt <= Duration::from_secs(5) && virtual_timer_jumps < 400 {
+                virtual_timer_jumps += 1;
+                if !dt.is_zero() {
+                    rt.event_loop.borrow_mut().advance_clock(dt);
+                }
+                continue;
+            }
         }
         if async_waits >= 80 {
             break;
