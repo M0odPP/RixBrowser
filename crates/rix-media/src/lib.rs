@@ -20,12 +20,13 @@ pub use audio_clock::{
 pub use demuxer::{demux_bytes, detect_container};
 pub use mse::{
     is_type_supported, AppendMode, AppendResult, CodedFrame, EndOfStreamError, MediaSourceEngine,
-    MseError, ReadyState, SourceBufferEngine, TimeRanges, DEFAULT_SOURCE_BUFFER_QUOTA_BYTES,
+    MseError, PendingBufferOp, ReadyState, SourceBufferEngine, TimeRanges,
+    DEFAULT_SOURCE_BUFFER_QUOTA_BYTES,
 };
 pub use types::{
     AudioCodec, AudioFrame, AudioTrackConfig, ColorMatrix, ColorRange, ContainerFormat,
-    DemuxedMedia, EncodedPacket, MediaError, PacketKind, PcmSampleFormat, PixelFormat, TrackInfo,
-    TrackKind, VideoCodec, VideoFrame, VideoTrackConfig,
+    DemuxedMedia, EncodedPacket, MediaError, MseSample, PacketKind, PcmSampleFormat, PixelFormat,
+    TrackInfo, TrackKind, VideoCodec, VideoFrame, VideoTrackConfig,
 };
 pub use video::{
     create_video_decoder, Av1VideoDecoder, H264VideoDecoder, VideoDecoder, Vp8VideoDecoder,

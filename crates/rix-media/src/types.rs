@@ -62,7 +62,13 @@ impl AudioCodec {
         let lower = codec.trim().to_ascii_lowercase();
         if lower == "opus" || lower == "a_opus" {
             Some(Self::Opus)
-        } else if lower.starts_with("mp4a.40") || lower == "aac" || lower == "a_aac" {
+        } else if lower == "aac"
+            || lower == "a_aac"
+            || lower == "mp4a.67"
+            || lower
+                .strip_prefix("mp4a.40.")
+                .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        {
             Some(Self::Aac)
         } else if lower == "vorbis" || lower == "a_vorbis" {
             Some(Self::Vorbis)
@@ -148,6 +154,19 @@ pub struct EncodedPacket {
     pub duration_us: u64,
     /// Whether this packet is a random-access point (keyframe / IDR / sync sample).
     pub is_keyframe: bool,
+}
+
+/// High-precision demuxed sample for W3C MSE coded-frame processing (preserves sub-microsecond timestamps).
+#[derive(Debug, Clone)]
+pub struct MseSample {
+    pub track_id: u32,
+    pub kind: PacketKind,
+    pub data: Vec<u8>,
+    pub pts_s: f64,
+    pub dts_s: f64,
+    pub duration_s: f64,
+    pub is_keyframe: bool,
+    pub video_dims: Option<(u32, u32)>,
 }
 
 /// Planar pixel layout for decoded video frames.

@@ -215,7 +215,7 @@ fn mse_quota_eviction_and_quota_exceeded_error() {
             step++;
             if (step === 1) sb.appendBuffer(seg1);
             else if (step === 2) sb.appendBuffer(seg2);
-            else if (step === 3) sb.appendBuffer(seg3);
+            else if (step === 3) {{ video.currentTime = 0.15; sb.appendBuffer(seg3); }}
             else if (step === 4) {{
                 summary = quotaErr + "|" + sb.buffered.length + "|" + sb.buffered.start(0).toFixed(2) + "|" + sb.buffered.end(0).toFixed(2);
             }}

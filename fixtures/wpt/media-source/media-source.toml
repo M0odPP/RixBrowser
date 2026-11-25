@@ -201,19 +201,23 @@ script = """
 var ms = new MediaSource();
 var video = document.createElement("video");
 var out = "";
+var beforeEnd = NaN;
 var endedFired = false;
 ms.addEventListener("sourceended", function() {
     endedFired = true;
-    out = ms.readyState + "|" + ms.duration + "|" + endedFired + "|" + video.duration;
+    // Per W3C MSE §2.4.7 & official WPT mediasource-endofstream.html, endOfStream()
+    // with no buffered coded frames truncates duration to 0.
+    out = ms.readyState + "|" + beforeEnd + "|" + ms.duration + "|" + endedFired + "|" + video.duration;
 });
 ms.addEventListener("sourceopen", function() {
     ms.duration = 42.5;
+    beforeEnd = ms.duration;
     ms.endOfStream();
 });
 video.srcObject = ms;
 """
 assert_expr = "out"
-expected = "ended|42.5|true|42.5"
+expected = "ended|42.5|0|true|0"
 
 [[script_cases]]
 name = "sourcebuffer_change_type_and_abort_resets_window"
