@@ -1320,6 +1320,8 @@ pub fn layout_grid_lanes_container(
             box_id: oof_id,
             static_pos: grid_area_cb.origin,
             is_fixed,
+            static_x_is_end: false,
+            static_y_is_end: false,
             flex_hint: None,
             grid_hint: Some(GridAbsposHint {
                 is_direct_child: true,

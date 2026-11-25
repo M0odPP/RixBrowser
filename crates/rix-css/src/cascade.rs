@@ -227,6 +227,7 @@ pub struct StyleContext {
     media: MediaContext,
     ua_sheet: Arc<Stylesheet>,
     author_sheets: Vec<Arc<Stylesheet>>,
+    shadow_adopted_sheets: HashMap<NodeId, Vec<Arc<Stylesheet>>>,
     js_registered_properties: Vec<RegisteredProperty>,
     rule_index: RuleIndex,
     invalidation_map: InvalidationMap,
@@ -262,6 +263,7 @@ impl StyleContext {
             media,
             ua_sheet,
             author_sheets: Vec::new(),
+            shadow_adopted_sheets: HashMap::new(),
             js_registered_properties: Vec::new(),
             rule_index: RuleIndex::default(),
             invalidation_map: InvalidationMap::default(),
@@ -292,6 +294,7 @@ impl StyleContext {
                 &media,
             )),
             author_sheets: Vec::new(),
+            shadow_adopted_sheets: HashMap::new(),
             js_registered_properties: Vec::new(),
             rule_index: RuleIndex::default(),
             invalidation_map: InvalidationMap::default(),
@@ -394,6 +397,11 @@ impl StyleContext {
         }
         self.author_sheets.push(sheet);
         self.index_dirty = true;
+    }
+
+    /// Sets the compiled per-`ShadowRoot` adopted stylesheets (Constructable Stylesheets).
+    pub fn set_shadow_adopted_stylesheets(&mut self, map: HashMap<NodeId, Vec<Arc<Stylesheet>>>) {
+        self.shadow_adopted_sheets = map;
     }
 
     /// Clears all author stylesheets and resolved styles (e.g. on navigation).
@@ -699,6 +707,7 @@ impl StyleContext {
                 16.0,
                 true,
                 &self.ua_sheet,
+                &self.shadow_adopted_sheets,
                 &self.rule_index,
                 &self.inline_color_exprs,
                 &self.media,
@@ -784,6 +793,7 @@ impl StyleContext {
                 root_font_size,
                 false,
                 &self.ua_sheet,
+                &self.shadow_adopted_sheets,
                 &self.rule_index,
                 &self.inline_color_exprs,
                 &self.media,
@@ -883,12 +893,13 @@ fn next_layout_parent_flex_grid(style: &ComputedStyle, inherited: bool) -> bool 
     }
 }
 
-/// Builds a tree-scoped [`RuleIndex`] for a `ShadowRoot` containing the UA stylesheet
-/// plus any `<style>` elements directly inside that shadow tree (encapsulating outer author styles).
+/// Builds a tree-scoped [`RuleIndex`] for a `ShadowRoot` containing the UA stylesheet,
+/// any `<style>` elements inside that shadow tree, and its `adoptedStyleSheets` in cascade order.
 fn build_shadow_rule_index(
     doc: &Document,
     sr_id: NodeId,
     ua_sheet: &Arc<Stylesheet>,
+    shadow_adopted: &HashMap<NodeId, Vec<Arc<Stylesheet>>>,
     media: &MediaContext,
 ) -> RuleIndex {
     let mut sheets = Vec::new();
@@ -909,6 +920,9 @@ fn build_shadow_rule_index(
             }
         }
     }
+    if let Some(adopted) = shadow_adopted.get(&sr_id) {
+        sheets.extend(adopted.iter().cloned());
+    }
     let (index, _) = RuleIndex::build(&sheets);
     index
 }
@@ -922,6 +936,7 @@ fn cascade_subtree_par(
     root_font_size: f32,
     allow_parallel: bool,
     ua_sheet: &Arc<Stylesheet>,
+    shadow_adopted: &HashMap<NodeId, Vec<Arc<Stylesheet>>>,
     rule_index: &RuleIndex,
     inline_color_exprs: &FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
     media: &MediaContext,
@@ -989,7 +1004,7 @@ fn cascade_subtree_par(
             .filter(|&c| matches!(doc.get(c), Some(NodeData::Element(_))))
             .collect();
         if !shadow_children.is_empty() {
-            let shadow_index = build_shadow_rule_index(doc, sr_id, ua_sheet, media);
+            let shadow_index = build_shadow_rule_index(doc, sr_id, ua_sheet, shadow_adopted, media);
             let mut shadow_bloom = BloomFilter::new();
             let mut shadow_memo = StyleMemo::with_capacity(32);
             for &sc in &shadow_children {
@@ -1001,6 +1016,7 @@ fn cascade_subtree_par(
                     next_root_font,
                     false,
                     ua_sheet,
+                    shadow_adopted,
                     &shadow_index,
                     inline_color_exprs,
                     media,
@@ -1052,6 +1068,7 @@ fn cascade_subtree_par(
                         next_root_font,
                         false,
                         ua_sheet,
+                        shadow_adopted,
                         rule_index,
                         inline_color_exprs,
                         media,
@@ -1085,6 +1102,7 @@ fn cascade_subtree_par(
                 next_root_font,
                 allow_parallel,
                 ua_sheet,
+                shadow_adopted,
                 rule_index,
                 inline_color_exprs,
                 media,
@@ -1112,6 +1130,7 @@ fn restyle_dirty_walk(
     root_font_size: f32,
     force_inherit_restyle: bool,
     ua_sheet: &Arc<Stylesheet>,
+    shadow_adopted: &HashMap<NodeId, Vec<Arc<Stylesheet>>>,
     rule_index: &RuleIndex,
     inline_color_exprs: &FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
     media: &MediaContext,
@@ -1265,7 +1284,7 @@ fn restyle_dirty_walk(
     let force_children = propagate_inherited || propagate_through_contents;
 
     if let Some(sr_id) = elem.shadow_root {
-        let shadow_index = build_shadow_rule_index(doc, sr_id, ua_sheet, media);
+        let shadow_index = build_shadow_rule_index(doc, sr_id, ua_sheet, shadow_adopted, media);
         let mut shadow_bloom = BloomFilter::new();
         let mut shadow_memo = StyleMemo::default();
         for sc in doc.children(sr_id) {
@@ -1279,6 +1298,7 @@ fn restyle_dirty_walk(
                     next_root_font,
                     sc_force,
                     ua_sheet,
+                    shadow_adopted,
                     &shadow_index,
                     inline_color_exprs,
                     media,
@@ -1307,6 +1327,7 @@ fn restyle_dirty_walk(
                 next_root_font,
                 force_children,
                 ua_sheet,
+                shadow_adopted,
                 rule_index,
                 inline_color_exprs,
                 media,

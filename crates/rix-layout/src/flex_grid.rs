@@ -274,6 +274,8 @@ pub fn layout_flex_grid_container(
                 metrics.border.top + metrics.padding.top,
             ),
             is_fixed,
+            static_x_is_end: false,
+            static_y_is_end: false,
             flex_hint: None,
             grid_hint: None,
         });

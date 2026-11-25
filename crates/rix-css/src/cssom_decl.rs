@@ -59,6 +59,9 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
     if prop_kind == PropertyIdKind::All {
         return None;
     }
+    if let Some(extra_ser) = parse_and_serialize_extra_css2_property(prop_kind, trimmed) {
+        return extra_ser;
+    }
 
     // CSS Color Level 4 & 5: parse and serialize color longhands via our native Color 4/5
     // engine so wide-gamut spaces, `none`, `color-mix()`, relative colors, `alpha()`,
@@ -208,9 +211,9 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
                     .unwrap_or_else(|| trimmed.to_string());
                 let canon = canonicalize_cssom_calc(&raw_out);
                 if prop_disallows_unitless_nonzero(prop_kind) {
-                    Some(canonicalize_zero_lengths(&canon))
+                    Some(canonicalize_zero_lengths(&normalize_cssom_urls(&canon)))
                 } else {
-                    Some(canon)
+                    Some(normalize_cssom_urls(&canon))
                 }
             }
             Err(_) => None,
@@ -742,9 +745,9 @@ pub(crate) fn format_cssom_color(
     s
 }
 
-/// Converts bare `"0"` length tokens to canonical CSSOM `"0px"`.
+/// Converts bare `"0"` and `"-0px"` length tokens to canonical CSSOM `"0px"`.
 fn canonicalize_zero_lengths(input: &str) -> String {
-    if input == "0" {
+    if input == "0" || input == "-0px" || input == "-0" {
         return "0px".to_string();
     }
     if !input.contains('0') || input.contains("calc(") {
@@ -752,9 +755,239 @@ fn canonicalize_zero_lengths(input: &str) -> String {
     }
     input
         .split_ascii_whitespace()
-        .map(|tok| if tok == "0" { "0px" } else { tok })
+        .map(|tok| {
+            if tok == "0" || tok == "-0px" || tok == "-0" {
+                "0px"
+            } else {
+                tok
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Ensures `url(foo)` serializes with CSSOM double quotes (`url("foo")`).
+fn normalize_cssom_urls(input: &str) -> String {
+    if !input.contains("url(") && !input.contains("URL(") {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len() + 4);
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if input[i..].len() >= 4 && input[i..i + 4].eq_ignore_ascii_case("url(") {
+            let start = i + 4;
+            if let Some(rel_end) = input[start..].find(')') {
+                let inner = input[start..start + rel_end].trim();
+                out.push_str("url(");
+                if (inner.starts_with('"') && inner.ends_with('"') && inner.len() >= 2)
+                    || (inner.starts_with('\'') && inner.ends_with('\'') && inner.len() >= 2)
+                {
+                    let unquoted = &inner[1..inner.len() - 1];
+                    out.push('"');
+                    out.push_str(&unquoted.replace('"', "\\\""));
+                    out.push('"');
+                } else {
+                    out.push('"');
+                    out.push_str(&inner.replace('"', "\\\""));
+                    out.push('"');
+                }
+                out.push(')');
+                i = start + rel_end + 1;
+                continue;
+            }
+        }
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Validates and canonically serializes CSS2/CSS3 properties that `lightningcss` leaves as `Custom`.
+/// Returns `Some(Some(canon))` if valid, `Some(None)` if explicitly invalid, or `None` to fall through.
+fn parse_and_serialize_extra_css2_property(
+    kind: PropertyIdKind,
+    trimmed: &str,
+) -> Option<Option<String>> {
+    let low = trimmed.to_ascii_lowercase();
+    match kind {
+        PropertyIdKind::AlignmentBaseline => {
+            let ok = matches!(
+                low.as_str(),
+                "baseline"
+                    | "alphabetic"
+                    | "ideographic"
+                    | "middle"
+                    | "central"
+                    | "mathematical"
+                    | "text-before-edge"
+                    | "text-after-edge"
+                    | "before-edge"
+                    | "after-edge"
+                    | "hanging"
+                    | "auto"
+                    | "top"
+                    | "center"
+                    | "bottom"
+                    | "text-top"
+                    | "text-bottom"
+            );
+            Some(ok.then_some(low))
+        }
+        PropertyIdKind::BaselineSource => {
+            let ok = matches!(low.as_str(), "auto" | "first" | "last");
+            Some(ok.then_some(low))
+        }
+        PropertyIdKind::BaselineShift => {
+            if matches!(
+                low.as_str(),
+                "baseline" | "sub" | "super" | "top" | "center" | "bottom"
+            ) {
+                return Some(Some(low));
+            }
+            // Also accepts `<length-percentage>` (including negative lengths like `-0px`, `-.1em`, `-.5%`).
+            let canon = parse_and_serialize_declaration("top", trimmed)?;
+            Some(Some(canon))
+        }
+        PropertyIdKind::UnicodeBidi => {
+            let ok = matches!(
+                low.as_str(),
+                "normal" | "embed" | "isolate" | "bidi-override" | "isolate-override" | "plaintext"
+            );
+            Some(ok.then_some(low))
+        }
+        PropertyIdKind::PageBreakAfter | PropertyIdKind::PageBreakBefore => {
+            let ok = matches!(low.as_str(), "auto" | "always" | "avoid" | "left" | "right");
+            Some(ok.then_some(low))
+        }
+        PropertyIdKind::PageBreakInside => {
+            let ok = matches!(low.as_str(), "auto" | "avoid");
+            Some(ok.then_some(low))
+        }
+        PropertyIdKind::FontVariant => {
+            let ok = matches!(low.as_str(), "normal" | "small-caps" | "none");
+            if ok {
+                Some(Some(low))
+            } else {
+                None
+            }
+        }
+        PropertyIdKind::Clip => {
+            if low == "auto" {
+                return Some(Some("auto".to_string()));
+            }
+            if let Some(inner) = low.strip_prefix("rect(").and_then(|s| s.strip_suffix(')')) {
+                let raw_parts: Vec<&str> = if inner.contains(',') {
+                    inner.split(',').map(str::trim).collect()
+                } else {
+                    inner.split_ascii_whitespace().collect()
+                };
+                if raw_parts.len() == 4 {
+                    let mut norm = Vec::with_capacity(4);
+                    for p in raw_parts {
+                        if p == "auto" {
+                            norm.push("auto".to_string());
+                        } else if let Some(l) = parse_and_serialize_declaration("top", p) {
+                            if !l.ends_with('%') {
+                                norm.push(l);
+                            } else {
+                                return Some(None);
+                            }
+                        } else {
+                            return Some(None);
+                        }
+                    }
+                    return Some(Some(format!("rect({})", norm.join(", "))));
+                }
+            }
+            Some(None)
+        }
+        PropertyIdKind::BorderImage => {
+            if low == "none" {
+                return Some(Some("none".to_string()));
+            }
+            None
+        }
+        PropertyIdKind::BackgroundAttachment => {
+            let parts: Vec<&str> = low.split(',').map(str::trim).collect();
+            if parts
+                .iter()
+                .all(|p| matches!(*p, "scroll" | "fixed" | "local"))
+            {
+                Some(Some(parts.join(", ")))
+            } else {
+                Some(None)
+            }
+        }
+        PropertyIdKind::BackgroundRepeat => {
+            let parts: Vec<&str> = low.split(',').map(str::trim).collect();
+            let mut norm = Vec::with_capacity(parts.len());
+            for p in parts {
+                let toks: Vec<&str> = p.split_ascii_whitespace().collect();
+                match toks.as_slice() {
+                    ["repeat" | "repeat-x" | "repeat-y" | "space" | "round" | "no-repeat"] => {
+                        norm.push(toks[0].to_string());
+                    }
+                    [a, b]
+                        if matches!(*a, "repeat" | "space" | "round" | "no-repeat")
+                            && matches!(*b, "repeat" | "space" | "round" | "no-repeat") =>
+                    {
+                        if *a == "repeat" && *b == "no-repeat" {
+                            norm.push("repeat-x".to_string());
+                        } else if *a == "no-repeat" && *b == "repeat" {
+                            norm.push("repeat-y".to_string());
+                        } else if a == b {
+                            norm.push((*a).to_string());
+                        } else {
+                            norm.push(format!("{a} {b}"));
+                        }
+                    }
+                    _ => return Some(None),
+                }
+            }
+            Some(Some(norm.join(", ")))
+        }
+        PropertyIdKind::ListStyleImage => {
+            if low == "none" {
+                return Some(Some("none".to_string()));
+            }
+            if low.starts_with("url(") && low.ends_with(')') {
+                return Some(Some(normalize_cssom_urls(trimmed)));
+            }
+            None
+        }
+        PropertyIdKind::ListStylePosition => {
+            let ok = matches!(low.as_str(), "inside" | "outside");
+            Some(ok.then_some(low))
+        }
+        PropertyIdKind::ListStyleType => {
+            if matches!(
+                low.as_str(),
+                "none"
+                    | "disc"
+                    | "circle"
+                    | "square"
+                    | "decimal"
+                    | "decimal-leading-zero"
+                    | "lower-roman"
+                    | "upper-roman"
+                    | "lower-greek"
+                    | "lower-latin"
+                    | "upper-latin"
+                    | "armenian"
+                    | "georgian"
+                    | "lower-alpha"
+                    | "upper-alpha"
+                    | "disclosure-open"
+                    | "disclosure-closed"
+            ) {
+                return Some(Some(low));
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Restores leading `0` before decimals (`.5em` -> `0.5em`) and sorts additive `calc(...)`
@@ -987,6 +1220,47 @@ pub(crate) fn serialize_cssom_property(prop: &Property<'_>, raw_input: &str) -> 
         Property::BorderInline(b) => Some(format_cssom_generic_border(b, hint)),
         Property::BorderInlineStart(b) => Some(format_cssom_generic_border(b, hint)),
         Property::BorderInlineEnd(b) => Some(format_cssom_generic_border(b, hint)),
+        Property::BackgroundPosition(positions) => {
+            use lightningcss::values::position::{
+                HorizontalPosition, HorizontalPositionKeyword, VerticalPosition,
+                VerticalPositionKeyword,
+            };
+            let formatted: Vec<String> = positions
+                .iter()
+                .map(|pos| {
+                    let x = match &pos.x {
+                        HorizontalPosition::Center => "center".to_string(),
+                        HorizontalPosition::Length(lp) => format_cssom_len_to_css(lp),
+                        HorizontalPosition::Side { side, offset } => {
+                            let kw = match side {
+                                HorizontalPositionKeyword::Left => "left",
+                                HorizontalPositionKeyword::Right => "right",
+                            };
+                            match offset {
+                                Some(lp) => format!("{kw} {}", format_cssom_len_to_css(lp)),
+                                None => kw.to_string(),
+                            }
+                        }
+                    };
+                    let y = match &pos.y {
+                        VerticalPosition::Center => "center".to_string(),
+                        VerticalPosition::Length(lp) => format_cssom_len_to_css(lp),
+                        VerticalPosition::Side { side, offset } => {
+                            let kw = match side {
+                                VerticalPositionKeyword::Top => "top",
+                                VerticalPositionKeyword::Bottom => "bottom",
+                            };
+                            match offset {
+                                Some(lp) => format!("{kw} {}", format_cssom_len_to_css(lp)),
+                                None => kw.to_string(),
+                            }
+                        }
+                    };
+                    format!("{x} {y}")
+                })
+                .collect();
+            Some(formatted.join(", "))
+        }
         _ => None,
     }
 }
@@ -1039,11 +1313,13 @@ fn expand_lightning_shorthand_cssom(
     let c = |col| format_cssom_color(col, hint);
     match prop {
         Property::Border(b) => {
-            return Some(expand_border_sides(
+            let mut out = expand_border_sides(
                 &["border-top", "border-right", "border-bottom", "border-left"],
                 b,
                 hint,
-            ));
+            );
+            out.push(("border-image".to_string(), "none".to_string()));
+            return Some(out);
         }
         Property::BorderTop(b) => return Some(expand_border_sides(&["border-top"], b, hint)),
         Property::BorderRight(b) => return Some(expand_border_sides(&["border-right"], b, hint)),
@@ -1168,6 +1444,17 @@ fn expand_lightning_shorthand_cssom(
             ("border-bottom-right-radius", f(&br.bottom_right)),
             ("border-bottom-left-radius", f(&br.bottom_left)),
         ],
+        Property::Overflow(o) => vec![("overflow-x", g(&o.x)), ("overflow-y", g(&o.y))],
+        Property::Outline(o) => vec![
+            ("outline-width", f(&o.width)),
+            ("outline-style", g(&o.style)),
+            ("outline-color", c(&o.color)),
+        ],
+        Property::ListStyle(ls) => vec![
+            ("list-style-position", g(&ls.position)),
+            ("list-style-image", normalize_cssom_urls(&g(&ls.image))),
+            ("list-style-type", g(&ls.list_style_type)),
+        ],
         _ => return None,
     };
     Some(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
@@ -1176,6 +1463,16 @@ fn expand_lightning_shorthand_cssom(
 /// Validates that `input` has balanced strings/delimiters and no top-level `;` or `!`.
 pub(crate) fn has_valid_css_tokens_pub(input: &str, require_closed: bool) -> bool {
     has_valid_css_tokens(input, require_closed)
+}
+
+/// Normalizes unitless zero length tokens (`0` -> `0px`) for CSSOM serialization.
+pub(crate) fn canonicalize_zero_lengths_pub(input: &str) -> String {
+    canonicalize_zero_lengths(input)
+}
+
+/// Returns true if `prop_name` is a length-valued CSS property whose `0` serializes as `0px`.
+pub(crate) fn prop_name_uses_zero_px(prop_name: &str) -> bool {
+    PropertyIdKind::from_name(prop_name).is_some_and(prop_disallows_unitless_nonzero)
 }
 
 fn has_valid_css_tokens(input: &str, require_closed: bool) -> bool {

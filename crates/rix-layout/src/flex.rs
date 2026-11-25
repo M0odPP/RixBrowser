@@ -2160,6 +2160,8 @@ pub fn layout_flex_container(
             box_id: oof_id,
             static_pos: Point::new(content_origin_x, content_origin_y),
             is_fixed,
+            static_x_is_end: false,
+            static_y_is_end: false,
             flex_hint: Some(FlexAbsposHint {
                 content_rect: content_rect_in_border,
                 axes,

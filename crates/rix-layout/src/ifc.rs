@@ -510,13 +510,24 @@ pub fn layout_ifc(
             }
             InlineItem::OutOfFlow(oof_id) => {
                 let is_fixed = ctx.tree.get(oof_id).style.position == rix_css::PositionMode::Fixed;
+                let is_rtl = container_style.text.direction == rix_css::DirectionMode::Rtl;
+                let is_vert = container_style.text.writing_mode.is_vertical();
+                let x_end = (!is_vert && is_rtl)
+                    || matches!(
+                        container_style.text.writing_mode,
+                        rix_css::WritingMode::VerticalRl | rix_css::WritingMode::SidewaysRl
+                    );
+                let sx = if x_end {
+                    content_origin.x + band_right - cur_x - pending_left_edge
+                } else {
+                    content_origin.x + band_left + cur_x + pending_left_edge
+                };
                 ctx.pending_oof.push(crate::position::PendingOof {
                     box_id: oof_id,
-                    static_pos: Point::new(
-                        content_origin.x + band_left + cur_x + pending_left_edge,
-                        content_origin.y + cursor_y,
-                    ),
+                    static_pos: Point::new(sx, content_origin.y + cursor_y),
                     is_fixed,
+                    static_x_is_end: x_end,
+                    static_y_is_end: false,
                     flex_hint: None,
                     grid_hint: None,
                 });
