@@ -447,7 +447,6 @@ pub(crate) fn serialize_with_transfer(
 /// Performs WHATWG HTML §2.7.4 `StructuredSerializeForStorage` (rejecting
 /// `SharedArrayBuffer`, `MessagePort`, `ImageBitmap`, `OffscreenCanvas`, functions,
 /// symbols, and non-serializable platform objects with `DataCloneError`).
-#[allow(dead_code)]
 pub(crate) fn serialize_for_storage(
     vm: &mut JsVm,
     ctx: &CloneContext<'_>,
@@ -466,7 +465,6 @@ pub(crate) fn serialize_for_storage(
 
 /// Deserializes a storage [`StructuredClonePayload`] back into fresh JS values on `vm`,
 /// bypassing `Object.prototype` and `Array.prototype` setters per WebIDL / IndexedDB spec.
-#[allow(dead_code)]
 pub(crate) fn deserialize_for_storage(
     vm: &mut JsVm,
     ctx: &CloneContext<'_>,
@@ -1777,7 +1775,6 @@ fn sc_write_val(out: &mut Vec<u8>, v: &CloneValue) {
 
 /// Serializes a storage [`StructuredClonePayload`] into compact exact binary bytes
 /// (exact IEEE-754 float bits, raw `Vec<u8>` buffers/Blobs, full cyclic object graph).
-#[allow(dead_code)]
 pub(crate) fn encode_storage_payload(payload: &StructuredClonePayload) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
     out.extend_from_slice(SC_BIN_MAGIC);
@@ -2064,7 +2061,6 @@ impl<'a> ScReader<'a> {
 }
 
 /// Decodes compact binary bytes back into a [`StructuredClonePayload`].
-#[allow(dead_code)]
 pub(crate) fn decode_storage_payload(raw: &[u8]) -> Option<StructuredClonePayload> {
     if raw.len() < SC_BIN_MAGIC.len() || &raw[..SC_BIN_MAGIC.len()] != SC_BIN_MAGIC {
         return None;

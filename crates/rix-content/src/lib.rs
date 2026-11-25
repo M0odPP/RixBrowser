@@ -293,7 +293,17 @@ impl ContentRuntime {
         frames.borrow_mut().workers = Some(Rc::clone(&workers));
         let service_workers =
             install_service_worker_and_cache_apis(&mut vm, &host, &web_apis, &streams, &net);
-        let indexeddb = install_indexeddb(&mut vm, &host, &events, &event_loop, &web_apis);
+        let indexeddb = install_indexeddb(
+            &mut vm,
+            &host,
+            &events,
+            &event_loop,
+            &web_apis,
+            &net,
+            &canvas2d,
+            &frames,
+            &workers,
+        );
         let media_source = install_media_source(&mut vm, &host, &events, &event_loop, &web_apis);
         let media_elements = install_media_elements(
             &mut vm,

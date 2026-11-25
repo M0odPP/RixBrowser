@@ -1107,8 +1107,17 @@ fn run_worker_thread(
         &frames,
     );
     frames.borrow_mut().workers = Some(Rc::clone(&workers));
-    let indexeddb =
-        crate::indexeddb::install_indexeddb(&mut vm, &host, &events, &event_loop, &web_apis);
+    let indexeddb = crate::indexeddb::install_indexeddb(
+        &mut vm,
+        &host,
+        &events,
+        &event_loop,
+        &web_apis,
+        &net,
+        &canvas2d,
+        &frames,
+        &workers,
+    );
 
     // Register host GC root collectors so long-running workers never sweep live host wrappers.
     {
