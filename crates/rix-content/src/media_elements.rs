@@ -586,6 +586,7 @@ pub fn install_media_elements(
         let me_g = Rc::clone(&media_sys);
         let h_s = Rc::clone(host);
         let me_s = Rc::clone(&media_sys);
+        let ms_s = Rc::clone(ms_sys);
         define_host_accessor(
             vm,
             media_proto,
@@ -613,6 +614,12 @@ pub fn install_media_elements(
                     let p = sys.ensure_player(nid);
                     p.clock.seek_seconds(sec);
                     p.audio_queue.clear();
+                    let ms_h_opt = ms_s.borrow().attached_sources.get(&nid).copied();
+                    if let Some(ms_h) = ms_h_opt {
+                        if let Some(entry) = ms_s.borrow_mut().media_sources.get_mut(&ms_h) {
+                            entry.current_playback_time_s = sec.max(0.0);
+                        }
+                    }
                 }
                 Ok(JsValue::UNDEFINED)
             },

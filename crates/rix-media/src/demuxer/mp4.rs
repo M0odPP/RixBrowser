@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::types::{
     AudioCodec, AudioTrackConfig, ContainerFormat, DemuxedMedia, EncodedPacket, MediaError,
-    PacketKind, TrackInfo, TrackKind, VideoCodec, VideoTrackConfig,
+    MseSample, PacketKind, TrackInfo, TrackKind, VideoCodec, VideoTrackConfig,
 };
 
 /// Track defaults from `mvex/trex` and `moov/trak` persisted across fMP4 media segments.
@@ -16,6 +16,10 @@ pub struct Mp4TrackState {
     pub default_sample_size: u32,
     pub default_sample_flags: u32,
     pub next_decode_time: u64,
+    /// Raw ISO BMFF `edts/elst` entries `(segment_duration_mvhd_ticks, media_time_mdhd_ticks)`.
+    pub elst_entries: Vec<(u64, i64)>,
+    /// Precomputed presentation offset in seconds derived from leading empty/trim `elst` edits.
+    pub elst_offset_s: f64,
 }
 
 /// Stateful initialization header state for incremental MSE fMP4 segment parsing.
@@ -23,8 +27,135 @@ pub struct Mp4TrackState {
 pub struct Mp4InitState {
     pub movie_timescale: u32,
     pub duration_us: Option<u64>,
+    pub init_duration_s: Option<f64>,
     pub tracks: HashMap<u32, Mp4TrackState>,
     pub track_order: Vec<u32>,
+}
+
+/// Structural classification of an incremental fMP4 byte buffer for MSE parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mp4BufferStatus {
+    Complete { has_moov: bool, has_moof: bool },
+    Partial { in_media_segment: bool },
+    Corrupt,
+}
+
+fn is_valid_mp4_fourcc(kind: &[u8; 4]) -> bool {
+    kind.iter().all(|&b| (0x20..=0x7E).contains(&b))
+}
+
+/// Inspects top-level ISO BMFF boxes in `buf` to distinguish complete segments, partial streamed
+/// appends (including split `moof`/`mdat` pairs), and corrupt byte streams.
+pub fn inspect_mp4_buffer(buf: &[u8]) -> Mp4BufferStatus {
+    if buf.is_empty() {
+        return Mp4BufferStatus::Complete {
+            has_moov: false,
+            has_moof: false,
+        };
+    }
+    let mut off = 0usize;
+    let mut has_moov = false;
+    let mut has_moof = false;
+    let mut pending_moof_without_mdat = false;
+    let mut saw_known_box = false;
+
+    while off < buf.len() {
+        let rem = buf.len() - off;
+        if rem < 8 {
+            return if saw_known_box {
+                Mp4BufferStatus::Partial {
+                    in_media_segment: has_moof || pending_moof_without_mdat,
+                }
+            } else {
+                Mp4BufferStatus::Corrupt
+            };
+        }
+        let size32 = u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+        let kind = [buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]];
+        if !is_valid_mp4_fourcc(&kind) {
+            return Mp4BufferStatus::Corrupt;
+        }
+        let known = matches!(
+            &kind,
+            b"ftyp"
+                | b"styp"
+                | b"moov"
+                | b"moof"
+                | b"mdat"
+                | b"sidx"
+                | b"free"
+                | b"skip"
+                | b"uuid"
+                | b"mfra"
+                | b"emsg"
+                | b"prft"
+                | b"pdin"
+                | b"meta"
+                | b"ssix"
+                | b"wide"
+        );
+        if !known {
+            return Mp4BufferStatus::Corrupt;
+        }
+        saw_known_box = true;
+
+        let (hdr_len, box_size) = if size32 == 1 {
+            if rem < 16 {
+                return Mp4BufferStatus::Partial {
+                    in_media_segment: has_moof || &kind == b"moof" || &kind == b"mdat",
+                };
+            }
+            let sz64 = u64::from_be_bytes([
+                buf[off + 8],
+                buf[off + 9],
+                buf[off + 10],
+                buf[off + 11],
+                buf[off + 12],
+                buf[off + 13],
+                buf[off + 14],
+                buf[off + 15],
+            ]);
+            let Ok(sz) = usize::try_from(sz64) else {
+                return Mp4BufferStatus::Corrupt;
+            };
+            (16usize, sz)
+        } else if size32 == 0 {
+            (8usize, rem)
+        } else {
+            (8usize, size32 as usize)
+        };
+
+        if box_size < hdr_len {
+            return Mp4BufferStatus::Corrupt;
+        }
+        if off.saturating_add(box_size) > buf.len() {
+            return Mp4BufferStatus::Partial {
+                in_media_segment: has_moof
+                    || pending_moof_without_mdat
+                    || &kind == b"moof"
+                    || &kind == b"mdat",
+            };
+        }
+        match &kind {
+            b"moov" => has_moov = true,
+            b"moof" => {
+                has_moof = true;
+                pending_moof_without_mdat = true;
+            }
+            b"mdat" => {
+                pending_moof_without_mdat = false;
+            }
+            _ => {}
+        }
+        off += box_size;
+    }
+
+    if pending_moof_without_mdat {
+        return Mp4BufferStatus::Partial {
+            in_media_segment: true,
+        };
+    }
+    Mp4BufferStatus::Complete { has_moov, has_moof }
 }
 
 impl Mp4InitState {
@@ -133,6 +264,59 @@ pub fn parse_mp4_media_segments(
         pos = bx.box_end;
     }
     Ok(packets)
+}
+
+/// Parses one or more fMP4 media segments into high-precision [`MseSample`]s (preserving
+/// sub-microsecond durations, `edts/elst` edit-list offsets, and per-frame video dimensions).
+pub fn parse_mp4_mse_segments(
+    bytes: &[u8],
+    state: &mut Mp4InitState,
+) -> Result<Vec<MseSample>, MediaError> {
+    let mut samples = Vec::new();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let Some(bx) = read_box_header(bytes, pos)? else {
+            break;
+        };
+        let body = &bytes[bx.body_start..bx.box_end];
+        match &bx.kind {
+            b"moov" => {
+                *state = Mp4InitState::default();
+                let mut stbl_pkts = Vec::new();
+                parse_moov(bytes, body, state, &mut stbl_pkts)?;
+                for pkt in stbl_pkts {
+                    let vdims = state
+                        .tracks
+                        .get(&pkt.track_id)
+                        .and_then(|t| match &t.info.kind {
+                            TrackKind::Video(v) => Some((v.width, v.height)),
+                            TrackKind::Audio(_) => None,
+                        });
+                    let elst_off = state
+                        .tracks
+                        .get(&pkt.track_id)
+                        .map(|t| t.elst_offset_s)
+                        .unwrap_or(0.0);
+                    samples.push(MseSample {
+                        track_id: pkt.track_id,
+                        kind: pkt.kind,
+                        data: pkt.data,
+                        pts_s: pkt.pts_us as f64 / 1_000_000.0 + elst_off,
+                        dts_s: pkt.dts_us as f64 / 1_000_000.0,
+                        duration_s: pkt.duration_us as f64 / 1_000_000.0,
+                        is_keyframe: pkt.is_keyframe,
+                        video_dims: vdims,
+                    });
+                }
+            }
+            b"moof" => {
+                parse_moof_mse(bytes, bx.box_start, body, state, &mut samples)?;
+            }
+            _ => {}
+        }
+        pos = bx.box_end;
+    }
+    Ok(samples)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -254,6 +438,7 @@ fn parse_moov(
     packets: &mut Vec<EncodedPacket>,
 ) -> Result<(), MediaError> {
     let mut trex_defaults: HashMap<u32, (u32, u32, u32, u32)> = HashMap::new();
+    let mut mehd_duration_ticks: Option<u64> = None;
     let mut pos = 0usize;
     while pos < moov_body.len() {
         let Some(bx) = read_box_header(moov_body, pos)? else {
@@ -270,6 +455,7 @@ fn parse_moov(
                         state.movie_timescale = ts;
                         if ts > 0 && dur > 0 && dur != u64::from(u32::MAX) {
                             state.duration_us = Some(ticks_to_us_u64(dur, ts));
+                            state.init_duration_s = Some(dur as f64 / f64::from(ts));
                         }
                     } else if version == 1 && body.len() >= 32 {
                         let ts = read_u32(body, 20)?;
@@ -277,15 +463,17 @@ fn parse_moov(
                         state.movie_timescale = ts;
                         if ts > 0 && dur > 0 && dur != u64::MAX {
                             state.duration_us = Some(ticks_to_us_u64(dur, ts));
+                            state.init_duration_s = Some(dur as f64 / f64::from(ts));
                         }
                     }
                 }
             }
             b"mvex" => {
-                parse_mvex(body, &mut trex_defaults)?;
+                parse_mvex(body, &mut trex_defaults, &mut mehd_duration_ticks)?;
             }
             b"trak" => {
-                if let Some((track_info, stbl_packets)) = parse_trak(full_file, body)? {
+                if let Some((track_info, elst_entries, stbl_packets)) = parse_trak(full_file, body)?
+                {
                     let tid = track_info.id;
                     let (desc_idx, def_dur, def_size, def_flags) =
                         trex_defaults.get(&tid).copied().unwrap_or((1, 0, 0, 0));
@@ -301,6 +489,8 @@ fn parse_moov(
                             default_sample_size: def_size,
                             default_sample_flags: def_flags,
                             next_decode_time: 0,
+                            elst_entries,
+                            elst_offset_s: 0.0,
                         },
                     );
                     packets.extend(stbl_packets);
@@ -309,6 +499,13 @@ fn parse_moov(
             _ => {}
         }
         pos = bx.box_end;
+    }
+
+    if let Some(mehd_ticks) = mehd_duration_ticks {
+        if state.movie_timescale > 0 && mehd_ticks > 0 {
+            state.duration_us = Some(ticks_to_us_u64(mehd_ticks, state.movie_timescale));
+            state.init_duration_s = Some(mehd_ticks as f64 / f64::from(state.movie_timescale));
+        }
     }
 
     // Apply `trex` defaults in case `mvex` appeared after `trak` (the standard order in MP4!).
@@ -321,21 +518,54 @@ fn parse_moov(
         }
     }
 
+    // Compute per-track `elst` edit-list presentation offsets once `movie_timescale` is known.
+    let mvhd_ts = f64::from(state.movie_timescale.max(1));
+    for track in state.tracks.values_mut() {
+        let mdhd_ts = f64::from(track.info.timescale.max(1));
+        let mut empty_s = 0.0f64;
+        let mut trim_s = 0.0f64;
+        let mut saw_media = false;
+        for &(seg_dur, media_time) in &track.elst_entries {
+            if media_time == -1 && !saw_media {
+                empty_s += (seg_dur as f64) / mvhd_ts;
+            } else if media_time >= 0 && !saw_media {
+                trim_s = (media_time as f64) / mdhd_ts;
+                saw_media = true;
+            }
+        }
+        track.elst_offset_s = empty_s - trim_s;
+    }
+
     Ok(())
 }
 
 fn parse_mvex(
     mvex_body: &[u8],
     trex_defaults: &mut HashMap<u32, (u32, u32, u32, u32)>,
+    mehd_duration_ticks: &mut Option<u64>,
 ) -> Result<(), MediaError> {
     let mut pos = 0usize;
     while pos < mvex_body.len() {
         let Some(bx) = read_box_header(mvex_body, pos)? else {
             break;
         };
-        if &bx.kind == b"trex" {
-            let body = &mvex_body[bx.body_start..bx.box_end];
-            if body.len() >= 24 {
+        let body = &mvex_body[bx.body_start..bx.box_end];
+        match &bx.kind {
+            b"mehd" if !body.is_empty() => {
+                let version = body[0];
+                if version == 0 && body.len() >= 8 {
+                    let dur = u64::from(read_u32(body, 4)?);
+                    if dur > 0 && dur != u64::from(u32::MAX) {
+                        *mehd_duration_ticks = Some(dur);
+                    }
+                } else if version == 1 && body.len() >= 12 {
+                    let dur = read_u64(body, 4)?;
+                    if dur > 0 && dur != u64::MAX {
+                        *mehd_duration_ticks = Some(dur);
+                    }
+                }
+            }
+            b"trex" if body.len() >= 24 => {
                 let track_id = read_u32(body, 4)?;
                 let desc_idx = read_u32(body, 8)?;
                 let def_dur = read_u32(body, 12)?;
@@ -343,6 +573,7 @@ fn parse_mvex(
                 let def_flags = read_u32(body, 20)?;
                 trex_defaults.insert(track_id, (desc_idx, def_dur, def_size, def_flags));
             }
+            _ => {}
         }
         pos = bx.box_end;
     }
@@ -364,16 +595,16 @@ struct StblTables {
     has_stss: bool,
 }
 
-fn parse_trak(
-    full_file: &[u8],
-    trak_body: &[u8],
-) -> Result<Option<(TrackInfo, Vec<EncodedPacket>)>, MediaError> {
+type ParsedTrak = (TrackInfo, Vec<(u64, i64)>, Vec<EncodedPacket>);
+
+fn parse_trak(full_file: &[u8], trak_body: &[u8]) -> Result<Option<ParsedTrak>, MediaError> {
     let mut track_id = 0u32;
     let mut timescale = 1_000u32;
     let mut duration_us = None;
     let mut language = None;
     let mut handler = [0u8; 4];
     let mut stbl = StblTables::default();
+    let mut elst_entries: Vec<(u64, i64)> = Vec::new();
 
     let mut pos = 0usize;
     while pos < trak_body.len() {
@@ -391,6 +622,9 @@ fn parse_trak(
                         track_id = read_u32(body, 20)?;
                     }
                 }
+            }
+            b"edts" => {
+                parse_edts(body, &mut elst_entries)?;
             }
             b"mdia" => {
                 parse_mdia(
@@ -427,7 +661,47 @@ fn parse_trak(
         language,
         extra_data: stbl.extra_data,
     };
-    Ok(Some((info, packets)))
+    Ok(Some((info, elst_entries, packets)))
+}
+
+fn parse_edts(edts_body: &[u8], out: &mut Vec<(u64, i64)>) -> Result<(), MediaError> {
+    let mut pos = 0usize;
+    while pos < edts_body.len() {
+        let Some(bx) = read_box_header(edts_body, pos)? else {
+            break;
+        };
+        if &bx.kind == b"elst" {
+            let body = &edts_body[bx.body_start..bx.box_end];
+            if body.len() >= 8 {
+                let version = body[0];
+                let count = read_u32(body, 4)? as usize;
+                let mut off = 8usize;
+                for _ in 0..count {
+                    if version == 0 {
+                        if off + 12 > body.len() {
+                            break;
+                        }
+                        let seg_dur = u64::from(read_u32(body, off)?);
+                        let media_time = i64::from(read_i32(body, off + 4)?);
+                        out.push((seg_dur, media_time));
+                        off += 12;
+                    } else if version == 1 {
+                        if off + 20 > body.len() {
+                            break;
+                        }
+                        let seg_dur = read_u64(body, off)?;
+                        let media_time = read_u64(body, off + 8)? as i64;
+                        out.push((seg_dur, media_time));
+                        off += 20;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        pos = bx.box_end;
+    }
+    Ok(())
 }
 
 fn parse_mdia(
@@ -1126,6 +1400,218 @@ fn parse_traf(
                 dts_us: ticks_to_us_i64(dts_i64, timescale),
                 duration_us: ticks_to_us_u64(u64::from(dur), timescale),
                 is_keyframe,
+            });
+
+            sample_pos = end;
+            cur_dts = cur_dts.saturating_add(u64::from(dur));
+        }
+    }
+
+    track_state.next_decode_time = cur_dts;
+    Ok(())
+}
+
+fn parse_moof_mse(
+    full_buf: &[u8],
+    moof_start: usize,
+    moof_body: &[u8],
+    state: &mut Mp4InitState,
+    samples: &mut Vec<MseSample>,
+) -> Result<(), MediaError> {
+    let mut pos = 0usize;
+    let mut saw_traf = false;
+    while pos < moof_body.len() {
+        let Some(bx) = read_box_header(moof_body, pos)? else {
+            break;
+        };
+        if &bx.kind == b"traf" {
+            saw_traf = true;
+            parse_traf_mse(
+                full_buf,
+                moof_start,
+                &moof_body[bx.body_start..bx.box_end],
+                state,
+                samples,
+            )?;
+        }
+        pos = bx.box_end;
+    }
+    if !saw_traf {
+        return Err(MediaError::MalformedContainer(
+            "fMP4 moof contains no traf box".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_traf_mse(
+    full_buf: &[u8],
+    moof_start: usize,
+    traf_body: &[u8],
+    state: &mut Mp4InitState,
+    samples: &mut Vec<MseSample>,
+) -> Result<(), MediaError> {
+    let mut track_id = 0u32;
+    let mut base_data_offset = moof_start as u64;
+    let mut tfhd_def_dur: Option<u32> = None;
+    let mut tfhd_def_size: Option<u32> = None;
+    let mut tfhd_def_flags: Option<u32> = None;
+    let mut tfdt_time: Option<u64> = None;
+    let mut trun_bodies: Vec<&[u8]> = Vec::new();
+
+    let mut pos = 0usize;
+    while pos < traf_body.len() {
+        let Some(bx) = read_box_header(traf_body, pos)? else {
+            break;
+        };
+        let body = &traf_body[bx.body_start..bx.box_end];
+        match &bx.kind {
+            b"tfhd" => {
+                if body.len() < 8 {
+                    return Err(MediaError::MalformedContainer("truncated tfhd".to_string()));
+                }
+                let flags = read_u32(body, 0)? & 0x00ff_ffff;
+                track_id = read_u32(body, 4)?;
+                let mut off = 8usize;
+                if (flags & 0x0000_0001) != 0 {
+                    base_data_offset = read_u64(body, off)?;
+                    off += 8;
+                }
+                if (flags & 0x0000_0002) != 0 {
+                    off += 4;
+                }
+                if (flags & 0x0000_0008) != 0 {
+                    tfhd_def_dur = Some(read_u32(body, off)?);
+                    off += 4;
+                }
+                if (flags & 0x0000_0010) != 0 {
+                    tfhd_def_size = Some(read_u32(body, off)?);
+                    off += 4;
+                }
+                if (flags & 0x0000_0020) != 0 {
+                    tfhd_def_flags = Some(read_u32(body, off)?);
+                }
+            }
+            b"tfdt" => {
+                if !body.is_empty() {
+                    let version = body[0];
+                    if version == 0 && body.len() >= 8 {
+                        tfdt_time = Some(u64::from(read_u32(body, 4)?));
+                    } else if version == 1 && body.len() >= 12 {
+                        tfdt_time = Some(read_u64(body, 4)?);
+                    }
+                }
+            }
+            b"trun" => trun_bodies.push(body),
+            _ => {}
+        }
+        pos = bx.box_end;
+    }
+
+    let Some(track_state) = state.tracks.get_mut(&track_id) else {
+        return Err(MediaError::MalformedContainer(format!(
+            "fMP4 traf references unknown track {track_id}"
+        )));
+    };
+    let timescale = f64::from(track_state.info.timescale.max(1));
+    let elst_offset_s = track_state.elst_offset_s;
+    let (packet_kind, video_dims) = match &track_state.info.kind {
+        TrackKind::Video(v) => (PacketKind::Video, Some((v.width, v.height))),
+        TrackKind::Audio(_) => (PacketKind::Audio, None),
+    };
+
+    let def_dur = tfhd_def_dur.unwrap_or(track_state.default_sample_duration);
+    let def_size = tfhd_def_size.unwrap_or(track_state.default_sample_size);
+    let def_flags = tfhd_def_flags.unwrap_or(track_state.default_sample_flags);
+    let mut cur_dts = tfdt_time.unwrap_or(track_state.next_decode_time);
+
+    for body in trun_bodies {
+        if body.len() < 8 {
+            return Err(MediaError::MalformedContainer("truncated trun".to_string()));
+        }
+        let version = body[0];
+        let flags = read_u32(body, 0)? & 0x00ff_ffff;
+        let sample_count = read_u32(body, 4)? as usize;
+        let mut off = 8usize;
+
+        let data_offset = if (flags & 0x0000_0001) != 0 {
+            let v = read_i32(body, off)?;
+            off += 4;
+            v
+        } else {
+            0
+        };
+        let first_sample_flags = if (flags & 0x0000_0004) != 0 {
+            let v = read_u32(body, off)?;
+            off += 4;
+            Some(v)
+        } else {
+            None
+        };
+
+        let mut sample_pos = if data_offset >= 0 {
+            (base_data_offset as usize).saturating_add(data_offset as usize)
+        } else {
+            (base_data_offset as usize).saturating_sub(data_offset.unsigned_abs() as usize)
+        };
+
+        for idx in 0..sample_count {
+            let dur = if (flags & 0x0000_0100) != 0 {
+                let v = read_u32(body, off)?;
+                off += 4;
+                v
+            } else {
+                def_dur
+            };
+            let size = if (flags & 0x0000_0200) != 0 {
+                let v = read_u32(body, off)?;
+                off += 4;
+                v as usize
+            } else {
+                def_size as usize
+            };
+            let sflags = if (flags & 0x0000_0400) != 0 {
+                let v = read_u32(body, off)?;
+                off += 4;
+                v
+            } else if idx == 0 {
+                first_sample_flags.unwrap_or(def_flags)
+            } else {
+                def_flags
+            };
+            let cto: i64 = if (flags & 0x0000_0800) != 0 {
+                let v = if version == 0 {
+                    i64::from(read_u32(body, off)?)
+                } else {
+                    i64::from(read_i32(body, off)?)
+                };
+                off += 4;
+                v
+            } else {
+                0
+            };
+
+            let end = sample_pos.saturating_add(size);
+            if end > full_buf.len() {
+                return Err(MediaError::MalformedContainer(
+                    "fMP4 trun sample exceeds buffer length".to_string(),
+                ));
+            }
+
+            let is_non_sync = (sflags & 0x0001_0000) != 0;
+            let is_keyframe = packet_kind == PacketKind::Audio || !is_non_sync;
+            let dts_i64 = cur_dts as i64;
+            let pts_i64 = dts_i64 + cto;
+
+            samples.push(MseSample {
+                track_id,
+                kind: packet_kind,
+                data: full_buf[sample_pos..end].to_vec(),
+                pts_s: (pts_i64 as f64) / timescale + elst_offset_s,
+                dts_s: (dts_i64 as f64) / timescale,
+                duration_s: f64::from(dur) / timescale,
+                is_keyframe,
+                video_dims,
             });
 
             sample_pos = end;

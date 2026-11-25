@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::types::{
     AudioCodec, AudioTrackConfig, ContainerFormat, DemuxedMedia, EncodedPacket, MediaError,
-    PacketKind, TrackInfo, TrackKind, VideoCodec, VideoTrackConfig,
+    MseSample, PacketKind, TrackInfo, TrackKind, VideoCodec, VideoTrackConfig,
 };
 
 // Standard EBML / Matroska / WebM element IDs (full VINT-encoded IDs).
@@ -41,8 +41,11 @@ pub struct WebmInitState {
     /// Timestamp scale in nanoseconds per tick (WebM default: 1_000_000 ns = 1 ms).
     pub timestamp_scale_ns: u64,
     pub duration_us: Option<u64>,
+    pub init_duration_s: Option<f64>,
     pub tracks: HashMap<u32, TrackInfo>,
     pub default_durations_us: HashMap<u32, u64>,
+    pub default_durations_s: HashMap<u32, f64>,
+    pub last_frame_delta_s: HashMap<u32, f64>,
     pub track_order: Vec<u32>,
 }
 
@@ -51,10 +54,144 @@ impl Default for WebmInitState {
         Self {
             timestamp_scale_ns: 1_000_000,
             duration_us: None,
+            init_duration_s: None,
             tracks: HashMap::new(),
             default_durations_us: HashMap::new(),
+            default_durations_s: HashMap::new(),
+            last_frame_delta_s: HashMap::new(),
             track_order: Vec::new(),
         }
+    }
+}
+
+/// Structural classification of an incremental WebM byte buffer for MSE parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebmBufferStatus {
+    Complete { has_init: bool, has_cluster: bool },
+    Partial { in_media_segment: bool },
+    Corrupt,
+}
+
+/// Inspects top-level EBML/WebM elements in `bytes` to distinguish complete segments,
+/// partial streamed clusters/headers, and corrupt byte streams.
+pub fn inspect_webm_buffer(bytes: &[u8]) -> WebmBufferStatus {
+    if bytes.is_empty() {
+        return WebmBufferStatus::Complete {
+            has_init: false,
+            has_cluster: false,
+        };
+    }
+    let mut pos = 0usize;
+    let mut has_init = false;
+    let mut has_cluster = false;
+    let mut saw_known = false;
+    while pos < bytes.len() {
+        let Ok((id, id_len)) = read_ebml_id(&bytes[pos..]) else {
+            return if saw_known {
+                WebmBufferStatus::Partial {
+                    in_media_segment: has_cluster,
+                }
+            } else {
+                WebmBufferStatus::Corrupt
+            };
+        };
+        let known = matches!(
+            id,
+            ID_EBML
+                | ID_SEGMENT
+                | ID_INFO
+                | ID_TRACKS
+                | ID_CLUSTER
+                | 0x114D_9B74 // SeekHead
+                | 0x1C53_BB6B // Cues
+                | 0x1254_C367 // Tags
+                | 0xEC        // Void
+                | 0xBF // CRC-32
+        );
+        if !known {
+            return WebmBufferStatus::Corrupt;
+        }
+        saw_known = true;
+        let size_pos = pos + id_len;
+        if size_pos >= bytes.len() {
+            return WebmBufferStatus::Partial {
+                in_media_segment: has_cluster || id == ID_CLUSTER,
+            };
+        }
+        let Ok((size_opt, size_len)) = read_ebml_size(&bytes[size_pos..]) else {
+            return WebmBufferStatus::Partial {
+                in_media_segment: has_cluster || id == ID_CLUSTER,
+            };
+        };
+        let body_start = size_pos + size_len;
+        match size_opt {
+            Some(sz) => {
+                let end = body_start.saturating_add(sz);
+                if end > bytes.len() {
+                    if id == ID_SEGMENT {
+                        // A streaming Segment with a declared total size larger than this chunk
+                        // still has complete child Info/Tracks/Cluster elements inside!
+                        let sub = inspect_webm_buffer(&bytes[body_start..]);
+                        return match sub {
+                            WebmBufferStatus::Complete {
+                                has_init: si,
+                                has_cluster: sc,
+                            } => WebmBufferStatus::Complete {
+                                has_init: has_init || si,
+                                has_cluster: has_cluster || sc,
+                            },
+                            WebmBufferStatus::Partial { in_media_segment } => {
+                                WebmBufferStatus::Partial {
+                                    in_media_segment: in_media_segment || has_cluster,
+                                }
+                            }
+                            WebmBufferStatus::Corrupt => WebmBufferStatus::Corrupt,
+                        };
+                    }
+                    return WebmBufferStatus::Partial {
+                        in_media_segment: has_cluster || id == ID_CLUSTER,
+                    };
+                }
+                if id == ID_EBML || id == ID_TRACKS {
+                    has_init = true;
+                } else if id == ID_CLUSTER {
+                    has_cluster = true;
+                } else if id == ID_SEGMENT {
+                    if let WebmBufferStatus::Complete {
+                        has_init: si,
+                        has_cluster: sc,
+                    } = inspect_webm_buffer(&bytes[body_start..end])
+                    {
+                        has_init |= si;
+                        has_cluster |= sc;
+                    }
+                }
+                pos = end;
+            }
+            None => {
+                if id == ID_SEGMENT {
+                    let sub = inspect_webm_buffer(&bytes[body_start..]);
+                    return match sub {
+                        WebmBufferStatus::Complete {
+                            has_init: si,
+                            has_cluster: sc,
+                        } => WebmBufferStatus::Complete {
+                            has_init: has_init || si,
+                            has_cluster: has_cluster || sc,
+                        },
+                        other => other,
+                    };
+                }
+                if id == ID_CLUSTER {
+                    has_cluster = true;
+                }
+                break;
+            }
+        }
+    }
+    WebmBufferStatus::Complete {
+        has_init,
+        has_cluster,
     }
 }
 
@@ -106,6 +243,80 @@ pub fn parse_webm_media_segments(
     let mut packets = Vec::new();
     parse_webm_stream(bytes, state, &mut packets)?;
     Ok(packets)
+}
+
+/// Parses one or more WebM `Cluster` media segments into high-precision [`MseSample`]s,
+/// inferring missing `SimpleBlock` frame durations from consecutive same-track timestamps.
+pub fn parse_webm_mse_segments(
+    bytes: &[u8],
+    state: &mut WebmInitState,
+) -> Result<Vec<MseSample>, MediaError> {
+    let mut packets = Vec::new();
+    parse_webm_stream(bytes, state, &mut packets)?;
+    let mut samples: Vec<MseSample> = packets
+        .into_iter()
+        .map(|p| {
+            let video_dims = state.tracks.get(&p.track_id).and_then(|t| match &t.kind {
+                TrackKind::Video(v) => Some((v.width, v.height)),
+                TrackKind::Audio(_) => None,
+            });
+            let dur_s = if p.duration_us > 0 {
+                p.duration_us as f64 / 1_000_000.0
+            } else {
+                state
+                    .default_durations_s
+                    .get(&p.track_id)
+                    .copied()
+                    .unwrap_or(0.0)
+            };
+            MseSample {
+                track_id: p.track_id,
+                kind: p.kind,
+                data: p.data,
+                pts_s: p.pts_us as f64 / 1_000_000.0,
+                dts_s: p.dts_us as f64 / 1_000_000.0,
+                duration_s: dur_s,
+                is_keyframe: p.is_keyframe,
+                video_dims,
+            }
+        })
+        .collect();
+
+    // Infer missing SimpleBlock durations from the next frame's PTS on the same track.
+    let mut indices_by_track: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (idx, s) in samples.iter().enumerate() {
+        indices_by_track.entry(s.track_id).or_default().push(idx);
+    }
+    for (tid, idxs) in indices_by_track {
+        for win in idxs.windows(2) {
+            let cur = win[0];
+            let next = win[1];
+            let delta = samples[next].pts_s - samples[cur].pts_s;
+            if delta > 0.0 && delta < 1.0 {
+                state.last_frame_delta_s.insert(tid, delta);
+                if samples[cur].duration_s <= 0.0 {
+                    samples[cur].duration_s = delta;
+                }
+            }
+        }
+        if let Some(&last_idx) = idxs.last() {
+            if samples[last_idx].duration_s <= 0.0 {
+                let default_kind_dur = match samples[last_idx].kind {
+                    PacketKind::Video => 1.0 / 30.0,
+                    PacketKind::Audio => 0.020,
+                };
+                let fallback = state
+                    .last_frame_delta_s
+                    .get(&tid)
+                    .copied()
+                    .or_else(|| state.default_durations_s.get(&tid).copied())
+                    .unwrap_or(default_kind_dur);
+                samples[last_idx].duration_s = fallback;
+            }
+        }
+    }
+
+    Ok(samples)
 }
 
 fn parse_webm_stream(
@@ -177,6 +388,10 @@ fn parse_info(info_body: &[u8], state: &mut WebmInitState) -> Result<(), MediaEr
     }
     if let Some(dur_ticks) = raw_duration {
         if dur_ticks.is_finite() && dur_ticks >= 0.0 {
+            let dur_s = dur_ticks * (state.timestamp_scale_ns as f64) / 1_000_000_000.0;
+            if dur_s > 0.0 {
+                state.init_duration_s = Some(dur_s);
+            }
             let us = (dur_ticks * (state.timestamp_scale_ns as f64) / 1_000.0).round();
             if us >= 0.0 {
                 state.duration_us = Some(us as u64);
@@ -323,6 +538,9 @@ fn parse_track_entry(entry_body: &[u8], state: &mut WebmInitState) -> Result<(),
         state
             .default_durations_us
             .insert(track_number, default_dur_ns / 1_000);
+        state
+            .default_durations_s
+            .insert(track_number, (default_dur_ns as f64) / 1_000_000_000.0);
     }
     Ok(())
 }
@@ -398,7 +616,9 @@ fn parse_block_payload(
     }
     let track_id = track_num as u32;
     let Some(track) = state.tracks.get(&track_id) else {
-        return Ok(());
+        return Err(MediaError::MalformedContainer(format!(
+            "WebM block references unknown track {track_id}"
+        )));
     };
     let packet_kind = match &track.kind {
         TrackKind::Video(_) => PacketKind::Video,
