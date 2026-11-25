@@ -2977,6 +2977,78 @@ fn install_structured_clone(vm: &mut JsVm, web_apis: &SharedWebApis) {
     let wa = Rc::clone(web_apis);
     let sc_fn = vm.alloc_host_fn("structuredClone", move |vm, _, args| {
         let mut memo = HashMap::new();
+        let mut transfer_list: Vec<HeapHandle> = Vec::new();
+        let opts = arg(args, 1);
+        if !opts.is_undefined() && !opts.is_null() {
+            let Some(oh) = opts.as_object() else {
+                return Err(vm.type_error("structuredClone options must be an object"));
+            };
+            let kt = vm.heap.intern_key("transfer");
+            let tv = vm.get_property_by_key(oh, kt)?;
+            if !tv.is_undefined() && !tv.is_null() {
+                let items = vm.collect_iterable(tv)?;
+                let mut seen = std::collections::HashSet::new();
+                for item in items {
+                    let Some(th) = item.as_object() else {
+                        return Err(create_dom_exception(
+                            vm,
+                            "DataCloneError",
+                            "Value in transfer list is not transferable",
+                        ));
+                    };
+                    if !seen.insert(th) {
+                        return Err(create_dom_exception(
+                            vm,
+                            "DataCloneError",
+                            "Duplicate object in transfer list",
+                        ));
+                    }
+                    let is_transferable_ab = vm.heap.get_object(th).is_some_and(|o| {
+                        matches!(o.kind, ObjectKind::ArrayBuffer(_))
+                            && !o.rare.as_deref().is_some_and(|r| {
+                                r.ab_detached
+                                    || r.ab_immutable
+                                    || r.ab_wasm_memory
+                                    || r.shared_mem.is_some()
+                            })
+                    });
+                    if !is_transferable_ab {
+                        return Err(create_dom_exception(
+                            vm,
+                            "DataCloneError",
+                            "Object in transfer list is not transferable",
+                        ));
+                    }
+                    transfer_list.push(th);
+                }
+            }
+        }
+        // Pre-populate memo with transferred ArrayBuffers and detach originals.
+        for th in transfer_list {
+            let (bytes, max_len) = {
+                let Some(o) = vm.heap.get_object_mut(th) else {
+                    continue;
+                };
+                let max_len = o.rare.as_deref().and_then(|r| r.ab_max_byte_length);
+                let bytes = if let ObjectKind::ArrayBuffer(buf) = &mut o.kind {
+                    std::mem::take(buf.as_mut())
+                } else {
+                    Vec::new()
+                };
+                o.rare_mut().ab_detached = true;
+                (bytes, max_len)
+            };
+            let new_ab = vm.heap.alloc_object(JsObject::with_kind(
+                ObjectKind::ArrayBuffer(Box::new(bytes)),
+                Some(vm.array_buffer_proto),
+            ));
+            if let Some(ml) = max_len {
+                if let Some(o) = vm.heap.get_object_mut(new_ab) {
+                    o.rare_mut().ab_max_byte_length = Some(ml);
+                }
+            }
+            memo.insert(th, new_ab);
+        }
         structured_clone_inner(vm, &wa, arg(args, 0), &mut memo)
     });
     define_global(vm, "structuredClone", JsValue::from_object(sc_fn));

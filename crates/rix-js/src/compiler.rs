@@ -127,6 +127,7 @@ struct FunctionCompiler {
     pending_label: Option<String>,
     chain_exits: Vec<Vec<(usize, u8)>>,
     active_finalizers: Vec<Vec<Statement>>,
+    active_iter_closes: Vec<(u8, bool)>,
     annex_b_hoisted: HashSet<String>,
     param_names: Vec<String>,
     in_param_init: bool,
@@ -168,6 +169,7 @@ impl FunctionCompiler {
             pending_label: None,
             chain_exits: Vec::new(),
             active_finalizers: Vec::new(),
+            active_iter_closes: Vec::new(),
             annex_b_hoisted: HashSet::new(),
             param_names: Vec::new(),
             in_param_init: false,
@@ -1272,6 +1274,28 @@ impl Compiler {
                     self.cur()
                         .emit(Instruction::abc(Opcode::LoadUndef, r, 0, 0));
                 }
+                if !self.cur().active_iter_closes.is_empty() {
+                    let iters = self.cur().active_iter_closes.clone();
+                    for &(iter_reg, is_async) in iters.iter().rev() {
+                        if is_async {
+                            self.cur().emit(Instruction::abc(
+                                Opcode::IteratorClose,
+                                iter_reg,
+                                0,
+                                1,
+                            ));
+                            self.cur()
+                                .emit(Instruction::abc(Opcode::Await, iter_reg, iter_reg, 0));
+                        } else {
+                            self.cur().emit(Instruction::abc(
+                                Opcode::IteratorClose,
+                                iter_reg,
+                                0,
+                                0,
+                            ));
+                        }
+                    }
+                }
                 if !self.cur().active_finalizers.is_empty() {
                     let fins = std::mem::take(&mut self.cur().active_finalizers);
                     for fin_body in fins.iter().rev() {
@@ -1777,7 +1801,15 @@ impl Compiler {
             }
         }
 
+        if kind != ForEachKind::In {
+            self.cur()
+                .active_iter_closes
+                .push((iter_reg, kind == ForEachKind::AsyncOf));
+        }
         self.compile_stmt(body)?;
+        if kind != ForEachKind::In {
+            self.cur().active_iter_closes.pop();
+        }
         let continue_pc = self.cur().code.len();
         if let Some(close_reg) = per_iter_close_reg {
             self.cur()
@@ -1787,17 +1819,20 @@ impl Compiler {
         self.cur().emit_loop_back(loop_start)?;
 
         let end_pc = self.cur().code.len();
-        self.cur().patch_jump(jmp_done, end_pc)?;
         let ctrl = self.cur().loops.pop().expect("loop frame");
         for j in ctrl.continue_jumps {
             self.cur().patch_jump(j, continue_pc)?;
         }
-        for j in ctrl.break_jumps {
-            self.cur().patch_jump(j, end_pc)?;
-        }
-        if kind != ForEachKind::In {
+        if kind == ForEachKind::AsyncOf {
+            // Normal completion (`done === true`) skips AsyncIteratorClose;
+            // `break` and abrupt throws invoke `iter.return()` and await its result.
+            for j in ctrl.break_jumps {
+                self.cur().patch_jump(j, end_pc)?;
+            }
             self.cur()
-                .emit(Instruction::abc(Opcode::IteratorClose, iter_reg, 0, 0));
+                .emit(Instruction::abc(Opcode::IteratorClose, iter_reg, 0, 1));
+            self.cur()
+                .emit(Instruction::abc(Opcode::Await, iter_reg, iter_reg, 0));
             let jmp_after_abrupt = self.cur().emit_jump(Opcode::Jump, 0);
             let handler_pc = self.cur().code.len() as u32;
             let exc_reg = self.cur().alloc_reg()?;
@@ -1809,12 +1844,55 @@ impl Compiler {
                 is_finally: true,
             });
             self.cur()
-                .emit(Instruction::abc(Opcode::IteratorClose, iter_reg, 1, 0));
+                .emit(Instruction::abc(Opcode::IteratorClose, iter_reg, 1, 1));
+            let close_try_start = self.cur().code.len() as u32;
+            self.cur()
+                .emit(Instruction::abc(Opcode::Await, iter_reg, iter_reg, 0));
+            let close_try_end = self.cur().code.len() as u32;
+            let jmp_rethrow = self.cur().emit_jump(Opcode::Jump, 0);
+            let swallow_pc = self.cur().code.len() as u32;
+            let ignored_reg = self.cur().alloc_reg()?;
+            self.cur().exception_handlers.push(ExceptionHandler {
+                try_start: close_try_start,
+                try_end: close_try_end,
+                handler_pc: swallow_pc,
+                catch_reg: ignored_reg,
+                is_finally: false,
+            });
+            let rethrow_pc = self.cur().code.len();
+            self.cur().patch_jump(jmp_rethrow, rethrow_pc)?;
             self.cur()
                 .emit(Instruction::abc(Opcode::Throw, exc_reg, 0, 0));
             self.cur().free_to(exc_reg);
             let after_abrupt = self.cur().code.len();
+            self.cur().patch_jump(jmp_done, after_abrupt)?;
             self.cur().patch_jump(jmp_after_abrupt, after_abrupt)?;
+        } else {
+            self.cur().patch_jump(jmp_done, end_pc)?;
+            for j in ctrl.break_jumps {
+                self.cur().patch_jump(j, end_pc)?;
+            }
+            if kind != ForEachKind::In {
+                self.cur()
+                    .emit(Instruction::abc(Opcode::IteratorClose, iter_reg, 0, 0));
+                let jmp_after_abrupt = self.cur().emit_jump(Opcode::Jump, 0);
+                let handler_pc = self.cur().code.len() as u32;
+                let exc_reg = self.cur().alloc_reg()?;
+                self.cur().exception_handlers.push(ExceptionHandler {
+                    try_start: body_try_start,
+                    try_end: body_try_end,
+                    handler_pc,
+                    catch_reg: exc_reg,
+                    is_finally: true,
+                });
+                self.cur()
+                    .emit(Instruction::abc(Opcode::IteratorClose, iter_reg, 1, 0));
+                self.cur()
+                    .emit(Instruction::abc(Opcode::Throw, exc_reg, 0, 0));
+                self.cur().free_to(exc_reg);
+                let after_abrupt = self.cur().code.len();
+                self.cur().patch_jump(jmp_after_abrupt, after_abrupt)?;
+            }
         }
         self.cur().end_scope();
         Ok(())

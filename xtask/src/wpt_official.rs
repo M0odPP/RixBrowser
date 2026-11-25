@@ -124,13 +124,29 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
         }
     }
     function assert_object_equals(actual, expected, desc) {
-        if (actual === expected) return;
-        if (!actual || !expected || typeof actual !== "object" || typeof expected !== "object") {
-            fail((desc ? desc + ": " : "") + "objects differ");
+        if (typeof actual !== "object" || actual === null) {
+            fail((desc ? desc + ": " : "") + "value is " + format_value(actual) + ", expected object");
         }
-        const ak = Object.keys(actual), ek = Object.keys(expected);
-        assert_equals(ak.length, ek.length, desc);
-        for (const k of ek) assert_object_equals(actual[k], expected[k], desc);
+        function check_equal(a, e, stack) {
+            stack.push(a);
+            for (var p in a) {
+                if (!e || !Object.prototype.hasOwnProperty.call(e, p)) {
+                    fail((desc ? desc + ": " : "") + "unexpected property " + p);
+                }
+                if (typeof a[p] === "object" && a[p] !== null) {
+                    if (stack.indexOf(a[p]) === -1) check_equal(a[p], e[p], stack);
+                } else {
+                    assert_equals(a[p], e[p], (desc ? desc + " " : "") + "property " + p);
+                }
+            }
+            for (var p in e) {
+                if (!Object.prototype.hasOwnProperty.call(a, p)) {
+                    fail((desc ? desc + ": " : "") + "expected property " + p + " missing");
+                }
+            }
+            stack.pop();
+        }
+        check_equal(actual, expected, []);
     }
     function assert_in_array(actual, expected, desc) {
         if (!expected || expected.indexOf(actual) === -1) {

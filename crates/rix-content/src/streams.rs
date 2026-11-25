@@ -13,6 +13,12 @@ use rix_js::promise::{
 };
 use rix_js::{HeapHandle, JsException, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs};
 
+use crate::streams_bytes::{
+    acquire_byob_reader, alloc_byte_readable_stream, byte_call_pull_if_needed,
+    byte_cancel_internal, byte_controller_error, byte_default_read_with_request,
+    byte_on_default_reader_released, install_byte_stream_types, parse_positive_u64_enforce_range,
+    readable_byte_stream_tee, ByobRequestState, ByteControllerState, ReadableByobReaderState,
+};
 use crate::streams_pipe::{readable_pipe_through, readable_pipe_to_method};
 use crate::streams_transform::{install_transform_stream_types, TransformStreamState};
 pub(crate) use crate::streams_writable::create_writable_stream_from_callbacks;
@@ -44,7 +50,7 @@ pub(crate) enum ReadRequest {
     },
 }
 
-fn fulfill_read_request(vm: &mut JsVm, req: ReadRequest, chunk: JsValue) {
+pub(crate) fn fulfill_read_request(vm: &mut JsVm, req: ReadRequest, chunk: JsValue) {
     match req {
         ReadRequest::Promise(p) => {
             let res = make_read_result(vm, chunk, false);
@@ -58,7 +64,7 @@ fn fulfill_read_request(vm: &mut JsVm, req: ReadRequest, chunk: JsValue) {
     }
 }
 
-fn close_read_request(vm: &mut JsVm, req: ReadRequest) {
+pub(crate) fn close_read_request(vm: &mut JsVm, req: ReadRequest) {
     match req {
         ReadRequest::Promise(p) => {
             let res = make_read_result(vm, JsValue::UNDEFINED, true);
@@ -72,7 +78,7 @@ fn close_read_request(vm: &mut JsVm, req: ReadRequest) {
     }
 }
 
-fn error_read_request(vm: &mut JsVm, req: ReadRequest, err: JsValue) {
+pub(crate) fn error_read_request(vm: &mut JsVm, req: ReadRequest, err: JsValue) {
     match req {
         ReadRequest::Promise(p) => reject_promise(vm, p, err),
         ReadRequest::Callback { on_error, .. } => {
@@ -100,6 +106,7 @@ pub(crate) struct ReadableStreamState {
     pub(crate) stored_error: JsValue,
     pub(crate) disturbed: bool,
     pub(crate) reader: Option<HeapHandle>,
+    pub(crate) reader_is_byob: bool,
     pub(crate) controller: Option<HeapHandle>,
     pub(crate) queue: QueueWithSizes,
     pub(crate) hwm: f64,
@@ -109,6 +116,7 @@ pub(crate) struct ReadableStreamState {
     pub(crate) pull_again: bool,
     pub(crate) pulling: bool,
     pub(crate) is_byte_stream: bool,
+    pub(crate) byte_controller: Option<ByteControllerState>,
     pub(crate) pull_fn: Option<HeapHandle>,
     pub(crate) cancel_fn: Option<HeapHandle>,
     pub(crate) source_obj: Option<HeapHandle>,
@@ -122,6 +130,7 @@ impl ReadableStreamState {
             stored_error: JsValue::UNDEFINED,
             disturbed: false,
             reader: None,
+            reader_is_byob: false,
             controller: None,
             queue: QueueWithSizes::new(),
             hwm,
@@ -131,6 +140,7 @@ impl ReadableStreamState {
             pull_again: false,
             pulling: false,
             is_byte_stream: false,
+            byte_controller: None,
             pull_fn: None,
             cancel_fn: None,
             source_obj: None,
@@ -171,7 +181,10 @@ struct AsyncIteratorState {
 pub struct StreamSystem {
     pub(crate) readable: HashMap<HeapHandle, ReadableStreamState>,
     pub(crate) readable_controllers: HashMap<HeapHandle, HeapHandle>,
+    pub(crate) byte_controllers: HashMap<HeapHandle, HeapHandle>,
     pub(crate) readable_readers: HashMap<HeapHandle, ReadableDefaultReaderState>,
+    pub(crate) byob_readers: HashMap<HeapHandle, ReadableByobReaderState>,
+    pub(crate) byob_requests: HashMap<HeapHandle, ByobRequestState>,
     async_iterators: HashMap<HeapHandle, AsyncIteratorState>,
     pub(crate) writable: HashMap<HeapHandle, WritableStreamState>,
     pub(crate) writable_controllers: HashMap<HeapHandle, HeapHandle>,
@@ -184,6 +197,9 @@ pub struct StreamSystem {
     pub readable_proto: Option<HeapHandle>,
     pub readable_reader_proto: Option<HeapHandle>,
     pub readable_controller_proto: Option<HeapHandle>,
+    pub byte_controller_proto: Option<HeapHandle>,
+    pub byob_reader_proto: Option<HeapHandle>,
+    pub byob_request_proto: Option<HeapHandle>,
     pub async_iterator_proto: Option<HeapHandle>,
     pub writable_proto: Option<HeapHandle>,
     pub writable_writer_proto: Option<HeapHandle>,
@@ -206,6 +222,9 @@ impl StreamSystem {
             self.readable_proto,
             self.readable_reader_proto,
             self.readable_controller_proto,
+            self.byte_controller_proto,
+            self.byob_reader_proto,
+            self.byob_request_proto,
             self.async_iterator_proto,
             self.writable_proto,
             self.writable_writer_proto,
@@ -245,12 +264,29 @@ impl StreamSystem {
                     out.push(JsValue::from_object(*p));
                 }
             }
+            if let Some(ref bc) = rs.byte_controller {
+                bc.collect_roots(out);
+            }
         }
         for r in self.readable_readers.values() {
             if let Some(s) = r.stream {
                 out.push(JsValue::from_object(s));
             }
             out.push(JsValue::from_object(r.closed_promise));
+        }
+        for r in self.byob_readers.values() {
+            if let Some(s) = r.stream {
+                out.push(JsValue::from_object(s));
+            }
+            out.push(JsValue::from_object(r.closed_promise));
+        }
+        for br in self.byob_requests.values() {
+            if let Some(s) = br.stream {
+                out.push(JsValue::from_object(s));
+            }
+            if let Some(v) = br.view {
+                out.push(JsValue::from_object(v));
+            }
         }
         for it in self.async_iterators.values() {
             out.push(JsValue::from_object(it.reader));
@@ -288,7 +324,10 @@ impl StreamSystem {
     pub fn sweep_dead(&mut self, heap: &rix_js::GcHeap) {
         self.readable.retain(|&h, _| heap.is_alive(h));
         self.readable_controllers.retain(|&h, _| heap.is_alive(h));
+        self.byte_controllers.retain(|&h, _| heap.is_alive(h));
         self.readable_readers.retain(|&h, _| heap.is_alive(h));
+        self.byob_readers.retain(|&h, _| heap.is_alive(h));
+        self.byob_requests.retain(|&h, _| heap.is_alive(h));
         self.async_iterators.retain(|&h, _| heap.is_alive(h));
         self.writable.retain(|&h, _| heap.is_alive(h));
         self.writable_controllers.retain(|&h, _| heap.is_alive(h));
@@ -505,6 +544,15 @@ pub(crate) fn readable_error_internal(
     stream_h: HeapHandle,
     reason: JsValue,
 ) {
+    if streams
+        .borrow()
+        .readable
+        .get(&stream_h)
+        .is_some_and(|rs| rs.is_byte_stream)
+    {
+        byte_controller_error(vm, streams, stream_h, reason);
+        return;
+    }
     let (pending, closed_p) = {
         let mut st = streams.borrow_mut();
         let Some(rs) = st.readable.get_mut(&stream_h) else {
@@ -541,6 +589,14 @@ pub(crate) fn readable_cancel_internal(
     stream_h: HeapHandle,
     reason: JsValue,
 ) -> HeapHandle {
+    if streams
+        .borrow()
+        .readable
+        .get(&stream_h)
+        .is_some_and(|rs| rs.is_byte_stream)
+    {
+        return byte_cancel_internal(vm, streams, stream_h, reason);
+    }
     let action = {
         let mut st = streams.borrow_mut();
         let Some(rs) = st.readable.get_mut(&stream_h) else {
@@ -576,6 +632,15 @@ pub(crate) fn readable_read_with_request(
     stream_h: HeapHandle,
     req: ReadRequest,
 ) {
+    if streams
+        .borrow()
+        .readable
+        .get(&stream_h)
+        .is_some_and(|rs| rs.is_byte_stream)
+    {
+        byte_default_read_with_request(vm, streams, stream_h, req);
+        return;
+    }
     enum ReadOutcome {
         Chunk(JsValue, bool, ReadRequest),
         Closed(ReadRequest),
@@ -689,14 +754,21 @@ pub(crate) fn release_default_reader(vm: &mut JsVm, streams: &SharedStreams, rea
             return;
         };
         let closed_p = r.closed_promise;
-        let pending = if let Some(rs) = st.readable.get_mut(&stream_h) {
+        let (pending, byte_stream_h) = if let Some(rs) = st.readable.get_mut(&stream_h) {
             rs.reader = None;
-            std::mem::take(&mut rs.read_requests)
+            rs.reader_is_byob = false;
+            (
+                std::mem::take(&mut rs.read_requests),
+                rs.is_byte_stream.then_some(stream_h),
+            )
         } else {
-            VecDeque::new()
+            (VecDeque::new(), None)
         };
-        (closed_p, pending)
+        (closed_p, pending, byte_stream_h)
     };
+    if let Some(sh) = info.2 {
+        byte_on_default_reader_released(streams, sh);
+    }
     let rel_err = vm.type_error("Reader lock was released").value;
     if promise_is_pending(vm, info.0) {
         reject_promise(vm, info.0, rel_err);
@@ -1505,7 +1577,8 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
             };
             (it.finished, it.reader, it.ongoing_promise)
         };
-        if finished {
+        let has_pending_ongoing = ongoing.filter(|&p| promise_is_pending(vm, p));
+        if finished && has_pending_ongoing.is_none() {
             let res = make_read_result(vm, JsValue::UNDEFINED, true);
             return Ok(JsValue::from_object(promise_resolve_value(vm, res)));
         }
@@ -1562,7 +1635,7 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
             });
             promise_then(vm, rp, Some(on_ok), Some(on_err))
         };
-        let next_p = if let Some(prev) = ongoing.filter(|&p| promise_is_pending(vm, p)) {
+        let next_p = if let Some(prev) = has_pending_ongoing {
             let on_prev = vm.alloc_host_fn("rs_aiter_chain", move |vm, _, _| {
                 Ok(JsValue::from_object(run_step(vm)))
             });
@@ -1570,8 +1643,8 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
         } else {
             run_step(vm)
         };
-        if let Some(it) = ss.borrow_mut().async_iterators.get_mut(&ih) {
-            if !it.finished {
+        if promise_is_pending(vm, next_p) {
+            if let Some(it) = ss.borrow_mut().async_iterators.get_mut(&ih) {
                 it.ongoing_promise = Some(next_p);
             }
         }
@@ -1607,7 +1680,8 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
                 it.ongoing_promise,
             )
         };
-        if finished {
+        let has_pending_ongoing = ongoing.filter(|&p| promise_is_pending(vm, p));
+        if finished && has_pending_ongoing.is_none() {
             let res = make_read_result(vm, value, true);
             return Ok(JsValue::from_object(promise_resolve_value(vm, res)));
         }
@@ -1645,7 +1719,7 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
             let res = make_read_result(vm, value, true);
             promise_resolve_value(vm, res)
         };
-        let ret_p = if let Some(prev) = ongoing.filter(|&p| promise_is_pending(vm, p)) {
+        let ret_p = if let Some(prev) = has_pending_ongoing {
             let on_prev = vm.alloc_host_fn("rs_aiter_ret_chain", move |vm, _, _| {
                 Ok(JsValue::from_object(do_return(vm)))
             });
@@ -1653,6 +1727,11 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
         } else {
             do_return(vm)
         };
+        if promise_is_pending(vm, ret_p) {
+            if let Some(it) = ss.borrow_mut().async_iterators.get_mut(&ih) {
+                it.ongoing_promise = Some(ret_p);
+            }
+        }
         Ok(JsValue::from_object(ret_p))
     });
     vm.set_fn_length(aiter_ret_fn, 1);
@@ -1695,17 +1774,8 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
             if !mv.is_undefined() {
                 let s = vm.to_js_string(mv)?;
                 if s == "byob" {
-                    let is_byte = ss
-                        .borrow()
-                        .readable
-                        .get(&h)
-                        .is_some_and(|rs| rs.is_byte_stream);
-                    if !is_byte {
-                        return Err(vm.type_error(
-                            "Cannot acquire BYOB reader on a non-byte ReadableStream",
-                        ));
-                    }
-                    // Byte reader upgraded fully in Phase 6E-2; default reader fallback on byte streams.
+                    let reader = acquire_byob_reader(vm, &ss, h)?;
+                    return Ok(JsValue::from_object(reader));
                 } else {
                     return Err(vm.type_error(format!("Invalid ReadableStreamReaderMode '{s}'")));
                 }
@@ -1760,7 +1830,16 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
     let ss = Rc::clone(&streams);
     define_host_method(vm, rsp, "tee", move |vm, this_val, _| {
         let src_h = require_readable(vm, &ss, this_val)?;
-        let arr = readable_stream_default_tee(vm, &ss, src_h)?;
+        let is_byte = ss
+            .borrow()
+            .readable
+            .get(&src_h)
+            .is_some_and(|rs| rs.is_byte_stream);
+        let arr = if is_byte {
+            readable_byte_stream_tee(vm, &ss, src_h)?
+        } else {
+            readable_stream_default_tee(vm, &ss, src_h)?
+        };
         Ok(JsValue::from_object(arr))
     });
 
@@ -1826,6 +1905,7 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
         let mut pull_fn = None;
         let mut cancel_fn = None;
         let mut is_byte_stream = false;
+        let mut auto_alloc_size = None;
         let source_obj = src_val.as_object();
         if let Some(sh) = source_obj {
             // Read `UnderlyingSource` dictionary members.
@@ -1837,6 +1917,13 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
                     is_byte_stream = true;
                 } else {
                     return Err(vm.type_error(format!("Invalid ReadableStream type '{s}'")));
+                }
+            }
+            if is_byte_stream {
+                let k_aac = vm.heap.intern_key("autoAllocateChunkSize");
+                let aac_v = vm.get_property_by_key(sh, k_aac)?;
+                if !aac_v.is_undefined() {
+                    auto_alloc_size = Some(parse_positive_u64_enforce_range(vm, aac_v)?);
                 }
             }
             start_fn = get_method_checked(vm, sh, "start")?;
@@ -1855,14 +1942,22 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
             None => default_hwm,
         };
 
-        let (obj, ctrl) = alloc_readable_stream_internal(
-            vm, &ss, hwm, size_fn, pull_fn, cancel_fn, source_obj, false,
-        );
-        if is_byte_stream {
-            if let Some(rs) = ss.borrow_mut().readable.get_mut(&obj) {
-                rs.is_byte_stream = true;
-            }
-        }
+        let (obj, ctrl) = if is_byte_stream {
+            alloc_byte_readable_stream(
+                vm,
+                &ss,
+                hwm,
+                auto_alloc_size,
+                pull_fn,
+                cancel_fn,
+                source_obj,
+                false,
+            )
+        } else {
+            alloc_readable_stream_internal(
+                vm, &ss, hwm, size_fn, pull_fn, cancel_fn, source_obj, false,
+            )
+        };
 
         let start_res = if let Some(sf) = start_fn {
             vm.call_value(
@@ -1879,7 +1974,11 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
             if let Some(rs) = ss_ok.borrow_mut().readable.get_mut(&obj) {
                 rs.started = true;
             }
-            readable_call_pull_if_needed(vm, &ss_ok, obj);
+            if is_byte_stream {
+                byte_call_pull_if_needed(vm, &ss_ok, obj);
+            } else {
+                readable_call_pull_if_needed(vm, &ss_ok, obj);
+            }
             Ok(JsValue::UNDEFINED)
         });
         let ss_err = Rc::clone(&ss);
@@ -1897,6 +1996,9 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
     });
     bind_ctor_proto(vm, rs_ctor, rsp);
     define_global(vm, "ReadableStream", JsValue::from_object(rs_ctor));
+
+    // --- ReadableByteStreamController + ReadableStreamBYOBReader + ReadableStreamBYOBRequest ---
+    install_byte_stream_types(vm, &streams);
 
     // --- WritableStream + WritableStreamDefaultWriter + WritableStreamDefaultController ---
     let wsp = install_writable_stream_types(vm, &streams, web_apis);

@@ -249,6 +249,8 @@ pub struct JsVm {
     pub regexp_iter_proto: HeapHandle,
     pub generator_proto: HeapHandle,
     pub async_generator_proto: HeapHandle,
+    pub generator_function_proto: HeapHandle,
+    pub async_generator_function_proto: HeapHandle,
     pub sym_iterator: SymbolId,
     pub key_symbol_iterator: PropertyKey,
     pub sym_async_iterator: SymbolId,
@@ -462,6 +464,8 @@ impl JsVm {
         let regexp_iter_proto = make_proto(&mut heap, &mut shapes, iterator_proto);
         let generator_proto = make_proto(&mut heap, &mut shapes, iterator_proto);
         let async_generator_proto = make_proto(&mut heap, &mut shapes, async_iterator_proto);
+        let generator_function_proto = make_proto(&mut heap, &mut shapes, function_proto);
+        let async_generator_function_proto = make_proto(&mut heap, &mut shapes, function_proto);
 
         let alloc_wk = |heap: &mut GcHeap, desc: &str| {
             let s = heap.alloc_symbol(Some(desc.into()));
@@ -512,6 +516,23 @@ impl JsVm {
         let key_get_prototype_of = heap.intern_key("getPrototypeOf");
         let key_set_prototype_of = heap.intern_key("setPrototypeOf");
         let key_own_keys = heap.intern_key("ownKeys");
+
+        // ECMA-262 §27.4.3 / §27.6.3: `%GeneratorFunction.prototype%.prototype` -> `%GeneratorPrototype%`,
+        // `%AsyncGeneratorFunction.prototype%.prototype` -> `%AsyncGeneratorPrototype%`.
+        heap.object_define_data(
+            generator_function_proto,
+            key_prototype,
+            JsValue::from_object(generator_proto),
+            PropertyAttrs::CONFIGURABLE,
+            &mut shapes,
+        );
+        heap.object_define_data(
+            async_generator_function_proto,
+            key_prototype,
+            JsValue::from_object(async_generator_proto),
+            PropertyAttrs::CONFIGURABLE,
+            &mut shapes,
+        );
 
         let mut vm = Self {
             heap,
@@ -569,6 +590,8 @@ impl JsVm {
             regexp_iter_proto,
             generator_proto,
             async_generator_proto,
+            generator_function_proto,
+            async_generator_function_proto,
             sym_iterator,
             key_symbol_iterator,
             sym_async_iterator,
@@ -762,6 +785,8 @@ impl JsVm {
             self.regexp_iter_proto,
             self.generator_proto,
             self.async_generator_proto,
+            self.generator_function_proto,
+            self.async_generator_function_proto,
         ] {
             roots.push(JsValue::from_object(h));
         }
@@ -1905,6 +1930,15 @@ impl JsVm {
                     self.capture_function_upvalues(prog_id, child_fn_idx, frame_idx, base)?;
                 let bound_this = is_arrow.then_some(self.frames[frame_idx].this_val);
                 let is_ctor = !is_arrow && !is_async && !is_generator && !is_method;
+                let fn_proto = if is_generator {
+                    if is_async {
+                        self.async_generator_function_proto
+                    } else {
+                        self.generator_function_proto
+                    }
+                } else {
+                    self.function_proto
+                };
                 let mut js_obj = JsObject::with_kind(
                     ObjectKind::Closure(Box::new(ClosureObject {
                         program_id: prog_id as u32,
@@ -1914,7 +1948,7 @@ impl JsVm {
                         super_ctor: None,
                         field_init: None,
                     })),
-                    Some(self.function_proto),
+                    Some(fn_proto),
                 );
                 js_obj.is_constructor = is_ctor;
                 let closure_obj = self.heap.alloc_object(js_obj);
@@ -3037,15 +3071,46 @@ impl JsVm {
             }
             Opcode::IteratorClose => {
                 let abrupt = inst.b() != 0;
+                let mut async_ret = JsValue::UNDEFINED;
                 if let Some(h) = self.registers[a].as_object() {
-                    if let Some(IteratorState::Custom {
-                        iter_obj,
-                        exhausted: false,
-                        ..
-                    }) = self.iterators.remove(&h)
-                    {
-                        self.iterator_close_custom(iter_obj, abrupt)?;
+                    match self.iterators.remove(&h) {
+                        Some(IteratorState::Custom {
+                            iter_obj,
+                            exhausted: false,
+                            ..
+                        }) => {
+                            self.iterator_close_custom(iter_obj, abrupt)?;
+                        }
+                        Some(IteratorState::AsyncCustom { iter_obj }) => {
+                            let ret_res = self.get_property_by_key(iter_obj, self.key_return);
+                            match ret_res {
+                                Ok(ret_fn) if !ret_fn.is_undefined() && !ret_fn.is_null() => {
+                                    match self.call_value(
+                                        ret_fn,
+                                        JsValue::from_object(iter_obj),
+                                        &[],
+                                    ) {
+                                        Ok(v) => async_ret = v,
+                                        Err(e) => {
+                                            if !abrupt {
+                                                return Err(e);
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    if !abrupt {
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
+                }
+                if inst.c() != 0 {
+                    self.registers[a] = async_ret;
                 }
             }
             Opcode::RequireObjectCoercible => {
