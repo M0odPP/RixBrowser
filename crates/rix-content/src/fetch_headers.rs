@@ -81,7 +81,6 @@ pub(crate) fn is_valid_header_name(name: &str) -> bool {
 }
 
 /// Trims leading and trailing HTTP whitespace (`\t`, `\n`, `\r`, ` `) per WHATWG Fetch §2.2.
-#[allow(dead_code)]
 pub(crate) fn trim_http_whitespace(s: &str) -> &str {
     s.trim_matches(|c: char| matches!(c, '\t' | '\n' | '\r' | ' '))
 }
@@ -271,7 +270,6 @@ pub(crate) fn parse_mime_essence(input: &str) -> Option<String> {
 }
 
 /// Validates HTTP `statusText` (`reason-phrase`: `*( HTAB / SP / VCHAR / obs-text )`).
-#[allow(dead_code)]
 pub(crate) fn is_valid_status_text(s: &str) -> bool {
     s.chars().all(|c| {
         let cp = c as u32;
@@ -346,7 +344,6 @@ impl HeadersEntry {
     }
 
     /// Raw unchecked append (used for internal system headers like `Response.redirect`).
-    #[allow(dead_code)]
     pub(crate) fn push_unchecked(&mut self, name: &str, value: String) {
         self.pairs.push((name.to_ascii_lowercase(), value));
     }
