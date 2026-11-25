@@ -821,7 +821,7 @@ fn collect_transition_candidates(before: &ComputedStyle, after: &ComputedStyle, 
         if !Arc::ptr_eq(&before.visual, &after.visual) && before.visual != after.visual {
             all_p.extend_from_slice(&[P::BackgroundColor, P::BorderTopColor, P::BorderRightColor, P::BorderBottomColor, P::BorderLeftColor, P::OutlineColor,
                 P::OutlineWidth, P::OutlineOffset, P::BorderTopLeftRadius, P::BorderTopRightRadius, P::BorderBottomRightRadius, P::BorderBottomLeftRadius,
-                P::BackgroundPosition, P::ObjectPosition]);
+                P::BackgroundPosition, P::ObjectPosition, P::TextDecorationColor, P::TextDecorationInset]);
         }
         if before.display != after.display { all_p.push(P::Display); }
         if before.position != after.position { all_p.push(P::Position); }
@@ -838,7 +838,7 @@ fn collect_transition_candidates(before: &ComputedStyle, after: &ComputedStyle, 
                 P::TextSpacingTrim, P::HangingPunctuation, P::Hyphens, P::HyphenateLimitChars, P::LineBreak,
                 P::TextFit, P::WordSpaceTransform, P::Orphans, P::Widows, P::TabSize, P::TextJustify, P::TextAlignLast,
                 P::HyphenateCharacter, P::HyphenateLimitLines, P::BorderSpacing, P::BorderCollapse, P::EmptyCells, P::CaptionSide,
-                P::ColorInterpolationFilters]);
+                P::ColorInterpolationFilters, P::TextShadow]);
         }
         if before.z_index != after.z_index { all_p.push(P::ZIndex); }
         if before.flex_grid != after.flex_grid { all_p.extend_from_slice(&[P::FlexGrow, P::FlexShrink, P::FlexBasis, P::Order, P::FlexDirection, P::FlexWrap, P::AlignItems, P::AlignSelf, P::AlignContent, P::JustifyContent, P::JustifyItems, P::JustifySelf, P::RowGap, P::ColumnGap, P::GridTemplateColumns, P::GridTemplateRows, P::GridTemplateAreas, P::GridAutoColumns, P::GridAutoRows, P::GridAutoFlow, P::GridRowStart, P::GridRowEnd, P::GridColumnStart, P::GridColumnEnd, P::FitTolerance, P::GridLanesDirection, P::GridLanesPack]); }
@@ -856,18 +856,45 @@ fn collect_transition_candidates(before: &ComputedStyle, after: &ComputedStyle, 
 }
 
 #[rustfmt::skip]
+fn lp_computed_differs(a: &LengthPercentage, ea: &EvalContext, b: &LengthPercentage, eb: &EvalContext) -> bool {
+    if a == b && ea == eb { return false; }
+    match (a, b) {
+        (LengthPercentage::Percent(pa), LengthPercentage::Percent(pb)) => (pa - pb).abs() > 1e-6,
+        _ => (a.resolve_px(0.0, ea) - b.resolve_px(0.0, eb)).abs() > 1e-4 || a != b,
+    }
+}
+
+#[rustfmt::skip]
+fn lpa_computed_differs(a: &LengthPercentageAuto, ea: &EvalContext, b: &LengthPercentageAuto, eb: &EvalContext) -> bool {
+    match (a, b) {
+        (LengthPercentageAuto::Value(x), LengthPercentageAuto::Value(y)) => lp_computed_differs(x, ea, y, eb),
+        _ => a != b,
+    }
+}
+
+#[rustfmt::skip]
 fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind, cname: Option<&InternedStr>) -> bool {
     use PropertyIdKind as P;
+    let (ea, eb) = (&a.text.eval_ctx, &b.text.eval_ctx);
     match prop {
-        P::Width => a.box_model.width != b.box_model.width, P::Height => a.box_model.height != b.box_model.height,
-        P::MinWidth => a.box_model.min_width != b.box_model.min_width, P::MinHeight => a.box_model.min_height != b.box_model.min_height,
-        P::MaxWidth => a.box_model.max_width != b.box_model.max_width, P::MaxHeight => a.box_model.max_height != b.box_model.max_height,
-        P::MarginTop => a.box_model.margin.top != b.box_model.margin.top, P::MarginRight => a.box_model.margin.right != b.box_model.margin.right,
-        P::MarginBottom => a.box_model.margin.bottom != b.box_model.margin.bottom, P::MarginLeft => a.box_model.margin.left != b.box_model.margin.left,
-        P::PaddingTop => a.box_model.padding.top != b.box_model.padding.top, P::PaddingRight => a.box_model.padding.right != b.box_model.padding.right,
-        P::PaddingBottom => a.box_model.padding.bottom != b.box_model.padding.bottom, P::PaddingLeft => a.box_model.padding.left != b.box_model.padding.left,
-        P::Top => a.box_model.inset.top != b.box_model.inset.top, P::Right => a.box_model.inset.right != b.box_model.inset.right,
-        P::Bottom => a.box_model.inset.bottom != b.box_model.inset.bottom, P::Left => a.box_model.inset.left != b.box_model.inset.left,
+        P::Width => a.box_model.width != b.box_model.width || (ea != eb && !matches!(a.box_model.width, SizeValue::Auto)),
+        P::Height => a.box_model.height != b.box_model.height || (ea != eb && !matches!(a.box_model.height, SizeValue::Auto)),
+        P::MinWidth => a.box_model.min_width != b.box_model.min_width || (ea != eb && !matches!(a.box_model.min_width, SizeValue::Auto)),
+        P::MinHeight => a.box_model.min_height != b.box_model.min_height || (ea != eb && !matches!(a.box_model.min_height, SizeValue::Auto)),
+        P::MaxWidth => a.box_model.max_width != b.box_model.max_width || (ea != eb && !matches!(a.box_model.max_width, SizeValue::None)),
+        P::MaxHeight => a.box_model.max_height != b.box_model.max_height || (ea != eb && !matches!(a.box_model.max_height, SizeValue::None)),
+        P::MarginTop => lpa_computed_differs(&a.box_model.margin.top, ea, &b.box_model.margin.top, eb),
+        P::MarginRight => lpa_computed_differs(&a.box_model.margin.right, ea, &b.box_model.margin.right, eb),
+        P::MarginBottom => lpa_computed_differs(&a.box_model.margin.bottom, ea, &b.box_model.margin.bottom, eb),
+        P::MarginLeft => lpa_computed_differs(&a.box_model.margin.left, ea, &b.box_model.margin.left, eb),
+        P::PaddingTop => lp_computed_differs(&a.box_model.padding.top, ea, &b.box_model.padding.top, eb),
+        P::PaddingRight => lp_computed_differs(&a.box_model.padding.right, ea, &b.box_model.padding.right, eb),
+        P::PaddingBottom => lp_computed_differs(&a.box_model.padding.bottom, ea, &b.box_model.padding.bottom, eb),
+        P::PaddingLeft => lp_computed_differs(&a.box_model.padding.left, ea, &b.box_model.padding.left, eb),
+        P::Top => lpa_computed_differs(&a.box_model.inset.top, ea, &b.box_model.inset.top, eb),
+        P::Right => lpa_computed_differs(&a.box_model.inset.right, ea, &b.box_model.inset.right, eb),
+        P::Bottom => lpa_computed_differs(&a.box_model.inset.bottom, ea, &b.box_model.inset.bottom, eb),
+        P::Left => lpa_computed_differs(&a.box_model.inset.left, ea, &b.box_model.inset.left, eb),
         P::Color => a.text.color != b.text.color || a.text.color_computed != b.text.color_computed,
         P::BackgroundColor => a.visual.background_color != b.visual.background_color || a.visual.background_color_computed != b.visual.background_color_computed,
         P::Opacity => a.opacity != b.opacity, P::FontSize => a.text.font_size_px != b.text.font_size_px,
@@ -966,12 +993,19 @@ fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind,
         P::RowGap => a.flex_grid.as_ref().map(|f| &f.row_gap) != b.flex_grid.as_ref().map(|f| &f.row_gap),
         P::ColumnGap => a.flex_grid.as_ref().map(|f| &f.column_gap) != b.flex_grid.as_ref().map(|f| &f.column_gap),
         P::Visibility => a.visibility != b.visibility,
-        P::VerticalAlign => a.box_model.vertical_align != b.box_model.vertical_align,
+        P::VerticalAlign => a.box_model.vertical_align != b.box_model.vertical_align || a.box_model.vertical_align_lp != b.box_model.vertical_align_lp,
+        P::TextShadow => a.text.text_shadow != b.text.text_shadow,
+        P::TextDecorationColor => a.visual.text_decoration_color != b.visual.text_decoration_color || a.visual.text_decoration_color_computed != b.visual.text_decoration_color_computed,
+        P::TextDecorationInset => a.visual.text_decoration_inset != b.visual.text_decoration_inset,
         P::OffsetDistance | P::ShapeMargin | P::StrokeWidth | P::StrokeDashoffset
         | P::BackgroundPositionX | P::BackgroundPositionY | P::ScrollPaddingTop | P::ScrollPaddingRight
         | P::ScrollPaddingBottom | P::ScrollPaddingLeft | P::SvgCx | P::SvgCy | P::SvgRx | P::SvgRy
         | P::SvgX | P::SvgY | P::BorderImageSlice => {
-            a.effects.as_ref().and_then(|e| e.extra_math_props.get(&prop)) != b.effects.as_ref().and_then(|e| e.extra_math_props.get(&prop))
+            let ma = a.effects.as_ref().and_then(|e| e.extra_math_props.get(&prop));
+            let mb = b.effects.as_ref().and_then(|e| e.extra_math_props.get(&prop));
+            if ma != mb { true } else if ea != eb {
+                matches!((ma, mb), (Some(x), Some(y)) if (x.eval_scalar(ea, Some((100.0, false))) - y.eval_scalar(eb, Some((100.0, false)))).abs() > 1e-4)
+            } else { false }
         }
         P::Custom => cname.and_then(|n| a.custom_properties.get(n)) != cname.and_then(|n| b.custom_properties.get(n)),
         _ => a != b,
@@ -1170,6 +1204,42 @@ fn compose_property(
             let u = underlying.effects.as_ref().map(|e| e.box_shadow.as_slice()).unwrap_or(&[]);
             let k = kf.effects.as_ref().map(|e| e.box_shadow.as_slice()).unwrap_or(&[]);
             kf.effects_mut().box_shadow = compose_box_shadows(u, k, mode, underlying.text.color, kf.text.color, eval);
+        }
+        P::TextShadow => {
+            let u = underlying.text.text_shadow.as_slice();
+            let k = kf.text.text_shadow.as_slice();
+            Arc::make_mut(&mut kf.text).text_shadow = compose_box_shadows(u, k, mode, underlying.text.color, kf.text.color, eval);
+        }
+        P::VerticalAlign => {
+            let va_lp = |s: &ComputedStyle| -> Option<LengthPercentage> {
+                match s.box_model.vertical_align {
+                    VerticalAlignMode::Baseline => Some(LengthPercentage::px(0.0)),
+                    VerticalAlignMode::LengthPx(px) => Some(s.box_model.vertical_align_lp.clone().unwrap_or_else(|| LengthPercentage::px(px))),
+                    _ => None,
+                }
+            };
+            if let (Some(u), Some(k)) = (va_lp(underlying), va_lp(kf)) {
+                let res = compose_lp(&u, &k, eval, false);
+                let px = res.resolve_px(0.0, eval);
+                let bm = Arc::make_mut(&mut kf.box_model);
+                bm.vertical_align = VerticalAlignMode::LengthPx(px);
+                bm.vertical_align_lp = Some(res);
+            }
+        }
+        P::TextDecorationInset => {
+            use crate::anim_css::TextDecorationInsetValue as Tdi;
+            let to_pair = |v: &Tdi| match v {
+                Tdi::Auto => (LengthPercentage::px(0.0), LengthPercentage::px(0.0)),
+                Tdi::Lengths(a, b) => (a.clone(), b.clone()),
+            };
+            if !(matches!(underlying.visual.text_decoration_inset, Tdi::Auto)
+                && matches!(kf.visual.text_decoration_inset, Tdi::Auto))
+            {
+                let (ua, ub) = to_pair(&underlying.visual.text_decoration_inset);
+                let (ka, kb) = to_pair(&kf.visual.text_decoration_inset);
+                Arc::make_mut(&mut kf.visual).text_decoration_inset =
+                    Tdi::Lengths(compose_lp(&ua, &ka, eval, false), compose_lp(&ub, &kb, eval, false));
+            }
         }
         P::Filter => {
             let u = underlying.effects.as_ref().map(|e| e.filter.as_slice()).unwrap_or(&[]);
@@ -1443,12 +1513,32 @@ fn interpolate_property_into(
         P::TextOverflow => Arc::make_mut(&mut target.box_model).text_overflow = if use_from_disc { from.box_model.text_overflow } else { to.box_model.text_overflow },
         P::Content => Arc::make_mut(&mut target.box_model).content = if use_from_disc { from.box_model.content.clone() } else { to.box_model.content.clone() },
         P::VerticalAlign => {
-            Arc::make_mut(&mut target.box_model).vertical_align = match (from.box_model.vertical_align, to.box_model.vertical_align) {
-                (VerticalAlignMode::LengthPx(a), VerticalAlignMode::LengthPx(b)) => {
-                    VerticalAlignMode::LengthPx((f64::from(a) * (1.0 - p) + f64::from(b) * p) as f32)
+            let va_lp = |s: &ComputedStyle| -> Option<LengthPercentage> {
+                match s.box_model.vertical_align {
+                    VerticalAlignMode::Baseline => Some(LengthPercentage::px(0.0)),
+                    VerticalAlignMode::LengthPx(px) => Some(s.box_model.vertical_align_lp.clone().unwrap_or_else(|| LengthPercentage::px(px))),
+                    _ => None,
                 }
-                _ => if use_from_disc { from.box_model.vertical_align } else { to.box_model.vertical_align },
             };
+            let bm = Arc::make_mut(&mut target.box_model);
+            let both_baseline = matches!(
+                (from.box_model.vertical_align, to.box_model.vertical_align),
+                (VerticalAlignMode::Baseline, VerticalAlignMode::Baseline)
+            );
+            if both_baseline {
+                bm.vertical_align = VerticalAlignMode::Baseline;
+                bm.vertical_align_lp = None;
+            } else if let (Some(fa), Some(tb)) = (va_lp(from), va_lp(to)) {
+                let res = interpolate_lp(&fa, &tb, p, eval, is_transition);
+                bm.vertical_align = VerticalAlignMode::LengthPx(res.resolve_px(0.0, eval));
+                bm.vertical_align_lp = Some(res);
+            } else if use_from_disc {
+                bm.vertical_align = from.box_model.vertical_align;
+                bm.vertical_align_lp = from.box_model.vertical_align_lp.clone();
+            } else {
+                bm.vertical_align = to.box_model.vertical_align;
+                bm.vertical_align_lp = to.box_model.vertical_align_lp.clone();
+            }
         }
         P::BorderTopWidth => Arc::make_mut(&mut target.box_model).border_width.top = (f64::from(from.box_model.border_width.top) * (1.0 - p) + f64::from(to.box_model.border_width.top) * p).max(0.0) as f32,
         P::BorderRightWidth => Arc::make_mut(&mut target.box_model).border_width.right = (f64::from(from.box_model.border_width.right) * (1.0 - p) + f64::from(to.box_model.border_width.right) * p).max(0.0) as f32,
@@ -1495,6 +1585,32 @@ fn interpolate_property_into(
             let v = Arc::make_mut(&mut target.visual);
             v.text_decoration_color_computed = Some(Arc::new(CssColorExpr::Resolved(c)));
             v.text_decoration_color = Some(CssColor::Rgba(c.to_srgb_u8()));
+        }
+        P::TextDecorationInset => {
+            use crate::anim_css::TextDecorationInsetValue as Tdi;
+            let res = match (&from.visual.text_decoration_inset, &to.visual.text_decoration_inset) {
+                (Tdi::Auto, Tdi::Auto) => Tdi::Auto,
+                (a, b) => {
+                    let pair = |v: &Tdi| match v {
+                        Tdi::Auto => (LengthPercentage::px(0.0), LengthPercentage::px(0.0)),
+                        Tdi::Lengths(x, y) => (x.clone(), y.clone()),
+                    };
+                    let (ax, ay) = pair(a);
+                    let (bx, by) = pair(b);
+                    Tdi::Lengths(
+                        interpolate_lp(&ax, &bx, p, eval, is_transition),
+                        interpolate_lp(&ay, &by, p, eval, is_transition),
+                    )
+                }
+            };
+            Arc::make_mut(&mut target.visual).text_decoration_inset = res;
+        }
+        P::TextShadow => {
+            let fa = from.text.text_shadow.as_slice();
+            let tb = to.text.text_shadow.as_slice();
+            Arc::make_mut(&mut target.text).text_shadow =
+                interpolate_box_shadows(fa, tb, p, from.text.color, to.text.color, eval)
+                    .unwrap_or_else(|| if use_from_disc { fa.to_vec() } else { tb.to_vec() });
         }
         P::BackgroundLayers => {
             let src = if use_from_disc { &from.visual } else { &to.visual };
@@ -1593,13 +1709,13 @@ fn interpolate_property_into(
             _ => if use_from_disc { from.text.line_height.clone() } else { to.text.line_height.clone() },
         },
         P::ZIndex => target.z_index = match (from.z_index, to.z_index) {
-            (ZIndexValue::Integer(a), ZIndexValue::Integer(b)) => ZIndexValue::Integer(((f64::from(a) * (1.0 - p) + f64::from(b) * p) + 0.5).floor() as i32),
+            (ZIndexValue::Integer(a), ZIndexValue::Integer(b)) => ZIndexValue::Integer(((f64::from(a) * (1.0 - p) + f64::from(b) * p) + 0.5 + 1e-9).floor() as i32),
             _ => if use_from_disc { from.z_index } else { to.z_index },
         },
-        P::Orphans => Arc::make_mut(&mut target.text).orphans = (((f64::from(from.text.orphans) * (1.0 - p) + f64::from(to.text.orphans) * p) + 0.5).floor() as i32).max(1),
-        P::Widows => Arc::make_mut(&mut target.text).widows = (((f64::from(from.text.widows) * (1.0 - p) + f64::from(to.text.widows) * p) + 0.5).floor() as i32).max(1),
+        P::Orphans => Arc::make_mut(&mut target.text).orphans = (((f64::from(from.text.orphans) * (1.0 - p) + f64::from(to.text.orphans) * p) + 0.5 + 1e-9).floor() as i32).max(1),
+        P::Widows => Arc::make_mut(&mut target.text).widows = (((f64::from(from.text.widows) * (1.0 - p) + f64::from(to.text.widows) * p) + 0.5 + 1e-9).floor() as i32).max(1),
         P::ColumnCount => Arc::make_mut(&mut target.box_model).column_count = match (from.box_model.column_count, to.box_model.column_count) {
-            (Some(a), Some(b)) => Some((((f64::from(a) * (1.0 - p) + f64::from(b) * p) + 0.5).floor() as i32).max(1)),
+            (Some(a), Some(b)) => Some((((f64::from(a) * (1.0 - p) + f64::from(b) * p) + 0.5 + 1e-9).floor() as i32).max(1)),
             _ => if use_from_disc { from.box_model.column_count } else { to.box_model.column_count },
         },
         P::Color => {
@@ -1789,8 +1905,19 @@ fn scale_math_for_interp(n: MathNode, w: f64) -> MathNode {
 }
 
 #[rustfmt::skip]
+fn lp_is_pure_px(lp: &LengthPercentage) -> bool {
+    matches!(lp, LengthPercentage::Zero | LengthPercentage::Length(_, _))
+}
+
+#[rustfmt::skip]
+fn lp_is_pure_pct(lp: &LengthPercentage) -> bool {
+    matches!(lp, LengthPercentage::Percent(_))
+}
+
+#[rustfmt::skip]
 fn interpolate_lp(a: &LengthPercentage, b: &LengthPercentage, p: f64, eval: &EvalContext, is_tr: bool) -> LengthPercentage {
-    if p == 0.0 { return lp_from_math_node(math_node_from_lp(a, eval, is_tr)); }
+    let same_kind = (lp_is_pure_px(a) && lp_is_pure_px(b)) || (lp_is_pure_pct(a) && lp_is_pure_pct(b));
+    if same_kind && p == 0.0 { return lp_from_math_node(math_node_from_lp(a, eval, is_tr)); }
     if p == 1.0 { return lp_from_math_node(math_node_from_lp(b, eval, is_tr)); }
     let combined = MathNode::Sum(vec![scale_math_for_interp(math_node_from_lp(a, eval, is_tr), 1.0 - p), scale_math_for_interp(math_node_from_lp(b, eval, is_tr), p)]).simplify(Some(eval), None);
     lp_from_math_node(combined)
@@ -1911,11 +2038,11 @@ fn interpolate_resolved_color(a: ResolvedColor, b: ResolvedColor, p: f64) -> Res
     };
     let alpha_raw = safe_lerp(aa, ba);
     let alpha = if alpha_raw.is_nan() { 0.0 } else { alpha_raw.clamp(0.0, 1.0) };
-    let (r, g, bl) = if alpha_raw > 1e-9 {
+    let (r, g, bl) = if alpha > 1e-9 {
         (
-            safe_lerp(ar * aa, br * ba) / alpha_raw,
-            safe_lerp(ag * aa, bg * ba) / alpha_raw,
-            safe_lerp(ab * aa, bb * ba) / alpha_raw,
+            safe_lerp(ar * aa, br * ba) / alpha,
+            safe_lerp(ag * aa, bg * ba) / alpha,
+            safe_lerp(ab * aa, bb * ba) / alpha,
         )
     } else { (0.0, 0.0, 0.0) };
     let clamp01 = |v: f64| if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };

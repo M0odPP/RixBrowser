@@ -391,6 +391,31 @@ pub fn parse_and_expand_declaration(name: &str, value: &str) -> Option<Vec<(Stri
             ("text-autospace".to_string(), a.serialize()),
         ]);
     }
+    if prop_kind == PropertyIdKind::Transition {
+        let (specs, _) = crate::properties::parse_transition_shorthand_pub(cleaned.trim())?;
+        return Some(crate::anim_css::expand_transition_longhands(&specs));
+    }
+    if prop_kind == PropertyIdKind::Animation {
+        let (specs, _) = crate::anim_css::parse_animation_shorthand_full(cleaned.trim())?;
+        return Some(crate::anim_css::expand_animation_longhands(&specs));
+    }
+    if prop_kind == PropertyIdKind::AnimationRange {
+        let (starts, ends, _) = crate::anim_css::parse_animation_range_shorthand(cleaned.trim())?;
+        let s_str = starts
+            .iter()
+            .map(|p| p.serialize(false, None))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let e_str = ends
+            .iter()
+            .map(|p| p.serialize(true, None))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(vec![
+            ("animation-range-start".to_string(), s_str),
+            ("animation-range-end".to_string(), e_str),
+        ]);
+    }
     if is_color_longhand(prop_kind)
         || prop_kind == PropertyIdKind::Opacity
         || crate::properties::should_use_values4_parser(prop_kind, &canonical)

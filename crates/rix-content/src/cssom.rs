@@ -4512,6 +4512,86 @@ fn lookup_decl_or_shorthand(decls: &[(String, String, bool)], prop: &str) -> Str
             let pa = rix_css::TextAutospaceValue::parse(a)?;
             Some(rix_css::text_css::serialize_text_spacing(pt, pa))
         })(),
+        "transition" => (|| {
+            let (p, ip) = get("transition-property")?;
+            let (du, idu) = get("transition-duration")?;
+            let (tf, itf) = get("transition-timing-function")?;
+            let (de, ide) = get("transition-delay")?;
+            let (be, ibe) = get("transition-behavior")?;
+            if ip != idu || idu != itf || itf != ide || ide != ibe {
+                return None;
+            }
+            if p == du
+                && du == tf
+                && tf == de
+                && de == be
+                && rix_css::GlobalKeyword::from_ident(p).is_some()
+            {
+                return Some(p.to_string());
+            }
+            rix_css::anim_css::serialize_transition_shorthand_from_longhands(p, du, tf, de, be)
+        })(),
+        "animation" => (|| {
+            let (du, idu) = get("animation-duration")?;
+            let (tf, itf) = get("animation-timing-function")?;
+            let (de, ide) = get("animation-delay")?;
+            let (it, iit) = get("animation-iteration-count")?;
+            let (di, idi) = get("animation-direction")?;
+            let (fi, ifi) = get("animation-fill-mode")?;
+            let (st, ist) = get("animation-play-state")?;
+            let (nm, inm) = get("animation-name")?;
+            let (tl, itl) = get("animation-timeline")?;
+            let (rs, irs) = get("animation-range-start")?;
+            let (re, ire) = get("animation-range-end")?;
+            if idu != itf
+                || itf != ide
+                || ide != iit
+                || iit != idi
+                || idi != ifi
+                || ifi != ist
+                || ist != inm
+                || inm != itl
+                || itl != irs
+                || irs != ire
+            {
+                return None;
+            }
+            if du == tf
+                && tf == de
+                && de == it
+                && it == di
+                && di == fi
+                && fi == st
+                && st == nm
+                && nm == tl
+                && tl == rs
+                && rs == re
+                && rix_css::GlobalKeyword::from_ident(du).is_some()
+            {
+                return Some(du.to_string());
+            }
+            rix_css::anim_css::serialize_animation_shorthand_from_longhands(
+                du, tf, de, it, di, fi, st, nm, tl, rs, re,
+            )
+        })(),
+        "animation-range" => (|| {
+            let (rs, irs) = get("animation-range-start")?;
+            let (re, ire) = get("animation-range-end")?;
+            if irs != ire {
+                return None;
+            }
+            if rs == re && rix_css::GlobalKeyword::from_ident(rs).is_some() {
+                return Some(rs.to_string());
+            }
+            let (starts, _) = rix_css::anim_css::parse_animation_range_point_list(rs, false)?;
+            let (ends, _) = rix_css::anim_css::parse_animation_range_point_list(re, true)?;
+            if starts.len() != ends.len() {
+                return None;
+            }
+            Some(rix_css::anim_css::serialize_animation_range_shorthand(
+                &starts, &ends, None,
+            ))
+        })(),
         _ => {
             // If `all: <css-wide-keyword>` was declared and `prop` is a recognized standard
             // property affected by `all`, return that CSS-wide keyword!
@@ -6256,8 +6336,34 @@ pub(crate) fn format_computed_property_resolved(
             VerticalAlignMode::TextBottom => "text-bottom".into(),
             VerticalAlignMode::Sub => "sub".into(),
             VerticalAlignMode::Super => "super".into(),
-            VerticalAlignMode::LengthPx(px) => format_px(px),
+            VerticalAlignMode::LengthPx(px) => match style.box_model.vertical_align_lp.as_ref() {
+                Some(lp) => format_lp(lp, &eval),
+                None => format_px(px),
+            },
         },
+        "text-shadow" => {
+            if style.text.text_shadow.is_empty() {
+                "none".into()
+            } else {
+                style
+                    .text
+                    .text_shadow
+                    .iter()
+                    .map(|sh| {
+                        let c = format_css_color(sh.color, cc, dark);
+                        let ox = format_lp(&sh.offset_x, &eval);
+                        let oy = format_lp(&sh.offset_y, &eval);
+                        let bl = format_lp_opts(&sh.blur, &eval, true);
+                        format!("{c} {ox} {oy} {bl}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        }
+        "text-decoration-inset" => rix_css::anim_css::serialize_text_decoration_inset_computed(
+            &style.visual.text_decoration_inset,
+            &eval,
+        ),
         "text-overflow" => match style.box_model.text_overflow {
             TextOverflowMode::Clip => "clip",
             TextOverflowMode::Ellipsis => "ellipsis",
@@ -6607,14 +6713,120 @@ pub(crate) fn format_computed_property_resolved(
             .as_ref()
             .and_then(|e| e.view_transition_name.as_ref())
             .map_or_else(|| "none".to_string(), |s| s.as_str().to_string()),
+        "animation" => match style.effects.as_ref().map(|e| e.animations.as_slice()) {
+            Some(list) if !list.is_empty() => rix_css::anim_css::serialize_animation_list(list),
+            _ => "none".into(),
+        },
         "animation-name" => match style.effects.as_ref().map(|e| e.animations.as_slice()) {
             Some(list) if !list.is_empty() => list
                 .iter()
-                .map(|a| a.name.as_str())
+                .map(|a| rix_css::anim_css::serialize_animation_name_token(a.name.as_str()))
                 .collect::<Vec<_>>()
                 .join(", "),
             _ => "none".into(),
         },
+        "animation-direction" => match style.effects.as_ref().map(|e| e.animations.as_slice()) {
+            Some(list) if !list.is_empty() => list
+                .iter()
+                .map(|a| match a.direction {
+                    rix_css::AnimationDirectionMode::Normal => "normal",
+                    rix_css::AnimationDirectionMode::Reverse => "reverse",
+                    rix_css::AnimationDirectionMode::Alternate => "alternate",
+                    rix_css::AnimationDirectionMode::AlternateReverse => "alternate-reverse",
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => "normal".into(),
+        },
+        "animation-fill-mode" => match style.effects.as_ref().map(|e| e.animations.as_slice()) {
+            Some(list) if !list.is_empty() => list
+                .iter()
+                .map(|a| match a.fill_mode {
+                    rix_css::AnimationFillModeKind::None => "none",
+                    rix_css::AnimationFillModeKind::Forwards => "forwards",
+                    rix_css::AnimationFillModeKind::Backwards => "backwards",
+                    rix_css::AnimationFillModeKind::Both => "both",
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => "none".into(),
+        },
+        "animation-play-state" => match style.effects.as_ref().map(|e| e.animations.as_slice()) {
+            Some(list) if !list.is_empty() => list
+                .iter()
+                .map(|a| match a.play_state {
+                    rix_css::AnimationPlayStateMode::Running => "running",
+                    rix_css::AnimationPlayStateMode::Paused => "paused",
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => "running".into(),
+        },
+        "animation-timing-function" => {
+            match style.effects.as_ref().map(|e| e.animations.as_slice()) {
+                Some(list) if !list.is_empty() => list
+                    .iter()
+                    .map(|a| a.timing.to_css_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => "ease".into(),
+            }
+        }
+        "animation-timeline" => {
+            match style
+                .effects
+                .as_ref()
+                .map(|e| e.animation_timelines.as_slice())
+            {
+                Some(list) if !list.is_empty() => list
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => "auto".into(),
+            }
+        }
+        "animation-range-start" => {
+            match style
+                .effects
+                .as_ref()
+                .map(|e| e.animation_range_starts.as_slice())
+            {
+                Some(list) if !list.is_empty() => list
+                    .iter()
+                    .map(|pt| pt.serialize(false, Some(&eval)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => "normal".into(),
+            }
+        }
+        "animation-range-end" => {
+            match style
+                .effects
+                .as_ref()
+                .map(|e| e.animation_range_ends.as_slice())
+            {
+                Some(list) if !list.is_empty() => list
+                    .iter()
+                    .map(|pt| pt.serialize(true, Some(&eval)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => "normal".into(),
+            }
+        }
+        "animation-range" => {
+            let starts = style
+                .effects
+                .as_ref()
+                .map(|e| e.animation_range_starts.as_slice())
+                .unwrap_or(&[]);
+            let ends = style
+                .effects
+                .as_ref()
+                .map(|e| e.animation_range_ends.as_slice())
+                .unwrap_or(&[]);
+            rix_css::anim_css::serialize_animation_range_shorthand(starts, ends, Some(&eval))
+        }
         "background-image" => {
             if let Some(raw) = style.visual.background_image_raw.as_deref() {
                 rix_css::substitution::parse_and_serialize_bg_image_fn(raw, &eval)
@@ -6682,10 +6894,25 @@ pub(crate) fn format_computed_property_resolved(
                     None,
                 );
             }
+            let timelines = style
+                .effects
+                .as_ref()
+                .map(|e| e.animation_timelines.as_slice())
+                .unwrap_or(&[]);
+            // CSSWG #6530: `animation-duration: auto` resolves to `0s` when `animation-timeline`
+            // is the initial single `auto` timeline; otherwise it stays `auto`.
+            let single_auto_timeline = timelines.is_empty()
+                || (timelines.len() == 1 && timelines[0].as_str().eq_ignore_ascii_case("auto"));
             match style.effects.as_ref().map(|e| e.animations.as_slice()) {
                 Some(list) if !list.is_empty() => list
                     .iter()
-                    .map(|a| format!("{}s", format_num(a.duration_ms / 1000.0)))
+                    .map(|a| {
+                        if a.duration_auto && !single_auto_timeline {
+                            "auto".to_string()
+                        } else {
+                            format!("{}s", format_num(a.duration_ms / 1000.0))
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(", "),
                 _ => "0s".into(),
