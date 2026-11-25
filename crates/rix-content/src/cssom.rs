@@ -1911,8 +1911,48 @@ fn serialize_style_decls_with_priority(decls: &[(String, String, bool)]) -> Stri
     } else {
         String::new()
     };
+    const BORDER_WIDTH_ALL: [&str; 4] = [
+        "border-top-width",
+        "border-right-width",
+        "border-bottom-width",
+        "border-left-width",
+    ];
+    let bw_sh: Option<(String, bool)> = {
+        let vals: Vec<Option<(&str, bool)>> = BORDER_WIDTH_ALL
+            .iter()
+            .map(|n| {
+                decls
+                    .iter()
+                    .find(|(k, _, _)| k == n)
+                    .map(|(_, v, i)| (v.as_str(), *i))
+            })
+            .collect();
+        if vals.iter().all(Option::is_some) {
+            let (t, ti) = vals[0].unwrap();
+            let (r, ri) = vals[1].unwrap();
+            let (b, bi) = vals[2].unwrap();
+            let (l, li) = vals[3].unwrap();
+            if ti == ri && ri == bi && bi == li {
+                let compact = if t == r && r == b && b == l {
+                    t.to_string()
+                } else if t == b && r == l {
+                    format!("{t} {r}")
+                } else if r == l {
+                    format!("{t} {r} {b}")
+                } else {
+                    format!("{t} {r} {b} {l}")
+                };
+                Some((compact, ti))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
     let mut emitted_grid = false;
     let mut emitted_tmpl = false;
+    let mut emitted_bw = false;
     let mut out = Vec::with_capacity(decls.len());
     let fmt_one = |k: &str, v: &str, imp: bool| -> String {
         let sep = if k.starts_with("--") && v.starts_with(' ') {
@@ -1944,6 +1984,15 @@ fn serialize_style_decls_with_priority(decls: &[(String, String, bool)]) -> Stri
                 out.push(fmt_one("grid-template", &grid_tmpl_sh, *imp));
             }
             continue;
+        }
+        if let Some((ref sh_v, sh_imp)) = bw_sh {
+            if BORDER_WIDTH_ALL.contains(&k.as_str()) {
+                if !emitted_bw {
+                    emitted_bw = true;
+                    out.push(fmt_one("border-width", sh_v, sh_imp));
+                }
+                continue;
+            }
         }
         out.push(fmt_one(k, v, *imp));
     }
@@ -2554,7 +2603,7 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
                 JsValue::from_string(vm.heap.alloc_string(name))
             }));
         }
-        let css_key = camel_to_kebab(&prop_name);
+        let css_key = inline_prop_to_css_name(&prop_name);
         let val = lookup_decl_or_shorthand(&decls, &css_key);
         Ok(JsValue::from_string(vm.heap.alloc_string(val)))
     });
@@ -2571,7 +2620,7 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
             set_inline_style_css_text(vm, &h_set, nid, &val);
             return Ok(JsValue::TRUE);
         }
-        let css_key = camel_to_kebab(&prop_name);
+        let css_key = inline_prop_to_css_name(&prop_name);
         let raw = get_attr_string(&h_set, nid, "style").unwrap_or_default();
         let mut decls = parse_style_decls_with_priority(&raw);
         if !set_decl_expanded(&mut decls, &css_key, &val, false, false) {
@@ -2597,6 +2646,27 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
         Some(vm.object_proto),
     ));
     JsValue::from_object(proxy)
+}
+
+fn inline_prop_to_css_name(prop_name: &str) -> String {
+    if prop_name == "cssFloat" {
+        return "float".to_string();
+    }
+    let kebab = camel_to_kebab(prop_name);
+    match kebab.as_str() {
+        "webkit-filter" | "-webkit-filter" => "filter".to_string(),
+        "webkit-transform" | "-webkit-transform" => "transform".to_string(),
+        "webkit-transition" | "-webkit-transition" => "transition".to_string(),
+        "webkit-animation" | "-webkit-animation" => "animation".to_string(),
+        "webkit-box-sizing" | "-webkit-box-sizing" => "box-sizing".to_string(),
+        other => {
+            if let Some(rest) = other.strip_prefix("webkit-") {
+                format!("-webkit-{rest}")
+            } else {
+                other.to_string()
+            }
+        }
+    }
 }
 
 fn kebab_to_camel(kebab: &str) -> String {

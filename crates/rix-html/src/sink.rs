@@ -294,13 +294,15 @@ impl TreeSink for DomTreeSink {
         }
         elem_data.sync_cached_attrs();
 
-        // WHATWG HTML §13.2.6.1: capture `is` value for customized built-in elements.
+        // WHATWG HTML §13.2.6.1: capture `is` value for customized built-in elements
+        // and `customelementregistry` boolean attribute for scoped null-registry elements.
         if &*elem_data.name.ns == "http://www.w3.org/1999/xhtml" {
             if let Some(is_val) = elem_data.get_attribute("is").map(str::to_string) {
-                elem_data.is_value = Some(is_val.clone());
-                if rix_dom::is_valid_custom_element_name(&is_val) {
-                    elem_data.set_custom_element_state(rix_dom::CustomElementState::Undefined);
-                }
+                elem_data.is_value = Some(is_val);
+                elem_data.set_custom_element_state(rix_dom::CustomElementState::Undefined);
+            }
+            if elem_data.has_attribute("customelementregistry") {
+                elem_data.null_registry = true;
             }
         }
 

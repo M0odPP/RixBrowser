@@ -894,6 +894,266 @@ fn install_html_helper_reflections(vm: &mut JsVm, host: &SharedHost, event_loop:
             Ok(JsValue::from_object(arr))
         });
         define_host_accessor(vm, tp, "rows", Some(g), None);
+
+        // `HTMLTableElement.prototype.{caption, tHead, tFoot}` + `deleteCaption/deleteTHead/deleteTFoot/deleteRow`
+        for (prop, tag, del_method) in [
+            ("caption", "caption", "deleteCaption"),
+            ("tHead", "thead", "deleteTHead"),
+            ("tFoot", "tfoot", "deleteTFoot"),
+        ] {
+            let h1 = Rc::clone(host);
+            let g = vm.alloc_host_fn(&format!("get {prop}"), move |vm, t, _| {
+                let tid = require_node(vm, &h1, t)?;
+                let found = {
+                    let hb = h1.borrow();
+                    let doc = hb.document.borrow();
+                    let found = doc.children(tid).find(|&c| {
+                        matches!(
+                            doc.get(c),
+                            Some(NodeData::Element(e)) if e.name.local.as_str().eq_ignore_ascii_case(tag)
+                        )
+                    });
+                    found
+                };
+                Ok(found.map_or(JsValue::NULL, |n| wrap_node(vm, &h1, n)))
+            });
+            let h2 = Rc::clone(host);
+            let s = vm.alloc_host_fn(&format!("set {prop}"), move |vm, t, args| {
+                let tid = require_node(vm, &h2, t)?;
+                let v = arg(args, 0);
+                let new_node = if v.is_null() {
+                    None
+                } else {
+                    let nid = require_node(vm, &h2, v)?;
+                    let ok = matches!(
+                        h2.borrow().document.borrow().get(nid),
+                        Some(NodeData::Element(e)) if e.name.local.as_str().eq_ignore_ascii_case(tag)
+                    );
+                    if !ok {
+                        return Err(crate::web_apis::create_dom_exception(
+                            vm,
+                            "HierarchyRequestError",
+                            &format!("HTMLTableElement.{prop} requires a <{tag}> element"),
+                        ));
+                    }
+                    Some(nid)
+                };
+                crate::custom_elements::with_ce_reactions(vm, &h2, |vm| {
+                    let existing = {
+                        let hb = h2.borrow();
+                        let doc = hb.document.borrow();
+                        let found = doc.children(tid).find(|&c| {
+                            matches!(
+                                doc.get(c),
+                                Some(NodeData::Element(e)) if e.name.local.as_str().eq_ignore_ascii_case(tag)
+                            )
+                        });
+                        found
+                    };
+                    if let Some(ex) = existing {
+                        crate::dom_bridge::remove_node_from_parent(vm, &h2, tid, ex)?;
+                    }
+                    if let Some(nn) = new_node {
+                        let before = if tag == "caption" {
+                            h2.borrow().document.borrow().first_child(tid)
+                        } else {
+                            None
+                        };
+                        crate::dom_bridge::insert_node_into_parent(vm, &h2, tid, nn, before)?;
+                    }
+                    Ok(())
+                })?;
+                Ok(JsValue::UNDEFINED)
+            });
+            define_host_accessor(vm, tp, prop, Some(g), Some(s));
+
+            let h3 = Rc::clone(host);
+            define_host_method(vm, tp, del_method, move |vm, t, _| {
+                let tid = require_node(vm, &h3, t)?;
+                crate::custom_elements::with_ce_reactions(vm, &h3, |vm| {
+                    let existing = {
+                        let hb = h3.borrow();
+                        let doc = hb.document.borrow();
+                        let found = doc.children(tid).find(|&c| {
+                            matches!(
+                                doc.get(c),
+                                Some(NodeData::Element(e)) if e.name.local.as_str().eq_ignore_ascii_case(tag)
+                            )
+                        });
+                        found
+                    };
+                    if let Some(ex) = existing {
+                        crate::dom_bridge::remove_node_from_parent(vm, &h3, tid, ex)?;
+                    }
+                    Ok(())
+                })?;
+                Ok(JsValue::UNDEFINED)
+            });
+        }
+        let h_dr = Rc::clone(host);
+        define_host_method(vm, tp, "deleteRow", move |vm, t, args| {
+            let tid = require_node(vm, &h_dr, t)?;
+            let idx = vm.to_number(arg(args, 0))? as isize;
+            let rows: Vec<NodeId> = {
+                let hb = h_dr.borrow();
+                let doc = hb.document.borrow();
+                let mut out = Vec::new();
+                for child in doc.children(tid) {
+                    if let Some(NodeData::Element(e)) = doc.get(child) {
+                        match e.name.local.as_str() {
+                            "tr" => out.push(child),
+                            "thead" | "tbody" | "tfoot" => {
+                                out.extend(doc.children(child).filter(|&gc| {
+                                    matches!(
+                                        doc.get(gc),
+                                        Some(NodeData::Element(ge)) if ge.name.local.as_str() == "tr"
+                                    )
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                out
+            };
+            let target_row = if idx == -1 {
+                rows.last().copied()
+            } else if idx >= 0 {
+                rows.get(idx as usize).copied()
+            } else {
+                None
+            };
+            let Some(row) = target_row else {
+                return Err(crate::web_apis::create_dom_exception(
+                    vm,
+                    "IndexSizeError",
+                    "Row index out of range",
+                ));
+            };
+            let row_parent = h_dr.borrow().document.borrow().parent(row);
+            if let Some(rp) = row_parent {
+                crate::custom_elements::with_ce_reactions(vm, &h_dr, |vm| {
+                    crate::dom_bridge::remove_node_from_parent(vm, &h_dr, rp, row)
+                })?;
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+
+    // `HTMLSelectElement.prototype.{options, length, add, remove}` with `[CEReactions]`
+    if let Some(&sp) = protos.get("HTMLSelectElement") {
+        let collect_options = |h: &SharedHost, sid: NodeId| -> Vec<NodeId> {
+            let hb = h.borrow();
+            let doc = hb.document.borrow();
+            doc.descendants(sid)
+                .filter(|&c| {
+                    c != sid
+                        && matches!(
+                            doc.get(c),
+                            Some(NodeData::Element(e)) if e.name.local.as_str().eq_ignore_ascii_case("option")
+                        )
+                })
+                .collect()
+        };
+        let h1 = Rc::clone(host);
+        let g_opts = vm.alloc_host_fn("get options", move |vm, t, _| {
+            let sid = require_node(vm, &h1, t)?;
+            let opts = collect_options(&h1, sid);
+            let arr = vm.alloc_array();
+            for o in opts {
+                let w = wrap_node(vm, &h1, o);
+                vm.heap.object_push_element(arr, w);
+            }
+            Ok(JsValue::from_object(arr))
+        });
+        define_host_accessor(vm, sp, "options", Some(g_opts), None);
+
+        let h1 = Rc::clone(host);
+        let g_len = vm.alloc_host_fn("get length", move |vm, t, _| {
+            let sid = require_node(vm, &h1, t)?;
+            let len = collect_options(&h1, sid).len();
+            Ok(JsValue::from_f64(len as f64))
+        });
+        let h2 = Rc::clone(host);
+        let s_len = vm.alloc_host_fn("set length", move |vm, t, args| {
+            let sid = require_node(vm, &h2, t)?;
+            let target_len = vm.to_number(arg(args, 0))?.max(0.0) as usize;
+            crate::custom_elements::with_ce_reactions(vm, &h2, |vm| {
+                let opts = collect_options(&h2, sid);
+                if target_len < opts.len() {
+                    for &opt in &opts[target_len..] {
+                        let parent_opt = h2.borrow().document.borrow().parent(opt);
+                        if let Some(p) = parent_opt {
+                            crate::dom_bridge::remove_node_from_parent(vm, &h2, p, opt)?;
+                        }
+                    }
+                } else if target_len > opts.len() {
+                    let owner = h2.borrow().owner_doc_of(sid);
+                    for _ in opts.len()..target_len {
+                        let new_opt = h2.borrow().document.borrow_mut().create_element_ns(
+                            crate::dom_interfaces::HTML_NS,
+                            None,
+                            "option",
+                        );
+                        h2.borrow_mut().set_owner_doc(new_opt, owner);
+                        crate::dom_bridge::insert_node_into_parent(vm, &h2, sid, new_opt, None)?;
+                    }
+                }
+                Ok(())
+            })?;
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, sp, "length", Some(g_len), Some(s_len));
+
+        let h_add = Rc::clone(host);
+        define_host_method(vm, sp, "add", move |vm, t, args| {
+            let sid = require_node(vm, &h_add, t)?;
+            let item = require_node(vm, &h_add, arg(args, 0))?;
+            let before_arg = arg(args, 1);
+            let before = if before_arg.is_undefined() || before_arg.is_null() {
+                None
+            } else if before_arg.is_number() {
+                let idx = vm.to_number(before_arg)? as isize;
+                if idx >= 0 {
+                    collect_options(&h_add, sid).get(idx as usize).copied()
+                } else {
+                    None
+                }
+            } else {
+                Some(require_node(vm, &h_add, before_arg)?)
+            };
+            crate::custom_elements::with_ce_reactions(vm, &h_add, |vm| {
+                crate::dom_bridge::insert_node_into_parent(vm, &h_add, sid, item, before)
+            })?;
+            Ok(JsValue::UNDEFINED)
+        });
+
+        let h_rem = Rc::clone(host);
+        define_host_method(vm, sp, "remove", move |vm, t, args| {
+            let sid = require_node(vm, &h_rem, t)?;
+            if args.is_empty() {
+                // `ChildNode.prototype.remove()` fallback when called with 0 args!
+                let parent_opt = h_rem.borrow().document.borrow().parent(sid);
+                if let Some(p) = parent_opt {
+                    crate::custom_elements::with_ce_reactions(vm, &h_rem, |vm| {
+                        crate::dom_bridge::remove_node_from_parent(vm, &h_rem, p, sid)
+                    })?;
+                }
+                return Ok(JsValue::UNDEFINED);
+            }
+            let idx = vm.to_number(arg(args, 0))? as isize;
+            if idx >= 0 {
+                if let Some(&opt) = collect_options(&h_rem, sid).get(idx as usize) {
+                    let parent_opt = h_rem.borrow().document.borrow().parent(opt);
+                    if let Some(p) = parent_opt {
+                        crate::custom_elements::with_ce_reactions(vm, &h_rem, |vm| {
+                            crate::dom_bridge::remove_node_from_parent(vm, &h_rem, p, opt)
+                        })?;
+                    }
+                }
+            }
+            Ok(JsValue::UNDEFINED)
+        });
     }
 
     // `HTMLOptGroupElement.prototype.label` & `HTMLScriptElement.prototype.{src, type, defer, async}`
@@ -1643,6 +1903,15 @@ fn sync_node_recursive(
                         }
                     }
                     new_el.sync_cached_attrs();
+                    new_el.is_value = src_el.is_value.clone();
+                    if new_el
+                        .is_value
+                        .as_deref()
+                        .is_some_and(rix_dom::is_valid_custom_element_name)
+                    {
+                        new_el.set_custom_element_state(rix_dom::CustomElementState::Undefined);
+                    }
+                    new_el.null_registry = src_el.null_registry;
 
                     let dst_tc = if src_el.template_contents.is_some() {
                         let f = host

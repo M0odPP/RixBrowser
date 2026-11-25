@@ -771,16 +771,28 @@ pub fn install_media_elements(
             media_proto,
             "loop",
             move |vm, this, _| {
-                let v = h_g
-                    .borrow()
-                    .node_for_value(vm, this)
-                    .and_then(|nid| me_g.borrow().players.get(&nid).map(|p| p.loop_enabled))
-                    .unwrap_or(false);
+                let nid_opt = h_g.borrow().node_for_value(vm, this);
+                let v = nid_opt.is_some_and(|nid| {
+                    h_g.borrow().document.borrow().get(nid).is_some_and(
+                        |d| matches!(d, rix_dom::NodeData::Element(e) if e.has_attribute("loop")),
+                    ) || me_g
+                        .borrow()
+                        .players
+                        .get(&nid)
+                        .is_some_and(|p| p.loop_enabled)
+                });
                 Ok(JsValue::from_bool(v))
             },
             move |vm, this, args| {
-                if let Some(nid) = h_s.borrow().node_for_value(vm, this) {
-                    me_s.borrow_mut().ensure_player(nid).loop_enabled = vm.to_boolean(arg(args, 0));
+                let nid_opt = h_s.borrow().node_for_value(vm, this);
+                if let Some(nid) = nid_opt {
+                    let on = vm.to_boolean(arg(args, 0));
+                    me_s.borrow_mut().ensure_player(nid).loop_enabled = on;
+                    if on {
+                        crate::dom_bridge::set_element_attr(vm, &h_s, nid, "loop", "");
+                    } else {
+                        crate::dom_bridge::remove_element_attr(vm, &h_s, nid, "loop");
+                    }
                 }
                 Ok(JsValue::UNDEFINED)
             },

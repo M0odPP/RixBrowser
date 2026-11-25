@@ -829,7 +829,15 @@ fn set_inner_html_spec(
         let is_conn = doc.is_connected(target_container);
         (removed, added, is_conn)
     };
-    let target_reg = {
+    let is_template_el = target_container != nid;
+    let effective_owner_doc = if is_template_el {
+        host.borrow_mut().inert_template_doc_for(owner_doc)
+    } else {
+        owner_doc
+    };
+    let target_reg = if is_template_el {
+        None
+    } else {
         let doc_rc = Rc::clone(&host.borrow().document);
         let doc = doc_rc.borrow();
         match doc.get(target_container) {
@@ -849,8 +857,11 @@ fn set_inner_html_spec(
     };
     {
         let mut hb = host.borrow_mut();
+        if is_template_el {
+            hb.adopt_subtree(target_container, effective_owner_doc);
+        }
         for &n in &added {
-            hb.adopt_subtree(n, owner_doc);
+            hb.adopt_subtree(n, effective_owner_doc);
         }
         hb.invalidate_dom_mutation(target_container, None);
     }
@@ -859,7 +870,13 @@ fn set_inner_html_spec(
         let doc = doc_rc.borrow();
         for &n in &added {
             for el in crate::custom_elements::collect_shadow_including_elements(&doc, n, true) {
-                crate::custom_elements::set_element_registry(host, el, target_reg);
+                let is_null_attr = matches!(
+                    doc.get(el),
+                    Some(NodeData::Element(e)) if e.null_registry
+                );
+                if !is_null_attr {
+                    crate::custom_elements::set_element_registry(host, el, target_reg);
+                }
             }
         }
     }
@@ -877,6 +894,13 @@ fn set_inner_html_spec(
             }
             for &n in &added {
                 notify_custom_element_subtree(vm, host, n, true);
+            }
+            Ok(())
+        });
+    } else if !is_template_el {
+        let _ = crate::custom_elements::with_ce_reactions(vm, host, |vm| {
+            for &n in &added {
+                crate::custom_elements::upgrade_subtree(vm, host, n, true);
             }
             Ok(())
         });

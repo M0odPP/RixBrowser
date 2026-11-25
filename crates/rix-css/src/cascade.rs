@@ -665,12 +665,19 @@ impl StyleContext {
 
     /// Performs a full parallel top-down cascade over the entire document.
     pub fn cascade_full(&mut self, doc: &mut Document) -> RestyleReport {
+        let root = doc.root();
+        self.cascade_full_from(doc, root)
+    }
+
+    /// Performs a full parallel top-down cascade starting at `doc_root` (supports sub-documents
+    /// such as same-origin `iframe.contentDocument`).
+    pub fn cascade_full_from(&mut self, doc: &mut Document, doc_root: NodeId) -> RestyleReport {
         self.ensure_index();
         self.styles.clear();
         self.pseudo_styles.clear();
 
         let root_children: Vec<NodeId> = doc
-            .children(doc.root())
+            .children(doc_root)
             .filter(|&c| matches!(doc.get(c), Some(NodeData::Element(_))))
             .collect();
 
@@ -720,7 +727,7 @@ impl StyleContext {
         }
         self.apply_post_cascade_animations(doc, &styled_ids, None);
         doc.clear_dirty_flags(
-            doc.root(),
+            doc_root,
             DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::DESCENDANT_STYLE_DIRTY,
         );
 
