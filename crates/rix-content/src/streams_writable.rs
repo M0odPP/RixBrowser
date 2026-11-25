@@ -145,7 +145,7 @@ impl WritableStreamState {
         }
     }
 
-    fn close_queued_or_in_flight(&self) -> bool {
+    pub(crate) fn close_queued_or_in_flight(&self) -> bool {
         self.close_request.is_some() || self.in_flight_close_request.is_some()
     }
 
@@ -688,6 +688,29 @@ pub(crate) fn writable_close_internal(
     out_p
 }
 
+/// WHATWG Streams §5.5.4 `WritableStreamDefaultWriterCloseWithErrorPropagation`.
+pub(crate) fn writable_close_with_error_propagation(
+    vm: &mut JsVm,
+    streams: &SharedStreams,
+    ws_h: HeapHandle,
+) -> HeapHandle {
+    let info = streams
+        .borrow()
+        .writable
+        .get(&ws_h)
+        .map(|ws| (ws.state, ws.stored_error, ws.close_queued_or_in_flight()));
+    let Some((state, stored_error, closing)) = info else {
+        return promise_resolve_value(vm, JsValue::UNDEFINED);
+    };
+    if closing || state == WritableState::Closed {
+        return promise_resolve_value(vm, JsValue::UNDEFINED);
+    }
+    if state == WritableState::Errored {
+        return promise_reject_value(vm, stored_error);
+    }
+    writable_close_internal(vm, streams, ws_h)
+}
+
 pub(crate) fn writable_abort_internal(
     vm: &mut JsVm,
     streams: &SharedStreams,
@@ -858,6 +881,74 @@ pub(crate) fn create_writable_stream_from_callbacks(
     abort_fn: HeapHandle,
 ) -> HeapHandle {
     create_writable_stream_with_strategy(vm, streams, write_fn, close_fn, abort_fn, 1.0, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_writable_stream_with_abort_and_start(
+    vm: &mut JsVm,
+    streams: &SharedStreams,
+    web_apis: &SharedWebApis,
+    write_fn: HeapHandle,
+    close_fn: HeapHandle,
+    abort_fn: HeapHandle,
+    hwm: f64,
+    size_fn: Option<HeapHandle>,
+    start_p: HeapHandle,
+) -> HeapHandle {
+    let (wsp, wcp) = {
+        let s = streams.borrow();
+        (
+            s.writable_proto.unwrap_or(vm.object_proto),
+            s.writable_controller_proto.unwrap_or(vm.object_proto),
+        )
+    };
+    let obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(wsp)));
+    let ctrl = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(wcp)));
+    let ac_pair = create_internal_abort_controller(vm, web_apis);
+    let mut ws = WritableStreamState::new(
+        hwm,
+        size_fn,
+        Some(write_fn),
+        Some(close_fn),
+        Some(abort_fn),
+        None,
+    );
+    ws.started = false;
+    ws.backpressure = ws.compute_backpressure();
+    ws.controller = Some(ctrl);
+    if let Some((ac_h, sig_h)) = ac_pair {
+        ws.abort_controller = Some(ac_h);
+        ws.abort_signal = Some(sig_h);
+        ws.web_apis = Some(Rc::clone(web_apis));
+    }
+    attach_gc_anchor(vm, ctrl, obj);
+    {
+        let mut reg = streams.borrow_mut();
+        reg.writable.insert(obj, ws);
+        reg.writable_controllers.insert(ctrl, obj);
+    }
+    let ss_ok = Rc::clone(streams);
+    let on_ok = vm.alloc_host_fn("ws_ts_start_ok", move |vm, _, _| {
+        if let Some(ws) = ss_ok.borrow_mut().writable.get_mut(&obj) {
+            ws.started = true;
+        }
+        writable_advance_queue_if_needed(vm, &ss_ok, obj);
+        Ok(JsValue::UNDEFINED)
+    });
+    let ss_err = Rc::clone(streams);
+    let on_err = vm.alloc_host_fn("ws_ts_start_err", move |vm, _, a| {
+        if let Some(ws) = ss_err.borrow_mut().writable.get_mut(&obj) {
+            ws.started = true;
+        }
+        writable_deal_with_rejection(vm, &ss_err, obj, arg(a, 0));
+        Ok(JsValue::UNDEFINED)
+    });
+    let _ = promise_then(vm, start_p, Some(on_ok), Some(on_err));
+    obj
 }
 
 pub(crate) fn create_writable_stream_with_strategy(

@@ -31,6 +31,8 @@ pub mod service_worker;
 pub mod shadow_dom;
 pub mod streams;
 mod streams_common;
+mod streams_pipe;
+mod streams_transform;
 mod streams_writable;
 pub mod trusted_types;
 pub mod web_apis;
