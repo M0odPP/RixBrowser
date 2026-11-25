@@ -23,8 +23,9 @@ pub use anim_css::{
     AnimationRangePoint, TextDecorationInsetValue, TextShadowSpec, TimelineRangeName,
 };
 pub use animations::{
-    compute_effect_timing, ActiveTransition, AnimationStateSnapshot, ComputedEffectTiming,
-    EffectPhase, EffectTimingInput, WebAnimationKeyframe, WebAnimationSpec,
+    compute_effect_timing, compute_transition_eased_progress_local, ActiveTransition,
+    AnimationStateSnapshot, ComputedEffectTiming, EffectPhase, EffectTimingInput,
+    TransitionControlOverride, WebAnimationKeyframe, WebAnimationSpec,
 };
 pub use cascade::{RestyleReport, StyleContext, StyleMemo};
 pub use color::{

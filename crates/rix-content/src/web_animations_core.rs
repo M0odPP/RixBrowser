@@ -530,6 +530,7 @@ pub(crate) fn sync_target_to_style_ctx(
                     end_delay_ms: eff.timing.end_delay_ms,
                     iteration_start: eff.timing.iteration_start,
                     timing: eff.timing.easing.clone(),
+                    keyframe_default_timing: None,
                     iteration_count: eff.timing.iterations,
                     direction: eff.timing.direction,
                     fill_mode: eff.timing.fill_mode,

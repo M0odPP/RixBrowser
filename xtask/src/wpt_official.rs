@@ -412,28 +412,62 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
     function on_event(obj, event, cb) {
         obj.addEventListener(event, cb, false);
     }
-    function EventWatcher(testObj, watchedNode, eventTypes) {
+    function EventWatcher(testObj, watchedNode, eventTypes, timeoutPromise) {
         if (typeof eventTypes === "string") eventTypes = [eventTypes];
-        const waitingFor = [];
+        let waitingFor = null;
+        let recordedEvents = null;
         const handler = function(evt) {
-            if (waitingFor.length === 0) return;
-            const waiter = waitingFor.shift();
-            if (waiter.types.indexOf(evt.type) === -1) {
-                waiter.reject(new AssertionError("Unexpected event " + evt.type));
-            } else {
-                waiter.resolve(evt);
+            if (!waitingFor) return;
+            if (evt.type !== waitingFor.types[0]) {
+                const rejectFunc = waitingFor.reject;
+                waitingFor = null;
+                recordedEvents = null;
+                rejectFunc(new AssertionError("Expected " + (evt && evt.type) + " to match expected event"));
+                return;
             }
+            if (Array.isArray(recordedEvents)) {
+                recordedEvents.push(evt);
+            }
+            if (waitingFor.types.length > 1) {
+                waitingFor.types.shift();
+                return;
+            }
+            const resolveFunc = waitingFor.resolve;
+            waitingFor = null;
+            const result = recordedEvents || evt;
+            recordedEvents = null;
+            resolveFunc(result);
         };
-        for (const ty of eventTypes) watchedNode.addEventListener(ty, handler);
+        for (const ty of eventTypes) watchedNode.addEventListener(ty, handler, false);
+        this.stop_watching = function() {
+            for (const ty of eventTypes) watchedNode.removeEventListener(ty, handler, false);
+        };
         if (testObj && typeof testObj.add_cleanup === "function") {
-            testObj.add_cleanup(function() {
-                for (const ty of eventTypes) watchedNode.removeEventListener(ty, handler);
-            });
+            testObj.add_cleanup(this.stop_watching);
         }
-        this.wait_for = function(types) {
+        this.wait_for = function(types, options) {
+            if (waitingFor) {
+                return Promise.reject(new Error("Already waiting for an event or events"));
+            }
             if (typeof types === "string") types = [types];
+            else types = types.slice();
+            if (options && options.record === "all") {
+                recordedEvents = [];
+            }
             return new Promise(function(resolve, reject) {
-                waitingFor.push({ types: types, resolve: resolve, reject: reject });
+                if (timeoutPromise) {
+                    const tp = typeof timeoutPromise === "function" ? timeoutPromise() : timeoutPromise;
+                    if (tp && typeof tp.then === "function") {
+                        tp.then(function() {
+                            if (!waitingFor || waitingFor.resolve !== resolve) return;
+                            const missing = waitingFor.types.join(", ");
+                            waitingFor = null;
+                            recordedEvents = null;
+                            reject(new AssertionError("Timed out waiting for " + missing));
+                        });
+                    }
+                }
+                waitingFor = { types: types, resolve: resolve, reject: reject };
             });
         };
     }
