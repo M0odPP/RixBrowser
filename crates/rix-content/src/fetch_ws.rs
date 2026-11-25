@@ -59,6 +59,11 @@ pub enum AsyncNetEvent {
         id: u64,
         message: String,
     },
+    ExternalScriptLoaded {
+        script_nid: rix_dom::NodeId,
+        is_module: bool,
+        code: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -204,7 +209,7 @@ pub(crate) type AsyncFetchInterceptor = Arc<
 pub struct NetworkBridge {
     pub(crate) fetch_engine: Arc<FetchEngine>,
     pub(crate) fetch_interceptor: Option<AsyncFetchInterceptor>,
-    async_tx: mpsc::UnboundedSender<AsyncNetEvent>,
+    pub(crate) async_tx: mpsc::UnboundedSender<AsyncNetEvent>,
     pub(crate) async_rx: RefCell<Option<mpsc::UnboundedReceiver<AsyncNetEvent>>>,
     next_id: u64,
     pending_fetches: HashMap<u64, PendingFetch>,
@@ -307,6 +312,8 @@ impl NetworkBridge {
 pub fn install_fetch_and_websocket(
     vm: &mut JsVm,
     host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
     web_apis: &SharedWebApis,
     streams: &SharedStreams,
     fetch_engine: Option<Arc<FetchEngine>>,
@@ -320,7 +327,7 @@ pub fn install_fetch_and_websocket(
     install_request(vm, web_apis, &net);
     install_response(vm, web_apis, streams, &net);
     install_fetch_fn(vm, web_apis, &net);
-    install_websocket(vm, host, web_apis, &net);
+    install_websocket(vm, host, events, event_loop, web_apis, &net);
     install_xml_http_request(vm, host, web_apis, &net);
     net
 }
@@ -479,6 +486,13 @@ pub fn deliver_async_net_event(
                     ("wasClean", JsValue::FALSE),
                 ],
             );
+        }
+        AsyncNetEvent::ExternalScriptLoaded {
+            script_nid,
+            is_module,
+            code,
+        } => {
+            crate::dom_sanitizer::eval_script_node(vm, host, script_nid, &code, is_module);
         }
     }
 }
@@ -1678,6 +1692,8 @@ fn install_fetch_fn(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBrid
 fn install_websocket(
     vm: &mut JsVm,
     host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
     web_apis: &SharedWebApis,
     net: &SharedNetBridge,
 ) {
@@ -1841,8 +1857,12 @@ fn install_websocket(
 
     let nb = Rc::clone(net);
     let wa = Rc::clone(web_apis);
+    let h_ws = Rc::clone(host);
+    let evs_ws = Rc::clone(events);
+    let el_ws = Rc::clone(event_loop);
     let ctor = vm.alloc_host_fn("WebSocket", move |vm, _, args| {
         let raw_url = vm.value_to_rust_string(arg(args, 0));
+        crate::trusted_types::check_connect_src_allowed(vm, &h_ws, &evs_ws, &el_ws, &raw_url)?;
         if !raw_url.starts_with("ws://") && !raw_url.starts_with("wss://") {
             return Err(create_dom_exception(
                 vm,

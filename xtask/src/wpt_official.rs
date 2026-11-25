@@ -1124,14 +1124,47 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
                 if fname.contains(".sub.") {
                     if let Ok(txt) = String::from_utf8(body.clone()) {
                         let port_s = port.to_string();
-                        let sub = txt
+                        let mut sub = txt
                             .replace("{{host}}", "127.0.0.1")
                             .replace("{{domains[]}}", "127.0.0.1")
                             .replace("{{ports[http][0]}}", &port_s)
                             .replace("{{ports[https][0]}}", &port_s)
                             .replace("{{ports[ws][0]}}", &port_s)
                             .replace("{{ports[wss][0]}}", &port_s);
+                        // Substitute WPT `{{GET[key]}}` template placeholders from query string.
+                        let mut get_params: HashMap<String, String> = HashMap::new();
+                        for pair in query_only.split('&') {
+                            if let Some((k, v)) = pair.split_once('=') {
+                                get_params.insert(percent_decode_path(k), percent_decode_path(v));
+                            }
+                        }
+                        while let Some(pos) = sub.find("{{GET[") {
+                            let rest = &sub[pos + 6..];
+                            let Some(end) = rest.find("]}}") else {
+                                break;
+                            };
+                            let key = &rest[..end];
+                            let repl = get_params.get(key).map(String::as_str).unwrap_or("");
+                            sub.replace_range(pos..pos + 6 + end + 3, repl);
+                        }
                         body = sub.into_bytes();
+                    }
+                }
+                // Honor WPT `pipe=trickle(d<seconds>)` delay parameter in query string.
+                for pair in query_only.split('&') {
+                    if let Some(pipe_val) = pair.strip_prefix("pipe=") {
+                        let dec = percent_decode_path(pipe_val);
+                        if let Some(pos) = dec.find("trickle(d") {
+                            let rest = &dec[pos + 9..];
+                            if let Some(end) = rest.find(')') {
+                                if let Ok(secs) = rest[..end].trim().parse::<f64>() {
+                                    let ms = (secs.clamp(0.0, 0.06) * 1000.0) as u64;
+                                    if ms > 0 {
+                                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 let mut content_type = wpt_mime_type(&file_path).to_string();
@@ -1227,7 +1260,21 @@ fn run_wpt_testharness_file(
                     ext_scripts.insert(src.to_string(), WPT_TESTHARNESS_SHIM.to_string());
                 } else {
                     let js_path = resolve_wpt_path(wpt_root, path, src);
-                    if let Ok(code) = fs::read_to_string(&js_path) {
+                    if let Ok(mut code) = fs::read_to_string(&js_path) {
+                        if js_path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|n| n.contains(".sub."))
+                        {
+                            let port_s = server.port.to_string();
+                            code = code
+                                .replace("{{host}}", "127.0.0.1")
+                                .replace("{{domains[]}}", "127.0.0.1")
+                                .replace("{{ports[http][0]}}", &port_s)
+                                .replace("{{ports[https][0]}}", &port_s)
+                                .replace("{{ports[ws][0]}}", &port_s)
+                                .replace("{{ports[wss][0]}}", &port_s);
+                        }
                         if is_module {
                             module_scan_queue.push((js_path, code.clone()));
                         }
@@ -1288,6 +1335,15 @@ fn run_wpt_testharness_file(
     );
     rt.vm.max_loop_iterations = Some(2_500_000);
     rt.event_loop.borrow_mut().enable_virtual_clock();
+    // Apply WPT `.headers` sidecar CSP headers (e.g. `Content-Security-Policy` / `-Report-Only`).
+    let headers_sidecar = PathBuf::from(format!("{}.headers", path.display()));
+    if let Ok(hdr_txt) = fs::read_to_string(&headers_sidecar) {
+        for line in hdr_txt.lines() {
+            if let Some((k, v)) = line.trim().split_once(':') {
+                rt.apply_response_csp_header(k.trim(), v.trim());
+            }
+        }
+    }
     rt.host.borrow_mut().set_external_stylesheets(ext_sheets);
     preload_local_wpt_images(
         wpt_root,

@@ -25,6 +25,7 @@ pub mod observers;
 pub mod selection;
 pub mod service_worker;
 pub mod streams;
+pub mod trusted_types;
 pub mod web_apis;
 pub mod webaudio;
 pub mod webgl2;
@@ -174,6 +175,26 @@ impl ContentRuntime {
         Self::with_full_config(document, viewport, font_db, origin_url, storage, None)
     }
 
+    /// Applies an HTTP `Content-Security-Policy` or `Content-Security-Policy-Report-Only`
+    /// response header to the main document's CSP policy set.
+    pub fn apply_response_csp_header(&self, header_name: &str, header_value: &str) {
+        let report_only = if header_name.eq_ignore_ascii_case("content-security-policy-report-only")
+        {
+            true
+        } else if header_name.eq_ignore_ascii_case("content-security-policy") {
+            false
+        } else {
+            return;
+        };
+        let root = self.host.borrow().document.borrow().root();
+        self.host
+            .borrow_mut()
+            .doc_csp
+            .entry(root)
+            .or_default()
+            .apply_header(header_value, report_only);
+    }
+
     /// Creates a runtime configured with an explicit origin URL, [`StorageEngine`],
     /// and optional shared [`FetchEngine`].
     #[must_use]
@@ -194,13 +215,23 @@ impl ContentRuntime {
         let events = install_event_system(&mut vm, &host, &event_loop);
         let observers = install_observers(&mut vm, &host, &event_loop);
         let web_apis = install_web_apis(&mut vm, &host, &events, &event_loop, origin_url, storage);
-        dom_parsing::install_dom_parsing(&mut vm, &host, &web_apis);
+        trusted_types::install_trusted_types(&mut vm, &host, &events);
+        dom_parsing::install_dom_parsing(&mut vm, &host, &events, &event_loop, &web_apis);
         cssom::install_cssom(&mut vm, &host);
         let streams = install_streams(&mut vm, &web_apis);
-        let net = install_fetch_and_websocket(&mut vm, &host, &web_apis, &streams, fetch_engine);
+        let net = install_fetch_and_websocket(
+            &mut vm,
+            &host,
+            &events,
+            &event_loop,
+            &web_apis,
+            &streams,
+            fetch_engine,
+        );
         dom_sanitizer::install_dom_sanitizer_and_streaming(
             &mut vm,
             &host,
+            &events,
             &event_loop,
             &web_apis,
             &streams,

@@ -1493,6 +1493,7 @@ fn install_range_prototypes(
                 };
                 for &sid in &script_nodes[..executable_len] {
                     hb.contextual_scripts.insert(sid);
+                    hb.script_force_async.insert(sid);
                 }
             }
             Ok(wrap_node(vm, &h, frag_id))

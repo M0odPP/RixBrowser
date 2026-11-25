@@ -809,6 +809,8 @@ fn run_service_worker_thread(
         let net = install_fetch_and_websocket(
             &mut vm,
             &host,
+            &events,
+            &event_loop,
             &web_apis,
             &streams,
             Some(Arc::clone(&fetch_engine)),

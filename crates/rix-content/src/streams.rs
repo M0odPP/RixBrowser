@@ -982,8 +982,25 @@ fn finish_write_step(
             }
         }
         Err(e) => {
-            fail_writable_stream(vm, streams, ws_h, e.value);
-            reject_promise(vm, out_p, e.value);
+            let err_v = e.value;
+            let rp = alloc_promise(vm);
+            reject_promise(vm, rp, err_v);
+            let ss_err = Rc::clone(streams);
+            let on_err = vm.alloc_host_fn("ws_write_sync_err", move |vm, _, _| {
+                reject_promise(vm, out_p, err_v);
+                let has_pending_abort = ss_err
+                    .borrow()
+                    .writable
+                    .get(&ws_h)
+                    .is_some_and(|ws| ws.pending_abort.is_some());
+                if has_pending_abort {
+                    drain_writable_queue(vm, &ss_err, ws_h);
+                } else {
+                    fail_writable_stream(vm, &ss_err, ws_h, err_v);
+                }
+                Ok(JsValue::UNDEFINED)
+            });
+            let _ = promise_then(vm, rp, None, Some(on_err));
         }
     }
 }
