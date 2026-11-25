@@ -1080,7 +1080,12 @@ impl<'a> StylesheetCompiler<'a> {
     fn compile_keyframes(&mut self, kf: &LightningKeyframes<'_>, layer_id: LayerId) {
         let name = match &kf.name {
             KeyframesName::Ident(id) => intern_str(id.as_ref()),
-            KeyframesName::Custom(s) => intern_str(s.as_ref()),
+            KeyframesName::Custom(s) => {
+                if s.as_ref().is_empty() {
+                    return;
+                }
+                intern_str(s.as_ref())
+            }
         };
         let mut steps = Vec::with_capacity(kf.keyframes.len());
         for frame in &kf.keyframes {
@@ -2507,7 +2512,14 @@ fn convert_lightning_rule_to_cssom(
         CssRule::Keyframes(kf) => {
             let name = match &kf.name {
                 KeyframesName::Ident(id) => id.as_ref().to_string(),
-                KeyframesName::Custom(s) => s.as_ref().to_string(),
+                KeyframesName::Custom(s) => {
+                    if s.as_ref().is_empty() {
+                        return Err(CssomParseError::SyntaxError(
+                            "Empty @keyframes string name is invalid".to_string(),
+                        ));
+                    }
+                    s.as_ref().to_string()
+                }
             };
             let mut rules = Vec::with_capacity(kf.keyframes.len());
             for frame in &kf.keyframes {
@@ -2527,8 +2539,18 @@ fn convert_lightning_rule_to_cssom(
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                let declarations_text =
-                    serialize_lightning_decl_block_cssom(&frame.declarations, None);
+                let mut filtered_block = frame.declarations.clone();
+                let keep_kf_prop = |prop: &lightningcss::properties::Property<'_>| {
+                    let pid = prop.property_id();
+                    let n = pid.name();
+                    !n.eq_ignore_ascii_case("animation")
+                        && (!n.to_ascii_lowercase().starts_with("animation-")
+                            || n.eq_ignore_ascii_case("animation-timing-function")
+                            || n.eq_ignore_ascii_case("animation-composition"))
+                };
+                filtered_block.declarations.retain(keep_kf_prop);
+                filtered_block.important_declarations.retain(keep_kf_prop);
+                let declarations_text = serialize_lightning_decl_block_cssom(&filtered_block, None);
                 rules.push(CssomRuleKind::Keyframe {
                     key_text,
                     declarations_text,
@@ -2552,9 +2574,13 @@ fn convert_lightning_rule_to_cssom(
         CssRule::Ignored | CssRule::Unknown(_) => {
             Err(CssomParseError::SyntaxError("Ignored CSS rule".to_string()))
         }
-        other => Ok(CssomRuleKind::Other {
-            css_text: lightning_to_css_string(other),
-        }),
+        other => {
+            let mut css_text = lightning_to_css_string(other);
+            if css_text == "@starting-style {\n  \n}" {
+                css_text = "@starting-style {\n}".to_string();
+            }
+            Ok(CssomRuleKind::Other { css_text })
+        }
     }
 }
 

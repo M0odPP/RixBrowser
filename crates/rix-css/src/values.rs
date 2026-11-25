@@ -2093,6 +2093,7 @@ pub enum AnimationPlayStateMode {
 pub struct AnimationSpec {
     pub name: InternedStr,
     pub duration_ms: f32,
+    pub duration_auto: bool,
     pub delay_ms: f32,
     pub timing: TimingFunction,
     /// `f32::INFINITY` represents CSS `infinite`.
@@ -2101,6 +2102,9 @@ pub struct AnimationSpec {
     pub fill_mode: AnimationFillModeKind,
     pub play_state: AnimationPlayStateMode,
     pub composition: AnimationCompositionMode,
+    pub timeline: InternedStr,
+    pub range_start: crate::anim_css::AnimationRangePoint,
+    pub range_end: crate::anim_css::AnimationRangePoint,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3190,6 +3194,7 @@ pub fn convert_animation(anim: &LightningAnimation<'_>) -> AnimationSpec {
     AnimationSpec {
         name: convert_animation_name(&anim.name),
         duration_ms: anim.duration.to_ms().max(0.0),
+        duration_auto: false,
         delay_ms: anim.delay.to_ms(),
         timing: convert_easing(&anim.timing_function),
         iteration_count: convert_animation_iteration(&anim.iteration_count),
@@ -3197,6 +3202,9 @@ pub fn convert_animation(anim: &LightningAnimation<'_>) -> AnimationSpec {
         fill_mode: convert_animation_fill(&anim.fill_mode),
         play_state: convert_animation_play_state(&anim.play_state),
         composition: AnimationCompositionMode::Replace,
+        timeline: rix_core::intern_str("auto"),
+        range_start: crate::anim_css::AnimationRangePoint::Normal,
+        range_end: crate::anim_css::AnimationRangePoint::Normal,
     }
 }
 

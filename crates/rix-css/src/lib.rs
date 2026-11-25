@@ -2,6 +2,7 @@
 //! Typed CSS stylesheet compiler, Selectors Level 4 integration, and compact
 //! `Arc`-grouped `ComputedStyle` for RixBrowser.
 
+pub mod anim_css;
 pub mod animations;
 pub mod cascade;
 pub mod color;
@@ -18,6 +19,9 @@ pub mod ua;
 pub mod values;
 pub mod values_math;
 
+pub use anim_css::{
+    AnimationRangePoint, TextDecorationInsetValue, TextShadowSpec, TimelineRangeName,
+};
 pub use animations::{
     compute_effect_timing, ActiveTransition, AnimationStateSnapshot, ComputedEffectTiming,
     EffectPhase, EffectTimingInput, WebAnimationKeyframe, WebAnimationSpec,

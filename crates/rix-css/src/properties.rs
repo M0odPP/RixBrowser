@@ -515,6 +515,12 @@ pub enum PropertyIdKind {
     AnimationFillMode,
     AnimationPlayState,
     AnimationComposition,
+    AnimationTimeline,
+    AnimationRange,
+    AnimationRangeStart,
+    AnimationRangeEnd,
+    TextShadow,
+    TextDecorationInset,
     InterpolateSize,
     ViewTransitionName,
     Overlay,
@@ -893,6 +899,12 @@ impl PropertyIdKind {
             "animation-fill-mode" => Self::AnimationFillMode,
             "animation-play-state" => Self::AnimationPlayState,
             "animation-composition" => Self::AnimationComposition,
+            "animation-timeline" => Self::AnimationTimeline,
+            "animation-range" => Self::AnimationRange,
+            "animation-range-start" => Self::AnimationRangeStart,
+            "animation-range-end" => Self::AnimationRangeEnd,
+            "text-shadow" => Self::TextShadow,
+            "text-decoration-inset" => Self::TextDecorationInset,
             "interpolate-size" => Self::InterpolateSize,
             "view-transition-name" => Self::ViewTransitionName,
             "overlay" => Self::Overlay,
@@ -1135,6 +1147,12 @@ impl PropertyIdKind {
             Self::AnimationFillMode => "animation-fill-mode",
             Self::AnimationPlayState => "animation-play-state",
             Self::AnimationComposition => "animation-composition",
+            Self::AnimationTimeline => "animation-timeline",
+            Self::AnimationRange => "animation-range",
+            Self::AnimationRangeStart => "animation-range-start",
+            Self::AnimationRangeEnd => "animation-range-end",
+            Self::TextShadow => "text-shadow",
+            Self::TextDecorationInset => "text-decoration-inset",
             Self::InterpolateSize => "interpolate-size",
             Self::ViewTransitionName => "view-transition-name",
             Self::Overlay => "overlay",
@@ -1382,6 +1400,7 @@ impl PropertyIdKind {
                 | Self::BorderSpacing
                 | Self::EmptyCells
                 | Self::ColorInterpolationFilters
+                | Self::TextShadow
                 | Self::Custom
         )
     }
@@ -1612,7 +1631,13 @@ impl PropertyIdKind {
                 Self::AnimationDirection,
                 Self::AnimationFillMode,
                 Self::AnimationPlayState,
+                Self::AnimationTimeline,
+                Self::AnimationRangeStart,
+                Self::AnimationRangeEnd,
             ]),
+            Self::AnimationRange => {
+                SmallVec::from_slice(&[Self::AnimationRangeStart, Self::AnimationRangeEnd])
+            }
             other => {
                 let mut v = SmallVec::new();
                 v.push(other);
@@ -1636,6 +1661,9 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "animation-iteration-count",
     "animation-name",
     "animation-play-state",
+    "animation-range-end",
+    "animation-range-start",
+    "animation-timeline",
     "animation-timing-function",
     "background-color",
     "background-image",
@@ -1826,9 +1854,11 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "table-layout",
     "text-align",
     "text-decoration-color",
+    "text-decoration-inset",
     "text-decoration-line",
     "text-indent",
     "text-overflow",
+    "text-shadow",
     "text-transform",
     "top",
     "transform",
@@ -1941,6 +1971,11 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::AnimationFillMode,
     PropertyIdKind::AnimationPlayState,
     PropertyIdKind::AnimationComposition,
+    PropertyIdKind::AnimationTimeline,
+    PropertyIdKind::AnimationRangeStart,
+    PropertyIdKind::AnimationRangeEnd,
+    PropertyIdKind::TextShadow,
+    PropertyIdKind::TextDecorationInset,
     PropertyIdKind::InterpolateSize,
     PropertyIdKind::Overlay,
     PropertyIdKind::ReadingFlow,
@@ -2329,11 +2364,16 @@ pub enum PropertyValue {
     Animations(Vec<AnimationSpec>),
     NameList(Vec<InternedStr>),
     DurationList(Vec<f32>),
+    DurationAutoList(Vec<(f32, bool)>),
     TimingList(Vec<TimingFunction>),
     DirectionList(Vec<AnimationDirectionMode>),
     FillModeList(Vec<AnimationFillModeKind>),
     PlayStateList(Vec<AnimationPlayStateMode>),
+    AnimationRangeList(Vec<crate::anim_css::AnimationRangePoint>),
+    TextShadow(Vec<crate::anim_css::TextShadowSpec>),
+    TextDecorationInset(crate::anim_css::TextDecorationInsetValue),
     VerticalAlign(VerticalAlignMode),
+    VerticalAlignFull(VerticalAlignMode, Option<LengthPercentage>),
     TextOverflow(TextOverflowMode),
     BorderCollapse(BorderCollapseMode),
     BorderSpacing(LengthPercentage, LengthPercentage),
@@ -2779,6 +2819,20 @@ pub fn is_values4_native_property(prop: PropertyIdKind) -> bool {
             | PropertyIdKind::Filter
             | PropertyIdKind::BackdropFilter
             | PropertyIdKind::ColorInterpolationFilters
+            | PropertyIdKind::Transition
+            | PropertyIdKind::TransitionDuration
+            | PropertyIdKind::TransitionDelay
+            | PropertyIdKind::Animation
+            | PropertyIdKind::AnimationName
+            | PropertyIdKind::AnimationDuration
+            | PropertyIdKind::AnimationDelay
+            | PropertyIdKind::AnimationTimeline
+            | PropertyIdKind::AnimationRange
+            | PropertyIdKind::AnimationRangeStart
+            | PropertyIdKind::AnimationRangeEnd
+            | PropertyIdKind::TextShadow
+            | PropertyIdKind::TextDecorationInset
+            | PropertyIdKind::VerticalAlign
     )
 }
 
@@ -2841,6 +2895,17 @@ pub fn should_use_values4_parser(prop: PropertyIdKind, raw: &str) -> bool {
         return true;
     }
     if prop == PropertyIdKind::Animation && lower.contains("--") {
+        return true;
+    }
+    if prop == PropertyIdKind::AnimationDuration
+        && (lower.contains("auto") || lower.contains(','))
+        && !crate::values_math::has_values4_syntax(trimmed)
+    {
+        return true;
+    }
+    if prop == PropertyIdKind::AnimationIterationCount
+        && !crate::values_math::has_values4_syntax(trimmed)
+    {
         return true;
     }
     supports_values4_math(prop) && crate::values_math::has_values4_syntax(trimmed)
@@ -2968,37 +3033,36 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
             ));
         }
         PropertyIdKind::TransitionProperty => {
+            let mut pi = cssparser::ParserInput::new(trimmed);
+            let mut p = cssparser::Parser::new(&mut pi);
             let mut names = Vec::new();
             let mut texts = Vec::new();
-            let parts: Vec<&str> = trimmed.split(',').collect();
-            for part in &parts {
-                let p = part.trim();
-                if p.is_empty() || p.chars().any(char::is_whitespace) {
+            let mut saw_none = false;
+            loop {
+                let id = p.expect_ident().ok()?.as_ref().to_string();
+                let lower = id.to_ascii_lowercase();
+                if GlobalKeyword::from_ident(&lower).is_some() || lower == "default" {
                     return None;
                 }
-                let lower = p.to_ascii_lowercase();
-                if GlobalKeyword::from_ident(&lower).is_some() {
-                    return None;
+                if lower == "none" {
+                    saw_none = true;
                 }
-                if lower == "none" && parts.len() > 1 {
-                    return None;
-                }
-                if !p.starts_with("--")
-                    && !p
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                let stored = if lower == "all"
+                    || lower == "none"
+                    || PropertyIdKind::from_name(&lower).is_some()
                 {
-                    return None;
-                }
-                let stored = if p.starts_with("--") {
-                    p.to_string()
-                } else {
                     lower
+                } else {
+                    crate::substitution::escape_css_ident(&id)
                 };
                 names.push(intern_str(&stored));
                 texts.push(stored);
+                if p.is_exhausted() {
+                    break;
+                }
+                p.expect_comma().ok()?;
             }
-            if names.is_empty() {
+            if names.is_empty() || !p.is_exhausted() || (saw_none && names.len() > 1) {
                 return None;
             }
             return Some((PropertyValue::NameList(names), texts.join(", ")));
@@ -3011,9 +3075,92 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
             let (specs, spec) = parse_transition_shorthand(trimmed)?;
             return Some((PropertyValue::Transitions(specs), spec));
         }
+        PropertyIdKind::TransitionDuration
+            if trimmed.contains(',')
+                || (!trimmed.to_ascii_lowercase().contains("sibling-")
+                    && !trimmed.to_ascii_lowercase().contains("random(")
+                    && !trimmed.to_ascii_lowercase().contains("cq")) =>
+        {
+            let (durs, spec) = crate::anim_css::parse_time_list_values4(trimmed, false, true)?;
+            return Some((
+                PropertyValue::DurationList(durs.into_iter().map(|(ms, _)| ms).collect()),
+                spec,
+            ));
+        }
+        PropertyIdKind::TransitionDelay
+            if trimmed.contains(',')
+                || (!trimmed.to_ascii_lowercase().contains("sibling-")
+                    && !trimmed.to_ascii_lowercase().contains("random(")
+                    && !trimmed.to_ascii_lowercase().contains("cq")) =>
+        {
+            let (durs, spec) = crate::anim_css::parse_time_list_values4(trimmed, false, false)?;
+            return Some((
+                PropertyValue::DurationList(durs.into_iter().map(|(ms, _)| ms).collect()),
+                spec,
+            ));
+        }
         PropertyIdKind::Animation => {
             let (specs, spec) = parse_animation_shorthand(trimmed)?;
             return Some((PropertyValue::Animations(specs), spec));
+        }
+        PropertyIdKind::AnimationName => {
+            let (names, spec) = crate::anim_css::parse_animation_name_list(trimmed)?;
+            return Some((PropertyValue::NameList(names), spec));
+        }
+        PropertyIdKind::AnimationDuration
+            if trimmed.contains(',')
+                || (!trimmed.to_ascii_lowercase().contains("sibling-")
+                    && !trimmed.to_ascii_lowercase().contains("random(")
+                    && !trimmed.to_ascii_lowercase().contains("cq")) =>
+        {
+            let (durs, spec) = crate::anim_css::parse_animation_duration_list(trimmed)?;
+            return Some((PropertyValue::DurationAutoList(durs), spec));
+        }
+        PropertyIdKind::AnimationDelay
+            if trimmed.contains(',')
+                || (!trimmed.to_ascii_lowercase().contains("sibling-")
+                    && !trimmed.to_ascii_lowercase().contains("random(")
+                    && !trimmed.to_ascii_lowercase().contains("cq")) =>
+        {
+            let (durs, spec) = crate::anim_css::parse_time_list_values4(trimmed, false, false)?;
+            return Some((
+                PropertyValue::DurationList(durs.into_iter().map(|(ms, _)| ms).collect()),
+                spec,
+            ));
+        }
+        PropertyIdKind::AnimationIterationCount
+            if !crate::values_math::has_values4_syntax(trimmed) =>
+        {
+            let (counts, spec) = crate::anim_css::parse_animation_iteration_count_list(trimmed)?;
+            return Some((PropertyValue::DurationList(counts), spec));
+        }
+        PropertyIdKind::AnimationTimeline => {
+            let (tls, spec) = crate::anim_css::parse_animation_timeline_list(trimmed)?;
+            return Some((PropertyValue::NameList(tls), spec));
+        }
+        PropertyIdKind::AnimationRangeStart => {
+            let (pts, spec) = crate::anim_css::parse_animation_range_point_list(trimmed, false)?;
+            return Some((PropertyValue::AnimationRangeList(pts), spec));
+        }
+        PropertyIdKind::AnimationRangeEnd => {
+            let (pts, spec) = crate::anim_css::parse_animation_range_point_list(trimmed, true)?;
+            return Some((PropertyValue::AnimationRangeList(pts), spec));
+        }
+        PropertyIdKind::AnimationRange => {
+            let (starts, _, spec) = crate::anim_css::parse_animation_range_shorthand(trimmed)?;
+            return Some((PropertyValue::AnimationRangeList(starts), spec));
+        }
+        PropertyIdKind::TextShadow => {
+            let (shadows, spec) = crate::anim_css::parse_text_shadow_list(trimmed)?;
+            return Some((PropertyValue::TextShadow(shadows), spec));
+        }
+        PropertyIdKind::TextDecorationInset => {
+            let (val, spec) = crate::anim_css::parse_text_decoration_inset(trimmed)?;
+            return Some((PropertyValue::TextDecorationInset(val), spec));
+        }
+        PropertyIdKind::VerticalAlign => {
+            let (va, lp, spec) = crate::anim_css::parse_vertical_align_values4(trimmed)?;
+            return Some((PropertyValue::VerticalAlignFull(va, lp), spec));
         }
         p if is_sizing_property(p) && trimmed.to_ascii_lowercase().starts_with("calc-size(") => {
             let allow_auto = !matches!(
@@ -3769,8 +3916,21 @@ fn parse_timing_fn_from_parser<'i, 't>(p: &mut cssparser::Parser<'i, 't>) -> Opt
         }
         cssparser::Token::Function(ref fname) if fname.eq_ignore_ascii_case("steps") => {
             let res = p.parse_nested_block(|n| -> Result<(TimingFunction, String), cssparser::ParseError<'i, ()>> {
-                let cnt = n.expect_integer()?;
-                if cnt < 1 { return Err(n.new_custom_error(())); }
+                let st_cnt = n.state();
+                let (cnt, spec_cnt_opt) = if let Ok(c) = n.try_parse(cssparser::Parser::expect_integer) {
+                    if c < 1 { return Err(n.new_custom_error(())); }
+                    (c, None)
+                } else {
+                    n.reset(&st_cnt);
+                    let Some(pm) = crate::values_math::parse_math_value_from_parser(n, crate::values_math::ValueKind::Integer) else {
+                        return Err(n.new_custom_error(()));
+                    };
+                    let v = pm.node.eval_scalar(&crate::values::EvalContext::default(), None);
+                    let c = if v.is_finite() { v.round() as i32 } else { 1 };
+                    if !pm.was_math_fn && c < 1 { return Err(n.new_custom_error(())); }
+                    let spec_opt = pm.node.contains_sibling_fn().then(|| pm.node.serialize_specified(pm.was_math_fn));
+                    (c.max(1), spec_opt)
+                };
                 let pos_mode = if n.try_parse(cssparser::Parser::expect_comma).is_ok() {
                     let pos = n.expect_ident()?.to_ascii_lowercase();
                     match pos.as_str() {
@@ -3780,7 +3940,7 @@ fn parse_timing_fn_from_parser<'i, 't>(p: &mut cssparser::Parser<'i, 't>) -> Opt
                         "end" => crate::values::StepPositionMode::End,
                         "jump-end" => crate::values::StepPositionMode::JumpEnd,
                         "jump-none" => {
-                            if cnt < 2 { return Err(n.new_custom_error(())); }
+                            if spec_cnt_opt.is_none() && cnt < 2 { return Err(n.new_custom_error(())); }
                             crate::values::StepPositionMode::JumpNone
                         }
                         _ => return Err(n.new_custom_error(())),
@@ -3788,7 +3948,17 @@ fn parse_timing_fn_from_parser<'i, 't>(p: &mut cssparser::Parser<'i, 't>) -> Opt
                 } else { crate::values::StepPositionMode::End };
                 if !n.is_exhausted() { return Err(n.new_custom_error(())); }
                 let tf = TimingFunction::Steps(cnt as u32, pos_mode);
-                let canon = tf.to_css_string();
+                let canon = if let Some(sc) = spec_cnt_opt {
+                    match pos_mode {
+                        crate::values::StepPositionMode::End | crate::values::StepPositionMode::JumpEnd => format!("steps({sc})"),
+                        crate::values::StepPositionMode::Start => format!("steps({sc}, start)"),
+                        crate::values::StepPositionMode::JumpStart => format!("steps({sc}, jump-start)"),
+                        crate::values::StepPositionMode::JumpNone => format!("steps({sc}, jump-none)"),
+                        crate::values::StepPositionMode::JumpBoth => format!("steps({sc}, jump-both)"),
+                    }
+                } else {
+                    tf.to_css_string()
+                };
                 Ok((tf, canon))
             }).ok();
             if res.is_none() { p.reset(&st); }
@@ -3856,8 +4026,13 @@ fn parse_transition_shorthand(input: &str) -> Option<(Vec<TransitionSpec>, Strin
                     behavior = Some(if lower == "allow-discrete" { TransitionBehaviorMode::AllowDiscrete } else { TransitionBehaviorMode::Normal });
                     any = true; continue;
                 }
-                if prop.is_none() && GlobalKeyword::from_ident(&lower).is_none() {
-                    prop = Some(intern_str(if ident.starts_with("--") { &ident } else { &lower }));
+                if prop.is_none() && GlobalKeyword::from_ident(&lower).is_none() && lower != "default" {
+                    let stored = if lower == "all" || lower == "none" || PropertyIdKind::from_name(&lower).is_some() {
+                        lower
+                    } else {
+                        crate::substitution::escape_css_ident(&ident)
+                    };
+                    prop = Some(intern_str(&stored));
                     any = true; continue;
                 }
                 return None;
@@ -3874,87 +4049,20 @@ fn parse_transition_shorthand(input: &str) -> Option<(Vec<TransitionSpec>, Strin
         });
         if p.try_parse(cssparser::Parser::expect_comma).is_err() { break; }
     }
-    (!out.is_empty() && p.is_exhausted()).then(|| (out, input.trim().to_string()))
+    if !out.is_empty() && p.is_exhausted() {
+        let ser = crate::anim_css::serialize_transition_list(&out);
+        Some((out, ser))
+    } else {
+        None
+    }
 }
 
-#[rustfmt::skip]
+pub(crate) fn parse_transition_shorthand_pub(input: &str) -> Option<(Vec<TransitionSpec>, String)> {
+    parse_transition_shorthand(input)
+}
+
 fn parse_animation_shorthand(input: &str) -> Option<(Vec<AnimationSpec>, String)> {
-    let mut pi = cssparser::ParserInput::new(input);
-    let mut p = cssparser::Parser::new(&mut pi);
-    let mut out = Vec::new();
-    loop {
-        let (mut name, mut dur, mut del, mut timing, mut iter, mut dir, mut fill, mut state, mut comp) =
-            (None, None, None, None, None, None, None, None, None);
-        let mut any = false;
-        while !p.is_exhausted() {
-            let st = p.state();
-            if matches!(p.next(), Ok(cssparser::Token::Comma)) { p.reset(&st); break; }
-            p.reset(&st);
-            if let Some(ms) = parse_time_ms_from_parser(&mut p) {
-                if dur.is_none() { if ms < 0.0 { return None; } dur = Some(ms); }
-                else if del.is_none() { del = Some(ms); }
-                else { return None; }
-                any = true; continue;
-            }
-            if timing.is_none() {
-                if let Some((tf, _)) = parse_timing_fn_from_parser(&mut p) { timing = Some(tf); any = true; continue; }
-            }
-            if iter.is_none() {
-                if let Ok(n) = p.try_parse(cssparser::Parser::expect_number) {
-                    if n < 0.0 { return None; }
-                    iter = Some(n); any = true; continue;
-                }
-            }
-            if let Ok(ident) = p.try_parse(|p| p.expect_ident().map(|s| s.to_string())) {
-                let lower = ident.to_ascii_lowercase();
-                if iter.is_none() && lower == "infinite" { iter = Some(f32::INFINITY); any = true; continue; }
-                if dir.is_none() {
-                    let d = match lower.as_str() {
-                        "normal" => Some(AnimationDirectionMode::Normal),
-                        "reverse" => Some(AnimationDirectionMode::Reverse),
-                        "alternate" => Some(AnimationDirectionMode::Alternate),
-                        "alternate-reverse" => Some(AnimationDirectionMode::AlternateReverse),
-                        _ => None,
-                    };
-                    if let Some(d) = d { dir = Some(d); any = true; continue; }
-                }
-                if fill.is_none() {
-                    let f = match lower.as_str() {
-                        "forwards" => Some(AnimationFillModeKind::Forwards),
-                        "backwards" => Some(AnimationFillModeKind::Backwards),
-                        "both" => Some(AnimationFillModeKind::Both),
-                        _ => None,
-                    };
-                    if let Some(f) = f { fill = Some(f); any = true; continue; }
-                }
-                if state.is_none() && (lower == "running" || lower == "paused") {
-                    state = Some(if lower == "paused" { AnimationPlayStateMode::Paused } else { AnimationPlayStateMode::Running });
-                    any = true; continue;
-                }
-                if comp.is_none() && matches!(lower.as_str(), "replace" | "add" | "accumulate") {
-                    comp = Some(match lower.as_str() { "add" => AnimationCompositionMode::Add, "accumulate" => AnimationCompositionMode::Accumulate, _ => AnimationCompositionMode::Replace });
-                    any = true; continue;
-                }
-                if name.is_none() { name = Some(intern_str(&ident)); any = true; continue; }
-                return None;
-            }
-            return None;
-        }
-        if !any { return None; }
-        out.push(AnimationSpec {
-            name: name.unwrap_or_else(|| intern_str("none")),
-            duration_ms: dur.unwrap_or(0.0),
-            delay_ms: del.unwrap_or(0.0),
-            timing: timing.unwrap_or(TimingFunction::Ease),
-            iteration_count: iter.unwrap_or(1.0),
-            direction: dir.unwrap_or(AnimationDirectionMode::Normal),
-            fill_mode: fill.unwrap_or(AnimationFillModeKind::None),
-            play_state: state.unwrap_or(AnimationPlayStateMode::Running),
-            composition: comp.unwrap_or(AnimationCompositionMode::Replace),
-        });
-        if p.try_parse(cssparser::Parser::expect_comma).is_err() { break; }
-    }
-    (!out.is_empty() && p.is_exhausted()).then(|| (out, input.trim().to_string()))
+    crate::anim_css::parse_animation_shorthand_full(input)
 }
 
 /// Wraps CSS Color 4/5 functional & system-color longhand declarations into an opaque
@@ -6677,6 +6785,18 @@ fn compile_property(
             );
         }
         Property::TransitionProperty(props, _) => {
+            if props.len() == 1 {
+                if let Some(kw) = GlobalKeyword::from_ident(props[0].name()) {
+                    push_decl(
+                        out,
+                        ord,
+                        PropertyIdKind::TransitionProperty,
+                        PropertyValue::Global(kw),
+                        imp,
+                    );
+                    return;
+                }
+            }
             let names = props.iter().map(|p| intern_str(p.name())).collect();
             push_decl(
                 out,
@@ -7123,9 +7243,7 @@ fn compile_property(
                         }
                         let mut buf = String::new();
                         write_tokens_for_reparse(&tokens, &mut buf);
-                        if let Some((val, _)) = parse_values4_property(kind, buf.trim()) {
-                            push_decl(out, ord, kind, val, imp);
-                        }
+                        let _ = parse_values4_property_decls(kind, buf.trim(), imp, ord, out);
                         return;
                     }
                 }
@@ -7362,6 +7480,26 @@ fn parse_values4_property_decls(
                     ord,
                     PropertyIdKind::GridLanesDirection,
                     PropertyValue::GridLanesDirection(d),
+                    imp,
+                );
+                return true;
+            }
+            false
+        }
+        PropertyIdKind::AnimationRange => {
+            if let Some((starts, ends, _)) = crate::anim_css::parse_animation_range_shorthand(raw) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::AnimationRangeStart,
+                    PropertyValue::AnimationRangeList(starts),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::AnimationRangeEnd,
+                    PropertyValue::AnimationRangeList(ends),
                     imp,
                 );
                 return true;
