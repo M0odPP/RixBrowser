@@ -197,6 +197,7 @@ pub struct HostState {
     pub css_stylesheet_proto: Option<HeapHandle>,
     pub css_rule_protos: HashMap<&'static str, HeapHandle>,
     pub subdoc_scroll_offsets: HashMap<NodeId, Point>,
+    pub(crate) cssom_geometry_state: RefCell<crate::cssom_geometry::CssomGeometryState>,
     pub style_element_sheets: HashMap<NodeId, crate::cssom::SharedStyleSheet>,
     pub stylesheet_handle_map: HashMap<HeapHandle, crate::cssom::SharedStyleSheet>,
     pub adopted_stylesheets: Vec<crate::cssom::SharedStyleSheet>,
@@ -299,6 +300,7 @@ impl HostState {
             css_stylesheet_proto: None,
             css_rule_protos: HashMap::new(),
             subdoc_scroll_offsets: HashMap::new(),
+            cssom_geometry_state: RefCell::new(crate::cssom_geometry::CssomGeometryState::default()),
             style_element_sheets: HashMap::new(),
             stylesheet_handle_map: HashMap::new(),
             adopted_stylesheets: Vec::new(),
@@ -467,6 +469,7 @@ impl HostState {
         }
         self.trusted_types.collect_roots(out);
         self.custom_elements_state.borrow().collect_roots(out);
+        self.cssom_geometry_state.borrow().collect_roots(out);
         self.prototypes.collect_roots(out);
         for &proto in self.interface_protos.values() {
             out.push(JsValue::from_object(proto));
@@ -3947,10 +3950,7 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
     let h = Rc::clone(host);
     define_host_method(vm, ep, "getBoundingClientRect", move |vm, t, _| {
         let nid = require_node(vm, &h, t)?;
-        let rect = h
-            .borrow_mut()
-            .bounding_rects_for_node(nid)
-            .map_or(Rect::ZERO, |(b, _)| b);
+        let rect = crate::cssom_geometry::transformed_bounding_rect_for_node(&h, nid);
         Ok(JsValue::from_object(alloc_dom_rect(vm, &h, rect)))
     });
 
@@ -4830,8 +4830,16 @@ fn compute_element_validity(host: &SharedHost, nid: NodeId) -> (bool, bool, bool
     (true, false, false, String::new())
 }
 
-pub(crate) fn alloc_dom_rect(vm: &mut JsVm, _host: &SharedHost, rect: Rect) -> HeapHandle {
-    let obj = vm.alloc_ordinary_object();
+pub(crate) fn alloc_dom_rect(vm: &mut JsVm, host: &SharedHost, rect: Rect) -> HeapHandle {
+    let proto = host
+        .borrow()
+        .cssom_geometry_state
+        .borrow()
+        .dom_rect_proto
+        .unwrap_or(vm.object_proto);
+    let obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
     let x = f64::from(rect.origin.x);
     let y = f64::from(rect.origin.y);
     let w = f64::from(rect.size.width);
