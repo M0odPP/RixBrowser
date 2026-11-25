@@ -25,6 +25,7 @@ pub mod fetch_ws;
 pub mod frames;
 pub mod indexeddb;
 pub mod indexeddb_engine;
+pub(crate) mod indexeddb_runtime;
 pub mod media_elements;
 pub mod media_source;
 pub mod observers;

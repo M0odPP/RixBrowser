@@ -2119,6 +2119,18 @@ fn dispatch_event_internal(
     target_key: EventTargetKey,
     ev_h: HeapHandle,
 ) -> Result<bool, JsException> {
+    dispatch_event_with_options(vm, host, events, event_loop, target_key, ev_h, false)
+}
+
+fn dispatch_event_with_options(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    target_key: EventTargetKey,
+    ev_h: HeapHandle,
+    checkpoint_per_listener: bool,
+) -> Result<bool, JsException> {
     let (ev_type, bubbles, composed) = {
         let es = events.borrow();
         let Some(ev) = es.events.get(&ev_h) else {
@@ -2167,7 +2179,18 @@ fn dispatch_event_internal(
         } else {
             1
         };
-        invoke_listeners_at(vm, host, events, ev_h, &ev_type, *entry, phase, Some(true));
+        invoke_listeners_at(
+            vm,
+            host,
+            events,
+            event_loop,
+            ev_h,
+            &ev_type,
+            *entry,
+            phase,
+            Some(true),
+            checkpoint_per_listener,
+        );
     }
 
     // WHATWG DOM §2.9 Pass 2 (Bubbling, innermost -> outermost INCLUDING `path[0]`):
@@ -2182,7 +2205,18 @@ fn dispatch_event_internal(
             continue;
         }
         let phase = if at_target { 2 } else { 3 };
-        invoke_listeners_at(vm, host, events, ev_h, &ev_type, *entry, phase, Some(false));
+        invoke_listeners_at(
+            vm,
+            host,
+            events,
+            event_loop,
+            ev_h,
+            &ev_type,
+            *entry,
+            phase,
+            Some(false),
+            checkpoint_per_listener,
+        );
     }
 
     // Clean up phase/currentTarget/dispatch_flag and apply WHATWG DOM §2.9 step 14
@@ -2250,11 +2284,13 @@ fn invoke_listeners_at(
     vm: &mut JsVm,
     host: &SharedHost,
     events: &SharedEvents,
+    event_loop: &SharedEventLoop,
     ev_h: HeapHandle,
     ev_type: &str,
     entry: PathEntry,
     phase: i32,
     capture_filter: Option<bool>,
+    checkpoint_per_listener: bool,
 ) {
     let snapshot: Vec<ListenerEntry> = events
         .borrow()
@@ -2366,6 +2402,9 @@ fn invoke_listeners_at(
                     }
                 }
             }
+        }
+        if checkpoint_per_listener {
+            run_microtask_checkpoint(event_loop, vm);
         }
     }
 }
@@ -2971,13 +3010,14 @@ pub(crate) fn fire_idb_event(
         vm.heap
             .object_define_data(ev_h, k, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
     }
-    let _ = dispatch_event_internal(
+    let _ = dispatch_event_with_options(
         vm,
         host,
         events,
         event_loop,
         EventTargetKey::Object(target),
         ev_h,
+        true,
     );
     let mut es = events.borrow_mut();
     let threw = es.dispatch_threw_stack.pop().unwrap_or(false);

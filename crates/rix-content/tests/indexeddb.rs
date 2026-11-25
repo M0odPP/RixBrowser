@@ -194,8 +194,9 @@ fn indexeddb_crud_indexes_cursors_key_ranges_and_acid_rollback() {
     assert_eq!(parsed["midAges"], serde_json::json!([28, 30, 30]));
     assert_eq!(parsed["uniqAges"], serde_json::json!([22, 28, 30, 40]));
     // Tx 2 & Tx 3 aborted (reverting key generator to 5); in Tx 4 the prevented ConstraintError
-    // consumed key 5 per W3C IndexedDB §2.11 so `eve` received autoIncrement key 6.
-    assert_eq!(parsed["revIds"], serde_json::json!([6, 4, 3, 2]));
+    // reverts its failed operation per W3C IndexedDB 3.0 §5.1 (matching WPT
+    // `request-event-ordering-small-values.any.js`) so `eve` receives autoIncrement key 5.
+    assert_eq!(parsed["revIds"], serde_json::json!([5, 4, 3, 2]));
     assert_eq!(parsed["finalCountAfterCursorDelete"], 4);
     assert_eq!(parsed["cmpNumStr"], -1);
     assert_eq!(parsed["rangeIncludes"], true);

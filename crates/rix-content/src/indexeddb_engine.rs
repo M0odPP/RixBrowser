@@ -545,14 +545,15 @@ pub fn validate_put_or_add_sync(
 
 /// Applies `put` or `add` onto `store` with key generation (`1..=2^53`), key injection,
 /// duplicate-key checking, and `unique` secondary index validation.
+/// Per W3C IDB §5.6, failed writes leave `store.next_key` and `store.records` untouched.
 pub fn store_put_or_add_payload(
     store: &mut IdbStoreSnapshot,
     mut payload: StructuredClonePayload,
     resolved_key: Option<IdbKey>,
     no_overwrite: bool,
 ) -> Result<IdbKey, (&'static str, String)> {
+    let mut generated_key: Option<u64> = None;
     let key = if let Some(k) = resolved_key {
-        update_key_generator(store, &k);
         k
     } else {
         if store.next_key > MAX_KEY_GENERATOR {
@@ -562,7 +563,6 @@ pub fn store_put_or_add_payload(
             ));
         }
         let gen = store.next_key;
-        store.next_key = store.next_key.saturating_add(1);
         if let Some(ref kp) = store.key_path {
             if !store.key_path_is_array
                 && kp.len() == 1
@@ -574,6 +574,7 @@ pub fn store_put_or_add_payload(
                 ));
             }
         }
+        generated_key = Some(gen);
         IdbKey::Number(gen as f64)
     };
 
@@ -615,6 +616,13 @@ pub fn store_put_or_add_payload(
         }
     }
 
+    // Commit key generator update ONLY after all uniqueness constraints succeed.
+    if let Some(gen) = generated_key {
+        store.next_key = gen.saturating_add(1);
+    } else {
+        update_key_generator(store, &key);
+    }
+
     let value_bytes = encode_storage_payload(&payload);
     store.records.insert(
         encoded_pk,
@@ -625,6 +633,34 @@ pub fn store_put_or_add_payload(
         },
     );
     Ok(key)
+}
+
+/// Validates a newly created `unique` secondary index against all existing records in `store`.
+pub fn validate_index_unique_constraint(
+    store: &IdbStoreSnapshot,
+    idx_schema: &IdbIndexSchema,
+) -> Result<(), (&'static str, String)> {
+    if !idx_schema.unique {
+        return Ok(());
+    }
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    for rec in store.records.values() {
+        let Some(payload) = decode_record_payload(rec) else {
+            continue;
+        };
+        for ik in extract_index_keys_from_payload(&payload, idx_schema) {
+            if !seen.insert(ik.to_encoded_bytes()) {
+                return Err((
+                    "ConstraintError",
+                    format!(
+                        "Existing records violate unique constraint on index '{}'",
+                        idx_schema.name
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn alloc_js_array(vm: &mut JsVm, items: &[JsValue]) -> HeapHandle {
@@ -920,8 +956,10 @@ pub fn idb_key_to_js(vm: &mut JsVm, key: &IdbKey) -> JsValue {
     }
 }
 
-/// Parses and validates a JS `keyPath` option (`string | sequence<string> | null`).
-pub fn parse_key_path_arg(
+/// Performs WebIDL argument conversion of `keyPath` (`DOMString | sequence<DOMString> | null`)
+/// WITHOUT running W3C IDB syntax validation yet (so callers can enforce exact W3C exception
+/// ordering such as `TransactionInactiveError`/`ConstraintError` before `SyntaxError`).
+pub fn parse_key_path_raw(
     vm: &mut JsVm,
     val: JsValue,
     allow_null: bool,
@@ -930,15 +968,7 @@ pub fn parse_key_path_arg(
         return Ok(None);
     }
     if val.is_string() {
-        let s = vm.value_to_rust_string(val);
-        if !is_valid_key_path_str(&s) {
-            return Err(create_dom_exception(
-                vm,
-                "SyntaxError",
-                &format!("Invalid keyPath '{s}'"),
-            ));
-        }
-        return Ok(Some((vec![s], false)));
+        return Ok(Some((vec![vm.value_to_rust_string(val)], false)));
     }
     if let Some(h) = val.as_object() {
         let is_array = matches!(
@@ -953,37 +983,53 @@ pub fn parse_key_path_arg(
         };
         if is_iterable {
             let raw_items = vm.collect_iterable(val)?;
-            if raw_items.is_empty() {
-                return Err(create_dom_exception(
-                    vm,
-                    "SyntaxError",
-                    "Empty array keyPath is invalid",
-                ));
-            }
             let mut out = Vec::with_capacity(raw_items.len());
             for item in raw_items {
-                let s = vm.to_js_string(item)?;
-                if !is_valid_key_path_str(&s) {
-                    return Err(create_dom_exception(
-                        vm,
-                        "SyntaxError",
-                        &format!("Invalid keyPath '{s}'"),
-                    ));
-                }
-                out.push(s);
+                out.push(vm.to_js_string(item)?);
             }
             return Ok(Some((out, true)));
         }
     }
-    let s = vm.to_js_string(val)?;
-    if !is_valid_key_path_str(&s) {
+    Ok(Some((vec![vm.to_js_string(val)?], false)))
+}
+
+/// Validates W3C IndexedDB 3.0 syntax of an already WebIDL-converted `keyPath`.
+pub fn validate_key_path_syntax(
+    vm: &mut JsVm,
+    paths: &[String],
+    is_array: bool,
+) -> Result<(), JsException> {
+    if is_array && paths.is_empty() {
         return Err(create_dom_exception(
             vm,
             "SyntaxError",
-            &format!("Invalid keyPath '{s}'"),
+            "Empty array keyPath is invalid",
         ));
     }
-    Ok(Some((vec![s], false)))
+    for s in paths {
+        if !is_valid_key_path_str(s) {
+            return Err(create_dom_exception(
+                vm,
+                "SyntaxError",
+                &format!("Invalid keyPath '{s}'"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parses and validates a JS `keyPath` option (`string | sequence<string> | null`).
+#[allow(dead_code)]
+pub fn parse_key_path_arg(
+    vm: &mut JsVm,
+    val: JsValue,
+    allow_null: bool,
+) -> Result<Option<(Vec<String>, bool)>, JsException> {
+    let raw = parse_key_path_raw(vm, val, allow_null)?;
+    if let Some((ref paths, is_array)) = raw {
+        validate_key_path_syntax(vm, paths, is_array)?;
+    }
+    Ok(raw)
 }
 
 /// Converts a structured-clone JSON value to an [`IdbKey`] if valid.
@@ -1191,6 +1237,342 @@ pub struct IdbCursorEntry {
     pub primary_key: IdbKey,
     pub value_bytes: Vec<u8>,
     pub value_json: String,
+}
+
+/// Live-position cursor step operation (avoids snapshotting entire stores in memory!).
+#[derive(Debug, Clone)]
+pub enum CursorStepRequest {
+    /// Initial cursor open: find the first matching record in `range` along `direction`.
+    Initial,
+    /// `cursor.continue(target_key?)`: advance past current position (or seek to `target_key`).
+    Continue(Option<IdbKey>),
+    /// `cursor.advance(count)`: advance `count` steps (`>= 1`) from current position.
+    Advance(usize),
+    /// `cursor.continuePrimaryKey(target_key, target_pk)`: seek a non-unique index cursor.
+    ContinuePrimaryKey(IdbKey, IdbKey),
+}
+
+/// Steps a live object-store cursor in O(log N + steps) over `store.records` (`BTreeMap`),
+/// cloning ONLY the single winning record's payload (or zero bytes when `key_only == true`).
+#[must_use]
+pub fn step_store_cursor(
+    store: &IdbStoreSnapshot,
+    range: Option<&KeyRange>,
+    dir: CursorDirection,
+    cur_key: Option<&IdbKey>,
+    step: &CursorStepRequest,
+    key_only: bool,
+) -> Option<IdbCursorEntry> {
+    use std::ops::Bound;
+
+    let mut remaining = match *step {
+        CursorStepRequest::Advance(n) => n.max(1),
+        _ => 1,
+    };
+
+    let make_entry = |rec: &IdbRecord| IdbCursorEntry {
+        key: rec.key.clone(),
+        primary_key: rec.key.clone(),
+        value_bytes: if key_only {
+            Vec::new()
+        } else {
+            rec.value_bytes.clone()
+        },
+        value_json: if key_only {
+            String::new()
+        } else {
+            rec.value_json.clone()
+        },
+    };
+
+    if !dir.is_reverse() {
+        let mut lo_bound: Bound<Vec<u8>> = match range.and_then(|r| r.lower.as_ref()) {
+            Some(lo) => {
+                if range.is_some_and(|r| r.lower_open) {
+                    Bound::Excluded(lo.to_encoded_bytes())
+                } else {
+                    Bound::Included(lo.to_encoded_bytes())
+                }
+            }
+            None => Bound::Unbounded,
+        };
+        let step_lo: Option<Bound<Vec<u8>>> = match step {
+            CursorStepRequest::Continue(Some(tk)) => Some(Bound::Included(tk.to_encoded_bytes())),
+            CursorStepRequest::Continue(None) | CursorStepRequest::Advance(_) => {
+                cur_key.map(|ck| Bound::Excluded(ck.to_encoded_bytes()))
+            }
+            _ => None,
+        };
+        if let Some(sl) = step_lo {
+            lo_bound = match (&lo_bound, &sl) {
+                (Bound::Unbounded, _) => sl,
+                (Bound::Included(a), Bound::Included(b)) => {
+                    if b > a {
+                        sl
+                    } else {
+                        lo_bound
+                    }
+                }
+                (Bound::Included(a), Bound::Excluded(b)) => {
+                    if b >= a {
+                        sl
+                    } else {
+                        lo_bound
+                    }
+                }
+                (Bound::Excluded(a), Bound::Included(b)) => {
+                    if b > a {
+                        sl
+                    } else {
+                        lo_bound
+                    }
+                }
+                (Bound::Excluded(a), Bound::Excluded(b)) => {
+                    if b > a {
+                        sl
+                    } else {
+                        lo_bound
+                    }
+                }
+                (_, Bound::Unbounded) => lo_bound,
+            };
+        }
+
+        for (_, rec) in store.records.range((lo_bound, Bound::Unbounded)) {
+            if let Some(r) = range {
+                if let Some(ref hi) = r.upper {
+                    match rec.key.idb_cmp(hi) {
+                        Ordering::Greater => break,
+                        Ordering::Equal if r.upper_open => break,
+                        _ => {}
+                    }
+                }
+                if !r.matches(&rec.key) {
+                    continue;
+                }
+            }
+            if let Some(ck) = cur_key {
+                if rec.key.idb_cmp(ck) != Ordering::Greater {
+                    continue;
+                }
+            }
+            if let CursorStepRequest::Continue(Some(ref tk)) = step {
+                if rec.key.idb_cmp(tk) == Ordering::Less {
+                    continue;
+                }
+            }
+            remaining -= 1;
+            if remaining == 0 {
+                return Some(make_entry(rec));
+            }
+        }
+        None
+    } else {
+        let mut hi_bound: Bound<Vec<u8>> = match range.and_then(|r| r.upper.as_ref()) {
+            Some(hi) => {
+                if range.is_some_and(|r| r.upper_open) {
+                    Bound::Excluded(hi.to_encoded_bytes())
+                } else {
+                    Bound::Included(hi.to_encoded_bytes())
+                }
+            }
+            None => Bound::Unbounded,
+        };
+        let step_hi: Option<Bound<Vec<u8>>> = match step {
+            CursorStepRequest::Continue(Some(tk)) => Some(Bound::Included(tk.to_encoded_bytes())),
+            CursorStepRequest::Continue(None) | CursorStepRequest::Advance(_) => {
+                cur_key.map(|ck| Bound::Excluded(ck.to_encoded_bytes()))
+            }
+            _ => None,
+        };
+        if let Some(sh) = step_hi {
+            hi_bound = match (&hi_bound, &sh) {
+                (Bound::Unbounded, _) => sh,
+                (Bound::Included(a), Bound::Included(b)) => {
+                    if b < a {
+                        sh
+                    } else {
+                        hi_bound
+                    }
+                }
+                (Bound::Included(a), Bound::Excluded(b)) => {
+                    if b <= a {
+                        sh
+                    } else {
+                        hi_bound
+                    }
+                }
+                (Bound::Excluded(a), Bound::Included(b)) => {
+                    if b < a {
+                        sh
+                    } else {
+                        hi_bound
+                    }
+                }
+                (Bound::Excluded(a), Bound::Excluded(b)) => {
+                    if b < a {
+                        sh
+                    } else {
+                        hi_bound
+                    }
+                }
+                (_, Bound::Unbounded) => hi_bound,
+            };
+        }
+
+        for (_, rec) in store.records.range((Bound::Unbounded, hi_bound)).rev() {
+            if let Some(r) = range {
+                if let Some(ref lo) = r.lower {
+                    match rec.key.idb_cmp(lo) {
+                        Ordering::Less => break,
+                        Ordering::Equal if r.lower_open => break,
+                        _ => {}
+                    }
+                }
+                if !r.matches(&rec.key) {
+                    continue;
+                }
+            }
+            if let Some(ck) = cur_key {
+                if rec.key.idb_cmp(ck) != Ordering::Less {
+                    continue;
+                }
+            }
+            if let CursorStepRequest::Continue(Some(ref tk)) = step {
+                if rec.key.idb_cmp(tk) == Ordering::Greater {
+                    continue;
+                }
+            }
+            remaining -= 1;
+            if remaining == 0 {
+                return Some(make_entry(rec));
+            }
+        }
+        None
+    }
+}
+
+/// Steps a live secondary-index cursor without cloning record payloads during scanning;
+/// ONLY the single matching record's payload is cloned (or zero bytes when `key_only == true`).
+#[must_use]
+pub fn step_index_cursor(
+    store: &IdbStoreSnapshot,
+    idx_schema: &IdbIndexSchema,
+    range: Option<&KeyRange>,
+    dir: CursorDirection,
+    cur_pos: Option<(&IdbKey, &IdbKey)>,
+    step: &CursorStepRequest,
+    key_only: bool,
+) -> Option<IdbCursorEntry> {
+    let mut keys_only: Vec<(IdbKey, IdbKey, &Vec<u8>)> = Vec::new();
+    for (pk_bytes, rec) in &store.records {
+        let Some(payload) = decode_record_payload(rec) else {
+            continue;
+        };
+        for ik in extract_index_keys_from_payload(&payload, idx_schema) {
+            if range.is_none_or(|r| r.matches(&ik)) {
+                keys_only.push((ik, rec.key.clone(), pk_bytes));
+            }
+        }
+    }
+    match dir {
+        CursorDirection::Next | CursorDirection::NextUnique => {
+            keys_only.sort_by(|a, b| a.0.idb_cmp(&b.0).then_with(|| a.1.idb_cmp(&b.1)));
+        }
+        CursorDirection::Prev => {
+            keys_only.sort_by(|a, b| b.0.idb_cmp(&a.0).then_with(|| b.1.idb_cmp(&a.1)));
+        }
+        CursorDirection::PrevUnique => {
+            keys_only.sort_by(|a, b| b.0.idb_cmp(&a.0).then_with(|| a.1.idb_cmp(&b.1)));
+        }
+    }
+    if dir.is_unique() {
+        let mut deduped: Vec<(IdbKey, IdbKey, &Vec<u8>)> = Vec::with_capacity(keys_only.len());
+        for item in keys_only {
+            let dup = deduped
+                .last()
+                .is_some_and(|prev| prev.0.idb_cmp(&item.0) == Ordering::Equal);
+            if !dup {
+                deduped.push(item);
+            }
+        }
+        keys_only = deduped;
+    }
+
+    let mut remaining = match *step {
+        CursorStepRequest::Advance(n) => n.max(1),
+        _ => 1,
+    };
+
+    for (ik, pk, pk_bytes) in keys_only {
+        if let Some((ck, cpk)) = cur_pos {
+            let past_cur = match dir {
+                CursorDirection::Next => match ik.idb_cmp(ck) {
+                    Ordering::Greater => true,
+                    Ordering::Equal => pk.idb_cmp(cpk) == Ordering::Greater,
+                    Ordering::Less => false,
+                },
+                CursorDirection::NextUnique => ik.idb_cmp(ck) == Ordering::Greater,
+                CursorDirection::Prev => match ik.idb_cmp(ck) {
+                    Ordering::Less => true,
+                    Ordering::Equal => pk.idb_cmp(cpk) == Ordering::Less,
+                    Ordering::Greater => false,
+                },
+                CursorDirection::PrevUnique => ik.idb_cmp(ck) == Ordering::Less,
+            };
+            if !past_cur {
+                continue;
+            }
+        }
+        match step {
+            CursorStepRequest::Initial
+            | CursorStepRequest::Continue(None)
+            | CursorStepRequest::Advance(_) => {}
+            CursorStepRequest::Continue(Some(tk)) => {
+                let reached = if dir.is_reverse() {
+                    ik.idb_cmp(tk) != Ordering::Greater
+                } else {
+                    ik.idb_cmp(tk) != Ordering::Less
+                };
+                if !reached {
+                    continue;
+                }
+            }
+            CursorStepRequest::ContinuePrimaryKey(tk, tpk) => {
+                let cmp_k = ik.idb_cmp(tk);
+                let cmp_pk = pk.idb_cmp(tpk);
+                let reached = if dir.is_reverse() {
+                    cmp_k == Ordering::Less
+                        || (cmp_k == Ordering::Equal && cmp_pk != Ordering::Greater)
+                } else {
+                    cmp_k == Ordering::Greater
+                        || (cmp_k == Ordering::Equal && cmp_pk != Ordering::Less)
+                };
+                if !reached {
+                    continue;
+                }
+            }
+        }
+        remaining -= 1;
+        if remaining == 0 {
+            let rec = store.records.get(pk_bytes)?;
+            return Some(IdbCursorEntry {
+                key: ik,
+                primary_key: pk,
+                value_bytes: if key_only {
+                    Vec::new()
+                } else {
+                    rec.value_bytes.clone()
+                },
+                value_json: if key_only {
+                    String::new()
+                } else {
+                    rec.value_json.clone()
+                },
+            });
+        }
+    }
+    None
 }
 
 /// Collects matching primary-key records from `store` in cursor `dir` order.
