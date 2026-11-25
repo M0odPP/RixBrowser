@@ -8,21 +8,18 @@ use rix_js::heap::PrivateEntry;
 use rix_js::promise::{alloc_promise, promise_resolve_value, promise_then, reject_promise};
 use rix_js::{HeapHandle, JsException, JsValue, JsVm, ObjectKind, PromiseState, PropertyAttrs};
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct QueueEntry {
     pub(crate) value: JsValue,
     pub(crate) size: f64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct QueueWithSizes {
     pub(crate) entries: VecDeque<QueueEntry>,
     pub(crate) total_size: f64,
 }
 
-#[allow(dead_code)]
 impl QueueWithSizes {
     pub(crate) fn new() -> Self {
         Self {
@@ -83,7 +80,6 @@ pub(crate) fn promise_is_pending(vm: &JsVm, p: HeapHandle) -> bool {
     )
 }
 
-#[allow(dead_code)]
 pub(crate) fn promise_map_to_undefined(vm: &mut JsVm, p: HeapHandle) -> HeapHandle {
     let on_ok = vm.alloc_host_fn("stream_map_undef", |_, _, _| Ok(JsValue::UNDEFINED));
     promise_then(vm, p, Some(on_ok), None)
