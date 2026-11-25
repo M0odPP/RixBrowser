@@ -235,6 +235,7 @@ pub struct StyleContext {
     pseudo_styles: FastMap<(NodeId, RixPseudoElement), Arc<ComputedStyle>>,
     inline_color_exprs: FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
     before_change_styles: FastMap<NodeId, Arc<ComputedStyle>>,
+    pre_anim_styles: FastMap<NodeId, Arc<ComputedStyle>>,
     active_transitions: FastMap<NodeId, Vec<ActiveTransition>>,
     web_animations: FastMap<NodeId, Vec<WebAnimationSpec>>,
     animation_clock_ms: f32,
@@ -271,6 +272,7 @@ impl StyleContext {
             pseudo_styles: FastMap::default(),
             inline_color_exprs: FastMap::default(),
             before_change_styles: FastMap::default(),
+            pre_anim_styles: FastMap::default(),
             active_transitions: FastMap::default(),
             web_animations: FastMap::default(),
             animation_clock_ms: 0.0,
@@ -302,6 +304,7 @@ impl StyleContext {
             pseudo_styles: FastMap::default(),
             inline_color_exprs: FastMap::default(),
             before_change_styles: FastMap::default(),
+            pre_anim_styles: FastMap::default(),
             active_transitions: FastMap::default(),
             web_animations: FastMap::default(),
             animation_clock_ms: 0.0,
@@ -330,6 +333,15 @@ impl StyleContext {
         if let Some(seed) = snap.random_doc_seed {
             self.random_doc_seed = seed;
             self.rule_index.random_doc_seed = seed;
+        }
+    }
+
+    /// Replaces the entire list of Web Animations attached to `node`.
+    pub fn set_web_animations_for_node(&mut self, node: NodeId, anims: Vec<WebAnimationSpec>) {
+        if anims.is_empty() {
+            self.web_animations.remove(&node);
+        } else {
+            self.web_animations.insert(node, anims);
         }
     }
 
@@ -734,15 +746,14 @@ impl StyleContext {
                     .insert(DirtyFlags::SELF_LAYOUT_DIRTY | DirtyFlags::PAINT_DIRTY);
             }
         }
+        for ((id, pe), style) in pseudo_results {
+            self.pseudo_styles.insert((id, pe), style);
+        }
         self.apply_post_cascade_animations(doc, &styled_ids, None);
         doc.clear_dirty_flags(
             doc_root,
             DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::DESCENDANT_STYLE_DIRTY,
         );
-
-        for ((id, pe), style) in pseudo_results {
-            self.pseudo_styles.insert((id, pe), style);
-        }
         for feat in missing_local {
             if self.missing_seen.insert(feat.clone()) {
                 self.missing_features.push(feat);
@@ -862,6 +873,11 @@ impl StyleContext {
             let parent_style = doc.parent(id).and_then(|pid| self.styles.get(&pid)).cloned();
             let before = self.before_change_styles.get(&id).cloned();
             let web_slice = self.web_animations.get(&id).cloned();
+            if has_web {
+                self.pre_anim_styles.insert(id, Arc::clone(&base_style));
+            } else {
+                self.pre_anim_styles.remove(&id);
+            }
             let mut active_trs = self.active_transitions.remove(&id).unwrap_or_default();
             let final_style = apply_animations_and_transitions(
                 Arc::clone(&base_style), parent_style.as_deref(), dark_mode, elapsed_ms,
@@ -872,9 +888,71 @@ impl StyleContext {
             if let Some(dirty_out) = extra_layout_dirty.as_deref_mut() {
                 if before.as_deref() != Some(&*final_style) || final_style != base_style { dirty_out.push(id); }
             }
+            // Apply pseudo-element targeted Web Animations onto `self.pseudo_styles`.
+            if let Some(ref wanims) = web_slice {
+                for &(pe_name, pe_kind) in &[
+                    ("::before", RixPseudoElement::Before),
+                    ("::after", RixPseudoElement::After),
+                    ("::marker", RixPseudoElement::Marker),
+                    ("::first-line", RixPseudoElement::FirstLine),
+                    ("::first-letter", RixPseudoElement::FirstLetter),
+                    ("::backdrop", RixPseudoElement::Backdrop),
+                    ("::placeholder", RixPseudoElement::Placeholder),
+                ] {
+                    if wanims.iter().any(|w| w.pseudo_element.as_deref() == Some(pe_name) && !w.cancelled && !w.removed) {
+                        let base_pe = self
+                            .pseudo_styles
+                            .get(&(id, pe_kind))
+                            .cloned()
+                            .unwrap_or_else(|| Arc::new(ComputedStyle::inherit_from(&final_style)));
+                        let animated_pe = crate::animations::apply_web_animations_for_pseudo(
+                            base_pe,
+                            Some(&final_style),
+                            dark_mode,
+                            wanims,
+                            pe_name,
+                            &self.rule_index.registered_properties,
+                        );
+                        self.pseudo_styles.insert((id, pe_kind), animated_pe);
+                    }
+                }
+            }
             self.before_change_styles.insert(id, Arc::clone(&final_style));
             self.styles.insert(id, final_style);
         }
+    }
+
+    /// Evaluates the computed style of `id` applying only Web Animations up to and including
+    /// `commit_anim_id` (with W3C Web Animations §4.4.17 `commitStyles` inclusive boundary fill).
+    #[must_use]
+    pub fn compute_style_for_web_anim_commit(
+        &self,
+        doc: &Document,
+        id: NodeId,
+        commit_anim_id: u64,
+    ) -> Option<Arc<ComputedStyle>> {
+        let base_style = self
+            .pre_anim_styles
+            .get(&id)
+            .or_else(|| self.styles.get(&id))
+            .cloned()?;
+        let parent_style = doc
+            .parent(id)
+            .and_then(|pid| self.styles.get(&pid))
+            .cloned();
+        let web_slice = self
+            .web_animations
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        Some(crate::animations::apply_web_animations_for_commit(
+            base_style,
+            parent_style.as_deref(),
+            self.media.dark_mode,
+            web_slice,
+            commit_anim_id,
+            &self.rule_index.registered_properties,
+        ))
     }
 }
 

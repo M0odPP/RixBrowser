@@ -1515,6 +1515,16 @@ impl HostState {
         self.style_ctx.clear_inline_color_exprs(node);
     }
 
+    /// Replaces the entire list of Web Animations on `node` and marks it dirty.
+    pub fn set_web_animations_for_node(
+        &mut self,
+        node: NodeId,
+        anims: Vec<rix_css::WebAnimationSpec>,
+    ) {
+        self.style_ctx.set_web_animations_for_node(node, anims);
+        self.mark_node_style_dirty(node);
+    }
+
     /// Attaches a Web Animation (`Element.prototype.animate`) to `node` and marks it dirty.
     pub fn add_web_animation(&mut self, node: NodeId, mut anim: rix_css::WebAnimationSpec) -> u64 {
         let id = self.next_web_anim_id;
@@ -1543,6 +1553,19 @@ impl HostState {
     #[must_use]
     pub fn all_web_animations(&self) -> Vec<(NodeId, rix_css::WebAnimationSpec)> {
         self.style_ctx.all_web_animations()
+    }
+
+    /// Computes `node`'s style for `Animation.prototype.commitStyles()` (applying only animations
+    /// up to and including `commit_anim_id` with CSSWG #5394 inclusive active-interval endpoints).
+    pub fn compute_style_for_web_anim_commit(
+        &mut self,
+        node: NodeId,
+        commit_anim_id: u64,
+    ) -> Option<Arc<ComputedStyle>> {
+        let _ = self.ensure_styles();
+        let doc = self.document.borrow();
+        self.style_ctx
+            .compute_style_for_web_anim_commit(&doc, node, commit_anim_id)
     }
 
     /// Marks `node` and its ancestors dirty for style/layout recalculation.

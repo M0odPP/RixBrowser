@@ -6546,30 +6546,7 @@ fn format_computed_property_resolved(
                         parts.push(format!("{}s", format_num(dur_s)));
                     }
                     if !is_def_timing {
-                        parts.push(match t.timing {
-                            rix_css::TimingFunction::Linear => "linear".to_string(),
-                            rix_css::TimingFunction::Ease => "ease".to_string(),
-                            rix_css::TimingFunction::EaseIn => "ease-in".to_string(),
-                            rix_css::TimingFunction::EaseOut => "ease-out".to_string(),
-                            rix_css::TimingFunction::EaseInOut => "ease-in-out".to_string(),
-                            rix_css::TimingFunction::CubicBezier(a, b, c, d) => {
-                                use rix_css::values_math::format_math_f64;
-                                format!(
-                                    "cubic-bezier({}, {}, {}, {})",
-                                    format_math_f64(a),
-                                    format_math_f64(b),
-                                    format_math_f64(c),
-                                    format_math_f64(d)
-                                )
-                            }
-                            rix_css::TimingFunction::Steps(n, start) => {
-                                if start {
-                                    format!("steps({n}, start)")
-                                } else {
-                                    format!("steps({n})")
-                                }
-                            }
-                        });
+                        parts.push(t.timing.to_css_string());
                     }
                     if del_s != 0.0 {
                         parts.push(format!("{}s", format_num(del_s)));
@@ -7116,30 +7093,7 @@ fn format_computed_property_resolved(
             match style.effects.as_ref().map(|e| e.transitions.as_slice()) {
                 Some(list) if !list.is_empty() => list
                     .iter()
-                    .map(|t| match t.timing {
-                        rix_css::TimingFunction::Linear => "linear".to_string(),
-                        rix_css::TimingFunction::Ease => "ease".to_string(),
-                        rix_css::TimingFunction::EaseIn => "ease-in".to_string(),
-                        rix_css::TimingFunction::EaseOut => "ease-out".to_string(),
-                        rix_css::TimingFunction::EaseInOut => "ease-in-out".to_string(),
-                        rix_css::TimingFunction::CubicBezier(a, b, c, d) => {
-                            use rix_css::values_math::format_math_f64;
-                            format!(
-                                "cubic-bezier({}, {}, {}, {})",
-                                format_math_f64(a),
-                                format_math_f64(b),
-                                format_math_f64(c),
-                                format_math_f64(d)
-                            )
-                        }
-                        rix_css::TimingFunction::Steps(n, start) => {
-                            if start {
-                                format!("steps({n}, start)")
-                            } else {
-                                format!("steps({n})")
-                            }
-                        }
-                    })
+                    .map(|t| t.timing.to_css_string())
                     .collect::<Vec<_>>()
                     .join(", "),
                 _ => "ease".into(),
@@ -7422,6 +7376,7 @@ fn parse_js_keyframes(vm: &mut JsVm, val: JsValue) -> Vec<rix_css::WebAnimationK
             }
             rix_css::WebAnimationKeyframe {
                 offset: None,
+                computed_offset: f64::NAN,
                 composite: None,
                 easing: None,
                 declarations,
@@ -7467,6 +7422,7 @@ fn parse_single_js_keyframe(vm: &mut JsVm, item_h: HeapHandle) -> rix_css::WebAn
     }
     rix_css::WebAnimationKeyframe {
         offset,
+        computed_offset: f64::NAN,
         composite,
         easing,
         declarations,
@@ -7476,16 +7432,18 @@ fn parse_single_js_keyframe(vm: &mut JsVm, item_h: HeapHandle) -> rix_css::WebAn
 #[rustfmt::skip]
 fn parse_js_animation_options(vm: &mut JsVm, opts_val: JsValue) -> rix_css::WebAnimationSpec {
     let mut spec = rix_css::WebAnimationSpec {
-        id: 0, keyframes: Vec::new(), duration_ms: 0.0, delay_ms: 0.0,
-        timing: rix_css::TimingFunction::Linear, iteration_count: 1.0,
+        id: 0, keyframes: Vec::new(), duration_ms: 0.0, delay_ms: 0.0, end_delay_ms: 0.0,
+        iteration_start: 0.0, timing: rix_css::TimingFunction::Linear, iteration_count: 1.0,
         direction: rix_css::AnimationDirectionMode::Normal,
-        fill_mode: rix_css::AnimationFillModeKind::None,
+        fill_mode: rix_css::AnimationFillModeKind::None, fill_is_auto: false,
         play_state: rix_css::AnimationPlayStateMode::Running,
         composite: rix_css::AnimationCompositionMode::Replace,
-        current_time_ms: Some(0.0), cancelled: false,
+        iteration_composite: rix_css::AnimationCompositionMode::Replace,
+        current_time_ms: Some(0.0), playback_rate: 1.0, pseudo_element: None,
+        cancelled: false, removed: false,
     };
     if let Some(n) = opts_val.to_number_f64() {
-        if n.is_finite() && n >= 0.0 { spec.duration_ms = n as f32; }
+        if n.is_finite() && n >= 0.0 { spec.duration_ms = n; }
         return spec;
     }
     let Some(oh) = opts_val.as_object() else { return spec; };
@@ -7493,9 +7451,9 @@ fn parse_js_animation_options(vm: &mut JsVm, opts_val: JsValue) -> rix_css::WebA
         let k = vm.heap.intern_key(name);
         vm.get_property_by_key(oh, k).ok().filter(|v| !v.is_undefined() && !v.is_null())
     };
-    if let Some(n) = get(vm, "duration").and_then(|v| v.to_number_f64()).filter(|n| n.is_finite() && *n >= 0.0) { spec.duration_ms = n as f32; }
-    if let Some(n) = get(vm, "delay").and_then(|v| v.to_number_f64()).filter(|n| n.is_finite()) { spec.delay_ms = n as f32; }
-    if let Some(n) = get(vm, "iterations").and_then(|v| v.to_number_f64()).filter(|n| *n >= 0.0) { spec.iteration_count = n as f32; }
+    if let Some(n) = get(vm, "duration").and_then(|v| v.to_number_f64()).filter(|n| n.is_finite() && *n >= 0.0) { spec.duration_ms = n; }
+    if let Some(n) = get(vm, "delay").and_then(|v| v.to_number_f64()).filter(|n| n.is_finite()) { spec.delay_ms = n; }
+    if let Some(n) = get(vm, "iterations").and_then(|v| v.to_number_f64()).filter(|n| *n >= 0.0) { spec.iteration_count = n; }
     if let Some(v) = get(vm, "easing") {
         if let Some((tf, _)) = rix_css::parse_single_timing_function(&vm.value_to_rust_string(v)) { spec.timing = tf; }
     }
@@ -7555,12 +7513,12 @@ fn create_js_animation_handle(
         Ok(JsValue::undefined())
     });
     let s_get = Rc::clone(&state);
-    let g_ct = vm.alloc_host_fn("get currentTime", move |_, _, _| Ok(JsValue::from_f64(f64::from(s_get.borrow().0))));
+    let g_ct = vm.alloc_host_fn("get currentTime", move |_, _, _| Ok(JsValue::from_f64(s_get.borrow().0)));
     let (h_set, s_set) = (Rc::clone(host), Rc::clone(&state));
     let s_ct = vm.alloc_host_fn("set currentTime", move |_, _, args| {
         if let Some(n) = arg(args, 0).to_number_f64().filter(|n| n.is_finite()) {
-            s_set.borrow_mut().0 = n as f32;
-            h_set.borrow_mut().update_web_animation(node, anim_id, |a| a.current_time_ms = Some(n as f32));
+            s_set.borrow_mut().0 = n;
+            h_set.borrow_mut().update_web_animation(node, anim_id, |a| a.current_time_ms = Some(n));
         }
         Ok(JsValue::undefined())
     });

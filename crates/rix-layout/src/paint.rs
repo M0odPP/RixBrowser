@@ -341,7 +341,7 @@ impl<'a> Painter<'a> {
                             direction: to_anim_direction(spec.direction),
                             fill_mode: to_anim_fill(spec.fill_mode),
                             paused: spec.play_state == AnimationPlayStateMode::Paused,
-                            timing: to_timing_curve(spec.timing),
+                            timing: to_timing_curve(&spec.timing),
                             target: AnimationTarget::Transform {
                                 spatial: SpatialNodeId(0), // patched right after node allocation
                                 keyframes: tf_kfs,
@@ -363,7 +363,7 @@ impl<'a> Painter<'a> {
                         direction: to_anim_direction(spec.direction),
                         fill_mode: to_anim_fill(spec.fill_mode),
                         paused: spec.play_state == AnimationPlayStateMode::Paused,
-                        timing: to_timing_curve(spec.timing),
+                        timing: to_timing_curve(&spec.timing),
                         target: AnimationTarget::Opacity { keyframes: op_kfs },
                     });
                 }
@@ -1701,7 +1701,7 @@ fn linear_gradient_endpoints(rect: Rect, angle_deg: f32) -> (Point, Point) {
     )
 }
 
-fn to_timing_curve(t: TimingFunction) -> TimingCurve {
+fn to_timing_curve(t: &TimingFunction) -> TimingCurve {
     match t {
         TimingFunction::Linear => TimingCurve::Linear,
         TimingFunction::Ease => TimingCurve::Ease,
@@ -1709,9 +1709,18 @@ fn to_timing_curve(t: TimingFunction) -> TimingCurve {
         TimingFunction::EaseOut => TimingCurve::EaseOut,
         TimingFunction::EaseInOut => TimingCurve::EaseInOut,
         TimingFunction::CubicBezier(x1, y1, x2, y2) => {
-            TimingCurve::CubicBezier(x1 as f32, y1 as f32, x2 as f32, y2 as f32)
+            TimingCurve::CubicBezier(*x1 as f32, *y1 as f32, *x2 as f32, *y2 as f32)
         }
-        TimingFunction::Steps(c, s) => TimingCurve::Steps(c, s),
+        TimingFunction::Steps(c, pos) => TimingCurve::Steps(
+            *c,
+            matches!(
+                pos,
+                rix_css::StepPositionMode::Start
+                    | rix_css::StepPositionMode::JumpStart
+                    | rix_css::StepPositionMode::JumpBoth
+            ),
+        ),
+        TimingFunction::LinearStops(_) => TimingCurve::Linear,
     }
 }
 
