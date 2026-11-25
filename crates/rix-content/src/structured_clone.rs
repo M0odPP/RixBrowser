@@ -203,6 +203,24 @@ pub(crate) enum CloneNode {
     TransferredPort {
         port_index: usize,
     },
+    DomPoint {
+        readonly: bool,
+        x: f64,
+        y: f64,
+        z: f64,
+        w: f64,
+    },
+    DomRect {
+        readonly: bool,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    },
+    DomMatrix {
+        readonly: bool,
+        m: [f64; 16],
+    },
 }
 
 /// Runtime context needed during structured serialization and deserialization.
@@ -377,7 +395,7 @@ pub(crate) fn serialize_with_transfer(
         }
     }
 
-    let root = serialize_value(vm, ctx, value, &mut nodes, &mut memo, &transfer_set)?;
+    let root = serialize_value(vm, ctx, value, &mut nodes, &mut memo, &transfer_set, false)?;
 
     // 3. Commit transfers (detach ArrayBuffers, ImageBitmaps, OffscreenCanvases, and MessagePorts).
     let local_async_tx = ctx.workers.borrow().async_tx_clone();
@@ -424,6 +442,37 @@ pub(crate) fn serialize_with_transfer(
         nodes,
         transferred_ports,
     })
+}
+
+/// Performs WHATWG HTML §2.7.4 `StructuredSerializeForStorage` (rejecting
+/// `SharedArrayBuffer`, `MessagePort`, `ImageBitmap`, `OffscreenCanvas`, functions,
+/// symbols, and non-serializable platform objects with `DataCloneError`).
+#[allow(dead_code)]
+pub(crate) fn serialize_for_storage(
+    vm: &mut JsVm,
+    ctx: &CloneContext<'_>,
+    value: JsValue,
+) -> Result<StructuredClonePayload, JsException> {
+    let mut nodes: Vec<CloneNode> = Vec::new();
+    let mut memo: HashMap<HeapHandle, usize> = HashMap::new();
+    let transfer_set: HashSet<HeapHandle> = HashSet::new();
+    let root = serialize_value(vm, ctx, value, &mut nodes, &mut memo, &transfer_set, true)?;
+    Ok(StructuredClonePayload {
+        root,
+        nodes,
+        transferred_ports: Vec::new(),
+    })
+}
+
+/// Deserializes a storage [`StructuredClonePayload`] back into fresh JS values on `vm`,
+/// bypassing `Object.prototype` and `Array.prototype` setters per WebIDL / IndexedDB spec.
+#[allow(dead_code)]
+pub(crate) fn deserialize_for_storage(
+    vm: &mut JsVm,
+    ctx: &CloneContext<'_>,
+    payload: &StructuredClonePayload,
+) -> JsValue {
+    deserialize_payload_ref(vm, ctx, payload, &[])
 }
 
 fn is_non_serializable_platform_object(vm: &JsVm, ctx: &CloneContext<'_>, h: HeapHandle) -> bool {
@@ -534,6 +583,7 @@ fn serialize_value(
     nodes: &mut Vec<CloneNode>,
     memo: &mut HashMap<HeapHandle, usize>,
     transfer_set: &HashSet<HeapHandle>,
+    for_storage: bool,
 ) -> Result<CloneValue, JsException> {
     if val.is_undefined() {
         return Ok(CloneValue::Undefined);
@@ -644,8 +694,15 @@ fn serialize_value(
         return Ok(CloneValue::Node(idx));
     }
 
-    // 4. ImageBitmap
+    // 4. ImageBitmap (NOT serializable for storage per HTML §2.7.4)
     if let Some(ib) = ctx.canvas2d.borrow().image_bitmaps.get(&h).cloned() {
+        if for_storage {
+            return Err(create_dom_exception(
+                vm,
+                "DataCloneError",
+                "ImageBitmap cannot be serialized for storage",
+            ));
+        }
         if ib.closed {
             return Err(create_dom_exception(
                 vm,
@@ -680,6 +737,66 @@ fn serialize_value(
         });
         memo.insert(h, idx);
         return Ok(CloneValue::Node(idx));
+    }
+
+    // 5b. Geometry Interfaces Level 1 ([Serializable]: DOMPoint*, DOMRect*, DOMMatrix*)
+    {
+        let obj_proto = vm.heap.get_object(h).and_then(|o| o.prototype);
+        let geom_match = {
+            let st = ctx.host.borrow();
+            let gs = st.cssom_geometry_state.borrow();
+            if obj_proto.is_some() && obj_proto == gs.dom_point_proto {
+                Some(1u8)
+            } else if obj_proto.is_some() && obj_proto == gs.dom_point_readonly_proto {
+                Some(2)
+            } else if obj_proto.is_some() && obj_proto == gs.dom_rect_proto {
+                Some(3)
+            } else if obj_proto.is_some() && obj_proto == gs.dom_rect_readonly_proto {
+                Some(4)
+            } else if obj_proto.is_some() && obj_proto == gs.dom_matrix_proto {
+                Some(5)
+            } else if obj_proto.is_some() && obj_proto == gs.dom_matrix_readonly_proto {
+                Some(6)
+            } else {
+                None
+            }
+        };
+        if let Some(tag) = geom_match {
+            let idx = nodes.len();
+            let read_num = |vm: &mut JsVm, kname: &str, def: f64| -> f64 {
+                let k = vm.heap.intern_key(kname);
+                vm.heap
+                    .object_get_own(h, k, &vm.shapes)
+                    .and_then(|p| p.value.as_number())
+                    .unwrap_or(def)
+            };
+            let node = match tag {
+                1 | 2 => CloneNode::DomPoint {
+                    readonly: tag == 2,
+                    x: read_num(vm, "x", 0.0),
+                    y: read_num(vm, "y", 0.0),
+                    z: read_num(vm, "z", 0.0),
+                    w: read_num(vm, "w", 1.0),
+                },
+                3 | 4 => CloneNode::DomRect {
+                    readonly: tag == 4,
+                    x: read_num(vm, "x", 0.0),
+                    y: read_num(vm, "y", 0.0),
+                    width: read_num(vm, "width", 0.0),
+                    height: read_num(vm, "height", 0.0),
+                },
+                _ => {
+                    let m = crate::cssom_geometry::read_dom_matrix(vm, h)?;
+                    CloneNode::DomMatrix {
+                        readonly: tag == 6,
+                        m,
+                    }
+                }
+            };
+            nodes.push(node);
+            memo.insert(h, idx);
+            return Ok(CloneValue::Node(idx));
+        }
     }
 
     // 6. Boxed primitives (Boolean / Number / String / BigInt; Symbol throws DataCloneError)
@@ -761,6 +878,7 @@ fn serialize_value(
                         nodes,
                         memo,
                         transfer_set,
+                        for_storage,
                     )?)
                 } else {
                     None
@@ -822,7 +940,8 @@ fn serialize_value(
             for key_s in keys {
                 let k = vm.heap.intern_key(&key_s);
                 let prop_val = vm.get_property_by_key(h, k)?;
-                let cloned = serialize_value(vm, ctx, prop_val, nodes, memo, transfer_set)?;
+                let cloned =
+                    serialize_value(vm, ctx, prop_val, nodes, memo, transfer_set, for_storage)?;
                 if let Ok(i) = key_s.parse::<u32>() {
                     if i.to_string() == key_s && i < arr_len {
                         indexed.push((i, cloned));
@@ -860,6 +979,13 @@ fn serialize_value(
             }
             let idx = nodes.len();
             if let Some(backing) = shared_mem {
+                if for_storage {
+                    return Err(create_dom_exception(
+                        vm,
+                        "DataCloneError",
+                        "SharedArrayBuffer cannot be serialized for storage",
+                    ));
+                }
                 if !ctx.web_apis.borrow().cross_origin_isolated {
                     return Err(create_dom_exception(
                         vm,
@@ -917,6 +1043,7 @@ fn serialize_value(
                 nodes,
                 memo,
                 transfer_set,
+                for_storage,
             )?
             else {
                 return Err(create_dom_exception(
@@ -974,6 +1101,7 @@ fn serialize_value(
                 nodes,
                 memo,
                 transfer_set,
+                for_storage,
             )?
             else {
                 return Err(create_dom_exception(
@@ -1022,8 +1150,8 @@ fn serialize_value(
             };
             let mut entries = Vec::with_capacity(raw_entries.len());
             for (k, v) in raw_entries {
-                let ck = serialize_value(vm, ctx, k, nodes, memo, transfer_set)?;
-                let cv = serialize_value(vm, ctx, v, nodes, memo, transfer_set)?;
+                let ck = serialize_value(vm, ctx, k, nodes, memo, transfer_set, for_storage)?;
+                let cv = serialize_value(vm, ctx, v, nodes, memo, transfer_set, for_storage)?;
                 entries.push((ck, cv));
             }
             nodes[idx] = CloneNode::Map { entries };
@@ -1039,7 +1167,15 @@ fn serialize_value(
             };
             let mut items = Vec::with_capacity(raw_items.len());
             for item in raw_items {
-                items.push(serialize_value(vm, ctx, item, nodes, memo, transfer_set)?);
+                items.push(serialize_value(
+                    vm,
+                    ctx,
+                    item,
+                    nodes,
+                    memo,
+                    transfer_set,
+                    for_storage,
+                )?);
             }
             nodes[idx] = CloneNode::Set { items };
             Ok(CloneValue::Node(idx))
@@ -1053,7 +1189,8 @@ fn serialize_value(
             for key_s in keys {
                 let k = vm.heap.intern_key(&key_s);
                 let prop_val = vm.get_property_by_key(h, k)?;
-                let cloned = serialize_value(vm, ctx, prop_val, nodes, memo, transfer_set)?;
+                let cloned =
+                    serialize_value(vm, ctx, prop_val, nodes, memo, transfer_set, for_storage)?;
                 props.push((key_s, cloned));
             }
             nodes[idx] = CloneNode::Object { props };
@@ -1121,6 +1258,25 @@ pub(crate) fn deserialize_payload(
         attached_ports.push(port_h);
     }
 
+    let root_val = deserialize_payload_ref(
+        vm,
+        ctx,
+        &StructuredClonePayload {
+            root: payload.root,
+            nodes: payload.nodes,
+            transferred_ports: Vec::new(),
+        },
+        &attached_ports,
+    );
+    (root_val, attached_ports)
+}
+
+fn deserialize_payload_ref(
+    vm: &mut JsVm,
+    ctx: &CloneContext<'_>,
+    payload: &StructuredClonePayload,
+    attached_ports: &[HeapHandle],
+) -> JsValue {
     // 2. Two-pass graph reconstruction so circular references resolve accurately.
     let n = payload.nodes.len();
     let mut handles: Vec<Option<HeapHandle>> = vec![None; n];
@@ -1379,6 +1535,25 @@ pub(crate) fn deserialize_payload(
                 .get(*port_index)
                 .copied()
                 .unwrap_or_else(|| vm.alloc_ordinary_object()),
+            CloneNode::DomPoint {
+                readonly,
+                x,
+                y,
+                z,
+                w,
+            } => crate::cssom_geometry::alloc_dom_point(vm, ctx.host, *readonly, *x, *y, *z, *w),
+            CloneNode::DomRect {
+                readonly,
+                x,
+                y,
+                width,
+                height,
+            } => crate::cssom_geometry::alloc_dom_rect_f64(
+                vm, ctx.host, *readonly, *x, *y, *width, *height,
+            ),
+            CloneNode::DomMatrix { readonly, m } => {
+                crate::cssom_geometry::alloc_dom_matrix(vm, ctx.host, *readonly, *m)
+            }
         };
         handles[idx] = Some(h);
     }
@@ -1452,14 +1627,21 @@ pub(crate) fn deserialize_payload(
         let Some(h) = handles[idx] else { continue };
         match node {
             CloneNode::Array {
+                length,
                 indexed,
                 extra_props,
-                ..
             } => {
                 for (i, cv) in indexed {
                     let v = materialize_value(vm, cv, &handles);
-                    let k = vm.heap.intern_key(&i.to_string());
-                    let _ = vm.set_property_by_key(h, k, v);
+                    if let Some(o) = vm.heap.get_object_mut(h) {
+                        o.elements.set(*i, v);
+                    }
+                    vm.heap.write_barrier(h, v);
+                }
+                if let Some(o) = vm.heap.get_object_mut(h) {
+                    if o.elements.len() < *length {
+                        o.elements.set_len(*length);
+                    }
                 }
                 for (k_s, cv) in extra_props {
                     let v = materialize_value(vm, cv, &handles);
@@ -1514,8 +1696,7 @@ pub(crate) fn deserialize_payload(
         }
     }
 
-    let root_val = materialize_value(vm, &payload.root, &handles);
-    (root_val, attached_ports)
+    materialize_value(vm, &payload.root, &handles)
 }
 
 fn materialize_value(vm: &mut JsVm, val: &CloneValue, handles: &[Option<HeapHandle>]) -> JsValue {
@@ -1534,4 +1715,537 @@ fn materialize_value(vm: &mut JsVm, val: &CloneValue, handles: &[Option<HeapHand
             .and_then(|o| *o)
             .map_or(JsValue::NULL, JsValue::from_object),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Compact binary codec for persistent IndexedDB structured-clone values
+// ---------------------------------------------------------------------------
+
+const SC_BIN_MAGIC: &[u8; 7] = b"RIXSC01";
+
+fn sc_write_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn sc_write_f64(out: &mut Vec<u8>, v: f64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn sc_write_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    sc_write_u32(out, b.len() as u32);
+    out.extend_from_slice(b);
+}
+
+fn sc_write_str(out: &mut Vec<u8>, s: &str) {
+    sc_write_bytes(out, s.as_bytes());
+}
+
+fn sc_write_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        None => out.push(0),
+        Some(v) => {
+            out.push(1);
+            sc_write_str(out, v);
+        }
+    }
+}
+
+fn sc_write_val(out: &mut Vec<u8>, v: &CloneValue) {
+    match v {
+        CloneValue::Undefined => out.push(0),
+        CloneValue::Null => out.push(1),
+        CloneValue::Bool(false) => out.push(2),
+        CloneValue::Bool(true) => out.push(3),
+        CloneValue::Number(n) => {
+            out.push(4);
+            sc_write_f64(out, *n);
+        }
+        CloneValue::String(s) => {
+            out.push(5);
+            sc_write_str(out, s);
+        }
+        CloneValue::BigInt(s) => {
+            out.push(6);
+            sc_write_str(out, s);
+        }
+        CloneValue::Node(idx) => {
+            out.push(7);
+            sc_write_u32(out, *idx as u32);
+        }
+    }
+}
+
+/// Serializes a storage [`StructuredClonePayload`] into compact exact binary bytes
+/// (exact IEEE-754 float bits, raw `Vec<u8>` buffers/Blobs, full cyclic object graph).
+#[allow(dead_code)]
+pub(crate) fn encode_storage_payload(payload: &StructuredClonePayload) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(SC_BIN_MAGIC);
+    sc_write_val(&mut out, &payload.root);
+    sc_write_u32(&mut out, payload.nodes.len() as u32);
+    for node in &payload.nodes {
+        match node {
+            CloneNode::Placeholder => out.push(0),
+            CloneNode::BoxedBool(b) => {
+                out.push(1);
+                out.push(u8::from(*b));
+            }
+            CloneNode::BoxedNumber(n) => {
+                out.push(2);
+                sc_write_f64(&mut out, *n);
+            }
+            CloneNode::BoxedString(s) => {
+                out.push(3);
+                sc_write_str(&mut out, s);
+            }
+            CloneNode::BoxedBigInt(s) => {
+                out.push(4);
+                sc_write_str(&mut out, s);
+            }
+            CloneNode::Date(ms) => {
+                out.push(5);
+                sc_write_f64(&mut out, *ms);
+            }
+            CloneNode::RegExp { pattern, flags } => {
+                out.push(6);
+                sc_write_str(&mut out, pattern);
+                sc_write_str(&mut out, flags);
+            }
+            CloneNode::Error {
+                kind,
+                name,
+                message,
+                cause,
+                stack,
+            } => {
+                out.push(7);
+                let tag: u8 = match kind {
+                    ErrorCloneKind::Error => 0,
+                    ErrorCloneKind::EvalError => 1,
+                    ErrorCloneKind::RangeError => 2,
+                    ErrorCloneKind::ReferenceError => 3,
+                    ErrorCloneKind::SyntaxError => 4,
+                    ErrorCloneKind::TypeError => 5,
+                    ErrorCloneKind::URIError => 6,
+                    ErrorCloneKind::DOMException => 7,
+                };
+                out.push(tag);
+                sc_write_opt_str(&mut out, name.as_deref());
+                sc_write_opt_str(&mut out, message.as_deref());
+                match cause {
+                    None => out.push(0),
+                    Some(cv) => {
+                        out.push(1);
+                        sc_write_val(&mut out, cv);
+                    }
+                }
+                sc_write_opt_str(&mut out, stack.as_deref());
+            }
+            CloneNode::ArrayBuffer {
+                bytes,
+                max_byte_length,
+            } => {
+                out.push(8);
+                sc_write_bytes(&mut out, bytes);
+                match max_byte_length {
+                    None => out.push(0),
+                    Some(ml) => {
+                        out.push(1);
+                        sc_write_u32(&mut out, *ml as u32);
+                    }
+                }
+            }
+            CloneNode::TypedArray {
+                kind,
+                buffer_node,
+                byte_offset,
+                length,
+                auto_length,
+            } => {
+                out.push(9);
+                out.push(*kind as u8);
+                sc_write_u32(&mut out, *buffer_node as u32);
+                sc_write_u32(&mut out, *byte_offset);
+                sc_write_u32(&mut out, *length);
+                out.push(u8::from(*auto_length));
+            }
+            CloneNode::DataView {
+                buffer_node,
+                byte_offset,
+                byte_length,
+                auto_length,
+            } => {
+                out.push(10);
+                sc_write_u32(&mut out, *buffer_node as u32);
+                sc_write_u32(&mut out, *byte_offset);
+                sc_write_u32(&mut out, *byte_length);
+                out.push(u8::from(*auto_length));
+            }
+            CloneNode::Array {
+                length,
+                indexed,
+                extra_props,
+            } => {
+                out.push(11);
+                sc_write_u32(&mut out, *length);
+                sc_write_u32(&mut out, indexed.len() as u32);
+                for (i, v) in indexed {
+                    sc_write_u32(&mut out, *i);
+                    sc_write_val(&mut out, v);
+                }
+                sc_write_u32(&mut out, extra_props.len() as u32);
+                for (k, v) in extra_props {
+                    sc_write_str(&mut out, k);
+                    sc_write_val(&mut out, v);
+                }
+            }
+            CloneNode::Object { props } => {
+                out.push(12);
+                sc_write_u32(&mut out, props.len() as u32);
+                for (k, v) in props {
+                    sc_write_str(&mut out, k);
+                    sc_write_val(&mut out, v);
+                }
+            }
+            CloneNode::Map { entries } => {
+                out.push(13);
+                sc_write_u32(&mut out, entries.len() as u32);
+                for (k, v) in entries {
+                    sc_write_val(&mut out, k);
+                    sc_write_val(&mut out, v);
+                }
+            }
+            CloneNode::Set { items } => {
+                out.push(14);
+                sc_write_u32(&mut out, items.len() as u32);
+                for it in items {
+                    sc_write_val(&mut out, it);
+                }
+            }
+            CloneNode::Blob {
+                bytes,
+                content_type,
+            } => {
+                out.push(15);
+                sc_write_bytes(&mut out, bytes);
+                sc_write_str(&mut out, content_type);
+            }
+            CloneNode::File {
+                bytes,
+                content_type,
+                name,
+                last_modified,
+            } => {
+                out.push(16);
+                sc_write_bytes(&mut out, bytes);
+                sc_write_str(&mut out, content_type);
+                sc_write_str(&mut out, name);
+                sc_write_f64(&mut out, *last_modified);
+            }
+            CloneNode::FileList { files } => {
+                out.push(17);
+                sc_write_u32(&mut out, files.len() as u32);
+                for (b, ct, n, lm) in files {
+                    sc_write_bytes(&mut out, b);
+                    sc_write_str(&mut out, ct);
+                    sc_write_str(&mut out, n);
+                    sc_write_f64(&mut out, *lm);
+                }
+            }
+            CloneNode::ImageData {
+                width,
+                height,
+                rgba,
+            } => {
+                out.push(18);
+                sc_write_u32(&mut out, *width);
+                sc_write_u32(&mut out, *height);
+                sc_write_bytes(&mut out, rgba);
+            }
+            CloneNode::DomPoint {
+                readonly,
+                x,
+                y,
+                z,
+                w,
+            } => {
+                out.push(19);
+                out.push(u8::from(*readonly));
+                sc_write_f64(&mut out, *x);
+                sc_write_f64(&mut out, *y);
+                sc_write_f64(&mut out, *z);
+                sc_write_f64(&mut out, *w);
+            }
+            CloneNode::DomRect {
+                readonly,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                out.push(20);
+                out.push(u8::from(*readonly));
+                sc_write_f64(&mut out, *x);
+                sc_write_f64(&mut out, *y);
+                sc_write_f64(&mut out, *width);
+                sc_write_f64(&mut out, *height);
+            }
+            CloneNode::DomMatrix { readonly, m } => {
+                out.push(21);
+                out.push(u8::from(*readonly));
+                for &v in m {
+                    sc_write_f64(&mut out, v);
+                }
+            }
+            CloneNode::SharedArrayBuffer { .. }
+            | CloneNode::ImageBitmap { .. }
+            | CloneNode::OffscreenCanvas { .. }
+            | CloneNode::TransferredPort { .. } => {
+                out.push(0);
+            }
+        }
+    }
+    out
+}
+
+struct ScReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ScReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+    fn u8(&mut self) -> Option<u8> {
+        let b = *self.buf.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+    fn u32(&mut self) -> Option<u32> {
+        let s = self.buf.get(self.pos..self.pos + 4)?;
+        self.pos += 4;
+        Some(u32::from_le_bytes(s.try_into().ok()?))
+    }
+    fn f64(&mut self) -> Option<f64> {
+        let s = self.buf.get(self.pos..self.pos + 8)?;
+        self.pos += 8;
+        Some(f64::from_le_bytes(s.try_into().ok()?))
+    }
+    fn bytes(&mut self) -> Option<Vec<u8>> {
+        let len = self.u32()? as usize;
+        let s = self.buf.get(self.pos..self.pos + len)?;
+        self.pos += len;
+        Some(s.to_vec())
+    }
+    fn str(&mut self) -> Option<String> {
+        String::from_utf8(self.bytes()?).ok()
+    }
+    fn opt_str(&mut self) -> Option<Option<String>> {
+        match self.u8()? {
+            0 => Some(None),
+            1 => Some(Some(self.str()?)),
+            _ => None,
+        }
+    }
+    fn val(&mut self) -> Option<CloneValue> {
+        match self.u8()? {
+            0 => Some(CloneValue::Undefined),
+            1 => Some(CloneValue::Null),
+            2 => Some(CloneValue::Bool(false)),
+            3 => Some(CloneValue::Bool(true)),
+            4 => Some(CloneValue::Number(self.f64()?)),
+            5 => Some(CloneValue::String(self.str()?)),
+            6 => Some(CloneValue::BigInt(self.str()?)),
+            7 => Some(CloneValue::Node(self.u32()? as usize)),
+            _ => None,
+        }
+    }
+}
+
+/// Decodes compact binary bytes back into a [`StructuredClonePayload`].
+#[allow(dead_code)]
+pub(crate) fn decode_storage_payload(raw: &[u8]) -> Option<StructuredClonePayload> {
+    if raw.len() < SC_BIN_MAGIC.len() || &raw[..SC_BIN_MAGIC.len()] != SC_BIN_MAGIC {
+        return None;
+    }
+    let mut r = ScReader::new(&raw[SC_BIN_MAGIC.len()..]);
+    let root = r.val()?;
+    let n = r.u32()? as usize;
+    let mut nodes = Vec::with_capacity(n.min(4096));
+    for _ in 0..n {
+        let node = match r.u8()? {
+            0 => CloneNode::Placeholder,
+            1 => CloneNode::BoxedBool(r.u8()? != 0),
+            2 => CloneNode::BoxedNumber(r.f64()?),
+            3 => CloneNode::BoxedString(r.str()?),
+            4 => CloneNode::BoxedBigInt(r.str()?),
+            5 => CloneNode::Date(r.f64()?),
+            6 => CloneNode::RegExp {
+                pattern: r.str()?,
+                flags: r.str()?,
+            },
+            7 => {
+                let kind = match r.u8()? {
+                    0 => ErrorCloneKind::Error,
+                    1 => ErrorCloneKind::EvalError,
+                    2 => ErrorCloneKind::RangeError,
+                    3 => ErrorCloneKind::ReferenceError,
+                    4 => ErrorCloneKind::SyntaxError,
+                    5 => ErrorCloneKind::TypeError,
+                    6 => ErrorCloneKind::URIError,
+                    7 => ErrorCloneKind::DOMException,
+                    _ => return None,
+                };
+                let name = r.opt_str()?;
+                let message = r.opt_str()?;
+                let cause = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.val()?),
+                    _ => return None,
+                };
+                let stack = r.opt_str()?;
+                CloneNode::Error {
+                    kind,
+                    name,
+                    message,
+                    cause,
+                    stack,
+                }
+            }
+            8 => {
+                let bytes = r.bytes()?;
+                let max_byte_length = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.u32()? as usize),
+                    _ => return None,
+                };
+                CloneNode::ArrayBuffer {
+                    bytes,
+                    max_byte_length,
+                }
+            }
+            9 => {
+                let kind_idx = r.u8()? as usize;
+                let kind = *TypedArrayKind::ALL.get(kind_idx)?;
+                let buffer_node = r.u32()? as usize;
+                let byte_offset = r.u32()?;
+                let length = r.u32()?;
+                let auto_length = r.u8()? != 0;
+                CloneNode::TypedArray {
+                    kind,
+                    buffer_node,
+                    byte_offset,
+                    length,
+                    auto_length,
+                }
+            }
+            10 => {
+                let buffer_node = r.u32()? as usize;
+                let byte_offset = r.u32()?;
+                let byte_length = r.u32()?;
+                let auto_length = r.u8()? != 0;
+                CloneNode::DataView {
+                    buffer_node,
+                    byte_offset,
+                    byte_length,
+                    auto_length,
+                }
+            }
+            11 => {
+                let length = r.u32()?;
+                let ilen = r.u32()? as usize;
+                let mut indexed = Vec::with_capacity(ilen.min(4096));
+                for _ in 0..ilen {
+                    indexed.push((r.u32()?, r.val()?));
+                }
+                let elen = r.u32()? as usize;
+                let mut extra_props = Vec::with_capacity(elen.min(4096));
+                for _ in 0..elen {
+                    extra_props.push((r.str()?, r.val()?));
+                }
+                CloneNode::Array {
+                    length,
+                    indexed,
+                    extra_props,
+                }
+            }
+            12 => {
+                let plen = r.u32()? as usize;
+                let mut props = Vec::with_capacity(plen.min(4096));
+                for _ in 0..plen {
+                    props.push((r.str()?, r.val()?));
+                }
+                CloneNode::Object { props }
+            }
+            13 => {
+                let elen = r.u32()? as usize;
+                let mut entries = Vec::with_capacity(elen.min(4096));
+                for _ in 0..elen {
+                    entries.push((r.val()?, r.val()?));
+                }
+                CloneNode::Map { entries }
+            }
+            14 => {
+                let ilen = r.u32()? as usize;
+                let mut items = Vec::with_capacity(ilen.min(4096));
+                for _ in 0..ilen {
+                    items.push(r.val()?);
+                }
+                CloneNode::Set { items }
+            }
+            15 => CloneNode::Blob {
+                bytes: r.bytes()?,
+                content_type: r.str()?,
+            },
+            16 => CloneNode::File {
+                bytes: r.bytes()?,
+                content_type: r.str()?,
+                name: r.str()?,
+                last_modified: r.f64()?,
+            },
+            17 => {
+                let flen = r.u32()? as usize;
+                let mut files = Vec::with_capacity(flen.min(256));
+                for _ in 0..flen {
+                    files.push((r.bytes()?, r.str()?, r.str()?, r.f64()?));
+                }
+                CloneNode::FileList { files }
+            }
+            18 => CloneNode::ImageData {
+                width: r.u32()?,
+                height: r.u32()?,
+                rgba: r.bytes()?,
+            },
+            19 => CloneNode::DomPoint {
+                readonly: r.u8()? != 0,
+                x: r.f64()?,
+                y: r.f64()?,
+                z: r.f64()?,
+                w: r.f64()?,
+            },
+            20 => CloneNode::DomRect {
+                readonly: r.u8()? != 0,
+                x: r.f64()?,
+                y: r.f64()?,
+                width: r.f64()?,
+                height: r.f64()?,
+            },
+            21 => {
+                let readonly = r.u8()? != 0;
+                let mut m = [0.0f64; 16];
+                for slot in &mut m {
+                    *slot = r.f64()?;
+                }
+                CloneNode::DomMatrix { readonly, m }
+            }
+            _ => return None,
+        };
+        nodes.push(node);
+    }
+    Some(StructuredClonePayload {
+        root,
+        nodes,
+        transferred_ports: Vec::new(),
+    })
 }

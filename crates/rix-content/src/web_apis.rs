@@ -3328,6 +3328,7 @@ fn install_form_data(vm: &mut JsVm, host: &SharedHost, web_apis: &SharedWebApis)
 fn install_blob_and_file(vm: &mut JsVm, host: &SharedHost, web_apis: &SharedWebApis) {
     let bp = vm.alloc_ordinary_object();
     vm.heap.get_object_mut(bp).unwrap().is_prototype = true;
+    crate::dom_interfaces::define_to_string_tag(vm, bp, "Blob");
     web_apis.borrow_mut().protos.blob_proto = Some(bp);
 
     let wa = Rc::clone(web_apis);
@@ -3476,6 +3477,7 @@ fn install_blob_and_file(vm: &mut JsVm, host: &SharedHost, web_apis: &SharedWebA
         .heap
         .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(bp)));
     vm.heap.get_object_mut(fp).unwrap().is_prototype = true;
+    crate::dom_interfaces::define_to_string_tag(vm, fp, "File");
     web_apis.borrow_mut().protos.file_proto = Some(fp);
 
     let wa = Rc::clone(web_apis);

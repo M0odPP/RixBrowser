@@ -1992,6 +1992,15 @@ impl Compiler {
                 self.compile_pattern_bind(left, tmp)?;
                 self.cur().free_to(saved);
             }
+            Pattern::Member {
+                object, property, ..
+            } => {
+                let saved = self.cur().next_reg;
+                let obj_reg = self.cur().alloc_reg()?;
+                self.compile_expr(object, obj_reg)?;
+                self.emit_member_store(obj_reg, property, val_reg)?;
+                self.cur().free_to(saved);
+            }
             Pattern::Array { elements, rest, .. } => {
                 let saved = self.cur().next_reg;
                 let iter_reg = self.cur().alloc_reg()?;
@@ -3926,6 +3935,12 @@ fn pattern_uses_arguments(pat: &Pattern) -> bool {
         }
         Pattern::Assign { left, right, .. } => {
             pattern_uses_arguments(left) || expr_uses_arguments(right)
+        }
+        Pattern::Member {
+            object, property, ..
+        } => {
+            expr_uses_arguments(object)
+                || matches!(property, MemberProp::Computed(e) if expr_uses_arguments(e))
         }
     }
 }

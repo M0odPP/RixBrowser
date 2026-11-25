@@ -512,6 +512,7 @@ pub fn store_put_or_add(
         IdbRecord {
             key: key.clone(),
             value_json: serialized,
+            value_bytes: Vec::new(),
         },
     );
     Ok(key)
@@ -598,6 +599,7 @@ mod tests {
             IdbIndexSchema {
                 name: "email".into(),
                 key_path: vec!["email".into()],
+                key_path_is_array: false,
                 unique: true,
                 multi_entry: false,
             },
@@ -607,6 +609,7 @@ mod tests {
             IdbIndexSchema {
                 name: "tags".into(),
                 key_path: vec!["tags".into()],
+                key_path_is_array: false,
                 unique: false,
                 multi_entry: true,
             },

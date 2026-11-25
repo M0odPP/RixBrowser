@@ -1285,7 +1285,7 @@ pub(crate) fn set_f64_prop(vm: &mut JsVm, obj: HeapHandle, key: &str, val: f64) 
     );
 }
 
-fn alloc_dom_point(
+pub(crate) fn alloc_dom_point(
     vm: &mut JsVm,
     host: &SharedHost,
     readonly: bool,
@@ -1327,7 +1327,7 @@ fn extract_point_init(vm: &mut JsVm, val: JsValue) -> Result<(f64, f64, f64, f64
     }
 }
 
-fn alloc_dom_rect_f64(
+pub(crate) fn alloc_dom_rect_f64(
     vm: &mut JsVm,
     host: &SharedHost,
     readonly: bool,
@@ -1417,7 +1417,12 @@ fn alloc_dom_quad(vm: &mut JsVm, host: &SharedHost, pts: [(f64, f64, f64, f64); 
     obj
 }
 
-fn alloc_dom_matrix(vm: &mut JsVm, host: &SharedHost, readonly: bool, m: [f64; 16]) -> HeapHandle {
+pub(crate) fn alloc_dom_matrix(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    readonly: bool,
+    m: [f64; 16],
+) -> HeapHandle {
     let proto = {
         let st = host.borrow();
         let cv = st.cssom_geometry_state.borrow();
@@ -1450,7 +1455,7 @@ fn alloc_dom_matrix(vm: &mut JsVm, host: &SharedHost, readonly: bool, m: [f64; 1
     obj
 }
 
-fn read_dom_matrix(vm: &mut JsVm, obj: HeapHandle) -> Result<[f64; 16], JsException> {
+pub(crate) fn read_dom_matrix(vm: &mut JsVm, obj: HeapHandle) -> Result<[f64; 16], JsException> {
     let mut m = MAT4_ID;
     let names = [
         ("m11", 0, 1.0),
