@@ -822,6 +822,23 @@ fn run_service_worker_thread(
             &streams,
             Some(Arc::clone(&fetch_engine)),
         );
+        let frames = crate::frames::install_frame_and_messaging_apis(
+            &mut vm,
+            &host,
+            &events,
+            &event_loop,
+            &web_apis,
+            &net,
+        );
+        let workers = crate::workers::install_worker_and_sse_apis(
+            &mut vm,
+            &host,
+            &events,
+            &event_loop,
+            &web_apis,
+            &net,
+            &frames,
+        );
         let local_sw = Rc::new(RefCell::new(ServiceWorkerSystem::new()));
         install_cache_storage(&mut vm, &web_apis, &streams, &net, &local_sw);
 
@@ -869,8 +886,11 @@ fn run_service_worker_thread(
         );
         define_global(&mut vm, "registration", JsValue::from_object(reg_h));
 
-        // Take net_rx once for our reactive tokio::select! loop
+        // Take net_rx and worker_rx once for our reactive tokio::select! loop
         let Some(mut net_rx) = net.borrow().async_rx.borrow_mut().take() else {
+            return;
+        };
+        let Some(mut worker_rx) = workers.borrow().async_rx.borrow_mut().take() else {
             return;
         };
 
@@ -898,6 +918,19 @@ fn run_service_worker_thread(
                 );
                 drain_ready_tasks(&event_loop, &mut vm);
             }
+            while let Ok(wev) = worker_rx.try_recv() {
+                crate::workers::deliver_async_worker_event(
+                    &mut vm,
+                    &host,
+                    &events,
+                    &event_loop,
+                    &web_apis,
+                    &frames,
+                    &workers,
+                    wev,
+                );
+                drain_ready_tasks(&event_loop, &mut vm);
+            }
 
             let next_timer = event_loop
                 .borrow_mut()
@@ -907,6 +940,7 @@ fn run_service_worker_thread(
             enum SwWake {
                 Cmd(Option<SwCommand>),
                 Net(Option<crate::fetch_ws::AsyncNetEvent>),
+                Worker(Option<crate::workers::AsyncWorkerEvent>),
                 Timer,
             }
 
@@ -915,12 +949,14 @@ fn run_service_worker_thread(
                     biased;
                     c = cmd_rx.recv() => SwWake::Cmd(c),
                     n = net_rx.recv() => SwWake::Net(n),
+                    w = worker_rx.recv() => SwWake::Worker(w),
                     () = tokio::time::sleep_until(deadline) => SwWake::Timer,
                 },
                 None => tokio::select! {
                     biased;
                     c = cmd_rx.recv() => SwWake::Cmd(c),
                     n = net_rx.recv() => SwWake::Net(n),
+                    w = worker_rx.recv() => SwWake::Worker(w),
                 },
             };
 
@@ -940,7 +976,22 @@ fn run_service_worker_thread(
                         nev,
                     );
                 }
-                SwWake::Net(None) | SwWake::Cmd(None) | SwWake::Cmd(Some(SwCommand::Terminate)) => {
+                SwWake::Worker(Some(wev)) => {
+                    crate::workers::deliver_async_worker_event(
+                        &mut vm,
+                        &host,
+                        &events,
+                        &event_loop,
+                        &web_apis,
+                        &frames,
+                        &workers,
+                        wev,
+                    );
+                }
+                SwWake::Net(None)
+                | SwWake::Worker(None)
+                | SwWake::Cmd(None)
+                | SwWake::Cmd(Some(SwCommand::Terminate)) => {
                     break;
                 }
                 SwWake::Cmd(Some(SwCommand::InstallAndActivate { reply_tx })) => {
@@ -953,7 +1004,10 @@ fn run_service_worker_thread(
                         &web_apis,
                         &streams,
                         &net,
+                        &frames,
+                        &workers,
                         &mut net_rx,
+                        &mut worker_rx,
                         base_ev_proto,
                         "install",
                     )
@@ -970,7 +1024,10 @@ fn run_service_worker_thread(
                         &web_apis,
                         &streams,
                         &net,
+                        &frames,
+                        &workers,
                         &mut net_rx,
+                        &mut worker_rx,
                         base_ev_proto,
                         "activate",
                     )
@@ -1021,7 +1078,10 @@ async fn dispatch_extendable_event_and_await(
     web_apis: &SharedWebApis,
     streams: &SharedStreams,
     net: &SharedNetBridge,
+    frames: &crate::frames::SharedFrames,
+    workers: &crate::workers::SharedWorkers,
     net_rx: &mut mpsc::UnboundedReceiver<crate::fetch_ws::AsyncNetEvent>,
+    worker_rx: &mut mpsc::UnboundedReceiver<crate::workers::AsyncWorkerEvent>,
     base_ev_proto: HeapHandle,
     ev_type: &str,
 ) -> Result<(), String> {
@@ -1098,6 +1158,15 @@ async fn dispatch_extendable_event_and_await(
             maybe_nev = net_rx.recv() => {
                 if let Some(nev) = maybe_nev {
                     deliver_async_net_event(vm, host, events, event_loop, web_apis, streams, net, nev);
+                } else {
+                    break;
+                }
+            }
+            maybe_wev = worker_rx.recv() => {
+                if let Some(wev) = maybe_wev {
+                    crate::workers::deliver_async_worker_event(
+                        vm, host, events, event_loop, web_apis, frames, workers, wev,
+                    );
                 } else {
                     break;
                 }

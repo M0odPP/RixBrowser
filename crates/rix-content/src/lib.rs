@@ -667,6 +667,15 @@ impl ContentRuntime {
                             doc.root()
                         };
                         custom_elements::upgrade_subtree(&mut self.vm, &self.host, doc_root, false);
+                        sync_all_iframes_in_document(
+                            &mut self.vm,
+                            &self.host,
+                            &self.events,
+                            &self.event_loop,
+                            &self.web_apis,
+                            &self.net,
+                            &self.frames,
+                        );
                         self.host.borrow_mut().current_script = Some(script_id);
                         let res = self.eval_script_cached(&code);
                         self.host.borrow_mut().current_script = None;
@@ -927,6 +936,7 @@ impl ContentRuntime {
                 &self.host,
                 &self.events,
                 &self.event_loop,
+                &self.web_apis,
                 &self.frames,
                 &self.workers,
                 ev,
@@ -1090,6 +1100,7 @@ impl ContentRuntime {
                     &self.host,
                     &self.events,
                     &self.event_loop,
+                    &self.web_apis,
                     &self.frames,
                     &self.workers,
                     ev,
@@ -1142,6 +1153,7 @@ impl ContentRuntime {
                             &self.host,
                             &self.events,
                             &self.event_loop,
+                            &self.web_apis,
                             &self.frames,
                             &self.workers,
                             ev,
