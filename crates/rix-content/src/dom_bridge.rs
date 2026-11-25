@@ -5185,7 +5185,77 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         let el = find_elements_by_tag(&h, doc_id, "body").into_iter().next();
         Ok(el.map_or(JsValue::NULL, |id| wrap_node(vm, &h, id)))
     });
-    define_host_accessor(vm, dp, "body", Some(g), None);
+    let h_set = Rc::clone(host);
+    let s = vm.alloc_host_fn("set body", move |vm, t, args| {
+        let doc_id = require_node(vm, &h_set, t)?;
+        let val = arg(args, 0);
+        let Some(new_body) = h_set.borrow().node_for_value(vm, val) else {
+            return Err(crate::web_apis::create_dom_exception(
+                vm,
+                "HierarchyRequestError",
+                "Document.body must be an HTMLBodyElement or HTMLFrameSetElement",
+            ));
+        };
+        let is_valid_body = {
+            let doc_rc = Rc::clone(&h_set.borrow().document);
+            let doc = doc_rc.borrow();
+            matches!(
+                doc.get(new_body),
+                Some(NodeData::Element(e))
+                    if e.name.local.as_str().eq_ignore_ascii_case("body")
+                        || e.name.local.as_str().eq_ignore_ascii_case("frameset")
+            )
+        };
+        if !is_valid_body {
+            return Err(crate::web_apis::create_dom_exception(
+                vm,
+                "HierarchyRequestError",
+                "Document.body must be a <body> or <frameset> element",
+            ));
+        }
+        let existing_body = find_elements_by_tag(&h_set, doc_id, "body")
+            .into_iter()
+            .next()
+            .or_else(|| {
+                find_elements_by_tag(&h_set, doc_id, "frameset")
+                    .into_iter()
+                    .next()
+            });
+        if existing_body == Some(new_body) {
+            return Ok(JsValue::UNDEFINED);
+        }
+        let doc_el = {
+            let doc_rc = Rc::clone(&h_set.borrow().document);
+            let doc = doc_rc.borrow();
+            let found = doc
+                .children(doc_id)
+                .find(|&cid| matches!(doc.get(cid), Some(NodeData::Element(_))));
+            found
+        };
+        let Some(html_id) = doc_el else {
+            return Err(crate::web_apis::create_dom_exception(
+                vm,
+                "HierarchyRequestError",
+                "Cannot set document.body when documentElement is null",
+            ));
+        };
+        {
+            let doc_rc = Rc::clone(&h_set.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            if let Some(old_body) = existing_body {
+                if doc.parent(old_body) == Some(html_id) {
+                    doc.insert_before(old_body, new_body);
+                    doc.remove_child(old_body);
+                } else {
+                    doc.append_child(html_id, new_body);
+                }
+            } else {
+                doc.append_child(html_id, new_body);
+            }
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_accessor(vm, dp, "body", Some(g), Some(s));
 
     let h1 = Rc::clone(host);
     let g = vm.alloc_host_fn("get title", move |vm, t, _| {

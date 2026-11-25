@@ -315,14 +315,23 @@ impl ContentRuntime {
             &frames,
             &workers,
         );
-        let media_source = install_media_source(&mut vm, &host, &events, &event_loop, &web_apis);
-        let media_elements = install_media_elements(
+        let media_elements = Rc::new(RefCell::new(MediaElementSystem::new()));
+        let media_source = media_source::install_media_source_with_elements(
+            &mut vm,
+            &host,
+            &events,
+            &event_loop,
+            &web_apis,
+            &media_elements,
+        );
+        media_elements::install_media_elements_with_system(
             &mut vm,
             &host,
             &events,
             &event_loop,
             &web_apis,
             &media_source,
+            &media_elements,
         );
         let webaudio = install_webaudio(&mut vm, &host, &media_elements);
         let webgpu = install_webgpu(&mut vm, &host, &canvas2d);
@@ -346,6 +355,7 @@ impl ContentRuntime {
             let sw_r = Rc::clone(&service_workers);
             let idb_r = Rc::clone(&indexeddb);
             let mse_r = Rc::clone(&media_source);
+            let me_r = Rc::clone(&media_elements);
             let audio_r = Rc::clone(&webaudio);
             let host_r = Rc::clone(&host);
             vm.add_host_root_collector(move |roots| {
@@ -392,6 +402,9 @@ impl ContentRuntime {
                     g.collect_roots(roots);
                 }
                 if let Ok(g) = mse_r.try_borrow() {
+                    g.collect_roots(roots);
+                }
+                if let Ok(g) = me_r.try_borrow() {
                     g.collect_roots(roots);
                 }
                 if let Ok(g) = audio_r.try_borrow() {
@@ -1082,6 +1095,15 @@ impl ContentRuntime {
             timestamp_ms,
         );
         let ran = fire_vsync(&self.event_loop, &mut self.vm, timestamp_ms);
+        media_elements::tick_playback_with_events(
+            &mut self.vm,
+            &self.host,
+            &self.events,
+            &self.event_loop,
+            &self.media_source,
+            &self.media_elements,
+            timestamp_ms,
+        );
         self.flush_layout_observers(timestamp_ms);
         ran
     }
