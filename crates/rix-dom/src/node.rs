@@ -60,6 +60,7 @@ pub struct ElementData {
     pub custom_element_state: CustomElementState,
     pub is_value: Option<String>,
     pub custom_states: Vec<InternedStr>,
+    pub null_registry: bool,
 }
 
 pub fn parse_non_negative_integer(input: &str) -> Option<u32> {
@@ -119,6 +120,7 @@ impl ElementData {
             custom_element_state: initial_ce_state,
             is_value: None,
             custom_states: Vec::new(),
+            null_registry: false,
         };
         elem.sync_intrinsic_state();
         elem

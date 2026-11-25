@@ -14,6 +14,7 @@ pub mod dom_collections;
 pub mod dom_interfaces;
 pub mod dom_parsing;
 pub mod dom_sanitizer;
+pub mod element_internals;
 pub mod event_loop;
 pub mod events;
 pub mod fetch_ws;

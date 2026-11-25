@@ -1180,8 +1180,6 @@ fn install_media_element_mse_hooks(
     ms_sys: &SharedMediaSource,
 ) {
     let media_proto = host.borrow().prototypes.html_media_element_proto;
-    let video_proto = host.borrow().prototypes.html_video_element_proto;
-    let audio_proto = host.borrow().prototypes.html_audio_element_proto;
 
     // `src` property on HTMLMediaElement.prototype
     {
@@ -1332,19 +1330,6 @@ fn install_media_element_mse_hooks(
         };
         Ok(JsValue::from_string(vm.heap.alloc_string(ans)))
     });
-
-    // Expose standard global constructors
-    for (name, proto) in [
-        ("HTMLMediaElement", media_proto),
-        ("HTMLVideoElement", video_proto),
-        ("HTMLAudioElement", audio_proto),
-    ] {
-        let ctor = vm.alloc_host_fn(name, move |vm, _, _| {
-            Err(vm.type_error(format!("Illegal constructor: {name}")))
-        });
-        bind_ctor_proto(vm, ctor, proto);
-        define_global(vm, name, JsValue::from_object(ctor));
-    }
 }
 
 fn require_ms(

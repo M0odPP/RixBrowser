@@ -687,13 +687,17 @@ fn attach_declarative_shadow_roots_in_subtree(doc: &mut Document, root: NodeId) 
         }
 
         attach_declarative_shadow_roots_in_subtree(doc, child);
-        let shadow_root_to_recurse = if let Some(NodeData::Element(elem)) = doc.get(child) {
-            elem.shadow_root
-        } else {
-            None
-        };
+        let (shadow_root_to_recurse, template_contents_to_recurse) =
+            if let Some(NodeData::Element(elem)) = doc.get(child) {
+                (elem.shadow_root, elem.template_contents)
+            } else {
+                (None, None)
+            };
         if let Some(sr) = shadow_root_to_recurse {
             attach_declarative_shadow_roots_in_subtree(doc, sr);
+        }
+        if let Some(tc) = template_contents_to_recurse {
+            attach_declarative_shadow_roots_in_subtree(doc, tc);
         }
     }
 }

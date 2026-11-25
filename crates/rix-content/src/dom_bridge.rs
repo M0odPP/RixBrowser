@@ -210,6 +210,7 @@ pub struct HostState {
     pub(crate) doc_csp: HashMap<NodeId, crate::trusted_types::DocumentCspPolicy>,
     pub(crate) shadow_dom: RefCell<crate::shadow_dom::ShadowDomState>,
     pub(crate) custom_elements_state: RefCell<crate::custom_elements::CustomElementsState>,
+    pub(crate) template_inert_docs: HashMap<NodeId, NodeId>,
     pub(crate) contextual_scripts: HashSet<NodeId>,
     pub(crate) script_force_async: HashSet<NodeId>,
     pub(crate) iframe_connect_hook: Option<IframeConnectHook>,
@@ -312,6 +313,7 @@ impl HostState {
             custom_elements_state: RefCell::new(
                 crate::custom_elements::CustomElementsState::default(),
             ),
+            template_inert_docs: HashMap::new(),
             contextual_scripts: HashSet::new(),
             script_force_async: HashSet::new(),
             iframe_connect_hook: None,
@@ -397,6 +399,24 @@ impl HostState {
         doc.bump_style_revision_for(nid);
         self.style_ctx
             .invalidate_state_change(&mut doc, nid, changed);
+    }
+
+    /// Returns (or creates) the associated inert template document for `owner_doc` per HTML §4.12.3.
+    pub(crate) fn inert_template_doc_for(&mut self, owner_doc: NodeId) -> NodeId {
+        if let Some(&inert_doc) = self.template_inert_docs.get(&owner_doc) {
+            return inert_doc;
+        }
+        let inert_doc = self.document.borrow_mut().new_node(NodeData::Document);
+        let mut meta = crate::dom_interfaces::DocumentMeta::html("about:blank");
+        meta.default_view = None;
+        self.doc_meta.insert(inert_doc, meta);
+        self.owner_docs.insert(inert_doc, inert_doc);
+        self.custom_elements_state
+            .borrow_mut()
+            .doc_registries
+            .insert(inert_doc, None);
+        self.template_inert_docs.insert(owner_doc, inert_doc);
+        inert_doc
     }
 
     /// Invalidates style & layout caches for `nid` (e.g. `:state(...)` custom state change).
@@ -1088,11 +1108,65 @@ impl HostState {
     }
 
     /// Returns the cached `ComputedStyle` for `node` or its pseudo-element (`::before`, `::after`, etc.).
+    /// Automatically cascades same-origin sub-documents (e.g. `iframe.contentDocument`).
     pub fn computed_style_for_node_pseudo(
         &mut self,
         node: NodeId,
         pseudo: Option<RixPseudoElement>,
     ) -> Option<Arc<ComputedStyle>> {
+        let owner_doc = self.owner_doc_of(node);
+        let main_root = self.document.borrow().root();
+        if owner_doc != main_root {
+            let media = MediaContext {
+                viewport_width: self.viewport.width,
+                viewport_height: self.viewport.height,
+                dark_mode: self.dark_mode,
+                ..MediaContext::default()
+            };
+            let css_blocks: Vec<(String, Option<NodeId>)> = {
+                let doc = self.document.borrow();
+                let mut blocks = Vec::new();
+                for n in doc.descendants_with_shadow_roots(owner_doc) {
+                    if let Some(NodeData::Element(el)) = doc.get(n) {
+                        if el.name.local.as_str().eq_ignore_ascii_case("style") {
+                            let text = doc.inner_text(n);
+                            if !text.trim().is_empty() {
+                                blocks.push((text, doc.parent(n)));
+                            }
+                        }
+                    }
+                }
+                blocks
+            };
+            let mut ctx = StyleContext::new(media);
+            for (css, owner_parent) in css_blocks {
+                if owner_parent.is_some() && (css.contains("@scope") || css.contains("@SCOPE")) {
+                    ctx.add_stylesheet(Arc::new(Stylesheet::parse_with_owner(
+                        &css,
+                        CascadeOrigin::Author,
+                        &media,
+                        owner_parent,
+                    )));
+                } else {
+                    ctx.add_stylesheet(Stylesheet::parse_cached(
+                        &css,
+                        CascadeOrigin::Author,
+                        &media,
+                    ));
+                }
+            }
+            {
+                let mut doc = self.document.borrow_mut();
+                let _ = ctx.cascade_full_from(&mut doc, owner_doc);
+            }
+            return match pseudo {
+                Some(pe) => ctx.pseudo_style_for(node, pe).cloned().or_else(|| {
+                    ctx.style_for(node)
+                        .map(|orig| Arc::new(ComputedStyle::inherit_from(orig)))
+                }),
+                None => ctx.style_for(node).cloned(),
+            };
+        }
         let ctx = self.ensure_styles();
         match pseudo {
             Some(pe) => ctx.pseudo_style_for(node, pe).cloned().or_else(|| {
@@ -2111,10 +2185,8 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
             }
         };
         if let Some(od) = owner_doc {
+            crate::custom_elements::copy_cloned_registries(&h, nid, cloned);
             h.borrow_mut().adopt_subtree(cloned, od);
-            if let Some(src_reg) = crate::custom_elements::effective_registry_for_element(&h, nid) {
-                crate::custom_elements::set_element_registry(&h, cloned, Some(src_reg));
-            }
             crate::custom_elements::upgrade_subtree(vm, &h, cloned, true);
         } else {
             let meta_opt = h.borrow().doc_meta.get(&nid).cloned();
@@ -2166,6 +2238,7 @@ pub(crate) fn remove_node_from_parent(
             idx,
         )
     };
+    crate::custom_elements::freeze_subtree_registries(host, child);
     crate::dom_collections::adjust_node_iterators_for_remove(host, child);
     crate::selection::adjust_ranges_for_remove_node(host, child, parent, old_index);
     host.borrow().document.borrow_mut().remove_child(child);
@@ -2179,6 +2252,15 @@ pub(crate) fn remove_node_from_parent(
     });
     if was_connected {
         notify_custom_element_subtree(vm, host, child, false);
+    } else {
+        crate::custom_elements::sync_form_associated_subtree(vm, host, child);
+    }
+    let parent_is_fieldset = matches!(
+        host.borrow().document.borrow().get(parent),
+        Some(NodeData::Element(e)) if e.name.local.as_str().eq_ignore_ascii_case("fieldset")
+    );
+    if parent_is_fieldset {
+        crate::custom_elements::sync_form_associated_subtree(vm, host, parent);
     }
     Ok(())
 }
@@ -2227,8 +2309,10 @@ pub(crate) fn insert_node_into_parent(
         if to_insert.is_empty() {
             return Ok(());
         }
+        let frag_connected = host.borrow().document.borrow().is_connected(child);
         // Remove all children from the fragment (firing live range updates & MutationObserver on fragment).
         for &n in &to_insert {
+            crate::custom_elements::freeze_subtree_registries(host, n);
             crate::dom_collections::adjust_node_iterators_for_remove(host, n);
             crate::selection::adjust_ranges_for_remove_node(host, n, child, 0);
             host.borrow().document.borrow_mut().remove_child(n);
@@ -2240,6 +2324,11 @@ pub(crate) fn insert_node_into_parent(
             previous_sibling: None,
             next_sibling: None,
         });
+        if frag_connected {
+            for &n in &to_insert {
+                notify_custom_element_subtree(vm, host, n, false);
+            }
+        }
     } else {
         // If `child` currently has a parent, properly remove it first (adjusts ranges & emits removal mutation!).
         let old_parent = host.borrow().document.borrow().parent(child);
@@ -2253,6 +2342,9 @@ pub(crate) fn insert_node_into_parent(
         .map(|&n| (n, host.borrow().owner_doc_of(n)))
         .collect();
     for &(n, old_doc) in &prev_docs {
+        if old_doc != target_doc {
+            crate::custom_elements::update_registries_on_adopt(host, n, target_doc);
+        }
         host.borrow_mut().adopt_subtree(n, target_doc);
         if old_doc != target_doc {
             crate::custom_elements::notify_subtree_adopted(vm, host, n, old_doc, target_doc);
@@ -2354,6 +2446,17 @@ pub(crate) fn insert_node_into_parent(
                 }
             }
         }
+    } else {
+        for &n in &to_insert {
+            crate::custom_elements::sync_form_associated_subtree(vm, host, n);
+        }
+    }
+    let parent_is_fieldset = matches!(
+        host.borrow().document.borrow().get(parent),
+        Some(NodeData::Element(e)) if e.name.local.as_str().eq_ignore_ascii_case("fieldset")
+    );
+    if parent_is_fieldset {
+        crate::custom_elements::sync_form_associated_subtree(vm, host, parent);
     }
     Ok(())
 }
@@ -3228,6 +3331,14 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
             ));
         }
         let owner_doc = h.borrow().owner_doc_of(host_id);
+        if has_explicit_reg {
+            crate::custom_elements::validate_registry_for_document(
+                vm,
+                &h,
+                resolved_reg,
+                owner_doc,
+            )?;
+        }
         let sr_id = {
             let _doc_rc = Rc::clone(&h.borrow().document);
             let mut doc = _doc_rc.borrow_mut();
@@ -3528,7 +3639,18 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
                 _ => None,
             }
         };
-        Ok(frag.map_or(JsValue::UNDEFINED, |f| wrap_node(vm, &h, f)))
+        if let Some(f) = frag {
+            let tmpl_doc = h.borrow().owner_doc_of(nid);
+            let frag_doc = h.borrow().owner_doc_of(f);
+            if frag_doc == tmpl_doc {
+                let mut hb = h.borrow_mut();
+                let inert_doc = hb.inert_template_doc_for(tmpl_doc);
+                hb.adopt_subtree(f, inert_doc);
+            }
+            Ok(wrap_node(vm, &h, f))
+        } else {
+            Ok(JsValue::UNDEFINED)
+        }
     });
     define_host_accessor(vm, template_proto, "content", Some(g), None);
 
@@ -4675,9 +4797,7 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         let mut is_opt: Option<String> = None;
         let mut explicit_reg: Option<Option<crate::custom_elements::RegistryId>> = None;
         let opts_arg = arg(args, 1);
-        if opts_arg.is_string() {
-            is_opt = Some(vm.value_to_rust_string(opts_arg));
-        } else if let Some(oh) = opts_arg.as_object() {
+        if let Some(oh) = opts_arg.as_object() {
             let k_is = vm.heap.intern_key("is");
             let iv = vm.get_property_by_key(oh, k_is)?;
             if !iv.is_undefined() {
@@ -4721,9 +4841,7 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         let mut is_opt: Option<String> = None;
         let mut explicit_reg: Option<Option<crate::custom_elements::RegistryId>> = None;
         let opts_arg = arg(args, 2);
-        if opts_arg.is_string() {
-            is_opt = Some(vm.value_to_rust_string(opts_arg));
-        } else if let Some(oh) = opts_arg.as_object() {
+        if let Some(oh) = opts_arg.as_object() {
             let k_is = vm.heap.intern_key("is");
             let iv = vm.get_property_by_key(oh, k_is)?;
             if !iv.is_undefined() {
@@ -4948,6 +5066,9 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
             if let Some(op) = old_parent {
                 remove_node_from_parent(vm, &h, op, nid)?;
             }
+            if old_doc != doc_id {
+                crate::custom_elements::update_registries_on_adopt(&h, nid, doc_id);
+            }
             h.borrow_mut().adopt_subtree(nid, doc_id);
             if old_doc != doc_id {
                 crate::custom_elements::notify_subtree_adopted(vm, &h, nid, old_doc, doc_id);
@@ -5018,6 +5139,9 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
                 "Document or ShadowRoot nodes cannot be imported",
             ));
         }
+        if let Some(r) = explicit_reg {
+            crate::custom_elements::validate_registry_for_document(vm, &h, r, doc_id)?;
+        }
         let cloned = {
             let doc_rc = Rc::clone(&h.borrow().document);
             let mut doc = doc_rc.borrow_mut();
@@ -5025,6 +5149,30 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
                 let snap = doc.clone();
                 doc.clone_subtree_with_options(&snap, nid, true)
             } else {
+                let clonable_sr = match doc.get(nid) {
+                    Some(NodeData::Element(el)) => {
+                        el.shadow_root.and_then(|sr| match doc.get(sr) {
+                            Some(NodeData::ShadowRoot {
+                                mode,
+                                delegates_focus,
+                                clonable: true,
+                                serializable,
+                                slot_assignment,
+                                null_registry,
+                                ..
+                            }) => Some((
+                                sr,
+                                mode.clone(),
+                                *delegates_focus,
+                                *serializable,
+                                slot_assignment.clone(),
+                                *null_registry,
+                            )),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                };
                 let mut data = doc.get(nid).cloned().unwrap_or(NodeData::DocumentFragment);
                 if let NodeData::Element(ref mut el) = data {
                     el.shadow_root = None;
@@ -5042,15 +5190,40 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
                         el.template_contents = Some(doc.new_node(NodeData::DocumentFragment));
                     }
                 }
-                doc.new_node(data)
+                let copy = doc.new_node(data);
+                if let Some((
+                    src_sr,
+                    mode,
+                    delegates_focus,
+                    serializable,
+                    slot_assignment,
+                    null_registry,
+                )) = clonable_sr
+                {
+                    let snap = doc.clone();
+                    let copy_sr = doc.new_node(NodeData::ShadowRoot {
+                        host: copy,
+                        mode,
+                        delegates_focus,
+                        clonable: true,
+                        serializable,
+                        slot_assignment,
+                        declarative: false,
+                        null_registry,
+                    });
+                    if let Some(NodeData::Element(el)) = doc.get_mut(copy) {
+                        el.shadow_root = Some(copy_sr);
+                    }
+                    for ch in snap.children(src_sr) {
+                        let cloned_ch = doc.clone_subtree_with_options(&snap, ch, true);
+                        doc.append_child(copy_sr, cloned_ch);
+                    }
+                }
+                copy
             }
         };
-        h.borrow_mut().adopt_subtree(cloned, doc_id);
-        let target_reg = match explicit_reg {
-            Some(r) => r,
-            None => crate::custom_elements::registry_for_document(&h, doc_id),
-        };
-        {
+        if let Some(target_reg) = explicit_reg {
+            h.borrow_mut().adopt_subtree(cloned, doc_id);
             let elements = {
                 let doc_rc = Rc::clone(&h.borrow().document);
                 let doc = doc_rc.borrow();
@@ -5059,6 +5232,10 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
             for el in elements {
                 crate::custom_elements::set_element_registry(&h, el, target_reg);
             }
+        } else {
+            crate::custom_elements::copy_cloned_registries(&h, nid, cloned);
+            crate::custom_elements::update_registries_on_adopt(&h, cloned, doc_id);
+            h.borrow_mut().adopt_subtree(cloned, doc_id);
         }
         crate::custom_elements::upgrade_subtree(vm, &h, cloned, true);
         Ok(wrap_node(vm, &h, cloned))
@@ -5304,7 +5481,7 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
             });
         }
     }
-    fn write_to_doc_impl(h: &SharedHost, did: NodeId, html: &str) {
+    fn write_to_doc_impl(vm: &mut JsVm, h: &SharedHost, did: NodeId, html: &str) {
         let main_root = h.borrow().document.borrow().root();
         let parser_opt = if did == main_root {
             h.borrow().active_parser.clone()
@@ -5368,14 +5545,28 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         }
         for &n in &added {
             h.borrow_mut().adopt_subtree(n, did);
+            crate::custom_elements::update_registries_on_adopt(h, n, did);
         }
         h.borrow_mut().invalidate_dom_mutation(target_body, None);
+        for &n in &added {
+            crate::custom_elements::upgrade_subtree(vm, h, n, true);
+        }
     }
     {
         let h = Rc::clone(host);
-        define_host_method(vm, dp, "open", move |vm, t, _| {
+        define_host_method(vm, dp, "open", move |vm, t, args| {
             let did = require_node(vm, &h, t)?;
-            open_doc_impl(&h, did);
+            // 3-arg `document.open(url, name, features)` is window-open, not dynamic markup insertion.
+            if args.len() < 3 && crate::custom_elements::is_dynamic_markup_blocked(&h, did) {
+                return Err(crate::web_apis::create_dom_exception(
+                    vm,
+                    "InvalidStateError",
+                    "Cannot call document.open() while custom element reactions are running",
+                ));
+            }
+            if args.len() < 3 {
+                open_doc_impl(&h, did);
+            }
             Ok(t)
         });
     }
@@ -5383,6 +5574,13 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         let h = Rc::clone(host);
         define_host_method(vm, dp, "close", move |vm, t, _| {
             let did = require_node(vm, &h, t)?;
+            if crate::custom_elements::is_dynamic_markup_blocked(&h, did) {
+                return Err(crate::web_apis::create_dom_exception(
+                    vm,
+                    "InvalidStateError",
+                    "Cannot call document.close() while custom element reactions are running",
+                ));
+            }
             let main_root = h.borrow().document.borrow().root();
             let mut hb = h.borrow_mut();
             if did == main_root {
@@ -5400,27 +5598,39 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
     {
         let h = Rc::clone(host);
         define_host_method(vm, dp, "write", move |vm, t, args| {
+            let did = require_node(vm, &h, t)?;
+            if crate::custom_elements::is_dynamic_markup_blocked(&h, did) {
+                return Err(crate::web_apis::create_dom_exception(
+                    vm,
+                    "InvalidStateError",
+                    "Cannot call document.write() while custom element reactions are running",
+                ));
+            }
             let mut html = String::new();
             for &a in args {
                 html.push_str(&vm.value_to_rust_string(a));
             }
-            if let Ok(did) = require_node(vm, &h, t) {
-                write_to_doc_impl(&h, did, &html);
-            }
+            write_to_doc_impl(vm, &h, did, &html);
             Ok(JsValue::UNDEFINED)
         });
     }
     {
         let h = Rc::clone(host);
         define_host_method(vm, dp, "writeln", move |vm, t, args| {
+            let did = require_node(vm, &h, t)?;
+            if crate::custom_elements::is_dynamic_markup_blocked(&h, did) {
+                return Err(crate::web_apis::create_dom_exception(
+                    vm,
+                    "InvalidStateError",
+                    "Cannot call document.writeln() while custom element reactions are running",
+                ));
+            }
             let mut html = String::new();
             for &a in args {
                 html.push_str(&vm.value_to_rust_string(a));
             }
             html.push('\n');
-            if let Ok(did) = require_node(vm, &h, t) {
-                write_to_doc_impl(&h, did, &html);
-            }
+            write_to_doc_impl(vm, &h, did, &html);
             Ok(JsValue::UNDEFINED)
         });
     }

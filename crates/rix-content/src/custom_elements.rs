@@ -143,6 +143,7 @@ pub struct ElementInternalsData {
     pub role: Option<String>,
     pub aria_strings: HashMap<String, Option<String>>,
     pub aria_elements: HashMap<String, Option<Vec<NodeId>>>,
+    pub cached_aria_arrays: HashMap<String, (HeapHandle, Vec<NodeId>)>,
     pub form_value: Option<JsValue>,
     pub form_state: Option<JsValue>,
     pub validity: ValidityFlags,
@@ -179,6 +180,16 @@ pub struct CustomElementsState {
     pub active_upgrade_stack: Vec<(RegistryId, String, NodeId)>,
     /// Active constructor-invocation registry hint (for `createElement` with explicit scoped registry).
     pub active_construct_registry: Vec<RegistryId>,
+    /// WHATWG HTML §8.4 per-document throw-on-dynamic-markup-insertion counter.
+    pub throw_on_dynamic_markup_insertion_counters: HashMap<NodeId, u32>,
+    /// Explicitly set `Element.prototype.aria*Element(s)` targets (WHATWG HTML §2.6.10).
+    pub element_aria_elements: HashMap<(NodeId, String), Vec<NodeId>>,
+    /// Guard set while `Element.prototype.aria*Element(s)` writes `""` to the reflected attribute.
+    pub suppressing_aria_clear: bool,
+    /// Last reported form owner for form-associated custom elements (prevents duplicate callbacks).
+    pub last_form_owner: HashMap<NodeId, Option<NodeId>>,
+    /// Last reported disabled state for form-associated custom elements.
+    pub last_form_disabled: HashMap<NodeId, bool>,
 }
 
 impl CustomElementsState {
@@ -226,6 +237,9 @@ impl CustomElementsState {
         for data in self.internals_data.values() {
             out.push(JsValue::from_object(data.js_handle));
             out.push(JsValue::from_object(data.states_handle));
+            for &(ah, _) in data.cached_aria_arrays.values() {
+                out.push(JsValue::from_object(ah));
+            }
             if let Some(v) = data.form_value {
                 out.push(v);
             }
@@ -361,6 +375,21 @@ pub(crate) fn effective_registry_for_element(host: &SharedHost, nid: NodeId) -> 
             return reg;
         }
         let doc = hb.document.borrow();
+        // Walk ancestors in the same tree: if self or any un-initialized ancestor was parsed with
+        // `customelementregistry`, this element uses the null registry!
+        let mut walk = Some(nid);
+        while let Some(cur) = walk {
+            if let Some(&reg) = ce.element_registries.get(&cur) {
+                if cur == nid {
+                    return reg;
+                }
+                break;
+            }
+            if matches!(doc.get(cur), Some(NodeData::Element(e)) if e.null_registry) {
+                return None;
+            }
+            walk = doc.parent(cur);
+        }
         let root = crate::shadow_dom::tree_root(&doc, nid);
         let info = match doc.get(root) {
             Some(NodeData::ShadowRoot { .. }) => Some((true, root)),
@@ -376,6 +405,289 @@ pub(crate) fn effective_registry_for_element(host: &SharedHost, nid: NodeId) -> 
         Some((true, sr)) => registry_for_shadow_root(host, sr),
         Some((false, doc_id)) => registry_for_document(host, doc_id),
         None => None,
+    }
+}
+
+/// Allocates (or returns cached) a non-scoped global `CustomElementRegistry` bound to a
+/// same-origin child iframe's `Window` & `Document`.
+pub(crate) fn ensure_child_global_registry(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    child_doc_id: NodeId,
+) -> HeapHandle {
+    if let Some(Some(rid)) = host
+        .borrow()
+        .custom_elements_state
+        .borrow()
+        .doc_registries
+        .get(&child_doc_id)
+        .copied()
+    {
+        if let Some(r) = host
+            .borrow()
+            .custom_elements_state
+            .borrow()
+            .registries
+            .get(&rid)
+        {
+            return r.js_handle;
+        }
+    }
+    let proto = host
+        .borrow()
+        .custom_elements_state
+        .borrow()
+        .registry_proto
+        .unwrap_or(vm.object_proto);
+    let (rid, handle) = alloc_registry_instance(vm, host, proto, false);
+    set_document_registry(host, child_doc_id, Some(rid));
+    handle
+}
+
+/// Updates custom element registries across the shadow-including subtree of `root` when
+/// adopting into `target_doc` per Scoped Custom Element Registries adoption semantics.
+pub(crate) fn update_registries_on_adopt(host: &SharedHost, root: NodeId, target_doc: NodeId) {
+    let new_doc_reg = registry_for_document(host, target_doc);
+    let is_global = |reg: Option<RegistryId>| -> bool {
+        let Some(rid) = reg else {
+            return false;
+        };
+        host.borrow()
+            .custom_elements_state
+            .borrow()
+            .registries
+            .get(&rid)
+            .is_some_and(|r| !r.is_scoped)
+    };
+    let target_global = if is_global(new_doc_reg) {
+        new_doc_reg
+    } else {
+        None
+    };
+
+    // Walk shadow-including subtree in top-down order so parent/shadow-root updates happen first.
+    let order: Vec<(NodeId, bool, Option<NodeId>)> = {
+        let hb = host.borrow();
+        let doc = hb.document.borrow();
+        let mut out = Vec::new();
+        fn walk(
+            doc: &Document,
+            nid: NodeId,
+            parent_opt: Option<NodeId>,
+            out: &mut Vec<(NodeId, bool, Option<NodeId>)>,
+        ) {
+            match doc.get(nid) {
+                Some(NodeData::ShadowRoot { .. }) => {
+                    out.push((nid, true, parent_opt));
+                    for c in doc.children(nid) {
+                        walk(doc, c, Some(nid), out);
+                    }
+                }
+                Some(NodeData::Element(e)) => {
+                    out.push((nid, false, parent_opt));
+                    if let Some(sr) = e.shadow_root {
+                        walk(doc, sr, Some(nid), out);
+                    }
+                    for c in doc.children(nid) {
+                        walk(doc, c, Some(nid), out);
+                    }
+                }
+                _ => {
+                    for c in doc.children(nid) {
+                        walk(doc, c, parent_opt, out);
+                    }
+                }
+            }
+        }
+        walk(&doc, root, None, &mut out);
+        out
+    };
+
+    for (nid, is_sr, parent_opt) in order {
+        let parent_is_global_or_root = parent_opt.is_none_or(|p| {
+            let is_p_sr = matches!(
+                host.borrow().document.borrow().get(p),
+                Some(NodeData::ShadowRoot { .. })
+            );
+            let pr = if is_p_sr {
+                registry_for_shadow_root(host, p)
+            } else {
+                effective_registry_for_element(host, p)
+            };
+            is_global(pr)
+        });
+        if is_sr {
+            let cur = registry_for_shadow_root(host, nid);
+            let is_explicit_null_sr = matches!(
+                host.borrow().document.borrow().get(nid),
+                Some(NodeData::ShadowRoot {
+                    null_registry: true,
+                    ..
+                })
+            );
+            if is_global(cur)
+                || (cur.is_none()
+                    && !is_explicit_null_sr
+                    && parent_is_global_or_root
+                    && target_global.is_some())
+            {
+                set_shadow_root_registry(host, nid, target_global);
+            }
+        } else {
+            let cur = effective_registry_for_element(host, nid);
+            if is_global(cur) {
+                set_element_registry(host, nid, target_global);
+            } else if cur.is_none() {
+                let has_explicit_attr = matches!(
+                    host.borrow().document.borrow().get(nid),
+                    Some(NodeData::Element(e)) if e.null_registry
+                );
+                if !has_explicit_attr && parent_is_global_or_root && target_global.is_some() {
+                    set_element_registry(host, nid, target_global);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn inc_dynamic_markup_counter(host: &SharedHost, doc_id: NodeId) {
+    let hb = host.borrow();
+    let mut ce = hb.custom_elements_state.borrow_mut();
+    *ce.throw_on_dynamic_markup_insertion_counters
+        .entry(doc_id)
+        .or_insert(0) += 1;
+}
+
+pub(crate) fn dec_dynamic_markup_counter(host: &SharedHost, doc_id: NodeId) {
+    let hb = host.borrow();
+    let mut ce = hb.custom_elements_state.borrow_mut();
+    if let Some(c) = ce
+        .throw_on_dynamic_markup_insertion_counters
+        .get_mut(&doc_id)
+    {
+        *c = c.saturating_sub(1);
+        if *c == 0 {
+            ce.throw_on_dynamic_markup_insertion_counters
+                .remove(&doc_id);
+        }
+    }
+}
+
+pub(crate) fn is_dynamic_markup_blocked(host: &SharedHost, doc_id: NodeId) -> bool {
+    host.borrow()
+        .custom_elements_state
+        .borrow()
+        .throw_on_dynamic_markup_insertion_counters
+        .get(&doc_id)
+        .copied()
+        .unwrap_or(0)
+        > 0
+}
+
+/// Throws `NotSupportedError` when a global (non-scoped) `CustomElementRegistry` belonging
+/// to another document is passed for `target_doc`.
+pub(crate) fn validate_registry_for_document(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    reg_opt: Option<RegistryId>,
+    target_doc: NodeId,
+) -> Result<(), JsException> {
+    let Some(rid) = reg_opt else {
+        return Ok(());
+    };
+    let is_global = host
+        .borrow()
+        .custom_elements_state
+        .borrow()
+        .registries
+        .get(&rid)
+        .is_some_and(|r| !r.is_scoped);
+    if is_global && registry_for_document(host, target_doc) != Some(rid) {
+        return Err(create_dom_exception(
+            vm,
+            "NotSupportedError",
+            "Cannot use another document's global CustomElementRegistry",
+        ));
+    }
+    Ok(())
+}
+
+/// Materializes effective `None` or scoped registries into `element_registries` for elements
+/// under `root` before detaching `root` from a null/scoped parent or shadow root.
+pub(crate) fn freeze_subtree_registries(host: &SharedHost, root: NodeId) {
+    let elements = {
+        let hb = host.borrow();
+        let doc = hb.document.borrow();
+        collect_shadow_including_elements(&doc, root, true)
+    };
+    for nid in elements {
+        let already_set = host
+            .borrow()
+            .custom_elements_state
+            .borrow()
+            .element_registries
+            .contains_key(&nid);
+        if !already_set {
+            let eff = effective_registry_for_element(host, nid);
+            let owner_doc = host.borrow().owner_doc_of(nid);
+            let doc_reg = registry_for_document(host, owner_doc);
+            if eff != doc_reg {
+                set_element_registry(host, nid, eff);
+            }
+        }
+    }
+}
+
+/// Copies explicit / effective custom element registries from `src_root` onto structurally
+/// cloned `dst_root` (in shadow-including tree order) for `cloneNode` / `importNode`.
+pub(crate) fn copy_cloned_registries(host: &SharedHost, src_root: NodeId, dst_root: NodeId) {
+    let pairs: Vec<(NodeId, NodeId, bool)> = {
+        let hb = host.borrow();
+        let doc = hb.document.borrow();
+        let mut out = Vec::new();
+        fn walk_pair(
+            doc: &Document,
+            src: NodeId,
+            dst: NodeId,
+            out: &mut Vec<(NodeId, NodeId, bool)>,
+        ) {
+            match (doc.get(src), doc.get(dst)) {
+                (Some(NodeData::ShadowRoot { .. }), Some(NodeData::ShadowRoot { .. })) => {
+                    out.push((src, dst, true));
+                    for (sc, dc) in doc.children(src).zip(doc.children(dst)) {
+                        walk_pair(doc, sc, dc, out);
+                    }
+                }
+                (Some(NodeData::Element(se)), Some(NodeData::Element(de))) => {
+                    out.push((src, dst, false));
+                    if let (Some(ssr), Some(dsr)) = (se.shadow_root, de.shadow_root) {
+                        walk_pair(doc, ssr, dsr, out);
+                    }
+                    if let (Some(stc), Some(dtc)) = (se.template_contents, de.template_contents) {
+                        walk_pair(doc, stc, dtc, out);
+                    }
+                    for (sc, dc) in doc.children(src).zip(doc.children(dst)) {
+                        walk_pair(doc, sc, dc, out);
+                    }
+                }
+                _ => {
+                    for (sc, dc) in doc.children(src).zip(doc.children(dst)) {
+                        walk_pair(doc, sc, dc, out);
+                    }
+                }
+            }
+        }
+        walk_pair(&doc, src_root, dst_root, &mut out);
+        out
+    };
+    for (src, dst, is_sr) in pairs {
+        if is_sr {
+            let r = registry_for_shadow_root(host, src);
+            set_shadow_root_registry(host, dst, r);
+        } else {
+            let r = effective_registry_for_element(host, src);
+            set_element_registry(host, dst, r);
+        }
     }
 }
 
@@ -578,6 +890,9 @@ pub(crate) fn drain_backup_queue(vm: &mut JsVm, host: &SharedHost) {
 /// Invokes a list of queued reactions in FIFO order. Exceptions in callbacks are reported
 /// to the global error handler and do NOT abort subsequent reactions (WHATWG HTML §4.13.6).
 fn invoke_reaction_queue(vm: &mut JsVm, host: &SharedHost, queue: Vec<CeReaction>) {
+    if queue.is_empty() {
+        return;
+    }
     for reaction in queue {
         match reaction {
             CeReaction::Upgrade(nid) => {
@@ -658,7 +973,10 @@ fn invoke_reaction_queue(vm: &mut JsVm, host: &SharedHost, queue: Vec<CeReaction
     }
 }
 
-fn lookup_element_def(host: &SharedHost, nid: NodeId) -> Option<CustomElementDefinition> {
+pub(crate) fn lookup_element_def(
+    host: &SharedHost,
+    nid: NodeId,
+) -> Option<CustomElementDefinition> {
     let hb = host.borrow();
     let ce = hb.custom_elements_state.borrow();
     let (reg_id, name) = ce.element_definitions.get(&nid)?;
@@ -806,6 +1124,30 @@ pub(crate) fn upgrade_element_now(vm: &mut JsVm, host: &SharedHost, nid: NodeId)
         }
     };
 
+    // WHATWG §4.13.5 step 2: if definition disables shadow and element already has a shadow root -> fail!
+    if def.disable_shadow {
+        let has_sr = matches!(
+            host.borrow().document.borrow().get(nid),
+            Some(NodeData::Element(e)) if e.shadow_root.is_some()
+        );
+        if has_sr {
+            {
+                let doc_rc = Rc::clone(&host.borrow().document);
+                let mut doc = doc_rc.borrow_mut();
+                if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
+                    e.set_custom_element_state(CustomElementState::Failed);
+                }
+            }
+            let err = create_dom_exception(
+                vm,
+                "NotSupportedError",
+                "Cannot upgrade element with shadow root when disabledFeatures includes 'shadow'",
+            );
+            report_ce_exception(vm, err);
+            return;
+        }
+    }
+
     // Step 2: Set custom element state to "precustomized" and record definition.
     {
         let doc_rc = Rc::clone(&host.borrow().document);
@@ -847,9 +1189,40 @@ pub(crate) fn upgrade_element_now(vm: &mut JsVm, host: &SharedHost, nid: NodeId)
     if is_connected {
         pre_reactions.push(CeReaction::Connected(nid));
     }
+    if def.form_associated {
+        let form = crate::element_internals::find_form_owner(host, nid);
+        let disabled = crate::element_internals::is_element_disabled_for_form(host, nid);
+        {
+            let hb = host.borrow();
+            let mut ce = hb.custom_elements_state.borrow_mut();
+            ce.last_form_owner.insert(nid, form);
+            ce.last_form_disabled.insert(nid, disabled);
+        }
+        {
+            let doc_rc = Rc::clone(&host.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
+                e.pseudo_state.set(ElementState::DISABLED, disabled);
+            }
+        }
+        if let Some(f) = form {
+            pre_reactions.push(CeReaction::FormAssociated {
+                node: nid,
+                form: Some(f),
+            });
+        }
+        if disabled {
+            pre_reactions.push(CeReaction::FormDisabled {
+                node: nid,
+                disabled: true,
+            });
+        }
+    }
 
     let ctor_val = JsValue::from_object(def.constructor);
     let wrapper = wrap_node(vm, host, nid);
+    let owner_doc = host.borrow().owner_doc_of(nid);
+    inc_dynamic_markup_counter(host, owner_doc);
     let construct_result = vm.construct_value(ctor_val, &[], ctor_val);
 
     // Pop construction stack & active upgrade stack.
@@ -884,6 +1257,7 @@ pub(crate) fn upgrade_element_now(vm: &mut JsVm, host: &SharedHost, nid: NodeId)
     };
 
     if failed {
+        dec_dynamic_markup_counter(host, owner_doc);
         {
             let doc_rc = Rc::clone(&host.borrow().document);
             let mut doc = doc_rc.borrow_mut();
@@ -910,8 +1284,9 @@ pub(crate) fn upgrade_element_now(vm: &mut JsVm, host: &SharedHost, nid: NodeId)
     }
     host.borrow_mut()
         .invalidate_element_state(nid, ElementState::DEFINED);
-    // Run the upgrade's enqueued attributeChanged / connected callbacks immediately!
+    // Run the upgrade's enqueued attributeChanged / connected / form callbacks immediately!
     invoke_reaction_queue(vm, host, pre_reactions);
+    dec_dynamic_markup_counter(host, owner_doc);
 }
 
 // ---------------------------------------------------------------------------
@@ -973,15 +1348,18 @@ pub(crate) fn handle_builtin_html_constructor(
             }
         }
         if res.is_none() {
-            if let Some(reg) = ce.registries.get(&RegistryId::GLOBAL) {
-                if let Some(def_name) = reg.by_ctor.get(&new_target) {
-                    if let Some(def) = reg.by_name.get(def_name) {
-                        res = Some((
-                            RegistryId::GLOBAL,
-                            def.name.clone(),
-                            def.local_name.clone(),
-                            def.construction_stack.last().copied(),
-                        ));
+            for reg in ce.registries.values() {
+                if !reg.is_scoped {
+                    if let Some(def_name) = reg.by_ctor.get(&new_target) {
+                        if let Some(def) = reg.by_name.get(def_name) {
+                            res = Some((
+                                reg.id,
+                                def.name.clone(),
+                                def.local_name.clone(),
+                                def.construction_stack.last().copied(),
+                            ));
+                            break;
+                        }
                     }
                 }
             }
@@ -1058,7 +1436,14 @@ pub(crate) fn handle_builtin_html_constructor(
             {
                 let mut hb = host.borrow_mut();
                 let root = hb.document.borrow().root();
-                hb.set_owner_doc(nid, root);
+                let owner_doc = {
+                    let ce = hb.custom_elements_state.borrow();
+                    ce.doc_registries
+                        .iter()
+                        .find_map(|(&did, &r)| if r == Some(reg_id) { Some(did) } else { None })
+                        .unwrap_or(root)
+                };
+                hb.set_owner_doc(nid, owner_doc);
                 let mut ce = hb.custom_elements_state.borrow_mut();
                 ce.element_registries.insert(nid, Some(reg_id));
                 ce.element_definitions.insert(nid, (reg_id, def_name));
@@ -1092,6 +1477,9 @@ pub(crate) fn create_element_with_ce(
     explicit_reg: Option<Option<RegistryId>>,
     synchronous_custom_elements: bool,
 ) -> Result<JsValue, JsException> {
+    if let Some(r) = explicit_reg {
+        validate_registry_for_document(vm, host, r, doc_id)?;
+    }
     let reg_opt = match explicit_reg {
         Some(r) => r,
         None => registry_for_document(host, doc_id),
@@ -1116,6 +1504,7 @@ pub(crate) fn create_element_with_ce(
                     .borrow_mut()
                     .active_construct_registry
                     .push(reg_id);
+                inc_dynamic_markup_counter(host, doc_id);
                 let ctor_val = JsValue::from_object(def.constructor);
                 let construct_res = vm.construct_value(ctor_val, &[], ctor_val);
                 host.borrow()
@@ -1123,44 +1512,55 @@ pub(crate) fn create_element_with_ce(
                     .borrow_mut()
                     .active_construct_registry
                     .pop();
+                dec_dynamic_markup_counter(host, doc_id);
 
                 let valid_nid: Result<NodeId, JsException> = match construct_res {
                     Err(exc) => Err(exc),
                     Ok(val) => {
                         let nid_opt = host.borrow().node_for_value(vm, val);
                         if let Some(nid) = nid_opt {
-                            let check_err = {
+                            let check_res = {
                                 let hb = host.borrow();
                                 let doc = hb.document.borrow();
                                 match doc.get(nid) {
                                     Some(NodeData::Element(e)) => {
                                         if !e.attributes.is_empty() {
-                                            Some("Constructed custom element must not have attributes")
+                                            Err((false, "Constructed custom element must not have attributes"))
                                         } else if doc.first_child(nid).is_some() {
-                                            Some(
+                                            Err((
+                                                false,
                                                 "Constructed custom element must not have children",
-                                            )
+                                            ))
                                         } else if doc.parent(nid).is_some() {
-                                            Some(
+                                            Err((
+                                                false,
                                                 "Constructed custom element must not have a parent",
-                                            )
+                                            ))
                                         } else if hb.owner_doc_of(nid) != doc_id {
-                                            Some("Constructed custom element has wrong ownerDocument")
+                                            Err((false, "Constructed custom element has wrong ownerDocument"))
                                         } else if &*e.name.ns != HTML_NS
                                             || e.name.local.as_str() != local
                                         {
-                                            Some("Constructed custom element has wrong localName")
+                                            Err((
+                                                false,
+                                                "Constructed custom element has wrong localName",
+                                            ))
                                         } else {
-                                            None
+                                            Ok(nid)
                                         }
                                     }
-                                    _ => Some("Constructed result is not an Element"),
+                                    _ => Err((
+                                        true,
+                                        "Constructed result does not implement HTMLElement",
+                                    )),
                                 }
                             };
-                            if let Some(msg) = check_err {
-                                Err(create_dom_exception(vm, "NotSupportedError", msg))
-                            } else {
-                                Ok(nid)
+                            match check_res {
+                                Ok(nid) => Ok(nid),
+                                Err((true, msg)) => Err(vm.type_error(msg)),
+                                Err((false, msg)) => {
+                                    Err(create_dom_exception(vm, "NotSupportedError", msg))
+                                }
                             }
                         } else {
                             Err(vm.type_error(
@@ -1271,7 +1671,7 @@ pub(crate) fn create_element_with_ce(
         if let Some(NodeData::Element(e)) = doc.get_mut(n) {
             if let Some(is_v) = is_opt {
                 e.is_value = Some(is_v.to_string());
-                if ns == HTML_NS && is_valid_custom_element_name(is_v) {
+                if ns == HTML_NS {
                     e.set_custom_element_state(CustomElementState::Undefined);
                 }
             } else if ns == HTML_NS && is_valid_custom_element_name(local) {
@@ -1345,8 +1745,88 @@ pub(crate) fn upgrade_subtree(vm: &mut JsVm, host: &SharedHost, root: NodeId, in
     });
 }
 
-/// Enqueues `Upgrade` + `Connected` (or `Disconnected`) for all custom elements in the
-/// shadow-including subtree rooted at `root`.
+/// Synchronizes `formAssociatedCallback` and `formDisabledCallback` (plus `ElementState::DISABLED`)
+/// for all form-associated custom elements under `root` in tree order.
+pub(crate) fn enqueue_form_state_changes_for_node(host: &SharedHost, nid: NodeId) {
+    let is_fa = lookup_element_def(host, nid).is_some_and(|d| d.form_associated);
+    if !is_fa {
+        return;
+    }
+    let new_form = crate::element_internals::find_form_owner(host, nid);
+    let new_disabled = crate::element_internals::is_element_disabled_for_form(host, nid);
+    let (form_changed, disabled_changed) = {
+        let hb = host.borrow();
+        let mut ce = hb.custom_elements_state.borrow_mut();
+        let prev_form = ce.last_form_owner.get(&nid).copied().flatten();
+        let fc = prev_form != new_form;
+        if fc {
+            ce.last_form_owner.insert(nid, new_form);
+        }
+        let prev_dis = ce.last_form_disabled.get(&nid).copied().unwrap_or(false);
+        let dc = prev_dis != new_disabled;
+        if dc {
+            ce.last_form_disabled.insert(nid, new_disabled);
+        }
+        (fc, dc)
+    };
+    if disabled_changed {
+        {
+            let doc_rc = Rc::clone(&host.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
+                e.pseudo_state.set(ElementState::DISABLED, new_disabled);
+            }
+        }
+        if let Ok(mut hb) = host.try_borrow_mut() {
+            hb.invalidate_element_state(nid, ElementState::DISABLED);
+        }
+    }
+    if form_changed {
+        enqueue_reaction(
+            host,
+            CeReaction::FormAssociated {
+                node: nid,
+                form: new_form,
+            },
+        );
+    }
+    if disabled_changed {
+        enqueue_reaction(
+            host,
+            CeReaction::FormDisabled {
+                node: nid,
+                disabled: new_disabled,
+            },
+        );
+    }
+}
+
+/// Synchronizes form-associated custom elements across `root` (and parent `<fieldset>` when
+/// `<legend>` children change) even when disconnected from a document.
+pub(crate) fn sync_form_associated_subtree(vm: &mut JsVm, host: &SharedHost, root: NodeId) {
+    if !host
+        .borrow()
+        .custom_elements_state
+        .borrow()
+        .has_any_definitions()
+    {
+        return;
+    }
+    let elements = {
+        let doc_rc = Rc::clone(&host.borrow().document);
+        let doc = doc_rc.borrow();
+        collect_shadow_including_elements(&doc, root, true)
+    };
+    let _ = with_ce_reactions(vm, host, |_vm| {
+        for nid in elements {
+            enqueue_form_state_changes_for_node(host, nid);
+        }
+        Ok(())
+    });
+}
+
+/// Enqueues `Upgrade` + `Connected` (or `Disconnected`) + form-associated callbacks in tree order
+/// for all custom elements in the shadow-including subtree rooted at `root`.
 pub(crate) fn notify_subtree_connected(
     vm: &mut JsVm,
     host: &SharedHost,
@@ -1383,6 +1863,7 @@ pub(crate) fn notify_subtree_connected(
                     } else {
                         enqueue_reaction(host, CeReaction::Disconnected(nid));
                     }
+                    enqueue_form_state_changes_for_node(host, nid);
                 }
                 Some(CustomElementState::Undefined) if connected => {
                     enqueue_reaction(host, CeReaction::Upgrade(nid));
@@ -1485,12 +1966,27 @@ pub fn install_custom_elements(
                         old_value,
                     } = mutation
                     {
+                        {
+                            let hb = h.borrow();
+                            let mut ce = hb.custom_elements_state.borrow_mut();
+                            if !ce.suppressing_aria_clear
+                                && attribute_namespace.is_none()
+                                && attribute_name.starts_with("aria-")
+                            {
+                                ce.element_aria_elements
+                                    .remove(&(*target, attribute_name.clone()));
+                            }
+                        }
                         let hb = h.borrow();
                         let ce = hb.custom_elements_state.borrow();
-                        if !ce.element_definitions.contains_key(target) {
-                            return;
-                        }
-                        let new_value = {
+                        let is_ce = ce.element_definitions.contains_key(target);
+                        let is_fa = is_ce
+                            && ce
+                                .element_definitions
+                                .get(target)
+                                .and_then(|(rid, n)| ce.registries.get(rid)?.by_name.get(n))
+                                .is_some_and(|d| d.form_associated);
+                        let new_value = if is_ce {
                             let doc = hb.document.borrow();
                             match doc.get(*target) {
                                 Some(NodeData::Element(e)) => e
@@ -1501,29 +1997,63 @@ pub fn install_custom_elements(
                                     .map(str::to_string),
                                 _ => None,
                             }
+                        } else {
+                            None
+                        };
+                        let is_fieldset = !is_ce
+                            && attribute_name == "disabled"
+                            && attribute_namespace.is_none()
+                            && matches!(
+                                hb.document.borrow().get(*target),
+                                Some(NodeData::Element(e)) if e.name.local.as_str().eq_ignore_ascii_case("fieldset")
+                            );
+                        let fieldset_fa_descendants: Vec<NodeId> = if is_fieldset {
+                            let doc = hb.document.borrow();
+                            doc.descendants(*target)
+                                .filter(|id| {
+                                    *id != *target
+                                        && ce
+                                            .element_definitions
+                                            .get(id)
+                                            .and_then(|(rid, n)| {
+                                                ce.registries.get(rid)?.by_name.get(n)
+                                            })
+                                            .is_some_and(|d| d.form_associated)
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
                         };
                         drop(ce);
                         drop(hb);
-                        // Only enqueue onto the backup/active queue if NOT already inside
-                        // `set_element_attr` / `remove_element_attr` which call `notify_attribute_changed`
-                        // directly; wait: to avoid double firing, we route `set_element_attr` and
-                        // `remove_element_attr` purely through this sink + `drain_backup_queue`!
-                        enqueue_reaction(
-                            &h,
-                            CeReaction::AttributeChanged {
-                                node: *target,
-                                name: attribute_name.clone(),
-                                old_value: old_value.clone(),
-                                new_value,
-                                namespace: attribute_namespace.clone(),
-                            },
-                        );
+                        if is_ce {
+                            enqueue_reaction(
+                                &h,
+                                CeReaction::AttributeChanged {
+                                    node: *target,
+                                    name: attribute_name.clone(),
+                                    old_value: old_value.clone(),
+                                    new_value: new_value.clone(),
+                                    namespace: attribute_namespace.clone(),
+                                },
+                            );
+                            if is_fa
+                                && attribute_namespace.is_none()
+                                && (attribute_name == "disabled" || attribute_name == "form")
+                            {
+                                enqueue_form_state_changes_for_node(&h, *target);
+                            }
+                        }
+                        for desc in fieldset_fa_descendants {
+                            enqueue_form_state_changes_for_node(&h, desc);
+                        }
                     }
                 },
             ))));
     }
 
     install_custom_element_registry(vm, host);
+    crate::element_internals::install_element_internals_and_aria(vm, host);
 }
 
 fn alloc_registry_instance(
@@ -1848,12 +2378,28 @@ fn install_custom_element_registry(vm: &mut JsVm, host: &SharedHost) {
             }
         };
 
-        // Step 19-20: Upgrade shadow-including descendants of the main document matching this registry.
-        let main_root = h.borrow().document.borrow().root();
-        let all_elements = {
+        // Step 19-20: Upgrade shadow-including descendants of the main document AND any
+        // sub-document (e.g. same-origin iframe) associated with `reg_id`.
+        let doc_roots: Vec<NodeId> = {
+            let hb = h.borrow();
+            let main_root = hb.document.borrow().root();
+            let mut roots = vec![main_root];
+            let ce = hb.custom_elements_state.borrow();
+            for (&did, &r) in &ce.doc_registries {
+                if r == Some(reg_id) && !roots.contains(&did) {
+                    roots.push(did);
+                }
+            }
+            roots
+        };
+        let all_elements: Vec<NodeId> = {
             let doc_rc = Rc::clone(&h.borrow().document);
             let doc = doc_rc.borrow();
-            collect_shadow_including_elements(&doc, main_root, false)
+            let mut elems = Vec::new();
+            for root in doc_roots {
+                elems.extend(collect_shadow_including_elements(&doc, root, false));
+            }
+            elems
         };
         let mut candidates = Vec::new();
         for nid in all_elements {
@@ -1915,9 +2461,13 @@ fn install_custom_element_registry(vm: &mut JsVm, host: &SharedHost) {
     let h = Rc::clone(host);
     define_host_method(vm, proto, "getName", move |vm, t, args| {
         let reg_id = require_registry_id(vm, &h, t)?;
-        let Some(ch) = arg(args, 0).as_object() else {
-            return Ok(JsValue::NULL);
+        let ctor_arg = arg(args, 0);
+        let Some(ch) = ctor_arg.as_object() else {
+            return Err(vm.type_error("CustomElementRegistry.getName requires a constructor"));
         };
+        if !vm.is_constructor_handle(ch) {
+            return Err(vm.type_error("CustomElementRegistry.getName requires a constructor"));
+        }
         let found = h
             .borrow()
             .custom_elements_state
@@ -1999,16 +2549,7 @@ fn install_custom_element_registry(vm: &mut JsVm, host: &SharedHost) {
             let hb = h.borrow();
             let doc = hb.document.borrow();
             match doc.get(root_id) {
-                Some(NodeData::Document) => {
-                    if is_scoped {
-                        return Err(create_dom_exception(
-                            vm,
-                            "NotSupportedError",
-                            "Scoped CustomElementRegistry cannot initialize a Document",
-                        ));
-                    }
-                    1u8
-                }
+                Some(NodeData::Document) => 1u8,
                 Some(NodeData::ShadowRoot { .. }) => 2u8,
                 Some(NodeData::Element(_) | NodeData::DocumentFragment) => 3u8,
                 _ => 0u8,
@@ -2016,6 +2557,19 @@ fn install_custom_element_registry(vm: &mut JsVm, host: &SharedHost) {
         };
         if root_is_doc_or_sr == 0 {
             return Ok(JsValue::UNDEFINED);
+        }
+        let target_doc = if root_is_doc_or_sr == 1 {
+            root_id
+        } else {
+            h.borrow().owner_doc_of(root_id)
+        };
+        validate_registry_for_document(vm, &h, Some(reg_id), target_doc)?;
+        if root_is_doc_or_sr == 1 && is_scoped && registry_for_document(&h, root_id).is_some() {
+            return Err(create_dom_exception(
+                vm,
+                "NotSupportedError",
+                "Cannot initialize a Document that already has a CustomElementRegistry with a scoped registry",
+            ));
         }
 
         // Associate `root_id` (if ShadowRoot/Document with null registry) and all null-registry

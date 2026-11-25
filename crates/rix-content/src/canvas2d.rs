@@ -581,12 +581,6 @@ fn install_html_canvas_element_proto(
         let _ = vm.call_value(cb, JsValue::UNDEFINED, &[blob_val]);
         Ok(JsValue::UNDEFINED)
     });
-
-    let ctor = vm.alloc_host_fn("HTMLCanvasElement", |vm, _, _| {
-        Err(vm.type_error("Illegal constructor: HTMLCanvasElement"))
-    });
-    bind_ctor_proto(vm, ctor, cp);
-    define_global(vm, "HTMLCanvasElement", JsValue::from_object(ctor));
 }
 
 fn parse_js_paint(vm: &JsVm, canvas_sys: &SharedCanvas2D, val: JsValue) -> Option<CanvasPaint> {

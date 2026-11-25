@@ -725,19 +725,21 @@ pub fn install_all_dom_interfaces(vm: &mut JsVm, host: &SharedHost) {
             }
         }
     }
-    let _ = register_dom_interface(
+    let _ = register_dom_interface_with_ce(
         vm,
         "HTMLVideoElement",
         p.html_video_element_proto,
         Some(media_ctor),
         false,
+        Some(host),
     );
-    let _ = register_dom_interface(
+    let _ = register_dom_interface_with_ce(
         vm,
         "HTMLAudioElement",
         p.html_audio_element_proto,
         Some(media_ctor),
         false,
+        Some(host),
     );
 
     // Register SVG*Element subclasses.

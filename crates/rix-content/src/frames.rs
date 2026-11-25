@@ -1257,6 +1257,11 @@ fn install_same_origin_child_globals(
         "NodeFilter",
         "DOMParser",
         "XMLSerializer",
+        "CustomElementRegistry",
+        "ElementInternals",
+        "CustomStateSet",
+        "ShadowRoot",
+        "getComputedStyle",
         "URL",
         "URLSearchParams",
         "AbortController",
@@ -1881,6 +1886,19 @@ pub(crate) fn sync_iframe_node(
             PropertyAttrs::METHOD,
             &mut vm.shapes,
         );
+        // Every same-origin child browsing context gets its own global `CustomElementRegistry`.
+        if let Some(cd_nid) = child_doc_nid {
+            let child_ce_reg =
+                crate::custom_elements::ensure_child_global_registry(vm, host, cd_nid);
+            let k_ce = vm.heap.intern_key("customElements");
+            vm.heap.object_define_data(
+                proxy_h,
+                k_ce,
+                JsValue::from_object(child_ce_reg),
+                PropertyAttrs::METHOD,
+                &mut vm.shapes,
+            );
+        }
 
         // Execute external & inline scripts inside the same-origin child iframe's isolated global.
         if sandbox.scripts_allowed() && !inline_scripts.is_empty() {
