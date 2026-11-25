@@ -1614,7 +1614,7 @@ fn alloc_array_iterator(
     };
     let iter_obj = vm.heap.alloc_object(JsObject::with_kind(
         ObjectKind::Ordinary,
-        Some(vm.iterator_proto),
+        Some(vm.array_iter_proto),
     ));
     let idx_cell = std::rc::Rc::new(std::cell::Cell::new(0u32));
     let done_cell = std::rc::Rc::new(std::cell::Cell::new(false));

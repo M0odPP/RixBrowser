@@ -465,6 +465,11 @@ pub(crate) fn readable_stream_pipe_to(
         }
     };
 
+    // WHATWG Streams §4.8 ReadableStreamPipeTo step 5: mark source disturbed synchronously!
+    if let Some(rs) = streams.borrow_mut().readable.get_mut(&src_h) {
+        rs.disturbed = true;
+    }
+
     let promise = alloc_promise(vm);
     let init_write = promise_resolve_value(vm, JsValue::UNDEFINED);
     let st = Rc::new(RefCell::new(PipeState {

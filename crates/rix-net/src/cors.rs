@@ -35,6 +35,18 @@ pub enum FetchCredentials {
     Include,
 }
 
+/// WHATWG Fetch request `cache` mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FetchCache {
+    #[default]
+    Default,
+    NoStore,
+    Reload,
+    NoCache,
+    ForceCache,
+    OnlyIfCached,
+}
+
 /// WHATWG Fetch request `redirect`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FetchRedirect {
@@ -74,6 +86,7 @@ pub struct FetchRequest {
     pub body: Vec<u8>,
     pub mode: FetchMode,
     pub credentials: FetchCredentials,
+    pub cache: FetchCache,
     pub redirect: FetchRedirect,
     /// Initiating document origin (e.g. `"https://app.example"` or `"http://127.0.0.1:8080"`).
     pub origin: String,
@@ -196,12 +209,78 @@ impl PreflightCache {
     }
 }
 
-/// High-level WHATWG Fetch engine wrapping [`HttpClient`] with full CORS enforcement
-/// and preflight caching.
+#[derive(Debug, Clone)]
+struct CachedFetchEntry {
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+    req_headers: HashMap<String, String>,
+    fetched_at_secs: u64,
+}
+
+impl CachedFetchEntry {
+    fn is_fresh(&self, now_secs: u64) -> bool {
+        if let Some(cc) = get_header_ci(&self.headers, "cache-control") {
+            let directives = crate::cache::CacheControlDirectives::parse(cc);
+            if directives.no_cache || directives.no_store {
+                return false;
+            }
+            if let Some(max_age) = directives.max_age {
+                return now_secs.saturating_sub(self.fetched_at_secs) < max_age;
+            }
+        }
+        if let Some(exp) = get_header_ci(&self.headers, "expires") {
+            if let Some(exp_secs) = crate::cache::parse_http_date(exp) {
+                return now_secs < exp_secs;
+            }
+            return false;
+        }
+        false
+    }
+
+    fn vary_matches(&self, req_headers: &HashMap<String, String>) -> bool {
+        let Some(vary) = get_header_ci(&self.headers, "vary") else {
+            return true;
+        };
+        for field in vary.split(',') {
+            let name = field.trim().to_ascii_lowercase();
+            if name.is_empty() {
+                continue;
+            }
+            if name == "*" {
+                return false;
+            }
+            let a = get_header_ci(&self.req_headers, &name).unwrap_or("");
+            let b = get_header_ci(req_headers, &name).unwrap_or("");
+            if a != b {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn is_conditional_request_header(headers: &HashMap<String, String>) -> bool {
+    headers.keys().any(|k| {
+        matches!(
+            k.to_ascii_lowercase().as_str(),
+            "if-modified-since" | "if-none-match" | "if-unmodified-since" | "if-match" | "if-range"
+        )
+    })
+}
+
+fn response_forbids_cache_store(headers: &HashMap<String, String>) -> bool {
+    get_header_ci(headers, "cache-control")
+        .is_some_and(|cc| crate::cache::CacheControlDirectives::parse(cc).no_store)
+}
+
+/// High-level WHATWG Fetch engine wrapping [`HttpClient`] with full CORS enforcement,
+/// RFC 9111 HTTP cache semantics, and preflight caching.
 #[derive(Clone)]
 pub struct FetchEngine {
     client: HttpClient,
     preflight_cache: Arc<Mutex<PreflightCache>>,
+    http_cache: Arc<Mutex<HashMap<String, CachedFetchEntry>>>,
 }
 
 impl FetchEngine {
@@ -210,6 +289,7 @@ impl FetchEngine {
         Self {
             client,
             preflight_cache: Arc::new(Mutex::new(PreflightCache::new())),
+            http_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -220,7 +300,7 @@ impl FetchEngine {
     }
 
     /// Executes a WHATWG Fetch request with full CORS preflight, header filtering,
-    /// opaque `no-cors` handling, and instant zero-polling `AbortHandle` cancellation.
+    /// opaque `no-cors` handling, RFC 9111 HTTP caching, and instant zero-polling `AbortHandle` cancellation.
     pub async fn fetch(&self, req: FetchRequest) -> Result<FetchResponse> {
         let abort = req.abort_signal.clone();
         if abort.as_ref().is_some_and(AbortHandle::is_aborted) {
@@ -238,121 +318,312 @@ impl FetchEngine {
     }
 
     async fn fetch_inner(&self, req: FetchRequest) -> Result<FetchResponse> {
-        let target_url = RixUrl::parse(&req.url)?;
+        let initial_url = RixUrl::parse(&req.url)?;
         let origin_url = RixUrl::parse(&req.origin).ok();
-        let is_same_origin = origin_url
-            .as_ref()
-            .is_some_and(|orig| same_origin(orig, &target_url));
-        let method = req.method.to_ascii_uppercase();
+        let mut current_url = initial_url.clone();
+        let mut method = req.method.to_ascii_uppercase();
+        let mut body = req.body;
+        let mut base_headers = req.headers;
+        let mut redirected = false;
+        let mut redirects_followed = 0u32;
 
-        if !is_same_origin && req.mode == FetchMode::SameOrigin {
-            return Err(NetError::Cors(format!(
-                "Cross-origin request to {} blocked by mode 'same-origin'",
-                req.url
-            )));
-        }
+        loop {
+            let is_same_origin = origin_url
+                .as_ref()
+                .is_some_and(|orig| same_origin(orig, &current_url));
 
-        // Cross-origin `no-cors` restricts to CORS-safelisted methods/headers and yields an opaque response.
-        if !is_same_origin && req.mode == FetchMode::NoCors {
-            if !is_cors_safelisted_method(&method) {
+            if !is_same_origin && req.mode == FetchMode::SameOrigin {
                 return Err(NetError::Cors(format!(
-                    "Method '{method}' is not allowed in 'no-cors' mode"
+                    "Cross-origin request to {} blocked by mode 'same-origin'",
+                    current_url.as_str()
                 )));
             }
-            let mut filtered_headers = HashMap::new();
-            for (k, v) in &req.headers {
-                if is_cors_safelisted_request_header(k, v) {
-                    filtered_headers.insert(k.clone(), v.clone());
+
+            // Cross-origin `no-cors` restricts to CORS-safelisted methods/headers and yields an opaque response.
+            if !is_same_origin && req.mode == FetchMode::NoCors {
+                if !is_cors_safelisted_method(&method) {
+                    return Err(NetError::Cors(format!(
+                        "Method '{method}' is not allowed in 'no-cors' mode"
+                    )));
+                }
+                let mut filtered_headers = HashMap::new();
+                for (k, v) in &base_headers {
+                    if is_cors_safelisted_request_header(k, v) {
+                        filtered_headers.insert(k.clone(), v.clone());
+                    }
+                }
+                let _ = self
+                    .send_raw(&current_url, &method, &filtered_headers, body, false)
+                    .await?;
+                return Ok(FetchResponse {
+                    url: String::new(),
+                    status: 0,
+                    status_text: String::new(),
+                    headers: HashMap::new(),
+                    body: Vec::new(),
+                    response_type: FetchResponseType::Opaque,
+                    redirected: false,
+                });
+            }
+
+            let include_credentials = match req.credentials {
+                FetchCredentials::Include => true,
+                FetchCredentials::SameOrigin => is_same_origin,
+                FetchCredentials::Omit => false,
+            };
+
+            // Cross-origin CORS mode: determine if an automatic `OPTIONS` preflight is required.
+            let mut wire_headers = base_headers.clone();
+            if !is_same_origin && req.mode == FetchMode::Cors {
+                wire_headers.insert("Origin".to_string(), req.origin.clone());
+                let mut unsafe_headers: Vec<String> = base_headers
+                    .iter()
+                    .filter(|(k, v)| !is_cors_safelisted_request_header(k, v))
+                    .map(|(k, _)| k.to_ascii_lowercase())
+                    .collect();
+                unsafe_headers.sort();
+                unsafe_headers.dedup();
+
+                let needs_preflight =
+                    !is_cors_safelisted_method(&method) || !unsafe_headers.is_empty();
+                if needs_preflight {
+                    self.ensure_cors_preflight(
+                        &current_url,
+                        &req.origin,
+                        &method,
+                        &unsafe_headers,
+                        include_credentials,
+                    )
+                    .await?;
                 }
             }
-            let _ = self
-                .send_raw(&target_url, &method, &filtered_headers, req.body, false)
-                .await?;
-            return Ok(FetchResponse {
-                url: String::new(),
-                status: 0,
-                status_text: String::new(),
-                headers: HashMap::new(),
-                body: Vec::new(),
-                response_type: FetchResponseType::Opaque,
-                redirected: false,
-            });
-        }
 
-        let include_credentials = match req.credentials {
-            FetchCredentials::Include => true,
-            FetchCredentials::SameOrigin => is_same_origin,
-            FetchCredentials::Omit => false,
-        };
-
-        // Cross-origin CORS mode: determine if an automatic `OPTIONS` preflight is required.
-        let mut wire_headers = req.headers.clone();
-        if !is_same_origin && req.mode == FetchMode::Cors {
-            wire_headers.insert("Origin".to_string(), req.origin.clone());
-            let mut unsafe_headers: Vec<String> = req
-                .headers
-                .iter()
-                .filter(|(k, v)| !is_cors_safelisted_request_header(k, v))
-                .map(|(k, _)| k.to_ascii_lowercase())
-                .collect();
-            unsafe_headers.sort();
-            unsafe_headers.dedup();
-
-            let needs_preflight = !is_cors_safelisted_method(&method) || !unsafe_headers.is_empty();
-            if needs_preflight {
-                self.ensure_cors_preflight(
-                    &target_url,
-                    &req.origin,
+            let (status, resp_headers, resp_body) = self
+                .http_network_or_cache_fetch(
+                    &current_url,
                     &method,
-                    &unsafe_headers,
+                    &wire_headers,
+                    &body,
                     include_credentials,
+                    req.cache,
                 )
                 .await?;
+
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                if let Some(loc) = get_header_ci(&resp_headers, "location") {
+                    match req.redirect {
+                        FetchRedirect::Error => {
+                            return Err(NetError::Http(
+                                "Redirect blocked by redirect: 'error'".into(),
+                            ));
+                        }
+                        FetchRedirect::Manual => {
+                            return Ok(FetchResponse {
+                                url: String::new(),
+                                status: 0,
+                                status_text: String::new(),
+                                headers: HashMap::new(),
+                                body: Vec::new(),
+                                response_type: FetchResponseType::OpaqueRedirect,
+                                redirected: false,
+                            });
+                        }
+                        FetchRedirect::Follow => {
+                            if redirects_followed >= 20 {
+                                return Err(NetError::TooManyRedirects(20));
+                            }
+                            let next_url = current_url
+                                .join(loc)
+                                .unwrap_or_else(|_| current_url.clone());
+                            if !same_origin(&current_url, &next_url) {
+                                base_headers.retain(|k, _| {
+                                    !matches!(
+                                        k.to_ascii_lowercase().as_str(),
+                                        "authorization" | "proxy-authorization" | "cookie"
+                                    )
+                                });
+                            }
+                            if (matches!(status, 301 | 302) && method == "POST")
+                                || (status == 303 && !matches!(method.as_str(), "GET" | "HEAD"))
+                            {
+                                method = "GET".to_string();
+                                body.clear();
+                            }
+                            current_url = next_url;
+                            redirected = true;
+                            redirects_followed += 1;
+                            continue;
+                        }
+                    }
+                }
             }
+
+            if is_same_origin {
+                return Ok(FetchResponse {
+                    url: current_url.as_str().to_string(),
+                    status,
+                    status_text: reason_phrase(status).to_string(),
+                    headers: resp_headers,
+                    body: resp_body,
+                    response_type: FetchResponseType::Basic,
+                    redirected,
+                });
+            }
+
+            // Cross-origin CORS response validation.
+            validate_cors_response(&resp_headers, &req.origin, include_credentials)?;
+            let filtered = filter_cors_response_headers(&resp_headers, include_credentials);
+
+            return Ok(FetchResponse {
+                url: current_url.as_str().to_string(),
+                status,
+                status_text: reason_phrase(status).to_string(),
+                headers: filtered,
+                body: resp_body,
+                response_type: FetchResponseType::Cors,
+                redirected,
+            });
+        }
+    }
+
+    async fn http_network_or_cache_fetch(
+        &self,
+        url: &RixUrl,
+        method: &str,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        include_credentials: bool,
+        req_cache: FetchCache,
+    ) -> Result<(u16, HashMap<String, String>, Vec<u8>)> {
+        let is_cacheable_method = method == "GET";
+        let effective_cache =
+            if req_cache == FetchCache::Default && is_conditional_request_header(headers) {
+                FetchCache::NoStore
+            } else {
+                req_cache
+            };
+
+        let cache_key = url.as_str().to_string();
+        let now = crate::cache::now_secs();
+
+        let cached = if is_cacheable_method
+            && !matches!(effective_cache, FetchCache::NoStore | FetchCache::Reload)
+        {
+            let guard = self.http_cache.lock().await;
+            guard
+                .get(&cache_key)
+                .filter(|e| e.vary_matches(headers))
+                .cloned()
+        } else {
+            None
+        };
+
+        // Fast cache hits without touching the network.
+        if let Some(ref entry) = cached {
+            let can_serve_direct = match effective_cache {
+                FetchCache::Default => entry.is_fresh(now),
+                FetchCache::ForceCache | FetchCache::OnlyIfCached => true,
+                FetchCache::NoCache | FetchCache::NoStore | FetchCache::Reload => false,
+            };
+            if can_serve_direct {
+                return Ok((entry.status, entry.headers.clone(), entry.body.clone()));
+            }
+        }
+
+        if effective_cache == FetchCache::OnlyIfCached {
+            return Err(NetError::Http(
+                "Response not found in cache for 'only-if-cached'".into(),
+            ));
+        }
+
+        let mut net_headers = headers.clone();
+        match effective_cache {
+            FetchCache::Reload => {
+                if get_header_ci(&net_headers, "pragma").is_none() {
+                    net_headers.insert("Pragma".to_string(), "no-cache".to_string());
+                }
+                if get_header_ci(&net_headers, "cache-control").is_none() {
+                    net_headers.insert("Cache-Control".to_string(), "no-cache".to_string());
+                }
+            }
+            FetchCache::NoCache => {
+                if let Some(ref entry) = cached {
+                    if let Some(etag) = get_header_ci(&entry.headers, "etag") {
+                        net_headers.insert("If-None-Match".to_string(), etag.to_string());
+                    }
+                    if let Some(lm) = get_header_ci(&entry.headers, "last-modified") {
+                        net_headers.insert("If-Modified-Since".to_string(), lm.to_string());
+                    }
+                    net_headers.insert("Cache-Control".to_string(), "max-age=0".to_string());
+                } else {
+                    if get_header_ci(&net_headers, "pragma").is_none() {
+                        net_headers.insert("Pragma".to_string(), "no-cache".to_string());
+                    }
+                    if get_header_ci(&net_headers, "cache-control").is_none() {
+                        net_headers.insert("Cache-Control".to_string(), "no-cache".to_string());
+                    }
+                }
+            }
+            FetchCache::Default => {
+                if let Some(ref entry) = cached {
+                    if let Some(etag) = get_header_ci(&entry.headers, "etag") {
+                        net_headers.insert("If-None-Match".to_string(), etag.to_string());
+                    }
+                    if let Some(lm) = get_header_ci(&entry.headers, "last-modified") {
+                        net_headers.insert("If-Modified-Since".to_string(), lm.to_string());
+                    }
+                }
+            }
+            FetchCache::NoStore | FetchCache::ForceCache | FetchCache::OnlyIfCached => {}
         }
 
         let resp = self
-            .send_raw(
-                &target_url,
-                &method,
-                &wire_headers,
-                req.body,
+            .send_single_hop(
+                url,
+                method,
+                &net_headers,
+                body.to_vec(),
                 include_credentials,
             )
             .await?;
 
-        let redirected = resp.final_url.as_str() != target_url.as_str();
-        if redirected && req.redirect == FetchRedirect::Error {
-            return Err(NetError::Http(
-                "Redirect blocked by redirect: 'error'".into(),
-            ));
+        if resp.status == 304 {
+            if let Some(mut entry) = cached {
+                for (k, v) in resp.headers {
+                    entry.headers.insert(k, v);
+                }
+                entry.fetched_at_secs = crate::cache::now_secs();
+                let out = (entry.status, entry.headers.clone(), entry.body.clone());
+                if effective_cache != FetchCache::NoStore
+                    && !response_forbids_cache_store(&entry.headers)
+                {
+                    self.http_cache.lock().await.insert(cache_key, entry);
+                }
+                return Ok(out);
+            }
         }
 
-        if is_same_origin {
-            return Ok(FetchResponse {
-                url: resp.final_url.as_str().to_string(),
-                status: resp.status,
-                status_text: reason_phrase(resp.status).to_string(),
-                headers: resp.headers,
-                body: resp.body,
-                response_type: FetchResponseType::Basic,
-                redirected,
-            });
+        if is_cacheable_method
+            && effective_cache != FetchCache::NoStore
+            && matches!(
+                resp.status,
+                200 | 203 | 204 | 206 | 300 | 301 | 302 | 307 | 308 | 404 | 410
+            )
+            && !response_forbids_cache_store(&resp.headers)
+        {
+            self.http_cache.lock().await.insert(
+                cache_key,
+                CachedFetchEntry {
+                    status: resp.status,
+                    headers: resp.headers.clone(),
+                    body: resp.body.clone(),
+                    req_headers: headers.clone(),
+                    fetched_at_secs: crate::cache::now_secs(),
+                },
+            );
         }
 
-        // Cross-origin CORS response validation.
-        validate_cors_response(&resp.headers, &req.origin, include_credentials)?;
-        let filtered = filter_cors_response_headers(&resp.headers, include_credentials);
-
-        Ok(FetchResponse {
-            url: resp.final_url.as_str().to_string(),
-            status: resp.status,
-            status_text: reason_phrase(resp.status).to_string(),
-            headers: filtered,
-            body: resp.body,
-            response_type: FetchResponseType::Cors,
-            redirected,
-        })
+        Ok((resp.status, resp.headers, resp.body))
     }
 
     async fn ensure_cors_preflight(
@@ -481,6 +752,21 @@ impl FetchEngine {
             client.set_storage(None);
         }
         client.request(url, method, headers, body).await
+    }
+
+    async fn send_single_hop(
+        &self,
+        url: &RixUrl,
+        method: &str,
+        headers: &HashMap<String, String>,
+        body: Vec<u8>,
+        include_credentials: bool,
+    ) -> Result<crate::client::HttpResponse> {
+        let mut client = self.client.clone();
+        if !include_credentials {
+            client.set_storage(None);
+        }
+        client.request_no_redirect(url, method, headers, body).await
     }
 }
 

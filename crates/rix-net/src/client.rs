@@ -531,6 +531,9 @@ impl HttpClient {
         headers: &HashMap<String, String>,
         body: Vec<u8>,
     ) -> Result<HttpResponse> {
+        if url.scheme() == RixScheme::Http && headers_need_raw_http1(headers) {
+            return self.raw_http1_exchange(url, method, headers, &body).await;
+        }
         let mut request = self.clone();
         request.request_method = Method::from_bytes(method.as_bytes())
             .map_err(|error| NetError::Http(format!("Invalid HTTP method: {error}")))?;
@@ -542,12 +545,187 @@ impl HttpClient {
             let name = name
                 .parse::<hyper::header::HeaderName>()
                 .map_err(|error| NetError::Header(error.to_string()))?;
-            let value = HeaderValue::from_str(value)
+            let raw = isomorphic_encode(value);
+            let value = HeaderValue::from_bytes(&raw)
                 .map_err(|error| NetError::Header(error.to_string()))?;
             request.request_headers.insert(name, value);
         }
         request.request_body = Bytes::from(body);
         request.fetch(url).await
+    }
+
+    /// Executes a single HTTP hop without following 3xx redirects (used by `FetchEngine`
+    /// to enforce per-hop CORS, `redirect`, and RFC 9111 HTTP cache semantics).
+    pub async fn request_no_redirect(
+        &self,
+        url: &RixUrl,
+        method: &str,
+        headers: &HashMap<String, String>,
+        body: Vec<u8>,
+    ) -> Result<HttpResponse> {
+        if url.scheme() == RixScheme::Http && headers_need_raw_http1(headers) {
+            return self.raw_http1_exchange(url, method, headers, &body).await;
+        }
+        let mut request = self.clone();
+        request.request_method = Method::from_bytes(method.as_bytes())
+            .map_err(|error| NetError::Http(format!("Invalid HTTP method: {error}")))?;
+        if matches!(request.request_method, Method::GET | Method::HEAD) && !body.is_empty() {
+            return Err(NetError::Http("GET and HEAD cannot carry a body".into()));
+        }
+        request.request_headers.clear();
+        for (name, value) in headers {
+            let name = name
+                .parse::<hyper::header::HeaderName>()
+                .map_err(|error| NetError::Header(error.to_string()))?;
+            let raw = isomorphic_encode(value);
+            let value = HeaderValue::from_bytes(&raw)
+                .map_err(|error| NetError::Header(error.to_string()))?;
+            request.request_headers.insert(name, value);
+        }
+        request.request_body = Bytes::from(body);
+        let clock = FetchClock::new();
+        let fetch_start_ms = clock.elapsed_ms();
+        tokio::time::timeout(
+            request.request_timeout,
+            request.fetch_single(url, &ConditionalRequest::empty(), clock, fetch_start_ms),
+        )
+        .await
+        .map_err(|_| NetError::Timeout(request.request_timeout))?
+    }
+
+    /// Pure-Rust RFC 9112 HTTP/1.1 exchange preserving raw WHATWG Fetch ByteString header
+    /// bytes (`0x01..=0xFF`, excluding NUL/CR/LF) that `http::HeaderValue` rejects.
+    async fn raw_http1_exchange(
+        &self,
+        url: &RixUrl,
+        method: &str,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> Result<HttpResponse> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let host = url
+            .host_str()
+            .ok_or_else(|| NetError::Http("URL missing host".into()))?;
+        let port = url.port().unwrap_or(80);
+        let authority = request_authority(url)?;
+        let path_and_query = match url.query() {
+            Some(q) => format!("{}?{q}", url.path()),
+            None => url.path().to_string(),
+        };
+        let addrs = self.dns.resolve_socket_addrs(host, port).await?;
+        let addr = *addrs
+            .first()
+            .ok_or_else(|| NetError::Dns(format!("No IP addresses found for '{host}'")))?;
+        let mut stream = tokio::time::timeout(self.request_timeout, TcpStream::connect(addr))
+            .await
+            .map_err(|_| NetError::Timeout(self.request_timeout))?
+            .map_err(|e| NetError::Http(format!("TCP connect failed: {e}")))?;
+
+        let mut req_buf = Vec::with_capacity(512 + body.len());
+        req_buf.extend_from_slice(
+            format!(
+                "{method} {path_and_query} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n"
+            )
+            .as_bytes(),
+        );
+        if !body.is_empty()
+            && !headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("content-length"))
+        {
+            req_buf.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+        }
+        for (k, v) in headers {
+            req_buf.extend_from_slice(k.as_bytes());
+            req_buf.extend_from_slice(b": ");
+            req_buf.extend_from_slice(&isomorphic_encode(v));
+            req_buf.extend_from_slice(b"\r\n");
+        }
+        req_buf.extend_from_slice(b"\r\n");
+        req_buf.extend_from_slice(body);
+        stream
+            .write_all(&req_buf)
+            .await
+            .map_err(|e| NetError::Http(format!("HTTP/1.1 write failed: {e}")))?;
+
+        let mut raw_resp = Vec::new();
+        tokio::time::timeout(self.request_timeout, stream.read_to_end(&mut raw_resp))
+            .await
+            .map_err(|_| NetError::Timeout(self.request_timeout))?
+            .map_err(|e| NetError::Http(format!("HTTP/1.1 read failed: {e}")))?;
+
+        let sep = raw_resp
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| NetError::Http("Malformed HTTP/1.1 response head".into()))?;
+        let head_bytes = &raw_resp[..sep];
+        let body_raw = &raw_resp[sep + 4..];
+
+        let mut lines = head_bytes.split(|&b| b == b'\n');
+        let status_line = lines.next().unwrap_or(b"");
+        let status_str = String::from_utf8_lossy(status_line);
+        let status = status_str
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(200);
+
+        let mut resp_headers: HashMap<String, String> = HashMap::new();
+        for raw_line in lines {
+            let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+            if let Some(colon) = line.iter().position(|&b| b == b':') {
+                let name = String::from_utf8_lossy(&line[..colon])
+                    .trim()
+                    .to_ascii_lowercase();
+                let mut val_slice = &line[colon + 1..];
+                while let Some((&first, rest)) = val_slice.split_first() {
+                    if first == b' ' || first == b'\t' {
+                        val_slice = rest;
+                    } else {
+                        break;
+                    }
+                }
+                while let Some((&last, rest)) = val_slice.split_last() {
+                    if last == b' ' || last == b'\t' {
+                        val_slice = rest;
+                    } else {
+                        break;
+                    }
+                }
+                let val_str = isomorphic_decode(val_slice);
+                resp_headers
+                    .entry(name)
+                    .and_modify(|e| {
+                        e.push_str(", ");
+                        e.push_str(&val_str);
+                    })
+                    .or_insert(val_str);
+            }
+        }
+
+        let resp_body = if resp_headers
+            .get("transfer-encoding")
+            .is_some_and(|te| te.to_ascii_lowercase().contains("chunked"))
+        {
+            decode_http1_chunked(body_raw)
+        } else {
+            body_raw.to_vec()
+        };
+        let content_type = resp_headers
+            .get("content-type")
+            .cloned()
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        Ok(HttpResponse {
+            status,
+            headers: resp_headers,
+            body: resp_body,
+            final_url: url.clone(),
+            content_type,
+            protocol: NegotiatedProtocol::Http11,
+            navigation_timing: NavigationTiming::default(),
+            navigation_started: Instant::now(),
+            set_cookies: Vec::new(),
+        })
     }
 
     pub async fn request_stream(
@@ -1934,12 +2112,60 @@ async fn collect_body_limited(mut body: hyper::body::Incoming, limit: usize) -> 
     Ok(bytes)
 }
 
+fn isomorphic_encode(s: &str) -> Vec<u8> {
+    s.chars()
+        .map(|c| {
+            let cp = c as u32;
+            if cp <= 0xFF {
+                cp as u8
+            } else {
+                b'?'
+            }
+        })
+        .collect()
+}
+
+fn isomorphic_decode(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| char::from(b)).collect()
+}
+
+fn headers_need_raw_http1(headers: &HashMap<String, String>) -> bool {
+    headers.values().any(|v| {
+        isomorphic_encode(v)
+            .into_iter()
+            .any(|b| (b < 0x20 && b != b'\t') || b == 0x7F)
+    })
+}
+
+fn decode_http1_chunked(mut data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(pos) = data.windows(2).position(|w| w == b"\r\n") {
+        let size_str = String::from_utf8_lossy(&data[..pos]);
+        let hex = size_str.split(';').next().unwrap_or("").trim();
+        let Ok(len) = usize::from_str_radix(hex, 16) else {
+            break;
+        };
+        data = &data[pos + 2..];
+        if len == 0 || len > data.len() {
+            break;
+        }
+        out.extend_from_slice(&data[..len]);
+        data = data[len..].strip_prefix(b"\r\n").unwrap_or(&data[len..]);
+    }
+    out
+}
+
 fn header_map_to_hash_map(header_map: &HeaderMap) -> HashMap<String, String> {
     let mut headers = HashMap::new();
     for (key, value) in header_map.iter() {
-        if let Ok(val_str) = value.to_str() {
-            headers.insert(key.as_str().to_lowercase(), val_str.to_string());
-        }
+        let val_str = isomorphic_decode(value.as_bytes());
+        headers
+            .entry(key.as_str().to_lowercase())
+            .and_modify(|e: &mut String| {
+                e.push_str(", ");
+                e.push_str(&val_str);
+            })
+            .or_insert(val_str);
     }
     headers
 }

@@ -242,6 +242,7 @@ pub struct JsVm {
     pub promise_proto: HeapHandle,
     pub promise_ctor: Option<HeapHandle>,
     pub iterator_proto: HeapHandle,
+    pub array_iter_proto: HeapHandle,
     pub iterator_helper_proto: HeapHandle,
     pub wrap_iterator_proto: HeapHandle,
     pub async_iterator_proto: HeapHandle,
@@ -457,6 +458,7 @@ impl JsVm {
             std::array::from_fn(|_| make_proto(&mut heap, &mut shapes, typed_array_proto));
         let promise_proto = make_proto(&mut heap, &mut shapes, object_proto);
         let iterator_proto = make_proto(&mut heap, &mut shapes, object_proto);
+        let array_iter_proto = make_proto(&mut heap, &mut shapes, iterator_proto);
         let iterator_helper_proto = make_proto(&mut heap, &mut shapes, iterator_proto);
         let wrap_iterator_proto = make_proto(&mut heap, &mut shapes, iterator_proto);
         let async_iterator_proto = make_proto(&mut heap, &mut shapes, object_proto);
@@ -583,6 +585,7 @@ impl JsVm {
             promise_proto,
             promise_ctor: None,
             iterator_proto,
+            array_iter_proto,
             iterator_helper_proto,
             wrap_iterator_proto,
             async_iterator_proto,
@@ -628,7 +631,24 @@ impl JsVm {
             symbol_descriptions: HashMap::new(),
             regexp_statics: crate::builtins_regexp::RegExpLegacyStatics::default(),
             atomic_async_waiters: Vec::new(),
-            rng_state: 0x9E37_79B9_7F4A_7C15,
+            rng_state: {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static VM_SEED_COUNTER: AtomicU64 = AtomicU64::new(1);
+                let seq = VM_SEED_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64);
+                let mut z = nanos.wrapping_add(seq.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                    ^ 0xBF58_476D_1CE4_E5B9;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                if z == 0 {
+                    0x9E37_79B9_7F4A_7C15
+                } else {
+                    z
+                }
+            },
             microtasks: VecDeque::new(),
             module_envs: HashMap::new(),
             dynamic_import_handler: None,
@@ -778,6 +798,7 @@ impl JsVm {
             self.typed_array_proto,
             self.promise_proto,
             self.iterator_proto,
+            self.array_iter_proto,
             self.iterator_helper_proto,
             self.wrap_iterator_proto,
             self.async_iterator_proto,

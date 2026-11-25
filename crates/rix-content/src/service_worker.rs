@@ -776,6 +776,7 @@ fn run_service_worker_thread(
                 body: Vec::new(),
                 mode: FetchMode::SameOrigin,
                 credentials: FetchCredentials::SameOrigin,
+                cache: rix_net::FetchCache::Default,
                 redirect: FetchRedirect::Follow,
                 origin: origin.clone(),
                 abort_signal: None,
