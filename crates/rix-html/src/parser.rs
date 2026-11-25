@@ -625,6 +625,7 @@ fn attach_declarative_shadow_roots_in_subtree(doc: &mut Document, root: NodeId) 
                         } else {
                             "named".to_string()
                         };
+                        let null_registry = elem.has_attribute("shadowrootcustomelementregistry");
                         let frag = elem.template_contents.unwrap_or(child);
                         Some((
                             mode_lower,
@@ -632,6 +633,7 @@ fn attach_declarative_shadow_roots_in_subtree(doc: &mut Document, root: NodeId) 
                             clonable,
                             serializable,
                             slot_assignment,
+                            null_registry,
                             frag,
                         ))
                     } else {
@@ -647,8 +649,15 @@ fn attach_declarative_shadow_roots_in_subtree(doc: &mut Document, root: NodeId) 
             None
         };
 
-        if let Some((mode_lower, delegates_focus, clonable, serializable, slot_assignment, frag)) =
-            template_info
+        if let Some((
+            mode_lower,
+            delegates_focus,
+            clonable,
+            serializable,
+            slot_assignment,
+            null_registry,
+            frag,
+        )) = template_info
         {
             let parent = doc.parent(child);
             if let Some(parent) = parent {
@@ -661,6 +670,7 @@ fn attach_declarative_shadow_roots_in_subtree(doc: &mut Document, root: NodeId) 
                         serializable,
                         slot_assignment,
                         declarative: true,
+                        null_registry,
                     });
                     if let Some(NodeData::Element(parent_elem)) = doc.get_mut(parent) {
                         parent_elem.shadow_root = Some(shadow_root);

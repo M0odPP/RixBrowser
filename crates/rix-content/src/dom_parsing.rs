@@ -829,6 +829,24 @@ fn set_inner_html_spec(
         let is_conn = doc.is_connected(target_container);
         (removed, added, is_conn)
     };
+    let target_reg = {
+        let doc_rc = Rc::clone(&host.borrow().document);
+        let doc = doc_rc.borrow();
+        match doc.get(target_container) {
+            Some(NodeData::ShadowRoot { .. }) => {
+                drop(doc);
+                crate::custom_elements::registry_for_shadow_root(host, target_container)
+            }
+            Some(NodeData::Element(_)) => {
+                drop(doc);
+                crate::custom_elements::effective_registry_for_element(host, target_container)
+            }
+            _ => {
+                drop(doc);
+                crate::custom_elements::registry_for_document(host, owner_doc)
+            }
+        }
+    };
     {
         let mut hb = host.borrow_mut();
         for &n in &added {
@@ -836,17 +854,32 @@ fn set_inner_html_spec(
         }
         hb.invalidate_dom_mutation(target_container, None);
     }
+    {
+        let doc_rc = Rc::clone(&host.borrow().document);
+        let doc = doc_rc.borrow();
+        for &n in &added {
+            for el in crate::custom_elements::collect_shadow_including_elements(&doc, n, true) {
+                crate::custom_elements::set_element_registry(host, el, target_reg);
+            }
+        }
+    }
     host.borrow().emit_mutation(DomMutation::ChildList {
         target: target_container,
         added: added.clone(),
-        removed,
+        removed: removed.clone(),
         previous_sibling: None,
         next_sibling: None,
     });
     if is_conn {
-        for &n in &added {
-            notify_custom_element_subtree(vm, host, n, true);
-        }
+        let _ = crate::custom_elements::with_ce_reactions(vm, host, |vm| {
+            for &old in &removed {
+                notify_custom_element_subtree(vm, host, old, false);
+            }
+            for &n in &added {
+                notify_custom_element_subtree(vm, host, n, true);
+            }
+            Ok(())
+        });
     }
     if run_scripts {
         maybe_run_fragment_scripts(vm, host, &added, is_conn);

@@ -19,7 +19,7 @@ use rix_js::{HeapHandle, JsException, JsObject, JsValue, JsVm, ObjectKind, Prope
 
 use crate::dom_bridge::{
     arg, define_global, define_host_accessor, define_host_method, notify_custom_element_subtree,
-    require_node, upgrade_if_custom_element, wrap_node, DomMutation, SharedHost,
+    require_node, wrap_node, DomMutation, SharedHost,
 };
 use crate::dom_interfaces::{HTML_NS, SVG_NS};
 use crate::dom_parsing::to_dom_string;
@@ -1580,6 +1580,8 @@ fn sync_node_recursive(
                                     serializable: src_el.has_attribute("shadowrootserializable"),
                                     slot_assignment,
                                     declarative: true,
+                                    null_registry: src_el
+                                        .has_attribute("shadowrootcustomelementregistry"),
                                 });
                                 if let Some(NodeData::Element(pe)) = doc.get_mut(dst_parent) {
                                     pe.shadow_root = Some(sr);
@@ -1766,53 +1768,7 @@ fn insert_mirrored_leaf(
 }
 
 fn maybe_upgrade_and_connect_single_ce(vm: &mut JsVm, host: &SharedHost, nid: NodeId) {
-    if host.borrow().custom_elements.is_empty() {
-        return;
-    }
-    let ce_match: Option<(String, String)> = {
-        let hb = host.borrow();
-        let doc = hb.document.borrow();
-        if let Some(NodeData::Element(e)) = doc.get(nid) {
-            if &*e.name.ns == HTML_NS {
-                let tag = e.name.local.as_str().to_ascii_lowercase();
-                if hb
-                    .custom_elements
-                    .get(&tag)
-                    .is_some_and(|d| d.extends.is_none())
-                {
-                    Some((tag.clone(), tag))
-                } else if let Some(is_val) = e.get_attribute("is") {
-                    if hb
-                        .custom_elements
-                        .get(is_val)
-                        .is_some_and(|d| d.extends.as_deref() == Some(tag.as_str()))
-                    {
-                        Some((is_val.to_string(), tag))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
-    if let Some((ce_name, tag)) = ce_match {
-        upgrade_if_custom_element(vm, host, nid, &ce_name, &tag);
-        let wrapper = wrap_node(vm, host, nid);
-        if let Some(wh) = wrapper.as_object() {
-            let k = vm.heap.intern_key("connectedCallback");
-            if let Ok(cb) = vm.get_property_by_key(wh, k) {
-                if cb.as_object().is_some_and(|h| vm.is_callable_handle(h)) {
-                    let _ = vm.call_value(cb, wrapper, &[]);
-                }
-            }
-        }
-    }
+    crate::custom_elements::upgrade_element_now(vm, host, nid);
 }
 
 /// Checks if a parsed `<script>` element should execute, and runs inline or external scripts.

@@ -5,6 +5,17 @@ use rix_core::{intern_str, InternedStr};
 use smallvec::SmallVec;
 use std::fmt;
 
+/// WHATWG DOM §4.9 custom element state of an element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CustomElementState {
+    #[default]
+    Uncustomized,
+    Undefined,
+    Precustomized,
+    Custom,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum NodeData {
     Document,
@@ -17,6 +28,7 @@ pub enum NodeData {
         serializable: bool,
         slot_assignment: String,
         declarative: bool,
+        null_registry: bool,
     },
     DocumentType {
         name: String,
@@ -45,6 +57,9 @@ pub struct ElementData {
     pub cached_id: Option<InternedStr>,
     pub class_hashes: SmallVec<[u64; 4]>,
     pub tag_hash: u64,
+    pub custom_element_state: CustomElementState,
+    pub is_value: Option<String>,
+    pub custom_states: Vec<InternedStr>,
 }
 
 pub fn parse_non_negative_integer(input: &str) -> Option<u32> {
@@ -74,6 +89,20 @@ pub fn parse_non_negative_integer(input: &str) -> Option<u32> {
 impl ElementData {
     pub fn new(name: QualName) -> Self {
         let tag_hash = hash_ident_ascii_lower(&name.local);
+        let initial_ce_state = if &*name.ns == "http://www.w3.org/1999/xhtml"
+            && is_valid_custom_element_name(&name.local)
+        {
+            CustomElementState::Undefined
+        } else {
+            CustomElementState::Uncustomized
+        };
+        let mut pseudo_state = ElementState::empty();
+        if matches!(
+            initial_ce_state,
+            CustomElementState::Uncustomized | CustomElementState::Custom
+        ) {
+            pseudo_state.insert(ElementState::DEFINED);
+        }
         let mut elem = Self {
             name,
             attributes: Vec::new(),
@@ -83,13 +112,30 @@ impl ElementData {
             dirty_flags: DirtyFlags::SELF_STYLE_DIRTY
                 | DirtyFlags::SELF_LAYOUT_DIRTY
                 | DirtyFlags::PAINT_DIRTY,
-            pseudo_state: ElementState::empty(),
+            pseudo_state,
             cached_id: None,
             class_hashes: SmallVec::new(),
             tag_hash,
+            custom_element_state: initial_ce_state,
+            is_value: None,
+            custom_states: Vec::new(),
         };
         elem.sync_intrinsic_state();
         elem
+    }
+
+    #[must_use]
+    pub fn is_defined(&self) -> bool {
+        matches!(
+            self.custom_element_state,
+            CustomElementState::Uncustomized | CustomElementState::Custom
+        )
+    }
+
+    pub fn set_custom_element_state(&mut self, state: CustomElementState) {
+        self.custom_element_state = state;
+        self.pseudo_state
+            .set(ElementState::DEFINED, self.is_defined());
     }
 
     pub fn sync_cached_attrs(&mut self) {
@@ -374,6 +420,7 @@ pub fn is_valid_shadow_host_name(local_name: &str) -> bool {
     ) || is_valid_custom_element_name(local_name)
 }
 
+/// WHATWG HTML §4.13.3 valid custom element name (including modern HTML PR #7991 / #10602).
 pub fn is_valid_custom_element_name(name: &str) -> bool {
     const RESERVED: &[&str] = &[
         "annotation-xml",
@@ -392,10 +439,9 @@ pub fn is_valid_custom_element_name(name: &str) -> bool {
     first.is_ascii_lowercase()
         && name.contains('-')
         && !RESERVED.contains(&name)
-        && chars.all(|character| {
-            character.is_ascii_lowercase()
-                || character.is_ascii_digit()
-                || matches!(character, '-' | '.' | '_')
+        && chars.all(|c| {
+            !c.is_ascii_uppercase()
+                && !matches!(c, '\0' | '\t' | '\n' | '\x0C' | '\r' | ' ' | '/' | '>')
         })
 }
 

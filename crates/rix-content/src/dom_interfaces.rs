@@ -577,64 +577,20 @@ fn register_dom_interface_with_ce(
     ce_host: Option<&SharedHost>,
 ) -> HeapHandle {
     define_to_string_tag(vm, proto, name);
+    let self_ctor_cell: Rc<std::cell::Cell<Option<HeapHandle>>> =
+        Rc::new(std::cell::Cell::new(None));
     let ctor = if let Some(h_ref) = ce_host {
         let h = Rc::clone(h_ref);
+        let sc = Rc::clone(&self_ctor_cell);
         vm.alloc_host_fn(name, move |vm, this_val, _| {
-            // 1. Upgrade stack: `upgrade_if_custom_element` set `pending_ce_upgrade_node`.
-            let pending_nid = h.borrow_mut().pending_ce_upgrade_node.take();
-            if let Some(nid) = pending_nid {
-                let wrapper = wrap_node(vm, &h, nid);
-                if let (Some(wh), Some(nt)) =
-                    (wrapper.as_object(), vm.native_new_target.as_object())
-                {
-                    if let Ok(nt_proto) = vm.get_property_by_key(nt, vm.key_prototype) {
-                        if let Some(ph) = nt_proto.as_object() {
-                            vm.heap.object_set_prototype(wh, Some(ph), &mut vm.shapes);
-                        }
-                    }
-                }
-                return Ok(wrapper);
-            }
-            // 2. Direct `new MyCustomElement()` construction via registered constructor.
-            if let Some(nt) = vm.native_new_target.as_object() {
-                let found_def = h
-                    .borrow()
-                    .custom_elements
-                    .iter()
-                    .find(|(_, d)| d.constructor == nt)
-                    .map(|(ce_name, d)| (ce_name.clone(), d.extends.clone()));
-                if let Some((ce_name, extends)) = found_def {
-                    let (local, is_attr) = match extends {
-                        Some(ext) => (ext, Some(ce_name)),
-                        None => (ce_name, None),
-                    };
-                    let nid = {
-                        let doc_rc = Rc::clone(&h.borrow().document);
-                        let mut doc = doc_rc.borrow_mut();
-                        let n = doc.create_element_ns(HTML_NS, None, &local);
-                        if let Some(NodeData::Element(e)) = doc.get_mut(n) {
-                            if let Some(ref is_val) = is_attr {
-                                e.set_attribute("is", is_val);
-                            }
-                            e.pseudo_state.insert(rix_dom::ElementState::DEFINED);
-                        }
-                        n
-                    };
-                    {
-                        let mut hb = h.borrow_mut();
-                        let root = hb.document.borrow().root();
-                        hb.set_owner_doc(nid, root);
-                        hb.upgraded_custom_elements.insert(nid);
-                    }
-                    let wrapper = wrap_node(vm, &h, nid);
-                    if let Some(wh) = wrapper.as_object() {
-                        if let Ok(nt_proto) = vm.get_property_by_key(nt, vm.key_prototype) {
-                            if let Some(ph) = nt_proto.as_object() {
-                                vm.heap.object_set_prototype(wh, Some(ph), &mut vm.shapes);
-                            }
-                        }
-                    }
-                    return Ok(wrapper);
+            if let Some(active_ctor) = sc.get() {
+                if !vm.native_new_target.is_undefined() {
+                    return crate::custom_elements::handle_builtin_html_constructor(
+                        vm,
+                        &h,
+                        name,
+                        active_ctor,
+                    );
                 }
             }
             if allow_construct {
@@ -649,6 +605,7 @@ fn register_dom_interface_with_ce(
             Err(vm.type_error(format!("Illegal constructor: {name}")))
         })
     };
+    self_ctor_cell.set(Some(ctor));
     if let Some(pc) = parent_ctor {
         vm.heap.object_set_prototype(ctor, Some(pc), &mut vm.shapes);
     }
@@ -2321,7 +2278,22 @@ impl HostState {
     }
 
     pub fn adopt_subtree(&mut self, root: NodeId, target_doc: NodeId) {
-        let nodes: Vec<NodeId> = self.document.borrow().descendants(root).collect();
+        let mut nodes: Vec<NodeId> = Vec::new();
+        {
+            let doc = self.document.borrow();
+            let mut stack = vec![root];
+            while let Some(cur) = stack.pop() {
+                nodes.push(cur);
+                if let Some(NodeData::Element(e)) = doc.get(cur) {
+                    if let Some(sr) = e.shadow_root {
+                        stack.push(sr);
+                    }
+                }
+                for ch in doc.children(cur) {
+                    stack.push(ch);
+                }
+            }
+        }
         let main_root = self.document.borrow().root();
         for n in nodes {
             if target_doc == main_root {

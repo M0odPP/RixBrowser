@@ -264,6 +264,7 @@ fn shadow_dom_host_and_slotted_selectors() {
         serializable: false,
         slot_assignment: "named".to_owned(),
         declarative: false,
+        null_registry: false,
     });
     if let Some(NodeData::Element(el)) = doc.get_mut(host) {
         el.shadow_root = Some(shadow_root);

@@ -1008,7 +1008,9 @@ impl<'a> Element for DomElement<'a> {
                 self.attr_value("min").is_some() || self.attr_value("max").is_some()
             }
             RixPseudoClass::OutOfRange => false,
-            RixPseudoClass::Defined => !tag.contains('-') || st.contains(ElementState::DEFINED),
+            RixPseudoClass::Defined => self
+                .element_data()
+                .is_some_and(rix_dom::ElementData::is_defined),
             RixPseudoClass::Target => st.contains(ElementState::TARGET),
             RixPseudoClass::Modal => st.contains(ElementState::MODAL),
             RixPseudoClass::PopoverOpen => st.contains(ElementState::POPOVER_OPEN),
@@ -1038,7 +1040,9 @@ impl<'a> Element for DomElement<'a> {
             RixPseudoClass::Lang(expected_list) => expected_list
                 .iter()
                 .any(|lang| self.matches_lang(lang.as_str())),
-            RixPseudoClass::State(_) => false,
+            RixPseudoClass::State(ident) => self
+                .element_data()
+                .is_some_and(|e| e.custom_states.iter().any(|s| s.as_str() == ident.as_str())),
         }
     }
 

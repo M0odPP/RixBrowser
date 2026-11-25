@@ -125,7 +125,7 @@ fn write_attr_value(vm: &mut JsVm, host: &SharedHost, attr_h: HeapHandle, new_va
             },
             old_value: old_val,
         });
-        let _ = vm;
+        crate::custom_elements::drain_backup_queue(vm, host);
     } else if let Some(e) = host.borrow_mut().attrs.get_mut(&attr_h) {
         e.detached_value = new_val.to_string();
     }
@@ -476,6 +476,7 @@ pub fn set_attribute_node_on_element(
         },
         old_value: old_val,
     });
+    crate::custom_elements::drain_backup_queue(vm, host);
     Ok(old_attr_handle.map_or(JsValue::NULL, JsValue::from_object))
 }
 
@@ -534,6 +535,7 @@ pub fn remove_attribute_node_from_element(
         },
         old_value: Some(old_val),
     });
+    crate::custom_elements::drain_backup_queue(vm, host);
     Ok(JsValue::from_object(attr_h))
 }
 
