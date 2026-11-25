@@ -40,6 +40,10 @@ mod streams_transform;
 mod streams_writable;
 pub(crate) mod structured_clone;
 pub mod trusted_types;
+#[allow(dead_code)]
+mod web_animations_core;
+#[allow(dead_code)]
+mod web_animations_timing;
 pub mod web_apis;
 pub mod webaudio;
 pub mod webgl2;
