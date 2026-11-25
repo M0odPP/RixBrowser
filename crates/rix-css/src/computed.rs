@@ -462,6 +462,9 @@ fn default_custom_props() -> &'static Arc<CustomPropertyMap> {
 }
 
 /// Compact `Arc`-grouped computed style (`size_of::<ComputedStyle>() <= 96`).
+/// List of `(PropertyIdKind, Option<custom_prop_name>)` whose winning declaration was `!important`.
+pub type ImportantPropList = Arc<Vec<(PropertyIdKind, Option<InternedStr>)>>;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
     pub display: DisplayMode,
@@ -480,6 +483,11 @@ pub struct ComputedStyle {
     pub z_index: ZIndexValue,
     pub opacity: f32,
     pub color_scheme_dark: bool,
+    /// `true` when any winning declaration on this element used the explicit `inherit` keyword.
+    pub uses_explicit_inherit: bool,
+    /// Non-empty only when `!important` author/user/UA declarations won on this element
+    /// (used to enforce W3C Cascade L4 §6.1: `!important` overrides CSS/Web Animations).
+    pub important_props: Option<ImportantPropList>,
     pub box_model: Arc<BoxModelStyle>,
     pub visual: Arc<VisualStyle>,
     pub text: Arc<InheritedTextStyle>,
@@ -507,6 +515,8 @@ impl Default for ComputedStyle {
             z_index: ZIndexValue::Auto,
             opacity: 1.0,
             color_scheme_dark: false,
+            uses_explicit_inherit: false,
+            important_props: None,
             box_model: Arc::clone(default_box_model()),
             visual: Arc::clone(default_visual()),
             text: Arc::clone(default_text()),
@@ -538,6 +548,8 @@ impl ComputedStyle {
             z_index: ZIndexValue::Auto,
             opacity: 1.0,
             color_scheme_dark: parent.color_scheme_dark,
+            uses_explicit_inherit: false,
+            important_props: None,
             box_model: Arc::clone(default_box_model()),
             visual: Arc::clone(default_visual()),
             text: Arc::clone(&parent.text),
@@ -1110,6 +1122,7 @@ pub fn resolve_element_style_with_context(
     };
 
     // Pass 1: Resolve CSS custom properties (`--*`) & `@property` registrations.
+    let mut important_props_acc: Vec<(PropertyIdKind, Option<InternedStr>)> = Vec::new();
     let mut raw_custom: HashMap<InternedStr, Vec<(CascadeKey, &SpecifiedDeclaration)>> =
         HashMap::new();
     for c in &candidates {
@@ -1211,6 +1224,12 @@ pub fn resolve_element_style_with_context(
             };
         for (name, stack) in &raw_custom {
             if let Some(winner) = select_winning_candidate(stack) {
+                if winner.important {
+                    important_props_acc.push((PropertyIdKind::Custom, Some(name.clone())));
+                }
+                if matches!(winner.value, PropertyValue::Global(GlobalKeyword::Inherit)) {
+                    style.uses_explicit_inherit = true;
+                }
                 match &winner.value {
                     PropertyValue::Custom(tokens) => {
                         custom_map.insert(name.clone(), tokens.clone());
@@ -1390,12 +1409,192 @@ pub fn resolve_element_style_with_context(
         }
     }
 
+    // Expand `transition` and `animation` shorthands into their constituent longhands so
+    // cascade ordering (specificity, source order, `!important`, layers) against explicit
+    // `transition-*` / `animation-*` longhands is 100% deterministic.
+    let mut shorthand_expanded: Vec<(CascadeKey, SpecifiedDeclaration)> = Vec::new();
+    let mut expand_anim_tr = |k: CascadeKey, d: &SpecifiedDeclaration| -> bool {
+        let mk = |property: PropertyIdKind, value: PropertyValue| SpecifiedDeclaration {
+            property,
+            custom_name: None,
+            value,
+            important: d.important,
+            order: d.order,
+        };
+        match (d.property, &d.value) {
+            (PropertyIdKind::Transition, PropertyValue::Transitions(v)) => {
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::TransitionProperty,
+                        PropertyValue::NameList(v.iter().map(|s| s.property.clone()).collect()),
+                    ),
+                ));
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::TransitionDuration,
+                        PropertyValue::DurationList(v.iter().map(|s| s.duration_ms).collect()),
+                    ),
+                ));
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::TransitionDelay,
+                        PropertyValue::DurationList(v.iter().map(|s| s.delay_ms).collect()),
+                    ),
+                ));
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::TransitionTimingFunction,
+                        PropertyValue::TimingList(v.iter().map(|s| s.timing.clone()).collect()),
+                    ),
+                ));
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::TransitionBehavior,
+                        PropertyValue::TransitionBehaviorList(
+                            v.iter().map(|s| s.behavior).collect(),
+                        ),
+                    ),
+                ));
+                true
+            }
+            (PropertyIdKind::Transition, PropertyValue::Global(kw)) => {
+                for p in [
+                    PropertyIdKind::TransitionProperty,
+                    PropertyIdKind::TransitionDuration,
+                    PropertyIdKind::TransitionDelay,
+                    PropertyIdKind::TransitionTimingFunction,
+                    PropertyIdKind::TransitionBehavior,
+                ] {
+                    shorthand_expanded.push((k, mk(p, PropertyValue::Global(*kw))));
+                }
+                true
+            }
+            (PropertyIdKind::Animation, PropertyValue::Animations(v)) => {
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::AnimationName,
+                        PropertyValue::NameList(v.iter().map(|s| s.name.clone()).collect()),
+                    ),
+                ));
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::AnimationDuration,
+                        PropertyValue::DurationAutoList(
+                            v.iter().map(|s| (s.duration_ms, s.duration_auto)).collect(),
+                        ),
+                    ),
+                ));
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::AnimationTimingFunction,
+                        PropertyValue::TimingList(v.iter().map(|s| s.timing.clone()).collect()),
+                    ),
+                ));
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::AnimationDelay,
+                        PropertyValue::DurationList(v.iter().map(|s| s.delay_ms).collect()),
+                    ),
+                ));
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::AnimationIterationCount,
+                        PropertyValue::DurationList(v.iter().map(|s| s.iteration_count).collect()),
+                    ),
+                ));
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::AnimationDirection,
+                        PropertyValue::DirectionList(v.iter().map(|s| s.direction).collect()),
+                    ),
+                ));
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::AnimationFillMode,
+                        PropertyValue::FillModeList(v.iter().map(|s| s.fill_mode).collect()),
+                    ),
+                ));
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::AnimationPlayState,
+                        PropertyValue::PlayStateList(v.iter().map(|s| s.play_state).collect()),
+                    ),
+                ));
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::AnimationTimeline,
+                        PropertyValue::NameList(v.iter().map(|s| s.timeline.clone()).collect()),
+                    ),
+                ));
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::AnimationRangeStart,
+                        PropertyValue::AnimationRangeList(
+                            v.iter().map(|s| s.range_start.clone()).collect(),
+                        ),
+                    ),
+                ));
+                shorthand_expanded.push((
+                    k,
+                    mk(
+                        PropertyIdKind::AnimationRangeEnd,
+                        PropertyValue::AnimationRangeList(
+                            v.iter().map(|s| s.range_end.clone()).collect(),
+                        ),
+                    ),
+                ));
+                true
+            }
+            (PropertyIdKind::Animation, PropertyValue::Global(kw)) => {
+                for p in [
+                    PropertyIdKind::AnimationName,
+                    PropertyIdKind::AnimationDuration,
+                    PropertyIdKind::AnimationTimingFunction,
+                    PropertyIdKind::AnimationDelay,
+                    PropertyIdKind::AnimationIterationCount,
+                    PropertyIdKind::AnimationDirection,
+                    PropertyIdKind::AnimationFillMode,
+                    PropertyIdKind::AnimationPlayState,
+                    PropertyIdKind::AnimationTimeline,
+                    PropertyIdKind::AnimationRangeStart,
+                    PropertyIdKind::AnimationRangeEnd,
+                ] {
+                    shorthand_expanded.push((k, mk(p, PropertyValue::Global(*kw))));
+                }
+                true
+            }
+            _ => false,
+        }
+    };
+
     let mut per_prop: HashMap<PropertyIdKind, Vec<(CascadeKey, &SpecifiedDeclaration)>> =
         HashMap::new();
     for (k, d) in &standard_candidates {
-        per_prop.entry(d.property).or_default().push((*k, *d));
+        if !expand_anim_tr(*k, d) {
+            per_prop.entry(d.property).or_default().push((*k, *d));
+        }
     }
     for (k, d) in &expanded_owned {
+        if !expand_anim_tr(*k, d) {
+            per_prop.entry(d.property).or_default().push((*k, d));
+        }
+    }
+    for (k, d) in &shorthand_expanded {
         per_prop.entry(d.property).or_default().push((*k, d));
     }
 
@@ -1433,6 +1632,12 @@ pub fn resolve_element_style_with_context(
         if let Some(stack) = per_prop.get_mut(&early_prop) {
             stack.sort_by_key(|(k, _)| *k);
             if let Some(winner) = select_winning_candidate(stack) {
+                if winner.important {
+                    important_props_acc.push((early_prop, None));
+                }
+                if matches!(winner.value, PropertyValue::Global(GlobalKeyword::Inherit)) {
+                    style.uses_explicit_inherit = true;
+                }
                 apply_declaration(
                     &mut style,
                     winner,
@@ -1451,6 +1656,12 @@ pub fn resolve_element_style_with_context(
     if let Some(stack) = per_prop.get_mut(&PropertyIdKind::LineHeight) {
         stack.sort_by_key(|(k, _)| *k);
         if let Some(winner) = select_winning_candidate(stack) {
+            if winner.important {
+                important_props_acc.push((PropertyIdKind::LineHeight, None));
+            }
+            if matches!(winner.value, PropertyValue::Global(GlobalKeyword::Inherit)) {
+                style.uses_explicit_inherit = true;
+            }
             apply_declaration(&mut style, winner, parent_style, &lh_eval, media.dark_mode);
         }
     }
@@ -1528,6 +1739,12 @@ pub fn resolve_element_style_with_context(
     if let Some(stack) = per_prop.get_mut(&PropertyIdKind::Color) {
         stack.sort_by_key(|(k, _)| *k);
         if let Some(winner) = select_winning_candidate(stack) {
+            if winner.important {
+                important_props_acc.push((PropertyIdKind::Color, None));
+            }
+            if matches!(winner.value, PropertyValue::Global(GlobalKeyword::Inherit)) {
+                style.uses_explicit_inherit = true;
+            }
             apply_declaration(&mut style, winner, parent_style, &eval_ctx, media.dark_mode);
             explicit_color = true;
         }
@@ -1540,7 +1757,22 @@ pub fn resolve_element_style_with_context(
         Arc::make_mut(&mut style.text).color = ColorRgba::rgb(241, 245, 249);
     }
 
-    // Pass 2d: Resolve all remaining physical properties.
+    // Pass 2d: Resolve list-sizing properties (`transition-property`, `animation-name`) first
+    // so repeating/truncating `transition-*` and `animation-*` longhand lists always align.
+    for list_prop in [
+        PropertyIdKind::TransitionProperty,
+        PropertyIdKind::AnimationName,
+    ] {
+        if let Some(stack) = per_prop.get_mut(&list_prop) {
+            stack.sort_by_key(|(k, _)| *k);
+            if let Some(winner) = select_winning_candidate(stack) {
+                if matches!(winner.value, PropertyValue::Global(GlobalKeyword::Inherit)) {
+                    style.uses_explicit_inherit = true;
+                }
+                apply_declaration(&mut style, winner, parent_style, &eval_ctx, media.dark_mode);
+            }
+        }
+    }
     let mut explicit_bw = [false; 4]; // top, right, bottom, left
     for (&prop, stack) in &mut per_prop {
         if matches!(
@@ -1551,11 +1783,19 @@ pub fn resolve_element_style_with_context(
                 | PropertyIdKind::LineHeight
                 | PropertyIdKind::Color
                 | PropertyIdKind::ColorScheme
+                | PropertyIdKind::TransitionProperty
+                | PropertyIdKind::AnimationName
         ) {
             continue;
         }
         stack.sort_by_key(|(k, _)| *k);
         if let Some(winner) = select_winning_candidate(stack) {
+            if winner.important {
+                important_props_acc.push((prop, None));
+            }
+            if matches!(winner.value, PropertyValue::Global(GlobalKeyword::Inherit)) {
+                style.uses_explicit_inherit = true;
+            }
             match prop {
                 PropertyIdKind::BorderTopWidth => explicit_bw[0] = true,
                 PropertyIdKind::BorderRightWidth => explicit_bw[1] = true,
@@ -1565,6 +1805,9 @@ pub fn resolve_element_style_with_context(
             }
             apply_declaration(&mut style, winner, parent_style, &eval_ctx, media.dark_mode);
         }
+    }
+    if !important_props_acc.is_empty() {
+        style.important_props = Some(Arc::new(important_props_acc));
     }
 
     // CSS Backgrounds L3 §3.3: initial `border-*-width` is `medium` (3px), and computed
@@ -3995,6 +4238,55 @@ fn copy_property_from_parent(
                 .as_ref()
                 .map(|e| e.animation_range_ends.clone())
                 .unwrap_or_default();
+        }
+        PropertyIdKind::Scale => {
+            style.effects_mut().scale = parent
+                .effects
+                .as_ref()
+                .map_or(crate::values_math::ScaleSpec::None, |e| e.scale.clone());
+        }
+        PropertyIdKind::Rotate => {
+            style.effects_mut().rotate = parent
+                .effects
+                .as_ref()
+                .map_or(crate::values_math::RotateSpec::None, |e| e.rotate.clone());
+        }
+        PropertyIdKind::Translate => {
+            style.effects_mut().translate = parent
+                .effects
+                .as_ref()
+                .map_or(crate::values_math::TranslateSpec::None, |e| {
+                    e.translate.clone()
+                });
+        }
+        PropertyIdKind::OffsetDistance
+        | PropertyIdKind::ShapeMargin
+        | PropertyIdKind::StrokeWidth
+        | PropertyIdKind::StrokeDashoffset
+        | PropertyIdKind::BackgroundPositionX
+        | PropertyIdKind::BackgroundPositionY
+        | PropertyIdKind::ScrollPaddingTop
+        | PropertyIdKind::ScrollPaddingRight
+        | PropertyIdKind::ScrollPaddingBottom
+        | PropertyIdKind::ScrollPaddingLeft
+        | PropertyIdKind::SvgCx
+        | PropertyIdKind::SvgCy
+        | PropertyIdKind::SvgRx
+        | PropertyIdKind::SvgRy
+        | PropertyIdKind::SvgX
+        | PropertyIdKind::SvgY
+        | PropertyIdKind::BorderImageSlice => {
+            if let Some(node) = parent
+                .effects
+                .as_ref()
+                .and_then(|e| e.extra_math_props.get(&prop))
+                .cloned()
+            {
+                let resolved = node.simplify(Some(&parent.text.eval_ctx), None);
+                style.effects_mut().extra_math_props.insert(prop, resolved);
+            } else if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).extra_math_props.remove(&prop);
+            }
         }
         _ => {}
     }

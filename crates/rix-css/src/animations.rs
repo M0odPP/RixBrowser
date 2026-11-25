@@ -280,27 +280,58 @@ pub struct WebAnimationSpec {
     pub current_time_ms: Option<f64>,
     pub playback_rate: f64,
     pub pseudo_element: Option<String>,
+    /// Default keyframe segment timing function for CSS `@keyframes` animations when a
+    /// synthesized `0%` neutral keyframe has no explicit `animation-timing-function`.
+    pub keyframe_default_timing: Option<TimingFunction>,
     pub cancelled: bool,
     pub removed: bool,
 }
 
-/// Active CSS Transition running on a single property of a DOM element.
+/// Script-driven control override from `CSSTransition` (`WebAnimationSystem`) onto a
+/// running [`ActiveTransition`] in `StyleContext`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransitionControlOverride {
+    pub current_time_ms: Option<f64>,
+    pub cancelled: bool,
+    pub disassociated: bool,
+}
+
+/// Active CSS Transition running on a single property of a DOM element or pseudo-element.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActiveTransition {
+    pub id: u64,
+    pub generation: u64,
+    pub pseudo_element: Option<String>,
     pub prop: PropertyIdKind,
     pub custom_name: Option<InternedStr>,
     pub from_style: Arc<ComputedStyle>,
     pub to_style: Arc<ComputedStyle>,
+    pub reversing_adjusted_start_style: Arc<ComputedStyle>,
+    pub reversing_shortening_factor: f64,
     pub spec: TransitionSpec,
     pub start_elapsed_ms: f32,
+    pub current_time_override_ms: Option<f64>,
+    pub cancelled: bool,
+    pub disassociated: bool,
+    /// `true` once this transition finished naturally while `after`-change style still matches `to_style`.
+    pub completed: bool,
 }
 
 /// Portable animation/transition state preserved across stylesheet rebuilds.
 #[derive(Debug, Default, Clone)]
 pub struct AnimationStateSnapshot {
     pub before_change: HashMap<NodeId, Arc<ComputedStyle>>,
+    pub pseudo_before_change:
+        HashMap<(NodeId, crate::selector::RixPseudoElement), Arc<ComputedStyle>>,
     pub active_transitions: HashMap<NodeId, Vec<ActiveTransition>>,
+    pub pseudo_active_transitions:
+        HashMap<(NodeId, crate::selector::RixPseudoElement), Vec<ActiveTransition>>,
+    pub managed_css_animations: HashMap<NodeId, Vec<WebAnimationSpec>>,
     pub web_animations: HashMap<NodeId, Vec<WebAnimationSpec>>,
+    pub transition_overrides: HashMap<u64, TransitionControlOverride>,
+    pub next_transition_id: u64,
+    pub transition_generation: u64,
+    pub css_animations_managed: bool,
     pub random_doc_seed: Option<u64>,
 }
 
@@ -370,13 +401,79 @@ fn apply_direction(p: f32, iter_idx: u64, dir: AnimationDirectionMode) -> f32 {
 
 #[must_use]
 #[rustfmt::skip]
-pub fn compute_transition_eased_progress(spec: &TransitionSpec, elapsed_ms: f32, start_ms: f32) -> Option<f64> {
+pub fn compute_transition_eased_progress_local(spec: &TransitionSpec, local_elapsed_ms: f64) -> Option<f64> {
     if spec.duration_ms + spec.delay_ms <= 0.0 { return None; }
-    let local = f64::from(elapsed_ms - start_ms) - f64::from(spec.delay_ms);
+    let local = local_elapsed_ms - f64::from(spec.delay_ms);
     if spec.duration_ms <= 0.0 { return (local < 0.0).then_some(0.0); }
     if local < 0.0 { return Some(0.0); }
     if local >= f64::from(spec.duration_ms) { return None; }
     Some(spec.timing.evaluate_f64((local / f64::from(spec.duration_ms)).clamp(0.0, 1.0)))
+}
+
+#[must_use]
+#[rustfmt::skip]
+pub fn compute_transition_eased_progress(spec: &TransitionSpec, elapsed_ms: f32, start_ms: f32) -> Option<f64> {
+    compute_transition_eased_progress_local(spec, f64::from(elapsed_ms - start_ms))
+}
+
+#[rustfmt::skip]
+fn is_property_transitionable(
+    before: &ComputedStyle, after: &ComputedStyle, prop: PropertyIdKind,
+    cname: Option<&InternedStr>, allow_discrete: bool, allow_kw: bool,
+    registered_props: &HashMap<InternedStr, RegisteredProperty>,
+) -> bool {
+    use PropertyIdKind as P;
+    if allow_discrete { return true; }
+    let lpa_ok = |a: &LengthPercentageAuto, b: &LengthPercentageAuto| matches!((a, b), (LengthPercentageAuto::Value(_), LengthPercentageAuto::Value(_)));
+    let size_ok = |a: &SizeValue, b: &SizeValue| match (a, b) {
+        (SizeValue::Length(_), SizeValue::Length(_)) => true,
+        (SizeValue::CalcSize(_), _) | (_, SizeValue::CalcSize(_)) => true,
+        _ => allow_kw && !matches!(a, SizeValue::None) && !matches!(b, SizeValue::None),
+    };
+    match prop {
+        P::Width => size_ok(&before.box_model.width, &after.box_model.width),
+        P::Height => size_ok(&before.box_model.height, &after.box_model.height),
+        P::MinWidth => size_ok(&before.box_model.min_width, &after.box_model.min_width),
+        P::MinHeight => size_ok(&before.box_model.min_height, &after.box_model.min_height),
+        P::MaxWidth => size_ok(&before.box_model.max_width, &after.box_model.max_width),
+        P::MaxHeight => size_ok(&before.box_model.max_height, &after.box_model.max_height),
+        P::MarginTop => lpa_ok(&before.box_model.margin.top, &after.box_model.margin.top),
+        P::MarginRight => lpa_ok(&before.box_model.margin.right, &after.box_model.margin.right),
+        P::MarginBottom => lpa_ok(&before.box_model.margin.bottom, &after.box_model.margin.bottom),
+        P::MarginLeft => lpa_ok(&before.box_model.margin.left, &after.box_model.margin.left),
+        P::Top => lpa_ok(&before.box_model.inset.top, &after.box_model.inset.top),
+        P::Right => lpa_ok(&before.box_model.inset.right, &after.box_model.inset.right),
+        P::Bottom => lpa_ok(&before.box_model.inset.bottom, &after.box_model.inset.bottom),
+        P::Left => lpa_ok(&before.box_model.inset.left, &after.box_model.inset.left),
+        P::ZIndex => matches!((before.z_index, after.z_index), (ZIndexValue::Integer(_), ZIndexValue::Integer(_))),
+        P::ColumnCount => before.box_model.column_count.is_some() && after.box_model.column_count.is_some(),
+        P::LineHeight => matches!((&before.text.line_height, &after.text.line_height), (LineHeightValue::Length(_), LineHeightValue::Length(_)) | (LineHeightValue::Number(_), LineHeightValue::Number(_))),
+        P::VerticalAlign => {
+            let is_len = |m: VerticalAlignMode| matches!(m, VerticalAlignMode::Baseline | VerticalAlignMode::LengthPx(_));
+            is_len(before.box_model.vertical_align) && is_len(after.box_model.vertical_align)
+        }
+        P::Display | P::Position | P::Overlay | P::Float | P::Clear | P::BoxSizing
+        | P::OverflowX | P::OverflowY | P::BorderTopStyle | P::BorderRightStyle
+        | P::BorderBottomStyle | P::BorderLeftStyle | P::OutlineStyle | P::FontStyle
+        | P::TextAlign | P::TextAlignAll | P::TextAlignLast | P::TextTransform
+        | P::TextDecorationLine | P::WordBreak | P::OverflowWrap | P::WhiteSpaceCollapse
+        | P::WhiteSpaceTrim | P::TextWrapMode | P::TextWrapStyle | P::TextAutospace
+        | P::TextAutospaceSize | P::TextSpacingTrim | P::HangingPunctuation | P::Hyphens
+        | P::LineBreak | P::TextFit | P::TextGroupAlign | P::WordSpaceTransform | P::WrapInside
+        | P::TextJustify | P::BorderCollapse | P::EmptyCells | P::CaptionSide | P::TableLayout
+        | P::TextOverflow | P::Content | P::Cursor | P::PointerEvents | P::UserSelect
+        | P::MixBlendMode | P::ViewTransitionName | P::ReadingFlow | P::ColorInterpolationFilters
+        | P::FlexDirection | P::FlexWrap | P::AlignItems | P::AlignSelf | P::AlignContent
+        | P::JustifyContent | P::JustifyItems | P::JustifySelf | P::GridTemplateAreas
+        | P::GridAutoColumns | P::GridAutoRows | P::GridAutoFlow | P::GridRowStart
+        | P::GridRowEnd | P::GridColumnStart | P::GridColumnEnd | P::GridLanesDirection
+        | P::GridLanesPack | P::BackgroundLayers => false,
+        P::Custom => cname.is_some_and(|n| registered_props.get(n).is_some_and(|r| {
+            let s = r.syntax.as_str().trim().trim_matches(|c| c == '"' || c == '\'').trim();
+            matches!(s, "<length>" | "<length-percentage>" | "<percentage>" | "<number>" | "<integer>" | "<angle>" | "<time>" | "<resolution>" | "<color>")
+        })),
+        _ => true,
+    }
 }
 
 /// Applies CSS Animations (`@keyframes`), Web Animations (`element.animate()`), and
@@ -385,20 +482,34 @@ pub fn compute_transition_eased_progress(spec: &TransitionSpec, elapsed_ms: f32,
 #[rustfmt::skip]
 pub fn apply_animations_and_transitions<'a, F>(
     base_style: Arc<ComputedStyle>, parent: Option<&ComputedStyle>, dark_mode: bool, elapsed_ms: f32,
-    keyframes_lookup: &F, web_anims: Option<&[WebAnimationSpec]>, before_change: Option<&Arc<ComputedStyle>>,
+    keyframes_lookup: &F, css_animations_managed: bool, managed_css_anims: Option<&[WebAnimationSpec]>,
+    web_anims: Option<&[WebAnimationSpec]>, before_change: Option<&Arc<ComputedStyle>>,
     active_transitions: &mut Vec<ActiveTransition>, registered_props: &HashMap<InternedStr, RegisteredProperty>,
+    pseudo_element: Option<&str>, hidden_ancestor: bool,
+    ancestor_transitioning: &[(PropertyIdKind, Option<InternedStr>)],
+    transition_overrides: &HashMap<u64, TransitionControlOverride>,
+    next_transition_id: &mut u64, generation: u64, started_any: &mut bool, cancelled_out: &mut Vec<u64>,
 ) -> Arc<ComputedStyle>
 where F: Fn(&str) -> Option<&'a KeyframesRule>,
 {
-    let has_css = base_style.effects.as_ref().is_some_and(|e| !e.animations.is_empty());
-    let has_web = web_anims.is_some_and(|w| w.iter().any(|a| !a.cancelled && !a.removed));
+    let has_raw_css = !css_animations_managed && base_style.effects.as_ref().is_some_and(|e| !e.animations.is_empty());
+    let has_managed_css = managed_css_anims.is_some_and(|w| w.iter().any(|a| !a.cancelled && !a.removed && a.pseudo_element.as_deref() == pseudo_element));
+    let has_web = web_anims.is_some_and(|w| w.iter().any(|a| !a.cancelled && !a.removed && a.pseudo_element.as_deref() == pseudo_element));
     let has_tr = base_style.effects.as_ref().is_some_and(|e| !e.transitions.is_empty()) || !active_transitions.is_empty();
-    if !has_css && !has_web && !has_tr { return base_style; }
+    if !has_raw_css && !has_managed_css && !has_web && !has_tr { return base_style; }
 
     let mut current = (*base_style).clone();
     let eval = current.text.eval_ctx;
 
-    if has_css {
+    // 1. CSS Animations cascade origin (either managed via WebAnimationSystem or direct fallback).
+    if css_animations_managed {
+        if let Some(manims) = managed_css_anims {
+            for wa in manims {
+                if wa.cancelled || wa.removed || wa.keyframes.is_empty() || wa.pseudo_element.as_deref() != pseudo_element { continue; }
+                apply_single_web_animation(&mut current, parent, dark_mode, &eval, wa, false, registered_props);
+            }
+        }
+    } else if has_raw_css {
         for anim in &base_style.effects.as_ref().unwrap().animations {
             if anim.name.as_str().eq_ignore_ascii_case("none") { continue; }
             let Some(kf_rule) = keyframes_lookup(anim.name.as_str()) else { continue };
@@ -407,41 +518,164 @@ where F: Fn(&str) -> Option<&'a KeyframesRule>,
             apply_keyframe_effect(&mut current, &base_style, parent, dark_mode, &eval, &stops, f64::from(raw_p), false, 0, AnimationCompositionMode::Replace, &anim.timing, anim.composition, registered_props);
         }
     }
+
+    // 2. Web Animations (script) cascade origin (higher priority than CSS Animations).
     if let Some(wanims) = web_anims {
         for wa in wanims {
-            if wa.cancelled || wa.removed || wa.keyframes.is_empty() || wa.pseudo_element.is_some() { continue; }
+            if wa.cancelled || wa.removed || wa.keyframes.is_empty() || wa.pseudo_element.as_deref() != pseudo_element { continue; }
             apply_single_web_animation(&mut current, parent, dark_mode, &eval, wa, false, registered_props);
         }
     }
+
+    // 3. CSS Transitions cascade origin (highest priority).
     if has_tr {
-        let after = Arc::new(current.clone());
-        let specs = base_style.effects.as_ref().map(|e| e.transitions.clone()).unwrap_or_default();
-        active_transitions.retain(|tr| {
-            find_matching_transition_spec(&specs, tr.prop, tr.custom_name.as_ref(), &after)
-                .is_some_and(|m| compute_transition_eased_progress(&m, elapsed_ms, tr.start_elapsed_ms).is_some())
-        });
-        if let Some(before) = before_change {
-            // CSS Transitions L2 §3: transitions do not start from `display: none`.
-            if before.display != DisplayMode::None {
-                for (prop, cname, spec) in collect_transition_candidates(before, &after, &specs) {
-                    if is_property_not_animatable(prop) || compute_transition_eased_progress(&spec, elapsed_ms, elapsed_ms).is_none()
-                        || !properties_differ(before, &after, prop, cname.as_ref()) { continue; }
-                    if let Some(ex) = active_transitions.iter_mut().find(|t| t.prop == prop && t.custom_name == cname) {
-                        if !properties_differ(&ex.to_style, &after, prop, cname.as_ref()) { ex.spec = spec; }
-                        else { ex.from_style = Arc::clone(before); ex.to_style = Arc::clone(&after); ex.spec = spec; ex.start_elapsed_ms = elapsed_ms; }
-                    } else {
-                        active_transitions.push(ActiveTransition {
-                            prop, custom_name: cname, from_style: Arc::clone(before), to_style: Arc::clone(&after), spec, start_elapsed_ms: elapsed_ms,
-                        });
+        for tr in active_transitions.iter_mut() {
+            if let Some(ov) = transition_overrides.get(&tr.id) {
+                tr.current_time_override_ms = ov.current_time_ms;
+                tr.cancelled = ov.cancelled;
+                tr.disassociated = ov.disassociated;
+                if let Some(ct) = ov.current_time_ms {
+                    if compute_transition_eased_progress_local(&tr.spec, ct).is_some() {
+                        tr.completed = false;
                     }
                 }
             }
         }
-        let allow_kw = after.text.interpolate_size == InterpolateSizeMode::AllowKeywords;
-        for tr in active_transitions.iter() {
-            if let Some(p) = compute_transition_eased_progress(&tr.spec, elapsed_ms, tr.start_elapsed_ms) {
-                let allow_disc = tr.spec.behavior == TransitionBehaviorMode::AllowDiscrete;
-                interpolate_property_into(&mut current, &tr.from_style, &tr.to_style, tr.prop, tr.custom_name.as_ref(), p, true, allow_disc, allow_kw, &eval, registered_props);
+        let specs = base_style.effects.as_ref().map(|e| e.transitions.clone()).unwrap_or_default();
+        // CSS Display L4 / Transitions L2: `display` transitioning from non-none to `none` with
+        // `allow-discrete` keeps the element rendered while `p < 1` and does NOT cancel transitions.
+        let display_transitioning_to_none = !hidden_ancestor
+            && current.display == DisplayMode::None
+            && (active_transitions.iter().any(|t| !t.cancelled && !t.disassociated && !t.completed && t.prop == PropertyIdKind::Display)
+                || before_change.is_some_and(|b| {
+                    b.display != DisplayMode::None
+                        && find_matching_transition_spec(&specs, PropertyIdKind::Display, None, &current)
+                            .is_some_and(|sp| sp.behavior == TransitionBehaviorMode::AllowDiscrete && compute_transition_eased_progress_local(&sp, 0.0).is_some())
+                }));
+        if hidden_ancestor || (current.display == DisplayMode::None && !display_transitioning_to_none) {
+            for tr in active_transitions.drain(..) {
+                if !tr.cancelled && !tr.disassociated && !tr.completed {
+                    cancelled_out.push(tr.id);
+                }
+            }
+        } else {
+            let after = Arc::new(current.clone());
+            let allow_kw = after.text.interpolate_size == InterpolateSizeMode::AllowKeywords;
+
+            // Cancel transitions whose property is no longer in `transition-property`, and mark
+            // naturally finished transitions as `completed` (retaining them while `to_style == after`
+            // per W3C CSS Transitions 1 §3 so no duplicate transition spawns on completion!).
+            let mut retained = Vec::with_capacity(active_transitions.len());
+            for mut tr in active_transitions.drain(..) {
+                if tr.cancelled || tr.disassociated || tr.completed {
+                    if !properties_differ(&tr.to_style, &after, tr.prop, tr.custom_name.as_ref()) {
+                        retained.push(tr);
+                    }
+                    continue;
+                }
+                if find_matching_transition_spec(&specs, tr.prop, tr.custom_name.as_ref(), &after).is_none() {
+                    cancelled_out.push(tr.id);
+                    continue;
+                }
+                let local_t = tr.current_time_override_ms.unwrap_or_else(|| f64::from(elapsed_ms - tr.start_elapsed_ms));
+                if compute_transition_eased_progress_local(&tr.spec, local_t).is_some() {
+                    retained.push(tr);
+                } else {
+                    tr.completed = true;
+                    if !properties_differ(&tr.to_style, &after, tr.prop, tr.custom_name.as_ref()) {
+                        retained.push(tr);
+                    }
+                }
+            }
+            *active_transitions = retained;
+
+            if let Some(before) = before_change {
+                if before.display != DisplayMode::None {
+                    for (prop, cname, mut spec) in collect_transition_candidates(before, &after, &specs) {
+                        if is_property_not_animatable(prop) { continue; }
+                        // W3C CSS Transitions 1 §3: do not start a transition when the computed
+                        // value changed because it was inherited from an ancestor transitioning
+                        // the same property.
+                        if (prop.is_inherited() || base_style.uses_explicit_inherit)
+                            && ancestor_transitioning.iter().any(|(ap, ac)| *ap == prop && *ac == cname)
+                        {
+                            continue;
+                        }
+                        let ex_pos = active_transitions.iter().position(|t| t.prop == prop && t.custom_name == cname);
+                        if let Some(idx) = ex_pos {
+                            if !properties_differ(&active_transitions[idx].to_style, &after, prop, cname.as_ref()) {
+                                // W3C CSS Transitions 1 §3: running/completed/cancelled transition is NOT
+                                // affected by changes to transition-* while after-change value matches to_style.
+                                continue;
+                            }
+                            let old = active_transitions.remove(idx);
+                            let mut rev_start = Arc::clone(before);
+                            let mut rev_sf = 1.0_f64;
+                            let mut eff_before = Arc::clone(before);
+                            if !old.cancelled && !old.disassociated && !old.completed {
+                                cancelled_out.push(old.id);
+                                let old_local = old.current_time_override_ms.unwrap_or_else(|| f64::from(elapsed_ms - old.start_elapsed_ms));
+                                let portion = compute_transition_eased_progress_local(&old.spec, old_local).unwrap_or(1.0);
+                                let old_allow_disc = old.spec.behavior == TransitionBehaviorMode::AllowDiscrete;
+                                let mut cur_interp = (**before).clone();
+                                interpolate_property_into(&mut cur_interp, &old.from_style, &old.to_style, prop, cname.as_ref(), portion, true, old_allow_disc, allow_kw, &eval, registered_props);
+                                eff_before = Arc::new(cur_interp);
+                                rev_start = Arc::clone(&eff_before);
+                                if !properties_differ(&old.reversing_adjusted_start_style, &after, prop, cname.as_ref()) {
+                                    let clamped_p = portion.clamp(0.0, 1.0);
+                                    rev_sf = (clamped_p * old.reversing_shortening_factor + (1.0 - old.reversing_shortening_factor)).clamp(0.0, 1.0);
+                                    spec.duration_ms = (f64::from(spec.duration_ms) * rev_sf) as f32;
+                                    if spec.delay_ms < 0.0 {
+                                        spec.delay_ms = (f64::from(spec.delay_ms) * rev_sf) as f32;
+                                    }
+                                    rev_start = Arc::clone(&old.to_style);
+                                }
+                            }
+                            let allow_disc = spec.behavior == TransitionBehaviorMode::AllowDiscrete;
+                            if properties_differ(&eff_before, &after, prop, cname.as_ref())
+                                && compute_transition_eased_progress_local(&spec, 0.0).is_some()
+                                && is_property_transitionable(&eff_before, &after, prop, cname.as_ref(), allow_disc, allow_kw, registered_props)
+                            {
+                                let id = *next_transition_id;
+                                *next_transition_id = next_transition_id.wrapping_add(1).max(1);
+                                *started_any = true;
+                                active_transitions.push(ActiveTransition {
+                                    id, generation, pseudo_element: pseudo_element.map(str::to_string),
+                                    prop, custom_name: cname, from_style: eff_before, to_style: Arc::clone(&after),
+                                    reversing_adjusted_start_style: rev_start, reversing_shortening_factor: rev_sf,
+                                    spec, start_elapsed_ms: elapsed_ms, current_time_override_ms: None,
+                                    cancelled: false, disassociated: false, completed: false,
+                                });
+                            }
+                            continue;
+                        }
+                        let allow_disc = spec.behavior == TransitionBehaviorMode::AllowDiscrete;
+                        if !properties_differ(before, &after, prop, cname.as_ref())
+                            || compute_transition_eased_progress_local(&spec, 0.0).is_none()
+                            || !is_property_transitionable(before, &after, prop, cname.as_ref(), allow_disc, allow_kw, registered_props)
+                        {
+                            continue;
+                        }
+                        let id = *next_transition_id;
+                        *next_transition_id = next_transition_id.wrapping_add(1).max(1);
+                        *started_any = true;
+                        active_transitions.push(ActiveTransition {
+                            id, generation, pseudo_element: pseudo_element.map(str::to_string),
+                            prop, custom_name: cname, from_style: Arc::clone(before), to_style: Arc::clone(&after),
+                            reversing_adjusted_start_style: Arc::clone(before), reversing_shortening_factor: 1.0,
+                            spec, start_elapsed_ms: elapsed_ms, current_time_override_ms: None,
+                            cancelled: false, disassociated: false, completed: false,
+                        });
+                    }
+                }
+            }
+            for tr in active_transitions.iter() {
+                if tr.cancelled || tr.disassociated || tr.completed { continue; }
+                let local_t = tr.current_time_override_ms.unwrap_or_else(|| f64::from(elapsed_ms - tr.start_elapsed_ms));
+                if let Some(p) = compute_transition_eased_progress_local(&tr.spec, local_t) {
+                    let allow_disc = tr.spec.behavior == TransitionBehaviorMode::AllowDiscrete;
+                    interpolate_property_into(&mut current, &tr.from_style, &tr.to_style, tr.prop, tr.custom_name.as_ref(), p, true, allow_disc, allow_kw, &eval, registered_props);
+                }
             }
         }
     }
@@ -561,6 +795,10 @@ fn apply_single_web_animation(
     });
     let stops = build_web_keyframe_stops(&wa.keyframes, current);
     let underlying = current.clone();
+    let default_kf_timing = wa
+        .keyframe_default_timing
+        .as_ref()
+        .unwrap_or(&TimingFunction::Linear);
     apply_keyframe_effect(
         current,
         &underlying,
@@ -572,7 +810,7 @@ fn apply_single_web_animation(
         ct.before_flag,
         cur_iter,
         wa.iteration_composite,
-        &TimingFunction::Linear,
+        default_kf_timing,
         wa.composite,
         registered_props,
     );
@@ -641,6 +879,14 @@ fn apply_keyframe_effect(
     for s in stops { for d in &s.declarations { let k = (d.property, d.custom_name.clone()); if !props.contains(&k) { props.push(k); } } }
     let allow_kw = underlying.text.interpolate_size == InterpolateSizeMode::AllowKeywords;
     for (prop, cname) in props {
+        // W3C Cascade Level 4 §6.1: `!important` author/user/UA declarations override CSS & Web Animations.
+        if underlying
+            .important_props
+            .as_deref()
+            .is_some_and(|list| list.iter().any(|(ip, ic)| *ip == prop && *ic == cname))
+        {
+            continue;
+        }
         let mut ps: Vec<(f64, Option<&SpecifiedDeclaration>, AnimationCompositionMode, Option<&TimingFunction>)> = Vec::new();
         for s in stops {
             if let Some(decl) = s.declarations.iter().rev().find(|d| d.property == prop && d.custom_name == cname) {
@@ -898,9 +1144,14 @@ fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind,
         P::Color => a.text.color != b.text.color || a.text.color_computed != b.text.color_computed,
         P::BackgroundColor => a.visual.background_color != b.visual.background_color || a.visual.background_color_computed != b.visual.background_color_computed,
         P::Opacity => a.opacity != b.opacity, P::FontSize => a.text.font_size_px != b.text.font_size_px,
-        P::FontWeight => a.text.font_weight != b.text.font_weight, P::LineHeight => a.text.line_height != b.text.line_height,
-        P::LetterSpacing => a.text.letter_spacing != b.text.letter_spacing, P::WordSpacing => a.text.word_spacing != b.text.word_spacing,
-        P::TextIndent => a.text.text_indent != b.text.text_indent || a.text.text_indent_hanging != b.text.text_indent_hanging || a.text.text_indent_each_line != b.text.text_indent_each_line,
+        P::FontWeight => a.text.font_weight != b.text.font_weight,
+        P::LineHeight => match (&a.text.line_height, &b.text.line_height) {
+            (LineHeightValue::Length(x), LineHeightValue::Length(y)) => lp_computed_differs(x, ea, y, eb),
+            _ => a.text.line_height != b.text.line_height,
+        },
+        P::LetterSpacing => lp_computed_differs(&a.text.letter_spacing, ea, &b.text.letter_spacing, eb),
+        P::WordSpacing => lp_computed_differs(&a.text.word_spacing, ea, &b.text.word_spacing, eb),
+        P::TextIndent => lp_computed_differs(&a.text.text_indent, ea, &b.text.text_indent, eb) || a.text.text_indent_hanging != b.text.text_indent_hanging || a.text.text_indent_each_line != b.text.text_indent_each_line,
         P::TextAlign | P::TextAlignAll => a.text.text_align != b.text.text_align,
         P::TextTransform => a.text.text_transform_flags != b.text.text_transform_flags,
         P::WordBreak => a.text.word_break != b.text.word_break,
@@ -926,7 +1177,7 @@ fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind,
         P::Position => a.position != b.position,
         P::Overlay => a.overlay != b.overlay,
         P::ColumnCount => a.box_model.column_count != b.box_model.column_count,
-        P::BorderSpacing => a.text.border_spacing_x != b.text.border_spacing_x || a.text.border_spacing_y != b.text.border_spacing_y,
+        P::BorderSpacing => lp_computed_differs(&a.text.border_spacing_x, ea, &b.text.border_spacing_x, eb) || lp_computed_differs(&a.text.border_spacing_y, ea, &b.text.border_spacing_y, eb),
         P::BorderCollapse => a.text.border_collapse != b.text.border_collapse,
         P::EmptyCells => a.text.empty_cells != b.text.empty_cells,
         P::TabSize => a.text.tab_size_num != b.text.tab_size_num || a.text.tab_size_len != b.text.tab_size_len,
@@ -934,45 +1185,72 @@ fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind,
         P::TextAlignLast => a.text.text_align_last != b.text.text_align_last,
         P::HyphenateCharacter => a.text.hyphenate_character != b.text.hyphenate_character,
         P::HyphenateLimitLines => a.text.hyphenate_limit_lines != b.text.hyphenate_limit_lines,
-        P::Order => a.flex_grid.as_ref().map_or(0, |f| f.order) != b.flex_grid.as_ref().map_or(0, |f| f.order),
-        P::FlexGrow => a.flex_grid.as_ref().map_or(0.0, |f| f.flex_grow) != b.flex_grid.as_ref().map_or(0.0, |f| f.flex_grow),
-        P::FlexShrink => a.flex_grid.as_ref().map_or(1.0, |f| f.flex_shrink) != b.flex_grid.as_ref().map_or(1.0, |f| f.flex_shrink),
-        P::FlexBasis => a.flex_grid.as_ref().map(|f| (&f.flex_basis, &f.flex_basis_size)) != b.flex_grid.as_ref().map(|f| (&f.flex_basis, &f.flex_basis_size)),
-        P::FlexDirection => a.flex_grid.as_ref().map(|f| f.flex_direction) != b.flex_grid.as_ref().map(|f| f.flex_direction),
-        P::FlexWrap => a.flex_grid.as_ref().map(|f| f.flex_wrap) != b.flex_grid.as_ref().map(|f| f.flex_wrap),
-        P::AlignItems => a.flex_grid.as_ref().map(|f| f.align_items) != b.flex_grid.as_ref().map(|f| f.align_items),
-        P::AlignSelf => a.flex_grid.as_ref().map(|f| f.align_self) != b.flex_grid.as_ref().map(|f| f.align_self),
-        P::AlignContent => a.flex_grid.as_ref().map(|f| f.align_content) != b.flex_grid.as_ref().map(|f| f.align_content),
-        P::JustifyContent => a.flex_grid.as_ref().map(|f| f.justify_content) != b.flex_grid.as_ref().map(|f| f.justify_content),
-        P::JustifyItems => a.flex_grid.as_ref().map(|f| f.justify_items) != b.flex_grid.as_ref().map(|f| f.justify_items),
-        P::JustifySelf => a.flex_grid.as_ref().map(|f| f.justify_self) != b.flex_grid.as_ref().map(|f| f.justify_self),
-        P::GridTemplateColumns => a.flex_grid.as_ref().map(|f| &f.grid_template_columns_list) != b.flex_grid.as_ref().map(|f| &f.grid_template_columns_list),
-        P::GridTemplateRows => a.flex_grid.as_ref().map(|f| &f.grid_template_rows_list) != b.flex_grid.as_ref().map(|f| &f.grid_template_rows_list),
-        P::GridTemplateAreas => a.flex_grid.as_ref().map(|f| &f.grid_template_areas) != b.flex_grid.as_ref().map(|f| &f.grid_template_areas),
-        P::GridAutoColumns => a.flex_grid.as_ref().map(|f| &f.grid_auto_columns) != b.flex_grid.as_ref().map(|f| &f.grid_auto_columns),
-        P::GridAutoRows => a.flex_grid.as_ref().map(|f| &f.grid_auto_rows) != b.flex_grid.as_ref().map(|f| &f.grid_auto_rows),
-        P::GridAutoFlow => a.flex_grid.as_ref().map(|f| f.grid_auto_flow) != b.flex_grid.as_ref().map(|f| f.grid_auto_flow),
-        P::GridRowStart => a.flex_grid.as_ref().map(|f| &f.grid_row_start) != b.flex_grid.as_ref().map(|f| &f.grid_row_start),
-        P::GridRowEnd => a.flex_grid.as_ref().map(|f| &f.grid_row_end) != b.flex_grid.as_ref().map(|f| &f.grid_row_end),
-        P::GridColumnStart => a.flex_grid.as_ref().map(|f| &f.grid_column_start) != b.flex_grid.as_ref().map(|f| &f.grid_column_start),
-        P::GridColumnEnd => a.flex_grid.as_ref().map(|f| &f.grid_column_end) != b.flex_grid.as_ref().map(|f| &f.grid_column_end),
-        P::FitTolerance => a.flex_grid.as_ref().map(|f| &f.fit_tolerance) != b.flex_grid.as_ref().map(|f| &f.fit_tolerance),
-        P::GridLanesDirection => a.flex_grid.as_ref().map(|f| f.grid_lanes_direction) != b.flex_grid.as_ref().map(|f| f.grid_lanes_direction),
-        P::GridLanesPack => a.flex_grid.as_ref().map(|f| f.grid_lanes_pack) != b.flex_grid.as_ref().map(|f| f.grid_lanes_pack),
-        P::ReadingFlow => a.effects.as_ref().map(|e| e.reading_flow) != b.effects.as_ref().map(|e| e.reading_flow),
-        P::ReadingOrder => a.effects.as_ref().map_or(0, |e| e.reading_order) != b.effects.as_ref().map_or(0, |e| e.reading_order),
-        P::Filter => a.effects.as_ref().map(|e| e.filter.as_slice()).unwrap_or(&[]) != b.effects.as_ref().map(|e| e.filter.as_slice()).unwrap_or(&[]),
-        P::BackdropFilter => a.effects.as_ref().map(|e| e.backdrop_filter.as_slice()).unwrap_or(&[]) != b.effects.as_ref().map(|e| e.backdrop_filter.as_slice()).unwrap_or(&[]),
+        P::Order | P::FlexGrow | P::FlexShrink | P::FlexBasis | P::FlexDirection | P::FlexWrap
+        | P::AlignItems | P::AlignSelf | P::AlignContent | P::JustifyContent | P::JustifyItems
+        | P::JustifySelf | P::GridTemplateColumns | P::GridTemplateRows | P::GridTemplateAreas
+        | P::GridAutoColumns | P::GridAutoRows | P::GridAutoFlow | P::GridRowStart | P::GridRowEnd
+        | P::GridColumnStart | P::GridColumnEnd | P::FitTolerance | P::GridLanesDirection
+        | P::GridLanesPack | P::RowGap | P::ColumnGap => {
+            static DEF_FG: std::sync::LazyLock<crate::computed::FlexGridStyle> =
+                std::sync::LazyLock::new(crate::computed::FlexGridStyle::default);
+            let fa = a.flex_grid.as_deref().unwrap_or(&DEF_FG);
+            let fb = b.flex_grid.as_deref().unwrap_or(&DEF_FG);
+            match prop {
+                P::Order => fa.order != fb.order,
+                P::FlexGrow => fa.flex_grow != fb.flex_grow,
+                P::FlexShrink => fa.flex_shrink != fb.flex_shrink,
+                P::FlexBasis => (&fa.flex_basis, &fa.flex_basis_size) != (&fb.flex_basis, &fb.flex_basis_size),
+                P::FlexDirection => fa.flex_direction != fb.flex_direction,
+                P::FlexWrap => fa.flex_wrap != fb.flex_wrap,
+                P::AlignItems => fa.align_items != fb.align_items,
+                P::AlignSelf => fa.align_self != fb.align_self,
+                P::AlignContent => fa.align_content != fb.align_content,
+                P::JustifyContent => fa.justify_content != fb.justify_content,
+                P::JustifyItems => fa.justify_items != fb.justify_items,
+                P::JustifySelf => fa.justify_self != fb.justify_self,
+                P::GridTemplateColumns => fa.grid_template_columns_list != fb.grid_template_columns_list,
+                P::GridTemplateRows => fa.grid_template_rows_list != fb.grid_template_rows_list,
+                P::GridTemplateAreas => fa.grid_template_areas != fb.grid_template_areas,
+                P::GridAutoColumns => fa.grid_auto_columns != fb.grid_auto_columns,
+                P::GridAutoRows => fa.grid_auto_rows != fb.grid_auto_rows,
+                P::GridAutoFlow => fa.grid_auto_flow != fb.grid_auto_flow,
+                P::GridRowStart => fa.grid_row_start != fb.grid_row_start,
+                P::GridRowEnd => fa.grid_row_end != fb.grid_row_end,
+                P::GridColumnStart => fa.grid_column_start != fb.grid_column_start,
+                P::GridColumnEnd => fa.grid_column_end != fb.grid_column_end,
+                P::FitTolerance => fa.fit_tolerance != fb.fit_tolerance,
+                P::GridLanesDirection => fa.grid_lanes_direction != fb.grid_lanes_direction,
+                P::GridLanesPack => fa.grid_lanes_pack != fb.grid_lanes_pack,
+                P::RowGap => lp_computed_differs(&fa.row_gap, ea, &fb.row_gap, eb),
+                P::ColumnGap => lp_computed_differs(&fa.column_gap, ea, &fb.column_gap, eb),
+                _ => false,
+            }
+        }
+        P::ReadingFlow | P::ReadingOrder | P::Filter | P::BackdropFilter | P::BoxShadow
+        | P::Transform | P::TransformOrigin | P::Scale | P::Rotate | P::Translate
+        | P::ClipPath | P::MixBlendMode | P::ViewTransitionName => {
+            static DEF_EFF: std::sync::LazyLock<crate::computed::EffectsStyle> =
+                std::sync::LazyLock::new(crate::computed::EffectsStyle::default);
+            let efa = a.effects.as_deref().unwrap_or(&DEF_EFF);
+            let efb = b.effects.as_deref().unwrap_or(&DEF_EFF);
+            match prop {
+                P::ReadingFlow => efa.reading_flow != efb.reading_flow,
+                P::ReadingOrder => efa.reading_order != efb.reading_order,
+                P::Filter => efa.filter != efb.filter,
+                P::BackdropFilter => efa.backdrop_filter != efb.backdrop_filter,
+                P::BoxShadow => efa.box_shadow != efb.box_shadow,
+                P::Transform => (&efa.transform, &efa.transform_raw) != (&efb.transform, &efb.transform_raw),
+                P::TransformOrigin => efa.transform_origin != efb.transform_origin,
+                P::Scale => efa.scale != efb.scale,
+                P::Rotate => efa.rotate != efb.rotate,
+                P::Translate => efa.translate != efb.translate,
+                P::ClipPath => efa.clip_path != efb.clip_path,
+                P::MixBlendMode => efa.mix_blend_mode != efb.mix_blend_mode,
+                P::ViewTransitionName => efa.view_transition_name != efb.view_transition_name,
+                _ => false,
+            }
+        }
         P::ColorInterpolationFilters => a.text.color_interpolation_filters != b.text.color_interpolation_filters,
-        P::BoxShadow => a.effects.as_ref().map(|e| e.box_shadow.as_slice()).unwrap_or(&[]) != b.effects.as_ref().map(|e| e.box_shadow.as_slice()).unwrap_or(&[]),
-        P::Transform => a.effects.as_ref().map(|e| (&e.transform, &e.transform_raw)) != b.effects.as_ref().map(|e| (&e.transform, &e.transform_raw)),
-        P::TransformOrigin => a.effects.as_ref().map(|e| &e.transform_origin) != b.effects.as_ref().map(|e| &e.transform_origin),
-        P::Scale => a.effects.as_ref().map(|e| &e.scale) != b.effects.as_ref().map(|e| &e.scale),
-        P::Rotate => a.effects.as_ref().map(|e| &e.rotate) != b.effects.as_ref().map(|e| &e.rotate),
-        P::Translate => a.effects.as_ref().map(|e| &e.translate) != b.effects.as_ref().map(|e| &e.translate),
-        P::ClipPath => a.effects.as_ref().map(|e| &e.clip_path) != b.effects.as_ref().map(|e| &e.clip_path),
-        P::MixBlendMode => a.effects.as_ref().map(|e| e.mix_blend_mode) != b.effects.as_ref().map(|e| e.mix_blend_mode),
-        P::ViewTransitionName => a.effects.as_ref().and_then(|e| e.view_transition_name.as_ref()) != b.effects.as_ref().and_then(|e| e.view_transition_name.as_ref()),
         P::BorderTopWidth => a.box_model.border_width.top != b.box_model.border_width.top,
         P::BorderRightWidth => a.box_model.border_width.right != b.box_model.border_width.right,
         P::BorderBottomWidth => a.box_model.border_width.bottom != b.box_model.border_width.bottom,
@@ -981,22 +1259,29 @@ fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind,
         P::BorderRightColor => a.visual.border_color.right != b.visual.border_color.right || a.visual.border_color_computed[1] != b.visual.border_color_computed[1],
         P::BorderBottomColor => a.visual.border_color.bottom != b.visual.border_color.bottom || a.visual.border_color_computed[2] != b.visual.border_color_computed[2],
         P::BorderLeftColor => a.visual.border_color.left != b.visual.border_color.left || a.visual.border_color_computed[3] != b.visual.border_color_computed[3],
-        P::BorderTopLeftRadius => a.visual.border_radius.top_left != b.visual.border_radius.top_left,
-        P::BorderTopRightRadius => a.visual.border_radius.top_right != b.visual.border_radius.top_right,
-        P::BorderBottomRightRadius => a.visual.border_radius.bottom_right != b.visual.border_radius.bottom_right,
-        P::BorderBottomLeftRadius => a.visual.border_radius.bottom_left != b.visual.border_radius.bottom_left,
+        P::BorderTopLeftRadius => lp_computed_differs(&a.visual.border_radius.top_left.x, ea, &b.visual.border_radius.top_left.x, eb) || lp_computed_differs(&a.visual.border_radius.top_left.y, ea, &b.visual.border_radius.top_left.y, eb),
+        P::BorderTopRightRadius => lp_computed_differs(&a.visual.border_radius.top_right.x, ea, &b.visual.border_radius.top_right.x, eb) || lp_computed_differs(&a.visual.border_radius.top_right.y, ea, &b.visual.border_radius.top_right.y, eb),
+        P::BorderBottomRightRadius => lp_computed_differs(&a.visual.border_radius.bottom_right.x, ea, &b.visual.border_radius.bottom_right.x, eb) || lp_computed_differs(&a.visual.border_radius.bottom_right.y, ea, &b.visual.border_radius.bottom_right.y, eb),
+        P::BorderBottomLeftRadius => lp_computed_differs(&a.visual.border_radius.bottom_left.x, ea, &b.visual.border_radius.bottom_left.x, eb) || lp_computed_differs(&a.visual.border_radius.bottom_left.y, ea, &b.visual.border_radius.bottom_left.y, eb),
         P::OutlineColor => a.visual.outline_color != b.visual.outline_color || a.visual.outline_color_computed != b.visual.outline_color_computed,
         P::OutlineWidth => a.visual.outline_width != b.visual.outline_width,
-        P::OutlineOffset => a.visual.outline_offset != b.visual.outline_offset,
-        P::BackgroundPosition => a.visual.background_position != b.visual.background_position,
+        P::OutlineOffset => lp_computed_differs(&a.visual.outline_offset, ea, &b.visual.outline_offset, eb),
+        P::BackgroundPosition => lp_computed_differs(&a.visual.background_position.0, ea, &b.visual.background_position.0, eb) || lp_computed_differs(&a.visual.background_position.1, ea, &b.visual.background_position.1, eb),
         P::ObjectPosition => a.visual.object_position != b.visual.object_position,
-        P::RowGap => a.flex_grid.as_ref().map(|f| &f.row_gap) != b.flex_grid.as_ref().map(|f| &f.row_gap),
-        P::ColumnGap => a.flex_grid.as_ref().map(|f| &f.column_gap) != b.flex_grid.as_ref().map(|f| &f.column_gap),
         P::Visibility => a.visibility != b.visibility,
-        P::VerticalAlign => a.box_model.vertical_align != b.box_model.vertical_align || a.box_model.vertical_align_lp != b.box_model.vertical_align_lp,
+        P::VerticalAlign => {
+            if a.box_model.vertical_align != b.box_model.vertical_align { true }
+            else if let (Some(x), Some(y)) = (&a.box_model.vertical_align_lp, &b.box_model.vertical_align_lp) { lp_computed_differs(x, ea, y, eb) }
+            else { a.box_model.vertical_align_lp != b.box_model.vertical_align_lp }
+        }
         P::TextShadow => a.text.text_shadow != b.text.text_shadow,
         P::TextDecorationColor => a.visual.text_decoration_color != b.visual.text_decoration_color || a.visual.text_decoration_color_computed != b.visual.text_decoration_color_computed,
-        P::TextDecorationInset => a.visual.text_decoration_inset != b.visual.text_decoration_inset,
+        P::TextDecorationInset => match (&a.visual.text_decoration_inset, &b.visual.text_decoration_inset) {
+            (crate::anim_css::TextDecorationInsetValue::Lengths(ax, ay), crate::anim_css::TextDecorationInsetValue::Lengths(bx, by)) => {
+                lp_computed_differs(ax, ea, bx, eb) || lp_computed_differs(ay, ea, by, eb)
+            }
+            _ => a.visual.text_decoration_inset != b.visual.text_decoration_inset,
+        },
         P::OffsetDistance | P::ShapeMargin | P::StrokeWidth | P::StrokeDashoffset
         | P::BackgroundPositionX | P::BackgroundPositionY | P::ScrollPaddingTop | P::ScrollPaddingRight
         | P::ScrollPaddingBottom | P::ScrollPaddingLeft | P::SvgCx | P::SvgCy | P::SvgRx | P::SvgRy
@@ -1008,7 +1293,7 @@ fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind,
             } else { false }
         }
         P::Custom => cname.and_then(|n| a.custom_properties.get(n)) != cname.and_then(|n| b.custom_properties.get(n)),
-        _ => a != b,
+        _ => false,
     }
 }
 
@@ -1321,6 +1606,8 @@ fn interpolate_property_into(
 ) {
     use PropertyIdKind as P;
     let use_from_disc = allow_discrete && p < 0.5;
+    let ef = if is_transition { &from.text.eval_ctx } else { eval };
+    let et = if is_transition { &to.text.eval_ctx } else { eval };
     match prop {
         P::Width | P::Height | P::MinWidth | P::MinHeight | P::MaxWidth | P::MaxHeight => {
             let (fv, tv) = match prop {
@@ -1328,7 +1615,7 @@ fn interpolate_property_into(
                 P::MinWidth => (&from.box_model.min_width, &to.box_model.min_width), P::MinHeight => (&from.box_model.min_height, &to.box_model.min_height),
                 P::MaxWidth => (&from.box_model.max_width, &to.box_model.max_width), _ => (&from.box_model.max_height, &to.box_model.max_height),
             };
-            let res = interpolate_size_value(fv, tv, p, allow_kw, eval, is_transition).unwrap_or_else(|| if use_from_disc { fv.clone() } else { tv.clone() });
+            let res = interpolate_size_value_pair(fv, ef, tv, et, p, allow_kw, eval, is_transition).unwrap_or_else(|| if use_from_disc { fv.clone() } else { tv.clone() });
             let bm = Arc::make_mut(&mut target.box_model);
             match prop { P::Width => bm.width = res, P::Height => bm.height = res, P::MinWidth => bm.min_width = res, P::MinHeight => bm.min_height = res, P::MaxWidth => bm.max_width = res, _ => bm.max_height = res }
         }
@@ -1340,7 +1627,7 @@ fn interpolate_property_into(
                 P::MarginTop => (&from.box_model.margin.top, &to.box_model.margin.top), _ => (&from.box_model.margin.bottom, &to.box_model.margin.bottom),
             };
             let res = match (fv, tv) {
-                (LengthPercentageAuto::Value(a), LengthPercentageAuto::Value(b)) => LengthPercentageAuto::Value(interpolate_lp(a, b, p, eval, is_transition)),
+                (LengthPercentageAuto::Value(a), LengthPercentageAuto::Value(b)) => LengthPercentageAuto::Value(interpolate_lp_pair(a, ef, b, et, p, eval, is_transition)),
                 _ => if use_from_disc { fv.clone() } else { tv.clone() },
             };
             let bm = Arc::make_mut(&mut target.box_model);
@@ -1353,7 +1640,7 @@ fn interpolate_property_into(
                 P::LetterSpacing => (&from.text.letter_spacing, &to.text.letter_spacing),
                 _ => (&from.text.word_spacing, &to.text.word_spacing),
             };
-            let mut res = interpolate_lp(fv, tv, p, eval, is_transition);
+            let mut res = interpolate_lp_pair(fv, ef, tv, et, p, eval, is_transition);
             if matches!(prop, P::PaddingTop | P::PaddingRight | P::PaddingBottom | P::PaddingLeft) {
                 res = clamp_lp_non_neg(res);
             }
@@ -1369,7 +1656,7 @@ fn interpolate_property_into(
             if from.text.text_indent_hanging == to.text.text_indent_hanging
                 && from.text.text_indent_each_line == to.text.text_indent_each_line
             {
-                t.text_indent = interpolate_lp(&from.text.text_indent, &to.text.text_indent, p, eval, is_transition);
+                t.text_indent = interpolate_lp_pair(&from.text.text_indent, ef, &to.text.text_indent, et, p, eval, is_transition);
                 t.text_indent_hanging = from.text.text_indent_hanging;
                 t.text_indent_each_line = from.text.text_indent_each_line;
             } else {
@@ -1529,7 +1816,7 @@ fn interpolate_property_into(
                 bm.vertical_align = VerticalAlignMode::Baseline;
                 bm.vertical_align_lp = None;
             } else if let (Some(fa), Some(tb)) = (va_lp(from), va_lp(to)) {
-                let res = interpolate_lp(&fa, &tb, p, eval, is_transition);
+                let res = interpolate_lp_pair(&fa, ef, &tb, et, p, eval, is_transition);
                 bm.vertical_align = VerticalAlignMode::LengthPx(res.resolve_px(0.0, eval));
                 bm.vertical_align_lp = Some(res);
             } else if use_from_disc {
@@ -1572,7 +1859,7 @@ fn interpolate_property_into(
         }
         P::OutlineWidth => Arc::make_mut(&mut target.visual).outline_width = (f64::from(from.visual.outline_width) * (1.0 - p) + f64::from(to.visual.outline_width) * p).max(0.0) as f32,
         P::OutlineStyle => Arc::make_mut(&mut target.visual).outline_style = if use_from_disc { from.visual.outline_style } else { to.visual.outline_style },
-        P::OutlineOffset => Arc::make_mut(&mut target.visual).outline_offset = interpolate_lp(&from.visual.outline_offset, &to.visual.outline_offset, p, eval, is_transition),
+        P::OutlineOffset => Arc::make_mut(&mut target.visual).outline_offset = interpolate_lp_pair(&from.visual.outline_offset, ef, &to.visual.outline_offset, et, p, eval, is_transition),
         P::OutlineColor => {
             let c = interpolate_resolved_color(resolved_outline_color(from, eval), resolved_outline_color(to, eval), p);
             let v = Arc::make_mut(&mut target.visual);
@@ -1590,6 +1877,12 @@ fn interpolate_property_into(
             use crate::anim_css::TextDecorationInsetValue as Tdi;
             let res = match (&from.visual.text_decoration_inset, &to.visual.text_decoration_inset) {
                 (Tdi::Auto, Tdi::Auto) => Tdi::Auto,
+                (Tdi::Lengths(ax, ay), Tdi::Auto) if p == 0.0 => {
+                    Tdi::Lengths(
+                        lp_from_math_node(math_node_from_lp(ax, ef, is_transition)),
+                        lp_from_math_node(math_node_from_lp(ay, ef, is_transition)),
+                    )
+                }
                 (a, b) => {
                     let pair = |v: &Tdi| match v {
                         Tdi::Auto => (LengthPercentage::px(0.0), LengthPercentage::px(0.0)),
@@ -1598,8 +1891,8 @@ fn interpolate_property_into(
                     let (ax, ay) = pair(a);
                     let (bx, by) = pair(b);
                     Tdi::Lengths(
-                        interpolate_lp(&ax, &bx, p, eval, is_transition),
-                        interpolate_lp(&ay, &by, p, eval, is_transition),
+                        interpolate_lp_pair(&ax, ef, &bx, et, p, eval, is_transition),
+                        interpolate_lp_pair(&ay, ef, &by, et, p, eval, is_transition),
                     )
                 }
             };
@@ -1685,7 +1978,9 @@ fn interpolate_property_into(
             let tb = to.effects.as_ref().and_then(|e| e.extra_math_props.get(&prop));
             match (fa, tb) {
                 (Some(a), Some(b)) => {
-                    let combined = MathNode::Sum(vec![scale_math_for_interp(a.clone(), 1.0 - p), scale_math_for_interp(b.clone(), p)]).simplify(Some(eval), None);
+                    let a_res = a.clone().simplify(Some(ef), None);
+                    let b_res = b.clone().simplify(Some(et), None);
+                    let combined = MathNode::Sum(vec![scale_math_for_interp(a_res, 1.0 - p), scale_math_for_interp(b_res, p)]).simplify(Some(eval), None);
                     target.effects_mut().extra_math_props.insert(prop, combined);
                 }
                 _ => {
@@ -1704,12 +1999,12 @@ fn interpolate_property_into(
         P::FontWeight => Arc::make_mut(&mut target.text).font_weight = (f64::from(from.text.font_weight) * (1.0 - p) + f64::from(to.text.font_weight) * p).clamp(1.0, 1000.0) as f32,
         P::FontStyle => Arc::make_mut(&mut target.text).font_style = if use_from_disc { from.text.font_style } else { to.text.font_style },
         P::LineHeight => Arc::make_mut(&mut target.text).line_height = match (&from.text.line_height, &to.text.line_height) {
-            (LineHeightValue::Length(a), LineHeightValue::Length(b)) => LineHeightValue::Length(interpolate_lp(a, b, p, eval, is_transition)),
+            (LineHeightValue::Length(a), LineHeightValue::Length(b)) => LineHeightValue::Length(interpolate_lp_pair(a, ef, b, et, p, eval, is_transition)),
             (LineHeightValue::Number(a), LineHeightValue::Number(b)) => LineHeightValue::Number((f64::from(*a) * (1.0 - p) + f64::from(*b) * p).max(0.0) as f32),
             _ => if use_from_disc { from.text.line_height.clone() } else { to.text.line_height.clone() },
         },
         P::ZIndex => target.z_index = match (from.z_index, to.z_index) {
-            (ZIndexValue::Integer(a), ZIndexValue::Integer(b)) => ZIndexValue::Integer(((f64::from(a) * (1.0 - p) + f64::from(b) * p) + 0.5 + 1e-9).floor() as i32),
+            (ZIndexValue::Integer(a), ZIndexValue::Integer(b)) => ZIndexValue::Integer(((f64::from(a) * (1.0 - p) + f64::from(b) * p) + 0.5 + 1e-5).floor() as i32),
             _ => if use_from_disc { from.z_index } else { to.z_index },
         },
         P::Orphans => Arc::make_mut(&mut target.text).orphans = (((f64::from(from.text.orphans) * (1.0 - p) + f64::from(to.text.orphans) * p) + 0.5 + 1e-9).floor() as i32).max(1),
@@ -1915,12 +2210,17 @@ fn lp_is_pure_pct(lp: &LengthPercentage) -> bool {
 }
 
 #[rustfmt::skip]
-fn interpolate_lp(a: &LengthPercentage, b: &LengthPercentage, p: f64, eval: &EvalContext, is_tr: bool) -> LengthPercentage {
+fn interpolate_lp_pair(a: &LengthPercentage, ea: &EvalContext, b: &LengthPercentage, eb: &EvalContext, p: f64, eval: &EvalContext, is_tr: bool) -> LengthPercentage {
     let same_kind = (lp_is_pure_px(a) && lp_is_pure_px(b)) || (lp_is_pure_pct(a) && lp_is_pure_pct(b));
-    if same_kind && p == 0.0 { return lp_from_math_node(math_node_from_lp(a, eval, is_tr)); }
-    if p == 1.0 { return lp_from_math_node(math_node_from_lp(b, eval, is_tr)); }
-    let combined = MathNode::Sum(vec![scale_math_for_interp(math_node_from_lp(a, eval, is_tr), 1.0 - p), scale_math_for_interp(math_node_from_lp(b, eval, is_tr), p)]).simplify(Some(eval), None);
+    if same_kind && p == 0.0 { return lp_from_math_node(math_node_from_lp(a, ea, is_tr)); }
+    if p == 1.0 { return lp_from_math_node(math_node_from_lp(b, eb, is_tr)); }
+    let combined = MathNode::Sum(vec![scale_math_for_interp(math_node_from_lp(a, ea, is_tr), 1.0 - p), scale_math_for_interp(math_node_from_lp(b, eb, is_tr), p)]).simplify(Some(eval), None);
     lp_from_math_node(combined)
+}
+
+#[rustfmt::skip]
+fn interpolate_lp(a: &LengthPercentage, b: &LengthPercentage, p: f64, eval: &EvalContext, is_tr: bool) -> LengthPercentage {
+    interpolate_lp_pair(a, eval, b, eval, p, eval, is_tr)
 }
 
 #[rustfmt::skip]
@@ -1957,10 +2257,16 @@ fn compose_size_value(underlying: &SizeValue, kf: &SizeValue, mode: AnimationCom
 
 #[rustfmt::skip]
 fn interpolate_size_value(from: &SizeValue, to: &SizeValue, p: f64, allow_kw: bool, eval: &EvalContext, is_tr: bool) -> Option<SizeValue> {
-    if let (SizeValue::Length(a), SizeValue::Length(b)) = (from, to) { return Some(SizeValue::Length(interpolate_lp(a, b, p, eval, is_tr))); }
+    interpolate_size_value_pair(from, eval, to, eval, p, allow_kw, eval, is_tr)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[rustfmt::skip]
+fn interpolate_size_value_pair(from: &SizeValue, ef: &EvalContext, to: &SizeValue, et: &EvalContext, p: f64, allow_kw: bool, eval: &EvalContext, is_tr: bool) -> Option<SizeValue> {
+    if let (SizeValue::Length(a), SizeValue::Length(b)) = (from, to) { return Some(SizeValue::Length(interpolate_lp_pair(a, ef, b, et, p, eval, is_tr))); }
     let eff = allow_kw || matches!(from, SizeValue::CalcSize(_)) || matches!(to, SizeValue::CalcSize(_));
-    let (b1, c1) = normalize_size_for_interp(from, eff, eval, is_tr)?;
-    let (b2, c2) = normalize_size_for_interp(to, eff, eval, is_tr)?;
+    let (b1, c1) = normalize_size_for_interp(from, eff, ef, is_tr)?;
+    let (b2, c2) = normalize_size_for_interp(to, eff, et, is_tr)?;
     let basis = combine_calc_size_bases(&b1, &b2)?;
     let combined = MathNode::Sum(vec![scale_math_for_interp(c1, 1.0 - p), scale_math_for_interp(c2, p)]).simplify(Some(eval), None);
     if basis == CalcSizeBasis::Any && !matches!(from, SizeValue::CalcSize(_)) && !matches!(to, SizeValue::CalcSize(_)) { Some(SizeValue::Length(lp_from_math_node(combined))) }

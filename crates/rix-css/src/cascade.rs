@@ -235,9 +235,17 @@ pub struct StyleContext {
     pseudo_styles: FastMap<(NodeId, RixPseudoElement), Arc<ComputedStyle>>,
     inline_color_exprs: FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
     before_change_styles: FastMap<NodeId, Arc<ComputedStyle>>,
+    pseudo_before_change_styles: FastMap<(NodeId, RixPseudoElement), Arc<ComputedStyle>>,
     pre_anim_styles: FastMap<NodeId, Arc<ComputedStyle>>,
     active_transitions: FastMap<NodeId, Vec<ActiveTransition>>,
+    pseudo_active_transitions: FastMap<(NodeId, RixPseudoElement), Vec<ActiveTransition>>,
+    managed_css_animations: FastMap<NodeId, Vec<WebAnimationSpec>>,
     web_animations: FastMap<NodeId, Vec<WebAnimationSpec>>,
+    transition_overrides: HashMap<u64, crate::animations::TransitionControlOverride>,
+    cancelled_transition_ids: Vec<u64>,
+    next_transition_id: u64,
+    transition_generation: u64,
+    css_animations_managed: bool,
     animation_clock_ms: f32,
     random_doc_seed: u64,
     missing_seen: HashSet<MissingCssFeature>,
@@ -272,9 +280,17 @@ impl StyleContext {
             pseudo_styles: FastMap::default(),
             inline_color_exprs: FastMap::default(),
             before_change_styles: FastMap::default(),
+            pseudo_before_change_styles: FastMap::default(),
             pre_anim_styles: FastMap::default(),
             active_transitions: FastMap::default(),
+            pseudo_active_transitions: FastMap::default(),
+            managed_css_animations: FastMap::default(),
             web_animations: FastMap::default(),
+            transition_overrides: HashMap::new(),
+            cancelled_transition_ids: Vec::new(),
+            next_transition_id: 1,
+            transition_generation: 1,
+            css_animations_managed: false,
             animation_clock_ms: 0.0,
             random_doc_seed: next_random_doc_seed(),
             missing_seen: HashSet::new(),
@@ -304,9 +320,17 @@ impl StyleContext {
             pseudo_styles: FastMap::default(),
             inline_color_exprs: FastMap::default(),
             before_change_styles: FastMap::default(),
+            pseudo_before_change_styles: FastMap::default(),
             pre_anim_styles: FastMap::default(),
             active_transitions: FastMap::default(),
+            pseudo_active_transitions: FastMap::default(),
+            managed_css_animations: FastMap::default(),
             web_animations: FastMap::default(),
+            transition_overrides: HashMap::new(),
+            cancelled_transition_ids: Vec::new(),
+            next_transition_id: 1,
+            transition_generation: 1,
+            css_animations_managed: false,
             animation_clock_ms: 0.0,
             random_doc_seed: next_random_doc_seed(),
             missing_seen: HashSet::new(),
@@ -319,8 +343,15 @@ impl StyleContext {
     pub fn take_animation_state(&mut self) -> AnimationStateSnapshot {
         AnimationStateSnapshot {
             before_change: self.before_change_styles.drain().collect(),
+            pseudo_before_change: self.pseudo_before_change_styles.drain().collect(),
             active_transitions: self.active_transitions.drain().collect(),
+            pseudo_active_transitions: self.pseudo_active_transitions.drain().collect(),
+            managed_css_animations: self.managed_css_animations.drain().collect(),
             web_animations: self.web_animations.drain().collect(),
+            transition_overrides: std::mem::take(&mut self.transition_overrides),
+            next_transition_id: self.next_transition_id,
+            transition_generation: self.transition_generation,
+            css_animations_managed: self.css_animations_managed,
             random_doc_seed: Some(self.random_doc_seed),
         }
     }
@@ -328,11 +359,170 @@ impl StyleContext {
     /// Restores portable animation/transition state onto a newly constructed [`StyleContext`].
     pub fn restore_animation_state(&mut self, snap: AnimationStateSnapshot) {
         self.before_change_styles.extend(snap.before_change);
+        self.pseudo_before_change_styles
+            .extend(snap.pseudo_before_change);
         self.active_transitions.extend(snap.active_transitions);
+        self.pseudo_active_transitions
+            .extend(snap.pseudo_active_transitions);
+        self.managed_css_animations
+            .extend(snap.managed_css_animations);
         self.web_animations.extend(snap.web_animations);
+        self.transition_overrides.extend(snap.transition_overrides);
+        if snap.next_transition_id > 0 {
+            self.next_transition_id = snap.next_transition_id;
+        }
+        if snap.transition_generation > 0 {
+            self.transition_generation = snap.transition_generation;
+        }
+        self.css_animations_managed = snap.css_animations_managed;
         if let Some(seed) = snap.random_doc_seed {
             self.random_doc_seed = seed;
             self.rule_index.random_doc_seed = seed;
+        }
+    }
+
+    /// Enables or disables `WebAnimationSystem` management of CSS `@keyframes` animations.
+    pub fn set_css_animations_managed(&mut self, managed: bool) {
+        self.css_animations_managed = managed;
+    }
+
+    /// Replaces the list of `WebAnimationSystem`-managed CSS `@keyframes` animations on `node`.
+    pub fn set_managed_css_animations_for_node(
+        &mut self,
+        node: NodeId,
+        anims: Vec<WebAnimationSpec>,
+    ) {
+        if anims.is_empty() {
+            self.managed_css_animations.remove(&node);
+        } else {
+            self.managed_css_animations.insert(node, anims);
+        }
+    }
+
+    /// Sets or clears a script-driven control override (`currentTime`, `cancelled`, `disassociated`)
+    /// for the CSS transition identified by `transition_id`.
+    pub fn set_transition_override(
+        &mut self,
+        transition_id: u64,
+        ov: Option<crate::animations::TransitionControlOverride>,
+    ) {
+        match ov {
+            Some(v) => {
+                self.transition_overrides.insert(transition_id, v);
+                for list in self.active_transitions.values_mut() {
+                    if let Some(tr) = list.iter_mut().find(|t| t.id == transition_id) {
+                        tr.current_time_override_ms = v.current_time_ms;
+                        tr.cancelled = v.cancelled;
+                        tr.disassociated = v.disassociated;
+                        if let Some(ct) = v.current_time_ms {
+                            if crate::animations::compute_transition_eased_progress_local(
+                                &tr.spec, ct,
+                            )
+                            .is_some()
+                            {
+                                tr.completed = false;
+                            }
+                        }
+                    }
+                }
+                for list in self.pseudo_active_transitions.values_mut() {
+                    if let Some(tr) = list.iter_mut().find(|t| t.id == transition_id) {
+                        tr.current_time_override_ms = v.current_time_ms;
+                        tr.cancelled = v.cancelled;
+                        tr.disassociated = v.disassociated;
+                        if let Some(ct) = v.current_time_ms {
+                            if crate::animations::compute_transition_eased_progress_local(
+                                &tr.spec, ct,
+                            )
+                            .is_some()
+                            {
+                                tr.completed = false;
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                self.transition_overrides.remove(&transition_id);
+            }
+        }
+    }
+
+    /// Returns all currently active (non-cancelled, non-disassociated, non-completed) CSS transitions across
+    /// elements and pseudo-elements.
+    #[must_use]
+    pub fn all_active_transitions(&self) -> Vec<(NodeId, ActiveTransition)> {
+        let mut out = Vec::new();
+        for (&node, list) in &self.active_transitions {
+            for tr in list {
+                if !tr.cancelled && !tr.disassociated && !tr.completed {
+                    out.push((node, tr.clone()));
+                }
+            }
+        }
+        for (&(node, _), list) in &self.pseudo_active_transitions {
+            for tr in list {
+                if !tr.cancelled && !tr.disassociated && !tr.completed {
+                    out.push((node, tr.clone()));
+                }
+            }
+        }
+        out.sort_by_key(|(_, tr)| tr.id);
+        out
+    }
+
+    /// Drains IDs of CSS transitions cancelled by style changes since the previous sync.
+    pub fn drain_cancelled_transition_ids(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.cancelled_transition_ids)
+    }
+
+    /// Returns all styled elements and pseudo-elements that declare CSS `animation-name` specs.
+    #[must_use]
+    pub fn all_css_animation_candidates(
+        &self,
+    ) -> Vec<(NodeId, Option<String>, Vec<crate::values::AnimationSpec>)> {
+        let mut out = Vec::new();
+        for (&node, st) in &self.styles {
+            if st.display == crate::values::DisplayMode::None {
+                continue;
+            }
+            if let Some(eff) = &st.effects {
+                if !eff.animations.is_empty() {
+                    out.push((node, None, eff.animations.clone()));
+                }
+            }
+        }
+        for (&(node, pe), st) in &self.pseudo_styles {
+            if st.display == crate::values::DisplayMode::None {
+                continue;
+            }
+            if let Some(eff) = &st.effects {
+                if !eff.animations.is_empty() {
+                    let pe_str = match pe {
+                        RixPseudoElement::Before => "::before",
+                        RixPseudoElement::After => "::after",
+                        RixPseudoElement::Marker => "::marker",
+                        RixPseudoElement::FirstLine => "::first-line",
+                        RixPseudoElement::FirstLetter => "::first-letter",
+                        RixPseudoElement::Backdrop => "::backdrop",
+                        RixPseudoElement::Placeholder => "::placeholder",
+                        RixPseudoElement::Selection => "::selection",
+                        RixPseudoElement::FileSelectorButton => "::file-selector-button",
+                        RixPseudoElement::DetailsContent => "::details-content",
+                        RixPseudoElement::Cue => "::cue",
+                        RixPseudoElement::TargetText => "::target-text",
+                    };
+                    out.push((node, Some(pe_str.to_string()), eff.animations.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Sets the document animation clock in milliseconds (synchronized with `DocumentTimeline`).
+    pub fn set_animation_clock_ms(&mut self, clock_ms: f32) {
+        if clock_ms.is_finite() && clock_ms >= 0.0 {
+            self.animation_clock_ms = clock_ms;
         }
     }
 
@@ -397,7 +587,10 @@ impl StyleContext {
     /// Returns `true` if any element has active transitions or animations.
     #[must_use]
     pub fn has_active_animations(&self) -> bool {
-        !self.active_transitions.is_empty() || !self.web_animations.is_empty()
+        !self.active_transitions.is_empty()
+            || !self.pseudo_active_transitions.is_empty()
+            || !self.managed_css_animations.is_empty()
+            || !self.web_animations.is_empty()
     }
 
     /// Appends a compiled author or user stylesheet and marks the rule index dirty.
@@ -739,12 +932,11 @@ impl StyleContext {
         for (id, style) in results {
             styled_ids.push(id);
             self.styles.insert(id, style);
-            if let Some(NodeData::Element(el)) = doc.get_mut(id) {
-                el.dirty_flags
-                    .remove(DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::DESCENDANT_STYLE_DIRTY);
-                el.dirty_flags
-                    .insert(DirtyFlags::SELF_LAYOUT_DIRTY | DirtyFlags::PAINT_DIRTY);
-            }
+            doc.clear_dirty_flags(
+                id,
+                DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::DESCENDANT_STYLE_DIRTY,
+            );
+            doc.mark_node_dirty(id, DirtyFlags::SELF_LAYOUT_DIRTY | DirtyFlags::PAINT_DIRTY);
         }
         for ((id, pe), style) in pseudo_results {
             self.pseudo_styles.insert((id, pe), style);
@@ -795,6 +987,25 @@ impl StyleContext {
             .and_then(|id| self.styles.get(id))
             .map_or(16.0, |s| s.text.font_size_px);
 
+        let mut anim_ctx = AnimWalkCtx {
+            dark_mode: self.media.dark_mode,
+            elapsed_ms: self.animation_clock_ms,
+            generation: self.transition_generation,
+            css_animations_managed: self.css_animations_managed,
+            rule_index: &self.rule_index,
+            before_change_styles: &mut self.before_change_styles,
+            pseudo_before_change_styles: &mut self.pseudo_before_change_styles,
+            pre_anim_styles: &mut self.pre_anim_styles,
+            active_transitions: &mut self.active_transitions,
+            pseudo_active_transitions: &mut self.pseudo_active_transitions,
+            managed_css_animations: &self.managed_css_animations,
+            web_animations: &self.web_animations,
+            transition_overrides: &self.transition_overrides,
+            next_transition_id: &mut self.next_transition_id,
+            started_any: false,
+            cancelled_local: Vec::new(),
+        };
+
         for child in root_children {
             restyle_dirty_walk(
                 doc,
@@ -803,6 +1014,8 @@ impl StyleContext {
                 false,
                 root_font_size,
                 false,
+                false,
+                &[],
                 &self.ua_sheet,
                 &self.shadow_adopted_sheets,
                 &self.rule_index,
@@ -813,6 +1026,7 @@ impl StyleContext {
                 &mut memo,
                 &mut self.styles,
                 &mut self.pseudo_styles,
+                &mut anim_ctx,
                 &mut missing_local,
                 &mut cleared_nodes,
                 &mut layout_dirty_nodes,
@@ -821,7 +1035,12 @@ impl StyleContext {
             );
         }
 
-        self.apply_post_cascade_animations(doc, &cleared_nodes, Some(&mut layout_dirty_nodes));
+        let started_any = anim_ctx.started_any;
+        let cancelled_local = anim_ctx.cancelled_local;
+        if started_any {
+            self.transition_generation = self.transition_generation.wrapping_add(1).max(1);
+        }
+        self.cancelled_transition_ids.extend(cancelled_local);
 
         for id in cleared_nodes {
             doc.clear_dirty_flags(
@@ -851,75 +1070,52 @@ impl StyleContext {
     fn apply_post_cascade_animations(
         &mut self, doc: &Document, node_ids: &[NodeId], mut extra_layout_dirty: Option<&mut Vec<NodeId>>,
     ) {
-        let (dark_mode, elapsed_ms) = (self.media.dark_mode, self.animation_clock_ms);
+        let mut anim_ctx = AnimWalkCtx {
+            dark_mode: self.media.dark_mode,
+            elapsed_ms: self.animation_clock_ms,
+            generation: self.transition_generation,
+            css_animations_managed: self.css_animations_managed,
+            rule_index: &self.rule_index,
+            before_change_styles: &mut self.before_change_styles,
+            pseudo_before_change_styles: &mut self.pseudo_before_change_styles,
+            pre_anim_styles: &mut self.pre_anim_styles,
+            active_transitions: &mut self.active_transitions,
+            pseudo_active_transitions: &mut self.pseudo_active_transitions,
+            managed_css_animations: &self.managed_css_animations,
+            web_animations: &self.web_animations,
+            transition_overrides: &self.transition_overrides,
+            next_transition_id: &mut self.next_transition_id,
+            started_any: false,
+            cancelled_local: Vec::new(),
+        };
         for &id in node_ids {
-            let Some(mut base_style) = self.styles.get(&id).cloned() else { continue; };
-            let eff = base_style.effects.as_ref();
-            let has_css_anims = eff.is_some_and(|e| !e.animations.is_empty());
-            let has_css_tr = eff.is_some_and(|e| !e.transitions.is_empty());
-            let has_web = self.web_animations.contains_key(&id);
-            if !has_css_anims && !has_css_tr && !has_web && !self.active_transitions.contains_key(&id) {
-                self.before_change_styles.insert(id, base_style);
-                continue;
-            }
-            if has_css_anims || has_web {
-                let (sib_idx, sib_cnt) = element_sibling_position(doc, id);
-                let mut cloned = (*base_style).clone();
-                let t = Arc::make_mut(&mut cloned.text);
-                t.eval_ctx.sibling_index = sib_idx;
-                t.eval_ctx.sibling_count = sib_cnt;
-                base_style = Arc::new(cloned);
-            }
-            let parent_style = doc.parent(id).and_then(|pid| self.styles.get(&pid)).cloned();
-            let before = self.before_change_styles.get(&id).cloned();
-            let web_slice = self.web_animations.get(&id).cloned();
-            if has_web {
-                self.pre_anim_styles.insert(id, Arc::clone(&base_style));
-            } else {
-                self.pre_anim_styles.remove(&id);
-            }
-            let mut active_trs = self.active_transitions.remove(&id).unwrap_or_default();
-            let final_style = apply_animations_and_transitions(
-                Arc::clone(&base_style), parent_style.as_deref(), dark_mode, elapsed_ms,
-                &|name| self.keyframes(name), web_slice.as_deref(), before.as_ref(),
-                &mut active_trs, &self.rule_index.registered_properties,
-            );
-            if !active_trs.is_empty() { self.active_transitions.insert(id, active_trs); }
-            if let Some(dirty_out) = extra_layout_dirty.as_deref_mut() {
-                if before.as_deref() != Some(&*final_style) || final_style != base_style { dirty_out.push(id); }
-            }
-            // Apply pseudo-element targeted Web Animations onto `self.pseudo_styles`.
-            if let Some(ref wanims) = web_slice {
-                for &(pe_name, pe_kind) in &[
-                    ("::before", RixPseudoElement::Before),
-                    ("::after", RixPseudoElement::After),
-                    ("::marker", RixPseudoElement::Marker),
-                    ("::first-line", RixPseudoElement::FirstLine),
-                    ("::first-letter", RixPseudoElement::FirstLetter),
-                    ("::backdrop", RixPseudoElement::Backdrop),
-                    ("::placeholder", RixPseudoElement::Placeholder),
-                ] {
-                    if wanims.iter().any(|w| w.pseudo_element.as_deref() == Some(pe_name) && !w.cancelled && !w.removed) {
-                        let base_pe = self
-                            .pseudo_styles
-                            .get(&(id, pe_kind))
-                            .cloned()
-                            .unwrap_or_else(|| Arc::new(ComputedStyle::inherit_from(&final_style)));
-                        let animated_pe = crate::animations::apply_web_animations_for_pseudo(
-                            base_pe,
-                            Some(&final_style),
-                            dark_mode,
-                            wanims,
-                            pe_name,
-                            &self.rule_index.registered_properties,
-                        );
-                        self.pseudo_styles.insert((id, pe_kind), animated_pe);
+            let mut hidden_ancestor = false;
+            let mut anc_trs: Vec<(PropertyIdKind, Option<rix_core::InternedStr>)> = Vec::new();
+            let mut anc = doc.parent(id);
+            while let Some(a) = anc {
+                if self.styles.get(&a).is_some_and(|s| s.display == crate::values::DisplayMode::None) {
+                    hidden_ancestor = true;
+                }
+                if let Some(list) = anim_ctx.active_transitions.get(&a) {
+                    for tr in list {
+                        if !tr.cancelled && !tr.disassociated && !tr.completed {
+                            anc_trs.push((tr.prop, tr.custom_name.clone()));
+                        }
                     }
                 }
+                anc = doc.parent(a);
             }
-            self.before_change_styles.insert(id, Arc::clone(&final_style));
-            self.styles.insert(id, final_style);
+            let _ = anim_ctx.apply_node(
+                doc, id, &mut self.styles, &mut self.pseudo_styles,
+                hidden_ancestor, &anc_trs, extra_layout_dirty.as_deref_mut(),
+            );
         }
+        let started_any = anim_ctx.started_any;
+        let cancelled_local = anim_ctx.cancelled_local;
+        if started_any {
+            self.transition_generation = self.transition_generation.wrapping_add(1).max(1);
+        }
+        self.cancelled_transition_ids.extend(cancelled_local);
     }
 
     /// Evaluates the computed style of `id` applying only Web Animations up to and including
@@ -1069,6 +1265,7 @@ fn cascade_subtree_par(
         caches,
         out_pseudos,
     );
+    out_styles.push((node, Arc::clone(&style)));
 
     let elem_children: SmallVec<[NodeId; 16]> = doc
         .children(node)
@@ -1111,7 +1308,6 @@ fn cascade_subtree_par(
     }
 
     if elem_children.is_empty() {
-        out_styles.push((node, style));
         return;
     }
 
@@ -1196,7 +1392,170 @@ fn cascade_subtree_par(
     }
 
     pop_bloom_hashes(&dom_el, bloom);
-    out_styles.push((node, style));
+}
+
+struct AnimWalkCtx<'a> {
+    dark_mode: bool,
+    elapsed_ms: f32,
+    generation: u64,
+    css_animations_managed: bool,
+    rule_index: &'a RuleIndex,
+    before_change_styles: &'a mut FastMap<NodeId, Arc<ComputedStyle>>,
+    pseudo_before_change_styles: &'a mut FastMap<(NodeId, RixPseudoElement), Arc<ComputedStyle>>,
+    pre_anim_styles: &'a mut FastMap<NodeId, Arc<ComputedStyle>>,
+    active_transitions: &'a mut FastMap<NodeId, Vec<ActiveTransition>>,
+    pseudo_active_transitions: &'a mut FastMap<(NodeId, RixPseudoElement), Vec<ActiveTransition>>,
+    managed_css_animations: &'a FastMap<NodeId, Vec<WebAnimationSpec>>,
+    web_animations: &'a FastMap<NodeId, Vec<WebAnimationSpec>>,
+    transition_overrides: &'a HashMap<u64, crate::animations::TransitionControlOverride>,
+    next_transition_id: &'a mut u64,
+    started_any: bool,
+    cancelled_local: Vec<u64>,
+}
+
+impl AnimWalkCtx<'_> {
+    #[allow(clippy::too_many_arguments)]
+    #[rustfmt::skip]
+    fn apply_node(
+        &mut self,
+        doc: &Document,
+        id: NodeId,
+        styles: &mut FastMap<NodeId, Arc<ComputedStyle>>,
+        pseudo_styles: &mut FastMap<(NodeId, RixPseudoElement), Arc<ComputedStyle>>,
+        hidden_ancestor: bool,
+        ancestor_transitioning: &[(PropertyIdKind, Option<rix_core::InternedStr>)],
+        extra_layout_dirty: Option<&mut Vec<NodeId>>,
+    ) -> Option<Arc<ComputedStyle>> {
+        let mut base_style = styles.get(&id).cloned()?;
+        let eff = base_style.effects.as_ref();
+        let has_css_anims = eff.is_some_and(|e| !e.animations.is_empty());
+        let has_css_tr = eff.is_some_and(|e| !e.transitions.is_empty());
+        let has_managed = self.managed_css_animations.contains_key(&id);
+        let has_web = self.web_animations.contains_key(&id);
+        let has_active_tr = self.active_transitions.contains_key(&id);
+        let has_pseudo_work = [
+            RixPseudoElement::Before,
+            RixPseudoElement::After,
+            RixPseudoElement::Marker,
+        ]
+        .iter()
+        .any(|&pe| {
+            self.pseudo_active_transitions.contains_key(&(id, pe))
+                || pseudo_styles
+                    .get(&(id, pe))
+                    .and_then(|s| s.effects.as_ref())
+                    .is_some_and(|e| !e.transitions.is_empty() || !e.animations.is_empty())
+        });
+        if !has_css_anims && !has_css_tr && !has_managed && !has_web && !has_active_tr && !has_pseudo_work {
+            self.before_change_styles.insert(id, Arc::clone(&base_style));
+            return Some(base_style);
+        }
+        if has_css_anims || has_managed || has_web {
+            let (sib_idx, sib_cnt) = element_sibling_position(doc, id);
+            let mut cloned = (*base_style).clone();
+            let t = Arc::make_mut(&mut cloned.text);
+            t.eval_ctx.sibling_index = sib_idx;
+            t.eval_ctx.sibling_count = sib_cnt;
+            base_style = Arc::new(cloned);
+        }
+        let parent_style = doc.parent(id).and_then(|pid| styles.get(&pid)).cloned();
+        let before = self.before_change_styles.get(&id).cloned();
+        let managed_slice = self.managed_css_animations.get(&id).cloned();
+        let web_slice = self.web_animations.get(&id).cloned();
+        if has_web || has_managed {
+            self.pre_anim_styles.insert(id, Arc::clone(&base_style));
+        } else {
+            self.pre_anim_styles.remove(&id);
+        }
+        let mut active_trs = self.active_transitions.remove(&id).unwrap_or_default();
+        let final_style = apply_animations_and_transitions(
+            Arc::clone(&base_style),
+            parent_style.as_deref(),
+            self.dark_mode,
+            self.elapsed_ms,
+            &|name| self.rule_index.keyframes.get(&rix_core::intern_str(name)),
+            self.css_animations_managed,
+            managed_slice.as_deref(),
+            web_slice.as_deref(),
+            before.as_ref(),
+            &mut active_trs,
+            &self.rule_index.registered_properties,
+            None,
+            hidden_ancestor,
+            ancestor_transitioning,
+            self.transition_overrides,
+            self.next_transition_id,
+            self.generation,
+            &mut self.started_any,
+            &mut self.cancelled_local,
+        );
+        if !active_trs.is_empty() {
+            self.active_transitions.insert(id, active_trs);
+        }
+        if let Some(dirty_out) = extra_layout_dirty {
+            if before.as_deref() != Some(&*final_style) || final_style != base_style {
+                dirty_out.push(id);
+            }
+        }
+        let pe_hidden = hidden_ancestor || final_style.display == crate::values::DisplayMode::None;
+        for &(pe_name, pe_kind) in &[
+            ("::before", RixPseudoElement::Before),
+            ("::after", RixPseudoElement::After),
+            ("::marker", RixPseudoElement::Marker),
+            ("::first-line", RixPseudoElement::FirstLine),
+            ("::first-letter", RixPseudoElement::FirstLetter),
+            ("::backdrop", RixPseudoElement::Backdrop),
+            ("::placeholder", RixPseudoElement::Placeholder),
+        ] {
+            let has_pe_web = web_slice.as_ref().is_some_and(|w| w.iter().any(|a| a.pseudo_element.as_deref() == Some(pe_name) && !a.cancelled && !a.removed));
+            let has_pe_man = managed_slice.as_ref().is_some_and(|w| w.iter().any(|a| a.pseudo_element.as_deref() == Some(pe_name) && !a.cancelled && !a.removed));
+            let has_pe_tr = self.pseudo_active_transitions.contains_key(&(id, pe_kind))
+                || pseudo_styles.get(&(id, pe_kind)).and_then(|s| s.effects.as_ref()).is_some_and(|e| !e.transitions.is_empty() || !e.animations.is_empty());
+            if !has_pe_web && !has_pe_man && !has_pe_tr {
+                if let Some(pe_st) = pseudo_styles.get(&(id, pe_kind)).cloned() {
+                    if matches!(pe_kind, RixPseudoElement::Before | RixPseudoElement::After | RixPseudoElement::Marker) {
+                        self.pseudo_before_change_styles.insert((id, pe_kind), pe_st);
+                    }
+                }
+                continue;
+            }
+            let base_pe = pseudo_styles
+                .get(&(id, pe_kind))
+                .cloned()
+                .unwrap_or_else(|| Arc::new(ComputedStyle::inherit_from(&final_style)));
+            let pe_before = self.pseudo_before_change_styles.get(&(id, pe_kind)).cloned();
+            let mut pe_trs = self.pseudo_active_transitions.remove(&(id, pe_kind)).unwrap_or_default();
+            let animated_pe = apply_animations_and_transitions(
+                Arc::clone(&base_pe),
+                Some(&final_style),
+                self.dark_mode,
+                self.elapsed_ms,
+                &|name| self.rule_index.keyframes.get(&rix_core::intern_str(name)),
+                self.css_animations_managed,
+                managed_slice.as_deref(),
+                web_slice.as_deref(),
+                pe_before.as_ref(),
+                &mut pe_trs,
+                &self.rule_index.registered_properties,
+                Some(pe_name),
+                pe_hidden,
+                &[],
+                self.transition_overrides,
+                self.next_transition_id,
+                self.generation,
+                &mut self.started_any,
+                &mut self.cancelled_local,
+            );
+            if !pe_trs.is_empty() {
+                self.pseudo_active_transitions.insert((id, pe_kind), pe_trs);
+            }
+            self.pseudo_before_change_styles.insert((id, pe_kind), Arc::clone(&animated_pe));
+            pseudo_styles.insert((id, pe_kind), animated_pe);
+        }
+        self.before_change_styles.insert(id, Arc::clone(&final_style));
+        styles.insert(id, Arc::clone(&final_style));
+        Some(final_style)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1207,6 +1566,8 @@ fn restyle_dirty_walk(
     layout_parent_flex_grid: bool,
     root_font_size: f32,
     force_inherit_restyle: bool,
+    hidden_ancestor: bool,
+    ancestor_transitioning: &[(PropertyIdKind, Option<rix_core::InternedStr>)],
     ua_sheet: &Arc<Stylesheet>,
     shadow_adopted: &HashMap<NodeId, Vec<Arc<Stylesheet>>>,
     rule_index: &RuleIndex,
@@ -1217,6 +1578,7 @@ fn restyle_dirty_walk(
     memo: &mut StyleMemo,
     styles: &mut FastMap<NodeId, Arc<ComputedStyle>>,
     pseudo_styles: &mut FastMap<(NodeId, RixPseudoElement), Arc<ComputedStyle>>,
+    anim_ctx: &mut AnimWalkCtx<'_>,
     missing_out: &mut Vec<MissingCssFeature>,
     cleared_nodes: &mut Vec<NodeId>,
     layout_dirty: &mut Vec<NodeId>,
@@ -1235,7 +1597,9 @@ fn restyle_dirty_walk(
     }
 
     let mut propagate_inherited = false;
+    let mut style_changed = false;
     let current_style = if needs_self {
+        let old_style_opt = styles.get(&node).cloned();
         let (new_style, hit) = compute_single_element_style(
             doc,
             node,
@@ -1254,52 +1618,6 @@ fn restyle_dirty_walk(
         report.restyled_elements += 1;
         if hit {
             report.shared_memo_hits += 1;
-        }
-
-        if let Some(old_style) = styles.get(&node) {
-            if !old_style.layout_eq(&new_style) {
-                layout_dirty.push(node);
-                report.layout_dirty_count += 1;
-            } else if **old_style != *new_style {
-                paint_dirty.push(node);
-                report.paint_only_count += 1;
-            }
-            let text_changed =
-                !Arc::ptr_eq(&old_style.text, &new_style.text) && old_style.text != new_style.text;
-            let vars_changed =
-                !Arc::ptr_eq(&old_style.custom_properties, &new_style.custom_properties)
-                    && old_style.custom_properties != new_style.custom_properties;
-            let inherited_scalar_changed = old_style.visibility != new_style.visibility
-                || old_style.pointer_events != new_style.pointer_events
-                || old_style.cursor != new_style.cursor;
-            let blockify_changed = old_style.display != new_style.display
-                && (matches!(
-                    old_style.display,
-                    crate::values::DisplayMode::Flex
-                        | crate::values::DisplayMode::InlineFlex
-                        | crate::values::DisplayMode::Grid
-                        | crate::values::DisplayMode::InlineGrid
-                        | crate::values::DisplayMode::GridLanes
-                        | crate::values::DisplayMode::InlineGridLanes
-                        | crate::values::DisplayMode::InlineGridLanesMulti
-                        | crate::values::DisplayMode::Contents
-                ) || matches!(
-                    new_style.display,
-                    crate::values::DisplayMode::Flex
-                        | crate::values::DisplayMode::InlineFlex
-                        | crate::values::DisplayMode::Grid
-                        | crate::values::DisplayMode::InlineGrid
-                        | crate::values::DisplayMode::GridLanes
-                        | crate::values::DisplayMode::InlineGridLanes
-                        | crate::values::DisplayMode::InlineGridLanesMulti
-                        | crate::values::DisplayMode::Contents
-                ));
-            propagate_inherited =
-                text_changed || vars_changed || inherited_scalar_changed || blockify_changed;
-        } else {
-            layout_dirty.push(node);
-            report.layout_dirty_count += 1;
-            propagate_inherited = true;
         }
 
         let next_lp_fg = next_layout_parent_flex_grid(&new_style, layout_parent_flex_grid);
@@ -1334,7 +1652,72 @@ fn restyle_dirty_walk(
         }
 
         styles.insert(node, Arc::clone(&new_style));
-        new_style
+        let final_style = anim_ctx
+            .apply_node(
+                doc,
+                node,
+                styles,
+                pseudo_styles,
+                hidden_ancestor,
+                ancestor_transitioning,
+                Some(layout_dirty),
+            )
+            .unwrap_or(new_style);
+
+        if let Some(old_style) = old_style_opt {
+            if !old_style.layout_eq(&final_style) {
+                layout_dirty.push(node);
+                report.layout_dirty_count += 1;
+                style_changed = true;
+            } else if *old_style != *final_style {
+                paint_dirty.push(node);
+                report.paint_only_count += 1;
+                style_changed = true;
+            }
+            let text_changed = !Arc::ptr_eq(&old_style.text, &final_style.text)
+                && old_style.text != final_style.text;
+            let vars_changed =
+                !Arc::ptr_eq(&old_style.custom_properties, &final_style.custom_properties)
+                    && old_style.custom_properties != final_style.custom_properties;
+            let inherited_scalar_changed = old_style.visibility != final_style.visibility
+                || old_style.pointer_events != final_style.pointer_events
+                || old_style.cursor != final_style.cursor;
+            let display_none_toggled = (old_style.display == crate::values::DisplayMode::None)
+                != (final_style.display == crate::values::DisplayMode::None);
+            let blockify_changed = old_style.display != final_style.display
+                && (matches!(
+                    old_style.display,
+                    crate::values::DisplayMode::Flex
+                        | crate::values::DisplayMode::InlineFlex
+                        | crate::values::DisplayMode::Grid
+                        | crate::values::DisplayMode::InlineGrid
+                        | crate::values::DisplayMode::GridLanes
+                        | crate::values::DisplayMode::InlineGridLanes
+                        | crate::values::DisplayMode::InlineGridLanesMulti
+                        | crate::values::DisplayMode::Contents
+                ) || matches!(
+                    final_style.display,
+                    crate::values::DisplayMode::Flex
+                        | crate::values::DisplayMode::InlineFlex
+                        | crate::values::DisplayMode::Grid
+                        | crate::values::DisplayMode::InlineGrid
+                        | crate::values::DisplayMode::GridLanes
+                        | crate::values::DisplayMode::InlineGridLanes
+                        | crate::values::DisplayMode::InlineGridLanesMulti
+                        | crate::values::DisplayMode::Contents
+                ));
+            propagate_inherited = text_changed
+                || vars_changed
+                || inherited_scalar_changed
+                || blockify_changed
+                || display_none_toggled;
+        } else {
+            layout_dirty.push(node);
+            report.layout_dirty_count += 1;
+            propagate_inherited = true;
+            style_changed = true;
+        }
+        final_style
     } else if let Some(existing) = styles.get(&node) {
         Arc::clone(existing)
     } else {
@@ -1347,8 +1730,31 @@ fn restyle_dirty_walk(
 
     let propagate_through_contents =
         force_inherit_restyle && current_style.display == crate::values::DisplayMode::Contents;
-    if !needs_desc && !propagate_inherited && !propagate_through_contents {
+    let any_child_explicit_inherit = style_changed
+        && doc
+            .children(node)
+            .any(|c| styles.get(&c).is_some_and(|s| s.uses_explicit_inherit));
+    if !needs_desc
+        && !propagate_inherited
+        && !propagate_through_contents
+        && !any_child_explicit_inherit
+    {
         return;
+    }
+
+    let next_hidden_ancestor =
+        hidden_ancestor || current_style.display == crate::values::DisplayMode::None;
+    let mut next_anc_trs: SmallVec<[(PropertyIdKind, Option<rix_core::InternedStr>); 8]> =
+        ancestor_transitioning.iter().cloned().collect();
+    if let Some(list) = anim_ctx.active_transitions.get(&node) {
+        for tr in list {
+            if !tr.cancelled && !tr.disassociated && !tr.completed {
+                let key = (tr.prop, tr.custom_name.clone());
+                if !next_anc_trs.contains(&key) {
+                    next_anc_trs.push(key);
+                }
+            }
+        }
     }
 
     let dom_el = DomElement::new(doc, node);
@@ -1367,7 +1773,9 @@ fn restyle_dirty_walk(
         let mut shadow_memo = StyleMemo::default();
         for sc in doc.children(sr_id) {
             if matches!(doc.get(sc), Some(NodeData::Element(_))) {
-                let sc_force = force_children || !styles.contains_key(&sc);
+                let sc_force = force_children
+                    || !styles.contains_key(&sc)
+                    || (style_changed && styles.get(&sc).is_some_and(|s| s.uses_explicit_inherit));
                 restyle_dirty_walk(
                     doc,
                     sc,
@@ -1375,6 +1783,8 @@ fn restyle_dirty_walk(
                     next_lp_fg,
                     next_root_font,
                     sc_force,
+                    next_hidden_ancestor,
+                    &next_anc_trs,
                     ua_sheet,
                     shadow_adopted,
                     &shadow_index,
@@ -1385,6 +1795,7 @@ fn restyle_dirty_walk(
                     &mut shadow_memo,
                     styles,
                     pseudo_styles,
+                    anim_ctx,
                     missing_out,
                     cleared_nodes,
                     layout_dirty,
@@ -1397,13 +1808,17 @@ fn restyle_dirty_walk(
 
     for child in doc.children(node) {
         if matches!(doc.get(child), Some(NodeData::Element(_))) {
+            let child_force = force_children
+                || (style_changed && styles.get(&child).is_some_and(|s| s.uses_explicit_inherit));
             restyle_dirty_walk(
                 doc,
                 child,
                 Some(&current_style),
                 next_lp_fg,
                 next_root_font,
-                force_children,
+                child_force,
+                next_hidden_ancestor,
+                &next_anc_trs,
                 ua_sheet,
                 shadow_adopted,
                 rule_index,
@@ -1414,6 +1829,7 @@ fn restyle_dirty_walk(
                 memo,
                 styles,
                 pseudo_styles,
+                anim_ctx,
                 missing_out,
                 cleared_nodes,
                 layout_dirty,
