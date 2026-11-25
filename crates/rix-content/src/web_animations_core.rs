@@ -67,6 +67,7 @@ pub(crate) struct EffectState {
     pub(crate) composite: AnimationCompositionMode,
     pub(crate) iteration_composite: AnimationCompositionMode,
     pub(crate) keyframes: Vec<ProcessedKeyframe>,
+    pub(crate) css_default_timing: Option<TimingFunction>,
     pub(crate) owner_anim: Option<HeapHandle>,
 }
 
@@ -80,6 +81,7 @@ impl EffectState {
             composite: AnimationCompositionMode::Replace,
             iteration_composite: AnimationCompositionMode::Replace,
             keyframes: Vec::new(),
+            css_default_timing: None,
             owner_anim: None,
         }
     }
@@ -87,6 +89,60 @@ impl EffectState {
     pub(crate) fn end_time(&self) -> f64 {
         compute_effect_timing(&self.timing, None, 1.0).end_time
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CssEventPhase {
+    Idle,
+    Before,
+    Active,
+    After,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum AnimOrigin {
+    Script,
+    CssTransition {
+        transition_id: u64,
+        owning_element: Option<NodeId>,
+        event_target: NodeId,
+        pseudo_element: Option<String>,
+        transition_property: String,
+        generation: u64,
+        prev_phase: CssEventPhase,
+        last_active_time_ms: f64,
+        effect_replaced: bool,
+    },
+    CssAnimation {
+        owning_element: Option<NodeId>,
+        event_target: NodeId,
+        pseudo_element: Option<String>,
+        animation_name: String,
+        list_index: usize,
+        effect_overridden: bool,
+        keyframes_overridden: bool,
+        /// Bitmask of `EffectTiming` properties explicitly overridden via `updateTiming()`:
+        /// 1=delay, 2=direction, 4=duration, 8=easing, 16=endDelay, 32=fill, 64=iterationStart, 128=iterations.
+        timing_overridden_mask: u8,
+        play_state_overridden: bool,
+        timeline_overridden: bool,
+        css_paused: bool,
+        prev_phase: CssEventPhase,
+        prev_iteration: Option<u64>,
+        last_active_time_ms: f64,
+    },
+}
+
+pub(crate) struct QueuedCssEvent {
+    pub(crate) target_node: NodeId,
+    pub(crate) anim_h: HeapHandle,
+    pub(crate) is_transition: bool,
+    pub(crate) event_type: &'static str,
+    pub(crate) name: String,
+    pub(crate) elapsed_time_s: f64,
+    pub(crate) pseudo_element: String,
+    pub(crate) scheduled_time: f64,
+    pub(crate) seq_id: u64,
 }
 
 pub(crate) struct AnimState {
@@ -104,6 +160,7 @@ pub(crate) struct AnimState {
     pub(crate) ready_settled: bool,
     pub(crate) finished_promise: HeapHandle,
     pub(crate) finished_settled: bool,
+    pub(crate) origin: AnimOrigin,
 }
 
 pub(crate) struct QueuedPlaybackEvent {
@@ -123,6 +180,10 @@ pub(crate) struct WebAnimProtos {
     pub(crate) effect_proto: Option<HeapHandle>,
     pub(crate) keyframe_effect_proto: Option<HeapHandle>,
     pub(crate) animation_proto: Option<HeapHandle>,
+    pub(crate) css_transition_proto: Option<HeapHandle>,
+    pub(crate) css_animation_proto: Option<HeapHandle>,
+    pub(crate) transition_event_proto: Option<HeapHandle>,
+    pub(crate) animation_event_proto: Option<HeapHandle>,
 }
 
 /// Content-runtime registry of Web Animations timelines, effects, and animations.
@@ -132,7 +193,10 @@ pub struct WebAnimationSystem {
     pub(crate) doc_creation_time_ms: HashMap<NodeId, f64>,
     pub(crate) effects: HashMap<HeapHandle, EffectState>,
     pub(crate) animations: HashMap<HeapHandle, AnimState>,
+    pub(crate) css_transition_map: HashMap<u64, HeapHandle>,
+    pub(crate) css_animation_map: HashMap<(NodeId, Option<String>, String, usize), HeapHandle>,
     pub(crate) queued_events: Vec<QueuedPlaybackEvent>,
+    pub(crate) queued_css_events: Vec<QueuedCssEvent>,
     pub(crate) frame_time_ms: f64,
     pub(crate) next_seq_id: u64,
     pub(crate) protos: WebAnimProtos,
@@ -156,7 +220,10 @@ impl WebAnimationSystem {
             doc_creation_time_ms: HashMap::new(),
             effects: HashMap::new(),
             animations: HashMap::new(),
+            css_transition_map: HashMap::new(),
+            css_animation_map: HashMap::new(),
             queued_events: Vec::new(),
+            queued_css_events: Vec::new(),
             frame_time_ms: 0.0,
             next_seq_id: 1,
             protos: WebAnimProtos::default(),
@@ -193,6 +260,10 @@ impl WebAnimationSystem {
             self.protos.effect_proto,
             self.protos.keyframe_effect_proto,
             self.protos.animation_proto,
+            self.protos.css_transition_proto,
+            self.protos.css_animation_proto,
+            self.protos.transition_event_proto,
+            self.protos.animation_event_proto,
         ]
         .into_iter()
         .flatten()
@@ -201,6 +272,12 @@ impl WebAnimationSystem {
         }
         for &tl_h in self.doc_timelines.values() {
             out.push(JsValue::from_object(tl_h));
+        }
+        for &ah in self.css_transition_map.values() {
+            out.push(JsValue::from_object(ah));
+        }
+        for &ah in self.css_animation_map.values() {
+            out.push(JsValue::from_object(ah));
         }
         for (&ah, anim) in &self.animations {
             let keep = anim.pending_task != PendingTask::None
@@ -221,6 +298,9 @@ impl WebAnimationSystem {
         for ev in &self.queued_events {
             out.push(JsValue::from_object(ev.anim_h));
         }
+        for ev in &self.queued_css_events {
+            out.push(JsValue::from_object(ev.anim_h));
+        }
     }
 
     /// Sweeps dead JS wrapper handles after Major GC.
@@ -229,6 +309,8 @@ impl WebAnimationSystem {
             .retain(|h, _| heap.is_alive(*h) || self.doc_timelines.values().any(|v| v == h));
         self.effects.retain(|h, _| heap.is_alive(*h));
         self.animations.retain(|h, _| heap.is_alive(*h));
+        self.css_transition_map.retain(|_, h| heap.is_alive(*h));
+        self.css_animation_map.retain(|_, h| heap.is_alive(*h));
     }
 }
 
@@ -494,10 +576,42 @@ pub(crate) fn sync_target_to_style_ctx(
     wa: &SharedWebAnimations,
     target: NodeId,
 ) {
-    let specs: Vec<WebAnimationSpec> = {
+    let (script_specs, css_anim_specs, tr_overrides) = {
         let sys = wa.borrow();
-        let mut list: Vec<(u64, WebAnimationSpec)> = Vec::new();
+        let mut script_list: Vec<(u64, WebAnimationSpec)> = Vec::new();
+        let mut css_list: Vec<(usize, u64, WebAnimationSpec)> = Vec::new();
+        let mut tr_ovs: Vec<(u64, rix_css::TransitionControlOverride)> = Vec::new();
+
         for anim in sys.animations.values() {
+            let ct = anim_current_time(&sys, host, anim);
+            let ps = anim_play_state(&sys, host, anim);
+
+            if let AnimOrigin::CssTransition {
+                transition_id,
+                owning_element,
+                effect_replaced,
+                ..
+            } = &anim.origin
+            {
+                let eff_target = anim
+                    .effect
+                    .and_then(|eh| sys.effects.get(&eh))
+                    .and_then(|e| e.target);
+                if *owning_element == Some(target) || eff_target == Some(target) {
+                    tr_ovs.push((
+                        *transition_id,
+                        rix_css::TransitionControlOverride {
+                            current_time_ms: ct,
+                            cancelled: ps == "idle" || anim.effect.is_none(),
+                            disassociated: *effect_replaced,
+                        },
+                    ));
+                }
+                if !*effect_replaced {
+                    continue;
+                }
+            }
+
             let Some(eh) = anim.effect else {
                 continue;
             };
@@ -507,8 +621,6 @@ pub(crate) fn sync_target_to_style_ctx(
             if eff.target != Some(target) {
                 continue;
             }
-            let ct = anim_current_time(&sys, host, anim);
-            let ps = anim_play_state(&sys, host, anim);
             let kfs: Vec<WebAnimationKeyframe> = eff
                 .keyframes
                 .iter()
@@ -520,52 +632,87 @@ pub(crate) fn sync_target_to_style_ctx(
                     declarations: k.declarations.clone(),
                 })
                 .collect();
-            list.push((
-                anim.seq_id,
-                WebAnimationSpec {
-                    id: anim.seq_id,
-                    keyframes: kfs,
-                    duration_ms: eff.timing.duration_ms.unwrap_or(0.0),
-                    delay_ms: eff.timing.delay_ms,
-                    end_delay_ms: eff.timing.end_delay_ms,
-                    iteration_start: eff.timing.iteration_start,
-                    timing: eff.timing.easing.clone(),
-                    keyframe_default_timing: None,
-                    iteration_count: eff.timing.iterations,
-                    direction: eff.timing.direction,
-                    fill_mode: eff.timing.fill_mode,
-                    fill_is_auto: eff.timing.fill_is_auto,
-                    play_state: if ps == "paused" {
-                        AnimationPlayStateMode::Paused
-                    } else {
-                        AnimationPlayStateMode::Running
-                    },
-                    composite: eff.composite,
-                    iteration_composite: eff.iteration_composite,
-                    current_time_ms: ct,
-                    playback_rate: anim.playback_rate,
-                    pseudo_element: eff.pseudo_element.clone(),
-                    cancelled: ps == "idle",
-                    removed: anim.replace_state == ReplaceState::Removed,
+            let spec = WebAnimationSpec {
+                id: anim.seq_id,
+                keyframes: kfs,
+                duration_ms: eff.timing.duration_ms.unwrap_or(0.0),
+                delay_ms: eff.timing.delay_ms,
+                end_delay_ms: eff.timing.end_delay_ms,
+                iteration_start: eff.timing.iteration_start,
+                timing: eff.timing.easing.clone(),
+                iteration_count: eff.timing.iterations,
+                direction: eff.timing.direction,
+                fill_mode: eff.timing.fill_mode,
+                fill_is_auto: eff.timing.fill_is_auto,
+                play_state: if ps == "paused" {
+                    AnimationPlayStateMode::Paused
+                } else {
+                    AnimationPlayStateMode::Running
                 },
-            ));
+                composite: eff.composite,
+                iteration_composite: eff.iteration_composite,
+                current_time_ms: ct,
+                playback_rate: anim.playback_rate,
+                pseudo_element: eff.pseudo_element.clone(),
+                keyframe_default_timing: eff.css_default_timing.clone(),
+                cancelled: ps == "idle",
+                removed: anim.replace_state == ReplaceState::Removed,
+            };
+            match &anim.origin {
+                AnimOrigin::CssAnimation {
+                    owning_element: Some(_),
+                    list_index,
+                    ..
+                } => css_list.push((*list_index, anim.seq_id, spec)),
+                _ => script_list.push((anim.seq_id, spec)),
+            }
         }
-        list.sort_by_key(|(seq, _)| *seq);
-        list.into_iter().map(|(_, s)| s).collect()
+        script_list.sort_by_key(|(seq, _)| *seq);
+        css_list.sort_by_key(|(idx, seq, _)| (*idx, *seq));
+        (
+            script_list.into_iter().map(|(_, s)| s).collect::<Vec<_>>(),
+            css_list.into_iter().map(|(_, _, s)| s).collect::<Vec<_>>(),
+            tr_ovs,
+        )
     };
-    host.borrow_mut().set_web_animations_for_node(target, specs);
+    let mut hb = host.borrow_mut();
+    hb.set_managed_css_animations_for_node(target, css_anim_specs);
+    hb.set_web_animations_for_node(target, script_specs);
+    for (tr_id, ov) in tr_overrides {
+        hb.set_transition_override(tr_id, Some(target), Some(ov));
+    }
 }
 
 pub(crate) fn sync_anim_target(host: &SharedHost, wa: &SharedWebAnimations, anim_h: HeapHandle) {
-    let target = {
+    crate::css_animations_api::sync_css_transition_override(host, wa, anim_h);
+    let targets: Vec<NodeId> = {
         let sys = wa.borrow();
-        sys.animations
-            .get(&anim_h)
-            .and_then(|a| a.effect)
-            .and_then(|eh| sys.effects.get(&eh))
-            .and_then(|e| e.target)
+        let mut out = Vec::new();
+        if let Some(a) = sys.animations.get(&anim_h) {
+            if let Some(t) = a
+                .effect
+                .and_then(|eh| sys.effects.get(&eh))
+                .and_then(|e| e.target)
+            {
+                out.push(t);
+            }
+            match &a.origin {
+                AnimOrigin::CssTransition {
+                    owning_element: Some(ow),
+                    ..
+                }
+                | AnimOrigin::CssAnimation {
+                    owning_element: Some(ow),
+                    ..
+                } if !out.contains(ow) => {
+                    out.push(*ow);
+                }
+                _ => {}
+            }
+        }
+        out
     };
-    if let Some(t) = target {
+    for t in targets {
         sync_target_to_style_ctx(host, wa, t);
     }
 }
@@ -573,7 +720,23 @@ pub(crate) fn sync_anim_target(host: &SharedHost, wa: &SharedWebAnimations, anim
 pub(crate) fn sync_all_targets(host: &SharedHost, wa: &SharedWebAnimations) {
     let targets: HashSet<NodeId> = {
         let sys = wa.borrow();
-        sys.effects.values().filter_map(|e| e.target).collect()
+        let mut set: HashSet<NodeId> = sys.effects.values().filter_map(|e| e.target).collect();
+        for a in sys.animations.values() {
+            match &a.origin {
+                AnimOrigin::CssTransition {
+                    owning_element: Some(ow),
+                    ..
+                }
+                | AnimOrigin::CssAnimation {
+                    owning_element: Some(ow),
+                    ..
+                } => {
+                    set.insert(*ow);
+                }
+                _ => {}
+            }
+        }
+        set
     };
     for t in targets {
         sync_target_to_style_ctx(host, wa, t);
@@ -918,12 +1081,17 @@ pub fn update_animations_and_send_events(
     wa: &SharedWebAnimations,
     timestamp_ms: f64,
 ) {
-    // 1. Update document timeline sample time.
-    let anim_handles: Vec<HeapHandle> = {
+    // 1. Update document timeline sample time and sync CSS transitions/animations from StyleContext.
+    {
         let mut sys = wa.borrow_mut();
         if timestamp_ms > sys.frame_time_ms {
             sys.frame_time_ms = timestamp_ms;
         }
+    }
+    crate::css_animations_api::flush_and_sync_css_animations(vm, host, wa);
+
+    let anim_handles: Vec<HeapHandle> = {
+        let sys = wa.borrow();
         let mut hs: Vec<(u64, HeapHandle)> =
             sys.animations.iter().map(|(&h, a)| (a.seq_id, h)).collect();
         hs.sort_by_key(|(s, _)| *s);
@@ -992,10 +1160,11 @@ pub fn update_animations_and_send_events(
         resolve_promise(vm, p, JsValue::from_object(ah));
     }
 
-    // 3. Update finished states across all animations.
+    // 3. Update finished states across all animations and evaluate CSS transition/animation events.
     for &ah in &anim_handles {
         update_finished_state(vm, host, wa, ah, false, false);
     }
+    crate::css_animations_api::update_css_events_for_all(host, wa);
 
     // 4. Remove replaced animations (W3C Web Animations §4.4.19).
     remove_replaced_animations(host, wa);
@@ -1007,8 +1176,9 @@ pub fn update_animations_and_send_events(
     // BEFORE event dispatch (HTML §8.1.7.3 / Web Animations §4.1.2).
     run_microtask_checkpoint(event_loop, vm);
 
-    // 7. Snapshot and dispatch queued `AnimationPlaybackEvent`s (`finish`, `cancel`, `remove`)
+    // 7. Dispatch queued CSS `TransitionEvent`s & `AnimationEvent`s and `AnimationPlaybackEvent`s
     // BEFORE rAF! Events queued *during* event dispatch wait until the next frame.
+    crate::css_animations_api::dispatch_queued_css_events(vm, host, events, event_loop, wa);
     let mut to_dispatch = std::mem::take(&mut wa.borrow_mut().queued_events);
     to_dispatch.sort_by(|a, b| {
         a.scheduled_time
@@ -1706,6 +1876,7 @@ pub(crate) fn alloc_animation_object(
             ready_settled: true,
             finished_promise,
             finished_settled: false,
+            origin: AnimOrigin::Script,
         },
     );
     anim_h
@@ -1745,7 +1916,8 @@ pub(crate) fn collect_animations_for_scope(
     let sys = wa.borrow();
     let hb = host.borrow();
     let doc = hb.document.borrow();
-    let mut matches: Vec<(u64, HeapHandle)> = Vec::new();
+    let mut raw_matches: Vec<HeapHandle> = Vec::new();
+    let mut needs_tree_order = false;
     for (&ah, anim) in &sys.animations {
         if !anim_is_relevant(&sys, host, anim) {
             continue;
@@ -1782,9 +1954,92 @@ pub(crate) fn collect_animations_for_scope(
             false
         };
         if in_scope {
-            matches.push((anim.seq_id, ah));
+            if matches!(
+                anim.origin,
+                AnimOrigin::CssTransition {
+                    owning_element: Some(_),
+                    ..
+                } | AnimOrigin::CssAnimation {
+                    owning_element: Some(_),
+                    ..
+                }
+            ) {
+                needs_tree_order = true;
+            }
+            raw_matches.push(ah);
         }
     }
-    matches.sort_by_key(|(seq, _)| *seq);
-    matches.into_iter().map(|(_, h)| h).collect()
+
+    let tree_order: HashMap<NodeId, usize> = if needs_tree_order {
+        let mut map = HashMap::new();
+        let mut stack = vec![doc.root()];
+        let mut idx = 0usize;
+        while let Some(n) = stack.pop() {
+            map.insert(n, idx);
+            idx += 1;
+            let children: Vec<NodeId> = doc.children(n).collect();
+            for ch in children.into_iter().rev() {
+                stack.push(ch);
+            }
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+
+    // W3C Web Animations / CSS Transitions 2 / CSS Animations 2 composite order:
+    // 1. Owned CSSTransitions (tree order -> pseudo -> transition generation -> transitionProperty)
+    // 2. Owned CSSAnimations (tree order -> pseudo -> animation-name list order)
+    // 3. Script & disassociated animations (creation seq_id)
+    let pseudo_rank = |pe: &Option<String>| -> u8 {
+        match pe.as_deref() {
+            None => 0,
+            Some("::marker") => 1,
+            Some("::before") => 2,
+            Some("::after") => 3,
+            _ => 4,
+        }
+    };
+    type AnimCompositeOrderKey = (u8, usize, u8, u64, String, usize, u64);
+    let mut keyed: Vec<(AnimCompositeOrderKey, HeapHandle)> = raw_matches
+        .into_iter()
+        .filter_map(|ah| {
+            let anim = sys.animations.get(&ah)?;
+            let sort_key = match &anim.origin {
+                AnimOrigin::CssTransition {
+                    owning_element: Some(ow),
+                    pseudo_element,
+                    generation,
+                    transition_property,
+                    ..
+                } => (
+                    0u8,
+                    tree_order.get(ow).copied().unwrap_or(usize::MAX),
+                    pseudo_rank(pseudo_element),
+                    *generation,
+                    transition_property.clone(),
+                    0usize,
+                    anim.seq_id,
+                ),
+                AnimOrigin::CssAnimation {
+                    owning_element: Some(ow),
+                    pseudo_element,
+                    list_index,
+                    ..
+                } => (
+                    1u8,
+                    tree_order.get(ow).copied().unwrap_or(usize::MAX),
+                    pseudo_rank(pseudo_element),
+                    0u64,
+                    String::new(),
+                    *list_index,
+                    anim.seq_id,
+                ),
+                _ => (2u8, 0usize, 0u8, 0u64, String::new(), 0usize, anim.seq_id),
+            };
+            Some((sort_key, ah))
+        })
+        .collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.into_iter().map(|(_, h)| h).collect()
 }

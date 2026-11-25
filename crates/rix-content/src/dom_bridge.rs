@@ -657,6 +657,16 @@ impl HostState {
         self.style_ctx.missing_features()
     }
 
+    /// Returns `true` when DOM or stylesheet revisions differ from the last style flush.
+    #[must_use]
+    pub fn styles_need_flush(&self) -> bool {
+        if self.sheets_dirty {
+            return true;
+        }
+        let doc = self.document.borrow();
+        self.last_style_revs != Some((doc.revision(), doc.style_revision()))
+    }
+
     /// Recomputes CSS cascade ONLY when document structure, style revision, or stylesheets changed.
     /// Uses fast incremental `restyle_dirty` when only DOM nodes/attributes mutated and cached
     /// `Stylesheet::parse_cached` when rebuilding the stylesheet list.
@@ -1523,6 +1533,65 @@ impl HostState {
     ) {
         self.style_ctx.set_web_animations_for_node(node, anims);
         self.mark_node_style_dirty(node);
+    }
+
+    /// Enables or disables `WebAnimationSystem` management of CSS `@keyframes` animations.
+    pub fn set_css_animations_managed(&mut self, managed: bool) {
+        self.style_ctx.set_css_animations_managed(managed);
+    }
+
+    /// Replaces the `WebAnimationSystem`-managed CSS `@keyframes` animations on `node`.
+    pub fn set_managed_css_animations_for_node(
+        &mut self,
+        node: NodeId,
+        anims: Vec<rix_css::WebAnimationSpec>,
+    ) {
+        self.style_ctx
+            .set_managed_css_animations_for_node(node, anims);
+        self.mark_node_style_dirty(node);
+    }
+
+    /// Sets or clears a script-driven control override on a running CSS transition.
+    pub fn set_transition_override(
+        &mut self,
+        transition_id: u64,
+        target: Option<NodeId>,
+        ov: Option<rix_css::TransitionControlOverride>,
+    ) {
+        self.style_ctx.set_transition_override(transition_id, ov);
+        if let Some(node) = target {
+            self.mark_node_style_dirty(node);
+        }
+    }
+
+    /// Returns all currently active CSS transitions across elements and pseudo-elements.
+    #[must_use]
+    pub fn all_active_transitions(&self) -> Vec<(NodeId, rix_css::ActiveTransition)> {
+        self.style_ctx.all_active_transitions()
+    }
+
+    /// Drains IDs of CSS transitions cancelled by style changes since the last sync.
+    pub fn drain_cancelled_transition_ids(&mut self) -> Vec<u64> {
+        self.style_ctx.drain_cancelled_transition_ids()
+    }
+
+    /// Returns all styled elements/pseudo-elements declaring CSS `animation-name`.
+    #[must_use]
+    pub fn all_css_animation_candidates(
+        &self,
+    ) -> Vec<(NodeId, Option<String>, Vec<rix_css::AnimationSpec>)> {
+        self.style_ctx.all_css_animation_candidates()
+    }
+
+    /// Looks up a compiled `@keyframes` rule by name.
+    #[must_use]
+    pub fn keyframes_rule(&self, name: &str) -> Option<rix_css::KeyframesRule> {
+        self.style_ctx.keyframes(name).cloned()
+    }
+
+    /// Synchronizes `StyleContext`'s animation clock with `DocumentTimeline`.
+    pub fn set_animation_clock_ms(&mut self, clock_ms: f32) {
+        self.style_ctx.set_animation_clock_ms(clock_ms);
     }
 
     /// Attaches a Web Animation (`Element.prototype.animate`) to `node` and marks it dirty.

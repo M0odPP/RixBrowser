@@ -7,6 +7,7 @@
 //! Reference: Spec 05 §2.2, Spec 06 §1–§3, Issues #16 & #17.
 
 pub mod canvas2d;
+mod css_animations_api;
 pub mod cssom;
 pub mod cssom_geometry;
 pub mod cssom_view;
@@ -260,8 +261,8 @@ impl ContentRuntime {
         let web_apis = install_web_apis(&mut vm, &host, &events, &event_loop, origin_url, storage);
         trusted_types::install_trusted_types(&mut vm, &host, &events);
         dom_parsing::install_dom_parsing(&mut vm, &host, &events, &event_loop, &web_apis);
-        cssom::install_cssom(&mut vm, &host);
         let web_animations = install_web_animations(&mut vm, &host, &events);
+        cssom::install_cssom(&mut vm, &host, &web_animations);
         cssom_geometry::install_cssom_geometry(&mut vm, &host);
         cssom_view::install_cssom_view(&mut vm, &host, &events, &event_loop);
         let streams = install_streams(&mut vm, &web_apis);

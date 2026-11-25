@@ -52,6 +52,7 @@ pub fn install_web_animations(
     install_playback_event(vm, events, &wa);
     install_effects(vm, host, &wa);
     install_animation_iface(vm, host, events, &wa, event_target_proto);
+    crate::css_animations_api::install_css_animations_and_transitions(vm, host, events, &wa);
     install_animatable_and_get_animations(vm, host, &wa);
 
     wa
@@ -259,11 +260,13 @@ fn install_effects(vm: &mut JsVm, host: &SharedHost, wa: &SharedWebAnimations) {
 
     // AnimationEffect.prototype.getTiming()
     {
+        let h_r = Rc::clone(host);
         let wa_r = Rc::clone(wa);
         define_host_method(vm, eff_proto, "getTiming", move |vm, this_val, _| {
             let Some(eh) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
+            crate::css_animations_api::flush_if_styles_dirty(vm, &h_r, &wa_r);
             let (timing, easing_str) = {
                 let sys = wa_r.borrow();
                 let Some(e) = sys.effects.get(&eh) else {
@@ -291,6 +294,7 @@ fn install_effects(vm: &mut JsVm, host: &SharedHost, wa: &SharedWebAnimations) {
                 let Some(eh) = this_val.as_object() else {
                     return Err(vm.type_error("Illegal invocation"));
                 };
+                crate::css_animations_api::flush_if_styles_dirty(vm, &h_r, &wa_r);
                 let (timing, easing_str, ct, rate) = {
                     let sys = wa_r.borrow();
                     let Some(e) = sys.effects.get(&eh) else {
@@ -362,10 +366,45 @@ fn install_effects(vm: &mut JsVm, host: &SharedHost, wa: &SharedWebAnimations) {
                     e.target,
                 )
             };
-            apply_timing_dict(vm, arg(args, 0), &mut timing, &mut easing_str, None)?;
-            if let Some(e) = wa_r.borrow_mut().effects.get_mut(&eh) {
-                e.timing = timing;
-                e.easing_str = easing_str;
+            let opts_arg = arg(args, 0);
+            let mut set_mask: u8 = 0;
+            if opts_arg.is_number() {
+                set_mask |= 4;
+            } else if let Some(oh) = opts_arg.as_object() {
+                for (name, bit) in [
+                    ("delay", 1u8),
+                    ("direction", 2),
+                    ("duration", 4),
+                    ("easing", 8),
+                    ("endDelay", 16),
+                    ("fill", 32),
+                    ("iterationStart", 64),
+                    ("iterations", 128),
+                ] {
+                    let k = vm.heap.intern_key(name);
+                    if !vm.get_property_by_key(oh, k)?.is_undefined() {
+                        set_mask |= bit;
+                    }
+                }
+            }
+            apply_timing_dict(vm, opts_arg, &mut timing, &mut easing_str, None)?;
+            {
+                let mut sys = wa_r.borrow_mut();
+                if let Some(e) = sys.effects.get_mut(&eh) {
+                    e.timing = timing;
+                    e.easing_str = easing_str;
+                }
+                if let Some(ah) = owner_anim {
+                    if let Some(a) = sys.animations.get_mut(&ah) {
+                        if let crate::web_animations_core::AnimOrigin::CssAnimation {
+                            timing_overridden_mask,
+                            ..
+                        } = &mut a.origin
+                        {
+                            *timing_overridden_mask |= set_mask;
+                        }
+                    }
+                }
             }
             if let Some(ah) = owner_anim {
                 update_finished_state(vm, &h_r, &wa_r, ah, false, false);
@@ -575,11 +614,13 @@ fn install_effects(vm: &mut JsVm, host: &SharedHost, wa: &SharedWebAnimations) {
 
     // KeyframeEffect.prototype.getKeyframes()
     {
+        let h_r = Rc::clone(host);
         let wa_r = Rc::clone(wa);
         define_host_method(vm, kf_proto, "getKeyframes", move |vm, this_val, _| {
             let Some(eh) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
+            crate::css_animations_api::flush_if_styles_dirty(vm, &h_r, &wa_r);
             let frames = wa_r
                 .borrow()
                 .effects
@@ -626,10 +667,41 @@ fn install_effects(vm: &mut JsVm, host: &SharedHost, wa: &SharedWebAnimations) {
                 return Err(vm.type_error("Illegal invocation"));
             }
             let frames = process_keyframes_arg(vm, arg(args, 0))?;
-            let target = wa_r.borrow_mut().effects.get_mut(&eh).and_then(|e| {
-                e.keyframes = frames;
-                e.target
-            });
+            let (target, owner_anim) = {
+                let mut sys = wa_r.borrow_mut();
+                let (t, oa) = sys
+                    .effects
+                    .get_mut(&eh)
+                    .map(|e| {
+                        e.keyframes = frames;
+                        e.css_default_timing = None;
+                        (e.target, e.owner_anim)
+                    })
+                    .unwrap_or((None, None));
+                if let Some(ah) = oa {
+                    if let Some(a) = sys.animations.get_mut(&ah) {
+                        match &mut a.origin {
+                            crate::web_animations_core::AnimOrigin::CssTransition {
+                                effect_replaced,
+                                ..
+                            } => {
+                                *effect_replaced = true;
+                            }
+                            crate::web_animations_core::AnimOrigin::CssAnimation {
+                                keyframes_overridden,
+                                ..
+                            } => {
+                                *keyframes_overridden = true;
+                            }
+                            crate::web_animations_core::AnimOrigin::Script => {}
+                        }
+                    }
+                }
+                (t, oa)
+            };
+            if let Some(ah) = owner_anim {
+                crate::css_animations_api::sync_css_transition_override(&h_r, &wa_r, ah);
+            }
             if let Some(t) = target {
                 sync_target_to_style_ctx(&h_r, &wa_r, t);
             }
@@ -822,10 +894,31 @@ fn install_animation_iface(
                     });
                     if let Some(a) = sys.animations.get_mut(&ah) {
                         a.effect = new_eff;
+                        match &mut a.origin {
+                            crate::web_animations_core::AnimOrigin::CssAnimation {
+                                effect_overridden,
+                                ..
+                            } => {
+                                *effect_overridden = true;
+                            }
+                            crate::web_animations_core::AnimOrigin::CssTransition {
+                                effect_replaced,
+                                ..
+                            } => {
+                                *effect_replaced = new_eff.is_some();
+                            }
+                            crate::web_animations_core::AnimOrigin::Script => {}
+                        }
                     }
                     (ot, nt)
                 };
                 update_finished_state(vm, &h_s, &wa_s, ah, false, false);
+                crate::css_animations_api::update_css_events_for_anim(
+                    &mut wa_s.borrow_mut(),
+                    &h_s,
+                    ah,
+                );
+                crate::css_animations_api::sync_css_transition_override(&h_s, &wa_s, ah);
                 if let Some(t) = old_target {
                     sync_target_to_style_ctx(&h_s, &wa_s, t);
                 }
@@ -879,6 +972,13 @@ fn install_animation_iface(
                 {
                     let mut sys = wa_s.borrow_mut();
                     if let Some(anim) = sys.animations.get_mut(&ah) {
+                        if let crate::web_animations_core::AnimOrigin::CssAnimation {
+                            timeline_overridden,
+                            ..
+                        } = &mut anim.origin
+                        {
+                            *timeline_overridden = true;
+                        }
                         if anim.timeline == new_tl {
                             return Ok(JsValue::UNDEFINED);
                         }
@@ -902,6 +1002,7 @@ fn install_animation_iface(
 
     // startTime
     {
+        let h_g = Rc::clone(host);
         let h_s = Rc::clone(host);
         let wa_g = Rc::clone(wa);
         let wa_s = Rc::clone(wa);
@@ -913,6 +1014,7 @@ fn install_animation_iface(
                 let Some(ah) = this_val.as_object() else {
                     return Err(vm.type_error("Illegal invocation"));
                 };
+                crate::css_animations_api::flush_if_styles_dirty(vm, &h_g, &wa_g);
                 let st = wa_g
                     .borrow()
                     .animations
@@ -978,6 +1080,11 @@ fn install_animation_iface(
                     resolve_promise(vm, rp, JsValue::from_object(ah));
                 }
                 update_finished_state(vm, &h_s, &wa_s, ah, true, false);
+                crate::css_animations_api::update_css_events_for_anim(
+                    &mut wa_s.borrow_mut(),
+                    &h_s,
+                    ah,
+                );
                 sync_anim_target(&h_s, &wa_s, ah);
                 Ok(JsValue::UNDEFINED)
             },
@@ -998,6 +1105,7 @@ fn install_animation_iface(
                 let Some(ah) = this_val.as_object() else {
                     return Err(vm.type_error("Illegal invocation"));
                 };
+                crate::css_animations_api::flush_if_styles_dirty(vm, &h_g, &wa_g);
                 let sys = wa_g.borrow();
                 let Some(a) = sys.animations.get(&ah) else {
                     return Err(vm.type_error("Illegal invocation"));
@@ -1075,6 +1183,11 @@ fn install_animation_iface(
                     resolve_promise(vm, rp, JsValue::from_object(ah));
                 }
                 update_finished_state(vm, &h_s, &wa_s, ah, true, false);
+                crate::css_animations_api::update_css_events_for_anim(
+                    &mut wa_s.borrow_mut(),
+                    &h_s,
+                    ah,
+                );
                 sync_anim_target(&h_s, &wa_s, ah);
                 Ok(JsValue::UNDEFINED)
             },
@@ -1156,6 +1269,7 @@ fn install_animation_iface(
             let Some(ah) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
+            crate::css_animations_api::flush_if_styles_dirty(vm, &h_r, &wa_r);
             let sys = wa_r.borrow();
             let Some(a) = sys.animations.get(&ah) else {
                 return Err(vm.type_error("Illegal invocation"));
@@ -1181,11 +1295,13 @@ fn install_animation_iface(
         });
     }
     {
+        let h_r = Rc::clone(host);
         let wa_r = Rc::clone(wa);
         define_host_getter(vm, proto, "pending", move |vm, this_val, _| {
             let Some(ah) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
+            crate::css_animations_api::flush_if_styles_dirty(vm, &h_r, &wa_r);
             let p = wa_r
                 .borrow()
                 .animations
@@ -1196,11 +1312,13 @@ fn install_animation_iface(
         });
     }
     {
+        let h_r = Rc::clone(host);
         let wa_r = Rc::clone(wa);
         define_host_getter(vm, proto, "ready", move |vm, this_val, _| {
             let Some(ah) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
+            crate::css_animations_api::flush_if_styles_dirty(vm, &h_r, &wa_r);
             let p = wa_r
                 .borrow()
                 .animations
@@ -1211,11 +1329,13 @@ fn install_animation_iface(
         });
     }
     {
+        let h_r = Rc::clone(host);
         let wa_r = Rc::clone(wa);
         define_host_getter(vm, proto, "finished", move |vm, this_val, _| {
             let Some(ah) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
+            crate::css_animations_api::flush_if_styles_dirty(vm, &h_r, &wa_r);
             let p = wa_r
                 .borrow()
                 .animations
@@ -1271,6 +1391,16 @@ fn install_animation_iface(
                 return Err(vm.type_error("Illegal invocation"));
             }
             play_animation(vm, &h_r, &wa_r, ah, true)?;
+            if let Some(a) = wa_r.borrow_mut().animations.get_mut(&ah) {
+                if let crate::web_animations_core::AnimOrigin::CssAnimation {
+                    play_state_overridden,
+                    ..
+                } = &mut a.origin
+                {
+                    *play_state_overridden = true;
+                }
+            }
+            crate::css_animations_api::update_css_events_for_anim(&mut wa_r.borrow_mut(), &h_r, ah);
             Ok(JsValue::UNDEFINED)
         });
     }
@@ -1285,6 +1415,16 @@ fn install_animation_iface(
                 return Err(vm.type_error("Illegal invocation"));
             }
             pause_animation(vm, &h_r, &wa_r, ah)?;
+            if let Some(a) = wa_r.borrow_mut().animations.get_mut(&ah) {
+                if let crate::web_animations_core::AnimOrigin::CssAnimation {
+                    play_state_overridden,
+                    ..
+                } = &mut a.origin
+                {
+                    *play_state_overridden = true;
+                }
+            }
+            crate::css_animations_api::update_css_events_for_anim(&mut wa_r.borrow_mut(), &h_r, ah);
             Ok(JsValue::UNDEFINED)
         });
     }
@@ -1299,6 +1439,7 @@ fn install_animation_iface(
                 return Err(vm.type_error("Illegal invocation"));
             }
             finish_animation(vm, &h_r, &wa_r, ah)?;
+            crate::css_animations_api::update_css_events_for_anim(&mut wa_r.borrow_mut(), &h_r, ah);
             Ok(JsValue::UNDEFINED)
         });
     }
@@ -1313,6 +1454,7 @@ fn install_animation_iface(
                 return Err(vm.type_error("Illegal invocation"));
             }
             cancel_animation(vm, &h_r, &wa_r, ah);
+            crate::css_animations_api::update_css_events_for_anim(&mut wa_r.borrow_mut(), &h_r, ah);
             Ok(JsValue::UNDEFINED)
         });
     }
@@ -1680,6 +1822,7 @@ fn install_animatable_and_get_animations(
                             .map_err(|e| create_dom_exception(vm, "SyntaxError", &e))?;
                     }
                 }
+                crate::css_animations_api::flush_and_sync_css_animations(vm, &h_r, &wa_r);
                 let matching = collect_animations_for_scope(
                     &h_r,
                     &wa_r,
@@ -1703,6 +1846,7 @@ fn install_animatable_and_get_animations(
         let wa_r = Rc::clone(wa);
         define_host_method(vm, doc_proto, "getAnimations", move |vm, this_val, _| {
             let doc_node = require_node(vm, &h_r, this_val)?;
+            crate::css_animations_api::flush_and_sync_css_animations(vm, &h_r, &wa_r);
             let matching =
                 collect_animations_for_scope(&h_r, &wa_r, None, true, None, Some(doc_node));
             let arr = vm.alloc_array();
@@ -1719,6 +1863,7 @@ fn install_animatable_and_get_animations(
         let wa_r = Rc::clone(wa);
         define_host_method(vm, sr_proto, "getAnimations", move |vm, this_val, _| {
             let sr_node = require_node(vm, &h_r, this_val)?;
+            crate::css_animations_api::flush_and_sync_css_animations(vm, &h_r, &wa_r);
             let matching =
                 collect_animations_for_scope(&h_r, &wa_r, Some(sr_node), true, None, None);
             let arr = vm.alloc_array();

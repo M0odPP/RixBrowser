@@ -175,13 +175,17 @@ fn simple_hash(bytes: &[u8]) -> u64 {
 
 /// Installs global `CSS`, `CSSStyleSheet`, `CSSRule*`, `<style>.sheet`,
 /// `document.styleSheets`, `document.adoptedStyleSheets`, and `getComputedStyle(el, pseudo)`.
-pub fn install_cssom(vm: &mut JsVm, host: &SharedHost) {
+pub fn install_cssom(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    wa: &crate::web_animations::SharedWebAnimations,
+) {
     install_css_namespace(vm, host);
     install_css_rule_ctors(vm, host);
     install_css_stylesheet_ctor(vm, host);
     install_style_element_sheet_accessor(vm, host);
     install_document_stylesheets(vm, host);
-    install_get_computed_style(vm, host);
+    install_get_computed_style(vm, host, wa);
     install_web_animations_and_typed_om(vm, host);
     install_document_fonts(vm, host);
 }
@@ -3425,7 +3429,7 @@ fn create_highlight_computed_style_proxy(
     nid: NodeId,
     highlight_name: String,
 ) -> JsValue {
-    let base = create_computed_style_proxy(vm, Rc::clone(&host), nid, None);
+    let base = create_computed_style_proxy(vm, Rc::clone(&host), None, nid, None);
     let Some(base_h) = base.as_object() else {
         return base;
     };
@@ -3468,8 +3472,13 @@ fn create_highlight_computed_style_proxy(
     JsValue::from_object(proxy)
 }
 
-fn install_get_computed_style(vm: &mut JsVm, host: &SharedHost) {
+fn install_get_computed_style(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    wa: &crate::web_animations::SharedWebAnimations,
+) {
     let h = Rc::clone(host);
+    let wa_r = Rc::clone(wa);
     let gcs = vm.alloc_host_fn("getComputedStyle", move |vm, _, args| {
         let nid = require_node(vm, &h, arg(args, 0))?;
         let target = if args.len() >= 2 && !arg(args, 1).is_undefined() && !arg(args, 1).is_null() {
@@ -3482,12 +3491,17 @@ fn install_get_computed_style(vm: &mut JsVm, host: &SharedHost) {
             return Ok(create_empty_computed_style_proxy(vm, &h));
         }
         match target {
-            ComputedPseudoTarget::Element => {
-                Ok(create_computed_style_proxy(vm, Rc::clone(&h), nid, None))
-            }
+            ComputedPseudoTarget::Element => Ok(create_computed_style_proxy(
+                vm,
+                Rc::clone(&h),
+                Some(Rc::clone(&wa_r)),
+                nid,
+                None,
+            )),
             ComputedPseudoTarget::Pseudo(pe) => Ok(create_computed_style_proxy(
                 vm,
                 Rc::clone(&h),
+                Some(Rc::clone(&wa_r)),
                 nid,
                 Some(pe),
             )),
@@ -5166,12 +5180,17 @@ fn live_computed_property(
 pub(crate) fn create_computed_style_proxy(
     vm: &mut JsVm,
     host: SharedHost,
+    wa: Option<crate::web_animations::SharedWebAnimations>,
     nid: NodeId,
     pseudo: Option<RixPseudoElement>,
 ) -> JsValue {
     let target = alloc_style_decl_target(vm, &host);
     let h1 = Rc::clone(&host);
+    let wa1 = wa.clone();
     define_host_method(vm, target, "getPropertyValue", move |vm, _, args| {
+        if let Some(ref wa_ref) = wa1 {
+            crate::css_animations_api::flush_and_sync_css_animations(vm, &h1, wa_ref);
+        }
         let prop = vm.value_to_rust_string(arg(args, 0));
         let val = live_computed_property(&h1, nid, pseudo, &prop);
         Ok(JsValue::from_string(vm.heap.alloc_string(val)))
@@ -5337,6 +5356,7 @@ pub(crate) fn create_computed_style_proxy(
     });
 
     let h_get = host;
+    let wa_get = wa;
     define_host_method(vm, handler, "get", move |vm, _, args| {
         let key_val = arg(args, 1);
         if key_val.is_symbol() {
@@ -5344,6 +5364,9 @@ pub(crate) fn create_computed_style_proxy(
         }
         let prop = vm.value_to_rust_string(key_val);
         if prop == "length" {
+            if let Some(ref wa_ref) = wa_get {
+                crate::css_animations_api::flush_and_sync_css_animations(vm, &h_get, wa_ref);
+            }
             let style = live_style_for(&h_get, nid, pseudo);
             let total = COMPUTED_STYLE_LONGHANDS.len() + style.custom_properties.entries.len();
             return Ok(JsValue::from_i32(total as i32));
@@ -5364,6 +5387,9 @@ pub(crate) fn create_computed_style_proxy(
             if vm.heap.object_get_own(t_h, k, &vm.shapes).is_some() {
                 return vm.get_property_by_key(t_h, k);
             }
+        }
+        if let Some(ref wa_ref) = wa_get {
+            crate::css_animations_api::flush_and_sync_css_animations(vm, &h_get, wa_ref);
         }
         let css_key = camel_to_kebab(&prop);
         let val = live_computed_property(&h_get, nid, pseudo, &css_key);
