@@ -134,6 +134,17 @@ pub(crate) struct WebApiPrototypes {
     pub text_decoder_proto: Option<HeapHandle>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct StoredCookie {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub secure: bool,
+    pub http_only: bool,
+    pub expires_epoch_ms: Option<i64>,
+}
+
 /// Shared state backing all non-network WHATWG Web APIs in a `ContentRuntime`.
 pub struct WebApiState {
     pub(crate) blobs: HashMap<HeapHandle, BlobEntry>,
@@ -146,6 +157,7 @@ pub struct WebApiState {
     history: Vec<HistoryItem>,
     history_index: usize,
     pub(crate) storage: StorageEngine,
+    pub(crate) cookies: Vec<StoredCookie>,
     pub(crate) object_urls: HashMap<String, Vec<u8>>,
     pub(crate) object_url_types: HashMap<String, String>,
     pub(crate) object_url_objects: HashMap<String, HeapHandle>,
@@ -178,6 +190,7 @@ impl WebApiState {
             history_index: 0,
             location_url: parsed,
             storage,
+            cookies: Vec::new(),
             object_urls: HashMap::new(),
             object_url_types: HashMap::new(),
             object_url_objects: HashMap::new(),
@@ -228,6 +241,149 @@ impl WebApiState {
     /// Replaces the backing [`StorageEngine`] used by `localStorage`.
     pub fn set_storage(&mut self, storage: StorageEngine) {
         self.storage = storage;
+    }
+
+    /// Parses and stores an RFC 6265 `Set-Cookie` / `document.cookie` assignment for `url`.
+    pub(crate) fn set_cookie_from_header(&mut self, url: &Url, raw: &str, from_js: bool) {
+        let mut parts = raw.split(';');
+        let Some(first) = parts.next() else {
+            return;
+        };
+        let (name, value) = match first.split_once('=') {
+            Some((n, v)) => (n.trim().to_string(), v.trim().to_string()),
+            None => (String::new(), first.trim().to_string()),
+        };
+        if name.is_empty() && value.is_empty() {
+            return;
+        }
+        let req_host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        let default_path = {
+            let p = url.path();
+            if p.is_empty() || !p.starts_with('/') {
+                "/".to_string()
+            } else if let Some(slash) = p.rfind('/') {
+                if slash == 0 {
+                    "/".to_string()
+                } else {
+                    p[..slash].to_string()
+                }
+            } else {
+                "/".to_string()
+            }
+        };
+        let mut domain = req_host.clone();
+        let mut path = default_path;
+        let mut secure = false;
+        let mut http_only = false;
+        let mut expires_epoch_ms: Option<i64> = None;
+
+        for attr in parts {
+            let trimmed = attr.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = trimmed.split_once('=') {
+                let kl = k.trim().to_ascii_lowercase();
+                let vt = v.trim();
+                match kl.as_str() {
+                    "path" => {
+                        if vt.starts_with('/') {
+                            path = vt.to_string();
+                        }
+                    }
+                    "domain" => {
+                        let d = vt.trim_start_matches('.').to_ascii_lowercase();
+                        if !d.is_empty() && (req_host == d || req_host.ends_with(&format!(".{d}")))
+                        {
+                            domain = d;
+                        }
+                    }
+                    "max-age" => {
+                        if let Ok(secs) = vt.parse::<i64>() {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0);
+                            expires_epoch_ms = Some(if secs <= 0 {
+                                0
+                            } else {
+                                now.saturating_add(secs.saturating_mul(1000))
+                            });
+                        }
+                    }
+                    // Treat dates clearly in the past (e.g. 1970/1994) as immediate expiration.
+                    "expires"
+                        if vt.contains("1970") || vt.contains("1994") || vt.contains("1999") =>
+                    {
+                        expires_epoch_ms = Some(0);
+                    }
+                    _ => {}
+                }
+            } else {
+                match trimmed.to_ascii_lowercase().as_str() {
+                    "secure" => secure = true,
+                    "httponly" => http_only = true,
+                    _ => {}
+                }
+            }
+        }
+        if from_js && http_only {
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        // Remove existing cookie with same (name, domain, path).
+        self.cookies
+            .retain(|c| !(c.name == name && c.domain == domain && c.path == path));
+        if expires_epoch_ms.is_some_and(|exp| exp <= now_ms) {
+            return;
+        }
+        self.cookies.push(StoredCookie {
+            name,
+            value,
+            domain,
+            path,
+            secure,
+            http_only,
+            expires_epoch_ms,
+        });
+    }
+
+    /// Serializes matching RFC 6265 cookies for `url` (`for_js = true` hides `HttpOnly` cookies).
+    pub(crate) fn cookie_header_for_url(&mut self, url: &Url, for_js: bool) -> String {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.cookies
+            .retain(|c| c.expires_epoch_ms.is_none_or(|exp| exp > now_ms));
+        let req_host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        let req_path = url.path();
+        let is_secure = matches!(url.scheme(), "https" | "wss");
+        let mut pairs = Vec::new();
+        for c in &self.cookies {
+            if for_js && c.http_only {
+                continue;
+            }
+            if c.secure && !is_secure {
+                continue;
+            }
+            let host_ok = req_host == c.domain || req_host.ends_with(&format!(".{}", c.domain));
+            let path_ok = req_path == c.path
+                || (c.path.ends_with('/') && req_path.starts_with(&c.path))
+                || (req_path.starts_with(&c.path)
+                    && req_path.as_bytes().get(c.path.len()) == Some(&b'/'));
+            if host_ok && path_ok {
+                if c.name.is_empty() {
+                    pairs.push(c.value.clone());
+                } else {
+                    pairs.push(format!("{}={}", c.name, c.value));
+                }
+            }
+        }
+        pairs.join("; ")
     }
 
     /// Registers a predicate recognizing host objects (e.g., `MediaSource`) accepted by `URL.createObjectURL`.
@@ -690,7 +846,32 @@ pub fn install_web_apis(
     install_performance(vm, event_loop, &web_apis);
     install_console(vm, &web_apis);
     install_window_and_navigator(vm, host, event_loop, &web_apis);
+    install_document_cookie(vm, host, &web_apis);
     web_apis
+}
+
+fn install_document_cookie(vm: &mut JsVm, host: &SharedHost, web_apis: &SharedWebApis) {
+    let dp = host.borrow().prototypes.document_proto;
+    let wa_g = Rc::clone(web_apis);
+    let wa_s = Rc::clone(web_apis);
+    define_host_accessor(
+        vm,
+        dp,
+        "cookie",
+        move |vm, _, _| {
+            let mut st = wa_g.borrow_mut();
+            let url = st.location_url.clone();
+            let s = st.cookie_header_for_url(&url, true);
+            Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+        },
+        move |vm, _, args| {
+            let raw = vm.to_js_string(arg(args, 0))?;
+            let mut st = wa_s.borrow_mut();
+            let url = st.location_url.clone();
+            st.set_cookie_from_header(&url, &raw, true);
+            Ok(JsValue::UNDEFINED)
+        },
+    );
 }
 
 fn install_file_reader(

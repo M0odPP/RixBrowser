@@ -21,7 +21,9 @@ use tokio::sync::mpsc;
 
 use crate::dom_bridge::SharedHost;
 use crate::event_loop::{run_microtask_checkpoint, SharedEventLoop};
-use crate::events::{fire_object_event, SharedEvents};
+use crate::events::{
+    fire_object_event_dispatch_only, install_object_event_handler_accessor, SharedEvents,
+};
 use crate::fetch_body::{
     body_is_used, body_to_array_buffer, body_to_blob, body_to_bytes, body_to_form_data,
     body_to_json, body_to_text, clone_fetch_body, consume_fetch_body_promise, extract_fetch_body,
@@ -41,6 +43,11 @@ use crate::web_apis::{
     create_dom_exception, create_internal_abort_controller, define_global, define_host_accessor,
     define_host_getter, define_host_method, extract_bytes_from_js, SharedWebApis,
 };
+use crate::websocket_stream::{
+    deliver_ws_stream_binary, deliver_ws_stream_closed, deliver_ws_stream_error,
+    deliver_ws_stream_opened, deliver_ws_stream_sent, deliver_ws_stream_text,
+    install_websocket_stream, JsWebSocketStreamEntry, WebSocketErrorData, WsStreamPhase,
+};
 
 /// Reactive async event pushed from background network / WebSocket tokio tasks
 /// directly into the content runtime's `tokio::select!` wakeup channel (ZERO polling).
@@ -53,6 +60,8 @@ pub enum AsyncNetEvent {
     WsOpened {
         id: u64,
         protocol: String,
+        extensions: String,
+        set_cookies: Vec<String>,
     },
     WsText {
         id: u64,
@@ -62,12 +71,44 @@ pub enum AsyncNetEvent {
         id: u64,
         bytes: Vec<u8>,
     },
+    WsDrained {
+        id: u64,
+        bytes: usize,
+    },
     WsClosed {
         id: u64,
         code: u16,
         reason: String,
+        was_clean: bool,
     },
     WsError {
+        id: u64,
+        message: String,
+    },
+    WsStreamOpened {
+        id: u64,
+        protocol: String,
+        extensions: String,
+        set_cookies: Vec<String>,
+    },
+    WsStreamText {
+        id: u64,
+        text: String,
+    },
+    WsStreamBinary {
+        id: u64,
+        bytes: Vec<u8>,
+    },
+    WsStreamSent {
+        id: u64,
+    },
+    WsStreamClosed {
+        id: u64,
+        code: u16,
+        reason: String,
+        was_clean: bool,
+    },
+    WsStreamError {
         id: u64,
         message: String,
     },
@@ -156,10 +197,14 @@ struct PendingFetch {
 struct JsWebSocketEntry {
     js_obj: HeapHandle,
     url: String,
+    origin: String,
     protocol: String,
+    extensions: String,
     ready_state: u8,
     binary_type: String,
+    buffered_amount: u64,
     cmd_tx: mpsc::UnboundedSender<WsCommand>,
+    abort_connect: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -169,6 +214,8 @@ pub(crate) struct NetPrototypes {
     pub(crate) request_proto: Option<HeapHandle>,
     pub(crate) response_proto: Option<HeapHandle>,
     pub(crate) websocket_proto: Option<HeapHandle>,
+    pub(crate) ws_stream_proto: Option<HeapHandle>,
+    pub(crate) ws_error_proto: Option<HeapHandle>,
 }
 
 /// Async `ServiceWorker` fetch interception hook invoked before network fetch.
@@ -194,6 +241,9 @@ pub struct NetworkBridge {
     keepalive_inflight_bytes: usize,
     websockets: HashMap<u64, JsWebSocketEntry>,
     ws_handle_to_id: HashMap<HeapHandle, u64>,
+    pub(crate) ws_streams: HashMap<u64, JsWebSocketStreamEntry>,
+    pub(crate) ws_stream_handle_to_id: HashMap<HeapHandle, u64>,
+    pub(crate) ws_errors: HashMap<HeapHandle, WebSocketErrorData>,
     pub(crate) headers: HashMap<HeapHandle, HeadersEntry>,
     pub(crate) header_iterators: HashMap<HeapHandle, HeaderIterState>,
     requests: HashMap<HeapHandle, RequestEntry>,
@@ -208,7 +258,12 @@ impl NetworkBridge {
     /// Returns `true` when at least one async `fetch()` request or live `WebSocket` is active.
     #[must_use]
     pub fn has_pending_io(&self) -> bool {
-        !self.pending_fetches.is_empty() || !self.websockets.is_empty()
+        !self.pending_fetches.is_empty()
+            || !self.websockets.is_empty()
+            || self
+                .ws_streams
+                .values()
+                .any(|s| s.phase != WsStreamPhase::Closed)
     }
 
     pub(crate) fn new(fetch_engine: Arc<FetchEngine>) -> Self {
@@ -223,6 +278,9 @@ impl NetworkBridge {
             keepalive_inflight_bytes: 0,
             websockets: HashMap::new(),
             ws_handle_to_id: HashMap::new(),
+            ws_streams: HashMap::new(),
+            ws_stream_handle_to_id: HashMap::new(),
+            ws_errors: HashMap::new(),
             headers: HashMap::new(),
             header_iterators: HashMap::new(),
             requests: HashMap::new(),
@@ -234,10 +292,15 @@ impl NetworkBridge {
     /// Returns `true` when there is at least one in-flight `fetch()` or active `WebSocket`.
     #[must_use]
     pub fn has_active_io(&self) -> bool {
-        !self.pending_fetches.is_empty() || self.websockets.values().any(|ws| ws.ready_state < 3)
+        !self.pending_fetches.is_empty()
+            || self.websockets.values().any(|ws| ws.ready_state < 3)
+            || self
+                .ws_streams
+                .values()
+                .any(|s| s.phase != WsStreamPhase::Closed)
     }
 
-    fn alloc_id(&mut self) -> u64 {
+    pub(crate) fn alloc_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         id
@@ -251,6 +314,8 @@ impl NetworkBridge {
             self.protos.request_proto,
             self.protos.response_proto,
             self.protos.websocket_proto,
+            self.protos.ws_stream_proto,
+            self.protos.ws_error_proto,
         ]
         .into_iter()
         .flatten()
@@ -267,6 +332,9 @@ impl NetworkBridge {
             if ws.ready_state < 3 {
                 out.push(JsValue::from_object(ws.js_obj));
             }
+        }
+        for wss in self.ws_streams.values() {
+            wss.collect_roots(out);
         }
         for hi in self.header_iterators.values() {
             out.push(JsValue::from_object(hi.target));
@@ -295,6 +363,10 @@ impl NetworkBridge {
         self.ws_handle_to_id.retain(|&h, _| heap.is_alive(h));
         self.websockets
             .retain(|_, ws| ws.ready_state < 3 || heap.is_alive(ws.js_obj));
+        self.ws_stream_handle_to_id.retain(|&h, _| heap.is_alive(h));
+        self.ws_streams
+            .retain(|_, s| s.phase != WsStreamPhase::Closed || heap.is_alive(s.js_obj));
+        self.ws_errors.retain(|&h, _| heap.is_alive(h));
     }
 }
 
@@ -318,6 +390,7 @@ pub fn install_fetch_and_websocket(
     install_response(vm, web_apis, streams, &net);
     install_fetch_fn(vm, web_apis, streams, &net);
     install_websocket(vm, host, events, event_loop, web_apis, &net);
+    install_websocket_stream(vm, events, web_apis, streams, &net);
     install_xml_http_request(vm, host, web_apis, &net);
     net
 }
@@ -367,19 +440,46 @@ pub fn deliver_async_net_event(
             }
             run_microtask_checkpoint(event_loop, vm);
         }
-        AsyncNetEvent::WsOpened { id, protocol } => {
-            let obj = {
+        AsyncNetEvent::WsOpened {
+            id,
+            protocol,
+            extensions,
+            set_cookies,
+        } => {
+            let (obj, ws_url) = {
                 let mut nb = net.borrow_mut();
                 let Some(ws) = nb.websockets.get_mut(&id) else {
                     return;
                 };
-                if ws.ready_state == 0 {
-                    ws.ready_state = 1;
-                    ws.protocol = protocol;
+                if ws.ready_state != 0 {
+                    return;
                 }
-                ws.js_obj
+                ws.ready_state = 1;
+                ws.protocol = protocol;
+                ws.extensions = extensions;
+                ws.abort_connect = None;
+                (ws.js_obj, ws.url.clone())
             };
-            fire_object_event(vm, host, events, event_loop, obj, "open", &[]);
+            if !set_cookies.is_empty() {
+                if let Ok(u) = url::Url::parse(&ws_url) {
+                    let mut wa = web_apis.borrow_mut();
+                    for sc in &set_cookies {
+                        wa.set_cookie_from_header(&u, sc, false);
+                    }
+                }
+            }
+            let ev_proto = events.borrow().event_proto.unwrap_or(vm.object_proto);
+            fire_object_event_dispatch_only(
+                vm,
+                host,
+                events,
+                event_loop,
+                obj,
+                "open",
+                ev_proto,
+                &[],
+                None,
+            );
         }
         AsyncNetEvent::WsText { id, text } => {
             let (obj, origin) = {
@@ -387,18 +487,32 @@ pub fn deliver_async_net_event(
                 let Some(ws) = nb.websockets.get(&id) else {
                     return;
                 };
-                (ws.js_obj, ws.url.clone())
+                if ws.ready_state != 1 {
+                    return;
+                }
+                (ws.js_obj, ws.origin.clone())
             };
             let data_v = JsValue::from_string(vm.heap.alloc_string(&text));
             let orig_v = JsValue::from_string(vm.heap.alloc_string(&origin));
-            fire_object_event(
+            let empty_v = JsValue::from_string(vm.heap.alloc_string(""));
+            let ports_v = JsValue::from_object(vm.alloc_array());
+            let proto = lookup_global_event_proto(vm, events, "MessageEvent");
+            fire_object_event_dispatch_only(
                 vm,
                 host,
                 events,
                 event_loop,
                 obj,
                 "message",
-                &[("data", data_v), ("origin", orig_v)],
+                proto,
+                &[
+                    ("data", data_v),
+                    ("origin", orig_v),
+                    ("lastEventId", empty_v),
+                    ("source", JsValue::NULL),
+                    ("ports", ports_v),
+                ],
+                None,
             );
         }
         AsyncNetEvent::WsBinary { id, bytes } => {
@@ -407,7 +521,10 @@ pub fn deliver_async_net_event(
                 let Some(ws) = nb.websockets.get(&id) else {
                     return;
                 };
-                (ws.js_obj, ws.url.clone(), ws.binary_type.clone())
+                if ws.ready_state != 1 {
+                    return;
+                }
+                (ws.js_obj, ws.origin.clone(), ws.binary_type.clone())
             };
             let data_v = if binary_type == "arraybuffer" {
                 JsValue::from_object(alloc_array_buffer(vm, bytes))
@@ -415,17 +532,39 @@ pub fn deliver_async_net_event(
                 JsValue::from_object(create_blob_object(vm, web_apis, bytes, String::new()))
             };
             let orig_v = JsValue::from_string(vm.heap.alloc_string(&origin));
-            fire_object_event(
+            let empty_v = JsValue::from_string(vm.heap.alloc_string(""));
+            let ports_v = JsValue::from_object(vm.alloc_array());
+            let proto = lookup_global_event_proto(vm, events, "MessageEvent");
+            fire_object_event_dispatch_only(
                 vm,
                 host,
                 events,
                 event_loop,
                 obj,
                 "message",
-                &[("data", data_v), ("origin", orig_v)],
+                proto,
+                &[
+                    ("data", data_v),
+                    ("origin", orig_v),
+                    ("lastEventId", empty_v),
+                    ("source", JsValue::NULL),
+                    ("ports", ports_v),
+                ],
+                None,
             );
         }
-        AsyncNetEvent::WsClosed { id, code, reason } => {
+        AsyncNetEvent::WsDrained { id, bytes } => {
+            let mut nb = net.borrow_mut();
+            if let Some(ws) = nb.websockets.get_mut(&id) {
+                ws.buffered_amount = ws.buffered_amount.saturating_sub(bytes as u64);
+            }
+        }
+        AsyncNetEvent::WsClosed {
+            id,
+            code,
+            reason,
+            was_clean,
+        } => {
             let obj = {
                 let mut nb = net.borrow_mut();
                 let Some(ws) = nb.websockets.get_mut(&id) else {
@@ -435,21 +574,20 @@ pub fn deliver_async_net_event(
                     return;
                 }
                 ws.ready_state = 3;
+                ws.abort_connect = None;
                 ws.js_obj
             };
-            let r_val = JsValue::from_string(vm.heap.alloc_string(&reason));
-            fire_object_event(
+            let close_proto = lookup_global_event_proto(vm, events, "CloseEvent");
+            fire_object_event_dispatch_only(
                 vm,
                 host,
                 events,
                 event_loop,
                 obj,
                 "close",
-                &[
-                    ("code", JsValue::from_i32(i32::from(code))),
-                    ("reason", r_val),
-                    ("wasClean", JsValue::from_bool(code == 1000)),
-                ],
+                close_proto,
+                &[],
+                Some((was_clean, code, reason)),
             );
         }
         AsyncNetEvent::WsError { id, message } => {
@@ -458,33 +596,76 @@ pub fn deliver_async_net_event(
                 let Some(ws) = nb.websockets.get_mut(&id) else {
                     return;
                 };
+                if ws.ready_state == 3 {
+                    return;
+                }
                 ws.ready_state = 3;
+                ws.abort_connect = None;
                 ws.js_obj
             };
             let m_val = JsValue::from_string(vm.heap.alloc_string(&message));
-            fire_object_event(
+            let ev_proto = events.borrow().event_proto.unwrap_or(vm.object_proto);
+            fire_object_event_dispatch_only(
                 vm,
                 host,
                 events,
                 event_loop,
                 obj,
                 "error",
+                ev_proto,
                 &[("message", m_val)],
+                None,
             );
-            let empty_str = JsValue::from_string(vm.heap.alloc_string(""));
-            fire_object_event(
+            let close_proto = lookup_global_event_proto(vm, events, "CloseEvent");
+            fire_object_event_dispatch_only(
                 vm,
                 host,
                 events,
                 event_loop,
                 obj,
                 "close",
-                &[
-                    ("code", JsValue::from_i32(1006)),
-                    ("reason", empty_str),
-                    ("wasClean", JsValue::FALSE),
-                ],
+                close_proto,
+                &[],
+                Some((false, 1006, String::new())),
             );
+        }
+        AsyncNetEvent::WsStreamOpened {
+            id,
+            protocol,
+            extensions,
+            set_cookies,
+        } => {
+            deliver_ws_stream_opened(
+                vm,
+                event_loop,
+                web_apis,
+                streams,
+                net,
+                id,
+                protocol,
+                extensions,
+                set_cookies,
+            );
+        }
+        AsyncNetEvent::WsStreamText { id, text } => {
+            deliver_ws_stream_text(vm, event_loop, streams, net, id, text);
+        }
+        AsyncNetEvent::WsStreamBinary { id, bytes } => {
+            deliver_ws_stream_binary(vm, event_loop, streams, net, id, bytes);
+        }
+        AsyncNetEvent::WsStreamSent { id } => {
+            deliver_ws_stream_sent(vm, event_loop, net, id);
+        }
+        AsyncNetEvent::WsStreamClosed {
+            id,
+            code,
+            reason,
+            was_clean,
+        } => {
+            deliver_ws_stream_closed(vm, event_loop, streams, net, id, code, reason, was_clean);
+        }
+        AsyncNetEvent::WsStreamError { id, message } => {
+            deliver_ws_stream_error(vm, event_loop, streams, net, id, message);
         }
         AsyncNetEvent::ExternalScriptLoaded {
             script_nid,
@@ -2244,8 +2425,103 @@ fn install_fetch_fn(
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket (RFC 6455 backed by rix_net::WebSocketConnection)
+// WebSocket (WHATWG WebSockets §9.3 backed by rix_net::WebSocketConnection)
 // ---------------------------------------------------------------------------
+
+fn lookup_global_event_proto(vm: &mut JsVm, events: &SharedEvents, name: &str) -> HeapHandle {
+    if let Some(&p) = events.borrow().event_protos.get(name) {
+        return p;
+    }
+    let k = vm.heap.intern_key(name);
+    let kp = vm.key_prototype;
+    vm.get_property_by_key(vm.global, k)
+        .ok()
+        .and_then(JsValue::as_object)
+        .and_then(|c| vm.get_property_by_key(c, kp).ok())
+        .and_then(JsValue::as_object)
+        .or_else(|| events.borrow().event_proto)
+        .unwrap_or(vm.object_proto)
+}
+
+pub(crate) fn clamp_u16(n: f64) -> u16 {
+    if n.is_nan() || n <= 0.0 {
+        0
+    } else if n >= 65535.0 {
+        65535
+    } else {
+        n.round_ties_even() as u16
+    }
+}
+
+pub(crate) fn is_valid_ws_subprotocol(proto: &str) -> bool {
+    !proto.is_empty()
+        && proto.bytes().all(|b| {
+            (0x21..=0x7E).contains(&b)
+                && !matches!(
+                    b,
+                    b'(' | b')'
+                        | b'<'
+                        | b'>'
+                        | b'@'
+                        | b','
+                        | b';'
+                        | b':'
+                        | b'\\'
+                        | b'"'
+                        | b'/'
+                        | b'['
+                        | b']'
+                        | b'?'
+                        | b'='
+                        | b'{'
+                        | b'}'
+                )
+        })
+}
+
+pub(crate) fn resolve_ws_url(
+    vm: &mut JsVm,
+    web_apis: &SharedWebApis,
+    raw_url: &str,
+) -> Result<(String, String), JsException> {
+    let base = web_apis.borrow().location_url.clone();
+    let mut parsed = url::Url::options()
+        .base_url(Some(&base))
+        .parse(raw_url)
+        .map_err(|_| {
+            create_dom_exception(
+                vm,
+                "SyntaxError",
+                &format!("Invalid WebSocket URL: {raw_url}"),
+            )
+        })?;
+    match parsed.scheme() {
+        "http" => {
+            let _ = parsed.set_scheme("ws");
+        }
+        "https" => {
+            let _ = parsed.set_scheme("wss");
+        }
+        "ws" | "wss" => {}
+        _ => {
+            return Err(create_dom_exception(
+                vm,
+                "SyntaxError",
+                &format!("Unsupported WebSocket scheme: {}", parsed.scheme()),
+            ));
+        }
+    }
+    if parsed.fragment().is_some() {
+        return Err(create_dom_exception(
+            vm,
+            "SyntaxError",
+            "WebSocket URL must not contain a fragment",
+        ));
+    }
+    let serialized = parsed.as_str().to_string();
+    let origin = parsed.origin().ascii_serialization();
+    Ok((serialized, origin))
+}
 
 fn install_websocket(
     vm: &mut JsVm,
@@ -2260,6 +2536,7 @@ fn install_websocket(
         .heap
         .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(etp)));
     vm.heap.get_object_mut(wsp).unwrap().is_prototype = true;
+    set_to_string_tag(vm, wsp, "WebSocket");
     net.borrow_mut().protos.websocket_proto = Some(wsp);
 
     let define_ws_consts = |vm: &mut JsVm, target: HeapHandle| {
@@ -2274,7 +2551,7 @@ fn install_websocket(
                 target,
                 k,
                 JsValue::from_i32(val),
-                PropertyAttrs::empty(),
+                PropertyAttrs::ENUMERABLE,
                 &mut vm.shapes,
             );
         }
@@ -2310,6 +2587,27 @@ fn install_websocket(
         Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
     });
     let nb = Rc::clone(net);
+    define_host_getter(vm, wsp, "extensions", move |vm, this_val, _| {
+        let id = require_ws_id(vm, &nb, this_val)?;
+        let s = nb
+            .borrow()
+            .websockets
+            .get(&id)
+            .map(|w| w.extensions.clone())
+            .unwrap_or_default();
+        Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+    });
+    let nb = Rc::clone(net);
+    define_host_getter(vm, wsp, "bufferedAmount", move |vm, this_val, _| {
+        let id = require_ws_id(vm, &nb, this_val)?;
+        let amt = nb
+            .borrow()
+            .websockets
+            .get(&id)
+            .map_or(0, |w| w.buffered_amount);
+        Ok(JsValue::from_f64(amt as f64))
+    });
+    let nb = Rc::clone(net);
     define_host_accessor(
         vm,
         wsp,
@@ -2329,7 +2627,7 @@ fn install_websocket(
         },
         move |vm, this_val, args| {
             let id = require_ws_id(vm, &nb, this_val)?;
-            let val = vm.value_to_rust_string(arg(args, 0));
+            let val = vm.to_js_string(arg(args, 0))?;
             if val == "blob" || val == "arraybuffer" {
                 if let Some(w) = nb.borrow_mut().websockets.get_mut(&id) {
                     w.binary_type = val;
@@ -2339,10 +2637,24 @@ fn install_websocket(
         },
     );
 
+    // Event handler IDL attributes (`onopen`, `onmessage`, `onerror`, `onclose`) per HTML §8.1.7.1.
+    for &prop in &["onopen", "onmessage", "onerror", "onclose"] {
+        let nb_v = Rc::clone(net);
+        install_object_event_handler_accessor(vm, wsp, events, prop, move |vm, this_val| {
+            let _ = require_ws_id(vm, &nb_v, this_val)?;
+            this_val
+                .as_object()
+                .ok_or_else(|| vm.type_error("Incompatible WebSocket receiver"))
+        });
+    }
+
     let nb = Rc::clone(net);
     let wa = Rc::clone(web_apis);
     define_host_method(vm, wsp, "send", move |vm, this_val, args| {
         let id = require_ws_id(vm, &nb, this_val)?;
+        if args.is_empty() {
+            return Err(vm.type_error("WebSocket.send requires 1 argument"));
+        }
         let (ready_state, cmd_tx) = {
             let st = nb.borrow();
             let w = st
@@ -2358,14 +2670,8 @@ fn install_websocket(
                 "WebSocket is still in CONNECTING state",
             ));
         }
-        if ready_state >= 2 {
-            return Ok(JsValue::UNDEFINED);
-        }
         let data = arg(args, 0);
-        if data.is_string() {
-            let text = vm.value_to_rust_string(data);
-            let _ = cmd_tx.send(WsCommand::SendText(text));
-        } else if data.as_object().is_some_and(|h| {
+        let is_binary_obj = data.as_object().is_some_and(|h| {
             wa.borrow().blobs.contains_key(&h)
                 || matches!(
                     vm.heap.get_object(h).map(|o| &o.kind),
@@ -2375,12 +2681,25 @@ fn install_websocket(
                             | ObjectKind::DataView(_)
                     )
                 )
-        }) {
+        });
+        if is_binary_obj {
             let bytes = extract_bytes_from_js(vm, &wa, data)?;
-            let _ = cmd_tx.send(WsCommand::SendBinary(bytes));
+            let byte_len = bytes.len() as u64;
+            if let Some(w) = nb.borrow_mut().websockets.get_mut(&id) {
+                w.buffered_amount = w.buffered_amount.saturating_add(byte_len);
+            }
+            if ready_state == 1 {
+                let _ = cmd_tx.send(WsCommand::SendBinary(bytes));
+            }
         } else {
-            let text = vm.value_to_rust_string(data);
-            let _ = cmd_tx.send(WsCommand::SendText(text));
+            let text = vm.to_js_string(data)?;
+            let byte_len = text.len() as u64;
+            if let Some(w) = nb.borrow_mut().websockets.get_mut(&id) {
+                w.buffered_amount = w.buffered_amount.saturating_add(byte_len);
+            }
+            if ready_state == 1 {
+                let _ = cmd_tx.send(WsCommand::SendText(text));
+            }
         }
         Ok(JsValue::UNDEFINED)
     });
@@ -2388,17 +2707,37 @@ fn install_websocket(
     let nb = Rc::clone(net);
     define_host_method(vm, wsp, "close", move |vm, this_val, args| {
         let id = require_ws_id(vm, &nb, this_val)?;
-        let code = if arg(args, 0).is_undefined() {
-            1000u16
+        let code_arg = arg(args, 0);
+        let code = if code_arg.is_undefined() {
+            None
         } else {
-            vm.to_number(arg(args, 0))?.clamp(1000.0, 4999.0) as u16
+            let n = vm.to_number(code_arg)?;
+            // WebIDL `[Clamp] unsigned short`.
+            let raw_u16 = clamp_u16(n);
+            if raw_u16 != 1000 && !(3000..=4999).contains(&raw_u16) {
+                return Err(create_dom_exception(
+                    vm,
+                    "InvalidAccessError",
+                    &format!("Invalid WebSocket close code: {raw_u16}"),
+                ));
+            }
+            Some(raw_u16)
         };
-        let reason = if arg(args, 1).is_undefined() {
+        let reason_arg = arg(args, 1);
+        let reason = if reason_arg.is_undefined() {
             String::new()
         } else {
-            vm.value_to_rust_string(arg(args, 1))
+            let r = vm.to_js_string(reason_arg)?;
+            if r.len() > 123 {
+                return Err(create_dom_exception(
+                    vm,
+                    "SyntaxError",
+                    "WebSocket close reason must not be greater than 123 UTF-8 bytes",
+                ));
+            }
+            r
         };
-        let cmd_tx = {
+        let (was_connecting, abort_tx, cmd_tx) = {
             let mut st = nb.borrow_mut();
             let Some(w) = st.websockets.get_mut(&id) else {
                 return Ok(JsValue::UNDEFINED);
@@ -2406,10 +2745,17 @@ fn install_websocket(
             if w.ready_state >= 2 {
                 return Ok(JsValue::UNDEFINED);
             }
+            let was_conn = w.ready_state == 0;
             w.ready_state = 2;
-            w.cmd_tx.clone()
+            (was_conn, w.abort_connect.take(), w.cmd_tx.clone())
         };
-        let _ = cmd_tx.send(WsCommand::Close { code, reason });
+        if was_connecting {
+            if let Some(tx) = abort_tx {
+                let _ = tx.send(());
+            }
+        } else {
+            let _ = cmd_tx.send(WsCommand::Close { code, reason });
+        }
         Ok(JsValue::UNDEFINED)
     });
 
@@ -2419,31 +2765,93 @@ fn install_websocket(
     let evs_ws = Rc::clone(events);
     let el_ws = Rc::clone(event_loop);
     let ctor = vm.alloc_host_fn("WebSocket", move |vm, _, args| {
-        let raw_url = vm.value_to_rust_string(arg(args, 0));
-        crate::trusted_types::check_connect_src_allowed(vm, &h_ws, &evs_ws, &el_ws, &raw_url)?;
-        if !raw_url.starts_with("ws://") && !raw_url.starts_with("wss://") {
-            return Err(create_dom_exception(
-                vm,
-                "SyntaxError",
-                &format!("Invalid WebSocket URL: {raw_url}"),
-            ));
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("WebSocket constructor requires 'new'"));
         }
+        if args.is_empty() {
+            return Err(vm.type_error("WebSocket constructor requires at least 1 argument"));
+        }
+        let raw_url = vm.to_js_string(arg(args, 0))?;
+        let (resolved_url, ws_origin) = resolve_ws_url(vm, &wa, &raw_url)?;
+        crate::trusted_types::check_connect_src_allowed(
+            vm,
+            &h_ws,
+            &evs_ws,
+            &el_ws,
+            &resolved_url,
+        )?;
+
         let mut protocols = Vec::new();
         let proto_arg = arg(args, 1);
         if !proto_arg.is_undefined() {
-            if proto_arg.is_string() {
-                protocols.push(vm.value_to_rust_string(proto_arg));
-            } else if proto_arg.as_object().is_some() {
-                for p in vm.collect_iterable(proto_arg)? {
-                    protocols.push(vm.value_to_rust_string(p));
+            if let Some(h) = proto_arg.as_object() {
+                let sym = vm.key_symbol_iterator;
+                let is_seq = vm
+                    .get_property_by_key(h, sym)
+                    .ok()
+                    .and_then(JsValue::as_object)
+                    .is_some_and(|f| vm.is_callable_handle(f));
+                let is_boxed_string = vm
+                    .heap
+                    .get_object(h)
+                    .and_then(|o| o.prototype)
+                    == Some(vm.string_proto);
+                if is_seq && !is_boxed_string {
+                    for p in vm.collect_iterable(proto_arg)? {
+                        protocols.push(vm.to_js_string(p)?);
+                    }
+                } else if !is_boxed_string {
+                    // Option bag dictionary `{ protocols?: sequence<DOMString> }` (WHATWG WebSocket).
+                    let kp = vm.heap.intern_key("protocols");
+                    let vp = vm.get_property_by_key(h, kp)?;
+                    if !vp.is_undefined() {
+                        if vp.as_object().is_some() {
+                            for p in vm.collect_iterable(vp)? {
+                                protocols.push(vm.to_js_string(p)?);
+                            }
+                        } else {
+                            return Err(vm.type_error("WebSocketInit.protocols must be iterable"));
+                        }
+                    }
+                } else {
+                    protocols.push(vm.to_js_string(proto_arg)?);
                 }
+            } else {
+                protocols.push(vm.to_js_string(proto_arg)?);
             }
         }
+        // Validate subprotocols per WHATWG WebSockets §9.3 / RFC 6455 §4.1 (ASCII case-insensitive uniqueness).
+        let mut seen = std::collections::HashSet::with_capacity(protocols.len());
+        for p in &protocols {
+            if !is_valid_ws_subprotocol(p) {
+                return Err(create_dom_exception(
+                    vm,
+                    "SyntaxError",
+                    &format!("Invalid WebSocket subprotocol: '{p}'"),
+                ));
+            }
+            if !seen.insert(p.to_ascii_lowercase()) {
+                return Err(create_dom_exception(
+                    vm,
+                    "SyntaxError",
+                    &format!("Duplicate WebSocket subprotocol: '{p}'"),
+                ));
+            }
+        }
+
         let obj = vm
             .heap
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(wsp)));
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<WsCommand>();
+        let (abort_tx, mut abort_rx) = tokio::sync::oneshot::channel::<()>();
         let origin = wa.borrow().current_origin();
+        let mut extra_headers: Vec<(String, String)> = Vec::new();
+        if let Ok(parsed_u) = url::Url::parse(&resolved_url) {
+            let cookie_hdr = wa.borrow_mut().cookie_header_for_url(&parsed_u, false);
+            if !cookie_hdr.is_empty() {
+                extra_headers.push(("Cookie".to_string(), cookie_hdr));
+            }
+        }
         let (id, ev_tx) = {
             let mut st = nb.borrow_mut();
             let id = st.alloc_id();
@@ -2451,11 +2859,15 @@ fn install_websocket(
                 id,
                 JsWebSocketEntry {
                     js_obj: obj,
-                    url: raw_url.clone(),
+                    url: resolved_url.clone(),
+                    origin: ws_origin,
                     protocol: String::new(),
+                    extensions: String::new(),
                     ready_state: 0,
                     binary_type: "blob".to_string(),
+                    buffered_amount: 0,
                     cmd_tx,
+                    abort_connect: Some(abort_tx),
                 },
             );
             st.ws_handle_to_id.insert(obj, id);
@@ -2471,13 +2883,23 @@ fn install_websocket(
             return Ok(JsValue::from_object(obj));
         };
         rt_handle.spawn(async move {
-            let mut conn = match WebSocketConnection::connect(
-                &raw_url,
-                Some(&origin),
-                &protocols,
-            )
-            .await
-            {
+            let connect_res = tokio::select! {
+                biased;
+                _ = &mut abort_rx => {
+                    let _ = ev_tx.send(AsyncNetEvent::WsError {
+                        id,
+                        message: "WebSocket was closed before connection was established".to_string(),
+                    });
+                    return;
+                }
+                res = WebSocketConnection::connect_with_headers(
+                    &resolved_url,
+                    Some(&origin),
+                    &protocols,
+                    &extra_headers,
+                ) => res,
+            };
+            let mut conn = match connect_res {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = ev_tx.send(AsyncNetEvent::WsError {
@@ -2490,6 +2912,8 @@ fn install_websocket(
             let _ = ev_tx.send(AsyncNetEvent::WsOpened {
                 id,
                 protocol: conn.negotiated_protocol.clone(),
+                extensions: conn.negotiated_extensions.clone(),
+                set_cookies: std::mem::take(&mut conn.response_set_cookies),
             });
 
             loop {
@@ -2517,8 +2941,11 @@ fn install_websocket(
                             Some(Ok(WsMessage::Binary(bytes))) => {
                                 let _ = ev_tx.send(AsyncNetEvent::WsBinary { id, bytes });
                             }
-                            Some(Ok(WsMessage::Close { code, reason })) => {
-                                let _ = ev_tx.send(AsyncNetEvent::WsClosed { id, code, reason });
+                            Some(Ok(WsMessage::Sent { bytes })) => {
+                                let _ = ev_tx.send(AsyncNetEvent::WsDrained { id, bytes });
+                            }
+                            Some(Ok(WsMessage::Close { code, reason, was_clean })) => {
+                                let _ = ev_tx.send(AsyncNetEvent::WsClosed { id, code, reason, was_clean });
                                 break;
                             }
                             Some(Err(e)) => {
@@ -2530,6 +2957,7 @@ fn install_websocket(
                                     id,
                                     code: 1006,
                                     reason: String::new(),
+                                    was_clean: false,
                                 });
                                 break;
                             }

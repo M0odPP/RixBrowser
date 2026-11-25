@@ -62,7 +62,9 @@ struct EventInternal {
 pub struct EventSystem {
     listeners: HashMap<(EventTargetKey, String), Vec<ListenerEntry>>,
     events: HashMap<HeapHandle, EventInternal>,
+    close_events: HashMap<HeapHandle, (bool, u16, String)>,
     event_handlers: HashMap<(EventTargetKey, String), JsValue>,
+    idl_handler_trampolines: HashMap<(EventTargetKey, String), HeapHandle>,
     pub event_proto: Option<HeapHandle>,
     pub event_protos: HashMap<&'static str, HeapHandle>,
     start_instant: Instant,
@@ -83,7 +85,9 @@ impl EventSystem {
         Self {
             listeners: HashMap::new(),
             events: HashMap::new(),
+            close_events: HashMap::new(),
             event_handlers: HashMap::new(),
+            idl_handler_trampolines: HashMap::new(),
             event_proto: None,
             event_protos: HashMap::new(),
             start_instant: Instant::now(),
@@ -111,11 +115,15 @@ impl EventSystem {
         for &v in self.event_handlers.values() {
             out.push(v);
         }
+        for &tramp in self.idl_handler_trampolines.values() {
+            out.push(JsValue::from_object(tramp));
+        }
     }
 
     /// Drops event internal state entries for collected JS event objects.
     pub fn sweep_dead(&mut self, heap: &rix_js::GcHeap) {
         self.events.retain(|&h, _| heap.is_alive(h));
+        self.close_events.retain(|&h, _| heap.is_alive(h));
         self.listeners.retain(|(k, _), list| {
             let key_alive = match *k {
                 EventTargetKey::Object(h) => heap.is_alive(h),
@@ -124,6 +132,10 @@ impl EventSystem {
             key_alive && !list.is_empty()
         });
         self.event_handlers.retain(|(k, _), _| match *k {
+            EventTargetKey::Object(h) => heap.is_alive(h),
+            EventTargetKey::Window | EventTargetKey::Node(_) => true,
+        });
+        self.idl_handler_trampolines.retain(|(k, _), _| match *k {
             EventTargetKey::Object(h) => heap.is_alive(h),
             EventTargetKey::Window | EventTargetKey::Node(_) => true,
         });
@@ -912,6 +924,79 @@ fn install_event_constructors(vm: &mut JsVm, host: &SharedHost, events: &SharedE
         }
         Ok(JsValue::UNDEFINED)
     });
+
+    // `CloseEvent` (WHATWG WebSocket §9.3.4 — prototype readonly getters)
+    let evs_ce_ctor = Rc::clone(events);
+    let (_, close_proto) = register_event_subclass_with_proto(
+        vm,
+        events,
+        "CloseEvent",
+        ep,
+        Some(ev_ctor),
+        move |vm, obj, init| {
+            let was_clean_v = read_init_prop(vm, init, "wasClean", JsValue::FALSE)?;
+            let was_clean = vm.to_boolean(was_clean_v);
+            let code_v = read_init_prop(vm, init, "code", JsValue::from_i32(0))?;
+            let code_n = vm.to_number(code_v)?;
+            let code_u16 = if code_n.is_finite() {
+                (code_n.trunc() as i64).rem_euclid(65536) as u16
+            } else {
+                0
+            };
+            let reason_v = read_init_prop(vm, init, "reason", JsValue::UNDEFINED)?;
+            let reason_str = if reason_v.is_undefined() {
+                String::new()
+            } else {
+                vm.to_js_string(reason_v)?
+            };
+            evs_ce_ctor
+                .borrow_mut()
+                .close_events
+                .insert(obj, (was_clean, code_u16, reason_str));
+            Ok(())
+        },
+    );
+    {
+        let evs_wc = Rc::clone(events);
+        define_host_getter(vm, close_proto, "wasClean", move |vm, this_val, _| {
+            let h = this_val
+                .as_object()
+                .ok_or_else(|| vm.type_error("Incompatible CloseEvent receiver"))?;
+            let wc = evs_wc
+                .borrow()
+                .close_events
+                .get(&h)
+                .map(|&(wc, _, _)| wc)
+                .ok_or_else(|| vm.type_error("Incompatible CloseEvent receiver"))?;
+            Ok(JsValue::from_bool(wc))
+        });
+        let evs_cd = Rc::clone(events);
+        define_host_getter(vm, close_proto, "code", move |vm, this_val, _| {
+            let h = this_val
+                .as_object()
+                .ok_or_else(|| vm.type_error("Incompatible CloseEvent receiver"))?;
+            let code = evs_cd
+                .borrow()
+                .close_events
+                .get(&h)
+                .map(|&(_, code, _)| code)
+                .ok_or_else(|| vm.type_error("Incompatible CloseEvent receiver"))?;
+            Ok(JsValue::from_i32(i32::from(code)))
+        });
+        let evs_rs = Rc::clone(events);
+        define_host_getter(vm, close_proto, "reason", move |vm, this_val, _| {
+            let h = this_val
+                .as_object()
+                .ok_or_else(|| vm.type_error("Incompatible CloseEvent receiver"))?;
+            let reason = evs_rs
+                .borrow()
+                .close_events
+                .get(&h)
+                .map(|(_, _, r)| r.clone())
+                .ok_or_else(|| vm.type_error("Incompatible CloseEvent receiver"))?;
+            Ok(JsValue::from_string(vm.heap.alloc_string(&reason)))
+        });
+    }
 
     // `UIEvent`
     let (ui_ctor, ui_proto) = register_event_subclass_with_proto(
@@ -2366,6 +2451,171 @@ pub(crate) fn fire_object_event_with_proto(
         EventTargetKey::Object(target)
     };
 
+    let _ = dispatch_event_internal(vm, host, events, event_loop, target_key, ev_h);
+}
+
+/// Registers an `EventHandler` IDL attribute (`on<type>`) on `target_proto` following
+/// WHATWG HTML §8.1.7.1: any object value is stored verbatim, activating inserts a single
+/// trampoline listener in `EventTarget` listener order, deactivating removes it, and
+/// dispatch invokes the stored value only if callable.
+pub(crate) fn install_object_event_handler_accessor<F>(
+    vm: &mut JsVm,
+    target_proto: HeapHandle,
+    events: &SharedEvents,
+    attr_name: &'static str,
+    validate_receiver: F,
+) where
+    F: Fn(&mut JsVm, JsValue) -> Result<HeapHandle, JsException> + 'static,
+{
+    let ev_type = &attr_name[2..];
+    let validate = Rc::new(validate_receiver);
+    let v_g = Rc::clone(&validate);
+    let e_g = Rc::clone(events);
+    let v_s = Rc::clone(&validate);
+    let e_s = Rc::clone(events);
+    define_host_accessor(
+        vm,
+        target_proto,
+        attr_name,
+        move |vm, this_val, _| {
+            let h = v_g(vm, this_val)?;
+            let key = (EventTargetKey::Object(h), ev_type.to_string());
+            Ok(e_g
+                .borrow()
+                .event_handlers
+                .get(&key)
+                .copied()
+                .unwrap_or(JsValue::NULL))
+        },
+        move |vm, this_val, args| {
+            let h = v_s(vm, this_val)?;
+            let v = arg(args, 0);
+            let stored = if v.is_object() { v } else { JsValue::NULL };
+            let key = (EventTargetKey::Object(h), ev_type.to_string());
+            if stored.is_null() {
+                let mut es = e_s.borrow_mut();
+                es.event_handlers.insert(key.clone(), JsValue::NULL);
+                if let Some(tramp) = es.idl_handler_trampolines.remove(&key) {
+                    if let Some(list) = es.listeners.get_mut(&key) {
+                        list.retain(|entry| entry.listener != tramp);
+                    }
+                }
+            } else {
+                let needs_trampoline = !e_s.borrow().idl_handler_trampolines.contains_key(&key);
+                e_s.borrow_mut().event_handlers.insert(key.clone(), stored);
+                if needs_trampoline {
+                    let e_cb = Rc::clone(&e_s);
+                    let key_cb = key.clone();
+                    let tramp = vm.alloc_host_fn(attr_name, move |vm, this_v, cb_args| {
+                        let cb = e_cb
+                            .borrow()
+                            .event_handlers
+                            .get(&key_cb)
+                            .copied()
+                            .unwrap_or(JsValue::NULL);
+                        if cb.as_object().is_some_and(|fh| vm.is_callable_handle(fh)) {
+                            let ev_arg = arg(cb_args, 0);
+                            let _ = vm.call_value(cb, this_v, &[ev_arg]);
+                        }
+                        Ok(JsValue::UNDEFINED)
+                    });
+                    let mut es = e_s.borrow_mut();
+                    es.idl_handler_trampolines.insert(key.clone(), tramp);
+                    es.listeners.entry(key).or_default().push(ListenerEntry {
+                        listener: tramp,
+                        capture: false,
+                        once: false,
+                        passive: false,
+                    });
+                }
+            }
+            Ok(JsValue::UNDEFINED)
+        },
+    );
+}
+
+/// Registers an internal listener on an `EventTarget` JS object (e.g. `AbortSignal`).
+pub(crate) fn add_internal_object_listener(
+    events: &SharedEvents,
+    target: HeapHandle,
+    ev_type: &str,
+    listener: HeapHandle,
+    once: bool,
+) {
+    let key = (EventTargetKey::Object(target), ev_type.to_string());
+    events
+        .borrow_mut()
+        .listeners
+        .entry(key)
+        .or_default()
+        .push(ListenerEntry {
+            listener,
+            capture: false,
+            once,
+            passive: false,
+        });
+}
+
+/// Dispatches a trusted `Event` (or `CloseEvent`) on `target` purely through `EventTarget`'s
+/// listener list (respecting WHATWG HTML §8.1.7.1 EventHandler ordering).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fire_object_event_dispatch_only(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    target: HeapHandle,
+    ev_type: &str,
+    proto: HeapHandle,
+    props: &[(&str, JsValue)],
+    close_fields: Option<(bool, u16, String)>,
+) {
+    let ev_h = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    let ts = events.borrow().now_ms();
+    {
+        let mut es = events.borrow_mut();
+        es.events.insert(
+            ev_h,
+            EventInternal {
+                event_type: ev_type.to_string(),
+                bubbles: false,
+                cancelable: false,
+                composed: false,
+                is_trusted: true,
+                initialized: true,
+                dispatch_flag: false,
+                default_prevented: false,
+                propagation_stopped: false,
+                immediate_stopped: false,
+                in_passive_listener: false,
+                event_phase: 2,
+                time_stamp: ts,
+                target: JsValue::from_object(target),
+                current_target: JsValue::from_object(target),
+                composed_path: vec![JsValue::from_object(target)],
+                path_keys: Vec::new(),
+                current_target_key: None,
+            },
+        );
+        if let Some(cf) = close_fields {
+            es.close_events.insert(ev_h, cf);
+        }
+    }
+    define_own_is_trusted(vm, events, ev_h);
+    for &(name, val) in props {
+        let k = vm.heap.intern_key(name);
+        vm.heap
+            .object_define_data(ev_h, k, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    }
+    let target_key = if target == vm.global {
+        EventTargetKey::Window
+    } else if let Some(nid) = host.borrow().node_for_handle(vm, target) {
+        EventTargetKey::Node(nid)
+    } else {
+        EventTargetKey::Object(target)
+    };
     let _ = dispatch_event_internal(vm, host, events, event_loop, target_key, ev_h);
 }
 
