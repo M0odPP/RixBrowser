@@ -107,6 +107,8 @@ struct RafEntry {
 
 /// Shared hook invoked at every microtask checkpoint (e.g. `MutationObserver` delivery).
 pub type MicrotaskCheckpointHook = Rc<RefCell<Box<dyn FnMut(&mut JsVm)>>>;
+/// Shared callback invoked when a timer, macrotask, or rAF callback throws an uncaught exception.
+pub(crate) type UncaughtErrorHook = Rc<dyn Fn(&mut JsVm, rix_js::JsException)>;
 
 /// Core WHATWG Event Loop state shared cleanly between `ContentRuntime` and JS bindings.
 pub struct EventLoopState {
@@ -128,6 +130,7 @@ pub struct EventLoopState {
     performing_microtask_checkpoint: bool,
     consecutive_net_tasks: u32,
     checkpoint_hooks: Vec<MicrotaskCheckpointHook>,
+    pub(crate) on_uncaught_error: Option<UncaughtErrorHook>,
 }
 
 impl Default for EventLoopState {
@@ -158,6 +161,7 @@ impl EventLoopState {
             performing_microtask_checkpoint: false,
             consecutive_net_tasks: 0,
             checkpoint_hooks: Vec::new(),
+            on_uncaught_error: None,
         }
     }
 
@@ -467,7 +471,12 @@ pub fn step_event_loop_once(loop_state: &SharedEventLoop, vm: &mut JsVm) -> bool
             prev
         };
         let global = JsValue::from_object(vm.global);
-        let _ = vm.call_value(JsValue::from_object(timer.callback), global, &timer.args);
+        if let Err(ex) = vm.call_value(JsValue::from_object(timer.callback), global, &timer.args) {
+            let hook = loop_state.borrow().on_uncaught_error.clone();
+            if let Some(hook) = hook {
+                hook(vm, ex);
+            }
+        }
         {
             let mut st = loop_state.borrow_mut();
             st.current_timer_nesting = prev_nesting;
@@ -495,7 +504,12 @@ fn execute_macrotask(loop_state: &SharedEventLoop, vm: &mut JsVm, task: Macrotas
             this_val,
             args,
         } => {
-            let _ = vm.call_value(JsValue::from_object(func), this_val, &args);
+            if let Err(ex) = vm.call_value(JsValue::from_object(func), this_val, &args) {
+                let hook = loop_state.borrow().on_uncaught_error.clone();
+                if let Some(hook) = hook {
+                    hook(vm, ex);
+                }
+            }
         }
         MacrotaskAction::HostClosure(f) => f(vm),
     }
@@ -510,11 +524,16 @@ pub fn fire_vsync(loop_state: &SharedEventLoop, vm: &mut JsVm, timestamp_ms: f64
     let batch = loop_state.borrow_mut().take_raf_batch();
     let count = batch.len();
     for entry in batch {
-        let _ = vm.call_value(
+        if let Err(ex) = vm.call_value(
             JsValue::from_object(entry.callback),
             JsValue::UNDEFINED,
             &[JsValue::from_f64(timestamp_ms)],
-        );
+        ) {
+            let hook = loop_state.borrow().on_uncaught_error.clone();
+            if let Some(hook) = hook {
+                hook(vm, ex);
+            }
+        }
         loop_state.borrow_mut().tasks_executed += 1;
         run_microtask_checkpoint(loop_state, vm);
     }
@@ -697,7 +716,10 @@ fn resolve_timer_callback(vm: &mut JsVm, val: JsValue) -> Result<HeapHandle, rix
     if val.is_string() {
         let src = vm.value_to_rust_string(val);
         let wrapper = vm.alloc_host_fn("timer_eval", move |vm, _, _| {
-            let _ = vm.eval_script(&src);
+            vm.eval_script(&src).map_err(|e| match e {
+                rix_js::EvalError::Runtime(ex) => ex,
+                other => vm.make_error("SyntaxError", other.to_string()),
+            })?;
             Ok(JsValue::UNDEFINED)
         });
         return Ok(wrapper);

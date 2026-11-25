@@ -27,11 +27,29 @@ use crate::web_apis::{
 };
 
 #[derive(Debug, Clone, Default)]
-struct CanvasPrototypes {
-    ctx2d_proto: Option<HeapHandle>,
-    gradient_proto: Option<HeapHandle>,
-    pattern_proto: Option<HeapHandle>,
-    image_data_proto: Option<HeapHandle>,
+pub(crate) struct CanvasPrototypes {
+    pub(crate) ctx2d_proto: Option<HeapHandle>,
+    pub(crate) gradient_proto: Option<HeapHandle>,
+    pub(crate) pattern_proto: Option<HeapHandle>,
+    pub(crate) image_data_proto: Option<HeapHandle>,
+    pub(crate) image_bitmap_proto: Option<HeapHandle>,
+    pub(crate) offscreen_canvas_proto: Option<HeapHandle>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ImageBitmapEntry {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rgba: Vec<u8>,
+    pub(crate) closed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OffscreenCanvasEntry {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rgba: Vec<u8>,
+    pub(crate) detached: bool,
 }
 
 /// Hook invoked by `HTMLCanvasElement.prototype.getContext(kind, options)` for
@@ -51,9 +69,11 @@ pub struct Canvas2DSystem {
     node_to_ctx_handle: HashMap<NodeId, HeapHandle>,
     gradients: HashMap<HeapHandle, CanvasGradient>,
     patterns: HashMap<HeapHandle, CanvasPattern>,
-    image_data: HashMap<HeapHandle, (u32, u32, HeapHandle)>,
+    pub(crate) image_data: HashMap<HeapHandle, (u32, u32, HeapHandle)>,
+    pub(crate) image_bitmaps: HashMap<HeapHandle, ImageBitmapEntry>,
+    pub(crate) offscreen_canvases: HashMap<HeapHandle, OffscreenCanvasEntry>,
     readback_renderer: Option<VelloRenderer>,
-    protos: CanvasPrototypes,
+    pub(crate) protos: CanvasPrototypes,
     context_hooks: Vec<CanvasContextHook>,
     resize_hooks: Vec<CanvasResizeHook>,
     readback_hooks: Vec<CanvasReadbackHook>,
@@ -78,6 +98,8 @@ impl Canvas2DSystem {
             gradients: HashMap::new(),
             patterns: HashMap::new(),
             image_data: HashMap::new(),
+            image_bitmaps: HashMap::new(),
+            offscreen_canvases: HashMap::new(),
             readback_renderer: None,
             protos: CanvasPrototypes::default(),
             context_hooks: Vec::new(),
@@ -173,6 +195,8 @@ impl Canvas2DSystem {
             self.protos.gradient_proto,
             self.protos.pattern_proto,
             self.protos.image_data_proto,
+            self.protos.image_bitmap_proto,
+            self.protos.offscreen_canvas_proto,
         ]
         .into_iter()
         .flatten()
@@ -192,6 +216,8 @@ impl Canvas2DSystem {
         self.gradients.retain(|&h, _| heap.is_alive(h));
         self.patterns.retain(|&h, _| heap.is_alive(h));
         self.image_data.retain(|&h, _| heap.is_alive(h));
+        self.image_bitmaps.retain(|&h, _| heap.is_alive(h));
+        self.offscreen_canvases.retain(|&h, _| heap.is_alive(h));
         self.ctx_handle_to_node.retain(|&h, _| heap.is_alive(h));
         self.node_to_ctx_handle.retain(|_, &mut h| heap.is_alive(h));
     }
@@ -205,7 +231,7 @@ pub fn install_canvas2d(
     web_apis: &SharedWebApis,
 ) -> SharedCanvas2D {
     let canvas_sys = Rc::new(RefCell::new(Canvas2DSystem::new()));
-    install_image_data(vm, &canvas_sys);
+    install_image_data(vm, host, &canvas_sys);
     install_gradient_and_pattern(vm, &canvas_sys);
     install_context2d_proto(vm, host, &canvas_sys);
     install_html_canvas_element_proto(vm, host, web_apis, &canvas_sys);
@@ -292,7 +318,7 @@ fn alloc_uint8_clamped_array(vm: &mut JsVm, bytes: Vec<u8>) -> HeapHandle {
     ))
 }
 
-fn create_image_data_obj(
+pub(crate) fn create_image_data_obj(
     vm: &mut JsVm,
     canvas_sys: &SharedCanvas2D,
     width: u32,
@@ -344,9 +370,64 @@ fn extract_image_data_pixels(
     Some((w, h_px, buf[off.min(end)..end].to_vec()))
 }
 
-fn install_image_data(vm: &mut JsVm, canvas_sys: &SharedCanvas2D) {
+pub(crate) fn create_image_bitmap_obj(
+    vm: &mut JsVm,
+    canvas_sys: &SharedCanvas2D,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+) -> HeapHandle {
+    let proto = canvas_sys
+        .borrow()
+        .protos
+        .image_bitmap_proto
+        .unwrap_or(vm.object_proto);
+    let obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    canvas_sys.borrow_mut().image_bitmaps.insert(
+        obj,
+        ImageBitmapEntry {
+            width,
+            height,
+            rgba,
+            closed: false,
+        },
+    );
+    obj
+}
+
+pub(crate) fn create_offscreen_canvas_obj(
+    vm: &mut JsVm,
+    canvas_sys: &SharedCanvas2D,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+) -> HeapHandle {
+    let proto = canvas_sys
+        .borrow()
+        .protos
+        .offscreen_canvas_proto
+        .unwrap_or(vm.object_proto);
+    let obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    canvas_sys.borrow_mut().offscreen_canvases.insert(
+        obj,
+        OffscreenCanvasEntry {
+            width,
+            height,
+            rgba,
+            detached: false,
+        },
+    );
+    obj
+}
+
+fn install_image_data(vm: &mut JsVm, host: &SharedHost, canvas_sys: &SharedCanvas2D) {
     let idp = vm.alloc_ordinary_object();
     vm.heap.get_object_mut(idp).unwrap().is_prototype = true;
+    crate::dom_interfaces::define_to_string_tag(vm, idp, "ImageData");
     canvas_sys.borrow_mut().protos.image_data_proto = Some(idp);
 
     let cs = Rc::clone(canvas_sys);
@@ -404,6 +485,264 @@ fn install_image_data(vm: &mut JsVm, canvas_sys: &SharedCanvas2D) {
     });
     bind_ctor_proto(vm, ctor, idp);
     define_global(vm, "ImageData", JsValue::from_object(ctor));
+
+    // ImageBitmap interface
+    let ibp = vm.alloc_ordinary_object();
+    vm.heap.get_object_mut(ibp).unwrap().is_prototype = true;
+    crate::dom_interfaces::define_to_string_tag(vm, ibp, "ImageBitmap");
+    canvas_sys.borrow_mut().protos.image_bitmap_proto = Some(ibp);
+    {
+        let cs = Rc::clone(canvas_sys);
+        define_host_getter(vm, ibp, "width", move |vm, this_val, _| {
+            let Some(h) = this_val.as_object() else {
+                return Err(vm.type_error("Illegal invocation on ImageBitmap"));
+            };
+            let w = cs
+                .borrow()
+                .image_bitmaps
+                .get(&h)
+                .map(|b| if b.closed { 0 } else { b.width })
+                .ok_or_else(|| vm.type_error("Illegal invocation on ImageBitmap"))?;
+            Ok(JsValue::from_f64(f64::from(w)))
+        });
+    }
+    {
+        let cs = Rc::clone(canvas_sys);
+        define_host_getter(vm, ibp, "height", move |vm, this_val, _| {
+            let Some(h) = this_val.as_object() else {
+                return Err(vm.type_error("Illegal invocation on ImageBitmap"));
+            };
+            let h_px = cs
+                .borrow()
+                .image_bitmaps
+                .get(&h)
+                .map(|b| if b.closed { 0 } else { b.height })
+                .ok_or_else(|| vm.type_error("Illegal invocation on ImageBitmap"))?;
+            Ok(JsValue::from_f64(f64::from(h_px)))
+        });
+    }
+    {
+        let cs = Rc::clone(canvas_sys);
+        define_host_method(vm, ibp, "close", move |vm, this_val, _| {
+            let Some(h) = this_val.as_object() else {
+                return Err(vm.type_error("Illegal invocation on ImageBitmap"));
+            };
+            let mut st = cs.borrow_mut();
+            let entry = st
+                .image_bitmaps
+                .get_mut(&h)
+                .ok_or_else(|| vm.type_error("Illegal invocation on ImageBitmap"))?;
+            entry.closed = true;
+            entry.rgba.clear();
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+    let ib_ctor = vm.alloc_host_fn("ImageBitmap", |vm, _, _| {
+        Err(vm.type_error("Illegal constructor: ImageBitmap"))
+    });
+    bind_ctor_proto(vm, ib_ctor, ibp);
+    define_global(vm, "ImageBitmap", JsValue::from_object(ib_ctor));
+
+    // OffscreenCanvas interface (WHATWG HTML §4.12.5.14)
+    let ocp = vm.alloc_ordinary_object();
+    vm.heap.get_object_mut(ocp).unwrap().is_prototype = true;
+    crate::dom_interfaces::define_to_string_tag(vm, ocp, "OffscreenCanvas");
+    canvas_sys.borrow_mut().protos.offscreen_canvas_proto = Some(ocp);
+    {
+        let cs_g = Rc::clone(canvas_sys);
+        let cs_s = Rc::clone(canvas_sys);
+        define_host_accessor(
+            vm,
+            ocp,
+            "width",
+            move |vm, this_val, _| {
+                let Some(h) = this_val.as_object() else {
+                    return Err(vm.type_error("Illegal invocation on OffscreenCanvas"));
+                };
+                let w = cs_g
+                    .borrow()
+                    .offscreen_canvases
+                    .get(&h)
+                    .map(|c| c.width)
+                    .ok_or_else(|| vm.type_error("Illegal invocation on OffscreenCanvas"))?;
+                Ok(JsValue::from_f64(f64::from(w)))
+            },
+            move |vm, this_val, args| {
+                let Some(h) = this_val.as_object() else {
+                    return Err(vm.type_error("Illegal invocation on OffscreenCanvas"));
+                };
+                let w = vm.to_u32(arg(args, 0))?;
+                let mut st = cs_s.borrow_mut();
+                let entry = st
+                    .offscreen_canvases
+                    .get_mut(&h)
+                    .ok_or_else(|| vm.type_error("Illegal invocation on OffscreenCanvas"))?;
+                entry.width = w;
+                entry.rgba = vec![0u8; (w as usize).saturating_mul(entry.height as usize) * 4];
+                Ok(JsValue::UNDEFINED)
+            },
+        );
+    }
+    {
+        let cs_g = Rc::clone(canvas_sys);
+        let cs_s = Rc::clone(canvas_sys);
+        define_host_accessor(
+            vm,
+            ocp,
+            "height",
+            move |vm, this_val, _| {
+                let Some(h) = this_val.as_object() else {
+                    return Err(vm.type_error("Illegal invocation on OffscreenCanvas"));
+                };
+                let h_px = cs_g
+                    .borrow()
+                    .offscreen_canvases
+                    .get(&h)
+                    .map(|c| c.height)
+                    .ok_or_else(|| vm.type_error("Illegal invocation on OffscreenCanvas"))?;
+                Ok(JsValue::from_f64(f64::from(h_px)))
+            },
+            move |vm, this_val, args| {
+                let Some(h) = this_val.as_object() else {
+                    return Err(vm.type_error("Illegal invocation on OffscreenCanvas"));
+                };
+                let h_px = vm.to_u32(arg(args, 0))?;
+                let mut st = cs_s.borrow_mut();
+                let entry = st
+                    .offscreen_canvases
+                    .get_mut(&h)
+                    .ok_or_else(|| vm.type_error("Illegal invocation on OffscreenCanvas"))?;
+                entry.height = h_px;
+                entry.rgba = vec![0u8; (entry.width as usize).saturating_mul(h_px as usize) * 4];
+                Ok(JsValue::UNDEFINED)
+            },
+        );
+    }
+    {
+        let cs = Rc::clone(canvas_sys);
+        define_host_method(vm, ocp, "getContext", move |vm, this_val, args| {
+            let Some(h) = this_val.as_object() else {
+                return Err(vm.type_error("Illegal invocation on OffscreenCanvas"));
+            };
+            if !cs.borrow().offscreen_canvases.contains_key(&h) {
+                return Err(vm.type_error("Illegal invocation on OffscreenCanvas"));
+            }
+            let kind = vm.value_to_rust_string(arg(args, 0));
+            if kind != "2d" {
+                return Ok(JsValue::NULL);
+            }
+            let ctx = vm.alloc_ordinary_object();
+            let k_c = vm.heap.intern_key("canvas");
+            vm.heap.object_define_data(
+                ctx,
+                k_c,
+                JsValue::from_object(h),
+                PropertyAttrs::DEFAULT,
+                &mut vm.shapes,
+            );
+            let k_fs = vm.heap.intern_key("fillStyle");
+            let black = JsValue::from_string(vm.heap.alloc_string("#000000"));
+            vm.heap
+                .object_define_data(ctx, k_fs, black, PropertyAttrs::DEFAULT, &mut vm.shapes);
+            define_host_method(vm, ctx, "fillRect", |_, _, _| Ok(JsValue::UNDEFINED));
+            define_host_method(vm, ctx, "clearRect", |_, _, _| Ok(JsValue::UNDEFINED));
+            let cs_gi = Rc::clone(&cs);
+            define_host_method(vm, ctx, "getImageData", move |vm, _, args| {
+                let w = vm.to_u32(arg(args, 2)).unwrap_or(1).max(1);
+                let h_px = vm.to_u32(arg(args, 3)).unwrap_or(1).max(1);
+                let rgba = vec![0u8; (w as usize).saturating_mul(h_px as usize) * 4];
+                Ok(JsValue::from_object(create_image_data_obj(
+                    vm, &cs_gi, w, h_px, rgba,
+                )))
+            });
+            define_host_method(vm, ctx, "putImageData", |_, _, _| Ok(JsValue::UNDEFINED));
+            Ok(JsValue::from_object(ctx))
+        });
+    }
+    {
+        let cs = Rc::clone(canvas_sys);
+        define_host_method(vm, ocp, "transferToImageBitmap", move |vm, this_val, _| {
+            let Some(h) = this_val.as_object() else {
+                return Err(vm.type_error("Illegal invocation on OffscreenCanvas"));
+            };
+            let (w, h_px, rgba) = {
+                let st = cs.borrow();
+                let entry = st
+                    .offscreen_canvases
+                    .get(&h)
+                    .ok_or_else(|| vm.type_error("Illegal invocation on OffscreenCanvas"))?;
+                (entry.width, entry.height, entry.rgba.clone())
+            };
+            Ok(JsValue::from_object(create_image_bitmap_obj(
+                vm, &cs, w, h_px, rgba,
+            )))
+        });
+    }
+    {
+        let cs = Rc::clone(canvas_sys);
+        let oc_ctor = vm.alloc_host_fn("OffscreenCanvas", move |vm, _, args| {
+            if vm.native_new_target.is_undefined() {
+                return Err(vm.type_error("OffscreenCanvas constructor requires 'new'"));
+            }
+            let w = vm.to_u32(arg(args, 0))?;
+            let h_px = vm.to_u32(arg(args, 1))?;
+            let rgba = vec![0u8; (w as usize).saturating_mul(h_px as usize).min(16_777_216) * 4];
+            Ok(JsValue::from_object(create_offscreen_canvas_obj(
+                vm, &cs, w, h_px, rgba,
+            )))
+        });
+        bind_ctor_proto(vm, oc_ctor, ocp);
+        define_global(vm, "OffscreenCanvas", JsValue::from_object(oc_ctor));
+    }
+
+    // global `createImageBitmap(image)` -> Promise<ImageBitmap>
+    {
+        let cs = Rc::clone(canvas_sys);
+        let h_ib = Rc::clone(host);
+        let g = vm.global;
+        define_host_method(vm, g, "createImageBitmap", move |vm, _, args| {
+            let src = arg(args, 0);
+            let dims = src.as_object().and_then(|sh| {
+                if let Some(oc) = cs.borrow().offscreen_canvases.get(&sh) {
+                    return Some((oc.width, oc.height, oc.rgba.clone()));
+                }
+                if let Some(ib) = cs.borrow().image_bitmaps.get(&sh) {
+                    if !ib.closed {
+                        return Some((ib.width, ib.height, ib.rgba.clone()));
+                    }
+                }
+                if let Some((w, h_px, rgba)) = extract_image_data_pixels(vm, &cs, src) {
+                    return Some((w, h_px, rgba));
+                }
+                if let Some(nid) = h_ib.borrow().node_for_handle(vm, sh) {
+                    let is_canvas = matches!(
+                        h_ib.borrow().document.borrow().get(nid),
+                        Some(NodeData::Element(el)) if el.name.local.as_str().eq_ignore_ascii_case("canvas")
+                    );
+                    if is_canvas {
+                        let w = canvas_attr_dim(&h_ib, nid, "width", 300);
+                        let h_px = canvas_attr_dim(&h_ib, nid, "height", 150);
+                        let rgba = vec![0u8; (w as usize).saturating_mul(h_px as usize).min(16_777_216) * 4];
+                        return Some((w, h_px, rgba));
+                    }
+                }
+                None
+            });
+            let p = rix_js::promise::alloc_promise(vm);
+            if let Some((w, h_px, rgba)) = dims {
+                let bm = create_image_bitmap_obj(vm, &cs, w, h_px, rgba);
+                rix_js::promise::resolve_promise(vm, p, JsValue::from_object(bm));
+            } else {
+                let err = create_dom_exception(
+                    vm,
+                    "InvalidStateError",
+                    "Invalid createImageBitmap source",
+                );
+                rix_js::promise::reject_promise(vm, p, err.value);
+            }
+            Ok(JsValue::from_object(p))
+        });
+    }
 }
 
 fn install_gradient_and_pattern(vm: &mut JsVm, canvas_sys: &SharedCanvas2D) {

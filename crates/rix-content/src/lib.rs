@@ -37,6 +37,7 @@ mod streams_common;
 mod streams_pipe;
 mod streams_transform;
 mod streams_writable;
+pub(crate) mod structured_clone;
 pub mod trusted_types;
 pub mod web_apis;
 pub mod webaudio;
@@ -191,6 +192,24 @@ impl ContentRuntime {
     /// Applies an HTTP `Content-Security-Policy` or `Content-Security-Policy-Report-Only`
     /// response header to the main document's CSP policy set.
     pub fn apply_response_csp_header(&self, header_name: &str, header_value: &str) {
+        if header_name.eq_ignore_ascii_case("cross-origin-opener-policy") {
+            let v = header_value.split(';').next().unwrap_or("").trim();
+            if v.eq_ignore_ascii_case("same-origin") {
+                let mut wa = self.web_apis.borrow_mut();
+                wa.coop_same_origin = true;
+                wa.cross_origin_isolated = wa.coop_same_origin && wa.coep_require_corp;
+            }
+            return;
+        }
+        if header_name.eq_ignore_ascii_case("cross-origin-embedder-policy") {
+            let v = header_value.split(';').next().unwrap_or("").trim();
+            if v.eq_ignore_ascii_case("require-corp") || v.eq_ignore_ascii_case("credentialless") {
+                let mut wa = self.web_apis.borrow_mut();
+                wa.coep_require_corp = true;
+                wa.cross_origin_isolated = wa.coop_same_origin && wa.coep_require_corp;
+            }
+            return;
+        }
         let report_only = if header_name.eq_ignore_ascii_case("content-security-policy-report-only")
         {
             true
@@ -257,6 +276,11 @@ impl ContentRuntime {
         let canvas2d = install_canvas2d(&mut vm, &host, &web_apis);
         let frames =
             install_frame_and_messaging_apis(&mut vm, &host, &events, &event_loop, &web_apis, &net);
+        {
+            let mut fs = frames.borrow_mut();
+            fs.canvas2d = Some(Rc::clone(&canvas2d));
+            fs.net = Some(Rc::clone(&net));
+        }
         let workers = install_worker_and_sse_apis(
             &mut vm,
             &host,
@@ -266,6 +290,7 @@ impl ContentRuntime {
             &net,
             &frames,
         );
+        frames.borrow_mut().workers = Some(Rc::clone(&workers));
         let service_workers =
             install_service_worker_and_cache_apis(&mut vm, &host, &web_apis, &streams, &net);
         let indexeddb = install_indexeddb(&mut vm, &host, &events, &event_loop, &web_apis);

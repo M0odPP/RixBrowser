@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rix_dom::{NodeData, NodeId};
 use rix_html::{decode_html_bytes, parse_html};
@@ -17,20 +18,27 @@ use rix_js::{
     HeapHandle, JsBigInt, JsException, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs,
 };
 use rix_layout::surface_id_for_node;
+use tokio::sync::mpsc;
 use url::Url;
 
+use crate::canvas2d::SharedCanvas2D;
 use crate::dom_bridge::{set_element_attr, wrap_node, SharedHost};
 use crate::event_loop::{SharedEventLoop, TaskPriority};
 use crate::events::{
     fire_dom_node_event, fire_object_event_with_proto, register_constructed_event, SharedEvents,
 };
 use crate::fetch_ws::SharedNetBridge;
+use crate::structured_clone::{
+    deserialize_payload, extract_transfer_arg, serialize_with_transfer, CloneContext,
+    CrossThreadPortEnd, PortRoute, StructuredClonePayload,
+};
 use crate::web_apis::{
     alloc_array_buffer, apply_url_host_setter, apply_url_port_setter, arg, create_dom_exception,
     define_global, define_host_accessor, define_host_getter, define_host_method,
     form_urlencode_pairs_with_charset, origin_of_url, parse_url_with_charset, strip_ascii_tab_lf,
     structured_clone_inner, SharedWebApis,
 };
+use crate::workers::{AsyncWorkerEvent, SharedWorkers};
 
 #[inline]
 fn node_id_u64(id: NodeId) -> u64 {
@@ -176,6 +184,8 @@ struct MessagePortState {
     id: MessagePortId,
     partner_id: Option<MessagePortId>,
     remote_pipeline: Option<PipelineId>,
+    local_route: Option<Arc<Mutex<PortRoute>>>,
+    remote_route: Option<Arc<Mutex<PortRoute>>>,
     started: bool,
     closed: bool,
     neutered: bool,
@@ -252,6 +262,9 @@ pub struct FrameSystem {
     auxiliary_windows: Vec<HeapHandle>,
     detached_buffers: HashSet<HeapHandle>,
     outbound_ipc: VecDeque<ContentToBrowser>,
+    pub(crate) canvas2d: Option<SharedCanvas2D>,
+    pub(crate) workers: Option<SharedWorkers>,
+    pub(crate) net: Option<SharedNetBridge>,
 }
 
 /// Shared handle to [`FrameSystem`].
@@ -283,7 +296,30 @@ impl FrameSystem {
             auxiliary_windows: Vec::new(),
             detached_buffers: HashSet::new(),
             outbound_ipc: VecDeque::new(),
+            canvas2d: None,
+            workers: None,
+            net: None,
         }
+    }
+
+    pub(crate) fn is_message_port(&self, h: HeapHandle) -> bool {
+        self.ports.contains_key(&h)
+    }
+
+    pub(crate) fn is_port_detached_or_closed(&self, h: HeapHandle) -> bool {
+        self.ports.get(&h).is_none_or(|p| p.neutered || p.closed)
+    }
+
+    pub(crate) fn is_buffer_detached(&self, h: HeapHandle) -> bool {
+        self.detached_buffers.contains(&h)
+    }
+
+    pub(crate) fn mark_buffer_detached(&mut self, h: HeapHandle) {
+        self.detached_buffers.insert(h);
+    }
+
+    pub(crate) fn is_window_proxy(&self, h: HeapHandle) -> bool {
+        self.proxies.contains_key(&h)
     }
 
     /// Returns the effective serialized origin of this window (respecting `sandbox`).
@@ -872,6 +908,8 @@ fn execute_in_process_transfer(
                             id: port_id,
                             partner_id,
                             remote_pipeline,
+                            local_route: None,
+                            remote_route: None,
                             started: false,
                             closed,
                             neutered: false,
@@ -1113,6 +1151,8 @@ fn alloc_message_port(
             id,
             partner_id,
             remote_pipeline,
+            local_route: None,
+            remote_route: None,
             started: false,
             closed: false,
             neutered: false,
@@ -1123,6 +1163,188 @@ fn alloc_message_port(
         },
     );
     h
+}
+
+/// Detaches a local `MessagePort` for cross-thread transfer into a `Worker` or `SharedWorker`,
+/// returning a [`CrossThreadPortEnd`] whose partner automatically routes messages across threads.
+pub(crate) fn detach_port_for_cross_thread_transfer(
+    vm: &mut JsVm,
+    ctx: &CloneContext<'_>,
+    port_h: HeapHandle,
+    local_async_tx: mpsc::UnboundedSender<AsyncWorkerEvent>,
+) -> Result<CrossThreadPortEnd, JsException> {
+    let (port_id, partner_id, existing_routes, pending_msgs) = {
+        let mut fs = ctx.frames.borrow_mut();
+        let Some(p) = fs.ports.get_mut(&port_h) else {
+            return Err(create_dom_exception(
+                vm,
+                "DataCloneError",
+                "Port is not a valid MessagePort",
+            ));
+        };
+        if p.neutered || p.closed {
+            return Err(create_dom_exception(
+                vm,
+                "DataCloneError",
+                "Cannot transfer closed or neutered MessagePort",
+            ));
+        }
+        p.neutered = true;
+        let pid = p.id;
+        let partner = p.partner_id.take();
+        let lr = p.local_route.take();
+        let rr = p.remote_route.take();
+        let pending: Vec<QueuedPortMessage> = p.pending.drain(..).collect();
+        fs.port_by_id.remove(&pid);
+        (pid, partner, (lr, rr), pending)
+    };
+
+    // Re-serialize any messages that were already buffered on this port before transfer.
+    let mut buffered_payloads = VecDeque::with_capacity(pending_msgs.len());
+    for q in pending_msgs {
+        let ports_arr = alloc_array_from(vm, q.ports.iter().map(|&ph| JsValue::from_object(ph)));
+        let transfer_val = if q.ports.is_empty() {
+            JsValue::UNDEFINED
+        } else {
+            JsValue::from_object(ports_arr)
+        };
+        if let Ok(payload) = serialize_with_transfer(vm, ctx, q.data, transfer_val, &[]) {
+            buffered_payloads.push_back(payload);
+        }
+    }
+
+    // Case A: this port ALREADY had cross-thread routes (e.g. transferred back from Worker -> Main
+    // OR the second port in `[port1, port2]` after `port1` already bridged them).
+    if let (Some(local_r), Some(remote_r)) = existing_routes {
+        if let Ok(mut guard) = local_r.lock() {
+            match &mut *guard {
+                PortRoute::Buffered(q) => {
+                    for p in buffered_payloads {
+                        q.push_back(p);
+                    }
+                }
+                PortRoute::Live { .. } => {
+                    *guard = PortRoute::Buffered(buffered_payloads);
+                }
+                PortRoute::Closed => {}
+            }
+        }
+        return Ok(CrossThreadPortEnd {
+            local_route: local_r,
+            remote_route: remote_r,
+        });
+    }
+
+    // Case B: brand-new cross-thread bridge between `port_h` and its in-process `partner_id`.
+    let route_to_transferred = Arc::new(Mutex::new(PortRoute::Buffered(buffered_payloads)));
+    let route_to_partner = if let Some(pid) = partner_id {
+        let mut fs = ctx.frames.borrow_mut();
+        if let Some(&partner_h) = fs.port_by_id.get(&pid) {
+            let r = Arc::new(Mutex::new(PortRoute::Live {
+                tx: local_async_tx,
+                port_id: pid,
+            }));
+            if let Some(partner) = fs.ports.get_mut(&partner_h) {
+                partner.partner_id = None;
+                partner.local_route = Some(Arc::clone(&r));
+                partner.remote_route = Some(Arc::clone(&route_to_transferred));
+            }
+            r
+        } else {
+            Arc::new(Mutex::new(PortRoute::Closed))
+        }
+    } else {
+        let _ = port_id;
+        Arc::new(Mutex::new(PortRoute::Closed))
+    };
+
+    Ok(CrossThreadPortEnd {
+        local_route: route_to_transferred,
+        remote_route: route_to_partner,
+    })
+}
+
+/// Attaches a transferred [`CrossThreadPortEnd`] into this runtime's [`FrameSystem`],
+/// allocating a live `MessagePort` object and flipping its inbound route to `Live`.
+pub(crate) fn attach_transferred_cross_thread_port(
+    vm: &mut JsVm,
+    frames: &SharedFrames,
+    end: CrossThreadPortEnd,
+    local_async_tx: mpsc::UnboundedSender<AsyncWorkerEvent>,
+) -> HeapHandle {
+    let pipeline = frames.borrow().pipeline_id;
+    let new_id = alloc_port_id(pipeline);
+    let port_h = alloc_message_port(vm, frames, new_id, None, None);
+    let buffered: Vec<StructuredClonePayload> = {
+        let mut guard = end.local_route.lock().expect("port route lock");
+        let drained = match &mut *guard {
+            PortRoute::Buffered(q) => q.drain(..).collect(),
+            _ => Vec::new(),
+        };
+        if !matches!(*guard, PortRoute::Closed) {
+            *guard = PortRoute::Live {
+                tx: local_async_tx.clone(),
+                port_id: new_id,
+            };
+        }
+        drained
+    };
+    if let Some(p) = frames.borrow_mut().ports.get_mut(&port_h) {
+        p.local_route = Some(end.local_route);
+        p.remote_route = Some(end.remote_route);
+    }
+    for payload in buffered {
+        let _ = local_async_tx.send(AsyncWorkerEvent::BridgePortMessage {
+            port_id: new_id,
+            payload,
+        });
+    }
+    port_h
+}
+
+/// Delivers an inbound cross-thread [`StructuredClonePayload`] onto the target local `MessagePort`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deliver_cross_thread_port_message(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
+    net: &SharedNetBridge,
+    canvas2d: &SharedCanvas2D,
+    frames: &SharedFrames,
+    workers: &SharedWorkers,
+    port_id: MessagePortId,
+    payload: StructuredClonePayload,
+) {
+    let target_h = frames.borrow().port_by_id.get(&port_id).copied();
+    let Some(target_h) = target_h else { return };
+    let clone_ctx = CloneContext {
+        host,
+        events,
+        web_apis,
+        net,
+        canvas2d,
+        frames,
+        workers,
+    };
+    let (data, transferred_ports) = deserialize_payload(vm, &clone_ctx, payload);
+    let should_flush = {
+        let mut fs = frames.borrow_mut();
+        match fs.ports.get_mut(&target_h) {
+            Some(p) if !p.closed && !p.neutered => {
+                p.pending.push_back(QueuedPortMessage {
+                    data,
+                    ports: transferred_ports,
+                });
+                p.started
+            }
+            _ => false,
+        }
+    };
+    if should_flush {
+        schedule_port_flush(host, events, event_loop, frames, target_h);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2827,6 +3049,7 @@ fn install_message_channel_and_port(
     vm.heap
         .object_set_prototype(port_proto, Some(etp), &mut vm.shapes);
     vm.heap.get_object_mut(port_proto).unwrap().is_prototype = true;
+    crate::dom_interfaces::define_to_string_tag(vm, port_proto, "MessagePort");
     frames.borrow_mut().message_port_proto = Some(port_proto);
 
     // MessagePort.prototype.start()
@@ -2862,15 +3085,19 @@ fn install_message_channel_and_port(
                 return Err(vm.type_error("MessagePort.close called on invalid receiver"));
             };
             let mut fs = fr.borrow_mut();
-            let (id, remote) = match fs.ports.get_mut(&ph) {
+            let (id, remote, local_route) = match fs.ports.get_mut(&ph) {
                 Some(p) => {
                     p.closed = true;
                     p.partner_id = None;
                     p.pending.clear();
-                    (p.id, p.remote_pipeline.take())
+                    p.remote_route = None;
+                    (p.id, p.remote_pipeline.take(), p.local_route.take())
                 }
                 None => return Err(vm.type_error("Illegal invocation of MessagePort.close")),
             };
+            if let Some(lr) = local_route {
+                PortRoute::close(&lr);
+            }
             if remote.is_some() {
                 fs.outbound_ipc
                     .push_back(ContentToBrowser::MessagePortClose { port_id: id });
@@ -2983,18 +3210,8 @@ fn install_message_channel_and_port(
             }
             let msg_val = arg(args, 0);
             let second = arg(args, 1);
-            let transfer_val = if let Some(oh) = second.as_object() {
-                if is_js_array(vm, oh) {
-                    second
-                } else {
-                    let kt = vm.heap.intern_key("transfer");
-                    vm.get_property_by_key(oh, kt)?
-                }
-            } else {
-                JsValue::UNDEFINED
-            };
 
-            let (closed_or_neutered, partner_id, partner_h, remote_pipeline) = {
+            let (closed_or_neutered, partner_id, partner_h, remote_pipeline, remote_route) = {
                 let fs = fr.borrow();
                 let Some(src) = fs.ports.get(&src_h) else {
                     return Err(vm.type_error("Illegal invocation of MessagePort.postMessage"));
@@ -3007,7 +3224,50 @@ fn install_message_channel_and_port(
                     src.partner_id,
                     ph,
                     src.remote_pipeline,
+                    src.remote_route.clone(),
                 )
+            };
+
+            // Cross-thread bridged partner port (e.g. MessagePort transferred to/from a Worker)!
+            if !closed_or_neutered {
+                if let Some(route) = remote_route {
+                    let transfer_val = extract_transfer_arg(vm, second)?;
+                    let (nb_opt, c2d_opt, ws_opt) = {
+                        let fs = fr.borrow();
+                        (fs.net.clone(), fs.canvas2d.clone(), fs.workers.clone())
+                    };
+                    if let (Some(nb), Some(c2d), Some(ws)) = (nb_opt, c2d_opt, ws_opt) {
+                        let clone_ctx = CloneContext {
+                            host: &h,
+                            events: &ev,
+                            web_apis: &wa,
+                            net: &nb,
+                            canvas2d: &c2d,
+                            frames: &fr,
+                            workers: &ws,
+                        };
+                        let payload = serialize_with_transfer(
+                            vm,
+                            &clone_ctx,
+                            msg_val,
+                            transfer_val,
+                            &[src_h],
+                        )?;
+                        PortRoute::send_payload(&route, payload);
+                        return Ok(JsValue::UNDEFINED);
+                    }
+                }
+            }
+
+            let transfer_val = if let Some(oh) = second.as_object() {
+                if is_js_array(vm, oh) {
+                    second
+                } else {
+                    let kt = vm.heap.intern_key("transfer");
+                    vm.get_property_by_key(oh, kt)?
+                }
+            } else {
+                JsValue::UNDEFINED
             };
 
             let disallowed = vec![src_h];

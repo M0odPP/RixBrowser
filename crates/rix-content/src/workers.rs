@@ -170,6 +170,10 @@ pub enum AsyncWorkerEvent {
         port_id: u64,
         payload_json: String,
     },
+    BridgePortMessage {
+        port_id: rix_ipc::MessagePortId,
+        payload: crate::structured_clone::StructuredClonePayload,
+    },
     BroadcastMessage {
         channel_id: u64,
         origin: String,
@@ -271,6 +275,17 @@ impl WorkerSystem {
             sse_handle_to_id: HashMap::new(),
             protos: WorkerPrototypes::default(),
         }
+    }
+
+    pub(crate) fn async_tx_clone(&self) -> mpsc::UnboundedSender<AsyncWorkerEvent> {
+        self.async_tx.clone()
+    }
+
+    pub(crate) fn is_worker_platform_object(&self, h: HeapHandle) -> bool {
+        self.worker_handle_to_id.contains_key(&h)
+            || self.shared_port_handle_to_id.contains_key(&h)
+            || self.broadcast_handle_to_id.contains_key(&h)
+            || self.sse_handle_to_id.contains_key(&h)
     }
 
     /// Collects GC roots for active workers, ports, channels, SSE handles, and prototypes.
@@ -1800,6 +1815,18 @@ pub fn deliver_async_worker_event(
             if should_flush {
                 flush_shared_client_port(
                     vm, host, events, event_loop, frames, workers, port_id, false,
+                );
+            }
+        }
+        AsyncWorkerEvent::BridgePortMessage { port_id, payload } => {
+            let (nb_opt, c2d_opt) = {
+                let fs = frames.borrow();
+                (fs.net.clone(), fs.canvas2d.clone())
+            };
+            if let (Some(nb), Some(c2d)) = (nb_opt, c2d_opt) {
+                crate::frames::deliver_cross_thread_port_message(
+                    vm, host, events, event_loop, web_apis, &nb, &c2d, frames, workers, port_id,
+                    payload,
                 );
             }
         }
