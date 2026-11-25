@@ -13,6 +13,11 @@ use rix_js::promise::{
 };
 use rix_js::{HeapHandle, JsException, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs};
 
+pub(crate) use crate::streams_writable::create_writable_stream_from_callbacks;
+use crate::streams_writable::{
+    install_writable_stream_types, writable_close_internal, writable_write_internal,
+    WritableDefaultWriterState, WritableStreamState,
+};
 use crate::web_apis::{
     alloc_uint8_array, arg, bind_ctor_proto, define_global, define_host_getter, define_host_method,
     SharedWebApis,
@@ -49,57 +54,17 @@ impl ReadableStreamState {
     }
 }
 
-#[derive(Debug, Clone)]
-enum PendingWriteOp {
-    Write(JsValue, HeapHandle),
-    Close(HeapHandle),
-}
-
-#[derive(Debug, Clone)]
-struct WritableStreamState {
-    closed: bool,
-    errored: Option<JsValue>,
-    locked: bool,
-    in_write: bool,
-    write_fn: Option<HeapHandle>,
-    close_fn: Option<HeapHandle>,
-    abort_fn: Option<HeapHandle>,
-    sink_obj: Option<HeapHandle>,
-    closed_promise: Option<HeapHandle>,
-    pending_ops: VecDeque<PendingWriteOp>,
-    pending_abort: Option<(JsValue, HeapHandle)>,
-}
-
-impl WritableStreamState {
-    fn new(
-        write_fn: Option<HeapHandle>,
-        close_fn: Option<HeapHandle>,
-        abort_fn: Option<HeapHandle>,
-        sink_obj: Option<HeapHandle>,
-    ) -> Self {
-        Self {
-            closed: false,
-            errored: None,
-            locked: false,
-            in_write: false,
-            write_fn,
-            close_fn,
-            abort_fn,
-            sink_obj,
-            closed_promise: None,
-            pending_ops: VecDeque::new(),
-            pending_abort: None,
-        }
-    }
-}
-
 /// Shared registry for WHATWG `ReadableStream`, `WritableStream`, and `TransformStream`.
 #[derive(Default)]
 pub struct StreamSystem {
     readable: HashMap<HeapHandle, ReadableStreamState>,
-    writable: HashMap<HeapHandle, WritableStreamState>,
+    pub(crate) writable: HashMap<HeapHandle, WritableStreamState>,
+    pub(crate) writable_controllers: HashMap<HeapHandle, HeapHandle>,
+    pub(crate) writable_writers: HashMap<HeapHandle, WritableDefaultWriterState>,
     pub readable_proto: Option<HeapHandle>,
     pub writable_proto: Option<HeapHandle>,
+    pub writable_writer_proto: Option<HeapHandle>,
+    pub writable_controller_proto: Option<HeapHandle>,
     pub transform_proto: Option<HeapHandle>,
 }
 
@@ -112,6 +77,8 @@ impl StreamSystem {
         for p in [
             self.readable_proto,
             self.writable_proto,
+            self.writable_writer_proto,
+            self.writable_controller_proto,
             self.transform_proto,
         ]
         .into_iter()
@@ -140,34 +107,14 @@ impl StreamSystem {
             }
         }
         for ws in self.writable.values() {
-            if let Some(e) = ws.errored {
-                out.push(e);
+            ws.collect_roots(out);
+        }
+        for w in self.writable_writers.values() {
+            if let Some(s) = w.stream {
+                out.push(JsValue::from_object(s));
             }
-            for h in [
-                ws.write_fn,
-                ws.close_fn,
-                ws.abort_fn,
-                ws.sink_obj,
-                ws.closed_promise,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                out.push(JsValue::from_object(h));
-            }
-            for op in &ws.pending_ops {
-                match op {
-                    PendingWriteOp::Write(v, p) => {
-                        out.push(*v);
-                        out.push(JsValue::from_object(*p));
-                    }
-                    PendingWriteOp::Close(p) => out.push(JsValue::from_object(*p)),
-                }
-            }
-            if let Some((reason, p)) = ws.pending_abort {
-                out.push(reason);
-                out.push(JsValue::from_object(p));
-            }
+            out.push(JsValue::from_object(w.closed_promise));
+            out.push(JsValue::from_object(w.ready_promise));
         }
     }
 
@@ -180,6 +127,8 @@ impl StreamSystem {
     pub fn sweep_dead(&mut self, heap: &rix_js::GcHeap) {
         self.readable.retain(|&h, _| heap.is_alive(h));
         self.writable.retain(|&h, _| heap.is_alive(h));
+        self.writable_controllers.retain(|&h, _| heap.is_alive(h));
+        self.writable_writers.retain(|&h, _| heap.is_alive(h));
     }
 }
 
@@ -613,121 +562,8 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
     bind_ctor_proto(vm, rs_ctor, rsp);
     define_global(vm, "ReadableStream", JsValue::from_object(rs_ctor));
 
-    // --- WritableStream ---
-    let wsp = vm.alloc_ordinary_object();
-    vm.heap.get_object_mut(wsp).unwrap().is_prototype = true;
-    streams.borrow_mut().writable_proto = Some(wsp);
-
-    let ss = Rc::clone(&streams);
-    define_host_getter(vm, wsp, "locked", move |vm, this_val, _| {
-        let h = require_writable(vm, &ss, this_val)?;
-        let locked = ss.borrow().writable.get(&h).is_some_and(|ws| ws.locked);
-        Ok(JsValue::from_bool(locked))
-    });
-
-    let ss = Rc::clone(&streams);
-    define_host_method(vm, wsp, "getWriter", move |vm, this_val, _| {
-        let h = require_writable(vm, &ss, this_val)?;
-        {
-            let mut st = ss.borrow_mut();
-            let ws = st
-                .writable
-                .get_mut(&h)
-                .ok_or_else(|| vm.type_error("Invalid WritableStream"))?;
-            if ws.locked {
-                return Err(vm.type_error("WritableStream is already locked"));
-            }
-            ws.locked = true;
-        }
-        let writer = vm.alloc_ordinary_object();
-        let ready_p = promise_resolve_value(vm, JsValue::UNDEFINED);
-        let closed_p = alloc_promise(vm);
-        if let Some(ws) = ss.borrow_mut().writable.get_mut(&h) {
-            ws.closed_promise = Some(closed_p);
-        }
-        let k_ready = vm.heap.intern_key("ready");
-        let k_closed = vm.heap.intern_key("closed");
-        vm.heap.object_define_data(
-            writer,
-            k_ready,
-            JsValue::from_object(ready_p),
-            PropertyAttrs::DEFAULT,
-            &mut vm.shapes,
-        );
-        vm.heap.object_define_data(
-            writer,
-            k_closed,
-            JsValue::from_object(closed_p),
-            PropertyAttrs::DEFAULT,
-            &mut vm.shapes,
-        );
-        let ss_w = Rc::clone(&ss);
-        define_host_method(vm, writer, "write", move |vm, _, args| {
-            Ok(JsValue::from_object(writable_write_chunk(
-                vm,
-                &ss_w,
-                h,
-                arg(args, 0),
-            )))
-        });
-        let ss_cl = Rc::clone(&ss);
-        define_host_method(vm, writer, "close", move |vm, _, _| {
-            let p = writable_close(vm, &ss_cl, h);
-            Ok(JsValue::from_object(p))
-        });
-        let ss_ab = Rc::clone(&ss);
-        define_host_method(vm, writer, "abort", move |vm, _, args| {
-            let reason = arg(args, 0);
-            let p = writable_abort(vm, &ss_ab, h, reason);
-            Ok(JsValue::from_object(p))
-        });
-        let ss_rel = Rc::clone(&ss);
-        define_host_method(vm, writer, "releaseLock", move |_, _, _| {
-            if let Some(ws) = ss_rel.borrow_mut().writable.get_mut(&h) {
-                ws.locked = false;
-            }
-            Ok(JsValue::UNDEFINED)
-        });
-        Ok(JsValue::from_object(writer))
-    });
-
-    let ss = Rc::clone(&streams);
-    let ws_ctor = vm.alloc_host_fn("WritableStream", move |vm, _, args| {
-        let obj = vm
-            .heap
-            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(wsp)));
-        let sink_val = arg(args, 0);
-        let mut ws = WritableStreamState::new(None, None, None, sink_val.as_object());
-        let mut start_fn = None;
-        if let Some(sh) = sink_val.as_object() {
-            for (name, slot) in [
-                ("write", &mut ws.write_fn),
-                ("close", &mut ws.close_fn),
-                ("abort", &mut ws.abort_fn),
-            ] {
-                let k = vm.heap.intern_key(name);
-                if let Ok(v) = vm.get_property_by_key(sh, k) {
-                    *slot = v.as_object().filter(|&fh| vm.is_callable_handle(fh));
-                }
-            }
-            let ks = vm.heap.intern_key("start");
-            if let Ok(v) = vm.get_property_by_key(sh, ks) {
-                start_fn = v.as_object().filter(|&fh| vm.is_callable_handle(fh));
-            }
-        }
-        ss.borrow_mut().writable.insert(obj, ws);
-        if let Some(sf) = start_fn {
-            let ctrl = vm.alloc_ordinary_object();
-            vm.call_value(
-                JsValue::from_object(sf),
-                sink_val,
-                &[JsValue::from_object(ctrl)],
-            )?;
-        }
-        Ok(JsValue::from_object(obj))
-    });
-    bind_ctor_proto(vm, ws_ctor, wsp);
-    define_global(vm, "WritableStream", JsValue::from_object(ws_ctor));
+    // --- WritableStream + WritableStreamDefaultWriter + WritableStreamDefaultController ---
+    let _wsp = install_writable_stream_types(vm, &streams, web_apis);
 
     // --- TransformStream ---
     let tsp = vm.alloc_ordinary_object();
@@ -797,13 +633,12 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
             Ok(JsValue::UNDEFINED)
         });
 
-        let writable = vm
-            .heap
-            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(wsp)));
-        ss.borrow_mut().writable.insert(
-            writable,
-            WritableStreamState::new(Some(write_cb), Some(close_cb), None, None),
-        );
+        let ss_ab = Rc::clone(&ss);
+        let abort_cb = vm.alloc_host_fn("transform_abort", move |vm, _, a| {
+            readable_error(vm, &ss_ab, readable, arg(a, 0));
+            Ok(JsValue::UNDEFINED)
+        });
+        let writable = create_writable_stream_from_callbacks(vm, &ss, write_cb, close_cb, abort_cb);
 
         let ts_obj = vm
             .heap
@@ -830,7 +665,7 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
     define_global(vm, "TransformStream", JsValue::from_object(ts_ctor));
 
     // --- TextDecoderStream & TextEncoderStream (WHATWG Encoding §8.5) ---
-    install_text_encoding_streams(vm, &streams, web_apis, rsp, wsp);
+    install_text_encoding_streams(vm, &streams, web_apis, rsp);
 
     // Attach `Blob.prototype.stream()` cleanly once streams are installed.
     if let Some(bp) = web_apis.borrow().protos.blob_proto {
@@ -870,7 +705,7 @@ fn require_readable(
     }
 }
 
-fn require_writable(
+pub(crate) fn require_writable(
     vm: &mut JsVm,
     streams: &SharedStreams,
     val: JsValue,
@@ -882,358 +717,6 @@ fn require_writable(
         Ok(h)
     } else {
         Err(vm.type_error("Incompatible WritableStream receiver"))
-    }
-}
-
-/// Creates a `WritableStream` backed directly by host callbacks (`write`, `close`, `abort`),
-/// supporting WHATWG reentrant write/close queueing and deferred abort during active writes.
-pub(crate) fn create_writable_stream_from_callbacks(
-    vm: &mut JsVm,
-    streams: &SharedStreams,
-    write_fn: HeapHandle,
-    close_fn: HeapHandle,
-    abort_fn: HeapHandle,
-) -> HeapHandle {
-    let wsp = streams.borrow().writable_proto.unwrap_or(vm.object_proto);
-    let obj = vm
-        .heap
-        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(wsp)));
-    streams.borrow_mut().writable.insert(
-        obj,
-        WritableStreamState::new(Some(write_fn), Some(close_fn), Some(abort_fn), None),
-    );
-    obj
-}
-
-fn writable_write_chunk(
-    vm: &mut JsVm,
-    streams: &SharedStreams,
-    ws_h: HeapHandle,
-    chunk: JsValue,
-) -> HeapHandle {
-    let info = {
-        let mut st = streams.borrow_mut();
-        let Some(ws) = st.writable.get_mut(&ws_h) else {
-            return promise_resolve_value(vm, JsValue::UNDEFINED);
-        };
-        if let Some(err) = ws.errored {
-            let p = alloc_promise(vm);
-            reject_promise(vm, p, err);
-            return p;
-        }
-        if ws.closed {
-            let p = alloc_promise(vm);
-            let err = vm.type_error("Cannot write to a closed WritableStream");
-            reject_promise(vm, p, err.value);
-            return p;
-        }
-        if ws.in_write {
-            let p = alloc_promise(vm);
-            ws.pending_ops.push_back(PendingWriteOp::Write(chunk, p));
-            return p;
-        }
-        ws.in_write = true;
-        (ws.write_fn, ws.sink_obj)
-    };
-    let out_p = alloc_promise(vm);
-    let call_res = if let Some(wf) = info.0 {
-        let this_v = info.1.map_or(JsValue::UNDEFINED, JsValue::from_object);
-        vm.call_value(JsValue::from_object(wf), this_v, &[chunk])
-    } else {
-        Ok(JsValue::UNDEFINED)
-    };
-    finish_write_step(vm, streams, ws_h, out_p, call_res);
-    out_p
-}
-
-fn finish_write_step(
-    vm: &mut JsVm,
-    streams: &SharedStreams,
-    ws_h: HeapHandle,
-    out_p: HeapHandle,
-    call_res: Result<JsValue, JsException>,
-) {
-    match call_res {
-        Ok(v) => {
-            let returned_promise = v.as_object().filter(|&h| {
-                matches!(
-                    vm.heap.get_object(h).map(|o| &o.kind),
-                    Some(ObjectKind::Promise(_))
-                )
-            });
-            if let Some(rp) = returned_promise {
-                let ss_ok = Rc::clone(streams);
-                let on_ok = vm.alloc_host_fn("ws_write_ok", move |vm, _, args| {
-                    resolve_promise(vm, out_p, arg(args, 0));
-                    drain_writable_queue(vm, &ss_ok, ws_h);
-                    Ok(JsValue::UNDEFINED)
-                });
-                let ss_err = Rc::clone(streams);
-                let on_err = vm.alloc_host_fn("ws_write_err", move |vm, _, args| {
-                    let err_v = arg(args, 0);
-                    fail_writable_stream(vm, &ss_err, ws_h, err_v);
-                    reject_promise(vm, out_p, err_v);
-                    Ok(JsValue::UNDEFINED)
-                });
-                let _ = promise_then(vm, rp, Some(on_ok), Some(on_err));
-            } else {
-                resolve_promise(vm, out_p, JsValue::UNDEFINED);
-                drain_writable_queue(vm, streams, ws_h);
-            }
-        }
-        Err(e) => {
-            let err_v = e.value;
-            let rp = alloc_promise(vm);
-            reject_promise(vm, rp, err_v);
-            let ss_err = Rc::clone(streams);
-            let on_err = vm.alloc_host_fn("ws_write_sync_err", move |vm, _, _| {
-                reject_promise(vm, out_p, err_v);
-                let has_pending_abort = ss_err
-                    .borrow()
-                    .writable
-                    .get(&ws_h)
-                    .is_some_and(|ws| ws.pending_abort.is_some());
-                if has_pending_abort {
-                    drain_writable_queue(vm, &ss_err, ws_h);
-                } else {
-                    fail_writable_stream(vm, &ss_err, ws_h, err_v);
-                }
-                Ok(JsValue::UNDEFINED)
-            });
-            let _ = promise_then(vm, rp, None, Some(on_err));
-        }
-    }
-}
-
-fn fail_writable_stream(vm: &mut JsVm, streams: &SharedStreams, ws_h: HeapHandle, err_v: JsValue) {
-    let (closed_p, ops, pending_ab) = {
-        let mut st = streams.borrow_mut();
-        let Some(ws) = st.writable.get_mut(&ws_h) else {
-            return;
-        };
-        ws.in_write = false;
-        ws.errored = Some(err_v);
-        ws.closed = true;
-        (
-            ws.closed_promise,
-            std::mem::take(&mut ws.pending_ops),
-            ws.pending_abort.take(),
-        )
-    };
-    if let Some(cp) = closed_p {
-        reject_promise(vm, cp, err_v);
-    }
-    for op in ops {
-        match op {
-            PendingWriteOp::Write(_, p) | PendingWriteOp::Close(p) => {
-                reject_promise(vm, p, err_v);
-            }
-        }
-    }
-    if let Some((_, ap)) = pending_ab {
-        resolve_promise(vm, ap, JsValue::UNDEFINED);
-    }
-}
-
-fn drain_writable_queue(vm: &mut JsVm, streams: &SharedStreams, ws_h: HeapHandle) {
-    loop {
-        let (pending_abort, next_op, info, closed_p) = {
-            let mut st = streams.borrow_mut();
-            let Some(ws) = st.writable.get_mut(&ws_h) else {
-                return;
-            };
-            if let Some((reason, ab_p)) = ws.pending_abort.take() {
-                ws.in_write = false;
-                ws.errored = Some(reason);
-                ws.closed = true;
-                let ops = std::mem::take(&mut ws.pending_ops);
-                let af = ws.abort_fn;
-                let sink = ws.sink_obj;
-                let cp = ws.closed_promise;
-                drop(st);
-                if let Some(af_h) = af {
-                    let this_v = sink.map_or(JsValue::UNDEFINED, JsValue::from_object);
-                    let _ = vm.call_value(JsValue::from_object(af_h), this_v, &[reason]);
-                }
-                for op in ops {
-                    match op {
-                        PendingWriteOp::Write(_, p) | PendingWriteOp::Close(p) => {
-                            reject_promise(vm, p, reason);
-                        }
-                    }
-                }
-                if let Some(cp_h) = cp {
-                    reject_promise(vm, cp_h, reason);
-                }
-                resolve_promise(vm, ab_p, JsValue::UNDEFINED);
-                return;
-            }
-            if let Some(op) = ws.pending_ops.pop_front() {
-                (
-                    None::<()>,
-                    Some(op),
-                    (ws.write_fn, ws.close_fn, ws.sink_obj),
-                    ws.closed_promise,
-                )
-            } else {
-                ws.in_write = false;
-                return;
-            }
-        };
-        let _ = pending_abort;
-        match next_op {
-            Some(PendingWriteOp::Write(chunk, p)) => {
-                let res = if let Some(wf) = info.0 {
-                    let this_v = info.2.map_or(JsValue::UNDEFINED, JsValue::from_object);
-                    vm.call_value(JsValue::from_object(wf), this_v, &[chunk])
-                } else {
-                    Ok(JsValue::UNDEFINED)
-                };
-                match res {
-                    Ok(v) => {
-                        let rp = v.as_object().filter(|&h| {
-                            matches!(
-                                vm.heap.get_object(h).map(|o| &o.kind),
-                                Some(ObjectKind::Promise(_))
-                            )
-                        });
-                        if let Some(rp_h) = rp {
-                            finish_write_step(vm, streams, ws_h, p, Ok(JsValue::from_object(rp_h)));
-                            return;
-                        }
-                        resolve_promise(vm, p, JsValue::UNDEFINED);
-                    }
-                    Err(e) => {
-                        fail_writable_stream(vm, streams, ws_h, e.value);
-                        reject_promise(vm, p, e.value);
-                        return;
-                    }
-                }
-            }
-            Some(PendingWriteOp::Close(p)) => {
-                if let Some(ws) = streams.borrow_mut().writable.get_mut(&ws_h) {
-                    ws.closed = true;
-                    ws.in_write = false;
-                }
-                if let Some(cf) = info.1 {
-                    let this_v = info.2.map_or(JsValue::UNDEFINED, JsValue::from_object);
-                    match vm.call_value(JsValue::from_object(cf), this_v, &[]) {
-                        Ok(_) => {
-                            if let Some(cp) = closed_p {
-                                resolve_promise(vm, cp, JsValue::UNDEFINED);
-                            }
-                            resolve_promise(vm, p, JsValue::UNDEFINED);
-                        }
-                        Err(e) => {
-                            if let Some(cp) = closed_p {
-                                reject_promise(vm, cp, e.value);
-                            }
-                            reject_promise(vm, p, e.value);
-                        }
-                    }
-                } else {
-                    if let Some(cp) = closed_p {
-                        resolve_promise(vm, cp, JsValue::UNDEFINED);
-                    }
-                    resolve_promise(vm, p, JsValue::UNDEFINED);
-                }
-                return;
-            }
-            None => return,
-        }
-    }
-}
-
-fn writable_abort(
-    vm: &mut JsVm,
-    streams: &SharedStreams,
-    ws_h: HeapHandle,
-    reason: JsValue,
-) -> HeapHandle {
-    let ab_p = alloc_promise(vm);
-    let immediate = {
-        let mut st = streams.borrow_mut();
-        let Some(ws) = st.writable.get_mut(&ws_h) else {
-            resolve_promise(vm, ab_p, JsValue::UNDEFINED);
-            return ab_p;
-        };
-        if ws.in_write {
-            // Defer abort until the active write completes (WHATWG Streams §5.4).
-            ws.pending_abort = Some((reason, ab_p));
-            None
-        } else {
-            ws.errored = Some(reason);
-            ws.closed = true;
-            Some((
-                ws.abort_fn,
-                ws.sink_obj,
-                ws.closed_promise,
-                std::mem::take(&mut ws.pending_ops),
-            ))
-        }
-    };
-    if let Some((af, sink, closed_p, ops)) = immediate {
-        if let Some(af_h) = af {
-            let this_v = sink.map_or(JsValue::UNDEFINED, JsValue::from_object);
-            let _ = vm.call_value(JsValue::from_object(af_h), this_v, &[reason]);
-        }
-        for op in ops {
-            match op {
-                PendingWriteOp::Write(_, p) | PendingWriteOp::Close(p) => {
-                    reject_promise(vm, p, reason);
-                }
-            }
-        }
-        if let Some(cp) = closed_p {
-            reject_promise(vm, cp, reason);
-        }
-        resolve_promise(vm, ab_p, JsValue::UNDEFINED);
-    }
-    ab_p
-}
-
-fn writable_close(vm: &mut JsVm, streams: &SharedStreams, ws_h: HeapHandle) -> HeapHandle {
-    let info = {
-        let mut st = streams.borrow_mut();
-        let Some(ws) = st.writable.get_mut(&ws_h) else {
-            return promise_resolve_value(vm, JsValue::UNDEFINED);
-        };
-        if let Some(err) = ws.errored {
-            let p = alloc_promise(vm);
-            reject_promise(vm, p, err);
-            return p;
-        }
-        if ws.in_write {
-            let p = alloc_promise(vm);
-            ws.pending_ops.push_back(PendingWriteOp::Close(p));
-            return p;
-        }
-        ws.closed = true;
-        (ws.close_fn, ws.sink_obj, ws.closed_promise)
-    };
-    if let Some(cf) = info.0 {
-        let this_v = info.1.map_or(JsValue::UNDEFINED, JsValue::from_object);
-        match vm.call_value(JsValue::from_object(cf), this_v, &[]) {
-            Ok(v) => {
-                if let Some(cp) = info.2 {
-                    resolve_promise(vm, cp, JsValue::UNDEFINED);
-                }
-                promise_resolve_value(vm, v)
-            }
-            Err(e) => {
-                if let Some(cp) = info.2 {
-                    reject_promise(vm, cp, e.value);
-                }
-                let p = alloc_promise(vm);
-                reject_promise(vm, p, e.value);
-                p
-            }
-        }
-    } else {
-        if let Some(cp) = info.2 {
-            resolve_promise(vm, cp, JsValue::UNDEFINED);
-        }
-        promise_resolve_value(vm, JsValue::UNDEFINED)
     }
 }
 
@@ -1269,7 +752,7 @@ fn pump_pipe_step(
             .get_property_by_key(rh, k_done)
             .is_ok_and(|v| vm.to_boolean(v));
         if is_done {
-            let close_p = writable_close(vm, &ss_ok, dst_h);
+            let close_p = writable_close_internal(vm, &ss_ok, dst_h);
             let on_cl = vm.alloc_host_fn("pipe_close_ok", move |vm, _, _| {
                 resolve_promise(vm, done_p, JsValue::UNDEFINED);
                 Ok(JsValue::UNDEFINED)
@@ -1279,7 +762,7 @@ fn pump_pipe_step(
             let val = vm
                 .get_property_by_key(rh, k_val)
                 .unwrap_or(JsValue::UNDEFINED);
-            let wp = writable_write_chunk(vm, &ss_ok, dst_h, val);
+            let wp = writable_write_internal(vm, &ss_ok, dst_h, val);
             let ss_next = Rc::clone(&ss_ok);
             let on_wr = vm.alloc_host_fn("pipe_write_ok", move |vm, _, _| {
                 pump_pipe_step(vm, &ss_next, src_h, dst_h, done_p);
@@ -1305,7 +788,6 @@ fn install_text_encoding_streams(
     streams: &SharedStreams,
     web_apis: &SharedWebApis,
     rsp: HeapHandle,
-    wsp: HeapHandle,
 ) {
     // TextDecoderStream
     let tdsp = vm.alloc_ordinary_object();
@@ -1343,10 +825,6 @@ fn install_text_encoding_streams(
         ss_d.borrow_mut()
             .readable
             .insert(readable, ReadableStreamState::new());
-        let writable = vm
-            .heap
-            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(wsp)));
-
         let ss_w = Rc::clone(&ss_d);
         let wa_w = Rc::clone(&wa_d);
         let dec_w = Rc::clone(&decoder);
@@ -1385,11 +863,13 @@ fn install_text_encoding_streams(
             readable_close(vm, &ss_c, readable);
             Ok(JsValue::UNDEFINED)
         });
-
-        ss_d.borrow_mut().writable.insert(
-            writable,
-            WritableStreamState::new(Some(write_fn), Some(close_fn), None, None),
-        );
+        let ss_ab = Rc::clone(&ss_d);
+        let abort_fn = vm.alloc_host_fn("tds_abort", move |vm, _, a| {
+            readable_error(vm, &ss_ab, readable, arg(a, 0));
+            Ok(JsValue::UNDEFINED)
+        });
+        let writable =
+            create_writable_stream_from_callbacks(vm, &ss_d, write_fn, close_fn, abort_fn);
         let inst = vm
             .heap
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(tdsp)));
@@ -1425,10 +905,6 @@ fn install_text_encoding_streams(
         ss_e.borrow_mut()
             .readable
             .insert(readable, ReadableStreamState::new());
-        let writable = vm
-            .heap
-            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(wsp)));
-
         let ss_w = Rc::clone(&ss_e);
         let write_fn = vm.alloc_host_fn("tes_write", move |vm, _, args| {
             let text = vm.to_js_string(arg(args, 0))?;
@@ -1444,10 +920,13 @@ fn install_text_encoding_streams(
             readable_close(vm, &ss_c, readable);
             Ok(JsValue::UNDEFINED)
         });
-        ss_e.borrow_mut().writable.insert(
-            writable,
-            WritableStreamState::new(Some(write_fn), Some(close_fn), None, None),
-        );
+        let ss_ab = Rc::clone(&ss_e);
+        let abort_fn = vm.alloc_host_fn("tes_abort", move |vm, _, a| {
+            readable_error(vm, &ss_ab, readable, arg(a, 0));
+            Ok(JsValue::UNDEFINED)
+        });
+        let writable =
+            create_writable_stream_from_callbacks(vm, &ss_e, write_fn, close_fn, abort_fn);
         let inst = vm
             .heap
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(tesp)));
