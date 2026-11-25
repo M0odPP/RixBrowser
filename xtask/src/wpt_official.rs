@@ -260,8 +260,14 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
         this._cleanups = [];
         this._done = false;
         this._status = 0;
+        this.status = this.NOTRUN;
         this._message = null;
     }
+    TestObj.prototype.PASS = 0;
+    TestObj.prototype.FAIL = 1;
+    TestObj.prototype.TIMEOUT = 2;
+    TestObj.prototype.NOTRUN = 3;
+    TestObj.prototype.PRECONDITION_FAILED = 4;
     TestObj.prototype.add_cleanup = function(fn) { this._cleanups.push(fn); };
     TestObj.prototype._run_cleanups = function() {
         while (this._cleanups.length) {
@@ -310,6 +316,7 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
         if (this._done) return;
         this._done = true;
         this._status = 1;
+        this.status = this.FAIL;
         this._message = e && e.message ? (e.name ? e.name + ": " + e.message : e.message) : String(e);
         this._run_cleanups();
         if (this._isAsync) pendingAsync = Math.max(0, pendingAsync - 1);
@@ -319,6 +326,7 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
         if (this._done) return;
         this._done = true;
         this._status = 0;
+        this.status = this.PASS;
         this._run_cleanups();
         if (this._isAsync) pendingAsync = Math.max(0, pendingAsync - 1);
         results.push({ name: this.name, pass: true, message: "" });
@@ -2039,6 +2047,7 @@ fn run_wpt_testharness_file(
     // until all async/promise subtests settle (exiting immediately when pending == 0).
     let mut async_waits = 0u32;
     let mut virtual_timer_jumps = 0u32;
+    let mut media_playback_ticks = 0u32;
     for tick in 0..1000u32 {
         rt.advance_and_drain(Duration::from_millis(if tick == 0 { 0 } else { 10 }));
         if !has_pending(&mut rt) {
@@ -2050,9 +2059,20 @@ fn run_wpt_testharness_file(
         if !has_pending(&mut rt) {
             break;
         }
-        // When rAF animations (e.g. smooth-scroll observers) are actively pumping frames,
-        // keep advancing VSync immediately without burning wall-clock async waits.
+        // When rAF animations or active HTML5 media playback are running, keep advancing VSync
+        // smoothly without burning wall-clock async waits.
         if had_raf || rt.event_loop.borrow().has_pending_raf() {
+            continue;
+        }
+        if rt.media_elements.borrow().has_active_playback()
+            && media_playback_ticks < 200
+            && !rt.net.borrow().has_pending_io()
+            && !rt.workers.borrow().has_active_workers()
+        {
+            media_playback_ticks += 1;
+            rt.event_loop
+                .borrow_mut()
+                .advance_clock(Duration::from_millis(50));
             continue;
         }
         // When JS timers (`setTimeout` / `delay(500)`) are pending, fast-forward virtual time
