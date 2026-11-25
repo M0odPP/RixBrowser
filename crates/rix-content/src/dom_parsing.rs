@@ -18,8 +18,11 @@ use crate::dom_bridge::{
 };
 use crate::dom_interfaces::{
     is_valid_xml_char, is_valid_xml_name, parse_xml_fragment_into_node, parse_xml_into_document,
-    DocumentMeta, HTML_NS, XMLNS_NS, XML_NS,
+    DocumentMeta, HTML_NS, SVG_NS, XMLNS_NS, XML_NS,
 };
+use crate::event_loop::SharedEventLoop;
+use crate::events::SharedEvents;
+use crate::trusted_types::{check_classic_html_sink_options, check_trusted_html_sink};
 use crate::web_apis::{create_dom_exception, SharedWebApis};
 
 const PARSERERROR_NS: &str = "http://www.mozilla.org/newlayout/xml/parsererror.xml";
@@ -49,9 +52,15 @@ pub(crate) fn to_dom_string(vm: &mut JsVm, val: JsValue) -> Result<String, JsExc
 /// Installs `DOMParser`, `XMLSerializer`, `Document.parseHTML{Unsafe}`,
 /// `Element.prototype.{innerHTML, outerHTML, insertAdjacentHTML, getHTML}`,
 /// and `ShadowRoot.prototype.{innerHTML, getHTML}`.
-pub fn install_dom_parsing(vm: &mut JsVm, host: &SharedHost, web_apis: &SharedWebApis) {
+pub fn install_dom_parsing(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
+) {
     install_dom_parser_and_xml_serializer(vm, host, web_apis);
-    install_html_parsing_and_serialization(vm, host, web_apis);
+    install_html_parsing_and_serialization(vm, host, events, event_loop, web_apis);
     install_document_parse_html_statics(vm, host, web_apis);
     install_document_domain(vm, host, web_apis);
 }
@@ -422,6 +431,8 @@ fn sanitize_default_safe_subtree(doc: &mut Document, root: NodeId) {
 fn install_html_parsing_and_serialization(
     vm: &mut JsVm,
     host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
     _web_apis: &SharedWebApis,
 ) {
     let ep = host.borrow().prototypes.element_proto;
@@ -435,10 +446,33 @@ fn install_html_parsing_and_serialization(
             serialize_inner_html_for_node(vm, &h_g, nid)
         });
         let h_s = Rc::clone(host);
+        let evs_s = Rc::clone(events);
+        let el_s = Rc::clone(event_loop);
         let s = vm.alloc_host_fn("set innerHTML", move |vm, t, args| {
             let nid = require_node(vm, &h_s, t)?;
-            let markup = legacy_null_to_empty_string(vm, arg(args, 0))?;
-            set_inner_html_spec(vm, &h_s, nid, &markup, false)?;
+            let val = arg(args, 0);
+            let trusted_opts =
+                check_classic_html_sink_options(vm, &h_s, &evs_s, &el_s, nid, "Element innerHTML")?;
+            let markup = if trusted_opts.is_some() {
+                if let Some(s) = h_s.borrow().trusted_types.is_trusted_html(val) {
+                    s
+                } else {
+                    legacy_null_to_empty_string(vm, val)?
+                }
+            } else {
+                check_trusted_html_sink(
+                    vm,
+                    &h_s,
+                    &evs_s,
+                    &el_s,
+                    nid,
+                    "Element innerHTML",
+                    val,
+                    true,
+                )?
+            };
+            let run_scripts = trusted_opts.is_some_and(|o| o.run_scripts);
+            set_inner_html_spec(vm, &h_s, nid, &markup, false, run_scripts)?;
             Ok(JsValue::UNDEFINED)
         });
         define_host_accessor(vm, ep, "innerHTML", Some(g), Some(s));
@@ -452,10 +486,39 @@ fn install_html_parsing_and_serialization(
             serialize_inner_html_for_node(vm, &h_g, nid)
         });
         let h_s = Rc::clone(host);
+        let evs_s = Rc::clone(events);
+        let el_s = Rc::clone(event_loop);
         let s = vm.alloc_host_fn("set innerHTML", move |vm, t, args| {
             let nid = require_node(vm, &h_s, t)?;
-            let markup = legacy_null_to_empty_string(vm, arg(args, 0))?;
-            set_inner_html_spec(vm, &h_s, nid, &markup, false)?;
+            let val = arg(args, 0);
+            let trusted_opts = check_classic_html_sink_options(
+                vm,
+                &h_s,
+                &evs_s,
+                &el_s,
+                nid,
+                "ShadowRoot innerHTML",
+            )?;
+            let markup = if trusted_opts.is_some() {
+                if let Some(s) = h_s.borrow().trusted_types.is_trusted_html(val) {
+                    s
+                } else {
+                    legacy_null_to_empty_string(vm, val)?
+                }
+            } else {
+                check_trusted_html_sink(
+                    vm,
+                    &h_s,
+                    &evs_s,
+                    &el_s,
+                    nid,
+                    "ShadowRoot innerHTML",
+                    val,
+                    true,
+                )?
+            };
+            let run_scripts = trusted_opts.is_some_and(|o| o.run_scripts);
+            set_inner_html_spec(vm, &h_s, nid, &markup, false, run_scripts)?;
             Ok(JsValue::UNDEFINED)
         });
         define_host_accessor(vm, srp, "innerHTML", Some(g), Some(s));
@@ -482,10 +545,33 @@ fn install_html_parsing_and_serialization(
             }
         });
         let h_s = Rc::clone(host);
+        let evs_s = Rc::clone(events);
+        let el_s = Rc::clone(event_loop);
         let s = vm.alloc_host_fn("set outerHTML", move |vm, t, args| {
             let nid = require_node(vm, &h_s, t)?;
-            let markup = legacy_null_to_empty_string(vm, arg(args, 0))?;
-            set_outer_html_spec(vm, &h_s, nid, &markup)?;
+            let val = arg(args, 0);
+            let trusted_opts =
+                check_classic_html_sink_options(vm, &h_s, &evs_s, &el_s, nid, "Element outerHTML")?;
+            let markup = if trusted_opts.is_some() {
+                if let Some(s) = h_s.borrow().trusted_types.is_trusted_html(val) {
+                    s
+                } else {
+                    legacy_null_to_empty_string(vm, val)?
+                }
+            } else {
+                check_trusted_html_sink(
+                    vm,
+                    &h_s,
+                    &evs_s,
+                    &el_s,
+                    nid,
+                    "Element outerHTML",
+                    val,
+                    true,
+                )?
+            };
+            let run_scripts = trusted_opts.is_some_and(|o| o.run_scripts);
+            set_outer_html_spec(vm, &h_s, nid, &markup, run_scripts)?;
             Ok(JsValue::UNDEFINED)
         });
         define_host_accessor(vm, ep, "outerHTML", Some(g), Some(s));
@@ -494,14 +580,43 @@ fn install_html_parsing_and_serialization(
     // Element.prototype.insertAdjacentHTML(position, text)
     {
         let h = Rc::clone(host);
+        let evs = Rc::clone(events);
+        let el = Rc::clone(event_loop);
         define_host_method(vm, ep, "insertAdjacentHTML", move |vm, t, args| {
             let nid = require_node(vm, &h, t)?;
             if args.len() < 2 {
                 return Err(vm.type_error("insertAdjacentHTML requires 2 arguments"));
             }
             let pos = to_dom_string(vm, arg(args, 0))?;
-            let markup = to_dom_string(vm, arg(args, 1))?;
-            insert_adjacent_html_spec(vm, &h, nid, &pos, &markup)?;
+            let val = arg(args, 1);
+            let trusted_opts = check_classic_html_sink_options(
+                vm,
+                &h,
+                &evs,
+                &el,
+                nid,
+                "Element insertAdjacentHTML",
+            )?;
+            let markup = if trusted_opts.is_some() {
+                if let Some(s) = h.borrow().trusted_types.is_trusted_html(val) {
+                    s
+                } else {
+                    to_dom_string(vm, val)?
+                }
+            } else {
+                check_trusted_html_sink(
+                    vm,
+                    &h,
+                    &evs,
+                    &el,
+                    nid,
+                    "Element insertAdjacentHTML",
+                    val,
+                    false,
+                )?
+            };
+            let run_scripts = trusted_opts.is_some_and(|o| o.run_scripts);
+            insert_adjacent_html_spec(vm, &h, nid, &pos, &markup, run_scripts)?;
             Ok(JsValue::UNDEFINED)
         });
     }
@@ -607,12 +722,54 @@ fn serialize_inner_html_for_node(
     }
 }
 
+fn maybe_run_fragment_scripts(vm: &mut JsVm, host: &SharedHost, added: &[NodeId], is_conn: bool) {
+    let scripts: Vec<NodeId> = {
+        let doc_rc = Rc::clone(&host.borrow().document);
+        let doc = doc_rc.borrow();
+        let mut out = Vec::new();
+        for &root in added {
+            for id in doc.descendants(root) {
+                if matches!(
+                    doc.get(id),
+                    Some(NodeData::Element(e))
+                        if e.name.local.as_str() == "script"
+                            && matches!(&*e.name.ns, HTML_NS | SVG_NS)
+                ) {
+                    out.push(id);
+                }
+            }
+        }
+        out
+    };
+    if scripts.is_empty() {
+        return;
+    }
+    let hook = {
+        let mut hb = host.borrow_mut();
+        for &sid in &scripts {
+            hb.script_force_async.insert(sid);
+            if !is_conn {
+                hb.contextual_scripts.insert(sid);
+            }
+        }
+        hb.script_connect_hook.clone()
+    };
+    if is_conn {
+        if let Some(ref h) = hook {
+            for sid in scripts {
+                h(vm, sid);
+            }
+        }
+    }
+}
+
 fn set_inner_html_spec(
     vm: &mut JsVm,
     host: &SharedHost,
     nid: NodeId,
     markup: &str,
     allow_declarative_shadow: bool,
+    run_scripts: bool,
 ) -> Result<(), JsException> {
     let owner_doc = host.borrow().owner_doc_of(nid);
     let is_xml = host.borrow().is_xml_doc(owner_doc);
@@ -687,9 +844,12 @@ fn set_inner_html_spec(
         next_sibling: None,
     });
     if is_conn {
-        for n in added {
+        for &n in &added {
             notify_custom_element_subtree(vm, host, n, true);
         }
+    }
+    if run_scripts {
+        maybe_run_fragment_scripts(vm, host, &added, is_conn);
     }
     Ok(())
 }
@@ -699,6 +859,7 @@ fn set_outer_html_spec(
     host: &SharedHost,
     nid: NodeId,
     markup: &str,
+    run_scripts: bool,
 ) -> Result<(), JsException> {
     let owner_doc = host.borrow().owner_doc_of(nid);
     let is_xml = host.borrow().is_xml_doc(owner_doc);
@@ -776,9 +937,12 @@ fn set_outer_html_spec(
     });
     if is_conn {
         notify_custom_element_subtree(vm, host, nid, false);
-        for n in added {
+        for &n in &added {
             notify_custom_element_subtree(vm, host, n, true);
         }
+    }
+    if run_scripts {
+        maybe_run_fragment_scripts(vm, host, &added, is_conn);
     }
     Ok(())
 }
@@ -789,6 +953,7 @@ fn insert_adjacent_html_spec(
     nid: NodeId,
     pos_raw: &str,
     markup: &str,
+    run_scripts: bool,
 ) -> Result<(), JsException> {
     // ASCII case-insensitive match ONLY (non-ASCII Turkish 'İ'/'ı' must throw SyntaxError).
     let pos_kind = if pos_raw.eq_ignore_ascii_case("beforebegin") {
@@ -917,9 +1082,12 @@ fn insert_adjacent_html_spec(
         next_sibling: next_sib,
     });
     if is_conn {
-        for n in added {
+        for &n in &added {
             notify_custom_element_subtree(vm, host, n, true);
         }
+    }
+    if run_scripts {
+        maybe_run_fragment_scripts(vm, host, &added, is_conn);
     }
     Ok(())
 }

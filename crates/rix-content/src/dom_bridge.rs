@@ -209,11 +209,15 @@ pub struct HostState {
     pub(crate) dom_parser_proto: Option<HeapHandle>,
     pub(crate) sanitizer_proto: Option<HeapHandle>,
     pub(crate) sanitizers: HashMap<HeapHandle, crate::dom_sanitizer::SanitizerConfig>,
+    pub(crate) trusted_types: crate::trusted_types::TrustedTypesState,
+    pub(crate) doc_csp: HashMap<NodeId, crate::trusted_types::DocumentCspPolicy>,
     pub(crate) contextual_scripts: HashSet<NodeId>,
+    pub(crate) script_force_async: HashSet<NodeId>,
     pub(crate) upgraded_custom_elements: HashSet<NodeId>,
     pub(crate) pending_ce_upgrade_node: Option<NodeId>,
     pub(crate) iframe_connect_hook: Option<IframeConnectHook>,
     pub(crate) body_attr_handler_hook: Option<BodyAttrHandlerHook>,
+    pub(crate) script_connect_hook: Option<ScriptConnectHook>,
 }
 
 /// Callback invoked when an `<iframe>` element is connected into a live document.
@@ -221,6 +225,9 @@ pub(crate) type IframeConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
 
 /// Callback invoked when an `on*` attribute is set on `<body>`/`<frameset>`.
 pub(crate) type BodyAttrHandlerHook = Rc<dyn Fn(&mut JsVm, NodeId, &str, &str)>;
+
+/// Callback invoked when an executable fragment-created `<script>` element becomes connected.
+pub(crate) type ScriptConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
 
 /// Shared handle to [`HostState`].
 pub type SharedHost = Rc<RefCell<HostState>>;
@@ -302,11 +309,15 @@ impl HostState {
             dom_parser_proto: None,
             sanitizer_proto: None,
             sanitizers: HashMap::new(),
+            trusted_types: crate::trusted_types::TrustedTypesState::default(),
+            doc_csp: HashMap::new(),
             contextual_scripts: HashSet::new(),
+            script_force_async: HashSet::new(),
             upgraded_custom_elements: HashSet::new(),
             pending_ce_upgrade_node: None,
             iframe_connect_hook: None,
             body_attr_handler_hook: None,
+            script_connect_hook: None,
         }
     }
 
@@ -424,6 +435,7 @@ impl HostState {
         if let Some(sp) = self.sanitizer_proto {
             out.push(JsValue::from_object(sp));
         }
+        self.trusted_types.collect_roots(out);
         self.prototypes.collect_roots(out);
         for &proto in self.interface_protos.values() {
             out.push(JsValue::from_object(proto));
@@ -497,6 +509,7 @@ impl HostState {
         self.static_node_lists
             .retain(|h, _| heap.get_object(*h).is_some());
         self.traversals.retain(|h, _| heap.get_object(*h).is_some());
+        self.trusted_types.sweep_dead(heap);
         let removed = self.wrappers.sweep_dead(heap);
         if removed > 0 {
             let mut dead_nodes = Vec::new();
@@ -2190,7 +2203,9 @@ pub(crate) fn insert_node_into_parent(
         let iframe_hook = host.borrow().iframe_connect_hook.clone();
         for n in to_insert {
             notify_custom_element_subtree(vm, host, n, true);
-            // Execute any `<script>` nodes created by `Range.prototype.createContextualFragment()`.
+            // Execute any `<script>` nodes created by `Range.prototype.createContextualFragment()`
+            // or disconnected `*HTMLUnsafe({ runScripts: true })` / `stream*HTMLUnsafe({ runScripts: true })`.
+            let script_hook = host.borrow().script_connect_hook.clone();
             let scripts_to_run: Vec<(NodeId, String)> = {
                 let mut hb = host.borrow_mut();
                 if hb.contextual_scripts.is_empty() {
@@ -2218,7 +2233,9 @@ pub(crate) fn insert_node_into_parent(
                 }
             };
             for (sid, code) in scripts_to_run {
-                if !code.trim().is_empty() {
+                if let Some(ref hook) = script_hook {
+                    hook(vm, sid);
+                } else if !code.trim().is_empty() {
                     let prev = host.borrow().current_script;
                     host.borrow_mut().current_script = Some(sid);
                     let _ = vm.eval_script(&code);
@@ -4353,7 +4370,10 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
             if doc_id == hb.document.borrow().root() {
                 hb.ready_state.clone()
             } else {
-                "complete".to_string()
+                hb.doc_meta
+                    .get(&doc_id)
+                    .map(|m| m.ready_state.clone())
+                    .unwrap_or_else(|| "complete".to_string())
             }
         };
         Ok(JsValue::from_string(vm.heap.alloc_string(rs)))
@@ -4992,60 +5012,162 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         ))
     });
 
-    // document.write(...) / document.writeln(...) -> injects into paused HtmlParserStream
-    // or appends parsed fragment into sub-document's body when called outside active parse.
-    let h = Rc::clone(host);
-    define_host_method(vm, dp, "write", move |vm, t, args| {
-        let mut html = String::new();
-        for &a in args {
-            html.push_str(&vm.value_to_rust_string(a));
-        }
-        let doc_id = require_node(vm, &h, t).ok();
+    // document.open() / document.close() / document.write(...) / document.writeln(...)
+    fn open_doc_impl(h: &SharedHost, did: NodeId) {
         let main_root = h.borrow().document.borrow().root();
-        let parser_opt = if doc_id == Some(main_root) {
+        let removed: Vec<NodeId> = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            let children: Vec<NodeId> = doc.children(did).collect();
+            for &c in &children {
+                doc.remove_child(c);
+            }
+            children
+        };
+        {
+            let mut hb = h.borrow_mut();
+            if did == main_root {
+                hb.ready_state = "loading".to_string();
+            } else {
+                let url = hb.doc_url_for_node(did);
+                let meta = hb
+                    .doc_meta
+                    .entry(did)
+                    .or_insert_with(|| crate::dom_interfaces::DocumentMeta::html(url));
+                meta.ready_state = "loading".to_string();
+            }
+            hb.invalidate_dom_mutation(did, None);
+        }
+        if !removed.is_empty() {
+            h.borrow().emit_mutation(DomMutation::ChildList {
+                target: did,
+                added: Vec::new(),
+                removed,
+                previous_sibling: None,
+                next_sibling: None,
+            });
+        }
+    }
+    fn write_to_doc_impl(h: &SharedHost, did: NodeId, html: &str) {
+        let main_root = h.borrow().document.borrow().root();
+        let parser_opt = if did == main_root {
             h.borrow().active_parser.clone()
         } else {
             None
         };
         if let Some(parser) = parser_opt {
-            parser.borrow_mut().insert_document_write(&html);
-        } else if let Some(did) = doc_id {
-            let body = find_elements_by_tag(&h, did, "body")
-                .into_iter()
-                .next()
-                .or_else(|| h.borrow().document.borrow().document_element_of(did));
-            if let Some(target_el) = body {
-                let (frag_doc, roots) = parse_html_fragment(&html, None);
-                let mut added = Vec::new();
-                {
+            parser.borrow_mut().insert_document_write(html);
+            return;
+        }
+        let is_loading = {
+            let hb = h.borrow();
+            if did == main_root {
+                hb.ready_state == "loading"
+            } else {
+                hb.doc_meta
+                    .get(&did)
+                    .is_some_and(|m| m.ready_state == "loading")
+            }
+        };
+        if !is_loading {
+            open_doc_impl(h, did);
+        }
+        // Ensure `<html><head></head><body></body></html>` skeleton exists after implied `open()`.
+        let target_body = {
+            let existing_body = find_elements_by_tag(h, did, "body").into_iter().next();
+            if let Some(b) = existing_body {
+                b
+            } else {
+                let (html_el, body_el) = {
                     let doc_rc = Rc::clone(&h.borrow().document);
                     let mut doc = doc_rc.borrow_mut();
-                    for c in roots {
-                        let cloned = doc.clone_subtree_from(&frag_doc, c);
-                        doc.append_child(target_el, cloned);
-                        added.push(cloned);
-                    }
-                }
-                for &n in &added {
-                    h.borrow_mut().adopt_subtree(n, did);
-                }
+                    let html_el = doc.document_element_of(did).unwrap_or_else(|| {
+                        let he =
+                            doc.create_element_ns(crate::dom_interfaces::HTML_NS, None, "html");
+                        doc.append_child(did, he);
+                        he
+                    });
+                    let head_el =
+                        doc.create_element_ns(crate::dom_interfaces::HTML_NS, None, "head");
+                    let body_el =
+                        doc.create_element_ns(crate::dom_interfaces::HTML_NS, None, "body");
+                    doc.append_child(html_el, head_el);
+                    doc.append_child(html_el, body_el);
+                    (html_el, body_el)
+                };
+                h.borrow_mut().adopt_subtree(html_el, did);
+                body_el
+            }
+        };
+        let (frag_doc, roots) = parse_html_fragment(html, None);
+        let mut added = Vec::new();
+        {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            for c in roots {
+                let cloned = doc.clone_subtree_from(&frag_doc, c);
+                doc.append_child(target_body, cloned);
+                added.push(cloned);
             }
         }
-        Ok(JsValue::UNDEFINED)
-    });
-    let h = Rc::clone(host);
-    define_host_method(vm, dp, "writeln", move |vm, _, args| {
-        let mut html = String::new();
-        for &a in args {
-            html.push_str(&vm.value_to_rust_string(a));
+        for &n in &added {
+            h.borrow_mut().adopt_subtree(n, did);
         }
-        html.push('\n');
-        let parser_opt = h.borrow().active_parser.clone();
-        if let Some(parser) = parser_opt {
-            parser.borrow_mut().insert_document_write(&html);
-        }
-        Ok(JsValue::UNDEFINED)
-    });
+        h.borrow_mut().invalidate_dom_mutation(target_body, None);
+    }
+    {
+        let h = Rc::clone(host);
+        define_host_method(vm, dp, "open", move |vm, t, _| {
+            let did = require_node(vm, &h, t)?;
+            open_doc_impl(&h, did);
+            Ok(t)
+        });
+    }
+    {
+        let h = Rc::clone(host);
+        define_host_method(vm, dp, "close", move |vm, t, _| {
+            let did = require_node(vm, &h, t)?;
+            let main_root = h.borrow().document.borrow().root();
+            let mut hb = h.borrow_mut();
+            if did == main_root {
+                if hb.ready_state == "loading" {
+                    hb.ready_state = "interactive".to_string();
+                }
+            } else if let Some(meta) = hb.doc_meta.get_mut(&did) {
+                if meta.ready_state == "loading" {
+                    meta.ready_state = "interactive".to_string();
+                }
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+    {
+        let h = Rc::clone(host);
+        define_host_method(vm, dp, "write", move |vm, t, args| {
+            let mut html = String::new();
+            for &a in args {
+                html.push_str(&vm.value_to_rust_string(a));
+            }
+            if let Ok(did) = require_node(vm, &h, t) {
+                write_to_doc_impl(&h, did, &html);
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+    {
+        let h = Rc::clone(host);
+        define_host_method(vm, dp, "writeln", move |vm, t, args| {
+            let mut html = String::new();
+            for &a in args {
+                html.push_str(&vm.value_to_rust_string(a));
+            }
+            html.push('\n');
+            if let Ok(did) = require_node(vm, &h, t) {
+                write_to_doc_impl(&h, did, &html);
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+    }
 }
 
 fn install_shadow_root_prototype(vm: &mut JsVm, host: &SharedHost) {

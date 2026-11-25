@@ -33,6 +33,7 @@ pub struct DocumentMeta {
     pub character_set: String,
     pub quirks_mode: u8,
     pub default_view: Option<HeapHandle>,
+    pub ready_state: String,
 }
 
 impl DocumentMeta {
@@ -47,6 +48,7 @@ impl DocumentMeta {
             character_set: "UTF-8".to_string(),
             quirks_mode: 0,
             default_view: None,
+            ready_state: "complete".to_string(),
         }
     }
 
@@ -61,6 +63,7 @@ impl DocumentMeta {
             character_set: "UTF-8".to_string(),
             quirks_mode: 0,
             default_view: None,
+            ready_state: "complete".to_string(),
         }
     }
 
@@ -75,6 +78,7 @@ impl DocumentMeta {
             character_set: "UTF-8".to_string(),
             quirks_mode: 0,
             default_view: None,
+            ready_state: "complete".to_string(),
         }
     }
 }

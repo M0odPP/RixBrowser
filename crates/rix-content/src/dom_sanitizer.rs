@@ -7,6 +7,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use rix_dom::{
     is_valid_shadow_host_name, Document, ElementData, LocalName, Namespace, NodeData, NodeId,
@@ -23,8 +24,10 @@ use crate::dom_bridge::{
 use crate::dom_interfaces::{HTML_NS, SVG_NS};
 use crate::dom_parsing::to_dom_string;
 use crate::event_loop::{SharedEventLoop, TaskPriority};
-use crate::fetch_ws::SharedNetBridge;
+use crate::events::SharedEvents;
+use crate::fetch_ws::{AsyncNetEvent, SharedNetBridge};
 use crate::streams::{create_writable_stream_from_callbacks, SharedStreams};
+use crate::trusted_types::{check_trusted_html_parser_options, check_trusted_html_sink};
 use crate::web_apis::{create_dom_exception, SharedWebApis};
 
 /// Unsafe HTML/SVG elements stripped by the WHATWG safe sanitizer baseline.
@@ -296,15 +299,34 @@ impl InsertKind {
 pub fn install_dom_sanitizer_and_streaming(
     vm: &mut JsVm,
     host: &SharedHost,
+    events: &SharedEvents,
     event_loop: &SharedEventLoop,
     web_apis: &SharedWebApis,
     streams: &SharedStreams,
     net: &SharedNetBridge,
 ) {
+    // Register weak connected-script hook so `<script>` elements created by
+    // `createContextualFragment`, disconnected `*HTMLUnsafe({ runScripts: true })`,
+    // and Trusted Types `createParserOptions({ runScripts: true })` run inline sync
+    // and external scripts asynchronously (zero `Rc` cycles via `Weak`).
+    {
+        let wh = Rc::downgrade(host);
+        let wel = Rc::downgrade(event_loop);
+        let wwa = Rc::downgrade(web_apis);
+        let wn = Rc::downgrade(net);
+        host.borrow_mut().script_connect_hook = Some(Rc::new(move |vm, sid| {
+            let (Some(h), Some(el), Some(wa), Some(n)) =
+                (wh.upgrade(), wel.upgrade(), wwa.upgrade(), wn.upgrade())
+            else {
+                return;
+            };
+            run_fragment_script_now(vm, &h, &el, &wa, &n, sid);
+        }));
+    }
     install_sanitizer_ctor(vm, host);
     install_html_helper_reflections(vm, host, event_loop);
-    install_positional_html_methods(vm, host, event_loop, web_apis, net);
-    install_streaming_html_methods(vm, host, event_loop, web_apis, streams, net);
+    install_positional_html_methods(vm, host, events, event_loop, web_apis, net);
+    install_streaming_html_methods(vm, host, events, event_loop, web_apis, streams, net);
 }
 
 // ---------------------------------------------------------------------------
@@ -736,12 +758,12 @@ fn parse_sanitizer_config_dict(
 }
 
 #[derive(Debug, Clone)]
-struct ParsedMethodOptions {
-    sanitizer: SanitizerConfig,
-    run_scripts: bool,
+pub(crate) struct ParsedMethodOptions {
+    pub sanitizer: SanitizerConfig,
+    pub run_scripts: bool,
 }
 
-fn parse_html_method_options(
+pub(crate) fn parse_html_method_options(
     vm: &mut JsVm,
     host: &SharedHost,
     opts_val: JsValue,
@@ -883,18 +905,23 @@ fn install_html_helper_reflections(vm: &mut JsVm, host: &SharedHost, event_loop:
         install_str_attr_prop(vm, sp, host, "type", "type");
         for attr in ["defer", "async"] {
             let h1 = Rc::clone(host);
+            let is_async_prop = attr == "async";
             let g = vm.alloc_host_fn(attr, move |vm, t, _| {
                 let nid = require_node(vm, &h1, t)?;
+                let hb = h1.borrow();
                 let has = matches!(
-                    h1.borrow().document.borrow().get(nid),
+                    hb.document.borrow().get(nid),
                     Some(NodeData::Element(e)) if e.has_attribute(attr)
-                );
+                ) || (is_async_prop && hb.script_force_async.contains(&nid));
                 Ok(JsValue::from_bool(has))
             });
             let h2 = Rc::clone(host);
             let s = vm.alloc_host_fn(attr, move |vm, t, args| {
                 let nid = require_node(vm, &h2, t)?;
                 let on = vm.to_boolean(arg(args, 0));
+                if is_async_prop {
+                    h2.borrow_mut().script_force_async.remove(&nid);
+                }
                 if let Some(NodeData::Element(e)) = h2.borrow().document.borrow_mut().get_mut(nid) {
                     if on {
                         e.set_attribute(attr, "");
@@ -1791,51 +1818,28 @@ fn prepare_and_run_script(
     let Some(&MirrorEntry::Mapped(dst_script_id)) = st.mirror.get(&src_script_id) else {
         return;
     };
+    let is_connected = {
+        let hb = host.borrow();
+        let doc = hb.document.borrow();
+        doc.is_connected(dst_script_id) && hb.owner_doc_of(dst_script_id) == st.owner_doc
+    };
+    // Per HTML §4.12.1.1 / WHATWG #13079: fragment-parsed scripts (positional `*HTMLUnsafe`
+    // and disconnected streaming targets) retain `force_async = true`.
+    if !is_streaming || !is_connected {
+        host.borrow_mut().script_force_async.insert(dst_script_id);
+    }
+    if !is_connected {
+        // Not connected yet: leave unstarted so it executes when later connected!
+        host.borrow_mut().contextual_scripts.insert(dst_script_id);
+        return;
+    }
     if !st.started_scripts.insert(dst_script_id) {
         return;
     }
-    let script_info = {
-        let hb = host.borrow();
-        let doc = hb.document.borrow();
-        if !doc.is_connected(dst_script_id) || hb.owner_doc_of(dst_script_id) != st.owner_doc {
-            return;
-        }
-        let Some(NodeData::Element(el)) = doc.get(dst_script_id) else {
-            return;
-        };
-        if el.name.local.as_str() != "script" || (&*el.name.ns != HTML_NS && &*el.name.ns != SVG_NS)
-        {
-            return;
-        }
-        let script_type = el
-            .get_attribute("type")
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-        let is_module = script_type == "module";
-        let is_classic = script_type.is_empty()
-            || matches!(
-                script_type.as_str(),
-                "text/javascript"
-                    | "application/javascript"
-                    | "application/ecmascript"
-                    | "text/ecmascript"
-            );
-        if !is_module && !is_classic {
-            return;
-        }
-        let src_attr = el.get_attribute("src").map(ToString::to_string);
-        let is_defer = el.has_attribute("defer") && src_attr.is_some();
-        let is_async = el.has_attribute("async");
-        let mut inline_code = String::new();
-        for c in doc.descendants(dst_script_id) {
-            if let Some(NodeData::Text(t)) = doc.get(c) {
-                inline_code.push_str(t);
-            }
-        }
-        (src_attr, inline_code, is_defer, is_async, is_module)
+    let script_info = extract_executable_script_info(host, dst_script_id);
+    let Some((src_attr, inline_code, is_defer, is_async, is_module)) = script_info else {
+        return;
     };
-    let (src_attr, inline_code, is_defer, is_async, is_module) = script_info;
 
     // Defer & module scripts during streaming execute in queued tasks after `close()`!
     if is_streaming && (is_defer || (is_module && !is_async)) {
@@ -1845,35 +1849,185 @@ fn prepare_and_run_script(
     }
 
     if let Some(src) = src_attr {
-        let code_opt = fetch_script_source_sync(web_apis, net, &src);
-        if let Some(code) = code_opt {
-            if is_async || !is_streaming {
-                // External scripts in `setHTMLUnsafe` or `async` scripts run in a queued task.
-                let h_cb = Rc::clone(host);
-                event_loop
-                    .borrow_mut()
-                    .post_host_task(TaskPriority::Networking, move |vm| {
-                        eval_script_node(vm, &h_cb, dst_script_id, &code, is_module);
-                    });
-            } else {
-                eval_script_node(vm, host, dst_script_id, &code, is_module);
-            }
+        if is_async || !is_streaming {
+            schedule_async_external_script(
+                host,
+                event_loop,
+                web_apis,
+                net,
+                dst_script_id,
+                src,
+                is_module,
+            );
+        } else if let Some(code) = fetch_script_source_sync(web_apis, net, &src) {
+            eval_script_node(vm, host, dst_script_id, &code, is_module);
         }
     } else if !inline_code.trim().is_empty() {
         eval_script_node(vm, host, dst_script_id, &inline_code, is_module);
     }
 }
 
-fn eval_script_node(
+fn extract_executable_script_info(
+    host: &SharedHost,
+    dst_script_id: NodeId,
+) -> Option<(Option<String>, String, bool, bool, bool)> {
+    let hb = host.borrow();
+    let doc = hb.document.borrow();
+    let Some(NodeData::Element(el)) = doc.get(dst_script_id) else {
+        return None;
+    };
+    if el.name.local.as_str() != "script" || (&*el.name.ns != HTML_NS && &*el.name.ns != SVG_NS) {
+        return None;
+    }
+    let script_type = el
+        .get_attribute("type")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let is_module = script_type == "module";
+    let is_classic = script_type.is_empty()
+        || matches!(
+            script_type.as_str(),
+            "text/javascript"
+                | "application/javascript"
+                | "application/ecmascript"
+                | "text/ecmascript"
+        );
+    if !is_module && !is_classic {
+        return None;
+    }
+    let src_attr = el.get_attribute("src").map(ToString::to_string);
+    let is_defer = el.has_attribute("defer") && src_attr.is_some();
+    let is_async = el.has_attribute("async") || hb.script_force_async.contains(&dst_script_id);
+    let mut inline_code = String::new();
+    for c in doc.descendants(dst_script_id) {
+        if let Some(NodeData::Text(t)) = doc.get(c) {
+            inline_code.push_str(t);
+        }
+    }
+    Some((src_attr, inline_code, is_defer, is_async, is_module))
+}
+
+fn run_fragment_script_now(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
+    net: &SharedNetBridge,
+    script_nid: NodeId,
+) {
+    let Some((src_attr, inline_code, _is_defer, is_async, is_module)) =
+        extract_executable_script_info(host, script_nid)
+    else {
+        return;
+    };
+    if let Some(src) = src_attr {
+        if is_async {
+            schedule_async_external_script(
+                host, event_loop, web_apis, net, script_nid, src, is_module,
+            );
+        } else if let Some(code) = fetch_script_source_sync(web_apis, net, &src) {
+            eval_script_node(vm, host, script_nid, &code, is_module);
+        }
+    } else if !inline_code.trim().is_empty() {
+        eval_script_node(vm, host, script_nid, &inline_code, is_module);
+    }
+}
+
+fn schedule_async_external_script(
+    host: &SharedHost,
+    event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
+    net: &SharedNetBridge,
+    script_nid: NodeId,
+    src: String,
+    is_module: bool,
+) {
+    let trimmed = src.trim();
+    if trimmed.starts_with("data:") {
+        if let Some(code) = fetch_script_source_sync(web_apis, net, trimmed) {
+            let h_cb = Rc::clone(host);
+            event_loop
+                .borrow_mut()
+                .post_host_task(TaskPriority::Networking, move |vm| {
+                    eval_script_node(vm, &h_cb, script_nid, &code, is_module);
+                });
+        }
+        return;
+    }
+    let resolved = url::Url::parse(&web_apis.borrow().current_href())
+        .ok()
+        .and_then(|base| base.join(trimmed).ok())
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| trimmed.to_string());
+    if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
+        let engine = Arc::clone(&net.borrow().fetch_engine);
+        let tx = net.borrow().async_tx.clone();
+        let origin = web_apis.borrow().current_origin();
+        rt_handle.spawn(async move {
+            let req = rix_net::FetchRequest {
+                url: resolved,
+                method: "GET".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+                mode: rix_net::FetchMode::Cors,
+                credentials: rix_net::FetchCredentials::SameOrigin,
+                redirect: rix_net::FetchRedirect::Follow,
+                origin,
+                abort_signal: None,
+            };
+            if let Ok(resp) = engine.fetch(req).await {
+                let code = String::from_utf8_lossy(&resp.body).into_owned();
+                let _ = tx.send(AsyncNetEvent::ExternalScriptLoaded {
+                    script_nid,
+                    is_module,
+                    code,
+                });
+            }
+        });
+    } else if let Some(code) = fetch_script_source_sync(web_apis, net, &resolved) {
+        let h_cb = Rc::clone(host);
+        event_loop
+            .borrow_mut()
+            .post_host_task(TaskPriority::Networking, move |vm| {
+                eval_script_node(vm, &h_cb, script_nid, &code, is_module);
+            });
+    }
+}
+
+pub(crate) fn eval_script_node(
     vm: &mut JsVm,
     host: &SharedHost,
     script_nid: NodeId,
     code: &str,
     is_module: bool,
 ) {
+    let owner_doc = host.borrow().owner_doc_of(script_nid);
+    let main_root = host.borrow().document.borrow().root();
     let prev = host.borrow().current_script;
     host.borrow_mut().current_script = if is_module { None } else { Some(script_nid) };
-    let _ = vm.eval_script(code);
+    if owner_doc != main_root {
+        // Bind `document` on global scope to the script's owning sub-document (e.g. iframe)
+        // so `document.write()` / `document.open()` inside streamed iframe scripts targets it!
+        let k_doc = vm.heap.intern_key("document");
+        let prev_doc_val = vm.get_property_by_key(vm.global, k_doc).ok();
+        let sub_doc_val = wrap_node(vm, host, owner_doc);
+        let g = vm.global;
+        vm.heap.object_define_data(
+            g,
+            k_doc,
+            sub_doc_val,
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+        let _ = vm.eval_script(code);
+        if let Some(orig) = prev_doc_val {
+            vm.heap
+                .object_define_data(g, k_doc, orig, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        }
+    } else {
+        let _ = vm.eval_script(code);
+    }
     host.borrow_mut().current_script = prev;
 }
 
@@ -2033,9 +2187,28 @@ fn perform_immediate_removal(
 // Positional HTML Insertion Methods (12 methods)
 // ---------------------------------------------------------------------------
 
+fn trusted_sink_name(
+    host: &SharedHost,
+    self_nid: NodeId,
+    kind: InsertKind,
+    method: &str,
+) -> String {
+    if kind.is_sibling() {
+        format!("Node {method}")
+    } else if matches!(
+        host.borrow().document.borrow().get(self_nid),
+        Some(NodeData::ShadowRoot { .. })
+    ) {
+        format!("ShadowRoot {method}")
+    } else {
+        format!("Element {method}")
+    }
+}
+
 fn install_positional_html_methods(
     vm: &mut JsVm,
     host: &SharedHost,
+    events: &SharedEvents,
     event_loop: &SharedEventLoop,
     web_apis: &SharedWebApis,
     net: &SharedNetBridge,
@@ -2055,7 +2228,7 @@ fn install_positional_html_methods(
     for &(name, kind, is_safe) in container_methods {
         for proto in [ep, srp] {
             install_one_positional_method(
-                vm, proto, name, kind, is_safe, host, event_loop, web_apis, net,
+                vm, proto, name, kind, is_safe, host, events, event_loop, web_apis, net,
             );
         }
     }
@@ -2071,7 +2244,7 @@ fn install_positional_html_methods(
     for &(name, kind, is_safe) in sibling_methods {
         for proto in [ep, cdp] {
             install_one_positional_method(
-                vm, proto, name, kind, is_safe, host, event_loop, web_apis, net,
+                vm, proto, name, kind, is_safe, host, events, event_loop, web_apis, net,
             );
         }
     }
@@ -2085,11 +2258,13 @@ fn install_one_positional_method(
     kind: InsertKind,
     is_safe: bool,
     host: &SharedHost,
+    events: &SharedEvents,
     event_loop: &SharedEventLoop,
     web_apis: &SharedWebApis,
     net: &SharedNetBridge,
 ) {
     let h = Rc::clone(host);
+    let evs = Rc::clone(events);
     let el = Rc::clone(event_loop);
     let wa = Rc::clone(web_apis);
     let n = Rc::clone(net);
@@ -2098,12 +2273,38 @@ fn install_one_positional_method(
         if args.is_empty() {
             return Err(vm.type_error(format!("{name} requires at least 1 argument")));
         }
-        let markup = to_dom_string(vm, arg(args, 0))?;
+        let html_arg = arg(args, 0);
+        let opts_arg = arg(args, 1);
+        let (markup, pre_opts) = if is_safe {
+            let markup = to_dom_string(vm, html_arg)?;
+            (markup, None)
+        } else {
+            let sink_name = trusted_sink_name(&h, self_nid, kind, name);
+            let trusted_opts = check_trusted_html_parser_options(
+                vm, &h, &evs, &el, self_nid, &sink_name, opts_arg, true,
+            )?;
+            if let Some(opts) = trusted_opts {
+                let markup = if let Some(s) = h.borrow().trusted_types.is_trusted_html(html_arg) {
+                    s
+                } else {
+                    to_dom_string(vm, html_arg)?
+                };
+                (markup, Some(opts))
+            } else {
+                let markup = check_trusted_html_sink(
+                    vm, &h, &evs, &el, self_nid, &sink_name, html_arg, false,
+                )?;
+                (markup, None)
+            }
+        };
         let Some(target) = resolve_target_for_html_method(vm, &h, self_nid, kind, false, is_safe)?
         else {
             return Ok(JsValue::UNDEFINED);
         };
-        let opts = parse_html_method_options(vm, &h, arg(args, 1), is_safe)?;
+        let opts = match pre_opts {
+            Some(o) => o,
+            None => parse_html_method_options(vm, &h, opts_arg, is_safe)?,
+        };
 
         if kind.removes_immediately() {
             perform_immediate_removal(vm, &h, self_nid, &target, kind);
@@ -2138,9 +2339,11 @@ fn install_one_positional_method(
 // Streaming HTML Methods (12 methods)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn install_streaming_html_methods(
     vm: &mut JsVm,
     host: &SharedHost,
+    events: &SharedEvents,
     event_loop: &SharedEventLoop,
     web_apis: &SharedWebApis,
     streams: &SharedStreams,
@@ -2161,7 +2364,7 @@ fn install_streaming_html_methods(
     for &(name, kind, is_safe) in container_methods {
         for proto in [ep, srp] {
             install_one_streaming_method(
-                vm, proto, name, kind, is_safe, host, event_loop, web_apis, streams, net,
+                vm, proto, name, kind, is_safe, host, events, event_loop, web_apis, streams, net,
             );
         }
     }
@@ -2181,7 +2384,7 @@ fn install_streaming_html_methods(
     for &(name, kind, is_safe) in sibling_methods {
         for proto in [ep, cdp] {
             install_one_streaming_method(
-                vm, proto, name, kind, is_safe, host, event_loop, web_apis, streams, net,
+                vm, proto, name, kind, is_safe, host, events, event_loop, web_apis, streams, net,
             );
         }
     }
@@ -2195,18 +2398,39 @@ fn install_one_streaming_method(
     kind: InsertKind,
     is_safe: bool,
     host: &SharedHost,
+    events: &SharedEvents,
     event_loop: &SharedEventLoop,
     web_apis: &SharedWebApis,
     streams: &SharedStreams,
     net: &SharedNetBridge,
 ) {
     let h = Rc::clone(host);
+    let evs = Rc::clone(events);
     let el = Rc::clone(event_loop);
     let wa = Rc::clone(web_apis);
     let ss = Rc::clone(streams);
     let n = Rc::clone(net);
     define_host_method(vm, proto, name, move |vm, this_val, args| {
         let self_nid = require_node(vm, &h, this_val)?;
+        // Per WHATWG HTML streaming methods + W3C Trusted Types:
+        // for unsafe methods, vet `TrustedHTMLParserOptions` BEFORE hierarchy checks,
+        // parent/sibling capture, or clearing children; for safe methods (and unvetted
+        // options), validate target hierarchy BEFORE validating the sanitizer config!
+        let pre_opts = if is_safe {
+            None
+        } else {
+            let sink_name = trusted_sink_name(&h, self_nid, kind, name);
+            check_trusted_html_parser_options(
+                vm,
+                &h,
+                &evs,
+                &el,
+                self_nid,
+                &sink_name,
+                arg(args, 0),
+                false,
+            )?
+        };
         let Some(target) = resolve_target_for_html_method(vm, &h, self_nid, kind, true, is_safe)?
         else {
             return Err(create_dom_exception(
@@ -2215,7 +2439,10 @@ fn install_one_streaming_method(
                 "Invalid target for HTML streaming method",
             ));
         };
-        let opts = parse_html_method_options(vm, &h, arg(args, 0), is_safe)?;
+        let opts = match pre_opts {
+            Some(o) => o,
+            None => parse_html_method_options(vm, &h, arg(args, 0), is_safe)?,
+        };
 
         if kind.removes_immediately() {
             perform_immediate_removal(vm, &h, self_nid, &target, kind);
@@ -2462,46 +2689,28 @@ fn extract_script_action(
     let &MirrorEntry::Mapped(dst_script_id) = st.mirror.get(&src_script_id)? else {
         return None;
     };
+    let (is_connected, same_doc) = {
+        let hb = host.borrow();
+        let doc = hb.document.borrow();
+        (
+            doc.is_connected(dst_script_id),
+            hb.owner_doc_of(dst_script_id) == st.owner_doc,
+        )
+    };
+    if !is_connected {
+        let mut hb = host.borrow_mut();
+        hb.script_force_async.insert(dst_script_id);
+        hb.contextual_scripts.insert(dst_script_id);
+        return None;
+    }
+    if !same_doc {
+        return None;
+    }
     if !st.started_scripts.insert(dst_script_id) {
         return None;
     }
-    let hb = host.borrow();
-    let doc = hb.document.borrow();
-    if !doc.is_connected(dst_script_id) || hb.owner_doc_of(dst_script_id) != st.owner_doc {
-        return None;
-    }
-    let Some(NodeData::Element(el)) = doc.get(dst_script_id) else {
-        return None;
-    };
-    if el.name.local.as_str() != "script" || (&*el.name.ns != HTML_NS && &*el.name.ns != SVG_NS) {
-        return None;
-    }
-    let script_type = el
-        .get_attribute("type")
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    let is_module = script_type == "module";
-    let is_classic = script_type.is_empty()
-        || matches!(
-            script_type.as_str(),
-            "text/javascript"
-                | "application/javascript"
-                | "application/ecmascript"
-                | "text/ecmascript"
-        );
-    if !is_module && !is_classic {
-        return None;
-    }
-    let src_attr = el.get_attribute("src").map(ToString::to_string);
-    let is_defer = el.has_attribute("defer") && src_attr.is_some();
-    let is_async = el.has_attribute("async");
-    let mut inline_code = String::new();
-    for c in doc.descendants(dst_script_id) {
-        if let Some(NodeData::Text(t)) = doc.get(c) {
-            inline_code.push_str(t);
-        }
-    }
+    let (src_attr, inline_code, is_defer, is_async, is_module) =
+        extract_executable_script_info(host, dst_script_id)?;
     Some((
         dst_script_id,
         src_attr,
@@ -2531,17 +2740,10 @@ fn dispatch_stream_script(
             .deferred_scripts
             .push((dst_sid, src_attr, inline_code, is_mod));
     } else if let Some(src) = src_attr {
-        if let Some(code) = fetch_script_source_sync(web_apis, net, &src) {
-            if is_async {
-                let h_cb = Rc::clone(host);
-                event_loop
-                    .borrow_mut()
-                    .post_host_task(TaskPriority::Networking, move |vm| {
-                        eval_script_node(vm, &h_cb, dst_sid, &code, is_mod);
-                    });
-            } else {
-                eval_script_node(vm, host, dst_sid, &code, is_mod);
-            }
+        if is_async {
+            schedule_async_external_script(host, event_loop, web_apis, net, dst_sid, src, is_mod);
+        } else if let Some(code) = fetch_script_source_sync(web_apis, net, &src) {
+            eval_script_node(vm, host, dst_sid, &code, is_mod);
         }
     } else if !inline_code.trim().is_empty() {
         eval_script_node(vm, host, dst_sid, &inline_code, is_mod);
