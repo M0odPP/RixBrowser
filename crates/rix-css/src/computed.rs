@@ -2285,7 +2285,10 @@ pub fn apply_declaration(
             Arc::make_mut(&mut style.visual).outline_style = *s;
         }
         (PropertyIdKind::OutlineWidth, PropertyValue::Number(w)) => {
-            Arc::make_mut(&mut style.visual).outline_width = *w;
+            Arc::make_mut(&mut style.visual).outline_width = w.max(0.0);
+        }
+        (PropertyIdKind::OutlineWidth, PropertyValue::Length(lp)) => {
+            Arc::make_mut(&mut style.visual).outline_width = lp.resolve_px(0.0, eval).max(0.0);
         }
         (PropertyIdKind::OutlineOffset, PropertyValue::Length(l)) => {
             Arc::make_mut(&mut style.visual).outline_offset = l.clone();
@@ -2910,7 +2913,7 @@ pub fn apply_declaration(
             }
             for (i, slot) in trs.iter_mut().enumerate() {
                 if !fns.is_empty() {
-                    slot.timing = fns[i % fns.len()];
+                    slot.timing = fns[i % fns.len()].clone();
                 }
             }
         }
@@ -2972,7 +2975,7 @@ pub fn apply_declaration(
             }
             for (i, slot) in anims.iter_mut().enumerate() {
                 if !fns.is_empty() {
-                    slot.timing = fns[i % fns.len()];
+                    slot.timing = fns[i % fns.len()].clone();
                 }
             }
         }

@@ -1648,7 +1648,20 @@ pub enum ClipPathValue {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+/// W3C CSS Easing Level 1 step position keyword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum StepPositionMode {
+    Start,
+    #[default]
+    End,
+    JumpStart,
+    JumpEnd,
+    JumpNone,
+    JumpBoth,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum TimingFunction {
     Linear,
     #[default]
@@ -1657,44 +1670,176 @@ pub enum TimingFunction {
     EaseOut,
     EaseInOut,
     CubicBezier(f64, f64, f64, f64),
-    Steps(u32, bool),
+    Steps(u32, StepPositionMode),
+    /// W3C CSS Easing Level 2 `linear(...)` piecewise linear stop list `(input, output)`.
+    LinearStops(Box<[(f64, f64)]>),
 }
 
 impl TimingFunction {
-    /// Evaluates the CSS easing curve at normalized progress `t` in `[0.0, 1.0]` in `f64` precision.
+    /// Evaluates the CSS easing curve at progress `t` in `f64` precision with optional
+    /// W3C Web Animations / CSS Easing Level 1 `before_flag` (for step discontinuities
+    /// and cubic-bezier extrapolation outside `[0.0, 1.0]`).
     #[must_use]
-    pub fn evaluate_f64(self, t: f64) -> f64 {
-        let t = t.clamp(0.0, 1.0);
+    pub fn evaluate_f64_with_before_flag(&self, t: f64, before_flag: bool) -> f64 {
         match self {
             Self::Linear => t,
             Self::Ease => eval_cubic_bezier(0.25, 0.1, 0.25, 1.0, t),
             Self::EaseIn => eval_cubic_bezier(0.42, 0.0, 1.0, 1.0, t),
             Self::EaseOut => eval_cubic_bezier(0.0, 0.0, 0.58, 1.0, t),
             Self::EaseInOut => eval_cubic_bezier(0.42, 0.0, 0.58, 1.0, t),
-            Self::CubicBezier(x1, y1, x2, y2) => eval_cubic_bezier(x1, y1, x2, y2, t),
-            Self::Steps(count, jump_start) => {
-                let n = f64::from(count.max(1));
-                if jump_start {
-                    ((t * n).floor() + 1.0).min(n) / n
-                } else {
-                    (t * n).floor() / n
+            Self::CubicBezier(x1, y1, x2, y2) => eval_cubic_bezier(*x1, *y1, *x2, *y2, t),
+            Self::Steps(count, pos) => {
+                let n = f64::from((*count).max(1));
+                let mut step = (t * n).floor();
+                if matches!(
+                    pos,
+                    StepPositionMode::Start
+                        | StepPositionMode::JumpStart
+                        | StepPositionMode::JumpBoth
+                ) {
+                    step += 1.0;
                 }
+                if before_flag && ((t * n) - (t * n).round()).abs() < 1e-12 {
+                    step -= 1.0;
+                }
+                if t >= 0.0 && step < 0.0 {
+                    step = 0.0;
+                }
+                let jumps = match pos {
+                    StepPositionMode::Start
+                    | StepPositionMode::End
+                    | StepPositionMode::JumpStart
+                    | StepPositionMode::JumpEnd => n,
+                    StepPositionMode::JumpNone => (n - 1.0).max(1.0),
+                    StepPositionMode::JumpBoth => n + 1.0,
+                };
+                if t <= 1.0 && step > jumps {
+                    step = jumps;
+                }
+                step / jumps
             }
+            Self::LinearStops(stops) => eval_linear_stops(stops, t),
         }
+    }
+
+    /// Evaluates the CSS easing curve at normalized progress `t` in `[0.0, 1.0]` in `f64` precision.
+    #[must_use]
+    pub fn evaluate_f64(&self, t: f64) -> f64 {
+        self.evaluate_f64_with_before_flag(t.clamp(0.0, 1.0), false)
     }
 
     /// Evaluates the CSS easing curve at normalized progress `t` in `[0.0, 1.0]`.
     #[must_use]
-    pub fn evaluate(self, t: f32) -> f32 {
+    pub fn evaluate(&self, t: f32) -> f32 {
         self.evaluate_f64(f64::from(t)) as f32
+    }
+
+    /// Returns canonical CSS Easing Level 1/2 serialization for this timing function.
+    #[must_use]
+    pub fn to_css_string(&self) -> String {
+        match self {
+            Self::Linear => "linear".to_string(),
+            Self::Ease => "ease".to_string(),
+            Self::EaseIn => "ease-in".to_string(),
+            Self::EaseOut => "ease-out".to_string(),
+            Self::EaseInOut => "ease-in-out".to_string(),
+            Self::CubicBezier(a, b, c, d) => {
+                use crate::values_math::format_math_f64;
+                format!(
+                    "cubic-bezier({}, {}, {}, {})",
+                    format_math_f64(*a),
+                    format_math_f64(*b),
+                    format_math_f64(*c),
+                    format_math_f64(*d)
+                )
+            }
+            Self::Steps(n, pos) => match pos {
+                StepPositionMode::End | StepPositionMode::JumpEnd => format!("steps({n})"),
+                StepPositionMode::Start => format!("steps({n}, start)"),
+                StepPositionMode::JumpStart => format!("steps({n}, jump-start)"),
+                StepPositionMode::JumpNone => format!("steps({n}, jump-none)"),
+                StepPositionMode::JumpBoth => format!("steps({n}, jump-both)"),
+            },
+            Self::LinearStops(stops) => {
+                use crate::values_math::format_math_f64;
+                let parts: Vec<String> = stops
+                    .iter()
+                    .map(|&(inp, out)| {
+                        format!("{} {}%", format_math_f64(out), format_math_f64(inp * 100.0))
+                    })
+                    .collect();
+                format!("linear({})", parts.join(", "))
+            }
+        }
     }
 }
 
+fn eval_linear_stops(stops: &[(f64, f64)], t: f64) -> f64 {
+    if stops.is_empty() {
+        return t;
+    }
+    if stops.len() == 1 {
+        return stops[0].1;
+    }
+    if t < stops[0].0 {
+        let (x0, y0) = stops[0];
+        if let Some(&(x1, y1)) = stops.iter().find(|&&(x, _)| x > x0) {
+            return y0 + (y1 - y0) * ((t - x0) / (x1 - x0));
+        }
+        return y0;
+    }
+    let last = stops[stops.len() - 1];
+    if t >= last.0 {
+        if t == last.0 {
+            return last.1;
+        }
+        if let Some(&(x0, y0)) = stops.iter().rev().find(|&&(x, _)| x < last.0) {
+            return last.1 + (last.1 - y0) * ((t - last.0) / (last.0 - x0));
+        }
+        return last.1;
+    }
+    // Find last stop with input <= t and next stop after it.
+    let mut idx = 0usize;
+    for (i, &(x, _)) in stops.iter().enumerate() {
+        if x <= t {
+            idx = i;
+        } else {
+            break;
+        }
+    }
+    let (x0, y0) = stops[idx];
+    let (x1, y1) = stops[(idx + 1).min(stops.len() - 1)];
+    if (x1 - x0).abs() < 1e-12 {
+        return y1;
+    }
+    y0 + (y1 - y0) * ((t - x0) / (x1 - x0))
+}
+
 fn eval_cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, x: f64) -> f64 {
-    if x <= 0.0 {
+    if x < 0.0 {
+        let slope = if x1 > 0.0 {
+            y1 / x1
+        } else if y1 == 0.0 && x2 > 0.0 {
+            y2 / x2
+        } else {
+            0.0
+        };
+        return slope * x;
+    }
+    if x == 0.0 {
         return 0.0;
     }
-    if x >= 1.0 {
+    if x > 1.0 {
+        let slope = if x2 < 1.0 {
+            (1.0 - y2) / (1.0 - x2)
+        } else if y2 == 1.0 && x1 < 1.0 {
+            (1.0 - y1) / (1.0 - x1)
+        } else {
+            0.0
+        };
+        return 1.0 + slope * (x - 1.0);
+    }
+    if x == 1.0 {
         return 1.0;
     }
     let sample_x = |u: f64| {
@@ -2056,7 +2201,7 @@ pub fn convert_overflow(ov: &OverflowKeyword) -> OverflowMode {
 
 #[must_use]
 pub fn convert_alpha(alpha: &AlphaValue) -> f32 {
-    alpha.0.clamp(0.0, 1.0)
+    alpha.0
 }
 
 #[must_use]
@@ -2804,7 +2949,12 @@ pub fn convert_easing(ef: &EasingFunction) -> TimingFunction {
         ),
         EasingFunction::Steps { count, position } => TimingFunction::Steps(
             (*count).max(1) as u32,
-            matches!(position, StepPosition::Start | StepPosition::JumpBoth),
+            match position {
+                StepPosition::Start => StepPositionMode::Start,
+                StepPosition::End => StepPositionMode::End,
+                StepPosition::JumpNone => StepPositionMode::JumpNone,
+                StepPosition::JumpBoth => StepPositionMode::JumpBoth,
+            },
         ),
     }
 }

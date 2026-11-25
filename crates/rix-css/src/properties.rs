@@ -21,12 +21,12 @@ use crate::values::{
     angle_to_deg, convert_align_content, convert_align_items, convert_align_self, convert_alpha,
     convert_animation, convert_animation_direction, convert_animation_fill,
     convert_animation_iteration, convert_animation_name, convert_animation_play_state,
-    convert_background_layer, convert_blend_mode, convert_border_width, convert_border_width_lp,
-    convert_box_shadow, convert_clip_path, convert_color, convert_corner_radius, convert_cursor,
-    convert_direction, convert_display, convert_easing, convert_filter, convert_flex_direction,
-    convert_flex_wrap, convert_font_family_name, convert_font_size, convert_font_style,
-    convert_font_weight, convert_grid_auto_flow, convert_image, convert_justify_content,
-    convert_justify_items, convert_justify_self, convert_length, convert_length_percentage,
+    convert_background_layer, convert_blend_mode, convert_border_width_lp, convert_box_shadow,
+    convert_clip_path, convert_color, convert_corner_radius, convert_cursor, convert_direction,
+    convert_display, convert_easing, convert_filter, convert_flex_direction, convert_flex_wrap,
+    convert_font_family_name, convert_font_size, convert_font_style, convert_font_weight,
+    convert_grid_auto_flow, convert_image, convert_justify_content, convert_justify_items,
+    convert_justify_self, convert_length, convert_length_percentage,
     convert_length_percentage_or_auto, convert_length_value, convert_line_height,
     convert_line_style, convert_max_size, convert_overflow, convert_overflow_wrap,
     convert_position, convert_size, convert_spacing, convert_text_align,
@@ -3663,8 +3663,8 @@ fn parse_timing_fn_from_parser<'i, 't>(p: &mut cssparser::Parser<'i, 't>) -> Opt
             "ease-in" => Some((TimingFunction::EaseIn, "ease-in".to_string())),
             "ease-out" => Some((TimingFunction::EaseOut, "ease-out".to_string())),
             "ease-in-out" => Some((TimingFunction::EaseInOut, "ease-in-out".to_string())),
-            "step-start" => Some((TimingFunction::Steps(1, true), "steps(1, start)".to_string())),
-            "step-end" => Some((TimingFunction::Steps(1, false), "steps(1, end)".to_string())),
+            "step-start" => Some((TimingFunction::Steps(1, crate::values::StepPositionMode::Start), "steps(1, start)".to_string())),
+            "step-end" => Some((TimingFunction::Steps(1, crate::values::StepPositionMode::End), "steps(1)".to_string())),
             _ => { p.reset(&st); None }
         },
         cssparser::Token::Function(ref fname) if fname.eq_ignore_ascii_case("cubic-bezier") => {
@@ -3682,8 +3682,59 @@ fn parse_timing_fn_from_parser<'i, 't>(p: &mut cssparser::Parser<'i, 't>) -> Opt
                     || !y1.is_finite() || !y2.is_finite() {
                     return Err(n.new_custom_error(()));
                 }
-                let fmt = |v: f64| if v == 0.0 { "0".to_string() } else { format!("{v}") };
-                Ok((TimingFunction::CubicBezier(x1, y1, x2, y2), format!("cubic-bezier({}, {}, {}, {})", fmt(x1), fmt(y1), fmt(x2), fmt(y2))))
+                let tf = TimingFunction::CubicBezier(x1, y1, x2, y2);
+                let canon = tf.to_css_string();
+                Ok((tf, canon))
+            }).ok();
+            if res.is_none() { p.reset(&st); }
+            res
+        }
+        cssparser::Token::Function(ref fname) if fname.eq_ignore_ascii_case("linear") => {
+            let res = p.parse_nested_block(|n| -> Result<(TimingFunction, String), cssparser::ParseError<'i, ()>> {
+                let mut raw_stops: Vec<(f64, Option<f64>)> = Vec::new();
+                loop {
+                    let s = n.position();
+                    let out_f = n.expect_number()?;
+                    let out = n.slice_from(s).trim().parse::<f64>().unwrap_or(f64::from(out_f));
+                    if !out.is_finite() { return Err(n.new_custom_error(())); }
+                    let p1 = n.try_parse(|p| p.expect_percentage().map(f64::from)).ok();
+                    let p2 = if p1.is_some() {
+                        n.try_parse(|p| p.expect_percentage().map(f64::from)).ok()
+                    } else { None };
+                    raw_stops.push((out, p1));
+                    if let Some(in2) = p2 {
+                        raw_stops.push((out, Some(in2)));
+                    }
+                    if n.try_parse(cssparser::Parser::expect_comma).is_err() { break; }
+                }
+                if raw_stops.len() < 2 || !n.is_exhausted() { return Err(n.new_custom_error(())); }
+                // W3C CSS Easing L2: normalize missing input positions & enforce monotonicity.
+                if raw_stops[0].1.is_none() { raw_stops[0].1 = Some(0.0); }
+                let last_i = raw_stops.len() - 1;
+                if raw_stops[last_i].1.is_none() { raw_stops[last_i].1 = Some(1.0); }
+                let mut max_seen = f64::NEG_INFINITY;
+                for item in &mut raw_stops {
+                    if let Some(v) = item.1 {
+                        let clamped = v.max(max_seen);
+                        max_seen = clamped;
+                        item.1 = Some(clamped);
+                    }
+                }
+                let mut prev_idx = 0usize;
+                for i in 1..raw_stops.len() {
+                    if let Some(end_in) = raw_stops[i].1 {
+                        let start_in = raw_stops[prev_idx].1.unwrap_or(0.0);
+                        let span = i - prev_idx;
+                        for j in 1..span {
+                            raw_stops[prev_idx + j].1 = Some(start_in + (end_in - start_in) * (j as f64 / span as f64));
+                        }
+                        prev_idx = i;
+                    }
+                }
+                let stops: Box<[(f64, f64)]> = raw_stops.into_iter().map(|(out, inp)| (inp.unwrap_or(0.0), out)).collect();
+                let tf = TimingFunction::LinearStops(stops);
+                let canon = tf.to_css_string();
+                Ok((tf, canon))
             }).ok();
             if res.is_none() { p.reset(&st); }
             res
@@ -3692,17 +3743,25 @@ fn parse_timing_fn_from_parser<'i, 't>(p: &mut cssparser::Parser<'i, 't>) -> Opt
             let res = p.parse_nested_block(|n| -> Result<(TimingFunction, String), cssparser::ParseError<'i, ()>> {
                 let cnt = n.expect_integer()?;
                 if cnt < 1 { return Err(n.new_custom_error(())); }
-                let (jump_start, pos_s) = if n.try_parse(cssparser::Parser::expect_comma).is_ok() {
+                let pos_mode = if n.try_parse(cssparser::Parser::expect_comma).is_ok() {
                     let pos = n.expect_ident()?.to_ascii_lowercase();
                     match pos.as_str() {
-                        "start" | "jump-start" | "jump-both" => (true, pos),
-                        "end" | "jump-end" | "jump-none" => (false, pos),
+                        "start" => crate::values::StepPositionMode::Start,
+                        "jump-start" => crate::values::StepPositionMode::JumpStart,
+                        "jump-both" => crate::values::StepPositionMode::JumpBoth,
+                        "end" => crate::values::StepPositionMode::End,
+                        "jump-end" => crate::values::StepPositionMode::JumpEnd,
+                        "jump-none" => {
+                            if cnt < 2 { return Err(n.new_custom_error(())); }
+                            crate::values::StepPositionMode::JumpNone
+                        }
                         _ => return Err(n.new_custom_error(())),
                     }
-                } else { (false, "end".to_string()) };
+                } else { crate::values::StepPositionMode::End };
                 if !n.is_exhausted() { return Err(n.new_custom_error(())); }
-                let spec = if pos_s == "end" || pos_s == "jump-end" { format!("steps({cnt})") } else { format!("steps({cnt}, {pos_s})") };
-                Ok((TimingFunction::Steps(cnt as u32, jump_start), spec))
+                let tf = TimingFunction::Steps(cnt as u32, pos_mode);
+                let canon = tf.to_css_string();
+                Ok((tf, canon))
             }).ok();
             if res.is_none() { p.reset(&st); }
             res
@@ -5902,7 +5961,7 @@ fn compile_property(
             out,
             ord,
             PropertyIdKind::OutlineWidth,
-            PropertyValue::Number(convert_border_width(w)),
+            PropertyValue::Length(convert_border_width_lp(w)),
             imp,
         ),
         Property::OutlineColor(c) => {
@@ -5921,7 +5980,7 @@ fn compile_property(
                 out,
                 ord,
                 PropertyIdKind::OutlineWidth,
-                PropertyValue::Number(convert_border_width(&o.width)),
+                PropertyValue::Length(convert_border_width_lp(&o.width)),
                 imp,
             );
             if let Some(c) = convert_color(&o.color) {

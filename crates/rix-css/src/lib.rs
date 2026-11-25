@@ -19,7 +19,8 @@ pub mod values;
 pub mod values_math;
 
 pub use animations::{
-    ActiveTransition, AnimationStateSnapshot, WebAnimationKeyframe, WebAnimationSpec,
+    compute_effect_timing, ActiveTransition, AnimationStateSnapshot, ComputedEffectTiming,
+    EffectPhase, EffectTimingInput, WebAnimationKeyframe, WebAnimationSpec,
 };
 pub use cascade::{RestyleReport, StyleContext, StyleMemo};
 pub use color::{
@@ -84,9 +85,9 @@ pub use values::{
     InterpolateSizeMode, LengthPercentage, LengthPercentageAuto, LengthUnit, LineHeightValue,
     LineStyle, MixBlendMode, OverflowMode, OverflowPair, OverflowWrapMode, OverlayMode,
     OverscrollBehaviorMode, PointerEventsMode, PositionMode, ReadingFlowMode, ResizeMode,
-    ScrollBehaviorMode, SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode,
-    TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode, TextTransformMode,
-    TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec,
-    UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode,
-    ZIndexValue,
+    ScrollBehaviorMode, SizeValue, StepPositionMode, TableLayoutMode, TextAlignLastMode,
+    TextAlignMode, TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode,
+    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode,
+    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
+    WordBreakMode, WritingMode, ZIndexValue,
 };
