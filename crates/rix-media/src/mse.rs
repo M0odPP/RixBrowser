@@ -920,6 +920,49 @@ impl SourceBufferEngine {
                 self.pending_bytes = input.to_vec();
                 Ok(Vec::new())
             }
+            Mp4BufferStatus::CompletePrefix {
+                split_at,
+                has_moov,
+                has_moof,
+                trailing_in_media,
+            } => {
+                let prefix = &input[..split_at];
+                let trailing = &input[split_at..];
+                if has_moov {
+                    let new_state = parse_mp4_init_segment(prefix)
+                        .map_err(|e| MseError::DecodeError(e.to_string()))?;
+                    if new_state.tracks.is_empty() {
+                        return Err(MseError::DecodeError(
+                            "MP4 init segment contains no recognized tracks".to_string(),
+                        ));
+                    }
+                    self.validate_and_accept_init_tracks(new_state.tracks())?;
+                    result.init_duration_s = new_state.init_duration_s;
+                    self.mp4_state = Some(new_state);
+                    self.init_segment_received = true;
+                    result.init_segment_received = true;
+                }
+                let samples = if has_moof {
+                    let Some(state) = self.mp4_state.as_mut() else {
+                        return Err(MseError::DecodeError(
+                            "fMP4 media segment received before initialization segment".to_string(),
+                        ));
+                    };
+                    parse_mp4_mse_segments(prefix, state)
+                        .map_err(|e| MseError::DecodeError(e.to_string()))?
+                } else {
+                    Vec::new()
+                };
+                if trailing_in_media && self.mp4_state.is_none() {
+                    self.append_state_parsing_segment = false;
+                    return Err(MseError::DecodeError(
+                        "fMP4 media segment received before initialization segment".to_string(),
+                    ));
+                }
+                self.append_state_parsing_segment = trailing_in_media;
+                self.pending_bytes = trailing.to_vec();
+                Ok(samples)
+            }
             Mp4BufferStatus::Complete { has_moov, has_moof } => {
                 self.append_state_parsing_segment = false;
                 if !has_moov && !has_moof {

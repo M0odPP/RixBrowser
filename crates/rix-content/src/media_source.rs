@@ -23,20 +23,29 @@ use crate::dom_interfaces::define_to_string_tag;
 use crate::event_loop::{SharedEventLoop, TaskPriority};
 use crate::events::{fire_object_event, fire_object_event_with_proto, SharedEvents};
 use crate::media_elements::{
-    time_is_buffered, SharedMediaElements, HAVE_ENOUGH_DATA, HAVE_FUTURE_DATA, HAVE_METADATA,
-    HAVE_NOTHING, MEDIA_ERR_DECODE, MEDIA_ERR_NETWORK, MEDIA_ERR_SRC_NOT_SUPPORTED,
-    NETWORK_LOADING, NETWORK_NO_SOURCE,
+    reject_pending_play_promises, resolve_pending_play_promises, time_is_buffered,
+    SharedMediaElements, HAVE_ENOUGH_DATA, HAVE_FUTURE_DATA, HAVE_METADATA, HAVE_NOTHING,
+    MEDIA_ERR_DECODE, MEDIA_ERR_NETWORK, MEDIA_ERR_SRC_NOT_SUPPORTED, NETWORK_LOADING,
+    NETWORK_NO_SOURCE,
+};
+use crate::media_source_worker::{
+    detach_bridge_attachment, mark_worker_mse_dead, push_worker_mse_snapshot, read_bridge_snapshot,
+    register_worker_mse_bridge, try_claim_bridge_attachment, MediaSourceHandleState,
+    WorkerMseSnapshot,
 };
 use crate::web_apis::{
     arg, bind_ctor_proto, create_dom_exception, define_global, define_host_accessor,
     define_host_getter, define_host_method, SharedWebApis,
 };
 use crate::webgpu_types::extract_gpu_buffer_source;
+use crate::workers::AsyncWorkerEvent;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Default)]
 struct MediaSourceProtos {
     media_source_proto: Option<HeapHandle>,
     managed_media_source_proto: Option<HeapHandle>,
+    media_source_handle_proto: Option<HeapHandle>,
     source_buffer_proto: Option<HeapHandle>,
     managed_source_buffer_proto: Option<HeapHandle>,
     source_buffer_list_proto: Option<HeapHandle>,
@@ -57,6 +66,10 @@ pub struct MediaSourceEntry {
     /// Explicitly disabled/deselected `SourceBuffer` handles via `audioTracks`/`videoTracks`.
     pub disabled_buffers: std::collections::HashSet<HeapHandle>,
     pub attached_element: Option<NodeId>,
+    /// Cross-thread bridge ID when constructed inside a `DedicatedWorkerGlobalScope`.
+    pub worker_bridge_id: Option<u64>,
+    /// Cached `[SameObject]` `MediaSourceHandle` JS wrapper for worker-created `MediaSource`.
+    pub worker_handle: Option<HeapHandle>,
     /// Current playback head in seconds (updated by `HTMLMediaElement` playback).
     pub current_playback_time_s: f64,
     pub is_managed: bool,
@@ -85,8 +98,20 @@ pub struct MediaSourceSystem {
     source_buffers: HashMap<HeapHandle, SourceBufferRef>,
     source_buffer_lists: HashMap<HeapHandle, (HeapHandle, bool)>,
     time_ranges: HashMap<HeapHandle, TimeRanges>,
-    /// Media element `NodeId` -> attached `MediaSource` JS handle (via `src` or `srcObject`).
+    /// Media element `NodeId` -> attached local `MediaSource` JS handle (via `src` or `srcObject`).
     pub attached_sources: HashMap<NodeId, HeapHandle>,
+    /// Media element `NodeId` -> attached cross-thread `(MediaSourceHandle, bridge_id)`.
+    pub(crate) attached_worker_handles: HashMap<NodeId, (HeapHandle, u64)>,
+    /// Monotonic attachment generation per element so stale async attach tasks are ignored.
+    attach_generations: HashMap<NodeId, u64>,
+    /// Local `MediaSourceHandle` JS objects in this realm (Window or DedicatedWorker).
+    pub(crate) handles: HashMap<HeapHandle, MediaSourceHandleState>,
+    /// Worker-side reverse lookup `bridge_id -> MediaSource` JS handle.
+    worker_bridge_to_ms: HashMap<u64, HeapHandle>,
+    /// Reactive async sender for this realm (Worker's own `async_tx`, or Window's `async_tx`).
+    pub(crate) realm_async_tx: Option<mpsc::UnboundedSender<AsyncWorkerEvent>>,
+    /// `true` inside a `DedicatedWorkerGlobalScope`, `false` inside `Window`.
+    pub(crate) is_dedicated_worker: bool,
     /// Persistent `HTMLMediaElement.{audioTracks,videoTracks}` lists `(list_h, track_handles, synced_len)`.
     elem_audio_lists: HashMap<NodeId, (HeapHandle, Vec<HeapHandle>, usize)>,
     elem_video_lists: HashMap<NodeId, (HeapHandle, Vec<HeapHandle>, usize)>,
@@ -104,6 +129,20 @@ impl Default for MediaSourceSystem {
     }
 }
 
+impl Drop for MediaSourceSystem {
+    fn drop(&mut self) {
+        if self.is_dedicated_worker {
+            for &bridge_id in self.worker_bridge_to_ms.keys() {
+                mark_worker_mse_dead(bridge_id);
+            }
+        } else {
+            for (&nid, &(_, bridge_id)) in &self.attached_worker_handles {
+                detach_bridge_attachment(bridge_id, nid);
+            }
+        }
+    }
+}
+
 impl MediaSourceSystem {
     pub fn new() -> Self {
         Self {
@@ -113,11 +152,69 @@ impl MediaSourceSystem {
             source_buffer_lists: HashMap::new(),
             time_ranges: HashMap::new(),
             attached_sources: HashMap::new(),
+            attached_worker_handles: HashMap::new(),
+            attach_generations: HashMap::new(),
+            handles: HashMap::new(),
+            worker_bridge_to_ms: HashMap::new(),
+            realm_async_tx: None,
+            is_dedicated_worker: false,
             elem_audio_lists: HashMap::new(),
             elem_video_lists: HashMap::new(),
             track_states: HashMap::new(),
             media_elements: None,
         }
+    }
+
+    pub(crate) fn is_media_source_handle(&self, h: HeapHandle) -> bool {
+        self.handles.contains_key(&h)
+    }
+
+    pub(crate) fn can_transfer_media_source_handle(&self, h: HeapHandle) -> bool {
+        self.handles
+            .get(&h)
+            .is_some_and(|st| !st.detached && !st.has_been_attached)
+    }
+
+    pub(crate) fn take_media_source_handle_for_transfer(&mut self, h: HeapHandle) -> Option<u64> {
+        let st = self.handles.get_mut(&h)?;
+        if st.detached || st.has_been_attached {
+            return None;
+        }
+        st.detached = true;
+        Some(st.bridge_id)
+    }
+
+    pub(crate) fn alloc_media_source_handle(
+        &mut self,
+        vm: &mut JsVm,
+        bridge_id: u64,
+    ) -> HeapHandle {
+        let proto = self
+            .protos
+            .media_source_handle_proto
+            .unwrap_or(vm.object_proto);
+        let h = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+        self.handles.insert(
+            h,
+            MediaSourceHandleState {
+                bridge_id,
+                detached: false,
+                has_been_attached: false,
+            },
+        );
+        h
+    }
+
+    pub(crate) fn worker_bridge_id_for_element(&self, nid: NodeId) -> Option<u64> {
+        self.attached_worker_handles.get(&nid).map(|&(_, id)| id)
+    }
+
+    fn next_attach_gen(&mut self, nid: NodeId) -> u64 {
+        let g = self.attach_generations.entry(nid).or_insert(0);
+        *g = g.wrapping_add(1);
+        *g
     }
 
     /// Computes active `SourceBuffer` handles for `entry` respecting track enablement.
@@ -167,6 +264,7 @@ impl MediaSourceSystem {
         for p in [
             self.protos.media_source_proto,
             self.protos.managed_media_source_proto,
+            self.protos.media_source_handle_proto,
             self.protos.source_buffer_proto,
             self.protos.managed_source_buffer_proto,
             self.protos.source_buffer_list_proto,
@@ -183,9 +281,18 @@ impl MediaSourceSystem {
             out.push(JsValue::from_object(ms_h));
             out.push(JsValue::from_object(entry.source_buffers_list));
             out.push(JsValue::from_object(entry.active_source_buffers_list));
+            if let Some(wh) = entry.worker_handle {
+                out.push(JsValue::from_object(wh));
+            }
             for &sb_h in &entry.buffer_handles {
                 out.push(JsValue::from_object(sb_h));
             }
+        }
+        for &hh in self.handles.keys() {
+            out.push(JsValue::from_object(hh));
+        }
+        for &(hh, _) in self.attached_worker_handles.values() {
+            out.push(JsValue::from_object(hh));
         }
         for (&sb_h, sb_ref) in &self.source_buffers {
             if let Some((tr_h, _)) = &sb_ref.cached_buffered {
@@ -225,6 +332,9 @@ impl MediaSourceSystem {
         self.source_buffers.retain(|&h, _| heap.is_alive(h));
         self.media_sources.retain(|&h, _| heap.is_alive(h));
         self.attached_sources.retain(|_, &mut h| heap.is_alive(h));
+        self.handles.retain(|&h, _| heap.is_alive(h));
+        self.worker_bridge_to_ms
+            .retain(|_, &mut h| heap.is_alive(h));
         self.track_states.retain(|&h, _| heap.is_alive(h));
     }
 
@@ -573,6 +683,8 @@ fn populate_tracks_for_source_buffer(
                     change_info
                 {
                     sync_sbl_indices(vm, active_h, &new_active, &mut prev_len);
+                    let sb_list_h = if is_video { sb_video_lh } else { sb_audio_lh };
+                    queue_object_event(&h_s2, &ev_s2, &el_s2, sb_list_h, "change");
                     if let Some(el_h) = elem_list_h {
                         queue_object_event(&h_s2, &ev_s2, &el_s2, el_h, "change");
                     }
@@ -906,7 +1018,404 @@ pub fn attach_media_source_to_element(
         });
 }
 
-/// Detaches any `MediaSource` currently attached to `media_node`.
+/// Builds a thread-safe snapshot of a worker `MediaSourceEntry` for main-thread mirroring.
+fn build_worker_snapshot(entry: &MediaSourceEntry) -> WorkerMseSnapshot {
+    let all_inits_received = !entry.engine.source_buffers.is_empty()
+        && entry
+            .engine
+            .source_buffers
+            .iter()
+            .all(|b| b.init_segment_received);
+    let first_video_dims = entry
+        .engine
+        .source_buffers
+        .iter()
+        .flat_map(|b| b.tracks.iter())
+        .find_map(|t| match &t.kind {
+            TrackKind::Video(v) if v.width > 0 && v.height > 0 => Some((v.width, v.height)),
+            _ => None,
+        });
+    WorkerMseSnapshot {
+        ready_state: entry.engine.ready_state,
+        duration: entry.engine.duration,
+        buffered: entry.engine.buffered(),
+        seekable: entry.engine.seekable(),
+        all_inits_received,
+        first_video_dims,
+        current_playback_time_s: entry.current_playback_time_s,
+    }
+}
+
+fn push_worker_entry_sync(
+    entry: &MediaSourceEntry,
+    duration_changed: bool,
+    eos_error: Option<EndOfStreamError>,
+) {
+    if let Some(bridge_id) = entry.worker_bridge_id {
+        push_worker_mse_snapshot(
+            bridge_id,
+            build_worker_snapshot(entry),
+            duration_changed,
+            eos_error,
+        );
+    }
+}
+
+/// Worker-thread delivery of main-thread `video.srcObject = handle` attachment.
+pub(crate) fn deliver_worker_mse_attach(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    ms_sys: &SharedMediaSource,
+    bridge_id: u64,
+) {
+    let open_info = {
+        let mut s = ms_sys.borrow_mut();
+        let Some(&ms_h) = s.worker_bridge_to_ms.get(&bridge_id) else {
+            return;
+        };
+        if let Some(entry) = s.media_sources.get_mut(&ms_h) {
+            if entry.engine.open() {
+                let is_managed = entry.is_managed;
+                if is_managed {
+                    entry.streaming = true;
+                }
+                push_worker_entry_sync(entry, false, None);
+                Some((ms_h, is_managed))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some((ms_h, is_managed)) = open_info {
+        fire_object_event(vm, host, events, event_loop, ms_h, "sourceopen", &[]);
+        if is_managed {
+            fire_object_event(vm, host, events, event_loop, ms_h, "startstreaming", &[]);
+        }
+    }
+}
+
+/// Worker-thread delivery of main-thread `video.srcObject = null` detachment.
+pub(crate) fn deliver_worker_mse_detach(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    ms_sys: &SharedMediaSource,
+    bridge_id: u64,
+) {
+    let ms_h_opt = ms_sys.borrow().worker_bridge_to_ms.get(&bridge_id).copied();
+    if let Some(ms_h) = ms_h_opt {
+        close_media_source_now(vm, ms_h, host, events, event_loop, ms_sys);
+    }
+}
+
+/// Main-thread delivery of a worker `MediaSource` state update (`duration`, `appendBuffer`, `endOfStream`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deliver_main_mse_sync(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    ms_sys: &SharedMediaSource,
+    bridge_id: u64,
+    elem_id: NodeId,
+    duration_changed: bool,
+    eos_error: Option<EndOfStreamError>,
+) {
+    let still_attached = ms_sys
+        .borrow()
+        .attached_worker_handles
+        .get(&elem_id)
+        .is_some_and(|&(_, id)| id == bridge_id);
+    if !still_attached {
+        return;
+    }
+    let Some(snap) = read_bridge_snapshot(bridge_id) else {
+        return;
+    };
+    let me_opt = ms_sys.borrow().media_elements.clone();
+    let elem_v = wrap_node(vm, host, elem_id);
+    let Some(elem_h) = elem_v.as_object() else {
+        return;
+    };
+
+    if let Some(err) = eos_error {
+        if let Some(me) = &me_opt {
+            let mut me_b = me.borrow_mut();
+            let p = me_b.ensure_player(elem_id);
+            if p.ready_state == HAVE_NOTHING {
+                p.error = Some((
+                    MEDIA_ERR_SRC_NOT_SUPPORTED,
+                    "Worker MSE decode/network error before metadata".to_string(),
+                ));
+                p.network_state = NETWORK_NO_SOURCE;
+            } else {
+                let code = match err {
+                    EndOfStreamError::Network => MEDIA_ERR_NETWORK,
+                    EndOfStreamError::Decode => MEDIA_ERR_DECODE,
+                };
+                p.error = Some((code, "Worker MSE endOfStream error".to_string()));
+            }
+        }
+        reject_pending_play_promises(vm, &me_opt, elem_id, "Worker MSE error");
+        fire_object_event(vm, host, events, event_loop, elem_h, "error", &[]);
+        return;
+    }
+
+    if duration_changed {
+        fire_object_event(vm, host, events, event_loop, elem_h, "durationchange", &[]);
+    }
+
+    let Some(me) = me_opt else {
+        return;
+    };
+    let is_ended = snap.ready_state == ReadyState::Ended;
+    let (fire_meta, fire_ld, fire_cp, fire_cpt, fire_pl, fire_seeked, fire_seeking) = {
+        let mut me_b = me.borrow_mut();
+        let p = me_b.ensure_player(elem_id);
+        let mut f_seeking = false;
+        if snap.duration.is_finite() {
+            p.duration_s = snap.duration;
+            if duration_changed && p.clock.current_time_s() > snap.duration {
+                p.clock.seek_seconds(snap.duration);
+                p.exact_time_s = Some(snap.duration);
+                p.seeking = true;
+                p.seek_target_s = Some(snap.duration);
+                f_seeking = true;
+            }
+        }
+        if let Some((w, h)) = snap.first_video_dims {
+            if p.video_width == 0 && p.video_height == 0 {
+                p.video_width = w;
+                p.video_height = h;
+            }
+        }
+        let mut f_meta = false;
+        if snap.all_inits_received && !p.has_fired_loadedmetadata {
+            p.has_fired_loadedmetadata = true;
+            if p.ready_state < HAVE_METADATA {
+                p.ready_state = HAVE_METADATA;
+            }
+            f_meta = true;
+        }
+        let cur_t = p.clock.current_time_s();
+        let covered = !snap.buffered.is_empty() && time_is_buffered(&snap.buffered, cur_t);
+        let mut f_seeked = false;
+        if p.seeking {
+            let tgt = p.seek_target_s.unwrap_or(cur_t);
+            if is_ended || (!snap.buffered.is_empty() && time_is_buffered(&snap.buffered, tgt)) {
+                p.seeking = false;
+                p.seek_target_s = None;
+                f_seeked = true;
+            }
+        }
+        let mut f_ld = false;
+        let mut f_cp = false;
+        let mut f_cpt = false;
+        let mut f_pl = false;
+        if p.has_fired_loadedmetadata && (covered || is_ended) {
+            if p.ready_state < HAVE_ENOUGH_DATA {
+                p.ready_state = HAVE_ENOUGH_DATA;
+            }
+            if !p.has_fired_loadeddata {
+                p.has_fired_loadeddata = true;
+                f_ld = true;
+            }
+            if !p.has_fired_canplay {
+                p.has_fired_canplay = true;
+                f_cp = true;
+            }
+            if is_ended && !p.has_fired_canplaythrough {
+                p.has_fired_canplaythrough = true;
+                f_cpt = true;
+            }
+            if p.clock.is_playing() && !p.seeking && !p.has_fired_playing {
+                p.has_fired_playing = true;
+                f_pl = true;
+            }
+        }
+        (f_meta, f_ld, f_cp, f_cpt, f_pl, f_seeked, f_seeking)
+    };
+    if fire_seeking {
+        fire_object_event(vm, host, events, event_loop, elem_h, "seeking", &[]);
+    }
+    if fire_meta {
+        fire_object_event(vm, host, events, event_loop, elem_h, "loadedmetadata", &[]);
+    }
+    if fire_ld {
+        fire_object_event(vm, host, events, event_loop, elem_h, "loadeddata", &[]);
+    }
+    if fire_cp {
+        fire_object_event(vm, host, events, event_loop, elem_h, "canplay", &[]);
+    }
+    if fire_cpt {
+        fire_object_event(vm, host, events, event_loop, elem_h, "canplaythrough", &[]);
+    }
+    if fire_seeked {
+        fire_object_event(vm, host, events, event_loop, elem_h, "timeupdate", &[]);
+        fire_object_event(vm, host, events, event_loop, elem_h, "seeked", &[]);
+    }
+    if fire_pl {
+        resolve_pending_play_promises(vm, &Some(Rc::clone(&me)), elem_id);
+        fire_object_event(vm, host, events, event_loop, elem_h, "playing", &[]);
+    }
+}
+
+/// Main-thread notification that the owning `DedicatedWorker` terminated.
+pub(crate) fn deliver_main_mse_worker_terminated(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    ms_sys: &SharedMediaSource,
+    bridge_id: u64,
+    elem_id: NodeId,
+) {
+    let still_attached = ms_sys
+        .borrow()
+        .attached_worker_handles
+        .get(&elem_id)
+        .is_some_and(|&(_, id)| id == bridge_id);
+    if !still_attached {
+        return;
+    }
+    let me_opt = ms_sys.borrow().media_elements.clone();
+    let should_error = if let Some(me) = &me_opt {
+        let mut me_b = me.borrow_mut();
+        let p = me_b.ensure_player(elem_id);
+        if p.ready_state == HAVE_NOTHING && p.error.is_none() {
+            p.error = Some((
+                MEDIA_ERR_SRC_NOT_SUPPORTED,
+                "DedicatedWorker owning MediaSourceHandle terminated before metadata".to_string(),
+            ));
+            p.network_state = NETWORK_NO_SOURCE;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if should_error {
+        reject_pending_play_promises(
+            vm,
+            &me_opt,
+            elem_id,
+            "DedicatedWorker owning MediaSourceHandle terminated",
+        );
+        let elem_v = wrap_node(vm, host, elem_id);
+        if let Some(elem_h) = elem_v.as_object() {
+            fire_object_event(vm, host, events, event_loop, elem_h, "error", &[]);
+        }
+    }
+}
+
+/// Attaches a `MediaSourceHandle` to `media_node` per W3C MSE-in-Workers §8 & HTML resource selection:
+/// synchronously sets `networkState = NETWORK_NO_SOURCE` and marks the handle as non-transferable,
+/// then asynchronously dispatches `"loadstart"` (`NETWORK_LOADING`) and claims single-owner bridge
+/// attachment (failing with `MEDIA_ERR_SRC_NOT_SUPPORTED` if detached, already attached, or worker dead).
+#[allow(clippy::too_many_arguments)]
+fn attach_worker_handle_to_element(
+    vm: &mut JsVm,
+    media_node: NodeId,
+    handle_h: HeapHandle,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    ms_sys: &SharedMediaSource,
+) {
+    detach_media_source_from_element(vm, media_node, host, events, event_loop, ms_sys);
+
+    let (bridge_id, was_detached, gen, main_tx_opt, me_opt) = {
+        let mut sys = ms_sys.borrow_mut();
+        let Some(hst) = sys.handles.get_mut(&handle_h) else {
+            return;
+        };
+        let was_detached = hst.detached;
+        let bridge_id = hst.bridge_id;
+        // W3C MSE-in-Workers: once assigned to `srcObject`, this handle can never be transferred again,
+        // even if `srcObject` is immediately reset to `null` before async load starts.
+        hst.has_been_attached = true;
+        sys.attached_worker_handles
+            .insert(media_node, (handle_h, bridge_id));
+        let gen = sys.next_attach_gen(media_node);
+        (
+            bridge_id,
+            was_detached,
+            gen,
+            sys.realm_async_tx.clone(),
+            sys.media_elements.clone(),
+        )
+    };
+
+    if let Some(me) = &me_opt {
+        let mut me_b = me.borrow_mut();
+        let p = me_b.ensure_player(media_node);
+        p.reset_for_source_change();
+        p.network_state = NETWORK_NO_SOURCE;
+    }
+
+    let h_cl = Rc::clone(host);
+    let ev_cl = Rc::clone(events);
+    let el_cl = Rc::clone(event_loop);
+    let ms_cl = Rc::clone(ms_sys);
+    event_loop
+        .borrow_mut()
+        .post_host_task(TaskPriority::Timer, move |vm| {
+            let still_current =
+                ms_cl.borrow().attach_generations.get(&media_node).copied() == Some(gen);
+            if !still_current {
+                return;
+            }
+            let me_opt = ms_cl.borrow().media_elements.clone();
+            if let Some(me) = &me_opt {
+                me.borrow_mut().ensure_player(media_node).network_state = NETWORK_LOADING;
+            }
+            let elem_v = wrap_node(vm, &h_cl, media_node);
+            if let Some(elem_h) = elem_v.as_object() {
+                fire_object_event(vm, &h_cl, &ev_cl, &el_cl, elem_h, "loadstart", &[]);
+            }
+            // Re-check generation in case a `loadstart` listener cleared `video.srcObject = null`.
+            let still_current_after =
+                ms_cl.borrow().attach_generations.get(&media_node).copied() == Some(gen);
+            if !still_current_after {
+                return;
+            }
+            let claimed = !was_detached
+                && main_tx_opt.as_ref().is_some_and(|tx| {
+                    try_claim_bridge_attachment(bridge_id, media_node, tx.clone())
+                });
+            if !claimed {
+                if let Some(me) = &me_opt {
+                    let mut me_b = me.borrow_mut();
+                    let p = me_b.ensure_player(media_node);
+                    p.error = Some((
+                        MEDIA_ERR_SRC_NOT_SUPPORTED,
+                        "MediaSourceHandle is detached, already attached, or its worker terminated"
+                            .to_string(),
+                    ));
+                    p.ready_state = HAVE_NOTHING;
+                    p.network_state = NETWORK_NO_SOURCE;
+                }
+                reject_pending_play_promises(
+                    vm,
+                    &me_opt,
+                    media_node,
+                    "MediaSourceHandle load failed",
+                );
+                let elem_v2 = wrap_node(vm, &h_cl, media_node);
+                if let Some(elem_h) = elem_v2.as_object() {
+                    fire_object_event(vm, &h_cl, &ev_cl, &el_cl, elem_h, "error", &[]);
+                }
+            }
+        });
+}
+
+/// Detaches any `MediaSource` or `MediaSourceHandle` currently attached to `media_node`.
 pub fn detach_media_source_from_element(
     vm: &mut JsVm,
     media_node: NodeId,
@@ -915,9 +1424,19 @@ pub fn detach_media_source_from_element(
     event_loop: &SharedEventLoop,
     ms_sys: &SharedMediaSource,
 ) {
-    let old_ms = ms_sys.borrow_mut().attached_sources.remove(&media_node);
+    let (old_ms, old_worker) = {
+        let mut s = ms_sys.borrow_mut();
+        s.next_attach_gen(media_node);
+        (
+            s.attached_sources.remove(&media_node),
+            s.attached_worker_handles.remove(&media_node),
+        )
+    };
     if let Some(ms_h) = old_ms {
         close_media_source_now(vm, ms_h, host, events, event_loop, ms_sys);
+    }
+    if let Some((_, bridge_id)) = old_worker {
+        detach_bridge_attachment(bridge_id, media_node);
     }
 }
 
@@ -951,8 +1470,29 @@ fn install_null_event_handlers(vm: &mut JsVm, proto: HeapHandle, names: &[&str])
     }
 }
 
+/// Installs MSE bindings inside a `DedicatedWorkerGlobalScope`, exposing `MediaSource.prototype.handle`,
+/// `MediaSource.canConstructInDedicatedWorker === true`, `ManagedMediaSource`, `SourceBuffer`,
+/// `ManagedSourceBuffer`, `BufferedChangeEvent`, and `MediaSourceHandle`.
+pub fn install_media_source_in_worker(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
+    worker_async_tx: mpsc::UnboundedSender<AsyncWorkerEvent>,
+) -> SharedMediaSource {
+    let ms_sys = Rc::new(RefCell::new(MediaSourceSystem::new()));
+    {
+        let mut s = ms_sys.borrow_mut();
+        s.is_dedicated_worker = true;
+        s.realm_async_tx = Some(worker_async_tx);
+    }
+    install_media_source_inner(vm, host, events, event_loop, web_apis, &ms_sys, true);
+    ms_sys
+}
+
 /// Installs `MediaSource`, `ManagedMediaSource`, `SourceBuffer`, `ManagedSourceBuffer`,
-/// `SourceBufferList`, `TimeRanges`, `BufferedChangeEvent`, and `HTMLMediaElement` MSE hooks.
+/// `SourceBufferList`, `TimeRanges`, `BufferedChangeEvent`, `MediaSourceHandle`, and `HTMLMediaElement` MSE hooks.
 pub fn install_media_source(
     vm: &mut JsVm,
     host: &SharedHost,
@@ -961,7 +1501,7 @@ pub fn install_media_source(
     web_apis: &SharedWebApis,
 ) -> SharedMediaSource {
     let ms_sys = Rc::new(RefCell::new(MediaSourceSystem::new()));
-    install_media_source_inner(vm, host, events, event_loop, web_apis, &ms_sys);
+    install_media_source_inner(vm, host, events, event_loop, web_apis, &ms_sys, false);
     ms_sys
 }
 
@@ -977,7 +1517,7 @@ pub fn install_media_source_with_elements(
 ) -> SharedMediaSource {
     let ms_sys = Rc::new(RefCell::new(MediaSourceSystem::new()));
     ms_sys.borrow_mut().media_elements = Some(Rc::clone(media_elements));
-    install_media_source_inner(vm, host, events, event_loop, web_apis, &ms_sys);
+    install_media_source_inner(vm, host, events, event_loop, web_apis, &ms_sys, false);
     ms_sys
 }
 
@@ -988,6 +1528,7 @@ fn install_media_source_inner(
     event_loop: &SharedEventLoop,
     web_apis: &SharedWebApis,
     ms_sys: &SharedMediaSource,
+    is_dedicated_worker: bool,
 ) {
     // Register validator so `URL.createObjectURL(mediaSource)` recognizes `MediaSource` / `ManagedMediaSource`.
     {
@@ -1000,11 +1541,29 @@ fn install_media_source_inner(
     install_time_ranges_proto(vm, ms_sys);
     install_quota_exceeded_error_ctor(vm, ms_sys);
     install_buffered_change_event_ctor(vm, events, ms_sys);
+    install_media_source_handle_ctor(vm, ms_sys);
     install_source_buffer_list_proto(vm, host, ms_sys);
     install_source_buffer_proto(vm, host, events, event_loop, ms_sys);
-    install_media_source_ctor(vm, host, events, event_loop, ms_sys);
+    install_media_source_ctor(vm, host, events, event_loop, ms_sys, is_dedicated_worker);
     install_managed_media_source_ctors(vm, ms_sys);
-    install_media_element_mse_hooks(vm, host, events, event_loop, web_apis, ms_sys);
+    if !is_dedicated_worker {
+        install_media_element_mse_hooks(vm, host, events, event_loop, web_apis, ms_sys);
+    }
+}
+
+fn install_media_source_handle_ctor(vm: &mut JsVm, ms_sys: &SharedMediaSource) {
+    let proto = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Ordinary,
+        Some(vm.object_proto),
+    ));
+    vm.heap.get_object_mut(proto).unwrap().is_prototype = true;
+    define_to_string_tag(vm, proto, "MediaSourceHandle");
+    ms_sys.borrow_mut().protos.media_source_handle_proto = Some(proto);
+    let ctor = vm.alloc_host_fn("MediaSourceHandle", |vm, _, _| {
+        Err(vm.type_error("Illegal constructor: MediaSourceHandle"))
+    });
+    bind_ctor_proto(vm, ctor, proto);
+    define_global(vm, "MediaSourceHandle", JsValue::from_object(ctor));
 }
 
 fn install_quota_exceeded_error_ctor(vm: &mut JsVm, ms_sys: &SharedMediaSource) {
@@ -1229,6 +1788,15 @@ fn install_managed_media_source_ctors(vm: &mut JsVm, ms_sys: &SharedMediaSource)
             .heap
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(sbl_proto)));
         let mut s = sys_ctor.borrow_mut();
+        let worker_bridge_id = if s.is_dedicated_worker {
+            s.realm_async_tx.clone().map(|tx| {
+                let bid = register_worker_mse_bridge(tx);
+                s.worker_bridge_to_ms.insert(bid, ms_h);
+                bid
+            })
+        } else {
+            None
+        };
         s.source_buffer_lists.insert(sbl_h, (ms_h, false));
         s.source_buffer_lists.insert(active_h, (ms_h, true));
         s.media_sources.insert(
@@ -1241,6 +1809,8 @@ fn install_managed_media_source_ctors(vm: &mut JsVm, ms_sys: &SharedMediaSource)
                 active_buffer_handles: Vec::new(),
                 disabled_buffers: std::collections::HashSet::new(),
                 attached_element: None,
+                worker_bridge_id,
+                worker_handle: None,
                 current_playback_time_s: 0.0,
                 is_managed: true,
                 streaming: false,
@@ -1254,6 +1824,16 @@ fn install_managed_media_source_ctors(vm: &mut JsVm, ms_sys: &SharedMediaSource)
         let mime = vm.value_to_rust_string(arg(args, 0));
         Ok(JsValue::from_bool(is_type_supported(&mime)))
     });
+    {
+        let k_can = vm.heap.intern_key("canConstructInDedicatedWorker");
+        vm.heap.object_define_data(
+            mms_ctor,
+            k_can,
+            JsValue::from_bool(true),
+            PropertyAttrs::ENUMERABLE | PropertyAttrs::CONFIGURABLE,
+            &mut vm.shapes,
+        );
+    }
     bind_ctor_proto(vm, mms_ctor, mms_proto);
     define_global(vm, "ManagedMediaSource", JsValue::from_object(mms_ctor));
 }
@@ -1403,6 +1983,9 @@ fn complete_end_of_stream(
 
     let (attached_nid, me_opt) = {
         let s = ms_sys.borrow();
+        if let Some(entry) = s.media_sources.get(&ms_h) {
+            push_worker_entry_sync(entry, duration_changed, eos_err);
+        }
         (
             s.media_sources.get(&ms_h).and_then(|e| e.attached_element),
             s.media_elements.clone(),
@@ -1894,6 +2477,7 @@ fn install_source_buffer_proto(
                                     diff_time_ranges(&old_r, &new_r)
                                 });
                                 let attached_nid = entry.attached_element;
+                                push_worker_entry_sync(entry, duration_changed, None);
                                 Some(AppendOutcome::Success {
                                     active_list_h: active_h,
                                     active_handles,
@@ -2271,6 +2855,9 @@ fn install_source_buffer_proto(
                         } else {
                             None
                         };
+                        if ok {
+                            push_worker_entry_sync(entry, false, None);
+                        }
                         (ok, managed_diff, should_restart_streaming)
                     };
                     if result.0 {
@@ -2387,6 +2974,7 @@ fn install_media_source_ctor(
     events: &SharedEvents,
     event_loop: &SharedEventLoop,
     ms_sys: &SharedMediaSource,
+    is_dedicated_worker: bool,
 ) {
     let et_proto = host.borrow().prototypes.event_target_proto;
     let proto = vm
@@ -2400,6 +2988,32 @@ fn install_media_source_ctor(
         &["onsourceopen", "onsourceended", "onsourceclose"],
     );
     ms_sys.borrow_mut().protos.media_source_proto = Some(proto);
+
+    // `[SameObject] readonly attribute MediaSourceHandle handle` — exposed ONLY in DedicatedWorkerGlobalScope!
+    if is_dedicated_worker {
+        let sys = Rc::clone(ms_sys);
+        define_host_getter(vm, proto, "handle", move |vm, this, _| {
+            let ms_h = require_ms(vm, &sys, this)?;
+            let existing = sys.borrow().media_sources[&ms_h].worker_handle;
+            if let Some(h) = existing {
+                return Ok(JsValue::from_object(h));
+            }
+            let bridge_id = sys.borrow().media_sources[&ms_h]
+                .worker_bridge_id
+                .ok_or_else(|| {
+                    create_dom_exception(
+                        vm,
+                        "InvalidStateError",
+                        "MediaSource does not have a dedicated-worker bridge",
+                    )
+                })?;
+            let handle_h = sys.borrow_mut().alloc_media_source_handle(vm, bridge_id);
+            if let Some(entry) = sys.borrow_mut().media_sources.get_mut(&ms_h) {
+                entry.worker_handle = Some(handle_h);
+            }
+            Ok(JsValue::from_object(handle_h))
+        });
+    }
 
     // `readyState`
     {
@@ -2438,6 +3052,9 @@ fn install_media_source_ctor(
                         .engine
                         .set_duration_spec(d)
                         .map_err(|e| mse_err_to_js(vm, e))?;
+                    if changed {
+                        push_worker_entry_sync(entry, true, None);
+                    }
                     (
                         changed,
                         entry.engine.duration,
@@ -2460,6 +3077,7 @@ fn install_media_source_ctor(
                                         && p.clock.current_time_s() > actual_dur
                                     {
                                         p.clock.seek_seconds(actual_dur);
+                                        p.exact_time_s = Some(actual_dur);
                                         p.seeking = true;
                                         p.seek_target_s = Some(actual_dur);
                                         true
@@ -2783,6 +3401,15 @@ fn install_media_source_ctor(
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(sbl_proto)));
 
         let mut s = sys_ctor.borrow_mut();
+        let worker_bridge_id = if s.is_dedicated_worker {
+            s.realm_async_tx.clone().map(|tx| {
+                let bid = register_worker_mse_bridge(tx);
+                s.worker_bridge_to_ms.insert(bid, ms_h);
+                bid
+            })
+        } else {
+            None
+        };
         s.source_buffer_lists.insert(sbl_h, (ms_h, false));
         s.source_buffer_lists.insert(active_h, (ms_h, true));
         s.media_sources.insert(
@@ -2795,6 +3422,8 @@ fn install_media_source_ctor(
                 active_buffer_handles: Vec::new(),
                 disabled_buffers: std::collections::HashSet::new(),
                 attached_element: None,
+                worker_bridge_id,
+                worker_handle: None,
                 current_playback_time_s: 0.0,
                 is_managed: false,
                 streaming: false,
@@ -2810,6 +3439,17 @@ fn install_media_source_ctor(
         let mime = vm.value_to_rust_string(arg(args, 0));
         Ok(JsValue::from_bool(is_type_supported(&mime)))
     });
+    // Static `MediaSource.canConstructInDedicatedWorker` (W3C MSE-in-Workers)
+    {
+        let k_can = vm.heap.intern_key("canConstructInDedicatedWorker");
+        vm.heap.object_define_data(
+            ctor,
+            k_can,
+            JsValue::from_bool(true),
+            PropertyAttrs::ENUMERABLE | PropertyAttrs::CONFIGURABLE,
+            &mut vm.shapes,
+        );
+    }
 
     bind_ctor_proto(vm, ctor, proto);
     define_global(vm, "MediaSource", JsValue::from_object(ctor));
@@ -2910,11 +3550,12 @@ fn install_media_element_mse_hooks(
                 let Some(nid) = h_g.borrow().node_for_value(vm, this) else {
                     return Ok(JsValue::NULL);
                 };
-                let val = ms_g
-                    .borrow()
+                let s = ms_g.borrow();
+                let val = s
                     .attached_sources
                     .get(&nid)
                     .copied()
+                    .or_else(|| s.attached_worker_handles.get(&nid).map(|&(hh, _)| hh))
                     .map(JsValue::from_object)
                     .unwrap_or(JsValue::NULL);
                 Ok(val)
@@ -2929,12 +3570,23 @@ fn install_media_element_mse_hooks(
                     return Ok(JsValue::UNDEFINED);
                 }
                 if let Some(obj_h) = val.as_object() {
-                    if ms_s.borrow().media_sources.contains_key(&obj_h) {
+                    let (is_ms, is_handle) = {
+                        let s = ms_s.borrow();
+                        (
+                            s.media_sources.contains_key(&obj_h),
+                            s.handles.contains_key(&obj_h),
+                        )
+                    };
+                    if is_ms {
                         attach_media_source_to_element(vm, nid, obj_h, &h_s, &ev_s, &el_s, &ms_s);
                         return Ok(JsValue::UNDEFINED);
                     }
+                    if is_handle {
+                        attach_worker_handle_to_element(vm, nid, obj_h, &h_s, &ev_s, &el_s, &ms_s);
+                        return Ok(JsValue::UNDEFINED);
+                    }
                 }
-                Err(vm.type_error("srcObject must be a MediaSource or null"))
+                Err(vm.type_error("srcObject must be a MediaSource, MediaSourceHandle, or null"))
             },
         );
     }
@@ -2963,11 +3615,19 @@ fn install_media_element_mse_hooks(
         define_host_getter(vm, media_proto, "buffered", move |vm, this, _| {
             let ranges = if let Some(nid) = h_g.borrow().node_for_value(vm, this) {
                 let s = ms_g.borrow();
-                s.attached_sources
+                if let Some(entry) = s
+                    .attached_sources
                     .get(&nid)
                     .and_then(|ms_h| s.media_sources.get(ms_h))
-                    .map(|entry| entry.engine.buffered())
-                    .unwrap_or_default()
+                {
+                    entry.engine.buffered()
+                } else if let Some(&(_, bridge_id)) = s.attached_worker_handles.get(&nid) {
+                    read_bridge_snapshot(bridge_id)
+                        .map(|sn| sn.buffered)
+                        .unwrap_or_default()
+                } else {
+                    TimeRanges::new()
+                }
             } else {
                 TimeRanges::new()
             };
@@ -2982,11 +3642,17 @@ fn install_media_element_mse_hooks(
         define_host_getter(vm, media_proto, "duration", move |vm, this, _| {
             let dur = if let Some(nid) = h_g.borrow().node_for_value(vm, this) {
                 let s = ms_g.borrow();
-                s.attached_sources
+                if let Some(entry) = s
+                    .attached_sources
                     .get(&nid)
                     .and_then(|ms_h| s.media_sources.get(ms_h))
-                    .map(|entry| entry.engine.duration)
-                    .unwrap_or(f64::NAN)
+                {
+                    entry.engine.duration
+                } else if let Some(&(_, bridge_id)) = s.attached_worker_handles.get(&nid) {
+                    read_bridge_snapshot(bridge_id).map_or(f64::NAN, |sn| sn.duration)
+                } else {
+                    f64::NAN
+                }
             } else {
                 f64::NAN
             };

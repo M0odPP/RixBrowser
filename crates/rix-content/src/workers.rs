@@ -219,6 +219,26 @@ pub enum AsyncWorkerEvent {
         sse_id: u64,
         closed: bool,
     },
+    /// Main-thread `<video>.srcObject = handle` attaching to a worker-owned `MediaSource`.
+    WorkerMseAttach {
+        bridge_id: u64,
+    },
+    /// Main-thread `<video>.srcObject = null` detaching from a worker-owned `MediaSource`.
+    WorkerMseDetach {
+        bridge_id: u64,
+    },
+    /// Worker-side `MediaSource` state update (`duration`, `appendBuffer`, `remove`, `endOfStream`).
+    MainMseSync {
+        bridge_id: u64,
+        elem_id: rix_dom::NodeId,
+        duration_changed: bool,
+        eos_error: Option<rix_media::EndOfStreamError>,
+    },
+    /// Owning `DedicatedWorker` terminated while a `MediaSourceHandle` was attached to `<video>`.
+    MainMseWorkerTerminated {
+        bridge_id: u64,
+        elem_id: rix_dom::NodeId,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,6 +1138,22 @@ fn run_worker_thread(
         &frames,
         &workers,
     );
+    // W3C MSE-in-Workers: expose `MediaSource` / `ManagedMediaSource` / `MediaSourceHandle`
+    // ONLY in `DedicatedWorkerGlobalScope` (never in `SharedWorkerGlobalScope`).
+    let worker_media_source = if is_dedicated {
+        let ms = crate::media_source::install_media_source_in_worker(
+            &mut vm,
+            &host,
+            &events,
+            &event_loop,
+            &web_apis,
+            workers.borrow().async_tx_clone(),
+        );
+        frames.borrow_mut().media_source = Some(Rc::clone(&ms));
+        Some(ms)
+    } else {
+        None
+    };
 
     // Register host GC root collectors so long-running workers never sweep live host wrappers.
     {
@@ -1130,6 +1166,7 @@ fn run_worker_thread(
         let fr_r = Rc::clone(&frames);
         let ws_r = Rc::clone(&workers);
         let idb_r = Rc::clone(&indexeddb);
+        let ms_r = worker_media_source.clone();
         let h_r = Rc::clone(&host);
         vm.add_host_root_collector(move |roots| {
             if let Ok(g) = el_r.try_borrow() {
@@ -1158,6 +1195,11 @@ fn run_worker_thread(
             }
             if let Ok(g) = idb_r.try_borrow() {
                 g.collect_roots(roots);
+            }
+            if let Some(ref ms) = ms_r {
+                if let Ok(g) = ms.try_borrow() {
+                    g.collect_roots(roots);
+                }
             }
             if let Ok(g) = h_r.try_borrow() {
                 g.collect_roots(roots);
@@ -1509,8 +1551,10 @@ fn run_worker_thread(
     )));
     ModuleLoader::install_on_vm(&mod_loader, &mut vm);
 
-    // 6. Evaluate top-level worker script (Module or Classic).
+    // 6. Evaluate top-level worker script (Module or Classic) inside `rt.enter()` so top-level
+    //    `fetch()` / `WebSocket` calls have an active Tokio runtime handle!
     let mut mode = mode;
+    let rt_eval_guard = rt.enter();
     if options.worker_type == WorkerType::Module {
         match ModuleLoader::load_and_evaluate(&mod_loader, &mut vm, &final_url) {
             Ok(eval_p) => {
@@ -1634,6 +1678,7 @@ fn run_worker_thread(
     }
     run_microtask_checkpoint(&event_loop, &mut vm);
     drain_ready_tasks(&event_loop, &mut vm);
+    drop(rt_eval_guard);
 
     // 7. Take async receivers and enter zero-polling `tokio::select!` event loop.
     let Some(mut net_rx) = net.borrow().async_rx.borrow_mut().take() else {
@@ -2358,6 +2403,47 @@ pub fn deliver_async_worker_event(
             };
             if let Some(target) = target {
                 fire_object_event(vm, host, events, event_loop, target, "error", &[]);
+            }
+        }
+        AsyncWorkerEvent::WorkerMseAttach { bridge_id } => {
+            if let Some(ms) = frames.borrow().media_source.clone() {
+                crate::media_source::deliver_worker_mse_attach(
+                    vm, host, events, event_loop, &ms, bridge_id,
+                );
+            }
+        }
+        AsyncWorkerEvent::WorkerMseDetach { bridge_id } => {
+            if let Some(ms) = frames.borrow().media_source.clone() {
+                crate::media_source::deliver_worker_mse_detach(
+                    vm, host, events, event_loop, &ms, bridge_id,
+                );
+            }
+        }
+        AsyncWorkerEvent::MainMseSync {
+            bridge_id,
+            elem_id,
+            duration_changed,
+            eos_error,
+        } => {
+            if let Some(ms) = frames.borrow().media_source.clone() {
+                crate::media_source::deliver_main_mse_sync(
+                    vm,
+                    host,
+                    events,
+                    event_loop,
+                    &ms,
+                    bridge_id,
+                    elem_id,
+                    duration_changed,
+                    eos_error,
+                );
+            }
+        }
+        AsyncWorkerEvent::MainMseWorkerTerminated { bridge_id, elem_id } => {
+            if let Some(ms) = frames.borrow().media_source.clone() {
+                crate::media_source::deliver_main_mse_worker_terminated(
+                    vm, host, events, event_loop, &ms, bridge_id, elem_id,
+                );
             }
         }
     }

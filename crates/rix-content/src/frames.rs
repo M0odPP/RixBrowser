@@ -29,7 +29,7 @@ use crate::events::{
 };
 use crate::fetch_ws::SharedNetBridge;
 use crate::structured_clone::{
-    deserialize_payload, extract_transfer_arg, serialize_with_transfer, CloneContext,
+    extract_transfer_arg, serialize_with_transfer, try_deserialize_payload, CloneContext,
     CrossThreadPortEnd, PortRoute, StructuredClonePayload,
 };
 use crate::web_apis::{
@@ -178,6 +178,7 @@ impl SandboxFlags {
 struct QueuedPortMessage {
     data: JsValue,
     ports: Vec<HeapHandle>,
+    is_error: bool,
 }
 
 struct MessagePortState {
@@ -265,6 +266,7 @@ pub struct FrameSystem {
     pub(crate) canvas2d: Option<SharedCanvas2D>,
     pub(crate) workers: Option<SharedWorkers>,
     pub(crate) net: Option<SharedNetBridge>,
+    pub(crate) media_source: Option<crate::media_source::SharedMediaSource>,
 }
 
 /// Shared handle to [`FrameSystem`].
@@ -299,6 +301,7 @@ impl FrameSystem {
             canvas2d: None,
             workers: None,
             net: None,
+            media_source: None,
         }
     }
 
@@ -1103,13 +1106,18 @@ fn schedule_port_flush(
                 .message_event_proto
                 .or_else(|| ev.borrow().event_proto)
                 .unwrap_or(vm.object_proto);
+            let ev_name = if queued.is_error {
+                "messageerror"
+            } else {
+                "message"
+            };
             fire_object_event_with_proto(
                 vm,
                 &h,
                 &ev,
                 &el,
                 port_h,
-                "message",
+                ev_name,
                 proto,
                 &[
                     ("data", queued.data),
@@ -1328,7 +1336,11 @@ pub(crate) fn deliver_cross_thread_port_message(
         frames,
         workers,
     };
-    let (data, transferred_ports) = deserialize_payload(vm, &clone_ctx, payload);
+    let (data, transferred_ports, is_error) = match try_deserialize_payload(vm, &clone_ctx, payload)
+    {
+        Ok((d, p)) => (d, p, false),
+        Err(()) => (JsValue::NULL, Vec::new(), true),
+    };
     let should_flush = {
         let mut fs = frames.borrow_mut();
         match fs.ports.get_mut(&target_h) {
@@ -1336,6 +1348,7 @@ pub(crate) fn deliver_cross_thread_port_message(
                 p.pending.push_back(QueuedPortMessage {
                     data,
                     ports: transferred_ports,
+                    is_error,
                 });
                 p.started
             }
@@ -2893,6 +2906,7 @@ pub fn deliver_ipc_port_message(
                 p.pending.push_back(QueuedPortMessage {
                     data,
                     ports: port_handles,
+                    is_error: false,
                 });
                 p.started
             }
@@ -3334,6 +3348,7 @@ fn install_message_channel_and_port(
                         partner.pending.push_back(QueuedPortMessage {
                             data: cloned_data,
                             ports: transferred_ports,
+                            is_error: false,
                         });
                         partner.started
                     }

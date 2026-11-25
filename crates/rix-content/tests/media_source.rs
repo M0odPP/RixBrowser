@@ -240,3 +240,77 @@ fn mse_quota_eviction_and_quota_exceeded_error() {
         "expected QuotaExceededError and evicted oldest frame, got `{s}`"
     );
 }
+
+#[test]
+fn mse_in_dedicated_worker_handle_transfer_and_duration_sync() {
+    let tokio_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let mut rt = ContentRuntime::with_empty_document();
+
+    rt.eval_script(
+        r#"
+        var result = "";
+        var checks = [];
+        checks.push(MediaSource.canConstructInDedicatedWorker === true);
+        checks.push(!("handle" in MediaSource.prototype));
+        checks.push(typeof MediaSourceHandle === "function");
+
+        var workerSrc = `
+            const ms = new MediaSource();
+            const h1 = ms.handle;
+            const h2 = ms.handle;
+            let cloneErr = "";
+            try { postMessage(h1); } catch (e) { cloneErr = e.name; }
+            ms.addEventListener("sourceopen", () => {
+                ms.duration = 2.5;
+                postMessage({ type: "opened", same: h1 === h2, cloneErr, hasHandle: "handle" in MediaSource.prototype });
+            });
+            postMessage({ type: "handle", handle: h1 }, [h1]);
+        `;
+        var blob = new Blob([workerSrc], { type: "application/javascript" });
+        var w = new Worker(URL.createObjectURL(blob));
+        var video = document.createElement("video");
+        w.onmessage = function(e) {
+            if (e.data.type === "handle") {
+                var handle = e.data.handle;
+                checks.push(handle instanceof MediaSourceHandle);
+                video.srcObject = handle;
+                checks.push(video.networkState === HTMLMediaElement.NETWORK_NO_SOURCE);
+                var postAssignErr = "";
+                try { w.postMessage(handle, [handle]); } catch (err) { postAssignErr = err.name; }
+                checks.push(postAssignErr === "DataCloneError");
+            } else if (e.data.type === "opened") {
+                checks.push(e.data.same === true);
+                checks.push(e.data.cloneErr === "DataCloneError");
+                checks.push(e.data.hasHandle === true);
+                video.addEventListener("durationchange", function() {
+                    checks.push(video.duration === 2.5);
+                    result = checks.every(Boolean) ? "PASS" : JSON.stringify(checks);
+                    w.terminate();
+                });
+                if (video.duration === 2.5) {
+                    checks.push(true);
+                    result = checks.every(Boolean) ? "PASS" : JSON.stringify(checks);
+                    w.terminate();
+                }
+            }
+        };
+        "#,
+    )
+    .expect("eval worker mse test");
+
+    let settled = tokio_rt.block_on(rt.drive_async_until(
+        std::time::Duration::from_secs(5),
+        |rt| {
+            rt.eval_script("result.length > 0")
+                .ok()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        },
+    ));
+    assert!(settled, "worker MSE test timed out");
+    let out = rt.eval_script("result").expect("read result");
+    assert_eq!(rt.vm.value_to_rust_string(out), "PASS");
+}
