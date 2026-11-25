@@ -67,6 +67,7 @@ pub struct EventSystem {
     idl_handler_trampolines: HashMap<(EventTargetKey, String), HeapHandle>,
     pub event_proto: Option<HeapHandle>,
     pub event_protos: HashMap<&'static str, HeapHandle>,
+    pub(crate) on_uncaught_error: Option<crate::event_loop::UncaughtErrorHook>,
     start_instant: Instant,
 }
 
@@ -90,6 +91,7 @@ impl EventSystem {
             idl_handler_trampolines: HashMap::new(),
             event_proto: None,
             event_protos: HashMap::new(),
+            on_uncaught_error: None,
             start_instant: Instant::now(),
         }
     }
@@ -145,6 +147,10 @@ impl EventSystem {
         self.listeners
             .iter()
             .any(|((k, _), list)| *k == EventTargetKey::Node(nid) && !list.is_empty())
+    }
+
+    pub(crate) fn is_event_object(&self, h: HeapHandle) -> bool {
+        self.events.contains_key(&h)
     }
 }
 
@@ -1339,6 +1345,41 @@ fn install_event_constructors(vm: &mut JsVm, host: &SharedHost, events: &SharedE
     let _ = register_event_subclass_with_proto(
         vm,
         events,
+        "ErrorEvent",
+        ep,
+        Some(ev_ctor),
+        |vm, obj, init| {
+            let empty = JsValue::from_string(vm.heap.alloc_string(""));
+            let msg_v = read_init_prop(vm, init, "message", empty)?;
+            let msg = if msg_v.is_string() {
+                msg_v
+            } else {
+                let s = vm.to_js_string(msg_v)?;
+                JsValue::from_string(vm.heap.alloc_string(&s))
+            };
+            let fn_v = read_init_prop(vm, init, "filename", empty)?;
+            let filename = if fn_v.is_string() {
+                fn_v
+            } else {
+                let s = vm.to_js_string(fn_v)?;
+                JsValue::from_string(vm.heap.alloc_string(&s))
+            };
+            let lineno_v = read_init_prop(vm, init, "lineno", JsValue::from_i32(0))?;
+            let lineno = vm.to_u32(lineno_v).unwrap_or(0);
+            let colno_v = read_init_prop(vm, init, "colno", JsValue::from_i32(0))?;
+            let colno = vm.to_u32(colno_v).unwrap_or(0);
+            let error = read_init_prop(vm, init, "error", JsValue::NULL)?;
+            define_data(vm, obj, "message", msg);
+            define_data(vm, obj, "filename", filename);
+            define_data(vm, obj, "lineno", JsValue::from_f64(f64::from(lineno)));
+            define_data(vm, obj, "colno", JsValue::from_f64(f64::from(colno)));
+            define_data(vm, obj, "error", error);
+            Ok(())
+        },
+    );
+    let _ = register_event_subclass_with_proto(
+        vm,
+        events,
         "DeviceOrientationEvent",
         ep,
         Some(ev_ctor),
@@ -1885,7 +1926,12 @@ fn install_global_and_window_event_handlers(
                             .unwrap_or(JsValue::NULL);
                         if cb.as_object().is_some_and(|fh| vm.is_callable_handle(fh)) {
                             let ev_arg = arg(cb_args, 0);
-                            let _ = vm.call_value(cb, this_v, &[ev_arg]);
+                            if let Err(ex) = vm.call_value(cb, this_v, &[ev_arg]) {
+                                let hook = e_cb.borrow().on_uncaught_error.clone();
+                                if let Some(hook) = hook {
+                                    hook(vm, ex);
+                                }
+                            }
                         }
                         Ok(JsValue::UNDEFINED)
                     });
@@ -2221,20 +2267,30 @@ fn invoke_listeners_at(
         // `.handleEvent` dynamically on an EventListener object with `this = listener`.
         // Exceptions thrown by listeners MUST NOT abort remaining listeners.
         if vm.is_callable_handle(listener.listener) {
-            let _ = vm.call_value(
+            if let Err(ex) = vm.call_value(
                 JsValue::from_object(listener.listener),
                 cur_val,
                 &[JsValue::from_object(ev_h)],
-            );
+            ) {
+                let hook = events.borrow().on_uncaught_error.clone();
+                if let Some(cb) = hook {
+                    cb(vm, ex);
+                }
+            }
         } else {
             let k_he = vm.heap.intern_key("handleEvent");
             if let Ok(he_val) = vm.get_property_by_key(listener.listener, k_he) {
                 if let Some(fh) = he_val.as_object().filter(|&h| vm.is_callable_handle(h)) {
-                    let _ = vm.call_value(
+                    if let Err(ex) = vm.call_value(
                         JsValue::from_object(fh),
                         JsValue::from_object(listener.listener),
                         &[JsValue::from_object(ev_h)],
-                    );
+                    ) {
+                        let hook = events.borrow().on_uncaught_error.clone();
+                        if let Some(cb) = hook {
+                            cb(vm, ex);
+                        }
+                    }
                 }
             }
         }
@@ -2473,16 +2529,148 @@ pub(crate) fn fire_object_event_with_proto(
                 .as_object()
                 .filter(|&fh| vm.is_callable_handle(fh))
             {
-                let _ = vm.call_value(
+                if let Err(ex) = vm.call_value(
                     JsValue::from_object(h),
                     JsValue::from_object(target),
                     &[JsValue::from_object(ev_h)],
-                );
+                ) {
+                    let hook = events.borrow().on_uncaught_error.clone();
+                    if let Some(cb) = hook {
+                        cb(vm, ex);
+                    }
+                }
             }
         }
     }
 
     let _ = dispatch_event_internal(vm, host, events, event_loop, target_key, ev_h);
+}
+
+/// Dispatches a trusted cancelable `ErrorEvent` (`bubbles: false`, `cancelable: true`)
+/// on `target` (invoking `target.onerror` and `addEventListener("error")` listeners).
+/// Returns `true` if the error was handled (`preventDefault()` called or `onerror` returned `true`
+/// when `use_window_onerror_signature` is `true`).
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn fire_error_event(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    target: HeapHandle,
+    message: &str,
+    filename: &str,
+    lineno: u32,
+    colno: u32,
+    error: JsValue,
+    use_window_onerror_signature: bool,
+) -> (bool, Option<JsException>) {
+    let proto = events
+        .borrow()
+        .event_protos
+        .get("ErrorEvent")
+        .copied()
+        .or_else(|| events.borrow().event_proto)
+        .unwrap_or(vm.object_proto);
+    let ev_h = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    let ts = events.borrow().now_ms();
+    events.borrow_mut().events.insert(
+        ev_h,
+        EventInternal {
+            event_type: "error".to_string(),
+            bubbles: false,
+            cancelable: true,
+            composed: false,
+            is_trusted: true,
+            initialized: true,
+            dispatch_flag: false,
+            default_prevented: false,
+            propagation_stopped: false,
+            immediate_stopped: false,
+            in_passive_listener: false,
+            event_phase: 2,
+            time_stamp: ts,
+            target: JsValue::from_object(target),
+            current_target: JsValue::from_object(target),
+            composed_path: vec![JsValue::from_object(target)],
+            path_keys: Vec::new(),
+            current_target_key: None,
+        },
+    );
+    define_own_is_trusted(vm, events, ev_h);
+    let msg_v = JsValue::from_string(vm.heap.alloc_string(message));
+    let fn_v = JsValue::from_string(vm.heap.alloc_string(filename));
+    let line_v = JsValue::from_f64(f64::from(lineno));
+    let col_v = JsValue::from_f64(f64::from(colno));
+    for &(name, val) in &[
+        ("message", msg_v),
+        ("filename", fn_v),
+        ("lineno", line_v),
+        ("colno", col_v),
+        ("error", error),
+    ] {
+        let k = vm.heap.intern_key(name);
+        vm.heap
+            .object_define_data(ev_h, k, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    }
+
+    let target_key = if target == vm.global {
+        EventTargetKey::Window
+    } else if let Some(nid) = host.borrow().node_for_handle(vm, target) {
+        EventTargetKey::Node(nid)
+    } else {
+        EventTargetKey::Object(target)
+    };
+
+    let mut handler_exception: Option<JsException> = None;
+    let has_trampoline = events
+        .borrow()
+        .idl_handler_trampolines
+        .contains_key(&(target_key, "error".to_string()));
+    if !has_trampoline {
+        let handler_key = vm.heap.intern_key("onerror");
+        if let Ok(handler_val) = vm.get_property_by_key(target, handler_key) {
+            if let Some(h) = handler_val
+                .as_object()
+                .filter(|&fh| vm.is_callable_handle(fh))
+            {
+                let call_res = if use_window_onerror_signature {
+                    vm.call_value(
+                        JsValue::from_object(h),
+                        JsValue::from_object(target),
+                        &[msg_v, fn_v, line_v, col_v, error],
+                    )
+                } else {
+                    vm.call_value(
+                        JsValue::from_object(h),
+                        JsValue::from_object(target),
+                        &[JsValue::from_object(ev_h)],
+                    )
+                };
+                match call_res {
+                    Ok(ret) => {
+                        if use_window_onerror_signature && ret == JsValue::TRUE {
+                            if let Some(ev) = events.borrow_mut().events.get_mut(&ev_h) {
+                                ev.default_prevented = true;
+                            }
+                        }
+                    }
+                    Err(ex) => {
+                        handler_exception = Some(ex);
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = dispatch_event_internal(vm, host, events, event_loop, target_key, ev_h);
+    let prevented = events
+        .borrow()
+        .events
+        .get(&ev_h)
+        .is_some_and(|ev| ev.default_prevented);
+    (prevented, handler_exception)
 }
 
 /// Registers an `EventHandler` IDL attribute (`on<type>`) on `target_proto` following
@@ -2546,7 +2734,12 @@ pub(crate) fn install_object_event_handler_accessor<F>(
                             .unwrap_or(JsValue::NULL);
                         if cb.as_object().is_some_and(|fh| vm.is_callable_handle(fh)) {
                             let ev_arg = arg(cb_args, 0);
-                            let _ = vm.call_value(cb, this_v, &[ev_arg]);
+                            if let Err(ex) = vm.call_value(cb, this_v, &[ev_arg]) {
+                                let hook = e_cb.borrow().on_uncaught_error.clone();
+                                if let Some(hook) = hook {
+                                    hook(vm, ex);
+                                }
+                            }
                         }
                         Ok(JsValue::UNDEFINED)
                     });

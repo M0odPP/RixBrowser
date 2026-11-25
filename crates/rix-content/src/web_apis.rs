@@ -14,6 +14,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use encoding_rs::Encoding;
 use rix_js::builtins_collections::alloc_values_iterator;
@@ -125,6 +127,8 @@ struct PerfEntry {
 pub(crate) struct WebApiPrototypes {
     pub blob_proto: Option<HeapHandle>,
     pub file_proto: Option<HeapHandle>,
+    pub file_list_proto: Option<HeapHandle>,
+    pub dom_exception_proto: Option<HeapHandle>,
     pub abort_signal_proto: Option<HeapHandle>,
     pub abort_controller_ctor: Option<HeapHandle>,
     pub abort_controller_abort_fn: Option<HeapHandle>,
@@ -132,6 +136,36 @@ pub(crate) struct WebApiPrototypes {
     pub search_params_proto: Option<HeapHandle>,
     pub form_data_proto: Option<HeapHandle>,
     pub text_decoder_proto: Option<HeapHandle>,
+}
+
+/// Process-wide registry of live `blob:` object URLs so workers, shared workers,
+/// and service workers can `fetch()` or `import()` dynamically created `blob:` URLs.
+type GlobalObjectUrlMap = HashMap<String, (Vec<u8>, String)>;
+static GLOBAL_OBJECT_URLS: OnceLock<Mutex<GlobalObjectUrlMap>> = OnceLock::new();
+static GLOBAL_OBJECT_URL_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn global_object_urls() -> &'static Mutex<GlobalObjectUrlMap> {
+    GLOBAL_OBJECT_URLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn register_global_object_url(url: String, bytes: Vec<u8>, content_type: String) {
+    if let Ok(mut guard) = global_object_urls().lock() {
+        guard.insert(url, (bytes, content_type));
+    }
+}
+
+pub(crate) fn unregister_global_object_url(url: &str) {
+    if let Ok(mut guard) = global_object_urls().lock() {
+        guard.remove(url);
+    }
+}
+
+pub(crate) fn lookup_global_object_url(url: &str) -> Option<(Vec<u8>, String)> {
+    let key = url.split('#').next().unwrap_or(url);
+    global_object_urls()
+        .lock()
+        .ok()
+        .and_then(|g| g.get(key).cloned())
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +182,7 @@ pub(crate) struct StoredCookie {
 /// Shared state backing all non-network WHATWG Web APIs in a `ContentRuntime`.
 pub struct WebApiState {
     pub(crate) blobs: HashMap<HeapHandle, BlobEntry>,
+    pub(crate) file_lists: HashMap<HeapHandle, Vec<BlobEntry>>,
     pub(crate) abort_signals: HashMap<HeapHandle, AbortSignalEntry>,
     url_objects: HashMap<HeapHandle, UrlEntry>,
     pub(crate) search_params: HashMap<HeapHandle, SearchParamsEntry>,
@@ -166,6 +201,9 @@ pub struct WebApiState {
     session_storage: HashMap<String, Vec<(String, String)>>,
     perf_entries: Vec<PerfEntry>,
     pub console_messages: Vec<(String, String)>,
+    pub(crate) cross_origin_isolated: bool,
+    pub(crate) coop_same_origin: bool,
+    pub(crate) coep_require_corp: bool,
     pub(crate) protos: WebApiPrototypes,
 }
 
@@ -178,6 +216,7 @@ impl WebApiState {
             .unwrap_or_else(|_| Url::parse(DEFAULT_DOCUMENT_URL).expect("valid default url"));
         Self {
             blobs: HashMap::new(),
+            file_lists: HashMap::new(),
             abort_signals: HashMap::new(),
             url_objects: HashMap::new(),
             search_params: HashMap::new(),
@@ -199,6 +238,9 @@ impl WebApiState {
             session_storage: HashMap::new(),
             perf_entries: Vec::new(),
             console_messages: Vec::new(),
+            cross_origin_isolated: false,
+            coop_same_origin: false,
+            coep_require_corp: false,
             protos: WebApiPrototypes::default(),
         }
     }
@@ -236,6 +278,14 @@ impl WebApiState {
     #[must_use]
     pub fn current_href(&self) -> String {
         self.location_url.as_str().to_string()
+    }
+
+    pub(crate) fn url_objects_contains(&self, h: HeapHandle) -> bool {
+        self.url_objects.contains_key(&h)
+    }
+
+    pub(crate) fn text_decoders_contains(&self, h: HeapHandle) -> bool {
+        self.text_decoders.contains_key(&h)
     }
 
     /// Replaces the backing [`StorageEngine`] used by `localStorage`.
@@ -399,6 +449,8 @@ impl WebApiState {
         for p in [
             self.protos.blob_proto,
             self.protos.file_proto,
+            self.protos.file_list_proto,
+            self.protos.dom_exception_proto,
             self.protos.abort_signal_proto,
             self.protos.abort_controller_ctor,
             self.protos.abort_controller_abort_fn,
@@ -439,6 +491,7 @@ impl WebApiState {
     /// Drops internal native slots for GC-collected JS objects.
     pub fn sweep_dead(&mut self, heap: &rix_js::GcHeap) {
         self.blobs.retain(|&h, _| heap.is_alive(h));
+        self.file_lists.retain(|&h, _| heap.is_alive(h));
         self.abort_signals.retain(|&h, _| heap.is_alive(h));
         for s in self.abort_signals.values_mut() {
             s.dependent_signals.retain(|&h| heap.is_alive(h));
@@ -719,6 +772,10 @@ const DOM_EXCEPTION_CODES: &[(&str, i32)] = &[
     ("DATA_CLONE_ERR", 25),
 ];
 
+pub(crate) fn dom_exception_code(name: &str) -> i32 {
+    dom_exception_legacy_code(name)
+}
+
 fn dom_exception_legacy_code(name: &str) -> i32 {
     match name {
         "IndexSizeError" => 1,
@@ -811,6 +868,69 @@ pub(crate) fn create_blob_object(
     obj
 }
 
+pub(crate) fn create_file_object(
+    vm: &mut JsVm,
+    web_apis: &SharedWebApis,
+    bytes: Vec<u8>,
+    content_type: String,
+    name: String,
+    last_modified: f64,
+) -> HeapHandle {
+    let proto = web_apis
+        .borrow()
+        .protos
+        .file_proto
+        .unwrap_or(vm.object_proto);
+    let obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    web_apis.borrow_mut().blobs.insert(
+        obj,
+        BlobEntry {
+            bytes,
+            content_type,
+            name: Some(name),
+            last_modified: Some(last_modified),
+        },
+    );
+    obj
+}
+
+pub(crate) fn create_file_list_object(
+    vm: &mut JsVm,
+    web_apis: &SharedWebApis,
+    files: Vec<BlobEntry>,
+) -> HeapHandle {
+    let proto = web_apis
+        .borrow()
+        .protos
+        .file_list_proto
+        .unwrap_or(vm.object_proto);
+    let obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    for (idx, f) in files.iter().enumerate() {
+        let fh = create_file_object(
+            vm,
+            web_apis,
+            f.bytes.clone(),
+            f.content_type.clone(),
+            f.name.clone().unwrap_or_default(),
+            f.last_modified.unwrap_or(0.0),
+        );
+        let k = vm.heap.intern_key(&idx.to_string());
+        vm.heap.object_define_data(
+            obj,
+            k,
+            JsValue::from_object(fh),
+            PropertyAttrs::ENUMERABLE | PropertyAttrs::CONFIGURABLE,
+            &mut vm.shapes,
+        );
+    }
+    web_apis.borrow_mut().file_lists.insert(obj, files);
+    obj
+}
+
 #[allow(dead_code)]
 pub(crate) fn abort_info_for_signal(
     web_apis: &SharedWebApis,
@@ -833,10 +953,10 @@ pub fn install_web_apis(
 ) -> SharedWebApis {
     let web_apis = Rc::new(RefCell::new(WebApiState::new(origin_url, storage)));
     host.borrow_mut().main_document_url = web_apis.borrow().current_href();
-    install_dom_exception_ctor(vm);
+    install_dom_exception_ctor(vm, &web_apis);
     install_url_and_search_params(vm, &web_apis);
     install_text_encoding(vm, &web_apis);
-    install_blob_and_file(vm, &web_apis);
+    install_blob_and_file(vm, host, &web_apis);
     install_file_reader(vm, host, events, event_loop, &web_apis);
     install_form_data(vm, host, &web_apis);
     install_structured_clone(vm, &web_apis);
@@ -1139,12 +1259,13 @@ fn encode_base64(input: &[u8]) -> String {
     out
 }
 
-fn install_dom_exception_ctor(vm: &mut JsVm) {
+fn install_dom_exception_ctor(vm: &mut JsVm, web_apis: &SharedWebApis) {
     let proto = vm.heap.alloc_object(JsObject::with_kind(
         ObjectKind::Ordinary,
         Some(vm.error_proto),
     ));
     vm.heap.get_object_mut(proto).unwrap().is_prototype = true;
+    web_apis.borrow_mut().protos.dom_exception_proto = Some(proto);
 
     let brand_check = |vm: &mut JsVm, this_val: JsValue| -> Result<HeapHandle, JsException> {
         let Some(h) = this_val.as_object() else {
@@ -2538,11 +2659,12 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
                 );
             }
             let mut st = wa_c.borrow_mut();
-            let id = st.next_object_url_id;
-            st.next_object_url_id = st.next_object_url_id.wrapping_add(1).max(1);
+            let id = GLOBAL_OBJECT_URL_SEQ.fetch_add(1, Ordering::Relaxed);
+            st.next_object_url_id = id.wrapping_add(1).max(1);
             let origin = origin_of_url(&st.location_url);
             let url = format!("blob:{origin}/{id}");
             if let Some((bytes, ct)) = blob_data {
+                register_global_object_url(url.clone(), bytes.clone(), ct.clone());
                 st.object_urls.insert(url.clone(), bytes);
                 st.object_url_types.insert(url.clone(), ct);
             } else {
@@ -2555,6 +2677,7 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
         let wa_r = Rc::clone(web_apis);
         define_host_method(vm, url_ctor, "revokeObjectURL", move |vm, _, args| {
             let url = vm.value_to_rust_string(arg(args, 0));
+            unregister_global_object_url(&url);
             let mut st = wa_r.borrow_mut();
             st.object_urls.remove(&url);
             st.object_url_types.remove(&url);
@@ -3202,7 +3325,7 @@ fn install_form_data(vm: &mut JsVm, host: &SharedHost, web_apis: &SharedWebApis)
 // Blob & File
 // ---------------------------------------------------------------------------
 
-fn install_blob_and_file(vm: &mut JsVm, web_apis: &SharedWebApis) {
+fn install_blob_and_file(vm: &mut JsVm, host: &SharedHost, web_apis: &SharedWebApis) {
     let bp = vm.alloc_ordinary_object();
     vm.heap.get_object_mut(bp).unwrap().is_prototype = true;
     web_apis.borrow_mut().protos.blob_proto = Some(bp);
@@ -3324,7 +3447,25 @@ fn install_blob_and_file(vm: &mut JsVm, web_apis: &SharedWebApis) {
                 }
             }
         }
-        let obj = create_blob_object(vm, &wa, bytes, content_type);
+        let target_proto = vm
+            .native_new_target
+            .as_object()
+            .and_then(|nt| vm.get_property_by_key(nt, vm.key_prototype).ok())
+            .and_then(JsValue::as_object)
+            .unwrap_or(bp);
+        let obj = vm.heap.alloc_object(JsObject::with_kind(
+            ObjectKind::Ordinary,
+            Some(target_proto),
+        ));
+        wa.borrow_mut().blobs.insert(
+            obj,
+            BlobEntry {
+                bytes,
+                content_type,
+                name: None,
+                last_modified: None,
+            },
+        );
         Ok(JsValue::from_object(obj))
     });
     bind_ctor_proto(vm, blob_ctor, bp);
@@ -3389,9 +3530,16 @@ fn install_blob_and_file(vm: &mut JsVm, web_apis: &SharedWebApis) {
                 }
             }
         }
-        let obj = vm
-            .heap
-            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(fp)));
+        let target_proto = vm
+            .native_new_target
+            .as_object()
+            .and_then(|nt| vm.get_property_by_key(nt, vm.key_prototype).ok())
+            .and_then(JsValue::as_object)
+            .unwrap_or(fp);
+        let obj = vm.heap.alloc_object(JsObject::with_kind(
+            ObjectKind::Ordinary,
+            Some(target_proto),
+        ));
         wa.borrow_mut().blobs.insert(
             obj,
             BlobEntry {
@@ -3404,7 +3552,84 @@ fn install_blob_and_file(vm: &mut JsVm, web_apis: &SharedWebApis) {
         Ok(JsValue::from_object(obj))
     });
     bind_ctor_proto(vm, file_ctor, fp);
+    vm.heap
+        .object_set_prototype(file_ctor, Some(blob_ctor), &mut vm.shapes);
     define_global(vm, "File", JsValue::from_object(file_ctor));
+
+    // FileList interface (WHATWG File API §5) + HTMLInputElement.prototype.files
+    let flp = vm.alloc_ordinary_object();
+    vm.heap.get_object_mut(flp).unwrap().is_prototype = true;
+    crate::dom_interfaces::define_to_string_tag(vm, flp, "FileList");
+    web_apis.borrow_mut().protos.file_list_proto = Some(flp);
+    {
+        let wa = Rc::clone(web_apis);
+        define_host_getter(vm, flp, "length", move |vm, this_val, _| {
+            let Some(h) = this_val.as_object() else {
+                return Err(vm.type_error("Illegal invocation on FileList"));
+            };
+            let len = wa
+                .borrow()
+                .file_lists
+                .get(&h)
+                .map(Vec::len)
+                .ok_or_else(|| vm.type_error("Illegal invocation on FileList"))?;
+            Ok(JsValue::from_f64(len as f64))
+        });
+    }
+    {
+        let wa = Rc::clone(web_apis);
+        define_host_method(vm, flp, "item", move |vm, this_val, args| {
+            let Some(h) = this_val.as_object() else {
+                return Err(vm.type_error("Illegal invocation on FileList"));
+            };
+            let idx = vm.to_u32(arg(args, 0))? as usize;
+            let len = wa
+                .borrow()
+                .file_lists
+                .get(&h)
+                .map(Vec::len)
+                .ok_or_else(|| vm.type_error("Illegal invocation on FileList"))?;
+            if idx >= len {
+                return Ok(JsValue::NULL);
+            }
+            let k = vm.heap.intern_key(&idx.to_string());
+            Ok(vm.get_property_by_key(h, k).unwrap_or(JsValue::NULL))
+        });
+    }
+    let fl_ctor = vm.alloc_host_fn("FileList", |vm, _, _| {
+        Err(vm.type_error("Illegal constructor: FileList"))
+    });
+    bind_ctor_proto(vm, fl_ctor, flp);
+    define_global(vm, "FileList", JsValue::from_object(fl_ctor));
+
+    if let Some(&input_proto) = host.borrow().interface_protos.get("HTMLInputElement") {
+        let h_f = Rc::clone(host);
+        let wa_f = Rc::clone(web_apis);
+        define_host_getter(vm, input_proto, "files", move |vm, this_val, _| {
+            let Some(nid) = h_f.borrow().node_for_value(vm, this_val) else {
+                return Err(vm.type_error("Illegal invocation on HTMLInputElement"));
+            };
+            let is_file = {
+                let doc_rc = Rc::clone(&h_f.borrow().document);
+                let doc = doc_rc.borrow();
+                matches!(
+                    doc.get(nid),
+                    Some(rix_dom::NodeData::Element(el))
+                        if el
+                            .get_attribute("type")
+                            .is_some_and(|t| t.eq_ignore_ascii_case("file"))
+                )
+            };
+            if !is_file {
+                return Ok(JsValue::NULL);
+            }
+            Ok(JsValue::from_object(create_file_list_object(
+                vm,
+                &wa_f,
+                Vec::new(),
+            )))
+        });
+    }
 }
 
 fn require_blob(
@@ -4867,6 +5092,14 @@ fn install_window_and_navigator(
 
     // navigator object (preserved & extended by service_worker.rs and webgpu.rs).
     let nav = vm.alloc_ordinary_object();
+    let app_code_name = JsValue::from_string(vm.heap.alloc_string("Mozilla"));
+    let app_name = JsValue::from_string(vm.heap.alloc_string("Netscape"));
+    let app_version = JsValue::from_string(
+        vm.heap.alloc_string(
+            "5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) RixBrowser/0.2.0 Safari/537.36",
+        ),
+    );
+    let product = JsValue::from_string(vm.heap.alloc_string("Gecko"));
     let ua = JsValue::from_string(
         vm.heap
             .alloc_string("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) RixBrowser/0.2.0 Safari/537.36"),
@@ -4877,6 +5110,10 @@ fn install_window_and_navigator(
     let plat = JsValue::from_string(vm.heap.alloc_string("Linux x86_64"));
     let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get) as f64;
     for (k, v) in [
+        ("appCodeName", app_code_name),
+        ("appName", app_name),
+        ("appVersion", app_version),
+        ("product", product),
         ("userAgent", ua),
         ("language", lang),
         ("languages", JsValue::from_object(langs)),
@@ -4907,6 +5144,12 @@ fn install_window_and_navigator(
         });
     }
     define_global(vm, "navigator", JsValue::from_object(nav));
+    {
+        let wa_coi = Rc::clone(web_apis);
+        define_host_getter(vm, global, "crossOriginIsolated", move |_, _, _| {
+            Ok(JsValue::from_bool(wa_coi.borrow().cross_origin_isolated))
+        });
+    }
 
     // HTML §8.4 base64 utilities: `btoa` & `atob`
     define_host_method(vm, global, "btoa", |vm, _, args| {

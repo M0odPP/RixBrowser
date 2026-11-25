@@ -822,6 +822,7 @@ fn run_service_worker_thread(
             &streams,
             Some(Arc::clone(&fetch_engine)),
         );
+        let canvas2d = crate::canvas2d::install_canvas2d(&mut vm, &host, &web_apis);
         let frames = crate::frames::install_frame_and_messaging_apis(
             &mut vm,
             &host,
@@ -830,6 +831,11 @@ fn run_service_worker_thread(
             &web_apis,
             &net,
         );
+        {
+            let mut fs = frames.borrow_mut();
+            fs.canvas2d = Some(Rc::clone(&canvas2d));
+            fs.net = Some(Rc::clone(&net));
+        }
         let workers = crate::workers::install_worker_and_sse_apis(
             &mut vm,
             &host,
@@ -839,6 +845,7 @@ fn run_service_worker_thread(
             &net,
             &frames,
         );
+        frames.borrow_mut().workers = Some(Rc::clone(&workers));
         let local_sw = Rc::new(RefCell::new(ServiceWorkerSystem::new()));
         install_cache_storage(&mut vm, &web_apis, &streams, &net, &local_sw);
 

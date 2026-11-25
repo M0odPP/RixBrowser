@@ -251,6 +251,17 @@ pub struct NetworkBridge {
     pub(crate) protos: NetPrototypes,
 }
 
+impl NetworkBridge {
+    pub(crate) fn is_non_serializable_net_object(&self, h: HeapHandle) -> bool {
+        self.requests.contains_key(&h)
+            || self.responses.contains_key(&h)
+            || self.headers.contains_key(&h)
+            || self.header_iterators.contains_key(&h)
+            || self.ws_stream_handle_to_id.contains_key(&h)
+            || self.ws_errors.contains_key(&h)
+    }
+}
+
 /// Shared handle to [`NetworkBridge`].
 pub type SharedNetBridge = Rc<RefCell<NetworkBridge>>;
 
@@ -2288,14 +2299,18 @@ fn install_fetch_fn(
                 .to_string();
             let found = {
                 let st = wa.borrow();
-                st.object_urls.get(&lookup_url).cloned().map(|bytes| {
-                    let ct = st
-                        .object_url_types
-                        .get(&lookup_url)
-                        .cloned()
-                        .unwrap_or_default();
-                    (bytes, ct)
-                })
+                st.object_urls
+                    .get(&lookup_url)
+                    .cloned()
+                    .map(|bytes| {
+                        let ct = st
+                            .object_url_types
+                            .get(&lookup_url)
+                            .cloned()
+                            .unwrap_or_default();
+                        (bytes, ct)
+                    })
+                    .or_else(|| crate::web_apis::lookup_global_object_url(&lookup_url))
             };
             match found {
                 Some((bytes, ct)) => {
