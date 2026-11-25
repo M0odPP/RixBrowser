@@ -1768,6 +1768,7 @@ fn install_document_create_event(vm: &mut JsVm, host: &SharedHost, events: &Shar
 /// Standard `GlobalEventHandlers` + `WindowEventHandlers` IDL event handler names (WHATWG HTML §8.1.7.2).
 const GLOBAL_EVENT_HANDLERS: &[&str] = &[
     "onabort",
+    "onanimationcancel",
     "onanimationend",
     "onanimationiteration",
     "onanimationstart",
@@ -1799,7 +1800,10 @@ const GLOBAL_EVENT_HANDLERS: &[&str] = &[
     "onscroll",
     "onselect",
     "onsubmit",
+    "ontransitioncancel",
     "ontransitionend",
+    "ontransitionrun",
+    "ontransitionstart",
     "onwebkitanimationend",
     "onwebkitanimationiteration",
     "onwebkitanimationstart",
@@ -2425,6 +2429,24 @@ pub fn fire_dom_node_event(
     props: &[(&str, JsValue)],
 ) -> Result<bool, JsException> {
     let proto = events.borrow().event_proto.unwrap_or(vm.object_proto);
+    fire_dom_node_event_with_proto(
+        vm, host, events, event_loop, node, ev_type, bubbles, cancelable, proto, props,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fire_dom_node_event_with_proto(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    node: NodeId,
+    ev_type: &str,
+    bubbles: bool,
+    cancelable: bool,
+    proto: HeapHandle,
+    props: &[(&str, JsValue)],
+) -> Result<bool, JsException> {
     let ev_h = vm
         .heap
         .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
@@ -2457,8 +2479,13 @@ pub fn fire_dom_node_event(
     define_own_is_trusted(vm, events, ev_h);
     for &(name, val) in props {
         let k = vm.heap.intern_key(name);
+        let attrs = if name.starts_with("__rix_") {
+            PropertyAttrs::empty()
+        } else {
+            PropertyAttrs::DEFAULT
+        };
         vm.heap
-            .object_define_data(ev_h, k, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+            .object_define_data(ev_h, k, val, attrs, &mut vm.shapes);
     }
 
     // Invoke inline HTML `on<type>="..."` attributes and JS `node.on<type>` handlers along the
