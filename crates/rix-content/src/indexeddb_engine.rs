@@ -7,13 +7,14 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use rix_js::{HeapHandle, JsException, JsObject, JsValue, JsVm, ObjectKind};
+use rix_js::{HeapHandle, JsException, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs};
 use rix_storage::{IdbIndexSchema, IdbKey, IdbRecord, IdbStoreSnapshot};
 
+use crate::frames::SharedFrames;
 use crate::structured_clone::{
     decode_storage_payload, encode_storage_payload, CloneNode, CloneValue, StructuredClonePayload,
 };
-use crate::web_apis::{alloc_array_buffer, arg, create_dom_exception, define_host_method};
+use crate::web_apis::{alloc_array_buffer, create_dom_exception};
 
 /// Maximum valid value yielded by an IndexedDB `autoIncrement` key generator ($2^{53}$).
 pub const MAX_KEY_GENERATOR: u64 = 9_007_199_254_740_992;
@@ -634,35 +635,80 @@ pub fn alloc_js_array(vm: &mut JsVm, items: &[JsValue]) -> HeapHandle {
     arr
 }
 
-/// Allocates a `DOMStringList` (array of sorted strings with `.contains(s)` and `.item(i)`).
-pub fn alloc_dom_string_list(vm: &mut JsVm, mut names: Vec<String>) -> HeapHandle {
-    names.sort();
-    let vals: Vec<JsValue> = names
-        .iter()
-        .map(|s| JsValue::from_string(vm.heap.alloc_string(s)))
-        .collect();
-    let arr = alloc_js_array(vm, &vals);
-    let names_c = names.clone();
-    define_host_method(vm, arr, "contains", move |vm, _, args| {
-        let needle = vm.value_to_rust_string(arg(args, 0));
-        Ok(JsValue::from_bool(names_c.iter().any(|n| n == &needle)))
-    });
-    define_host_method(vm, arr, "item", move |vm, _, args| {
-        let idx = arg(args, 0).as_number().unwrap_or(-1.0);
-        if idx >= 0.0 && (idx as usize) < names.len() {
-            Ok(JsValue::from_string(
-                vm.heap.alloc_string(&names[idx as usize]),
-            ))
-        } else {
-            Ok(JsValue::NULL)
-        }
-    });
-    arr
+/// Allocates a W3C `DOMStringList` sorted by UTF-16 code units, inheriting from
+/// `dom_string_list_proto` (with `.length`, indexed properties `0..n`, `.item(i)`, `.contains(s)`).
+pub fn alloc_dom_string_list(
+    vm: &mut JsVm,
+    dom_string_list_proto: HeapHandle,
+    mut names: Vec<String>,
+) -> HeapHandle {
+    names.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
+    names.dedup();
+    let obj = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Ordinary,
+        Some(dom_string_list_proto),
+    ));
+    for (idx, s) in names.iter().enumerate() {
+        let v = JsValue::from_string(vm.heap.alloc_string(s));
+        let k = vm.heap.intern_key(&idx.to_string());
+        vm.heap.object_define_data(
+            obj,
+            k,
+            v,
+            PropertyAttrs::ENUMERABLE | PropertyAttrs::CONFIGURABLE,
+            &mut vm.shapes,
+        );
+    }
+    let k_len = vm.heap.intern_key("__rix_dsl_len__");
+    vm.heap.object_define_data(
+        obj,
+        k_len,
+        JsValue::from_number(names.len() as f64),
+        PropertyAttrs::empty(),
+        &mut vm.shapes,
+    );
+    obj
 }
 
-/// Converts a JS value to a valid W3C IndexedDB key, throwing `DataError` on invalid values.
+fn read_buffer_bytes_for_key(
+    vm: &mut JsVm,
+    frames: Option<&SharedFrames>,
+    buf_h: HeapHandle,
+) -> Result<Vec<u8>, JsException> {
+    let Some(o) = vm.heap.get_object(buf_h) else {
+        return Err(create_dom_exception(
+            vm,
+            "DataError",
+            "Buffer is not a valid IndexedDB key",
+        ));
+    };
+    let detached = o.rare.as_deref().is_some_and(|r| r.ab_detached)
+        || frames.is_some_and(|f| f.borrow().is_buffer_detached(buf_h));
+    if detached {
+        return Err(create_dom_exception(
+            vm,
+            "DataError",
+            "Detached ArrayBuffer is not a valid IndexedDB key",
+        ));
+    }
+    if let Some(shared) = o.rare.as_deref().and_then(|r| r.shared_mem.as_ref()) {
+        let bytes = shared.data.lock().map(|g| g.clone()).unwrap_or_default();
+        return Ok(bytes);
+    }
+    match &o.kind {
+        ObjectKind::ArrayBuffer(b) => Ok((**b).clone()),
+        _ => Err(create_dom_exception(
+            vm,
+            "DataError",
+            "Buffer is not a valid IndexedDB key",
+        )),
+    }
+}
+
+/// Converts a JS value to a valid W3C IndexedDB 3.0 key, throwing `DataError` on invalid values.
 pub fn js_to_idb_key(
     vm: &mut JsVm,
+    frames: Option<&SharedFrames>,
     val: JsValue,
     seen: &mut HashSet<HeapHandle>,
 ) -> Result<IdbKey, JsException> {
@@ -682,42 +728,44 @@ pub fn js_to_idb_key(
     if let Some(h) = val.as_object() {
         enum KindInfo {
             Date(f64),
-            Binary(Vec<u8>),
-            Array(Vec<JsValue>),
+            ArrayBuffer,
+            TypedArray {
+                buffer: HeapHandle,
+                byte_offset: u32,
+                length: u32,
+                bpe: usize,
+                auto_length: bool,
+            },
+            DataView {
+                buffer: HeapHandle,
+                byte_offset: u32,
+                byte_length: u32,
+                auto_length: bool,
+            },
+            Array,
             Invalid,
         }
-        let info = match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::Date(ms)) => KindInfo::Date(*ms),
-            Some(ObjectKind::ArrayBuffer(buf)) => KindInfo::Binary(buf.as_ref().clone()),
-            Some(ObjectKind::TypedArray(ta)) => {
-                let bytes = match vm.heap.get_object(ta.buffer).map(|o| &o.kind) {
-                    Some(ObjectKind::ArrayBuffer(buf)) => {
-                        let start = (ta.byte_offset as usize).min(buf.len());
-                        let byte_len =
-                            (ta.length as usize).saturating_mul(ta.kind.bytes_per_element());
-                        let end = start.saturating_add(byte_len).min(buf.len());
-                        buf[start..end].to_vec()
-                    }
-                    _ => Vec::new(),
-                };
-                KindInfo::Binary(bytes)
-            }
-            Some(ObjectKind::Array) => {
-                let len = vm
-                    .heap
-                    .get_object(h)
-                    .map_or(0, |o| o.elements.len() as usize);
-                let mut elems = Vec::with_capacity(len);
-                for i in 0..len {
-                    let v = u32::try_from(i)
-                        .ok()
-                        .and_then(|idx| vm.heap.get_object(h).and_then(|o| o.elements.get(idx)))
-                        .unwrap_or(JsValue::UNDEFINED);
-                    elems.push(v);
-                }
-                KindInfo::Array(elems)
-            }
-            _ => KindInfo::Invalid,
+        let info = match vm.heap.get_object(h) {
+            Some(o) => match &o.kind {
+                ObjectKind::Date(ms) => KindInfo::Date(*ms),
+                ObjectKind::ArrayBuffer(_) => KindInfo::ArrayBuffer,
+                ObjectKind::TypedArray(ta) => KindInfo::TypedArray {
+                    buffer: ta.buffer,
+                    byte_offset: ta.byte_offset,
+                    length: ta.length,
+                    bpe: ta.kind.bytes_per_element(),
+                    auto_length: o.rare.as_deref().is_some_and(|r| r.view_auto_length),
+                },
+                ObjectKind::DataView(dv) => KindInfo::DataView {
+                    buffer: dv.buffer,
+                    byte_offset: dv.byte_offset,
+                    byte_length: dv.byte_length,
+                    auto_length: o.rare.as_deref().is_some_and(|r| r.view_auto_length),
+                },
+                ObjectKind::Array => KindInfo::Array,
+                _ => KindInfo::Invalid,
+            },
+            None => KindInfo::Invalid,
         };
         match info {
             KindInfo::Date(ms) => {
@@ -728,10 +776,75 @@ pub fn js_to_idb_key(
                         "Invalid Date is not a valid IndexedDB key",
                     ));
                 }
-                return Ok(IdbKey::Date(ms));
+                return Ok(IdbKey::Date(if ms == 0.0 { 0.0 } else { ms }));
             }
-            KindInfo::Binary(b) => return Ok(IdbKey::Binary(b)),
-            KindInfo::Array(elems) => {
+            KindInfo::ArrayBuffer => {
+                let bytes = read_buffer_bytes_for_key(vm, frames, h)?;
+                return Ok(IdbKey::Binary(bytes));
+            }
+            KindInfo::TypedArray {
+                buffer,
+                byte_offset,
+                length,
+                bpe,
+                auto_length,
+            } => {
+                let raw = read_buffer_bytes_for_key(vm, frames, buffer)?;
+                let start = byte_offset as usize;
+                let end = if auto_length {
+                    if start > raw.len() {
+                        return Err(create_dom_exception(
+                            vm,
+                            "DataError",
+                            "TypedArray key view is out of bounds",
+                        ));
+                    }
+                    let count = (raw.len() - start) / bpe;
+                    start + count * bpe
+                } else {
+                    let e = start.saturating_add((length as usize).saturating_mul(bpe));
+                    if e > raw.len() {
+                        return Err(create_dom_exception(
+                            vm,
+                            "DataError",
+                            "TypedArray key view is out of bounds",
+                        ));
+                    }
+                    e
+                };
+                return Ok(IdbKey::Binary(raw[start..end].to_vec()));
+            }
+            KindInfo::DataView {
+                buffer,
+                byte_offset,
+                byte_length,
+                auto_length,
+            } => {
+                let raw = read_buffer_bytes_for_key(vm, frames, buffer)?;
+                let start = byte_offset as usize;
+                let end = if auto_length {
+                    if start > raw.len() {
+                        return Err(create_dom_exception(
+                            vm,
+                            "DataError",
+                            "DataView key is out of bounds",
+                        ));
+                    }
+                    raw.len()
+                } else {
+                    let e = start.saturating_add(byte_length as usize);
+                    if e > raw.len() {
+                        return Err(create_dom_exception(
+                            vm,
+                            "DataError",
+                            "DataView key is out of bounds",
+                        ));
+                    }
+                    e
+                };
+                return Ok(IdbKey::Binary(raw[start..end].to_vec()));
+            }
+            KindInfo::Array => {
                 if !seen.insert(h) {
                     return Err(create_dom_exception(
                         vm,
@@ -739,9 +852,40 @@ pub fn js_to_idb_key(
                         "Cyclic array is not a valid IndexedDB key",
                     ));
                 }
-                let mut keys = Vec::with_capacity(elems.len());
-                for elem in elems {
-                    keys.push(js_to_idb_key(vm, elem, seen)?);
+                let k_len = vm.heap.intern_key("length");
+                let len_val = vm.get_property_by_key(h, k_len)?;
+                let len = vm.to_u32(len_val)? as usize;
+                let mut keys = Vec::with_capacity(len.min(1024));
+                for i in 0..len {
+                    let key_s = i.to_string();
+                    let pk = vm.heap.intern_key(&key_s);
+                    let has_own = vm
+                        .heap
+                        .get_object(h)
+                        .is_some_and(|o| o.elements.has(i as u32))
+                        || vm.heap.object_get_own(h, pk, &vm.shapes).is_some();
+                    if !has_own {
+                        seen.remove(&h);
+                        return Err(create_dom_exception(
+                            vm,
+                            "DataError",
+                            "Sparse array is not a valid IndexedDB key",
+                        ));
+                    }
+                    let elem = match vm.get_property_by_key(h, pk) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            seen.remove(&h);
+                            return Err(e);
+                        }
+                    };
+                    match js_to_idb_key(vm, frames, elem, seen) {
+                        Ok(k) => keys.push(k),
+                        Err(e) => {
+                            seen.remove(&h);
+                            return Err(e);
+                        }
+                    }
                 }
                 seen.remove(&h);
                 return Ok(IdbKey::Array(keys));
@@ -776,42 +920,70 @@ pub fn idb_key_to_js(vm: &mut JsVm, key: &IdbKey) -> JsValue {
     }
 }
 
-/// Parses a JS `keyPath` option (`string`, `string[]`, or `null`/`undefined`).
-pub fn parse_key_path_arg(vm: &mut JsVm, val: JsValue) -> Result<Option<Vec<String>>, JsException> {
-    if val.is_undefined() || val.is_null() {
+/// Parses and validates a JS `keyPath` option (`string | sequence<string> | null`).
+pub fn parse_key_path_arg(
+    vm: &mut JsVm,
+    val: JsValue,
+    allow_null: bool,
+) -> Result<Option<(Vec<String>, bool)>, JsException> {
+    if val.is_undefined() || (allow_null && val.is_null()) {
         return Ok(None);
     }
     if val.is_string() {
-        return Ok(Some(vec![vm.value_to_rust_string(val)]));
+        let s = vm.value_to_rust_string(val);
+        if !is_valid_key_path_str(&s) {
+            return Err(create_dom_exception(
+                vm,
+                "SyntaxError",
+                &format!("Invalid keyPath '{s}'"),
+            ));
+        }
+        return Ok(Some((vec![s], false)));
     }
     if let Some(h) = val.as_object() {
-        if matches!(
+        let is_array = matches!(
             vm.heap.get_object(h).map(|o| &o.kind),
             Some(ObjectKind::Array)
-        ) {
-            let len = vm
-                .heap
-                .get_object(h)
-                .map_or(0, |o| o.elements.len() as usize);
-            let mut out = Vec::with_capacity(len);
-            for i in 0..len {
-                let v = u32::try_from(i)
-                    .ok()
-                    .and_then(|idx| vm.heap.get_object(h).and_then(|o| o.elements.get(idx)))
-                    .unwrap_or(JsValue::UNDEFINED);
-                out.push(vm.value_to_rust_string(v));
-            }
-            if out.is_empty() {
+        );
+        let is_iterable = is_array || {
+            let sym_iter = vm.key_symbol_iterator;
+            vm.get_property_by_key(h, sym_iter)?
+                .as_object()
+                .is_some_and(|f| vm.is_callable_handle(f))
+        };
+        if is_iterable {
+            let raw_items = vm.collect_iterable(val)?;
+            if raw_items.is_empty() {
                 return Err(create_dom_exception(
                     vm,
                     "SyntaxError",
                     "Empty array keyPath is invalid",
                 ));
             }
-            return Ok(Some(out));
+            let mut out = Vec::with_capacity(raw_items.len());
+            for item in raw_items {
+                let s = vm.to_js_string(item)?;
+                if !is_valid_key_path_str(&s) {
+                    return Err(create_dom_exception(
+                        vm,
+                        "SyntaxError",
+                        &format!("Invalid keyPath '{s}'"),
+                    ));
+                }
+                out.push(s);
+            }
+            return Ok(Some((out, true)));
         }
     }
-    Ok(Some(vec![vm.value_to_rust_string(val)]))
+    let s = vm.to_js_string(val)?;
+    if !is_valid_key_path_str(&s) {
+        return Err(create_dom_exception(
+            vm,
+            "SyntaxError",
+            &format!("Invalid keyPath '{s}'"),
+        ));
+    }
+    Ok(Some((vec![s], false)))
 }
 
 /// Converts a structured-clone JSON value to an [`IdbKey`] if valid.
@@ -1012,124 +1184,13 @@ impl CursorDirection {
     }
 }
 
-/// Materialized cursor entry pairing effective key, primary key, and serialized JSON value.
+/// Materialized cursor / `getAllRecords` entry pairing effective key, primary key, and payload.
 #[derive(Debug, Clone)]
 pub struct IdbCursorEntry {
     pub key: IdbKey,
     pub primary_key: IdbKey,
+    pub value_bytes: Vec<u8>,
     pub value_json: String,
-}
-
-/// Applies `put` or `add` onto `store` with keyPath extraction, `autoIncrement` key
-/// generation, duplicate-key checking, and `unique` secondary index validation.
-pub fn store_put_or_add(
-    store: &mut IdbStoreSnapshot,
-    mut val_json: serde_json::Value,
-    explicit_key: Option<IdbKey>,
-    no_overwrite: bool,
-) -> Result<IdbKey, (&'static str, String)> {
-    let key = if let Some(ref kp) = store.key_path {
-        if explicit_key.is_some() {
-            return Err((
-                "DataError",
-                "Explicit key is forbidden when object store has a keyPath".to_string(),
-            ));
-        }
-        if let Some(extracted) = extract_key_path_from_json(&val_json, kp) {
-            if store.auto_increment {
-                if let IdbKey::Number(n) = extracted {
-                    if n >= 1.0 && n.is_finite() && (n as u64) >= store.next_key {
-                        store.next_key = (n as u64).saturating_add(1);
-                    }
-                }
-            }
-            extracted
-        } else if store.auto_increment && kp.len() == 1 {
-            let gen = store.next_key;
-            store.next_key = store.next_key.saturating_add(1);
-            if !inject_auto_key_into_json(&mut val_json, &kp[0], gen) {
-                return Err((
-                    "DataError",
-                    "Cannot inject autoIncrement key into non-object value".to_string(),
-                ));
-            }
-            IdbKey::Number(gen as f64)
-        } else {
-            return Err((
-                "DataError",
-                "Evaluating the object store's keyPath did not yield a valid key".to_string(),
-            ));
-        }
-    } else if let Some(k) = explicit_key {
-        if store.auto_increment {
-            if let IdbKey::Number(n) = k {
-                if n >= 1.0 && n.is_finite() && (n as u64) >= store.next_key {
-                    store.next_key = (n as u64).saturating_add(1);
-                }
-            }
-        }
-        k
-    } else if store.auto_increment {
-        let gen = store.next_key;
-        store.next_key = store.next_key.saturating_add(1);
-        IdbKey::Number(gen as f64)
-    } else {
-        return Err((
-            "DataError",
-            "No key provided and store does not use keyPath or autoIncrement".to_string(),
-        ));
-    };
-
-    let encoded_pk = key.to_encoded_bytes();
-    if no_overwrite && store.records.contains_key(&encoded_pk) {
-        return Err((
-            "ConstraintError",
-            "Key already exists in object store".to_string(),
-        ));
-    }
-
-    // Validate every `unique: true` index BEFORE mutating `store.records`!
-    for idx_schema in store.indexes.values() {
-        if !idx_schema.unique {
-            continue;
-        }
-        let new_idx_keys = extract_index_keys_from_json(&val_json, idx_schema);
-        if new_idx_keys.is_empty() {
-            continue;
-        }
-        for (other_pk, other_rec) in &store.records {
-            if other_pk == &encoded_pk {
-                continue;
-            }
-            let Ok(other_val) = serde_json::from_str::<serde_json::Value>(&other_rec.value_json)
-            else {
-                continue;
-            };
-            let existing_keys = extract_index_keys_from_json(&other_val, idx_schema);
-            for nk in &new_idx_keys {
-                if existing_keys
-                    .iter()
-                    .any(|ek| ek.idb_cmp(nk) == Ordering::Equal)
-                {
-                    return Err((
-                        "ConstraintError",
-                        format!("Unique constraint violated on index '{}'", idx_schema.name),
-                    ));
-                }
-            }
-        }
-    }
-
-    let serialized = serde_json::to_string(&val_json).unwrap_or_else(|_| "null".into());
-    store.records.insert(
-        encoded_pk,
-        IdbRecord {
-            key: key.clone(),
-            value_json: serialized,
-            value_bytes: Vec::new(),
-        },
-    );
-    Ok(key)
 }
 
 /// Collects matching primary-key records from `store` in cursor `dir` order.
@@ -1146,6 +1207,7 @@ pub fn collect_store_entries(
         .map(|rec| IdbCursorEntry {
             key: rec.key.clone(),
             primary_key: rec.key.clone(),
+            value_bytes: rec.value_bytes.clone(),
             value_json: rec.value_json.clone(),
         })
         .collect();
@@ -1165,26 +1227,42 @@ pub fn collect_index_entries(
 ) -> Vec<IdbCursorEntry> {
     let mut pairs: Vec<IdbCursorEntry> = Vec::new();
     for rec in store.records.values() {
-        let Ok(jv) = serde_json::from_str::<serde_json::Value>(&rec.value_json) else {
+        let Some(payload) = decode_record_payload(rec) else {
             continue;
         };
-        for ik in extract_index_keys_from_json(&jv, idx_schema) {
+        for ik in extract_index_keys_from_payload(&payload, idx_schema) {
             if range.is_none_or(|r| r.matches(&ik)) {
                 pairs.push(IdbCursorEntry {
                     key: ik,
                     primary_key: rec.key.clone(),
+                    value_bytes: rec.value_bytes.clone(),
                     value_json: rec.value_json.clone(),
                 });
             }
         }
     }
-    pairs.sort_by(|a, b| {
-        a.key
-            .idb_cmp(&b.key)
-            .then_with(|| a.primary_key.idb_cmp(&b.primary_key))
-    });
-    if dir.is_reverse() {
-        pairs.reverse();
+    match dir {
+        CursorDirection::Next | CursorDirection::NextUnique => {
+            pairs.sort_by(|a, b| {
+                a.key
+                    .idb_cmp(&b.key)
+                    .then_with(|| a.primary_key.idb_cmp(&b.primary_key))
+            });
+        }
+        CursorDirection::Prev => {
+            pairs.sort_by(|a, b| {
+                b.key
+                    .idb_cmp(&a.key)
+                    .then_with(|| b.primary_key.idb_cmp(&a.primary_key))
+            });
+        }
+        CursorDirection::PrevUnique => {
+            pairs.sort_by(|a, b| {
+                b.key
+                    .idb_cmp(&a.key)
+                    .then_with(|| a.primary_key.idb_cmp(&b.primary_key))
+            });
+        }
     }
     if dir.is_unique() {
         let mut deduped: Vec<IdbCursorEntry> = Vec::with_capacity(pairs.len());
@@ -1229,18 +1307,20 @@ mod tests {
             },
         );
 
-        let k1 = store_put_or_add(
+        let k1 = store_put_or_add_payload(
             &mut store,
-            serde_json::json!({ "email": "a@ex.com", "tags": ["rust", "rust", "gpu"] }),
+            json_value_to_payload(
+                &serde_json::json!({ "email": "a@ex.com", "tags": ["rust", "rust", "gpu"] }),
+            ),
             None,
             true,
         )
         .expect("insert 1");
         assert_eq!(k1, IdbKey::Number(1.0));
 
-        let dup = store_put_or_add(
+        let dup = store_put_or_add_payload(
             &mut store,
-            serde_json::json!({ "email": "a@ex.com", "tags": ["js"] }),
+            json_value_to_payload(&serde_json::json!({ "email": "a@ex.com", "tags": ["js"] })),
             None,
             true,
         );

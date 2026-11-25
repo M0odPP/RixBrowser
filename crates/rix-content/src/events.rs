@@ -102,7 +102,6 @@ impl EventSystem {
 
     /// Registers or clears the WHATWG DOM "get the parent" `EventTarget` parent for a non-Node
     /// object (e.g. `IDBRequest -> IDBTransaction -> IDBDatabase`).
-    #[allow(dead_code)]
     pub(crate) fn set_object_event_parent(
         &mut self,
         child: HeapHandle,
@@ -2918,80 +2917,11 @@ pub(crate) fn fire_object_event_dispatch_only(
     let _ = dispatch_event_internal(vm, host, events, event_loop, target_key, ev_h);
 }
 
-/// Fires a trusted cancelable event on `target` and returns `true` if a listener called `preventDefault()`.
-#[allow(clippy::too_many_arguments, dead_code)]
-pub(crate) fn fire_cancelable_object_event(
-    vm: &mut JsVm,
-    host: &SharedHost,
-    events: &SharedEvents,
-    event_loop: &SharedEventLoop,
-    target: HeapHandle,
-    ev_type: &str,
-    proto: HeapHandle,
-) -> bool {
-    let ev_h = vm
-        .heap
-        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
-    let ts = events.borrow().now_ms();
-    events.borrow_mut().events.insert(
-        ev_h,
-        EventInternal {
-            event_type: ev_type.to_string(),
-            bubbles: true,
-            cancelable: true,
-            composed: false,
-            is_trusted: true,
-            initialized: true,
-            dispatch_flag: false,
-            default_prevented: false,
-            propagation_stopped: false,
-            immediate_stopped: false,
-            in_passive_listener: false,
-            event_phase: 2,
-            time_stamp: ts,
-            target: JsValue::from_object(target),
-            current_target: JsValue::from_object(target),
-            composed_path: vec![JsValue::from_object(target)],
-            path_keys: Vec::new(),
-            current_target_key: None,
-        },
-    );
-    define_own_is_trusted(vm, events, ev_h);
-
-    let handler_key = vm.heap.intern_key(&format!("on{ev_type}"));
-    if let Ok(handler_val) = vm.get_property_by_key(target, handler_key) {
-        if let Some(h) = handler_val
-            .as_object()
-            .filter(|&fh| vm.is_callable_handle(fh))
-        {
-            let _ = vm.call_value(
-                JsValue::from_object(h),
-                JsValue::from_object(target),
-                &[JsValue::from_object(ev_h)],
-            );
-        }
-    }
-
-    let target_key = if target == vm.global {
-        EventTargetKey::Window
-    } else if let Some(nid) = host.borrow().node_for_handle(vm, target) {
-        EventTargetKey::Node(nid)
-    } else {
-        EventTargetKey::Object(target)
-    };
-    let _ = dispatch_event_internal(vm, host, events, event_loop, target_key, ev_h);
-    events
-        .borrow()
-        .events
-        .get(&ev_h)
-        .is_some_and(|e| e.default_prevented)
-}
-
 /// Dispatches a trusted IndexedDB event purely through `EventTarget` capture/target/bubble
 /// propagation (including HTML §8.1.7.1 `EventHandler` IDL accessors and `object_parents`
 /// `IDBRequest -> IDBTransaction -> IDBDatabase` parent chain).
 /// Returns `(default_prevented, listener_threw)`.
-#[allow(clippy::too_many_arguments, dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fire_idb_event(
     vm: &mut JsVm,
     host: &SharedHost,
