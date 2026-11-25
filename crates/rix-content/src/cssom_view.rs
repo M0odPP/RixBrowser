@@ -91,7 +91,7 @@ impl CssomViewState {
 // checkVisibility, currentCSSZoom, scrollParent
 // ---------------------------------------------------------------------------
 
-fn flat_tree_parent(doc: &rix_dom::Document, n: NodeId) -> Option<NodeId> {
+pub(crate) fn flat_tree_parent(doc: &rix_dom::Document, n: NodeId) -> Option<NodeId> {
     if let Some(p) = doc.parent(n) {
         if let Some(NodeData::Element(pel)) = doc.get(p) {
             if let Some(sr) = pel.shadow_root {
@@ -255,7 +255,7 @@ fn check_visibility_impl(
     true
 }
 
-fn current_css_zoom_impl(host: &SharedHost, nid: NodeId) -> f64 {
+pub(crate) fn current_css_zoom_impl(host: &SharedHost, nid: NodeId) -> f64 {
     let chain = {
         let hb = host.borrow();
         let doc = hb.document.borrow();
@@ -284,7 +284,7 @@ fn current_css_zoom_impl(host: &SharedHost, nid: NodeId) -> f64 {
     product
 }
 
-fn is_scroll_container_style(st: &ComputedStyle) -> bool {
+pub(crate) fn is_scroll_container_style(st: &ComputedStyle) -> bool {
     matches!(
         st.overflow.x,
         OverflowMode::Scroll | OverflowMode::Auto | OverflowMode::Hidden
@@ -294,7 +294,7 @@ fn is_scroll_container_style(st: &ComputedStyle) -> bool {
     )
 }
 
-fn establishes_fixed_cb(st: &ComputedStyle) -> bool {
+pub(crate) fn establishes_fixed_cb(st: &ComputedStyle) -> bool {
     if let Some(fx) = st.effects.as_deref() {
         if !fx.transform.is_empty()
             || !matches!(fx.translate, rix_css::values_math::TranslateSpec::None)

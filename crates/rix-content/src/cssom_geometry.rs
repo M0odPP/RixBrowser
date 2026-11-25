@@ -177,7 +177,7 @@ fn mat4_transform_point(m: &[f64; 16], x: f64, y: f64, z: f64, w: f64) -> (f64, 
     (ox, oy, oz, ow)
 }
 
-fn mat4_project_2d(m: &[f64; 16], x: f64, y: f64) -> (f64, f64) {
+pub(crate) fn mat4_project_2d(m: &[f64; 16], x: f64, y: f64) -> (f64, f64) {
     let (ox, oy, _, ow) = mat4_transform_point(m, x, y, 0.0, 1.0);
     if ow.abs() > 1e-9 && (ow - 1.0).abs() > 1e-9 {
         (ox / ow, oy / ow)
@@ -459,16 +459,16 @@ impl CssBoxType {
 #[derive(Debug, Clone)]
 pub(crate) struct FragmentBox {
     /// Transform mapping local border-box `(0, 0)` into viewport coordinates.
-    to_viewport: [f64; 16],
-    border_size: Size,
-    padding: EdgeInsets,
-    border: EdgeInsets,
-    margin: EdgeInsets,
-    text: Option<String>,
+    pub(crate) to_viewport: [f64; 16],
+    pub(crate) border_size: Size,
+    pub(crate) padding: EdgeInsets,
+    pub(crate) border: EdgeInsets,
+    pub(crate) margin: EdgeInsets,
+    pub(crate) text: Option<String>,
 }
 
 impl FragmentBox {
-    fn local_rect(&self, box_type: CssBoxType) -> Rect {
+    pub(crate) fn local_rect(&self, box_type: CssBoxType) -> Rect {
         match box_type {
             CssBoxType::Border => {
                 Rect::new(0.0, 0.0, self.border_size.width, self.border_size.height)
@@ -721,40 +721,167 @@ fn parse_svg_transform_attr(raw: &str) -> [f64; 16] {
     m
 }
 
-fn svg_local_bbox_rec(doc: &rix_dom::Document, nid: NodeId) -> Option<Rect> {
+fn parse_svg_len(raw: &str, pct_basis: f32, vp: Size, font_size: f32) -> Option<f32> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+    if let Some(v) = lower.strip_suffix("px") {
+        return v.trim().parse::<f32>().ok();
+    }
+    if let Some(v) = lower.strip_suffix("vh") {
+        return v.trim().parse::<f32>().ok().map(|n| n * vp.height / 100.0);
+    }
+    if let Some(v) = lower.strip_suffix("vw") {
+        return v.trim().parse::<f32>().ok().map(|n| n * vp.width / 100.0);
+    }
+    if let Some(v) = lower.strip_suffix("vmin") {
+        return v
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|n| n * vp.width.min(vp.height) / 100.0);
+    }
+    if let Some(v) = lower.strip_suffix("vmax") {
+        return v
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|n| n * vp.width.max(vp.height) / 100.0);
+    }
+    if let Some(v) = lower.strip_suffix('%') {
+        return v.trim().parse::<f32>().ok().map(|n| n * pct_basis / 100.0);
+    }
+    if let Some(v) = lower.strip_suffix("rem") {
+        return v.trim().parse::<f32>().ok().map(|n| n * 16.0);
+    }
+    if let Some(v) = lower.strip_suffix("em") {
+        return v.trim().parse::<f32>().ok().map(|n| n * font_size);
+    }
+    if let Some(v) = lower.strip_suffix("pt") {
+        return v.trim().parse::<f32>().ok().map(|n| n * 96.0 / 72.0);
+    }
+    if let Some(v) = lower.strip_suffix("pc") {
+        return v.trim().parse::<f32>().ok().map(|n| n * 16.0);
+    }
+    if let Some(v) = lower.strip_suffix("in") {
+        return v.trim().parse::<f32>().ok().map(|n| n * 96.0);
+    }
+    if let Some(v) = lower.strip_suffix("cm") {
+        return v.trim().parse::<f32>().ok().map(|n| n * 96.0 / 2.54);
+    }
+    if let Some(v) = lower.strip_suffix("mm") {
+        return v.trim().parse::<f32>().ok().map(|n| n * 96.0 / 25.4);
+    }
+    lower.parse::<f32>().ok()
+}
+
+fn svg_local_bbox_rec(
+    doc: &rix_dom::Document,
+    nid: NodeId,
+    vp: Size,
+    parent_box: Size,
+) -> Option<Rect> {
     let NodeData::Element(el) = doc.get(nid)? else {
         return None;
     };
-    let num = |a: &str| {
+    let fs = el
+        .get_attribute("font-size")
+        .and_then(|s| parse_svg_len(s, 16.0, vp, 16.0))
+        .unwrap_or(16.0);
+    let num_x = |a: &str| {
         el.get_attribute(a)
-            .and_then(|s| s.trim().trim_end_matches("px").parse::<f32>().ok())
+            .and_then(|s| parse_svg_len(s, parent_box.width, vp, fs))
+    };
+    let num_y = |a: &str| {
+        el.get_attribute(a)
+            .and_then(|s| parse_svg_len(s, parent_box.height, vp, fs))
     };
     let tag = el.name.local.as_str();
     match tag {
-        "rect" => Some(Rect::new(
-            num("x").unwrap_or(0.0),
-            num("y").unwrap_or(0.0),
-            num("width").unwrap_or(0.0).max(0.0),
-            num("height").unwrap_or(0.0).max(0.0),
+        "rect" | "image" | "foreignObject" | "foreignobject" => Some(Rect::new(
+            num_x("x").unwrap_or(0.0),
+            num_y("y").unwrap_or(0.0),
+            num_x("width").unwrap_or(0.0).max(0.0),
+            num_y("height").unwrap_or(0.0).max(0.0),
         )),
+        "polygon" | "polyline" => {
+            let pts = el.get_attribute("points")?;
+            let nums: Vec<f32> = pts
+                .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse::<f32>().ok())
+                .collect();
+            if nums.len() < 2 {
+                return None;
+            }
+            let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            );
+            for &[x, y] in nums.as_chunks::<2>().0 {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+            Some(Rect::new(
+                min_x,
+                min_y,
+                (max_x - min_x).max(0.0),
+                (max_y - min_y).max(0.0),
+            ))
+        }
+        "path" => {
+            let d = el.get_attribute("d")?;
+            let nums: Vec<f32> = d
+                .split(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+                .filter(|s| !s.is_empty() && *s != "-")
+                .filter_map(|s| s.parse::<f32>().ok())
+                .collect();
+            if nums.len() < 2 {
+                return None;
+            }
+            let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            );
+            for &[x, y] in nums.as_chunks::<2>().0 {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+            Some(Rect::new(
+                min_x,
+                min_y,
+                (max_x - min_x).max(0.0),
+                (max_y - min_y).max(0.0),
+            ))
+        }
         "circle" => {
-            let cx = num("cx").unwrap_or(0.0);
-            let cy = num("cy").unwrap_or(0.0);
-            let r = num("r").unwrap_or(0.0).max(0.0);
+            let cx = num_x("cx").unwrap_or(0.0);
+            let cy = num_y("cy").unwrap_or(0.0);
+            let r = num_x("r").unwrap_or(0.0).max(0.0);
             Some(Rect::new(cx - r, cy - r, r * 2.0, r * 2.0))
         }
         "ellipse" => {
-            let cx = num("cx").unwrap_or(0.0);
-            let cy = num("cy").unwrap_or(0.0);
-            let rx = num("rx").unwrap_or(0.0).max(0.0);
-            let ry = num("ry").unwrap_or(0.0).max(0.0);
+            let cx = num_x("cx").unwrap_or(0.0);
+            let cy = num_y("cy").unwrap_or(0.0);
+            let rx = num_x("rx").unwrap_or(0.0).max(0.0);
+            let ry = num_y("ry").unwrap_or(0.0).max(0.0);
             Some(Rect::new(cx - rx, cy - ry, rx * 2.0, ry * 2.0))
         }
         "line" => {
-            let x1 = num("x1").unwrap_or(0.0);
-            let y1 = num("y1").unwrap_or(0.0);
-            let x2 = num("x2").unwrap_or(0.0);
-            let y2 = num("y2").unwrap_or(0.0);
+            let x1 = num_x("x1").unwrap_or(0.0);
+            let y1 = num_y("y1").unwrap_or(0.0);
+            let x2 = num_x("x2").unwrap_or(0.0);
+            let y2 = num_y("y2").unwrap_or(0.0);
             Some(Rect::new(
                 x1.min(x2),
                 y1.min(y2),
@@ -763,19 +890,56 @@ fn svg_local_bbox_rec(doc: &rix_dom::Document, nid: NodeId) -> Option<Rect> {
             ))
         }
         "text" | "tspan" => {
-            let fs = num("font-size").unwrap_or(16.0);
-            let x = num("x").unwrap_or(0.0);
-            let y = num("y").unwrap_or(fs);
+            let x = num_x("x").unwrap_or(0.0);
+            let y = num_y("y").unwrap_or(fs);
+            let is_ahem = el
+                .get_attribute("font-family")
+                .is_some_and(|ff| ff.to_ascii_lowercase().contains("ahem"));
+            let advance = if is_ahem { fs } else { fs * 0.6 };
             let chars = doc.inner_text(nid).trim().chars().count().max(1) as f32;
-            Some(Rect::new(x, y - fs * 0.8, chars * fs * 0.6, fs))
+            Some(Rect::new(x, y - fs * 0.8, chars * advance, fs))
         }
-        "g" | "a" | "svg" => {
+        "svg" => {
+            let x = num_x("x").unwrap_or(0.0);
+            let y = num_y("y").unwrap_or(0.0);
+            if let (Some(w), Some(h)) = (num_x("width"), num_y("height")) {
+                return Some(Rect::new(x, y, w.max(0.0), h.max(0.0)));
+            }
             let mut min_x = f32::INFINITY;
             let mut min_y = f32::INFINITY;
             let mut max_x = f32::NEG_INFINITY;
             let mut max_y = f32::NEG_INFINITY;
             for ch in doc.children(nid) {
-                if let Some(r) = svg_local_bbox_rec(doc, ch) {
+                if let Some(r) = svg_local_bbox_rec(doc, ch, vp, parent_box) {
+                    min_x = min_x.min(r.origin.x);
+                    min_y = min_y.min(r.origin.y);
+                    max_x = max_x.max(r.max_x());
+                    max_y = max_y.max(r.max_y());
+                }
+            }
+            if min_x.is_finite() {
+                Some(Rect::new(
+                    x + min_x,
+                    y + min_y,
+                    (max_x - min_x).max(0.0),
+                    (max_y - min_y).max(0.0),
+                ))
+            } else {
+                Some(Rect::new(
+                    x,
+                    y,
+                    num_x("width").unwrap_or(0.0),
+                    num_y("height").unwrap_or(0.0),
+                ))
+            }
+        }
+        "g" | "a" => {
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+            for ch in doc.children(nid) {
+                if let Some(r) = svg_local_bbox_rec(doc, ch, vp, parent_box) {
                     min_x = min_x.min(r.origin.x);
                     min_y = min_y.min(r.origin.y);
                     max_x = max_x.max(r.max_x());
@@ -797,50 +961,96 @@ fn svg_local_bbox_rec(doc: &rix_dom::Document, nid: NodeId) -> Option<Rect> {
     }
 }
 
-fn synthesize_svg_element_box(host: &SharedHost, nid: NodeId) -> Option<FragmentBox> {
+fn find_outermost_svg_ancestor(
+    doc: &rix_dom::Document,
+    nid: NodeId,
+) -> Option<(NodeId, Vec<NodeId>)> {
     let svg_ns = rix_dom::Namespace::from("http://www.w3.org/2000/svg");
-    let (svg_root, chain, local_bbox, view_box) = {
+    let NodeData::Element(el) = doc.get(nid)? else {
+        return None;
+    };
+    if el.name.ns != svg_ns {
+        return None;
+    }
+    let mut chain = vec![nid];
+    let mut cur = doc.parent(nid);
+    let mut outermost_svg = None;
+    while let Some(p) = cur {
+        if let Some(NodeData::Element(pel)) = doc.get(p) {
+            if pel.name.ns != svg_ns {
+                break;
+            }
+            if pel.name.local.as_str().eq_ignore_ascii_case("svg") {
+                outermost_svg = Some(p);
+                // Keep walking in case this `<svg>` is nested inside another `<svg>` / `<foreignObject>`.
+            }
+            chain.push(p);
+        } else {
+            break;
+        }
+        cur = doc.parent(p);
+    }
+    let root_svg = outermost_svg?;
+    // Trim `chain` so it holds nodes strictly below `root_svg` down to `nid` in top-down order.
+    if let Some(pos) = chain.iter().position(|&x| x == root_svg) {
+        chain.truncate(pos);
+    }
+    chain.reverse();
+    Some((root_svg, chain))
+}
+
+fn synthesize_svg_element_box(host: &SharedHost, nid: NodeId) -> Option<FragmentBox> {
+    let owner_doc = host.borrow().owner_doc_of(nid);
+    let vp = host.borrow_mut().viewport_for_doc(owner_doc);
+    let (svg_root, chain, view_box) = {
         let hb = host.borrow();
         let doc = hb.document.borrow();
-        let Some(NodeData::Element(el)) = doc.get(nid) else {
-            return None;
+        let (root_svg, chain) = find_outermost_svg_ancestor(&doc, nid)?;
+        let vb = match doc.get(root_svg) {
+            Some(NodeData::Element(pel)) => pel
+                .get_attribute("viewBox")
+                .or_else(|| pel.get_attribute("viewbox"))
+                .and_then(|s| {
+                    let nums: Vec<f64> = s
+                        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                        .filter(|t| !t.is_empty())
+                        .filter_map(|t| t.parse::<f64>().ok())
+                        .collect();
+                    (nums.len() == 4 && nums[2] > 0.0 && nums[3] > 0.0)
+                        .then_some((nums[0], nums[1], nums[2], nums[3]))
+                }),
+            _ => None,
         };
-        if el.name.ns != svg_ns || el.name.local.as_str().eq_ignore_ascii_case("svg") {
-            return None;
-        }
-        let bbox = svg_local_bbox_rec(&doc, nid)?;
-        let mut chain = vec![nid];
-        let mut cur = doc.parent(nid);
-        let mut root_svg = None;
-        let mut vb = None;
-        while let Some(p) = cur {
-            if let Some(NodeData::Element(pel)) = doc.get(p) {
-                if pel.name.local.as_str().eq_ignore_ascii_case("svg") {
-                    root_svg = Some(p);
-                    vb = pel
-                        .get_attribute("viewBox")
-                        .or_else(|| pel.get_attribute("viewbox"))
-                        .and_then(|s| {
-                            let nums: Vec<f64> = s
-                                .split(|c: char| c == ',' || c.is_ascii_whitespace())
-                                .filter(|t| !t.is_empty())
-                                .filter_map(|t| t.parse::<f64>().ok())
-                                .collect();
-                            (nums.len() == 4 && nums[2] > 0.0 && nums[3] > 0.0)
-                                .then_some((nums[0], nums[1], nums[2], nums[3]))
-                        });
-                    break;
-                }
-                chain.push(p);
-            }
-            cur = doc.parent(p);
-        }
-        chain.reverse();
-        (root_svg?, chain, bbox, vb)
+        (root_svg, chain, vb)
     };
     let root_boxes = collect_boxes_for_node(host, svg_root);
     let svg_box = root_boxes.first()?;
     let c_rect = svg_box.local_rect(CssBoxType::Content);
+    let mut parent_box = view_box.map_or(c_rect.size, |(_, _, vw, vh)| {
+        Size::new(vw as f32, vh as f32)
+    });
+    // If `nid` is inside a `<foreignObject>` ancestor, resolve percentage attributes against its size.
+    {
+        let hb = host.borrow();
+        let doc = hb.document.borrow();
+        for &anc in &chain[..chain.len().saturating_sub(1)] {
+            if let Some(NodeData::Element(el)) = doc.get(anc) {
+                let tag = el.name.local.as_str();
+                if tag.eq_ignore_ascii_case("foreignobject") || tag.eq_ignore_ascii_case("svg") {
+                    if let Some(r) = svg_local_bbox_rec(&doc, anc, vp, parent_box) {
+                        if r.size.width > 0.0 && r.size.height > 0.0 {
+                            parent_box = r.size;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let local_bbox = {
+        let hb = host.borrow();
+        let doc = hb.document.borrow();
+        svg_local_bbox_rec(&doc, nid, vp, parent_box)?
+    };
     let mut mat = mat4_mul(
         &svg_box.to_viewport,
         &mat4_translate(f64::from(c_rect.origin.x), f64::from(c_rect.origin.y), 0.0),
@@ -891,6 +1101,112 @@ fn synthesize_svg_element_box(host: &SharedHost, nid: NodeId) -> Option<Fragment
         margin: EdgeInsets::ZERO,
         text: None,
     })
+}
+
+/// Returns the viewport-relative clipping rect of the outermost `<svg>` viewport when `nid`
+/// is an SVG child element and that `<svg>` clips overflow (SVG UA default `overflow: hidden`).
+pub(crate) fn svg_outer_root_clip_rect(host: &SharedHost, nid: NodeId) -> Option<Rect> {
+    let root_svg = {
+        let hb = host.borrow();
+        let doc = hb.document.borrow();
+        let (root_svg, _) = find_outermost_svg_ancestor(&doc, nid)?;
+        root_svg
+    };
+    let st_opt = host.borrow_mut().computed_style_for_node(root_svg);
+    if let Some(st) = st_opt {
+        // Explicit `overflow: visible` disables SVG viewport clipping only if author set it,
+        // wait: CSS default is Visible unless UA sets Hidden; SVG spec says non-root `<svg>`
+        // clips its viewport unless explicitly `overflow: visible` in author styles.
+        // We check `overflow == Visible` only if author explicitly set inline/authored overflow;
+        // otherwise default to clipping to the `<svg>` content box.
+        let explicit_visible = {
+            let hb = host.borrow();
+            let doc = hb.document.borrow();
+            matches!(
+                doc.get(root_svg),
+                Some(NodeData::Element(el))
+                    if el.get_attribute("overflow").is_some_and(|v| v.eq_ignore_ascii_case("visible"))
+                        || el.get_attribute("style").is_some_and(|s| s.to_ascii_lowercase().contains("overflow") && s.to_ascii_lowercase().contains("visible"))
+            )
+        };
+        if explicit_visible
+            && st.overflow.x == rix_css::OverflowMode::Visible
+            && st.overflow.y == rix_css::OverflowMode::Visible
+        {
+            return None;
+        }
+    }
+    let boxes = collect_boxes_for_node(host, root_svg);
+    boxes
+        .first()
+        .map(|b| b.aabb_in_viewport(CssBoxType::Content))
+}
+
+/// Returns half of the SVG `stroke-width` in viewport CSS pixels for SVG geometric primitives
+/// when a visible `stroke` is active (for IntersectionObserver visual bounding box).
+pub(crate) fn svg_stroke_expansion(host: &SharedHost, nid: NodeId) -> f32 {
+    let svg_ns = rix_dom::Namespace::from("http://www.w3.org/2000/svg");
+    let (stroke_w_local, root_svg) = {
+        let hb = host.borrow();
+        let doc = hb.document.borrow();
+        let Some(NodeData::Element(el)) = doc.get(nid) else {
+            return 0.0;
+        };
+        if el.name.ns != svg_ns {
+            return 0.0;
+        }
+        let tag = el.name.local.as_str();
+        if !matches!(
+            tag,
+            "rect" | "circle" | "ellipse" | "line" | "polygon" | "polyline" | "path"
+        ) {
+            return 0.0;
+        }
+        let has_stroke = el
+            .get_attribute("stroke")
+            .is_some_and(|s| !s.trim().is_empty() && !s.trim().eq_ignore_ascii_case("none"));
+        if !has_stroke {
+            return 0.0;
+        }
+        let sw = el
+            .get_attribute("stroke-width")
+            .and_then(|s| s.trim().trim_end_matches("px").parse::<f32>().ok())
+            .unwrap_or(1.0);
+        if sw <= 0.0 {
+            return 0.0;
+        }
+        let root_svg = find_outermost_svg_ancestor(&doc, nid).map(|(r, _)| r);
+        (sw, root_svg)
+    };
+    let mut scale = 1.0f32;
+    if let Some(rs) = root_svg {
+        let vb = {
+            let hb = host.borrow();
+            let doc = hb.document.borrow();
+            match doc.get(rs) {
+                Some(NodeData::Element(pel)) => pel
+                    .get_attribute("viewBox")
+                    .or_else(|| pel.get_attribute("viewbox"))
+                    .and_then(|s| {
+                        let nums: Vec<f32> = s
+                            .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                            .filter(|t| !t.is_empty())
+                            .filter_map(|t| t.parse::<f32>().ok())
+                            .collect();
+                        (nums.len() == 4 && nums[2] > 0.0 && nums[3] > 0.0)
+                            .then_some((nums[2], nums[3]))
+                    }),
+                _ => None,
+            }
+        };
+        if let Some((vw, vh)) = vb {
+            if let Some(b) = collect_boxes_for_node(host, rs).first() {
+                let cr = b.local_rect(CssBoxType::Content);
+                scale = (cr.size.width / vw).min(cr.size.height / vh);
+            }
+        }
+    }
+    stroke_w_local * 0.5 * scale
 }
 
 /// Computes the CSSOM View transformed bounding client rect of `nid` (union of all fragment boxes).
