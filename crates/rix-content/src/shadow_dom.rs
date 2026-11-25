@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use rix_dom::{Document, NodeData, NodeId};
-use rix_js::{JsValue, JsVm, ObjectKind};
+use rix_js::{JsValue, JsVm};
 
 use crate::dom_bridge::{
     arg, define_host_accessor, define_host_method, require_node, wrap_node, DomMutation, SharedHost,
@@ -1094,30 +1094,16 @@ pub fn install_shadow_dom_apis(
         }
     }
 
-    // `ShadowRoot.prototype.adoptedStyleSheets`
+    // `ShadowRoot.prototype.adoptedStyleSheets` (live ObservableArray Proxy)
     {
         let h1 = Rc::clone(host);
         let g = vm.alloc_host_fn("get adoptedStyleSheets", move |vm, t, _| {
             let sr_id = require_node(vm, &h1, t)?;
-            let sheets = h1
-                .borrow()
-                .shadow_dom
-                .borrow()
-                .adopted_stylesheets
-                .get(&sr_id)
-                .cloned()
-                .unwrap_or_default();
-            let arr = vm.alloc_array();
-            let proto = h1.borrow().css_stylesheet_proto.unwrap_or(vm.object_proto);
-            for sh in sheets {
-                let obj = vm.heap.alloc_object(rix_js::JsObject::with_kind(
-                    ObjectKind::Ordinary,
-                    Some(proto),
-                ));
-                h1.borrow_mut().stylesheet_handle_map.insert(obj, sh);
-                vm.heap.object_push_element(arr, JsValue::from_object(obj));
-            }
-            Ok(JsValue::from_object(arr))
+            Ok(crate::cssom::create_adopted_stylesheets_proxy(
+                vm,
+                &h1,
+                Some(sr_id),
+            ))
         });
         let h2 = Rc::clone(host);
         let s = vm.alloc_host_fn("set adoptedStyleSheets", move |vm, t, args| {
@@ -1137,6 +1123,13 @@ pub fn install_shadow_dom_apis(
                             vm.type_error("adoptedStyleSheets must contain CSSStyleSheet objects")
                         );
                     };
+                    if !sh.borrow().is_constructed {
+                        return Err(crate::web_apis::create_dom_exception(
+                            vm,
+                            "NotAllowedError",
+                            "Cannot adopt a non-constructed CSSStyleSheet",
+                        ));
+                    }
                     sheets.push(Rc::clone(sh));
                 }
             }

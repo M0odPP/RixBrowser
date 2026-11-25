@@ -2,26 +2,27 @@
 //! `CSSStyleDeclaration`, `document.styleSheets`, `document.adoptedStyleSheets`,
 //! `<style>.sheet`, `getComputedStyle(el, pseudo)`, and validated inline `el.style`).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use rix_css::{
     evaluate_supports_condition_str, is_logical_property, parse_and_expand_declaration,
-    parse_and_serialize_declaration, parse_and_serialize_selector_for_context, parse_cssom_rules,
-    parse_pseudo_element_str, parse_single_cssom_rule_with_context, resolve_logical_to_physical,
-    serialize_css_tokens, strip_outer_css_comments, AlignValue, BorderCollapseMode, BoxSizingMode,
-    CalcExpr, ClearMode, ColorRgba, ComputedStyle, CssAtom, CssColor, CssomNestingContext,
-    CssomParseError, CssomRuleKind, CursorKind, DirectionMode, DisplayMode, EmptyCellsMode,
-    EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
-    GridAutoFlowMode, LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle,
-    MixBlendMode, OverflowMode, PointerEventsMode, PositionMode, PropertyIdKind, RixPseudoElement,
-    SelectorNamespaceMap, SizeValue, TableLayoutMode, TextAlignMode, TextOverflowMode,
-    UserSelectMode, VerticalAlignMode, VisibilityMode, WordBreakMode, ZIndexValue,
-    COMPUTED_STYLE_LONGHANDS,
+    parse_and_serialize_declaration, parse_and_serialize_keyframe_selector,
+    parse_and_serialize_page_selector, parse_and_serialize_selector_for_context, parse_cssom_rules,
+    parse_single_cssom_rule_with_context, parse_single_keyframe_rule, resolve_logical_to_physical,
+    serialize_css_tokens, strip_outer_css_comments, validate_and_serialize_page_descriptor,
+    AlignValue, BorderCollapseMode, BoxSizingMode, CalcExpr, ClearMode, ColorRgba, ComputedStyle,
+    CssAtom, CssColor, CssomNestingContext, CssomParseError, CssomRuleKind, CursorKind,
+    DirectionMode, DisplayMode, EmptyCellsMode, EvalContext, FilterOp, FlexDirectionMode,
+    FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode, LengthPercentage,
+    LengthPercentageAuto, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
+    PointerEventsMode, PositionMode, PropertyIdKind, RixPseudoElement, SelectorNamespaceMap,
+    SizeValue, TableLayoutMode, TextAlignMode, TextOverflowMode, UserSelectMode, VerticalAlignMode,
+    VisibilityMode, WordBreakMode, ZIndexValue, COMPUTED_STYLE_LONGHANDS,
 };
 use rix_dom::{NodeData, NodeId};
-use rix_js::promise::{alloc_promise, resolve_promise};
+use rix_js::promise::{alloc_promise, reject_promise, resolve_promise};
 use rix_js::{HeapHandle, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs};
 
 use crate::dom_bridge::{
@@ -30,7 +31,7 @@ use crate::dom_bridge::{
 };
 use crate::web_apis::create_dom_exception;
 
-/// Mutable backing state for a live CSSOM `CSSStyleSheet` (either `<style>.sheet` or constructed).
+/// Mutable backing state for a live CSSOM `CSSStyleSheet` (either `<style>.sheet`, `<link>.sheet`, `@import`, or constructed).
 #[derive(Debug, Clone)]
 pub struct CssStyleSheetState {
     pub owner_node: Option<NodeId>,
@@ -38,6 +39,13 @@ pub struct CssStyleSheetState {
     pub disabled: bool,
     pub is_constructed: bool,
     pub source_hash: u64,
+    pub title: Option<String>,
+    pub href: Option<String>,
+    pub media: Rc<RefCell<Vec<String>>>,
+    pub parent_sheet: Option<HeapHandle>,
+    pub owner_rule: Option<HeapHandle>,
+    pub js_handle: Option<HeapHandle>,
+    pub media_proxy: Option<JsValue>,
 }
 
 /// Shared handle to a live [`CssStyleSheetState`].
@@ -52,6 +60,13 @@ impl CssStyleSheetState {
             disabled: false,
             is_constructed,
             source_hash: simple_hash(css.as_bytes()),
+            title: None,
+            href: None,
+            media: Rc::new(RefCell::new(Vec::new())),
+            parent_sheet: None,
+            owner_rule: None,
+            js_handle: None,
+            media_proxy: None,
         }
     }
 
@@ -205,6 +220,15 @@ fn install_document_fonts(vm: &mut JsVm, host: &SharedHost) {
 
 fn install_css_namespace(vm: &mut JsVm, host: &SharedHost) {
     let css_obj = vm.alloc_ordinary_object();
+    let k_tag = vm.key_symbol_to_string_tag;
+    let v_tag = JsValue::from_string(vm.heap.alloc_string("CSS"));
+    vm.heap.object_define_data(
+        css_obj,
+        k_tag,
+        v_tag,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
 
     define_host_method(vm, css_obj, "supports", move |vm, _, args| {
         if args.is_empty() {
@@ -404,7 +428,7 @@ fn install_css_rule_ctors(vm: &mut JsVm, host: &SharedHost) {
     for cond_sub in ["CSSMediaRule", "CSSSupportsRule", "CSSContainerRule"] {
         let _ = define_iface(vm, host, cond_sub, Some(cond_proto), Some(cond_ctor));
     }
-    for group_sub in ["CSSLayerBlockRule", "CSSScopeRule"] {
+    for group_sub in ["CSSLayerBlockRule", "CSSScopeRule", "CSSPageRule"] {
         let _ = define_iface(
             vm,
             host,
@@ -419,21 +443,324 @@ fn install_css_rule_ctors(vm: &mut JsVm, host: &SharedHost) {
         "CSSLayerStatementRule",
         "CSSNamespaceRule",
         "CSSKeyframesRule",
+        "CSSKeyframeRule",
         "CSSPropertyRule",
         "CSSFontFaceRule",
+        "CSSCounterStyleRule",
     ] {
         let _ = define_iface(vm, host, rule_sub, Some(rule_proto), Some(rule_ctor));
     }
-    // CSSStyleDeclaration inherits Object.prototype (NOT CSSRule).
-    let _ = define_iface(vm, host, "CSSStyleDeclaration", None, None);
+    // CSSStyleDeclaration, CSSPageDescriptors, CSSRuleList, MediaList, StyleSheet, StyleSheetList.
+    let (decl_ctor, decl_proto) = define_iface(vm, host, "CSSStyleDeclaration", None, None);
+    attach_array_like_iterator(vm, decl_proto);
+    let (_, page_desc_proto) = define_iface(
+        vm,
+        host,
+        "CSSPageDescriptors",
+        Some(decl_proto),
+        Some(decl_ctor),
+    );
+    for (js_prop, css_prop) in [
+        ("margin", "margin"),
+        ("margin-top", "margin-top"),
+        ("marginTop", "margin-top"),
+        ("margin-right", "margin-right"),
+        ("marginRight", "margin-right"),
+        ("margin-bottom", "margin-bottom"),
+        ("marginBottom", "margin-bottom"),
+        ("margin-left", "margin-left"),
+        ("marginLeft", "margin-left"),
+        ("page-orientation", "page-orientation"),
+        ("pageOrientation", "page-orientation"),
+        ("size", "size"),
+    ] {
+        let g = vm.alloc_host_fn("get pageDescriptor", move |vm, this_val, _| {
+            let Some(th) = this_val.as_object() else {
+                return Ok(JsValue::from_string(vm.heap.alloc_string("")));
+            };
+            let k_gpv = vm.heap.intern_key("getPropertyValue");
+            let func = vm.get_property_by_key(th, k_gpv)?;
+            let arg_s = JsValue::from_string(vm.heap.alloc_string(css_prop));
+            vm.call_value(func, this_val, &[arg_s])
+        });
+        let s = vm.alloc_host_fn("set pageDescriptor", move |vm, this_val, args| {
+            let Some(th) = this_val.as_object() else {
+                return Ok(JsValue::UNDEFINED);
+            };
+            let k_sp = vm.heap.intern_key("setProperty");
+            let func = vm.get_property_by_key(th, k_sp)?;
+            let arg_p = JsValue::from_string(vm.heap.alloc_string(css_prop));
+            let _ = vm.call_value(func, this_val, &[arg_p, arg(args, 0)])?;
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, page_desc_proto, js_prop, Some(g), Some(s));
+    }
+    let _ = define_iface(vm, host, "CSSRuleList", None, None);
+    let _ = define_iface(vm, host, "MediaList", None, None);
+    let _ = define_iface(vm, host, "StyleSheet", None, None);
+    let _ = define_iface(vm, host, "StyleSheetList", None, None);
+}
+
+/// Normalizes a single CSS media query per CSSOM §6.6 (`MediaList`).
+/// Invalid queries normalize to `"not all"`.
+fn normalize_single_media_query(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "not all".to_string();
+    }
+    // Validate balanced parens and reject disallowed punctuation (`$`, `;`, `@`, `{`, `}`, `!`, etc.).
+    let mut depth = 0i32;
+    let mut prev_space = false;
+    let mut out = String::with_capacity(trimmed.len());
+    for ch in trimmed.chars() {
+        if ch.is_ascii_whitespace() {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        prev_space = false;
+        match ch {
+            '(' => {
+                depth += 1;
+                out.push('(');
+            }
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return "not all".to_string();
+                }
+                out.push(')');
+            }
+            c if c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | ':' | '.' | '/' | '<' | '>' | '=' | '+') =>
+            {
+                out.push(c.to_ascii_lowercase());
+            }
+            _ => return "not all".to_string(),
+        }
+    }
+    if depth != 0 {
+        return "not all".to_string();
+    }
+    let clean = out.trim().to_string();
+    if clean.is_empty() {
+        return "not all".to_string();
+    }
+    // Single-token check: if it is a modifier keyword alone (`not`, `only`, `and`, `or`), invalid.
+    if matches!(clean.as_str(), "not" | "only" | "and" | "or") {
+        return "not all".to_string();
+    }
+    clean
+}
+
+fn parse_media_query_list(raw: &str) -> Vec<String> {
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+    raw.split(',').map(normalize_single_media_query).collect()
+}
+
+fn create_media_list_proxy(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    media: Rc<RefCell<Vec<String>>>,
+    on_change: Option<Rc<dyn Fn()>>,
+) -> JsValue {
+    let proto = host
+        .borrow()
+        .css_rule_protos
+        .get("MediaList")
+        .copied()
+        .unwrap_or(vm.object_proto);
+    let target = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    attach_array_like_iterator(vm, target);
+
+    let m_mt1 = Rc::clone(&media);
+    let g_mt = vm.alloc_host_fn("get mediaText", move |vm, _, _| {
+        let txt = m_mt1.borrow().join(", ");
+        Ok(JsValue::from_string(vm.heap.alloc_string(txt)))
+    });
+    let m_mt2 = Rc::clone(&media);
+    let cb_mt = on_change.clone();
+    let s_mt = vm.alloc_host_fn("set mediaText", move |vm, _, args| {
+        let v = arg(args, 0);
+        let raw = if v.is_null() {
+            String::new()
+        } else {
+            vm.value_to_rust_string(v)
+        };
+        *m_mt2.borrow_mut() = parse_media_query_list(&raw);
+        if let Some(ref cb) = cb_mt {
+            cb();
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_accessor(vm, target, "mediaText", Some(g_mt), Some(s_mt));
+
+    let m_item = Rc::clone(&media);
+    define_host_method(vm, target, "item", move |vm, _, args| {
+        let idx = vm.to_number(arg(args, 0)).unwrap_or(-1.0);
+        if idx < 0.0 || !idx.is_finite() {
+            return Ok(JsValue::NULL);
+        }
+        Ok(m_item
+            .borrow()
+            .get(idx as usize)
+            .map_or(JsValue::NULL, |s| {
+                JsValue::from_string(vm.heap.alloc_string(s))
+            }))
+    });
+
+    let m_app = Rc::clone(&media);
+    let cb_app = on_change.clone();
+    define_host_method(vm, target, "appendMedium", move |vm, _, args| {
+        let raw = vm.value_to_rust_string(arg(args, 0));
+        let norm = normalize_single_media_query(&raw);
+        let mut list = m_app.borrow_mut();
+        if !list.iter().any(|x| x == &norm) {
+            list.push(norm);
+        }
+        drop(list);
+        if let Some(ref cb) = cb_app {
+            cb();
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    let m_del = Rc::clone(&media);
+    let cb_del = on_change;
+    define_host_method(vm, target, "deleteMedium", move |vm, _, args| {
+        let raw = vm.value_to_rust_string(arg(args, 0));
+        let norm = normalize_single_media_query(&raw);
+        let mut list = m_del.borrow_mut();
+        let before = list.len();
+        list.retain(|x| x != &norm);
+        let removed = list.len() != before;
+        drop(list);
+        if !removed {
+            return Err(create_dom_exception(
+                vm,
+                "NotFoundError",
+                "Media query not found in MediaList",
+            ));
+        }
+        if let Some(ref cb) = cb_del {
+            cb();
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+
+    let m_to_str = Rc::clone(&media);
+    define_host_method(vm, target, "toString", move |vm, _, _| {
+        let txt = m_to_str.borrow().join(", ");
+        Ok(JsValue::from_string(vm.heap.alloc_string(txt)))
+    });
+
+    let handler = vm.alloc_ordinary_object();
+    let m_get = Rc::clone(&media);
+    define_host_method(vm, handler, "get", move |vm, _, args| {
+        let key_val = arg(args, 1);
+        if key_val.is_symbol() {
+            return forward_symbol_get(vm, arg(args, 0), key_val);
+        }
+        let prop = vm.value_to_rust_string(key_val);
+        if prop == "length" {
+            return Ok(JsValue::from_i32(m_get.borrow().len() as i32));
+        }
+        if let Ok(idx) = prop.parse::<usize>() {
+            return Ok(m_get.borrow().get(idx).map_or(JsValue::UNDEFINED, |s| {
+                JsValue::from_string(vm.heap.alloc_string(s))
+            }));
+        }
+        let k = vm.heap.intern_key(&prop);
+        if let Some(t_h) = arg(args, 0).as_object() {
+            return vm.get_property_by_key(t_h, k);
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_method(vm, handler, "set", move |vm, _, args| {
+        let prop = vm.value_to_rust_string(arg(args, 1));
+        if prop == "mediaText" {
+            if let Some(t_h) = arg(args, 0).as_object() {
+                let k = vm.heap.intern_key("mediaText");
+                vm.set_property_by_key(t_h, k, arg(args, 2))?;
+            }
+            return Ok(JsValue::TRUE);
+        }
+        Ok(JsValue::TRUE)
+    });
+
+    let proxy = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Proxy(rix_js::ProxyObject {
+            target,
+            handler,
+            revoked: false,
+        }),
+        Some(proto),
+    ));
+    JsValue::from_object(proxy)
 }
 
 fn install_css_stylesheet_ctor(vm: &mut JsVm, host: &SharedHost) {
-    let proto = vm.alloc_ordinary_object();
+    let ss_proto = host
+        .borrow()
+        .css_rule_protos
+        .get("StyleSheet")
+        .copied()
+        .unwrap_or(vm.object_proto);
+    let proto = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(ss_proto)));
     vm.heap.get_object_mut(proto).unwrap().is_prototype = true;
     let h = Rc::clone(host);
-    let ctor = vm.alloc_host_fn("CSSStyleSheet", move |vm, _, _args| {
-        let sheet_state = Rc::new(RefCell::new(CssStyleSheetState::from_css("", None, true)));
+    let ctor = vm.alloc_host_fn("CSSStyleSheet", move |vm, _, args| {
+        let mut state = CssStyleSheetState::from_css("", None, true);
+        if let Some(opts_h) = arg(args, 0).as_object() {
+            let k_dis = vm.heap.intern_key("disabled");
+            if let Ok(v) = vm.get_property_by_key(opts_h, k_dis) {
+                if !v.is_undefined() {
+                    state.disabled = vm.to_boolean(v);
+                }
+            }
+            let k_base = vm.heap.intern_key("baseURL");
+            if let Ok(v) = vm.get_property_by_key(opts_h, k_base) {
+                if !v.is_undefined() {
+                    let raw = vm.value_to_rust_string(v);
+                    let doc_url = h.borrow().main_document_url.clone();
+                    let parsed = url::Url::parse(&doc_url)
+                        .ok()
+                        .and_then(|b| b.join(&raw).ok())
+                        .or_else(|| url::Url::parse(&raw).ok());
+                    if parsed.is_none() {
+                        return Err(create_dom_exception(
+                            vm,
+                            "NotAllowedError",
+                            "Failed to construct 'CSSStyleSheet': invalid baseURL",
+                        ));
+                    }
+                }
+            }
+            let k_med = vm.heap.intern_key("media");
+            if let Ok(v) = vm.get_property_by_key(opts_h, k_med) {
+                if !v.is_undefined() && !v.is_null() {
+                    let media_str = if let Some(mh) = v.as_object() {
+                        let k_mt = vm.heap.intern_key("mediaText");
+                        match vm.get_property_by_key(mh, k_mt) {
+                            Ok(mt) if !mt.is_undefined() => vm.value_to_rust_string(mt),
+                            _ => vm.value_to_rust_string(v),
+                        }
+                    } else {
+                        vm.value_to_rust_string(v)
+                    };
+                    *state.media.borrow_mut() = parse_media_query_list(&media_str);
+                }
+            }
+        }
+        let sheet_state = Rc::new(RefCell::new(state));
         let obj = wrap_stylesheet(vm, &h, sheet_state, Some(proto));
         Ok(JsValue::from_object(obj))
     });
@@ -489,12 +816,18 @@ pub(crate) fn wrap_stylesheet(
     state: SharedStyleSheet,
     proto_override: Option<HeapHandle>,
 ) -> HeapHandle {
+    if let Some(existing) = state.borrow().js_handle {
+        if vm.heap.get_object(existing).is_some() {
+            return existing;
+        }
+    }
     let proto = proto_override
         .or_else(|| host.borrow().css_stylesheet_proto)
         .unwrap_or(vm.object_proto);
     let obj = vm
         .heap
         .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    state.borrow_mut().js_handle = Some(obj);
     host.borrow_mut()
         .stylesheet_handle_map
         .insert(obj, Rc::clone(&state));
@@ -519,7 +852,7 @@ pub(crate) fn wrap_stylesheet(
         &mut vm.shapes,
     );
 
-    // `ownerNode`, `href`, `title`, `type`
+    // `ownerNode`, `href`, `title`, `type`, `parentStyleSheet`, `ownerRule`, `media`
     let st_owner = Rc::clone(&state);
     let h_owner = Rc::clone(host);
     let g_owner = vm.alloc_host_fn("get ownerNode", move |vm, _, _| {
@@ -528,18 +861,78 @@ pub(crate) fn wrap_stylesheet(
     });
     define_host_accessor(vm, obj, "ownerNode", Some(g_owner), None);
 
-    let k_href = vm.heap.intern_key("href");
-    vm.heap.object_define_data(
-        obj,
-        k_href,
-        JsValue::NULL,
-        PropertyAttrs::DEFAULT,
-        &mut vm.shapes,
-    );
+    let st_href = Rc::clone(&state);
+    let g_href = vm.alloc_host_fn("get href", move |vm, _, _| {
+        let href = st_href.borrow().href.clone();
+        Ok(href.map_or(JsValue::NULL, |s| {
+            JsValue::from_string(vm.heap.alloc_string(s))
+        }))
+    });
+    define_host_accessor(vm, obj, "href", Some(g_href), None);
+
+    let st_title = Rc::clone(&state);
+    let g_title = vm.alloc_host_fn("get title", move |vm, _, _| {
+        let title = st_title.borrow().title.clone();
+        Ok(title.filter(|s| !s.is_empty()).map_or(JsValue::NULL, |s| {
+            JsValue::from_string(vm.heap.alloc_string(s))
+        }))
+    });
+    define_host_accessor(vm, obj, "title", Some(g_title), None);
+
+    let st_ps = Rc::clone(&state);
+    let g_ps = vm.alloc_host_fn("get parentStyleSheet", move |_, _, _| {
+        Ok(st_ps
+            .borrow()
+            .parent_sheet
+            .map_or(JsValue::NULL, JsValue::from_object))
+    });
+    define_host_accessor(vm, obj, "parentStyleSheet", Some(g_ps), None);
+
+    let st_or = Rc::clone(&state);
+    let g_or = vm.alloc_host_fn("get ownerRule", move |_, _, _| {
+        Ok(st_or
+            .borrow()
+            .owner_rule
+            .map_or(JsValue::NULL, JsValue::from_object))
+    });
+    define_host_accessor(vm, obj, "ownerRule", Some(g_or), None);
+
+    let media_rc = Rc::clone(&state.borrow().media);
+    let existing_mp = state.borrow().media_proxy;
+    let media_proxy = if let Some(mp) = existing_mp {
+        mp
+    } else {
+        let h_med = Rc::clone(host);
+        let mp = create_media_list_proxy(
+            vm,
+            host,
+            Rc::clone(&media_rc),
+            Some(Rc::new(move || {
+                h_med.borrow_mut().mark_sheets_dirty();
+            })),
+        );
+        state.borrow_mut().media_proxy = Some(mp);
+        mp
+    };
+    let g_med = vm.alloc_host_fn("get media", move |_, _, _| Ok(media_proxy));
+    let h_med_s = Rc::clone(host);
+    let s_med = vm.alloc_host_fn("set media", move |vm, _, args| {
+        let v = arg(args, 0);
+        let raw = if v.is_null() {
+            String::new()
+        } else {
+            vm.value_to_rust_string(v)
+        };
+        *media_rc.borrow_mut() = parse_media_query_list(&raw);
+        h_med_s.borrow_mut().mark_sheets_dirty();
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_accessor(vm, obj, "media", Some(g_med), Some(s_med));
+
     let k_type = vm.heap.intern_key("type");
     let v_type = JsValue::from_string(vm.heap.alloc_string("text/css"));
     vm.heap
-        .object_define_data(obj, k_type, v_type, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        .object_define_data(obj, k_type, v_type, PropertyAttrs::empty(), &mut vm.shapes);
 
     // `disabled` getter/setter
     let st_d1 = Rc::clone(&state);
@@ -555,20 +948,54 @@ pub(crate) fn wrap_stylesheet(
     });
     define_host_accessor(vm, obj, "disabled", Some(g_dis), Some(s_dis));
 
-    // `insertRule(rule, index = 0)`, `deleteRule(index)`, and legacy `removeRule(index)`
+    // `insertRule(rule, index = 0)`, `deleteRule(index)`, and legacy `removeRule(index)` / `addRule`
     attach_rule_list_mutators(vm, obj, host, Rc::clone(&state), Vec::new());
+
+    let st_add = Rc::clone(&state);
+    define_host_method(vm, obj, "addRule", move |vm, this_val, args| {
+        let sel = if args.is_empty() || arg(args, 0).is_undefined() {
+            "undefined".to_string()
+        } else {
+            vm.value_to_rust_string(arg(args, 0))
+        };
+        let style_str = if args.len() < 2 || arg(args, 1).is_undefined() {
+            String::new()
+        } else {
+            vm.value_to_rust_string(arg(args, 1))
+        };
+        let idx_val = if args.len() >= 3 && !arg(args, 2).is_undefined() {
+            arg(args, 2)
+        } else {
+            JsValue::from_i32(st_add.borrow().rules.len() as i32)
+        };
+        let combined = format!("{sel} {{ {style_str} }}");
+        let combined_js = JsValue::from_string(vm.heap.alloc_string(combined));
+        let k_ins = vm.heap.intern_key("insertRule");
+        let ins_fn = vm.get_property_by_key(obj, k_ins)?;
+        let _ = vm.call_value(ins_fn, this_val, &[combined_js, idx_val])?;
+        Ok(JsValue::from_i32(-1))
+    });
 
     // `replaceSync(text)` & `replace(text)`
     let st_rs = Rc::clone(&state);
     let h_rs = Rc::clone(host);
     define_host_method(vm, obj, "replaceSync", move |vm, _, args| {
+        if !st_rs.borrow().is_constructed {
+            return Err(create_dom_exception(
+                vm,
+                "NotAllowedError",
+                "replaceSync() can only be called on constructed CSSStyleSheets",
+            ));
+        }
         let text = vm.value_to_rust_string(arg(args, 0));
+        let mut parsed = parse_cssom_rules(&text);
+        parsed.retain(|r| !matches!(r, CssomRuleKind::Import { .. }));
+        detach_and_clear_child_rule_cache(vm, obj);
         {
             let mut st = st_rs.borrow_mut();
-            st.rules = parse_cssom_rules(&text);
+            st.rules = parsed;
             st.source_hash = simple_hash(text.as_bytes());
         }
-        clear_child_rule_cache(vm, obj);
         sync_sheet_to_dom(&h_rs, &st_rs);
         Ok(JsValue::UNDEFINED)
     });
@@ -576,15 +1003,26 @@ pub(crate) fn wrap_stylesheet(
     let st_rep = Rc::clone(&state);
     let h_rep = Rc::clone(host);
     define_host_method(vm, obj, "replace", move |vm, this_val, args| {
+        let p = alloc_promise(vm);
+        if !st_rep.borrow().is_constructed {
+            let err = create_dom_exception(
+                vm,
+                "NotAllowedError",
+                "replace() can only be called on constructed CSSStyleSheets",
+            );
+            reject_promise(vm, p, err.value);
+            return Ok(JsValue::from_object(p));
+        }
         let text = vm.value_to_rust_string(arg(args, 0));
+        let mut parsed = parse_cssom_rules(&text);
+        parsed.retain(|r| !matches!(r, CssomRuleKind::Import { .. }));
+        detach_and_clear_child_rule_cache(vm, obj);
         {
             let mut st = st_rep.borrow_mut();
-            st.rules = parse_cssom_rules(&text);
+            st.rules = parsed;
             st.source_hash = simple_hash(text.as_bytes());
         }
-        clear_child_rule_cache(vm, obj);
         sync_sheet_to_dom(&h_rep, &st_rep);
-        let p = alloc_promise(vm);
         resolve_promise(vm, p, this_val);
         Ok(JsValue::from_object(p))
     });
@@ -624,8 +1062,36 @@ fn get_or_init_child_cache(vm: &mut JsVm, owner_obj: HeapHandle) -> HeapHandle {
     cache
 }
 
-fn clear_child_rule_cache(vm: &mut JsVm, owner_obj: HeapHandle) {
+fn detach_rule_wrapper_tree(vm: &mut JsVm, rule_h: HeapHandle) {
+    let k_det = vm.heap.intern_key("__rix_detach__");
+    if let Some(prop) = vm.heap.object_get_own(rule_h, k_det, &vm.shapes) {
+        let f = prop.value;
+        let _ = vm.call_value(f, JsValue::from_object(rule_h), &[]);
+    }
+    detach_and_clear_child_rule_cache(vm, rule_h);
+}
+
+fn detach_and_clear_child_rule_cache(vm: &mut JsVm, owner_obj: HeapHandle) {
     let k = vm.heap.intern_key("__rix_rule_cache__");
+    if let Some(prop) = vm.heap.object_get_own(owner_obj, k, &vm.shapes) {
+        if let Some(cache_h) = prop.value.as_object() {
+            let children: Vec<HeapHandle> = {
+                let mut out = Vec::new();
+                for i in 0..512 {
+                    let ki = vm.heap.intern_key(&i.to_string());
+                    if let Some(cp) = vm.heap.object_get_own(cache_h, ki, &vm.shapes) {
+                        if let Some(ch) = cp.value.as_object() {
+                            out.push(ch);
+                        }
+                    }
+                }
+                out
+            };
+            for ch in children {
+                detach_rule_wrapper_tree(vm, ch);
+            }
+        }
+    }
     let fresh = vm.alloc_ordinary_object();
     vm.heap.object_define_data(
         owner_obj,
@@ -634,6 +1100,70 @@ fn clear_child_rule_cache(vm: &mut JsVm, owner_obj: HeapHandle) {
         PropertyAttrs::WRITABLE | PropertyAttrs::CONFIGURABLE,
         &mut vm.shapes,
     );
+}
+
+fn update_rule_wrapper_index(vm: &mut JsVm, rule_h: HeapHandle, new_idx: usize) {
+    let k_upd = vm.heap.intern_key("__rix_set_idx__");
+    if let Some(prop) = vm.heap.object_get_own(rule_h, k_upd, &vm.shapes) {
+        let f = prop.value;
+        let _ = vm.call_value(
+            f,
+            JsValue::from_object(rule_h),
+            &[JsValue::from_i32(new_idx as i32)],
+        );
+    }
+}
+
+fn shift_child_rule_cache_on_insert(
+    vm: &mut JsVm,
+    owner_obj: HeapHandle,
+    insert_idx: usize,
+    old_len: usize,
+) {
+    let cache = get_or_init_child_cache(vm, owner_obj);
+    for i in (insert_idx..old_len).rev() {
+        let k_from = vm.heap.intern_key(&i.to_string());
+        let k_to = vm.heap.intern_key(&(i + 1).to_string());
+        if let Some(prop) = vm.heap.object_get_own(cache, k_from, &vm.shapes) {
+            let val = prop.value;
+            let _ = vm.delete_property_by_key(cache, k_from);
+            vm.heap
+                .object_define_data(cache, k_to, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+            if let Some(ch) = val.as_object() {
+                update_rule_wrapper_index(vm, ch, i + 1);
+            }
+        }
+    }
+}
+
+fn shift_child_rule_cache_on_delete(
+    vm: &mut JsVm,
+    owner_obj: HeapHandle,
+    del_idx: usize,
+    old_len: usize,
+) {
+    let cache = get_or_init_child_cache(vm, owner_obj);
+    let k_del = vm.heap.intern_key(&del_idx.to_string());
+    if let Some(prop) = vm.heap.object_get_own(cache, k_del, &vm.shapes) {
+        let val = prop.value;
+        let _ = vm.delete_property_by_key(cache, k_del);
+        if let Some(ch) = val.as_object() {
+            detach_rule_wrapper_tree(vm, ch);
+        }
+    }
+    for i in (del_idx + 1)..old_len {
+        let k_from = vm.heap.intern_key(&i.to_string());
+        let k_to = vm.heap.intern_key(&(i - 1).to_string());
+        if let Some(prop) = vm.heap.object_get_own(cache, k_from, &vm.shapes) {
+            let val = prop.value;
+            let _ = vm.delete_property_by_key(cache, k_from);
+            vm.heap
+                .object_define_data(cache, k_to, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+            if let Some(ch) = val.as_object() {
+                update_rule_wrapper_index(vm, ch, i - 1);
+            }
+        }
+    }
 }
 
 fn attach_array_like_iterator(vm: &mut JsVm, target: HeapHandle) {
@@ -739,10 +1269,29 @@ fn attach_rule_list_mutators(
         } else {
             0usize
         };
-        let (ns, nesting) = {
+        let (ns, nesting, list_len, is_constructed) = {
             let st = st_ins.borrow();
-            (st.active_namespaces(), st.nesting_context_for_list(&p_ins))
+            let Some(list) = st.rule_list(&p_ins) else {
+                return Err(create_dom_exception(
+                    vm,
+                    "IndexSizeError",
+                    "Parent grouping rule no longer exists",
+                ));
+            };
+            (
+                st.active_namespaces(),
+                st.nesting_context_for_list(&p_ins),
+                list.len(),
+                st.is_constructed,
+            )
         };
+        if index > list_len {
+            return Err(create_dom_exception(
+                vm,
+                "IndexSizeError",
+                "Rule index exceeds cssRules.length",
+            ));
+        }
         let ns_opt = (!ns.is_empty()).then_some(&ns);
         let parsed = parse_single_cssom_rule_with_context(&rule_str, ns_opt, nesting).map_err(
             |e| match e {
@@ -752,6 +1301,25 @@ fn attach_rule_list_mutators(
                 }
             },
         )?;
+        if is_constructed && p_ins.is_empty() && matches!(parsed, CssomRuleKind::Import { .. }) {
+            return Err(create_dom_exception(
+                vm,
+                "SyntaxError",
+                "@import rules are disallowed in constructed CSSStyleSheets",
+            ));
+        }
+        if !p_ins.is_empty()
+            && matches!(
+                parsed,
+                CssomRuleKind::Import { .. } | CssomRuleKind::Namespace { .. }
+            )
+        {
+            return Err(create_dom_exception(
+                vm,
+                "HierarchyRequestError",
+                "Rule cannot be inserted inside a CSSGroupingRule",
+            ));
+        }
         {
             let mut st = st_ins.borrow_mut();
             let Some(list) = st.rule_list_mut(&p_ins) else {
@@ -761,16 +1329,9 @@ fn attach_rule_list_mutators(
                     "Parent grouping rule no longer exists",
                 ));
             };
-            if index > list.len() {
-                return Err(create_dom_exception(
-                    vm,
-                    "IndexSizeError",
-                    "Rule index exceeds cssRules.length",
-                ));
-            }
             list.insert(index, parsed);
         }
-        clear_child_rule_cache(vm, target_obj);
+        shift_child_rule_cache_on_insert(vm, target_obj, index, list_len);
         sync_sheet_to_dom(&h_ins, &st_ins);
         Ok(JsValue::from_i32(index as i32))
     });
@@ -778,7 +1339,7 @@ fn attach_rule_list_mutators(
     let is_top = list_path.is_empty();
     let st_del = Rc::clone(&state);
     let h_del = Rc::clone(host);
-    let p_del = list_path;
+    let p_del = list_path.clone();
     let del_fn = vm.alloc_host_fn("deleteRule", move |vm, _, args| {
         if args.is_empty() {
             return Err(vm.type_error("deleteRule requires 1 argument"));
@@ -793,7 +1354,7 @@ fn attach_rule_list_mutators(
                 "Invalid rule index",
             ));
         };
-        {
+        let old_len = {
             let mut st = st_del.borrow_mut();
             let Some(list) = st.rule_list_mut(&p_del) else {
                 return Err(create_dom_exception(
@@ -802,7 +1363,8 @@ fn attach_rule_list_mutators(
                     "Parent grouping rule no longer exists",
                 ));
             };
-            if index >= list.len() {
+            let len = list.len();
+            if index >= len {
                 return Err(create_dom_exception(
                     vm,
                     "IndexSizeError",
@@ -810,8 +1372,9 @@ fn attach_rule_list_mutators(
                 ));
             }
             list.remove(index);
-        }
-        clear_child_rule_cache(vm, target_obj);
+            len
+        };
+        shift_child_rule_cache_on_delete(vm, target_obj, index, old_len);
         sync_sheet_to_dom(&h_del, &st_del);
         Ok(JsValue::UNDEFINED)
     });
@@ -824,11 +1387,53 @@ fn attach_rule_list_mutators(
         &mut vm.shapes,
     );
     if is_top {
+        let st_rem = Rc::clone(&state);
+        let h_rem = Rc::clone(host);
+        let p_rem = list_path;
+        let rem_fn = vm.alloc_host_fn("removeRule", move |vm, _, args| {
+            let index = if args.is_empty() || arg(args, 0).is_undefined() {
+                0usize
+            } else {
+                let n = vm.to_number(arg(args, 0))?;
+                if n.is_finite() && n >= 0.0 {
+                    n as usize
+                } else {
+                    return Err(create_dom_exception(
+                        vm,
+                        "IndexSizeError",
+                        "Invalid rule index",
+                    ));
+                }
+            };
+            let old_len = {
+                let mut st = st_rem.borrow_mut();
+                let Some(list) = st.rule_list_mut(&p_rem) else {
+                    return Err(create_dom_exception(
+                        vm,
+                        "IndexSizeError",
+                        "Parent grouping rule no longer exists",
+                    ));
+                };
+                let len = list.len();
+                if index >= len {
+                    return Err(create_dom_exception(
+                        vm,
+                        "IndexSizeError",
+                        "Rule index out of bounds",
+                    ));
+                }
+                list.remove(index);
+                len
+            };
+            shift_child_rule_cache_on_delete(vm, target_obj, index, old_len);
+            sync_sheet_to_dom(&h_rem, &st_rem);
+            Ok(JsValue::UNDEFINED)
+        });
         let k_rem = vm.heap.intern_key("removeRule");
         vm.heap.object_define_data(
             target_obj,
             k_rem,
-            JsValue::from_object(del_fn),
+            JsValue::from_object(rem_fn),
             PropertyAttrs::DEFAULT,
             &mut vm.shapes,
         );
@@ -844,7 +1449,15 @@ fn create_live_css_rule_list(
     parent_rule: Option<HeapHandle>,
     list_path: Vec<usize>,
 ) -> JsValue {
-    let target = vm.alloc_ordinary_object();
+    let rl_proto = host
+        .borrow()
+        .css_rule_protos
+        .get("CSSRuleList")
+        .copied()
+        .unwrap_or(vm.object_proto);
+    let target = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(rl_proto)));
     attach_array_like_iterator(vm, target);
     let st_item = Rc::clone(&state);
     let h_item = Rc::clone(host);
@@ -959,7 +1572,10 @@ fn wrap_css_rule(
             }
             Some(CssomRuleKind::Import { .. }) => (3, "CSSImportRule", false, false),
             Some(CssomRuleKind::Media { .. }) => (4, "CSSMediaRule", false, true),
+            Some(CssomRuleKind::FontFace { .. }) => (5, "CSSFontFaceRule", true, false),
+            Some(CssomRuleKind::Page { .. }) => (6, "CSSPageRule", false, true),
             Some(CssomRuleKind::Keyframes { .. }) => (7, "CSSKeyframesRule", false, false),
+            Some(CssomRuleKind::Keyframe { .. }) => (8, "CSSKeyframeRule", true, false),
             Some(CssomRuleKind::Namespace { .. }) => (10, "CSSNamespaceRule", false, false),
             Some(CssomRuleKind::Supports { .. }) => (12, "CSSSupportsRule", false, true),
             Some(CssomRuleKind::Container { .. }) => (0, "CSSContainerRule", false, true),
@@ -969,6 +1585,14 @@ fn wrap_css_rule(
             }
             Some(CssomRuleKind::Scope { .. }) => (0, "CSSScopeRule", false, true),
             Some(CssomRuleKind::Property { .. }) => (0, "CSSPropertyRule", false, false),
+            Some(CssomRuleKind::Other { css_text })
+                if css_text
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("@counter-style") =>
+            {
+                (0, "CSSCounterStyleRule", false, false)
+            }
             _ => (0, "CSSRule", false, false),
         }
     };
@@ -982,11 +1606,43 @@ fn wrap_css_rule(
     let obj = vm
         .heap
         .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+
+    let path_rc = Rc::new(RefCell::new(rule_path));
+    let ps_slot = Rc::new(Cell::new(Some(parent_sheet)));
+    let pr_slot = Rc::new(Cell::new(parent_rule));
+    let detached_flag = Rc::new(Cell::new(false));
+    let ps_det = Rc::clone(&ps_slot);
+    let pr_det = Rc::clone(&pr_slot);
+    let det_f = Rc::clone(&detached_flag);
+    let detach_fn = vm.alloc_host_fn("__rix_detach__", move |_, _, _| {
+        ps_det.set(None);
+        pr_det.set(None);
+        det_f.set(true);
+        Ok(JsValue::UNDEFINED)
+    });
+    let k_det = vm.heap.intern_key("__rix_detach__");
     vm.heap.object_define_data(
-        cache,
-        cache_key,
-        JsValue::from_object(obj),
-        PropertyAttrs::DEFAULT,
+        obj,
+        k_det,
+        JsValue::from_object(detach_fn),
+        PropertyAttrs::empty(),
+        &mut vm.shapes,
+    );
+    let path_upd = Rc::clone(&path_rc);
+    let upd_fn = vm.alloc_host_fn("__rix_set_idx__", move |vm, _, args| {
+        let idx = vm.to_number(arg(args, 0)).unwrap_or(0.0) as usize;
+        let mut p = path_upd.borrow_mut();
+        if let Some(last) = p.last_mut() {
+            *last = idx;
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    let k_upd = vm.heap.intern_key("__rix_set_idx__");
+    vm.heap.object_define_data(
+        obj,
+        k_upd,
+        JsValue::from_object(upd_fn),
+        PropertyAttrs::empty(),
         &mut vm.shapes,
     );
 
@@ -998,44 +1654,45 @@ fn wrap_css_rule(
         PropertyAttrs::empty(),
         &mut vm.shapes,
     );
-    let k_ps = vm.heap.intern_key("parentStyleSheet");
-    vm.heap.object_define_data(
-        obj,
-        k_ps,
-        JsValue::from_object(parent_sheet),
-        PropertyAttrs::DEFAULT,
-        &mut vm.shapes,
-    );
+    let ps_get = Rc::clone(&ps_slot);
+    let g_ps = vm.alloc_host_fn("get parentStyleSheet", move |_, _, _| {
+        Ok(ps_get.get().map_or(JsValue::NULL, JsValue::from_object))
+    });
+    define_host_accessor(vm, obj, "parentStyleSheet", Some(g_ps), None);
 
-    // `parentRule` (null for top-level rules, exact cached parent wrapper for nested rules)
-    let k_pr = vm.heap.intern_key("parentRule");
-    vm.heap.object_define_data(
-        obj,
-        k_pr,
-        parent_rule.map_or(JsValue::NULL, JsValue::from_object),
-        PropertyAttrs::DEFAULT,
-        &mut vm.shapes,
-    );
+    // `parentRule` (null for top-level rules or detached rules, exact cached parent wrapper for nested rules)
+    let pr_get = Rc::clone(&pr_slot);
+    let g_pr = vm.alloc_host_fn("get parentRule", move |_, _, _| {
+        Ok(pr_get.get().map_or(JsValue::NULL, JsValue::from_object))
+    });
+    define_host_accessor(vm, obj, "parentRule", Some(g_pr), None);
 
     // `cssText`
     let st_ct = Rc::clone(&state);
-    let p_ct = rule_path.clone();
+    let p_ct = Rc::clone(&path_rc);
+    let det_ct = Rc::clone(&detached_flag);
     let g_ct = vm.alloc_host_fn("get cssText", move |vm, _, _| {
-        let text = st_ct
-            .borrow()
-            .rule_at(&p_ct)
-            .map(CssomRuleKind::to_css_text)
-            .unwrap_or_default();
+        let text = if det_ct.get() {
+            String::new()
+        } else {
+            let p = p_ct.borrow();
+            st_ct
+                .borrow()
+                .rule_at(&p)
+                .map(CssomRuleKind::to_css_text)
+                .unwrap_or_default()
+        };
         Ok(JsValue::from_string(vm.heap.alloc_string(text)))
     });
     define_host_accessor(vm, obj, "cssText", Some(g_ct), None);
 
-    // `selectorText` (for CSSStyleRule)
+    // `selectorText` (for CSSStyleRule & CSSPageRule)
     if proto_name == "CSSStyleRule" {
         let st_s1 = Rc::clone(&state);
-        let p_s1 = rule_path.clone();
+        let p_s1 = Rc::clone(&path_rc);
         let g_sel = vm.alloc_host_fn("get selectorText", move |vm, _, _| {
-            let sel = match st_s1.borrow().rule_at(&p_s1) {
+            let p = p_s1.borrow();
+            let sel = match st_s1.borrow().rule_at(&p) {
                 Some(CssomRuleKind::Style { selector_text, .. }) => selector_text.clone(),
                 _ => String::new(),
             };
@@ -1043,12 +1700,17 @@ fn wrap_css_rule(
         });
         let st_s2 = Rc::clone(&state);
         let h_s2 = Rc::clone(host);
-        let p_s2 = rule_path.clone();
+        let p_s2 = Rc::clone(&path_rc);
+        let det_s2 = Rc::clone(&detached_flag);
         let s_sel = vm.alloc_host_fn("set selectorText", move |vm, _, args| {
+            if det_s2.get() {
+                return Ok(JsValue::UNDEFINED);
+            }
             let raw = vm.value_to_rust_string(arg(args, 0));
+            let p = p_s2.borrow();
             let (ns, nesting) = {
                 let st = st_s2.borrow();
-                let parent_list = &p_s2[..p_s2.len().saturating_sub(1)];
+                let parent_list = &p[..p.len().saturating_sub(1)];
                 (
                     st.active_namespaces(),
                     st.nesting_context_for_list(parent_list),
@@ -1057,33 +1719,119 @@ fn wrap_css_rule(
             let ns_opt = (!ns.is_empty()).then_some(&ns);
             if let Ok(canonical) = parse_and_serialize_selector_for_context(&raw, ns_opt, nesting) {
                 if let Some(CssomRuleKind::Style { selector_text, .. }) =
-                    st_s2.borrow_mut().rule_at_mut(&p_s2)
+                    st_s2.borrow_mut().rule_at_mut(&p)
                 {
                     *selector_text = canonical;
                 }
+                drop(p);
                 sync_sheet_to_dom(&h_s2, &st_s2);
             }
             Ok(JsValue::UNDEFINED)
         });
         define_host_accessor(vm, obj, "selectorText", Some(g_sel), Some(s_sel));
+    } else if proto_name == "CSSPageRule" {
+        let st_ps1 = Rc::clone(&state);
+        let p_ps1 = Rc::clone(&path_rc);
+        let det_ps1 = Rc::clone(&detached_flag);
+        let detached_page_sel = Rc::new(RefCell::new(String::new()));
+        let dps1 = Rc::clone(&detached_page_sel);
+        let g_sel = vm.alloc_host_fn("get selectorText", move |vm, _, _| {
+            let sel = if det_ps1.get() {
+                dps1.borrow().clone()
+            } else {
+                let p = p_ps1.borrow();
+                match st_ps1.borrow().rule_at(&p) {
+                    Some(CssomRuleKind::Page { selector_text, .. }) => selector_text.clone(),
+                    _ => String::new(),
+                }
+            };
+            Ok(JsValue::from_string(vm.heap.alloc_string(sel)))
+        });
+        let st_ps2 = Rc::clone(&state);
+        let h_ps2 = Rc::clone(host);
+        let p_ps2 = Rc::clone(&path_rc);
+        let det_ps2 = Rc::clone(&detached_flag);
+        let dps2 = Rc::clone(&detached_page_sel);
+        let s_sel = vm.alloc_host_fn("set selectorText", move |vm, _, args| {
+            let raw = vm.value_to_rust_string(arg(args, 0));
+            if let Some(canonical) = parse_and_serialize_page_selector(&raw) {
+                if det_ps2.get() {
+                    *dps2.borrow_mut() = canonical;
+                } else {
+                    let p = p_ps2.borrow();
+                    if let Some(CssomRuleKind::Page { selector_text, .. }) =
+                        st_ps2.borrow_mut().rule_at_mut(&p)
+                    {
+                        *selector_text = canonical;
+                    }
+                    drop(p);
+                    sync_sheet_to_dom(&h_ps2, &st_ps2);
+                }
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, obj, "selectorText", Some(g_sel), Some(s_sel));
+
+        let page_style =
+            create_page_descriptors_obj(vm, host, Rc::clone(&state), Rc::clone(&path_rc));
+        let g_style = vm.alloc_host_fn("get style", move |_, _, _| Ok(page_style));
+        define_host_accessor(vm, obj, "style", Some(g_style), None);
+    } else if proto_name == "CSSKeyframeRule" {
+        let st_k1 = Rc::clone(&state);
+        let p_k1 = Rc::clone(&path_rc);
+        let g_kt = vm.alloc_host_fn("get keyText", move |vm, _, _| {
+            let p = p_k1.borrow();
+            let kt = match st_k1.borrow().rule_at(&p) {
+                Some(CssomRuleKind::Keyframe { key_text, .. }) => key_text.clone(),
+                _ => String::new(),
+            };
+            Ok(JsValue::from_string(vm.heap.alloc_string(kt)))
+        });
+        let st_k2 = Rc::clone(&state);
+        let h_k2 = Rc::clone(host);
+        let p_k2 = Rc::clone(&path_rc);
+        let s_kt = vm.alloc_host_fn("set keyText", move |vm, _, args| {
+            let raw = vm.value_to_rust_string(arg(args, 0));
+            let Some(canonical) = parse_and_serialize_keyframe_selector(&raw) else {
+                return Err(create_dom_exception(
+                    vm,
+                    "SyntaxError",
+                    "Invalid CSSKeyframeRule keyText",
+                ));
+            };
+            {
+                let p = p_k2.borrow();
+                if let Some(CssomRuleKind::Keyframe { key_text, .. }) =
+                    st_k2.borrow_mut().rule_at_mut(&p)
+                {
+                    *key_text = canonical;
+                }
+            }
+            sync_sheet_to_dom(&h_k2, &st_k2);
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, obj, "keyText", Some(g_kt), Some(s_kt));
     }
 
-    // `style` (`CSSStyleDeclaration` with `[PutForwards=cssText]` for CSSStyleRule & CSSNestedDeclarations)
+    // `style` (`CSSStyleDeclaration` with `[PutForwards=cssText]`)
     if has_style_decl {
-        let style_decl = create_rule_style_proxy(vm, host, Rc::clone(&state), rule_path.clone());
+        let style_decl = create_rule_style_proxy(vm, host, Rc::clone(&state), Rc::clone(&path_rc));
         let g_style = vm.alloc_host_fn("get style", move |_, _, _| Ok(style_decl));
         let st_rs = Rc::clone(&state);
         let h_rs = Rc::clone(host);
-        let p_rs = rule_path.clone();
+        let p_rs = Rc::clone(&path_rc);
         let s_style = vm.alloc_host_fn("set style", move |vm, _, args| {
             let val = vm.value_to_rust_string(arg(args, 0));
             let validated = canonicalize_css_decls(&val);
-            if let Some(decls_text) = st_rs
-                .borrow_mut()
-                .rule_at_mut(&p_rs)
-                .and_then(CssomRuleKind::declarations_text_mut)
             {
-                *decls_text = serialize_style_decls_with_priority(&validated);
+                let p = p_rs.borrow();
+                if let Some(decls_text) = st_rs
+                    .borrow_mut()
+                    .rule_at_mut(&p)
+                    .and_then(CssomRuleKind::declarations_text_mut)
+                {
+                    *decls_text = serialize_style_decls_with_priority(&validated);
+                }
             }
             sync_sheet_to_dom(&h_rs, &st_rs);
             Ok(JsValue::UNDEFINED)
@@ -1091,8 +1839,9 @@ fn wrap_css_rule(
         define_host_accessor(vm, obj, "style", Some(g_style), Some(s_style));
     }
 
-    // `CSSGroupingRule` (`CSSStyleRule`, `@media`, `@supports`, `@container`, `@layer`, `@scope`)
+    // `CSSGroupingRule` (`CSSStyleRule`, `@media`, `@supports`, `@container`, `@layer`, `@scope`, `@page`)
     if is_grouping {
+        let init_path = path_rc.borrow().clone();
         let live_child_rules = create_live_css_rule_list(
             vm,
             host,
@@ -1100,7 +1849,7 @@ fn wrap_css_rule(
             parent_sheet,
             obj,
             Some(obj),
-            rule_path.clone(),
+            init_path.clone(),
         );
         let k_cr = vm.heap.intern_key("cssRules");
         vm.heap.object_define_data(
@@ -1110,15 +1859,48 @@ fn wrap_css_rule(
             PropertyAttrs::DEFAULT,
             &mut vm.shapes,
         );
-        attach_rule_list_mutators(vm, obj, host, Rc::clone(&state), rule_path.clone());
+        attach_rule_list_mutators(vm, obj, host, Rc::clone(&state), init_path);
+    }
+
+    // `CSSContainerRule.containerName` / `CSSContainerRule.containerQuery`
+    if proto_name == "CSSContainerRule" {
+        let st_cn = Rc::clone(&state);
+        let p_cn = Rc::clone(&path_rc);
+        let g_cn = vm.alloc_host_fn("get containerName", move |vm, _, _| {
+            let p = p_cn.borrow();
+            let txt = match st_cn.borrow().rule_at(&p) {
+                Some(CssomRuleKind::Container {
+                    container_name: Some(n),
+                    ..
+                }) => n.clone(),
+                _ => String::new(),
+            };
+            Ok(JsValue::from_string(vm.heap.alloc_string(txt)))
+        });
+        define_host_accessor(vm, obj, "containerName", Some(g_cn), None);
+
+        let st_cq = Rc::clone(&state);
+        let p_cq = Rc::clone(&path_rc);
+        let g_cq = vm.alloc_host_fn("get containerQuery", move |vm, _, _| {
+            let p = p_cq.borrow();
+            let txt = match st_cq.borrow().rule_at(&p) {
+                Some(CssomRuleKind::Container {
+                    container_query, ..
+                }) => container_query.clone(),
+                _ => String::new(),
+            };
+            Ok(JsValue::from_string(vm.heap.alloc_string(txt)))
+        });
+        define_host_accessor(vm, obj, "containerQuery", Some(g_cq), None);
     }
 
     // `CSSScopeRule.start` / `CSSScopeRule.end`
     if proto_name == "CSSScopeRule" {
         let st_sc1 = Rc::clone(&state);
-        let p_sc1 = rule_path.clone();
+        let p_sc1 = Rc::clone(&path_rc);
         let g_start = vm.alloc_host_fn("get start", move |vm, _, _| {
-            let val = match st_sc1.borrow().rule_at(&p_sc1) {
+            let p = p_sc1.borrow();
+            let val = match st_sc1.borrow().rule_at(&p) {
                 Some(CssomRuleKind::Scope { start: Some(s), .. }) => {
                     JsValue::from_string(vm.heap.alloc_string(s.as_str()))
                 }
@@ -1129,9 +1911,10 @@ fn wrap_css_rule(
         define_host_accessor(vm, obj, "start", Some(g_start), None);
 
         let st_sc2 = Rc::clone(&state);
-        let p_sc2 = rule_path.clone();
+        let p_sc2 = Rc::clone(&path_rc);
         let g_end = vm.alloc_host_fn("get end", move |vm, _, _| {
-            let val = match st_sc2.borrow().rule_at(&p_sc2) {
+            let p = p_sc2.borrow();
+            let val = match st_sc2.borrow().rule_at(&p) {
                 Some(CssomRuleKind::Scope { end: Some(e), .. }) => {
                     JsValue::from_string(vm.heap.alloc_string(e.as_str()))
                 }
@@ -1145,10 +1928,11 @@ fn wrap_css_rule(
     // `CSSLayerStatementRule.nameList`
     if proto_name == "CSSLayerStatementRule" {
         let st_nl = Rc::clone(&state);
-        let p_nl = rule_path.clone();
+        let p_nl = Rc::clone(&path_rc);
         let g_nl = vm.alloc_host_fn("get nameList", move |vm, _, _| {
             let arr = vm.alloc_array();
-            if let Some(CssomRuleKind::LayerStatement { names }) = st_nl.borrow().rule_at(&p_nl) {
+            let p = p_nl.borrow();
+            if let Some(CssomRuleKind::LayerStatement { names }) = st_nl.borrow().rule_at(&p) {
                 for n in names {
                     let s = vm.heap.alloc_string(n.as_str());
                     vm.heap.object_push_element(arr, JsValue::from_string(s));
@@ -1159,12 +1943,13 @@ fn wrap_css_rule(
         define_host_accessor(vm, obj, "nameList", Some(g_nl), None);
     }
 
-    // `CSSImportRule` (`href`, `layerName`, `supportsText`, `media`)
+    // `CSSImportRule` (`href`, `layerName`, `supportsText`, `media`, `styleSheet`)
     if proto_name == "CSSImportRule" {
         let st_i1 = Rc::clone(&state);
-        let p_i1 = rule_path.clone();
+        let p_i1 = Rc::clone(&path_rc);
         let g_href = vm.alloc_host_fn("get href", move |vm, _, _| {
-            let s = match st_i1.borrow().rule_at(&p_i1) {
+            let p = p_i1.borrow();
+            let s = match st_i1.borrow().rule_at(&p) {
                 Some(CssomRuleKind::Import { url, .. }) => url.clone(),
                 _ => String::new(),
             };
@@ -1173,9 +1958,10 @@ fn wrap_css_rule(
         define_host_accessor(vm, obj, "href", Some(g_href), None);
 
         let st_i2 = Rc::clone(&state);
-        let p_i2 = rule_path.clone();
+        let p_i2 = Rc::clone(&path_rc);
         let g_ln = vm.alloc_host_fn("get layerName", move |vm, _, _| {
-            let v = match st_i2.borrow().rule_at(&p_i2) {
+            let p = p_i2.borrow();
+            let v = match st_i2.borrow().rule_at(&p) {
                 Some(CssomRuleKind::Import {
                     layer: Some(Some(n)),
                     ..
@@ -1190,9 +1976,10 @@ fn wrap_css_rule(
         define_host_accessor(vm, obj, "layerName", Some(g_ln), None);
 
         let st_i3 = Rc::clone(&state);
-        let p_i3 = rule_path.clone();
+        let p_i3 = Rc::clone(&path_rc);
         let g_sup = vm.alloc_host_fn("get supportsText", move |vm, _, _| {
-            let v = match st_i3.borrow().rule_at(&p_i3) {
+            let p = p_i3.borrow();
+            let v = match st_i3.borrow().rule_at(&p) {
                 Some(CssomRuleKind::Import {
                     supports: Some(s), ..
                 }) => JsValue::from_string(vm.heap.alloc_string(s.as_str())),
@@ -1202,47 +1989,131 @@ fn wrap_css_rule(
         });
         define_host_accessor(vm, obj, "supportsText", Some(g_sup), None);
 
-        let st_i4 = Rc::clone(&state);
-        let p_i4 = rule_path.clone();
-        let g_med = vm.alloc_host_fn("get media", move |vm, _, _| {
-            let media_text = match st_i4.borrow().rule_at(&p_i4) {
-                Some(CssomRuleKind::Import { media, .. }) => media.clone(),
-                _ => String::new(),
-            };
-            let m_obj = vm.alloc_ordinary_object();
-            let items: Vec<&str> = if media_text.trim().is_empty() {
-                Vec::new()
-            } else {
-                media_text.split(',').map(str::trim).collect()
-            };
-            let km = vm.heap.intern_key("mediaText");
-            let vm_s = JsValue::from_string(vm.heap.alloc_string(media_text.as_str()));
-            vm.heap
-                .object_define_data(m_obj, km, vm_s, PropertyAttrs::DEFAULT, &mut vm.shapes);
-            let kl = vm.heap.intern_key("length");
-            vm.heap.object_define_data(
-                m_obj,
-                kl,
-                JsValue::from_i32(items.len() as i32),
-                PropertyAttrs::DEFAULT,
-                &mut vm.shapes,
-            );
-            for (i, item) in items.iter().enumerate() {
-                let ki = vm.heap.intern_key(&i.to_string());
-                let vi = JsValue::from_string(vm.heap.alloc_string(*item));
-                vm.heap
-                    .object_define_data(m_obj, ki, vi, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        let init_media = {
+            let p = path_rc.borrow();
+            match state.borrow().rule_at(&p) {
+                Some(CssomRuleKind::Import { media, .. }) => parse_media_query_list(media),
+                _ => Vec::new(),
             }
-            Ok(JsValue::from_object(m_obj))
-        });
+        };
+        let imp_media_rc = Rc::new(RefCell::new(init_media));
+        let imp_media_sync = Rc::clone(&imp_media_rc);
+        let st_im = Rc::clone(&state);
+        let p_im = Rc::clone(&path_rc);
+        let h_im = Rc::clone(host);
+        let imp_media_proxy = create_media_list_proxy(
+            vm,
+            host,
+            Rc::clone(&imp_media_rc),
+            Some(Rc::new(move || {
+                let txt = imp_media_sync.borrow().join(", ");
+                {
+                    let p = p_im.borrow();
+                    if let Some(CssomRuleKind::Import { media, .. }) =
+                        st_im.borrow_mut().rule_at_mut(&p)
+                    {
+                        *media = txt;
+                    }
+                }
+                sync_sheet_to_dom(&h_im, &st_im);
+            })),
+        );
+        let g_med = vm.alloc_host_fn("get media", move |_, _, _| Ok(imp_media_proxy));
         define_host_accessor(vm, obj, "media", Some(g_med), None);
+
+        // `CSSImportRule.styleSheet` (shares the exact same `MediaList` object!)
+        let imp_href_raw = {
+            let p = path_rc.borrow();
+            match state.borrow().rule_at(&p) {
+                Some(CssomRuleKind::Import { url, .. }) => url.clone(),
+                _ => String::new(),
+            }
+        };
+        let resolved_href = url::Url::parse(&host.borrow().main_document_url)
+            .ok()
+            .and_then(|b| b.join(&imp_href_raw).ok())
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| imp_href_raw.clone());
+        let mut child_sheet = CssStyleSheetState::from_css("", None, false);
+        child_sheet.href = Some(resolved_href);
+        child_sheet.parent_sheet = Some(parent_sheet);
+        child_sheet.owner_rule = Some(obj);
+        child_sheet.media = Rc::clone(&imp_media_rc);
+        child_sheet.media_proxy = Some(imp_media_proxy);
+        let child_sheet_obj = wrap_stylesheet(vm, host, Rc::new(RefCell::new(child_sheet)), None);
+        let g_ss = vm.alloc_host_fn("get styleSheet", move |_, _, _| {
+            Ok(JsValue::from_object(child_sheet_obj))
+        });
+        define_host_accessor(vm, obj, "styleSheet", Some(g_ss), None);
+    }
+
+    // `CSSMediaRule.media` (live `MediaList` synced to rule's `condition_text`)
+    if proto_name == "CSSMediaRule" {
+        let init_media = {
+            let p = path_rc.borrow();
+            match state.borrow().rule_at(&p) {
+                Some(CssomRuleKind::Media { condition_text, .. }) => {
+                    parse_media_query_list(condition_text)
+                }
+                _ => Vec::new(),
+            }
+        };
+        let mr_media_rc = Rc::new(RefCell::new(init_media));
+        let mr_media_sync = Rc::clone(&mr_media_rc);
+        let st_mr = Rc::clone(&state);
+        let p_mr = Rc::clone(&path_rc);
+        let h_mr = Rc::clone(host);
+        let mr_media_proxy = create_media_list_proxy(
+            vm,
+            host,
+            Rc::clone(&mr_media_rc),
+            Some(Rc::new(move || {
+                let txt = mr_media_sync.borrow().join(", ");
+                {
+                    let p = p_mr.borrow();
+                    if let Some(CssomRuleKind::Media { condition_text, .. }) =
+                        st_mr.borrow_mut().rule_at_mut(&p)
+                    {
+                        *condition_text = txt;
+                    }
+                }
+                sync_sheet_to_dom(&h_mr, &st_mr);
+            })),
+        );
+        let g_med = vm.alloc_host_fn("get media", move |_, _, _| Ok(mr_media_proxy));
+        let st_mr2 = Rc::clone(&state);
+        let p_mr2 = Rc::clone(&path_rc);
+        let h_mr2 = Rc::clone(host);
+        let s_med = vm.alloc_host_fn("set media", move |vm, _, args| {
+            let v = arg(args, 0);
+            let raw = if v.is_null() {
+                String::new()
+            } else {
+                vm.value_to_rust_string(v)
+            };
+            let list = parse_media_query_list(&raw);
+            let txt = list.join(", ");
+            *mr_media_rc.borrow_mut() = list;
+            {
+                let p = p_mr2.borrow();
+                if let Some(CssomRuleKind::Media { condition_text, .. }) =
+                    st_mr2.borrow_mut().rule_at_mut(&p)
+                {
+                    *condition_text = txt;
+                }
+            }
+            sync_sheet_to_dom(&h_mr2, &st_mr2);
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, obj, "media", Some(g_med), Some(s_med));
     }
 
     // `conditionText` / `name` / `namespaceURI` / `prefix`
     let st_cond = Rc::clone(&state);
-    let p_cond = rule_path.clone();
+    let p_cond = Rc::clone(&path_rc);
     let g_cond = vm.alloc_host_fn("get conditionText", move |vm, _, _| {
-        let txt = match st_cond.borrow().rule_at(&p_cond) {
+        let p = p_cond.borrow();
+        let txt = match st_cond.borrow().rule_at(&p) {
             Some(
                 CssomRuleKind::Media { condition_text, .. }
                 | CssomRuleKind::Supports { condition_text, .. }
@@ -1255,9 +2126,10 @@ fn wrap_css_rule(
     define_host_accessor(vm, obj, "conditionText", Some(g_cond), None);
 
     let st_name = Rc::clone(&state);
-    let p_name = rule_path.clone();
+    let p_name = Rc::clone(&path_rc);
     let g_name = vm.alloc_host_fn("get name", move |vm, _, _| {
-        let txt = match st_name.borrow().rule_at(&p_name) {
+        let p = p_name.borrow();
+        let txt = match st_name.borrow().rule_at(&p) {
             Some(
                 CssomRuleKind::LayerBlock { name, .. }
                 | CssomRuleKind::Keyframes { name, .. }
@@ -1267,12 +2139,33 @@ fn wrap_css_rule(
         };
         Ok(JsValue::from_string(vm.heap.alloc_string(txt)))
     });
-    define_host_accessor(vm, obj, "name", Some(g_name), None);
+    let s_name_opt = if proto_name == "CSSKeyframesRule" {
+        let st_ns2 = Rc::clone(&state);
+        let h_ns2 = Rc::clone(host);
+        let p_ns2 = Rc::clone(&path_rc);
+        Some(vm.alloc_host_fn("set name", move |vm, _, args| {
+            let new_name = vm.value_to_rust_string(arg(args, 0));
+            {
+                let p = p_ns2.borrow();
+                if let Some(CssomRuleKind::Keyframes { name, .. }) =
+                    st_ns2.borrow_mut().rule_at_mut(&p)
+                {
+                    *name = new_name;
+                }
+            }
+            sync_sheet_to_dom(&h_ns2, &st_ns2);
+            Ok(JsValue::UNDEFINED)
+        }))
+    } else {
+        None
+    };
+    define_host_accessor(vm, obj, "name", Some(g_name), s_name_opt);
 
     let st_ns = Rc::clone(&state);
-    let p_ns = rule_path.clone();
+    let p_ns = Rc::clone(&path_rc);
     let g_ns = vm.alloc_host_fn("get namespaceURI", move |vm, _, _| {
-        let txt = match st_ns.borrow().rule_at(&p_ns) {
+        let p = p_ns.borrow();
+        let txt = match st_ns.borrow().rule_at(&p) {
             Some(CssomRuleKind::Namespace { url, .. }) => url.clone(),
             _ => String::new(),
         };
@@ -1281,9 +2174,10 @@ fn wrap_css_rule(
     define_host_accessor(vm, obj, "namespaceURI", Some(g_ns), None);
 
     let st_pref = Rc::clone(&state);
-    let p_pref = rule_path;
+    let p_pref = Rc::clone(&path_rc);
     let g_pref = vm.alloc_host_fn("get prefix", move |vm, _, _| {
-        let txt = match st_pref.borrow().rule_at(&p_pref) {
+        let p = p_pref.borrow();
+        let txt = match st_pref.borrow().rule_at(&p) {
             Some(CssomRuleKind::Namespace { prefix, .. }) => prefix.clone().unwrap_or_default(),
             _ => String::new(),
         };
@@ -1291,7 +2185,310 @@ fn wrap_css_rule(
     });
     define_host_accessor(vm, obj, "prefix", Some(g_pref), None);
 
-    obj
+    // `CSSKeyframesRule`: live `cssRules`, `length`, `appendRule`, `deleteRule`, `findRule`, and indexed Proxy!
+    let final_handle = if proto_name == "CSSKeyframesRule" {
+        let init_path = path_rc.borrow().clone();
+        let live_kf_rules = create_live_css_rule_list(
+            vm,
+            host,
+            Rc::clone(&state),
+            parent_sheet,
+            obj,
+            Some(obj),
+            init_path,
+        );
+        let k_cr = vm.heap.intern_key("cssRules");
+        vm.heap.object_define_data(
+            obj,
+            k_cr,
+            live_kf_rules,
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+
+        let st_len = Rc::clone(&state);
+        let p_len = Rc::clone(&path_rc);
+        let g_len = vm.alloc_host_fn("get length", move |_, _, _| {
+            let p = p_len.borrow();
+            let len = st_len
+                .borrow()
+                .rule_list(&p)
+                .map_or(0, <[CssomRuleKind]>::len);
+            Ok(JsValue::from_i32(len as i32))
+        });
+        define_host_accessor(vm, obj, "length", Some(g_len), None);
+
+        let st_app = Rc::clone(&state);
+        let h_app = Rc::clone(host);
+        let p_app = Rc::clone(&path_rc);
+        define_host_method(vm, obj, "appendRule", move |vm, _, args| {
+            let raw = vm.value_to_rust_string(arg(args, 0));
+            if let Some(kf_rule) = parse_single_keyframe_rule(&raw) {
+                {
+                    let p = p_app.borrow();
+                    if let Some(list) = st_app.borrow_mut().rule_list_mut(&p) {
+                        list.push(kf_rule);
+                    }
+                }
+                sync_sheet_to_dom(&h_app, &st_app);
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+
+        let st_find = Rc::clone(&state);
+        let h_find = Rc::clone(host);
+        let p_find = Rc::clone(&path_rc);
+        define_host_method(vm, obj, "findRule", move |vm, _, args| {
+            let raw = vm.value_to_rust_string(arg(args, 0));
+            let Some(target_key) = parse_and_serialize_keyframe_selector(&raw) else {
+                return Ok(JsValue::NULL);
+            };
+            let found_idx = {
+                let p = p_find.borrow();
+                st_find.borrow().rule_list(&p).and_then(|list| {
+                    list.iter().rposition(|r| {
+                        matches!(r, CssomRuleKind::Keyframe { key_text, .. } if key_text == &target_key)
+                    })
+                })
+            };
+            let Some(idx) = found_idx else {
+                return Ok(JsValue::NULL);
+            };
+            let mut child_path = p_find.borrow().clone();
+            child_path.push(idx);
+            Ok(JsValue::from_object(wrap_css_rule(
+                vm,
+                &h_find,
+                Rc::clone(&st_find),
+                child_path,
+                parent_sheet,
+                obj,
+                Some(obj),
+            )))
+        });
+
+        let st_del = Rc::clone(&state);
+        let h_del = Rc::clone(host);
+        let p_del = Rc::clone(&path_rc);
+        define_host_method(vm, obj, "deleteRule", move |vm, _, args| {
+            let raw = vm.value_to_rust_string(arg(args, 0));
+            let Some(target_key) = parse_and_serialize_keyframe_selector(&raw) else {
+                return Ok(JsValue::UNDEFINED);
+            };
+            let removed = {
+                let p = p_del.borrow();
+                let mut st = st_del.borrow_mut();
+                if let Some(list) = st.rule_list_mut(&p) {
+                    let old_len = list.len();
+                    if let Some(idx) = list.iter().rposition(|r| {
+                        matches!(r, CssomRuleKind::Keyframe { key_text, .. } if key_text == &target_key)
+                    }) {
+                        list.remove(idx);
+                        Some((idx, old_len))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some((idx, old_len)) = removed {
+                shift_child_rule_cache_on_delete(vm, obj, idx, old_len);
+                sync_sheet_to_dom(&h_del, &st_del);
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+
+        // Wrap in an indexed Proxy so `keyframesRule[0]`, `keyframesRule[1]` work per CSS Animations L1!
+        let handler = vm.alloc_ordinary_object();
+        let st_kg = Rc::clone(&state);
+        let h_kg = Rc::clone(host);
+        let p_kg = Rc::clone(&path_rc);
+        define_host_method(vm, handler, "get", move |vm, _, args| {
+            let key_val = arg(args, 1);
+            if key_val.is_symbol() {
+                return forward_symbol_get(vm, arg(args, 0), key_val);
+            }
+            let prop = vm.value_to_rust_string(key_val);
+            if let Ok(idx) = prop.parse::<usize>() {
+                let len = {
+                    let p = p_kg.borrow();
+                    st_kg
+                        .borrow()
+                        .rule_list(&p)
+                        .map_or(0, <[CssomRuleKind]>::len)
+                };
+                if idx < len {
+                    let mut child_path = p_kg.borrow().clone();
+                    child_path.push(idx);
+                    return Ok(JsValue::from_object(wrap_css_rule(
+                        vm,
+                        &h_kg,
+                        Rc::clone(&st_kg),
+                        child_path,
+                        parent_sheet,
+                        obj,
+                        Some(obj),
+                    )));
+                }
+                return Ok(JsValue::UNDEFINED);
+            }
+            let k = vm.heap.intern_key(&prop);
+            vm.get_property_by_key(obj, k)
+        });
+        define_host_method(vm, handler, "set", move |vm, _, args| {
+            let prop = vm.value_to_rust_string(arg(args, 1));
+            let k = vm.heap.intern_key(&prop);
+            vm.set_property_by_key(obj, k, arg(args, 2))?;
+            Ok(JsValue::TRUE)
+        });
+        vm.heap.alloc_object(JsObject::with_kind(
+            ObjectKind::Proxy(rix_js::ProxyObject {
+                target: obj,
+                handler,
+                revoked: false,
+            }),
+            Some(proto),
+        ))
+    } else {
+        obj
+    };
+
+    vm.heap.object_define_data(
+        cache,
+        cache_key,
+        JsValue::from_object(final_handle),
+        PropertyAttrs::DEFAULT,
+        &mut vm.shapes,
+    );
+    final_handle
+}
+
+fn create_page_descriptors_obj(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    state: SharedStyleSheet,
+    rule_path: Rc<RefCell<Vec<usize>>>,
+) -> JsValue {
+    let proto = host
+        .borrow()
+        .css_rule_protos
+        .get("CSSPageDescriptors")
+        .copied()
+        .unwrap_or(vm.object_proto);
+    let obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+
+    let st1 = Rc::clone(&state);
+    let p1 = Rc::clone(&rule_path);
+    define_host_method(vm, obj, "getPropertyValue", move |vm, _, args| {
+        let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
+        let p = p1.borrow();
+        let raw = st1
+            .borrow()
+            .rule_at(&p)
+            .and_then(CssomRuleKind::declarations_text)
+            .unwrap_or("")
+            .to_string();
+        let decls = parse_style_decls_with_priority(&raw);
+        let val = lookup_decl_or_shorthand(&decls, &prop);
+        Ok(JsValue::from_string(vm.heap.alloc_string(val)))
+    });
+
+    let st2 = Rc::clone(&state);
+    let h2 = Rc::clone(host);
+    let p2 = Rc::clone(&rule_path);
+    define_host_method(vm, obj, "setProperty", move |vm, _, args| {
+        let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
+        let raw_val = if args.len() < 2 || arg(args, 1).is_null() {
+            String::new()
+        } else {
+            vm.value_to_rust_string(arg(args, 1))
+        };
+        if raw_val.trim().is_empty() {
+            let p = p2.borrow();
+            let cur = st2
+                .borrow()
+                .rule_at(&p)
+                .and_then(CssomRuleKind::declarations_text)
+                .unwrap_or("")
+                .to_string();
+            let mut decls = parse_style_decls_with_priority(&cur);
+            let _ = remove_decl_or_shorthand(&mut decls, &prop);
+            if let Some(dt) = st2
+                .borrow_mut()
+                .rule_at_mut(&p)
+                .and_then(CssomRuleKind::declarations_text_mut)
+            {
+                *dt = serialize_style_decls_with_priority(&decls);
+            }
+            drop(p);
+            sync_sheet_to_dom(&h2, &st2);
+            return Ok(JsValue::UNDEFINED);
+        }
+        let Some(canonical) = validate_and_serialize_page_descriptor(&prop, &raw_val) else {
+            return Ok(JsValue::UNDEFINED);
+        };
+        {
+            let p = p2.borrow();
+            let cur = st2
+                .borrow()
+                .rule_at(&p)
+                .and_then(CssomRuleKind::declarations_text)
+                .unwrap_or("")
+                .to_string();
+            let mut decls = parse_style_decls_with_priority(&cur);
+            if prop == "margin" {
+                if let Some(exp) = parse_and_expand_declaration("margin", &raw_val) {
+                    for (lk, lv) in exp {
+                        upsert_decl(&mut decls, lk, lv, false, false);
+                    }
+                }
+            } else {
+                upsert_decl(&mut decls, prop, canonical, false, false);
+            }
+            if let Some(dt) = st2
+                .borrow_mut()
+                .rule_at_mut(&p)
+                .and_then(CssomRuleKind::declarations_text_mut)
+            {
+                *dt = serialize_style_decls_with_priority(&decls);
+            }
+        }
+        sync_sheet_to_dom(&h2, &st2);
+        Ok(JsValue::UNDEFINED)
+    });
+
+    let st3 = Rc::clone(&state);
+    let h3 = Rc::clone(host);
+    let p3 = Rc::clone(&rule_path);
+    define_host_method(vm, obj, "removeProperty", move |vm, _, args| {
+        let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
+        let old = {
+            let p = p3.borrow();
+            let cur = st3
+                .borrow()
+                .rule_at(&p)
+                .and_then(CssomRuleKind::declarations_text)
+                .unwrap_or("")
+                .to_string();
+            let mut decls = parse_style_decls_with_priority(&cur);
+            let old = remove_decl_or_shorthand(&mut decls, &prop);
+            if let Some(dt) = st3
+                .borrow_mut()
+                .rule_at_mut(&p)
+                .and_then(CssomRuleKind::declarations_text_mut)
+            {
+                *dt = serialize_style_decls_with_priority(&decls);
+            }
+            old
+        };
+        sync_sheet_to_dom(&h3, &st3);
+        Ok(JsValue::from_string(vm.heap.alloc_string(old)))
+    });
+
+    JsValue::from_object(obj)
 }
 
 fn alloc_style_decl_target(vm: &mut JsVm, host: &SharedHost) -> HeapHandle {
@@ -1312,16 +2509,17 @@ fn create_rule_style_proxy(
     vm: &mut JsVm,
     host: &SharedHost,
     state: SharedStyleSheet,
-    rule_path: Vec<usize>,
+    rule_path: Rc<RefCell<Vec<usize>>>,
 ) -> JsValue {
     let target = alloc_style_decl_target(vm, host);
     let st1 = Rc::clone(&state);
-    let p1 = rule_path.clone();
+    let p1 = Rc::clone(&rule_path);
     define_host_method(vm, target, "getPropertyValue", move |vm, _, args| {
         let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
+        let p = p1.borrow();
         let raw = st1
             .borrow()
-            .rule_at(&p1)
+            .rule_at(&p)
             .and_then(CssomRuleKind::declarations_text)
             .unwrap_or("")
             .to_string();
@@ -1330,12 +2528,13 @@ fn create_rule_style_proxy(
         Ok(JsValue::from_string(vm.heap.alloc_string(val)))
     });
     let st_prio = Rc::clone(&state);
-    let p_prio = rule_path.clone();
+    let p_prio = Rc::clone(&rule_path);
     define_host_method(vm, target, "getPropertyPriority", move |vm, _, args| {
         let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
+        let p = p_prio.borrow();
         let raw = st_prio
             .borrow()
-            .rule_at(&p_prio)
+            .rule_at(&p)
             .and_then(CssomRuleKind::declarations_text)
             .unwrap_or("")
             .to_string();
@@ -1348,15 +2547,16 @@ fn create_rule_style_proxy(
         Ok(JsValue::from_string(vm.heap.alloc_string(s)))
     });
     let st_item = Rc::clone(&state);
-    let p_item = rule_path.clone();
+    let p_item = Rc::clone(&rule_path);
     define_host_method(vm, target, "item", move |vm, _, args| {
         let idx = vm.to_number(arg(args, 0)).unwrap_or(-1.0);
         if idx < 0.0 || !idx.is_finite() {
             return Ok(JsValue::from_string(vm.heap.alloc_string("")));
         }
+        let p = p_item.borrow();
         let raw = st_item
             .borrow()
-            .rule_at(&p_item)
+            .rule_at(&p)
             .and_then(CssomRuleKind::declarations_text)
             .unwrap_or("")
             .to_string();
@@ -1369,14 +2569,13 @@ fn create_rule_style_proxy(
     });
     let st2 = Rc::clone(&state);
     let h2 = Rc::clone(host);
-    let p2 = rule_path.clone();
+    let p2 = Rc::clone(&rule_path);
     define_host_method(vm, target, "setProperty", move |vm, _, args| {
         let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
-        let val_arg = arg(args, 1);
-        let raw_val = if val_arg.is_null() || val_arg.is_undefined() {
+        let raw_val = if args.len() < 2 || arg(args, 1).is_null() {
             String::new()
         } else {
-            vm.value_to_rust_string(val_arg)
+            vm.value_to_rust_string(arg(args, 1))
         };
         let priority = if args.len() >= 3 && !arg(args, 2).is_undefined() && !arg(args, 2).is_null()
         {
@@ -1391,9 +2590,10 @@ fn create_rule_style_proxy(
         } else {
             return Ok(JsValue::UNDEFINED);
         };
+        let p = p2.borrow();
         let Some(cur) = st2
             .borrow()
-            .rule_at(&p2)
+            .rule_at(&p)
             .and_then(CssomRuleKind::declarations_text)
             .map(str::to_string)
         else {
@@ -1405,22 +2605,24 @@ fn create_rule_style_proxy(
         }
         if let Some(declarations_text) = st2
             .borrow_mut()
-            .rule_at_mut(&p2)
+            .rule_at_mut(&p)
             .and_then(CssomRuleKind::declarations_text_mut)
         {
             *declarations_text = serialize_style_decls_with_priority(&decls);
         }
+        drop(p);
         sync_sheet_to_dom(&h2, &st2);
         Ok(JsValue::UNDEFINED)
     });
     let st3 = Rc::clone(&state);
     let h3 = Rc::clone(host);
-    let p3 = rule_path.clone();
+    let p3 = Rc::clone(&rule_path);
     define_host_method(vm, target, "removeProperty", move |vm, _, args| {
         let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
+        let p = p3.borrow();
         let cur = st3
             .borrow()
-            .rule_at(&p3)
+            .rule_at(&p)
             .and_then(CssomRuleKind::declarations_text)
             .unwrap_or("")
             .to_string();
@@ -1428,18 +2630,19 @@ fn create_rule_style_proxy(
         let old = remove_decl_or_shorthand(&mut decls, &prop);
         if let Some(declarations_text) = st3
             .borrow_mut()
-            .rule_at_mut(&p3)
+            .rule_at_mut(&p)
             .and_then(CssomRuleKind::declarations_text_mut)
         {
             *declarations_text = serialize_style_decls_with_priority(&decls);
         }
+        drop(p);
         sync_sheet_to_dom(&h3, &st3);
         Ok(JsValue::from_string(vm.heap.alloc_string(old)))
     });
 
     let handler = vm.alloc_ordinary_object();
     let st_get = Rc::clone(&state);
-    let p_get = rule_path.clone();
+    let p_get = Rc::clone(&rule_path);
     define_host_method(vm, handler, "get", move |vm, _, args| {
         let key_val = arg(args, 1);
         if key_val.is_symbol() {
@@ -1452,9 +2655,10 @@ fn create_rule_style_proxy(
                 return vm.get_property_by_key(t_h, k);
             }
         }
+        let p = p_get.borrow();
         let raw = st_get
             .borrow()
-            .rule_at(&p_get)
+            .rule_at(&p)
             .and_then(CssomRuleKind::declarations_text)
             .unwrap_or("")
             .to_string();
@@ -1483,20 +2687,24 @@ fn create_rule_style_proxy(
         let raw_val = vm.value_to_rust_string(arg(args, 2));
         if prop == "cssText" {
             let validated = canonicalize_css_decls(&raw_val);
-            if let Some(declarations_text) = st_set
-                .borrow_mut()
-                .rule_at_mut(&p_set)
-                .and_then(CssomRuleKind::declarations_text_mut)
             {
-                *declarations_text = serialize_style_decls_with_priority(&validated);
+                let p = p_set.borrow();
+                if let Some(declarations_text) = st_set
+                    .borrow_mut()
+                    .rule_at_mut(&p)
+                    .and_then(CssomRuleKind::declarations_text_mut)
+                {
+                    *declarations_text = serialize_style_decls_with_priority(&validated);
+                }
             }
             sync_sheet_to_dom(&h_set, &st_set);
             return Ok(JsValue::TRUE);
         }
         let css_key = camel_to_kebab(&prop);
+        let p = p_set.borrow();
         let Some(cur) = st_set
             .borrow()
-            .rule_at(&p_set)
+            .rule_at(&p)
             .and_then(CssomRuleKind::declarations_text)
             .map(str::to_string)
         else {
@@ -1508,11 +2716,12 @@ fn create_rule_style_proxy(
         }
         if let Some(declarations_text) = st_set
             .borrow_mut()
-            .rule_at_mut(&p_set)
+            .rule_at_mut(&p)
             .and_then(CssomRuleKind::declarations_text_mut)
         {
             *declarations_text = serialize_style_decls_with_priority(&decls);
         }
+        drop(p);
         sync_sheet_to_dom(&h_set, &st_set);
         Ok(JsValue::TRUE)
     });
@@ -1533,40 +2742,89 @@ fn create_rule_style_proxy(
 // ---------------------------------------------------------------------------
 
 fn get_or_create_style_element_sheet(host: &SharedHost, nid: NodeId) -> Option<SharedStyleSheet> {
-    let (is_style, is_connected, css_text) = {
+    let (is_style, is_link_sheet, is_connected, css_text, title_attr, media_attr, href_attr) = {
         let doc_rc = Rc::clone(&host.borrow().document);
         let doc = doc_rc.borrow();
         let Some(NodeData::Element(el)) = doc.get(nid) else {
             return None;
         };
-        if !el.name.local.as_str().eq_ignore_ascii_case("style") {
+        let is_style = el.name.local.as_str().eq_ignore_ascii_case("style");
+        let is_link = el.name.local.as_str().eq_ignore_ascii_case("link")
+            && el.get_attribute("rel").is_some_and(|r| {
+                r.split_ascii_whitespace()
+                    .any(|tok| tok.eq_ignore_ascii_case("stylesheet"))
+            })
+            && el.get_attribute("href").is_some_and(|h| !h.is_empty());
+        if !is_style && !is_link {
             return None;
         }
         let connected = doc.is_connected(nid);
-        let text = doc.inner_text(nid);
-        (true, connected, text)
+        let text = if is_style {
+            doc.inner_text(nid)
+        } else {
+            String::new()
+        };
+        let title_attr = el
+            .get_attribute("title")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let media_attr = el.get_attribute("media").map(str::to_string);
+        let href_attr = el.get_attribute("href").map(str::to_string);
+        (
+            is_style, is_link, connected, text, title_attr, media_attr, href_attr,
+        )
     };
-    if !is_style {
-        return None;
-    }
     if !is_connected {
-        // Per HTML spec, disconnected `<style>` elements have `sheet === null`.
+        // Per HTML spec, disconnected `<style>` / `<link>` elements have `sheet === null`.
         return None;
     }
+    let resolved_href = if is_link_sheet {
+        href_attr.as_deref().map(|raw| {
+            url::Url::parse(&host.borrow().main_document_url)
+                .ok()
+                .and_then(|b| b.join(raw).ok())
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| raw.to_string())
+        })
+    } else {
+        None
+    };
+    let effective_css = if is_style {
+        css_text
+    } else {
+        host.borrow()
+            .document
+            .borrow()
+            .all_dynamic_stylesheets()
+            .get(&nid)
+            .cloned()
+            .unwrap_or_default()
+    };
     let mut st = host.borrow_mut();
     let sheet = st
         .style_element_sheets
         .entry(nid)
         .or_insert_with(|| {
-            Rc::new(RefCell::new(CssStyleSheetState::from_css(
-                &css_text,
-                Some(nid),
-                false,
-            )))
+            let mut s = CssStyleSheetState::from_css(&effective_css, Some(nid), false);
+            s.title = title_attr.clone();
+            s.href = resolved_href.clone();
+            if let Some(ref m) = media_attr {
+                *s.media.borrow_mut() = parse_media_query_list(m);
+            }
+            Rc::new(RefCell::new(s))
         })
         .clone();
     drop(st);
-    sheet.borrow_mut().sync_from_text_if_changed(&css_text);
+    {
+        let mut s = sheet.borrow_mut();
+        if is_style {
+            s.sync_from_text_if_changed(&effective_css);
+        }
+        s.title = title_attr;
+        if is_link_sheet {
+            s.href = resolved_href;
+        }
+    }
     Some(sheet)
 }
 
@@ -1588,10 +2846,144 @@ fn install_style_element_sheet_accessor(vm: &mut JsVm, host: &SharedHost) {
     define_host_accessor(vm, ep, "sheet", Some(g), None);
 }
 
+/// Syncs a JS array of `CSSStyleSheet` wrappers into either `Document.adoptedStyleSheets`
+/// (`shadow_root == None`) or `ShadowRoot.adoptedStyleSheets` (`Some(sr_id)`).
+fn sync_adopted_array_to_host(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    arr_h: HeapHandle,
+    shadow_root: Option<NodeId>,
+) -> Result<(), rix_js::JsException> {
+    let k_len = vm.heap.intern_key("length");
+    let len = vm
+        .get_property_by_key(arr_h, k_len)
+        .ok()
+        .and_then(|v| vm.to_number(v).ok())
+        .unwrap_or(0.0)
+        .max(0.0) as usize;
+    let mut new_sheets = Vec::with_capacity(len);
+    for i in 0..len {
+        let ki = vm.heap.intern_key(&i.to_string());
+        let v = vm.get_property_by_key(arr_h, ki)?;
+        let Some(sh_h) = v.as_object() else {
+            return Err(vm.type_error("adoptedStyleSheets must contain CSSStyleSheet objects"));
+        };
+        let Some(st) = host.borrow().stylesheet_handle_map.get(&sh_h).cloned() else {
+            return Err(vm.type_error("adoptedStyleSheets must contain CSSStyleSheet objects"));
+        };
+        if !st.borrow().is_constructed {
+            return Err(create_dom_exception(
+                vm,
+                "NotAllowedError",
+                "Cannot adopt a non-constructed CSSStyleSheet",
+            ));
+        }
+        new_sheets.push(st);
+    }
+    if let Some(sr_id) = shadow_root {
+        host.borrow()
+            .shadow_dom
+            .borrow_mut()
+            .adopted_stylesheets
+            .insert(sr_id, new_sheets);
+        host.borrow_mut().mark_sheets_dirty();
+    } else {
+        let mut hst = host.borrow_mut();
+        hst.adopted_stylesheets = new_sheets;
+        hst.mark_sheets_dirty();
+    }
+    Ok(())
+}
+
+/// Creates a live WebIDL `ObservableArray<CSSStyleSheet>` Proxy for `Document` or `ShadowRoot`
+/// so `.length = 0`, `.pop()`, `.push()`, `[i] = sheet`, `.splice()`, etc. immediately sync
+/// to the CSS cascade.
+pub(crate) fn create_adopted_stylesheets_proxy(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    shadow_root: Option<NodeId>,
+) -> JsValue {
+    let sheets: Vec<SharedStyleSheet> = if let Some(sr_id) = shadow_root {
+        host.borrow()
+            .shadow_dom
+            .borrow()
+            .adopted_stylesheets
+            .get(&sr_id)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        host.borrow().adopted_stylesheets.clone()
+    };
+    let target = vm.alloc_array();
+    for sh in sheets {
+        let obj = wrap_stylesheet(vm, host, sh, None);
+        vm.heap
+            .object_push_element(target, JsValue::from_object(obj));
+    }
+
+    let handler = vm.alloc_ordinary_object();
+    let h_set = Rc::clone(host);
+    define_host_method(vm, handler, "set", move |vm, _, args| {
+        let Some(t_h) = arg(args, 0).as_object() else {
+            return Ok(JsValue::FALSE);
+        };
+        let prop_val = arg(args, 1);
+        let new_val = arg(args, 2);
+        let prop_str = vm.value_to_rust_string(prop_val);
+        if prop_str.parse::<usize>().is_ok() {
+            // Validate element is a constructed CSSStyleSheet before mutating backing array!
+            let Some(sh_h) = new_val.as_object() else {
+                return Err(vm.type_error("adoptedStyleSheets must contain CSSStyleSheet objects"));
+            };
+            let st_opt = h_set.borrow().stylesheet_handle_map.get(&sh_h).cloned();
+            let Some(st) = st_opt else {
+                return Err(vm.type_error("adoptedStyleSheets must contain CSSStyleSheet objects"));
+            };
+            if !st.borrow().is_constructed {
+                return Err(create_dom_exception(
+                    vm,
+                    "NotAllowedError",
+                    "Cannot adopt a non-constructed CSSStyleSheet",
+                ));
+            }
+        }
+        let k = vm.heap.intern_key(&prop_str);
+        vm.set_property_by_key(t_h, k, new_val)?;
+        if prop_str == "length" || prop_str.parse::<usize>().is_ok() {
+            sync_adopted_array_to_host(vm, &h_set, t_h, shadow_root)?;
+        }
+        Ok(JsValue::TRUE)
+    });
+
+    let h_del = Rc::clone(host);
+    define_host_method(vm, handler, "deleteProperty", move |vm, _, args| {
+        let Some(t_h) = arg(args, 0).as_object() else {
+            return Ok(JsValue::FALSE);
+        };
+        let prop_str = vm.value_to_rust_string(arg(args, 1));
+        let k = vm.heap.intern_key(&prop_str);
+        let _ = vm.delete_property_by_key(t_h, k);
+        if prop_str.parse::<usize>().is_ok() {
+            let _ = sync_adopted_array_to_host(vm, &h_del, t_h, shadow_root);
+        }
+        Ok(JsValue::TRUE)
+    });
+
+    let proxy = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Proxy(rix_js::ProxyObject {
+            target,
+            handler,
+            revoked: false,
+        }),
+        Some(vm.array_proto),
+    ));
+    JsValue::from_object(proxy)
+}
+
 fn install_document_stylesheets(vm: &mut JsVm, host: &SharedHost) {
     let dp = host.borrow().prototypes.document_proto;
 
-    // `document.styleSheets`
+    // `document.styleSheets` & `shadowRoot.styleSheets` (does NOT include `adoptedStyleSheets`)
     let h = Rc::clone(host);
     let g = vm.alloc_host_fn("get styleSheets", move |vm, this_val, _| {
         let doc_root = crate::dom_bridge::extract_node(vm, &h, this_val)
@@ -1603,54 +2995,84 @@ fn install_document_stylesheets(vm: &mut JsVm, host: &SharedHost) {
                 .filter(|&n| {
                     matches!(
                         doc.get(n),
-                        Some(NodeData::Element(el)) if el.name.local.as_str().eq_ignore_ascii_case("style")
+                        Some(NodeData::Element(el))
+                            if el.name.local.as_str().eq_ignore_ascii_case("style")
+                                || (el.name.local.as_str().eq_ignore_ascii_case("link")
+                                    && el.get_attribute("disabled").is_none()
+                                    && el.get_attribute("rel").is_some_and(|r| r
+                                        .split_ascii_whitespace()
+                                        .any(|t| t.eq_ignore_ascii_case("stylesheet")))
+                                    && el.get_attribute("href").is_some_and(|hv| !hv.is_empty()))
                     )
                 })
                 .collect()
         };
+        let ssl_proto = h
+            .borrow()
+            .css_rule_protos
+            .get("StyleSheetList")
+            .copied()
+            .unwrap_or(vm.array_proto);
         let arr = vm.alloc_array();
+        vm.heap
+            .object_set_prototype(arr, Some(ssl_proto), &mut vm.shapes);
         for nid in style_nodes {
             if let Some(sheet_state) = get_or_create_style_element_sheet(&h, nid) {
                 let obj = wrap_stylesheet(vm, &h, sheet_state, None);
                 vm.heap.object_push_element(arr, JsValue::from_object(obj));
             }
         }
+        define_host_method(vm, arr, "item", |vm, t, args| {
+            let idx = vm.to_number(arg(args, 0)).unwrap_or(-1.0);
+            if idx < 0.0 || !idx.is_finite() {
+                return Ok(JsValue::NULL);
+            }
+            let Some(th) = t.as_object() else {
+                return Ok(JsValue::NULL);
+            };
+            let k = vm.heap.intern_key(&(idx as usize).to_string());
+            match vm.get_property_by_key(th, k) {
+                Ok(v) if !v.is_undefined() => Ok(v),
+                _ => Ok(JsValue::NULL),
+            }
+        });
+        attach_array_like_iterator(vm, arr);
         Ok(JsValue::from_object(arr))
     });
     define_host_accessor(vm, dp, "styleSheets", Some(g), None);
     let srp = host.borrow().prototypes.shadow_root_proto;
     define_host_accessor(vm, srp, "styleSheets", Some(g), None);
 
-    // `document.adoptedStyleSheets`
+    // `document.adoptedStyleSheets` (live ObservableArray Proxy)
     let h1 = Rc::clone(host);
     let g_ad = vm.alloc_host_fn("get adoptedStyleSheets", move |vm, _, _| {
-        let sheets: Vec<SharedStyleSheet> = h1.borrow().adopted_stylesheets.clone();
-        let arr = vm.alloc_array();
-        for sh in sheets {
-            let obj = wrap_stylesheet(vm, &h1, sh, None);
-            vm.heap.object_push_element(arr, JsValue::from_object(obj));
-        }
-        Ok(JsValue::from_object(arr))
+        Ok(create_adopted_stylesheets_proxy(vm, &h1, None))
     });
     let h2 = Rc::clone(host);
     let s_ad = vm.alloc_host_fn("set adoptedStyleSheets", move |vm, _, args| {
-        let mut new_sheets = Vec::new();
-        if let Some(arr_h) = arg(args, 0).as_object() {
-            let k_len = vm.heap.intern_key("length");
-            let len = vm
-                .get_property_by_key(arr_h, k_len)
-                .ok()
-                .and_then(|v| vm.to_number(v).ok())
-                .unwrap_or(0.0) as usize;
-            for i in 0..len {
-                let ki = vm.heap.intern_key(&i.to_string());
-                if let Ok(v) = vm.get_property_by_key(arr_h, ki) {
-                    if let Some(sh_h) = v.as_object() {
-                        if let Some(st) = h2.borrow().stylesheet_handle_map.get(&sh_h).cloned() {
-                            new_sheets.push(st);
-                        }
-                    }
+        let items = vm.collect_iterable(arg(args, 0))?;
+        let mut new_sheets = Vec::with_capacity(items.len());
+        {
+            let hb = h2.borrow();
+            for item in items {
+                let Some(sh_h) = item.as_object() else {
+                    return Err(
+                        vm.type_error("adoptedStyleSheets must contain CSSStyleSheet objects")
+                    );
+                };
+                let Some(st) = hb.stylesheet_handle_map.get(&sh_h) else {
+                    return Err(
+                        vm.type_error("adoptedStyleSheets must contain CSSStyleSheet objects")
+                    );
+                };
+                if !st.borrow().is_constructed {
+                    return Err(create_dom_exception(
+                        vm,
+                        "NotAllowedError",
+                        "Cannot adopt a non-constructed CSSStyleSheet",
+                    ));
                 }
+                new_sheets.push(Rc::clone(st));
             }
         }
         {
@@ -1667,17 +3089,416 @@ fn install_document_stylesheets(vm: &mut JsVm, host: &SharedHost) {
 // `window.getComputedStyle(element, pseudoElt?)` & full computed serialization
 // ---------------------------------------------------------------------------
 
+enum ComputedPseudoTarget {
+    Element,
+    Pseudo(RixPseudoElement),
+    Highlight(String),
+    Invalid,
+}
+
+fn decode_css_ident_strict(raw: &str) -> Option<String> {
+    let s = raw.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0C'));
+    if s.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            let mut hex = String::new();
+            while hex.len() < 6 && chars.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+                hex.push(chars.next().unwrap());
+            }
+            if !hex.is_empty() {
+                if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                    if let Some(decoded) = char::from_u32(cp) {
+                        out.push(decoded);
+                    }
+                }
+                if chars.peek().is_some_and(|c| c.is_ascii_whitespace()) {
+                    chars.next();
+                }
+            } else {
+                let esc = chars.next()?;
+                out.push(esc);
+            }
+        } else if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || !ch.is_ascii() {
+            out.push(ch);
+        } else {
+            return None;
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    // CSS `<ident>` cannot start with a digit or `--` followed by nothing / `-<digit>`.
+    let first = out.chars().next()?;
+    if first.is_ascii_digit() {
+        return None;
+    }
+    if first == '-' {
+        if let Some(second) = out.chars().nth(1) {
+            if second.is_ascii_digit() {
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+fn parse_get_computed_style_pseudo(raw: &str) -> ComputedPseudoTarget {
+    if raw.is_empty() || !raw.starts_with(':') {
+        // Per CSSOM §4.4.1, arguments not starting with `:` are ignored (treated as element itself).
+        return ComputedPseudoTarget::Element;
+    }
+    if let Some(after_two) = raw.strip_prefix("::") {
+        // Functional `::highlight(<ident>)` (EOF may implicitly close `)` per CSS Syntax!).
+        if after_two.len() >= 10 && after_two[..10].eq_ignore_ascii_case("highlight(") {
+            let rest = &after_two[10..];
+            let inner = if let Some(pos) = rest.find(')') {
+                // Reject any trailing tokens after `)`.
+                if pos + 1 != rest.len() {
+                    return ComputedPseudoTarget::Invalid;
+                }
+                &rest[..pos]
+            } else {
+                rest
+            };
+            return match decode_css_ident_strict(inner) {
+                Some(ident) => ComputedPseudoTarget::Highlight(ident),
+                None => ComputedPseudoTarget::Invalid,
+            };
+        }
+        // Standard non-functional double-colon pseudo-elements (exact match, NO trailing whitespace/tokens!).
+        match after_two.to_ascii_lowercase().as_str() {
+            "before" => ComputedPseudoTarget::Pseudo(RixPseudoElement::Before),
+            "after" => ComputedPseudoTarget::Pseudo(RixPseudoElement::After),
+            "marker" => ComputedPseudoTarget::Pseudo(RixPseudoElement::Marker),
+            "placeholder" => ComputedPseudoTarget::Pseudo(RixPseudoElement::Placeholder),
+            "selection" => ComputedPseudoTarget::Pseudo(RixPseudoElement::Selection),
+            "first-line" => ComputedPseudoTarget::Pseudo(RixPseudoElement::FirstLine),
+            "first-letter" => ComputedPseudoTarget::Pseudo(RixPseudoElement::FirstLetter),
+            "backdrop" => ComputedPseudoTarget::Pseudo(RixPseudoElement::Backdrop),
+            "file-selector-button" => {
+                ComputedPseudoTarget::Pseudo(RixPseudoElement::FileSelectorButton)
+            }
+            "details-content" => ComputedPseudoTarget::Pseudo(RixPseudoElement::DetailsContent),
+            "cue" => ComputedPseudoTarget::Pseudo(RixPseudoElement::Cue),
+            "target-text" => ComputedPseudoTarget::Pseudo(RixPseudoElement::TargetText),
+            _ => ComputedPseudoTarget::Invalid,
+        }
+    } else if let Some(after_one) = raw.strip_prefix(':') {
+        // Legacy single-colon CSS2 pseudo-elements ONLY (exact match, NO trailing whitespace/tokens!).
+        match after_one.to_ascii_lowercase().as_str() {
+            "before" => ComputedPseudoTarget::Pseudo(RixPseudoElement::Before),
+            "after" => ComputedPseudoTarget::Pseudo(RixPseudoElement::After),
+            "first-line" => ComputedPseudoTarget::Pseudo(RixPseudoElement::FirstLine),
+            "first-letter" => ComputedPseudoTarget::Pseudo(RixPseudoElement::FirstLetter),
+            _ => ComputedPseudoTarget::Invalid,
+        }
+    } else {
+        ComputedPseudoTarget::Invalid
+    }
+}
+
+fn create_empty_computed_style_proxy(vm: &mut JsVm, host: &SharedHost) -> JsValue {
+    let target = alloc_style_decl_target(vm, host);
+    define_host_method(vm, target, "getPropertyValue", move |vm, _, _| {
+        Ok(JsValue::from_string(vm.heap.alloc_string("")))
+    });
+    define_host_method(vm, target, "getPropertyPriority", move |vm, _, _| {
+        Ok(JsValue::from_string(vm.heap.alloc_string("")))
+    });
+    define_host_method(vm, target, "item", move |vm, _, _| {
+        Ok(JsValue::from_string(vm.heap.alloc_string("")))
+    });
+    define_host_method(vm, target, "setProperty", move |vm, _, _| {
+        Err(create_dom_exception(
+            vm,
+            "NoModificationAllowedError",
+            "Computed style declaration is read-only",
+        ))
+    });
+    define_host_method(vm, target, "removeProperty", move |vm, _, _| {
+        Err(create_dom_exception(
+            vm,
+            "NoModificationAllowedError",
+            "Computed style declaration is read-only",
+        ))
+    });
+    let handler = vm.alloc_ordinary_object();
+    define_host_method(vm, handler, "ownKeys", move |vm, _, _| {
+        Ok(JsValue::from_object(vm.alloc_array()))
+    });
+    define_host_method(vm, handler, "get", move |vm, _, args| {
+        let key_val = arg(args, 1);
+        if key_val.is_symbol() {
+            return forward_symbol_get(vm, arg(args, 0), key_val);
+        }
+        let prop = vm.value_to_rust_string(key_val);
+        if prop == "length" {
+            return Ok(JsValue::from_i32(0));
+        }
+        let k = vm.heap.intern_key(&prop);
+        if let Some(t_h) = arg(args, 0).as_object() {
+            if vm.heap.object_get_own(t_h, k, &vm.shapes).is_some() {
+                return vm.get_property_by_key(t_h, k);
+            }
+        }
+        if prop.parse::<usize>().is_ok() {
+            return Ok(JsValue::UNDEFINED);
+        }
+        Ok(JsValue::from_string(vm.heap.alloc_string("")))
+    });
+    let proxy = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Proxy(rix_js::ProxyObject {
+            target,
+            handler,
+            revoked: false,
+        }),
+        Some(vm.object_proto),
+    ));
+    JsValue::from_object(proxy)
+}
+
+fn resolve_highlight_property(
+    host: &SharedHost,
+    nid: NodeId,
+    highlight_name: &str,
+    css_prop: &str,
+) -> Option<String> {
+    let (elem_id, elem_tag) = match host.borrow().document.borrow().get(nid) {
+        Some(NodeData::Element(e)) => (
+            e.get_attribute("id").map(str::to_string),
+            Some(e.name.local.as_str().to_ascii_lowercase()),
+        ),
+        _ => (None, None),
+    };
+    let needle = format!("::highlight({highlight_name})");
+    let css_blocks: Vec<String> = {
+        let hb = host.borrow();
+        let doc = hb.document.borrow();
+        let mut out = Vec::new();
+        for n in doc.descendants_with_shadow_roots(doc.root()) {
+            if let Some(NodeData::Element(e)) = doc.get(n) {
+                if e.name.local.as_str().eq_ignore_ascii_case("style") {
+                    out.push(doc.inner_text(n));
+                }
+            }
+        }
+        out
+    };
+    let mut matched_val = None;
+    for css in css_blocks {
+        // Scan top-level `<selector> { <decls> }` blocks directly so `::highlight(<name>)`
+        // rules dropped by `lightningcss` are still resolved per CSS Highlight API L1.
+        let mut rest = css.as_str();
+        while let Some(open) = rest.find('{') {
+            let sel_raw = rest[..open].trim();
+            let after_open = &rest[open + 1..];
+            let Some(close) = after_open.find('}') else {
+                break;
+            };
+            let body = &after_open[..close];
+            rest = &after_open[close + 1..];
+            if !sel_raw.contains(&needle) {
+                continue;
+            }
+            for part in sel_raw.split(',') {
+                let p = part.trim();
+                let Some((prefix_raw, _)) = p.split_once(&needle) else {
+                    continue;
+                };
+                let prefix = prefix_raw.trim();
+                let matches = prefix.is_empty()
+                    || prefix == "*"
+                    || elem_id
+                        .as_deref()
+                        .is_some_and(|id| prefix == format!("#{id}"))
+                    || elem_tag
+                        .as_deref()
+                        .is_some_and(|t| prefix.eq_ignore_ascii_case(t));
+                if matches {
+                    let decls = parse_style_decls_with_priority(body);
+                    let v = lookup_decl_or_shorthand(&decls, css_prop);
+                    if !v.is_empty() {
+                        matched_val = Some(v);
+                    }
+                }
+            }
+        }
+    }
+    matched_val
+}
+
+/// Returns `true` iff `nid` is connected to a rendered document's flat tree per CSSOM §4.4.1:
+/// - Detached elements and shadow trees attached to detached hosts return `false`.
+/// - Light-DOM descendants of a shadow host that are not assigned to any `<slot>` return `false`.
+/// - Elements inside a sub-document whose owning `<iframe>` has `display: none` or is detached return `false`.
+fn is_in_flat_rendered_tree(host: &SharedHost, nid: NodeId) -> bool {
+    let main_root = host.borrow().document.borrow().root();
+    let mut cur = nid;
+    for _ in 0..512 {
+        let step = {
+            let hb = host.borrow();
+            let doc = hb.document.borrow();
+            match doc.parent(cur) {
+                Some(p) => {
+                    // If parent is a shadow host, `cur` must be slotted to participate in the flat tree.
+                    if let Some(NodeData::Element(pe)) = doc.get(p) {
+                        if let Some(sr_id) = pe.shadow_root {
+                            let sdom = hb.shadow_dom.borrow();
+                            let in_manual =
+                                sdom.manual_assignments.values().any(|v| v.contains(&cur));
+                            let slot_name = match doc.get(cur) {
+                                Some(NodeData::Element(ce)) => {
+                                    ce.get_attribute("slot").unwrap_or("").to_string()
+                                }
+                                _ => String::new(),
+                            };
+                            let has_matching_slot = in_manual
+                                || doc.descendants(sr_id).any(|dn| {
+                                    matches!(
+                                        doc.get(dn),
+                                        Some(NodeData::Element(se))
+                                            if se.name.local.as_str().eq_ignore_ascii_case("slot")
+                                                && se.get_attribute("name").unwrap_or("")
+                                                    == slot_name
+                                    )
+                                });
+                            if !has_matching_slot {
+                                return false;
+                            }
+                        }
+                    }
+                    Some(p)
+                }
+                None => {
+                    if cur == main_root {
+                        return true;
+                    }
+                    match doc.get(cur) {
+                        Some(NodeData::ShadowRoot { host: sh_host, .. }) => Some(*sh_host),
+                        Some(NodeData::Document) => {
+                            // Sub-document (e.g. iframe): find owning iframe element.
+                            let iframe_opt = doc
+                                .descendants_with_shadow_roots(main_root)
+                                .into_iter()
+                                .find(|&n| {
+                                    matches!(
+                                        doc.get(n),
+                                        Some(NodeData::Element(el)) if el.content_document == Some(cur)
+                                    )
+                                });
+                            let Some(iframe_nid) = iframe_opt else {
+                                return false;
+                            };
+                            drop(doc);
+                            drop(hb);
+                            if !is_in_flat_rendered_tree(host, iframe_nid) {
+                                return false;
+                            }
+                            let is_none = {
+                                let mut hm = host.borrow_mut();
+                                let ctx = hm.ensure_styles();
+                                ctx.style_for(iframe_nid)
+                                    .is_some_and(|s| s.display == DisplayMode::None)
+                            };
+                            return !is_none;
+                        }
+                        _ => return false,
+                    }
+                }
+            }
+        };
+        let Some(next) = step else {
+            return false;
+        };
+        cur = next;
+    }
+    false
+}
+
+fn create_highlight_computed_style_proxy(
+    vm: &mut JsVm,
+    host: SharedHost,
+    nid: NodeId,
+    highlight_name: String,
+) -> JsValue {
+    let base = create_computed_style_proxy(vm, Rc::clone(&host), nid, None);
+    let Some(base_h) = base.as_object() else {
+        return base;
+    };
+    let handler = vm.alloc_ordinary_object();
+    let h_get = Rc::clone(&host);
+    let hn_get = highlight_name;
+    define_host_method(vm, handler, "get", move |vm, _, args| {
+        let key_val = arg(args, 1);
+        if key_val.is_symbol() {
+            return forward_symbol_get(vm, arg(args, 0), key_val);
+        }
+        let prop = vm.value_to_rust_string(key_val);
+        if !matches!(
+            prop.as_str(),
+            "length"
+                | "item"
+                | "getPropertyValue"
+                | "getPropertyPriority"
+                | "setProperty"
+                | "removeProperty"
+                | "cssText"
+        ) && prop.parse::<usize>().is_err()
+        {
+            let css_key = camel_to_kebab(&prop);
+            if let Some(val) = resolve_highlight_property(&h_get, nid, &hn_get, &css_key) {
+                return Ok(JsValue::from_string(vm.heap.alloc_string(val)));
+            }
+        }
+        let k = vm.heap.intern_key(&prop);
+        vm.get_property_by_key(base_h, k)
+    });
+    let proxy = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Proxy(rix_js::ProxyObject {
+            target: base_h,
+            handler,
+            revoked: false,
+        }),
+        Some(vm.object_proto),
+    ));
+    JsValue::from_object(proxy)
+}
+
 fn install_get_computed_style(vm: &mut JsVm, host: &SharedHost) {
     let h = Rc::clone(host);
     let gcs = vm.alloc_host_fn("getComputedStyle", move |vm, _, args| {
         let nid = require_node(vm, &h, arg(args, 0))?;
-        let pseudo = if args.len() >= 2 && !arg(args, 1).is_undefined() && !arg(args, 1).is_null() {
+        let target = if args.len() >= 2 && !arg(args, 1).is_undefined() && !arg(args, 1).is_null() {
             let raw = vm.value_to_rust_string(arg(args, 1));
-            parse_pseudo_element_str(&raw)
+            parse_get_computed_style_pseudo(&raw)
         } else {
-            None
+            ComputedPseudoTarget::Element
         };
-        Ok(create_computed_style_proxy(vm, Rc::clone(&h), nid, pseudo))
+        if matches!(target, ComputedPseudoTarget::Invalid) || !is_in_flat_rendered_tree(&h, nid) {
+            return Ok(create_empty_computed_style_proxy(vm, &h));
+        }
+        match target {
+            ComputedPseudoTarget::Element => {
+                Ok(create_computed_style_proxy(vm, Rc::clone(&h), nid, None))
+            }
+            ComputedPseudoTarget::Pseudo(pe) => Ok(create_computed_style_proxy(
+                vm,
+                Rc::clone(&h),
+                nid,
+                Some(pe),
+            )),
+            ComputedPseudoTarget::Highlight(name) => Ok(create_highlight_computed_style_proxy(
+                vm,
+                Rc::clone(&h),
+                nid,
+                name,
+            )),
+            ComputedPseudoTarget::Invalid => Ok(create_empty_computed_style_proxy(vm, &h)),
+        }
     });
     define_global(vm, "getComputedStyle", JsValue::from_object(gcs));
 }
@@ -1891,6 +3712,10 @@ fn split_css_declarations(raw: &str) -> Vec<&str> {
     out
 }
 
+fn is_affected_by_all_shorthand(prop: &str) -> bool {
+    !prop.starts_with("--") && prop != "direction" && prop != "unicode-bidi" && prop != "all"
+}
+
 fn serialize_style_decls_with_priority(decls: &[(String, String, bool)]) -> String {
     const GRID_ALL: [&str; 6] = [
         "grid-template-rows",
@@ -1905,54 +3730,203 @@ fn serialize_style_decls_with_priority(decls: &[(String, String, bool)]) -> Stri
         "grid-template-columns",
         "grid-template-areas",
     ];
-    let grid_sh = lookup_decl_or_shorthand(decls, "grid");
-    let grid_tmpl_sh = if grid_sh.is_empty() {
-        lookup_decl_or_shorthand(decls, "grid-template")
-    } else {
-        String::new()
-    };
+    const BORDER_ALL_13: [&str; 13] = [
+        "border-top-width",
+        "border-right-width",
+        "border-bottom-width",
+        "border-left-width",
+        "border-top-style",
+        "border-right-style",
+        "border-bottom-style",
+        "border-left-style",
+        "border-top-color",
+        "border-right-color",
+        "border-bottom-color",
+        "border-left-color",
+        "border-image",
+    ];
     const BORDER_WIDTH_ALL: [&str; 4] = [
         "border-top-width",
         "border-right-width",
         "border-bottom-width",
         "border-left-width",
     ];
-    let bw_sh: Option<(String, bool)> = {
-        let vals: Vec<Option<(&str, bool)>> = BORDER_WIDTH_ALL
-            .iter()
-            .map(|n| {
-                decls
-                    .iter()
-                    .find(|(k, _, _)| k == n)
-                    .map(|(_, v, i)| (v.as_str(), *i))
-            })
-            .collect();
-        if vals.iter().all(Option::is_some) {
-            let (t, ti) = vals[0].unwrap();
-            let (r, ri) = vals[1].unwrap();
-            let (b, bi) = vals[2].unwrap();
-            let (l, li) = vals[3].unwrap();
-            if ti == ri && ri == bi && bi == li {
-                let compact = if t == r && r == b && b == l {
-                    t.to_string()
-                } else if t == b && r == l {
-                    format!("{t} {r}")
-                } else if r == l {
-                    format!("{t} {r} {b}")
-                } else {
-                    format!("{t} {r} {b} {l}")
-                };
-                Some((compact, ti))
-            } else {
-                None
-            }
+    const BORDER_STYLE_ALL: [&str; 4] = [
+        "border-top-style",
+        "border-right-style",
+        "border-bottom-style",
+        "border-left-style",
+    ];
+    const BORDER_COLOR_ALL: [&str; 4] = [
+        "border-top-color",
+        "border-right-color",
+        "border-bottom-color",
+        "border-left-color",
+    ];
+    const BORDER_SIDES: [(&str, [&str; 3]); 4] = [
+        (
+            "border-top",
+            ["border-top-width", "border-top-style", "border-top-color"],
+        ),
+        (
+            "border-right",
+            [
+                "border-right-width",
+                "border-right-style",
+                "border-right-color",
+            ],
+        ),
+        (
+            "border-bottom",
+            [
+                "border-bottom-width",
+                "border-bottom-style",
+                "border-bottom-color",
+            ],
+        ),
+        (
+            "border-left",
+            [
+                "border-left-width",
+                "border-left-style",
+                "border-left-color",
+            ],
+        ),
+    ];
+    const MARGIN_ALL: [&str; 4] = ["margin-top", "margin-right", "margin-bottom", "margin-left"];
+    const PADDING_ALL: [&str; 4] = [
+        "padding-top",
+        "padding-right",
+        "padding-bottom",
+        "padding-left",
+    ];
+    const OVERFLOW_ALL: [&str; 2] = ["overflow-x", "overflow-y"];
+    const OUTLINE_ALL: [&str; 3] = ["outline-width", "outline-style", "outline-color"];
+    const LIST_STYLE_ALL: [&str; 3] =
+        ["list-style-position", "list-style-image", "list-style-type"];
+    const FLEX_ALL: [&str; 3] = ["flex-grow", "flex-shrink", "flex-basis"];
+
+    let get_prio = |name: &str| -> Option<bool> {
+        decls.iter().find(|(k, _, _)| k == name).map(|(_, _, i)| *i)
+    };
+    let quad_sh = |names: [&str; 4], sh_name: &str| -> Option<(String, bool)> {
+        let v = lookup_decl_or_shorthand(decls, sh_name);
+        if v.is_empty() {
+            return None;
+        }
+        let p = get_prio(names[0])?;
+        if names.iter().all(|n| get_prio(n) == Some(p)) {
+            Some((v, p))
         } else {
             None
         }
     };
+
+    let grid_sh = lookup_decl_or_shorthand(decls, "grid");
+    let grid_tmpl_sh = if grid_sh.is_empty() {
+        lookup_decl_or_shorthand(decls, "grid-template")
+    } else {
+        String::new()
+    };
+    let border_sh: Option<(String, bool)> = {
+        let v = lookup_decl_or_shorthand(decls, "border");
+        if !v.is_empty() {
+            get_prio("border-top-width").and_then(|p| {
+                BORDER_ALL_13
+                    .iter()
+                    .all(|n| get_prio(n) == Some(p))
+                    .then_some((v, p))
+            })
+        } else {
+            None
+        }
+    };
+    let bw_sh = if border_sh.is_none() {
+        quad_sh(BORDER_WIDTH_ALL, "border-width")
+    } else {
+        None
+    };
+    let bs_sh = if border_sh.is_none() {
+        quad_sh(BORDER_STYLE_ALL, "border-style")
+    } else {
+        None
+    };
+    let bc_sh = if border_sh.is_none() {
+        quad_sh(BORDER_COLOR_ALL, "border-color")
+    } else {
+        None
+    };
+    let use_per_side_border =
+        border_sh.is_none() && bw_sh.is_none() && bs_sh.is_none() && bc_sh.is_none();
+    let side_sh: [Option<(String, bool)>; 4] = if use_per_side_border {
+        BORDER_SIDES.map(|(sh, lhs)| {
+            let v = lookup_decl_or_shorthand(decls, sh);
+            if v.is_empty() {
+                None
+            } else {
+                get_prio(lhs[0])
+                    .and_then(|p| lhs.iter().all(|n| get_prio(n) == Some(p)).then_some((v, p)))
+            }
+        })
+    } else {
+        [None, None, None, None]
+    };
+    let margin_sh = quad_sh(MARGIN_ALL, "margin");
+    let padding_sh = quad_sh(PADDING_ALL, "padding");
+    let overflow_sh: Option<(String, bool)> = {
+        let v = lookup_decl_or_shorthand(decls, "overflow");
+        if !v.is_empty() {
+            get_prio("overflow-x")
+                .filter(|&p| get_prio("overflow-y") == Some(p))
+                .map(|p| (v, p))
+        } else {
+            None
+        }
+    };
+    let outline_sh: Option<(String, bool)> = {
+        let v = lookup_decl_or_shorthand(decls, "outline");
+        if !v.is_empty() {
+            get_prio("outline-width")
+                .filter(|&p| OUTLINE_ALL.iter().all(|n| get_prio(n) == Some(p)))
+                .map(|p| (v, p))
+        } else {
+            None
+        }
+    };
+    let list_style_sh: Option<(String, bool)> = {
+        let v = lookup_decl_or_shorthand(decls, "list-style");
+        if !v.is_empty() {
+            get_prio("list-style-type")
+                .filter(|&p| LIST_STYLE_ALL.iter().all(|n| get_prio(n) == Some(p)))
+                .map(|p| (v, p))
+        } else {
+            None
+        }
+    };
+    let flex_sh: Option<(String, bool)> = {
+        let v = lookup_decl_or_shorthand(decls, "flex");
+        if !v.is_empty() {
+            get_prio("flex-grow")
+                .filter(|&p| FLEX_ALL.iter().all(|n| get_prio(n) == Some(p)))
+                .map(|p| (v, p))
+        } else {
+            None
+        }
+    };
+
     let mut emitted_grid = false;
     let mut emitted_tmpl = false;
+    let mut emitted_border = false;
     let mut emitted_bw = false;
+    let mut emitted_bs = false;
+    let mut emitted_bc = false;
+    let mut emitted_sides = [false; 4];
+    let mut emitted_margin = false;
+    let mut emitted_padding = false;
+    let mut emitted_overflow = false;
+    let mut emitted_outline = false;
+    let mut emitted_list_style = false;
+    let mut emitted_flex = false;
     let mut out = Vec::with_capacity(decls.len());
     let fmt_one = |k: &str, v: &str, imp: bool| -> String {
         let sep = if k.starts_with("--") && v.starts_with(' ') {
@@ -1971,25 +3945,125 @@ fn serialize_style_decls_with_priority(decls: &[(String, String, bool)]) -> Stri
         }
     };
     for (k, v, imp) in decls {
-        if !grid_sh.is_empty() && GRID_ALL.contains(&k.as_str()) {
+        let ks = k.as_str();
+        if !grid_sh.is_empty() && GRID_ALL.contains(&ks) {
             if !emitted_grid {
                 emitted_grid = true;
                 out.push(fmt_one("grid", &grid_sh, *imp));
             }
             continue;
         }
-        if !grid_tmpl_sh.is_empty() && GRID_TMPL.contains(&k.as_str()) {
+        if !grid_tmpl_sh.is_empty() && GRID_TMPL.contains(&ks) {
             if !emitted_tmpl {
                 emitted_tmpl = true;
                 out.push(fmt_one("grid-template", &grid_tmpl_sh, *imp));
             }
             continue;
         }
+        if let Some((ref sh_v, sh_imp)) = border_sh {
+            if BORDER_ALL_13.contains(&ks) {
+                if !emitted_border {
+                    emitted_border = true;
+                    out.push(fmt_one("border", sh_v, sh_imp));
+                }
+                continue;
+            }
+        }
         if let Some((ref sh_v, sh_imp)) = bw_sh {
-            if BORDER_WIDTH_ALL.contains(&k.as_str()) {
+            if BORDER_WIDTH_ALL.contains(&ks) {
                 if !emitted_bw {
                     emitted_bw = true;
                     out.push(fmt_one("border-width", sh_v, sh_imp));
+                }
+                continue;
+            }
+        }
+        if let Some((ref sh_v, sh_imp)) = bs_sh {
+            if BORDER_STYLE_ALL.contains(&ks) {
+                if !emitted_bs {
+                    emitted_bs = true;
+                    out.push(fmt_one("border-style", sh_v, sh_imp));
+                }
+                continue;
+            }
+        }
+        if let Some((ref sh_v, sh_imp)) = bc_sh {
+            if BORDER_COLOR_ALL.contains(&ks) {
+                if !emitted_bc {
+                    emitted_bc = true;
+                    out.push(fmt_one("border-color", sh_v, sh_imp));
+                }
+                continue;
+            }
+        }
+        if use_per_side_border {
+            let mut handled_side = false;
+            for (idx, (sh_name, lhs)) in BORDER_SIDES.iter().enumerate() {
+                if lhs.contains(&ks) {
+                    if let Some((ref sh_v, sh_imp)) = side_sh[idx] {
+                        if !emitted_sides[idx] {
+                            emitted_sides[idx] = true;
+                            out.push(fmt_one(sh_name, sh_v, sh_imp));
+                        }
+                        handled_side = true;
+                    }
+                    break;
+                }
+            }
+            if handled_side {
+                continue;
+            }
+        }
+        if let Some((ref sh_v, sh_imp)) = margin_sh {
+            if MARGIN_ALL.contains(&ks) {
+                if !emitted_margin {
+                    emitted_margin = true;
+                    out.push(fmt_one("margin", sh_v, sh_imp));
+                }
+                continue;
+            }
+        }
+        if let Some((ref sh_v, sh_imp)) = padding_sh {
+            if PADDING_ALL.contains(&ks) {
+                if !emitted_padding {
+                    emitted_padding = true;
+                    out.push(fmt_one("padding", sh_v, sh_imp));
+                }
+                continue;
+            }
+        }
+        if let Some((ref sh_v, sh_imp)) = overflow_sh {
+            if OVERFLOW_ALL.contains(&ks) {
+                if !emitted_overflow {
+                    emitted_overflow = true;
+                    out.push(fmt_one("overflow", sh_v, sh_imp));
+                }
+                continue;
+            }
+        }
+        if let Some((ref sh_v, sh_imp)) = outline_sh {
+            if OUTLINE_ALL.contains(&ks) {
+                if !emitted_outline {
+                    emitted_outline = true;
+                    out.push(fmt_one("outline", sh_v, sh_imp));
+                }
+                continue;
+            }
+        }
+        if let Some((ref sh_v, sh_imp)) = list_style_sh {
+            if LIST_STYLE_ALL.contains(&ks) {
+                if !emitted_list_style {
+                    emitted_list_style = true;
+                    out.push(fmt_one("list-style", sh_v, sh_imp));
+                }
+                continue;
+            }
+        }
+        if let Some((ref sh_v, sh_imp)) = flex_sh {
+            if FLEX_ALL.contains(&ks) {
+                if !emitted_flex {
+                    emitted_flex = true;
+                    out.push(fmt_one("flex", sh_v, sh_imp));
                 }
                 continue;
             }
@@ -2038,6 +4112,15 @@ fn collapse_4_sides_str(t: &str, r: &str, b: &str, l: &str) -> String {
 }
 
 fn format_border_triple(w: &str, s: &str, c: &str) -> String {
+    if w == s && s == c && rix_css::GlobalKeyword::from_ident(w).is_some() {
+        return w.to_string();
+    }
+    if rix_css::GlobalKeyword::from_ident(w).is_some()
+        || rix_css::GlobalKeyword::from_ident(s).is_some()
+        || rix_css::GlobalKeyword::from_ident(c).is_some()
+    {
+        return String::new();
+    }
     let mut parts = Vec::with_capacity(3);
     if !w.is_empty() && w != "medium" {
         parts.push(w);
@@ -2054,6 +4137,18 @@ fn format_border_triple(w: &str, s: &str, c: &str) -> String {
     parts.join(" ")
 }
 
+fn collapse_css_wide_pair(a: &str, b: &str) -> Option<String> {
+    let ka = rix_css::GlobalKeyword::from_ident(a).is_some();
+    let kb = rix_css::GlobalKeyword::from_ident(b).is_some();
+    if ka && kb {
+        (a == b).then(|| a.to_string())
+    } else if ka || kb {
+        Some(String::new())
+    } else {
+        None
+    }
+}
+
 fn has_var_ref_ci(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     lower.contains("var(") || lower.contains("env(")
@@ -2065,22 +4160,46 @@ fn lookup_decl_or_shorthand(decls: &[(String, String, bool)], prop: &str) -> Str
     } else {
         prop
     };
+    // CSS Cascade L5 `all` shorthand semantics:
+    // `all` returns its CSS-wide keyword ONLY if no affected property overrides it with a
+    // different value or priority after `all`.
+    if prop == "all" {
+        if let Some((all_idx, (_, all_val, all_imp))) =
+            decls.iter().enumerate().find(|(_, (k, _, _))| k == "all")
+        {
+            let overridden = decls.iter().enumerate().any(|(idx, (k, v, imp))| {
+                idx > all_idx && is_affected_by_all_shorthand(k) && (v != all_val || imp != all_imp)
+            });
+            return if overridden {
+                String::new()
+            } else {
+                all_val.clone()
+            };
+        }
+        return String::new();
+    }
     if let Some((_, v, _)) = decls.iter().find(|(k, _, _)| k == prop) {
         return v.clone();
     }
     let get = |name: &str| -> Option<(&str, bool)> {
-        decls
-            .iter()
-            .find(|(k, _, _)| k == name)
-            .and_then(|(_, v, imp)| {
-                (!v.is_empty() && !has_var_ref_ci(v)).then_some((v.as_str(), *imp))
-            })
+        if let Some((_, v, imp)) = decls.iter().find(|(k, _, _)| k == name) {
+            return (!v.is_empty() && !has_var_ref_ci(v)).then_some((v.as_str(), *imp));
+        }
+        if is_affected_by_all_shorthand(name) {
+            if let Some((_, av, aimp)) = decls.iter().find(|(k, _, _)| k == "all") {
+                return (!av.is_empty() && !has_var_ref_ci(av)).then_some((av.as_str(), *aimp));
+            }
+        }
+        None
     };
     let get_pair = |a: &str, b: &str| -> Option<String> {
         let (va, ia) = get(a)?;
         let (vb, ib) = get(b)?;
         if ia != ib {
             return None;
+        }
+        if let Some(kw) = collapse_css_wide_pair(va, vb) {
+            return (!kw.is_empty()).then_some(kw);
         }
         Some(collapse_2_sides_str(va, vb))
     };
@@ -2092,6 +4211,12 @@ fn lookup_decl_or_shorthand(decls: &[(String, String, bool)], prop: &str) -> Str
         if it != ir || ir != ib || ib != il {
             return None;
         }
+        let any_kw = [vt, vr, vb, vl]
+            .iter()
+            .any(|v| rix_css::GlobalKeyword::from_ident(v).is_some());
+        if any_kw {
+            return (vt == vr && vr == vb && vb == vl).then(|| vt.to_string());
+        }
         Some(collapse_4_sides_str(vt, vr, vb, vl))
     };
     let get_border_side = |prefix: &str| -> Option<String> {
@@ -2101,7 +4226,8 @@ fn lookup_decl_or_shorthand(decls: &[(String, String, bool)], prop: &str) -> Str
         if iw != is_ || is_ != ic {
             return None;
         }
-        Some(format_border_triple(w, s, c))
+        let formatted = format_border_triple(w, s, c);
+        (!formatted.is_empty()).then_some(formatted)
     };
     let res = match prop {
         "margin" => get_quad("margin-top", "margin-right", "margin-bottom", "margin-left"),
@@ -2158,12 +4284,68 @@ fn lookup_decl_or_shorthand(decls: &[(String, String, bool)], prop: &str) -> Str
             let e = get_border_side("border-inline-end")?;
             (s == e).then_some(s)
         }),
-        "border" => get_border_side("border-top").and_then(|t| {
+        "border" => (|| {
+            let t = get_border_side("border-top")?;
             let r = get_border_side("border-right")?;
             let b = get_border_side("border-bottom")?;
             let l = get_border_side("border-left")?;
-            (t == r && r == b && b == l).then_some(t)
-        }),
+            let (bi, ibi) = get("border-image")?;
+            let (_, it) = get("border-top-width")?;
+            let (_, ir) = get("border-right-width")?;
+            let (_, ib) = get("border-bottom-width")?;
+            let (_, il) = get("border-left-width")?;
+            if it != ir || ir != ib || ib != il || il != ibi {
+                return None;
+            }
+            if t == r && r == b && b == l {
+                if rix_css::GlobalKeyword::from_ident(&t).is_some() {
+                    return (bi == t).then_some(t);
+                }
+                if bi == "none" {
+                    return Some(t);
+                }
+            }
+            None
+        })(),
+        "overflow" => get_pair("overflow-x", "overflow-y"),
+        "outline" => (|| {
+            let (w, iw) = get("outline-width")?;
+            let (s, is_) = get("outline-style")?;
+            let (c, ic) = get("outline-color")?;
+            if iw != is_ || is_ != ic {
+                return None;
+            }
+            let f = format_border_triple(w, s, c);
+            (!f.is_empty()).then_some(f)
+        })(),
+        "list-style" => (|| {
+            let (pos, ip) = get("list-style-position")?;
+            let (img, ii) = get("list-style-image")?;
+            let (ty, it) = get("list-style-type")?;
+            if ip != ii || ii != it {
+                return None;
+            }
+            if pos == img && img == ty && rix_css::GlobalKeyword::from_ident(pos).is_some() {
+                return Some(pos.to_string());
+            }
+            if rix_css::GlobalKeyword::from_ident(pos).is_some()
+                || rix_css::GlobalKeyword::from_ident(img).is_some()
+                || rix_css::GlobalKeyword::from_ident(ty).is_some()
+            {
+                return None;
+            }
+            let mut parts = Vec::with_capacity(3);
+            if pos != "outside" {
+                parts.push(pos);
+            }
+            if img != "none" {
+                parts.push(img);
+            }
+            if ty != "disc" || parts.is_empty() {
+                parts.push(ty);
+            }
+            Some(parts.join(" "))
+        })(),
         "border-radius" => get_quad(
             "border-top-left-radius",
             "border-top-right-radius",
@@ -2175,6 +4357,15 @@ fn lookup_decl_or_shorthand(decls: &[(String, String, bool)], prop: &str) -> Str
             let (s, is_) = get("flex-shrink")?;
             let (b, ib) = get("flex-basis")?;
             if ig != is_ || is_ != ib {
+                return None;
+            }
+            if g == s && s == b && rix_css::GlobalKeyword::from_ident(g).is_some() {
+                return Some(g.to_string());
+            }
+            if rix_css::GlobalKeyword::from_ident(g).is_some()
+                || rix_css::GlobalKeyword::from_ident(s).is_some()
+                || rix_css::GlobalKeyword::from_ident(b).is_some()
+            {
                 return None;
             }
             Some(format!("{g} {s} {b}"))
@@ -2321,7 +4512,18 @@ fn lookup_decl_or_shorthand(decls: &[(String, String, bool)], prop: &str) -> Str
             let pa = rix_css::TextAutospaceValue::parse(a)?;
             Some(rix_css::text_css::serialize_text_spacing(pt, pa))
         })(),
-        _ => None,
+        _ => {
+            // If `all: <css-wide-keyword>` was declared and `prop` is a recognized standard
+            // property affected by `all`, return that CSS-wide keyword!
+            if is_affected_by_all_shorthand(prop) && PropertyIdKind::from_name(prop).is_some() {
+                decls
+                    .iter()
+                    .find(|(k, _, _)| k == "all")
+                    .map(|(_, v, _)| v.clone())
+            } else {
+                None
+            }
+        }
     };
     res.unwrap_or_default()
 }
@@ -2333,6 +4535,10 @@ fn remove_decl_or_shorthand(decls: &mut Vec<(String, String, bool)>, prop: &str)
         prop
     };
     let old = lookup_decl_or_shorthand(decls, prop);
+    if prop == "all" {
+        decls.retain(|(k, _, _)| !is_affected_by_all_shorthand(k) && k != "all");
+        return old;
+    }
     if let Some(kind) = PropertyIdKind::from_name(prop) {
         let longhands = kind.shorthand_longhands();
         if longhands.len() > 1 {
@@ -2359,6 +4565,24 @@ fn set_decl_expanded(
     let Some(pairs) = parse_and_expand_declaration(prop, raw_val) else {
         return false;
     };
+    if prop == "all" {
+        // Setting `all` overrides all prior affected declarations (keeping `direction`,
+        // `unicode-bidi`, and custom properties `--*`), unless protected by `!important`.
+        let blocked = respect_important_cascade
+            && !important
+            && decls.iter().any(|(k, _, i)| k == "all" && *i);
+        if blocked {
+            return true;
+        }
+        decls.retain(|(k, _, i)| {
+            !is_affected_by_all_shorthand(k) && k != "all"
+                || (respect_important_cascade && !important && *i && k != "all")
+        });
+        for (k, v) in pairs {
+            upsert_decl(decls, k, v, important, respect_important_cascade);
+        }
+        return true;
+    }
     if let Some(kind) = PropertyIdKind::from_name(prop) {
         let longhands = kind.shorthand_longhands();
         if longhands.len() > 1 {
@@ -2484,11 +4708,10 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
     let h = Rc::clone(host);
     define_host_method(vm, target, "setProperty", move |vm, _, args| {
         let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
-        let val_arg = arg(args, 1);
-        let raw_val = if val_arg.is_null() || val_arg.is_undefined() {
+        let raw_val = if args.len() < 2 || arg(args, 1).is_null() {
             String::new()
         } else {
-            vm.value_to_rust_string(val_arg)
+            vm.value_to_rust_string(arg(args, 1))
         };
         let priority = if args.len() >= 3 && !arg(args, 2).is_undefined() && !arg(args, 2).is_null()
         {
@@ -2524,15 +4747,18 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
         let prop = normalize_css_prop_name(&vm.value_to_rust_string(arg(args, 0)));
         let raw = get_attr_string(&h, nid, "style").unwrap_or_default();
         let mut decls = parse_style_decls_with_priority(&raw);
+        let before_len = decls.len();
         let old = remove_decl_or_shorthand(&mut decls, &prop);
-        sync_inline_color_expr(&h, nid, &prop, "");
-        set_element_attr(
-            vm,
-            &h,
-            nid,
-            "style",
-            &serialize_style_decls_with_priority(&decls),
-        );
+        if decls.len() != before_len {
+            sync_inline_color_expr(&h, nid, &prop, "");
+            set_element_attr(
+                vm,
+                &h,
+                nid,
+                "style",
+                &serialize_style_decls_with_priority(&decls),
+            );
+        }
         Ok(JsValue::from_string(vm.heap.alloc_string(old)))
     });
     let h = Rc::clone(host);
@@ -2567,13 +4793,75 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
         ) {
             return Ok(JsValue::TRUE);
         }
+        if let Ok(idx) = prop_name.parse::<usize>() {
+            let raw = get_attr_string(&h_has, nid, "style").unwrap_or_default();
+            let decls = parse_style_decls_with_priority(&raw);
+            return Ok(JsValue::from_bool(idx < decls.len()));
+        }
         let css_key = camel_to_kebab(&prop_name);
         if PropertyIdKind::from_name(&css_key).is_some() {
             return Ok(JsValue::TRUE);
         }
-        let _ = &h_has;
         Ok(JsValue::FALSE)
     });
+    let h_keys = Rc::clone(host);
+    define_host_method(vm, handler, "ownKeys", move |vm, _, _| {
+        let arr = vm.alloc_array();
+        let raw = get_attr_string(&h_keys, nid, "style").unwrap_or_default();
+        let decls = parse_style_decls_with_priority(&raw);
+        for i in 0..decls.len() {
+            let s = vm.heap.alloc_string(i.to_string());
+            vm.heap.object_push_element(arr, JsValue::from_string(s));
+        }
+        Ok(JsValue::from_object(arr))
+    });
+    let h_desc = Rc::clone(host);
+    define_host_method(
+        vm,
+        handler,
+        "getOwnPropertyDescriptor",
+        move |vm, _, args| {
+            let prop_name = vm.value_to_rust_string(arg(args, 1));
+            if let Ok(idx) = prop_name.parse::<usize>() {
+                let raw = get_attr_string(&h_desc, nid, "style").unwrap_or_default();
+                let decls = parse_style_decls_with_priority(&raw);
+                let Some((name, _, _)) = decls.get(idx) else {
+                    return Ok(JsValue::UNDEFINED);
+                };
+                let desc = vm.alloc_ordinary_object();
+                let kv = vm.heap.intern_key("value");
+                let kw = vm.heap.intern_key("writable");
+                let ke = vm.heap.intern_key("enumerable");
+                let kc = vm.heap.intern_key("configurable");
+                let val = JsValue::from_string(vm.heap.alloc_string(name.as_str()));
+                vm.heap
+                    .object_define_data(desc, kv, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+                vm.heap.object_define_data(
+                    desc,
+                    kw,
+                    JsValue::FALSE,
+                    PropertyAttrs::DEFAULT,
+                    &mut vm.shapes,
+                );
+                vm.heap.object_define_data(
+                    desc,
+                    ke,
+                    JsValue::TRUE,
+                    PropertyAttrs::DEFAULT,
+                    &mut vm.shapes,
+                );
+                vm.heap.object_define_data(
+                    desc,
+                    kc,
+                    JsValue::TRUE,
+                    PropertyAttrs::DEFAULT,
+                    &mut vm.shapes,
+                );
+                return Ok(JsValue::from_object(desc));
+            }
+            Ok(JsValue::UNDEFINED)
+        },
+    );
     let h_get = Rc::clone(host);
     define_host_method(vm, handler, "get", move |vm, _, args| {
         let key_val = arg(args, 1);
@@ -2611,7 +4899,7 @@ pub(crate) fn create_inline_style_proxy(vm: &mut JsVm, host: &SharedHost, nid: N
     define_host_method(vm, handler, "set", move |vm, _, args| {
         let prop_name = vm.value_to_rust_string(arg(args, 1));
         let val_arg = arg(args, 2);
-        let val = if val_arg.is_null() || val_arg.is_undefined() {
+        let val = if val_arg.is_null() {
             String::new()
         } else {
             vm.value_to_rust_string(val_arg)
@@ -3194,6 +5482,63 @@ fn format_align(a: AlignValue) -> &'static str {
 #[must_use]
 pub fn format_computed_property(style: &ComputedStyle, prop: &str) -> String {
     format_computed_property_resolved(style, prop, None, false, None)
+}
+
+fn resolve_inset_computed(
+    side: &LengthPercentageAuto,
+    opposite: &LengthPercentageAuto,
+    position: PositionMode,
+    eval: &EvalContext,
+    layout_box: Option<&ResolvedLayoutBox>,
+    is_vertical: bool,
+    used_side: impl FnOnce(&ResolvedLayoutBox) -> f32,
+) -> String {
+    let Some(lb) = layout_box else {
+        return format_lpa(side, eval);
+    };
+    match position {
+        PositionMode::Static => format_lpa(side, eval),
+        PositionMode::Sticky => match side {
+            LengthPercentageAuto::Auto => "auto".to_string(),
+            LengthPercentageAuto::Value(lp) => {
+                let basis = if is_vertical {
+                    lb.scroll_container_content_size.height
+                } else {
+                    lb.scroll_container_content_size.width
+                };
+                format_lp_used(lp, eval, false, basis)
+                    .unwrap_or_else(|| format_px(lp.resolve_px(basis, eval)))
+            }
+        },
+        PositionMode::Relative => {
+            let basis = if is_vertical {
+                lb.parent_content_size.height
+            } else {
+                lb.parent_content_size.width
+            };
+            match (side, opposite) {
+                (LengthPercentageAuto::Value(lp), _) => format_lp_used(lp, eval, false, basis)
+                    .unwrap_or_else(|| format_px(lp.resolve_px(basis, eval))),
+                (LengthPercentageAuto::Auto, LengthPercentageAuto::Value(opp)) => {
+                    let opp_px = opp.resolve_px(basis, eval);
+                    format_px(-opp_px)
+                }
+                (LengthPercentageAuto::Auto, LengthPercentageAuto::Auto) => "0px".to_string(),
+            }
+        }
+        PositionMode::Absolute | PositionMode::Fixed => {
+            let basis = if is_vertical {
+                lb.cb_padding_size.height
+            } else {
+                lb.cb_padding_size.width
+            };
+            match side {
+                LengthPercentageAuto::Value(lp) => format_lp_used(lp, eval, false, basis)
+                    .unwrap_or_else(|| format_px(lp.resolve_px(basis, eval))),
+                LengthPercentageAuto::Auto => format_px(used_side(lb)),
+            }
+        }
+    }
 }
 
 fn format_computed_property_resolved(
@@ -3811,46 +6156,42 @@ fn format_computed_property_resolved(
                 .unwrap_or_else(|| format_px(lb.padding.left.max(0.0)))
             },
         ),
-        "top" => match (&style.box_model.inset.top, layout_box) {
-            (LengthPercentageAuto::Value(lp), Some(lb))
-                if style.position != PositionMode::Static =>
-            {
-                format_lp_used(lp, &eval, false, lb.parent_content_size.height).unwrap_or_else(
-                    || format_px(lp.resolve_px(lb.parent_content_size.height, &eval)),
-                )
-            }
-            (v, _) => format_lpa(v, &eval),
-        },
-        "right" => match (&style.box_model.inset.right, layout_box) {
-            (LengthPercentageAuto::Value(lp), Some(lb))
-                if style.position != PositionMode::Static =>
-            {
-                format_lp_used(lp, &eval, false, lb.parent_content_size.width).unwrap_or_else(
-                    || format_px(lp.resolve_px(lb.parent_content_size.width, &eval)),
-                )
-            }
-            (v, _) => format_lpa(v, &eval),
-        },
-        "bottom" => match (&style.box_model.inset.bottom, layout_box) {
-            (LengthPercentageAuto::Value(lp), Some(lb))
-                if style.position != PositionMode::Static =>
-            {
-                format_lp_used(lp, &eval, false, lb.parent_content_size.height).unwrap_or_else(
-                    || format_px(lp.resolve_px(lb.parent_content_size.height, &eval)),
-                )
-            }
-            (v, _) => format_lpa(v, &eval),
-        },
-        "left" => match (&style.box_model.inset.left, layout_box) {
-            (LengthPercentageAuto::Value(lp), Some(lb))
-                if style.position != PositionMode::Static =>
-            {
-                format_lp_used(lp, &eval, false, lb.parent_content_size.width).unwrap_or_else(
-                    || format_px(lp.resolve_px(lb.parent_content_size.width, &eval)),
-                )
-            }
-            (v, _) => format_lpa(v, &eval),
-        },
+        "top" => resolve_inset_computed(
+            &style.box_model.inset.top,
+            &style.box_model.inset.bottom,
+            style.position,
+            &eval,
+            layout_box,
+            true,
+            |lb| lb.used_insets.top,
+        ),
+        "right" => resolve_inset_computed(
+            &style.box_model.inset.right,
+            &style.box_model.inset.left,
+            style.position,
+            &eval,
+            layout_box,
+            false,
+            |lb| lb.used_insets.right,
+        ),
+        "bottom" => resolve_inset_computed(
+            &style.box_model.inset.bottom,
+            &style.box_model.inset.top,
+            style.position,
+            &eval,
+            layout_box,
+            true,
+            |lb| lb.used_insets.bottom,
+        ),
+        "left" => resolve_inset_computed(
+            &style.box_model.inset.left,
+            &style.box_model.inset.right,
+            style.position,
+            &eval,
+            layout_box,
+            false,
+            |lb| lb.used_insets.left,
+        ),
         "border-top-width" => format_px(style.box_model.border_width.top),
         "border-right-width" => format_px(style.box_model.border_width.right),
         "border-bottom-width" => format_px(style.box_model.border_width.bottom),
