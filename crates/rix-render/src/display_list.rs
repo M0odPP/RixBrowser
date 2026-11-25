@@ -133,6 +133,10 @@ pub enum FilterOp {
     Brightness(f32),
     Contrast(f32),
     Grayscale(f32),
+    Saturate(f32),
+    Invert(f32),
+    Sepia(f32),
+    HueRotateDeg(f32),
     DropShadow {
         offset: Vec2,
         blur_radius: f32,
@@ -462,6 +466,13 @@ pub enum DisplayItem {
         bounds: Rect,
         surface_id: SurfaceId,
         radii: [f32; 4],
+    },
+    /// GPU `backdrop-filter` pass applied to previously painted pixels behind `bounds`
+    /// before this element's own translucent background, border, and children are drawn.
+    BackdropFilter {
+        bounds: Rect,
+        radii: [f32; 4],
+        filters: SmallVec<[FilterOp; 2]>,
     },
 }
 

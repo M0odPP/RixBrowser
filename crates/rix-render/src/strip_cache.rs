@@ -621,7 +621,8 @@ fn item_local_bounds(item: &DisplayItem) -> Option<Rect> {
         | DisplayItem::GlyphRun { bounds, .. }
         | DisplayItem::Image { bounds, .. }
         | DisplayItem::VectorPath { bounds, .. }
-        | DisplayItem::ExternalSurface { bounds, .. } => Some(*bounds),
+        | DisplayItem::ExternalSurface { bounds, .. }
+        | DisplayItem::BackdropFilter { bounds, .. } => Some(*bounds),
         DisplayItem::BoxShadow {
             bounds,
             offset,

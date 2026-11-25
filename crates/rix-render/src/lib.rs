@@ -6,6 +6,7 @@ pub mod canvas2d;
 pub mod compositor;
 pub mod display_list;
 pub mod gpu_context;
+pub mod gpu_filters;
 pub mod renderer;
 pub mod resources;
 pub mod scene_encoder;
@@ -27,7 +28,10 @@ pub use canvas2d::{
     CanvasFillRule, CanvasGradient, CanvasGradientKind, CanvasPaint, CanvasPattern,
     CanvasPatternRepeat, CanvasState, CanvasTextAlign, CanvasTextBaseline, CanvasTextMetrics,
 };
-pub use compositor::{Compositor, LayerRole, RetainedLayer};
+pub use compositor::{
+    BackdropCompositePlan, BackdropCompositeStep, Compositor, DamageTracker, LayerRole,
+    LayerTreeStats, RetainedLayer,
+};
 pub use display_list::{
     AnimationId, BlendMode, ClipPathShape, ColorStop, DisplayItem, DisplayList, FilterOp,
     GlyphInstance, ImageSampling, Rgba8, SpatialNode, SpatialNodeKind, SpatialTree, StickyMargins,
@@ -37,6 +41,7 @@ pub use gpu_context::{
     readback_wgpu_texture_rgba, request_device_from_adapter, request_headless_adapter,
     wait_for_gpu_idle, write_wgpu_buffer_mapped, SharedGpuDevice,
 };
+pub use gpu_filters::{BackdropFilterPass, ColorFilterMatrix, GpuFilterPipeline};
 pub use renderer::{RenderError, VelloRenderer};
 pub use resources::{ResourceRegistry, DEFAULT_IMAGE_CACHE_BUDGET_BYTES};
 pub use scene_encoder::{

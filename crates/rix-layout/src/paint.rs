@@ -389,8 +389,9 @@ impl<'a> Painter<'a> {
             }
         }
 
-        // 3. Finite stacking-context layer (`opacity < 1`, `filter`, `mix-blend-mode`, animation, or new spatial node).
+        // 3. Finite stacking-context layer (`opacity < 1`, `filter`, `backdrop-filter`, `mix-blend-mode`, animation, or new spatial node).
         let mut filters = extract_render_filters(style, abs_rect, self.dark_mode);
+        let backdrop_filters = extract_render_backdrop_filters(style, abs_rect, self.dark_mode);
         for anim_id in animated_opacity_ids {
             filters.push(RenderFilterOp::AnimatedOpacity(anim_id));
         }
@@ -399,6 +400,7 @@ impl<'a> Painter<'a> {
         });
         let needs_layer = style.opacity < 0.999
             || !filters.is_empty()
+            || !backdrop_filters.is_empty()
             || mix_blend != BlendMode::Normal
             || has_transform_anim
             || active_spatial != parent_spatial;
@@ -430,6 +432,15 @@ impl<'a> Painter<'a> {
                 });
                 pushed_clip_path = true;
             }
+        }
+
+        // 3c. W3C Filter Effects Level 2 `backdrop-filter` (filters rendered backdrop behind border box).
+        if !backdrop_filters.is_empty() && !abs_rect.is_empty() {
+            self.list.push(DisplayItem::BackdropFilter {
+                bounds: abs_rect,
+                radii: resolve_radii(style, abs_rect),
+                filters: backdrop_filters,
+            });
         }
 
         // Step 1 (Appendix E): Paint background, shadows, and borders of this root.
@@ -1511,44 +1522,73 @@ pub(crate) fn compose_transform_matrix(ops: &[TransformOp], rect: Rect) -> [f32;
     ]
 }
 
-fn extract_render_filters(
+fn extract_render_filter_ops(
+    ops: &[CssFilterOp],
     style: &ComputedStyle,
     rect: Rect,
     dark_mode: bool,
 ) -> SmallVec<[RenderFilterOp; 2]> {
     let mut out = SmallVec::new();
-    let eval = EvalContext::default();
-    if let Some(effects) = &style.effects {
-        for op in &effects.filter {
-            match op {
-                CssFilterOp::Blur(lp) => {
-                    out.push(RenderFilterOp::Blur(lp.resolve_px(0.0, &eval).max(0.0)));
-                }
-                CssFilterOp::Opacity(a) => out.push(RenderFilterOp::Opacity(*a)),
-                CssFilterOp::Brightness(b) => out.push(RenderFilterOp::Brightness(*b)),
-                CssFilterOp::Contrast(c) => out.push(RenderFilterOp::Contrast(*c)),
-                CssFilterOp::Grayscale(g) => out.push(RenderFilterOp::Grayscale(*g)),
-                CssFilterOp::DropShadow {
-                    offset_x,
-                    offset_y,
-                    blur,
-                    color,
-                } => {
-                    let c = color.resolve(style.text.color, dark_mode);
-                    out.push(RenderFilterOp::DropShadow {
-                        offset: Vec2::new(
-                            offset_x.resolve_px(rect.size.width, &eval),
-                            offset_y.resolve_px(rect.size.height, &eval),
-                        ),
-                        blur_radius: blur.resolve_px(rect.size.width, &eval).max(0.0),
-                        color: to_rgba8(c),
-                    });
-                }
-                _ => {}
+    let eval = style.text.eval_ctx;
+    for op in ops {
+        match op {
+            CssFilterOp::Blur(lp) => {
+                out.push(RenderFilterOp::Blur(lp.resolve_px(0.0, &eval).max(0.0)));
             }
+            CssFilterOp::Opacity(a) => out.push(RenderFilterOp::Opacity(*a)),
+            CssFilterOp::Brightness(b) => out.push(RenderFilterOp::Brightness(*b)),
+            CssFilterOp::Contrast(c) => out.push(RenderFilterOp::Contrast(*c)),
+            CssFilterOp::Grayscale(g) => out.push(RenderFilterOp::Grayscale(*g)),
+            CssFilterOp::Saturate(s) => out.push(RenderFilterOp::Saturate(*s)),
+            CssFilterOp::Invert(i) => out.push(RenderFilterOp::Invert(*i)),
+            CssFilterOp::Sepia(s) => out.push(RenderFilterOp::Sepia(*s)),
+            CssFilterOp::HueRotateDeg(d) => out.push(RenderFilterOp::HueRotateDeg(*d)),
+            CssFilterOp::DropShadow {
+                offset_x,
+                offset_y,
+                blur,
+                color,
+            } => {
+                let c = color.resolve(style.text.color, dark_mode);
+                out.push(RenderFilterOp::DropShadow {
+                    offset: Vec2::new(
+                        offset_x.resolve_px(rect.size.width, &eval),
+                        offset_y.resolve_px(rect.size.height, &eval),
+                    ),
+                    blur_radius: blur.resolve_px(rect.size.width, &eval).max(0.0),
+                    color: to_rgba8(c),
+                });
+            }
+            CssFilterOp::Url(_) => {}
         }
     }
     out
+}
+
+fn extract_render_filters(
+    style: &ComputedStyle,
+    rect: Rect,
+    dark_mode: bool,
+) -> SmallVec<[RenderFilterOp; 2]> {
+    match &style.effects {
+        Some(effects) if !effects.filter.is_empty() => {
+            extract_render_filter_ops(&effects.filter, style, rect, dark_mode)
+        }
+        _ => SmallVec::new(),
+    }
+}
+
+fn extract_render_backdrop_filters(
+    style: &ComputedStyle,
+    rect: Rect,
+    dark_mode: bool,
+) -> SmallVec<[RenderFilterOp; 2]> {
+    match &style.effects {
+        Some(effects) if !effects.backdrop_filter.is_empty() => {
+            extract_render_filter_ops(&effects.backdrop_filter, style, rect, dark_mode)
+        }
+        _ => SmallVec::new(),
+    }
 }
 
 fn to_render_blend_mode(m: MixBlendMode) -> BlendMode {

@@ -221,8 +221,10 @@ impl ApplicationHandler<AppWakeup> for BrowserShell {
             }
             WindowEvent::RedrawRequested => {
                 let clear = self.controller.clear_color();
-                if let Some(scene) = self.controller.compositor.compose() {
-                    if let Err(err) = self.renderer.render(scene, clear) {
+                if self.controller.compositor.compose().is_some() {
+                    let scene = self.controller.compositor.last_composed_scene();
+                    let plan = self.controller.compositor.backdrop_plan();
+                    if let Err(err) = self.renderer.render_with_backdrop_plan(scene, plan, clear) {
                         warn!(%err, "present failed");
                     } else {
                         self.present_count += 1;
@@ -230,7 +232,8 @@ impl ApplicationHandler<AppWakeup> for BrowserShell {
                     }
                 } else if self.needs_present {
                     let scene = self.controller.compositor.last_composed_scene();
-                    if let Err(err) = self.renderer.render(scene, clear) {
+                    let plan = self.controller.compositor.backdrop_plan();
+                    if let Err(err) = self.renderer.render_with_backdrop_plan(scene, plan, clear) {
                         warn!(%err, "present failed");
                     } else {
                         self.present_count += 1;

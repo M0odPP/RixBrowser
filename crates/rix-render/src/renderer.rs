@@ -10,7 +10,9 @@ use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene};
 
 use crate::canvas2d::Canvas2DContext;
+use crate::compositor::{BackdropCompositePlan, Compositor};
 use crate::gpu_context::SharedGpuDevice;
+use crate::gpu_filters::GpuFilterPipeline;
 
 static NEXT_RENDERER_TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -55,6 +57,8 @@ pub struct VelloRenderer {
     offscreen_surfaces: HashMap<SurfaceId, OffscreenGpuSurface>,
     external_gpu_textures: HashMap<SurfaceId, RegisteredExternalGpuTexture>,
     rgba_blitter: Option<vello::wgpu::util::TextureBlitter>,
+    gpu_filters: Option<GpuFilterPipeline>,
+    backdrop_target: Option<OffscreenGpuSurface>,
     gpu_surface_allocations: u64,
     width: u32,
     height: u32,
@@ -86,6 +90,8 @@ impl VelloRenderer {
             offscreen_surfaces: HashMap::new(),
             external_gpu_textures: HashMap::new(),
             rgba_blitter: None,
+            gpu_filters: None,
+            backdrop_target: None,
             gpu_surface_allocations: 0,
             width: 0,
             height: 0,
@@ -344,6 +350,17 @@ impl VelloRenderer {
     }
 
     pub fn render(&mut self, scene: &Scene, base_color: Color) -> Result<(), RenderError> {
+        self.render_with_backdrop_plan(scene, None, base_color)
+    }
+
+    /// Renders `scene` onto the swapchain, executing real GPU WGSL `backdrop-filter` passes
+    /// whenever `plan` is `Some` (zero CPU readback, exact painter's order).
+    pub fn render_with_backdrop_plan(
+        &mut self,
+        scene: &Scene,
+        plan: Option<&BackdropCompositePlan>,
+        base_color: Color,
+    ) -> Result<(), RenderError> {
         let (width, height) = (self.width.max(1), self.height.max(1));
         let surface = self.surface.as_mut().ok_or(RenderError::NoSurface)?;
         let renderer = self.renderer.as_mut().ok_or(RenderError::NoSurface)?;
@@ -375,6 +392,67 @@ impl VelloRenderer {
         let frame_view = frame
             .texture
             .create_view(&vello::wgpu::TextureViewDescriptor::default());
+
+        if let Some(bd_plan) = plan.filter(|p| !p.steps.is_empty()) {
+            let needs_alloc = self
+                .backdrop_target
+                .as_ref()
+                .is_none_or(|t| t.width != width || t.height != height);
+            if needs_alloc {
+                let texture = device.create_texture(&vello::wgpu::TextureDescriptor {
+                    label: Some("rix-backdrop-swapchain-target"),
+                    size: vello::wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: vello::wgpu::TextureDimension::D2,
+                    format: vello::wgpu::TextureFormat::Rgba8Unorm,
+                    usage: vello::wgpu::TextureUsages::STORAGE_BINDING
+                        | vello::wgpu::TextureUsages::TEXTURE_BINDING
+                        | vello::wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | vello::wgpu::TextureUsages::COPY_SRC
+                        | vello::wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&Default::default());
+                self.backdrop_target = Some(OffscreenGpuSurface {
+                    texture,
+                    view,
+                    width,
+                    height,
+                });
+            }
+            let target = self.backdrop_target.as_ref().unwrap();
+            let filters = self
+                .gpu_filters
+                .get_or_insert_with(|| GpuFilterPipeline::new(device));
+            execute_backdrop_plan(
+                device,
+                queue,
+                renderer,
+                filters,
+                &target.texture,
+                &target.view,
+                width,
+                height,
+                base_color,
+                bd_plan,
+            )?;
+            let mut encoder =
+                device.create_command_encoder(&vello::wgpu::CommandEncoderDescriptor {
+                    label: Some("rix-vello-backdrop-blit"),
+                });
+            surface
+                .blitter
+                .copy(device, &mut encoder, &target.view, &frame_view);
+            queue.submit([encoder.finish()]);
+            frame.present();
+            return Ok(());
+        }
+
         let params = render_params(width, height, base_color);
         renderer
             .render_to_texture(device, queue, scene, &surface.target_view, &params)
@@ -523,6 +601,146 @@ impl VelloRenderer {
         base_color: Color,
     ) -> Result<Vec<u8>, RenderError> {
         pollster::block_on(self.render_to_rgba(scene, width, height, base_color))
+    }
+
+    /// Composes `compositor` and renders the frame to RGBA8 on the GPU, including real
+    /// WGSL GPU `backdrop-filter` passes whenever present (exact painter's order).
+    pub async fn render_compositor_to_rgba(
+        &mut self,
+        compositor: &mut Compositor,
+        width: u32,
+        height: u32,
+        base_color: Color,
+    ) -> Result<Vec<u8>, RenderError> {
+        let _ = compositor.compose_force();
+        let Some(plan) = compositor.backdrop_plan() else {
+            let scene = compositor.last_composed_scene();
+            return self.render_to_rgba(scene, width, height, base_color).await;
+        };
+        if width == 0 || height == 0 {
+            return Err(RenderError::BadSize(width, height));
+        }
+        let device_id = match &self.surface {
+            Some(surface) => surface.dev_id,
+            None => self
+                .context
+                .device(None)
+                .await
+                .ok_or(RenderError::NoDevice)?,
+        };
+        let handle = &self.context.devices[device_id];
+        let limits = handle.device.limits();
+        if width > limits.max_texture_dimension_2d || height > limits.max_texture_dimension_2d {
+            return Err(RenderError::BadSize(width, height));
+        }
+        let row_bytes = width
+            .checked_mul(4)
+            .ok_or(RenderError::BadSize(width, height))?;
+        let padded_row_bytes = row_bytes
+            .checked_add(255)
+            .map(|b| b / 256 * 256)
+            .ok_or(RenderError::BadSize(width, height))?;
+        let buffer_size = u64::from(padded_row_bytes) * u64::from(height);
+        if buffer_size > limits.max_buffer_size {
+            return Err(RenderError::BadSize(width, height));
+        }
+        if self.renderer_device_id != Some(device_id) {
+            self.renderer = Some(
+                Renderer::new(&handle.device, RendererOptions::default())
+                    .map_err(|e| RenderError::Vello(format!("{e:?}")))?,
+            );
+            self.renderer_device_id = Some(device_id);
+        }
+
+        let device = &handle.device;
+        let queue = &handle.queue;
+        let size = vello::wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&vello::wgpu::TextureDescriptor {
+            label: Some("rix-offscreen-backdrop-frame"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: vello::wgpu::TextureDimension::D2,
+            format: vello::wgpu::TextureFormat::Rgba8Unorm,
+            usage: vello::wgpu::TextureUsages::STORAGE_BINDING
+                | vello::wgpu::TextureUsages::TEXTURE_BINDING
+                | vello::wgpu::TextureUsages::RENDER_ATTACHMENT
+                | vello::wgpu::TextureUsages::COPY_SRC
+                | vello::wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let renderer = self.renderer.as_mut().ok_or(RenderError::NoDevice)?;
+        let filters = self
+            .gpu_filters
+            .get_or_insert_with(|| GpuFilterPipeline::new(device));
+        execute_backdrop_plan(
+            device, queue, renderer, filters, &texture, &view, width, height, base_color, plan,
+        )?;
+
+        let buffer = device.create_buffer(&vello::wgpu::BufferDescriptor {
+            label: Some("rix-offscreen-backdrop-readback"),
+            size: buffer_size,
+            usage: vello::wgpu::BufferUsages::COPY_DST | vello::wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            vello::wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: vello::wgpu::Origin3d::ZERO,
+                aspect: vello::wgpu::TextureAspect::All,
+            },
+            vello::wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: vello::wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(height),
+                },
+            },
+            size,
+        );
+        let submission = queue.submit([encoder.finish()]);
+        let slice = buffer.slice(..);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(vello::wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        let timeout = Duration::from_secs(30);
+        device
+            .poll(vello::wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(timeout),
+            })
+            .map_err(|e| RenderError::Readback(e.to_string()))?;
+        rx.recv_timeout(timeout)
+            .map_err(|e| RenderError::Readback(e.to_string()))?
+            .map_err(|e| RenderError::Readback(e.to_string()))?;
+
+        let mapped = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity(row_bytes as usize * height as usize);
+        for row in mapped.chunks_exact(padded_row_bytes as usize) {
+            pixels.extend_from_slice(&row[..row_bytes as usize]);
+        }
+        drop(mapped);
+        buffer.unmap();
+        Ok(pixels)
+    }
+
+    pub fn render_compositor_to_rgba_blocking(
+        &mut self,
+        compositor: &mut Compositor,
+        width: u32,
+        height: u32,
+        base_color: Color,
+    ) -> Result<Vec<u8>, RenderError> {
+        pollster::block_on(self.render_compositor_to_rgba(compositor, width, height, base_color))
     }
 
     /// Renders a GPU-backed [`Canvas2DContext`] via Vello directly into a persistent
@@ -730,6 +948,46 @@ impl VelloRenderer {
         let pixels = renderer.render_to_rgba_blocking(scene, width, height, base_color)?;
         Self::save_rgba_png(path, &pixels, width, height)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_backdrop_plan(
+    device: &vello::wgpu::Device,
+    queue: &vello::wgpu::Queue,
+    renderer: &mut Renderer,
+    filters: &mut GpuFilterPipeline,
+    target_tex: &vello::wgpu::Texture,
+    target_view: &vello::wgpu::TextureView,
+    width: u32,
+    height: u32,
+    base_color: Color,
+    plan: &BackdropCompositePlan,
+) -> Result<(), RenderError> {
+    renderer
+        .render_to_texture(
+            device,
+            queue,
+            &plan.base_scene,
+            target_view,
+            &render_params(width, height, base_color),
+        )
+        .map_err(|e| RenderError::Vello(format!("{e:?}")))?;
+
+    for step in &plan.steps {
+        filters.apply_backdrop_pass(device, queue, target_tex, target_view, &step.pass);
+        let overlay_view = filters.overlay_view(device, width, height);
+        renderer
+            .render_to_texture(
+                device,
+                queue,
+                &step.overlay_scene,
+                overlay_view,
+                &render_params(width, height, Color::TRANSPARENT),
+            )
+            .map_err(|e| RenderError::Vello(format!("{e:?}")))?;
+        filters.composite_overlay_onto(device, queue, target_view);
+    }
+    Ok(())
 }
 
 fn render_params(width: u32, height: u32, base_color: Color) -> RenderParams {

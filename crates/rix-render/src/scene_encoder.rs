@@ -1,4 +1,5 @@
 use crate::display_list::{AnimationId, ClipPathShape, DisplayItem, DisplayList, FilterOp, Rgba8};
+use crate::gpu_filters::ColorFilterMatrix;
 use crate::resources::ResourceRegistry;
 use rix_core::Rect;
 use rix_ipc::{PipelineId, SpatialNodeId};
@@ -37,81 +38,31 @@ impl Default for EncodeOptions {
 
 #[derive(Debug, Clone, Copy)]
 struct ActiveFilterFrame {
-    brightness: f32,
-    contrast: f32,
-    grayscale: f32,
+    color_matrix: ColorFilterMatrix,
     blur_radius: f32,
 }
 
 impl Default for ActiveFilterFrame {
     fn default() -> Self {
         Self {
-            brightness: 1.0,
-            contrast: 1.0,
-            grayscale: 0.0,
+            color_matrix: ColorFilterMatrix::IDENTITY,
             blur_radius: 0.0,
         }
     }
 }
 
 impl ActiveFilterFrame {
-    fn is_identity_color(&self) -> bool {
-        (self.brightness - 1.0).abs() < 1e-4
-            && (self.contrast - 1.0).abs() < 1e-4
-            && self.grayscale.abs() < 1e-4
-    }
-
     fn apply_color(&self, c: Rgba8) -> Rgba8 {
-        if self.is_identity_color() {
-            return c;
-        }
-        let mut r = f32::from(c.r) / 255.0;
-        let mut g = f32::from(c.g) / 255.0;
-        let mut b = f32::from(c.b) / 255.0;
-        // W3C Filter Effects Level 1 sRGB matrices:
-        // 1. brightness(k): c' = c * k
-        if (self.brightness - 1.0).abs() >= 1e-4 {
-            let k = self.brightness.max(0.0);
-            r *= k;
-            g *= k;
-            b *= k;
-        }
-        // 2. contrast(k): c' = (c - 0.5) * k + 0.5
-        if (self.contrast - 1.0).abs() >= 1e-4 {
-            let k = self.contrast.max(0.0);
-            r = (r - 0.5) * k + 0.5;
-            g = (g - 0.5) * k + 0.5;
-            b = (b - 0.5) * k + 0.5;
-        }
-        // 3. grayscale(amount): lerp towards Rec.709 luminance
-        if self.grayscale > 1e-4 {
-            let amt = self.grayscale.clamp(0.0, 1.0);
-            let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-            r = r + (lum - r) * amt;
-            g = g + (lum - g) * amt;
-            b = b + (lum - b) * amt;
-        }
-        Rgba8::new(
-            (r.clamp(0.0, 1.0) * 255.0).round() as u8,
-            (g.clamp(0.0, 1.0) * 255.0).round() as u8,
-            (b.clamp(0.0, 1.0) * 255.0).round() as u8,
-            c.a,
-        )
+        self.color_matrix.apply_rgba(c)
     }
 
     fn combine(parent: Self, ops: &[FilterOp]) -> Self {
         let mut next = parent;
+        let step_matrix = ColorFilterMatrix::from_filters(ops, false);
+        next.color_matrix = next.color_matrix.then(step_matrix);
         for op in ops {
-            match *op {
-                FilterOp::Brightness(b) => next.brightness *= b.max(0.0),
-                FilterOp::Contrast(c) => next.contrast *= c.max(0.0),
-                FilterOp::Grayscale(g) => {
-                    next.grayscale = (next.grayscale + g.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-                }
-                FilterOp::Blur(r) => next.blur_radius += r.max(0.0),
-                FilterOp::Opacity(_)
-                | FilterOp::DropShadow { .. }
-                | FilterOp::AnimatedOpacity(_) => {}
+            if let FilterOp::Blur(r) = *op {
+                next.blur_radius += r.max(0.0);
             }
         }
         next
@@ -393,7 +344,11 @@ pub fn encode_display_list_ranges(
                         }
                         FilterOp::Brightness(_)
                         | FilterOp::Contrast(_)
-                        | FilterOp::Grayscale(_) => {}
+                        | FilterOp::Grayscale(_)
+                        | FilterOp::Saturate(_)
+                        | FilterOp::Invert(_)
+                        | FilterOp::Sepia(_)
+                        | FilterOp::HueRotateDeg(_) => {}
                     }
                 }
                 let expanded_bounds = if extra_blur_inflate > 0.0 {
@@ -933,6 +888,9 @@ pub fn encode_display_list_ranges(
                     );
                     stats.items_encoded += 1;
                 }
+            }
+            DisplayItem::BackdropFilter { .. } => {
+                // Executed as a GPU-to-GPU WGSL pass between pre/post scenes in `VelloRenderer`.
             }
         }
         idx += 1;
