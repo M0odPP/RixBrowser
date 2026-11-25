@@ -30,6 +30,7 @@ pub mod selection;
 pub mod service_worker;
 pub mod shadow_dom;
 pub mod streams;
+mod streams_bytes;
 mod streams_common;
 mod streams_pipe;
 mod streams_transform;
