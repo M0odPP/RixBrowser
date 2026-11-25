@@ -15,6 +15,8 @@ pub enum NodeData {
         delegates_focus: bool,
         clonable: bool,
         serializable: bool,
+        slot_assignment: String,
+        declarative: bool,
     },
     DocumentType {
         name: String,

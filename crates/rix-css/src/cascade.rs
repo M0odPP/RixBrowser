@@ -691,6 +691,7 @@ impl StyleContext {
                 false,
                 16.0,
                 true,
+                &self.ua_sheet,
                 &self.rule_index,
                 &self.inline_color_exprs,
                 &self.media,
@@ -775,6 +776,7 @@ impl StyleContext {
                 false,
                 root_font_size,
                 false,
+                &self.ua_sheet,
                 &self.rule_index,
                 &self.inline_color_exprs,
                 &self.media,
@@ -874,6 +876,36 @@ fn next_layout_parent_flex_grid(style: &ComputedStyle, inherited: bool) -> bool 
     }
 }
 
+/// Builds a tree-scoped [`RuleIndex`] for a `ShadowRoot` containing the UA stylesheet
+/// plus any `<style>` elements directly inside that shadow tree (encapsulating outer author styles).
+fn build_shadow_rule_index(
+    doc: &Document,
+    sr_id: NodeId,
+    ua_sheet: &Arc<Stylesheet>,
+    media: &MediaContext,
+) -> RuleIndex {
+    let mut sheets = Vec::new();
+    if !ua_sheet.rules.is_empty() {
+        sheets.push(Arc::clone(ua_sheet));
+    }
+    for nid in doc.descendants(sr_id) {
+        if let Some(NodeData::Element(el)) = doc.get(nid) {
+            if el.name.local.as_str().eq_ignore_ascii_case("style") {
+                let css = doc.inner_text(nid);
+                if !css.trim().is_empty() {
+                    sheets.push(Arc::new(Stylesheet::parse(
+                        &css,
+                        crate::stylesheet::CascadeOrigin::Author,
+                        media,
+                    )));
+                }
+            }
+        }
+    }
+    let (index, _) = RuleIndex::build(&sheets);
+    index
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cascade_subtree_par(
     doc: &Document,
@@ -882,6 +914,7 @@ fn cascade_subtree_par(
     layout_parent_flex_grid: bool,
     root_font_size: f32,
     allow_parallel: bool,
+    ua_sheet: &Arc<Stylesheet>,
     rule_index: &RuleIndex,
     inline_color_exprs: &FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
     media: &MediaContext,
@@ -941,6 +974,40 @@ fn cascade_subtree_par(
         .children(node)
         .filter(|&c| matches!(doc.get(c), Some(NodeData::Element(_))))
         .collect();
+    let shadow_root_id = elem.shadow_root;
+
+    if let Some(sr_id) = shadow_root_id {
+        let shadow_children: SmallVec<[NodeId; 16]> = doc
+            .children(sr_id)
+            .filter(|&c| matches!(doc.get(c), Some(NodeData::Element(_))))
+            .collect();
+        if !shadow_children.is_empty() {
+            let shadow_index = build_shadow_rule_index(doc, sr_id, ua_sheet, media);
+            let mut shadow_bloom = BloomFilter::new();
+            let mut shadow_memo = StyleMemo::with_capacity(32);
+            for &sc in &shadow_children {
+                cascade_subtree_par(
+                    doc,
+                    sc,
+                    Some(&style),
+                    next_lp_fg,
+                    next_root_font,
+                    false,
+                    ua_sheet,
+                    &shadow_index,
+                    inline_color_exprs,
+                    media,
+                    &mut shadow_bloom,
+                    caches,
+                    &mut shadow_memo,
+                    out_styles,
+                    out_pseudos,
+                    out_missing,
+                    report,
+                );
+            }
+        }
+    }
 
     if elem_children.is_empty() {
         out_styles.push((node, style));
@@ -977,6 +1044,7 @@ fn cascade_subtree_par(
                         next_lp_fg,
                         next_root_font,
                         false,
+                        ua_sheet,
                         rule_index,
                         inline_color_exprs,
                         media,
@@ -1009,6 +1077,7 @@ fn cascade_subtree_par(
                 next_lp_fg,
                 next_root_font,
                 allow_parallel,
+                ua_sheet,
                 rule_index,
                 inline_color_exprs,
                 media,
@@ -1035,6 +1104,7 @@ fn restyle_dirty_walk(
     layout_parent_flex_grid: bool,
     root_font_size: f32,
     force_inherit_restyle: bool,
+    ua_sheet: &Arc<Stylesheet>,
     rule_index: &RuleIndex,
     inline_color_exprs: &FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
     media: &MediaContext,
@@ -1187,6 +1257,39 @@ fn restyle_dirty_walk(
     let next_lp_fg = next_layout_parent_flex_grid(&current_style, layout_parent_flex_grid);
     let force_children = propagate_inherited || propagate_through_contents;
 
+    if let Some(sr_id) = elem.shadow_root {
+        let shadow_index = build_shadow_rule_index(doc, sr_id, ua_sheet, media);
+        let mut shadow_bloom = BloomFilter::new();
+        let mut shadow_memo = StyleMemo::default();
+        for sc in doc.children(sr_id) {
+            if matches!(doc.get(sc), Some(NodeData::Element(_))) {
+                let sc_force = force_children || !styles.contains_key(&sc);
+                restyle_dirty_walk(
+                    doc,
+                    sc,
+                    Some(&current_style),
+                    next_lp_fg,
+                    next_root_font,
+                    sc_force,
+                    ua_sheet,
+                    &shadow_index,
+                    inline_color_exprs,
+                    media,
+                    &mut shadow_bloom,
+                    caches,
+                    &mut shadow_memo,
+                    styles,
+                    pseudo_styles,
+                    missing_out,
+                    cleared_nodes,
+                    layout_dirty,
+                    paint_dirty,
+                    report,
+                );
+            }
+        }
+    }
+
     for child in doc.children(node) {
         if matches!(doc.get(child), Some(NodeData::Element(_))) {
             restyle_dirty_walk(
@@ -1196,6 +1299,7 @@ fn restyle_dirty_walk(
                 next_lp_fg,
                 next_root_font,
                 force_children,
+                ua_sheet,
                 rule_index,
                 inline_color_exprs,
                 media,

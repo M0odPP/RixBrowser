@@ -1096,6 +1096,49 @@ fn insert_adjacent_html_spec(
 // HTML Serialization with Declarative Shadow Roots (`Element.prototype.getHTML`)
 // ---------------------------------------------------------------------------
 
+fn serialize_shadow_root_if_allowed(
+    doc: &Document,
+    sr_id: NodeId,
+    serializable_shadow_roots: bool,
+    allowed_shadow_roots: &HashSet<NodeId>,
+    out: &mut String,
+) {
+    if let Some(NodeData::ShadowRoot {
+        mode,
+        delegates_focus,
+        clonable,
+        serializable,
+        ..
+    }) = doc.get(sr_id)
+    {
+        if (*serializable && serializable_shadow_roots) || allowed_shadow_roots.contains(&sr_id) {
+            out.push_str("<template shadowrootmode=\"");
+            out.push_str(mode);
+            out.push('"');
+            if *delegates_focus {
+                out.push_str(" shadowrootdelegatesfocus=\"\"");
+            }
+            if *serializable {
+                out.push_str(" shadowrootserializable=\"\"");
+            }
+            if *clonable {
+                out.push_str(" shadowrootclonable=\"\"");
+            }
+            out.push('>');
+            for sr_child in doc.children(sr_id) {
+                serialize_html_node_with_shadows(
+                    doc,
+                    sr_child,
+                    serializable_shadow_roots,
+                    allowed_shadow_roots,
+                    out,
+                );
+            }
+            out.push_str("</template>");
+        }
+    }
+}
+
 fn serialize_html_children_with_shadows(
     doc: &Document,
     container: NodeId,
@@ -1103,12 +1146,22 @@ fn serialize_html_children_with_shadows(
     allowed_shadow_roots: &HashSet<NodeId>,
 ) -> String {
     let mut out = String::new();
-    let actual_container = match doc.get(container) {
+    let (actual_container, own_shadow) = match doc.get(container) {
         Some(NodeData::Element(el)) if &*el.name.ns == HTML_NS && &*el.name.local == "template" => {
-            el.template_contents.unwrap_or(container)
+            (el.template_contents.unwrap_or(container), None)
         }
-        _ => container,
+        Some(NodeData::Element(el)) => (container, el.shadow_root),
+        _ => (container, None),
     };
+    if let Some(sr_id) = own_shadow {
+        serialize_shadow_root_if_allowed(
+            doc,
+            sr_id,
+            serializable_shadow_roots,
+            allowed_shadow_roots,
+            &mut out,
+        );
+    }
     for child in doc.children(actual_container) {
         serialize_html_node_with_shadows(
             doc,
@@ -1164,42 +1217,13 @@ fn serialize_html_node_with_shadows(
             }
             // Emit declarative shadow root `<template shadowrootmode="...">` if requested.
             if let Some(sr_id) = el.shadow_root {
-                if let Some(NodeData::ShadowRoot {
-                    mode,
-                    delegates_focus,
-                    clonable,
-                    serializable,
-                    ..
-                }) = doc.get(sr_id)
-                {
-                    if (*serializable && serializable_shadow_roots)
-                        || allowed_shadow_roots.contains(&sr_id)
-                    {
-                        out.push_str("<template shadowrootmode=\"");
-                        out.push_str(mode);
-                        out.push('"');
-                        if *delegates_focus {
-                            out.push_str(" shadowrootdelegatesfocus=\"\"");
-                        }
-                        if *clonable {
-                            out.push_str(" shadowrootclonable=\"\"");
-                        }
-                        if *serializable {
-                            out.push_str(" shadowrootserializable=\"\"");
-                        }
-                        out.push('>');
-                        for sr_child in doc.children(sr_id) {
-                            serialize_html_node_with_shadows(
-                                doc,
-                                sr_child,
-                                serializable_shadow_roots,
-                                allowed_shadow_roots,
-                                out,
-                            );
-                        }
-                        out.push_str("</template>");
-                    }
-                }
+                serialize_shadow_root_if_allowed(
+                    doc,
+                    sr_id,
+                    serializable_shadow_roots,
+                    allowed_shadow_roots,
+                    out,
+                );
             }
             let child_container = el.template_contents.unwrap_or(node);
             for child in doc.children(child_container) {

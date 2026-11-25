@@ -1543,7 +1543,15 @@ fn sync_node_recursive(
                         .parent(src_id)
                         .and_then(|p| st.mirror.get(&p))
                         .is_some_and(|e| matches!(e, MirrorEntry::Unwrapped));
-                    if !src_parent_unwrapped && st.sanitizer.allows_declarative_shadow() {
+                    // Per WHATWG HTML §13.2.6.4.7: a top-level `<template shadowrootmode>`
+                    // inside a fragment parse (`setHTMLUnsafe` / `streamHTMLUnsafe`) MUST NOT
+                    // attach a shadow root to the fragment context element (`st.insert_container`);
+                    // it only attaches to a host element parsed inside the fragment itself!
+                    let is_top_level_in_fragment = dst_parent == st.insert_container;
+                    if !is_top_level_in_fragment
+                        && !src_parent_unwrapped
+                        && st.sanitizer.allows_declarative_shadow()
+                    {
                         let can_attach = matches!(
                             host.borrow().document.borrow().get(dst_parent),
                             Some(NodeData::Element(pe))
@@ -1555,6 +1563,14 @@ fn sync_node_recursive(
                             let sr_id = {
                                 let doc_rc = Rc::clone(&host.borrow().document);
                                 let mut doc = doc_rc.borrow_mut();
+                                let slot_assignment = if src_el
+                                    .get_attribute("shadowrootslotassignment")
+                                    .is_some_and(|s| s.eq_ignore_ascii_case("manual"))
+                                {
+                                    "manual".to_string()
+                                } else {
+                                    "named".to_string()
+                                };
                                 let sr = doc.new_node(NodeData::ShadowRoot {
                                     host: dst_parent,
                                     mode,
@@ -1562,6 +1578,8 @@ fn sync_node_recursive(
                                         .has_attribute("shadowrootdelegatesfocus"),
                                     clonable: src_el.has_attribute("shadowrootclonable"),
                                     serializable: src_el.has_attribute("shadowrootserializable"),
+                                    slot_assignment,
+                                    declarative: true,
                                 });
                                 if let Some(NodeData::Element(pe)) = doc.get_mut(dst_parent) {
                                     pe.shadow_root = Some(sr);

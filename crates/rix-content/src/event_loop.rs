@@ -125,6 +125,7 @@ pub struct EventLoopState {
     use_virtual_clock: bool,
     pub tasks_executed: u64,
     pub checkpoints_executed: u64,
+    performing_microtask_checkpoint: bool,
     checkpoint_hooks: Vec<MicrotaskCheckpointHook>,
 }
 
@@ -153,6 +154,7 @@ impl EventLoopState {
             use_virtual_clock: false,
             tasks_executed: 0,
             checkpoints_executed: 0,
+            performing_microtask_checkpoint: false,
             checkpoint_hooks: Vec::new(),
         }
     }
@@ -389,6 +391,11 @@ pub type SharedEventLoop = Rc<RefCell<EventLoopState>>;
 /// Performs a strict WHATWG microtask checkpoint: drains `JsVm` microtasks and invokes
 /// registered checkpoint hooks (such as `MutationObserver` record delivery) until empty.
 pub fn run_microtask_checkpoint(loop_state: &SharedEventLoop, vm: &mut JsVm) {
+    // WHATWG HTML §8.1.4.3 step 1: guard against re-entrant microtask checkpoints.
+    if loop_state.borrow().performing_microtask_checkpoint {
+        return;
+    }
+    loop_state.borrow_mut().performing_microtask_checkpoint = true;
     loop {
         vm.drain_microtasks();
         let hooks: Vec<MicrotaskCheckpointHook> = loop_state.borrow().checkpoint_hooks.clone();
@@ -400,6 +407,7 @@ pub fn run_microtask_checkpoint(loop_state: &SharedEventLoop, vm: &mut JsVm) {
             break;
         }
     }
+    loop_state.borrow_mut().performing_microtask_checkpoint = false;
 }
 
 /// Executes at most one ready macrotask or due timer (strictly respecting

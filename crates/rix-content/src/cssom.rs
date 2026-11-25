@@ -1618,6 +1618,8 @@ fn install_document_stylesheets(vm: &mut JsVm, host: &SharedHost) {
         Ok(JsValue::from_object(arr))
     });
     define_host_accessor(vm, dp, "styleSheets", Some(g), None);
+    let srp = host.borrow().prototypes.shadow_root_proto;
+    define_host_accessor(vm, srp, "styleSheets", Some(g), None);
 
     // `document.adoptedStyleSheets`
     let h1 = Rc::clone(host);

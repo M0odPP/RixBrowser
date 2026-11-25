@@ -54,6 +54,8 @@ struct EventInternal {
     target: JsValue,
     current_target: JsValue,
     composed_path: Vec<JsValue>,
+    path_keys: Vec<EventTargetKey>,
+    current_target_key: Option<EventTargetKey>,
 }
 
 /// Shared registry of active event listeners, IDL event handlers, and event internal state.
@@ -558,13 +560,13 @@ pub fn install_event_system(
     );
     define_global(vm, "EventTarget", JsValue::from_object(et_ctor));
 
-    install_event_constructors(vm, &events);
+    install_event_constructors(vm, host, &events);
     install_document_create_event(vm, host, &events);
     install_global_and_window_event_handlers(vm, host, &events);
     events
 }
 
-fn install_event_constructors(vm: &mut JsVm, events: &SharedEvents) {
+fn install_event_constructors(vm: &mut JsVm, host: &SharedHost, events: &SharedEvents) {
     let ep = vm.heap.alloc_empty_object();
     vm.heap
         .object_set_prototype(ep, Some(vm.object_proto), &mut vm.shapes);
@@ -763,18 +765,61 @@ fn install_event_constructors(vm: &mut JsVm, events: &SharedEvents) {
         Ok(JsValue::UNDEFINED)
     });
     let e = Rc::clone(events);
+    let h_cp = Rc::clone(host);
     define_host_method(vm, ep, "composedPath", move |vm, t, _| {
         let arr = vm.alloc_array();
         if let Some(h) = t.as_object() {
-            let path = e
+            let info = e
                 .borrow()
                 .events
                 .get(&h)
                 .filter(|ev| ev.event_phase != 0)
-                .map(|ev| ev.composed_path.clone())
-                .unwrap_or_default();
-            for v in path {
-                vm.heap.object_push_element(arr, v);
+                .map(|ev| {
+                    (
+                        ev.path_keys.clone(),
+                        ev.current_target_key,
+                        ev.composed_path.clone(),
+                    )
+                });
+            if let Some((keys, cur_key, fallback_path)) = info {
+                if !keys.is_empty() {
+                    let cur_node = match cur_key {
+                        Some(EventTargetKey::Node(n)) => Some(n),
+                        _ => None,
+                    };
+                    let visible: Vec<EventTargetKey> = {
+                        let doc_rc = Rc::clone(&h_cp.borrow().document);
+                        let doc = doc_rc.borrow();
+                        keys.into_iter()
+                            .filter(|k| match k {
+                                EventTargetKey::Node(nid) => {
+                                    let root = crate::shadow_dom::tree_root(&doc, *nid);
+                                    if matches!(
+                                        doc.get(root),
+                                        Some(NodeData::ShadowRoot { mode, .. }) if mode == "closed"
+                                    ) {
+                                        cur_node.is_some_and(|cn| {
+                                            crate::shadow_dom::is_shadow_including_inclusive_ancestor(
+                                                &doc, root, cn,
+                                            )
+                                        })
+                                    } else {
+                                        true
+                                    }
+                                }
+                                _ => true,
+                            })
+                            .collect()
+                    };
+                    for k in visible {
+                        let v = value_for_target_key(vm, &h_cp, k);
+                        vm.heap.object_push_element(arr, v);
+                    }
+                } else {
+                    for v in fallback_path {
+                        vm.heap.object_push_element(arr, v);
+                    }
+                }
             }
         }
         Ok(JsValue::from_object(arr))
@@ -1387,6 +1432,8 @@ fn register_event_subclass_with_proto(
                 target: JsValue::NULL,
                 current_target: JsValue::NULL,
                 composed_path: Vec::new(),
+                path_keys: Vec::new(),
+                current_target_key: None,
             },
         );
         define_own_is_trusted(vm, &evs, obj);
@@ -1489,6 +1536,8 @@ fn install_document_create_event(vm: &mut JsVm, host: &SharedHost, events: &Shar
                 target: JsValue::NULL,
                 current_target: JsValue::NULL,
                 composed_path: Vec::new(),
+                path_keys: Vec::new(),
+                current_target_key: None,
             },
         );
         define_own_is_trusted(vm, &evs, obj);
@@ -1749,6 +1798,7 @@ fn install_global_and_window_event_handlers(
 struct PathEntry {
     current: EventTargetKey,
     retargeted_target: EventTargetKey,
+    retargeted_related_target: Option<EventTargetKey>,
     in_closed_shadow: bool,
 }
 
@@ -1756,59 +1806,98 @@ fn build_propagation_path(
     host: &SharedHost,
     target_key: EventTargetKey,
     composed: bool,
+    related_target: Option<NodeId>,
 ) -> Vec<PathEntry> {
     let EventTargetKey::Node(start_node) = target_key else {
         return vec![PathEntry {
             current: target_key,
             retargeted_target: target_key,
+            retargeted_related_target: related_target.map(EventTargetKey::Node),
             in_closed_shadow: false,
         }];
     };
 
-    let doc_rc = Rc::clone(&host.borrow().document);
-    let doc = doc_rc.borrow();
+    let hb = host.borrow();
+    let doc = hb.document.borrow();
     let doc_root = doc.root();
 
     let mut path = Vec::new();
-    let mut cur = Some(start_node);
-    let mut current_target_for_tree = EventTargetKey::Node(start_node);
-    let mut in_closed_shadow = false;
+    let mut cur = start_node;
+    let mut seen_steps = 0usize;
 
-    while let Some(nid) = cur {
+    while seen_steps < 512 {
+        seen_steps += 1;
+        let cur_root = crate::shadow_dom::tree_root(&doc, cur);
+        let in_closed_shadow = matches!(
+            doc.get(cur_root),
+            Some(NodeData::ShadowRoot { mode, .. }) if mode == "closed"
+        );
+        let adj_target = crate::shadow_dom::retarget_node(&doc, start_node, cur);
+        let adj_rt = related_target.map(|rt| crate::shadow_dom::retarget_node(&doc, rt, cur));
+
         path.push(PathEntry {
-            current: EventTargetKey::Node(nid),
-            retargeted_target: current_target_for_tree,
+            current: EventTargetKey::Node(cur),
+            retargeted_target: EventTargetKey::Node(adj_target),
+            retargeted_related_target: adj_rt.map(EventTargetKey::Node),
             in_closed_shadow,
         });
 
-        match doc.get(nid) {
-            Some(NodeData::ShadowRoot {
-                host: shadow_host,
-                mode,
-                ..
-            }) => {
-                if !composed {
-                    break;
+        // Compute next activation/propagation target (WHATWG DOM §2.9):
+        // 1. Assigned `<slot>` if `cur` is a slottable child of a shadow host.
+        // 2. Shadow host if `cur` is a `ShadowRoot` and `composed == true`.
+        // 3. `Window` if `cur == doc_root`.
+        // 4. Otherwise `doc.parent(cur)`.
+        let next = if let Some(slot_id) =
+            crate::shadow_dom::find_slot_for_slottable(&doc, &hb.shadow_dom.borrow(), cur, false)
+        {
+            Some(slot_id)
+        } else {
+            match doc.get(cur) {
+                Some(NodeData::ShadowRoot {
+                    host: shadow_host, ..
+                }) => {
+                    if !composed {
+                        None
+                    } else {
+                        Some(*shadow_host)
+                    }
                 }
-                if mode == "closed" {
-                    in_closed_shadow = true;
+                _ => {
+                    if cur == doc_root {
+                        let win_rt = related_target
+                            .map(|rt| crate::shadow_dom::retarget_node(&doc, rt, doc_root));
+                        let skip_win = related_target
+                            .is_some_and(|rt| start_node != rt && Some(adj_target) == win_rt);
+                        if !skip_win {
+                            path.push(PathEntry {
+                                current: EventTargetKey::Window,
+                                retargeted_target: EventTargetKey::Node(adj_target),
+                                retargeted_related_target: win_rt.map(EventTargetKey::Node),
+                                in_closed_shadow: false,
+                            });
+                        }
+                        break;
+                    }
+                    doc.parent(cur)
                 }
-                // Crossing out of a ShadowRoot retargets `event.target` to the shadow host!
-                current_target_for_tree = EventTargetKey::Node(*shadow_host);
-                cur = Some(*shadow_host);
             }
-            _ => {
-                if nid == doc_root {
-                    path.push(PathEntry {
-                        current: EventTargetKey::Window,
-                        retargeted_target: current_target_for_tree,
-                        in_closed_shadow: false,
-                    });
+        };
+
+        let Some(next_id) = next else {
+            break;
+        };
+        // WHATWG DOM §2.9 step 5.8: stop propagating if retargeted target and
+        // retargeted relatedTarget become identical at `next_id`!
+        if let Some(rt_id) = related_target {
+            if start_node != rt_id {
+                let next_t = crate::shadow_dom::retarget_node(&doc, start_node, next_id);
+                let next_rt = crate::shadow_dom::retarget_node(&doc, rt_id, next_id);
+                if next_t == next_rt {
                     break;
                 }
-                cur = doc.parent(nid);
             }
         }
+        cur = next_id;
     }
     path
 }
@@ -1836,7 +1925,13 @@ fn dispatch_event_internal(
         (ev.event_type.clone(), ev.bubbles, ev.composed)
     };
 
-    let path = build_propagation_path(host, target_key, composed);
+    // Inspect optional `relatedTarget` (MouseEvent, FocusEvent, PointerEvent, etc.) for DOM §2.9 retargeting.
+    let k_rt = vm.heap.intern_key("relatedTarget");
+    let orig_rt_val = vm.get_property_by_key(ev_h, k_rt).ok();
+    let related_target_node = orig_rt_val.and_then(|v| host.borrow().node_for_value(vm, v));
+
+    let path = build_propagation_path(host, target_key, composed, related_target_node);
+    let path_keys: Vec<EventTargetKey> = path.iter().map(|e| e.current).collect();
     let js_path: Vec<JsValue> = path
         .iter()
         .filter(|e| !e.in_closed_shadow)
@@ -1845,46 +1940,85 @@ fn dispatch_event_internal(
     if let Some(ev) = events.borrow_mut().events.get_mut(&ev_h) {
         ev.dispatch_flag = true;
         ev.composed_path = js_path;
+        ev.path_keys = path_keys;
+        ev.current_target_key = None;
         ev.propagation_stopped = false;
         ev.immediate_stopped = false;
     }
 
-    // Phase 1: Capturing (outermost ancestor -> target's immediate parent).
-    if path.len() > 1 {
-        for entry in path[1..].iter().rev() {
-            if is_propagation_stopped(events, ev_h) {
-                break;
-            }
-            invoke_listeners_at(vm, host, events, ev_h, &ev_type, *entry, 1, Some(true));
+    // WHATWG DOM §2.9 Pass 1 (Capturing, outermost -> innermost INCLUDING `path[0]`):
+    // When `entry.current == entry.retargeted_target` (including shadow hosts), `eventPhase` is
+    // `AT_TARGET` (2); otherwise `CAPTURING_PHASE` (1).
+    for entry in path.iter().rev() {
+        if is_propagation_stopped(events, ev_h) {
+            break;
         }
+        let phase = if entry.current == entry.retargeted_target {
+            2
+        } else {
+            1
+        };
+        invoke_listeners_at(vm, host, events, ev_h, &ev_type, *entry, phase, Some(true));
     }
 
-    // Phase 2: At Target (runs all listeners on target in registration order).
-    if !is_propagation_stopped(events, ev_h) {
-        if let Some(&target_entry) = path.first() {
-            invoke_listeners_at(vm, host, events, ev_h, &ev_type, target_entry, 2, None);
+    // WHATWG DOM §2.9 Pass 2 (Bubbling, innermost -> outermost INCLUDING `path[0]`):
+    // Runs on every entry where `bubbles == true` OR `entry.current == entry.retargeted_target`
+    // (`AT_TARGET`, including retargeted shadow hosts even when `bubbles == false`!).
+    for entry in &path {
+        if is_propagation_stopped(events, ev_h) {
+            break;
         }
+        let at_target = entry.current == entry.retargeted_target;
+        if !bubbles && !at_target {
+            continue;
+        }
+        let phase = if at_target { 2 } else { 3 };
+        invoke_listeners_at(vm, host, events, ev_h, &ev_type, *entry, phase, Some(false));
     }
 
-    // Phase 3: Bubbling (target's immediate parent -> outermost ancestor) when `bubbles == true`.
-    if bubbles && path.len() > 1 {
-        for entry in &path[1..] {
-            if is_propagation_stopped(events, ev_h) {
-                break;
-            }
-            invoke_listeners_at(vm, host, events, ev_h, &ev_type, *entry, 3, Some(false));
-        }
+    // Clean up phase/currentTarget/dispatch_flag and apply WHATWG DOM §2.9 step 14
+    // `clearTargets` post-dispatch rule (clears `target`/`relatedTarget` if either ends
+    // up in a ShadowRoot, otherwise sets `target` to the final retargeted target even
+    // when zero listeners fired).
+    let (clear_targets, final_target_key, final_rt_key) = {
+        let doc_rc = Rc::clone(&host.borrow().document);
+        let doc = doc_rc.borrow();
+        let ft = path.last().map(|e| e.retargeted_target);
+        let frt = path.last().and_then(|e| e.retargeted_related_target);
+        let in_shadow = |k: EventTargetKey| match k {
+            EventTargetKey::Node(n) => matches!(
+                doc.get(crate::shadow_dom::tree_root(&doc, n)),
+                Some(NodeData::ShadowRoot { .. })
+            ),
+            _ => false,
+        };
+        let clear = ft.is_some_and(in_shadow) || frt.is_some_and(in_shadow);
+        (clear, ft, frt)
+    };
+    let final_target_val = if clear_targets {
+        JsValue::NULL
+    } else {
+        final_target_key.map_or(JsValue::NULL, |k| value_for_target_key(vm, host, k))
+    };
+    if related_target_node.is_some() {
+        let final_rt_val = if clear_targets {
+            JsValue::NULL
+        } else {
+            final_rt_key.map_or(JsValue::NULL, |k| value_for_target_key(vm, host, k))
+        };
+        define_data(vm, ev_h, "relatedTarget", final_rt_val);
     }
-
-    // Clean up phase/currentTarget/dispatch_flag after dispatch & run WHATWG microtask checkpoint.
     let default_prevented = {
         let mut es = events.borrow_mut();
         if let Some(ev) = es.events.get_mut(&ev_h) {
             ev.dispatch_flag = false;
             ev.event_phase = 0;
+            ev.target = final_target_val;
             ev.current_target = JsValue::NULL;
+            ev.current_target_key = None;
             ev.in_passive_listener = false;
             ev.composed_path.clear();
+            ev.path_keys.clear();
             ev.default_prevented
         } else {
             false
@@ -1925,6 +2059,9 @@ fn invoke_listeners_at(
 
     let cur_val = value_for_target_key(vm, host, entry.current);
     let tgt_val = value_for_target_key(vm, host, entry.retargeted_target);
+    let rt_val = entry
+        .retargeted_related_target
+        .map(|rt| value_for_target_key(vm, host, rt));
 
     for listener in snapshot {
         if let Some(want_cap) = capture_filter {
@@ -1963,8 +2100,12 @@ fn invoke_listeners_at(
         if let Some(ev) = events.borrow_mut().events.get_mut(&ev_h) {
             ev.event_phase = phase;
             ev.current_target = cur_val;
+            ev.current_target_key = Some(entry.current);
             ev.target = tgt_val;
             ev.in_passive_listener = listener.passive;
+        }
+        if let Some(rv) = rt_val {
+            define_data(vm, ev_h, "relatedTarget", rv);
         }
         // WHATWG DOM §2.9: invoke callable directly with `this = currentTarget`, or look up
         // `.handleEvent` dynamically on an EventListener object with `this = listener`.
@@ -2011,13 +2152,14 @@ pub fn fire_dom_node_event(
         .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
     let target_val = value_for_target_key(vm, host, EventTargetKey::Node(node));
     let ts = events.borrow().now_ms();
+    let composed = ev_type != "slotchange";
     events.borrow_mut().events.insert(
         ev_h,
         EventInternal {
             event_type: ev_type.to_string(),
             bubbles,
             cancelable,
-            composed: true,
+            composed,
             is_trusted: true,
             initialized: true,
             dispatch_flag: false,
@@ -2030,6 +2172,8 @@ pub fn fire_dom_node_event(
             target: target_val,
             current_target: target_val,
             composed_path: Vec::new(),
+            path_keys: Vec::new(),
+            current_target_key: None,
         },
     );
     define_own_is_trusted(vm, events, ev_h);
@@ -2041,7 +2185,11 @@ pub fn fire_dom_node_event(
 
     // Invoke inline HTML `on<type>="..."` attributes and JS `node.on<type>` handlers along the
     // target -> ancestor path (respecting `bubbles`, `stopPropagation`, and `return false`).
-    let path = build_propagation_path(host, EventTargetKey::Node(node), true);
+    let rt_node = props
+        .iter()
+        .find(|&&(k, _)| k == "relatedTarget")
+        .and_then(|&(_, v)| host.borrow().node_for_value(vm, v));
+    let path = build_propagation_path(host, EventTargetKey::Node(node), composed, rt_node);
     let attr_name = format!("on{ev_type}");
     let prop_key = vm.heap.intern_key(&attr_name);
     for (idx, entry) in path.iter().enumerate() {
@@ -2185,6 +2333,8 @@ pub(crate) fn fire_object_event_with_proto(
             target: JsValue::from_object(target),
             current_target: JsValue::from_object(target),
             composed_path: vec![JsValue::from_object(target)],
+            path_keys: Vec::new(),
+            current_target_key: None,
         },
     );
     define_own_is_trusted(vm, events, ev_h);
@@ -2253,6 +2403,8 @@ pub(crate) fn fire_cancelable_object_event(
             target: JsValue::from_object(target),
             current_target: JsValue::from_object(target),
             composed_path: vec![JsValue::from_object(target)],
+            path_keys: Vec::new(),
+            current_target_key: None,
         },
     );
     define_own_is_trusted(vm, events, ev_h);
@@ -2316,6 +2468,8 @@ pub(crate) fn register_constructed_event(
             target: JsValue::NULL,
             current_target: JsValue::NULL,
             composed_path: Vec::new(),
+            path_keys: Vec::new(),
+            current_target_key: None,
         },
     );
 }
