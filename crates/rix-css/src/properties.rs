@@ -36,16 +36,17 @@ use crate::values::{
     AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
     AnimationPlayStateMode, AnimationSpec, BackgroundImageValue, BackgroundLayerValue,
     BorderCollapseMode, BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue,
-    ContentVisibilityMode, CornerRadius, CssColor, CursorKind, DirectionMode, DisplayMode,
-    EmptyCellsMode, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
-    GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
-    InterpolateSizeMode, LengthPercentage, LengthPercentageAuto, LengthUnit, LineHeightValue,
-    LineStyle, MixBlendMode, OverflowMode, OverflowWrapMode, OverlayMode, OverscrollBehaviorMode,
-    PointerEventsMode, PositionMode, ReadingFlowMode, ResizeMode, ScrollBehaviorMode, SizeValue,
-    TableLayoutMode, TextAlignLastMode, TextAlignMode, TextDecorationLine, TextJustifyMode,
-    TextOrientationMode, TextOverflowMode, TextTransformMode, TimingFunction, TransformOp,
-    TransformOrigin, TransitionBehaviorMode, TransitionSpec, UserSelectMode, VerticalAlignMode,
-    VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode, ZIndexValue,
+    ColorInterpolationFiltersMode, ContentVisibilityMode, CornerRadius, CssColor, CursorKind,
+    DirectionMode, DisplayMode, EmptyCellsMode, FilterOp, FilterSpecOp, FlexDirectionMode,
+    FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode, GridPlacementValue,
+    GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode, LengthPercentage,
+    LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
+    OverflowWrapMode, OverlayMode, OverscrollBehaviorMode, PointerEventsMode, PositionMode,
+    ReadingFlowMode, ResizeMode, ScrollBehaviorMode, SizeValue, TableLayoutMode, TextAlignLastMode,
+    TextAlignMode, TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode,
+    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode,
+    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
+    WordBreakMode, WritingMode, ZIndexValue,
 };
 
 /// Category of an unsupported CSS feature recorded during compilation.
@@ -494,6 +495,8 @@ pub enum PropertyIdKind {
     TabSize,
     ColumnCount,
     Filter,
+    BackdropFilter,
+    ColorInterpolationFilters,
     ClipPath,
     MixBlendMode,
     Transition,
@@ -870,6 +873,8 @@ impl PropertyIdKind {
             "tab-size" => Self::TabSize,
             "column-count" => Self::ColumnCount,
             "filter" => Self::Filter,
+            "backdrop-filter" | "-webkit-backdrop-filter" => Self::BackdropFilter,
+            "color-interpolation-filters" => Self::ColorInterpolationFilters,
             "clip-path" => Self::ClipPath,
             "mix-blend-mode" => Self::MixBlendMode,
             "transition" => Self::Transition,
@@ -1110,6 +1115,8 @@ impl PropertyIdKind {
             Self::TabSize => "tab-size",
             Self::ColumnCount => "column-count",
             Self::Filter => "filter",
+            Self::BackdropFilter => "backdrop-filter",
+            Self::ColorInterpolationFilters => "color-interpolation-filters",
             Self::ClipPath => "clip-path",
             Self::MixBlendMode => "mix-blend-mode",
             Self::Transition => "transition",
@@ -1374,6 +1381,7 @@ impl PropertyIdKind {
                 | Self::BorderCollapse
                 | Self::BorderSpacing
                 | Self::EmptyCells
+                | Self::ColorInterpolationFilters
                 | Self::Custom
         )
     }
@@ -1674,6 +1682,7 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "clear",
     "clip-path",
     "color",
+    "color-interpolation-filters",
     "color-scheme",
     "column-count",
     "column-gap",
@@ -1682,6 +1691,7 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "direction",
     "display",
     "empty-cells",
+    "backdrop-filter",
     "filter",
     "flex-basis",
     "flex-direction",
@@ -1911,6 +1921,8 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::TabSize,
     PropertyIdKind::ColumnCount,
     PropertyIdKind::Filter,
+    PropertyIdKind::BackdropFilter,
+    PropertyIdKind::ColorInterpolationFilters,
     PropertyIdKind::ClipPath,
     PropertyIdKind::MixBlendMode,
     PropertyIdKind::Transition,
@@ -2309,6 +2321,8 @@ pub enum PropertyValue {
     Transform(Vec<TransformOp>),
     TransformOrigin(TransformOrigin),
     Filter(Vec<FilterOp>),
+    FilterExpr(Vec<FilterSpecOp>),
+    ColorInterpolationFilters(ColorInterpolationFiltersMode),
     ClipPath(ClipPathValue),
     MixBlendMode(MixBlendMode),
     Transitions(Vec<TransitionSpec>),
@@ -2762,6 +2776,9 @@ pub fn is_values4_native_property(prop: PropertyIdKind) -> bool {
             | PropertyIdKind::GridColumn
             | PropertyIdKind::GridArea
             | PropertyIdKind::GridLanes
+            | PropertyIdKind::Filter
+            | PropertyIdKind::BackdropFilter
+            | PropertyIdKind::ColorInterpolationFilters
     )
 }
 
@@ -3084,6 +3101,17 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
                 OverlayMode::Auto => "auto",
             };
             return Some((PropertyValue::Overlay(mode), s.to_string()));
+        }
+        PropertyIdKind::Filter | PropertyIdKind::BackdropFilter => {
+            let (ops, s) = crate::values_math::parse_css_filter_list(trimmed)?;
+            return Some((PropertyValue::FilterExpr(ops), s));
+        }
+        PropertyIdKind::ColorInterpolationFilters => {
+            let mode = ColorInterpolationFiltersMode::parse_css(trimmed)?;
+            return Some((
+                PropertyValue::ColorInterpolationFilters(mode),
+                mode.to_css_string().to_string(),
+            ));
         }
         PropertyIdKind::ReadingFlow => {
             let mode = match trimmed.to_ascii_lowercase().as_str() {

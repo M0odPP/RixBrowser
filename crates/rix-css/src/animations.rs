@@ -815,13 +815,17 @@ fn collect_transition_candidates(before: &ComputedStyle, after: &ComputedStyle, 
         if !Arc::ptr_eq(&before.box_model, &after.box_model) && before.box_model != after.box_model {
             all_p.extend_from_slice(&[P::Width, P::Height, P::MinWidth, P::MinHeight, P::MaxWidth, P::MaxHeight,
                 P::MarginTop, P::MarginRight, P::MarginBottom, P::MarginLeft, P::PaddingTop, P::PaddingRight,
-                P::PaddingBottom, P::PaddingLeft, P::Top, P::Right, P::Bottom, P::Left, P::ColumnCount]);
+                P::PaddingBottom, P::PaddingLeft, P::Top, P::Right, P::Bottom, P::Left, P::ColumnCount,
+                P::BorderTopWidth, P::BorderRightWidth, P::BorderBottomWidth, P::BorderLeftWidth, P::VerticalAlign]);
         }
         if !Arc::ptr_eq(&before.visual, &after.visual) && before.visual != after.visual {
-            all_p.extend_from_slice(&[P::BackgroundColor, P::BorderTopColor, P::BorderRightColor, P::BorderBottomColor, P::BorderLeftColor, P::OutlineColor]);
+            all_p.extend_from_slice(&[P::BackgroundColor, P::BorderTopColor, P::BorderRightColor, P::BorderBottomColor, P::BorderLeftColor, P::OutlineColor,
+                P::OutlineWidth, P::OutlineOffset, P::BorderTopLeftRadius, P::BorderTopRightRadius, P::BorderBottomRightRadius, P::BorderBottomLeftRadius,
+                P::BackgroundPosition, P::ObjectPosition]);
         }
         if before.display != after.display { all_p.push(P::Display); }
         if before.position != after.position { all_p.push(P::Position); }
+        if before.visibility != after.visibility { all_p.push(P::Visibility); }
         if before.overlay != after.overlay { all_p.push(P::Overlay); }
         if before.opacity != after.opacity { all_p.push(P::Opacity); }
         if before.white_space_trim != after.white_space_trim { all_p.push(P::WhiteSpaceTrim); }
@@ -833,11 +837,15 @@ fn collect_transition_candidates(before: &ComputedStyle, after: &ComputedStyle, 
                 P::WhiteSpaceCollapse, P::TextWrapMode, P::TextWrapStyle, P::TextAutospace, P::TextAutospaceSize,
                 P::TextSpacingTrim, P::HangingPunctuation, P::Hyphens, P::HyphenateLimitChars, P::LineBreak,
                 P::TextFit, P::WordSpaceTransform, P::Orphans, P::Widows, P::TabSize, P::TextJustify, P::TextAlignLast,
-                P::HyphenateCharacter, P::HyphenateLimitLines, P::BorderSpacing, P::BorderCollapse, P::EmptyCells, P::CaptionSide]);
+                P::HyphenateCharacter, P::HyphenateLimitLines, P::BorderSpacing, P::BorderCollapse, P::EmptyCells, P::CaptionSide,
+                P::ColorInterpolationFilters]);
         }
         if before.z_index != after.z_index { all_p.push(P::ZIndex); }
-        if before.flex_grid != after.flex_grid { all_p.extend_from_slice(&[P::FlexGrow, P::FlexShrink, P::FlexBasis, P::Order, P::FlexDirection, P::FlexWrap, P::AlignItems, P::AlignSelf, P::AlignContent, P::JustifyContent, P::JustifyItems, P::JustifySelf, P::GridTemplateColumns, P::GridTemplateRows, P::GridTemplateAreas, P::GridAutoColumns, P::GridAutoRows, P::GridAutoFlow, P::GridRowStart, P::GridRowEnd, P::GridColumnStart, P::GridColumnEnd, P::FitTolerance, P::GridLanesDirection, P::GridLanesPack]); }
-        if before.effects != after.effects { all_p.extend_from_slice(&[P::Scale, P::Rotate, P::Translate, P::Transform, P::ReadingFlow, P::ReadingOrder]); }
+        if before.flex_grid != after.flex_grid { all_p.extend_from_slice(&[P::FlexGrow, P::FlexShrink, P::FlexBasis, P::Order, P::FlexDirection, P::FlexWrap, P::AlignItems, P::AlignSelf, P::AlignContent, P::JustifyContent, P::JustifyItems, P::JustifySelf, P::RowGap, P::ColumnGap, P::GridTemplateColumns, P::GridTemplateRows, P::GridTemplateAreas, P::GridAutoColumns, P::GridAutoRows, P::GridAutoFlow, P::GridRowStart, P::GridRowEnd, P::GridColumnStart, P::GridColumnEnd, P::FitTolerance, P::GridLanesDirection, P::GridLanesPack]); }
+        if before.effects != after.effects {
+            all_p.extend_from_slice(&[P::Scale, P::Rotate, P::Translate, P::Transform, P::TransformOrigin, P::BoxShadow, P::Filter, P::BackdropFilter, P::ClipPath, P::MixBlendMode, P::ViewTransitionName, P::ReadingFlow, P::ReadingOrder,
+                P::OffsetDistance, P::ShapeMargin, P::StrokeWidth, P::StrokeDashoffset, P::BackgroundPositionX, P::BackgroundPositionY, P::ScrollPaddingTop, P::ScrollPaddingRight, P::ScrollPaddingBottom, P::ScrollPaddingLeft, P::SvgCx, P::SvgCy, P::SvgRx, P::SvgRy, P::SvgX, P::SvgY, P::BorderImageSlice]);
+        }
         for pk in all_p {
             if let Some(sp) = find_matching_transition_spec(specs, pk, None, after) {
                 if !out.iter().any(|(p, c, _)| *p == pk && c.is_none()) { out.push((pk, None, sp)); }
@@ -926,8 +934,47 @@ fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind,
         P::GridLanesPack => a.flex_grid.as_ref().map(|f| f.grid_lanes_pack) != b.flex_grid.as_ref().map(|f| f.grid_lanes_pack),
         P::ReadingFlow => a.effects.as_ref().map(|e| e.reading_flow) != b.effects.as_ref().map(|e| e.reading_flow),
         P::ReadingOrder => a.effects.as_ref().map_or(0, |e| e.reading_order) != b.effects.as_ref().map_or(0, |e| e.reading_order),
+        P::Filter => a.effects.as_ref().map(|e| e.filter.as_slice()).unwrap_or(&[]) != b.effects.as_ref().map(|e| e.filter.as_slice()).unwrap_or(&[]),
+        P::BackdropFilter => a.effects.as_ref().map(|e| e.backdrop_filter.as_slice()).unwrap_or(&[]) != b.effects.as_ref().map(|e| e.backdrop_filter.as_slice()).unwrap_or(&[]),
+        P::ColorInterpolationFilters => a.text.color_interpolation_filters != b.text.color_interpolation_filters,
+        P::BoxShadow => a.effects.as_ref().map(|e| e.box_shadow.as_slice()).unwrap_or(&[]) != b.effects.as_ref().map(|e| e.box_shadow.as_slice()).unwrap_or(&[]),
+        P::Transform => a.effects.as_ref().map(|e| (&e.transform, &e.transform_raw)) != b.effects.as_ref().map(|e| (&e.transform, &e.transform_raw)),
+        P::TransformOrigin => a.effects.as_ref().map(|e| &e.transform_origin) != b.effects.as_ref().map(|e| &e.transform_origin),
+        P::Scale => a.effects.as_ref().map(|e| &e.scale) != b.effects.as_ref().map(|e| &e.scale),
+        P::Rotate => a.effects.as_ref().map(|e| &e.rotate) != b.effects.as_ref().map(|e| &e.rotate),
+        P::Translate => a.effects.as_ref().map(|e| &e.translate) != b.effects.as_ref().map(|e| &e.translate),
+        P::ClipPath => a.effects.as_ref().map(|e| &e.clip_path) != b.effects.as_ref().map(|e| &e.clip_path),
+        P::MixBlendMode => a.effects.as_ref().map(|e| e.mix_blend_mode) != b.effects.as_ref().map(|e| e.mix_blend_mode),
+        P::ViewTransitionName => a.effects.as_ref().and_then(|e| e.view_transition_name.as_ref()) != b.effects.as_ref().and_then(|e| e.view_transition_name.as_ref()),
+        P::BorderTopWidth => a.box_model.border_width.top != b.box_model.border_width.top,
+        P::BorderRightWidth => a.box_model.border_width.right != b.box_model.border_width.right,
+        P::BorderBottomWidth => a.box_model.border_width.bottom != b.box_model.border_width.bottom,
+        P::BorderLeftWidth => a.box_model.border_width.left != b.box_model.border_width.left,
+        P::BorderTopColor => a.visual.border_color.top != b.visual.border_color.top || a.visual.border_color_computed[0] != b.visual.border_color_computed[0],
+        P::BorderRightColor => a.visual.border_color.right != b.visual.border_color.right || a.visual.border_color_computed[1] != b.visual.border_color_computed[1],
+        P::BorderBottomColor => a.visual.border_color.bottom != b.visual.border_color.bottom || a.visual.border_color_computed[2] != b.visual.border_color_computed[2],
+        P::BorderLeftColor => a.visual.border_color.left != b.visual.border_color.left || a.visual.border_color_computed[3] != b.visual.border_color_computed[3],
+        P::BorderTopLeftRadius => a.visual.border_radius.top_left != b.visual.border_radius.top_left,
+        P::BorderTopRightRadius => a.visual.border_radius.top_right != b.visual.border_radius.top_right,
+        P::BorderBottomRightRadius => a.visual.border_radius.bottom_right != b.visual.border_radius.bottom_right,
+        P::BorderBottomLeftRadius => a.visual.border_radius.bottom_left != b.visual.border_radius.bottom_left,
+        P::OutlineColor => a.visual.outline_color != b.visual.outline_color || a.visual.outline_color_computed != b.visual.outline_color_computed,
+        P::OutlineWidth => a.visual.outline_width != b.visual.outline_width,
+        P::OutlineOffset => a.visual.outline_offset != b.visual.outline_offset,
+        P::BackgroundPosition => a.visual.background_position != b.visual.background_position,
+        P::ObjectPosition => a.visual.object_position != b.visual.object_position,
+        P::RowGap => a.flex_grid.as_ref().map(|f| &f.row_gap) != b.flex_grid.as_ref().map(|f| &f.row_gap),
+        P::ColumnGap => a.flex_grid.as_ref().map(|f| &f.column_gap) != b.flex_grid.as_ref().map(|f| &f.column_gap),
+        P::Visibility => a.visibility != b.visibility,
+        P::VerticalAlign => a.box_model.vertical_align != b.box_model.vertical_align,
+        P::OffsetDistance | P::ShapeMargin | P::StrokeWidth | P::StrokeDashoffset
+        | P::BackgroundPositionX | P::BackgroundPositionY | P::ScrollPaddingTop | P::ScrollPaddingRight
+        | P::ScrollPaddingBottom | P::ScrollPaddingLeft | P::SvgCx | P::SvgCy | P::SvgRx | P::SvgRy
+        | P::SvgX | P::SvgY | P::BorderImageSlice => {
+            a.effects.as_ref().and_then(|e| e.extra_math_props.get(&prop)) != b.effects.as_ref().and_then(|e| e.extra_math_props.get(&prop))
+        }
         P::Custom => cname.and_then(|n| a.custom_properties.get(n)) != cname.and_then(|n| b.custom_properties.get(n)),
-        _ => true,
+        _ => a != b,
     }
 }
 
@@ -1128,6 +1175,11 @@ fn compose_property(
             let u = underlying.effects.as_ref().map(|e| e.filter.as_slice()).unwrap_or(&[]);
             let k = kf.effects.as_ref().map(|e| e.filter.as_slice()).unwrap_or(&[]);
             kf.effects_mut().filter = compose_filters(u, k, mode, underlying.text.color, kf.text.color, eval);
+        }
+        P::BackdropFilter => {
+            let u = underlying.effects.as_ref().map(|e| e.backdrop_filter.as_slice()).unwrap_or(&[]);
+            let k = kf.effects.as_ref().map(|e| e.backdrop_filter.as_slice()).unwrap_or(&[]);
+            kf.effects_mut().backdrop_filter = compose_filters(u, k, mode, underlying.text.color, kf.text.color, eval);
         }
         P::Scale => {
             let u = underlying.effects.as_ref().map_or(ScaleSpec::None, |e| e.scale.clone());
@@ -1496,6 +1548,19 @@ fn interpolate_property_into(
             target.effects_mut().filter = interpolate_filters(fa, tb, p, from.text.color, to.text.color, eval)
                 .unwrap_or_else(|| if use_from_disc { fa.to_vec() } else { tb.to_vec() });
         }
+        P::BackdropFilter => {
+            let fa = from.effects.as_ref().map(|e| e.backdrop_filter.as_slice()).unwrap_or(&[]);
+            let tb = to.effects.as_ref().map(|e| e.backdrop_filter.as_slice()).unwrap_or(&[]);
+            target.effects_mut().backdrop_filter = interpolate_filters(fa, tb, p, from.text.color, to.text.color, eval)
+                .unwrap_or_else(|| if use_from_disc { fa.to_vec() } else { tb.to_vec() });
+        }
+        P::ColorInterpolationFilters => {
+            Arc::make_mut(&mut target.text).color_interpolation_filters = if use_from_disc {
+                from.text.color_interpolation_filters
+            } else {
+                to.text.color_interpolation_filters
+            };
+        }
         P::OffsetDistance | P::ShapeMargin | P::StrokeWidth | P::StrokeDashoffset
         | P::BackgroundPositionX | P::BackgroundPositionY | P::ScrollPaddingTop | P::ScrollPaddingRight
         | P::ScrollPaddingBottom | P::ScrollPaddingLeft | P::SvgCx | P::SvgCy | P::SvgRx | P::SvgRy
@@ -1841,11 +1906,21 @@ fn resolved_to_srgb_f64(c: ResolvedColor) -> (f64, f64, f64, f64) {
 fn interpolate_resolved_color(a: ResolvedColor, b: ResolvedColor, p: f64) -> ResolvedColor {
     let ((ar, ag, ab, aa), (br, bg, bb, ba)) = (resolved_to_srgb_f64(a), resolved_to_srgb_f64(b));
     let inv = 1.0 - p;
-    let alpha_raw = aa * inv + ba * p;
-    let alpha = alpha_raw.clamp(0.0, 1.0);
-    let (r, g, bl) = if alpha_raw > 1e-9 { ((ar * aa * inv + br * ba * p) / alpha_raw, (ag * aa * inv + bg * ba * p) / alpha_raw, (ab * aa * inv + bb * ba * p) / alpha_raw) } else { (0.0, 0.0, 0.0) };
+    let safe_lerp = |x: f64, y: f64| {
+        if (x - y).abs() < 1e-12 { x } else { x * inv + y * p }
+    };
+    let alpha_raw = safe_lerp(aa, ba);
+    let alpha = if alpha_raw.is_nan() { 0.0 } else { alpha_raw.clamp(0.0, 1.0) };
+    let (r, g, bl) = if alpha_raw > 1e-9 {
+        (
+            safe_lerp(ar * aa, br * ba) / alpha_raw,
+            safe_lerp(ag * aa, bg * ba) / alpha_raw,
+            safe_lerp(ab * aa, bb * ba) / alpha_raw,
+        )
+    } else { (0.0, 0.0, 0.0) };
+    let clamp01 = |v: f64| if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
     let space = if a.space == ColorSpace::SrgbLegacy && b.space == ColorSpace::SrgbLegacy { ColorSpace::SrgbLegacy } else { ColorSpace::Srgb };
-    ResolvedColor { space, c: [Some(r.clamp(0.0, 1.0)), Some(g.clamp(0.0, 1.0)), Some(bl.clamp(0.0, 1.0))], alpha: Some(alpha) }
+    ResolvedColor { space, c: [Some(clamp01(r)), Some(clamp01(g)), Some(clamp01(bl))], alpha: Some(alpha) }
 }
 
 #[rustfmt::skip]
@@ -1946,11 +2021,15 @@ fn lacuna_filter_op(op: &FilterOp) -> FilterOp {
             offset_x: LengthPercentage::px(0.0), offset_y: LengthPercentage::px(0.0),
             blur: LengthPercentage::px(0.0), color: CssColor::Rgba(ColorRgba::TRANSPARENT),
         },
+        FilterOp::Url(u) => FilterOp::Url(u.clone()),
     }
 }
 
 #[rustfmt::skip]
 fn interpolate_filters(a: &[FilterOp], b: &[FilterOp], p: f64, cc_a: ColorRgba, cc_b: ColorRgba, eval: &EvalContext) -> Option<Vec<FilterOp>> {
+    if a.iter().any(|f| matches!(f, FilterOp::Url(_))) || b.iter().any(|f| matches!(f, FilterOp::Url(_))) {
+        return None;
+    }
     let len = a.len().max(b.len());
     let mut out = Vec::with_capacity(len);
     let lerp = |x: f32, y: f32| (f64::from(x) * (1.0 - p) + f64::from(y) * p) as f32;

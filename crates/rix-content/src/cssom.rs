@@ -4943,6 +4943,7 @@ fn inline_prop_to_css_name(prop_name: &str) -> String {
     let kebab = camel_to_kebab(prop_name);
     match kebab.as_str() {
         "webkit-filter" | "-webkit-filter" => "filter".to_string(),
+        "webkit-backdrop-filter" | "-webkit-backdrop-filter" => "backdrop-filter".to_string(),
         "webkit-transform" | "-webkit-transform" => "transform".to_string(),
         "webkit-transition" | "-webkit-transition" => "transition".to_string(),
         "webkit-animation" | "-webkit-animation" => "animation".to_string(),
@@ -6296,36 +6297,23 @@ pub(crate) fn format_computed_property_resolved(
                 .join(", "),
             _ => "none".into(),
         },
-        "filter" => match style.effects.as_ref().map(|e| e.filter.as_slice()) {
-            Some(list) if !list.is_empty() => list
-                .iter()
-                .map(|op| match op {
-                    FilterOp::Blur(r) => format!("blur({})", format_lp_opts(r, &eval, true)),
-                    FilterOp::Brightness(v) => format!("brightness({})", format_num(*v)),
-                    FilterOp::Contrast(v) => format!("contrast({})", format_num(*v)),
-                    FilterOp::Grayscale(v) => format!("grayscale({})", format_num(*v)),
-                    FilterOp::Opacity(v) => format!("opacity({})", format_num(*v)),
-                    FilterOp::Saturate(v) => format!("saturate({})", format_num(*v)),
-                    FilterOp::Invert(v) => format!("invert({})", format_num(*v)),
-                    FilterOp::Sepia(v) => format!("sepia({})", format_num(*v)),
-                    FilterOp::HueRotateDeg(d) => format!("hue-rotate({}deg)", format_num(*d)),
-                    FilterOp::DropShadow {
-                        offset_x,
-                        offset_y,
-                        blur,
-                        color,
-                    } => format!(
-                        "drop-shadow({} {} {} {})",
-                        format_css_color(*color, cc, dark),
-                        format_lp(offset_x, &eval),
-                        format_lp(offset_y, &eval),
-                        format_lp_opts(blur, &eval, true),
-                    ),
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-            _ => "none".into(),
-        },
+        "filter" => format_computed_filter_list(
+            style.effects.as_ref().map(|e| e.filter.as_slice()),
+            &eval,
+            cc,
+            dark,
+        ),
+        "backdrop-filter" => format_computed_filter_list(
+            style.effects.as_ref().map(|e| e.backdrop_filter.as_slice()),
+            &eval,
+            cc,
+            dark,
+        ),
+        "color-interpolation-filters" => style
+            .text
+            .color_interpolation_filters
+            .to_css_string()
+            .into(),
         "table-layout" => match style.box_model.table_layout {
             TableLayoutMode::Auto => "auto",
             TableLayoutMode::Fixed => "fixed",
@@ -7514,6 +7502,57 @@ fn install_web_animations_and_typed_om(vm: &mut JsVm, host: &SharedHost) {
         });
         Ok(JsValue::from_object(map_obj))
     });
+}
+
+fn format_computed_filter_list(
+    list: Option<&[FilterOp]>,
+    eval: &EvalContext,
+    cc: ColorRgba,
+    dark: bool,
+) -> String {
+    match list {
+        Some(items) if !items.is_empty() => items
+            .iter()
+            .map(|op| match op {
+                FilterOp::Blur(r) => format!("blur({})", format_lp_opts(r, eval, true)),
+                FilterOp::Brightness(v) => format!("brightness({})", format_num(*v)),
+                FilterOp::Contrast(v) => format!("contrast({})", format_num(*v)),
+                FilterOp::Grayscale(v) => format!("grayscale({})", format_num(*v)),
+                FilterOp::Opacity(v) => format!("opacity({})", format_num(*v)),
+                FilterOp::Saturate(v) => format!("saturate({})", format_num(*v)),
+                FilterOp::Invert(v) => format!("invert({})", format_num(*v)),
+                FilterOp::Sepia(v) => format!("sepia({})", format_num(*v)),
+                FilterOp::HueRotateDeg(d) => format!("hue-rotate({}deg)", format_num(*d)),
+                FilterOp::DropShadow {
+                    offset_x,
+                    offset_y,
+                    blur,
+                    color,
+                } => format!(
+                    "drop-shadow({} {} {} {})",
+                    format_css_color(*color, cc, dark),
+                    format_lp(offset_x, eval),
+                    format_lp(offset_y, eval),
+                    format_lp_opts(blur, eval, true),
+                ),
+                FilterOp::Url(u) => {
+                    let mut escaped = String::with_capacity(u.as_str().len() + 7);
+                    escaped.push_str("url(\"");
+                    for ch in u.as_str().chars() {
+                        match ch {
+                            '"' => escaped.push_str("\\\""),
+                            '\\' => escaped.push_str("\\\\"),
+                            _ => escaped.push(ch),
+                        }
+                    }
+                    escaped.push_str("\")");
+                    escaped
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => "none".into(),
+    }
 }
 
 fn split_css_unit_value(s: &str) -> Option<(f64, String)> {

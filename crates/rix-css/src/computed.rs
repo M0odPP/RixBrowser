@@ -15,18 +15,18 @@ use crate::stylesheet::{CascadeOrigin, CompiledRule, LayerId, MediaContext, Regi
 use crate::values::{
     AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
     AnimationPlayStateMode, AnimationSpec, BackgroundLayerValue, BorderCollapseMode,
-    BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue, ColorRgba,
-    ContentVisibilityMode, CornerRadii, CssColor, CursorKind, DirectionMode, DisplayMode,
-    EdgeValues, EmptyCellsMode, EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode,
-    FontStyleMode, GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
-    InterpolateSizeMode, LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle,
-    MixBlendMode, OverflowMode, OverflowPair, OverflowWrapMode, OverlayMode,
-    OverscrollBehaviorMode, PointerEventsMode, PositionMode, ReadingFlowMode, ResizeMode,
-    ScrollBehaviorMode, SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode,
-    TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode, TextTransformMode,
-    TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec,
-    UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode,
-    ZIndexValue,
+    BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue,
+    ColorInterpolationFiltersMode, ColorRgba, ContentVisibilityMode, CornerRadii, CssColor,
+    CursorKind, DirectionMode, DisplayMode, EdgeValues, EmptyCellsMode, EvalContext, FilterOp,
+    FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
+    GridPlacementValue, GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode,
+    LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
+    OverflowPair, OverflowWrapMode, OverlayMode, OverscrollBehaviorMode, PointerEventsMode,
+    PositionMode, ReadingFlowMode, ResizeMode, ScrollBehaviorMode, SizeValue, TableLayoutMode,
+    TextAlignLastMode, TextAlignMode, TextDecorationLine, TextJustifyMode, TextOrientationMode,
+    TextOverflowMode, TextTransformMode, TimingFunction, TransformOp, TransformOrigin,
+    TransitionBehaviorMode, TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode,
+    WhiteSpaceMode, WordBreakMode, WritingMode, ZIndexValue,
 };
 
 const MAX_VAR_DEPTH: u8 = 64;
@@ -192,6 +192,7 @@ pub struct InheritedTextStyle {
     pub text_fit: crate::text_css::TextFitValue,
     pub word_space_transform: crate::text_css::WordSpaceTransformMode,
     pub interpolate_size: InterpolateSizeMode,
+    pub color_interpolation_filters: ColorInterpolationFiltersMode,
     /// Full CSS Values L4/L5 evaluation context snapshot for this element (`em`/`rem`/`lh`/`rlh`/viewport/container/sibling).
     pub eval_ctx: EvalContext,
 }
@@ -247,6 +248,7 @@ impl Default for InheritedTextStyle {
             text_fit: crate::text_css::TextFitValue::None,
             word_space_transform: crate::text_css::WordSpaceTransformMode::None,
             interpolate_size: InterpolateSizeMode::NumericOnly,
+            color_interpolation_filters: ColorInterpolationFiltersMode::LinearRgb,
             eval_ctx: EvalContext::default(),
         }
     }
@@ -383,6 +385,7 @@ pub struct EffectsStyle {
     pub translate: crate::values_math::TranslateSpec,
     pub image_resolution: Option<crate::values_math::MathNode>,
     pub filter: Vec<FilterOp>,
+    pub backdrop_filter: Vec<FilterOp>,
     pub clip_path: ClipPathValue,
     pub mix_blend_mode: MixBlendMode,
     pub transitions: Vec<TransitionSpec>,
@@ -2857,6 +2860,27 @@ pub fn apply_declaration(
         (PropertyIdKind::Filter, PropertyValue::Filter(v)) => {
             style.effects_mut().filter = v.clone();
         }
+        (PropertyIdKind::Filter, PropertyValue::FilterExpr(v)) => {
+            style.effects_mut().filter = v
+                .iter()
+                .map(|op| op.resolve(eval, current_color, effective_dark))
+                .collect();
+        }
+        (PropertyIdKind::BackdropFilter, PropertyValue::Filter(v)) => {
+            style.effects_mut().backdrop_filter = v.clone();
+        }
+        (PropertyIdKind::BackdropFilter, PropertyValue::FilterExpr(v)) => {
+            style.effects_mut().backdrop_filter = v
+                .iter()
+                .map(|op| op.resolve(eval, current_color, effective_dark))
+                .collect();
+        }
+        (
+            PropertyIdKind::ColorInterpolationFilters,
+            PropertyValue::ColorInterpolationFilters(v),
+        ) => {
+            Arc::make_mut(&mut style.text).color_interpolation_filters = *v;
+        }
         (PropertyIdKind::ClipPath, PropertyValue::ClipPath(v)) => {
             style.effects_mut().clip_path = v.clone();
         }
@@ -3660,6 +3684,63 @@ fn copy_property_from_parent(
                 .as_ref()
                 .map_or(AlignValue::Auto, |f| f.justify_self);
         }
+        PropertyIdKind::Filter => {
+            style.effects_mut().filter = parent
+                .effects
+                .as_ref()
+                .map(|e| e.filter.clone())
+                .unwrap_or_default();
+        }
+        PropertyIdKind::BackdropFilter => {
+            style.effects_mut().backdrop_filter = parent
+                .effects
+                .as_ref()
+                .map(|e| e.backdrop_filter.clone())
+                .unwrap_or_default();
+        }
+        PropertyIdKind::ColorInterpolationFilters => {
+            Arc::make_mut(&mut style.text).color_interpolation_filters =
+                parent.text.color_interpolation_filters;
+        }
+        PropertyIdKind::BoxShadow => {
+            style.effects_mut().box_shadow = parent
+                .effects
+                .as_ref()
+                .map(|e| e.box_shadow.clone())
+                .unwrap_or_default();
+        }
+        PropertyIdKind::Transform => {
+            let eff = style.effects_mut();
+            eff.transform = parent
+                .effects
+                .as_ref()
+                .map(|e| e.transform.clone())
+                .unwrap_or_default();
+            eff.transform_raw = parent
+                .effects
+                .as_ref()
+                .and_then(|e| e.transform_raw.clone());
+        }
+        PropertyIdKind::TransformOrigin => {
+            style.effects_mut().transform_origin = parent
+                .effects
+                .as_ref()
+                .map(|e| e.transform_origin.clone())
+                .unwrap_or_default();
+        }
+        PropertyIdKind::ClipPath => {
+            style.effects_mut().clip_path = parent
+                .effects
+                .as_ref()
+                .map(|e| e.clip_path.clone())
+                .unwrap_or_default();
+        }
+        PropertyIdKind::MixBlendMode => {
+            style.effects_mut().mix_blend_mode = parent
+                .effects
+                .as_ref()
+                .map_or(MixBlendMode::Normal, |e| e.mix_blend_mode);
+        }
         _ => {}
     }
 }
@@ -4140,6 +4221,40 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         PropertyIdKind::Contain => {
             if let Some(eff) = &mut style.effects {
                 Arc::make_mut(eff).contain = 0;
+            }
+        }
+        PropertyIdKind::Filter => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).filter.clear();
+            }
+        }
+        PropertyIdKind::BackdropFilter => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).backdrop_filter.clear();
+            }
+        }
+        PropertyIdKind::ColorInterpolationFilters => {
+            Arc::make_mut(&mut style.text).color_interpolation_filters =
+                ColorInterpolationFiltersMode::LinearRgb;
+        }
+        PropertyIdKind::BoxShadow => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).box_shadow.clear();
+            }
+        }
+        PropertyIdKind::TransformOrigin => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).transform_origin = TransformOrigin::default();
+            }
+        }
+        PropertyIdKind::ClipPath => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).clip_path = ClipPathValue::None;
+            }
+        }
+        PropertyIdKind::MixBlendMode => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).mix_blend_mode = MixBlendMode::Normal;
             }
         }
         _ => {}
