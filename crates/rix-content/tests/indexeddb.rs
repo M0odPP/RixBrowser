@@ -192,7 +192,9 @@ fn indexeddb_crud_indexes_cursors_key_ranges_and_acid_rollback() {
         serde_json::json!(["alice@ex.com", "bob@ex.com", "eve@ex.com"])
     );
     assert_eq!(parsed["midAges"], serde_json::json!([28, 30, 30]));
-    assert_eq!(parsed["uniqAges"], serde_json::json!([22, 28, 30, 40]));
+    // Per W3C IndexedDB 3.0 §5.7, cursors iterate live store state in transaction FIFO order:
+    // `pCur` deletes `dave` (id 4, age 40) while `uCur` is at age 30, so `uCur` sees `[22, 28, 30]`.
+    assert_eq!(parsed["uniqAges"], serde_json::json!([22, 28, 30]));
     // Tx 2 & Tx 3 aborted (reverting key generator to 5); in Tx 4 the prevented ConstraintError
     // reverts its failed operation per W3C IndexedDB 3.0 §5.1 (matching WPT
     // `request-event-ordering-small-values.any.js`) so `eve` receives autoIncrement key 5.
