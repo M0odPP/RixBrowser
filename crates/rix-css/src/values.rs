@@ -1589,6 +1589,171 @@ pub enum FilterOp {
         blur: LengthPercentage,
         color: CssColor,
     },
+    Url(String),
+}
+
+/// Specified CSS Filter Effects Level 1/2 scalar parameter supporting CSS Values L4/L5
+/// math expressions (`calc()`, `sign()`, `em`/`rem` font-relative expressions) resolved
+/// against [`EvalContext`] at computed-value time.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterScalar {
+    Value(f32),
+    Math(Box<crate::values_math::MathNode>),
+}
+
+impl FilterScalar {
+    #[must_use]
+    pub fn resolve_non_neg(&self, eval: &EvalContext) -> f32 {
+        let v = match self {
+            Self::Value(x) => f64::from(*x),
+            Self::Math(node) => node.eval_scalar(eval, Some((1.0, true))),
+        };
+        if v.is_nan() {
+            0.0
+        } else if v.is_infinite() {
+            if v.is_sign_positive() {
+                f32::MAX
+            } else {
+                0.0
+            }
+        } else {
+            v.max(0.0) as f32
+        }
+    }
+
+    #[must_use]
+    pub fn resolve_unit_clamped(&self, eval: &EvalContext) -> f32 {
+        let v = match self {
+            Self::Value(x) => f64::from(*x),
+            Self::Math(node) => node.eval_scalar(eval, Some((1.0, true))),
+        };
+        if v.is_nan() {
+            0.0
+        } else {
+            v.clamp(0.0, 1.0) as f32
+        }
+    }
+
+    #[must_use]
+    pub fn resolve_angle_deg(&self, eval: &EvalContext) -> f32 {
+        let v = match self {
+            Self::Value(x) => f64::from(*x),
+            Self::Math(node) => node.eval_scalar(eval, None),
+        };
+        if v.is_nan() {
+            0.0
+        } else if v.is_infinite() {
+            if v.is_sign_positive() {
+                f32::MAX
+            } else {
+                f32::MIN
+            }
+        } else {
+            v as f32
+        }
+    }
+}
+
+/// Specified CSS filter operation prior to computed-value evaluation against [`EvalContext`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterSpecOp {
+    Blur(LengthPercentage),
+    Brightness(FilterScalar),
+    Contrast(FilterScalar),
+    Grayscale(FilterScalar),
+    Opacity(FilterScalar),
+    Saturate(FilterScalar),
+    Invert(FilterScalar),
+    Sepia(FilterScalar),
+    HueRotateDeg(FilterScalar),
+    DropShadow {
+        offset_x: LengthPercentage,
+        offset_y: LengthPercentage,
+        blur: LengthPercentage,
+        color: Option<Box<crate::color::CssColorExpr>>,
+    },
+    Url(String),
+}
+
+impl FilterSpecOp {
+    #[must_use]
+    pub fn resolve(
+        &self,
+        eval: &EvalContext,
+        current_color: ColorRgba,
+        dark_mode: bool,
+    ) -> FilterOp {
+        match self {
+            Self::Blur(lp) => {
+                FilterOp::Blur(LengthPercentage::px(lp.resolve_px(0.0, eval).max(0.0)))
+            }
+            Self::Brightness(s) => FilterOp::Brightness(s.resolve_non_neg(eval)),
+            Self::Contrast(s) => FilterOp::Contrast(s.resolve_non_neg(eval)),
+            Self::Grayscale(s) => FilterOp::Grayscale(s.resolve_unit_clamped(eval)),
+            Self::Opacity(s) => FilterOp::Opacity(s.resolve_unit_clamped(eval)),
+            Self::Saturate(s) => FilterOp::Saturate(s.resolve_non_neg(eval)),
+            Self::Invert(s) => FilterOp::Invert(s.resolve_unit_clamped(eval)),
+            Self::Sepia(s) => FilterOp::Sepia(s.resolve_unit_clamped(eval)),
+            Self::HueRotateDeg(s) => FilterOp::HueRotateDeg(s.resolve_angle_deg(eval)),
+            Self::DropShadow {
+                offset_x,
+                offset_y,
+                blur,
+                color,
+            } => {
+                let resolved_color = match color.as_deref() {
+                    None => CssColor::CurrentColor,
+                    Some(crate::color::CssColorExpr::CurrentColor) => CssColor::CurrentColor,
+                    Some(expr) => CssColor::Rgba(
+                        expr.resolve(
+                            crate::color::ResolvedColor::from_rgba(current_color),
+                            dark_mode,
+                            eval,
+                        )
+                        .to_srgb_u8(),
+                    ),
+                };
+                FilterOp::DropShadow {
+                    offset_x: LengthPercentage::px(offset_x.resolve_px(0.0, eval)),
+                    offset_y: LengthPercentage::px(offset_y.resolve_px(0.0, eval)),
+                    blur: LengthPercentage::px(blur.resolve_px(0.0, eval).max(0.0)),
+                    color: resolved_color,
+                }
+            }
+            Self::Url(u) => FilterOp::Url(u.clone()),
+        }
+    }
+}
+
+/// W3C Filter Effects Level 1 `color-interpolation-filters` property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ColorInterpolationFiltersMode {
+    Auto,
+    SRgb,
+    #[default]
+    LinearRgb,
+}
+
+impl ColorInterpolationFiltersMode {
+    #[must_use]
+    pub fn parse_css(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "srgb" => Some(Self::SRgb),
+            "linearrgb" => Some(Self::LinearRgb),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn to_css_string(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::SRgb => "srgb",
+            Self::LinearRgb => "linearrgb",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -2826,7 +2991,7 @@ pub fn convert_filter(filter: &Filter<'_>) -> Option<FilterOp> {
             blur: convert_length(&ds.blur),
             color: convert_color(&ds.color).unwrap_or(CssColor::CurrentColor),
         }),
-        Filter::Url(_) => None,
+        Filter::Url(u) => Some(FilterOp::Url(u.url.as_ref().to_string())),
     }
 }
 

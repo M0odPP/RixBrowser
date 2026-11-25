@@ -2761,3 +2761,290 @@ fn parse_calc_size_basis<'i, 't>(p: &mut Parser<'i, 't>, allow_auto: bool, allow
     if !ct.matches_target(ValueKind::LengthPercentage) { p.reset(&st); return None; }
     Some(CalcSizeBasis::Length(Box::new(node.simplify(None, None))))
 }
+
+fn escape_css_url_string(u: &str) -> String {
+    let mut out = String::with_capacity(u.len() + 7);
+    out.push_str("url(\"");
+    for ch in u.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(ch),
+        }
+    }
+    out.push_str("\")");
+    out
+}
+
+fn math_node_to_length(pm: &ParsedMath) -> LengthPercentage {
+    if !pm.was_math_fn {
+        if let MathNode::Dimension(v, MathUnit::Length(LengthUnit::Px)) = pm.node {
+            return LengthPercentage::px(v as f32);
+        }
+    }
+    LengthPercentage::Calc(Box::new(crate::values::CalcExpr::Math(Box::new(
+        pm.node.clone(),
+    ))))
+}
+
+/// Parses a CSS Filter Effects Level 1/2 `<filter-value-list> | none` declaration
+/// (supporting both `filter` and `backdrop-filter`, omitted default arguments, `url()`,
+/// `drop-shadow()`, and full CSS Values L4/L5 math expressions such as `calc(sign(...))`).
+#[must_use]
+pub fn parse_css_filter_list(input: &str) -> Option<(Vec<crate::values::FilterSpecOp>, String)> {
+    use crate::values::{FilterScalar, FilterSpecOp};
+
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("none") {
+        return Some((Vec::new(), "none".to_string()));
+    }
+
+    let mut pi = ParserInput::new(trimmed);
+    let mut p = Parser::new(&mut pi);
+    let mut ops: Vec<FilterSpecOp> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+
+    while !p.is_exhausted() {
+        let tok = p.next().ok()?.clone();
+        match tok {
+            Token::UnquotedUrl(u) => {
+                let s = u.as_ref();
+                parts.push(escape_css_url_string(s));
+                ops.push(FilterSpecOp::Url(s.to_string()));
+            }
+            Token::Function(fname) => {
+                let lower = fname.to_ascii_lowercase();
+                let parsed: Option<(FilterSpecOp, String)> = p
+                    .parse_nested_block(|n| -> Result<(FilterSpecOp, String), cssparser::ParseError<'_, ()>> {
+                        match lower.as_str() {
+                            "url" => {
+                                let s = n.expect_string()?.as_ref().to_string();
+                                if !n.is_exhausted() {
+                                    return Err(n.new_custom_error(()));
+                                }
+                                Ok((
+                                    FilterSpecOp::Url(s.clone()),
+                                    escape_css_url_string(&s),
+                                ))
+                            }
+                            "blur" => {
+                                if n.is_exhausted() {
+                                    return Ok((
+                                        FilterSpecOp::Blur(LengthPercentage::px(0.0)),
+                                        "blur(0px)".to_string(),
+                                    ));
+                                }
+                                let Some(pm) = parse_math_value_from_parser(n, ValueKind::Length) else {
+                                    return Err(n.new_custom_error(()));
+                                };
+                                if !n.is_exhausted() {
+                                    return Err(n.new_custom_error(()));
+                                }
+                                if !pm.was_math_fn {
+                                    let v = pm.node.eval_scalar(&EvalContext::default(), None);
+                                    if !v.is_finite() || v < 0.0 {
+                                        return Err(n.new_custom_error(()));
+                                    }
+                                }
+                                let spec = pm.node.serialize_specified(pm.was_math_fn);
+                                Ok((FilterSpecOp::Blur(math_node_to_length(&pm)), format!("blur({spec})")))
+                            }
+                            "brightness" | "contrast" | "saturate" | "grayscale" | "invert" | "sepia" | "opacity" => {
+                                let clamped_unit = matches!(lower.as_str(), "grayscale" | "invert" | "sepia" | "opacity");
+                                if n.is_exhausted() {
+                                    let op = match lower.as_str() {
+                                        "brightness" => FilterSpecOp::Brightness(FilterScalar::Value(1.0)),
+                                        "contrast" => FilterSpecOp::Contrast(FilterScalar::Value(1.0)),
+                                        "saturate" => FilterSpecOp::Saturate(FilterScalar::Value(1.0)),
+                                        "grayscale" => FilterSpecOp::Grayscale(FilterScalar::Value(1.0)),
+                                        "invert" => FilterSpecOp::Invert(FilterScalar::Value(1.0)),
+                                        "sepia" => FilterSpecOp::Sepia(FilterScalar::Value(1.0)),
+                                        _ => FilterSpecOp::Opacity(FilterScalar::Value(1.0)),
+                                    };
+                                    return Ok((op, format!("{lower}(1)")));
+                                }
+                                let Some(pm) = parse_math_value_from_parser(n, ValueKind::NumberOrPercentage) else {
+                                    return Err(n.new_custom_error(()));
+                                };
+                                if !n.is_exhausted() {
+                                    return Err(n.new_custom_error(()));
+                                }
+                                let (scalar, spec_arg) = if !pm.was_math_fn {
+                                    match pm.node {
+                                        MathNode::Number(v) => {
+                                            if !v.is_finite() || v < 0.0 {
+                                                return Err(n.new_custom_error(()));
+                                            }
+                                            let cv = if clamped_unit { v.min(1.0) } else { v };
+                                            (FilterScalar::Value(cv as f32), format_math_f64(cv))
+                                        }
+                                        MathNode::Percent(pct) => {
+                                            if !pct.is_finite() || pct < 0.0 {
+                                                return Err(n.new_custom_error(()));
+                                            }
+                                            let cpct = if clamped_unit { pct.min(100.0) } else { pct };
+                                            (
+                                                FilterScalar::Value((cpct / 100.0) as f32),
+                                                format!("{}%", format_math_f64(cpct)),
+                                            )
+                                        }
+                                        _ => return Err(n.new_custom_error(())),
+                                    }
+                                } else {
+                                    let spec = pm.node.serialize_specified(true);
+                                    (FilterScalar::Math(Box::new(pm.node)), spec)
+                                };
+                                let op = match lower.as_str() {
+                                    "brightness" => FilterSpecOp::Brightness(scalar),
+                                    "contrast" => FilterSpecOp::Contrast(scalar),
+                                    "saturate" => FilterSpecOp::Saturate(scalar),
+                                    "grayscale" => FilterSpecOp::Grayscale(scalar),
+                                    "invert" => FilterSpecOp::Invert(scalar),
+                                    "sepia" => FilterSpecOp::Sepia(scalar),
+                                    _ => FilterSpecOp::Opacity(scalar),
+                                };
+                                Ok((op, format!("{lower}({spec_arg})")))
+                            }
+                            "hue-rotate" => {
+                                if n.is_exhausted() {
+                                    return Ok((
+                                        FilterSpecOp::HueRotateDeg(FilterScalar::Value(0.0)),
+                                        "hue-rotate(0deg)".to_string(),
+                                    ));
+                                }
+                                let st = n.state();
+                                let start_pos = n.position();
+                                if let Ok(tok) = n.next().cloned() {
+                                    match tok {
+                                        Token::Number { value, .. } if value == 0.0 && n.is_exhausted() => {
+                                            return Ok((
+                                                FilterSpecOp::HueRotateDeg(FilterScalar::Value(0.0)),
+                                                "hue-rotate(0deg)".to_string(),
+                                            ));
+                                        }
+                                        Token::Dimension { value, unit, .. } if n.is_exhausted() => {
+                                            let unit_low = unit.to_ascii_lowercase();
+                                            let v = exact_f64(n.slice_from(start_pos), unit.len(), f64::from(value));
+                                            let deg = match unit_low.as_str() {
+                                                "deg" => Some(v),
+                                                "grad" => Some(v * 0.9),
+                                                "rad" => Some(v * (180.0 / std::f64::consts::PI)),
+                                                "turn" => Some(v * 360.0),
+                                                _ => None,
+                                            };
+                                            if let Some(d) = deg {
+                                                return Ok((
+                                                    FilterSpecOp::HueRotateDeg(FilterScalar::Value(d as f32)),
+                                                    format!("hue-rotate({}{unit_low})", format_math_f64(v)),
+                                                ));
+                                            }
+                                            return Err(n.new_custom_error(()));
+                                        }
+                                        _ => n.reset(&st),
+                                    }
+                                } else {
+                                    n.reset(&st);
+                                }
+                                let Some(pm) = parse_math_value_from_parser(n, ValueKind::Angle) else {
+                                    return Err(n.new_custom_error(()));
+                                };
+                                if !n.is_exhausted() {
+                                    return Err(n.new_custom_error(()));
+                                }
+                                let spec = pm.node.serialize_specified(pm.was_math_fn);
+                                Ok((
+                                    FilterSpecOp::HueRotateDeg(FilterScalar::Math(Box::new(pm.node))),
+                                    format!("hue-rotate({spec})"),
+                                ))
+                            }
+                            "drop-shadow" => {
+                                let mut color_expr: Option<Box<crate::color::CssColorExpr>> = None;
+                                let mut color_ser: Option<String> = None;
+                                let mut lengths: Vec<(LengthPercentage, String, bool, f64)> = Vec::new();
+                                while !n.is_exhausted() {
+                                    let st = n.state();
+                                    if lengths.len() < 3 {
+                                        if let Some(pm) = parse_math_value_from_parser(n, ValueKind::Length) {
+                                            let raw_v = if !pm.was_math_fn {
+                                                pm.node.eval_scalar(&EvalContext::default(), None)
+                                            } else {
+                                                0.0
+                                            };
+                                            let spec = pm.node.serialize_specified(pm.was_math_fn);
+                                            lengths.push((math_node_to_length(&pm), spec, pm.was_math_fn, raw_v));
+                                            continue;
+                                        }
+                                        n.reset(&st);
+                                    }
+                                    if color_expr.is_some() || (!lengths.is_empty() && lengths.len() < 2) {
+                                        return Err(n.new_custom_error(()));
+                                    }
+                                    let c_start = n.position();
+                                    let c_tok = n.next()?.clone();
+                                    if matches!(c_tok, Token::Function(_)) {
+                                        let _ = n.parse_nested_block(|inner| -> Result<(), cssparser::ParseError<'_, ()>> {
+                                            while inner.next().is_ok() {}
+                                            Ok(())
+                                        });
+                                    }
+                                    let slice = n.slice_from(c_start).trim();
+                                    let Some(ce) = crate::color::parse_css_color(slice) else {
+                                        return Err(n.new_custom_error(()));
+                                    };
+                                    let Some(cs) = crate::color::parse_and_serialize_color_specified(slice) else {
+                                        return Err(n.new_custom_error(()));
+                                    };
+                                    color_expr = Some(Box::new(ce));
+                                    color_ser = Some(cs);
+                                }
+                                if lengths.len() < 2 || lengths.len() > 3 {
+                                    return Err(n.new_custom_error(()));
+                                }
+                                // W3C Filter Effects L1 §9.2: negative literal blur radius is invalid.
+                                if let Some((_, _, was_fn, raw_v)) = lengths.get(2) {
+                                    if !*was_fn && (!raw_v.is_finite() || *raw_v < 0.0) {
+                                        return Err(n.new_custom_error(()));
+                                    }
+                                }
+                                let mut ds_parts: Vec<String> = Vec::with_capacity(4);
+                                if let Some(cs) = color_ser {
+                                    ds_parts.push(cs);
+                                }
+                                ds_parts.push(lengths[0].1.clone());
+                                ds_parts.push(lengths[1].1.clone());
+                                let blur_lp = if let Some((lp, sp, _, _)) = lengths.get(2) {
+                                    ds_parts.push(sp.clone());
+                                    lp.clone()
+                                } else {
+                                    LengthPercentage::px(0.0)
+                                };
+                                Ok((
+                                    FilterSpecOp::DropShadow {
+                                        offset_x: lengths[0].0.clone(),
+                                        offset_y: lengths[1].0.clone(),
+                                        blur: blur_lp,
+                                        color: color_expr,
+                                    },
+                                    format!("drop-shadow({})", ds_parts.join(" ")),
+                                ))
+                            }
+                            _ => Err(n.new_custom_error(())),
+                        }
+                    })
+                    .ok();
+                let (op, ser) = parsed?;
+                ops.push(op);
+                parts.push(ser);
+            }
+            _ => return None,
+        }
+    }
+
+    if ops.is_empty() {
+        return None;
+    }
+    Some((ops, parts.join(" ")))
+}
