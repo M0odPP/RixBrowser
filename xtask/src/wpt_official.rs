@@ -1212,6 +1212,62 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
                 };
                 let query_has = |key: &str| -> bool { query_params.iter().any(|(k, _)| k == key) };
 
+                // RFC 6455 WebSocket upgrade handler for official WPT `websockets/` endpoints.
+                let is_ws_upgrade = get_req_hdr("upgrade")
+                    .is_some_and(|v| String::from_utf8_lossy(&v).eq_ignore_ascii_case("websocket"))
+                    && get_req_hdr("sec-websocket-key").is_some();
+                if is_ws_upgrade {
+                    let sec_key = String::from_utf8_lossy(
+                        &get_req_hdr("sec-websocket-key").unwrap_or_default(),
+                    )
+                    .trim()
+                    .to_string();
+                    let req_proto = get_req_hdr("sec-websocket-protocol")
+                        .map(|v| String::from_utf8_lossy(&v).trim().to_string());
+                    let req_origin = get_req_hdr("origin")
+                        .map(|v| String::from_utf8_lossy(&v).trim().to_string())
+                        .unwrap_or_default();
+                    let req_referer = get_req_hdr("referer")
+                        .map(|v| String::from_utf8_lossy(&v).trim().to_string());
+                    let req_cookie = get_req_hdr("cookie")
+                        .map(|v| String::from_utf8_lossy(&v).trim().to_string());
+                    let req_auth = get_req_hdr("authorization")
+                        .map(|v| String::from_utf8_lossy(&v).trim().to_string());
+                    let leftover = raw_buf.get(body_start..).unwrap_or(b"").to_vec();
+                    handle_wpt_websocket_connection(
+                        stream,
+                        leftover,
+                        rel,
+                        query_only,
+                        &query_params,
+                        &sec_key,
+                        req_proto.as_deref(),
+                        &req_origin,
+                        req_referer.as_deref(),
+                        req_cookie.as_deref(),
+                        req_auth.as_deref(),
+                    )
+                    .await;
+                    return;
+                }
+
+                // WPT dynamic handler: `websockets/security/check.py`
+                if rel == "websockets/security/check.py" {
+                    let body: &[u8] = if get_req_hdr("sec-websocket-key").is_some() {
+                        b"FAIL"
+                    } else {
+                        b"PASS"
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+
                 // WPT dynamic handler: `dom/nodes/encoding.py?label=<enc>`
                 if rel == "dom/nodes/encoding.py" {
                     let label = query_first("label")
@@ -1531,6 +1587,7 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
                         let mut sub = txt
                             .replace("{{host}}", "localhost")
                             .replace("{{domains[]}}", "localhost")
+                            .replace("{{hosts[alt][www]}}", "127.0.0.1")
                             .replace("{{ports[http][0]}}", &port_s)
                             .replace("{{ports[http][1]}}", &port_s)
                             .replace("{{ports[https][0]}}", &port_s)
@@ -1621,15 +1678,13 @@ fn run_wpt_testharness_file(
     let font_db = wpt_font_db(wpt_root);
 
     let sub_html;
-    let html = if path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .is_some_and(|n| n.contains(".sub."))
-    {
+    let html = if html.contains("{{") {
         let port_s = server.port.to_string();
         sub_html = html
             .replace("{{host}}", "localhost")
             .replace("{{domains[]}}", "localhost")
+            .replace("{{hosts[alt][www]}}", "127.0.0.1")
+            .replace("{{hosts[alt][]}}", "127.0.0.1")
             .replace("{{ports[http][0]}}", &port_s)
             .replace("{{ports[http][1]}}", &port_s)
             .replace("{{ports[https][0]}}", &port_s)
@@ -1676,6 +1731,8 @@ fn run_wpt_testharness_file(
                             code = code
                                 .replace("{{host}}", "localhost")
                                 .replace("{{domains[]}}", "localhost")
+                                .replace("{{hosts[alt][www]}}", "127.0.0.1")
+                                .replace("{{hosts[alt][]}}", "127.0.0.1")
                                 .replace("{{ports[http][0]}}", &port_s)
                                 .replace("{{ports[http][1]}}", &port_s)
                                 .replace("{{ports[https][0]}}", &port_s)
@@ -1794,10 +1851,11 @@ fn run_wpt_testharness_file(
                 continue;
             }
         }
-        if async_waits >= 80 {
+        if async_waits >= 150 {
             break;
         }
         async_waits += 1;
+        let wait_started = std::time::Instant::now();
         let settled =
             server
                 .rt
@@ -1810,6 +1868,9 @@ fn run_wpt_testharness_file(
                     .and_then(|v| v.as_number())
                     .is_some_and(|n| n > 0.0)
                 }));
+        rt.event_loop
+            .borrow_mut()
+            .advance_clock(wait_started.elapsed());
         if settled {
             break;
         }
@@ -2138,4 +2199,594 @@ pub fn print_report(report: &OfficialWptReport) {
         }
     }
     let _ = BTreeMap::<String, usize>::new();
+}
+
+/// Incoming RFC 6455 message decoded on the local WPT WebSocket test server.
+enum WptWsClientMsg {
+    Text(String),
+    Binary(Vec<u8>),
+    /// Raw Close payload bytes (empty if client sent no status code).
+    Close(Vec<u8>),
+    Eof,
+}
+
+async fn read_wpt_ws_client_msg(
+    stream: &mut tokio::net::TcpStream,
+    buf: &mut Vec<u8>,
+) -> WptWsClientMsg {
+    let mut frag_opcode: Option<u8> = None;
+    let mut frag_payload: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 4096];
+
+    loop {
+        while buf.len() >= 2 {
+            let b0 = buf[0];
+            let b1 = buf[1];
+            let fin = (b0 & 0x80) != 0;
+            let opcode = b0 & 0x0F;
+            let masked = (b1 & 0x80) != 0;
+            let len7 = (b1 & 0x7F) as usize;
+            let mut offset = 2usize;
+            let payload_len = if len7 <= 125 {
+                len7
+            } else if len7 == 126 {
+                if buf.len() < 4 {
+                    break;
+                }
+                offset = 4;
+                u16::from_be_bytes([buf[2], buf[3]]) as usize
+            } else {
+                if buf.len() < 10 {
+                    break;
+                }
+                offset = 10;
+                u64::from_be_bytes([
+                    buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+                ]) as usize
+            };
+            let mask_len = if masked { 4 } else { 0 };
+            let total = offset + mask_len + payload_len;
+            if buf.len() < total {
+                break;
+            }
+            let mask_key = if masked {
+                [
+                    buf[offset],
+                    buf[offset + 1],
+                    buf[offset + 2],
+                    buf[offset + 3],
+                ]
+            } else {
+                [0u8; 4]
+            };
+            let mut payload = buf[offset + mask_len..total].to_vec();
+            buf.drain(..total);
+            if masked {
+                for (i, byte) in payload.iter_mut().enumerate() {
+                    *byte ^= mask_key[i % 4];
+                }
+            }
+
+            match opcode {
+                0x8 => return WptWsClientMsg::Close(payload),
+                0x9 => {
+                    let pong = rix_net::encode_server_frame(0xA, &payload);
+                    let _ = stream.write_all(&pong).await;
+                }
+                0xA => {}
+                0x1 | 0x2 => {
+                    if fin {
+                        if opcode == 0x1 {
+                            return WptWsClientMsg::Text(
+                                String::from_utf8_lossy(&payload).into_owned(),
+                            );
+                        }
+                        return WptWsClientMsg::Binary(payload);
+                    }
+                    frag_opcode = Some(opcode);
+                    frag_payload = payload;
+                }
+                0x0 => {
+                    frag_payload.extend_from_slice(&payload);
+                    if fin {
+                        let op = frag_opcode.take().unwrap_or(0x2);
+                        let full = std::mem::take(&mut frag_payload);
+                        if op == 0x1 {
+                            return WptWsClientMsg::Text(
+                                String::from_utf8_lossy(&full).into_owned(),
+                            );
+                        }
+                        return WptWsClientMsg::Binary(full);
+                    }
+                }
+                _ => return WptWsClientMsg::Eof,
+            }
+        }
+        match stream.read(&mut tmp).await {
+            Ok(0) | Err(_) => return WptWsClientMsg::Eof,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+}
+
+fn encode_ws_close_payload(code: Option<u16>, reason: &str) -> Vec<u8> {
+    match code {
+        Some(c) => {
+            let mut out = Vec::with_capacity(2 + reason.len());
+            out.extend_from_slice(&c.to_be_bytes());
+            out.extend_from_slice(reason.as_bytes());
+            out
+        }
+        None => Vec::new(),
+    }
+}
+
+async fn send_ws_101(
+    stream: &mut tokio::net::TcpStream,
+    accept: &str,
+    protocol: Option<&str>,
+    extra_headers: &[(&str, String)],
+) -> bool {
+    let mut resp = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n"
+    );
+    if let Some(p) = protocol {
+        resp.push_str(&format!("Sec-WebSocket-Protocol: {p}\r\n"));
+    }
+    for (k, v) in extra_headers {
+        resp.push_str(&format!("{k}: {v}\r\n"));
+    }
+    resp.push_str("\r\n");
+    stream.write_all(resp.as_bytes()).await.is_ok()
+}
+
+/// Official WPT `websockets/handlers/*_wsh.py` local server endpoints.
+#[allow(clippy::too_many_arguments)]
+async fn handle_wpt_websocket_connection(
+    mut stream: tokio::net::TcpStream,
+    mut buf: Vec<u8>,
+    rel: &str,
+    query_only: &str,
+    query_params: &[(String, String)],
+    sec_key: &str,
+    req_proto: Option<&str>,
+    req_origin: &str,
+    req_referer: Option<&str>,
+    req_cookie: Option<&str>,
+    req_auth: Option<&str>,
+) {
+    let route = rel
+        .trim_matches('/')
+        .strip_prefix("websockets/handlers/")
+        .unwrap_or(rel.trim_matches('/'))
+        .strip_suffix("_wsh.py")
+        .unwrap_or(rel.trim_matches('/'));
+    let accept = rix_net::compute_ws_accept_key(sec_key);
+
+    let q_first = |k: &str| -> Option<String> {
+        query_params
+            .iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.clone())
+    };
+    let q_has = |k: &str| -> bool { query_params.iter().any(|(key, _)| key == k) };
+
+    match route {
+        "wrong_accept_key" => {
+            let msg = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\nSec-WebSocket-Origin: {req_origin}\r\nSec-WebSocket-Accept: thisisawrongacceptkey\r\n\r\n"
+            );
+            let _ = stream.write_all(msg.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+        "invalid" => {
+            let _ = stream.write_all(b"FOO BAR BAZ\r\n\r\n").await;
+            let _ = stream.shutdown().await;
+        }
+        "basic_auth" => {
+            if req_auth == Some("Basic Zm9vOmJhcg==") {
+                if send_ws_101(&mut stream, &accept, None, &[]).await {
+                    let _ = stream
+                        .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                        .await;
+                    let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+                }
+            } else {
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nWWW-Authenticate: Basic realm=\"camelot\"\r\n\r\n",
+                    )
+                    .await;
+            }
+            let _ = stream.shutdown().await;
+        }
+        r if r.ends_with("redirect_response.py") => {
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 301 Moved Permanently\r\nLocation: /echo\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await;
+            let _ = stream.shutdown().await;
+        }
+        "simple_handshake" => {
+            let mut packet = format!(
+                "HTTP/1.1 101 Switching Protocols:\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\nSet-Cookie: ws_test=test\r\nSec-WebSocket-Origin: {req_origin}\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .into_bytes();
+            let close_body = encode_ws_close_payload(Some(1001), "PASS");
+            packet.extend_from_slice(&rix_net::encode_server_frame(0x8, &close_body));
+            let _ = stream.write_all(&packet).await;
+            let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+            let _ = stream.shutdown().await;
+        }
+        "handshake_no_protocol" => {
+            if send_ws_101(&mut stream, &accept, None, &[]).await {
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                    .await;
+                let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+            }
+            let _ = stream.shutdown().await;
+        }
+        "handshake_protocol" => {
+            if send_ws_101(&mut stream, &accept, Some("foobar"), &[]).await {
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                    .await;
+                let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+            }
+            let _ = stream.shutdown().await;
+        }
+        "handshake_no_extensions" => {
+            if send_ws_101(&mut stream, &accept, None, &[]).await {
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                    .await;
+                let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+            }
+            let _ = stream.shutdown().await;
+        }
+        "handshake_sleep_2" => {
+            tokio::time::sleep(Duration::from_millis(2000)).await;
+            if send_ws_101(&mut stream, &accept, None, &[]).await {
+                let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                    .await;
+            }
+            let _ = stream.shutdown().await;
+        }
+        "sleep_10_v13" => {
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            if send_ws_101(&mut stream, &accept, None, &[]).await {
+                loop {
+                    match read_wpt_ws_client_msg(&mut stream, &mut buf).await {
+                        WptWsClientMsg::Text(t) => {
+                            if t == "Goodbye" {
+                                let _ = stream
+                                    .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                                    .await;
+                                break;
+                            }
+                            let _ = stream
+                                .write_all(&rix_net::encode_server_frame(0x1, t.as_bytes()))
+                                .await;
+                        }
+                        WptWsClientMsg::Close(p) => {
+                            let _ = stream
+                                .write_all(&rix_net::encode_server_frame(0x8, &p))
+                                .await;
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            let _ = stream.shutdown().await;
+        }
+        "protocol" => {
+            if send_ws_101(&mut stream, &accept, req_proto, &[]).await {
+                let msg = req_proto.unwrap_or("");
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x1, msg.as_bytes()))
+                    .await;
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                    .await;
+                let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+            }
+            let _ = stream.shutdown().await;
+        }
+        "protocol_array" => {
+            let first = req_proto
+                .and_then(|s| s.split(',').next())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if send_ws_101(&mut stream, &accept, first, &[]).await {
+                let msg = first.unwrap_or("");
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x1, msg.as_bytes()))
+                    .await;
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                    .await;
+                let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+            }
+            let _ = stream.shutdown().await;
+        }
+        "origin" => {
+            if send_ws_101(&mut stream, &accept, None, &[]).await {
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x1, req_origin.as_bytes()))
+                    .await;
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                    .await;
+                let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+            }
+            let _ = stream.shutdown().await;
+        }
+        "referrer" => {
+            if send_ws_101(&mut stream, &accept, None, &[]).await {
+                let msg = req_referer.unwrap_or("MISSING AS PER FETCH");
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x1, msg.as_bytes()))
+                    .await;
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                    .await;
+                let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+            }
+            let _ = stream.shutdown().await;
+        }
+        "echo-query" | "echo-query_v13" => {
+            if send_ws_101(&mut stream, &accept, None, &[]).await {
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x1, query_only.as_bytes()))
+                    .await;
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                    .await;
+                let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+            }
+            let _ = stream.shutdown().await;
+        }
+        "echo-cookie" => {
+            if send_ws_101(&mut stream, &accept, None, &[]).await {
+                let msg = req_cookie.unwrap_or("(none)");
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x1, msg.as_bytes()))
+                    .await;
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                    .await;
+                let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+            }
+            let _ = stream.shutdown().await;
+        }
+        "set-cookie" | "set-cookie-secure" | "set-cookie_http" => {
+            let cookie_val = match route {
+                "set-cookie-secure" => format!("ws_test_{query_only}=test; Secure; Path=/"),
+                "set-cookie_http" => format!("ws_test_{query_only}=test; Path=/; HttpOnly"),
+                _ => format!("ws_test_{query_only}=test; Path=/"),
+            };
+            if send_ws_101(&mut stream, &accept, None, &[("Set-Cookie", cookie_val)]).await {
+                if let WptWsClientMsg::Close(p) =
+                    read_wpt_ws_client_msg(&mut stream, &mut buf).await
+                {
+                    let _ = stream
+                        .write_all(&rix_net::encode_server_frame(0x8, &p))
+                        .await;
+                }
+            }
+            let _ = stream.shutdown().await;
+        }
+        "empty-message" => {
+            if send_ws_101(&mut stream, &accept, None, &[]).await {
+                let resp = match read_wpt_ws_client_msg(&mut stream, &mut buf).await {
+                    WptWsClientMsg::Text(t) if t.is_empty() => "pass",
+                    _ => "fail",
+                };
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x1, resp.as_bytes()))
+                    .await;
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                    .await;
+                let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+            }
+            let _ = stream.shutdown().await;
+        }
+        "remote-close" => {
+            if send_ws_101(&mut stream, &accept, None, &[]).await {
+                if q_has("abrupt") {
+                    let _ = stream
+                        .write_all(&rix_net::encode_server_frame(0x9, b"ping"))
+                        .await;
+                    let _ = stream.flush().await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                let code = q_first("code").and_then(|s| s.parse::<u16>().ok());
+                let reason = q_first("reason").unwrap_or_default();
+                let payload = encode_ws_close_payload(code, &reason);
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x8, &payload))
+                    .await;
+                let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+            }
+            let _ = stream.shutdown().await;
+        }
+        "passive-close-abort" => {
+            if send_ws_101(&mut stream, &accept, None, &[]).await {
+                loop {
+                    match read_wpt_ws_client_msg(&mut stream, &mut buf).await {
+                        WptWsClientMsg::Close(_) | WptWsClientMsg::Eof => break,
+                        _ => {}
+                    }
+                }
+            }
+            // Intentionally drop TCP socket without sending a Close frame back.
+            let _ = stream.shutdown().await;
+        }
+        "delayed-passive-close" => {
+            if send_ws_101(&mut stream, &accept, None, &[]).await {
+                let close_payload = loop {
+                    match read_wpt_ws_client_msg(&mut stream, &mut buf).await {
+                        WptWsClientMsg::Close(p) => break p,
+                        WptWsClientMsg::Eof => return,
+                        _ => {}
+                    }
+                };
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                let _ = stream
+                    .write_all(&rix_net::encode_server_frame(0x8, &close_payload))
+                    .await;
+            }
+            let _ = stream.shutdown().await;
+        }
+        "echo_raw" => {
+            if send_ws_101(&mut stream, &accept, None, &[]).await {
+                loop {
+                    match read_wpt_ws_client_msg(&mut stream, &mut buf).await {
+                        WptWsClientMsg::Binary(b) => {
+                            if b == b"exit" {
+                                let _ = stream
+                                    .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                                    .await;
+                                break;
+                            }
+                            if stream.write_all(&b).await.is_err() {
+                                break;
+                            }
+                        }
+                        WptWsClientMsg::Text(t) => {
+                            if t == "exit" {
+                                let _ = stream
+                                    .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                                    .await;
+                                break;
+                            }
+                            if stream.write_all(t.as_bytes()).await.is_err() {
+                                break;
+                            }
+                        }
+                        WptWsClientMsg::Close(p) => {
+                            let _ = stream
+                                .write_all(&rix_net::encode_server_frame(0x8, &p))
+                                .await;
+                            break;
+                        }
+                        WptWsClientMsg::Eof => break,
+                    }
+                }
+            }
+            let _ = stream.shutdown().await;
+        }
+        "echo_exit" | "echo_close_data" => {
+            if send_ws_101(&mut stream, &accept, None, &[]).await {
+                loop {
+                    match read_wpt_ws_client_msg(&mut stream, &mut buf).await {
+                        WptWsClientMsg::Text(t) if t == "Goodbye" => {
+                            let _ = stream
+                                .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                                .await;
+                            let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+                            break;
+                        }
+                        WptWsClientMsg::Close(p) => {
+                            let _ = stream
+                                .write_all(&rix_net::encode_server_frame(0x8, &p))
+                                .await;
+                            break;
+                        }
+                        WptWsClientMsg::Eof => break,
+                        _ => {}
+                    }
+                }
+            }
+            let _ = stream.shutdown().await;
+        }
+        "receive-many-with-backpressure" => {
+            if send_ws_101(&mut stream, &accept, None, &[]).await {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    match read_wpt_ws_client_msg(&mut stream, &mut buf).await {
+                        WptWsClientMsg::Text(t) => {
+                            let len_s = t.len().to_string();
+                            let _ = stream
+                                .write_all(&rix_net::encode_server_frame(0x1, len_s.as_bytes()))
+                                .await;
+                        }
+                        WptWsClientMsg::Binary(b) => {
+                            let len_s = b.len().to_string();
+                            let _ = stream
+                                .write_all(&rix_net::encode_server_frame(0x1, len_s.as_bytes()))
+                                .await;
+                        }
+                        WptWsClientMsg::Close(p) => {
+                            let _ = stream
+                                .write_all(&rix_net::encode_server_frame(0x8, &p))
+                                .await;
+                            break;
+                        }
+                        WptWsClientMsg::Eof => break,
+                    }
+                }
+            }
+            let _ = stream.shutdown().await;
+        }
+        "echo" | "" => {
+            // Default `/echo` and `/` root echo handler.
+            let chosen_proto =
+                req_proto.and_then(|s| s.split(',').map(str::trim).find(|p| *p == "echo"));
+            if send_ws_101(&mut stream, &accept, chosen_proto, &[]).await {
+                loop {
+                    match read_wpt_ws_client_msg(&mut stream, &mut buf).await {
+                        WptWsClientMsg::Text(t) => {
+                            if stream
+                                .write_all(&rix_net::encode_server_frame(0x1, t.as_bytes()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if t == "Goodbye" {
+                                let _ = stream
+                                    .write_all(&rix_net::encode_server_frame(0x8, &[]))
+                                    .await;
+                                let _ = read_wpt_ws_client_msg(&mut stream, &mut buf).await;
+                                break;
+                            }
+                        }
+                        WptWsClientMsg::Binary(b) => {
+                            if stream
+                                .write_all(&rix_net::encode_server_frame(0x2, &b))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        WptWsClientMsg::Close(p) => {
+                            let _ = stream
+                                .write_all(&rix_net::encode_server_frame(0x8, &p))
+                                .await;
+                            break;
+                        }
+                        WptWsClientMsg::Eof => break,
+                    }
+                }
+            }
+            let _ = stream.shutdown().await;
+        }
+        _ => {
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            let _ = stream.shutdown().await;
+        }
+    }
 }

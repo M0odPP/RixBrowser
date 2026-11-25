@@ -333,20 +333,27 @@ async fn rfc6455_websocket_handshake_text_binary_ping_pong_and_close() {
     assert_eq!(ws.negotiated_protocol, "chat");
 
     ws.send_text("hello rix").expect("send text");
-    let m1 = ws.recv().await.expect("msg 1").expect("ok");
+    let mut m1 = ws.recv().await.expect("msg 1").expect("ok");
+    if matches!(m1, WsMessage::Sent { .. }) {
+        m1 = ws.recv().await.expect("msg 1 text").expect("ok");
+    }
     assert_eq!(m1, WsMessage::Text("hello rix".into()));
 
     ws.send_binary(vec![1, 2, 3, 255]).expect("send bin");
-    let m2 = ws.recv().await.expect("msg 2").expect("ok");
+    let mut m2 = ws.recv().await.expect("msg 2").expect("ok");
+    if matches!(m2, WsMessage::Sent { .. }) {
+        m2 = ws.recv().await.expect("msg 2 bin").expect("ok");
+    }
     assert_eq!(m2, WsMessage::Binary(vec![1, 2, 3, 255]));
 
-    ws.close(1000, "bye").expect("close");
+    ws.close(Some(1000), "bye").expect("close");
     let m3 = ws.recv().await.expect("close msg").expect("ok");
     assert_eq!(
         m3,
         WsMessage::Close {
             code: 1000,
-            reason: "bye".into()
+            reason: "bye".into(),
+            was_clean: true,
         }
     );
 }

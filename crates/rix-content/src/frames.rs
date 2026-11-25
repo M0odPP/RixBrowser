@@ -1292,6 +1292,9 @@ fn install_same_origin_child_globals(
         "FileReader",
         "XMLHttpRequest",
         "WebSocket",
+        "CloseEvent",
+        "localStorage",
+        "sessionStorage",
         "TextDecoderStream",
         "TextEncoderStream",
         "CountQueuingStrategy",
@@ -2380,6 +2383,7 @@ fn install_message_event(vm: &mut JsVm, events: &SharedEvents, frames: &SharedFr
     vm.heap
         .object_set_prototype(me_proto, Some(ep), &mut vm.shapes);
     vm.heap.get_object_mut(me_proto).unwrap().is_prototype = true;
+    crate::streams_common::set_to_string_tag(vm, me_proto, "MessageEvent");
     frames.borrow_mut().message_event_proto = Some(me_proto);
 
     let ev_ref = Rc::clone(events);

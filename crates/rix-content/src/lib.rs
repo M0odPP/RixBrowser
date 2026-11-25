@@ -43,6 +43,7 @@ pub mod webaudio;
 pub mod webgl2;
 pub mod webgpu;
 pub mod webgpu_types;
+mod websocket_stream;
 pub mod workers;
 
 use std::cell::RefCell;
