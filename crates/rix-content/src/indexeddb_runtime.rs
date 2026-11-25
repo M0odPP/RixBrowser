@@ -3,8 +3,6 @@
 //!
 //! Reference: W3C Indexed Database API 3.0 §2.7, §4, §5.
 
-#![allow(dead_code)]
-
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::rc::Rc;

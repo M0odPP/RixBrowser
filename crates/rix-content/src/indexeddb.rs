@@ -6,7 +6,7 @@
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use rix_js::promise::{alloc_promise, reject_promise, resolve_promise};
@@ -16,24 +16,34 @@ use rix_storage::{IdbDatabaseSnapshot, IdbIndexSchema, IdbStoreSnapshot};
 use crate::canvas2d::SharedCanvas2D;
 use crate::dom_bridge::SharedHost;
 use crate::dom_interfaces::define_to_string_tag;
-use crate::event_loop::{SharedEventLoop, TaskPriority};
+use crate::event_loop::SharedEventLoop;
 use crate::events::{
-    fire_idb_event, install_object_event_handler_accessor, register_constructed_event, SharedEvents,
+    install_object_event_handler_accessor, register_constructed_event, SharedEvents,
 };
 use crate::fetch_ws::SharedNetBridge;
 use crate::frames::{decode_structured_json, SharedFrames};
 use crate::indexeddb_engine::{
     alloc_dom_string_list, alloc_js_array, collect_index_entries, collect_store_entries,
-    enforce_range_idb_version, enforce_range_u32, idb_key_to_js, js_to_idb_key, parse_key_path_arg,
-    store_put_or_add_payload, validate_put_or_add_sync, CursorDirection, IdbCursorEntry, KeyRange,
+    enforce_range_idb_version, enforce_range_u32, idb_key_to_js, js_to_idb_key, parse_key_path_raw,
+    store_put_or_add_payload, validate_key_path_syntax, validate_put_or_add_sync, CursorDirection,
+    CursorStepRequest, IdbCursorEntry, KeyRange,
+};
+use crate::indexeddb_runtime::{
+    alloc_request, begin_tx_abort, check_index_for_request, check_store_for_request,
+    enqueue_tx_request, idb_err, pump_db_tx_queue, pump_tx_ops, pump_tx_ops_ctx,
+    schedule_factory_pump, schedule_tx_commit, CloneDeps, IdbCtx, IdbCursorState, IdbIndexHandle,
+    IdbStoreHandle, IdbTransactionState, PendingFactoryOp, TxMode, TxOp, TxState,
+};
+pub use crate::indexeddb_runtime::{
+    IdbRuntimeState as IndexedDbSystem, SharedIdbRuntime as SharedIndexedDb,
 };
 use crate::structured_clone::{
     decode_storage_payload, deserialize_for_storage, serialize_for_storage, CloneContext,
     StructuredClonePayload,
 };
 use crate::web_apis::{
-    arg, bind_ctor_proto, create_dom_exception, define_global, define_host_getter,
-    define_host_method, SharedWebApis,
+    arg, bind_ctor_proto, create_dom_exception, define_global, define_host_accessor,
+    define_host_getter, define_host_method, SharedWebApis,
 };
 use crate::workers::SharedWorkers;
 
@@ -44,7 +54,17 @@ fn idb_frames(idb: &SharedIndexedDb) -> Option<SharedFrames> {
         .map(|d| Rc::clone(&d.frames))
 }
 
-fn idb_effective_origin(web_apis: &SharedWebApis, idb: &SharedIndexedDb) -> String {
+fn idb_effective_origin(vm: &mut JsVm, web_apis: &SharedWebApis, idb: &SharedIndexedDb) -> String {
+    // Sandboxed iframes run inside a local global whose own `origin` is `"null"`.
+    let k_orig = vm.heap.intern_key("origin");
+    if let Some(p) = vm.heap.object_get_own(vm.global, k_orig, &vm.shapes) {
+        if p.value.is_string() {
+            let s = vm.value_to_rust_string(p.value);
+            if s == "null" {
+                return s;
+            }
+        }
+    }
     if let Some(frames) = idb_frames(idb) {
         return frames.borrow().effective_origin(web_apis);
     }
@@ -353,559 +373,30 @@ fn parse_get_all_options_dict(
     Ok((range, count, direction))
 }
 
-// ---------------------------------------------------------------------------
-// Internal IndexedDB runtime tables & ACID transaction state
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TxMode {
-    ReadOnly,
-    ReadWrite,
-    VersionChange,
-}
-
-impl TxMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "readonly",
-            Self::ReadWrite => "readwrite",
-            Self::VersionChange => "versionchange",
-        }
-    }
-}
-
-struct IdbRequestState {
-    result: JsValue,
-    error: JsValue,
-    ready_state: &'static str,
-    source: JsValue,
-    transaction: JsValue,
-}
-
-struct IdbDatabaseState {
-    origin: String,
-    name: String,
-    version: u64,
-    store_names: Vec<String>,
-    closed: bool,
-    active_versionchange_tx: Option<HeapHandle>,
-}
-
-struct IdbTransactionState {
-    db_h: HeapHandle,
-    origin: String,
-    mode: TxMode,
-    durability: &'static str,
-    scope: Vec<String>,
-    working: IdbDatabaseSnapshot,
-    old_version: u64,
-    finished: bool,
-    aborted: bool,
-    pending_requests: usize,
-    commit_scheduled: bool,
-    error: JsValue,
-    versionchange_open_req: Option<HeapHandle>,
-}
-
-struct IdbStoreHandle {
-    tx_h: HeapHandle,
-    name: String,
-    cached_key_path: Option<JsValue>,
-}
-
-struct IdbIndexHandle {
-    tx_h: HeapHandle,
-    store_h: HeapHandle,
-    store_name: String,
-    index_name: String,
-    cached_key_path: Option<JsValue>,
-}
-
-struct IdbCursorState {
-    tx_h: HeapHandle,
-    req_h: HeapHandle,
-    source_h: HeapHandle,
-    store_name: String,
-    index_name: Option<String>,
-    range: Option<KeyRange>,
-    direction: CursorDirection,
-    key_only: bool,
-    initialized: bool,
-    entries: Vec<IdbCursorEntry>,
-    index: usize,
-    got_value: bool,
-}
-
-#[derive(Default)]
-struct IdbPrototypes {
-    factory_proto: Option<HeapHandle>,
-    request_proto: Option<HeapHandle>,
-    open_request_proto: Option<HeapHandle>,
-    database_proto: Option<HeapHandle>,
-    transaction_proto: Option<HeapHandle>,
-    object_store_proto: Option<HeapHandle>,
-    index_proto: Option<HeapHandle>,
-    cursor_proto: Option<HeapHandle>,
-    cursor_with_value_proto: Option<HeapHandle>,
-    key_range_proto: Option<HeapHandle>,
-    version_change_event_proto: Option<HeapHandle>,
-    dom_string_list_proto: Option<HeapHandle>,
-    record_proto: Option<HeapHandle>,
-}
-
-#[derive(Clone)]
-struct CloneDeps {
-    net: SharedNetBridge,
-    canvas2d: SharedCanvas2D,
-    frames: SharedFrames,
-    workers: SharedWorkers,
-}
-
-/// Content-runtime registry of active IndexedDB handles, transactions, and prototypes.
-#[derive(Default)]
-pub struct IndexedDbSystem {
-    requests: HashMap<HeapHandle, IdbRequestState>,
-    databases: HashMap<HeapHandle, IdbDatabaseState>,
-    transactions: HashMap<HeapHandle, IdbTransactionState>,
-    stores: HashMap<HeapHandle, IdbStoreHandle>,
-    indexes: HashMap<HeapHandle, IdbIndexHandle>,
-    cursors: HashMap<HeapHandle, IdbCursorState>,
-    key_ranges: HashMap<HeapHandle, KeyRange>,
-    protos: IdbPrototypes,
-    clone_deps: Option<CloneDeps>,
-}
-
-/// Shared handle to [`IndexedDbSystem`].
-pub type SharedIndexedDb = Rc<RefCell<IndexedDbSystem>>;
-
-impl IndexedDbSystem {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Collects GC roots for active transactions, requests, databases, cursors, and prototypes.
-    pub fn collect_roots(&self, out: &mut Vec<JsValue>) {
-        for p in [
-            self.protos.factory_proto,
-            self.protos.request_proto,
-            self.protos.open_request_proto,
-            self.protos.database_proto,
-            self.protos.transaction_proto,
-            self.protos.object_store_proto,
-            self.protos.index_proto,
-            self.protos.cursor_proto,
-            self.protos.cursor_with_value_proto,
-            self.protos.key_range_proto,
-            self.protos.version_change_event_proto,
-            self.protos.dom_string_list_proto,
-            self.protos.record_proto,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            out.push(JsValue::from_object(p));
-        }
-        for (&th, tx) in &self.transactions {
-            if !tx.finished {
-                out.push(JsValue::from_object(th));
-                out.push(JsValue::from_object(tx.db_h));
-                out.push(tx.error);
-                if let Some(req) = tx.versionchange_open_req {
-                    out.push(JsValue::from_object(req));
-                }
-            }
-        }
-        for (&rh, req) in &self.requests {
-            if req.ready_state == "pending" {
-                out.push(JsValue::from_object(rh));
-            }
-            out.push(req.result);
-            out.push(req.error);
-            out.push(req.source);
-            out.push(req.transaction);
-        }
-        for s in self.stores.values() {
-            if let Some(kp) = s.cached_key_path {
-                out.push(kp);
-            }
-        }
-        for i in self.indexes.values() {
-            if let Some(kp) = i.cached_key_path {
-                out.push(kp);
-            }
-        }
-        for (&ch, c) in &self.cursors {
-            let active = self.transactions.get(&c.tx_h).is_some_and(|t| !t.finished)
-                || self
-                    .requests
-                    .get(&c.req_h)
-                    .is_some_and(|r| r.ready_state == "pending");
-            if active {
-                out.push(JsValue::from_object(ch));
-                out.push(JsValue::from_object(c.req_h));
-                out.push(JsValue::from_object(c.source_h));
-                out.push(JsValue::from_object(c.tx_h));
-            }
-        }
-    }
-
-    /// Sweeps dead JS wrapper handles after Major GC.
-    pub fn sweep_dead(&mut self, heap: &rix_js::GcHeap) {
-        self.requests
-            .retain(|h, r| r.ready_state == "pending" || heap.is_alive(*h));
-        self.databases.retain(|h, _| heap.is_alive(*h));
-        self.transactions
-            .retain(|h, tx| !tx.finished || heap.is_alive(*h));
-        self.stores.retain(|h, _| heap.is_alive(*h));
-        self.indexes.retain(|h, _| heap.is_alive(*h));
-        self.cursors.retain(|h, _| heap.is_alive(*h));
-        self.key_ranges.retain(|h, _| heap.is_alive(*h));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Request & Transaction async scheduling (Networking vs Idle priority!)
-// ---------------------------------------------------------------------------
-
-fn alloc_request(
-    vm: &mut JsVm,
-    events: &SharedEvents,
-    idb: &SharedIndexedDb,
-    is_open: bool,
-    source: JsValue,
-    transaction: JsValue,
-) -> HeapHandle {
-    let proto = {
-        let st = idb.borrow();
-        if is_open {
-            st.protos.open_request_proto
-        } else {
-            st.protos.request_proto
-        }
-        .unwrap_or(vm.object_proto)
-    };
-    let h = vm
-        .heap
-        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
-    if let Some(tx_h) = transaction.as_object() {
-        events.borrow_mut().set_object_event_parent(h, Some(tx_h));
-    }
-    idb.borrow_mut().requests.insert(
-        h,
-        IdbRequestState {
-            result: JsValue::UNDEFINED,
-            error: JsValue::NULL,
-            ready_state: "pending",
-            source,
-            transaction,
-        },
-    );
-    h
-}
-
-fn abort_tx_with_error(
-    vm: &mut JsVm,
-    idb: &SharedIndexedDb,
-    tx_h: HeapHandle,
-    err_name: &str,
-    err_msg: &str,
-) {
-    let dom_err = create_dom_exception(vm, err_name, err_msg).value;
-    if let Some(tx) = idb.borrow_mut().transactions.get_mut(&tx_h) {
-        if !tx.finished {
-            tx.aborted = true;
-            tx.error = dom_err;
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-fn schedule_tx_commit_check(
-    host: &SharedHost,
-    events: &SharedEvents,
-    event_loop: &SharedEventLoop,
-    web_apis: &SharedWebApis,
-    idb: &SharedIndexedDb,
-    tx_h: HeapHandle,
-) {
-    let should_schedule = {
-        let mut st = idb.borrow_mut();
-        match st.transactions.get_mut(&tx_h) {
-            Some(tx) if !tx.finished && !tx.commit_scheduled => {
-                tx.commit_scheduled = true;
-                true
-            }
-            _ => false,
-        }
-    };
-    if !should_schedule {
-        return;
-    }
-    let h = Rc::clone(host);
-    let ev = Rc::clone(events);
-    let el = Rc::clone(event_loop);
-    let wa = Rc::clone(web_apis);
-    let db_sys = Rc::clone(idb);
-    event_loop
-        .borrow_mut()
-        .post_host_task(TaskPriority::Idle, move |vm| {
-            let outcome = {
-                let mut st = db_sys.borrow_mut();
-                let Some(tx) = st.transactions.get_mut(&tx_h) else {
-                    return;
-                };
-                tx.commit_scheduled = false;
-                if tx.finished {
-                    return;
-                }
-                if tx.pending_requests > 0 {
-                    // More requests still in flight at `Networking` priority; re-check later.
-                    None
-                } else {
-                    tx.finished = true;
-                    let db_h = tx.db_h;
-                    let aborted = tx.aborted;
-                    let mode = tx.mode;
-                    let origin = tx.origin.clone();
-                    let old_version = tx.old_version;
-                    let working = tx.working.clone();
-                    let open_req = tx.versionchange_open_req.take();
-                    let err_val = tx.error;
-                    if let Some(db) = st.databases.get_mut(&db_h) {
-                        if db.active_versionchange_tx == Some(tx_h) {
-                            db.active_versionchange_tx = None;
-                        }
-                        if mode == TxMode::VersionChange {
-                            if aborted {
-                                db.version = old_version;
-                            } else {
-                                db.version = working.version;
-                                db.store_names = working.stores.keys().cloned().collect();
-                            }
-                        }
-                    }
-                    Some((db_h, aborted, mode, origin, working, open_req, err_val))
-                }
-            };
-
-            let Some((db_h, aborted, mode, origin, working, open_req, err_val)) = outcome else {
-                schedule_tx_commit_check(&h, &ev, &el, &wa, &db_sys, tx_h);
-                return;
-            };
-
-            let ev_proto = ev.borrow().event_proto.unwrap_or(vm.object_proto);
-
-            if aborted {
-                // Transaction rolled back: ZERO writes to redb!
-                // W3C IDB §5.5: `abort` event bubbles (`transaction -> database`), not cancelable.
-                let _ = fire_idb_event(vm, &h, &ev, &el, tx_h, "abort", true, false, ev_proto, &[]);
-                if let Some(req_h) = open_req {
-                    let abort_err = if err_val.is_null() || err_val.is_undefined() {
-                        create_dom_exception(vm, "AbortError", "Version change transaction aborted")
-                            .value
-                    } else {
-                        err_val
-                    };
-                    if let Some(r) = db_sys.borrow_mut().requests.get_mut(&req_h) {
-                        r.ready_state = "done";
-                        r.result = JsValue::UNDEFINED;
-                        r.error = abort_err;
-                        r.transaction = JsValue::NULL;
-                    }
-                    ev.borrow_mut().set_object_event_parent(req_h, None);
-                    let _ =
-                        fire_idb_event(vm, &h, &ev, &el, req_h, "error", true, true, ev_proto, &[]);
-                }
-                return;
-            }
-
-            if mode != TxMode::ReadOnly {
-                let storage = wa.borrow().storage.clone();
-                if let Err(e) = storage.idb_commit_database(&origin, &working) {
-                    let dom_err = create_dom_exception(vm, "AbortError", &e.to_string()).value;
-                    if let Some(tx) = db_sys.borrow_mut().transactions.get_mut(&tx_h) {
-                        tx.aborted = true;
-                        tx.error = dom_err;
-                    }
-                    let _ =
-                        fire_idb_event(vm, &h, &ev, &el, tx_h, "abort", true, false, ev_proto, &[]);
-                    return;
-                }
-            }
-
-            let _ = fire_idb_event(
-                vm,
-                &h,
-                &ev,
-                &el,
-                tx_h,
-                "complete",
-                false,
-                false,
-                ev_proto,
-                &[],
-            );
-
-            if let Some(req_h) = open_req {
-                if let Some(r) = db_sys.borrow_mut().requests.get_mut(&req_h) {
-                    r.ready_state = "done";
-                    r.result = JsValue::from_object(db_h);
-                    r.error = JsValue::NULL;
-                    r.transaction = JsValue::NULL;
-                }
-                ev.borrow_mut().set_object_event_parent(req_h, None);
-                let _ = fire_idb_event(
-                    vm,
-                    &h,
-                    &ev,
-                    &el,
-                    req_h,
-                    "success",
-                    false,
-                    false,
-                    ev_proto,
-                    &[],
-                );
-            }
-        });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn enqueue_tx_request<F>(
+fn serialize_while_tx_inactive(
     vm: &mut JsVm,
     host: &SharedHost,
     events: &SharedEvents,
-    event_loop: &SharedEventLoop,
     web_apis: &SharedWebApis,
     idb: &SharedIndexedDb,
     tx_h: HeapHandle,
-    source_h: HeapHandle,
-    op: F,
-) -> Result<HeapHandle, JsException>
-where
-    F: FnOnce(&mut JsVm, &mut IdbTransactionState) -> Result<JsValue, (&'static str, String)>
-        + 'static,
-{
-    {
-        let mut st = idb.borrow_mut();
-        let Some(tx) = st.transactions.get_mut(&tx_h) else {
-            return Err(create_dom_exception(
-                vm,
-                "TransactionInactiveError",
-                "IndexedDB transaction does not exist",
-            ));
-        };
-        if tx.finished || tx.aborted {
-            return Err(create_dom_exception(
-                vm,
-                "TransactionInactiveError",
-                "IndexedDB transaction is not active",
-            ));
-        }
-        tx.pending_requests += 1;
-    }
-
-    let req_h = alloc_request(
-        vm,
-        events,
-        idb,
-        false,
-        JsValue::from_object(source_h),
-        JsValue::from_object(tx_h),
-    );
-    schedule_tx_commit_check(host, events, event_loop, web_apis, idb, tx_h);
-
-    let h = Rc::clone(host);
-    let ev = Rc::clone(events);
-    let el = Rc::clone(event_loop);
-    let wa = Rc::clone(web_apis);
-    let db_sys = Rc::clone(idb);
-    event_loop
-        .borrow_mut()
-        .post_host_task(TaskPriority::Networking, move |vm| {
-            let mut aborted_early = false;
-            let op_res = {
-                let mut st = db_sys.borrow_mut();
-                let Some(tx) = st.transactions.get_mut(&tx_h) else {
-                    return;
-                };
-                tx.pending_requests = tx.pending_requests.saturating_sub(1);
-                if tx.aborted || tx.finished {
-                    aborted_early = true;
-                    Err(("AbortError", "Transaction was aborted".to_string()))
-                } else {
-                    op(vm, tx)
-                }
-            };
-
-            let ev_proto = ev.borrow().event_proto.unwrap_or(vm.object_proto);
-            match op_res {
-                Ok(result_val) => {
-                    if let Some(r) = db_sys.borrow_mut().requests.get_mut(&req_h) {
-                        r.ready_state = "done";
-                        r.result = result_val;
-                        r.error = JsValue::NULL;
-                    }
-                    let (_, threw) = fire_idb_event(
-                        vm,
-                        &h,
-                        &ev,
-                        &el,
-                        req_h,
-                        "success",
-                        false,
-                        false,
-                        ev_proto,
-                        &[],
-                    );
-                    if threw {
-                        abort_tx_with_error(
-                            vm,
-                            &db_sys,
-                            tx_h,
-                            "AbortError",
-                            "Uncaught exception in success event handler",
-                        );
-                    }
-                }
-                Err((err_name, err_msg)) => {
-                    let dom_err = create_dom_exception(vm, err_name, &err_msg).value;
-                    if let Some(r) = db_sys.borrow_mut().requests.get_mut(&req_h) {
-                        r.ready_state = "done";
-                        r.result = JsValue::UNDEFINED;
-                        r.error = dom_err;
-                    }
-                    // W3C IDB §5.5: fire bubbling, cancelable `error` event along `req -> tx -> db`.
-                    // If ANY listener threw an uncaught exception, abort tx with `AbortError`
-                    // (even if `preventDefault()` was called!). Otherwise, if NOT canceled and
-                    // not already aborted, abort tx with the request's error.
-                    let (prevented, threw) =
-                        fire_idb_event(vm, &h, &ev, &el, req_h, "error", true, true, ev_proto, &[]);
-                    if !aborted_early {
-                        if threw {
-                            abort_tx_with_error(
-                                vm,
-                                &db_sys,
-                                tx_h,
-                                "AbortError",
-                                "Uncaught exception in error event handler",
-                            );
-                        } else if !prevented {
-                            if let Some(tx) = db_sys.borrow_mut().transactions.get_mut(&tx_h) {
-                                if !tx.finished {
-                                    tx.aborted = true;
-                                    tx.error = dom_err;
-                                }
-                            }
-                        }
-                    }
-                }
+    val: JsValue,
+) -> Result<StructuredClonePayload, JsException> {
+    let prev_state = idb.borrow_mut().transactions.get_mut(&tx_h).map(|t| {
+        let prev = t.state;
+        t.state = TxState::Inactive;
+        prev
+    });
+    let res = idb_serialize_value(vm, host, events, web_apis, idb, val);
+    if let Some(prev) = prev_state {
+        if let Some(t) = idb.borrow_mut().transactions.get_mut(&tx_h) {
+            if t.state == TxState::Inactive && !t.aborted && !t.aborting {
+                t.state = prev;
             }
-            schedule_tx_commit_check(&h, &ev, &el, &wa, &db_sys, tx_h);
-        });
-
-    Ok(req_h)
+        }
+    }
+    res
 }
 
 // ---------------------------------------------------------------------------
@@ -948,6 +439,50 @@ pub fn install_indexeddb(
     install_idb_transaction_proto(vm, host, events, event_loop, web_apis, &idb);
     install_idb_database_proto(vm, host, events, event_loop, web_apis, &idb);
     install_idb_factory(vm, host, events, event_loop, web_apis, &idb);
+
+    // W3C IDB §5.4: deactivate Active transactions (not currently inside event dispatch) at the
+    // end of each WHATWG microtask checkpoint, and trigger auto-commit when idle with 0 ops.
+    // Capture `Weak` handles so `event_loop -> checkpoint_hooks -> event_loop` never forms an Rc
+    // cycle that keeps `WebApiState` / `StorageEngine` (`redb`) alive after `ContentRuntime` drops.
+    let h_ck = Rc::downgrade(host);
+    let ev_ck = Rc::downgrade(events);
+    let el_ck = Rc::downgrade(event_loop);
+    let wa_ck = Rc::downgrade(web_apis);
+    let idb_ck = Rc::downgrade(&idb);
+    event_loop
+        .borrow_mut()
+        .add_checkpoint_hook(Rc::new(RefCell::new(Box::new(move |_vm| {
+            let (Some(h_r), Some(ev_r), Some(el_r), Some(wa_r), Some(idb_r)) = (
+                h_ck.upgrade(),
+                ev_ck.upgrade(),
+                el_ck.upgrade(),
+                wa_ck.upgrade(),
+                idb_ck.upgrade(),
+            ) else {
+                return;
+            };
+            let to_commit: Vec<HeapHandle> = {
+                let mut st = idb_r.borrow_mut();
+                let mut ready = Vec::new();
+                for (&th, tx) in &mut st.transactions {
+                    if tx.state == TxState::Active && tx.dispatching_depth == 0 {
+                        tx.state = TxState::Inactive;
+                        if tx.started
+                            && !tx.aborted
+                            && !tx.aborting
+                            && !tx.in_flight_op
+                            && tx.queued_ops.is_empty()
+                        {
+                            ready.push(th);
+                        }
+                    }
+                }
+                ready
+            };
+            for th in to_commit {
+                schedule_tx_commit(&h_r, &ev_r, &el_r, &wa_r, &idb_r, th);
+            }
+        }))));
 
     idb
 }
@@ -1527,16 +1062,24 @@ fn install_idb_cursor_proto(
             let Some(h) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
-            let key = {
+            let (cached, key) = {
                 let st = db.borrow();
                 let Some(c) = st.cursors.get(&h) else {
                     return Err(vm.type_error("Illegal invocation"));
                 };
-                c.entries.get(c.index).map(|e| e.key.clone())
+                (c.cached_key_js, c.current.as_ref().map(|e| e.key.clone()))
             };
-            Ok(key
-                .as_ref()
-                .map_or(JsValue::UNDEFINED, |k| idb_key_to_js(vm, k)))
+            if let Some(v) = cached {
+                return Ok(v);
+            }
+            let Some(k) = key else {
+                return Ok(JsValue::UNDEFINED);
+            };
+            let v = idb_key_to_js(vm, &k);
+            if let Some(c) = db.borrow_mut().cursors.get_mut(&h) {
+                c.cached_key_js = Some(v);
+            }
+            Ok(v)
         });
     }
     {
@@ -1545,16 +1088,27 @@ fn install_idb_cursor_proto(
             let Some(h) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
-            let pk = {
+            let (cached, pk) = {
                 let st = db.borrow();
                 let Some(c) = st.cursors.get(&h) else {
                     return Err(vm.type_error("Illegal invocation"));
                 };
-                c.entries.get(c.index).map(|e| e.primary_key.clone())
+                (
+                    c.cached_pk_js,
+                    c.current.as_ref().map(|e| e.primary_key.clone()),
+                )
             };
-            Ok(pk
-                .as_ref()
-                .map_or(JsValue::UNDEFINED, |k| idb_key_to_js(vm, k)))
+            if let Some(v) = cached {
+                return Ok(v);
+            }
+            let Some(k) = pk else {
+                return Ok(JsValue::UNDEFINED);
+            };
+            let v = idb_key_to_js(vm, &k);
+            if let Some(c) = db.borrow_mut().cursors.get_mut(&h) {
+                c.cached_pk_js = Some(v);
+            }
+            Ok(v)
         });
     }
     // `.value` belongs strictly on `IDBCursorWithValue.prototype`, NOT `IDBCursor.prototype`!
@@ -1567,7 +1121,7 @@ fn install_idb_cursor_proto(
             let Some(h) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
-            let (val_data, deps) = {
+            let (cached, val_data, deps) = {
                 let st = db.borrow();
                 let Some(c) = st.cursors.get(&h) else {
                     return Err(vm.type_error("Illegal invocation"));
@@ -1576,112 +1130,218 @@ fn install_idb_cursor_proto(
                     return Err(vm.type_error("Illegal invocation"));
                 }
                 (
-                    c.entries
-                        .get(c.index)
+                    c.cached_val_js,
+                    c.current
+                        .as_ref()
                         .map(|e| (e.value_bytes.clone(), e.value_json.clone())),
                     st.clone_deps.clone(),
                 )
             };
+            if let Some(v) = cached {
+                return Ok(v);
+            }
             let Some((vb, vj)) = val_data else {
                 return Ok(JsValue::UNDEFINED);
             };
-            Ok(idb_deserialize_entry(
-                vm,
-                &h_r,
-                &ev_r,
-                &wa_r,
-                deps.as_ref(),
-                &vb,
-                &vj,
-            ))
+            let v = idb_deserialize_entry(vm, &h_r, &ev_r, &wa_r, deps.as_ref(), &vb, &vj);
+            if let Some(c) = db.borrow_mut().cursors.get_mut(&h) {
+                c.cached_val_js = Some(v);
+            }
+            Ok(v)
         });
+    }
+
+    // Shared cursor validation helpers.
+    fn cursor_source_deleted(st: &IndexedDbSystem, c: &IdbCursorState) -> bool {
+        if let Some(s) = st.stores.get(&c.source_h) {
+            return s.deleted;
+        }
+        if let Some(i) = st.indexes.get(&c.source_h) {
+            return i.deleted || st.stores.get(&i.store_h).is_some_and(|s| s.deleted);
+        }
+        let Some(tx) = st.transactions.get(&c.tx_h) else {
+            return true;
+        };
+        let Some(store) = tx.store_snap(c.store_id) else {
+            return true;
+        };
+        c.index_id.is_some_and(|iid| {
+            tx.index_name(c.store_id, iid)
+                .and_then(|n| store.indexes.get(n))
+                .is_none()
+        })
+    }
+
+    fn validate_cursor_step<'a>(
+        vm: &mut JsVm,
+        st: &'a IndexedDbSystem,
+        ch: HeapHandle,
+        require_non_unique_index: bool,
+    ) -> Result<&'a IdbCursorState, JsException> {
+        let c = st
+            .cursors
+            .get(&ch)
+            .ok_or_else(|| vm.type_error("Illegal invocation"))?;
+        if !st
+            .transactions
+            .get(&c.tx_h)
+            .is_some_and(|t| t.state == TxState::Active && !t.aborted && !t.aborting)
+        {
+            return Err(idb_err(
+                vm,
+                "TransactionInactiveError",
+                "Transaction is not active",
+            ));
+        }
+        if cursor_source_deleted(st, c) {
+            return Err(idb_err(
+                vm,
+                "InvalidStateError",
+                "Cursor source or object store has been deleted",
+            ));
+        }
+        if require_non_unique_index && (c.index_id.is_none() || c.direction.is_unique()) {
+            return Err(idb_err(
+                vm,
+                "InvalidAccessError",
+                "continuePrimaryKey() requires a non-unique index cursor",
+            ));
+        }
+        if !c.got_value {
+            return Err(idb_err(
+                vm,
+                "InvalidStateError",
+                "Cursor has already been iterated",
+            ));
+        }
+        Ok(c)
+    }
+
+    fn validate_cursor_mutate(
+        vm: &mut JsVm,
+        st: &IndexedDbSystem,
+        ch: HeapHandle,
+    ) -> Result<(HeapHandle, u64, rix_storage::IdbKey), JsException> {
+        let c = st
+            .cursors
+            .get(&ch)
+            .ok_or_else(|| vm.type_error("Illegal invocation"))?;
+        let tx = st
+            .transactions
+            .get(&c.tx_h)
+            .ok_or_else(|| idb_err(vm, "TransactionInactiveError", "Transaction is not active"))?;
+        if tx.state != TxState::Active || tx.aborted || tx.aborting {
+            return Err(idb_err(
+                vm,
+                "TransactionInactiveError",
+                "Transaction is not active",
+            ));
+        }
+        if tx.mode == TxMode::ReadOnly {
+            return Err(idb_err(
+                vm,
+                "ReadOnlyError",
+                "Cannot mutate cursor inside a readonly transaction",
+            ));
+        }
+        if cursor_source_deleted(st, c) {
+            return Err(idb_err(
+                vm,
+                "InvalidStateError",
+                "Cursor source or object store has been deleted",
+            ));
+        }
+        if !c.got_value || c.key_only {
+            return Err(idb_err(
+                vm,
+                "InvalidStateError",
+                "Cannot mutate a key cursor or cursor without a value",
+            ));
+        }
+        let entry = c
+            .current
+            .as_ref()
+            .ok_or_else(|| idb_err(vm, "InvalidStateError", "Cursor has no current value"))?;
+        Ok((c.tx_h, c.store_id, entry.primary_key.clone()))
+    }
+
+    fn queue_cursor_step(
+        db: &SharedIndexedDb,
+        ch: HeapHandle,
+        tx_h: HeapHandle,
+        req_h: HeapHandle,
+        step: CursorStepRequest,
+    ) {
+        let mut st = db.borrow_mut();
+        if let Some(c) = st.cursors.get_mut(&ch) {
+            c.got_value = false;
+        }
+        if let Some(r) = st.requests.get_mut(&req_h) {
+            r.ready_state = "pending";
+        }
+        if let Some(tx) = st.transactions.get_mut(&tx_h) {
+            tx.queued_ops.push_back(TxOp::CursorStep {
+                req_h,
+                cursor_h: ch,
+                step,
+            });
+        }
     }
 
     // cursor.continue(key?)
     {
-        let h_r = Rc::clone(host);
-        let ev_r = Rc::clone(events);
-        let el_r = Rc::clone(event_loop);
-        let wa_r = Rc::clone(web_apis);
-        let db_r = Rc::clone(idb);
+        let ctx = IdbCtx::new(host, events, event_loop, web_apis, idb);
         define_host_method(vm, proto, "continue", move |vm, this_val, args| {
             let Some(ch) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
+            let (tx_h, req_h, dir, cur_key) = {
+                let st = ctx.idb.borrow();
+                let c = validate_cursor_step(vm, &st, ch, false)?;
+                (
+                    c.tx_h,
+                    c.req_h,
+                    c.direction,
+                    c.current.as_ref().map(|e| e.key.clone()),
+                )
+            };
             let target_key = if arg(args, 0).is_undefined() {
                 None
             } else {
-                let frames = idb_frames(&db_r);
+                let frames = idb_frames(&ctx.idb);
                 let mut seen = HashSet::new();
-                Some(js_to_idb_key(vm, frames.as_ref(), arg(args, 0), &mut seen)?)
-            };
-            let (tx_h, req_h) = {
-                let mut st = db_r.borrow_mut();
-                let Some(c) = st.cursors.get_mut(&ch) else {
-                    return Err(vm.type_error("Illegal invocation"));
-                };
-                if !c.got_value {
-                    return Err(create_dom_exception(
-                        vm,
-                        "InvalidStateError",
-                        "Cursor has already been iterated",
-                    ));
-                }
-                if let Some(ref tk) = target_key {
-                    if let Some(cur_entry) = c.entries.get(c.index) {
-                        let invalid = if c.direction.is_reverse() {
-                            tk.idb_cmp(&cur_entry.key) != Ordering::Less
-                        } else {
-                            tk.idb_cmp(&cur_entry.key) != Ordering::Greater
-                        };
-                        if invalid {
-                            return Err(create_dom_exception(
-                                vm,
-                                "DataError",
-                                "Cursor continue() key does not advance in cursor direction",
-                            ));
-                        }
+                let tk = js_to_idb_key(vm, frames.as_ref(), arg(args, 0), &mut seen)?;
+                if let Some(ref ck) = cur_key {
+                    let invalid = if dir.is_reverse() {
+                        tk.idb_cmp(ck) != Ordering::Less
+                    } else {
+                        tk.idb_cmp(ck) != Ordering::Greater
+                    };
+                    if invalid {
+                        return Err(idb_err(
+                            vm,
+                            "DataError",
+                            "Cursor continue() key does not advance in cursor direction",
+                        ));
                     }
-                    let mut next_idx = c.index + 1;
-                    while next_idx < c.entries.len() {
-                        let ek = &c.entries[next_idx].key;
-                        let reached = if c.direction.is_reverse() {
-                            ek.idb_cmp(tk) != Ordering::Greater
-                        } else {
-                            ek.idb_cmp(tk) != Ordering::Less
-                        };
-                        if reached {
-                            break;
-                        }
-                        next_idx += 1;
-                    }
-                    c.index = next_idx;
-                } else {
-                    c.index += 1;
                 }
-                c.got_value = false;
-                let tx_h = c.tx_h;
-                let req_h = c.req_h;
-                if let Some(r) = st.requests.get_mut(&req_h) {
-                    r.ready_state = "pending";
-                }
-                if let Some(tx) = st.transactions.get_mut(&tx_h) {
-                    tx.pending_requests += 1;
-                }
-                (tx_h, req_h)
+                Some(tk)
             };
-            schedule_cursor_step(&h_r, &ev_r, &el_r, &wa_r, &db_r, tx_h, req_h, ch);
+            queue_cursor_step(
+                &ctx.idb,
+                ch,
+                tx_h,
+                req_h,
+                CursorStepRequest::Continue(target_key),
+            );
+            pump_tx_ops_ctx(&ctx, tx_h);
             Ok(JsValue::UNDEFINED)
         });
     }
 
     // cursor.continuePrimaryKey(key, primaryKey)
     {
-        let h_r = Rc::clone(host);
-        let ev_r = Rc::clone(events);
-        let el_r = Rc::clone(event_loop);
-        let wa_r = Rc::clone(web_apis);
-        let db_r = Rc::clone(idb);
+        let ctx = IdbCtx::new(host, events, event_loop, web_apis, idb);
         define_host_method(
             vm,
             proto,
@@ -1693,44 +1353,24 @@ fn install_idb_cursor_proto(
                 if args.len() < 2 {
                     return Err(vm.type_error("IDBCursor.continuePrimaryKey requires 2 arguments"));
                 }
-                let (tx_h, req_h, is_index, dir, got_value, cur_key, cur_pk) = {
-                    let st = db_r.borrow();
-                    let Some(c) = st.cursors.get(&ch) else {
-                        return Err(vm.type_error("Illegal invocation"));
-                    };
-                    let cur = c.entries.get(c.index);
+                let (tx_h, req_h, dir, cur_key, cur_pk) = {
+                    let st = ctx.idb.borrow();
+                    let c = validate_cursor_step(vm, &st, ch, true)?;
                     (
                         c.tx_h,
                         c.req_h,
-                        c.index_name.is_some(),
                         c.direction,
-                        c.got_value,
-                        cur.map(|e| e.key.clone()),
-                        cur.map(|e| e.primary_key.clone()),
+                        c.current.as_ref().map(|e| e.key.clone()),
+                        c.current.as_ref().map(|e| e.primary_key.clone()),
                     )
                 };
-                if !is_index || dir.is_unique() {
-                    return Err(create_dom_exception(
-                        vm,
-                        "InvalidAccessError",
-                        "continuePrimaryKey() requires a non-unique index cursor",
-                    ));
-                }
-                if !got_value {
-                    return Err(create_dom_exception(
-                        vm,
-                        "InvalidStateError",
-                        "Cursor has already been iterated",
-                    ));
-                }
-                let frames = idb_frames(&db_r);
+                let frames = idb_frames(&ctx.idb);
                 let mut seen = HashSet::new();
                 let target_key = js_to_idb_key(vm, frames.as_ref(), arg(args, 0), &mut seen)?;
                 seen.clear();
                 let target_pk = js_to_idb_key(vm, frames.as_ref(), arg(args, 1), &mut seen)?;
                 if let (Some(ref ck), Some(ref cpk)) = (cur_key, cur_pk) {
-                    let cmp_k = target_key.idb_cmp(ck);
-                    let cmp_pk = target_pk.idb_cmp(cpk);
+                    let (cmp_k, cmp_pk) = (target_key.idb_cmp(ck), target_pk.idb_cmp(cpk));
                     let invalid = if dir.is_reverse() {
                         cmp_k == Ordering::Greater
                             || (cmp_k == Ordering::Equal && cmp_pk != Ordering::Less)
@@ -1739,44 +1379,21 @@ fn install_idb_cursor_proto(
                             || (cmp_k == Ordering::Equal && cmp_pk != Ordering::Greater)
                     };
                     if invalid {
-                        return Err(create_dom_exception(
-                        vm,
-                        "DataError",
-                        "continuePrimaryKey() key/primaryKey does not advance in cursor direction",
-                    ));
+                        return Err(idb_err(
+                            vm,
+                            "DataError",
+                            "continuePrimaryKey() key/primaryKey does not advance",
+                        ));
                     }
                 }
-                {
-                    let mut st = db_r.borrow_mut();
-                    if let Some(c) = st.cursors.get_mut(&ch) {
-                        let mut next_idx = c.index + 1;
-                        while next_idx < c.entries.len() {
-                            let e = &c.entries[next_idx];
-                            let cmp_k = e.key.idb_cmp(&target_key);
-                            let cmp_pk = e.primary_key.idb_cmp(&target_pk);
-                            let reached = if c.direction.is_reverse() {
-                                cmp_k == Ordering::Less
-                                    || (cmp_k == Ordering::Equal && cmp_pk != Ordering::Greater)
-                            } else {
-                                cmp_k == Ordering::Greater
-                                    || (cmp_k == Ordering::Equal && cmp_pk != Ordering::Less)
-                            };
-                            if reached {
-                                break;
-                            }
-                            next_idx += 1;
-                        }
-                        c.index = next_idx;
-                        c.got_value = false;
-                    }
-                    if let Some(r) = st.requests.get_mut(&req_h) {
-                        r.ready_state = "pending";
-                    }
-                    if let Some(tx) = st.transactions.get_mut(&tx_h) {
-                        tx.pending_requests += 1;
-                    }
-                }
-                schedule_cursor_step(&h_r, &ev_r, &el_r, &wa_r, &db_r, tx_h, req_h, ch);
+                queue_cursor_step(
+                    &ctx.idb,
+                    ch,
+                    tx_h,
+                    req_h,
+                    CursorStepRequest::ContinuePrimaryKey(target_key, target_pk),
+                );
+                pump_tx_ops_ctx(&ctx, tx_h);
                 Ok(JsValue::UNDEFINED)
             },
         );
@@ -1784,11 +1401,7 @@ fn install_idb_cursor_proto(
 
     // cursor.advance(count)
     {
-        let h_r = Rc::clone(host);
-        let ev_r = Rc::clone(events);
-        let el_r = Rc::clone(event_loop);
-        let wa_r = Rc::clone(web_apis);
-        let db_r = Rc::clone(idb);
+        let ctx = IdbCtx::new(host, events, event_loop, web_apis, idb);
         define_host_method(vm, proto, "advance", move |vm, this_val, args| {
             let Some(ch) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
@@ -1800,43 +1413,26 @@ fn install_idb_cursor_proto(
             if count == 0 {
                 return Err(vm.type_error("IDBCursor.advance count must be >= 1"));
             }
-            let step = count as usize;
             let (tx_h, req_h) = {
-                let mut st = db_r.borrow_mut();
-                let Some(c) = st.cursors.get_mut(&ch) else {
-                    return Err(vm.type_error("Illegal invocation"));
-                };
-                if !c.got_value {
-                    return Err(create_dom_exception(
-                        vm,
-                        "InvalidStateError",
-                        "Cursor has already been iterated",
-                    ));
-                }
-                c.index = c.index.saturating_add(step);
-                c.got_value = false;
-                let tx_h = c.tx_h;
-                let req_h = c.req_h;
-                if let Some(r) = st.requests.get_mut(&req_h) {
-                    r.ready_state = "pending";
-                }
-                if let Some(tx) = st.transactions.get_mut(&tx_h) {
-                    tx.pending_requests += 1;
-                }
-                (tx_h, req_h)
+                let st = ctx.idb.borrow();
+                let c = validate_cursor_step(vm, &st, ch, false)?;
+                (c.tx_h, c.req_h)
             };
-            schedule_cursor_step(&h_r, &ev_r, &el_r, &wa_r, &db_r, tx_h, req_h, ch);
+            queue_cursor_step(
+                &ctx.idb,
+                ch,
+                tx_h,
+                req_h,
+                CursorStepRequest::Advance(count as usize),
+            );
+            pump_tx_ops_ctx(&ctx, tx_h);
             Ok(JsValue::UNDEFINED)
         });
     }
 
     // cursor.update(value)
     {
-        let h_r = Rc::clone(host);
-        let ev_r = Rc::clone(events);
-        let el_r = Rc::clone(event_loop);
-        let wa_r = Rc::clone(web_apis);
-        let db_r = Rc::clone(idb);
+        let ctx = IdbCtx::new(host, events, event_loop, web_apis, idb);
         define_host_method(vm, proto, "update", move |vm, this_val, args| {
             let Some(ch) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
@@ -1844,83 +1440,56 @@ fn install_idb_cursor_proto(
             if args.is_empty() {
                 return Err(vm.type_error("IDBCursor.update requires 1 argument"));
             }
-            let info = {
-                let st = db_r.borrow();
-                let c = st
-                    .cursors
-                    .get(&ch)
-                    .ok_or_else(|| vm.type_error("Illegal invocation"))?;
-                if c.key_only {
-                    return Err(create_dom_exception(
-                        vm,
-                        "InvalidStateError",
-                        "Cannot call update() on a key cursor",
-                    ));
-                }
-                let entry = c.entries.get(c.index).ok_or_else(|| {
-                    create_dom_exception(vm, "InvalidStateError", "Cursor has no current value")
-                })?;
-                (c.tx_h, c.store_name.clone(), entry.primary_key.clone())
-            };
-            let (tx_h, store_name, pk) = info;
-            let is_ro = db_r
+            let (tx_h, store_id, pk) = validate_cursor_mutate(vm, &ctx.idb.borrow(), ch)?;
+            let payload = serialize_while_tx_inactive(
+                vm,
+                &ctx.host,
+                &ctx.events,
+                &ctx.web_apis,
+                &ctx.idb,
+                tx_h,
+                arg(args, 0),
+            )?;
+            if let Some(store) = ctx
+                .idb
                 .borrow()
                 .transactions
                 .get(&tx_h)
-                .is_some_and(|t| t.mode == TxMode::ReadOnly);
-            if is_ro {
-                return Err(create_dom_exception(
-                    vm,
-                    "ReadOnlyError",
-                    "Cannot call cursor.update() inside a readonly transaction",
-                ));
-            }
-            let payload = idb_serialize_value(vm, &h_r, &ev_r, &wa_r, &db_r, arg(args, 0))?;
-            // W3C IDB §4.7: if store uses inline keys, evaluated key MUST equal cursor's primaryKey!
+                .and_then(|tx| tx.store_snap(store_id))
             {
-                let st = db_r.borrow();
-                if let Some(store) = st
-                    .transactions
-                    .get(&tx_h)
-                    .and_then(|tx| tx.working.stores.get(&store_name))
-                {
-                    if store.key_path.is_some() {
-                        match validate_put_or_add_sync(store, &payload, None) {
-                            Ok(Some(extracted)) => {
-                                if extracted.idb_cmp(&pk) != Ordering::Equal {
-                                    return Err(create_dom_exception(
-                                        vm,
-                                        "DataError",
-                                        "Updated value's key does not match cursor's primaryKey",
-                                    ));
-                                }
-                            }
-                            Ok(None) => {
-                                return Err(create_dom_exception(
-                                    vm,
-                                    "DataError",
-                                    "Updated value is missing inline key",
-                                ));
-                            }
-                            Err((en, em)) => return Err(create_dom_exception(vm, en, &em)),
+                if store.key_path.is_some() {
+                    match validate_put_or_add_sync(store, &payload, None) {
+                        Ok(Some(extracted)) if extracted.idb_cmp(&pk) == Ordering::Equal => {}
+                        Ok(Some(_)) => {
+                            return Err(idb_err(
+                                vm,
+                                "DataError",
+                                "Updated key does not match cursor primaryKey",
+                            ))
                         }
+                        Ok(None) => {
+                            return Err(idb_err(
+                                vm,
+                                "DataError",
+                                "Updated value is missing inline key",
+                            ))
+                        }
+                        Err((en, em)) => return Err(idb_err(vm, en, &em)),
                     }
                 }
             }
             let req_h = enqueue_tx_request(
                 vm,
-                &h_r,
-                &ev_r,
-                &el_r,
-                &wa_r,
-                &db_r,
+                &ctx.host,
+                &ctx.events,
+                &ctx.event_loop,
+                &ctx.web_apis,
+                &ctx.idb,
                 tx_h,
                 ch,
                 move |vm, tx| {
                     let store = tx
-                        .working
-                        .stores
-                        .get_mut(&store_name)
+                        .store_snap_mut(store_id)
                         .ok_or(("NotFoundError", "Object store not found".to_string()))?;
                     let key = store_put_or_add_payload(store, payload, Some(pk), false)?;
                     Ok(idb_key_to_js(vm, &key))
@@ -1932,60 +1501,24 @@ fn install_idb_cursor_proto(
 
     // cursor.delete()
     {
-        let h_r = Rc::clone(host);
-        let ev_r = Rc::clone(events);
-        let el_r = Rc::clone(event_loop);
-        let wa_r = Rc::clone(web_apis);
-        let db_r = Rc::clone(idb);
+        let ctx = IdbCtx::new(host, events, event_loop, web_apis, idb);
         define_host_method(vm, proto, "delete", move |vm, this_val, _| {
             let Some(ch) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
-            let info = {
-                let st = db_r.borrow();
-                let c = st
-                    .cursors
-                    .get(&ch)
-                    .ok_or_else(|| vm.type_error("Illegal invocation"))?;
-                if c.key_only {
-                    return Err(create_dom_exception(
-                        vm,
-                        "InvalidStateError",
-                        "Cannot call delete() on a key cursor",
-                    ));
-                }
-                let entry = c.entries.get(c.index).ok_or_else(|| {
-                    create_dom_exception(vm, "InvalidStateError", "Cursor has no current value")
-                })?;
-                (c.tx_h, c.store_name.clone(), entry.primary_key.clone())
-            };
-            let (tx_h, store_name, pk) = info;
-            let is_ro = db_r
-                .borrow()
-                .transactions
-                .get(&tx_h)
-                .is_some_and(|t| t.mode == TxMode::ReadOnly);
-            if is_ro {
-                return Err(create_dom_exception(
-                    vm,
-                    "ReadOnlyError",
-                    "Cannot call cursor.delete() inside a readonly transaction",
-                ));
-            }
+            let (tx_h, store_id, pk) = validate_cursor_mutate(vm, &ctx.idb.borrow(), ch)?;
             let req_h = enqueue_tx_request(
                 vm,
-                &h_r,
-                &ev_r,
-                &el_r,
-                &wa_r,
-                &db_r,
+                &ctx.host,
+                &ctx.events,
+                &ctx.event_loop,
+                &ctx.web_apis,
+                &ctx.idb,
                 tx_h,
                 ch,
                 move |_, tx| {
                     let store = tx
-                        .working
-                        .stores
-                        .get_mut(&store_name)
+                        .store_snap_mut(store_id)
                         .ok_or(("NotFoundError", "Object store not found".to_string()))?;
                     store.records.remove(&pk.to_encoded_bytes());
                     Ok(JsValue::UNDEFINED)
@@ -1997,113 +1530,6 @@ fn install_idb_cursor_proto(
 
     install_illegal_ctor(vm, "IDBCursor", proto);
     install_illegal_ctor(vm, "IDBCursorWithValue", with_val_proto);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn schedule_cursor_step(
-    host: &SharedHost,
-    events: &SharedEvents,
-    event_loop: &SharedEventLoop,
-    web_apis: &SharedWebApis,
-    idb: &SharedIndexedDb,
-    tx_h: HeapHandle,
-    req_h: HeapHandle,
-    cursor_h: HeapHandle,
-) {
-    schedule_tx_commit_check(host, events, event_loop, web_apis, idb, tx_h);
-    let h = Rc::clone(host);
-    let ev = Rc::clone(events);
-    let el = Rc::clone(event_loop);
-    let wa = Rc::clone(web_apis);
-    let db_sys = Rc::clone(idb);
-    event_loop
-        .borrow_mut()
-        .post_host_task(TaskPriority::Networking, move |vm| {
-            let result = {
-                let mut st = db_sys.borrow_mut();
-                let mut needs_init = false;
-                if let Some(tx) = st.transactions.get_mut(&tx_h) {
-                    tx.pending_requests = tx.pending_requests.saturating_sub(1);
-                    if tx.aborted || tx.finished {
-                        None
-                    } else {
-                        if let Some(c) = st.cursors.get(&cursor_h) {
-                            needs_init = !c.initialized;
-                        }
-                        if needs_init {
-                            let collected = st.cursors.get(&cursor_h).and_then(|c| {
-                                let tx = st.transactions.get(&tx_h)?;
-                                let store = tx.working.stores.get(&c.store_name)?;
-                                Some(if let Some(ref idx_name) = c.index_name {
-                                    if let Some(idx_schema) = store.indexes.get(idx_name) {
-                                        collect_index_entries(
-                                            store,
-                                            idx_schema,
-                                            c.range.as_ref(),
-                                            c.direction,
-                                        )
-                                    } else {
-                                        Vec::new()
-                                    }
-                                } else {
-                                    collect_store_entries(store, c.range.as_ref(), c.direction)
-                                })
-                            });
-                            if let (Some(c), Some(entries)) =
-                                (st.cursors.get_mut(&cursor_h), collected)
-                            {
-                                c.entries = entries;
-                                c.initialized = true;
-                            }
-                        }
-                        let has_item = match st.cursors.get_mut(&cursor_h) {
-                            Some(c) if c.index < c.entries.len() => {
-                                c.got_value = true;
-                                true
-                            }
-                            _ => false,
-                        };
-                        Some(if has_item {
-                            JsValue::from_object(cursor_h)
-                        } else {
-                            JsValue::NULL
-                        })
-                    }
-                } else {
-                    None
-                }
-            };
-            if let Some(res_val) = result {
-                if let Some(r) = db_sys.borrow_mut().requests.get_mut(&req_h) {
-                    r.ready_state = "done";
-                    r.result = res_val;
-                    r.error = JsValue::NULL;
-                }
-                let ev_proto = ev.borrow().event_proto.unwrap_or(vm.object_proto);
-                let (_, threw) = fire_idb_event(
-                    vm,
-                    &h,
-                    &ev,
-                    &el,
-                    req_h,
-                    "success",
-                    false,
-                    false,
-                    ev_proto,
-                    &[],
-                );
-                if threw {
-                    abort_tx_with_error(
-                        vm,
-                        &db_sys,
-                        tx_h,
-                        "AbortError",
-                        "Uncaught exception in cursor success handler",
-                    );
-                }
-            }
-            schedule_tx_commit_check(&h, &ev, &el, &wa, &db_sys, tx_h);
-        });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2123,16 +1549,108 @@ fn install_idb_index_proto(
     idb.borrow_mut().protos.index_proto = Some(proto);
 
     {
-        let db = Rc::clone(idb);
-        define_host_getter(vm, proto, "name", move |vm, this_val, _| {
-            let Some(s) = this_val
-                .as_object()
-                .and_then(|h| db.borrow().indexes.get(&h).map(|i| i.index_name.clone()))
-            else {
-                return Err(vm.type_error("Illegal invocation"));
-            };
-            Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
-        });
+        let db_g = Rc::clone(idb);
+        let db_s = Rc::clone(idb);
+        define_host_accessor(
+            vm,
+            proto,
+            "name",
+            move |vm, this_val, _| {
+                let Some(s) = this_val
+                    .as_object()
+                    .and_then(|h| db_g.borrow().indexes.get(&h).map(|i| i.index_name.clone()))
+                else {
+                    return Err(vm.type_error("Illegal invocation"));
+                };
+                Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+            },
+            move |vm, this_val, args| {
+                let Some(ih) = this_val.as_object() else {
+                    return Err(vm.type_error("Illegal invocation"));
+                };
+                if !db_s.borrow().indexes.contains_key(&ih) {
+                    return Err(vm.type_error("Illegal invocation"));
+                }
+                let new_name = vm.to_js_string(arg(args, 0))?;
+                let mut st = db_s.borrow_mut();
+                let (tx_h, store_h, store_id, index_id, old_name, idx_deleted) = {
+                    let i = st
+                        .indexes
+                        .get(&ih)
+                        .ok_or_else(|| vm.type_error("Illegal invocation"))?;
+                    (
+                        i.tx_h,
+                        i.store_h,
+                        i.store_id,
+                        i.index_id,
+                        i.index_name.clone(),
+                        i.deleted,
+                    )
+                };
+                let store_deleted = st.stores.get(&store_h).is_some_and(|s| s.deleted);
+                let tx = st.transactions.get_mut(&tx_h).ok_or_else(|| {
+                    idb_err(vm, "TransactionInactiveError", "Transaction is not active")
+                })?;
+                if tx.mode != TxMode::VersionChange {
+                    return Err(idb_err(
+                        vm,
+                        "InvalidStateError",
+                        "Index can only be renamed during a versionchange transaction",
+                    ));
+                }
+                if idx_deleted || store_deleted {
+                    return Err(idb_err(
+                        vm,
+                        "InvalidStateError",
+                        "Index or its object store has been deleted",
+                    ));
+                }
+                if tx.state != TxState::Active || tx.aborted || tx.aborting {
+                    return Err(idb_err(
+                        vm,
+                        "TransactionInactiveError",
+                        "Transaction is not active",
+                    ));
+                }
+                if new_name == old_name {
+                    return Ok(JsValue::UNDEFINED);
+                }
+                let Some(store_name) = tx.name_by_store_id.get(&store_id).cloned() else {
+                    return Err(create_dom_exception(
+                        vm,
+                        "InvalidStateError",
+                        "Object store has been deleted",
+                    ));
+                };
+                let Some(store) = tx.working.stores.get_mut(&store_name) else {
+                    return Err(create_dom_exception(
+                        vm,
+                        "InvalidStateError",
+                        "Object store has been deleted",
+                    ));
+                };
+                if store.indexes.contains_key(&new_name) {
+                    return Err(create_dom_exception(
+                        vm,
+                        "ConstraintError",
+                        &format!("Index '{new_name}' already exists"),
+                    ));
+                }
+                if let Some(mut schema) = store.indexes.remove(&old_name) {
+                    schema.name = new_name.clone();
+                    store.indexes.insert(new_name.clone(), schema);
+                }
+                tx.index_id_by_name.remove(&(store_id, old_name));
+                tx.index_id_by_name
+                    .insert((store_id, new_name.clone()), index_id);
+                tx.name_by_index_id
+                    .insert((store_id, index_id), new_name.clone());
+                if let Some(i) = st.indexes.get_mut(&ih) {
+                    i.index_name = new_name;
+                }
+                Ok(JsValue::UNDEFINED)
+            },
+        );
     }
     {
         let db = Rc::clone(idb);
@@ -2168,10 +1686,11 @@ fn install_idb_index_proto(
                 let st = db.borrow();
                 st.indexes.get(&h).and_then(|idx| {
                     let tx = st.transactions.get(&idx.tx_h)?;
-                    let store = tx.working.stores.get(&idx.store_name)?;
+                    let store = tx.store_snap(idx.store_id)?;
+                    let iname = tx.index_name(idx.store_id, idx.index_id)?;
                     store
                         .indexes
-                        .get(&idx.index_name)
+                        .get(iname)
                         .map(|s| (s.key_path.clone(), s.key_path_is_array))
                 })
             };
@@ -2193,12 +1712,11 @@ fn install_idb_index_proto(
                 let Some(idx) = st.indexes.get(&h) else {
                     return Err(vm.type_error("Illegal invocation"));
                 };
-                st.transactions
-                    .get(&idx.tx_h)
-                    .and_then(|tx| tx.working.stores.get(&idx.store_name))
-                    .and_then(|store| store.indexes.get(&idx.index_name))
-                    .map(|s| if is_unique { s.unique } else { s.multi_entry })
-                    .unwrap_or(false)
+                if is_unique {
+                    idx.cached_unique
+                } else {
+                    idx.cached_multi_entry
+                }
             };
             Ok(JsValue::from_bool(b))
         });
@@ -2225,28 +1743,7 @@ fn install_idb_index_proto(
             if (mode_tag == 0 || mode_tag == 1) && args.is_empty() {
                 return Err(vm.type_error(format!("IDBIndex.{method_name} requires 1 argument")));
             }
-            let (tx_h, store_name, index_name) = {
-                let st = db_r.borrow();
-                let idx = st
-                    .indexes
-                    .get(&ih)
-                    .ok_or_else(|| vm.type_error("Illegal invocation"))?;
-                // W3C IDB: check deleted store/index BEFORE transaction inactive / key conversion!
-                let is_deleted = st
-                    .transactions
-                    .get(&idx.tx_h)
-                    .and_then(|tx| tx.working.stores.get(&idx.store_name))
-                    .and_then(|store| store.indexes.get(&idx.index_name))
-                    .is_none();
-                if is_deleted {
-                    return Err(create_dom_exception(
-                        vm,
-                        "InvalidStateError",
-                        "Index or its object store has been deleted",
-                    ));
-                }
-                (idx.tx_h, idx.store_name.clone(), idx.index_name.clone())
-            };
+            let (tx_h, store_id, index_id) = check_index_for_request(vm, &db_r, ih)?;
             let (range, count_limit, direction) = match mode_tag {
                 0 | 1 => (
                     Some(require_query_key_range(vm, &db_r, arg(args, 0))?),
@@ -2282,13 +1779,14 @@ fn install_idb_index_proto(
                 ih,
                 move |vm, tx| {
                     let store = tx
-                        .working
-                        .stores
-                        .get(&store_name)
+                        .store_snap(store_id)
                         .ok_or(("NotFoundError", "Object store not found".to_string()))?;
+                    let iname = tx
+                        .index_name(store_id, index_id)
+                        .ok_or(("NotFoundError", "Index not found".to_string()))?;
                     let idx_schema = store
                         .indexes
-                        .get(&index_name)
+                        .get(iname)
                         .ok_or(("NotFoundError", "Index not found".to_string()))?;
                     let entries =
                         collect_index_entries(store, idx_schema, range.as_ref(), direction);
@@ -2320,27 +1818,7 @@ fn install_idb_index_proto(
             let Some(ih) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
-            let (tx_h, store_name, index_name) = {
-                let st = db_r.borrow();
-                let idx = st
-                    .indexes
-                    .get(&ih)
-                    .ok_or_else(|| vm.type_error("Illegal invocation"))?;
-                let is_deleted = st
-                    .transactions
-                    .get(&idx.tx_h)
-                    .and_then(|tx| tx.working.stores.get(&idx.store_name))
-                    .and_then(|store| store.indexes.get(&idx.index_name))
-                    .is_none();
-                if is_deleted {
-                    return Err(create_dom_exception(
-                        vm,
-                        "InvalidStateError",
-                        "Index or its object store has been deleted",
-                    ));
-                }
-                (idx.tx_h, idx.store_name.clone(), idx.index_name.clone())
-            };
+            let (tx_h, store_id, index_id) = check_index_for_request(vm, &db_r, ih)?;
             let range = query_to_key_range(vm, &db_r, arg(args, 0))?;
             let dir = parse_cursor_direction(vm, arg(args, 1))?;
             let req_h = open_cursor_common(
@@ -2352,8 +1830,8 @@ fn install_idb_index_proto(
                 &db_r,
                 tx_h,
                 ih,
-                store_name,
-                Some(index_name),
+                store_id,
+                Some(index_id),
                 range,
                 dir,
                 key_only,
@@ -2375,29 +1853,28 @@ fn open_cursor_common(
     idb: &SharedIndexedDb,
     tx_h: HeapHandle,
     source_h: HeapHandle,
-    store_name: String,
-    index_name: Option<String>,
+    store_id: u64,
+    index_id: Option<u64>,
     range: Option<KeyRange>,
     direction: CursorDirection,
     key_only: bool,
 ) -> Result<HeapHandle, JsException> {
     {
-        let mut st = idb.borrow_mut();
-        let Some(tx) = st.transactions.get_mut(&tx_h) else {
+        let st = idb.borrow();
+        let Some(tx) = st.transactions.get(&tx_h) else {
             return Err(create_dom_exception(
                 vm,
                 "TransactionInactiveError",
-                "Transaction inactive",
+                "Transaction is not active",
             ));
         };
-        if tx.finished || tx.aborted {
+        if tx.state != TxState::Active || tx.aborted || tx.aborting {
             return Err(create_dom_exception(
                 vm,
                 "TransactionInactiveError",
-                "Transaction inactive",
+                "Transaction is not active",
             ));
         }
-        tx.pending_requests += 1;
     }
     let req_h = alloc_request(
         vm,
@@ -2420,26 +1897,35 @@ fn open_cursor_common(
         ObjectKind::Ordinary,
         Some(cursor_proto),
     ));
-    idb.borrow_mut().cursors.insert(
-        cursor_h,
-        IdbCursorState {
-            tx_h,
-            req_h,
-            source_h,
-            store_name,
-            index_name,
-            range,
-            direction,
-            key_only,
-            initialized: false,
-            entries: Vec::new(),
-            index: 0,
-            got_value: false,
-        },
-    );
-    schedule_cursor_step(
-        host, events, event_loop, web_apis, idb, tx_h, req_h, cursor_h,
-    );
+    {
+        let mut st = idb.borrow_mut();
+        st.cursors.insert(
+            cursor_h,
+            IdbCursorState {
+                tx_h,
+                req_h,
+                source_h,
+                store_id,
+                index_id,
+                range,
+                direction,
+                key_only,
+                got_value: false,
+                current: None,
+                cached_key_js: None,
+                cached_pk_js: None,
+                cached_val_js: None,
+            },
+        );
+        if let Some(tx) = st.transactions.get_mut(&tx_h) {
+            tx.queued_ops.push_back(TxOp::CursorStep {
+                req_h,
+                cursor_h,
+                step: CursorStepRequest::Initial,
+            });
+        }
+    }
+    pump_tx_ops(host, events, event_loop, web_apis, idb, tx_h);
     Ok(req_h)
 }
 
@@ -2460,16 +1946,89 @@ fn install_idb_object_store_proto(
     idb.borrow_mut().protos.object_store_proto = Some(proto);
 
     {
-        let db = Rc::clone(idb);
-        define_host_getter(vm, proto, "name", move |vm, this_val, _| {
-            let Some(s) = this_val
-                .as_object()
-                .and_then(|h| db.borrow().stores.get(&h).map(|s| s.name.clone()))
-            else {
-                return Err(vm.type_error("Illegal invocation"));
-            };
-            Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
-        });
+        let db_g = Rc::clone(idb);
+        let db_s = Rc::clone(idb);
+        define_host_accessor(
+            vm,
+            proto,
+            "name",
+            move |vm, this_val, _| {
+                let Some(s) = this_val
+                    .as_object()
+                    .and_then(|h| db_g.borrow().stores.get(&h).map(|s| s.name.clone()))
+                else {
+                    return Err(vm.type_error("Illegal invocation"));
+                };
+                Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+            },
+            move |vm, this_val, args| {
+                let Some(sh) = this_val.as_object() else {
+                    return Err(vm.type_error("Illegal invocation"));
+                };
+                if !db_s.borrow().stores.contains_key(&sh) {
+                    return Err(vm.type_error("Illegal invocation"));
+                }
+                let new_name = vm.to_js_string(arg(args, 0))?;
+                let mut st = db_s.borrow_mut();
+                let (tx_h, store_id, old_name, deleted) = {
+                    let s = st
+                        .stores
+                        .get(&sh)
+                        .ok_or_else(|| vm.type_error("Illegal invocation"))?;
+                    (s.tx_h, s.store_id, s.name.clone(), s.deleted)
+                };
+                let tx = st.transactions.get_mut(&tx_h).ok_or_else(|| {
+                    idb_err(vm, "TransactionInactiveError", "Transaction is not active")
+                })?;
+                if tx.mode != TxMode::VersionChange {
+                    return Err(idb_err(
+                        vm,
+                        "InvalidStateError",
+                        "Object store can only be renamed during a versionchange transaction",
+                    ));
+                }
+                if deleted {
+                    return Err(idb_err(
+                        vm,
+                        "InvalidStateError",
+                        "Object store has been deleted",
+                    ));
+                }
+                if tx.state != TxState::Active || tx.aborted || tx.aborting {
+                    return Err(idb_err(
+                        vm,
+                        "TransactionInactiveError",
+                        "Transaction is not active",
+                    ));
+                }
+                if new_name == old_name {
+                    return Ok(JsValue::UNDEFINED);
+                }
+                if tx.working.stores.contains_key(&new_name) {
+                    return Err(idb_err(
+                        vm,
+                        "ConstraintError",
+                        &format!("Object store '{new_name}' already exists"),
+                    ));
+                }
+                if let Some(mut snap) = tx.working.stores.remove(&old_name) {
+                    snap.name = new_name.clone();
+                    tx.working.stores.insert(new_name.clone(), snap);
+                }
+                for sname in &mut tx.scope {
+                    if *sname == old_name {
+                        *sname = new_name.clone();
+                    }
+                }
+                tx.store_id_by_name.remove(&old_name);
+                tx.store_id_by_name.insert(new_name.clone(), store_id);
+                tx.name_by_store_id.insert(store_id, new_name.clone());
+                if let Some(s) = st.stores.get_mut(&sh) {
+                    s.name = new_name;
+                }
+                Ok(JsValue::UNDEFINED)
+            },
+        );
     }
     {
         let db = Rc::clone(idb);
@@ -2505,7 +2064,7 @@ fn install_idb_object_store_proto(
                 let st = db.borrow();
                 st.stores.get(&h).and_then(|sh| {
                     let tx = st.transactions.get(&sh.tx_h)?;
-                    let s = tx.working.stores.get(&sh.name)?;
+                    let s = tx.store_snap(sh.store_id)?;
                     s.key_path.clone().map(|v| (v, s.key_path_is_array))
                 })
             };
@@ -2527,11 +2086,7 @@ fn install_idb_object_store_proto(
                 let Some(sh) = st.stores.get(&h) else {
                     return Err(vm.type_error("Illegal invocation"));
                 };
-                st.transactions
-                    .get(&sh.tx_h)
-                    .and_then(|tx| tx.working.stores.get(&sh.name))
-                    .map(|s| s.auto_increment)
-                    .unwrap_or(false)
+                sh.cached_auto_increment
             };
             Ok(JsValue::from_bool(ai))
         });
@@ -2547,12 +2102,15 @@ fn install_idb_object_store_proto(
                 let Some(sh) = st.stores.get(&h) else {
                     return Err(vm.type_error("Illegal invocation"));
                 };
-                let n = st
-                    .transactions
-                    .get(&sh.tx_h)
-                    .and_then(|tx| tx.working.stores.get(&sh.name))
-                    .map(|s| s.indexes.keys().cloned().collect::<Vec<_>>())
-                    .unwrap_or_default();
+                let n = if sh.deleted {
+                    Vec::new()
+                } else {
+                    st.transactions
+                        .get(&sh.tx_h)
+                        .and_then(|tx| tx.store_snap(sh.store_id))
+                        .map(|s| s.indexes.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                };
                 (
                     n,
                     st.protos.dom_string_list_proto.unwrap_or(vm.object_proto),
@@ -2580,40 +2138,9 @@ fn install_idb_object_store_proto(
                     "IDBObjectStore.{method_name} requires at least 1 argument"
                 )));
             }
-            let (tx_h, store_name) = {
-                let st = db_r.borrow();
-                let s = st
-                    .stores
-                    .get(&sh)
-                    .ok_or_else(|| vm.type_error("Illegal invocation"))?;
-                let tx = st.transactions.get(&s.tx_h).ok_or_else(|| {
-                    create_dom_exception(vm, "TransactionInactiveError", "Transaction inactive")
-                })?;
-                if !tx.working.stores.contains_key(&s.name) {
-                    return Err(create_dom_exception(
-                        vm,
-                        "InvalidStateError",
-                        "Object store has been deleted",
-                    ));
-                }
-                if tx.finished || tx.aborted {
-                    return Err(create_dom_exception(
-                        vm,
-                        "TransactionInactiveError",
-                        "Transaction inactive",
-                    ));
-                }
-                if tx.mode == TxMode::ReadOnly {
-                    return Err(create_dom_exception(
-                        vm,
-                        "ReadOnlyError",
-                        "Cannot mutate object store in a readonly transaction",
-                    ));
-                }
-                (s.tx_h, s.name.clone())
-            };
-            // W3C IDB §4.5: clone value BEFORE evaluating keyPath (so getters only run once!).
-            let payload = idb_serialize_value(vm, &h_r, &ev_r, &wa_r, &db_r, arg(args, 0))?;
+            let (tx_h, store_id) = check_store_for_request(vm, &db_r, sh, true)?;
+            let payload =
+                serialize_while_tx_inactive(vm, &h_r, &ev_r, &wa_r, &db_r, tx_h, arg(args, 0))?;
             let explicit_key = if arg(args, 1).is_undefined() {
                 None
             } else {
@@ -2628,10 +2155,28 @@ fn install_idb_object_store_proto(
             };
             let resolved_key = {
                 let st = db_r.borrow();
+                let s = st
+                    .stores
+                    .get(&sh)
+                    .ok_or_else(|| vm.type_error("Illegal invocation"))?;
+                if s.deleted {
+                    return Err(create_dom_exception(
+                        vm,
+                        "InvalidStateError",
+                        "Object store has been deleted",
+                    ));
+                }
                 let tx = st.transactions.get(&tx_h).ok_or_else(|| {
                     create_dom_exception(vm, "TransactionInactiveError", "Transaction inactive")
                 })?;
-                let store = tx.working.stores.get(&store_name).ok_or_else(|| {
+                if tx.state != TxState::Active || tx.aborted || tx.aborting {
+                    return Err(create_dom_exception(
+                        vm,
+                        "TransactionInactiveError",
+                        "Transaction is not active",
+                    ));
+                }
+                let store = tx.store_snap(store_id).ok_or_else(|| {
                     create_dom_exception(vm, "InvalidStateError", "Object store has been deleted")
                 })?;
                 validate_put_or_add_sync(store, &payload, explicit_key)
@@ -2648,9 +2193,7 @@ fn install_idb_object_store_proto(
                 sh,
                 move |vm, tx| {
                     let store = tx
-                        .working
-                        .stores
-                        .get_mut(&store_name)
+                        .store_snap_mut(store_id)
                         .ok_or(("NotFoundError", "Object store not found".to_string()))?;
                     let key = store_put_or_add_payload(store, payload, resolved_key, no_overwrite)?;
                     Ok(idb_key_to_js(vm, &key))
@@ -2683,26 +2226,7 @@ fn install_idb_object_store_proto(
                     vm.type_error(format!("IDBObjectStore.{method_name} requires 1 argument"))
                 );
             }
-            let (tx_h, store_name) = {
-                let st = db_r.borrow();
-                let s = st
-                    .stores
-                    .get(&sh)
-                    .ok_or_else(|| vm.type_error("Illegal invocation"))?;
-                let deleted = st
-                    .transactions
-                    .get(&s.tx_h)
-                    .and_then(|tx| tx.working.stores.get(&s.name))
-                    .is_none();
-                if deleted {
-                    return Err(create_dom_exception(
-                        vm,
-                        "InvalidStateError",
-                        "Object store has been deleted",
-                    ));
-                }
-                (s.tx_h, s.name.clone())
-            };
+            let (tx_h, store_id) = check_store_for_request(vm, &db_r, sh, false)?;
             let (range, count_limit, direction) = match mode_tag {
                 0 | 1 => (
                     Some(require_query_key_range(vm, &db_r, arg(args, 0))?),
@@ -2738,9 +2262,7 @@ fn install_idb_object_store_proto(
                 sh,
                 move |vm, tx| {
                     let store = tx
-                        .working
-                        .stores
-                        .get(&store_name)
+                        .store_snap(store_id)
                         .ok_or(("NotFoundError", "Object store not found".to_string()))?;
                     let entries = collect_store_entries(store, range.as_ref(), direction);
                     Ok(materialize_idb_query_result(
@@ -2774,38 +2296,7 @@ fn install_idb_object_store_proto(
             if args.is_empty() {
                 return Err(vm.type_error("IDBObjectStore.delete requires 1 argument"));
             }
-            let (tx_h, store_name) = {
-                let st = db_r.borrow();
-                let s = st
-                    .stores
-                    .get(&sh)
-                    .ok_or_else(|| vm.type_error("Illegal invocation"))?;
-                let tx = st.transactions.get(&s.tx_h).ok_or_else(|| {
-                    create_dom_exception(vm, "TransactionInactiveError", "Transaction inactive")
-                })?;
-                if !tx.working.stores.contains_key(&s.name) {
-                    return Err(create_dom_exception(
-                        vm,
-                        "InvalidStateError",
-                        "Object store has been deleted",
-                    ));
-                }
-                if tx.finished || tx.aborted {
-                    return Err(create_dom_exception(
-                        vm,
-                        "TransactionInactiveError",
-                        "Transaction inactive",
-                    ));
-                }
-                if tx.mode == TxMode::ReadOnly {
-                    return Err(create_dom_exception(
-                        vm,
-                        "ReadOnlyError",
-                        "Cannot delete in a readonly transaction",
-                    ));
-                }
-                (s.tx_h, s.name.clone())
-            };
+            let (tx_h, store_id) = check_store_for_request(vm, &db_r, sh, true)?;
             let range = require_query_key_range(vm, &db_r, arg(args, 0))?;
             let req_h = enqueue_tx_request(
                 vm,
@@ -2818,9 +2309,7 @@ fn install_idb_object_store_proto(
                 sh,
                 move |_, tx| {
                     let store = tx
-                        .working
-                        .stores
-                        .get_mut(&store_name)
+                        .store_snap_mut(store_id)
                         .ok_or(("NotFoundError", "Object store not found".to_string()))?;
                     store.records.retain(|_, rec| !range.matches(&rec.key));
                     Ok(JsValue::UNDEFINED)
@@ -2841,38 +2330,7 @@ fn install_idb_object_store_proto(
             let Some(sh) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
-            let (tx_h, store_name) = {
-                let st = db_r.borrow();
-                let s = st
-                    .stores
-                    .get(&sh)
-                    .ok_or_else(|| vm.type_error("Illegal invocation"))?;
-                let tx = st.transactions.get(&s.tx_h).ok_or_else(|| {
-                    create_dom_exception(vm, "TransactionInactiveError", "Transaction inactive")
-                })?;
-                if !tx.working.stores.contains_key(&s.name) {
-                    return Err(create_dom_exception(
-                        vm,
-                        "InvalidStateError",
-                        "Object store has been deleted",
-                    ));
-                }
-                if tx.finished || tx.aborted {
-                    return Err(create_dom_exception(
-                        vm,
-                        "TransactionInactiveError",
-                        "Transaction inactive",
-                    ));
-                }
-                if tx.mode == TxMode::ReadOnly {
-                    return Err(create_dom_exception(
-                        vm,
-                        "ReadOnlyError",
-                        "Cannot clear in a readonly transaction",
-                    ));
-                }
-                (s.tx_h, s.name.clone())
-            };
+            let (tx_h, store_id) = check_store_for_request(vm, &db_r, sh, true)?;
             let req_h = enqueue_tx_request(
                 vm,
                 &h_r,
@@ -2884,9 +2342,7 @@ fn install_idb_object_store_proto(
                 sh,
                 move |_, tx| {
                     let store = tx
-                        .working
-                        .stores
-                        .get_mut(&store_name)
+                        .store_snap_mut(store_id)
                         .ok_or(("NotFoundError", "Object store not found".to_string()))?;
                     store.records.clear();
                     Ok(JsValue::UNDEFINED)
@@ -2898,16 +2354,23 @@ fn install_idb_object_store_proto(
 
     // createIndex(name, keyPath, options?)
     {
+        let h_r = Rc::clone(host);
+        let ev_r = Rc::clone(events);
+        let el_r = Rc::clone(event_loop);
+        let wa_r = Rc::clone(web_apis);
         let db_r = Rc::clone(idb);
         define_host_method(vm, proto, "createIndex", move |vm, this_val, args| {
             let Some(sh) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
+            if !db_r.borrow().stores.contains_key(&sh) {
+                return Err(vm.type_error("Illegal invocation"));
+            }
             if args.len() < 2 {
                 return Err(vm.type_error("IDBObjectStore.createIndex requires 2 arguments"));
             }
             let idx_name = vm.to_js_string(arg(args, 0))?;
-            let Some((key_path, key_path_is_array)) = parse_key_path_arg(vm, arg(args, 1), false)?
+            let Some((key_path, key_path_is_array)) = parse_key_path_raw(vm, arg(args, 1), false)?
             else {
                 return Err(create_dom_exception(
                     vm,
@@ -2930,22 +2393,16 @@ fn install_idb_object_store_proto(
             } else {
                 (false, false)
             };
-            if multi_entry && (key_path_is_array || key_path.len() > 1) {
-                return Err(create_dom_exception(
-                    vm,
-                    "InvalidAccessError",
-                    "multiEntry cannot be true for array keyPath",
-                ));
-            }
-            let (tx_h, store_name, index_proto) = {
-                let mut st = db_r.borrow_mut();
+
+            // W3C IDB §4.5 exact exception ordering:
+            // VersionChange -> deleted -> TransactionInactiveError -> ConstraintError -> SyntaxError -> InvalidAccessError.
+            let (tx_h, store_id) = {
+                let st = db_r.borrow();
                 let s = st
                     .stores
                     .get(&sh)
                     .ok_or_else(|| vm.type_error("Illegal invocation"))?;
-                let tx_h = s.tx_h;
-                let store_name = s.name.clone();
-                let tx = st.transactions.get_mut(&tx_h).ok_or_else(|| {
+                let tx = st.transactions.get(&s.tx_h).ok_or_else(|| {
                     create_dom_exception(vm, "InvalidStateError", "Transaction inactive")
                 })?;
                 if tx.mode != TxMode::VersionChange {
@@ -2955,8 +2412,22 @@ fn install_idb_object_store_proto(
                         "createIndex() is only allowed inside a versionchange transaction",
                     ));
                 }
-                let store = tx.working.stores.get_mut(&store_name).ok_or_else(|| {
-                    create_dom_exception(vm, "InvalidStateError", "Store not found")
+                if s.deleted {
+                    return Err(create_dom_exception(
+                        vm,
+                        "InvalidStateError",
+                        "Object store has been deleted",
+                    ));
+                }
+                if tx.state != TxState::Active || tx.aborted || tx.aborting {
+                    return Err(create_dom_exception(
+                        vm,
+                        "TransactionInactiveError",
+                        "Transaction is not active",
+                    ));
+                }
+                let store = tx.store_snap(s.store_id).ok_or_else(|| {
+                    create_dom_exception(vm, "InvalidStateError", "Object store has been deleted")
                 })?;
                 if store.indexes.contains_key(&idx_name) {
                     return Err(create_dom_exception(
@@ -2965,35 +2436,77 @@ fn install_idb_object_store_proto(
                         &format!("Index '{idx_name}' already exists"),
                     ));
                 }
+                (s.tx_h, s.store_id)
+            };
+            validate_key_path_syntax(vm, &key_path, key_path_is_array)?;
+            if multi_entry && (key_path_is_array || key_path.len() > 1) {
+                return Err(create_dom_exception(
+                    vm,
+                    "InvalidAccessError",
+                    "multiEntry cannot be true for array keyPath",
+                ));
+            }
+            let (index_id, index_proto) = {
+                let mut st = db_r.borrow_mut();
+                let iid = st.alloc_meta_id();
+                let proto_h = st.protos.index_proto.unwrap_or(vm.object_proto);
+                let tx = st.transactions.get_mut(&tx_h).ok_or_else(|| {
+                    create_dom_exception(vm, "InvalidStateError", "Transaction inactive")
+                })?;
+                let store = tx.store_snap_mut(store_id).ok_or_else(|| {
+                    create_dom_exception(vm, "InvalidStateError", "Object store has been deleted")
+                })?;
                 store.indexes.insert(
                     idx_name.clone(),
                     IdbIndexSchema {
                         name: idx_name.clone(),
                         key_path,
                         key_path_is_array,
-                        unique,
+                        // Activated when `TxOp::ValidateUniqueIndex` executes in FIFO order after
+                        // any earlier queued `put`/`add` requests on this transaction.
+                        unique: false,
                         multi_entry,
                     },
                 );
-                (
-                    tx_h,
-                    store_name,
-                    st.protos.index_proto.unwrap_or(vm.object_proto),
-                )
+                tx.index_id_by_name
+                    .insert((store_id, idx_name.clone()), iid);
+                tx.name_by_index_id
+                    .insert((store_id, iid), idx_name.clone());
+                if unique {
+                    tx.queued_ops.push_back(TxOp::ValidateUniqueIndex {
+                        store_id,
+                        index_id: iid,
+                    });
+                }
+                (iid, proto_h)
             };
             let idx_h = vm
                 .heap
                 .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(index_proto)));
-            db_r.borrow_mut().indexes.insert(
-                idx_h,
-                IdbIndexHandle {
-                    tx_h,
-                    store_h: sh,
-                    store_name,
-                    index_name: idx_name,
-                    cached_key_path: None,
-                },
-            );
+            {
+                let mut st = db_r.borrow_mut();
+                st.indexes.insert(
+                    idx_h,
+                    IdbIndexHandle {
+                        tx_h,
+                        store_h: sh,
+                        store_id,
+                        index_id,
+                        index_name: idx_name,
+                        original_name: None,
+                        deleted: false,
+                        cached_key_path: None,
+                        cached_unique: unique,
+                        cached_multi_entry: multi_entry,
+                    },
+                );
+                if let Some(tx) = st.transactions.get_mut(&tx_h) {
+                    tx.index_handles.insert((store_id, index_id), idx_h);
+                }
+            }
+            if unique {
+                pump_tx_ops(&h_r, &ev_r, &el_r, &wa_r, &db_r, tx_h);
+            }
             Ok(JsValue::from_object(idx_h))
         });
     }
@@ -3010,31 +2523,59 @@ fn install_idb_object_store_proto(
             }
             let idx_name = vm.to_js_string(arg(args, 0))?;
             let mut st = db_r.borrow_mut();
-            let s = st
-                .stores
-                .get(&sh)
-                .ok_or_else(|| vm.type_error("Illegal invocation"))?;
-            let tx_h = s.tx_h;
-            let store_name = s.name.clone();
-            let tx = st.transactions.get_mut(&tx_h).ok_or_else(|| {
-                create_dom_exception(vm, "InvalidStateError", "Transaction inactive")
-            })?;
-            if tx.mode != TxMode::VersionChange {
-                return Err(create_dom_exception(
-                    vm,
-                    "InvalidStateError",
-                    "deleteIndex() is only allowed inside a versionchange transaction",
-                ));
-            }
-            let store = tx.working.stores.get_mut(&store_name).ok_or_else(|| {
-                create_dom_exception(vm, "InvalidStateError", "Object store has been deleted")
-            })?;
-            if store.indexes.remove(&idx_name).is_none() {
-                return Err(create_dom_exception(
-                    vm,
-                    "NotFoundError",
-                    &format!("Index '{idx_name}' not found"),
-                ));
+            let (tx_h, store_id, deleted) = {
+                let s = st
+                    .stores
+                    .get(&sh)
+                    .ok_or_else(|| vm.type_error("Illegal invocation"))?;
+                (s.tx_h, s.store_id, s.deleted)
+            };
+            let (removed_ih,) = {
+                let tx = st.transactions.get_mut(&tx_h).ok_or_else(|| {
+                    create_dom_exception(vm, "InvalidStateError", "Transaction inactive")
+                })?;
+                if tx.mode != TxMode::VersionChange {
+                    return Err(create_dom_exception(
+                        vm,
+                        "InvalidStateError",
+                        "deleteIndex() is only allowed inside a versionchange transaction",
+                    ));
+                }
+                if deleted {
+                    return Err(create_dom_exception(
+                        vm,
+                        "InvalidStateError",
+                        "Object store has been deleted",
+                    ));
+                }
+                if tx.state != TxState::Active || tx.aborted || tx.aborting {
+                    return Err(create_dom_exception(
+                        vm,
+                        "TransactionInactiveError",
+                        "Transaction is not active",
+                    ));
+                }
+                let store = tx.store_snap_mut(store_id).ok_or_else(|| {
+                    create_dom_exception(vm, "InvalidStateError", "Object store has been deleted")
+                })?;
+                if store.indexes.remove(&idx_name).is_none() {
+                    return Err(create_dom_exception(
+                        vm,
+                        "NotFoundError",
+                        &format!("Index '{idx_name}' not found"),
+                    ));
+                }
+                let iid = tx.index_id_by_name.remove(&(store_id, idx_name));
+                let ih = iid.and_then(|id| {
+                    tx.name_by_index_id.remove(&(store_id, id));
+                    tx.index_handles.get(&(store_id, id)).copied()
+                });
+                (ih,)
+            };
+            if let Some(ih) = removed_ih {
+                if let Some(i) = st.indexes.get_mut(&ih) {
+                    i.deleted = true;
+                }
             }
             Ok(JsValue::UNDEFINED)
         });
@@ -3051,51 +2592,103 @@ fn install_idb_object_store_proto(
                 return Err(vm.type_error("IDBObjectStore.index requires 1 argument"));
             }
             let idx_name = vm.to_js_string(arg(args, 0))?;
-            let (tx_h, store_name, index_proto) = {
+            let lookup = {
                 let st = db_r.borrow();
                 let s = st
                     .stores
                     .get(&sh)
                     .ok_or_else(|| vm.type_error("Illegal invocation"))?;
+                if s.deleted {
+                    return Err(create_dom_exception(
+                        vm,
+                        "InvalidStateError",
+                        "Object store has been deleted",
+                    ));
+                }
                 let tx = st.transactions.get(&s.tx_h).ok_or_else(|| {
-                    create_dom_exception(vm, "InvalidStateError", "Transaction inactive")
+                    create_dom_exception(
+                        vm,
+                        "InvalidStateError",
+                        "Transaction has already finished",
+                    )
                 })?;
-                if tx.finished {
+                if tx.is_finished() || tx.aborting {
                     return Err(create_dom_exception(
                         vm,
                         "InvalidStateError",
                         "Transaction has already finished",
                     ));
                 }
-                let store = tx.working.stores.get(&s.name).ok_or_else(|| {
+                let store = tx.store_snap(s.store_id).ok_or_else(|| {
                     create_dom_exception(vm, "InvalidStateError", "Object store has been deleted")
                 })?;
-                if !store.indexes.contains_key(&idx_name) {
+                let schema = store.indexes.get(&idx_name).ok_or_else(|| {
+                    create_dom_exception(
+                        vm,
+                        "NotFoundError",
+                        &format!("Index '{idx_name}' not found"),
+                    )
+                })?;
+                let Some(&iid) = tx.index_id_by_name.get(&(s.store_id, idx_name.clone())) else {
                     return Err(create_dom_exception(
                         vm,
                         "NotFoundError",
                         &format!("Index '{idx_name}' not found"),
                     ));
+                };
+                if let Some(&existing_ih) = tx.index_handles.get(&(s.store_id, iid)) {
+                    return Ok(JsValue::from_object(existing_ih));
                 }
+                let orig_name = if tx.initial_index_ids.values().any(|&id| id == iid) {
+                    Some(
+                        tx.initial_index_ids
+                            .iter()
+                            .find_map(|((sid, n), &id)| {
+                                (*sid == s.store_id && id == iid).then(|| n.clone())
+                            })
+                            .unwrap_or_else(|| idx_name.clone()),
+                    )
+                } else if tx.mode != TxMode::VersionChange {
+                    Some(idx_name.clone())
+                } else {
+                    None
+                };
                 (
                     s.tx_h,
-                    s.name.clone(),
+                    s.store_id,
+                    iid,
+                    orig_name,
+                    schema.unique,
+                    schema.multi_entry,
                     st.protos.index_proto.unwrap_or(vm.object_proto),
                 )
             };
+            let (tx_h, store_id, index_id, original_name, unique, multi_entry, index_proto) =
+                lookup;
             let idx_h = vm
                 .heap
                 .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(index_proto)));
-            db_r.borrow_mut().indexes.insert(
-                idx_h,
-                IdbIndexHandle {
-                    tx_h,
-                    store_h: sh,
-                    store_name,
-                    index_name: idx_name,
-                    cached_key_path: None,
-                },
-            );
+            {
+                let mut st = db_r.borrow_mut();
+                st.indexes.insert(
+                    idx_h,
+                    IdbIndexHandle {
+                        tx_h,
+                        store_h: sh,
+                        store_id,
+                        index_id,
+                        index_name: idx_name,
+                        original_name,
+                        deleted: false,
+                        cached_key_path: None,
+                        cached_unique: unique,
+                        cached_multi_entry: multi_entry,
+                    },
+                );
+                if let Some(tx) = st.transactions.get_mut(&tx_h) {
+                    tx.index_handles.insert((store_id, index_id), idx_h);
+                }
+            }
             Ok(JsValue::from_object(idx_h))
         });
     }
@@ -3111,30 +2704,11 @@ fn install_idb_object_store_proto(
             let Some(sh) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
-            let (tx_h, store_name) = {
-                let st = db_r.borrow();
-                let s = st
-                    .stores
-                    .get(&sh)
-                    .ok_or_else(|| vm.type_error("Illegal invocation"))?;
-                let deleted = st
-                    .transactions
-                    .get(&s.tx_h)
-                    .and_then(|tx| tx.working.stores.get(&s.name))
-                    .is_none();
-                if deleted {
-                    return Err(create_dom_exception(
-                        vm,
-                        "InvalidStateError",
-                        "Object store has been deleted",
-                    ));
-                }
-                (s.tx_h, s.name.clone())
-            };
+            let (tx_h, store_id) = check_store_for_request(vm, &db_r, sh, false)?;
             let range = query_to_key_range(vm, &db_r, arg(args, 0))?;
             let dir = parse_cursor_direction(vm, arg(args, 1))?;
             let req_h = open_cursor_common(
-                vm, &h_r, &ev_r, &el_r, &wa_r, &db_r, tx_h, sh, store_name, None, range, dir,
+                vm, &h_r, &ev_r, &el_r, &wa_r, &db_r, tx_h, sh, store_id, None, range, dir,
                 key_only,
             )?;
             Ok(JsValue::from_object(req_h))
@@ -3219,8 +2793,13 @@ fn install_idb_transaction_proto(
                 let Some(t) = st.transactions.get(&h) else {
                     return Err(vm.type_error("Illegal invocation"));
                 };
+                let n = if t.mode == TxMode::VersionChange {
+                    t.working.stores.keys().cloned().collect()
+                } else {
+                    t.scope.clone()
+                };
                 (
-                    t.scope.clone(),
+                    n,
                     st.protos.dom_string_list_proto.unwrap_or(vm.object_proto),
                 )
             };
@@ -3251,13 +2830,13 @@ fn install_idb_transaction_proto(
                 return Err(vm.type_error("IDBTransaction.objectStore requires 1 argument"));
             }
             let name = vm.to_js_string(arg(args, 0))?;
-            let store_proto = {
+            let lookup = {
                 let st = db.borrow();
                 let tx = st
                     .transactions
                     .get(&tx_h)
                     .ok_or_else(|| vm.type_error("Illegal invocation"))?;
-                if tx.finished {
+                if tx.is_finished() || tx.aborting {
                     return Err(create_dom_exception(
                         vm,
                         "InvalidStateError",
@@ -3266,26 +2845,64 @@ fn install_idb_transaction_proto(
                 }
                 let in_scope =
                     tx.mode == TxMode::VersionChange || tx.scope.iter().any(|s| s == &name);
-                if !in_scope || !tx.working.stores.contains_key(&name) {
+                if !in_scope {
                     return Err(create_dom_exception(
                         vm,
                         "NotFoundError",
                         &format!("Object store '{name}' not in transaction scope"),
                     ));
                 }
-                st.protos.object_store_proto.unwrap_or(vm.object_proto)
+                let Some(&store_id) = tx.store_id_by_name.get(&name) else {
+                    return Err(create_dom_exception(
+                        vm,
+                        "NotFoundError",
+                        &format!("Object store '{name}' not in transaction scope"),
+                    ));
+                };
+                if let Some(&existing_sh) = tx.store_handles.get(&store_id) {
+                    return Ok(JsValue::from_object(existing_sh));
+                }
+                let auto_inc = tx
+                    .working
+                    .stores
+                    .get(&name)
+                    .is_some_and(|s| s.auto_increment);
+                let orig_name = if tx.mode != TxMode::VersionChange {
+                    Some(name.clone())
+                } else {
+                    tx.initial_store_ids
+                        .iter()
+                        .find_map(|(n, &id)| (id == store_id).then(|| n.clone()))
+                };
+                (
+                    store_id,
+                    orig_name,
+                    auto_inc,
+                    st.protos.object_store_proto.unwrap_or(vm.object_proto),
+                )
             };
+            let (store_id, original_name, auto_inc, store_proto) = lookup;
             let store_h = vm
                 .heap
                 .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(store_proto)));
-            db.borrow_mut().stores.insert(
-                store_h,
-                IdbStoreHandle {
-                    tx_h,
-                    name,
-                    cached_key_path: None,
-                },
-            );
+            {
+                let mut st = db.borrow_mut();
+                st.stores.insert(
+                    store_h,
+                    IdbStoreHandle {
+                        tx_h,
+                        store_id,
+                        name,
+                        original_name,
+                        deleted: false,
+                        cached_key_path: None,
+                        cached_auto_increment: auto_inc,
+                    },
+                );
+                if let Some(tx) = st.transactions.get_mut(&tx_h) {
+                    tx.store_handles.insert(store_id, store_h);
+                }
+            }
             Ok(JsValue::from_object(store_h))
         });
     }
@@ -3302,21 +2919,20 @@ fn install_idb_transaction_proto(
                 return Err(vm.type_error("Illegal invocation"));
             };
             {
-                let mut st = db.borrow_mut();
-                let Some(tx) = st.transactions.get_mut(&tx_h) else {
+                let st = db.borrow();
+                let Some(tx) = st.transactions.get(&tx_h) else {
                     return Err(vm.type_error("Illegal invocation"));
                 };
-                if tx.finished {
+                if tx.is_finished() || tx.state == TxState::Committing || tx.aborted || tx.aborting
+                {
                     return Err(create_dom_exception(
                         vm,
                         "InvalidStateError",
-                        "Cannot abort a finished transaction",
+                        "Cannot abort a committing, finished, or already aborted transaction",
                     ));
                 }
-                tx.aborted = true;
-                tx.error = JsValue::NULL;
             }
-            schedule_tx_commit_check(&h_r, &ev_r, &el_r, &wa_r, &db, tx_h);
+            begin_tx_abort(&h_r, &ev_r, &el_r, &wa_r, &db, tx_h, JsValue::NULL);
             Ok(JsValue::UNDEFINED)
         });
     }
@@ -3332,20 +2948,25 @@ fn install_idb_transaction_proto(
             let Some(tx_h) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
-            {
-                let st = db.borrow();
-                let Some(tx) = st.transactions.get(&tx_h) else {
+            let should_kick_commit = {
+                let mut st = db.borrow_mut();
+                let Some(tx) = st.transactions.get_mut(&tx_h) else {
                     return Err(vm.type_error("Illegal invocation"));
                 };
-                if tx.finished || tx.aborted {
+                if tx.state != TxState::Active || tx.aborted || tx.aborting {
                     return Err(create_dom_exception(
                         vm,
                         "InvalidStateError",
-                        "Cannot commit a finished or aborted transaction",
+                        "Cannot commit an inactive, finished, or aborted transaction",
                     ));
                 }
+                tx.state = TxState::Committing;
+                tx.explicit_commit = true;
+                tx.started && !tx.in_flight_op && tx.queued_ops.is_empty()
+            };
+            if should_kick_commit {
+                schedule_tx_commit(&h_r, &ev_r, &el_r, &wa_r, &db, tx_h);
             }
-            schedule_tx_commit_check(&h_r, &ev_r, &el_r, &wa_r, &db, tx_h);
             Ok(JsValue::UNDEFINED)
         });
     }
@@ -3442,6 +3063,9 @@ fn install_idb_database_proto(
             let Some(db_h) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
+            if !db.borrow().databases.contains_key(&db_h) {
+                return Err(vm.type_error("Illegal invocation"));
+            }
             if args.is_empty() {
                 return Err(vm.type_error("IDBDatabase.createObjectStore requires 1 argument"));
             }
@@ -3454,33 +3078,17 @@ fn install_idb_database_proto(
                     .ok()
                     .is_some_and(|v| vm.to_boolean(v));
                 let kp_val = vm.get_property_by_key(opts, kk)?;
-                let kp = parse_key_path_arg(vm, kp_val, true)?;
+                let kp = parse_key_path_raw(vm, kp_val, true)?;
                 (kp, ai)
             } else {
                 (None, false)
             };
-            let (key_path, key_path_is_array) = match key_path_pair {
-                Some((v, is_arr)) => (Some(v), is_arr),
-                None => (None, false),
-            };
-            if auto_increment
-                && (key_path_is_array
-                    || key_path
-                        .as_ref()
-                        .is_some_and(|kp| kp.len() > 1 || kp[0].is_empty()))
-            {
-                return Err(create_dom_exception(
-                    vm,
-                    "InvalidAccessError",
-                    "autoIncrement cannot be combined with empty or compound keyPath",
-                ));
-            }
 
-            let (tx_h, store_proto) = {
-                let mut st = db.borrow_mut();
-                if !st.databases.contains_key(&db_h) {
-                    return Err(vm.type_error("Illegal invocation"));
-                }
+            // W3C IDB §4.3 exact exception order:
+            // VersionChange (`InvalidStateError`) -> Active (`TransactionInactiveError`)
+            // -> keyPath syntax (`SyntaxError`) -> duplicate (`ConstraintError`) -> autoIncrement (`InvalidAccessError`).
+            let vc_tx = {
+                let st = db.borrow();
                 let vc_tx = st
                     .databases
                     .get(&db_h)
@@ -3492,6 +3100,31 @@ fn install_idb_database_proto(
                             "createObjectStore() is only allowed during a versionchange transaction",
                         )
                     })?;
+                let tx = st.transactions.get(&vc_tx).ok_or_else(|| {
+                    create_dom_exception(vm, "InvalidStateError", "Transaction inactive")
+                })?;
+                if tx.state != TxState::Active || tx.aborted || tx.aborting {
+                    return Err(create_dom_exception(
+                        vm,
+                        "TransactionInactiveError",
+                        "Version change transaction is not active",
+                    ));
+                }
+                vc_tx
+            };
+
+            let (key_path, key_path_is_array) = match key_path_pair {
+                Some((v, is_arr)) => {
+                    validate_key_path_syntax(vm, &v, is_arr)?;
+                    (Some(v), is_arr)
+                }
+                None => (None, false),
+            };
+
+            let (store_id, store_proto) = {
+                let mut st = db.borrow_mut();
+                let sid = st.alloc_meta_id();
+                let proto_h = st.protos.object_store_proto.unwrap_or(vm.object_proto);
                 let tx = st.transactions.get_mut(&vc_tx).ok_or_else(|| {
                     create_dom_exception(vm, "InvalidStateError", "Transaction inactive")
                 })?;
@@ -3502,28 +3135,49 @@ fn install_idb_database_proto(
                         &format!("Object store '{name}' already exists"),
                     ));
                 }
+                if auto_increment
+                    && (key_path_is_array
+                        || key_path
+                            .as_ref()
+                            .is_some_and(|kp| kp.len() > 1 || kp[0].is_empty()))
+                {
+                    return Err(create_dom_exception(
+                        vm,
+                        "InvalidAccessError",
+                        "autoIncrement cannot be combined with empty or compound keyPath",
+                    ));
+                }
                 let mut snap_store = IdbStoreSnapshot::new(name.clone(), key_path, auto_increment);
                 snap_store.key_path_is_array = key_path_is_array;
                 tx.working.stores.insert(name.clone(), snap_store);
                 if !tx.scope.contains(&name) {
                     tx.scope.push(name.clone());
                 }
-                (
-                    vc_tx,
-                    st.protos.object_store_proto.unwrap_or(vm.object_proto),
-                )
+                tx.store_id_by_name.insert(name.clone(), sid);
+                tx.name_by_store_id.insert(sid, name.clone());
+                (sid, proto_h)
             };
             let store_h = vm
                 .heap
                 .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(store_proto)));
-            db.borrow_mut().stores.insert(
-                store_h,
-                IdbStoreHandle {
-                    tx_h,
-                    name,
-                    cached_key_path: None,
-                },
-            );
+            {
+                let mut st = db.borrow_mut();
+                st.stores.insert(
+                    store_h,
+                    IdbStoreHandle {
+                        tx_h: vc_tx,
+                        store_id,
+                        name,
+                        original_name: None,
+                        deleted: false,
+                        cached_key_path: None,
+                        cached_auto_increment: auto_increment,
+                    },
+                );
+                if let Some(tx) = st.transactions.get_mut(&vc_tx) {
+                    tx.store_handles.insert(store_id, store_h);
+                }
+            }
             Ok(JsValue::from_object(store_h))
         });
     }
@@ -3535,14 +3189,14 @@ fn install_idb_database_proto(
             let Some(db_h) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
+            if !db.borrow().databases.contains_key(&db_h) {
+                return Err(vm.type_error("Illegal invocation"));
+            }
             if args.is_empty() {
                 return Err(vm.type_error("IDBDatabase.deleteObjectStore requires 1 argument"));
             }
             let name = vm.to_js_string(arg(args, 0))?;
             let mut st = db.borrow_mut();
-            if !st.databases.contains_key(&db_h) {
-                return Err(vm.type_error("Illegal invocation"));
-            }
             let vc_tx = st
                 .databases
                 .get(&db_h)
@@ -3554,17 +3208,53 @@ fn install_idb_database_proto(
                         "deleteObjectStore() is only allowed during a versionchange transaction",
                     )
                 })?;
-            let tx = st.transactions.get_mut(&vc_tx).ok_or_else(|| {
-                create_dom_exception(vm, "InvalidStateError", "Transaction inactive")
-            })?;
-            if tx.working.stores.remove(&name).is_none() {
-                return Err(create_dom_exception(
-                    vm,
-                    "NotFoundError",
-                    &format!("Object store '{name}' does not exist"),
-                ));
+            let (removed_sh, removed_ihs) = {
+                let tx = st.transactions.get_mut(&vc_tx).ok_or_else(|| {
+                    create_dom_exception(vm, "InvalidStateError", "Transaction inactive")
+                })?;
+                if tx.state != TxState::Active || tx.aborted || tx.aborting {
+                    return Err(create_dom_exception(
+                        vm,
+                        "TransactionInactiveError",
+                        "Version change transaction is not active",
+                    ));
+                }
+                let Some(removed_store) = tx.working.stores.remove(&name) else {
+                    return Err(create_dom_exception(
+                        vm,
+                        "NotFoundError",
+                        &format!("Object store '{name}' does not exist"),
+                    ));
+                };
+                tx.scope.retain(|s| s != &name);
+                let sid = tx.store_id_by_name.remove(&name);
+                if let Some(id) = sid {
+                    tx.deleted_stores.insert(id, removed_store);
+                }
+                let sh = sid.and_then(|id| {
+                    tx.name_by_store_id.remove(&id);
+                    tx.store_handles.get(&id).copied()
+                });
+                let ihs: Vec<HeapHandle> = sid
+                    .map(|id| {
+                        tx.index_handles
+                            .iter()
+                            .filter_map(|(&(s, _), &ih)| (s == id).then_some(ih))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (sh, ihs)
+            };
+            if let Some(sh) = removed_sh {
+                if let Some(s) = st.stores.get_mut(&sh) {
+                    s.deleted = true;
+                }
             }
-            tx.scope.retain(|s| s != &name);
+            for ih in removed_ihs {
+                if let Some(i) = st.indexes.get_mut(&ih) {
+                    i.deleted = true;
+                }
+            }
             Ok(JsValue::UNDEFINED)
         });
     }
@@ -3608,17 +3298,15 @@ fn install_idb_database_proto(
             } else {
                 vec![vm.to_js_string(names_arg)?]
             };
-            let mode = if arg(args, 1).is_undefined() {
-                TxMode::ReadOnly
+            let mode_str = if arg(args, 1).is_undefined() {
+                "readonly".to_string()
             } else {
                 let ms = vm.to_js_string(arg(args, 1))?;
-                match ms.as_str() {
-                    "readonly" => TxMode::ReadOnly,
-                    "readwrite" => TxMode::ReadWrite,
-                    other => {
-                        return Err(vm.type_error(format!("Invalid transaction mode '{other}'")));
-                    }
+                // WebIDL enum `IDBTransactionMode` accepts `"readonly" | "readwrite" | "versionchange"`.
+                if !matches!(ms.as_str(), "readonly" | "readwrite" | "versionchange") {
+                    return Err(vm.type_error(format!("Invalid transaction mode '{ms}'")));
                 }
+                ms
             };
             let durability = if let Some(opts) = arg(args, 2).as_object() {
                 let kd = vm.heap.intern_key("durability");
@@ -3641,7 +3329,7 @@ fn install_idb_database_proto(
                 "default"
             };
 
-            let (origin, db_name, tx_proto) = {
+            let (origin, db_name, version, schema_stores, tx_proto) = {
                 let st = db.borrow();
                 let d = st
                     .databases
@@ -3661,78 +3349,101 @@ fn install_idb_database_proto(
                         "Database connection is closing",
                     ));
                 }
+                for sname in &scope {
+                    if !d.schema_stores.contains_key(sname) {
+                        return Err(create_dom_exception(
+                            vm,
+                            "NotFoundError",
+                            &format!("Object store '{sname}' does not exist"),
+                        ));
+                    }
+                }
+                if scope.is_empty() {
+                    return Err(create_dom_exception(
+                        vm,
+                        "InvalidAccessError",
+                        "Transaction storeNames must not be empty",
+                    ));
+                }
                 (
                     d.origin.clone(),
                     d.name.clone(),
+                    d.version,
+                    d.schema_stores.clone(),
                     st.protos.transaction_proto.unwrap_or(vm.object_proto),
                 )
             };
 
-            if scope.is_empty() {
-                return Err(create_dom_exception(
-                    vm,
-                    "InvalidAccessError",
-                    "Transaction storeNames must not be empty",
-                ));
-            }
-
-            let storage = wa_r.borrow().storage.clone();
-            let working = storage
-                .idb_load_database(&origin, &db_name)
-                .map_err(|e| create_dom_exception(vm, "UnknownError", &e.to_string()))?
-                .unwrap_or_else(|| IdbDatabaseSnapshot::new(db_name.clone(), 1));
-
-            for sname in &scope {
-                if !working.stores.contains_key(sname) {
-                    return Err(create_dom_exception(
-                        vm,
-                        "NotFoundError",
-                        &format!("Object store '{sname}' does not exist"),
-                    ));
+            let mode = match mode_str.as_str() {
+                "readonly" => TxMode::ReadOnly,
+                "readwrite" => TxMode::ReadWrite,
+                other => {
+                    return Err(vm.type_error(format!("Invalid transaction mode '{other}'")));
                 }
-            }
+            };
+
+            let mut working = IdbDatabaseSnapshot::new(db_name.clone(), version);
+            working.stores = schema_stores;
 
             let tx_h = vm
                 .heap
                 .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(tx_proto)));
             ev_r.borrow_mut().set_object_event_parent(tx_h, Some(db_h));
-            let ver = working.version;
-            db.borrow_mut().transactions.insert(
-                tx_h,
-                IdbTransactionState {
+            {
+                let mut st = db.borrow_mut();
+                let mut tx_state = IdbTransactionState::new(
                     db_h,
-                    origin,
+                    origin.clone(),
+                    db_name.clone(),
                     mode,
                     durability,
                     scope,
                     working,
-                    old_version: ver,
-                    finished: false,
-                    aborted: false,
-                    pending_requests: 0,
-                    commit_scheduled: false,
-                    error: JsValue::NULL,
-                    versionchange_open_req: None,
-                },
-            );
-            schedule_tx_commit_check(&h_r, &ev_r, &el_r, &wa_r, &db, tx_h);
+                    version,
+                    false,
+                    None,
+                    None,
+                );
+                let mut next_id = st.next_meta_id.max(1);
+                tx_state.init_meta_ids(&mut next_id);
+                st.next_meta_id = next_id;
+                st.transactions.insert(tx_h, tx_state);
+                st.coords
+                    .entry((origin.clone(), db_name.clone()))
+                    .or_default()
+                    .tx_queue
+                    .push_back(tx_h);
+            }
+            pump_db_tx_queue(&h_r, &ev_r, &el_r, &wa_r, &db, &origin, &db_name);
             Ok(JsValue::from_object(tx_h))
         });
     }
 
     // db.close()
     {
+        let h_r = Rc::clone(host);
+        let ev_r = Rc::clone(events);
+        let el_r = Rc::clone(event_loop);
+        let wa_r = Rc::clone(web_apis);
         let db = Rc::clone(idb);
         define_host_method(vm, proto, "close", move |vm, this_val, _| {
             let Some(h) = this_val.as_object() else {
                 return Err(vm.type_error("Illegal invocation"));
             };
-            if let Some(d) = db.borrow_mut().databases.get_mut(&h) {
+            let db_key = {
+                let mut st = db.borrow_mut();
+                let Some(d) = st.databases.get_mut(&h) else {
+                    return Err(vm.type_error("Illegal invocation"));
+                };
                 d.closed = true;
-                Ok(JsValue::UNDEFINED)
-            } else {
-                Err(vm.type_error("Illegal invocation"))
-            }
+                let key = (d.origin.clone(), d.name.clone());
+                if let Some(coord) = st.coords.get_mut(&key) {
+                    coord.open_connections.retain(|&dh| dh != h);
+                }
+                key
+            };
+            schedule_factory_pump(&h_r, &ev_r, &el_r, &wa_r, &db, &db_key.0, &db_key.1);
+            Ok(JsValue::UNDEFINED)
         });
     }
 
@@ -3766,9 +3477,9 @@ fn install_idb_factory(
             if args.is_empty() {
                 return Err(vm.type_error("IDBFactory.open requires at least 1 argument"));
             }
-            let origin_check = idb_effective_origin(&wa_r, &db_r);
-            if origin_check == "null" {
-                return Err(create_dom_exception(
+            let origin = idb_effective_origin(vm, &wa_r, &db_r);
+            if origin == "null" {
+                return Err(idb_err(
                     vm,
                     "SecurityError",
                     "IndexedDB access is denied in an opaque origin",
@@ -3782,166 +3493,19 @@ fn install_idb_factory(
             };
 
             let req_h = alloc_request(vm, &ev_r, &db_r, true, JsValue::NULL, JsValue::NULL);
-            let h = Rc::clone(&h_r);
-            let ev = Rc::clone(&ev_r);
-            let el = Rc::clone(&el_r);
-            let wa = Rc::clone(&wa_r);
-            let db_sys = Rc::clone(&db_r);
-
-            el_r.borrow_mut()
-                .post_host_task(TaskPriority::Networking, move |vm| {
-                    let origin = idb_effective_origin(&wa, &db_sys);
-                    let storage = wa.borrow().storage.clone();
-                    let ev_proto = ev.borrow().event_proto.unwrap_or(vm.object_proto);
-                    let existing = match storage.idb_load_database(&origin, &db_name) {
-                        Ok(opt) => opt,
-                        Err(e) => {
-                            let err = create_dom_exception(vm, "UnknownError", &e.to_string()).value;
-                            if let Some(r) = db_sys.borrow_mut().requests.get_mut(&req_h) {
-                                r.ready_state = "done";
-                                r.error = err;
-                            }
-                            let _ = fire_idb_event(
-                                vm, &h, &ev, &el, req_h, "error", true, true, ev_proto, &[],
-                            );
-                            return;
-                        }
-                    };
-
-                    let old_version = existing.as_ref().map_or(0, |d| d.version);
-                    let target_version = requested_version.unwrap_or_else(|| old_version.max(1));
-
-                    if old_version > 0 && target_version < old_version {
-                        let err = create_dom_exception(
-                            vm,
-                            "VersionError",
-                            &format!(
-                                "Requested version ({target_version}) is less than existing version ({old_version})"
-                            ),
-                        )
-                        .value;
-                        if let Some(r) = db_sys.borrow_mut().requests.get_mut(&req_h) {
-                            r.ready_state = "done";
-                            r.error = err;
-                        }
-                        let _ = fire_idb_event(
-                            vm, &h, &ev, &el, req_h, "error", true, true, ev_proto, &[],
-                        );
-                        return;
-                    }
-
-                    let mut snap = existing
-                        .unwrap_or_else(|| IdbDatabaseSnapshot::new(db_name.clone(), target_version));
-                    let needs_upgrade = old_version == 0 || target_version > old_version;
-                    snap.version = target_version;
-
-                    let (db_proto, tx_proto, vc_proto) = {
-                        let st = db_sys.borrow();
-                        (
-                            st.protos.database_proto.unwrap_or(vm.object_proto),
-                            st.protos.transaction_proto.unwrap_or(vm.object_proto),
-                            st.protos.version_change_event_proto.unwrap_or(ev_proto),
-                        )
-                    };
-                    let db_h = vm
-                        .heap
-                        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(db_proto)));
-                    let store_names: Vec<String> = snap.stores.keys().cloned().collect();
-
-                    if !needs_upgrade {
-                        db_sys.borrow_mut().databases.insert(
-                            db_h,
-                            IdbDatabaseState {
-                                origin,
-                                name: db_name,
-                                version: snap.version,
-                                store_names,
-                                closed: false,
-                                active_versionchange_tx: None,
-                            },
-                        );
-                        if let Some(r) = db_sys.borrow_mut().requests.get_mut(&req_h) {
-                            r.ready_state = "done";
-                            r.result = JsValue::from_object(db_h);
-                            r.error = JsValue::NULL;
-                        }
-                        let _ = fire_idb_event(
-                            vm, &h, &ev, &el, req_h, "success", false, false, ev_proto, &[],
-                        );
-                        return;
-                    }
-
-                    // Upgrade needed: create `versionchange` transaction and fire `upgradeneeded`!
-                    let tx_h = vm
-                        .heap
-                        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(tx_proto)));
-                    ev.borrow_mut().set_object_event_parent(tx_h, Some(db_h));
-                    ev.borrow_mut().set_object_event_parent(req_h, Some(tx_h));
-                    {
-                        let mut st = db_sys.borrow_mut();
-                        st.databases.insert(
-                            db_h,
-                            IdbDatabaseState {
-                                origin: origin.clone(),
-                                name: db_name,
-                                version: target_version,
-                                store_names: store_names.clone(),
-                                closed: false,
-                                active_versionchange_tx: Some(tx_h),
-                            },
-                        );
-                        st.transactions.insert(
-                            tx_h,
-                            IdbTransactionState {
-                                db_h,
-                                origin,
-                                mode: TxMode::VersionChange,
-                                durability: "default",
-                                scope: store_names,
-                                working: snap,
-                                old_version,
-                                finished: false,
-                                aborted: false,
-                                pending_requests: 0,
-                                commit_scheduled: false,
-                                error: JsValue::NULL,
-                                versionchange_open_req: Some(req_h),
-                            },
-                        );
-                        if let Some(r) = st.requests.get_mut(&req_h) {
-                            r.ready_state = "done";
-                            r.result = JsValue::from_object(db_h);
-                            r.transaction = JsValue::from_object(tx_h);
-                        }
-                    }
-
-                    let (_, threw) = fire_idb_event(
-                        vm,
-                        &h,
-                        &ev,
-                        &el,
-                        req_h,
-                        "upgradeneeded",
-                        false,
-                        false,
-                        vc_proto,
-                        &[
-                            ("__rix_idb_old_ver__", JsValue::from_number(old_version as f64)),
-                            ("__rix_idb_new_ver__", JsValue::from_number(target_version as f64)),
-                        ],
-                    );
-                    if threw {
-                        abort_tx_with_error(
-                            vm,
-                            &db_sys,
-                            tx_h,
-                            "AbortError",
-                            "Uncaught exception in upgradeneeded event handler",
-                        );
-                    }
-                    schedule_tx_commit_check(&h, &ev, &el, &wa, &db_sys, tx_h);
+            db_r.borrow_mut()
+                .coords
+                .entry((origin.clone(), db_name.clone()))
+                .or_default()
+                .open_delete_queue
+                .push_back(PendingFactoryOp {
+                    is_delete: false,
+                    req_h,
+                    requested_version,
+                    vc_sent: false,
+                    blocked_sent: false,
                 });
-
+            schedule_factory_pump(&h_r, &ev_r, &el_r, &wa_r, &db_r, &origin, &db_name);
             Ok(JsValue::from_object(req_h))
         });
     }
@@ -3957,8 +3521,9 @@ fn install_idb_factory(
             if args.is_empty() {
                 return Err(vm.type_error("IDBFactory.deleteDatabase requires 1 argument"));
             }
-            if idb_effective_origin(&wa_r, &db_r) == "null" {
-                return Err(create_dom_exception(
+            let origin = idb_effective_origin(vm, &wa_r, &db_r);
+            if origin == "null" {
+                return Err(idb_err(
                     vm,
                     "SecurityError",
                     "IndexedDB access is denied in an opaque origin",
@@ -3966,48 +3531,19 @@ fn install_idb_factory(
             }
             let db_name = vm.to_js_string(arg(args, 0))?;
             let req_h = alloc_request(vm, &ev_r, &db_r, true, JsValue::NULL, JsValue::NULL);
-            let h = Rc::clone(&h_r);
-            let ev = Rc::clone(&ev_r);
-            let el = Rc::clone(&el_r);
-            let wa = Rc::clone(&wa_r);
-            let db_sys = Rc::clone(&db_r);
-            el_r.borrow_mut()
-                .post_host_task(TaskPriority::Networking, move |vm| {
-                    let origin = idb_effective_origin(&wa, &db_sys);
-                    let storage = wa.borrow().storage.clone();
-                    let old_ver = storage
-                        .idb_load_database(&origin, &db_name)
-                        .ok()
-                        .flatten()
-                        .map_or(0, |d| d.version);
-                    let _ = storage.idb_delete_database(&origin, &db_name);
-                    if let Some(r) = db_sys.borrow_mut().requests.get_mut(&req_h) {
-                        r.ready_state = "done";
-                        r.result = JsValue::UNDEFINED;
-                        r.error = JsValue::NULL;
-                    }
-                    let ev_proto = ev.borrow().event_proto.unwrap_or(vm.object_proto);
-                    let vc_proto = db_sys
-                        .borrow()
-                        .protos
-                        .version_change_event_proto
-                        .unwrap_or(ev_proto);
-                    let _ = fire_idb_event(
-                        vm,
-                        &h,
-                        &ev,
-                        &el,
-                        req_h,
-                        "success",
-                        false,
-                        false,
-                        vc_proto,
-                        &[
-                            ("__rix_idb_old_ver__", JsValue::from_number(old_ver as f64)),
-                            ("__rix_idb_new_ver__", JsValue::NULL),
-                        ],
-                    );
+            db_r.borrow_mut()
+                .coords
+                .entry((origin.clone(), db_name.clone()))
+                .or_default()
+                .open_delete_queue
+                .push_back(PendingFactoryOp {
+                    is_delete: true,
+                    req_h,
+                    requested_version: None,
+                    vc_sent: false,
+                    blocked_sent: false,
                 });
+            schedule_factory_pump(&h_r, &ev_r, &el_r, &wa_r, &db_r, &origin, &db_name);
             Ok(JsValue::from_object(req_h))
         });
     }
@@ -4018,9 +3554,9 @@ fn install_idb_factory(
         let db_r = Rc::clone(idb);
         define_host_method(vm, proto, "databases", move |vm, _, _| {
             let p = alloc_promise(vm);
-            let origin = idb_effective_origin(&wa_r, &db_r);
+            let origin = idb_effective_origin(vm, &wa_r, &db_r);
             if origin == "null" {
-                let err = create_dom_exception(
+                let err = idb_err(
                     vm,
                     "SecurityError",
                     "IndexedDB access is denied in an opaque origin",
