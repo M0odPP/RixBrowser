@@ -379,6 +379,11 @@ pub enum Pattern {
         right: Box<Expr>,
         span: Span,
     },
+    Member {
+        object: Box<Expr>,
+        property: MemberProp,
+        span: Span,
+    },
 }
 
 impl Pattern {
@@ -387,7 +392,8 @@ impl Pattern {
             Pattern::Ident { span, .. }
             | Pattern::Array { span, .. }
             | Pattern::Object { span, .. }
-            | Pattern::Assign { span, .. } => *span,
+            | Pattern::Assign { span, .. }
+            | Pattern::Member { span, .. } => *span,
         }
     }
 
@@ -412,6 +418,7 @@ impl Pattern {
                 }
             }
             Pattern::Assign { left, .. } => left.collect_bound_names(out),
+            Pattern::Member { .. } => {}
         }
     }
 }

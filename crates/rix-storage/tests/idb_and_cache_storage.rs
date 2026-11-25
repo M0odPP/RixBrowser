@@ -82,6 +82,7 @@ fn cache_storage_and_indexeddb_persist_durably_across_redb_restarts() {
             IdbIndexSchema {
                 name: "by_title".to_string(),
                 key_path: vec!["title".to_string()],
+                key_path_is_array: false,
                 unique: true,
                 multi_entry: false,
             },
@@ -92,6 +93,7 @@ fn cache_storage_and_indexeddb_persist_durably_across_redb_restarts() {
             IdbRecord {
                 key: k1,
                 value_json: r#"{"id":1,"title":"persisted"}"#.to_string(),
+                value_bytes: Vec::new(),
             },
         );
         store.next_key = 2;

@@ -1961,6 +1961,7 @@ fn install_idb_object_store_proto(
                     IdbIndexSchema {
                         name: idx_name.clone(),
                         key_path,
+                        key_path_is_array: false,
                         unique,
                         multi_entry,
                     },

@@ -65,6 +65,8 @@ pub struct EventSystem {
     close_events: HashMap<HeapHandle, (bool, u16, String)>,
     event_handlers: HashMap<(EventTargetKey, String), JsValue>,
     idl_handler_trampolines: HashMap<(EventTargetKey, String), HeapHandle>,
+    object_parents: HashMap<HeapHandle, HeapHandle>,
+    dispatch_threw_stack: Vec<bool>,
     pub event_proto: Option<HeapHandle>,
     pub event_protos: HashMap<&'static str, HeapHandle>,
     pub(crate) on_uncaught_error: Option<crate::event_loop::UncaughtErrorHook>,
@@ -89,10 +91,36 @@ impl EventSystem {
             close_events: HashMap::new(),
             event_handlers: HashMap::new(),
             idl_handler_trampolines: HashMap::new(),
+            object_parents: HashMap::new(),
+            dispatch_threw_stack: Vec::new(),
             event_proto: None,
             event_protos: HashMap::new(),
             on_uncaught_error: None,
             start_instant: Instant::now(),
+        }
+    }
+
+    /// Registers or clears the WHATWG DOM "get the parent" `EventTarget` parent for a non-Node
+    /// object (e.g. `IDBRequest -> IDBTransaction -> IDBDatabase`).
+    #[allow(dead_code)]
+    pub(crate) fn set_object_event_parent(
+        &mut self,
+        child: HeapHandle,
+        parent: Option<HeapHandle>,
+    ) {
+        match parent {
+            Some(p) => {
+                self.object_parents.insert(child, p);
+            }
+            None => {
+                self.object_parents.remove(&child);
+            }
+        }
+    }
+
+    pub(crate) fn mark_current_dispatch_threw(&mut self) {
+        if let Some(top) = self.dispatch_threw_stack.last_mut() {
+            *top = true;
         }
     }
 
@@ -141,6 +169,8 @@ impl EventSystem {
             EventTargetKey::Object(h) => heap.is_alive(h),
             EventTargetKey::Window | EventTargetKey::Node(_) => true,
         });
+        self.object_parents
+            .retain(|&child, &mut parent| heap.is_alive(child) && heap.is_alive(parent));
     }
 
     fn has_any_listeners_for_node(&self, nid: NodeId) -> bool {
@@ -1927,6 +1957,7 @@ fn install_global_and_window_event_handlers(
                         if cb.as_object().is_some_and(|fh| vm.is_callable_handle(fh)) {
                             let ev_arg = arg(cb_args, 0);
                             if let Err(ex) = vm.call_value(cb, this_v, &[ev_arg]) {
+                                e_cb.borrow_mut().mark_current_dispatch_threw();
                                 let hook = e_cb.borrow().on_uncaught_error.clone();
                                 if let Some(hook) = hook {
                                     hook(vm, ex);
@@ -1960,17 +1991,40 @@ struct PathEntry {
 
 fn build_propagation_path(
     host: &SharedHost,
+    events: &SharedEvents,
     target_key: EventTargetKey,
     composed: bool,
     related_target: Option<NodeId>,
 ) -> Vec<PathEntry> {
     let EventTargetKey::Node(start_node) = target_key else {
-        return vec![PathEntry {
+        let mut path = vec![PathEntry {
             current: target_key,
             retargeted_target: target_key,
             retargeted_related_target: related_target.map(EventTargetKey::Node),
             in_closed_shadow: false,
         }];
+        if let EventTargetKey::Object(mut cur_h) = target_key {
+            let es = events.borrow();
+            let mut hops = 0u8;
+            while let Some(&parent_h) = es.object_parents.get(&cur_h) {
+                if parent_h == cur_h || hops >= 32 {
+                    break;
+                }
+                hops += 1;
+                let pk = EventTargetKey::Object(parent_h);
+                if path.iter().any(|e| e.current == pk) {
+                    break;
+                }
+                path.push(PathEntry {
+                    current: pk,
+                    retargeted_target: target_key,
+                    retargeted_related_target: related_target.map(EventTargetKey::Node),
+                    in_closed_shadow: false,
+                });
+                cur_h = parent_h;
+            }
+        }
+        return path;
     };
 
     let hb = host.borrow();
@@ -2086,7 +2140,7 @@ fn dispatch_event_internal(
     let orig_rt_val = vm.get_property_by_key(ev_h, k_rt).ok();
     let related_target_node = orig_rt_val.and_then(|v| host.borrow().node_for_value(vm, v));
 
-    let path = build_propagation_path(host, target_key, composed, related_target_node);
+    let path = build_propagation_path(host, events, target_key, composed, related_target_node);
     let path_keys: Vec<EventTargetKey> = path.iter().map(|e| e.current).collect();
     let js_path: Vec<JsValue> = path
         .iter()
@@ -2272,6 +2326,7 @@ fn invoke_listeners_at(
                 cur_val,
                 &[JsValue::from_object(ev_h)],
             ) {
+                events.borrow_mut().mark_current_dispatch_threw();
                 let hook = events.borrow().on_uncaught_error.clone();
                 if let Some(cb) = hook {
                     cb(vm, ex);
@@ -2279,17 +2334,36 @@ fn invoke_listeners_at(
             }
         } else {
             let k_he = vm.heap.intern_key("handleEvent");
-            if let Ok(he_val) = vm.get_property_by_key(listener.listener, k_he) {
-                if let Some(fh) = he_val.as_object().filter(|&h| vm.is_callable_handle(h)) {
-                    if let Err(ex) = vm.call_value(
-                        JsValue::from_object(fh),
-                        JsValue::from_object(listener.listener),
-                        &[JsValue::from_object(ev_h)],
-                    ) {
+            match vm.get_property_by_key(listener.listener, k_he) {
+                Ok(he_val) => {
+                    if let Some(fh) = he_val.as_object().filter(|&h| vm.is_callable_handle(h)) {
+                        if let Err(ex) = vm.call_value(
+                            JsValue::from_object(fh),
+                            JsValue::from_object(listener.listener),
+                            &[JsValue::from_object(ev_h)],
+                        ) {
+                            events.borrow_mut().mark_current_dispatch_threw();
+                            let hook = events.borrow().on_uncaught_error.clone();
+                            if let Some(cb) = hook {
+                                cb(vm, ex);
+                            }
+                        }
+                    } else {
+                        // WHATWG WebIDL / DOM §2.9: non-callable `handleEvent` throws `TypeError`
+                        // and reports an uncaught exception during listener invocation!
+                        let ex = vm.type_error("EventListener.handleEvent is not a function");
+                        events.borrow_mut().mark_current_dispatch_threw();
                         let hook = events.borrow().on_uncaught_error.clone();
                         if let Some(cb) = hook {
                             cb(vm, ex);
                         }
+                    }
+                }
+                Err(ex) => {
+                    events.borrow_mut().mark_current_dispatch_threw();
+                    let hook = events.borrow().on_uncaught_error.clone();
+                    if let Some(cb) = hook {
+                        cb(vm, ex);
                     }
                 }
             }
@@ -2355,7 +2429,7 @@ pub fn fire_dom_node_event(
         .iter()
         .find(|&&(k, _)| k == "relatedTarget")
         .and_then(|&(_, v)| host.borrow().node_for_value(vm, v));
-    let path = build_propagation_path(host, EventTargetKey::Node(node), composed, rt_node);
+    let path = build_propagation_path(host, events, EventTargetKey::Node(node), composed, rt_node);
     let attr_name = format!("on{ev_type}");
     let prop_key = vm.heap.intern_key(&attr_name);
     for (idx, entry) in path.iter().enumerate() {
@@ -2735,6 +2809,7 @@ pub(crate) fn install_object_event_handler_accessor<F>(
                         if cb.as_object().is_some_and(|fh| vm.is_callable_handle(fh)) {
                             let ev_arg = arg(cb_args, 0);
                             if let Err(ex) = vm.call_value(cb, this_v, &[ev_arg]) {
+                                e_cb.borrow_mut().mark_current_dispatch_threw();
                                 let hook = e_cb.borrow().on_uncaught_error.clone();
                                 if let Some(hook) = hook {
                                     hook(vm, ex);
@@ -2844,7 +2919,7 @@ pub(crate) fn fire_object_event_dispatch_only(
 }
 
 /// Fires a trusted cancelable event on `target` and returns `true` if a listener called `preventDefault()`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn fire_cancelable_object_event(
     vm: &mut JsVm,
     host: &SharedHost,
@@ -2910,6 +2985,74 @@ pub(crate) fn fire_cancelable_object_event(
         .events
         .get(&ev_h)
         .is_some_and(|e| e.default_prevented)
+}
+
+/// Dispatches a trusted IndexedDB event purely through `EventTarget` capture/target/bubble
+/// propagation (including HTML §8.1.7.1 `EventHandler` IDL accessors and `object_parents`
+/// `IDBRequest -> IDBTransaction -> IDBDatabase` parent chain).
+/// Returns `(default_prevented, listener_threw)`.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn fire_idb_event(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    target: HeapHandle,
+    ev_type: &str,
+    bubbles: bool,
+    cancelable: bool,
+    proto: HeapHandle,
+    props: &[(&str, JsValue)],
+) -> (bool, bool) {
+    let ev_h = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    let ts = events.borrow().now_ms();
+    {
+        let mut es = events.borrow_mut();
+        es.events.insert(
+            ev_h,
+            EventInternal {
+                event_type: ev_type.to_string(),
+                bubbles,
+                cancelable,
+                composed: false,
+                is_trusted: true,
+                initialized: true,
+                dispatch_flag: false,
+                default_prevented: false,
+                propagation_stopped: false,
+                immediate_stopped: false,
+                in_passive_listener: false,
+                event_phase: 0,
+                time_stamp: ts,
+                target: JsValue::from_object(target),
+                current_target: JsValue::NULL,
+                composed_path: Vec::new(),
+                path_keys: Vec::new(),
+                current_target_key: None,
+            },
+        );
+        es.dispatch_threw_stack.push(false);
+    }
+    define_own_is_trusted(vm, events, ev_h);
+    for &(name, val) in props {
+        let k = vm.heap.intern_key(name);
+        vm.heap
+            .object_define_data(ev_h, k, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    }
+    let _ = dispatch_event_internal(
+        vm,
+        host,
+        events,
+        event_loop,
+        EventTargetKey::Object(target),
+        ev_h,
+    );
+    let mut es = events.borrow_mut();
+    let threw = es.dispatch_threw_stack.pop().unwrap_or(false);
+    let prevented = es.events.get(&ev_h).is_some_and(|e| e.default_prevented);
+    (prevented, threw)
 }
 
 /// Registers an externally constructed `Event` subclass instance (such as `MessageEvent`)

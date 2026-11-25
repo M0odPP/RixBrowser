@@ -3547,9 +3547,15 @@ impl<'a> Parser<'a> {
                         Pattern::Ident { name, span: s }
                     }
                     AssignTarget::Pattern(p) => p,
-                    AssignTarget::Member { span: s, .. } => {
-                        return Err(SyntaxError::new("Invalid assignment pattern element", s));
-                    }
+                    AssignTarget::Member {
+                        object,
+                        property,
+                        span: s,
+                    } => Pattern::Member {
+                        object,
+                        property,
+                        span: s,
+                    },
                 };
                 Ok(Pattern::Assign {
                     left: Box::new(pat),
@@ -3646,6 +3652,15 @@ impl<'a> Parser<'a> {
                 }
                 Ok(Pattern::Object { props, rest, span })
             }
+            ExprKind::Member {
+                object,
+                property,
+                optional: false,
+            } => Ok(Pattern::Member {
+                object,
+                property,
+                span,
+            }),
             _ => Err(SyntaxError::new(
                 "Invalid destructuring assignment pattern",
                 span,
@@ -3851,6 +3866,15 @@ fn check_pattern_private_names(
         Pattern::Assign { left, right, .. } => {
             check_pattern_private_names(left, scopes)?;
             check_expr_private_names(right, scopes)
+        }
+        Pattern::Member {
+            object, property, ..
+        } => {
+            check_expr_private_names(object, scopes)?;
+            if let MemberProp::Computed(e) = property {
+                check_expr_private_names(e, scopes)?;
+            }
+            Ok(())
         }
         Pattern::Array { elements, rest, .. } => {
             for e in elements.iter().flatten() {
