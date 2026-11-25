@@ -29,6 +29,7 @@ pub mod indexeddb_engine;
 pub(crate) mod indexeddb_runtime;
 pub mod media_elements;
 pub mod media_source;
+pub(crate) mod media_source_worker;
 pub mod observers;
 pub mod selection;
 pub mod service_worker;
@@ -324,6 +325,8 @@ impl ContentRuntime {
             &web_apis,
             &media_elements,
         );
+        media_source.borrow_mut().realm_async_tx = Some(workers.borrow().async_tx_clone());
+        frames.borrow_mut().media_source = Some(Rc::clone(&media_source));
         media_elements::install_media_elements_with_system(
             &mut vm,
             &host,

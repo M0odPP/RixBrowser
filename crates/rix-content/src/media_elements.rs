@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use rix_dom::NodeId;
 use rix_ipc::SurfaceId;
-use rix_js::promise::promise_resolve_value;
+use rix_js::promise::{alloc_promise, promise_resolve_value, reject_promise, resolve_promise};
 use rix_js::{HeapHandle, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs};
 use rix_layout::surface_id_for_node;
 use rix_media::{
@@ -28,9 +28,10 @@ use crate::dom_interfaces::define_to_string_tag;
 use crate::event_loop::{SharedEventLoop, TaskPriority};
 use crate::events::{fire_object_event, SharedEvents};
 use crate::media_source::{detach_media_source_from_element, SharedMediaSource};
+use crate::media_source_worker::{read_bridge_snapshot, set_bridge_playback_time};
 use crate::web_apis::{
-    arg, bind_ctor_proto, define_global, define_host_accessor, define_host_getter,
-    define_host_method, SharedWebApis,
+    arg, bind_ctor_proto, create_dom_exception, define_global, define_host_accessor,
+    define_host_getter, define_host_method, SharedWebApis,
 };
 
 /// HTML5 `HTMLMediaElement.networkState` constants.
@@ -65,6 +66,7 @@ pub struct MediaPlayerState {
     pub error: Option<(u16, String)>,
     pub seeking: bool,
     pub seek_target_s: Option<f64>,
+    pub seek_generation: u64,
     pub ended: bool,
     pub loop_enabled: bool,
     pub autoplay: bool,
@@ -79,6 +81,8 @@ pub struct MediaPlayerState {
     pub last_timeupdate_s: f64,
     /// Full-precision playback/seek time in seconds (avoids integer-microsecond rounding on sub-us durations).
     pub exact_time_s: Option<f64>,
+    /// Pending `play()` promises awaiting playback readiness or source failure.
+    pub pending_play_promises: Vec<HeapHandle>,
     video_decoder: Option<Box<dyn VideoDecoder>>,
     audio_decoder: Option<Box<dyn AudioDecoder>>,
     decoded_video_queue: VecDeque<VideoFrame>,
@@ -108,6 +112,7 @@ impl MediaPlayerState {
             error: None,
             seeking: false,
             seek_target_s: None,
+            seek_generation: 0,
             ended: false,
             loop_enabled: false,
             autoplay: false,
@@ -121,6 +126,7 @@ impl MediaPlayerState {
             last_vsync_ms: None,
             last_timeupdate_s: -1.0,
             exact_time_s: None,
+            pending_play_promises: Vec::new(),
             video_decoder: None,
             audio_decoder: None,
             decoded_video_queue: VecDeque::new(),
@@ -147,6 +153,7 @@ impl MediaPlayerState {
         self.error = None;
         self.seeking = false;
         self.seek_target_s = None;
+        self.seek_generation = self.seek_generation.wrapping_add(1);
         self.ended = false;
         self.duration_s = f64::NAN;
         self.has_fired_loadedmetadata = false;
@@ -157,6 +164,7 @@ impl MediaPlayerState {
         self.last_vsync_ms = None;
         self.last_timeupdate_s = -1.0;
         self.exact_time_s = None;
+        self.pending_play_promises.clear();
         self.decoded_video_queue.clear();
         self.audio_queue.clear();
         self.mse_fed_counts.clear();
@@ -431,10 +439,15 @@ impl MediaElementSystem {
         }
     }
 
-    /// Roots JS prototype handles retained by `MediaElementSystem`.
+    /// Roots JS prototype handles and pending play promises retained by `MediaElementSystem`.
     pub fn collect_roots(&self, out: &mut Vec<JsValue>) {
         if let Some(p) = self.media_error_proto {
             out.push(JsValue::from_object(p));
+        }
+        for player in self.players.values() {
+            for &ph in &player.pending_play_promises {
+                out.push(JsValue::from_object(ph));
+            }
         }
     }
 
@@ -583,13 +596,53 @@ impl MediaElementSystem {
     }
 }
 
-/// Checks if timestamp `t` is covered by any buffered interval in `ranges` (with small frame epsilon).
+/// Resolves any pending `HTMLMediaElement.play()` promises for `nid`.
+pub(crate) fn resolve_pending_play_promises(
+    vm: &mut JsVm,
+    me_opt: &Option<SharedMediaElements>,
+    nid: NodeId,
+) {
+    let Some(me) = me_opt else { return };
+    let promises: Vec<HeapHandle> = me
+        .borrow_mut()
+        .players
+        .get_mut(&nid)
+        .map(|p| std::mem::take(&mut p.pending_play_promises))
+        .unwrap_or_default();
+    for ph in promises {
+        resolve_promise(vm, ph, JsValue::UNDEFINED);
+    }
+}
+
+/// Rejects any pending `HTMLMediaElement.play()` promises for `nid` with `NotSupportedError`.
+pub(crate) fn reject_pending_play_promises(
+    vm: &mut JsVm,
+    me_opt: &Option<SharedMediaElements>,
+    nid: NodeId,
+    reason: &str,
+) {
+    let Some(me) = me_opt else { return };
+    let promises: Vec<HeapHandle> = me
+        .borrow_mut()
+        .players
+        .get_mut(&nid)
+        .map(|p| std::mem::take(&mut p.pending_play_promises))
+        .unwrap_or_default();
+    for ph in promises {
+        let err = create_dom_exception(vm, "NotSupportedError", reason);
+        reject_promise(vm, ph, err.value);
+    }
+}
+
+/// Checks if timestamp `t` is covered by any buffered interval in `ranges`.
+/// At start of presentation (`t ≈ 0`), allows up to `0.1s` initial B-frame/edit-list offset
+/// (matching Chromium `ChunkDemuxer` / Gecko `FUZZ_FACTOR`).
 pub(crate) fn time_is_buffered(ranges: &TimeRanges, t: f64) -> bool {
     const EPS: f64 = 0.05;
-    ranges
-        .as_slice()
-        .iter()
-        .any(|&(s, e)| t >= s - EPS && t <= e + 1e-4)
+    ranges.as_slice().iter().any(|&(s, e)| {
+        let start_tol = if t < 0.001 && s <= 0.1 { s } else { EPS };
+        t >= s - start_tol && t <= e + 1e-4
+    })
 }
 
 /// Advances all actively playing / seeking media elements on each VSync tick, emitting HTML5
@@ -610,7 +663,13 @@ pub fn tick_playback_with_events(
 
     let mut pending_events: Vec<(NodeId, &'static str)> = Vec::new();
     for nid in node_ids {
-        let ms_handle_opt = ms_sys.borrow().attached_sources.get(&nid).copied();
+        let (ms_handle_opt, worker_bridge_opt) = {
+            let ms = ms_sys.borrow();
+            (
+                ms.attached_sources.get(&nid).copied(),
+                ms.worker_bridge_id_for_element(nid),
+            )
+        };
         let (is_ended_source, duration, buffered, frame_dims) = if let Some(ms_h) = ms_handle_opt {
             let ms = ms_sys.borrow();
             if let Some(entry) = ms.media_sources.get(&ms_h) {
@@ -629,6 +688,17 @@ pub fn tick_playback_with_events(
                 }
                 dims.sort_by(|a, b| a.0.total_cmp(&b.0));
                 (ended, dur, buf, dims)
+            } else {
+                (false, f64::NAN, TimeRanges::new(), Vec::new())
+            }
+        } else if let Some(bridge_id) = worker_bridge_opt {
+            if let Some(snap) = read_bridge_snapshot(bridge_id) {
+                (
+                    snap.ready_state == ReadyState::Ended,
+                    snap.duration,
+                    snap.buffered,
+                    Vec::new(),
+                )
             } else {
                 (false, f64::NAN, TimeRanges::new(), Vec::new())
             }
@@ -745,6 +815,8 @@ pub fn tick_playback_with_events(
                 if let Some(entry) = ms_sys.borrow_mut().media_sources.get_mut(&ms_h) {
                     entry.current_playback_time_s = new_t;
                 }
+            } else if let Some(bridge_id) = worker_bridge_opt {
+                set_bridge_playback_time(bridge_id, new_t);
             }
             if (new_t - player.last_timeupdate_s).abs() >= 0.04 {
                 player.last_timeupdate_s = new_t;
@@ -904,6 +976,10 @@ pub fn install_media_elements_with_system(
                     .and_then(|ms_h| s.media_sources.get(ms_h))
                 {
                     entry.engine.seekable()
+                } else if let Some(bridge_id) = s.worker_bridge_id_for_element(nid) {
+                    read_bridge_snapshot(bridge_id)
+                        .map(|sn| sn.seekable)
+                        .unwrap_or_default()
                 } else {
                     let dur = me_g
                         .borrow()
@@ -939,7 +1015,8 @@ pub fn install_media_elements_with_system(
                 )));
             };
             let this_h = this.as_object();
-            let (should_fire_play, should_fire_playing) = {
+            let has_worker_handle = ms_cl.borrow().worker_bridge_id_for_element(nid).is_some();
+            let (should_fire_play, should_fire_playing, existing_err, defer_promise) = {
                 let mut sys = me_cl.borrow_mut();
                 let player = sys.ensure_player(nid);
                 let was_paused = !player.clock.is_playing();
@@ -950,7 +1027,10 @@ pub fn install_media_elements_with_system(
                     player.has_fired_playing = false;
                 }
                 // If loaded from a Blob URL without MSE, load container bytes directly.
-                if !ms_cl.borrow().attached_sources.contains_key(&nid) && player.ready_state == 0 {
+                if !ms_cl.borrow().attached_sources.contains_key(&nid)
+                    && !has_worker_handle
+                    && player.ready_state == 0
+                {
                     let src_url = match h_cl.borrow().document.borrow().get(nid) {
                         Some(rix_dom::NodeData::Element(el)) => {
                             el.get_attribute("src").unwrap_or("").to_string()
@@ -961,13 +1041,22 @@ pub fn install_media_elements_with_system(
                         player.load_container_bytes(&blob_bytes);
                     }
                 }
-                player.clock.play();
+                let existing_err = player.error.as_ref().map(|(_, m)| m.clone());
+                if existing_err.is_none() {
+                    player.clock.play();
+                }
                 let ready_now = player.ready_state >= HAVE_FUTURE_DATA && !player.seeking;
-                let fire_playing = ready_now && !player.has_fired_playing;
+                let fire_playing = existing_err.is_none() && ready_now && !player.has_fired_playing;
                 if fire_playing {
                     player.has_fired_playing = true;
                 }
-                (was_paused, fire_playing)
+                let defer = existing_err.is_none() && has_worker_handle && !ready_now;
+                (
+                    was_paused && existing_err.is_none(),
+                    fire_playing,
+                    existing_err,
+                    defer,
+                )
             };
             if let Some(target_h) = this_h {
                 if should_fire_play || should_fire_playing {
@@ -985,6 +1074,21 @@ pub fn install_media_elements_with_system(
                             }
                         });
                 }
+            }
+            if let Some(msg) = existing_err {
+                let p = alloc_promise(vm);
+                let err = create_dom_exception(vm, "NotSupportedError", &msg);
+                reject_promise(vm, p, err.value);
+                return Ok(JsValue::from_object(p));
+            }
+            if defer_promise {
+                let p = alloc_promise(vm);
+                me_cl
+                    .borrow_mut()
+                    .ensure_player(nid)
+                    .pending_play_promises
+                    .push(p);
+                return Ok(JsValue::from_object(p));
             }
             Ok(JsValue::from_object(promise_resolve_value(
                 vm,
@@ -1093,6 +1197,17 @@ pub fn install_media_elements_with_system(
                             entry.engine.buffered(),
                             entry.engine.ready_state == ReadyState::Ended,
                         )
+                    } else if let Some(bridge_id) = s.worker_bridge_id_for_element(nid) {
+                        read_bridge_snapshot(bridge_id).map_or_else(
+                            || (f64::NAN, TimeRanges::new(), false),
+                            |sn| {
+                                (
+                                    sn.duration,
+                                    sn.buffered,
+                                    sn.ready_state == ReadyState::Ended,
+                                )
+                            },
+                        )
                     } else {
                         let d = me_s
                             .borrow()
@@ -1106,14 +1221,22 @@ pub fn install_media_elements_with_system(
                 if dur.is_finite() && dur >= 0.0 {
                     target = target.min(dur);
                 }
-                let ms_h_opt = ms_s.borrow().attached_sources.get(&nid).copied();
+                let (ms_h_opt, bridge_opt) = {
+                    let s = ms_s.borrow();
+                    (
+                        s.attached_sources.get(&nid).copied(),
+                        s.worker_bridge_id_for_element(nid),
+                    )
+                };
                 if let Some(ms_h) = ms_h_opt {
                     if let Some(entry) = ms_s.borrow_mut().media_sources.get_mut(&ms_h) {
                         entry.current_playback_time_s = target;
                     }
+                } else if let Some(bridge_id) = bridge_opt {
+                    set_bridge_playback_time(bridge_id, target);
                 }
 
-                let (should_seek_events, immediate_complete) = {
+                let (should_seek_events, immediate_complete, seek_gen) = {
                     let mut sys = me_s.borrow_mut();
                     let p = sys.ensure_player(nid);
                     p.clock.seek_seconds(target);
@@ -1121,15 +1244,17 @@ pub fn install_media_elements_with_system(
                     p.audio_queue.clear();
                     p.ended = false;
                     if p.ready_state == HAVE_NOTHING {
-                        (false, false)
+                        (false, false, 0)
                     } else {
                         let covered = is_ended || time_is_buffered(&buffered, target);
                         p.seeking = true;
                         p.seek_target_s = Some(target);
+                        p.seek_generation = p.seek_generation.wrapping_add(1);
+                        let gen = p.seek_generation;
                         if !covered && p.ready_state > HAVE_METADATA {
                             p.ready_state = HAVE_METADATA;
                         }
-                        (true, covered)
+                        (true, covered, gen)
                     }
                 };
 
@@ -1141,11 +1266,19 @@ pub fn install_media_elements_with_system(
                         let me_t = Rc::clone(&me_s);
                         el_s.borrow_mut()
                             .post_host_task(TaskPriority::Timer, move |vm| {
+                                let is_latest = me_t
+                                    .borrow()
+                                    .players
+                                    .get(&nid)
+                                    .is_some_and(|p| p.seek_generation == seek_gen);
+                                if !is_latest {
+                                    return;
+                                }
                                 fire_object_event(vm, &h_t, &ev_t, &el_t, target_h, "seeking", &[]);
                                 if immediate_complete {
                                     let still_same =
                                         me_t.borrow().players.get(&nid).is_some_and(|p| {
-                                            p.seeking && p.seek_target_s == Some(target)
+                                            p.seeking && p.seek_generation == seek_gen
                                         });
                                     if still_same {
                                         if let Some(p) = me_t.borrow_mut().players.get_mut(&nid) {

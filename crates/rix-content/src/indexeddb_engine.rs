@@ -458,6 +458,7 @@ fn json_value_to_payload(jv: &serde_json::Value) -> StructuredClonePayload {
         root,
         nodes,
         transferred_ports: Vec::new(),
+        has_transferred_media_handle: false,
     }
 }
 
@@ -1735,6 +1736,7 @@ mod tests {
                 props: vec![("v".into(), CloneValue::String("ok".into()))],
             }],
             transferred_ports: Vec::new(),
+            has_transferred_media_handle: false,
         };
         let rk = validate_put_or_add_sync(&pstore, &payload, None).expect("sync ok");
         let gen_k = store_put_or_add_payload(&mut pstore, payload, rk, true).expect("put ok");

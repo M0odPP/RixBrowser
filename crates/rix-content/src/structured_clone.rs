@@ -82,6 +82,7 @@ pub struct StructuredClonePayload {
     pub(crate) root: CloneValue,
     pub(crate) nodes: Vec<CloneNode>,
     pub(crate) transferred_ports: Vec<CrossThreadPortEnd>,
+    pub(crate) has_transferred_media_handle: bool,
 }
 
 impl StructuredClonePayload {
@@ -92,6 +93,7 @@ impl StructuredClonePayload {
             root: CloneValue::Undefined,
             nodes: Vec::new(),
             transferred_ports: Vec::new(),
+            has_transferred_media_handle: false,
         }
     }
 }
@@ -203,6 +205,9 @@ pub(crate) enum CloneNode {
     TransferredPort {
         port_index: usize,
     },
+    MediaSourceHandle {
+        bridge_id: u64,
+    },
     DomPoint {
         readonly: bool,
         x: f64,
@@ -239,6 +244,7 @@ enum CrossTransferItem {
     Port(HeapHandle),
     ImageBitmap(HeapHandle),
     OffscreenCanvas(HeapHandle),
+    MediaSourceHandle(HeapHandle),
 }
 
 /// Parses a WHATWG HTML `postMessage(message, transferOrOptions)` second argument
@@ -366,6 +372,19 @@ pub(crate) fn serialize_with_transfer(
                 transfer_items.push(CrossTransferItem::OffscreenCanvas(h));
                 continue;
             }
+            if let Some(ms) = ctx.frames.borrow().media_source.clone() {
+                if ms.borrow().is_media_source_handle(h) {
+                    if !ms.borrow().can_transfer_media_source_handle(h) {
+                        return Err(create_dom_exception(
+                            vm,
+                            "DataCloneError",
+                            "MediaSourceHandle is detached or has already been attached to a media element",
+                        ));
+                    }
+                    transfer_items.push(CrossTransferItem::MediaSourceHandle(h));
+                    continue;
+                }
+            }
             return Err(create_dom_exception(
                 vm,
                 "DataCloneError",
@@ -397,8 +416,9 @@ pub(crate) fn serialize_with_transfer(
 
     let root = serialize_value(vm, ctx, value, &mut nodes, &mut memo, &transfer_set, false)?;
 
-    // 3. Commit transfers (detach ArrayBuffers, ImageBitmaps, OffscreenCanvases, and MessagePorts).
+    // 3. Commit transfers (detach ArrayBuffers, ImageBitmaps, OffscreenCanvases, MessagePorts, and MediaSourceHandles).
     let local_async_tx = ctx.workers.borrow().async_tx_clone();
+    let mut has_transferred_media_handle = false;
     for item in transfer_items {
         match item {
             CrossTransferItem::ArrayBuffer(ab_h) => {
@@ -423,6 +443,12 @@ pub(crate) fn serialize_with_transfer(
                     entry.rgba.clear();
                 }
             }
+            CrossTransferItem::MediaSourceHandle(hh) => {
+                if let Some(ms) = ctx.frames.borrow().media_source.clone() {
+                    let _ = ms.borrow_mut().take_media_source_handle_for_transfer(hh);
+                    has_transferred_media_handle = true;
+                }
+            }
             CrossTransferItem::Port(port_h) => {
                 let end = crate::frames::detach_port_for_cross_thread_transfer(
                     vm,
@@ -441,6 +467,7 @@ pub(crate) fn serialize_with_transfer(
         root,
         nodes,
         transferred_ports,
+        has_transferred_media_handle,
     })
 }
 
@@ -460,6 +487,7 @@ pub(crate) fn serialize_for_storage(
         root,
         nodes,
         transferred_ports: Vec::new(),
+        has_transferred_media_handle: false,
     })
 }
 
@@ -735,6 +763,25 @@ fn serialize_value(
         });
         memo.insert(h, idx);
         return Ok(CloneValue::Node(idx));
+    }
+
+    // 5a. MediaSourceHandle (only transferable, never cloneable or storable!)
+    if let Some(ms) = ctx.frames.borrow().media_source.clone() {
+        if let Some(&hst) = ms.borrow().handles.get(&h) {
+            if for_storage || !transfer_set.contains(&h) || hst.detached || hst.has_been_attached {
+                return Err(create_dom_exception(
+                    vm,
+                    "DataCloneError",
+                    "MediaSourceHandle cannot be cloned; it must be transferred while attached to neither another transfer nor a media element",
+                ));
+            }
+            let idx = nodes.len();
+            nodes.push(CloneNode::MediaSourceHandle {
+                bridge_id: hst.bridge_id,
+            });
+            memo.insert(h, idx);
+            return Ok(CloneValue::Node(idx));
+        }
     }
 
     // 5b. Geometry Interfaces Level 1 ([Serializable]: DOMPoint*, DOMRect*, DOMMatrix*)
@@ -1236,6 +1283,30 @@ fn current_buffer_byte_len(
     }
 }
 
+/// Returns `true` if `payload` transfers a `MediaSourceHandle`, which is only exposed in
+/// `Window` and `DedicatedWorkerGlobalScope` (never `SharedWorker` or `ServiceWorker`).
+pub(crate) fn payload_has_media_source_handle(payload: &StructuredClonePayload) -> bool {
+    payload.has_transferred_media_handle
+        || payload
+            .nodes
+            .iter()
+            .any(|n| matches!(n, CloneNode::MediaSourceHandle { .. }))
+}
+
+/// Deserializes a cross-thread [`StructuredClonePayload`], returning `Err(())` if any
+/// transferred platform object (such as `MediaSourceHandle`) is not exposed in the target realm
+/// so callers can dispatch `messageerror` per HTML §2.7.5.
+pub(crate) fn try_deserialize_payload(
+    vm: &mut JsVm,
+    ctx: &CloneContext<'_>,
+    payload: StructuredClonePayload,
+) -> Result<(JsValue, Vec<HeapHandle>), ()> {
+    if payload_has_media_source_handle(&payload) && ctx.frames.borrow().media_source.is_none() {
+        return Err(());
+    }
+    Ok(deserialize_payload(vm, ctx, payload))
+}
+
 /// Deserializes a cross-thread [`StructuredClonePayload`] into live JS values on `vm`,
 /// returning `(root_value, transferred_message_ports)`.
 pub(crate) fn deserialize_payload(
@@ -1263,6 +1334,7 @@ pub(crate) fn deserialize_payload(
             root: payload.root,
             nodes: payload.nodes,
             transferred_ports: Vec::new(),
+            has_transferred_media_handle: payload.has_transferred_media_handle,
         },
         &attached_ports,
     );
@@ -1533,6 +1605,13 @@ fn deserialize_payload_ref(
                 .get(*port_index)
                 .copied()
                 .unwrap_or_else(|| vm.alloc_ordinary_object()),
+            CloneNode::MediaSourceHandle { bridge_id } => {
+                if let Some(ms) = ctx.frames.borrow().media_source.clone() {
+                    ms.borrow_mut().alloc_media_source_handle(vm, *bridge_id)
+                } else {
+                    vm.alloc_ordinary_object()
+                }
+            }
             CloneNode::DomPoint {
                 readonly,
                 x,
@@ -1997,7 +2076,8 @@ pub(crate) fn encode_storage_payload(payload: &StructuredClonePayload) -> Vec<u8
             CloneNode::SharedArrayBuffer { .. }
             | CloneNode::ImageBitmap { .. }
             | CloneNode::OffscreenCanvas { .. }
-            | CloneNode::TransferredPort { .. } => {
+            | CloneNode::TransferredPort { .. }
+            | CloneNode::MediaSourceHandle { .. } => {
                 out.push(0);
             }
         }
@@ -2243,5 +2323,6 @@ pub(crate) fn decode_storage_payload(raw: &[u8]) -> Option<StructuredClonePayloa
         root,
         nodes,
         transferred_ports: Vec::new(),
+        has_transferred_media_handle: false,
     })
 }

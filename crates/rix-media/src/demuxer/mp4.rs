@@ -35,8 +35,19 @@ pub struct Mp4InitState {
 /// Structural classification of an incremental fMP4 byte buffer for MSE parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mp4BufferStatus {
-    Complete { has_moov: bool, has_moof: bool },
-    Partial { in_media_segment: bool },
+    Complete {
+        has_moov: bool,
+        has_moof: bool,
+    },
+    CompletePrefix {
+        split_at: usize,
+        has_moov: bool,
+        has_moof: bool,
+        trailing_in_media: bool,
+    },
+    Partial {
+        in_media_segment: bool,
+    },
     Corrupt,
 }
 
@@ -54,6 +65,9 @@ pub fn inspect_mp4_buffer(buf: &[u8]) -> Mp4BufferStatus {
         };
     }
     let mut off = 0usize;
+    let mut last_complete_end = 0usize;
+    let mut prefix_has_moov = false;
+    let mut prefix_has_moof = false;
     let mut has_moov = false;
     let mut has_moof = false;
     let mut pending_moof_without_mdat = false;
@@ -62,6 +76,14 @@ pub fn inspect_mp4_buffer(buf: &[u8]) -> Mp4BufferStatus {
     while off < buf.len() {
         let rem = buf.len() - off;
         if rem < 8 {
+            if last_complete_end > 0 && (prefix_has_moov || prefix_has_moof) {
+                return Mp4BufferStatus::CompletePrefix {
+                    split_at: last_complete_end,
+                    has_moov: prefix_has_moov,
+                    has_moof: prefix_has_moof,
+                    trailing_in_media: pending_moof_without_mdat,
+                };
+            }
             return if saw_known_box {
                 Mp4BufferStatus::Partial {
                     in_media_segment: has_moof || pending_moof_without_mdat,
@@ -101,8 +123,18 @@ pub fn inspect_mp4_buffer(buf: &[u8]) -> Mp4BufferStatus {
 
         let (hdr_len, box_size) = if size32 == 1 {
             if rem < 16 {
+                let trailing_in_media =
+                    pending_moof_without_mdat || &kind == b"moof" || &kind == b"mdat";
+                if last_complete_end > 0 && (prefix_has_moov || prefix_has_moof) {
+                    return Mp4BufferStatus::CompletePrefix {
+                        split_at: last_complete_end,
+                        has_moov: prefix_has_moov,
+                        has_moof: prefix_has_moof,
+                        trailing_in_media,
+                    };
+                }
                 return Mp4BufferStatus::Partial {
-                    in_media_segment: has_moof || &kind == b"moof" || &kind == b"mdat",
+                    in_media_segment: has_moof || trailing_in_media,
                 };
             }
             let sz64 = u64::from_be_bytes([
@@ -129,28 +161,57 @@ pub fn inspect_mp4_buffer(buf: &[u8]) -> Mp4BufferStatus {
             return Mp4BufferStatus::Corrupt;
         }
         if off.saturating_add(box_size) > buf.len() {
+            let trailing_in_media =
+                pending_moof_without_mdat || &kind == b"moof" || &kind == b"mdat";
+            if last_complete_end > 0 && (prefix_has_moov || prefix_has_moof) {
+                return Mp4BufferStatus::CompletePrefix {
+                    split_at: last_complete_end,
+                    has_moov: prefix_has_moov,
+                    has_moof: prefix_has_moof,
+                    trailing_in_media,
+                };
+            }
             return Mp4BufferStatus::Partial {
-                in_media_segment: has_moof
-                    || pending_moof_without_mdat
-                    || &kind == b"moof"
-                    || &kind == b"mdat",
+                in_media_segment: has_moof || trailing_in_media,
             };
         }
         match &kind {
-            b"moov" => has_moov = true,
+            b"moov" => {
+                has_moov = true;
+                if !pending_moof_without_mdat {
+                    last_complete_end = off + box_size;
+                    prefix_has_moov = true;
+                }
+            }
             b"moof" => {
                 has_moof = true;
                 pending_moof_without_mdat = true;
             }
             b"mdat" => {
                 pending_moof_without_mdat = false;
+                last_complete_end = off + box_size;
+                if has_moof {
+                    prefix_has_moof = true;
+                }
             }
-            _ => {}
+            _ => {
+                if !pending_moof_without_mdat {
+                    last_complete_end = off + box_size;
+                }
+            }
         }
         off += box_size;
     }
 
     if pending_moof_without_mdat {
+        if last_complete_end > 0 && (prefix_has_moov || prefix_has_moof) {
+            return Mp4BufferStatus::CompletePrefix {
+                split_at: last_complete_end,
+                has_moov: prefix_has_moov,
+                has_moof: prefix_has_moof,
+                trailing_in_media: true,
+            };
+        }
         return Mp4BufferStatus::Partial {
             in_media_segment: true,
         };
