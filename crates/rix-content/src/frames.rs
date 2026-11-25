@@ -1126,6 +1126,7 @@ fn build_sub_document(
         };
         let mut meta = crate::dom_interfaces::DocumentMeta::html(url);
         meta.character_set = charset.to_string();
+        meta.quirks_mode = parsed_doc.quirks_mode();
         meta.default_view = Some(window_proxy);
         {
             let mut hb = host.borrow_mut();
@@ -1257,6 +1258,16 @@ fn install_same_origin_child_globals(
         "NodeFilter",
         "DOMParser",
         "XMLSerializer",
+        "DOMPointReadOnly",
+        "DOMPoint",
+        "DOMRectReadOnly",
+        "DOMRect",
+        "DOMRectList",
+        "DOMQuad",
+        "DOMMatrixReadOnly",
+        "DOMMatrix",
+        "MediaQueryList",
+        "MediaQueryListEvent",
         "CustomElementRegistry",
         "ElementInternals",
         "CustomStateSet",
@@ -1268,6 +1279,8 @@ fn install_same_origin_child_globals(
         "AbortSignal",
         "setTimeout",
         "clearTimeout",
+        "requestAnimationFrame",
+        "cancelAnimationFrame",
         "queueMicrotask",
     ];
     for name in intrinsics {
@@ -1799,6 +1812,17 @@ pub(crate) fn sync_iframe_node(
         let (html_content, child_charset, child_ct) = if let Some(ref sd) = srcdoc_attr {
             let cs = rix_html::detect_html_charset(sd.as_bytes());
             (sd.clone(), cs, "text/html".to_string())
+        } else if resolved_url.starts_with("blob:") {
+            if let Some(bytes) = web_apis.borrow().object_urls.get(&resolved_url) {
+                let cs = rix_html::detect_html_charset(bytes);
+                (
+                    String::from_utf8_lossy(bytes).into_owned(),
+                    cs,
+                    "text/html".to_string(),
+                )
+            } else {
+                (String::new(), "UTF-8", "text/html".to_string())
+            }
         } else if resolved_url.starts_with("http://") || resolved_url.starts_with("https://") {
             fetch_iframe_url_sync(net, &resolved_url, &parent_origin)
                 .unwrap_or_else(|| (String::new(), "UTF-8", "text/html".to_string()))
@@ -1844,6 +1868,12 @@ pub(crate) fn sync_iframe_node(
             proxy_h,
         );
         let child_doc_nid = host.borrow().node_for_handle(vm, child_doc);
+        if let Some(cd_nid) = child_doc_nid {
+            host.borrow()
+                .document
+                .borrow_mut()
+                .set_content_document(node_id, Some(cd_nid));
+        }
         if let Some(WindowProxyKind::SameOriginChild {
             child_doc: slot, ..
         }) = frames.borrow_mut().proxies.get_mut(&proxy_h)
@@ -1886,7 +1916,8 @@ pub(crate) fn sync_iframe_node(
             PropertyAttrs::METHOD,
             &mut vm.shapes,
         );
-        // Every same-origin child browsing context gets its own global `CustomElementRegistry`.
+        // Every same-origin child browsing context gets its own global `CustomElementRegistry`
+        // and document-scoped CSSOM View viewport/scroll/matchMedia bindings.
         if let Some(cd_nid) = child_doc_nid {
             let child_ce_reg =
                 crate::custom_elements::ensure_child_global_registry(vm, host, cd_nid);

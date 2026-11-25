@@ -16,16 +16,17 @@ use crate::values::{
     AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
     AnimationPlayStateMode, AnimationSpec, BackgroundLayerValue, BorderCollapseMode,
     BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue, ColorRgba,
-    CornerRadii, CssColor, CursorKind, DirectionMode, DisplayMode, EdgeValues, EmptyCellsMode,
-    EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
-    GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
+    ContentVisibilityMode, CornerRadii, CssColor, CursorKind, DirectionMode, DisplayMode,
+    EdgeValues, EmptyCellsMode, EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode,
+    FontStyleMode, GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
     InterpolateSizeMode, LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle,
     MixBlendMode, OverflowMode, OverflowPair, OverflowWrapMode, OverlayMode,
     OverscrollBehaviorMode, PointerEventsMode, PositionMode, ReadingFlowMode, ResizeMode,
-    SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode, TextDecorationLine,
-    TextJustifyMode, TextOrientationMode, TextOverflowMode, TextTransformMode, TimingFunction,
-    TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec, UserSelectMode,
-    VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode, ZIndexValue,
+    ScrollBehaviorMode, SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode,
+    TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode, TextTransformMode,
+    TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec,
+    UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode,
+    ZIndexValue,
 };
 
 const MAX_VAR_DEPTH: u8 = 64;
@@ -99,6 +100,9 @@ pub struct VisualStyle {
     pub resize: ResizeMode,
     pub overscroll_behavior_x: OverscrollBehaviorMode,
     pub overscroll_behavior_y: OverscrollBehaviorMode,
+    pub scroll_behavior: ScrollBehaviorMode,
+    pub content_visibility: ContentVisibilityMode,
+    pub zoom: f32,
 }
 
 impl Default for VisualStyle {
@@ -129,6 +133,9 @@ impl Default for VisualStyle {
             resize: ResizeMode::None,
             overscroll_behavior_x: OverscrollBehaviorMode::Auto,
             overscroll_behavior_y: OverscrollBehaviorMode::Auto,
+            scroll_behavior: ScrollBehaviorMode::Auto,
+            content_visibility: ContentVisibilityMode::Visible,
+            zoom: 1.0,
         }
     }
 }
@@ -3067,6 +3074,15 @@ pub fn apply_declaration(
         (PropertyIdKind::OverscrollBehaviorY, PropertyValue::OverscrollBehavior(v)) => {
             Arc::make_mut(&mut style.visual).overscroll_behavior_y = *v;
         }
+        (PropertyIdKind::ScrollBehavior, PropertyValue::ScrollBehavior(v)) => {
+            Arc::make_mut(&mut style.visual).scroll_behavior = *v;
+        }
+        (PropertyIdKind::ContentVisibility, PropertyValue::ContentVisibility(v)) => {
+            Arc::make_mut(&mut style.visual).content_visibility = *v;
+        }
+        (PropertyIdKind::Zoom, PropertyValue::Zoom(v)) => {
+            Arc::make_mut(&mut style.visual).zoom = *v;
+        }
         (PropertyIdKind::Overlay, PropertyValue::Overlay(v)) => {
             style.overlay = *v;
         }
@@ -3313,6 +3329,15 @@ fn copy_property_from_parent(
         PropertyIdKind::OverscrollBehaviorY => {
             Arc::make_mut(&mut style.visual).overscroll_behavior_y =
                 parent.visual.overscroll_behavior_y;
+        }
+        PropertyIdKind::ScrollBehavior => {
+            Arc::make_mut(&mut style.visual).scroll_behavior = parent.visual.scroll_behavior;
+        }
+        PropertyIdKind::ContentVisibility => {
+            Arc::make_mut(&mut style.visual).content_visibility = parent.visual.content_visibility;
+        }
+        PropertyIdKind::Zoom => {
+            Arc::make_mut(&mut style.visual).zoom = parent.visual.zoom;
         }
         PropertyIdKind::Width => {
             Arc::make_mut(&mut style.box_model).width = parent.box_model.width.clone();
@@ -3813,6 +3838,15 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         }
         PropertyIdKind::OverscrollBehaviorY => {
             Arc::make_mut(&mut style.visual).overscroll_behavior_y = OverscrollBehaviorMode::Auto;
+        }
+        PropertyIdKind::ScrollBehavior => {
+            Arc::make_mut(&mut style.visual).scroll_behavior = ScrollBehaviorMode::Auto;
+        }
+        PropertyIdKind::ContentVisibility => {
+            Arc::make_mut(&mut style.visual).content_visibility = ContentVisibilityMode::Visible;
+        }
+        PropertyIdKind::Zoom => {
+            Arc::make_mut(&mut style.visual).zoom = 1.0;
         }
         PropertyIdKind::Width => Arc::make_mut(&mut style.box_model).width = SizeValue::Auto,
         PropertyIdKind::Height => Arc::make_mut(&mut style.box_model).height = SizeValue::Auto,

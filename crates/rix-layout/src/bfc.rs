@@ -433,7 +433,11 @@ pub fn layout_block_box(
             style.text.writing_mode,
             rix_css::WritingMode::VerticalRl | rix_css::WritingMode::SidewaysRl
         );
-    let is_y_start_bottom = is_vert_box && style.text.direction == rix_css::DirectionMode::Rtl;
+    let is_y_start_bottom = (style.text.writing_mode == rix_css::WritingMode::SidewaysLr
+        && style.text.direction != rix_css::DirectionMode::Rtl)
+        || (is_vert_box
+            && style.text.writing_mode != rix_css::WritingMode::SidewaysLr
+            && style.text.direction == rix_css::DirectionMode::Rtl);
     let all_children_oof = !children_ids.is_empty()
         && children_ids
             .iter()
@@ -591,6 +595,7 @@ pub fn layout_block_box(
 
             let child_oof_start = ctx.pending_oof.len();
             // Compute child layout; if child establishes a BFC next to floats, shrink available width if needed.
+            let mut child_new_floats: Vec<FloatBand> = Vec::new();
             let mut frag = if child_is_bfc && !local_floats.is_empty() {
                 let probe_y = if child_clear != ClearMode::None {
                     local_floats.clear_y(child_clear, cursor_y)
@@ -605,10 +610,14 @@ pub fn layout_block_box(
                 child_box.kind,
                 BoxKind::Block { .. } | BoxKind::AnonymousBlock
             ) && !child_is_bfc
-                && !local_floats.is_empty()
             {
                 let mut child_floats = local_floats.translated(0.0, -cursor_y);
-                layout_block_box(ctx, cid, child_space, &mut child_floats)
+                let pre_len = child_floats.floats.len();
+                let f = layout_block_box(ctx, cid, child_space, &mut child_floats);
+                if child_floats.floats.len() > pre_len {
+                    child_new_floats.extend_from_slice(&child_floats.floats[pre_len..]);
+                }
+                f
             } else {
                 layout_box(ctx, cid, child_space)
             };
@@ -657,7 +666,7 @@ pub fn layout_block_box(
                 );
                 x_offset = lx + frag.margin.left;
             }
-            let y_offset = if is_y_start_bottom {
+            let y_offset = if is_y_start_bottom && frag.border_rect.size.height > 0.0 {
                 if let Some(dh) = definite_height {
                     dh - frag.margin.bottom - frag.border_rect.size.height
                 } else {
@@ -669,6 +678,20 @@ pub fn layout_block_box(
 
             frag.border_rect.origin =
                 Point::new(content_origin_x + x_offset, content_origin_y + y_offset);
+            for nf in child_new_floats {
+                let translated = FloatBand {
+                    rect: Rect::new(
+                        nf.rect.origin.x + x_offset,
+                        nf.rect.origin.y + y_offset,
+                        nf.rect.size.width,
+                        nf.rect.size.height,
+                    ),
+                    is_left: nf.is_left,
+                };
+                if !local_floats.floats.contains(&translated) {
+                    local_floats.floats.push(translated);
+                }
+            }
             apply_relative_offset(&mut frag, child_space);
             offset_pending_oof(
                 &mut ctx.pending_oof,

@@ -36,16 +36,16 @@ use crate::values::{
     AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
     AnimationPlayStateMode, AnimationSpec, BackgroundImageValue, BackgroundLayerValue,
     BorderCollapseMode, BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue,
-    CornerRadius, CssColor, CursorKind, DirectionMode, DisplayMode, EmptyCellsMode, FilterOp,
-    FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
-    GridPlacementValue, GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode,
-    LengthPercentage, LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, MixBlendMode,
-    OverflowMode, OverflowWrapMode, OverlayMode, OverscrollBehaviorMode, PointerEventsMode,
-    PositionMode, ReadingFlowMode, ResizeMode, SizeValue, TableLayoutMode, TextAlignLastMode,
-    TextAlignMode, TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode,
-    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode,
-    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
-    WordBreakMode, WritingMode, ZIndexValue,
+    ContentVisibilityMode, CornerRadius, CssColor, CursorKind, DirectionMode, DisplayMode,
+    EmptyCellsMode, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
+    GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
+    InterpolateSizeMode, LengthPercentage, LengthPercentageAuto, LengthUnit, LineHeightValue,
+    LineStyle, MixBlendMode, OverflowMode, OverflowWrapMode, OverlayMode, OverscrollBehaviorMode,
+    PointerEventsMode, PositionMode, ReadingFlowMode, ResizeMode, ScrollBehaviorMode, SizeValue,
+    TableLayoutMode, TextAlignLastMode, TextAlignMode, TextDecorationLine, TextJustifyMode,
+    TextOrientationMode, TextOverflowMode, TextTransformMode, TimingFunction, TransformOp,
+    TransformOrigin, TransitionBehaviorMode, TransitionSpec, UserSelectMode, VerticalAlignMode,
+    VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode, ZIndexValue,
 };
 
 /// Category of an unsupported CSS feature recorded during compilation.
@@ -634,6 +634,9 @@ pub enum PropertyIdKind {
     OverscrollBehaviorInline,
     OverscrollBehaviorBlock,
     OverscrollBehavior,
+    ScrollBehavior,
+    ContentVisibility,
+    Zoom,
     InlineSize,
     BlockSize,
     MinInlineSize,
@@ -756,6 +759,9 @@ impl PropertyIdKind {
             "overscroll-behavior-inline" => Self::OverscrollBehaviorInline,
             "overscroll-behavior-block" => Self::OverscrollBehaviorBlock,
             "overscroll-behavior" => Self::OverscrollBehavior,
+            "scroll-behavior" => Self::ScrollBehavior,
+            "content-visibility" => Self::ContentVisibility,
+            "zoom" => Self::Zoom,
             "inline-size" => Self::InlineSize,
             "block-size" => Self::BlockSize,
             "min-inline-size" => Self::MinInlineSize,
@@ -1240,6 +1246,9 @@ impl PropertyIdKind {
             Self::OverscrollBehaviorInline => "overscroll-behavior-inline",
             Self::OverscrollBehaviorBlock => "overscroll-behavior-block",
             Self::OverscrollBehavior => "overscroll-behavior",
+            Self::ScrollBehavior => "scroll-behavior",
+            Self::ContentVisibility => "content-visibility",
+            Self::Zoom => "zoom",
             Self::InlineSize => "inline-size",
             Self::BlockSize => "block-size",
             Self::MinInlineSize => "min-inline-size",
@@ -1785,6 +1794,9 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "overscroll-behavior-inline",
     "overscroll-behavior-x",
     "overscroll-behavior-y",
+    "scroll-behavior",
+    "content-visibility",
+    "zoom",
     "padding-block-end",
     "padding-block-start",
     "padding-bottom",
@@ -1999,6 +2011,9 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::CaptionSide,
     PropertyIdKind::OverscrollBehaviorX,
     PropertyIdKind::OverscrollBehaviorY,
+    PropertyIdKind::ScrollBehavior,
+    PropertyIdKind::ContentVisibility,
+    PropertyIdKind::Zoom,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2316,6 +2331,9 @@ pub enum PropertyValue {
     Resize(ResizeMode),
     CaptionSide(CaptionSideMode),
     OverscrollBehavior(OverscrollBehaviorMode),
+    ScrollBehavior(ScrollBehaviorMode),
+    ContentVisibility(ContentVisibilityMode),
+    Zoom(f32),
     MathVal(Box<crate::values_math::MathNode>),
     Scale(crate::values_math::ScaleSpec),
     Rotate(crate::values_math::RotateSpec),
@@ -7527,6 +7545,59 @@ pub(crate) fn compile_extra_standard_property(
             };
             let kind = PropertyIdKind::from_name(&lower).unwrap();
             push_decl(out, ord, kind, PropertyValue::OverscrollBehavior(mode), imp);
+        }
+        "scroll-behavior" => {
+            let mode = match single_ident.map(str::to_ascii_lowercase).as_deref() {
+                Some("auto") => ScrollBehaviorMode::Auto,
+                Some("smooth") => ScrollBehaviorMode::Smooth,
+                _ => return,
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::ScrollBehavior,
+                PropertyValue::ScrollBehavior(mode),
+                imp,
+            );
+        }
+        "content-visibility" => {
+            let mode = match single_ident.map(str::to_ascii_lowercase).as_deref() {
+                Some("visible") => ContentVisibilityMode::Visible,
+                Some("auto") => ContentVisibilityMode::Auto,
+                Some("hidden") => ContentVisibilityMode::Hidden,
+                _ => return,
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::ContentVisibility,
+                PropertyValue::ContentVisibility(mode),
+                imp,
+            );
+        }
+        "zoom" => {
+            if non_ws.len() != 1 {
+                return;
+            }
+            let z = match &non_ws[0] {
+                CssToken::Ident(s) if s.as_str().eq_ignore_ascii_case("normal") => 1.0,
+                CssToken::Number(n) if *n >= 0.0 && n.is_finite() => {
+                    if *n == 0.0 {
+                        1.0
+                    } else {
+                        *n
+                    }
+                }
+                CssToken::Percentage(p) if *p >= 0.0 && p.is_finite() => {
+                    if *p == 0.0 {
+                        1.0
+                    } else {
+                        *p
+                    }
+                }
+                _ => return,
+            };
+            push_decl(out, ord, PropertyIdKind::Zoom, PropertyValue::Zoom(z), imp);
         }
         "overscroll-behavior" => {
             let idents: SmallVec<[OverscrollBehaviorMode; 2]> = non_ws

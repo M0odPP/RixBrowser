@@ -137,6 +137,18 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
             fail((desc ? desc + ": " : "") + format_value(actual) + " not in array");
         }
     }
+    function assert_any(assert_func, actual, expected_array, ...extra) {
+        let errors = [];
+        for (let i = 0; i < expected_array.length; i++) {
+            try {
+                assert_func(actual, expected_array[i], ...extra);
+                return;
+            } catch (e) {
+                errors.push(e);
+            }
+        }
+        fail("assert_any failed: " + (errors[0] ? errors[0].message : format_value(actual)));
+    }
     function assert_own_property(obj, prop, desc) {
         if (!Object.prototype.hasOwnProperty.call(obj, prop)) {
             fail((desc ? desc + ": " : "") + "missing own property " + format_value(prop));
@@ -451,6 +463,7 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
     global.assert_array_approx_equals = assert_array_approx_equals;
     global.assert_object_equals = assert_object_equals;
     global.assert_in_array = assert_in_array;
+    global.assert_any = assert_any;
     global.assert_own_property = assert_own_property;
     global.assert_not_own_property = assert_not_own_property;
     global.assert_inherits = assert_inherits;
@@ -1361,15 +1374,26 @@ fn run_wpt_testharness_file(
     };
     // Drive async network/worker events, timers, microtasks, and VSync/layout observers
     // until all async/promise subtests settle (exiting immediately when pending == 0).
-    for tick in 0..80u32 {
+    let mut async_waits = 0u32;
+    for tick in 0..1000u32 {
         rt.advance_and_drain(Duration::from_millis(if tick == 0 { 0 } else { 10 }));
         if !has_pending(&mut rt) {
             break;
         }
+        let had_raf = rt.event_loop.borrow().has_pending_raf();
         rt.fire_vsync(f64::from(tick + 1) * 16.0);
         if !has_pending(&mut rt) {
             break;
         }
+        // When rAF animations (e.g. smooth-scroll observers) are actively pumping frames,
+        // keep advancing VSync immediately without burning wall-clock async waits.
+        if had_raf || rt.event_loop.borrow().has_pending_raf() {
+            continue;
+        }
+        if async_waits >= 80 {
+            break;
+        }
+        async_waits += 1;
         let settled =
             server
                 .rt

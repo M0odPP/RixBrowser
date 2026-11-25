@@ -196,6 +196,7 @@ pub struct HostState {
     pub open_popovers: Vec<NodeId>,
     pub css_stylesheet_proto: Option<HeapHandle>,
     pub css_rule_protos: HashMap<&'static str, HeapHandle>,
+    pub subdoc_scroll_offsets: HashMap<NodeId, Point>,
     pub style_element_sheets: HashMap<NodeId, crate::cssom::SharedStyleSheet>,
     pub stylesheet_handle_map: HashMap<HeapHandle, crate::cssom::SharedStyleSheet>,
     pub adopted_stylesheets: Vec<crate::cssom::SharedStyleSheet>,
@@ -297,6 +298,7 @@ impl HostState {
             open_popovers: Vec::new(),
             css_stylesheet_proto: None,
             css_rule_protos: HashMap::new(),
+            subdoc_scroll_offsets: HashMap::new(),
             style_element_sheets: HashMap::new(),
             stylesheet_handle_map: HashMap::new(),
             adopted_stylesheets: Vec::new(),
@@ -836,9 +838,272 @@ impl HostState {
         self.cached_fragment_tree.as_ref()
     }
 
+    /// Returns the viewport dimensions for `doc_id` (main viewport or owning `<iframe>`'s CSS size).
+    pub fn viewport_for_doc(&mut self, doc_id: NodeId) -> Size {
+        let main_root = self.document.borrow().root();
+        if doc_id == main_root {
+            return self.viewport;
+        }
+        let iframe_opt = {
+            let doc = self.document.borrow();
+            doc.descendants_with_shadow_roots(main_root)
+                .into_iter()
+                .find(|&n| {
+                    matches!(
+                        doc.get(n),
+                        Some(NodeData::Element(el)) if el.content_document == Some(doc_id)
+                    )
+                })
+        };
+        if let Some(iframe_nid) = iframe_opt {
+            // Prefer explicit layout content-box size; fallback to HTML width/height attributes or 300x150.
+            let attr_wh = {
+                let doc = self.document.borrow();
+                if let Some(NodeData::Element(el)) = doc.get(iframe_nid) {
+                    let parse_dim = |s: &str| {
+                        s.trim()
+                            .trim_end_matches("px")
+                            .trim_end_matches("PX")
+                            .trim()
+                            .parse::<f32>()
+                            .ok()
+                    };
+                    let aw = el.get_attribute("width").and_then(parse_dim);
+                    let ah = el.get_attribute("height").and_then(parse_dim);
+                    (aw, ah)
+                } else {
+                    (None, None)
+                }
+            };
+            let style_wh = self.computed_style_for_node(iframe_nid).map(|st| {
+                let eval = rix_css::EvalContext {
+                    font_size_px: st.text.font_size_px,
+                    root_font_size_px: 16.0,
+                    viewport_width_px: self.viewport.width,
+                    viewport_height_px: self.viewport.height,
+                    ..rix_css::EvalContext::default()
+                };
+                let sw = match &st.box_model.width {
+                    rix_css::SizeValue::Length(lp) => {
+                        Some(lp.resolve_px(self.viewport.width, &eval))
+                    }
+                    _ => None,
+                };
+                let sh = match &st.box_model.height {
+                    rix_css::SizeValue::Length(lp) => {
+                        Some(lp.resolve_px(self.viewport.height, &eval))
+                    }
+                    _ => None,
+                };
+                (sw, sh)
+            });
+            let w = style_wh.and_then(|(w, _)| w).or(attr_wh.0).unwrap_or(300.0);
+            let h = style_wh.and_then(|(_, h)| h).or(attr_wh.1).unwrap_or(150.0);
+            return Size::new(w.max(0.0), h.max(0.0));
+        }
+        Size::new(300.0, 150.0)
+    }
+
+    /// Returns true iff `doc_id` is in Quirks Mode (`BackCompat`).
+    #[must_use]
+    pub fn is_doc_quirks_mode(&self, doc_id: NodeId) -> bool {
+        if let Some(meta) = self.doc_meta.get(&doc_id) {
+            return meta.quirks_mode == 2;
+        }
+        self.document.borrow().quirks_mode() == 2
+    }
+
+    /// CSSOM View §6 `Document.prototype.scrollingElement` for `doc_id`.
+    pub fn scrolling_element_of(&mut self, doc_id: NodeId) -> Option<NodeId> {
+        let doc_el = self.document.borrow().document_element_of(doc_id)?;
+        if !self.is_doc_quirks_mode(doc_id) {
+            return Some(doc_el);
+        }
+        // In Quirks Mode, the root element MUST be an HTML `<html>` element and `body` an HTML `<body>` child.
+        let html_ns = rix_dom::Namespace::from("http://www.w3.org/1999/xhtml");
+        let body_opt = {
+            let doc = self.document.borrow();
+            let is_html_root = matches!(
+                doc.get(doc_el),
+                Some(NodeData::Element(e))
+                    if e.name.local.as_str().eq_ignore_ascii_case("html") && e.name.ns == html_ns
+            );
+            if !is_html_root {
+                return None;
+            }
+            let found = doc.children(doc_el).find(|&c| {
+                matches!(
+                    doc.get(c),
+                    Some(NodeData::Element(e))
+                        if e.name.local.as_str().eq_ignore_ascii_case("body")
+                            && e.name.ns == html_ns
+                )
+            });
+            found
+        };
+        let body_id = body_opt?;
+        // Per CSSOM View §6: `body` is potentially scrollable iff its own overflow is
+        // auto/scroll/hidden (NOT visible and NOT clip) AND `html` overflow is NOT visible.
+        let html_non_visible = self
+            .computed_style_for_node_pseudo(doc_el, None)
+            .is_some_and(|s| {
+                s.overflow.x != rix_css::OverflowMode::Visible
+                    || s.overflow.y != rix_css::OverflowMode::Visible
+            });
+        let body_potentially_scrollable = self
+            .computed_style_for_node_pseudo(body_id, None)
+            .is_some_and(|s| {
+                matches!(
+                    s.overflow.x,
+                    rix_css::OverflowMode::Auto
+                        | rix_css::OverflowMode::Scroll
+                        | rix_css::OverflowMode::Hidden
+                ) || matches!(
+                    s.overflow.y,
+                    rix_css::OverflowMode::Auto
+                        | rix_css::OverflowMode::Scroll
+                        | rix_css::OverflowMode::Hidden
+                )
+            });
+        if html_non_visible && body_potentially_scrollable {
+            return None;
+        }
+        Some(body_id)
+    }
+
+    /// Lays out a sub-document (e.g. same-origin `<iframe>`) against its viewport size.
+    pub fn layout_subdoc(&mut self, doc_id: NodeId) -> Option<(FragmentTree, StyleContext, Size)> {
+        let vp = self.viewport_for_doc(doc_id);
+        let media = MediaContext {
+            viewport_width: vp.width,
+            viewport_height: vp.height,
+            dark_mode: self.dark_mode,
+            ..MediaContext::default()
+        };
+        let sub_scroll = self
+            .subdoc_scroll_offsets
+            .get(&doc_id)
+            .copied()
+            .unwrap_or(Point::ZERO);
+        let doc = self.document.borrow();
+        let mut sub_doc_clone = Document::new();
+        let quirks = self.doc_meta.get(&doc_id).map_or(0, |m| m.quirks_mode);
+        sub_doc_clone.set_quirks_mode(quirks);
+        let sub_root = sub_doc_clone.root();
+        let mut id_map_rev: HashMap<NodeId, NodeId> = HashMap::new();
+        fn clone_with_map(
+            src: &Document,
+            src_node: NodeId,
+            dst: &mut Document,
+            dst_parent: NodeId,
+            map_rev: &mut HashMap<NodeId, NodeId>,
+        ) {
+            let Some(mut data) = src.get(src_node).cloned() else {
+                return;
+            };
+            let orig_sr = if let NodeData::Element(ref mut el) = data {
+                let sr = el.shadow_root.take();
+                el.template_contents = None;
+                el.content_document = None;
+                sr
+            } else {
+                None
+            };
+            let cloned_id = dst.new_node(data);
+            dst.append_child(dst_parent, cloned_id);
+            map_rev.insert(cloned_id, src_node);
+            if let Some(sr_id) = orig_sr {
+                if let Some(mut sr_data) = src.get(sr_id).cloned() {
+                    if let NodeData::ShadowRoot { ref mut host, .. } = sr_data {
+                        *host = cloned_id;
+                        let cloned_sr = dst.new_node(sr_data);
+                        if let Some(NodeData::Element(el)) = dst.get_mut(cloned_id) {
+                            el.shadow_root = Some(cloned_sr);
+                        }
+                        map_rev.insert(cloned_sr, sr_id);
+                        for sr_ch in src.children(sr_id) {
+                            clone_with_map(src, sr_ch, dst, cloned_sr, map_rev);
+                        }
+                    }
+                }
+            }
+            for ch in src.children(src_node) {
+                clone_with_map(src, ch, dst, cloned_id, map_rev);
+            }
+        }
+        for ch in doc.children(doc_id) {
+            clone_with_map(&doc, ch, &mut sub_doc_clone, sub_root, &mut id_map_rev);
+        }
+        drop(doc);
+        let mut sub_ctx = StyleContext::new(media);
+        for sheet in self.external_stylesheets.iter() {
+            sub_ctx.add_stylesheet(Arc::clone(sheet));
+        }
+        {
+            let doc = self.document.borrow();
+            for n in doc.descendants_with_shadow_roots(doc_id) {
+                if let Some(NodeData::Element(el)) = doc.get(n) {
+                    if el.name.local.as_str().eq_ignore_ascii_case("style") {
+                        let text = doc.inner_text(n);
+                        if !text.trim().is_empty() {
+                            sub_ctx.add_stylesheet(Stylesheet::parse_cached(
+                                &text,
+                                CascadeOrigin::Author,
+                                &media,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let _ = sub_ctx.cascade_full(&mut sub_doc_clone);
+        let mut sub_engine = LayoutEngine::new();
+        let (mut tree, _) = sub_engine.layout_only_with_scroll(
+            &sub_doc_clone,
+            &sub_ctx,
+            vp,
+            &self.font_db,
+            &HashMap::new(),
+            sub_scroll,
+        );
+        fn remap_frag_nodes(frag: &mut Fragment, map_rev: &HashMap<NodeId, NodeId>) {
+            if let Some(id) = frag.dom_node {
+                if let Some(&orig) = map_rev.get(&id) {
+                    frag.dom_node = Some(orig);
+                }
+            }
+            for ch in Arc::make_mut(&mut frag.children).iter_mut() {
+                remap_frag_nodes(ch, map_rev);
+            }
+        }
+        if let Some(ref mut root_f) = tree.root {
+            remap_frag_nodes(root_f, &id_map_rev);
+        }
+        Some((tree, sub_ctx, vp))
+    }
+
     /// Returns full CSSOM View geometry for `node` (document-space rects, box insets,
     /// overflow rect, and accumulated ancestor scroll offset).
     pub fn element_geometry_for_node(&mut self, node: NodeId) -> Option<ElementGeometryInfo> {
+        let owner_doc = self.owner_doc_of(node);
+        let main_root = self.document.borrow().root();
+        if owner_doc != main_root {
+            let (tree, _, _) = self.layout_subdoc(owner_doc)?;
+            let root = tree.root.as_ref()?;
+            let sub_scroll = self
+                .subdoc_scroll_offsets
+                .get(&owner_doc)
+                .copied()
+                .unwrap_or(Point::ZERO);
+            return find_element_geometry(
+                root,
+                Point::ZERO,
+                sub_scroll,
+                &self.element_scroll_offsets,
+                node,
+                true,
+            );
+        }
         let root_scroll = self.scroll_offset;
         let scroll_map = self.element_scroll_offsets.clone();
         let tree = self.ensure_layout()?;
@@ -920,13 +1185,20 @@ impl HostState {
         None
     }
 
-    /// Computes CSSOM View `clientWidth` and `clientHeight` (padding-box, or viewport for root).
+    /// Computes CSSOM View `clientWidth` and `clientHeight` (padding-box, or viewport for viewport scrolling element).
     pub fn client_size_for_node(&mut self, node: NodeId) -> (f32, f32) {
+        let owner_doc = self.owner_doc_of(node);
+        let vp = self.viewport_for_doc(owner_doc);
+        let is_quirks = self.is_doc_quirks_mode(owner_doc);
+        let scroll_el = self.scrolling_element_of(owner_doc);
+        if scroll_el == Some(node) {
+            return (vp.width, vp.height);
+        }
         let Some(info) = self.element_geometry_for_node(node) else {
             return (0.0, 0.0);
         };
-        if info.is_root_elem {
-            return (self.viewport.width, self.viewport.height);
+        if info.is_root_elem && !is_quirks {
+            return (vp.width, vp.height);
         }
         if info.is_inline_non_replaced {
             return (0.0, 0.0);
@@ -934,15 +1206,29 @@ impl HostState {
         (info.abs_padding.size.width, info.abs_padding.size.height)
     }
 
-    /// Computes CSSOM View `scrollWidth` and `scrollHeight` (including end-edge padding
-    /// and reversed scroll-origin negative overflow per CSS Overflow L3 §2.2).
+    /// Computes CSSOM View `scrollWidth` and `scrollHeight` per CSS Overflow L3 §2.2
+    /// (scrollable overflow area includes child border/overflow bounds + child margin-box
+    /// end-edge padding, clipped to the scrollable direction on each axis).
     pub fn scroll_size_for_node(&mut self, node: NodeId) -> (f32, f32) {
+        let owner_doc = self.owner_doc_of(node);
+        let vp = self.viewport_for_doc(owner_doc);
+        let scroll_el = self.scrolling_element_of(owner_doc);
         let Some(info) = self.element_geometry_for_node(node) else {
             return (0.0, 0.0);
         };
-        if info.is_root_elem {
-            let sw = info.overflow_rect.max_x().max(self.viewport.width);
-            let sh = info.overflow_rect.max_y().max(self.viewport.height);
+        if info.is_root_elem || scroll_el == Some(node) {
+            // In Quirks Mode, `body` (the scrollingElement) reports the viewport's scroll area
+            // which includes `html`'s full overflow (including body's border/margin/content).
+            let target_info = if scroll_el == Some(node) && !info.is_root_elem {
+                let de_opt = self.document.borrow().document_element_of(owner_doc);
+                de_opt
+                    .and_then(|de| self.element_geometry_for_node(de))
+                    .unwrap_or(info)
+            } else {
+                info
+            };
+            let sw = target_info.overflow_rect.max_x().max(vp.width);
+            let sh = target_info.overflow_rect.max_y().max(vp.height);
             return (sw, sh);
         }
         let pad_lo_x = info.border.left;
@@ -950,24 +1236,32 @@ impl HostState {
         let pad_lo_y = info.border.top;
         let pad_hi_y = info.border.top + info.abs_padding.size.height;
         let (eff_lo_x, eff_hi_x) = if info.has_children {
-            let lo = if info.scroll_neg_x {
-                pad_lo_x.min(info.children_bounds.origin.x - info.padding.left)
+            if info.scroll_neg_x {
+                let lo = pad_lo_x
+                    .min(info.children_bounds.origin.x)
+                    .min(info.children_margin_bounds.origin.x - info.padding.left);
+                (lo, pad_hi_x)
             } else {
-                pad_lo_x
-            };
-            let hi = pad_hi_x.max(info.children_bounds.max_x() + info.padding.right);
-            (lo, hi)
+                let hi = pad_hi_x
+                    .max(info.children_bounds.max_x())
+                    .max(info.children_margin_bounds.max_x() + info.padding.right);
+                (pad_lo_x, hi)
+            }
         } else {
             (pad_lo_x, pad_hi_x)
         };
         let (eff_lo_y, eff_hi_y) = if info.has_children {
-            let lo = if info.scroll_neg_y {
-                pad_lo_y.min(info.children_bounds.origin.y - info.padding.top)
+            if info.scroll_neg_y {
+                let lo = pad_lo_y
+                    .min(info.children_bounds.origin.y)
+                    .min(info.children_margin_bounds.origin.y - info.padding.top);
+                (lo, pad_hi_y)
             } else {
-                pad_lo_y
-            };
-            let hi = pad_hi_y.max(info.children_bounds.max_y() + info.padding.bottom);
-            (lo, hi)
+                let hi = pad_hi_y
+                    .max(info.children_bounds.max_y())
+                    .max(info.children_margin_bounds.max_y() + info.padding.bottom);
+                (pad_lo_y, hi)
+            }
         } else {
             (pad_lo_y, pad_hi_y)
         };
@@ -978,9 +1272,23 @@ impl HostState {
 
     /// Reads CSSOM View `scrollLeft` / `scrollTop` for `node`.
     pub fn scroll_offset_for_node(&mut self, node: NodeId) -> Point {
-        let is_root = self.document.borrow().document_element() == Some(node);
-        if is_root {
-            return self.scroll_offset;
+        let owner_doc = self.owner_doc_of(node);
+        let main_root = self.document.borrow().root();
+        let is_quirks = self.is_doc_quirks_mode(owner_doc);
+        let doc_el = self.document.borrow().document_element_of(owner_doc);
+        let scroll_el = self.scrolling_element_of(owner_doc);
+        if is_quirks && doc_el == Some(node) && scroll_el != Some(node) {
+            return Point::ZERO;
+        }
+        if scroll_el == Some(node) {
+            return if owner_doc == main_root {
+                self.scroll_offset
+            } else {
+                self.subdoc_scroll_offsets
+                    .get(&owner_doc)
+                    .copied()
+                    .unwrap_or(Point::ZERO)
+            };
         }
         self.element_scroll_offsets
             .get(&node)
@@ -988,43 +1296,79 @@ impl HostState {
             .unwrap_or(Point::ZERO)
     }
 
-    /// Updates `scrollLeft` / `scrollTop` for `node` (clamped to scrollable bounds) and
-    /// invalidates cached layout so `position: sticky` offsets recompute live.
+    /// Updates `scrollLeft` / `scrollTop` for `node` (clamped to scrollable bounds, including
+    /// negative scroll ranges for RTL / `vertical-rl` / reversed flex) and invalidates cached layout.
     pub fn set_scroll_offset_for_node(
         &mut self,
         node: NodeId,
         x: Option<f32>,
         y: Option<f32>,
         relative: bool,
-    ) {
-        let is_root = self.document.borrow().document_element() == Some(node);
+    ) -> bool {
+        let owner_doc = self.owner_doc_of(node);
+        let main_root = self.document.borrow().root();
+        let is_quirks = self.is_doc_quirks_mode(owner_doc);
+        let doc_el = self.document.borrow().document_element_of(owner_doc);
+        let scroll_el = self.scrolling_element_of(owner_doc);
+        if is_quirks && doc_el == Some(node) && scroll_el != Some(node) {
+            return false;
+        }
         let (cw, ch) = self.client_size_for_node(node);
         let (sw, sh) = self.scroll_size_for_node(node);
         let max_x = (sw - cw).max(0.0);
         let max_y = (sh - ch).max(0.0);
-        if is_root {
-            let cur = self.scroll_offset;
-            let nx = x
-                .map(|v| if relative { cur.x + v } else { v })
-                .unwrap_or(cur.x)
-                .clamp(0.0, max_x);
-            let ny = y
-                .map(|v| if relative { cur.y + v } else { v })
-                .unwrap_or(cur.y)
-                .clamp(0.0, max_y);
-            if (nx - cur.x).abs() > 1e-4 || (ny - cur.y).abs() > 1e-4 {
-                self.scroll_offset = Point::new(nx, ny);
-                self.last_layout_revs = None;
+        let info_opt = self.element_geometry_for_node(node);
+        let (neg_x, neg_y) = info_opt.map_or((false, false), |i| (i.scroll_neg_x, i.scroll_neg_y));
+        let clamp_x = |v: f32| {
+            if neg_x {
+                v.clamp(-max_x, 0.0)
+            } else {
+                v.clamp(0.0, max_x)
             }
-            return;
+        };
+        let clamp_y = |v: f32| {
+            if neg_y {
+                v.clamp(-max_y, 0.0)
+            } else {
+                v.clamp(0.0, max_y)
+            }
+        };
+        if scroll_el == Some(node) {
+            let cur = if owner_doc == main_root {
+                self.scroll_offset
+            } else {
+                self.subdoc_scroll_offsets
+                    .get(&owner_doc)
+                    .copied()
+                    .unwrap_or(Point::ZERO)
+            };
+            let nx = clamp_x(
+                x.map(|v| if relative { cur.x + v } else { v })
+                    .unwrap_or(cur.x),
+            );
+            let ny = clamp_y(
+                y.map(|v| if relative { cur.y + v } else { v })
+                    .unwrap_or(cur.y),
+            );
+            if (nx - cur.x).abs() > 1e-4 || (ny - cur.y).abs() > 1e-4 {
+                if owner_doc == main_root {
+                    self.scroll_offset = Point::new(nx, ny);
+                    self.last_layout_revs = None;
+                } else {
+                    self.subdoc_scroll_offsets
+                        .insert(owner_doc, Point::new(nx, ny));
+                }
+                return true;
+            }
+            return false;
         }
-        let Some(info) = self.element_geometry_for_node(node) else {
-            return;
+        let Some(info) = info_opt else {
+            return false;
         };
         let can_x = rix_layout::is_scroll_axis(info.overflow_x);
         let can_y = rix_layout::is_scroll_axis(info.overflow_y);
         if !can_x && !can_y {
-            return;
+            return false;
         }
         let cur = self
             .element_scroll_offsets
@@ -1032,44 +1376,75 @@ impl HostState {
             .copied()
             .unwrap_or(Point::ZERO);
         let nx = if can_x {
-            x.map(|v| if relative { cur.x + v } else { v })
-                .unwrap_or(cur.x)
-                .clamp(0.0, max_x)
+            clamp_x(
+                x.map(|v| if relative { cur.x + v } else { v })
+                    .unwrap_or(cur.x),
+            )
         } else {
             0.0
         };
         let ny = if can_y {
-            y.map(|v| if relative { cur.y + v } else { v })
-                .unwrap_or(cur.y)
-                .clamp(0.0, max_y)
+            clamp_y(
+                y.map(|v| if relative { cur.y + v } else { v })
+                    .unwrap_or(cur.y),
+            )
         } else {
             0.0
         };
         if (nx - cur.x).abs() > 1e-4 || (ny - cur.y).abs() > 1e-4 {
             self.element_scroll_offsets.insert(node, Point::new(nx, ny));
             self.last_layout_revs = None;
+            return true;
         }
+        false
     }
 
     /// Updates the viewport scroll offset (for `window.scrollTo` / `window.scrollBy`),
     /// clamping to scrollable bounds and invalidating cached sticky layout.
-    pub fn set_root_scroll(&mut self, x: Option<f32>, y: Option<f32>, relative: bool) {
-        let root_el = self.document.borrow().document_element();
-        if let Some(el) = root_el {
-            self.set_scroll_offset_for_node(el, x, y, relative);
-        } else {
-            let cur = self.scroll_offset;
-            let nx = x
-                .map(|v| if relative { cur.x + v } else { v })
-                .unwrap_or(cur.x)
-                .max(0.0);
-            let ny = y
-                .map(|v| if relative { cur.y + v } else { v })
-                .unwrap_or(cur.y)
-                .max(0.0);
-            self.scroll_offset = Point::new(nx, ny);
-            self.last_layout_revs = None;
+    pub fn set_root_scroll(&mut self, x: Option<f32>, y: Option<f32>, relative: bool) -> bool {
+        let root_doc = self.document.borrow().root();
+        self.set_doc_scroll(root_doc, x, y, relative)
+    }
+
+    /// Updates the viewport scroll offset for a specific document (`main` or `iframe`).
+    pub fn set_doc_scroll(
+        &mut self,
+        doc_id: NodeId,
+        x: Option<f32>,
+        y: Option<f32>,
+        relative: bool,
+    ) -> bool {
+        if let Some(el) = self.scrolling_element_of(doc_id) {
+            return self.set_scroll_offset_for_node(el, x, y, relative);
         }
+        let main_root = self.document.borrow().root();
+        let cur = if doc_id == main_root {
+            self.scroll_offset
+        } else {
+            self.subdoc_scroll_offsets
+                .get(&doc_id)
+                .copied()
+                .unwrap_or(Point::ZERO)
+        };
+        let nx = x
+            .map(|v| if relative { cur.x + v } else { v })
+            .unwrap_or(cur.x)
+            .max(0.0);
+        let ny = y
+            .map(|v| if relative { cur.y + v } else { v })
+            .unwrap_or(cur.y)
+            .max(0.0);
+        if (nx - cur.x).abs() > 1e-4 || (ny - cur.y).abs() > 1e-4 {
+            if doc_id == main_root {
+                self.scroll_offset = Point::new(nx, ny);
+                self.last_layout_revs = None;
+            } else {
+                self.subdoc_scroll_offsets
+                    .insert(doc_id, Point::new(nx, ny));
+            }
+            return true;
+        }
+        false
     }
 
     /// Returns layout-resolved box metrics (`content_size`, `border_size`, `margin`, `padding`,
@@ -1178,10 +1553,10 @@ impl HostState {
         self.last_layout_revs = None;
     }
 
-    /// Returns the cached `ComputedStyle` for `node`, running dirty-checked cascade if needed.
+    /// Returns the cached `ComputedStyle` for `node`, running dirty-checked cascade if needed
+    /// (including same-origin sub-documents such as `<iframe>`).
     pub fn computed_style_for_node(&mut self, node: NodeId) -> Option<Arc<ComputedStyle>> {
-        let ctx = self.ensure_styles();
-        ctx.style_for(node).cloned()
+        self.computed_style_for_node_pseudo(node, None)
     }
 
     /// Returns the cached `ComputedStyle` for `node` or its pseudo-element (`::before`, `::after`, etc.).
@@ -1194,9 +1569,10 @@ impl HostState {
         let owner_doc = self.owner_doc_of(node);
         let main_root = self.document.borrow().root();
         if owner_doc != main_root {
+            let vp = self.viewport_for_doc(owner_doc);
             let media = MediaContext {
-                viewport_width: self.viewport.width,
-                viewport_height: self.viewport.height,
+                viewport_width: vp.width,
+                viewport_height: vp.height,
                 dark_mode: self.dark_mode,
                 ..MediaContext::default()
             };
@@ -1420,8 +1796,10 @@ pub struct ElementGeometryInfo {
     pub abs_content: Rect,
     pub border: EdgeInsets,
     pub padding: EdgeInsets,
+    pub margin: EdgeInsets,
     pub overflow_rect: Rect,
     pub children_bounds: Rect,
+    pub children_margin_bounds: Rect,
     pub has_children: bool,
     pub scroll_neg_x: bool,
     pub scroll_neg_y: bool,
@@ -1462,13 +1840,17 @@ fn find_element_geometry(
         );
         let is_inline_non_replaced =
             matches!(frag.kind, rix_layout::FragmentKind::InlineBox { .. });
-        let (has_children, children_bounds) = if frag.children.is_empty() {
-            (false, Rect::ZERO)
+        let (has_children, children_bounds, children_margin_bounds) = if frag.children.is_empty() {
+            (false, Rect::ZERO, Rect::ZERO)
         } else {
             let mut min_x = f32::INFINITY;
             let mut min_y = f32::INFINITY;
             let mut max_x = f32::NEG_INFINITY;
             let mut max_y = f32::NEG_INFINITY;
+            let mut m_min_x = f32::INFINITY;
+            let mut m_min_y = f32::INFINITY;
+            let mut m_max_x = f32::NEG_INFINITY;
+            let mut m_max_y = f32::NEG_INFINITY;
             for ch in frag.children.iter() {
                 let cx = ch.border_rect.origin.x;
                 let cy = ch.border_rect.origin.y;
@@ -1476,6 +1858,10 @@ fn find_element_geometry(
                 min_y = min_y.min(cy + ch.overflow_rect.origin.y);
                 max_x = max_x.max(cx + ch.overflow_rect.max_x());
                 max_y = max_y.max(cy + ch.overflow_rect.max_y());
+                m_min_x = m_min_x.min(cx - ch.margin.left);
+                m_min_y = m_min_y.min(cy - ch.margin.top);
+                m_max_x = m_max_x.max(cx + ch.border_rect.size.width + ch.margin.right);
+                m_max_y = m_max_y.max(cy + ch.border_rect.size.height + ch.margin.bottom);
             }
             (
                 true,
@@ -1484,6 +1870,12 @@ fn find_element_geometry(
                     min_y,
                     (max_x - min_x).max(0.0),
                     (max_y - min_y).max(0.0),
+                ),
+                Rect::new(
+                    m_min_x,
+                    m_min_y,
+                    (m_max_x - m_min_x).max(0.0),
+                    (m_max_y - m_min_y).max(0.0),
                 ),
             )
         };
@@ -1531,8 +1923,10 @@ fn find_element_geometry(
             abs_content,
             border: frag.border,
             padding: frag.padding,
+            margin: frag.margin,
             overflow_rect: frag.overflow_rect,
             children_bounds,
+            children_margin_bounds,
             has_children,
             scroll_neg_x,
             scroll_neg_y,
@@ -3557,7 +3951,7 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
             .borrow_mut()
             .bounding_rects_for_node(nid)
             .map_or(Rect::ZERO, |(b, _)| b);
-        Ok(JsValue::from_object(alloc_dom_rect(vm, rect)))
+        Ok(JsValue::from_object(alloc_dom_rect(vm, &h, rect)))
     });
 
     // W3C CSSOM View §7.1: `offsetParent`, `offsetLeft`, `offsetTop`, `offsetWidth`, `offsetHeight`,
@@ -3624,10 +4018,15 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
                                 info.abs_border.origin.y
                             }
                         } else if let Some(op_info) = hs.element_geometry_for_node(op) {
-                            if field == 0 {
-                                info.abs_border.origin.x - op_info.abs_padding.origin.x
+                            let op_origin = if op_info.is_inline_non_replaced {
+                                op_info.abs_border.origin
                             } else {
-                                info.abs_border.origin.y - op_info.abs_padding.origin.y
+                                op_info.abs_padding.origin
+                            };
+                            if field == 0 {
+                                info.abs_border.origin.x - op_origin.x
+                            } else {
+                                info.abs_border.origin.y - op_origin.y
                             }
                         } else if field == 0 {
                             info.abs_border.origin.x
@@ -4431,17 +4830,21 @@ fn compute_element_validity(host: &SharedHost, nid: NodeId) -> (bool, bool, bool
     (true, false, false, String::new())
 }
 
-fn alloc_dom_rect(vm: &mut JsVm, rect: Rect) -> HeapHandle {
+pub(crate) fn alloc_dom_rect(vm: &mut JsVm, _host: &SharedHost, rect: Rect) -> HeapHandle {
     let obj = vm.alloc_ordinary_object();
+    let x = f64::from(rect.origin.x);
+    let y = f64::from(rect.origin.y);
+    let w = f64::from(rect.size.width);
+    let h = f64::from(rect.size.height);
     let fields = [
-        ("x", f64::from(rect.origin.x)),
-        ("y", f64::from(rect.origin.y)),
-        ("left", f64::from(rect.origin.x)),
-        ("top", f64::from(rect.origin.y)),
-        ("width", f64::from(rect.size.width)),
-        ("height", f64::from(rect.size.height)),
-        ("right", f64::from(rect.origin.x + rect.size.width)),
-        ("bottom", f64::from(rect.origin.y + rect.size.height)),
+        ("x", x),
+        ("y", y),
+        ("width", w),
+        ("height", h),
+        ("left", x.min(x + w)),
+        ("top", y.min(y + h)),
+        ("right", x.max(x + w)),
+        ("bottom", y.max(y + h)),
     ];
     for (name, val) in fields {
         let k = vm.heap.intern_key(name);
@@ -4645,7 +5048,7 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
     let h = Rc::clone(host);
     let g = vm.alloc_host_fn("get scrollingElement", move |vm, t, _| {
         let doc_id = require_node(vm, &h, t)?;
-        let el = h.borrow().document.borrow().document_element_of(doc_id);
+        let el = h.borrow_mut().scrolling_element_of(doc_id);
         Ok(el.map_or(JsValue::NULL, |id| wrap_node(vm, &h, id)))
     });
     define_host_accessor(vm, dp, "scrollingElement", Some(g), None);

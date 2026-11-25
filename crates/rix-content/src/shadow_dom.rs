@@ -508,18 +508,47 @@ fn elements_from_point_for_root(
     y: f64,
 ) -> Vec<NodeId> {
     let mut hb = host.borrow_mut();
-    let vw = f64::from(hb.viewport.width);
-    let vh = f64::from(hb.viewport.height);
-    if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 || x >= vw || y >= vh {
+    let owner_doc = hb.owner_doc_of(scope_root);
+    let main_root = hb.document.borrow().root();
+    let vp = hb.viewport_for_doc(owner_doc);
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || x >= f64::from(vp.width)
+        || y >= f64::from(vp.height)
+    {
         return Vec::new();
     }
-    let root_scroll = hb.scroll_offset;
+    let root_scroll = if owner_doc == main_root {
+        hb.scroll_offset
+    } else {
+        hb.subdoc_scroll_offsets
+            .get(&owner_doc)
+            .copied()
+            .unwrap_or(rix_core::Point::ZERO)
+    };
     let scroll_map = hb.element_scroll_offsets.clone();
     let doc_rc = Rc::clone(&hb.document);
-    let main_root = doc_rc.borrow().root();
     let mut raw_hits: Vec<NodeId> = Vec::new();
-    if let Some(tree) = hb.ensure_layout() {
+    let sub_tree_owned = if owner_doc != main_root {
+        hb.layout_subdoc(owner_doc).map(|(t, _, _)| t)
+    } else {
+        None
+    };
+    let tree_opt = if owner_doc != main_root {
+        sub_tree_owned.as_ref()
+    } else {
+        hb.ensure_layout()
+    };
+    if let Some(tree) = tree_opt {
         if let Some(root_frag) = tree.root.as_ref() {
+            fn z_order(frag: &rix_layout::Fragment) -> i32 {
+                match frag.style.z_index {
+                    rix_css::ZIndexValue::Integer(n) => n,
+                    rix_css::ZIndexValue::Auto => 0,
+                }
+            }
             fn hit_walk(
                 frag: &rix_layout::Fragment,
                 parent_origin: rix_core::Point,
@@ -529,6 +558,9 @@ fn elements_from_point_for_root(
                 is_root: bool,
                 out: &mut Vec<NodeId>,
             ) {
+                if matches!(frag.kind, rix_layout::FragmentKind::TextRun(_)) {
+                    return;
+                }
                 let (x, y) = pt;
                 let abs_border = frag.absolute_border_rect(parent_origin);
                 let eff_scroll = if !is_root && frag.style.position == rix_css::PositionMode::Fixed
@@ -546,8 +578,20 @@ fn elements_from_point_for_root(
                 } else {
                     eff_scroll
                 };
-                // Paint order is front-to-back = reverse child order, then self.
-                for ch in frag.children.iter().rev() {
+                // Paint order: positive/zero z-index children (front-to-back), then self,
+                // then negative z-index children (front-to-back).
+                let mut pos_children: Vec<&rix_layout::Fragment> = Vec::new();
+                let mut neg_children: Vec<&rix_layout::Fragment> = Vec::new();
+                for ch in frag.children.iter() {
+                    if z_order(ch) < 0 {
+                        neg_children.push(ch);
+                    } else {
+                        pos_children.push(ch);
+                    }
+                }
+                pos_children.sort_by_key(|c| z_order(c));
+                neg_children.sort_by_key(|c| z_order(c));
+                for ch in pos_children.into_iter().rev() {
                     hit_walk(
                         ch,
                         abs_border.origin,
@@ -559,13 +603,28 @@ fn elements_from_point_for_root(
                     );
                 }
                 if let Some(nid) = frag.dom_node {
-                    let vx = f64::from(abs_border.origin.x - eff_scroll.x);
-                    let vy = f64::from(abs_border.origin.y - eff_scroll.y);
-                    let w = f64::from(abs_border.size.width);
-                    let h = f64::from(abs_border.size.height);
-                    if w > 0.0 && h > 0.0 && x >= vx && x < vx + w && y >= vy && y < vy + h {
-                        out.push(nid);
+                    let hit_self = frag.style.pointer_events != rix_css::PointerEventsMode::None
+                        && frag.style.visibility == rix_css::VisibilityMode::Visible;
+                    if hit_self {
+                        let vx = f64::from(abs_border.origin.x - eff_scroll.x);
+                        let vy = f64::from(abs_border.origin.y - eff_scroll.y);
+                        let w = f64::from(abs_border.size.width);
+                        let h = f64::from(abs_border.size.height);
+                        if w > 0.0 && h > 0.0 && x >= vx && x < vx + w && y >= vy && y < vy + h {
+                            out.push(nid);
+                        }
                     }
+                }
+                for ch in neg_children.into_iter().rev() {
+                    hit_walk(
+                        ch,
+                        abs_border.origin,
+                        child_scroll,
+                        scroll_map,
+                        pt,
+                        false,
+                        out,
+                    );
                 }
             }
             hit_walk(
@@ -984,8 +1043,14 @@ pub fn install_shadow_dom_apis(
         let h1 = Rc::clone(host);
         define_host_method(vm, proto, "elementFromPoint", move |vm, t, args| {
             let root_id = require_node(vm, &h1, t)?;
-            let x = vm.to_number(arg(args, 0)).unwrap_or(0.0);
-            let y = vm.to_number(arg(args, 1)).unwrap_or(0.0);
+            if args.len() < 2 {
+                return Err(vm.type_error("elementFromPoint requires 2 arguments (x, y)"));
+            }
+            let x = vm.to_number(args[0])?;
+            let y = vm.to_number(args[1])?;
+            if !x.is_finite() || !y.is_finite() {
+                return Err(vm.type_error("elementFromPoint coordinates must be finite numbers"));
+            }
             let hits = elements_from_point_for_root(&h1, root_id, x, y);
             Ok(hits
                 .first()
@@ -994,8 +1059,14 @@ pub fn install_shadow_dom_apis(
         let h2 = Rc::clone(host);
         define_host_method(vm, proto, "elementsFromPoint", move |vm, t, args| {
             let root_id = require_node(vm, &h2, t)?;
-            let x = vm.to_number(arg(args, 0)).unwrap_or(0.0);
-            let y = vm.to_number(arg(args, 1)).unwrap_or(0.0);
+            if args.len() < 2 {
+                return Err(vm.type_error("elementsFromPoint requires 2 arguments (x, y)"));
+            }
+            let x = vm.to_number(args[0])?;
+            let y = vm.to_number(args[1])?;
+            if !x.is_finite() || !y.is_finite() {
+                return Err(vm.type_error("elementsFromPoint coordinates must be finite numbers"));
+            }
             let hits = elements_from_point_for_root(&h2, root_id, x, y);
             let arr = vm.alloc_array();
             for n in hits {
