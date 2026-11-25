@@ -1078,27 +1078,108 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
         Ok::<_, anyhow::Error>((l, p))
     })?;
     let root_arc = Arc::new(wpt_root);
+    let stash: Arc<std::sync::Mutex<HashMap<String, Vec<serde_json::Value>>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
     rt.spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
             let root = Arc::clone(&root_arc);
+            let stash_c = Arc::clone(&stash);
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 16 * 1024];
-                let Ok(Ok(n)) =
-                    tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await
-                else {
-                    return;
-                };
-                if n == 0 {
-                    return;
+                let mut raw_buf = Vec::with_capacity(8192);
+                let mut tmp = [0u8; 8192];
+                let head_end;
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut tmp)).await
+                    {
+                        Ok(Ok(0)) | Err(_) | Ok(Err(_)) => return,
+                        Ok(Ok(n)) => {
+                            raw_buf.extend_from_slice(&tmp[..n]);
+                            if let Some(pos) = raw_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                head_end = pos;
+                                break;
+                            }
+                            if raw_buf.len() > 256 * 1024 {
+                                return;
+                            }
+                        }
+                    }
                 }
-                let req_str = String::from_utf8_lossy(&buf[..n]);
-                let first_line = req_str.lines().next().unwrap_or("");
+                let head_bytes = &raw_buf[..head_end];
+                let mut head_lines = head_bytes.split(|&b| b == b'\n');
+                let first_raw = head_lines.next().unwrap_or(b"");
+                let first_line = String::from_utf8_lossy(
+                    first_raw.strip_suffix(b"\r").unwrap_or(first_raw),
+                );
                 let mut parts = first_line.split_whitespace();
-                let _method = parts.next().unwrap_or("GET");
-                let raw_target = parts.next().unwrap_or("/");
+                let method = parts.next().unwrap_or("GET").to_string();
+                let raw_target = parts.next().unwrap_or("/").to_string();
+
+                let mut req_headers_raw: Vec<(String, Vec<u8>)> = Vec::new();
+                let mut content_len = 0usize;
+                for raw_line in head_lines {
+                    let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+                    if let Some(colon) = line.iter().position(|&b| b == b':') {
+                        let k = String::from_utf8_lossy(&line[..colon])
+                            .trim()
+                            .to_ascii_lowercase();
+                        let mut v = &line[colon + 1..];
+                        while let Some((&f, r)) = v.split_first() {
+                            if f == b' ' || f == b'\t' {
+                                v = r;
+                            } else {
+                                break;
+                            }
+                        }
+                        while let Some((&l, r)) = v.split_last() {
+                            if l == b' ' || l == b'\t' {
+                                v = r;
+                            } else {
+                                break;
+                            }
+                        }
+                        if k == "content-length" {
+                            content_len = String::from_utf8_lossy(v)
+                                .trim()
+                                .parse::<usize>()
+                                .unwrap_or(0);
+                        }
+                        req_headers_raw.push((k, v.to_vec()));
+                    }
+                }
+                // Drain remaining request body bytes if `Content-Length` is present.
+                let body_start = head_end + 4;
+                let want_total = body_start.saturating_add(content_len.min(4 * 1024 * 1024));
+                while raw_buf.len() < want_total {
+                    match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut tmp)).await
+                    {
+                        Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
+                        Ok(Ok(n)) => raw_buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                let req_body = raw_buf
+                    .get(body_start..want_total.min(raw_buf.len()))
+                    .unwrap_or(b"");
+
+                let get_req_hdr = |name: &str| -> Option<Vec<u8>> {
+                    let lower = name.to_ascii_lowercase();
+                    let mut combined: Option<Vec<u8>> = None;
+                    for (k, v) in &req_headers_raw {
+                        if k == &lower {
+                            match &mut combined {
+                                Some(existing) => {
+                                    existing.extend_from_slice(b", ");
+                                    existing.extend_from_slice(v);
+                                }
+                                None => combined = Some(v.clone()),
+                            }
+                        }
+                    }
+                    combined
+                };
+
                 let (path_only, query_only) = match raw_target.split_once('?') {
                     Some((p, q)) => (p, q.split('#').next().unwrap_or("")),
                     None => (raw_target.split('#').next().unwrap_or("/"), ""),
@@ -1111,13 +1192,30 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
                         .await;
                     return;
                 }
+
+                let mut query_params: Vec<(String, String)> = Vec::new();
+                for pair in query_only.split('&') {
+                    if pair.is_empty() {
+                        continue;
+                    }
+                    if let Some((k, v)) = pair.split_once('=') {
+                        query_params.push((percent_decode_path(k), percent_decode_path(v)));
+                    } else {
+                        query_params.push((percent_decode_path(pair), String::new()));
+                    }
+                }
+                let query_first = |key: &str| -> Option<String> {
+                    query_params
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.clone())
+                };
+                let query_has = |key: &str| -> bool { query_params.iter().any(|(k, _)| k == key) };
+
                 // WPT dynamic handler: `dom/nodes/encoding.py?label=<enc>`
                 if rel == "dom/nodes/encoding.py" {
-                    let raw_label = query_only
-                        .split('&')
-                        .find_map(|pair| pair.strip_prefix("label="))
-                        .unwrap_or("");
-                    let label = percent_decode_path(raw_label)
+                    let label = query_first("label")
+                        .unwrap_or_default()
                         .replace('&', "&amp;")
                         .replace('"', "&quot;")
                         .replace('<', "&lt;")
@@ -1132,6 +1230,283 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
                     let _ = stream.shutdown().await;
                     return;
                 }
+
+                // WPT dynamic handler: `fetch/api/resources/inspect-headers.py`
+                if rel == "fetch/api/resources/inspect-headers.py" {
+                    let mut out = Vec::<u8>::new();
+                    out.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n");
+                    let mut checked: Vec<String> = Vec::new();
+                    if let Some(hdr_list) = query_first("headers") {
+                        for h in hdr_list.split('|') {
+                            checked.push(h.to_string());
+                            if let Some(val_bytes) = get_req_hdr(h) {
+                                out.extend_from_slice(format!("x-request-{h}: ").as_bytes());
+                                out.extend_from_slice(&val_bytes);
+                                out.extend_from_slice(b"\r\n");
+                            }
+                        }
+                    }
+                    if query_has("cors") {
+                        if let Some(orig) = get_req_hdr("origin") {
+                            out.extend_from_slice(b"Access-Control-Allow-Origin: ");
+                            out.extend_from_slice(&orig);
+                            out.extend_from_slice(b"\r\n");
+                        } else {
+                            out.extend_from_slice(b"Access-Control-Allow-Origin: *\r\n");
+                        }
+                        out.extend_from_slice(
+                            b"Access-Control-Allow-Credentials: true\r\nAccess-Control-Allow-Methods: GET, POST, HEAD\r\n",
+                        );
+                        let exposed: Vec<String> =
+                            checked.iter().map(|h| format!("x-request-{h}")).collect();
+                        out.extend_from_slice(
+                            format!("Access-Control-Expose-Headers: {}\r\n", exposed.join(", "))
+                                .as_bytes(),
+                        );
+                        if let Some(allow) = query_first("allow_headers") {
+                            out.extend_from_slice(
+                                format!("Access-Control-Allow-Headers: {allow}\r\n").as_bytes(),
+                            );
+                        } else {
+                            let names: Vec<&str> =
+                                req_headers_raw.iter().map(|(k, _)| k.as_str()).collect();
+                            out.extend_from_slice(
+                                format!("Access-Control-Allow-Headers: {}\r\n", names.join(", "))
+                                    .as_bytes(),
+                            );
+                        }
+                    } else {
+                        out.extend_from_slice(b"Access-Control-Allow-Origin: *\r\n");
+                    }
+                    out.extend_from_slice(b"Content-Length: 0\r\nConnection: close\r\n\r\n");
+                    let _ = stream.write_all(&out).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+
+                // WPT dynamic handler: `fetch/api/resources/echo-header-bytes.py`
+                if rel == "fetch/api/resources/echo-header-bytes.py" {
+                    let mut lines = Vec::new();
+                    if let Some(hdr_list) = query_first("headers") {
+                        for h in hdr_list.split('|') {
+                            let raw = get_req_hdr(h).unwrap_or_default();
+                            let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+                            lines.push(format!("{h}: {hex}"));
+                        }
+                    }
+                    let body = lines.join("\n").into_bytes();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+
+                // WPT dynamic handler: `fetch/api/resources/trickle.py`
+                if rel == "fetch/api/resources/trickle.py" {
+                    let delay_ms = query_first("ms")
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(500.0);
+                    let count = query_first("count")
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(50)
+                        .min(200);
+                    let capped_ms = (delay_ms * 0.1).clamp(0.0, 400.0) as u64;
+                    if capped_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(capped_ms)).await;
+                    }
+                    let body = "TEST_TRICKLE\n".repeat(count).into_bytes();
+                    let ct_line = if query_has("notype") {
+                        ""
+                    } else {
+                        "Content-Type: text/plain\r\n"
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\n{ct_line}Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+
+                // WPT dynamic handler: `fetch/api/resources/stashed-chunk.py`
+                if rel == "fetch/api/resources/stashed-chunk.py" {
+                    let mut body = Vec::with_capacity(4096 * 3);
+                    body.resize(4096, b'A');
+                    body.resize(8192, b'B');
+                    body.resize(12288, b'C');
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+
+                // WPT dynamic handler: `fetch/api/request/resources/cache.py`
+                if rel == "fetch/api/request/resources/cache.py" {
+                    let token = query_first("token").unwrap_or_default();
+                    if query_has("querystate") {
+                        let states = stash_c
+                            .lock()
+                            .ok()
+                            .and_then(|mut g| g.remove(&token))
+                            .unwrap_or_default();
+                        let json = serde_json::to_string(&states).unwrap_or_else(|_| "[]".into());
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            json.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes()).await;
+                        let _ = stream.write_all(json.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+                    let content = query_first("content").unwrap_or_default();
+                    let tag = query_first("tag").map(|t| format!("\"{t}\""));
+                    let date = query_first("date");
+                    let expires = query_first("expires");
+                    let vary = query_first("vary");
+                    let cc = query_first("cache_control");
+                    let redirect = query_first("redirect");
+                    let ignore = query_has("ignore");
+
+                    let inm = get_req_hdr("if-none-match")
+                        .map(|b| b.into_iter().map(char::from).collect::<String>());
+                    let ims = get_req_hdr("if-modified-since")
+                        .map(|b| b.into_iter().map(char::from).collect::<String>());
+                    let pragma = get_req_hdr("pragma")
+                        .map(|b| b.into_iter().map(char::from).collect::<String>());
+                    let req_cc = get_req_hdr("cache-control")
+                        .map(|b| b.into_iter().map(char::from).collect::<String>());
+
+                    let mut obj = serde_json::Map::new();
+                    if !ignore {
+                        if let Some(ref v) = inm {
+                            obj.insert("If-None-Match".into(), serde_json::Value::String(v.clone()));
+                        }
+                        if let Some(ref v) = ims {
+                            obj.insert(
+                                "If-Modified-Since".into(),
+                                serde_json::Value::String(v.clone()),
+                            );
+                        }
+                        if let Some(ref v) = pragma {
+                            obj.insert("Pragma".into(), serde_json::Value::String(v.clone()));
+                        }
+                        if let Some(ref v) = req_cc {
+                            obj.insert("Cache-Control".into(), serde_json::Value::String(v.clone()));
+                        }
+                    }
+                    if let Ok(mut g) = stash_c.lock() {
+                        g.entry(token).or_default().push(serde_json::Value::Object(obj));
+                    }
+
+                    let mut hdrs = String::new();
+                    if let Some(ref t) = tag {
+                        hdrs.push_str(&format!("ETag: {t}\r\n"));
+                    } else if let Some(ref d) = date {
+                        hdrs.push_str(&format!("Last-Modified: {d}\r\n"));
+                    }
+                    if let Some(ref e) = expires {
+                        hdrs.push_str(&format!("Expires: {e}\r\n"));
+                    }
+                    if let Some(ref v) = vary {
+                        hdrs.push_str(&format!("Vary: {v}\r\n"));
+                    }
+                    if let Some(ref c) = cc {
+                        hdrs.push_str(&format!("Cache-Control: {c}\r\n"));
+                    }
+                    hdrs.push_str("Access-Control-Allow-Origin: *\r\n");
+
+                    let (status_line, body_bytes) = if let Some(ref loc) = redirect {
+                        hdrs.push_str(&format!("Location: {loc}\r\n"));
+                        ("HTTP/1.1 302 Redirect", Vec::new())
+                    } else if (inm.is_some() && inm == tag) || (ims.is_some() && ims == date) {
+                        ("HTTP/1.1 304 Not Modified", Vec::new())
+                    } else {
+                        hdrs.push_str("Content-Type: text/plain\r\n");
+                        ("HTTP/1.1 200 OK", content.into_bytes())
+                    };
+                    let head = format!(
+                        "{status_line}\r\n{hdrs}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body_bytes.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body_bytes).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+
+                // WPT dynamic handler: `fetch/api/resources/cache.py`
+                if rel == "fetch/api/resources/cache.py" {
+                    let etag = "\"123abc\"";
+                    let inm = get_req_hdr("if-none-match")
+                        .map(|b| String::from_utf8_lossy(&b).into_owned());
+                    if inm.as_deref() == Some(etag) {
+                        let head = "HTTP/1.1 304 Not Modified\r\nX-HTTP-STATUS: 304\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(head.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+                    let body = b"lorem ipsum dolor sit amet";
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nETag: {etag}\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+
+                // WPT dynamic handler: `fetch/api/resources/echo-content.py`
+                if rel == "fetch/api/resources/echo-content.py" {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        req_body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(req_body).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+
+                // WPT dynamic handler: `fetch/api/resources/method.py`
+                if rel == "fetch/api/resources/method.py" {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nx-request-method: {method}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: x-request-method\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+
+                // WPT dynamic handler: `fetch/api/resources/status.py`
+                if rel == "fetch/api/resources/status.py" {
+                    let code = query_first("code")
+                        .and_then(|s| s.parse::<u16>().ok())
+                        .unwrap_or(200);
+                    let text = query_first("text").unwrap_or_else(|| "OMG".into());
+                    let ct = query_first("type").unwrap_or_else(|| "text/plain".into());
+                    let content = query_first("content").unwrap_or_default().into_bytes();
+                    let head = format!(
+                        "HTTP/1.1 {code} {text}\r\nContent-Type: {ct}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        content.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&content).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+
                 let mut file_path = if rel == "resources/WebIDLParser.js" {
                     root.join("resources/webidl2/lib/webidl2.js")
                 } else {
@@ -1154,9 +1529,10 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
                     if let Ok(txt) = String::from_utf8(body.clone()) {
                         let port_s = port.to_string();
                         let mut sub = txt
-                            .replace("{{host}}", "127.0.0.1")
-                            .replace("{{domains[]}}", "127.0.0.1")
+                            .replace("{{host}}", "localhost")
+                            .replace("{{domains[]}}", "localhost")
                             .replace("{{ports[http][0]}}", &port_s)
+                            .replace("{{ports[http][1]}}", &port_s)
                             .replace("{{ports[https][0]}}", &port_s)
                             .replace("{{ports[ws][0]}}", &port_s)
                             .replace("{{ports[wss][0]}}", &port_s);
@@ -1252,9 +1628,10 @@ fn run_wpt_testharness_file(
     {
         let port_s = server.port.to_string();
         sub_html = html
-            .replace("{{host}}", "127.0.0.1")
-            .replace("{{domains[]}}", "127.0.0.1")
+            .replace("{{host}}", "localhost")
+            .replace("{{domains[]}}", "localhost")
             .replace("{{ports[http][0]}}", &port_s)
+            .replace("{{ports[http][1]}}", &port_s)
             .replace("{{ports[https][0]}}", &port_s)
             .replace("{{ports[ws][0]}}", &port_s)
             .replace("{{ports[wss][0]}}", &port_s);
@@ -1297,9 +1674,10 @@ fn run_wpt_testharness_file(
                         {
                             let port_s = server.port.to_string();
                             code = code
-                                .replace("{{host}}", "127.0.0.1")
-                                .replace("{{domains[]}}", "127.0.0.1")
+                                .replace("{{host}}", "localhost")
+                                .replace("{{domains[]}}", "localhost")
                                 .replace("{{ports[http][0]}}", &port_s)
+                                .replace("{{ports[http][1]}}", &port_s)
                                 .replace("{{ports[https][0]}}", &port_s)
                                 .replace("{{ports[ws][0]}}", &port_s)
                                 .replace("{{ports[wss][0]}}", &port_s);
@@ -1318,7 +1696,7 @@ fn run_wpt_testharness_file(
             }
         }
     }
-    let origin_base = format!("http://127.0.0.1:{}", server.port);
+    let origin_base = format!("http://localhost:{}", server.port);
     // Recursively preload static ES module imports (`import ... from "..."`, `export ... from "..."`)
     // from the local WPT tree so `<script type="module">` tests work offline cleanly.
     let mut visited_modules: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -1355,13 +1733,9 @@ fn run_wpt_testharness_file(
     let rel = path.strip_prefix(wpt_root).unwrap_or(path);
     let doc_url = format!("{origin_base}/{}", rel.to_string_lossy().replace('\\', "/"));
     let doc = Rc::new(RefCell::new(Document::new()));
-    let mut rt = ContentRuntime::with_fetch_engine(
-        doc,
-        viewport,
-        font_db,
-        &doc_url,
-        Arc::clone(&server.fetch_engine),
-    );
+    let per_file_engine = Arc::new(FetchEngine::new(server.fetch_engine.client().clone()));
+    let mut rt =
+        ContentRuntime::with_fetch_engine(doc, viewport, font_db, &doc_url, per_file_engine);
     rt.vm.max_loop_iterations = Some(2_500_000);
     rt.event_loop.borrow_mut().enable_virtual_clock();
     // Apply WPT `.headers` sidecar CSP headers (e.g. `Content-Security-Policy` / `-Report-Only`).

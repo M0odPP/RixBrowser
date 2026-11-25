@@ -10,18 +10,23 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use rix_js::builtins_collections::alloc_values_iterator;
 use rix_js::promise::{alloc_promise, promise_resolve_value, reject_promise, resolve_promise};
 use rix_js::{HeapHandle, JsException, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs};
 use rix_net::{
-    FetchCredentials, FetchEngine, FetchMode, FetchRedirect, FetchRequest, FetchResponse,
-    FetchResponseType, HttpClient, NetError, WebSocketConnection, WsCommand, WsMessage,
+    FetchCache, FetchCredentials, FetchEngine, FetchMode, FetchRedirect, FetchRequest,
+    FetchResponse, FetchResponseType, HttpClient, NetError, WebSocketConnection, WsCommand,
+    WsMessage,
 };
 use tokio::sync::mpsc;
 
 use crate::dom_bridge::SharedHost;
 use crate::event_loop::{run_microtask_checkpoint, SharedEventLoop};
 use crate::events::{fire_object_event, SharedEvents};
+use crate::fetch_headers::{
+    alloc_headers_from_entry, install_headers, is_forbidden_method, is_forbidden_request_header,
+    is_valid_header_name, normalize_and_validate_header_value, normalize_method,
+    parse_headers_init, to_byte_string, HeaderIterState, HeadersEntry, HeadersGuard,
+};
 use crate::streams::{create_readable_stream_from_bytes, SharedStreams};
 use crate::web_apis::{
     abort_info_for_signal, alloc_array_buffer, alloc_form_data_from_urlencoded, alloc_uint8_array,
@@ -73,79 +78,6 @@ pub enum FetchFailure {
 }
 
 #[derive(Debug, Clone)]
-struct HeadersEntry {
-    /// Ordered `(lowercase_name, value)` pairs supporting `append` and comma-joined `get`.
-    pairs: Vec<(String, String)>,
-}
-
-impl HeadersEntry {
-    fn from_map(map: &HashMap<String, String>) -> Self {
-        let mut pairs: Vec<(String, String)> = map
-            .iter()
-            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
-            .collect();
-        pairs.sort_by(|a, b| a.0.cmp(&b.0));
-        Self { pairs }
-    }
-
-    fn to_map(&self) -> HashMap<String, String> {
-        let mut map: HashMap<String, String> = HashMap::new();
-        for (k, v) in &self.pairs {
-            map.entry(k.clone())
-                .and_modify(|e| {
-                    e.push_str(", ");
-                    e.push_str(v);
-                })
-                .or_insert_with(|| v.clone());
-        }
-        map
-    }
-
-    fn get(&self, name: &str) -> Option<String> {
-        let lower = name.to_ascii_lowercase();
-        let mut joined = String::new();
-        let mut found = false;
-        for (k, v) in &self.pairs {
-            if k == &lower {
-                if found {
-                    joined.push_str(", ");
-                }
-                joined.push_str(v);
-                found = true;
-            }
-        }
-        found.then_some(joined)
-    }
-
-    fn set(&mut self, name: &str, value: String) {
-        let lower = name.to_ascii_lowercase();
-        self.pairs.retain(|(k, _)| k != &lower);
-        self.pairs.push((lower, value));
-    }
-
-    fn append(&mut self, name: &str, value: String) {
-        self.pairs.push((name.to_ascii_lowercase(), value));
-    }
-
-    fn delete(&mut self, name: &str) {
-        let lower = name.to_ascii_lowercase();
-        self.pairs.retain(|(k, _)| k != &lower);
-    }
-
-    fn has(&self, name: &str) -> bool {
-        let lower = name.to_ascii_lowercase();
-        self.pairs.iter().any(|(k, _)| k == &lower)
-    }
-
-    fn combined_sorted_entries(&self) -> Vec<(String, String)> {
-        let mut map = self.to_map();
-        let mut out: Vec<(String, String)> = map.drain().collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
-    }
-}
-
-#[derive(Debug, Clone)]
 struct RequestEntry {
     url: String,
     method: String,
@@ -186,11 +118,12 @@ struct JsWebSocketEntry {
 }
 
 #[derive(Debug, Clone, Default)]
-struct NetPrototypes {
-    headers_proto: Option<HeapHandle>,
-    request_proto: Option<HeapHandle>,
-    response_proto: Option<HeapHandle>,
-    websocket_proto: Option<HeapHandle>,
+pub(crate) struct NetPrototypes {
+    pub(crate) headers_proto: Option<HeapHandle>,
+    pub(crate) headers_iter_proto: Option<HeapHandle>,
+    pub(crate) request_proto: Option<HeapHandle>,
+    pub(crate) response_proto: Option<HeapHandle>,
+    pub(crate) websocket_proto: Option<HeapHandle>,
 }
 
 /// Async `ServiceWorker` fetch interception hook invoked before network fetch.
@@ -215,10 +148,11 @@ pub struct NetworkBridge {
     pending_fetches: HashMap<u64, PendingFetch>,
     websockets: HashMap<u64, JsWebSocketEntry>,
     ws_handle_to_id: HashMap<HeapHandle, u64>,
-    headers: HashMap<HeapHandle, HeadersEntry>,
+    pub(crate) headers: HashMap<HeapHandle, HeadersEntry>,
+    pub(crate) header_iterators: HashMap<HeapHandle, HeaderIterState>,
     requests: HashMap<HeapHandle, RequestEntry>,
     responses: HashMap<HeapHandle, ResponseEntry>,
-    protos: NetPrototypes,
+    pub(crate) protos: NetPrototypes,
 }
 
 /// Shared handle to [`NetworkBridge`].
@@ -243,6 +177,7 @@ impl NetworkBridge {
             websockets: HashMap::new(),
             ws_handle_to_id: HashMap::new(),
             headers: HashMap::new(),
+            header_iterators: HashMap::new(),
             requests: HashMap::new(),
             responses: HashMap::new(),
             protos: NetPrototypes::default(),
@@ -265,6 +200,7 @@ impl NetworkBridge {
     pub fn collect_roots(&self, out: &mut Vec<JsValue>) {
         for p in [
             self.protos.headers_proto,
+            self.protos.headers_iter_proto,
             self.protos.request_proto,
             self.protos.response_proto,
             self.protos.websocket_proto,
@@ -285,6 +221,9 @@ impl NetworkBridge {
                 out.push(JsValue::from_object(ws.js_obj));
             }
         }
+        for hi in self.header_iterators.values() {
+            out.push(JsValue::from_object(hi.target));
+        }
         for req in self.requests.values() {
             out.push(JsValue::from_object(req.headers_h));
             out.push(req.signal_val);
@@ -300,6 +239,7 @@ impl NetworkBridge {
     /// Drops internal native entries for GC-collected JS objects.
     pub fn sweep_dead(&mut self, heap: &rix_js::GcHeap) {
         self.headers.retain(|&h, _| heap.is_alive(h));
+        self.header_iterators.retain(|&h, _| heap.is_alive(h));
         self.requests.retain(|&h, _| heap.is_alive(h));
         self.responses.retain(|&h, _| heap.is_alive(h));
         self.ws_handle_to_id.retain(|&h, _| heap.is_alive(h));
@@ -498,231 +438,6 @@ pub fn deliver_async_net_event(
 }
 
 // ---------------------------------------------------------------------------
-// Headers
-// ---------------------------------------------------------------------------
-
-fn alloc_headers_from_entry(
-    vm: &mut JsVm,
-    net: &SharedNetBridge,
-    entry: HeadersEntry,
-) -> HeapHandle {
-    let proto = net.borrow().protos.headers_proto.unwrap_or(vm.object_proto);
-    let obj = vm
-        .heap
-        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
-    net.borrow_mut().headers.insert(obj, entry);
-    obj
-}
-
-fn parse_headers_init(
-    vm: &mut JsVm,
-    net: &SharedNetBridge,
-    init: JsValue,
-) -> Result<HeadersEntry, JsException> {
-    let mut entry = HeadersEntry { pairs: Vec::new() };
-    if init.is_undefined() || init.is_null() {
-        return Ok(entry);
-    }
-    let Some(h) = init.as_object() else {
-        return Err(vm.type_error("Invalid HeadersInit"));
-    };
-    if let Some(existing) = net.borrow().headers.get(&h) {
-        return Ok(existing.clone());
-    }
-    if matches!(
-        vm.heap.get_object(h).map(|o| &o.kind),
-        Some(ObjectKind::Array)
-    ) {
-        for item in vm.collect_iterable(init)? {
-            let pair = vm.collect_iterable(item)?;
-            if pair.len() != 2 {
-                return Err(vm.type_error("Headers sequence entry must have 2 elements"));
-            }
-            let k = vm.value_to_rust_string(pair[0]);
-            let v = vm.value_to_rust_string(pair[1]);
-            entry.append(&k, v);
-        }
-    } else {
-        for k_str in vm.own_enumerable_keys_including_elements(h) {
-            let key = vm.heap.intern_key(&k_str);
-            let v_val = vm.get_property_by_key(h, key)?;
-            let v_str = vm.value_to_rust_string(v_val);
-            entry.append(&k_str, v_str);
-        }
-    }
-    Ok(entry)
-}
-
-fn install_headers(vm: &mut JsVm, net: &SharedNetBridge) {
-    let hp = vm.alloc_ordinary_object();
-    vm.heap.get_object_mut(hp).unwrap().is_prototype = true;
-    net.borrow_mut().protos.headers_proto = Some(hp);
-
-    let nb = Rc::clone(net);
-    define_host_method(vm, hp, "append", move |vm, this_val, args| {
-        let h = require_headers(vm, &nb, this_val)?;
-        let name = vm.value_to_rust_string(arg(args, 0));
-        let value = vm.value_to_rust_string(arg(args, 1));
-        if let Some(e) = nb.borrow_mut().headers.get_mut(&h) {
-            e.append(&name, value);
-        }
-        Ok(JsValue::UNDEFINED)
-    });
-
-    let nb = Rc::clone(net);
-    define_host_method(vm, hp, "set", move |vm, this_val, args| {
-        let h = require_headers(vm, &nb, this_val)?;
-        let name = vm.value_to_rust_string(arg(args, 0));
-        let value = vm.value_to_rust_string(arg(args, 1));
-        if let Some(e) = nb.borrow_mut().headers.get_mut(&h) {
-            e.set(&name, value);
-        }
-        Ok(JsValue::UNDEFINED)
-    });
-
-    let nb = Rc::clone(net);
-    define_host_method(vm, hp, "delete", move |vm, this_val, args| {
-        let h = require_headers(vm, &nb, this_val)?;
-        let name = vm.value_to_rust_string(arg(args, 0));
-        if let Some(e) = nb.borrow_mut().headers.get_mut(&h) {
-            e.delete(&name);
-        }
-        Ok(JsValue::UNDEFINED)
-    });
-
-    let nb = Rc::clone(net);
-    define_host_method(vm, hp, "get", move |vm, this_val, args| {
-        let h = require_headers(vm, &nb, this_val)?;
-        let name = vm.value_to_rust_string(arg(args, 0));
-        let val = nb.borrow().headers.get(&h).and_then(|e| e.get(&name));
-        Ok(match val {
-            Some(s) => JsValue::from_string(vm.heap.alloc_string(&s)),
-            None => JsValue::NULL,
-        })
-    });
-
-    let nb = Rc::clone(net);
-    define_host_method(vm, hp, "has", move |vm, this_val, args| {
-        let h = require_headers(vm, &nb, this_val)?;
-        let name = vm.value_to_rust_string(arg(args, 0));
-        let has = nb.borrow().headers.get(&h).is_some_and(|e| e.has(&name));
-        Ok(JsValue::from_bool(has))
-    });
-
-    let nb = Rc::clone(net);
-    let entries_fn = vm.alloc_host_fn("entries", move |vm, this_val, _| {
-        let h = require_headers(vm, &nb, this_val)?;
-        let entries = nb
-            .borrow()
-            .headers
-            .get(&h)
-            .map(HeadersEntry::combined_sorted_entries)
-            .unwrap_or_default();
-        let mut items = Vec::with_capacity(entries.len());
-        for (k, v) in entries {
-            let pair = vm.alloc_array();
-            let kv = JsValue::from_string(vm.heap.alloc_string(&k));
-            let vv = JsValue::from_string(vm.heap.alloc_string(&v));
-            vm.heap.object_push_element(pair, kv);
-            vm.heap.object_push_element(pair, vv);
-            items.push(JsValue::from_object(pair));
-        }
-        Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
-    });
-    let k_ent = vm.heap.intern_key("entries");
-    let sym_it = vm.key_symbol_iterator;
-    vm.heap.object_define_data(
-        hp,
-        k_ent,
-        JsValue::from_object(entries_fn),
-        PropertyAttrs::METHOD,
-        &mut vm.shapes,
-    );
-    vm.heap.object_define_data(
-        hp,
-        sym_it,
-        JsValue::from_object(entries_fn),
-        PropertyAttrs::METHOD,
-        &mut vm.shapes,
-    );
-
-    let nb = Rc::clone(net);
-    define_host_method(vm, hp, "keys", move |vm, this_val, _| {
-        let h = require_headers(vm, &nb, this_val)?;
-        let entries = nb
-            .borrow()
-            .headers
-            .get(&h)
-            .map(HeadersEntry::combined_sorted_entries)
-            .unwrap_or_default();
-        let items = entries
-            .into_iter()
-            .map(|(k, _)| JsValue::from_string(vm.heap.alloc_string(&k)))
-            .collect();
-        Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
-    });
-
-    let nb = Rc::clone(net);
-    define_host_method(vm, hp, "values", move |vm, this_val, _| {
-        let h = require_headers(vm, &nb, this_val)?;
-        let entries = nb
-            .borrow()
-            .headers
-            .get(&h)
-            .map(HeadersEntry::combined_sorted_entries)
-            .unwrap_or_default();
-        let items = entries
-            .into_iter()
-            .map(|(_, v)| JsValue::from_string(vm.heap.alloc_string(&v)))
-            .collect();
-        Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
-    });
-
-    let nb = Rc::clone(net);
-    define_host_method(vm, hp, "forEach", move |vm, this_val, args| {
-        let h = require_headers(vm, &nb, this_val)?;
-        let cb = arg(args, 0);
-        let this_arg = arg(args, 1);
-        let entries = nb
-            .borrow()
-            .headers
-            .get(&h)
-            .map(HeadersEntry::combined_sorted_entries)
-            .unwrap_or_default();
-        for (k, v) in entries {
-            let kv = JsValue::from_string(vm.heap.alloc_string(&k));
-            let vv = JsValue::from_string(vm.heap.alloc_string(&v));
-            vm.call_value(cb, this_arg, &[vv, kv, this_val])?;
-        }
-        Ok(JsValue::UNDEFINED)
-    });
-
-    let nb = Rc::clone(net);
-    let ctor = vm.alloc_host_fn("Headers", move |vm, _, args| {
-        let entry = parse_headers_init(vm, &nb, arg(args, 0))?;
-        let obj = alloc_headers_from_entry(vm, &nb, entry);
-        Ok(JsValue::from_object(obj))
-    });
-    bind_ctor_proto(vm, ctor, hp);
-    define_global(vm, "Headers", JsValue::from_object(ctor));
-}
-
-fn require_headers(
-    vm: &mut JsVm,
-    net: &SharedNetBridge,
-    val: JsValue,
-) -> Result<HeapHandle, JsException> {
-    let Some(h) = val.as_object() else {
-        return Err(vm.type_error("Incompatible Headers receiver"));
-    };
-    if net.borrow().headers.contains_key(&h) {
-        Ok(h)
-    } else {
-        Err(vm.type_error("Incompatible Headers receiver"))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Request
 // ---------------------------------------------------------------------------
 
@@ -798,7 +513,7 @@ fn build_request_entry(
                 .headers
                 .get(&existing.headers_h)
                 .cloned()
-                .unwrap_or(HeadersEntry { pairs: Vec::new() });
+                .unwrap_or_else(|| HeadersEntry::with_guard(HeadersGuard::Request));
             (
                 existing.url,
                 existing.method,
@@ -818,7 +533,7 @@ fn build_request_entry(
             (
                 resolved.as_str().to_string(),
                 "GET".to_string(),
-                HeadersEntry { pairs: Vec::new() },
+                HeadersEntry::with_guard(HeadersGuard::Request),
                 Vec::new(),
                 FetchMode::Cors,
                 FetchCredentials::SameOrigin,
@@ -835,7 +550,7 @@ fn build_request_entry(
         (
             resolved.as_str().to_string(),
             "GET".to_string(),
-            HeadersEntry { pairs: Vec::new() },
+            HeadersEntry::with_guard(HeadersGuard::Request),
             Vec::new(),
             FetchMode::Cors,
             FetchCredentials::SameOrigin,
@@ -848,25 +563,35 @@ fn build_request_entry(
         let km = vm.heap.intern_key("method");
         if let Ok(v) = vm.get_property_by_key(ih, km) {
             if !v.is_undefined() {
-                method = vm.value_to_rust_string(v).to_ascii_uppercase();
-            }
-        }
-        let kh = vm.heap.intern_key("headers");
-        if let Ok(v) = vm.get_property_by_key(ih, kh) {
-            if !v.is_undefined() && !v.is_null() {
-                hdr_entry = parse_headers_init(vm, net, v)?;
-            }
-        }
-        let kb = vm.heap.intern_key("body");
-        if let Ok(v) = vm.get_property_by_key(ih, kb) {
-            if !v.is_undefined() && !v.is_null() {
-                body = extract_bytes_from_js(vm, web_apis, v)?;
+                let raw_m = to_byte_string(vm, v)?;
+                if !is_valid_header_name(&raw_m) || is_forbidden_method(&raw_m) {
+                    return Err(vm.type_error(format!("Invalid HTTP method: '{raw_m}'")));
+                }
+                method = normalize_method(&raw_m);
             }
         }
         let kmode = vm.heap.intern_key("mode");
         if let Ok(v) = vm.get_property_by_key(ih, kmode) {
             if !v.is_undefined() {
                 mode = parse_mode(&vm.value_to_rust_string(v));
+            }
+        }
+        let guard = if mode == FetchMode::NoCors {
+            HeadersGuard::RequestNoCors
+        } else {
+            HeadersGuard::Request
+        };
+        hdr_entry.guard = guard;
+        let kh = vm.heap.intern_key("headers");
+        if let Ok(v) = vm.get_property_by_key(ih, kh) {
+            if !v.is_undefined() {
+                hdr_entry = parse_headers_init(vm, net, v, guard)?;
+            }
+        }
+        let kb = vm.heap.intern_key("body");
+        if let Ok(v) = vm.get_property_by_key(ih, kb) {
+            if !v.is_undefined() && !v.is_null() {
+                body = extract_bytes_from_js(vm, web_apis, v)?;
             }
         }
         let kc = vm.heap.intern_key("credentials");
@@ -1044,7 +769,7 @@ fn install_request(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBridg
             .headers
             .get(&entry.headers_h)
             .cloned()
-            .unwrap_or(HeadersEntry { pairs: Vec::new() });
+            .unwrap_or_else(|| HeadersEntry::with_guard(HeadersGuard::Request));
         entry.headers_h = alloc_headers_from_entry(vm, &nb, hdr);
         let obj = vm
             .heap
@@ -1109,7 +834,11 @@ pub(crate) fn alloc_response_from_fetch(
     net: &SharedNetBridge,
     resp: FetchResponse,
 ) -> HeapHandle {
-    let hdr_h = alloc_headers_from_entry(vm, net, HeadersEntry::from_map(&resp.headers));
+    let hdr_h = alloc_headers_from_entry(
+        vm,
+        net,
+        HeadersEntry::from_map(&resp.headers, HeadersGuard::Immutable),
+    );
     let stream_h = if resp.response_type == FetchResponseType::Opaque {
         None
     } else {
@@ -1175,6 +904,7 @@ pub(crate) fn alloc_response_from_cached(
 ) -> HeapHandle {
     let headers_map = HeadersEntry {
         pairs: cached.headers,
+        guard: HeadersGuard::None,
     }
     .to_map();
     alloc_response_from_fetch(
@@ -1210,7 +940,7 @@ pub(crate) fn alloc_request_from_url(
     net: &SharedNetBridge,
     url: String,
 ) -> HeapHandle {
-    let hdr_h = alloc_headers_from_entry(vm, net, HeadersEntry { pairs: Vec::new() });
+    let hdr_h = alloc_headers_from_entry(vm, net, HeadersEntry::with_guard(HeadersGuard::Request));
     let proto = net.borrow().protos.request_proto.unwrap_or(vm.object_proto);
     let obj = vm
         .heap
@@ -1423,7 +1153,7 @@ fn install_response(
             .headers
             .get(&entry.headers_h)
             .cloned()
-            .unwrap_or(HeadersEntry { pairs: Vec::new() });
+            .unwrap_or_else(|| HeadersEntry::with_guard(HeadersGuard::Request));
         entry.headers_h = alloc_headers_from_entry(vm, &nb, hdr);
         entry.body_stream = Some(create_readable_stream_from_bytes(
             vm,
@@ -1449,7 +1179,7 @@ fn install_response(
         };
         let mut status = 200u16;
         let mut status_text = "OK".to_string();
-        let mut hdr_entry = HeadersEntry { pairs: Vec::new() };
+        let mut hdr_entry = HeadersEntry::with_guard(HeadersGuard::Response);
         if let Some(ih) = arg(args, 1).as_object() {
             let ks = vm.heap.intern_key("status");
             if let Ok(v) = vm.get_property_by_key(ih, ks) {
@@ -1466,7 +1196,7 @@ fn install_response(
             let kh = vm.heap.intern_key("headers");
             if let Ok(v) = vm.get_property_by_key(ih, kh) {
                 if !v.is_undefined() && !v.is_null() {
-                    hdr_entry = parse_headers_init(vm, &nb, v)?;
+                    hdr_entry = parse_headers_init(vm, &nb, v, HeadersGuard::Response)?;
                 }
             }
         }
@@ -1504,8 +1234,8 @@ fn install_response(
         let str_fn = vm.get_property_by_key(jh, k_str)?;
         let s_val = vm.call_value(str_fn, json_v, &[arg(args, 0)])?;
         let bytes = vm.value_to_rust_string(s_val).into_bytes();
-        let mut hdr = HeadersEntry { pairs: Vec::new() };
-        hdr.set("content-type", "application/json".to_string());
+        let mut hdr = HeadersEntry::with_guard(HeadersGuard::Response);
+        hdr.set_unchecked("content-type", "application/json".to_string());
         let hdr_h = alloc_headers_from_entry(vm, &nb, hdr);
         let stream_h = Some(create_readable_stream_from_bytes(vm, &ss, bytes.clone()));
         let obj = vm
@@ -1530,7 +1260,8 @@ fn install_response(
 
     let nb = Rc::clone(net);
     define_host_method(vm, ctor, "error", move |vm, _, _| {
-        let hdr_h = alloc_headers_from_entry(vm, &nb, HeadersEntry { pairs: Vec::new() });
+        let hdr_h =
+            alloc_headers_from_entry(vm, &nb, HeadersEntry::with_guard(HeadersGuard::Immutable));
         let obj = vm
             .heap
             .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(rp)));
@@ -1627,6 +1358,7 @@ fn install_fetch_fn(vm: &mut JsVm, web_apis: &SharedWebApis, net: &SharedNetBrid
             body: entry.body,
             mode: entry.mode,
             credentials: entry.credentials,
+            cache: FetchCache::Default,
             redirect: entry.redirect,
             origin,
             abort_signal,
@@ -2175,18 +1907,35 @@ fn install_xml_http_request(
         let xm = Rc::clone(&xhrs);
         define_host_method(vm, xp, "setRequestHeader", move |vm, this_val, args| {
             let h = require_xhr(vm, &xm, this_val)?;
-            let name = vm.value_to_rust_string(arg(args, 0));
-            let value = vm.value_to_rust_string(arg(args, 1));
+            if args.len() < 2 {
+                return Err(vm.type_error("XMLHttpRequest.setRequestHeader requires 2 arguments"));
+            }
+            let ready = xm.borrow().get(&h).map_or(0, |st| st.ready_state);
+            if ready != 1 {
+                return Err(create_dom_exception(
+                    vm,
+                    "InvalidStateError",
+                    "XMLHttpRequest must be OPENED",
+                ));
+            }
+            let name = to_byte_string(vm, arg(args, 0))?;
+            let raw_value = to_byte_string(vm, arg(args, 1))?;
+            if !is_valid_header_name(&name) {
+                return Err(create_dom_exception(
+                    vm,
+                    "SyntaxError",
+                    &format!("Invalid header name: '{name}'"),
+                ));
+            }
+            let value = normalize_and_validate_header_value(&raw_value)
+                .map_err(|msg| create_dom_exception(vm, "SyntaxError", msg))?;
+            let lower = name.to_ascii_lowercase();
+            if is_forbidden_request_header(&lower, &value) {
+                return Ok(JsValue::UNDEFINED);
+            }
             if let Some(st) = xm.borrow_mut().get_mut(&h) {
-                if st.ready_state != 1 {
-                    return Err(create_dom_exception(
-                        vm,
-                        "InvalidStateError",
-                        "XMLHttpRequest must be OPENED",
-                    ));
-                }
                 st.req_headers
-                    .entry(name.to_ascii_lowercase())
+                    .entry(lower)
                     .and_modify(|v| {
                         v.push_str(", ");
                         v.push_str(&value);
@@ -2263,6 +2012,7 @@ fn install_xml_http_request(
                 body,
                 mode: FetchMode::Cors,
                 credentials: FetchCredentials::SameOrigin,
+                cache: FetchCache::Default,
                 redirect: FetchRedirect::Follow,
                 origin,
                 abort_signal: None,

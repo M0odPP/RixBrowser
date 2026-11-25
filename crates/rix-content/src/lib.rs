@@ -19,6 +19,7 @@ pub mod dom_sanitizer;
 pub mod element_internals;
 pub mod event_loop;
 pub mod events;
+mod fetch_headers;
 pub mod fetch_ws;
 pub mod frames;
 pub mod indexeddb;

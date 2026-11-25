@@ -17,8 +17,8 @@ pub use client::{
 };
 pub use cors::{
     filter_cors_response_headers, is_cors_safelisted_method, is_cors_safelisted_request_header,
-    validate_cors_response, AbortHandle, FetchCredentials, FetchEngine, FetchMode, FetchRedirect,
-    FetchRequest, FetchResponse, FetchResponseType, PreflightCache,
+    validate_cors_response, AbortHandle, FetchCache, FetchCredentials, FetchEngine, FetchMode,
+    FetchRedirect, FetchRequest, FetchResponse, FetchResponseType, PreflightCache,
 };
 pub use decompress::{
     decompress_body, decompress_body_for_header, encodings_from_header, ContentEncoding,

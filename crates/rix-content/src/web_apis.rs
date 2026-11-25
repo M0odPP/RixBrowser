@@ -48,8 +48,8 @@ pub(crate) struct AbortSignalEntry {
 }
 
 #[derive(Debug, Clone)]
-struct SearchParamsEntry {
-    pairs: Vec<(String, String)>,
+pub(crate) struct SearchParamsEntry {
+    pub(crate) pairs: Vec<(String, String)>,
     owner_url: Option<HeapHandle>,
 }
 
@@ -139,7 +139,7 @@ pub struct WebApiState {
     pub(crate) blobs: HashMap<HeapHandle, BlobEntry>,
     pub(crate) abort_signals: HashMap<HeapHandle, AbortSignalEntry>,
     url_objects: HashMap<HeapHandle, UrlEntry>,
-    search_params: HashMap<HeapHandle, SearchParamsEntry>,
+    pub(crate) search_params: HashMap<HeapHandle, SearchParamsEntry>,
     text_decoders: HashMap<HeapHandle, TextDecoderEntry>,
     pub(crate) form_data: HashMap<HeapHandle, FormDataEntry>,
     pub(crate) location_url: Url,
@@ -147,6 +147,7 @@ pub struct WebApiState {
     history_index: usize,
     pub(crate) storage: StorageEngine,
     pub(crate) object_urls: HashMap<String, Vec<u8>>,
+    pub(crate) object_url_types: HashMap<String, String>,
     pub(crate) object_url_objects: HashMap<String, HeapHandle>,
     object_url_validators: Vec<Rc<dyn Fn(HeapHandle) -> bool>>,
     next_object_url_id: u64,
@@ -178,6 +179,7 @@ impl WebApiState {
             location_url: parsed,
             storage,
             object_urls: HashMap::new(),
+            object_url_types: HashMap::new(),
             object_url_objects: HashMap::new(),
             object_url_validators: Vec::new(),
             next_object_url_id: 1,
@@ -679,6 +681,7 @@ pub fn install_web_apis(
     install_url_and_search_params(vm, &web_apis);
     install_text_encoding(vm, &web_apis);
     install_blob_and_file(vm, &web_apis);
+    install_file_reader(vm, host, events, event_loop, &web_apis);
     install_form_data(vm, host, &web_apis);
     install_structured_clone(vm, &web_apis);
     install_abort_controller(vm, host, events, event_loop, &web_apis);
@@ -688,6 +691,271 @@ pub fn install_web_apis(
     install_console(vm, &web_apis);
     install_window_and_navigator(vm, host, event_loop, &web_apis);
     web_apis
+}
+
+fn install_file_reader(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
+) {
+    #[derive(Clone)]
+    struct FileReaderState {
+        ready_state: i32,
+        result: JsValue,
+        error: JsValue,
+    }
+
+    let etp = host.borrow().prototypes.event_target_proto;
+    let frp = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(etp)));
+    vm.heap.get_object_mut(frp).unwrap().is_prototype = true;
+    let tag_k = vm.key_symbol_to_string_tag;
+    let tag_v = JsValue::from_string(vm.heap.alloc_string("FileReader"));
+    vm.heap.object_define_data(
+        frp,
+        tag_k,
+        tag_v,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+
+    let define_consts = |vm: &mut JsVm, obj: HeapHandle| {
+        for (name, v) in [("EMPTY", 0), ("LOADING", 1), ("DONE", 2)] {
+            let k = vm.heap.intern_key(name);
+            vm.heap.object_define_data(
+                obj,
+                k,
+                JsValue::from_i32(v),
+                PropertyAttrs::ENUMERABLE,
+                &mut vm.shapes,
+            );
+        }
+    };
+    define_consts(vm, frp);
+
+    let readers: Rc<RefCell<HashMap<HeapHandle, FileReaderState>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+
+    let require_fr = |vm: &mut JsVm,
+                      map: &Rc<RefCell<HashMap<HeapHandle, FileReaderState>>>,
+                      val: JsValue|
+     -> Result<HeapHandle, JsException> {
+        let Some(h) = val.as_object() else {
+            return Err(vm.type_error("Incompatible FileReader receiver"));
+        };
+        if map.borrow().contains_key(&h) {
+            Ok(h)
+        } else {
+            Err(vm.type_error("Incompatible FileReader receiver"))
+        }
+    };
+
+    {
+        let rm = Rc::clone(&readers);
+        define_host_getter(vm, frp, "readyState", move |vm, this_val, _| {
+            let h = require_fr(vm, &rm, this_val)?;
+            Ok(JsValue::from_i32(
+                rm.borrow().get(&h).map_or(0, |s| s.ready_state),
+            ))
+        });
+    }
+    {
+        let rm = Rc::clone(&readers);
+        define_host_getter(vm, frp, "result", move |vm, this_val, _| {
+            let h = require_fr(vm, &rm, this_val)?;
+            Ok(rm.borrow().get(&h).map_or(JsValue::NULL, |s| s.result))
+        });
+    }
+    {
+        let rm = Rc::clone(&readers);
+        define_host_getter(vm, frp, "error", move |vm, this_val, _| {
+            let h = require_fr(vm, &rm, this_val)?;
+            Ok(rm.borrow().get(&h).map_or(JsValue::NULL, |s| s.error))
+        });
+    }
+
+    let install_read_method =
+        |vm: &mut JsVm,
+         name: &'static str,
+         mode: u8,
+         readers: &Rc<RefCell<HashMap<HeapHandle, FileReaderState>>>| {
+            let rm = Rc::clone(readers);
+            let wa = Rc::clone(web_apis);
+            let hh = Rc::clone(host);
+            let ev = Rc::clone(events);
+            let el = Rc::clone(event_loop);
+            define_host_method(vm, frp, name, move |vm, this_val, args| {
+                let h = require_fr(vm, &rm, this_val)?;
+                if rm.borrow().get(&h).is_some_and(|s| s.ready_state == 1) {
+                    return Err(create_dom_exception(
+                        vm,
+                        "InvalidStateError",
+                        "FileReader is already reading",
+                    ));
+                }
+                let Some(blob_h) = arg(args, 0).as_object() else {
+                    return Err(vm.type_error("FileReader read requires a Blob argument"));
+                };
+                let Some(blob) = wa.borrow().blobs.get(&blob_h).cloned() else {
+                    return Err(vm.type_error("FileReader read argument must be a Blob"));
+                };
+                let label = if mode == 0 && !arg(args, 1).is_undefined() {
+                    Some(vm.value_to_rust_string(arg(args, 1)))
+                } else {
+                    None
+                };
+                let result_val = match mode {
+                    0 => {
+                        // readAsText
+                        let enc = label
+                            .as_deref()
+                            .and_then(|l| Encoding::for_label(l.trim().as_bytes()))
+                            .unwrap_or(encoding_rs::UTF_8);
+                        let (decoded, _) = enc.decode_without_bom_handling(&blob.bytes);
+                        let text = decoded.strip_prefix('\u{FEFF}').unwrap_or(&decoded);
+                        JsValue::from_string(vm.heap.alloc_string(text))
+                    }
+                    1 => {
+                        // readAsArrayBuffer
+                        JsValue::from_object(alloc_array_buffer(vm, blob.bytes.clone()))
+                    }
+                    2 => {
+                        // readAsDataURL
+                        let ct = if blob.content_type.is_empty() {
+                            "application/octet-stream"
+                        } else {
+                            blob.content_type.as_str()
+                        };
+                        let b64 = encode_base64(&blob.bytes);
+                        let s = format!("data:{ct};base64,{b64}");
+                        JsValue::from_string(vm.heap.alloc_string(&s))
+                    }
+                    _ => {
+                        // readAsBinaryString
+                        let s: String = blob.bytes.iter().map(|&b| char::from(b)).collect();
+                        JsValue::from_string(vm.heap.alloc_string(&s))
+                    }
+                };
+                if let Some(st) = rm.borrow_mut().get_mut(&h) {
+                    st.ready_state = 1;
+                    st.result = JsValue::NULL;
+                    st.error = JsValue::NULL;
+                }
+                let loaded = blob.bytes.len() as f64;
+                let rm_cb = Rc::clone(&rm);
+                let hh_cb = Rc::clone(&hh);
+                let ev_cb = Rc::clone(&ev);
+                let el_cb = Rc::clone(&el);
+                let finish_fn = vm.alloc_host_fn_rooted(
+                    "file_reader_done",
+                    &[JsValue::from_object(h), result_val],
+                    move |vm, _, _| {
+                        let was_aborted = rm_cb.borrow().get(&h).is_none_or(|s| s.ready_state != 1);
+                        if was_aborted {
+                            return Ok(JsValue::UNDEFINED);
+                        }
+                        if let Some(st) = rm_cb.borrow_mut().get_mut(&h) {
+                            st.ready_state = 2;
+                            st.result = result_val;
+                        }
+                        let lv = JsValue::from_f64(loaded);
+                        fire_object_event(
+                            vm,
+                            &hh_cb,
+                            &ev_cb,
+                            &el_cb,
+                            h,
+                            "load",
+                            &[("loaded", lv), ("total", lv)],
+                        );
+                        fire_object_event(
+                            vm,
+                            &hh_cb,
+                            &ev_cb,
+                            &el_cb,
+                            h,
+                            "loadend",
+                            &[("loaded", lv), ("total", lv)],
+                        );
+                        Ok(JsValue::UNDEFINED)
+                    },
+                );
+                let resolved = promise_resolve_value(vm, JsValue::UNDEFINED);
+                let _ = rix_js::promise::promise_then(vm, resolved, Some(finish_fn), None);
+                Ok(JsValue::UNDEFINED)
+            });
+        };
+
+    install_read_method(vm, "readAsText", 0, &readers);
+    install_read_method(vm, "readAsArrayBuffer", 1, &readers);
+    install_read_method(vm, "readAsDataURL", 2, &readers);
+    install_read_method(vm, "readAsBinaryString", 3, &readers);
+
+    {
+        let rm = Rc::clone(&readers);
+        define_host_method(vm, frp, "abort", move |vm, this_val, _| {
+            let h = require_fr(vm, &rm, this_val)?;
+            if let Some(st) = rm.borrow_mut().get_mut(&h) {
+                st.ready_state = 2;
+                st.result = JsValue::NULL;
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+
+    let rm_ctor = Rc::clone(&readers);
+    let ctor = vm.alloc_host_fn("FileReader", move |vm, _, _| {
+        let obj = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(frp)));
+        rm_ctor.borrow_mut().insert(
+            obj,
+            FileReaderState {
+                ready_state: 0,
+                result: JsValue::NULL,
+                error: JsValue::NULL,
+            },
+        );
+        Ok(JsValue::from_object(obj))
+    });
+    define_consts(vm, ctor);
+    bind_ctor_proto(vm, ctor, frp);
+    define_global(vm, "FileReader", JsValue::from_object(ctor));
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = if chunk.len() > 1 {
+            u32::from(chunk[1])
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            u32::from(chunk[2])
+        } else {
+            0
+        };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(n & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 fn install_dom_exception_ctor(vm: &mut JsVm) {
@@ -2073,15 +2341,17 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
                     vm.type_error("URL.createObjectURL requires a Blob or MediaSource argument")
                 );
             };
-            let (blob_bytes, validators) = {
+            let (blob_data, validators) = {
                 let st = wa_c.borrow();
                 (
-                    st.blobs.get(&bh).map(|b| b.bytes.clone()),
+                    st.blobs
+                        .get(&bh)
+                        .map(|b| (b.bytes.clone(), b.content_type.clone())),
                     st.object_url_validators.clone(),
                 )
             };
-            let is_valid_obj = blob_bytes.is_none() && validators.iter().any(|v| v(bh));
-            if blob_bytes.is_none() && !is_valid_obj {
+            let is_valid_obj = blob_data.is_none() && validators.iter().any(|v| v(bh));
+            if blob_data.is_none() && !is_valid_obj {
                 return Err(
                     vm.type_error("URL.createObjectURL argument must be a Blob or MediaSource")
                 );
@@ -2091,8 +2361,9 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
             st.next_object_url_id = st.next_object_url_id.wrapping_add(1).max(1);
             let origin = origin_of_url(&st.location_url);
             let url = format!("blob:{origin}/{id}");
-            if let Some(bytes) = blob_bytes {
+            if let Some((bytes, ct)) = blob_data {
                 st.object_urls.insert(url.clone(), bytes);
+                st.object_url_types.insert(url.clone(), ct);
             } else {
                 st.object_url_objects.insert(url.clone(), bh);
             }
@@ -2105,6 +2376,7 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
             let url = vm.value_to_rust_string(arg(args, 0));
             let mut st = wa_r.borrow_mut();
             st.object_urls.remove(&url);
+            st.object_url_types.remove(&url);
             st.object_url_objects.remove(&url);
             Ok(JsValue::UNDEFINED)
         });

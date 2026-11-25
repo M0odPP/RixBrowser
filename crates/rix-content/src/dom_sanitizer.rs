@@ -2215,6 +2215,7 @@ fn schedule_async_external_script(
                 body: Vec::new(),
                 mode: rix_net::FetchMode::Cors,
                 credentials: rix_net::FetchCredentials::SameOrigin,
+                cache: rix_net::FetchCache::Default,
                 redirect: rix_net::FetchRedirect::Follow,
                 origin,
                 abort_signal: None,
