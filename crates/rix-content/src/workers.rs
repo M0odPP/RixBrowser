@@ -1,20 +1,55 @@
 //! Dedicated `Worker`, `SharedWorker`, `BroadcastChannel`, and `EventSource` (SSE)
-//! Web APIs running isolated JS VM OS threads with `structuredClone` messaging and
-//! reactive zero-polling `tokio::select!` delivery.
+//! Web APIs running isolated full-stack JS VM OS threads with cross-thread
+//! structured clone, Transferables (`ArrayBuffer`, `MessagePort`, `SharedArrayBuffer`,
+//! `ImageBitmap`, `OffscreenCanvas`), ES Module workers, `ErrorEvent` reporting,
+//! and reactive zero-polling `tokio::select!` delivery.
 //!
-//! Reference: Spec 06 §3, Issue #24.
+//! Reference: WHATWG HTML §10 (Web Workers), §9.4 (BroadcastChannel), §9.2 (Server-Sent Events).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
-use rix_core::RixUrl;
-use rix_js::{HeapHandle, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs};
+use rix_core::{RixUrl, Size};
+use rix_dom::Document;
+use rix_ipc::MessagePortId;
+use rix_js::{
+    EvalError, HeapHandle, ImportMap, JsException, JsObject, JsValue, JsVm, ModuleError,
+    ModuleLoader, ModuleSourceProvider, ObjectKind, PropertyAttrs,
+};
 use rix_net::{FetchCredentials, FetchEngine, FetchMode, FetchRedirect, FetchRequest};
+use rix_storage::StorageEngine;
+use rix_text::FontDatabase;
 use tokio::sync::{mpsc, oneshot};
 use url::Url;
+
+use crate::dom_bridge::SharedHost;
+use crate::dom_interfaces::define_to_string_tag;
+use crate::event_loop::{
+    drain_ready_tasks, fire_vsync, install_event_loop_globals, run_microtask_checkpoint,
+    EventLoopState, SharedEventLoop,
+};
+use crate::events::{
+    fire_error_event, fire_object_event, fire_object_event_dispatch_only,
+    fire_object_event_with_proto, install_object_event_handler_accessor, SharedEvents,
+};
+use crate::fetch_ws::{deliver_async_net_event, SharedNetBridge};
+use crate::frames::{
+    attach_transferred_cross_thread_port, deliver_cross_thread_port_message, freeze_js_array,
+    SharedFrames,
+};
+use crate::structured_clone::{
+    deserialize_payload, extract_transfer_arg, serialize_with_transfer, CloneContext,
+    CrossThreadPortEnd, PortRoute, StructuredClonePayload,
+};
+use crate::web_apis::{
+    arg, bind_ctor_proto, create_dom_exception, define_global, define_host_getter,
+    define_host_method, lookup_global_object_url, origin_of_url, parse_url_with_charset,
+    SharedWebApis,
+};
 
 fn alloc_js_array(vm: &mut JsVm, items: &[JsValue]) -> HeapHandle {
     let arr = vm.alloc_array();
@@ -23,19 +58,6 @@ fn alloc_js_array(vm: &mut JsVm, items: &[JsValue]) -> HeapHandle {
     }
     arr
 }
-
-use crate::dom_bridge::SharedHost;
-use crate::event_loop::{
-    drain_ready_tasks, install_event_loop_globals, run_microtask_checkpoint, EventLoopState,
-    SharedEventLoop, TaskPriority,
-};
-use crate::events::{fire_object_event, fire_object_event_with_proto, SharedEvents};
-use crate::fetch_ws::SharedNetBridge;
-use crate::frames::{decode_structured_json, encode_structured_json, SharedFrames};
-use crate::web_apis::{
-    arg, bind_ctor_proto, create_dom_exception, define_global, define_host_accessor,
-    define_host_getter, define_host_method, origin_of_url, SharedWebApis,
-};
 
 // ---------------------------------------------------------------------------
 // Global registries (process-wide SharedWorker & BroadcastChannel hubs)
@@ -47,34 +69,48 @@ fn next_global_id() -> u64 {
     NEXT_GLOBAL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerType {
+    Classic,
+    Module,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerCreds {
+    Omit,
+    SameOrigin,
+    Include,
+}
+
+impl WorkerCreds {
+    fn to_fetch_credentials(self) -> FetchCredentials {
+        match self {
+            Self::Omit => FetchCredentials::Omit,
+            Self::SameOrigin => FetchCredentials::SameOrigin,
+            Self::Include => FetchCredentials::Include,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerOptions {
+    worker_type: WorkerType,
+    credentials: WorkerCreds,
+    extended_lifetime: bool,
+}
+
 #[derive(Debug)]
 enum WorkerCommand {
-    PostMessage(String),
-    BroadcastMessage {
-        channel_id: u64,
-        origin: String,
-        payload_json: String,
-    },
+    PostMessage(StructuredClonePayload),
     Terminate,
 }
 
 #[derive(Debug)]
 enum SharedWorkerCommand {
     Connect {
-        client_port_id: u64,
-        client_tx: mpsc::UnboundedSender<AsyncWorkerEvent>,
-    },
-    PortMessage {
-        client_port_id: u64,
-        payload_json: String,
-    },
-    PortClose {
-        client_port_id: u64,
-    },
-    BroadcastMessage {
-        channel_id: u64,
-        origin: String,
-        payload_json: String,
+        worker_port_end: CrossThreadPortEnd,
+        client_error_tx: mpsc::UnboundedSender<AsyncWorkerEvent>,
+        shared_worker_id: u64,
     },
     #[allow(dead_code)]
     Terminate,
@@ -82,7 +118,8 @@ enum SharedWorkerCommand {
 
 #[derive(Clone)]
 struct SharedWorkerHandle {
-    cmd_tx: std::sync::mpsc::Sender<SharedWorkerCommand>,
+    cmd_tx: mpsc::UnboundedSender<SharedWorkerCommand>,
+    options: WorkerOptions,
 }
 
 type SharedWorkerRegistry = HashMap<(String, String, String), SharedWorkerHandle>;
@@ -95,8 +132,6 @@ fn shared_workers_registry() -> &'static Mutex<SharedWorkerRegistry> {
 #[derive(Clone)]
 enum BroadcastSink {
     Async(mpsc::UnboundedSender<AsyncWorkerEvent>),
-    Dedicated(std::sync::mpsc::Sender<WorkerCommand>),
-    Shared(std::sync::mpsc::Sender<SharedWorkerCommand>),
 }
 
 impl BroadcastSink {
@@ -104,20 +139,6 @@ impl BroadcastSink {
         match self {
             Self::Async(tx) => tx
                 .send(AsyncWorkerEvent::BroadcastMessage {
-                    channel_id,
-                    origin,
-                    payload_json,
-                })
-                .is_ok(),
-            Self::Dedicated(tx) => tx
-                .send(WorkerCommand::BroadcastMessage {
-                    channel_id,
-                    origin,
-                    payload_json,
-                })
-                .is_ok(),
-            Self::Shared(tx) => tx
-                .send(SharedWorkerCommand::BroadcastMessage {
                     channel_id,
                     origin,
                     payload_json,
@@ -154,25 +175,30 @@ fn broadcast_hub() -> &'static Mutex<BroadcastHub> {
 }
 
 /// Reactive async events emitted from Worker threads, SharedWorker threads,
-/// BroadcastChannel peers, and streaming `EventSource` (SSE) tasks directly into
-/// `ContentRuntime`'s `tokio::select!` loop (ZERO polling timers).
+/// cross-thread MessagePorts, BroadcastChannel peers, and streaming `EventSource`
+/// (SSE) tasks directly into `ContentRuntime`'s `tokio::select!` loop.
 #[derive(Debug)]
 pub enum AsyncWorkerEvent {
     DedicatedMessage {
         worker_id: u64,
-        payload_json: String,
+        payload: StructuredClonePayload,
     },
-    DedicatedError {
+    DedicatedFetchError {
+        worker_id: u64,
+    },
+    DedicatedRuntimeError {
         worker_id: u64,
         message: String,
+        filename: String,
+        lineno: u32,
+        colno: u32,
     },
-    SharedPortMessage {
-        port_id: u64,
-        payload_json: String,
+    SharedWorkerFetchError {
+        shared_worker_id: u64,
     },
     BridgePortMessage {
-        port_id: rix_ipc::MessagePortId,
-        payload: crate::structured_clone::StructuredClonePayload,
+        port_id: MessagePortId,
+        payload: StructuredClonePayload,
     },
     BroadcastMessage {
         channel_id: u64,
@@ -201,17 +227,13 @@ pub enum AsyncWorkerEvent {
 
 struct DedicatedWorkerEntry {
     js_obj: HeapHandle,
-    cmd_tx: std::sync::mpsc::Sender<WorkerCommand>,
+    cmd_tx: mpsc::UnboundedSender<WorkerCommand>,
     terminated: bool,
 }
 
-struct SharedWorkerClientPort {
-    js_port: HeapHandle,
-    worker_tx: std::sync::mpsc::Sender<SharedWorkerCommand>,
-    started: bool,
-    closed: bool,
-    onmessage: JsValue,
-    pending: VecDeque<String>,
+struct SharedWorkerClientEntry {
+    js_obj: HeapHandle,
+    port_h: HeapHandle,
 }
 
 struct BroadcastChannelEntry {
@@ -234,7 +256,6 @@ struct EventSourceEntry {
 struct WorkerPrototypes {
     worker_proto: Option<HeapHandle>,
     shared_worker_proto: Option<HeapHandle>,
-    shared_port_proto: Option<HeapHandle>,
     broadcast_channel_proto: Option<HeapHandle>,
     event_source_proto: Option<HeapHandle>,
 }
@@ -246,8 +267,8 @@ pub struct WorkerSystem {
     pub(crate) async_rx: RefCell<Option<mpsc::UnboundedReceiver<AsyncWorkerEvent>>>,
     workers_by_id: HashMap<u64, DedicatedWorkerEntry>,
     worker_handle_to_id: HashMap<HeapHandle, u64>,
-    shared_ports_by_id: HashMap<u64, SharedWorkerClientPort>,
-    shared_port_handle_to_id: HashMap<HeapHandle, u64>,
+    shared_workers_by_id: HashMap<u64, SharedWorkerClientEntry>,
+    shared_worker_handle_to_id: HashMap<HeapHandle, u64>,
     broadcasts_by_id: HashMap<u64, BroadcastChannelEntry>,
     broadcast_handle_to_id: HashMap<HeapHandle, u64>,
     sse_by_id: HashMap<u64, EventSourceEntry>,
@@ -267,8 +288,8 @@ impl WorkerSystem {
             async_rx: RefCell::new(Some(async_rx)),
             workers_by_id: HashMap::new(),
             worker_handle_to_id: HashMap::new(),
-            shared_ports_by_id: HashMap::new(),
-            shared_port_handle_to_id: HashMap::new(),
+            shared_workers_by_id: HashMap::new(),
+            shared_worker_handle_to_id: HashMap::new(),
             broadcasts_by_id: HashMap::new(),
             broadcast_handle_to_id: HashMap::new(),
             sse_by_id: HashMap::new(),
@@ -283,17 +304,24 @@ impl WorkerSystem {
 
     pub(crate) fn is_worker_platform_object(&self, h: HeapHandle) -> bool {
         self.worker_handle_to_id.contains_key(&h)
-            || self.shared_port_handle_to_id.contains_key(&h)
+            || self.shared_worker_handle_to_id.contains_key(&h)
             || self.broadcast_handle_to_id.contains_key(&h)
             || self.sse_handle_to_id.contains_key(&h)
     }
 
-    /// Collects GC roots for active workers, ports, channels, SSE handles, and prototypes.
+    /// Returns `true` if any dedicated worker, shared worker, or SSE stream is currently live.
+    #[must_use]
+    pub fn has_active_workers(&self) -> bool {
+        self.workers_by_id.values().any(|w| !w.terminated)
+            || !self.shared_workers_by_id.is_empty()
+            || self.sse_by_id.values().any(|s| s.ready_state != 2)
+    }
+
+    /// Collects GC roots for active workers, channels, SSE handles, and prototypes.
     pub fn collect_roots(&self, out: &mut Vec<JsValue>) {
         for p in [
             self.protos.worker_proto,
             self.protos.shared_worker_proto,
-            self.protos.shared_port_proto,
             self.protos.broadcast_channel_proto,
             self.protos.event_source_proto,
         ]
@@ -307,11 +335,9 @@ impl WorkerSystem {
                 out.push(JsValue::from_object(w.js_obj));
             }
         }
-        for p in self.shared_ports_by_id.values() {
-            if !p.closed {
-                out.push(JsValue::from_object(p.js_port));
-                out.push(p.onmessage);
-            }
+        for sw in self.shared_workers_by_id.values() {
+            out.push(JsValue::from_object(sw.js_obj));
+            out.push(JsValue::from_object(sw.port_h));
         }
         for bc in self.broadcasts_by_id.values() {
             if !bc.closed {
@@ -330,9 +356,9 @@ impl WorkerSystem {
         self.workers_by_id
             .retain(|_, w| !w.terminated || heap.is_alive(w.js_obj));
         self.worker_handle_to_id.retain(|h, _| heap.is_alive(*h));
-        self.shared_ports_by_id
-            .retain(|_, p| !p.closed || heap.is_alive(p.js_port));
-        self.shared_port_handle_to_id
+        self.shared_workers_by_id
+            .retain(|_, sw| heap.is_alive(sw.js_obj));
+        self.shared_worker_handle_to_id
             .retain(|h, _| heap.is_alive(*h));
         self.broadcasts_by_id
             .retain(|_, b| !b.closed || heap.is_alive(b.js_obj));
@@ -355,14 +381,6 @@ impl Drop for WorkerSystem {
             if !w.terminated {
                 w.terminated = true;
                 let _ = w.cmd_tx.send(WorkerCommand::Terminate);
-            }
-        }
-        for (&port_id, p) in &mut self.shared_ports_by_id {
-            if !p.closed {
-                p.closed = true;
-                let _ = p.worker_tx.send(SharedWorkerCommand::PortClose {
-                    client_port_id: port_id,
-                });
             }
         }
         for bc in self.broadcasts_by_id.values_mut() {
@@ -392,92 +410,183 @@ fn unregister_broadcast_subscriber(origin: &str, name: &str, id: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Script resolution (`blob:`, `data:`, `http(s):`)
+// Script resolution, MIME validation, and URL decoding (`blob:`, `data:`, `http(s):`)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-enum ScriptSource {
-    Inline(String),
-    Remote {
-        url: String,
-        origin: String,
-        fetch_engine: Arc<FetchEngine>,
-    },
+/// WHATWG MIME Sniffing §4.6 JavaScript MIME type essence check.
+fn is_javascript_mime(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        essence.as_str(),
+        "application/ecmascript"
+            | "application/javascript"
+            | "application/x-ecmascript"
+            | "application/x-javascript"
+            | "text/ecmascript"
+            | "text/javascript"
+            | "text/javascript1.0"
+            | "text/javascript1.1"
+            | "text/javascript1.2"
+            | "text/javascript1.3"
+            | "text/javascript1.4"
+            | "text/javascript1.5"
+            | "text/jscript"
+            | "text/livescript"
+            | "text/x-ecmascript"
+            | "text/x-javascript"
+    )
 }
 
-fn resolve_script_url(raw: &str, base_href: &str) -> Result<String, String> {
-    if let Ok(u) = Url::parse(raw) {
-        return Ok(u.to_string());
-    }
-    let base = Url::parse(base_href).map_err(|e| format!("invalid base URL: {e}"))?;
-    base.join(raw)
+fn resolve_script_url(raw: &str, base_href: &str, charset: &str) -> Result<String, String> {
+    let base = Url::parse(base_href).unwrap_or_else(|_| {
+        Url::parse(crate::web_apis::DEFAULT_DOCUMENT_URL).expect("valid default url")
+    });
+    parse_url_with_charset(raw, &base, charset)
         .map(|u| u.to_string())
-        .map_err(|e| format!("invalid script URL '{raw}': {e}"))
+        .ok_or_else(|| format!("invalid script URL '{raw}'"))
 }
 
-fn prepare_script_source(
+struct FetchedScript {
+    code: String,
+    final_url: String,
+    content_type: String,
+    nosniff: bool,
+}
+
+static WORKER_FETCH_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn worker_fetch_rt() -> &'static tokio::runtime::Runtime {
+    WORKER_FETCH_RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("worker fetch runtime")
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fetch_script_sync(
     resolved_url: &str,
-    origin: &str,
-    object_urls: &HashMap<String, Vec<u8>>,
-    fetch_engine: Arc<FetchEngine>,
-) -> Result<ScriptSource, String> {
+    caller_origin: &str,
+    referer: &str,
+    credentials: WorkerCreds,
+    require_same_origin: bool,
+    require_js_mime_for_http: bool,
+    object_urls_snapshot: &HashMap<String, Vec<u8>>,
+    fetch_engine: &Arc<FetchEngine>,
+    cookie_header: Option<&str>,
+) -> Result<FetchedScript, String> {
     if resolved_url.starts_with("blob:") {
-        let bytes = object_urls
-            .get(resolved_url)
+        let lookup = resolved_url.split('#').next().unwrap_or(resolved_url);
+        let bytes = lookup_global_object_url(lookup)
+            .map(|(b, _)| b)
+            .or_else(|| object_urls_snapshot.get(lookup).cloned())
             .ok_or_else(|| format!("unknown blob URL '{resolved_url}'"))?;
-        return Ok(ScriptSource::Inline(
-            String::from_utf8_lossy(bytes).into_owned(),
-        ));
+        return Ok(FetchedScript {
+            code: String::from_utf8_lossy(&bytes).into_owned(),
+            final_url: resolved_url.to_string(),
+            content_type: "text/javascript".to_string(),
+            nosniff: false,
+        });
     }
     if let Some(rest) = resolved_url.strip_prefix("data:") {
         let decoded = decode_data_url(rest)?;
-        return Ok(ScriptSource::Inline(decoded));
+        return Ok(FetchedScript {
+            code: decoded,
+            final_url: resolved_url.to_string(),
+            content_type: "text/javascript".to_string(),
+            nosniff: false,
+        });
     }
     if resolved_url.starts_with("http://") || resolved_url.starts_with("https://") {
-        return Ok(ScriptSource::Remote {
+        let parsed = Url::parse(resolved_url).map_err(|e| format!("invalid URL: {e}"))?;
+        let target_origin = origin_of_url(&parsed);
+        let same_origin = caller_origin != "null" && target_origin == caller_origin;
+        if require_same_origin && !same_origin {
+            return Err(format!(
+                "cross-origin worker script '{resolved_url}' blocked"
+            ));
+        }
+        let mut headers = HashMap::new();
+        if !referer.is_empty() && !referer.starts_with("data:") && !referer.starts_with("blob:") {
+            headers.insert("referer".to_string(), referer.to_string());
+        }
+        let send_cookies = match credentials {
+            WorkerCreds::Omit => false,
+            WorkerCreds::SameOrigin => same_origin,
+            WorkerCreds::Include => true,
+        };
+        if send_cookies {
+            if let Some(ck) = cookie_header {
+                if !ck.is_empty() {
+                    headers.insert("cookie".to_string(), ck.to_string());
+                }
+            }
+        }
+        let req = FetchRequest {
             url: resolved_url.to_string(),
-            origin: origin.to_string(),
-            fetch_engine,
+            method: "GET".to_string(),
+            headers,
+            body: Vec::new(),
+            mode: if require_same_origin {
+                FetchMode::SameOrigin
+            } else {
+                FetchMode::Cors
+            },
+            credentials: credentials.to_fetch_credentials(),
+            cache: rix_net::FetchCache::Default,
+            redirect: FetchRedirect::Follow,
+            origin: caller_origin.to_string(),
+            abort_signal: None,
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let fe_c = Arc::clone(fetch_engine);
+        worker_fetch_rt().spawn(async move {
+            let _ = tx.send(fe_c.fetch(req).await);
+        });
+        let resp = rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|e| format!("worker script fetch timed out for '{resolved_url}': {e}"))?
+            .map_err(|e| format!("failed to fetch script '{resolved_url}': {e}"))?;
+        if !(200..300).contains(&resp.status) {
+            return Err(format!(
+                "script '{resolved_url}' returned HTTP status {}",
+                resp.status
+            ));
+        }
+        let ct = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let nosniff = resp.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("x-content-type-options")
+                && v.trim().eq_ignore_ascii_case("nosniff")
+        });
+        if require_js_mime_for_http && !is_javascript_mime(&ct) {
+            return Err(format!(
+                "invalid JavaScript MIME type '{ct}' for '{resolved_url}'"
+            ));
+        }
+        return Ok(FetchedScript {
+            code: String::from_utf8_lossy(&resp.body).into_owned(),
+            final_url: if resp.url.is_empty() {
+                resolved_url.to_string()
+            } else {
+                resp.url
+            },
+            content_type: ct,
+            nosniff,
         });
     }
     Err(format!("unsupported worker script URL '{resolved_url}'"))
-}
-
-fn load_script_on_worker_thread(
-    src: &ScriptSource,
-    rt: &tokio::runtime::Runtime,
-) -> Result<String, String> {
-    match src {
-        ScriptSource::Inline(code) => Ok(code.clone()),
-        ScriptSource::Remote {
-            url,
-            origin,
-            fetch_engine,
-        } => {
-            let req = FetchRequest {
-                url: url.clone(),
-                method: "GET".to_string(),
-                headers: HashMap::new(),
-                body: Vec::new(),
-                mode: FetchMode::SameOrigin,
-                credentials: FetchCredentials::SameOrigin,
-                cache: rix_net::FetchCache::Default,
-                redirect: FetchRedirect::Follow,
-                origin: origin.clone(),
-                abort_signal: None,
-            };
-            let resp = rt
-                .block_on(fetch_engine.fetch(req))
-                .map_err(|e| format!("failed to fetch worker script '{url}': {e}"))?;
-            if !(200..300).contains(&resp.status) {
-                return Err(format!(
-                    "worker script '{url}' returned HTTP status {}",
-                    resp.status
-                ));
-            }
-            Ok(String::from_utf8_lossy(&resp.body).into_owned())
-        }
-    }
 }
 
 fn decode_data_url(rest: &str) -> Result<String, String> {
@@ -566,972 +675,1212 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Isolated Worker JS VM helpers (Dedicated & Shared workers)
+// Worker ES Module provider (`type: "module"` + dynamic `import()`)
 // ---------------------------------------------------------------------------
 
-struct WorkerListenerTable {
-    listeners: HashMap<(HeapHandle, String), Vec<HeapHandle>>,
+struct WorkerModuleProvider {
+    entry_url: String,
+    entry_code: String,
+    origin: String,
+    referer: String,
+    credentials: WorkerCreds,
+    object_urls: Arc<HashMap<String, Vec<u8>>>,
+    fetch_engine: Arc<FetchEngine>,
+    cookie_header: String,
 }
 
-impl WorkerListenerTable {
-    fn new() -> Self {
-        Self {
-            listeners: HashMap::new(),
+impl ModuleSourceProvider for WorkerModuleProvider {
+    fn load_source(&self, url: &str) -> Result<String, String> {
+        if url == self.entry_url && !self.entry_code.is_empty() {
+            return Ok(self.entry_code.clone());
         }
-    }
-
-    fn add(&mut self, target: HeapHandle, ev_type: String, cb: HeapHandle) {
-        let list = self.listeners.entry((target, ev_type)).or_default();
-        if !list.contains(&cb) {
-            list.push(cb);
-        }
-    }
-
-    fn remove(&mut self, target: HeapHandle, ev_type: &str, cb: HeapHandle) {
-        if let Some(list) = self.listeners.get_mut(&(target, ev_type.to_string())) {
-            list.retain(|&h| h != cb);
-        }
-    }
-
-    fn snapshot(&self, target: HeapHandle, ev_type: &str) -> Vec<HeapHandle> {
-        self.listeners
-            .get(&(target, ev_type.to_string()))
-            .cloned()
-            .unwrap_or_default()
-    }
-}
-
-fn dispatch_worker_event(
-    vm: &mut JsVm,
-    listeners: &Rc<RefCell<WorkerListenerTable>>,
-    target: HeapHandle,
-    ev_type: &str,
-    props: &[(&str, JsValue)],
-) {
-    let ev_h = vm.heap.alloc_object(JsObject::with_kind(
-        ObjectKind::Ordinary,
-        Some(vm.object_proto),
-    ));
-    let type_k = vm.heap.intern_key("type");
-    let type_v = JsValue::from_string(vm.heap.alloc_string(ev_type));
-    vm.heap
-        .object_define_data(ev_h, type_k, type_v, PropertyAttrs::DEFAULT, &mut vm.shapes);
-    for &(name, val) in props {
-        let k = vm.heap.intern_key(name);
-        vm.heap
-            .object_define_data(ev_h, k, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
-    }
-    let handler_key = vm.heap.intern_key(&format!("on{ev_type}"));
-    if let Ok(handler_val) = vm.get_property_by_key(target, handler_key) {
-        if let Some(fh) = handler_val
-            .as_object()
-            .filter(|&h| vm.is_callable_handle(h))
-        {
-            let _ = vm.call_value(
-                JsValue::from_object(fh),
-                JsValue::from_object(target),
-                &[JsValue::from_object(ev_h)],
-            );
-        }
-    }
-    let cbs = listeners.borrow().snapshot(target, ev_type);
-    for cb in cbs {
-        let _ = vm.call_value(
-            JsValue::from_object(cb),
-            JsValue::from_object(target),
-            &[JsValue::from_object(ev_h)],
-        );
+        let fetched = fetch_script_sync(
+            url,
+            &self.origin,
+            &self.referer,
+            self.credentials,
+            false,
+            true,
+            &self.object_urls,
+            &self.fetch_engine,
+            Some(&self.cookie_header),
+        )?;
+        Ok(fetched.code)
     }
 }
 
-fn install_worker_event_target_methods(
-    vm: &mut JsVm,
-    obj: HeapHandle,
-    listeners: &Rc<RefCell<WorkerListenerTable>>,
-) {
-    {
-        let lt = Rc::clone(listeners);
-        define_host_method(vm, obj, "addEventListener", move |vm, this_val, args| {
-            let target = this_val.as_object().unwrap_or(vm.global);
-            let ev_type = vm.value_to_rust_string(arg(args, 0));
-            if let Some(cb) = arg(args, 1)
-                .as_object()
-                .filter(|&h| vm.is_callable_handle(h))
-            {
-                lt.borrow_mut().add(target, ev_type, cb);
-            }
-            Ok(JsValue::UNDEFINED)
-        });
-    }
-    {
-        let lt = Rc::clone(listeners);
-        define_host_method(vm, obj, "removeEventListener", move |vm, this_val, args| {
-            let target = this_val.as_object().unwrap_or(vm.global);
-            let ev_type = vm.value_to_rust_string(arg(args, 0));
-            if let Some(cb) = arg(args, 1).as_object() {
-                lt.borrow_mut().remove(target, &ev_type, cb);
-            }
-            Ok(JsValue::UNDEFINED)
-        });
-    }
-}
+// ---------------------------------------------------------------------------
+// Worker Error Reporting helper (HTML §8.1.7.3)
+// ---------------------------------------------------------------------------
 
-struct WorkerBroadcastTable {
-    by_id: HashMap<u64, (HeapHandle, String, String, bool)>,
-    handle_to_id: HashMap<HeapHandle, u64>,
-    blobs: HashMap<HeapHandle, (Vec<u8>, String)>,
-}
-
-impl WorkerBroadcastTable {
-    fn new() -> Self {
-        Self {
-            by_id: HashMap::new(),
-            handle_to_id: HashMap::new(),
-            blobs: HashMap::new(),
+fn format_exception_message(vm: &mut JsVm, ex: &JsException) -> String {
+    if let Some(eh) = ex.value.as_object() {
+        let kn = vm.heap.intern_key("name");
+        let km = vm.heap.intern_key("message");
+        let name = vm
+            .get_property_by_key(eh, kn)
+            .ok()
+            .filter(|v| !v.is_undefined())
+            .map(|v| vm.value_to_rust_string(v))
+            .unwrap_or_default();
+        let msg = vm
+            .get_property_by_key(eh, km)
+            .ok()
+            .filter(|v| !v.is_undefined())
+            .map(|v| vm.value_to_rust_string(v))
+            .unwrap_or_default();
+        if !name.is_empty() && !msg.is_empty() {
+            return format!("Uncaught {name}: {msg}");
+        }
+        if !msg.is_empty() {
+            return format!("Uncaught {msg}");
+        }
+        if !name.is_empty() {
+            return format!("Uncaught {name}");
         }
     }
-
-    fn unregister_all(&mut self) {
-        for (id, (_, origin, name, closed)) in self.by_id.iter_mut() {
-            if !*closed {
-                *closed = true;
-                unregister_broadcast_subscriber(origin, name, *id);
-            }
-        }
+    if !ex.message.is_empty() {
+        return format!("Uncaught {}", ex.message);
     }
-}
-
-fn encode_worker_json(
-    vm: &mut JsVm,
-    blobs: &HashMap<HeapHandle, (Vec<u8>, String)>,
-    val: JsValue,
-    seen: &mut HashSet<HeapHandle>,
-) -> Result<serde_json::Value, rix_js::JsException> {
-    if let Some(h) = val.as_object() {
-        if let Some((bytes, mime)) = blobs.get(&h) {
-            return Ok(serde_json::json!({
-                "$t": "blob",
-                "m": mime,
-                "v": bytes,
-            }));
-        }
-        // Recurse into plain objects/arrays to catch nested Blobs (e.g. `{ blob: new Blob(...) }`).
-        if matches!(
-            vm.heap.get_object(h).map(|o| &o.kind),
-            Some(ObjectKind::Ordinary)
-        ) && !vm.is_callable_handle(h)
-        {
-            if !seen.insert(h) {
-                return Err(create_dom_exception(
-                    vm,
-                    "DataCloneError",
-                    "Cyclic structure",
-                ));
-            }
-            let keys = vm.own_enumerable_keys_including_elements(h);
-            let mut map = serde_json::Map::with_capacity(keys.len());
-            for name in keys {
-                let k = vm.heap.intern_key(&name);
-                let v = vm.get_property_by_key(h, k)?;
-                map.insert(name, encode_worker_json(vm, blobs, v, seen)?);
-            }
-            seen.remove(&h);
-            return Ok(serde_json::Value::Object(map));
-        }
-    }
-    encode_structured_json(vm, val, seen)
+    format!("Uncaught {}", vm.value_to_rust_string(ex.value))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn install_common_worker_globals(
+fn report_worker_error(
     vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
     event_loop: &SharedEventLoop,
-    listeners: &Rc<RefCell<WorkerListenerTable>>,
-    bc_table: &Rc<RefCell<WorkerBroadcastTable>>,
-    bc_sink: BroadcastSink,
-    script_url: &str,
-    origin: &str,
-    worker_name: &str,
-    object_urls: Arc<HashMap<String, Vec<u8>>>,
-    fetch_engine: Arc<FetchEngine>,
-    closed_flag: Rc<RefCell<bool>>,
-    rt: Rc<tokio::runtime::Runtime>,
+    error_val: JsValue,
+    message: &str,
+    filename: &str,
+    lineno: u32,
+    colno: u32,
+    dedicated_parent: Option<(u64, &mpsc::UnboundedSender<AsyncWorkerEvent>)>,
+    in_onerror_guard: &Rc<RefCell<bool>>,
 ) {
-    install_event_loop_globals(vm, event_loop);
-    let global = vm.global;
-    define_global(vm, "self", JsValue::from_object(global));
-    let name_js = JsValue::from_string(vm.heap.alloc_string(worker_name));
-    define_global(vm, "name", name_js);
+    if *in_onerror_guard.borrow() {
+        // Already inside an `onerror` handler: forward directly to parent without re-entering.
+        if let Some((worker_id, ptx)) = dedicated_parent {
+            let _ = ptx.send(AsyncWorkerEvent::DedicatedRuntimeError {
+                worker_id,
+                message: message.to_string(),
+                filename: filename.to_string(),
+                lineno,
+                colno,
+            });
+        }
+        return;
+    }
 
-    // WorkerLocation (`self.location`)
-    let loc_h = vm.heap.alloc_object(JsObject::with_kind(
-        ObjectKind::Ordinary,
-        Some(vm.object_proto),
-    ));
+    *in_onerror_guard.borrow_mut() = true;
+    let g = vm.global;
+    let (prevented, handler_ex) = fire_error_event(
+        vm, host, events, event_loop, g, message, filename, lineno, colno, error_val, true,
+    );
+    *in_onerror_guard.borrow_mut() = false;
+
+    if let Some((worker_id, ptx)) = dedicated_parent {
+        if !prevented {
+            let _ = ptx.send(AsyncWorkerEvent::DedicatedRuntimeError {
+                worker_id,
+                message: message.to_string(),
+                filename: filename.to_string(),
+                lineno,
+                colno,
+            });
+        }
+        if let Some(hex) = handler_ex {
+            let hmsg = format_exception_message(vm, &hex);
+            let _ = ptx.send(AsyncWorkerEvent::DedicatedRuntimeError {
+                worker_id,
+                message: hmsg,
+                filename: filename.to_string(),
+                lineno,
+                colno,
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WorkerGlobalScope / WorkerLocation / WorkerNavigator installation
+// ---------------------------------------------------------------------------
+
+fn install_worker_location(vm: &mut JsVm, script_url: &str, effective_origin: &str) {
+    let loc_proto = vm.alloc_ordinary_object();
+    vm.heap.get_object_mut(loc_proto).unwrap().is_prototype = true;
+    define_to_string_tag(vm, loc_proto, "WorkerLocation");
+
     let parsed = Url::parse(script_url).ok();
-    let loc_origin = parsed
+    let href_s = script_url.to_string();
+    let origin_s = if script_url.starts_with("data:") {
+        "null".to_string()
+    } else if let Some(rest) = script_url.strip_prefix("blob:") {
+        Url::parse(rest)
+            .map(|u| origin_of_url(&u))
+            .unwrap_or_else(|_| effective_origin.to_string())
+    } else {
+        parsed
+            .as_ref()
+            .map(origin_of_url)
+            .unwrap_or_else(|| effective_origin.to_string())
+    };
+    let protocol_s = parsed
         .as_ref()
-        .map(origin_of_url)
-        .unwrap_or_else(|| origin.to_string());
-    let pathname = parsed
-        .as_ref()
-        .map_or_else(|| "/".to_string(), |u| u.path().to_string());
-    let protocol = parsed
-        .as_ref()
-        .map_or_else(|| "https:".to_string(), |u| format!("{}:", u.scheme()));
-    let hostname = parsed
+        .map_or_else(|| "http:".to_string(), |u| format!("{}:", u.scheme()));
+    let hostname_s = parsed
         .as_ref()
         .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_default();
-    let port_str = parsed
+    let port_s = parsed
         .as_ref()
         .and_then(Url::port)
         .map(|p| p.to_string())
         .unwrap_or_default();
-    let host = if port_str.is_empty() {
-        hostname.clone()
+    let host_s = if port_s.is_empty() {
+        hostname_s.clone()
     } else {
-        format!("{hostname}:{port_str}")
+        format!("{hostname_s}:{port_s}")
     };
-    let search = parsed
+    let pathname_s = parsed
+        .as_ref()
+        .map_or_else(|| "/".to_string(), |u| u.path().to_string());
+    // WHATWG URL: empty query `?` or empty fragment `#` returns `""` (not `"?"`/`"#"`).
+    let search_s = parsed
         .as_ref()
         .and_then(Url::query)
+        .filter(|q| !q.is_empty())
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
-    let hash = parsed
+    let hash_s = parsed
         .as_ref()
         .and_then(Url::fragment)
+        .filter(|f| !f.is_empty())
         .map(|f| format!("#{f}"))
         .unwrap_or_default();
-    for (k, v) in [
-        ("href", script_url.to_string()),
-        ("origin", loc_origin),
-        ("pathname", pathname),
-        ("protocol", protocol),
-        ("hostname", hostname),
-        ("port", port_str),
-        ("host", host),
-        ("search", search),
-        ("hash", hash),
+
+    for (prop, val_s) in [
+        ("href", href_s.clone()),
+        ("origin", origin_s),
+        ("protocol", protocol_s),
+        ("host", host_s),
+        ("hostname", hostname_s),
+        ("port", port_s),
+        ("pathname", pathname_s),
+        ("search", search_s),
+        ("hash", hash_s),
     ] {
-        let key = vm.heap.intern_key(k);
-        let val = JsValue::from_string(vm.heap.alloc_string(&v));
-        vm.heap
-            .object_define_data(loc_h, key, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        define_host_getter(vm, loc_proto, prop, move |vm, _, _| {
+            Ok(JsValue::from_string(vm.heap.alloc_string(&val_s)))
+        });
     }
-    define_global(vm, "location", JsValue::from_object(loc_h));
-
-    // Worker-side `Blob` constructor (supports `new Blob(parts, opts)` + BroadcastChannel transfer).
-    {
-        let blob_proto = vm.alloc_ordinary_object();
-        let bct_s = Rc::clone(bc_table);
-        define_host_getter(vm, blob_proto, "size", move |_, this_val, _| {
-            let sz = this_val
-                .as_object()
-                .and_then(|h| bct_s.borrow().blobs.get(&h).map(|(b, _)| b.len()))
-                .unwrap_or(0);
-            Ok(JsValue::from_f64(sz as f64))
-        });
-        let bct_t = Rc::clone(bc_table);
-        define_host_getter(vm, blob_proto, "type", move |vm, this_val, _| {
-            let ty = this_val
-                .as_object()
-                .and_then(|h| bct_t.borrow().blobs.get(&h).map(|(_, m)| m.clone()))
-                .unwrap_or_default();
-            Ok(JsValue::from_string(vm.heap.alloc_string(&ty)))
-        });
-        let bct_c = Rc::clone(bc_table);
-        let blob_ctor = vm.alloc_host_fn("Blob", move |vm, _, args| {
-            let mut bytes = Vec::new();
-            let parts = arg(args, 0);
-            if parts.as_object().is_some() {
-                if let Ok(items) = vm.collect_iterable(parts) {
-                    for it in items {
-                        if let Some(bh) = it.as_object() {
-                            if let Some((b, _)) = bct_c.borrow().blobs.get(&bh) {
-                                bytes.extend_from_slice(b);
-                                continue;
-                            }
-                        }
-                        bytes.extend_from_slice(vm.value_to_rust_string(it).as_bytes());
-                    }
-                }
-            }
-            let mime = arg(args, 1)
-                .as_object()
-                .and_then(|oh| {
-                    let kt = vm.heap.intern_key("type");
-                    vm.get_property_by_key(oh, kt).ok()
-                })
-                .filter(|v| !v.is_undefined())
-                .map(|v| vm.value_to_rust_string(v).to_ascii_lowercase())
-                .unwrap_or_default();
-            let h = vm
-                .heap
-                .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(blob_proto)));
-            bct_c.borrow_mut().blobs.insert(h, (bytes, mime));
-            Ok(JsValue::from_object(h))
-        });
-        bind_ctor_proto(vm, blob_ctor, blob_proto);
-        define_global(vm, "Blob", JsValue::from_object(blob_ctor));
-    }
-
-    // Worker-side `BroadcastChannel` connected directly to the process-wide `broadcast_hub()`!
-    {
-        let bc_proto = vm.alloc_ordinary_object();
-        install_worker_event_target_methods(vm, bc_proto, listeners);
-        let bct_n = Rc::clone(bc_table);
-        define_host_getter(vm, bc_proto, "name", move |vm, this_val, _| {
-            let n = this_val
-                .as_object()
-                .and_then(|h| bct_n.borrow().handle_to_id.get(&h).copied())
-                .and_then(|id| bct_n.borrow().by_id.get(&id).map(|e| e.2.clone()))
-                .unwrap_or_default();
-            Ok(JsValue::from_string(vm.heap.alloc_string(&n)))
-        });
-        let bct_p = Rc::clone(bc_table);
-        define_host_method(vm, bc_proto, "postMessage", move |vm, this_val, args| {
-            if args.is_empty() {
-                return Err(vm.type_error("BroadcastChannel.postMessage requires 1 argument"));
-            }
-            let Some(h) = this_val.as_object() else {
-                return Err(vm.type_error("Incompatible BroadcastChannel receiver"));
-            };
-            let info = {
-                let tbl = bct_p.borrow();
-                tbl.handle_to_id.get(&h).and_then(|id| {
-                    tbl.by_id
-                        .get(id)
-                        .map(|e| (*id, e.1.clone(), e.2.clone(), e.3))
-                })
-            };
-            let Some((sender_id, bc_origin, bc_name, closed)) = info else {
-                return Err(vm.type_error("Incompatible BroadcastChannel receiver"));
-            };
-            if closed {
-                return Err(create_dom_exception(
-                    vm,
-                    "InvalidStateError",
-                    "BroadcastChannel is closed",
-                ));
-            }
-            let mut seen = HashSet::new();
-            let encoded = {
-                let blobs = bct_p.borrow().blobs.clone();
-                encode_worker_json(vm, &blobs, arg(args, 0), &mut seen)?
-            };
-            let payload_json = serde_json::to_string(&encoded).unwrap_or_else(|_| "null".into());
-            broadcast_to_peers(sender_id, &bc_origin, &bc_name, &payload_json);
-            Ok(JsValue::UNDEFINED)
-        });
-        let bct_cl = Rc::clone(bc_table);
-        define_host_method(vm, bc_proto, "close", move |_, this_val, _| {
-            if let Some(h) = this_val.as_object() {
-                let mut tbl = bct_cl.borrow_mut();
-                if let Some(&id) = tbl.handle_to_id.get(&h) {
-                    if let Some((_, o, n, closed)) = tbl.by_id.get_mut(&id) {
-                        if !*closed {
-                            *closed = true;
-                            unregister_broadcast_subscriber(o, n, id);
-                        }
-                    }
-                }
-            }
-            Ok(JsValue::UNDEFINED)
-        });
-        let bct_c = Rc::clone(bc_table);
-        let bc_orig = origin.to_string();
-        let bc_ctor = vm.alloc_host_fn("BroadcastChannel", move |vm, _, args| {
-            if vm.native_new_target.is_undefined() {
-                return Err(vm.type_error("BroadcastChannel constructor requires 'new'"));
-            }
-            if args.is_empty() {
-                return Err(vm.type_error("BroadcastChannel constructor requires 1 argument"));
-            }
-            let name = vm.to_js_string(arg(args, 0))?;
-            let id = next_global_id();
-            let obj_h = vm
-                .heap
-                .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(bc_proto)));
-            let k_om = vm.heap.intern_key("onmessage");
-            let k_ome = vm.heap.intern_key("onmessageerror");
-            vm.heap.object_define_data(
-                obj_h,
-                k_om,
-                JsValue::NULL,
-                PropertyAttrs::DEFAULT,
-                &mut vm.shapes,
-            );
-            vm.heap.object_define_data(
-                obj_h,
-                k_ome,
-                JsValue::NULL,
-                PropertyAttrs::DEFAULT,
-                &mut vm.shapes,
-            );
-            if let Ok(mut hub) = broadcast_hub().lock() {
-                hub.entry((bc_orig.clone(), name.clone()))
-                    .or_default()
-                    .push(BroadcastSubscriber {
-                        id,
-                        sink: bc_sink.clone(),
-                    });
-            }
-            let mut tbl = bct_c.borrow_mut();
-            tbl.by_id.insert(id, (obj_h, bc_orig.clone(), name, false));
-            tbl.handle_to_id.insert(obj_h, id);
-            Ok(JsValue::from_object(obj_h))
-        });
-        bind_ctor_proto(vm, bc_ctor, bc_proto);
-        define_global(vm, "BroadcastChannel", JsValue::from_object(bc_ctor));
-    }
-
-    // `structuredClone(value)`
-    define_host_method(vm, global, "structuredClone", |vm, _, args| {
-        let mut seen = HashSet::new();
-        let encoded = encode_structured_json(vm, arg(args, 0), &mut seen)?;
-        Ok(decode_structured_json(vm, &encoded))
+    let href_for_str = href_s;
+    define_host_method(vm, loc_proto, "toString", move |vm, _, _| {
+        Ok(JsValue::from_string(vm.heap.alloc_string(&href_for_str)))
     });
 
-    // Minimal `console`
-    let console_h = vm.heap.alloc_object(JsObject::with_kind(
-        ObjectKind::Ordinary,
-        Some(vm.object_proto),
-    ));
-    for method in ["log", "info", "warn", "error", "debug"] {
-        define_host_method(vm, console_h, method, |_, _, _| Ok(JsValue::UNDEFINED));
-    }
-    define_global(vm, "console", JsValue::from_object(console_h));
+    let loc_ctor = vm.alloc_host_fn("WorkerLocation", |vm, _, _| {
+        Err(vm.type_error("Illegal constructor: WorkerLocation"))
+    });
+    bind_ctor_proto(vm, loc_ctor, loc_proto);
+    define_global(vm, "WorkerLocation", JsValue::from_object(loc_ctor));
 
-    // `self.close()`
+    let loc_obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(loc_proto)));
+    let k_loc = vm.heap.intern_key("location");
+    let g = vm.global;
+    let getter = vm.alloc_host_fn("get location", move |_, _, _| {
+        Ok(JsValue::from_object(loc_obj))
+    });
+    vm.heap.object_define_accessor(
+        g,
+        k_loc,
+        Some(getter),
+        None,
+        PropertyAttrs::ENUMERABLE | PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+}
+
+fn install_worker_navigator(vm: &mut JsVm) {
+    let nav_proto = vm.alloc_ordinary_object();
+    vm.heap.get_object_mut(nav_proto).unwrap().is_prototype = true;
+    define_to_string_tag(vm, nav_proto, "WorkerNavigator");
+
+    let ua_str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) RixBrowser/0.2.0 Safari/537.36";
+    let app_ver = "5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) RixBrowser/0.2.0 Safari/537.36";
+    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get) as f64;
+
+    for (prop, val) in [
+        ("appCodeName", "Mozilla"),
+        ("appName", "Netscape"),
+        ("appVersion", app_ver),
+        ("platform", "Linux x86_64"),
+        ("product", "Gecko"),
+        ("userAgent", ua_str),
+        ("language", "en-US"),
+    ] {
+        let v = val.to_string();
+        define_host_getter(vm, nav_proto, prop, move |vm, _, _| {
+            Ok(JsValue::from_string(vm.heap.alloc_string(&v)))
+        });
+    }
+    define_host_getter(vm, nav_proto, "onLine", |_, _, _| Ok(JsValue::TRUE));
+    define_host_getter(vm, nav_proto, "hardwareConcurrency", move |_, _, _| {
+        Ok(JsValue::from_number(cores))
+    });
+    let langs_arr = vm.alloc_array();
+    let en_us = JsValue::from_string(vm.heap.alloc_string("en-US"));
+    vm.heap.object_push_element(langs_arr, en_us);
+    freeze_js_array(vm, langs_arr);
+    define_host_getter(vm, nav_proto, "languages", move |_, _, _| {
+        Ok(JsValue::from_object(langs_arr))
+    });
+
+    let nav_ctor = vm.alloc_host_fn("WorkerNavigator", |vm, _, _| {
+        Err(vm.type_error("Illegal constructor: WorkerNavigator"))
+    });
+    bind_ctor_proto(vm, nav_ctor, nav_proto);
+    define_global(vm, "WorkerNavigator", JsValue::from_object(nav_ctor));
+
+    let nav_obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(nav_proto)));
+    define_global(vm, "navigator", JsValue::from_object(nav_obj));
+}
+
+// ---------------------------------------------------------------------------
+// Unified Full-Stack Worker Thread Runtime (Dedicated & Shared)
+// ---------------------------------------------------------------------------
+
+enum WorkerRuntimeMode {
+    Dedicated {
+        worker_id: u64,
+        parent_tx: mpsc::UnboundedSender<AsyncWorkerEvent>,
+        cmd_rx: mpsc::UnboundedReceiver<WorkerCommand>,
+    },
+    Shared {
+        cmd_rx: mpsc::UnboundedReceiver<SharedWorkerCommand>,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_worker_thread(
+    script_url: String,
+    caller_origin: String,
+    referer: String,
+    worker_name: String,
+    options: WorkerOptions,
+    cross_origin_isolated: bool,
+    object_urls_snapshot: Arc<HashMap<String, Vec<u8>>>,
+    fetch_engine: Arc<FetchEngine>,
+    cookie_header: String,
+    mode: WorkerRuntimeMode,
+) {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        if let WorkerRuntimeMode::Dedicated {
+            worker_id,
+            parent_tx,
+            ..
+        } = mode
+        {
+            let _ = parent_tx.send(AsyncWorkerEvent::DedicatedFetchError { worker_id });
+        }
+        return;
+    };
+    let rt = Rc::new(rt);
+    let is_dedicated = matches!(mode, WorkerRuntimeMode::Dedicated { .. });
+
+    // 1. Fetch top-level worker script (enforcing same-origin for http(s), JS MIME, and redirects).
+    let fetched = match fetch_script_sync(
+        &script_url,
+        &caller_origin,
+        &referer,
+        options.credentials,
+        true,
+        true,
+        &object_urls_snapshot,
+        &fetch_engine,
+        Some(&cookie_header),
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            match mode {
+                WorkerRuntimeMode::Dedicated {
+                    worker_id,
+                    parent_tx,
+                    ..
+                } => {
+                    let _ = parent_tx.send(AsyncWorkerEvent::DedicatedFetchError { worker_id });
+                }
+                WorkerRuntimeMode::Shared { mut cmd_rx } => {
+                    while let Ok(cmd) = cmd_rx.try_recv() {
+                        if let SharedWorkerCommand::Connect {
+                            client_error_tx,
+                            shared_worker_id,
+                            ..
+                        } = cmd
+                        {
+                            let _ =
+                                client_error_tx.send(AsyncWorkerEvent::SharedWorkerFetchError {
+                                    shared_worker_id,
+                                });
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    };
+
+    let final_url = fetched.final_url;
+    let code = fetched.code;
+    let effective_origin = if final_url.starts_with("data:") {
+        "null".to_string()
+    } else if let Some(rest) = final_url.strip_prefix("blob:") {
+        Url::parse(rest)
+            .map(|u| origin_of_url(&u))
+            .unwrap_or_else(|_| caller_origin.clone())
+    } else {
+        Url::parse(&final_url)
+            .map(|u| origin_of_url(&u))
+            .unwrap_or_else(|_| caller_origin.clone())
+    };
+
+    // 2. Initialize full `rix-content` Web Platform stack on this isolated worker thread.
+    let mut vm = JsVm::new();
+    let _jit = rix_jit::TieredJit::attach_to(&mut vm);
+    let _wasm = rix_jit::install_webassembly(&mut vm);
+    vm.max_loop_iterations = Some(5_000_000);
+
+    let event_loop = Rc::new(RefCell::new(EventLoopState::new()));
+    install_event_loop_globals(&mut vm, &event_loop);
+    let doc = Rc::new(RefCell::new(Document::new()));
+    let font_db = Arc::new(FontDatabase::new());
+    let host = crate::dom_bridge::install_dom_bridge(&mut vm, doc, Size::new(1.0, 1.0), font_db);
+    let events = crate::events::install_event_system(&mut vm, &host, &event_loop);
+    let web_apis = crate::web_apis::install_web_apis(
+        &mut vm,
+        &host,
+        &events,
+        &event_loop,
+        &final_url,
+        StorageEngine::in_memory().expect("worker in-memory storage"),
+    );
+    web_apis.borrow_mut().cross_origin_isolated = cross_origin_isolated;
+    let streams = crate::streams::install_streams(&mut vm, &web_apis);
+    let net = crate::fetch_ws::install_fetch_and_websocket(
+        &mut vm,
+        &host,
+        &events,
+        &event_loop,
+        &web_apis,
+        &streams,
+        Some(Arc::clone(&fetch_engine)),
+    );
+    let canvas2d = crate::canvas2d::install_canvas2d(&mut vm, &host, &web_apis);
+    let frames = crate::frames::install_frame_and_messaging_apis(
+        &mut vm,
+        &host,
+        &events,
+        &event_loop,
+        &web_apis,
+        &net,
+    );
     {
-        let closed = Rc::clone(&closed_flag);
-        define_host_method(vm, global, "close", move |_, _, _| {
-            *closed.borrow_mut() = true;
+        let mut fs = frames.borrow_mut();
+        fs.canvas2d = Some(Rc::clone(&canvas2d));
+        fs.net = Some(Rc::clone(&net));
+    }
+    let workers = install_worker_and_sse_apis(
+        &mut vm,
+        &host,
+        &events,
+        &event_loop,
+        &web_apis,
+        &net,
+        &frames,
+    );
+    frames.borrow_mut().workers = Some(Rc::clone(&workers));
+    let indexeddb =
+        crate::indexeddb::install_indexeddb(&mut vm, &host, &events, &event_loop, &web_apis);
+
+    // Register host GC root collectors so long-running workers never sweep live host wrappers.
+    {
+        let el_r = Rc::clone(&event_loop);
+        let ev_r = Rc::clone(&events);
+        let wa_r = Rc::clone(&web_apis);
+        let st_r = Rc::clone(&streams);
+        let nb_r = Rc::clone(&net);
+        let c2_r = Rc::clone(&canvas2d);
+        let fr_r = Rc::clone(&frames);
+        let ws_r = Rc::clone(&workers);
+        let idb_r = Rc::clone(&indexeddb);
+        let h_r = Rc::clone(&host);
+        vm.add_host_root_collector(move |roots| {
+            if let Ok(g) = el_r.try_borrow() {
+                g.collect_roots(roots);
+            }
+            if let Ok(g) = ev_r.try_borrow() {
+                g.collect_roots(roots);
+            }
+            if let Ok(g) = wa_r.try_borrow() {
+                g.collect_roots(roots);
+            }
+            if let Ok(g) = st_r.try_borrow() {
+                g.collect_roots(roots);
+            }
+            if let Ok(g) = nb_r.try_borrow() {
+                g.collect_roots(roots);
+            }
+            if let Ok(g) = c2_r.try_borrow() {
+                g.collect_roots(roots);
+            }
+            if let Ok(g) = fr_r.try_borrow() {
+                g.collect_roots(roots);
+            }
+            if let Ok(g) = ws_r.try_borrow() {
+                g.collect_roots(roots);
+            }
+            if let Ok(g) = idb_r.try_borrow() {
+                g.collect_roots(roots);
+            }
+            if let Ok(g) = h_r.try_borrow() {
+                g.collect_roots(roots);
+            }
+        });
+    }
+
+    // 3. Remove Window-only own properties from `vm.global` so they neither leak into
+    //    `WorkerGlobalScope` nor shadow `WorkerGlobalScope.prototype` / `DedicatedWorkerGlobalScope.prototype`
+    //    methods (`postMessage`, `name`, `close`, `location`, `navigator`, `onmessage`, `onerror`, `onconnect`).
+    for win_only in [
+        "window",
+        "document",
+        "parent",
+        "top",
+        "frames",
+        "opener",
+        "frameElement",
+        "postMessage",
+        "name",
+        "close",
+        "closed",
+        "open",
+        "print",
+        "stop",
+        "location",
+        "navigator",
+        "history",
+        "localStorage",
+        "sessionStorage",
+        "getComputedStyle",
+        "getSelection",
+        "alert",
+        "confirm",
+        "prompt",
+        "DOMParser",
+        "XMLSerializer",
+        "XPathEvaluator",
+        "innerWidth",
+        "innerHeight",
+        "outerWidth",
+        "outerHeight",
+        "pageXOffset",
+        "pageYOffset",
+        "scrollX",
+        "scrollY",
+        "screen",
+        "screenX",
+        "screenY",
+        "screenLeft",
+        "screenTop",
+        "length",
+        "status",
+        "defaultStatus",
+        "event",
+        "Image",
+        "Option",
+        "Audio",
+        "onerror",
+        "onmessage",
+        "onmessageerror",
+        "onconnect",
+        "crossOriginIsolated",
+    ] {
+        let k = vm.heap.intern_key(win_only);
+        let g = vm.global;
+        let _ = vm.delete_property_by_key(g, k);
+    }
+
+    // 4. Install WorkerGlobalScope / DedicatedWorkerGlobalScope / SharedWorkerGlobalScope hierarchy.
+    let etp = host.borrow().prototypes.event_target_proto;
+    let wgs_proto = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(etp)));
+    vm.heap.get_object_mut(wgs_proto).unwrap().is_prototype = true;
+    define_to_string_tag(&mut vm, wgs_proto, "WorkerGlobalScope");
+    let wgs_ctor = vm.alloc_host_fn("WorkerGlobalScope", |vm, _, _| {
+        Err(vm.type_error("Illegal constructor: WorkerGlobalScope"))
+    });
+    bind_ctor_proto(&mut vm, wgs_ctor, wgs_proto);
+    define_global(&mut vm, "WorkerGlobalScope", JsValue::from_object(wgs_ctor));
+
+    let concrete_proto = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(wgs_proto)));
+    vm.heap.get_object_mut(concrete_proto).unwrap().is_prototype = true;
+    if is_dedicated {
+        define_to_string_tag(&mut vm, concrete_proto, "DedicatedWorkerGlobalScope");
+        let dw_ctor = vm.alloc_host_fn("DedicatedWorkerGlobalScope", |vm, _, _| {
+            Err(vm.type_error("Illegal constructor: DedicatedWorkerGlobalScope"))
+        });
+        bind_ctor_proto(&mut vm, dw_ctor, concrete_proto);
+        define_global(
+            &mut vm,
+            "DedicatedWorkerGlobalScope",
+            JsValue::from_object(dw_ctor),
+        );
+    } else {
+        define_to_string_tag(&mut vm, concrete_proto, "SharedWorkerGlobalScope");
+        let sw_ctor = vm.alloc_host_fn("SharedWorkerGlobalScope", |vm, _, _| {
+            Err(vm.type_error("Illegal constructor: SharedWorkerGlobalScope"))
+        });
+        bind_ctor_proto(&mut vm, sw_ctor, concrete_proto);
+        define_global(
+            &mut vm,
+            "SharedWorkerGlobalScope",
+            JsValue::from_object(sw_ctor),
+        );
+    }
+    let global_h = vm.global;
+    vm.heap
+        .object_set_prototype(global_h, Some(concrete_proto), &mut vm.shapes);
+
+    define_global(&mut vm, "self", JsValue::from_object(global_h));
+    define_global(
+        &mut vm,
+        "crossOriginIsolated",
+        JsValue::from_bool(cross_origin_isolated),
+    );
+    // WorkerGlobalScope / DedicatedWorkerGlobalScope / SharedWorkerGlobalScope EventHandler IDL slots
+    {
+        let k_oe = vm.heap.intern_key("onerror");
+        vm.heap.object_define_data(
+            wgs_proto,
+            k_oe,
+            JsValue::NULL,
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+        if is_dedicated {
+            for attr in ["onmessage", "onmessageerror"] {
+                let k = vm.heap.intern_key(attr);
+                vm.heap.object_define_data(
+                    concrete_proto,
+                    k,
+                    JsValue::NULL,
+                    PropertyAttrs::DEFAULT,
+                    &mut vm.shapes,
+                );
+            }
+        } else {
+            let k_oc = vm.heap.intern_key("onconnect");
+            vm.heap.object_define_data(
+                concrete_proto,
+                k_oc,
+                JsValue::NULL,
+                PropertyAttrs::DEFAULT,
+                &mut vm.shapes,
+            );
+        }
+    }
+    {
+        let wn = worker_name.clone();
+        let k_name = vm.heap.intern_key("name");
+        let get_fn = vm.alloc_host_fn("get name", move |vm, _, _| {
+            Ok(JsValue::from_string(vm.heap.alloc_string(&wn)))
+        });
+        // HTML §10.2.2 `[Replaceable]` `name` attribute: assigning `name = x` defines an own data property.
+        let set_fn = vm.alloc_host_fn("set name", move |vm, this_val, args| {
+            let target = this_val.as_object().unwrap_or(vm.global);
+            let k = vm.heap.intern_key("name");
+            let v = arg(args, 0);
+            vm.heap
+                .object_define_data(target, k, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
+            Ok(JsValue::UNDEFINED)
+        });
+        vm.heap.object_define_accessor(
+            global_h,
+            k_name,
+            Some(get_fn),
+            Some(set_fn),
+            PropertyAttrs::ENUMERABLE | PropertyAttrs::CONFIGURABLE,
+            &mut vm.shapes,
+        );
+    }
+    // Opaque-origin (`data:` URL) workers must reject IndexedDB access with `SecurityError` per W3C IDB §4.1.
+    if effective_origin == "null" {
+        let k_idb = vm.heap.intern_key("indexedDB");
+        if let Ok(idb_val) = vm.get_property_by_key(global_h, k_idb) {
+            if let Some(idb_h) = idb_val.as_object() {
+                for m in ["open", "deleteDatabase", "databases"] {
+                    define_host_method(&mut vm, idb_h, m, |vm, _, _| {
+                        Err(create_dom_exception(
+                            vm,
+                            "SecurityError",
+                            "IndexedDB access is denied in opaque-origin worker",
+                        ))
+                    });
+                }
+            }
+        }
+    }
+    install_worker_location(&mut vm, &final_url, &effective_origin);
+    install_worker_navigator(&mut vm);
+
+    let closed_flag = Rc::new(RefCell::new(false));
+    {
+        let cf = Rc::clone(&closed_flag);
+        define_host_method(&mut vm, concrete_proto, "close", move |_, _, _| {
+            *cf.borrow_mut() = true;
             Ok(JsValue::UNDEFINED)
         });
     }
 
-    // `importScripts(...urls)`
+    // `self.importScripts(...urls)` (disallowed in module workers per HTML §10.2.5.1)
     {
-        let base_href = script_url.to_string();
-        let origin_owned = origin.to_string();
-        let blobs = Arc::clone(&object_urls);
+        let base_href = final_url.clone();
+        let origin_owned = effective_origin.clone();
+        let blobs = Arc::clone(&object_urls_snapshot);
         let fe = Arc::clone(&fetch_engine);
-        let rt_ref = Rc::clone(&rt);
-        define_host_method(vm, global, "importScripts", move |vm, _, args| {
+        let ck = cookie_header.clone();
+        let is_mod = options.worker_type == WorkerType::Module;
+        let creds = options.credentials;
+        define_host_method(&mut vm, wgs_proto, "importScripts", move |vm, _, args| {
+            if is_mod {
+                return Err(vm.type_error(
+                    "Module scripts don't support importScripts(). Use static or dynamic import instead.",
+                ));
+            }
+            let mut resolved_urls = Vec::with_capacity(args.len());
             for &val in args {
-                let raw = vm.value_to_rust_string(val);
-                let resolved = resolve_script_url(&raw, &base_href)
+                let raw = vm.to_js_string(val)?;
+                let resolved = resolve_script_url(&raw, &base_href, "utf-8")
                     .map_err(|m| create_dom_exception(vm, "SyntaxError", &m))?;
-                let src = prepare_script_source(&resolved, &origin_owned, &blobs, Arc::clone(&fe))
-                    .map_err(|m| create_dom_exception(vm, "NetworkError", &m))?;
-                let code = load_script_on_worker_thread(&src, &rt_ref)
-                    .map_err(|m| create_dom_exception(vm, "NetworkError", &m))?;
-                vm.eval_script(&code).map_err(|e| match e {
-                    rix_js::EvalError::Runtime(ex) => ex,
-                    other => create_dom_exception(vm, "SyntaxError", &other.to_string()),
+                resolved_urls.push(resolved);
+            }
+            for resolved in resolved_urls {
+                let fetched = fetch_script_sync(
+                    &resolved,
+                    &origin_owned,
+                    &base_href,
+                    creds,
+                    false,
+                    false,
+                    &blobs,
+                    &fe,
+                    Some(&ck),
+                )
+                .map_err(|m| create_dom_exception(vm, "NetworkError", &m))?;
+                if fetched.nosniff && !is_javascript_mime(&fetched.content_type) {
+                    return Err(create_dom_exception(
+                        vm,
+                        "NetworkError",
+                        &format!(
+                            "Blocked importScripts due to nosniff MIME type '{}'",
+                            fetched.content_type
+                        ),
+                    ));
+                }
+                vm.eval_script(&fetched.code).map_err(|e| match e {
+                    EvalError::Runtime(ex) => ex,
+                    other => vm.make_error("SyntaxError", other.to_string()),
                 })?;
             }
             Ok(JsValue::UNDEFINED)
         });
     }
 
-    install_worker_event_target_methods(vm, global, listeners);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_dedicated_worker_thread(
-    worker_id: u64,
-    script_url: String,
-    origin: String,
-    worker_name: String,
-    script_src: ScriptSource,
-    object_urls: Arc<HashMap<String, Vec<u8>>>,
-    fetch_engine: Arc<FetchEngine>,
-    parent_tx: mpsc::UnboundedSender<AsyncWorkerEvent>,
-    cmd_tx_self: std::sync::mpsc::Sender<WorkerCommand>,
-    cmd_rx: std::sync::mpsc::Receiver<WorkerCommand>,
-) {
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        let _ = parent_tx.send(AsyncWorkerEvent::DedicatedError {
-            worker_id,
-            message: "failed to initialize worker async runtime".to_string(),
-        });
-        return;
-    };
-    let rt = Rc::new(rt);
-
-    let code = match load_script_on_worker_thread(&script_src, &rt) {
-        Ok(c) => c,
-        Err(err) => {
-            let _ = parent_tx.send(AsyncWorkerEvent::DedicatedError {
-                worker_id,
-                message: err,
-            });
-            return;
-        }
-    };
-
-    let mut vm = JsVm::new();
-    let _jit = rix_jit::TieredJit::attach_to(&mut vm);
-    let event_loop = Rc::new(RefCell::new(EventLoopState::new()));
-    let listeners = Rc::new(RefCell::new(WorkerListenerTable::new()));
-    let bc_table = Rc::new(RefCell::new(WorkerBroadcastTable::new()));
-    let closed_flag = Rc::new(RefCell::new(false));
-
-    install_common_worker_globals(
-        &mut vm,
-        &event_loop,
-        &listeners,
-        &bc_table,
-        BroadcastSink::Dedicated(cmd_tx_self),
-        &script_url,
-        &origin,
-        &worker_name,
-        object_urls,
-        fetch_engine,
-        Rc::clone(&closed_flag),
-        Rc::clone(&rt),
-    );
-
-    // `self.postMessage(data)`
+    // Dedicated worker `self.postMessage(message, transferOrOptions?)`
+    if let WorkerRuntimeMode::Dedicated {
+        worker_id,
+        ref parent_tx,
+        ..
+    } = mode
     {
         let ptx = parent_tx.clone();
-        let g = vm.global;
-        define_host_method(&mut vm, g, "postMessage", move |vm, _, args| {
-            let mut seen = HashSet::new();
-            let encoded = encode_structured_json(vm, arg(args, 0), &mut seen)?;
-            let payload_json = serde_json::to_string(&encoded).unwrap_or_else(|_| "null".into());
-            let _ = ptx.send(AsyncWorkerEvent::DedicatedMessage {
-                worker_id,
-                payload_json,
-            });
-            Ok(JsValue::UNDEFINED)
-        });
-    }
-
-    if let Err(err) = vm.eval_script(&code) {
-        let _ = parent_tx.send(AsyncWorkerEvent::DedicatedError {
-            worker_id,
-            message: err.to_string(),
-        });
-    }
-    run_microtask_checkpoint(&event_loop, &mut vm);
-    drain_ready_tasks(&event_loop, &mut vm);
-
-    while !*closed_flag.borrow() {
-        let next_timer = event_loop.borrow_mut().time_until_next_timer();
-        let recv_res = match next_timer {
-            Some(dur) => cmd_rx.recv_timeout(dur),
-            None => cmd_rx
-                .recv()
-                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
-        };
-        match recv_res {
-            Ok(WorkerCommand::PostMessage(payload_json)) => {
-                let data = serde_json::from_str::<serde_json::Value>(&payload_json)
-                    .map(|jv| decode_structured_json(&mut vm, &jv))
-                    .unwrap_or(JsValue::NULL);
-                let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
-                let ports_arr = alloc_js_array(&mut vm, &[]);
-                let g = vm.global;
-                dispatch_worker_event(
-                    &mut vm,
-                    &listeners,
-                    g,
-                    "message",
-                    &[
-                        ("data", data),
-                        ("origin", empty_s),
-                        ("lastEventId", empty_s),
-                        ("ports", JsValue::from_object(ports_arr)),
-                    ],
-                );
-                run_microtask_checkpoint(&event_loop, &mut vm);
-                drain_ready_tasks(&event_loop, &mut vm);
-            }
-            Ok(WorkerCommand::BroadcastMessage {
-                channel_id,
-                origin: msg_origin,
-                payload_json,
-            }) => {
-                let target = bc_table
-                    .borrow()
-                    .by_id
-                    .get(&channel_id)
-                    .filter(|e| !e.3)
-                    .map(|e| e.0);
-                if let Some(bc_obj) = target {
-                    let data = serde_json::from_str::<serde_json::Value>(&payload_json)
-                        .map(|jv| decode_structured_json(&mut vm, &jv))
-                        .unwrap_or(JsValue::NULL);
-                    let orig_js = JsValue::from_string(vm.heap.alloc_string(&msg_origin));
-                    let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
-                    let ports_arr = alloc_js_array(&mut vm, &[]);
-                    dispatch_worker_event(
-                        &mut vm,
-                        &listeners,
-                        bc_obj,
-                        "message",
-                        &[
-                            ("data", data),
-                            ("origin", orig_js),
-                            ("lastEventId", empty_s),
-                            ("source", JsValue::NULL),
-                            ("ports", JsValue::from_object(ports_arr)),
-                        ],
-                    );
-                    run_microtask_checkpoint(&event_loop, &mut vm);
-                    drain_ready_tasks(&event_loop, &mut vm);
-                }
-            }
-            Ok(WorkerCommand::Terminate) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                break;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                drain_ready_tasks(&event_loop, &mut vm);
-            }
-        }
-    }
-    bc_table.borrow_mut().unregister_all();
-}
-
-struct SharedWorkerSidePort {
-    js_obj: HeapHandle,
-    client_tx: mpsc::UnboundedSender<AsyncWorkerEvent>,
-    started: bool,
-    closed: bool,
-    onmessage: JsValue,
-    pending: VecDeque<String>,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_shared_worker_thread(
-    script_url: String,
-    origin: String,
-    worker_name: String,
-    script_src: ScriptSource,
-    object_urls: Arc<HashMap<String, Vec<u8>>>,
-    fetch_engine: Arc<FetchEngine>,
-    cmd_tx_self: std::sync::mpsc::Sender<SharedWorkerCommand>,
-    cmd_rx: std::sync::mpsc::Receiver<SharedWorkerCommand>,
-) {
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        return;
-    };
-    let rt = Rc::new(rt);
-    let Ok(code) = load_script_on_worker_thread(&script_src, &rt) else {
-        return;
-    };
-
-    let mut vm = JsVm::new();
-    let _jit = rix_jit::TieredJit::attach_to(&mut vm);
-    let event_loop = Rc::new(RefCell::new(EventLoopState::new()));
-    let listeners = Rc::new(RefCell::new(WorkerListenerTable::new()));
-    let bc_table = Rc::new(RefCell::new(WorkerBroadcastTable::new()));
-    let closed_flag = Rc::new(RefCell::new(false));
-    let ports: Rc<RefCell<HashMap<u64, SharedWorkerSidePort>>> =
-        Rc::new(RefCell::new(HashMap::new()));
-    let port_handle_to_id: Rc<RefCell<HashMap<HeapHandle, u64>>> =
-        Rc::new(RefCell::new(HashMap::new()));
-
-    install_common_worker_globals(
-        &mut vm,
-        &event_loop,
-        &listeners,
-        &bc_table,
-        BroadcastSink::Shared(cmd_tx_self),
-        &script_url,
-        &origin,
-        &worker_name,
-        object_urls,
-        fetch_engine,
-        Rc::clone(&closed_flag),
-        Rc::clone(&rt),
-    );
-
-    // Worker-side MessagePort prototype
-    let port_proto = vm.heap.alloc_object(JsObject::with_kind(
-        ObjectKind::Ordinary,
-        Some(vm.object_proto),
-    ));
-    install_worker_event_target_methods(&mut vm, port_proto, &listeners);
-    {
-        let ps = Rc::clone(&ports);
-        let pmap = Rc::clone(&port_handle_to_id);
+        let h_pm = Rc::clone(&host);
+        let ev_pm = Rc::clone(&events);
+        let wa_pm = Rc::clone(&web_apis);
+        let nb_pm = Rc::clone(&net);
+        let c2_pm = Rc::clone(&canvas2d);
+        let fr_pm = Rc::clone(&frames);
+        let ws_pm = Rc::clone(&workers);
         define_host_method(
             &mut vm,
-            port_proto,
+            concrete_proto,
             "postMessage",
-            move |vm, this_val, args| {
-                let Some(h) = this_val.as_object() else {
-                    return Ok(JsValue::UNDEFINED);
+            move |vm, _, args| {
+                if args.is_empty() {
+                    return Err(vm.type_error("postMessage requires at least 1 argument"));
+                }
+                let transfer_val = extract_transfer_arg(vm, arg(args, 1))?;
+                let ctx = CloneContext {
+                    host: &h_pm,
+                    events: &ev_pm,
+                    web_apis: &wa_pm,
+                    net: &nb_pm,
+                    canvas2d: &c2_pm,
+                    frames: &fr_pm,
+                    workers: &ws_pm,
                 };
-                let Some(&pid) = pmap.borrow().get(&h) else {
-                    return Ok(JsValue::UNDEFINED);
+                let payload = serialize_with_transfer(vm, &ctx, arg(args, 0), transfer_val, &[])?;
+                let _ = ptx.send(AsyncWorkerEvent::DedicatedMessage { worker_id, payload });
+                Ok(JsValue::UNDEFINED)
+            },
+        );
+    }
+
+    // Install uncaught error reporting hooks on event_loop + events!
+    let in_onerror_guard = Rc::new(RefCell::new(false));
+    let ded_parent_info: Option<(u64, mpsc::UnboundedSender<AsyncWorkerEvent>)> = match &mode {
+        WorkerRuntimeMode::Dedicated {
+            worker_id,
+            parent_tx,
+            ..
+        } => Some((*worker_id, parent_tx.clone())),
+        WorkerRuntimeMode::Shared { .. } => None,
+    };
+    {
+        let h_e = Rc::clone(&host);
+        let ev_e = Rc::clone(&events);
+        let el_e = Rc::clone(&event_loop);
+        let fn_e = final_url.clone();
+        let dpi_e = ded_parent_info.clone();
+        let guard_e = Rc::clone(&in_onerror_guard);
+        let hook: crate::event_loop::UncaughtErrorHook = Rc::new(move |vm, ex| {
+            let msg = format_exception_message(vm, &ex);
+            let parent_ref = dpi_e.as_ref().map(|(id, tx)| (*id, tx));
+            report_worker_error(
+                vm, &h_e, &ev_e, &el_e, ex.value, &msg, &fn_e, 1, 1, parent_ref, &guard_e,
+            );
+        });
+        event_loop.borrow_mut().on_uncaught_error = Some(Rc::clone(&hook));
+        events.borrow_mut().on_uncaught_error = Some(hook);
+    }
+
+    // 5. Install ES Module loader (supports both `type: "module"` workers AND dynamic `import()`!).
+    let mod_provider = WorkerModuleProvider {
+        entry_url: final_url.clone(),
+        entry_code: if options.worker_type == WorkerType::Module {
+            code.clone()
+        } else {
+            String::new()
+        },
+        origin: effective_origin.clone(),
+        referer: final_url.clone(),
+        credentials: options.credentials,
+        object_urls: Arc::clone(&object_urls_snapshot),
+        fetch_engine: Arc::clone(&fetch_engine),
+        cookie_header: cookie_header.clone(),
+    };
+    let import_map = ImportMap {
+        base_url: final_url.clone(),
+        ..ImportMap::default()
+    };
+    let mod_loader = Rc::new(RefCell::new(ModuleLoader::new(
+        Box::new(mod_provider),
+        import_map,
+    )));
+    ModuleLoader::install_on_vm(&mod_loader, &mut vm);
+
+    // 6. Evaluate top-level worker script (Module or Classic).
+    let mut mode = mode;
+    if options.worker_type == WorkerType::Module {
+        match ModuleLoader::load_and_evaluate(&mod_loader, &mut vm, &final_url) {
+            Ok(eval_p) => {
+                run_microtask_checkpoint(&event_loop, &mut vm);
+                // If module evaluation rejected synchronously/microtask-wise, report runtime error.
+                let rejected_reason = if let Some(ObjectKind::Promise(po)) =
+                    vm.heap.get_object(eval_p).map(|o| &o.kind)
+                {
+                    if let rix_js::heap::PromiseState::Rejected(reason) = po.state {
+                        Some(reason)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 };
-                let mut seen = HashSet::new();
-                let encoded = encode_structured_json(vm, arg(args, 0), &mut seen)?;
-                let payload_json =
-                    serde_json::to_string(&encoded).unwrap_or_else(|_| "null".into());
-                if let Some(port) = ps.borrow().get(&pid) {
-                    if !port.closed {
-                        let _ = port.client_tx.send(AsyncWorkerEvent::SharedPortMessage {
-                            port_id: pid,
-                            payload_json,
+                if let Some(reason) = rejected_reason {
+                    let ex = JsException {
+                        value: reason,
+                        message: vm.value_to_rust_string(reason),
+                    };
+                    let msg = format_exception_message(&mut vm, &ex);
+                    let parent_ref = ded_parent_info.as_ref().map(|(id, tx)| (*id, tx));
+                    report_worker_error(
+                        &mut vm,
+                        &host,
+                        &events,
+                        &event_loop,
+                        reason,
+                        &msg,
+                        &final_url,
+                        1,
+                        1,
+                        parent_ref,
+                        &in_onerror_guard,
+                    );
+                }
+            }
+            Err(
+                ModuleError::Load { .. } | ModuleError::Compile { .. } | ModuleError::Link { .. },
+            )
+            | Err(_) => {
+                match &mut mode {
+                    WorkerRuntimeMode::Dedicated {
+                        worker_id,
+                        parent_tx,
+                        ..
+                    } => {
+                        let _ = parent_tx.send(AsyncWorkerEvent::DedicatedFetchError {
+                            worker_id: *worker_id,
                         });
                     }
-                }
-                Ok(JsValue::UNDEFINED)
-            },
-        );
-    }
-    {
-        let ps = Rc::clone(&ports);
-        let pmap = Rc::clone(&port_handle_to_id);
-        let lt = Rc::clone(&listeners);
-        define_host_method(&mut vm, port_proto, "start", move |vm, this_val, _| {
-            let Some(h) = this_val.as_object() else {
-                return Ok(JsValue::UNDEFINED);
-            };
-            let Some(&pid) = pmap.borrow().get(&h) else {
-                return Ok(JsValue::UNDEFINED);
-            };
-            flush_shared_worker_side_port(vm, &ps, &lt, pid, true);
-            Ok(JsValue::UNDEFINED)
-        });
-    }
-    {
-        let ps = Rc::clone(&ports);
-        let pmap = Rc::clone(&port_handle_to_id);
-        define_host_method(&mut vm, port_proto, "close", move |_, this_val, _| {
-            if let Some(h) = this_val.as_object() {
-                if let Some(&pid) = pmap.borrow().get(&h) {
-                    if let Some(port) = ps.borrow_mut().get_mut(&pid) {
-                        port.closed = true;
-                        port.pending.clear();
-                    }
-                }
-            }
-            Ok(JsValue::UNDEFINED)
-        });
-    }
-    {
-        let ps_g = Rc::clone(&ports);
-        let pmap_g = Rc::clone(&port_handle_to_id);
-        let ps_s = Rc::clone(&ports);
-        let pmap_s = Rc::clone(&port_handle_to_id);
-        let lt_s = Rc::clone(&listeners);
-        define_host_accessor(
-            &mut vm,
-            port_proto,
-            "onmessage",
-            move |_, this_val, _| {
-                let val = this_val
-                    .as_object()
-                    .and_then(|h| pmap_g.borrow().get(&h).copied())
-                    .and_then(|pid| ps_g.borrow().get(&pid).map(|p| p.onmessage))
-                    .unwrap_or(JsValue::NULL);
-                Ok(val)
-            },
-            move |vm, this_val, args| {
-                let Some(h) = this_val.as_object() else {
-                    return Ok(JsValue::UNDEFINED);
-                };
-                let Some(&pid) = pmap_s.borrow().get(&h) else {
-                    return Ok(JsValue::UNDEFINED);
-                };
-                let handler = arg(args, 0);
-                if let Some(port) = ps_s.borrow_mut().get_mut(&pid) {
-                    port.onmessage = handler;
-                }
-                flush_shared_worker_side_port(vm, &ps_s, &lt_s, pid, true);
-                Ok(JsValue::UNDEFINED)
-            },
-        );
-    }
-
-    let _ = vm.eval_script(&code);
-    run_microtask_checkpoint(&event_loop, &mut vm);
-    drain_ready_tasks(&event_loop, &mut vm);
-
-    while !*closed_flag.borrow() {
-        let next_timer = event_loop.borrow_mut().time_until_next_timer();
-        let recv_res = match next_timer {
-            Some(dur) => cmd_rx.recv_timeout(dur),
-            None => cmd_rx
-                .recv()
-                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
-        };
-        match recv_res {
-            Ok(SharedWorkerCommand::Connect {
-                client_port_id,
-                client_tx,
-            }) => {
-                let port_h = vm
-                    .heap
-                    .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(port_proto)));
-                ports.borrow_mut().insert(
-                    client_port_id,
-                    SharedWorkerSidePort {
-                        js_obj: port_h,
-                        client_tx,
-                        started: false,
-                        closed: false,
-                        onmessage: JsValue::NULL,
-                        pending: VecDeque::new(),
-                    },
-                );
-                port_handle_to_id
-                    .borrow_mut()
-                    .insert(port_h, client_port_id);
-
-                let ports_arr = alloc_js_array(&mut vm, &[JsValue::from_object(port_h)]);
-                let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
-                let g = vm.global;
-                dispatch_worker_event(
-                    &mut vm,
-                    &listeners,
-                    g,
-                    "connect",
-                    &[
-                        ("data", empty_s),
-                        ("source", JsValue::from_object(port_h)),
-                        ("ports", JsValue::from_object(ports_arr)),
-                    ],
-                );
-                run_microtask_checkpoint(&event_loop, &mut vm);
-                drain_ready_tasks(&event_loop, &mut vm);
-            }
-            Ok(SharedWorkerCommand::PortMessage {
-                client_port_id,
-                payload_json,
-            }) => {
-                let started = {
-                    let mut map = ports.borrow_mut();
-                    match map.get_mut(&client_port_id) {
-                        Some(p) if !p.closed => {
-                            p.pending.push_back(payload_json);
-                            p.started
+                    WorkerRuntimeMode::Shared { cmd_rx } => {
+                        while let Ok(cmd) = cmd_rx.try_recv() {
+                            if let SharedWorkerCommand::Connect {
+                                client_error_tx,
+                                shared_worker_id,
+                                ..
+                            } = cmd
+                            {
+                                let _ = client_error_tx.send(
+                                    AsyncWorkerEvent::SharedWorkerFetchError { shared_worker_id },
+                                );
+                            }
                         }
-                        _ => false,
                     }
-                };
-                if started {
-                    flush_shared_worker_side_port(
-                        &mut vm,
-                        &ports,
-                        &listeners,
-                        client_port_id,
-                        false,
-                    );
-                    run_microtask_checkpoint(&event_loop, &mut vm);
-                    drain_ready_tasks(&event_loop, &mut vm);
                 }
+                return;
             }
-            Ok(SharedWorkerCommand::PortClose { client_port_id }) => {
-                if let Some(p) = ports.borrow_mut().remove(&client_port_id) {
-                    port_handle_to_id.borrow_mut().remove(&p.js_obj);
+        }
+    } else if let Err(err) = vm.eval_script(&code) {
+        match err {
+            EvalError::Runtime(ex) => {
+                let msg = format_exception_message(&mut vm, &ex);
+                let parent_ref = ded_parent_info.as_ref().map(|(id, tx)| (*id, tx));
+                report_worker_error(
+                    &mut vm,
+                    &host,
+                    &events,
+                    &event_loop,
+                    ex.value,
+                    &msg,
+                    &final_url,
+                    1,
+                    1,
+                    parent_ref,
+                    &in_onerror_guard,
+                );
+            }
+            _ => {
+                // WHATWG HTML §10.2.5: top-level script parse/compile failure dispatches a plain
+                // `Event("error")` at the `Worker` / `SharedWorker` (not an `ErrorEvent`).
+                match &mut mode {
+                    WorkerRuntimeMode::Dedicated {
+                        worker_id,
+                        parent_tx,
+                        ..
+                    } => {
+                        let _ = parent_tx.send(AsyncWorkerEvent::DedicatedFetchError {
+                            worker_id: *worker_id,
+                        });
+                    }
+                    WorkerRuntimeMode::Shared { cmd_rx } => {
+                        while let Ok(cmd) = cmd_rx.try_recv() {
+                            if let SharedWorkerCommand::Connect {
+                                client_error_tx,
+                                shared_worker_id,
+                                ..
+                            } = cmd
+                            {
+                                let _ = client_error_tx.send(
+                                    AsyncWorkerEvent::SharedWorkerFetchError { shared_worker_id },
+                                );
+                            }
+                        }
+                    }
                 }
-            }
-            Ok(SharedWorkerCommand::BroadcastMessage {
-                channel_id,
-                origin: msg_origin,
-                payload_json,
-            }) => {
-                let target = bc_table
-                    .borrow()
-                    .by_id
-                    .get(&channel_id)
-                    .filter(|e| !e.3)
-                    .map(|e| e.0);
-                if let Some(bc_obj) = target {
-                    let data = serde_json::from_str::<serde_json::Value>(&payload_json)
-                        .map(|jv| decode_structured_json(&mut vm, &jv))
-                        .unwrap_or(JsValue::NULL);
-                    let orig_js = JsValue::from_string(vm.heap.alloc_string(&msg_origin));
-                    let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
-                    let ports_arr = alloc_js_array(&mut vm, &[]);
-                    dispatch_worker_event(
-                        &mut vm,
-                        &listeners,
-                        bc_obj,
-                        "message",
-                        &[
-                            ("data", data),
-                            ("origin", orig_js),
-                            ("lastEventId", empty_s),
-                            ("source", JsValue::NULL),
-                            ("ports", JsValue::from_object(ports_arr)),
-                        ],
-                    );
-                    run_microtask_checkpoint(&event_loop, &mut vm);
-                    drain_ready_tasks(&event_loop, &mut vm);
-                }
-            }
-            Ok(SharedWorkerCommand::Terminate)
-            | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                break;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                drain_ready_tasks(&event_loop, &mut vm);
+                return;
             }
         }
     }
-    bc_table.borrow_mut().unregister_all();
-}
+    run_microtask_checkpoint(&event_loop, &mut vm);
+    drain_ready_tasks(&event_loop, &mut vm);
 
-fn flush_shared_worker_side_port(
-    vm: &mut JsVm,
-    ports: &Rc<RefCell<HashMap<u64, SharedWorkerSidePort>>>,
-    listeners: &Rc<RefCell<WorkerListenerTable>>,
-    port_id: u64,
-    mark_started: bool,
-) {
-    loop {
-        let next = {
-            let mut map = ports.borrow_mut();
-            let Some(port) = map.get_mut(&port_id) else {
+    // 7. Take async receivers and enter zero-polling `tokio::select!` event loop.
+    let Some(mut net_rx) = net.borrow().async_rx.borrow_mut().take() else {
+        return;
+    };
+    let Some(mut worker_rx) = workers.borrow().async_rx.borrow_mut().take() else {
+        return;
+    };
+    let msg_proto = frames
+        .borrow()
+        .message_event_proto
+        .or_else(|| events.borrow().event_proto)
+        .unwrap_or(vm.object_proto);
+    let rt_handle = Rc::clone(&rt);
+
+    rt_handle.block_on(async move {
+        while !*closed_flag.borrow() {
+            drain_ready_tasks(&event_loop, &mut vm);
+            while let Ok(nev) = net_rx.try_recv() {
+                deliver_async_net_event(
+                    &mut vm,
+                    &host,
+                    &events,
+                    &event_loop,
+                    &web_apis,
+                    &streams,
+                    &net,
+                    nev,
+                );
+                drain_ready_tasks(&event_loop, &mut vm);
+            }
+            while let Ok(wev) = worker_rx.try_recv() {
+                deliver_async_worker_event(
+                    &mut vm,
+                    &host,
+                    &events,
+                    &event_loop,
+                    &web_apis,
+                    &frames,
+                    &workers,
+                    wev,
+                );
+                drain_ready_tasks(&event_loop, &mut vm);
+            }
+            if *closed_flag.borrow() {
                 break;
+            }
+
+            let next_timer = event_loop.borrow_mut().time_until_next_timer();
+            let raf_due = if event_loop.borrow().has_pending_raf() {
+                Some(Duration::from_millis(16))
+            } else {
+                None
             };
-            if mark_started {
-                port.started = true;
+            let sleep_dur = match (next_timer, raf_due) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let deadline = sleep_dur.map(|d| tokio::time::Instant::now() + d);
+
+            match &mut mode {
+                WorkerRuntimeMode::Dedicated { cmd_rx, .. } => {
+                    enum DedWake {
+                        Cmd(Option<WorkerCommand>),
+                        Net(Option<crate::fetch_ws::AsyncNetEvent>),
+                        Worker(Option<AsyncWorkerEvent>),
+                        Timer,
+                    }
+                    let wake = match deadline {
+                        Some(dl) => tokio::select! {
+                            biased;
+                            c = cmd_rx.recv() => DedWake::Cmd(c),
+                            n = net_rx.recv() => DedWake::Net(n),
+                            w = worker_rx.recv() => DedWake::Worker(w),
+                            () = tokio::time::sleep_until(dl) => DedWake::Timer,
+                        },
+                        None => tokio::select! {
+                            biased;
+                            c = cmd_rx.recv() => DedWake::Cmd(c),
+                            n = net_rx.recv() => DedWake::Net(n),
+                            w = worker_rx.recv() => DedWake::Worker(w),
+                        },
+                    };
+                    match wake {
+                        DedWake::Cmd(Some(WorkerCommand::PostMessage(payload))) => {
+                            let clone_ctx = CloneContext {
+                                host: &host,
+                                events: &events,
+                                web_apis: &web_apis,
+                                net: &net,
+                                canvas2d: &canvas2d,
+                                frames: &frames,
+                                workers: &workers,
+                            };
+                            let (data, ports) = deserialize_payload(&mut vm, &clone_ctx, payload);
+                            let ports_arr = alloc_js_array(
+                                &mut vm,
+                                &ports
+                                    .iter()
+                                    .map(|&p| JsValue::from_object(p))
+                                    .collect::<Vec<_>>(),
+                            );
+                            freeze_js_array(&mut vm, ports_arr);
+                            let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
+                            let g = vm.global;
+                            fire_object_event_with_proto(
+                                &mut vm,
+                                &host,
+                                &events,
+                                &event_loop,
+                                g,
+                                "message",
+                                msg_proto,
+                                &[
+                                    ("data", data),
+                                    ("origin", empty_s),
+                                    ("lastEventId", empty_s),
+                                    ("source", JsValue::NULL),
+                                    ("ports", JsValue::from_object(ports_arr)),
+                                ],
+                            );
+                            run_microtask_checkpoint(&event_loop, &mut vm);
+                            drain_ready_tasks(&event_loop, &mut vm);
+                        }
+                        DedWake::Cmd(Some(WorkerCommand::Terminate)) | DedWake::Cmd(None) => break,
+                        DedWake::Net(Some(nev)) => {
+                            deliver_async_net_event(
+                                &mut vm,
+                                &host,
+                                &events,
+                                &event_loop,
+                                &web_apis,
+                                &streams,
+                                &net,
+                                nev,
+                            );
+                        }
+                        DedWake::Worker(Some(wev)) => {
+                            deliver_async_worker_event(
+                                &mut vm,
+                                &host,
+                                &events,
+                                &event_loop,
+                                &web_apis,
+                                &frames,
+                                &workers,
+                                wev,
+                            );
+                        }
+                        DedWake::Timer => {
+                            if event_loop.borrow().has_pending_raf() {
+                                let now_ms = event_loop.borrow().now_ms();
+                                fire_vsync(&event_loop, &mut vm, now_ms);
+                            }
+                            drain_ready_tasks(&event_loop, &mut vm);
+                        }
+                        DedWake::Net(None) | DedWake::Worker(None) => {}
+                    }
+                }
+                WorkerRuntimeMode::Shared { cmd_rx } => {
+                    enum SharedWake {
+                        Cmd(Option<SharedWorkerCommand>),
+                        Net(Option<crate::fetch_ws::AsyncNetEvent>),
+                        Worker(Option<AsyncWorkerEvent>),
+                        Timer,
+                    }
+                    let wake = match deadline {
+                        Some(dl) => tokio::select! {
+                            biased;
+                            c = cmd_rx.recv() => SharedWake::Cmd(c),
+                            n = net_rx.recv() => SharedWake::Net(n),
+                            w = worker_rx.recv() => SharedWake::Worker(w),
+                            () = tokio::time::sleep_until(dl) => SharedWake::Timer,
+                        },
+                        None => tokio::select! {
+                            biased;
+                            c = cmd_rx.recv() => SharedWake::Cmd(c),
+                            n = net_rx.recv() => SharedWake::Net(n),
+                            w = worker_rx.recv() => SharedWake::Worker(w),
+                        },
+                    };
+                    match wake {
+                        SharedWake::Cmd(Some(SharedWorkerCommand::Connect {
+                            worker_port_end,
+                            ..
+                        })) => {
+                            let local_tx = workers.borrow().async_tx_clone();
+                            let port_h = attach_transferred_cross_thread_port(
+                                &mut vm,
+                                &frames,
+                                worker_port_end,
+                                local_tx,
+                            );
+                            let ports_arr =
+                                alloc_js_array(&mut vm, &[JsValue::from_object(port_h)]);
+                            freeze_js_array(&mut vm, ports_arr);
+                            let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
+                            let g = vm.global;
+                            fire_object_event_with_proto(
+                                &mut vm,
+                                &host,
+                                &events,
+                                &event_loop,
+                                g,
+                                "connect",
+                                msg_proto,
+                                &[
+                                    ("data", empty_s),
+                                    ("origin", empty_s),
+                                    ("lastEventId", empty_s),
+                                    ("source", JsValue::from_object(port_h)),
+                                    ("ports", JsValue::from_object(ports_arr)),
+                                ],
+                            );
+                            run_microtask_checkpoint(&event_loop, &mut vm);
+                            drain_ready_tasks(&event_loop, &mut vm);
+                        }
+                        SharedWake::Cmd(Some(SharedWorkerCommand::Terminate))
+                        | SharedWake::Cmd(None) => break,
+                        SharedWake::Net(Some(nev)) => {
+                            deliver_async_net_event(
+                                &mut vm,
+                                &host,
+                                &events,
+                                &event_loop,
+                                &web_apis,
+                                &streams,
+                                &net,
+                                nev,
+                            );
+                        }
+                        SharedWake::Worker(Some(wev)) => {
+                            deliver_async_worker_event(
+                                &mut vm,
+                                &host,
+                                &events,
+                                &event_loop,
+                                &web_apis,
+                                &frames,
+                                &workers,
+                                wev,
+                            );
+                        }
+                        SharedWake::Timer => {
+                            if event_loop.borrow().has_pending_raf() {
+                                let now_ms = event_loop.borrow().now_ms();
+                                fire_vsync(&event_loop, &mut vm, now_ms);
+                            }
+                            drain_ready_tasks(&event_loop, &mut vm);
+                        }
+                        SharedWake::Net(None) | SharedWake::Worker(None) => {}
+                    }
+                }
             }
-            if port.closed || !port.started {
-                break;
-            }
-            port.pending
-                .pop_front()
-                .map(|payload| (port.js_obj, payload))
-        };
-        let Some((port_h, payload_json)) = next else {
-            break;
-        };
-        let data = serde_json::from_str::<serde_json::Value>(&payload_json)
-            .map(|jv| decode_structured_json(vm, &jv))
-            .unwrap_or(JsValue::NULL);
-        let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
-        let ports_arr = alloc_js_array(vm, &[]);
-        dispatch_worker_event(
-            vm,
-            listeners,
-            port_h,
-            "message",
-            &[
-                ("data", data),
-                ("origin", empty_s),
-                ("lastEventId", empty_s),
-                ("ports", JsValue::from_object(ports_arr)),
-            ],
-        );
-    }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,11 +2068,10 @@ async fn run_sse_stream_task(
 }
 
 // ---------------------------------------------------------------------------
-// Delivery into `ContentRuntime` event loop
+// Delivery into `ContentRuntime` (or nested Worker) event loop
 // ---------------------------------------------------------------------------
 
-/// Delivers one reactive [`AsyncWorkerEvent`] into `ContentRuntime`'s JS VM,
-/// followed by a strict WHATWG microtask checkpoint.
+/// Delivers one reactive [`AsyncWorkerEvent`] into `vm`, followed by a microtask checkpoint.
 #[allow(clippy::too_many_arguments)]
 pub fn deliver_async_worker_event(
     vm: &mut JsVm,
@@ -1743,10 +2091,7 @@ pub fn deliver_async_worker_event(
     let base_event_proto = events.borrow().event_proto.unwrap_or(vm.object_proto);
 
     match ev {
-        AsyncWorkerEvent::DedicatedMessage {
-            worker_id,
-            payload_json,
-        } => {
+        AsyncWorkerEvent::DedicatedMessage { worker_id, payload } => {
             let target = {
                 let ws = workers.borrow();
                 ws.workers_by_id
@@ -1755,12 +2100,34 @@ pub fn deliver_async_worker_event(
                     .map(|w| w.js_obj)
             };
             let Some(target) = target else { return };
-            let data = serde_json::from_str::<serde_json::Value>(&payload_json)
-                .map(|jv| decode_structured_json(vm, &jv))
-                .unwrap_or(JsValue::NULL);
+            let (nb_opt, c2d_opt) = {
+                let fs = frames.borrow();
+                (fs.net.clone(), fs.canvas2d.clone())
+            };
+            let (data, ports) = if let (Some(nb), Some(c2d)) = (nb_opt, c2d_opt) {
+                let ctx = CloneContext {
+                    host,
+                    events,
+                    web_apis,
+                    net: &nb,
+                    canvas2d: &c2d,
+                    frames,
+                    workers,
+                };
+                deserialize_payload(vm, &ctx, payload)
+            } else {
+                (JsValue::NULL, Vec::new())
+            };
             let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
-            let ports_arr = alloc_js_array(vm, &[]);
-            fire_object_event_with_proto(
+            let ports_arr = alloc_js_array(
+                vm,
+                &ports
+                    .iter()
+                    .map(|&p| JsValue::from_object(p))
+                    .collect::<Vec<_>>(),
+            );
+            freeze_js_array(vm, ports_arr);
+            fire_object_event_dispatch_only(
                 vm,
                 host,
                 events,
@@ -1775,9 +2142,10 @@ pub fn deliver_async_worker_event(
                     ("source", JsValue::NULL),
                     ("ports", JsValue::from_object(ports_arr)),
                 ],
+                None,
             );
         }
-        AsyncWorkerEvent::DedicatedError { worker_id, message } => {
+        AsyncWorkerEvent::DedicatedFetchError { worker_id } => {
             let target = {
                 let ws = workers.borrow();
                 ws.workers_by_id
@@ -1786,8 +2154,7 @@ pub fn deliver_async_worker_event(
                     .map(|w| w.js_obj)
             };
             let Some(target) = target else { return };
-            let msg_js = JsValue::from_string(vm.heap.alloc_string(&message));
-            fire_object_event_with_proto(
+            fire_object_event_dispatch_only(
                 vm,
                 host,
                 events,
@@ -1795,28 +2162,75 @@ pub fn deliver_async_worker_event(
                 target,
                 "error",
                 base_event_proto,
-                &[("message", msg_js)],
+                &[],
+                None,
             );
         }
-        AsyncWorkerEvent::SharedPortMessage {
-            port_id,
-            payload_json,
+        AsyncWorkerEvent::DedicatedRuntimeError {
+            worker_id,
+            message,
+            filename,
+            lineno,
+            colno,
         } => {
-            let should_flush = {
-                let mut ws = workers.borrow_mut();
-                match ws.shared_ports_by_id.get_mut(&port_id) {
-                    Some(p) if !p.closed => {
-                        p.pending.push_back(payload_json);
-                        p.started
-                    }
-                    _ => false,
-                }
+            let target = {
+                let ws = workers.borrow();
+                ws.workers_by_id
+                    .get(&worker_id)
+                    .filter(|w| !w.terminated)
+                    .map(|w| w.js_obj)
             };
-            if should_flush {
-                flush_shared_client_port(
-                    vm, host, events, event_loop, frames, workers, port_id, false,
+            let Some(target) = target else { return };
+            // HTML §10.2.5: parent `Worker` receives cancelable `ErrorEvent` with `error: null`.
+            let (prevented, _) = fire_error_event(
+                vm,
+                host,
+                events,
+                event_loop,
+                target,
+                &message,
+                &filename,
+                lineno,
+                colno,
+                JsValue::NULL,
+                false,
+            );
+            if !prevented {
+                // Propagate uncanceled error up to parent global (`window.onerror` / parent worker).
+                let g = vm.global;
+                let _ = fire_error_event(
+                    vm,
+                    host,
+                    events,
+                    event_loop,
+                    g,
+                    &message,
+                    &filename,
+                    lineno,
+                    colno,
+                    JsValue::NULL,
+                    true,
                 );
             }
+        }
+        AsyncWorkerEvent::SharedWorkerFetchError { shared_worker_id } => {
+            let target = workers
+                .borrow()
+                .shared_workers_by_id
+                .get(&shared_worker_id)
+                .map(|sw| sw.js_obj);
+            let Some(target) = target else { return };
+            fire_object_event_dispatch_only(
+                vm,
+                host,
+                events,
+                event_loop,
+                target,
+                "error",
+                base_event_proto,
+                &[],
+                None,
+            );
         }
         AsyncWorkerEvent::BridgePortMessage { port_id, payload } => {
             let (nb_opt, c2d_opt) = {
@@ -1824,7 +2238,7 @@ pub fn deliver_async_worker_event(
                 (fs.net.clone(), fs.canvas2d.clone())
             };
             if let (Some(nb), Some(c2d)) = (nb_opt, c2d_opt) {
-                crate::frames::deliver_cross_thread_port_message(
+                deliver_cross_thread_port_message(
                     vm, host, events, event_loop, web_apis, &nb, &c2d, frames, workers, port_id,
                     payload,
                 );
@@ -1849,8 +2263,8 @@ pub fn deliver_async_worker_event(
             let origin_js = JsValue::from_string(vm.heap.alloc_string(&origin));
             let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
             let ports_arr = alloc_js_array(vm, &[]);
-            crate::frames::freeze_js_array(vm, ports_arr);
-            crate::events::fire_object_event_dispatch_only(
+            freeze_js_array(vm, ports_arr);
+            fire_object_event_dispatch_only(
                 vm,
                 host,
                 events,
@@ -1941,67 +2355,95 @@ pub fn deliver_async_worker_event(
     run_microtask_checkpoint(event_loop, vm);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn flush_shared_client_port(
+// ---------------------------------------------------------------------------
+// Options parsing helpers for `Worker` and `SharedWorker`
+// ---------------------------------------------------------------------------
+
+fn parse_worker_options_obj(
     vm: &mut JsVm,
-    host: &SharedHost,
-    events: &SharedEvents,
-    event_loop: &SharedEventLoop,
-    frames: &SharedFrames,
-    workers: &SharedWorkers,
-    port_id: u64,
-    mark_started: bool,
-) {
-    let msg_proto = frames
-        .borrow()
-        .message_event_proto
-        .or_else(|| events.borrow().event_proto)
-        .unwrap_or(vm.object_proto);
-    loop {
-        let next = {
-            let mut ws = workers.borrow_mut();
-            let Some(port) = ws.shared_ports_by_id.get_mut(&port_id) else {
-                break;
-            };
-            if mark_started {
-                port.started = true;
+    opts_h: HeapHandle,
+) -> Result<(String, WorkerOptions), JsException> {
+    let kt = vm.heap.intern_key("type");
+    let kc = vm.heap.intern_key("credentials");
+    let kn = vm.heap.intern_key("name");
+    let ke = vm.heap.intern_key("extendedLifetime");
+
+    let tv = vm.get_property_by_key(opts_h, kt)?;
+    let worker_type = if tv.is_undefined() {
+        WorkerType::Classic
+    } else {
+        match vm.to_js_string(tv)?.as_str() {
+            "classic" => WorkerType::Classic,
+            "module" => WorkerType::Module,
+            other => {
+                return Err(vm.type_error(format!("Invalid WorkerOptions.type value '{other}'")));
             }
-            if port.closed || !port.started {
-                break;
+        }
+    };
+
+    let cv = vm.get_property_by_key(opts_h, kc)?;
+    let credentials = if cv.is_undefined() {
+        WorkerCreds::SameOrigin
+    } else {
+        match vm.to_js_string(cv)?.as_str() {
+            "omit" => WorkerCreds::Omit,
+            "same-origin" => WorkerCreds::SameOrigin,
+            "include" => WorkerCreds::Include,
+            other => {
+                return Err(
+                    vm.type_error(format!("Invalid WorkerOptions.credentials value '{other}'"))
+                );
             }
-            port.pending
-                .pop_front()
-                .map(|payload| (port.js_port, payload))
-        };
-        let Some((port_h, payload_json)) = next else {
-            break;
-        };
-        let data = serde_json::from_str::<serde_json::Value>(&payload_json)
-            .map(|jv| decode_structured_json(vm, &jv))
-            .unwrap_or(JsValue::NULL);
-        let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
-        let ports_arr = alloc_js_array(vm, &[]);
-        fire_object_event_with_proto(
-            vm,
-            host,
-            events,
-            event_loop,
-            port_h,
-            "message",
-            msg_proto,
-            &[
-                ("data", data),
-                ("origin", empty_s),
-                ("lastEventId", empty_s),
-                ("source", JsValue::NULL),
-                ("ports", JsValue::from_object(ports_arr)),
-            ],
-        );
+        }
+    };
+
+    let nv = vm.get_property_by_key(opts_h, kn)?;
+    let name = if nv.is_undefined() {
+        String::new()
+    } else {
+        vm.to_js_string(nv)?
+    };
+
+    let ev = vm.get_property_by_key(opts_h, ke)?;
+    let extended_lifetime = !ev.is_undefined() && vm.to_boolean(ev);
+
+    Ok((
+        name,
+        WorkerOptions {
+            worker_type,
+            credentials,
+            extended_lifetime,
+        },
+    ))
+}
+
+fn current_doc_charset(host: &SharedHost) -> String {
+    host.borrow().document.borrow().character_set().to_string()
+}
+
+/// Resolves the document base URL honoring any `<base href="...">` element per HTML §4.2.3.
+fn document_base_href(host: &SharedHost, web_apis: &SharedWebApis) -> String {
+    let doc_href = web_apis.borrow().current_href();
+    let doc_rc = Rc::clone(&host.borrow().document);
+    let doc = doc_rc.borrow();
+    for nid in doc.descendants(doc.root()) {
+        if let Some(rix_dom::NodeData::Element(el)) = doc.get(nid) {
+            if el.name.local.as_str().eq_ignore_ascii_case("base") {
+                if let Some(href) = el.get_attribute("href") {
+                    if let Ok(base) = Url::parse(&doc_href) {
+                        if let Ok(joined) = base.join(href.trim()) {
+                            return joined.to_string();
+                        }
+                    }
+                }
+            }
+        }
     }
+    doc_href
 }
 
 // ---------------------------------------------------------------------------
-// Installation onto `ContentRuntime`'s `JsVm`
+// Installation onto `ContentRuntime`'s (or Worker's) `JsVm`
 // ---------------------------------------------------------------------------
 
 /// Installs `Worker`, `SharedWorker`, `BroadcastChannel`, and `EventSource`
@@ -2019,51 +2461,104 @@ pub fn install_worker_and_sse_apis(
     let workers = Rc::new(RefCell::new(WorkerSystem::new()));
     let event_target_proto = host.borrow().prototypes.event_target_proto;
 
-    install_dedicated_worker(vm, event_target_proto, web_apis, net, &workers);
+    install_dedicated_worker(
+        vm,
+        event_target_proto,
+        host,
+        events,
+        web_apis,
+        net,
+        frames,
+        &workers,
+    );
     install_shared_worker(
         vm,
         event_target_proto,
         host,
         events,
-        event_loop,
         web_apis,
         net,
         frames,
         &workers,
     );
     install_broadcast_channel(vm, event_target_proto, events, web_apis, &workers);
-    install_event_source(vm, event_target_proto, web_apis, net, &workers);
+    install_event_source(vm, event_target_proto, host, web_apis, net, &workers);
 
+    let _ = event_loop;
     workers
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_dedicated_worker(
     vm: &mut JsVm,
     event_target_proto: HeapHandle,
+    host: &SharedHost,
+    events: &SharedEvents,
     web_apis: &SharedWebApis,
     net: &SharedNetBridge,
+    frames: &SharedFrames,
     workers: &SharedWorkers,
 ) {
     let proto = vm.heap.alloc_object(JsObject::with_kind(
         ObjectKind::Ordinary,
         Some(event_target_proto),
     ));
+    vm.heap.get_object_mut(proto).unwrap().is_prototype = true;
+    define_to_string_tag(vm, proto, "Worker");
     workers.borrow_mut().protos.worker_proto = Some(proto);
 
+    for &attr in &["onmessage", "onmessageerror", "onerror"] {
+        let ws_v = Rc::clone(workers);
+        install_object_event_handler_accessor(vm, proto, events, attr, move |vm, this_val| {
+            let Some(h) = this_val.as_object() else {
+                return Err(vm.type_error("Incompatible Worker receiver"));
+            };
+            if ws_v.borrow().worker_handle_to_id.contains_key(&h) {
+                Ok(h)
+            } else {
+                Err(vm.type_error("Incompatible Worker receiver"))
+            }
+        });
+    }
+
     {
-        let ws = Rc::clone(workers);
+        let h_pm = Rc::clone(host);
+        let ev_pm = Rc::clone(events);
+        let wa_pm = Rc::clone(web_apis);
+        let nb_pm = Rc::clone(net);
+        let fr_pm = Rc::clone(frames);
+        let ws_pm = Rc::clone(workers);
         define_host_method(vm, proto, "postMessage", move |vm, this_val, args| {
             let Some(h) = this_val.as_object() else {
-                return Ok(JsValue::UNDEFINED);
+                return Err(vm.type_error("Incompatible Worker receiver"));
             };
-            let mut seen = HashSet::new();
-            let encoded = encode_structured_json(vm, arg(args, 0), &mut seen)?;
-            let payload_json = serde_json::to_string(&encoded).unwrap_or_else(|_| "null".into());
-            let map = ws.borrow();
+            if !ws_pm.borrow().worker_handle_to_id.contains_key(&h) {
+                return Err(vm.type_error("Incompatible Worker receiver"));
+            }
+            if args.is_empty() {
+                return Err(vm.type_error("Worker.postMessage requires at least 1 argument"));
+            }
+            let transfer_val = extract_transfer_arg(vm, arg(args, 1))?;
+            let c2d_opt = fr_pm.borrow().canvas2d.clone();
+            let payload = if let Some(c2d) = c2d_opt {
+                let ctx = CloneContext {
+                    host: &h_pm,
+                    events: &ev_pm,
+                    web_apis: &wa_pm,
+                    net: &nb_pm,
+                    canvas2d: &c2d,
+                    frames: &fr_pm,
+                    workers: &ws_pm,
+                };
+                serialize_with_transfer(vm, &ctx, arg(args, 0), transfer_val, &[])?
+            } else {
+                StructuredClonePayload::undefined()
+            };
+            let map = ws_pm.borrow();
             if let Some(&wid) = map.worker_handle_to_id.get(&h) {
                 if let Some(entry) = map.workers_by_id.get(&wid) {
                     if !entry.terminated {
-                        let _ = entry.cmd_tx.send(WorkerCommand::PostMessage(payload_json));
+                        let _ = entry.cmd_tx.send(WorkerCommand::PostMessage(payload));
                     }
                 }
             }
@@ -2072,76 +2567,99 @@ fn install_dedicated_worker(
     }
     {
         let ws = Rc::clone(workers);
-        define_host_method(vm, proto, "terminate", move |_, this_val, _| {
-            if let Some(h) = this_val.as_object() {
-                let mut map = ws.borrow_mut();
-                if let Some(&wid) = map.worker_handle_to_id.get(&h) {
-                    if let Some(entry) = map.workers_by_id.get_mut(&wid) {
-                        if !entry.terminated {
-                            entry.terminated = true;
-                            let _ = entry.cmd_tx.send(WorkerCommand::Terminate);
-                        }
-                    }
+        define_host_method(vm, proto, "terminate", move |vm, this_val, _| {
+            let Some(h) = this_val.as_object() else {
+                return Err(vm.type_error("Incompatible Worker receiver"));
+            };
+            let mut map = ws.borrow_mut();
+            let Some(&wid) = map.worker_handle_to_id.get(&h) else {
+                return Err(vm.type_error("Incompatible Worker receiver"));
+            };
+            if let Some(entry) = map.workers_by_id.get_mut(&wid) {
+                if !entry.terminated {
+                    entry.terminated = true;
+                    let _ = entry.cmd_tx.send(WorkerCommand::Terminate);
                 }
             }
             Ok(JsValue::UNDEFINED)
         });
     }
 
+    let h_c = Rc::clone(host);
     let wa = Rc::clone(web_apis);
     let nb = Rc::clone(net);
+    let fr = Rc::clone(frames);
     let ws = Rc::clone(workers);
     let ctor = vm.alloc_host_fn("Worker", move |vm, _, args| {
-        let raw_url = vm.value_to_rust_string(arg(args, 0));
-        let worker_name = if let Some(opts) = arg(args, 1).as_object() {
-            let nk = vm.heap.intern_key("name");
-            vm.get_property_by_key(opts, nk)
-                .ok()
-                .filter(|v| !v.is_undefined() && !v.is_null())
-                .map(|v| vm.value_to_rust_string(v))
-                .unwrap_or_default()
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("Worker constructor requires 'new'"));
+        }
+        if args.is_empty() {
+            return Err(vm.type_error("Worker constructor requires at least 1 argument"));
+        }
+        let raw_url = vm.to_js_string(arg(args, 0))?;
+        let second = arg(args, 1);
+        let (worker_name, options) = if second.is_undefined() || second.is_null() {
+            (
+                String::new(),
+                WorkerOptions {
+                    worker_type: WorkerType::Classic,
+                    credentials: WorkerCreds::SameOrigin,
+                    extended_lifetime: false,
+                },
+            )
+        } else if let Some(oh) = second.as_object() {
+            parse_worker_options_obj(vm, oh)?
         } else {
-            String::new()
+            return Err(vm.type_error("Worker options must be an object"));
         };
 
-        let (base_href, origin, object_urls_snapshot) = {
-            let state = wa.borrow();
+        let charset = current_doc_charset(&h_c);
+        let base_href = document_base_href(&h_c, &wa);
+        let (doc_href, origin, cross_origin_isolated, object_urls_snapshot, cookie_header) = {
+            let mut state = wa.borrow_mut();
+            let href = state.current_href();
+            let eff_origin = fr
+                .borrow()
+                .sandbox
+                .effective_origin(&state.current_origin());
+            let ck = Url::parse(&href)
+                .map(|u| state.cookie_header_for_url(&u, false))
+                .unwrap_or_default();
             (
-                state.current_href(),
-                state.current_origin(),
+                href,
+                eff_origin,
+                state.cross_origin_isolated,
                 Arc::new(state.object_urls.clone()),
+                ck,
             )
         };
-        let resolved_url = resolve_script_url(&raw_url, &base_href)
+        let resolved_url = resolve_script_url(&raw_url, &base_href, &charset)
             .map_err(|m| create_dom_exception(vm, "SyntaxError", &m))?;
         let fetch_engine = Arc::clone(&nb.borrow().fetch_engine);
-        let script_src = prepare_script_source(
-            &resolved_url,
-            &origin,
-            &object_urls_snapshot,
-            Arc::clone(&fetch_engine),
-        )
-        .map_err(|m| create_dom_exception(vm, "SecurityError", &m))?;
 
         let worker_id = next_global_id();
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-        let cmd_tx_self = cmd_tx.clone();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let parent_tx = ws.borrow().async_tx.clone();
 
         let _ = std::thread::Builder::new()
             .name(format!("rix-worker-{worker_id}"))
             .spawn(move || {
-                run_dedicated_worker_thread(
-                    worker_id,
+                run_worker_thread(
                     resolved_url,
                     origin,
+                    doc_href,
                     worker_name,
-                    script_src,
+                    options,
+                    cross_origin_isolated,
                     object_urls_snapshot,
                     fetch_engine,
-                    parent_tx,
-                    cmd_tx_self,
-                    cmd_rx,
+                    cookie_header,
+                    WorkerRuntimeMode::Dedicated {
+                        worker_id,
+                        parent_tx,
+                        cmd_rx,
+                    },
                 );
             });
 
@@ -2172,7 +2690,6 @@ fn install_shared_worker(
     event_target_proto: HeapHandle,
     host: &SharedHost,
     events: &SharedEvents,
-    event_loop: &SharedEventLoop,
     web_apis: &SharedWebApis,
     net: &SharedNetBridge,
     frames: &SharedFrames,
@@ -2182,250 +2699,210 @@ fn install_shared_worker(
         ObjectKind::Ordinary,
         Some(event_target_proto),
     ));
-    let port_proto = vm.heap.alloc_object(JsObject::with_kind(
-        ObjectKind::Ordinary,
-        Some(event_target_proto),
-    ));
-    {
-        let mut ws = workers.borrow_mut();
-        ws.protos.shared_worker_proto = Some(sw_proto);
-        ws.protos.shared_port_proto = Some(port_proto);
-    }
+    vm.heap.get_object_mut(sw_proto).unwrap().is_prototype = true;
+    define_to_string_tag(vm, sw_proto, "SharedWorker");
+    workers.borrow_mut().protos.shared_worker_proto = Some(sw_proto);
 
-    // SharedWorker client MessagePort methods
     {
-        let ws = Rc::clone(workers);
-        define_host_method(vm, port_proto, "postMessage", move |vm, this_val, args| {
-            let Some(h) = this_val.as_object() else {
-                return Ok(JsValue::UNDEFINED);
-            };
-            let mut seen = HashSet::new();
-            let encoded = encode_structured_json(vm, arg(args, 0), &mut seen)?;
-            let payload_json = serde_json::to_string(&encoded).unwrap_or_else(|_| "null".into());
-            let map = ws.borrow();
-            if let Some(&pid) = map.shared_port_handle_to_id.get(&h) {
-                if let Some(port) = map.shared_ports_by_id.get(&pid) {
-                    if !port.closed {
-                        let _ = port.worker_tx.send(SharedWorkerCommand::PortMessage {
-                            client_port_id: pid,
-                            payload_json,
-                        });
-                    }
-                }
-            }
-            Ok(JsValue::UNDEFINED)
-        });
-    }
-    {
-        let h_r = Rc::clone(host);
-        let ev_r = Rc::clone(events);
-        let el_r = Rc::clone(event_loop);
-        let fr_r = Rc::clone(frames);
-        let ws_r = Rc::clone(workers);
-        define_host_method(vm, port_proto, "start", move |_, this_val, _| {
-            let Some(h) = this_val.as_object() else {
-                return Ok(JsValue::UNDEFINED);
-            };
-            let pid_opt = ws_r.borrow().shared_port_handle_to_id.get(&h).copied();
-            if let Some(pid) = pid_opt {
-                if let Some(port) = ws_r.borrow_mut().shared_ports_by_id.get_mut(&pid) {
-                    port.started = true;
-                }
-                let h2 = Rc::clone(&h_r);
-                let ev2 = Rc::clone(&ev_r);
-                let el2 = Rc::clone(&el_r);
-                let fr2 = Rc::clone(&fr_r);
-                let ws2 = Rc::clone(&ws_r);
-                el_r.borrow_mut()
-                    .post_host_task(TaskPriority::Networking, move |vm| {
-                        flush_shared_client_port(vm, &h2, &ev2, &el2, &fr2, &ws2, pid, false);
-                    });
-            }
-            Ok(JsValue::UNDEFINED)
-        });
-    }
-    {
-        let ws = Rc::clone(workers);
-        define_host_method(vm, port_proto, "close", move |_, this_val, _| {
-            if let Some(h) = this_val.as_object() {
-                let mut map = ws.borrow_mut();
-                if let Some(&pid) = map.shared_port_handle_to_id.get(&h) {
-                    if let Some(port) = map.shared_ports_by_id.get_mut(&pid) {
-                        if !port.closed {
-                            port.closed = true;
-                            port.pending.clear();
-                            let _ = port.worker_tx.send(SharedWorkerCommand::PortClose {
-                                client_port_id: pid,
-                            });
-                        }
-                    }
-                }
-            }
-            Ok(JsValue::UNDEFINED)
-        });
-    }
-    {
-        let ws_g = Rc::clone(workers);
-        let h_s = Rc::clone(host);
-        let ev_s = Rc::clone(events);
-        let el_s = Rc::clone(event_loop);
-        let fr_s = Rc::clone(frames);
-        let ws_s = Rc::clone(workers);
-        define_host_accessor(
+        let ws_v = Rc::clone(workers);
+        install_object_event_handler_accessor(
             vm,
-            port_proto,
-            "onmessage",
-            move |_, this_val, _| {
-                let val = this_val
-                    .as_object()
-                    .and_then(|h| ws_g.borrow().shared_port_handle_to_id.get(&h).copied())
-                    .and_then(|pid| {
-                        ws_g.borrow()
-                            .shared_ports_by_id
-                            .get(&pid)
-                            .map(|p| p.onmessage)
-                    })
-                    .unwrap_or(JsValue::NULL);
-                Ok(val)
-            },
-            move |_, this_val, args| {
+            sw_proto,
+            events,
+            "onerror",
+            move |vm, this_val| {
                 let Some(h) = this_val.as_object() else {
-                    return Ok(JsValue::UNDEFINED);
+                    return Err(vm.type_error("Incompatible SharedWorker receiver"));
                 };
-                let pid_opt = ws_s.borrow().shared_port_handle_to_id.get(&h).copied();
-                if let Some(pid) = pid_opt {
-                    let handler = arg(args, 0);
-                    if let Some(port) = ws_s.borrow_mut().shared_ports_by_id.get_mut(&pid) {
-                        port.onmessage = handler;
-                        port.started = true;
-                    }
-                    let h2 = Rc::clone(&h_s);
-                    let ev2 = Rc::clone(&ev_s);
-                    let el2 = Rc::clone(&el_s);
-                    let fr2 = Rc::clone(&fr_s);
-                    let ws2 = Rc::clone(&ws_s);
-                    el_s.borrow_mut()
-                        .post_host_task(TaskPriority::Networking, move |vm| {
-                            flush_shared_client_port(vm, &h2, &ev2, &el2, &fr2, &ws2, pid, false);
-                        });
+                if ws_v.borrow().shared_worker_handle_to_id.contains_key(&h) {
+                    Ok(h)
+                } else {
+                    Err(vm.type_error("Incompatible SharedWorker receiver"))
                 }
-                Ok(JsValue::UNDEFINED)
             },
         );
     }
 
+    // Readonly `SharedWorker.prototype.port` getter per HTML §10.2.6.
+    {
+        let ws = Rc::clone(workers);
+        define_host_getter(vm, sw_proto, "port", move |vm, this_val, _| {
+            let Some(h) = this_val.as_object() else {
+                return Err(vm.type_error("Incompatible SharedWorker receiver"));
+            };
+            let state = ws.borrow();
+            let Some(&sw_id) = state.shared_worker_handle_to_id.get(&h) else {
+                return Err(vm.type_error("Incompatible SharedWorker receiver"));
+            };
+            let Some(entry) = state.shared_workers_by_id.get(&sw_id) else {
+                return Err(vm.type_error("Incompatible SharedWorker receiver"));
+            };
+            Ok(JsValue::from_object(entry.port_h))
+        });
+    }
+
+    let h_c = Rc::clone(host);
     let wa = Rc::clone(web_apis);
     let nb = Rc::clone(net);
+    let fr = Rc::clone(frames);
     let ws = Rc::clone(workers);
     let ctor = vm.alloc_host_fn("SharedWorker", move |vm, _, args| {
-        let raw_url = vm.value_to_rust_string(arg(args, 0));
-        let worker_name = if arg(args, 1).is_string() {
-            vm.value_to_rust_string(arg(args, 1))
-        } else if let Some(opts) = arg(args, 1).as_object() {
-            let nk = vm.heap.intern_key("name");
-            vm.get_property_by_key(opts, nk)
-                .ok()
-                .filter(|v| !v.is_undefined() && !v.is_null())
-                .map(|v| vm.value_to_rust_string(v))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        let (base_href, origin, object_urls_snapshot) = {
-            let state = wa.borrow();
+        if vm.native_new_target.is_undefined() {
+            return Err(vm.type_error("SharedWorker constructor requires 'new'"));
+        }
+        if args.is_empty() {
+            return Err(vm.type_error("SharedWorker constructor requires at least 1 argument"));
+        }
+        let raw_url = vm.to_js_string(arg(args, 0))?;
+        let second = arg(args, 1);
+        let (worker_name, options) = if second.is_undefined() || second.is_null() {
             (
-                state.current_href(),
-                state.current_origin(),
-                Arc::new(state.object_urls.clone()),
+                String::new(),
+                WorkerOptions {
+                    worker_type: WorkerType::Classic,
+                    credentials: WorkerCreds::SameOrigin,
+                    extended_lifetime: false,
+                },
+            )
+        } else if let Some(oh) = second.as_object() {
+            parse_worker_options_obj(vm, oh)?
+        } else {
+            // WebIDL `(DOMString or WorkerOptions)`: numbers (`1`, `NaN`, `Infinity`),
+            // booleans, `null`, and strings coerce to `DOMString` name.
+            let name = vm.to_js_string(second)?;
+            (
+                name,
+                WorkerOptions {
+                    worker_type: WorkerType::Classic,
+                    credentials: WorkerCreds::SameOrigin,
+                    extended_lifetime: false,
+                },
             )
         };
-        let resolved_url = resolve_script_url(&raw_url, &base_href)
+
+        let charset = current_doc_charset(&h_c);
+        let base_href = document_base_href(&h_c, &wa);
+        let (doc_href, origin, cross_origin_isolated, object_urls_snapshot, cookie_header) = {
+            let mut state = wa.borrow_mut();
+            let href = state.current_href();
+            let eff_origin = fr
+                .borrow()
+                .sandbox
+                .effective_origin(&state.current_origin());
+            let ck = Url::parse(&href)
+                .map(|u| state.cookie_header_for_url(&u, false))
+                .unwrap_or_default();
+            (
+                href,
+                eff_origin,
+                state.cross_origin_isolated,
+                Arc::new(state.object_urls.clone()),
+                ck,
+            )
+        };
+        let resolved_url = resolve_script_url(&raw_url, &base_href, &charset)
             .map_err(|m| create_dom_exception(vm, "SyntaxError", &m))?;
         let fetch_engine = Arc::clone(&nb.borrow().fetch_engine);
 
+        // Allocate paired cross-thread MessagePort routes so `worker.port` is a genuine `MessagePort`!
+        let route_to_client = Arc::new(Mutex::new(PortRoute::Buffered(
+            std::collections::VecDeque::new(),
+        )));
+        let route_to_worker = Arc::new(Mutex::new(PortRoute::Buffered(
+            std::collections::VecDeque::new(),
+        )));
+        let client_tx = ws.borrow().async_tx.clone();
+        let client_port_h = attach_transferred_cross_thread_port(
+            vm,
+            &fr,
+            CrossThreadPortEnd {
+                local_route: Arc::clone(&route_to_client),
+                remote_route: Arc::clone(&route_to_worker),
+            },
+            client_tx.clone(),
+        );
+
+        let shared_worker_id = next_global_id();
+        let sw_h = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(sw_proto)));
+        {
+            let mut state = ws.borrow_mut();
+            state.shared_workers_by_id.insert(
+                shared_worker_id,
+                SharedWorkerClientEntry {
+                    js_obj: sw_h,
+                    port_h: client_port_h,
+                },
+            );
+            state
+                .shared_worker_handle_to_id
+                .insert(sw_h, shared_worker_id);
+        }
+
         let registry_key = (origin.clone(), resolved_url.clone(), worker_name.clone());
-        let worker_tx = {
+        let connect_target = {
             let mut reg = shared_workers_registry()
                 .lock()
                 .expect("shared_workers lock");
+            // Prune dead registry entries whose thread already closed.
             if let Some(existing) = reg.get(&registry_key) {
-                existing.cmd_tx.clone()
+                if existing.cmd_tx.is_closed() {
+                    reg.remove(&registry_key);
+                }
+            }
+            if let Some(existing) = reg.get(&registry_key) {
+                if existing.options != options {
+                    // HTML §10.2.6.2: mismatched type / credentials / extendedLifetime -> async error event!
+                    None
+                } else {
+                    Some(existing.cmd_tx.clone())
+                }
             } else {
-                let script_src = prepare_script_source(
-                    &resolved_url,
-                    &origin,
-                    &object_urls_snapshot,
-                    Arc::clone(&fetch_engine),
-                )
-                .map_err(|m| create_dom_exception(vm, "SecurityError", &m))?;
-                let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-                let cmd_tx_self = cmd_tx.clone();
+                let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
                 let url_c = resolved_url.clone();
                 let origin_c = origin.clone();
+                let href_c = doc_href.clone();
                 let name_c = worker_name.clone();
                 let _ = std::thread::Builder::new()
-                    .name(format!("rix-shared-worker-{}", next_global_id()))
+                    .name(format!("rix-shared-worker-{shared_worker_id}"))
                     .spawn(move || {
-                        run_shared_worker_thread(
+                        run_worker_thread(
                             url_c,
                             origin_c,
+                            href_c,
                             name_c,
-                            script_src,
+                            options,
+                            cross_origin_isolated,
                             object_urls_snapshot,
                             fetch_engine,
-                            cmd_tx_self,
-                            cmd_rx,
+                            cookie_header,
+                            WorkerRuntimeMode::Shared { cmd_rx },
                         );
                     });
                 reg.insert(
                     registry_key,
                     SharedWorkerHandle {
                         cmd_tx: cmd_tx.clone(),
+                        options,
                     },
                 );
-                cmd_tx
+                Some(cmd_tx)
             }
         };
 
-        let client_port_id = next_global_id();
-        let port_h = vm
-            .heap
-            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(port_proto)));
-        let sw_h = vm
-            .heap
-            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(sw_proto)));
-        let port_k = vm.heap.intern_key("port");
-        vm.heap.object_define_data(
-            sw_h,
-            port_k,
-            JsValue::from_object(port_h),
-            PropertyAttrs::DEFAULT,
-            &mut vm.shapes,
-        );
-
-        let client_tx = ws.borrow().async_tx.clone();
-        let _ = worker_tx.send(SharedWorkerCommand::Connect {
-            client_port_id,
-            client_tx,
-        });
-
-        {
-            let mut state = ws.borrow_mut();
-            state.shared_ports_by_id.insert(
-                client_port_id,
-                SharedWorkerClientPort {
-                    js_port: port_h,
-                    worker_tx,
-                    started: false,
-                    closed: false,
-                    onmessage: JsValue::NULL,
-                    pending: VecDeque::new(),
+        if let Some(worker_tx) = connect_target {
+            let _ = worker_tx.send(SharedWorkerCommand::Connect {
+                worker_port_end: CrossThreadPortEnd {
+                    local_route: route_to_worker,
+                    remote_route: route_to_client,
                 },
-            );
-            state
-                .shared_port_handle_to_id
-                .insert(port_h, client_port_id);
+                client_error_tx: client_tx,
+                shared_worker_id,
+            });
+        } else {
+            PortRoute::close(&route_to_worker);
+            let _ = client_tx.send(AsyncWorkerEvent::SharedWorkerFetchError { shared_worker_id });
         }
 
         Ok(JsValue::from_object(sw_h))
@@ -2452,22 +2929,16 @@ fn install_broadcast_channel(
     // EventHandler IDL attributes (`onmessage`, `onmessageerror`) per HTML §8.1.7.1.
     for &attr in &["onmessage", "onmessageerror"] {
         let ws_v = Rc::clone(workers);
-        crate::events::install_object_event_handler_accessor(
-            vm,
-            proto,
-            events,
-            attr,
-            move |vm, this_val| {
-                let Some(h) = this_val.as_object() else {
-                    return Err(vm.type_error("Incompatible BroadcastChannel receiver"));
-                };
-                if ws_v.borrow().broadcast_handle_to_id.contains_key(&h) {
-                    Ok(h)
-                } else {
-                    Err(vm.type_error("Incompatible BroadcastChannel receiver"))
-                }
-            },
-        );
+        install_object_event_handler_accessor(vm, proto, events, attr, move |vm, this_val| {
+            let Some(h) = this_val.as_object() else {
+                return Err(vm.type_error("Incompatible BroadcastChannel receiver"));
+            };
+            if ws_v.borrow().broadcast_handle_to_id.contains_key(&h) {
+                Ok(h)
+            } else {
+                Err(vm.type_error("Incompatible BroadcastChannel receiver"))
+            }
+        });
     }
 
     {
@@ -2587,6 +3058,7 @@ fn install_broadcast_channel(
 fn install_event_source(
     vm: &mut JsVm,
     event_target_proto: HeapHandle,
+    host: &SharedHost,
     web_apis: &SharedWebApis,
     net: &SharedNetBridge,
     workers: &SharedWorkers,
@@ -2595,6 +3067,8 @@ fn install_event_source(
         ObjectKind::Ordinary,
         Some(event_target_proto),
     ));
+    vm.heap.get_object_mut(proto).unwrap().is_prototype = true;
+    define_to_string_tag(vm, proto, "EventSource");
     workers.borrow_mut().protos.event_source_proto = Some(proto);
 
     for (const_name, val) in [("CONNECTING", 0), ("OPEN", 1), ("CLOSED", 2)] {
@@ -2659,6 +3133,7 @@ fn install_event_source(
         });
     }
 
+    let h_c = Rc::clone(host);
     let wa = Rc::clone(web_apis);
     let nb = Rc::clone(net);
     let ws = Rc::clone(workers);
@@ -2672,11 +3147,12 @@ fn install_event_source(
         } else {
             false
         };
+        let charset = current_doc_charset(&h_c);
         let (base_href, origin) = {
             let state = wa.borrow();
             (state.current_href(), state.current_origin())
         };
-        let resolved_url = resolve_script_url(&raw_url, &base_href)
+        let resolved_url = resolve_script_url(&raw_url, &base_href, &charset)
             .map_err(|m| create_dom_exception(vm, "SyntaxError", &m))?;
         let sse_id = next_global_id();
         let (close_tx, close_rx) = oneshot::channel();

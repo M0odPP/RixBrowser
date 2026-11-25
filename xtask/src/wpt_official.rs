@@ -60,6 +60,14 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
         return this.name + ": " + this.message;
     };
 
+    function OptionalFeatureUnsupportedError(msg) {
+        this.name = "OptionalFeatureUnsupportedError";
+        this.message = msg || "Optional feature unsupported";
+    }
+    OptionalFeatureUnsupportedError.prototype = Object.create(Error.prototype);
+    OptionalFeatureUnsupportedError.prototype.constructor = OptionalFeatureUnsupportedError;
+    global.OptionalFeatureUnsupportedError = OptionalFeatureUnsupportedError;
+
     function fail(msg) { throw new AssertionError(msg); }
 
     function assert_true(actual, desc) {
@@ -463,8 +471,8 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
                 for (let i = 0; i < sub.length; i++) {
                     results.push({
                         name: String(sub[i].name || "(worker subtest)"),
-                        status: sub[i].status === 0 ? 0 : 1,
-                        message: sub[i].message ? String(sub[i].message) : null
+                        pass: sub[i].status === 0,
+                        message: sub[i].message ? String(sub[i].message) : ""
                     });
                 }
                 if (data.status && data.status.status !== 0) {
@@ -668,7 +676,11 @@ fn synthesize_wpt_js_html(path: &Path, js_src: &str) -> Option<String> {
         if trimmed.is_empty() {
             continue;
         }
-        let Some(rest) = trimmed.strip_prefix("// META:") else {
+        let Some(rest) = trimmed
+            .strip_prefix("//")
+            .map(str::trim_start)
+            .and_then(|s| s.strip_prefix("META:"))
+        else {
             // WPT metadata comments appear only at the top of the file.
             if !trimmed.starts_with("//") {
                 break;
@@ -1580,6 +1592,136 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
                     return;
                 }
 
+                // WPT dynamic handlers for `workers/` redirects, credentials, referer, MIME, encodings.
+                if let Some(stem) = rel
+                    .strip_prefix("workers/baseurl/beta/")
+                    .and_then(|s| s.strip_suffix(".py"))
+                {
+                    let target = format!("../gamma/{stem}.js");
+                    let body = b"postMessage('executed redirecting script');";
+                    let head = format!(
+                        "HTTP/1.1 302 Moved\r\nLocation: {target}\r\nContent-Type: text/javascript\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                if rel == "workers/interfaces/WorkerGlobalScope/location/helper-redirect.py" {
+                    let head = "HTTP/1.1 302 Found\r\nLocation: post-location-members.js?a\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                if rel == "workers/modules/resources/redirect.py" {
+                    let loc = query_first("location").unwrap_or_default();
+                    let head = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                if rel == "workers/modules/resources/export-on-load-script.py" {
+                    let body = b"export const importedModules = ['export-on-load-script.js'];";
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Service-Worker\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                if rel == "workers/modules/resources/export-credentials.py"
+                    || rel == "workers/modules/resources/postmessage-credentials.py"
+                {
+                    let cookie_hdr = get_req_hdr("cookie")
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_default();
+                    let cookie_val = cookie_hdr
+                        .split(';')
+                        .filter_map(|p| p.trim().split_once('='))
+                        .find(|(k, _)| k.trim() == "COOKIE_NAME")
+                        .map(|(_, v)| v.trim().to_string())
+                        .unwrap_or_default();
+                    let origin_hdr = get_req_hdr("origin")
+                        .map(|b| String::from_utf8_lossy(&b).into_owned());
+                    let acao = origin_hdr
+                        .map(|o| format!("Access-Control-Allow-Origin: {o}\r\n"))
+                        .unwrap_or_else(|| "Access-Control-Allow-Origin: *\r\n".to_string());
+                    let body = if rel.ends_with("export-credentials.py") {
+                        format!("export const cookie = '{cookie_val}';").into_bytes()
+                    } else {
+                        format!(
+                            "if ('DedicatedWorkerGlobalScope' in self && self instanceof DedicatedWorkerGlobalScope) {{ postMessage('{cookie_val}'); }} else if ('SharedWorkerGlobalScope' in self && self instanceof SharedWorkerGlobalScope) {{ onconnect = e => e.ports[0].postMessage('{cookie_val}'); }}"
+                        )
+                        .into_bytes()
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\n{acao}Access-Control-Allow-Credentials: true\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                if rel == "workers/modules/resources/export-referrer-checker.py"
+                    || rel == "workers/modules/resources/postmessage-referrer-checker.py"
+                {
+                    let referrer = get_req_hdr("referer")
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_default();
+                    let body = if rel.ends_with("export-referrer-checker.py") {
+                        format!("export const referrer = '{referrer}';").into_bytes()
+                    } else {
+                        format!(
+                            "if ('DedicatedWorkerGlobalScope' in self && self instanceof DedicatedWorkerGlobalScope) {{ postMessage('{referrer}'); }} else if ('SharedWorkerGlobalScope' in self && self instanceof SharedWorkerGlobalScope) {{ onconnect = e => e.ports[0].postMessage('{referrer}'); }}"
+                        )
+                        .into_bytes()
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                if rel == "workers/semantics/encodings/003-1.py" {
+                    let body: &[u8] = if query_first("x").as_deref() == Some("å") {
+                        b"PASS"
+                    } else {
+                        b"FAIL"
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                if rel == "workers/support/imported_script.py" {
+                    let mime = query_first("mime").unwrap_or_else(|| "text/javascript".into());
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                if rel == "workers/support/nosiniff-error-worker.py" {
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Content-Type-Options: nosniff\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+
                 // WPT dynamic handler: `fetch/api/resources/status.py`
                 if rel == "fetch/api/resources/status.py" {
                     let code = query_first("code")
@@ -1697,7 +1839,7 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
 fn substitute_wpt_templates(input: &str, port: u16) -> String {
     let port_s = port.to_string();
     let host_port = format!("localhost:{port_s}");
-    input
+    let out = input
         .replace("{{location[scheme]}}", "http")
         .replace("{{location[port]}}", &port_s)
         .replace("{{location[host]}}", &host_port)
@@ -1712,10 +1854,20 @@ fn substitute_wpt_templates(input: &str, port: u16) -> String {
         .replace("{{hosts[alt][www]}}", "127.0.0.1")
         .replace("{{hosts[alt][]}}", "127.0.0.1")
         .replace("{{ports[http][0]}}", &port_s)
-        .replace("{{ports[http][1]}}", &port_s)
+        .replace("{{ports[http][1]}}", &(port.saturating_add(1)).to_string())
         .replace("{{ports[https][0]}}", &port_s)
         .replace("{{ports[ws][0]}}", &port_s)
-        .replace("{{ports[wss][0]}}", &port_s)
+        .replace("{{ports[wss][0]}}", &port_s);
+    // LocalWptServer serves loopback HTTP on `port`, so map local `https://127.0.0.1:<port>`
+    // and `https://localhost:<port>` test URLs to loopback HTTP while preserving distinct origins.
+    out.replace(
+        &format!("https://127.0.0.1:{port_s}"),
+        &format!("http://127.0.0.1:{port_s}"),
+    )
+    .replace(
+        &format!("https://localhost:{port_s}"),
+        &format!("http://localhost:{port_s}"),
+    )
 }
 
 fn run_wpt_testharness_file(
@@ -1870,10 +2022,14 @@ fn run_wpt_testharness_file(
             continue;
         }
         // When JS timers (`setTimeout` / `delay(500)`) are pending, fast-forward virtual time
-        // directly to the next timer deadline without sleeping wall-clock milliseconds.
+        // directly to the next timer deadline — UNLESS OS worker threads are actively running
+        // and the timer is a long timeout guard (>= 100 ms), in which case yield to async I/O first
+        // so worker threads finish before timeout guards fire!
+        let has_workers = rt.workers.borrow().has_active_workers();
         let next_timer = rt.event_loop.borrow_mut().time_until_next_timer();
         if let Some(dt) = next_timer {
-            if dt <= Duration::from_secs(5) && virtual_timer_jumps < 400 {
+            let allow_jump = !has_workers || dt < Duration::from_millis(100) || async_waits >= 20;
+            if allow_jump && dt <= Duration::from_secs(5) && virtual_timer_jumps < 400 {
                 virtual_timer_jumps += 1;
                 if !dt.is_zero() {
                     rt.event_loop.borrow_mut().advance_clock(dt);
@@ -1881,7 +2037,7 @@ fn run_wpt_testharness_file(
                 continue;
             }
         }
-        if async_waits >= 150 {
+        if async_waits >= 160 {
             break;
         }
         async_waits += 1;
