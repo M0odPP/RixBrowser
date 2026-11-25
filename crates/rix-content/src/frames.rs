@@ -1282,6 +1282,7 @@ fn install_same_origin_child_globals(
         "WritableStreamDefaultWriter",
         "WritableStreamDefaultController",
         "TransformStream",
+        "TransformStreamDefaultController",
         "TextDecoderStream",
         "TextEncoderStream",
         "CountQueuingStrategy",

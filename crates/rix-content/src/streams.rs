@@ -13,10 +13,11 @@ use rix_js::promise::{
 };
 use rix_js::{HeapHandle, JsException, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs};
 
+use crate::streams_pipe::{readable_pipe_through, readable_pipe_to_method};
+use crate::streams_transform::{install_transform_stream_types, TransformStreamState};
 pub(crate) use crate::streams_writable::create_writable_stream_from_callbacks;
 use crate::streams_writable::{
-    install_writable_stream_types, writable_close_internal, writable_write_internal,
-    WritableDefaultWriterState, WritableStreamState,
+    install_writable_stream_types, WritableDefaultWriterState, WritableStreamState,
 };
 use crate::web_apis::{
     alloc_uint8_array, arg, bind_ctor_proto, define_global, define_host_getter, define_host_method,
@@ -29,6 +30,59 @@ use crate::streams_common::{
     promise_reject_value, set_to_string_tag, validate_and_normalize_hwm, QueueWithSizes,
 };
 
+pub(crate) type ChunkCallback = Rc<RefCell<Option<Box<dyn FnOnce(&mut JsVm, JsValue)>>>>;
+pub(crate) type CloseCallback = Rc<RefCell<Option<Box<dyn FnOnce(&mut JsVm)>>>>;
+pub(crate) type ErrorCallback = Rc<RefCell<Option<Box<dyn FnOnce(&mut JsVm, JsValue)>>>>;
+
+#[derive(Clone)]
+pub(crate) enum ReadRequest {
+    Promise(HeapHandle),
+    Callback {
+        on_chunk: ChunkCallback,
+        on_close: CloseCallback,
+        on_error: ErrorCallback,
+    },
+}
+
+fn fulfill_read_request(vm: &mut JsVm, req: ReadRequest, chunk: JsValue) {
+    match req {
+        ReadRequest::Promise(p) => {
+            let res = make_read_result(vm, chunk, false);
+            resolve_promise(vm, p, res);
+        }
+        ReadRequest::Callback { on_chunk, .. } => {
+            if let Some(cb) = on_chunk.borrow_mut().take() {
+                cb(vm, chunk);
+            }
+        }
+    }
+}
+
+fn close_read_request(vm: &mut JsVm, req: ReadRequest) {
+    match req {
+        ReadRequest::Promise(p) => {
+            let res = make_read_result(vm, JsValue::UNDEFINED, true);
+            resolve_promise(vm, p, res);
+        }
+        ReadRequest::Callback { on_close, .. } => {
+            if let Some(cb) = on_close.borrow_mut().take() {
+                cb(vm);
+            }
+        }
+    }
+}
+
+fn error_read_request(vm: &mut JsVm, req: ReadRequest, err: JsValue) {
+    match req {
+        ReadRequest::Promise(p) => reject_promise(vm, p, err),
+        ReadRequest::Callback { on_error, .. } => {
+            if let Some(cb) = on_error.borrow_mut().take() {
+                cb(vm, err);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ReadableStream State Machine Structures
 // ---------------------------------------------------------------------------
@@ -40,7 +94,7 @@ pub(crate) enum ReadableState {
     Errored,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ReadableStreamState {
     pub(crate) state: ReadableState,
     pub(crate) stored_error: JsValue,
@@ -58,7 +112,7 @@ pub(crate) struct ReadableStreamState {
     pub(crate) pull_fn: Option<HeapHandle>,
     pub(crate) cancel_fn: Option<HeapHandle>,
     pub(crate) source_obj: Option<HeapHandle>,
-    pub(crate) read_requests: VecDeque<HeapHandle>,
+    pub(crate) read_requests: VecDeque<ReadRequest>,
 }
 
 impl ReadableStreamState {
@@ -122,6 +176,9 @@ pub struct StreamSystem {
     pub(crate) writable: HashMap<HeapHandle, WritableStreamState>,
     pub(crate) writable_controllers: HashMap<HeapHandle, HeapHandle>,
     pub(crate) writable_writers: HashMap<HeapHandle, WritableDefaultWriterState>,
+    pub(crate) transforms: HashMap<HeapHandle, TransformStreamState>,
+    pub(crate) transform_controllers: HashMap<HeapHandle, HeapHandle>,
+    pub(crate) active_pipes: HashMap<HeapHandle, Vec<HeapHandle>>,
     count_strategies: HashMap<HeapHandle, f64>,
     byte_length_strategies: HashMap<HeapHandle, f64>,
     pub readable_proto: Option<HeapHandle>,
@@ -132,6 +189,9 @@ pub struct StreamSystem {
     pub writable_writer_proto: Option<HeapHandle>,
     pub writable_controller_proto: Option<HeapHandle>,
     pub transform_proto: Option<HeapHandle>,
+    pub transform_controller_proto: Option<HeapHandle>,
+    pub(crate) et_add_listener_fn: Option<HeapHandle>,
+    pub(crate) et_remove_listener_fn: Option<HeapHandle>,
     count_size_fn: Option<HeapHandle>,
     byte_length_size_fn: Option<HeapHandle>,
 }
@@ -151,6 +211,9 @@ impl StreamSystem {
             self.writable_writer_proto,
             self.writable_controller_proto,
             self.transform_proto,
+            self.transform_controller_proto,
+            self.et_add_listener_fn,
+            self.et_remove_listener_fn,
             self.count_size_fn,
             self.byte_length_size_fn,
         ]
@@ -177,8 +240,10 @@ impl StreamSystem {
             {
                 out.push(JsValue::from_object(h));
             }
-            for &p in &rs.read_requests {
-                out.push(JsValue::from_object(p));
+            for req in &rs.read_requests {
+                if let ReadRequest::Promise(p) = req {
+                    out.push(JsValue::from_object(*p));
+                }
             }
         }
         for r in self.readable_readers.values() {
@@ -203,6 +268,15 @@ impl StreamSystem {
             out.push(JsValue::from_object(w.closed_promise));
             out.push(JsValue::from_object(w.ready_promise));
         }
+        for ts in self.transforms.values() {
+            ts.collect_roots(out);
+        }
+        for (&pipe_p, handles) in &self.active_pipes {
+            out.push(JsValue::from_object(pipe_p));
+            for &h in handles {
+                out.push(JsValue::from_object(h));
+            }
+        }
     }
 
     /// Returns whether the given `ReadableStream` has been read from or canceled (disturbed).
@@ -219,6 +293,8 @@ impl StreamSystem {
         self.writable.retain(|&h, _| heap.is_alive(h));
         self.writable_controllers.retain(|&h, _| heap.is_alive(h));
         self.writable_writers.retain(|&h, _| heap.is_alive(h));
+        self.transforms.retain(|&h, _| heap.is_alive(h));
+        self.transform_controllers.retain(|&h, _| heap.is_alive(h));
         self.count_strategies.retain(|&h, _| heap.is_alive(h));
         self.byte_length_strategies.retain(|&h, _| heap.is_alive(h));
     }
@@ -332,9 +408,8 @@ pub(crate) fn readable_close_stream(vm: &mut JsVm, streams: &SharedStreams, stre
     if let Some(cp) = closed_p {
         resolve_promise(vm, cp, JsValue::UNDEFINED);
     }
-    for p in pending {
-        let res = make_read_result(vm, JsValue::UNDEFINED, true);
-        resolve_promise(vm, p, res);
+    for req in pending {
+        close_read_request(vm, req);
     }
 }
 
@@ -390,9 +465,8 @@ pub(crate) fn readable_controller_enqueue(
         }
     };
 
-    if let Some(req_p) = step.0 {
-        let res = make_read_result(vm, chunk, false);
-        resolve_promise(vm, req_p, res);
+    if let Some(req) = step.0 {
+        fulfill_read_request(vm, req, chunk);
         readable_call_pull_if_needed(vm, streams, stream_h);
         return Ok(());
     }
@@ -456,8 +530,8 @@ pub(crate) fn readable_error_internal(
         reject_promise(vm, cp, reason);
         promise_mark_handled(vm, cp);
     }
-    for p in pending {
-        reject_promise(vm, p, reason);
+    for req in pending {
+        error_read_request(vm, req, reason);
     }
 }
 
@@ -496,27 +570,29 @@ pub(crate) fn readable_cancel_internal(
     }
 }
 
-pub(crate) fn readable_reader_read_internal(
+pub(crate) fn readable_read_with_request(
     vm: &mut JsVm,
     streams: &SharedStreams,
     stream_h: HeapHandle,
-) -> HeapHandle {
+    req: ReadRequest,
+) {
     enum ReadOutcome {
-        Chunk(JsValue, bool),
-        Closed,
-        Errored(JsValue),
-        Pending(HeapHandle),
+        Chunk(JsValue, bool, ReadRequest),
+        Closed(ReadRequest),
+        Errored(JsValue, ReadRequest),
+        Pending,
     }
     let outcome = {
         let mut st = streams.borrow_mut();
         let Some(rs) = st.readable.get_mut(&stream_h) else {
-            let res = make_read_result(vm, JsValue::UNDEFINED, true);
-            return promise_resolve_value(vm, res);
+            drop(st);
+            close_read_request(vm, req);
+            return;
         };
         rs.disturbed = true;
         match rs.state {
-            ReadableState::Closed => ReadOutcome::Closed,
-            ReadableState::Errored => ReadOutcome::Errored(rs.stored_error),
+            ReadableState::Closed => ReadOutcome::Closed(req),
+            ReadableState::Errored => ReadOutcome::Errored(rs.stored_error, req),
             ReadableState::Readable => {
                 if let Some(chunk) = rs.queue.dequeue_value() {
                     let close_after = rs.close_requested && rs.queue.is_empty();
@@ -525,35 +601,37 @@ pub(crate) fn readable_reader_read_internal(
                         rs.cancel_fn = None;
                         rs.size_fn = None;
                     }
-                    ReadOutcome::Chunk(chunk, close_after)
+                    ReadOutcome::Chunk(chunk, close_after, req)
                 } else {
-                    let p = alloc_promise(vm);
-                    rs.read_requests.push_back(p);
-                    ReadOutcome::Pending(p)
+                    rs.read_requests.push_back(req);
+                    ReadOutcome::Pending
                 }
             }
         }
     };
     match outcome {
-        ReadOutcome::Chunk(chunk, close_after) => {
+        ReadOutcome::Chunk(chunk, close_after, r) => {
             if close_after {
                 readable_close_stream(vm, streams, stream_h);
             } else {
                 readable_call_pull_if_needed(vm, streams, stream_h);
             }
-            let res = make_read_result(vm, chunk, false);
-            promise_resolve_value(vm, res)
+            fulfill_read_request(vm, r, chunk);
         }
-        ReadOutcome::Closed => {
-            let res = make_read_result(vm, JsValue::UNDEFINED, true);
-            promise_resolve_value(vm, res)
-        }
-        ReadOutcome::Errored(err) => promise_reject_value(vm, err),
-        ReadOutcome::Pending(p) => {
-            readable_call_pull_if_needed(vm, streams, stream_h);
-            p
-        }
+        ReadOutcome::Closed(r) => close_read_request(vm, r),
+        ReadOutcome::Errored(err, r) => error_read_request(vm, r, err),
+        ReadOutcome::Pending => readable_call_pull_if_needed(vm, streams, stream_h),
     }
+}
+
+pub(crate) fn readable_reader_read_internal(
+    vm: &mut JsVm,
+    streams: &SharedStreams,
+    stream_h: HeapHandle,
+) -> HeapHandle {
+    let p = alloc_promise(vm);
+    readable_read_with_request(vm, streams, stream_h, ReadRequest::Promise(p));
+    p
 }
 
 pub(crate) fn acquire_default_reader(
@@ -630,8 +708,8 @@ pub(crate) fn release_default_reader(vm: &mut JsVm, streams: &SharedStreams, rea
             r.closed_promise = new_cp;
         }
     }
-    for p in info.1 {
-        reject_promise(vm, p, rel_err);
+    for req in info.1 {
+        error_read_request(vm, req, rel_err);
     }
 }
 
@@ -740,6 +818,7 @@ fn readable_stream_default_tee(
     }
 
     let cancel_promise = alloc_promise(vm);
+    attach_gc_anchor(vm, reader_h, cancel_promise);
     let shared = Rc::new(RefCell::new(TeeShared {
         reading: false,
         read_again: false,
@@ -766,81 +845,80 @@ fn readable_stream_default_tee(
             }
             sh.reading = true;
         }
-        let read_p = readable_reader_read_internal(vm, streams, src_h);
-        let ss_ok = Rc::clone(streams);
-        let sh_ok = Rc::clone(shared);
-        let on_ok = vm.alloc_host_fn("tee_read_ok", move |vm, _, args| {
-            let res = arg(args, 0);
-            let Some(rh) = res.as_object() else {
-                sh_ok.borrow_mut().reading = false;
-                return Ok(JsValue::UNDEFINED);
-            };
-            let k_done = vm.heap.intern_key("done");
-            let k_val = vm.heap.intern_key("value");
-            let is_done = vm
-                .get_property_by_key(rh, k_done)
-                .is_ok_and(|v| vm.to_boolean(v));
-            let val = vm
-                .get_property_by_key(rh, k_val)
-                .unwrap_or(JsValue::UNDEFINED);
-
-            let (c1, c2, b1, b2, cp) = {
-                let mut sh = sh_ok.borrow_mut();
-                sh.read_again = false;
-                (
-                    sh.canceled1,
-                    sh.canceled2,
-                    sh.branch1,
-                    sh.branch2,
-                    sh.cancel_promise,
-                )
-            };
-
-            if is_done {
-                sh_ok.borrow_mut().reading = false;
+        let ss_chunk = Rc::clone(streams);
+        let sh_chunk = Rc::clone(shared);
+        let ss_close = Rc::clone(streams);
+        let sh_close = Rc::clone(shared);
+        let sh_err = Rc::clone(shared);
+        let req = ReadRequest::Callback {
+            on_chunk: Rc::new(RefCell::new(Some(Box::new(
+                move |vm: &mut JsVm, val: JsValue| {
+                    let ss_m = Rc::clone(&ss_chunk);
+                    let sh_m = Rc::clone(&sh_chunk);
+                    let micro =
+                        vm.alloc_host_fn_rooted("tee_chunk_micro", &[val], move |vm, _, _| {
+                            let (c1, c2, b1, b2) = {
+                                let mut sh = sh_m.borrow_mut();
+                                sh.read_again = false;
+                                (sh.canceled1, sh.canceled2, sh.branch1, sh.branch2)
+                            };
+                            if !c1 {
+                                if let Some(h1) = b1 {
+                                    let _ = readable_controller_enqueue(vm, &ss_m, h1, val);
+                                }
+                            }
+                            if !c2 {
+                                if let Some(h2) = b2 {
+                                    let _ = readable_controller_enqueue(vm, &ss_m, h2, val);
+                                }
+                            }
+                            let again = {
+                                let mut sh = sh_m.borrow_mut();
+                                sh.reading = false;
+                                sh.read_again
+                            };
+                            if again {
+                                tee_pull(vm, &ss_m, src_h, &sh_m);
+                            }
+                            Ok(JsValue::UNDEFINED)
+                        });
+                    let resolved = promise_resolve_value(vm, JsValue::UNDEFINED);
+                    let _ = promise_then(vm, resolved, Some(micro), None);
+                },
+            )))),
+            on_close: Rc::new(RefCell::new(Some(Box::new(move |vm: &mut JsVm| {
+                let (c1, c2, b1, b2, cp) = {
+                    let mut sh = sh_close.borrow_mut();
+                    sh.reading = false;
+                    (
+                        sh.canceled1,
+                        sh.canceled2,
+                        sh.branch1,
+                        sh.branch2,
+                        sh.cancel_promise,
+                    )
+                };
                 if !c1 {
                     if let Some(h1) = b1 {
-                        let _ = readable_controller_close(vm, &ss_ok, h1);
+                        let _ = readable_controller_close(vm, &ss_close, h1);
                     }
                 }
                 if !c2 {
                     if let Some(h2) = b2 {
-                        let _ = readable_controller_close(vm, &ss_ok, h2);
+                        let _ = readable_controller_close(vm, &ss_close, h2);
                     }
                 }
                 if !c1 || !c2 {
                     resolve_promise(vm, cp, JsValue::UNDEFINED);
                 }
-                return Ok(JsValue::UNDEFINED);
-            }
-
-            if !c1 {
-                if let Some(h1) = b1 {
-                    let _ = readable_controller_enqueue(vm, &ss_ok, h1, val);
-                }
-            }
-            if !c2 {
-                if let Some(h2) = b2 {
-                    let _ = readable_controller_enqueue(vm, &ss_ok, h2, val);
-                }
-            }
-
-            let again = {
-                let mut sh = sh_ok.borrow_mut();
-                sh.reading = false;
-                sh.read_again
-            };
-            if again {
-                tee_pull(vm, &ss_ok, src_h, &sh_ok);
-            }
-            Ok(JsValue::UNDEFINED)
-        });
-        let sh_err = Rc::clone(shared);
-        let on_err = vm.alloc_host_fn("tee_read_err", move |_, _, _| {
-            sh_err.borrow_mut().reading = false;
-            Ok(JsValue::UNDEFINED)
-        });
-        let _ = promise_then(vm, read_p, Some(on_ok), Some(on_err));
+            })))),
+            on_error: Rc::new(RefCell::new(Some(Box::new(
+                move |_vm: &mut JsVm, _err: JsValue| {
+                    sh_err.borrow_mut().reading = false;
+                },
+            )))),
+        };
+        readable_read_with_request(vm, streams, src_h, req);
     }
 
     let ss_p1 = Rc::clone(streams);
@@ -1248,6 +1326,23 @@ fn install_queuing_strategies(vm: &mut JsVm, streams: &SharedStreams) {
 pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams {
     let streams = Rc::new(RefCell::new(StreamSystem::default()));
 
+    // Save tamper-proof native `EventTarget.prototype.{add,remove}EventListener` for `pipeTo({ signal })`.
+    if let Some(sig_proto) = web_apis.borrow().protos.abort_signal_proto {
+        let k_add = vm.heap.intern_key("addEventListener");
+        let k_rm = vm.heap.intern_key("removeEventListener");
+        let add_fn = vm
+            .get_property_by_key(sig_proto, k_add)
+            .ok()
+            .and_then(|v| v.as_object());
+        let rm_fn = vm
+            .get_property_by_key(sig_proto, k_rm)
+            .ok()
+            .and_then(|v| v.as_object());
+        let mut st = streams.borrow_mut();
+        st.et_add_listener_fn = add_fn;
+        st.et_remove_listener_fn = rm_fn;
+    }
+
     install_queuing_strategies(vm, &streams);
 
     // --- ReadableStreamDefaultController ---
@@ -1644,51 +1739,22 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
     });
 
     let ss = Rc::clone(&streams);
+    let wa_pt = Rc::clone(web_apis);
     define_host_method(vm, rsp, "pipeTo", move |vm, this_val, args| {
-        let src_h = match require_readable(vm, &ss, this_val) {
-            Ok(h) => h,
-            Err(e) => return Ok(JsValue::from_object(promise_reject_value(vm, e.value))),
-        };
-        let dst_h = match require_writable(vm, &ss, arg(args, 0)) {
-            Ok(h) => h,
-            Err(e) => return Ok(JsValue::from_object(promise_reject_value(vm, e.value))),
-        };
-        Ok(JsValue::from_object(pipe_readable_to_writable(
-            vm, &ss, src_h, dst_h,
+        Ok(JsValue::from_object(readable_pipe_to_method(
+            vm,
+            &ss,
+            &wa_pt,
+            this_val,
+            arg(args, 0),
+            arg(args, 1),
         )))
     });
 
     let ss = Rc::clone(&streams);
+    let wa_pth = Rc::clone(web_apis);
     define_host_method(vm, rsp, "pipeThrough", move |vm, this_val, args| {
-        let src_h = require_readable(vm, &ss, this_val)?;
-        let Some(tr_h) = arg(args, 0).as_object() else {
-            return Err(vm.type_error("pipeThrough requires a { readable, writable } object"));
-        };
-        let kr = vm.heap.intern_key("readable");
-        let kw = vm.heap.intern_key("writable");
-        let readable = vm.get_property_by_key(tr_h, kr)?;
-        let writable = vm.get_property_by_key(tr_h, kw)?;
-        let _ = require_readable(vm, &ss, readable)?;
-        let dst_h = require_writable(vm, &ss, writable)?;
-        let src_locked = ss
-            .borrow()
-            .readable
-            .get(&src_h)
-            .is_some_and(|rs| rs.reader.is_some());
-        if src_locked {
-            return Err(vm.type_error("Cannot pipeThrough a locked ReadableStream"));
-        }
-        let dst_locked = ss
-            .borrow()
-            .writable
-            .get(&dst_h)
-            .is_some_and(|ws| ws.writer.is_some());
-        if dst_locked {
-            return Err(vm.type_error("Cannot pipeThrough into a locked WritableStream"));
-        }
-        let p = pipe_readable_to_writable(vm, &ss, src_h, dst_h);
-        promise_mark_handled(vm, p);
-        Ok(readable)
+        readable_pipe_through(vm, &ss, &wa_pth, this_val, arg(args, 0), arg(args, 1))
     });
 
     let ss = Rc::clone(&streams);
@@ -1835,129 +1901,8 @@ pub fn install_streams(vm: &mut JsVm, web_apis: &SharedWebApis) -> SharedStreams
     // --- WritableStream + WritableStreamDefaultWriter + WritableStreamDefaultController ---
     let wsp = install_writable_stream_types(vm, &streams, web_apis);
 
-    // --- TransformStream ---
-    let tsp = vm.alloc_ordinary_object();
-    vm.heap.get_object_mut(tsp).unwrap().is_prototype = true;
-    set_to_string_tag(vm, tsp, "TransformStream");
-    streams.borrow_mut().transform_proto = Some(tsp);
-
-    let ss = Rc::clone(&streams);
-    let ts_ctor = vm.alloc_host_fn("TransformStream", move |vm, _, args| {
-        if vm.native_new_target.is_undefined() {
-            return Err(vm.type_error("TransformStream constructor requires 'new'"));
-        }
-        let transformer_val = arg(args, 0);
-        if !transformer_val.is_undefined() && !transformer_val.is_object() {
-            return Err(vm.type_error("TransformStream transformer must be an object"));
-        }
-        let (ws_hwm_v, ws_size) = extract_strategy(vm, arg(args, 1))?;
-        let (rs_hwm_v, rs_size) = extract_strategy(vm, arg(args, 2))?;
-        let ws_hwm = match ws_hwm_v {
-            Some(v) => validate_and_normalize_hwm(vm, v)?,
-            None => 1.0,
-        };
-        let rs_hwm = match rs_hwm_v {
-            Some(v) => validate_and_normalize_hwm(vm, v)?,
-            None => 0.0,
-        };
-
-        let mut start_fn = None;
-        let mut transform_fn = None;
-        let mut flush_fn = None;
-        let mut cancel_fn = None;
-        if let Some(th) = transformer_val.as_object() {
-            start_fn = get_method_checked(vm, th, "start")?;
-            transform_fn = get_method_checked(vm, th, "transform")?;
-            flush_fn = get_method_checked(vm, th, "flush")?;
-            cancel_fn = get_method_checked(vm, th, "cancel")?;
-        }
-
-        let cancel_cb = cancel_fn.map(|cf| {
-            vm.alloc_host_fn_rooted(
-                "ts_cancel",
-                &[transformer_val, JsValue::from_object(cf)],
-                move |vm, _, a| {
-                    vm.call_value(JsValue::from_object(cf), transformer_val, &[arg(a, 0)])
-                },
-            )
-        });
-        let (readable, ctrl) =
-            alloc_readable_stream_internal(vm, &ss, rs_hwm, rs_size, None, cancel_cb, None, true);
-
-        let ss_w = Rc::clone(&ss);
-        let write_cb = vm.alloc_host_fn("transform_write", move |vm, _, wargs| {
-            let chunk = arg(wargs, 0);
-            if let Some(tf) = transform_fn {
-                vm.call_value(
-                    JsValue::from_object(tf),
-                    transformer_val,
-                    &[chunk, JsValue::from_object(ctrl)],
-                )
-            } else {
-                readable_controller_enqueue(vm, &ss_w, readable, chunk)?;
-                Ok(JsValue::UNDEFINED)
-            }
-        });
-        let ss_cl = Rc::clone(&ss);
-        let close_cb = vm.alloc_host_fn("transform_close", move |vm, _, _| {
-            if let Some(ff) = flush_fn {
-                let res = vm.call_value(
-                    JsValue::from_object(ff),
-                    transformer_val,
-                    &[JsValue::from_object(ctrl)],
-                )?;
-                let p = promise_resolve_value(vm, res);
-                let ss_c2 = Rc::clone(&ss_cl);
-                let on_ok = vm.alloc_host_fn("ts_flush_ok", move |vm, _, _| {
-                    let _ = readable_controller_close(vm, &ss_c2, readable);
-                    Ok(JsValue::UNDEFINED)
-                });
-                return Ok(JsValue::from_object(promise_then(vm, p, Some(on_ok), None)));
-            }
-            let _ = readable_controller_close(vm, &ss_cl, readable);
-            Ok(JsValue::UNDEFINED)
-        });
-        let ss_ab = Rc::clone(&ss);
-        let abort_cb = vm.alloc_host_fn("transform_abort", move |vm, _, a| {
-            readable_error_internal(vm, &ss_ab, readable, arg(a, 0));
-            Ok(JsValue::UNDEFINED)
-        });
-
-        let writable = crate::streams_writable::create_writable_stream_with_strategy(
-            vm, &ss, write_cb, close_cb, abort_cb, ws_hwm, ws_size,
-        );
-
-        if let Some(sf) = start_fn {
-            vm.call_value(
-                JsValue::from_object(sf),
-                transformer_val,
-                &[JsValue::from_object(ctrl)],
-            )?;
-        }
-
-        let ts_obj = vm
-            .heap
-            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(tsp)));
-        let kr = vm.heap.intern_key("readable");
-        let kw = vm.heap.intern_key("writable");
-        vm.heap.object_define_data(
-            ts_obj,
-            kr,
-            JsValue::from_object(readable),
-            PropertyAttrs::DEFAULT,
-            &mut vm.shapes,
-        );
-        vm.heap.object_define_data(
-            ts_obj,
-            kw,
-            JsValue::from_object(writable),
-            PropertyAttrs::DEFAULT,
-            &mut vm.shapes,
-        );
-        Ok(JsValue::from_object(ts_obj))
-    });
-    bind_ctor_proto(vm, ts_ctor, tsp);
-    define_global(vm, "TransformStream", JsValue::from_object(ts_ctor));
+    // --- TransformStream + TransformStreamDefaultController ---
+    install_transform_stream_types(vm, &streams, web_apis);
 
     // --- TextDecoderStream & TextEncoderStream (WHATWG Encoding §8.5) ---
     install_text_encoding_streams(vm, &streams, web_apis, rsp, wsp);
@@ -2048,104 +1993,6 @@ pub(crate) fn require_writable(
     } else {
         Err(vm.type_error("Incompatible WritableStream receiver"))
     }
-}
-
-fn pipe_readable_to_writable(
-    vm: &mut JsVm,
-    streams: &SharedStreams,
-    src_h: HeapHandle,
-    dst_h: HeapHandle,
-) -> HeapHandle {
-    let reader_h = match acquire_default_reader(vm, streams, src_h) {
-        Ok(r) => r,
-        Err(e) => return promise_reject_value(vm, e.value),
-    };
-    let writer_h = match crate::streams_writable::acquire_default_writer(vm, streams, dst_h) {
-        Ok(w) => w,
-        Err(e) => {
-            release_default_reader(vm, streams, reader_h);
-            return promise_reject_value(vm, e.value);
-        }
-    };
-    let done_p = alloc_promise(vm);
-    pump_pipe_step(vm, streams, src_h, dst_h, reader_h, writer_h, done_p);
-    done_p
-}
-
-fn pump_pipe_step(
-    vm: &mut JsVm,
-    streams: &SharedStreams,
-    src_h: HeapHandle,
-    dst_h: HeapHandle,
-    reader_h: HeapHandle,
-    writer_h: HeapHandle,
-    done_p: HeapHandle,
-) {
-    let read_p = readable_reader_read_internal(vm, streams, src_h);
-    let ss_ok = Rc::clone(streams);
-    let on_read = vm.alloc_host_fn("pipe_step", move |vm, _, args| {
-        let res = arg(args, 0);
-        let Some(rh) = res.as_object() else {
-            release_default_reader(vm, &ss_ok, reader_h);
-            crate::streams_writable::release_default_writer(vm, &ss_ok, writer_h);
-            resolve_promise(vm, done_p, JsValue::UNDEFINED);
-            return Ok(JsValue::UNDEFINED);
-        };
-        let k_done = vm.heap.intern_key("done");
-        let k_val = vm.heap.intern_key("value");
-        let is_done = vm
-            .get_property_by_key(rh, k_done)
-            .is_ok_and(|v| vm.to_boolean(v));
-        if is_done {
-            let close_p = writable_close_internal(vm, &ss_ok, dst_h);
-            let ss_c1 = Rc::clone(&ss_ok);
-            let on_cl = vm.alloc_host_fn("pipe_close_ok", move |vm, _, _| {
-                release_default_reader(vm, &ss_c1, reader_h);
-                crate::streams_writable::release_default_writer(vm, &ss_c1, writer_h);
-                resolve_promise(vm, done_p, JsValue::UNDEFINED);
-                Ok(JsValue::UNDEFINED)
-            });
-            let ss_c2 = Rc::clone(&ss_ok);
-            let on_ce = vm.alloc_host_fn("pipe_close_err", move |vm, _, a| {
-                release_default_reader(vm, &ss_c2, reader_h);
-                crate::streams_writable::release_default_writer(vm, &ss_c2, writer_h);
-                reject_promise(vm, done_p, arg(a, 0));
-                Ok(JsValue::UNDEFINED)
-            });
-            let _ = promise_then(vm, close_p, Some(on_cl), Some(on_ce));
-        } else {
-            let val = vm
-                .get_property_by_key(rh, k_val)
-                .unwrap_or(JsValue::UNDEFINED);
-            let wp = writable_write_internal(vm, &ss_ok, dst_h, val);
-            let ss_next = Rc::clone(&ss_ok);
-            let on_wr = vm.alloc_host_fn("pipe_write_ok", move |vm, _, _| {
-                pump_pipe_step(vm, &ss_next, src_h, dst_h, reader_h, writer_h, done_p);
-                Ok(JsValue::UNDEFINED)
-            });
-            let ss_we = Rc::clone(&ss_ok);
-            let on_werr = vm.alloc_host_fn("pipe_write_err", move |vm, _, a| {
-                let err = arg(a, 0);
-                let _ = readable_cancel_internal(vm, &ss_we, src_h, err);
-                release_default_reader(vm, &ss_we, reader_h);
-                crate::streams_writable::release_default_writer(vm, &ss_we, writer_h);
-                reject_promise(vm, done_p, err);
-                Ok(JsValue::UNDEFINED)
-            });
-            let _ = promise_then(vm, wp, Some(on_wr), Some(on_werr));
-        }
-        Ok(JsValue::UNDEFINED)
-    });
-    let ss_re = Rc::clone(streams);
-    let on_err = vm.alloc_host_fn("pipe_read_err", move |vm, _, a| {
-        let err = arg(a, 0);
-        let _ = crate::streams_writable::writable_abort_internal(vm, &ss_re, dst_h, err);
-        release_default_reader(vm, &ss_re, reader_h);
-        crate::streams_writable::release_default_writer(vm, &ss_re, writer_h);
-        reject_promise(vm, done_p, err);
-        Ok(JsValue::UNDEFINED)
-    });
-    let _ = promise_then(vm, read_p, Some(on_read), Some(on_err));
 }
 
 // ---------------------------------------------------------------------------
