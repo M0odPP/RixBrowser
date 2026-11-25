@@ -24,6 +24,7 @@ pub mod media_source;
 pub mod observers;
 pub mod selection;
 pub mod service_worker;
+pub mod shadow_dom;
 pub mod streams;
 pub mod trusted_types;
 pub mod web_apis;
@@ -214,6 +215,7 @@ impl ContentRuntime {
         let host = install_dom_bridge(&mut vm, document, viewport, font_db);
         let events = install_event_system(&mut vm, &host, &event_loop);
         let observers = install_observers(&mut vm, &host, &event_loop);
+        shadow_dom::install_shadow_dom_apis(&mut vm, &host, &events, &event_loop);
         let web_apis = install_web_apis(&mut vm, &host, &events, &event_loop, origin_url, storage);
         trusted_types::install_trusted_types(&mut vm, &host, &events);
         dom_parsing::install_dom_parsing(&mut vm, &host, &events, &event_loop, &web_apis);

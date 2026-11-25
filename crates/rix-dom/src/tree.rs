@@ -486,7 +486,37 @@ impl Document {
         self.style_revision = self.style_revision.wrapping_add(1);
 
         let mut affected = self.update_ancestor_state_diff(prev, node, ElementState::FOCUS_WITHIN);
+        // Collect shadow host ancestors with `delegates_focus == true` so `:focus` applies
+        // to the host while focus is inside its shadow tree (WHATWG HTML §6.6.3).
+        let collect_delegating_hosts = |doc: &Document, start: Option<NodeId>| -> Vec<NodeId> {
+            let mut out = Vec::new();
+            let Some(mut cur) = start else {
+                return out;
+            };
+            for _ in 0..128 {
+                if let Some(p) = doc.parent(cur) {
+                    cur = p;
+                    continue;
+                }
+                match doc.get(cur) {
+                    Some(NodeData::ShadowRoot {
+                        host,
+                        delegates_focus,
+                        ..
+                    }) => {
+                        if *delegates_focus {
+                            out.push(*host);
+                        }
+                        cur = *host;
+                    }
+                    _ => break,
+                }
+            }
+            out
+        };
         if prev != node {
+            let old_hosts = collect_delegating_hosts(self, prev);
+            let new_hosts = collect_delegating_hosts(self, node);
             if let Some(old_id) = prev {
                 if self.set_element_state(
                     old_id,
@@ -500,6 +530,21 @@ impl Document {
                     }
                 }
             }
+            for oh in old_hosts {
+                if !new_hosts.contains(&oh)
+                    && self.set_element_state(
+                        oh,
+                        ElementState::FOCUS | ElementState::FOCUS_VISIBLE,
+                        false,
+                    )
+                {
+                    self.mark_style(oh);
+                    self.mark_node_dirty(oh, DirtyFlags::SELF_STYLE_DIRTY);
+                    if !affected.contains(&oh) {
+                        affected.push(oh);
+                    }
+                }
+            }
             if let Some(new_id) = node {
                 let mut changed = self.set_element_state(new_id, ElementState::FOCUS, true);
                 changed |= self.set_element_state(new_id, ElementState::FOCUS_VISIBLE, visible);
@@ -508,6 +553,17 @@ impl Document {
                     self.mark_node_dirty(new_id, DirtyFlags::SELF_STYLE_DIRTY);
                     if !affected.contains(&new_id) {
                         affected.push(new_id);
+                    }
+                }
+            }
+            for nh in new_hosts {
+                let mut changed = self.set_element_state(nh, ElementState::FOCUS, true);
+                changed |= self.set_element_state(nh, ElementState::FOCUS_VISIBLE, visible);
+                if changed {
+                    self.mark_style(nh);
+                    self.mark_node_dirty(nh, DirtyFlags::SELF_STYLE_DIRTY);
+                    if !affected.contains(&nh) {
+                        affected.push(nh);
                     }
                 }
             }
@@ -898,6 +954,15 @@ impl Document {
     }
 
     pub fn clone_subtree_from(&mut self, source_document: &Document, source: NodeId) -> NodeId {
+        self.clone_subtree_with_options(source_document, source, false)
+    }
+
+    pub fn clone_subtree_with_options(
+        &mut self,
+        source_document: &Document,
+        source: NodeId,
+        only_clonable_shadows: bool,
+    ) -> NodeId {
         fn shallow(
             source_document: &Document,
             source: NodeId,
@@ -937,10 +1002,27 @@ impl Document {
                             delegates_focus,
                             clonable,
                             serializable,
+                            slot_assignment,
+                            declarative,
                             ..
                         }) = source_document.get(sr)
                         {
-                            Some((sr, mode.clone(), *delegates_focus, *clonable, *serializable))
+                            if only_clonable_shadows && !*clonable {
+                                return None;
+                            }
+                            Some((
+                                sr,
+                                mode.clone(),
+                                *delegates_focus,
+                                *clonable,
+                                *serializable,
+                                slot_assignment.clone(),
+                                if only_clonable_shadows {
+                                    false
+                                } else {
+                                    *declarative
+                                },
+                            ))
                         } else {
                             None
                         }
@@ -953,8 +1035,15 @@ impl Document {
             if let (Some(sf), Some(cf)) = (source_fragment, copy_fragment) {
                 pending.push((sf, cf));
             }
-            if let Some((src_root, mode, delegates_focus, clonable, serializable)) =
-                shadow_root_info
+            if let Some((
+                src_root,
+                mode,
+                delegates_focus,
+                clonable,
+                serializable,
+                slot_assignment,
+                declarative,
+            )) = shadow_root_info
             {
                 let copy_root = self.new_node(NodeData::ShadowRoot {
                     host: parent,
@@ -962,6 +1051,8 @@ impl Document {
                     delegates_focus,
                     clonable,
                     serializable,
+                    slot_assignment,
+                    declarative,
                 });
                 if let Some(NodeData::Element(copy_elem)) = self.get_mut(parent) {
                     copy_elem.shadow_root = Some(copy_root);
@@ -1330,6 +1421,8 @@ mod tests {
             delegates_focus: false,
             clonable: true,
             serializable: false,
+            slot_assignment: "named".into(),
+            declarative: false,
         });
         let inner = doc.new_node(NodeData::Element(ElementData::new(
             markup5ever::QualName::new(None, "http://www.w3.org/1999/xhtml".into(), "p".into()),

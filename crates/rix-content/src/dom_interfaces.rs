@@ -1668,15 +1668,12 @@ pub fn validate_pre_insert(
             ));
         }
     }
-    // Step 4: node must be DocumentFragment, DocumentType, Element, or CharacterData.
-    if matches!(
-        doc.get(node),
-        Some(NodeData::Document | NodeData::ShadowRoot { .. })
-    ) {
+    // Step 4: node must be DocumentFragment (including ShadowRoot), DocumentType, Element, or CharacterData.
+    if matches!(doc.get(node), Some(NodeData::Document)) {
         return Err(create_dom_exception(
             vm,
             "HierarchyRequestError",
-            "Cannot insert a Document or ShadowRoot node",
+            "Cannot insert a Document node",
         ));
     }
     let parent_is_doc = matches!(doc.get(parent), Some(NodeData::Document));
@@ -1728,7 +1725,7 @@ pub fn validate_pre_insert(
             false
         };
         match doc.get(node) {
-            Some(NodeData::DocumentFragment) => {
+            Some(NodeData::DocumentFragment | NodeData::ShadowRoot { .. }) => {
                 let mut frag_elems = 0usize;
                 for c in doc.children(node) {
                     if matches!(

@@ -211,6 +211,7 @@ pub struct HostState {
     pub(crate) sanitizers: HashMap<HeapHandle, crate::dom_sanitizer::SanitizerConfig>,
     pub(crate) trusted_types: crate::trusted_types::TrustedTypesState,
     pub(crate) doc_csp: HashMap<NodeId, crate::trusted_types::DocumentCspPolicy>,
+    pub(crate) shadow_dom: RefCell<crate::shadow_dom::ShadowDomState>,
     pub(crate) contextual_scripts: HashSet<NodeId>,
     pub(crate) script_force_async: HashSet<NodeId>,
     pub(crate) upgraded_custom_elements: HashSet<NodeId>,
@@ -311,6 +312,7 @@ impl HostState {
             sanitizers: HashMap::new(),
             trusted_types: crate::trusted_types::TrustedTypesState::default(),
             doc_csp: HashMap::new(),
+            shadow_dom: RefCell::new(crate::shadow_dom::ShadowDomState::default()),
             contextual_scripts: HashSet::new(),
             script_force_async: HashSet::new(),
             upgraded_custom_elements: HashSet::new(),
@@ -786,13 +788,22 @@ impl HostState {
             }
         }
         let self_is_static = style.position == rix_css::PositionMode::Static;
-        let mut cur = doc.parent(node);
+        let next_anc = |n: NodeId| -> Option<NodeId> {
+            match doc.parent(n) {
+                Some(p) => Some(p),
+                None => match doc.get(n) {
+                    Some(NodeData::ShadowRoot { host, .. }) => Some(*host),
+                    _ => None,
+                },
+            }
+        };
+        let mut cur = next_anc(node);
         while let Some(anc) = cur {
             if let Some(NodeData::Element(el)) = doc.get(anc) {
                 let tag = el.name.local.as_str();
                 if let Some(ast) = self.style_ctx.style_for(anc) {
                     if ast.display == DisplayMode::Contents {
-                        cur = doc.parent(anc);
+                        cur = next_anc(anc);
                         continue;
                     }
                     if ast.position != rix_css::PositionMode::Static {
@@ -810,7 +821,7 @@ impl HostState {
                     }
                 }
             }
-            cur = doc.parent(anc);
+            cur = next_anc(anc);
         }
         None
     }
@@ -2001,6 +2012,16 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
     let h = Rc::clone(host);
     define_host_method(vm, np, "cloneNode", move |vm, t, args| {
         let nid = require_node(vm, &h, t)?;
+        if matches!(
+            h.borrow().document.borrow().get(nid),
+            Some(NodeData::ShadowRoot { .. })
+        ) {
+            return Err(crate::web_apis::create_dom_exception(
+                vm,
+                "NotSupportedError",
+                "ShadowRoot nodes cannot be cloned",
+            ));
+        }
         let deep = vm.to_boolean(arg(args, 0));
         let owner_doc = {
             let hb = h.borrow();
@@ -2015,8 +2036,30 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
             let mut doc = _doc_rc.borrow_mut();
             if deep {
                 let snapshot = doc.clone();
-                doc.clone_subtree_from(&snapshot, nid)
+                doc.clone_subtree_with_options(&snapshot, nid, true)
             } else {
+                let clonable_sr = match doc.get(nid) {
+                    Some(NodeData::Element(el)) => {
+                        el.shadow_root.and_then(|sr| match doc.get(sr) {
+                            Some(NodeData::ShadowRoot {
+                                mode,
+                                delegates_focus,
+                                clonable: true,
+                                serializable,
+                                slot_assignment,
+                                ..
+                            }) => Some((
+                                sr,
+                                mode.clone(),
+                                *delegates_focus,
+                                *serializable,
+                                slot_assignment.clone(),
+                            )),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                };
                 let mut data = doc.get(nid).cloned().unwrap_or(NodeData::DocumentFragment);
                 if let NodeData::Element(ref mut el) = data {
                     el.shadow_root = None;
@@ -2025,7 +2068,29 @@ fn install_node_prototype(vm: &mut JsVm, host: &SharedHost) {
                         el.template_contents = Some(doc.new_node(NodeData::DocumentFragment));
                     }
                 }
-                doc.new_node(data)
+                let copy = doc.new_node(data);
+                if let Some((src_sr, mode, delegates_focus, serializable, slot_assignment)) =
+                    clonable_sr
+                {
+                    let snapshot = doc.clone();
+                    let copy_sr = doc.new_node(NodeData::ShadowRoot {
+                        host: copy,
+                        mode,
+                        delegates_focus,
+                        clonable: true,
+                        serializable,
+                        slot_assignment,
+                        declarative: false,
+                    });
+                    if let Some(NodeData::Element(el)) = doc.get_mut(copy) {
+                        el.shadow_root = Some(copy_sr);
+                    }
+                    for ch in snapshot.children(src_sr) {
+                        let cloned_ch = doc.clone_subtree_with_options(&snapshot, ch, true);
+                        doc.append_child(copy_sr, cloned_ch);
+                    }
+                }
+                copy
             }
         };
         if let Some(od) = owner_doc {
@@ -2119,7 +2184,7 @@ pub(crate) fn insert_node_into_parent(
 
     let is_frag = matches!(
         host.borrow().document.borrow().get(child),
-        Some(NodeData::DocumentFragment)
+        Some(NodeData::DocumentFragment | NodeData::ShadowRoot { .. })
     );
     let to_insert: Vec<NodeId> = if is_frag {
         host.borrow().document.borrow().children(child).collect()
@@ -3085,7 +3150,7 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
     install_child_node_mixin(vm, host, ep);
     install_parent_node_mixin(vm, host, ep);
 
-    // Shadow DOM: attachShadow({ mode }) & shadowRoot getter
+    // Shadow DOM: attachShadow({ mode, delegatesFocus, slotAssignment, clonable, serializable }) & shadowRoot getter
     let h = Rc::clone(host);
     define_host_method(vm, ep, "attachShadow", move |vm, t, args| {
         let host_id = require_node(vm, &h, t)?;
@@ -3099,6 +3164,17 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         if mode != "open" && mode != "closed" {
             return Err(vm.type_error("ShadowRoot mode must be 'open' or 'closed'"));
         }
+        let k_sa = vm.heap.intern_key("slotAssignment");
+        let sa_val = vm.get_property_by_key(opts_h, k_sa)?;
+        let slot_assignment = if sa_val.is_undefined() {
+            "named".to_string()
+        } else {
+            let s = vm.value_to_rust_string(sa_val);
+            if s != "named" && s != "manual" {
+                return Err(vm.type_error("ShadowRoot slotAssignment must be 'named' or 'manual'"));
+            }
+            s
+        };
         let k_df = vm.heap.intern_key("delegatesFocus");
         let delegates_focus = vm
             .get_property_by_key(opts_h, k_df)
@@ -3111,34 +3187,69 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         let serializable = vm
             .get_property_by_key(opts_h, k_ser)
             .is_ok_and(|v| vm.to_boolean(v));
+        let owner_doc = h.borrow().owner_doc_of(host_id);
         let sr_id = {
             let _doc_rc = Rc::clone(&h.borrow().document);
             let mut doc = _doc_rc.borrow_mut();
-            let valid = match doc.get(host_id) {
-                Some(NodeData::Element(e)) => {
-                    e.shadow_root.is_none() && is_valid_shadow_host_name(&e.name.local)
-                }
-                _ => false,
+            let (is_html_valid, existing_sr) = match doc.get(host_id) {
+                Some(NodeData::Element(e)) => (
+                    &*e.name.ns == crate::dom_interfaces::HTML_NS
+                        && is_valid_shadow_host_name(&e.name.local),
+                    e.shadow_root,
+                ),
+                _ => (false, None),
             };
-            if !valid {
+            if !is_html_valid {
                 return Err(crate::web_apis::create_dom_exception(
                     vm,
                     "NotSupportedError",
-                    "Element cannot attach a shadow root or already has one",
+                    "Element cannot attach a shadow root",
                 ));
             }
-            let sr = doc.new_node(NodeData::ShadowRoot {
-                host: host_id,
-                mode,
-                delegates_focus,
-                clonable,
-                serializable,
-            });
-            if let Some(NodeData::Element(e)) = doc.get_mut(host_id) {
-                e.shadow_root = Some(sr);
+            if let Some(ex_sr) = existing_sr {
+                // WHATWG DOM §4.9: if host already has a declarative shadow root with matching mode,
+                // clear its children, mark it non-declarative, and return the same ShadowRoot!
+                let can_adopt_declarative = matches!(
+                    doc.get(ex_sr),
+                    Some(NodeData::ShadowRoot {
+                        declarative: true,
+                        mode: ref ex_mode,
+                        ..
+                    }) if ex_mode == &mode
+                );
+                if !can_adopt_declarative {
+                    return Err(crate::web_apis::create_dom_exception(
+                        vm,
+                        "NotSupportedError",
+                        "Shadow root cannot be created on a host which already hosts a shadow tree",
+                    ));
+                }
+                let old_children: Vec<NodeId> = doc.children(ex_sr).collect();
+                for ch in old_children {
+                    doc.remove_child(ch);
+                }
+                if let Some(NodeData::ShadowRoot { declarative, .. }) = doc.get_mut(ex_sr) {
+                    *declarative = false;
+                }
+                ex_sr
+            } else {
+                let sr = doc.new_node(NodeData::ShadowRoot {
+                    host: host_id,
+                    mode,
+                    delegates_focus,
+                    clonable,
+                    serializable,
+                    slot_assignment,
+                    declarative: false,
+                });
+                if let Some(NodeData::Element(e)) = doc.get_mut(host_id) {
+                    e.shadow_root = Some(sr);
+                }
+                sr
             }
-            sr
         };
+        h.borrow_mut().set_owner_doc(sr_id, owner_doc);
+        crate::shadow_dom::refresh_slots_for_shadow_root(&h, sr_id);
         Ok(wrap_node(vm, &h, sr_id))
     });
 
@@ -4909,6 +5020,47 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         Ok(body.map_or(JsValue::NULL, |b| wrap_node(vm, &h, b)))
     });
     define_host_accessor(vm, dp, "activeElement", Some(g_ae), None);
+
+    // HTML §3.1.3 Document tree accessors (`images`, `embeds`, `plugins`, `links`,
+    // `forms`, `scripts`, `applets`, `anchors`) — light tree only (never crossing into ShadowRoots).
+    for (prop, tags) in [
+        ("images", &["img"][..]),
+        ("embeds", &["embed"][..]),
+        ("plugins", &["embed"][..]),
+        ("forms", &["form"][..]),
+        ("scripts", &["script"][..]),
+        ("applets", &[][..]),
+        ("links", &["a", "area"][..]),
+        ("anchors", &["a"][..]),
+    ] {
+        let h = Rc::clone(host);
+        let prop_name = prop;
+        let g = vm.alloc_host_fn(prop, move |vm, t, _| {
+            let doc_id = require_node(vm, &h, t)?;
+            let matched: Vec<NodeId> = {
+                let doc_rc = Rc::clone(&h.borrow().document);
+                let doc = doc_rc.borrow();
+                doc.descendants(doc_id)
+                    .filter(|&id| match doc.get(id) {
+                        Some(NodeData::Element(e))
+                            if &*e.name.ns == crate::dom_interfaces::HTML_NS
+                                && tags.contains(&e.name.local.as_str()) =>
+                        {
+                            match prop_name {
+                                "links" => e.has_attribute("href"),
+                                "anchors" => e.has_attribute("name"),
+                                _ => true,
+                            }
+                        }
+                        _ => false,
+                    })
+                    .collect()
+            };
+            Ok(wrap_node_list(vm, &h, matched))
+        });
+        define_host_accessor(vm, dp, prop, Some(g), None);
+    }
+
     install_parent_node_mixin(vm, host, dp);
 
     // Document queries (per-document!)
@@ -5673,6 +5825,61 @@ pub(crate) fn install_child_node_mixin(vm: &mut JsVm, host: &SharedHost, proto: 
 }
 
 fn install_parent_node_mixin(vm: &mut JsVm, host: &SharedHost, proto: HeapHandle) {
+    // W3C DOM ParentNode element-child getters (`children`, `firstElementChild`,
+    // `lastElementChild`, `childElementCount`) on Element, Document, DocumentFragment, ShadowRoot.
+    let h = Rc::clone(host);
+    let g_ch = vm.alloc_host_fn("get children", move |vm, t, _| {
+        let parent = require_node(vm, &h, t)?;
+        Ok(crate::dom_collections::create_live_html_collection(
+            vm,
+            &h,
+            crate::dom_interfaces::HtmlCollectionKind::Children(parent),
+        ))
+    });
+    define_host_accessor(vm, proto, "children", Some(g_ch), None);
+
+    let h = Rc::clone(host);
+    let g_fec = vm.alloc_host_fn("get firstElementChild", move |vm, t, _| {
+        let parent = require_node(vm, &h, t)?;
+        let found = h.borrow().document.borrow().children(parent).find(|&c| {
+            matches!(
+                h.borrow().document.borrow().get(c),
+                Some(NodeData::Element(_))
+            )
+        });
+        Ok(found.map_or(JsValue::NULL, |n| wrap_node(vm, &h, n)))
+    });
+    define_host_accessor(vm, proto, "firstElementChild", Some(g_fec), None);
+
+    let h = Rc::clone(host);
+    let g_lec = vm.alloc_host_fn("get lastElementChild", move |vm, t, _| {
+        let parent = require_node(vm, &h, t)?;
+        let found = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            let kids: Vec<NodeId> = doc.children(parent).collect();
+            kids.into_iter()
+                .rev()
+                .find(|&c| matches!(doc.get(c), Some(NodeData::Element(_))))
+        };
+        Ok(found.map_or(JsValue::NULL, |n| wrap_node(vm, &h, n)))
+    });
+    define_host_accessor(vm, proto, "lastElementChild", Some(g_lec), None);
+
+    let h = Rc::clone(host);
+    let g_cec = vm.alloc_host_fn("get childElementCount", move |vm, t, _| {
+        let parent = require_node(vm, &h, t)?;
+        let cnt = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            doc.children(parent)
+                .filter(|&c| matches!(doc.get(c), Some(NodeData::Element(_))))
+                .count()
+        };
+        Ok(JsValue::from_i32(cnt as i32))
+    });
+    define_host_accessor(vm, proto, "childElementCount", Some(g_cec), None);
+
     let h = Rc::clone(host);
     define_host_method(vm, proto, "append", move |vm, t, args| {
         let parent = require_node(vm, &h, t)?;

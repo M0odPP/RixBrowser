@@ -405,6 +405,63 @@ impl<'a> BoxTreeBuilder<'a> {
             return Vec::new();
         }
 
+        // WHATWG Shadow DOM flat-tree slotting: an HTML `<slot>` inside a `ShadowRoot`
+        // lays out its assigned light-DOM slottables (or its own fallback children if none
+        // are assigned) directly as `display: contents` when not given an explicit box display.
+        if tag == "slot" && &*elem.name.ns == "http://www.w3.org/1999/xhtml" {
+            if let Some(sr_id) = self.doc.shadow_root_containing(node) {
+                if let Some(NodeData::ShadowRoot {
+                    host: shadow_host,
+                    slot_assignment,
+                    ..
+                }) = self.doc.get(sr_id)
+                {
+                    if slot_assignment == "named" {
+                        let slot_name = elem.get_attribute("name").unwrap_or("");
+                        // Only the FIRST `<slot>` with `slot_name` in tree order claims slottables.
+                        let is_first = self.doc.descendants(sr_id).find(|&id| {
+                            matches!(
+                                self.doc.get(id),
+                                Some(NodeData::Element(se))
+                                    if &*se.name.ns == "http://www.w3.org/1999/xhtml"
+                                        && &*se.name.local == "slot"
+                                        && se.get_attribute("name").unwrap_or("") == slot_name
+                            )
+                        }) == Some(node);
+                        let mut assigned = Vec::new();
+                        if is_first {
+                            for host_child in self.doc.children(*shadow_host) {
+                                let matches_slot = match self.doc.get(host_child) {
+                                    Some(NodeData::Element(ce)) => {
+                                        ce.get_attribute("slot").unwrap_or("") == slot_name
+                                    }
+                                    Some(NodeData::Text(_)) => slot_name.is_empty(),
+                                    _ => false,
+                                };
+                                if matches_slot {
+                                    assigned.push(host_child);
+                                }
+                            }
+                        }
+                        let sources: Vec<NodeId> = if assigned.is_empty() {
+                            self.doc.children(node).collect()
+                        } else {
+                            assigned
+                        };
+                        let mut flattened = Vec::new();
+                        for child in sources {
+                            flattened.extend(self.build_dom_node(
+                                child,
+                                parent_style,
+                                effective_lang.as_ref(),
+                            ));
+                        }
+                        return flattened;
+                    }
+                }
+            }
+        }
+
         // `display: contents` generates no box of its own; its children participate directly.
         // Per CSS Display L3 Appendix B, replaced elements with `display: contents` render as `none`.
         if style.display == DisplayMode::Contents {

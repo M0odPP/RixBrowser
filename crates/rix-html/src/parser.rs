@@ -617,8 +617,23 @@ fn attach_declarative_shadow_roots_in_subtree(doc: &mut Document, root: NodeId) 
                         let delegates_focus = elem.has_attribute("shadowrootdelegatesfocus");
                         let clonable = elem.has_attribute("shadowrootclonable");
                         let serializable = elem.has_attribute("shadowrootserializable");
+                        let slot_assignment = if elem
+                            .get_attribute("shadowrootslotassignment")
+                            .is_some_and(|s| s.eq_ignore_ascii_case("manual"))
+                        {
+                            "manual".to_string()
+                        } else {
+                            "named".to_string()
+                        };
                         let frag = elem.template_contents.unwrap_or(child);
-                        Some((mode_lower, delegates_focus, clonable, serializable, frag))
+                        Some((
+                            mode_lower,
+                            delegates_focus,
+                            clonable,
+                            serializable,
+                            slot_assignment,
+                            frag,
+                        ))
                     } else {
                         None
                     }
@@ -632,7 +647,9 @@ fn attach_declarative_shadow_roots_in_subtree(doc: &mut Document, root: NodeId) 
             None
         };
 
-        if let Some((mode_lower, delegates_focus, clonable, serializable, frag)) = template_info {
+        if let Some((mode_lower, delegates_focus, clonable, serializable, slot_assignment, frag)) =
+            template_info
+        {
             let parent = doc.parent(child);
             if let Some(parent) = parent {
                 if can_attach_declarative_shadow(doc, parent) {
@@ -642,6 +659,8 @@ fn attach_declarative_shadow_roots_in_subtree(doc: &mut Document, root: NodeId) 
                         delegates_focus,
                         clonable,
                         serializable,
+                        slot_assignment,
+                        declarative: true,
                     });
                     if let Some(NodeData::Element(parent_elem)) = doc.get_mut(parent) {
                         parent_elem.shadow_root = Some(shadow_root);
