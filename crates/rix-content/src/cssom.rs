@@ -555,7 +555,7 @@ fn normalize_single_media_query(raw: &str) -> String {
     clean
 }
 
-fn parse_media_query_list(raw: &str) -> Vec<String> {
+pub(crate) fn parse_media_query_list(raw: &str) -> Vec<String> {
     if raw.trim().is_empty() {
         return Vec::new();
     }
@@ -5704,6 +5704,9 @@ fn format_computed_property_resolved(
         "resize" => style.visual.resize.as_css_str().into(),
         "overscroll-behavior-x" => style.visual.overscroll_behavior_x.as_css_str().into(),
         "overscroll-behavior-y" => style.visual.overscroll_behavior_y.as_css_str().into(),
+        "scroll-behavior" => style.visual.scroll_behavior.as_css_str().into(),
+        "content-visibility" => style.visual.content_visibility.as_css_str().into(),
+        "zoom" => format!("{}", style.visual.zoom),
         "display" => style.display.to_css_string().into(),
         "overlay" => match style.overlay {
             rix_css::OverlayMode::None => "none",

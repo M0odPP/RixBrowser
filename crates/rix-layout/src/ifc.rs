@@ -1223,7 +1223,7 @@ fn finish_line(
                 };
                 emitted_pieces.push(Fragment {
                     box_id: piece.box_id,
-                    dom_node: None,
+                    dom_node: ctx.tree.get(piece.box_id).dom_node,
                     style,
                     border_rect: Rect::new(px, py, piece.width, piece.height),
                     padding: EdgeInsets::ZERO,

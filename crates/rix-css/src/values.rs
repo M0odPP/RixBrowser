@@ -1124,6 +1124,44 @@ impl OverscrollBehaviorMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[repr(u8)]
+pub enum ScrollBehaviorMode {
+    #[default]
+    Auto,
+    Smooth,
+}
+
+impl ScrollBehaviorMode {
+    #[must_use]
+    pub const fn as_css_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Smooth => "smooth",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ContentVisibilityMode {
+    #[default]
+    Visible,
+    Auto,
+    Hidden,
+}
+
+impl ContentVisibilityMode {
+    #[must_use]
+    pub const fn as_css_str(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Auto => "auto",
+            Self::Hidden => "hidden",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
 pub enum UserSelectMode {
     #[default]
     Auto,
