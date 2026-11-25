@@ -8,6 +8,7 @@
 
 pub mod canvas2d;
 pub mod cssom;
+pub mod cssom_geometry;
 pub mod custom_elements;
 pub mod dom_bridge;
 pub mod dom_collections;
@@ -223,6 +224,7 @@ impl ContentRuntime {
         trusted_types::install_trusted_types(&mut vm, &host, &events);
         dom_parsing::install_dom_parsing(&mut vm, &host, &events, &event_loop, &web_apis);
         cssom::install_cssom(&mut vm, &host);
+        cssom_geometry::install_cssom_geometry(&mut vm, &host);
         let streams = install_streams(&mut vm, &web_apis);
         let net = install_fetch_and_websocket(
             &mut vm,
