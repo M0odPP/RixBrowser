@@ -1929,6 +1929,9 @@ pub(crate) fn sync_iframe_node(
                 PropertyAttrs::METHOD,
                 &mut vm.shapes,
             );
+            crate::cssom_view::install_child_window_cssom_view(
+                vm, host, events, event_loop, proxy_h, cd_nid,
+            );
         }
 
         // Execute external & inline scripts inside the same-origin child iframe's isolated global.
