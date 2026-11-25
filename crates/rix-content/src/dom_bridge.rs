@@ -484,6 +484,35 @@ impl HostState {
         for &proto in self.css_rule_protos.values() {
             out.push(JsValue::from_object(proto));
         }
+        for sh in self.style_element_sheets.values() {
+            let st = sh.borrow();
+            if let Some(h) = st.js_handle {
+                out.push(JsValue::from_object(h));
+            }
+            if let Some(m) = st.media_proxy {
+                out.push(m);
+            }
+        }
+        for sh in &self.adopted_stylesheets {
+            let st = sh.borrow();
+            if let Some(h) = st.js_handle {
+                out.push(JsValue::from_object(h));
+            }
+            if let Some(m) = st.media_proxy {
+                out.push(m);
+            }
+        }
+        for list in self.shadow_dom.borrow().adopted_stylesheets.values() {
+            for sh in list {
+                let st = sh.borrow();
+                if let Some(h) = st.js_handle {
+                    out.push(JsValue::from_object(h));
+                }
+                if let Some(m) = st.media_proxy {
+                    out.push(m);
+                }
+            }
+        }
         if let Some(sel) = self.selection.selection_handle {
             out.push(JsValue::from_object(sel));
         }
@@ -509,8 +538,17 @@ impl HostState {
 
     /// Sweeps dead unpinned weak DOM wrappers and releases their tag table entries (zero leaks!).
     pub fn sweep_dead_wrappers(&mut self, heap: &GcHeap) -> usize {
-        self.stylesheet_handle_map
-            .retain(|h, _| heap.get_object(*h).is_some());
+        self.stylesheet_handle_map.retain(|h, sh| {
+            let alive = heap.get_object(*h).is_some();
+            if !alive {
+                if let Ok(mut st) = sh.try_borrow_mut() {
+                    if st.js_handle == Some(*h) {
+                        st.js_handle = None;
+                    }
+                }
+            }
+            alive
+        });
         self.selection
             .ranges
             .retain(|h, _| heap.get_object(*h).is_some());
@@ -623,7 +661,7 @@ impl HostState {
             return &self.style_ctx;
         }
 
-        let (inline_hash, maybe_sheets) = {
+        let (inline_hash, maybe_sheets, shadow_adopted_blocks) = {
             let doc = self.document.borrow();
             let mut h: u64 = 0xcbf2_9ce4_8422_2325;
             let mut css_blocks: Vec<(String, Option<NodeId>)> = Vec::new();
@@ -667,7 +705,25 @@ impl HostState {
                     }
                 }
             }
-            (h, css_blocks)
+            let mut shadow_adopted_blocks: HashMap<NodeId, Vec<String>> = HashMap::new();
+            for (&sr_id, list) in &self.shadow_dom.borrow().adopted_stylesheets {
+                let mut sr_css = Vec::new();
+                h = fnv_mix(h, &usize::from(sr_id).to_le_bytes());
+                for adopted in list {
+                    let st = adopted.borrow();
+                    if !st.disabled {
+                        let css = st.to_css_text();
+                        if !css.trim().is_empty() {
+                            h = fnv_mix(h, css.as_bytes());
+                            sr_css.push(css);
+                        }
+                    }
+                }
+                if !sr_css.is_empty() {
+                    shadow_adopted_blocks.insert(sr_id, sr_css);
+                }
+            }
+            (h, css_blocks, shadow_adopted_blocks)
         };
 
         if !self.sheets_dirty
@@ -724,6 +780,17 @@ impl HostState {
                     &media,
                 ));
             }
+        }
+        if !shadow_adopted_blocks.is_empty() {
+            let mut compiled_shadow: HashMap<NodeId, Vec<Arc<Stylesheet>>> = HashMap::new();
+            for (sr_id, blocks) in shadow_adopted_blocks {
+                let sheets = blocks
+                    .into_iter()
+                    .map(|css| Stylesheet::parse_cached(&css, CascadeOrigin::Author, &media))
+                    .collect();
+                compiled_shadow.insert(sr_id, sheets);
+            }
+            ctx.set_shadow_adopted_stylesheets(compiled_shadow);
         }
         {
             let mut doc = self.document.borrow_mut();
@@ -1005,12 +1072,22 @@ impl HostState {
         }
     }
 
-    /// Returns layout-resolved box metrics (`content_size`, `border_size`, `margin`, `padding`)
-    /// for CSSOM View §7.1 `getComputedStyle` resolved values (`width`, `height`, `margin-*`, `padding-*`).
+    /// Returns layout-resolved box metrics (`content_size`, `border_size`, `margin`, `padding`,
+    /// containing-block sizes, and used physical insets) for CSSOM View §7.1 `getComputedStyle`.
     pub fn resolved_layout_box_for_node(&mut self, node: NodeId) -> Option<ResolvedLayoutBox> {
+        let viewport = self.viewport;
         let tree = self.ensure_layout()?;
         let root = tree.root.as_ref()?;
-        find_fragment_metrics(root, root.content_rect.size, node)
+        let root_pad_rect = Rect::new(0.0, 0.0, viewport.width, viewport.height);
+        find_fragment_metrics(
+            root,
+            root.content_rect.size,
+            root_pad_rect,
+            viewport,
+            viewport,
+            true,
+            node,
+        )
     }
 
     /// Resolves the CSS Values L3 §5.1.1 `1ch` advance measure (`"0"` glyph width) for `style`.
@@ -1259,27 +1336,76 @@ pub struct ResolvedLayoutBox {
     pub padding: EdgeInsets,
     pub margin: EdgeInsets,
     pub parent_content_size: Size,
+    pub cb_padding_size: Size,
+    pub scroll_container_content_size: Size,
+    pub used_insets: EdgeInsets,
     pub resolved_grid_tracks: Option<Arc<rix_layout::ResolvedGridTracks>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn find_fragment_metrics(
     frag: &Fragment,
     parent_content_size: Size,
+    parent_padding_rect: Rect,
+    scroll_container_content_size: Size,
+    viewport: Size,
+    is_parent_root: bool,
     target: NodeId,
 ) -> Option<ResolvedLayoutBox> {
     if frag.dom_node == Some(target) {
+        let (cb_origin, cb_padding_size) =
+            if is_parent_root && frag.style.position == rix_css::PositionMode::Fixed {
+                (Point::ZERO, viewport)
+            } else {
+                (parent_padding_rect.origin, parent_padding_rect.size)
+            };
+        let x_rel = frag.border_rect.origin.x - cb_origin.x;
+        let y_rel = frag.border_rect.origin.y - cb_origin.y;
+        let used_insets = EdgeInsets {
+            top: y_rel - frag.margin.top,
+            left: x_rel - frag.margin.left,
+            bottom: cb_padding_size.height
+                - (y_rel + frag.border_rect.size.height + frag.margin.bottom),
+            right: cb_padding_size.width
+                - (x_rel + frag.border_rect.size.width + frag.margin.right),
+        };
         return Some(ResolvedLayoutBox {
             content_size: frag.content_rect.size,
             border_size: frag.border_rect.size,
             padding: frag.padding,
             margin: frag.margin,
             parent_content_size,
+            cb_padding_size,
+            scroll_container_content_size,
+            used_insets,
             resolved_grid_tracks: frag.resolved_grid_tracks.clone(),
         });
     }
     let next_parent = frag.content_rect.size;
+    let next_padding_rect = Rect::new(
+        frag.border.left,
+        frag.border.top,
+        frag.content_rect.size.width + frag.padding.left + frag.padding.right,
+        frag.content_rect.size.height + frag.padding.top + frag.padding.bottom,
+    );
+    let next_scroll = if rix_layout::is_scroll_axis(frag.style.overflow.x)
+        || rix_layout::is_scroll_axis(frag.style.overflow.y)
+    {
+        frag.content_rect.size
+    } else {
+        scroll_container_content_size
+    };
+    let next_is_root = frag.dom_node.is_none() && is_parent_root;
     for child in frag.children.iter() {
-        if let Some(found) = find_fragment_metrics(child, next_parent, target) {
+        if let Some(found) = find_fragment_metrics(
+            child,
+            next_parent,
+            next_padding_rect,
+            next_scroll,
+            viewport,
+            next_is_root,
+            target,
+        ) {
             return Some(found);
         }
     }
