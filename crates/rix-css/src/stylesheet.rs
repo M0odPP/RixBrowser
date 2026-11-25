@@ -1366,6 +1366,8 @@ pub enum CssomRuleKind {
         rules: Vec<CssomRuleKind>,
     },
     Container {
+        container_name: Option<String>,
+        container_query: String,
         condition_text: String,
         rules: Vec<CssomRuleKind>,
     },
@@ -1385,9 +1387,21 @@ pub enum CssomRuleKind {
         prefix: Option<String>,
         url: String,
     },
+    FontFace {
+        declarations_text: String,
+    },
+    Page {
+        selector_text: String,
+        declarations_text: String,
+        rules: Vec<CssomRuleKind>,
+    },
     Keyframes {
         name: String,
-        body_text: String,
+        rules: Vec<CssomRuleKind>,
+    },
+    Keyframe {
+        key_text: String,
+        declarations_text: String,
     },
     Property {
         name: String,
@@ -1451,7 +1465,7 @@ fn serialize_grouping_block(
 }
 
 impl CssomRuleKind {
-    /// Returns child rules if this is a `CSSGroupingRule` (including `CSSStyleRule`).
+    /// Returns child rules if this is a `CSSGroupingRule` (including `CSSStyleRule`, `CSSPageRule`, `CSSKeyframesRule`).
     #[must_use]
     pub fn child_rules(&self) -> Option<&[CssomRuleKind]> {
         match self {
@@ -1460,12 +1474,14 @@ impl CssomRuleKind {
             | Self::Supports { rules, .. }
             | Self::Container { rules, .. }
             | Self::LayerBlock { rules, .. }
-            | Self::Scope { rules, .. } => Some(rules),
+            | Self::Scope { rules, .. }
+            | Self::Page { rules, .. }
+            | Self::Keyframes { rules, .. } => Some(rules),
             _ => None,
         }
     }
 
-    /// Returns mutable child rules if this is a `CSSGroupingRule` (including `CSSStyleRule`).
+    /// Returns mutable child rules if this is a `CSSGroupingRule` (including `CSSStyleRule`, `CSSPageRule`, `CSSKeyframesRule`).
     pub fn child_rules_mut(&mut self) -> Option<&mut Vec<CssomRuleKind>> {
         match self {
             Self::Style { rules, .. }
@@ -1473,30 +1489,46 @@ impl CssomRuleKind {
             | Self::Supports { rules, .. }
             | Self::Container { rules, .. }
             | Self::LayerBlock { rules, .. }
-            | Self::Scope { rules, .. } => Some(rules),
+            | Self::Scope { rules, .. }
+            | Self::Page { rules, .. }
+            | Self::Keyframes { rules, .. } => Some(rules),
             _ => None,
         }
     }
 
-    /// Returns the declaration text for `Style` or `NestedDeclarations` rules.
+    /// Returns the declaration text for `Style`, `NestedDeclarations`, `Page`, `FontFace`, or `Keyframe` rules.
     #[must_use]
     pub fn declarations_text(&self) -> Option<&str> {
         match self {
             Self::Style {
                 declarations_text, ..
             }
-            | Self::NestedDeclarations { declarations_text } => Some(declarations_text),
+            | Self::NestedDeclarations { declarations_text }
+            | Self::Page {
+                declarations_text, ..
+            }
+            | Self::FontFace { declarations_text }
+            | Self::Keyframe {
+                declarations_text, ..
+            } => Some(declarations_text),
             _ => None,
         }
     }
 
-    /// Returns mutable declaration text for `Style` or `NestedDeclarations` rules.
+    /// Returns mutable declaration text for `Style`, `NestedDeclarations`, `Page`, `FontFace`, or `Keyframe` rules.
     pub fn declarations_text_mut(&mut self) -> Option<&mut String> {
         match self {
             Self::Style {
                 declarations_text, ..
             }
-            | Self::NestedDeclarations { declarations_text } => Some(declarations_text),
+            | Self::NestedDeclarations { declarations_text }
+            | Self::Page {
+                declarations_text, ..
+            }
+            | Self::FontFace { declarations_text }
+            | Self::Keyframe {
+                declarations_text, ..
+            } => Some(declarations_text),
             _ => None,
         }
     }
@@ -1552,6 +1584,7 @@ impl CssomRuleKind {
             Self::Container {
                 condition_text,
                 rules,
+                ..
             } => serialize_grouping_block(
                 &format!("@container {condition_text}"),
                 None,
@@ -1588,10 +1621,181 @@ impl CssomRuleKind {
                     _ => format!("@namespace url(\"{escaped}\");"),
                 }
             }
-            Self::Keyframes { name, body_text } => format!("@keyframes {name} {{ {body_text} }}"),
+            Self::FontFace { declarations_text } => {
+                let d = declarations_text.trim();
+                if d.is_empty() {
+                    "@font-face { }".to_string()
+                } else {
+                    format!("@font-face {{ {d} }}")
+                }
+            }
+            Self::Page {
+                selector_text,
+                declarations_text,
+                rules,
+            } => {
+                let header = if selector_text.is_empty() {
+                    "@page".to_string()
+                } else {
+                    format!("@page {selector_text}")
+                };
+                serialize_grouping_block(&header, Some(declarations_text), rules, true)
+            }
+            Self::Keyframes { name, rules } => {
+                let ser_name = serialize_keyframes_name(name);
+                if rules.is_empty() {
+                    format!("@keyframes {ser_name} {{ }}")
+                } else {
+                    let body = rules
+                        .iter()
+                        .map(Self::to_css_text)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!("@keyframes {ser_name} {{ {body} }}")
+                }
+            }
+            Self::Keyframe {
+                key_text,
+                declarations_text,
+            } => {
+                let d = declarations_text.trim();
+                if d.is_empty() {
+                    format!("{key_text} {{ }}")
+                } else {
+                    format!("{key_text} {{ {d} }}")
+                }
+            }
             Self::Property { css_text, .. } | Self::Other { css_text } => css_text.clone(),
         }
     }
+}
+
+fn serialize_keyframes_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let is_reserved = matches!(
+        lower.as_str(),
+        "initial" | "inherit" | "unset" | "revert" | "revert-layer" | "none" | "default"
+    );
+    let is_valid_ident = !name.is_empty()
+        && !is_reserved
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii());
+    if is_valid_ident {
+        name.to_string()
+    } else {
+        let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    }
+}
+
+/// Parses and canonically serializes a CSS Paged Media L3 `@page` selector list
+/// (`<page-selector-list>`). Returns `None` if syntactically invalid.
+#[must_use]
+pub fn parse_and_serialize_page_selector(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some(String::new());
+    }
+    let mut out = Vec::new();
+    for part in trimmed.split(',') {
+        let item = part.trim();
+        if item.is_empty() || item.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let mut chunks = item.split(':');
+        let page_name = chunks.next().unwrap_or("");
+        if !page_name.is_empty() {
+            let first = page_name.chars().next()?;
+            if first.is_ascii_digit()
+                || !page_name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii())
+            {
+                return None;
+            }
+        }
+        let mut serialized = page_name.to_string();
+        let mut saw_pseudo = false;
+        for pseudo in chunks {
+            saw_pseudo = true;
+            let low = pseudo.to_ascii_lowercase();
+            if !matches!(low.as_str(), "left" | "right" | "first" | "blank") {
+                return None;
+            }
+            serialized.push(':');
+            serialized.push_str(&low);
+        }
+        if page_name.is_empty() && !saw_pseudo {
+            return None;
+        }
+        out.push(serialized);
+    }
+    Some(out.join(", "))
+}
+
+/// Parses and canonically serializes a CSS Animations L1 keyframe selector list
+/// (`from` -> `0%`, `to` -> `100%`, comma-separated percentages). Returns `None` if invalid.
+#[must_use]
+pub fn parse_and_serialize_keyframe_selector(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for part in trimmed.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            return None;
+        }
+        if p.eq_ignore_ascii_case("from") {
+            out.push("0%".to_string());
+        } else if p.eq_ignore_ascii_case("to") {
+            out.push("100%".to_string());
+        } else {
+            let num_str = p.strip_suffix('%')?;
+            if num_str.is_empty() || num_str.chars().any(char::is_whitespace) {
+                return None;
+            }
+            let val: f64 = num_str.parse().ok()?;
+            if !val.is_finite() || !(0.0..=100.0).contains(&val) {
+                return None;
+            }
+            let norm = if val == 0.0 { 0.0 } else { val };
+            out.push(format!("{}%", crate::values_math::format_math_f64(norm)));
+        }
+    }
+    Some(out.join(", "))
+}
+
+/// Parses a single `@keyframes` child rule (`<keyframe-selector> { <decls> }`) for
+/// `CSSKeyframesRule.appendRule()`. Returns `None` if syntactically invalid or trailing garbage exists.
+#[must_use]
+pub fn parse_single_keyframe_rule(raw: &str) -> Option<CssomRuleKind> {
+    let trimmed = raw.trim();
+    let (raw_sel, raw_body) = split_single_style_rule(trimmed)?;
+    let key_text = parse_and_serialize_keyframe_selector(raw_sel)?;
+    let body_trimmed = raw_body.trim();
+    let declarations_text = if body_trimmed.is_empty() {
+        String::new()
+    } else {
+        let rewritten = crate::properties::rewrite_dynamic_var_names(body_trimmed);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let opts = ParserOptions {
+                error_recovery: true,
+                ..ParserOptions::default()
+            };
+            lightningcss::declaration::DeclarationBlock::parse_string(&rewritten, opts)
+                .map(|b| serialize_lightning_decl_block_cssom(&b, Some(body_trimmed)))
+                .unwrap_or_else(|_| body_trimmed.to_string())
+        }))
+        .unwrap_or_else(|_| body_trimmed.to_string())
+    };
+    Some(CssomRuleKind::Keyframe {
+        key_text,
+        declarations_text,
+    })
 }
 
 fn lightning_to_css_string<T: LightningToCss>(val: &T) -> String {
@@ -1632,7 +1836,8 @@ fn serialize_lightning_decl_block_cssom(
         if trimmed.is_empty() {
             return;
         }
-        // Normalize `prop:val` -> `prop: val` for custom properties emitted without space by lightningcss.
+        // Normalize `prop:val` -> `prop: val` for custom properties emitted without space by lightningcss,
+        // and canonicalize unitless `0` -> `0px` on length-valued properties.
         let formatted = if let Some((k, v)) = trimmed.split_once(':') {
             let k_t = k.trim();
             if k_t.starts_with("--") {
@@ -1641,6 +1846,16 @@ fn serialize_lightning_decl_block_cssom(
                 } else {
                     format!("{k_t}: {v}")
                 }
+            } else if crate::cssom_decl::prop_name_uses_zero_px(k_t) {
+                let v_t = v.trim();
+                let (val_part, imp_part) = match v_t.rsplit_once('!') {
+                    Some((before, after)) if after.trim().eq_ignore_ascii_case("important") => {
+                        (before.trim(), " !important")
+                    }
+                    _ => (v_t, ""),
+                };
+                let norm = crate::cssom_decl::canonicalize_zero_lengths_pub(val_part);
+                format!("{k_t}: {norm}{imp_part}")
             } else {
                 trimmed.to_string()
             }
@@ -2181,16 +2396,16 @@ fn convert_lightning_rule_to_cssom(
             rules: convert_lightning_rule_list_to_cssom(&sr.rules, namespaces, nesting, source_css),
         }),
         CssRule::Container(cr) => {
-            let cond = match &cr.name {
-                Some(name) => format!(
-                    "{} {}",
-                    lightning_to_css_string(name),
-                    lightning_to_css_string(&cr.condition)
-                ),
-                None => lightning_to_css_string(&cr.condition),
+            let container_name = cr.name.as_ref().map(lightning_to_css_string);
+            let container_query = lightning_to_css_string(&cr.condition);
+            let condition_text = match &container_name {
+                Some(name) => format!("{name} {container_query}"),
+                None => container_query.clone(),
             };
             Ok(CssomRuleKind::Container {
-                condition_text: cond,
+                container_name,
+                container_query,
+                condition_text,
                 rules: convert_lightning_rule_list_to_cssom(
                     &cr.rules, namespaces, nesting, source_css,
                 ),
@@ -2261,26 +2476,181 @@ fn convert_lightning_rule_to_cssom(
                 ),
             })
         }
+        CssRule::FontFace(ff) => {
+            let full = lightning_to_css_string(ff);
+            let body = full
+                .find('{')
+                .and_then(|s| full.rfind('}').map(|e| &full[s + 1..e]))
+                .unwrap_or("");
+            let declarations_text = body.split_whitespace().collect::<Vec<_>>().join(" ");
+            Ok(CssomRuleKind::FontFace { declarations_text })
+        }
+        CssRule::Page(pr) => {
+            let raw_prelude =
+                extract_raw_at_rule_prelude(source_css, pr.loc.line, pr.loc.column).unwrap_or("");
+            let selector_text =
+                parse_and_serialize_page_selector(raw_prelude).unwrap_or_else(|| {
+                    pr.selectors
+                        .iter()
+                        .map(lightning_to_css_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                });
+            let decl_hint = extract_rule_decls_slice(source_css, pr.loc.line, pr.loc.column, false);
+            let declarations_text = serialize_page_decl_block(&pr.declarations, decl_hint);
+            Ok(CssomRuleKind::Page {
+                selector_text,
+                declarations_text,
+                rules: Vec::new(),
+            })
+        }
         CssRule::Keyframes(kf) => {
             let name = match &kf.name {
                 KeyframesName::Ident(id) => id.as_ref().to_string(),
                 KeyframesName::Custom(s) => s.as_ref().to_string(),
             };
-            let full = lightning_to_css_string(kf);
-            let body_text = full
-                .find('{')
-                .and_then(|s| full.rfind('}').map(|e| full[s + 1..e].trim().to_string()))
-                .unwrap_or_default();
-            Ok(CssomRuleKind::Keyframes { name, body_text })
+            let mut rules = Vec::with_capacity(kf.keyframes.len());
+            for frame in &kf.keyframes {
+                let key_text = frame
+                    .selectors
+                    .iter()
+                    .map(|sel| match sel {
+                        KeyframeSelector::From => "0%".to_string(),
+                        KeyframeSelector::To => "100%".to_string(),
+                        KeyframeSelector::Percentage(p) => {
+                            let pct = (f64::from(p.0) * 100.0 * 1e6).round() / 1e6;
+                            format!("{}%", crate::values_math::format_math_f64(pct))
+                        }
+                        KeyframeSelector::TimelineRangePercentage(_) => {
+                            lightning_to_css_string(sel)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let declarations_text =
+                    serialize_lightning_decl_block_cssom(&frame.declarations, None);
+                rules.push(CssomRuleKind::Keyframe {
+                    key_text,
+                    declarations_text,
+                });
+            }
+            Ok(CssomRuleKind::Keyframes { name, rules })
         }
         CssRule::Property(pr) => Ok(CssomRuleKind::Property {
             name: pr.name.as_ref().to_string(),
             css_text: lightning_to_css_string(pr),
         }),
-        CssRule::Ignored => Err(CssomParseError::SyntaxError("Ignored CSS rule".to_string())),
+        CssRule::CounterStyle(cs) => {
+            let collapsed = lightning_to_css_string(cs)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            Ok(CssomRuleKind::Other {
+                css_text: collapsed,
+            })
+        }
+        CssRule::Ignored | CssRule::Unknown(_) => {
+            Err(CssomParseError::SyntaxError("Ignored CSS rule".to_string()))
+        }
         other => Ok(CssomRuleKind::Other {
             css_text: lightning_to_css_string(other),
         }),
+    }
+}
+
+fn serialize_page_decl_block(
+    block: &lightningcss::declaration::DeclarationBlock<'_>,
+    raw_hint: Option<&str>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(raw) = raw_hint {
+        for piece in raw.split(';') {
+            let p = piece.trim();
+            if p.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = p.split_once(':') {
+                let key = k.trim().to_ascii_lowercase();
+                let val = v.trim();
+                if let Some(ser) = validate_and_serialize_page_descriptor(&key, val) {
+                    if key == "margin" {
+                        if let Some(exp) =
+                            crate::cssom_decl::parse_and_expand_declaration("margin", val)
+                        {
+                            for (lk, lv) in exp {
+                                parts.push(format!("{lk}: {lv};"));
+                            }
+                            continue;
+                        }
+                    }
+                    parts.push(format!("{key}: {ser};"));
+                }
+            }
+        }
+        if !parts.is_empty() {
+            return parts.join(" ");
+        }
+    }
+    serialize_lightning_decl_block_cssom(block, raw_hint)
+}
+
+/// Validates and canonically serializes a CSS Paged Media L3 `@page` descriptor
+/// (`size`, `page-orientation`, `margin`, `margin-top/right/bottom/left`).
+#[must_use]
+pub fn validate_and_serialize_page_descriptor(name: &str, value: &str) -> Option<String> {
+    let key = name.trim().to_ascii_lowercase();
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    match key.as_str() {
+        "page-orientation" => {
+            matches!(lower.as_str(), "upright" | "rotate-left" | "rotate-right").then_some(lower)
+        }
+        "size" => {
+            if matches!(lower.as_str(), "auto" | "portrait" | "landscape") {
+                return Some(lower);
+            }
+            let toks: Vec<&str> = lower.split_ascii_whitespace().collect();
+            if toks.is_empty() || toks.len() > 2 {
+                return None;
+            }
+            const PAGE_SIZES: &[&str] = &[
+                "a5", "a4", "a3", "b5", "b4", "jis-b5", "jis-b4", "letter", "legal", "ledger",
+            ];
+            let is_orient = |s: &str| matches!(s, "portrait" | "landscape");
+            let is_page_size = |s: &str| PAGE_SIZES.contains(&s);
+            let is_len = |s: &str| {
+                crate::cssom_decl::parse_and_serialize_declaration("width", s)
+                    .is_some_and(|v| !matches!(v.as_str(), "auto" | "min-content" | "max-content"))
+            };
+            if toks.len() == 1 {
+                if is_page_size(toks[0]) {
+                    return Some(toks[0].to_string());
+                }
+                if is_len(toks[0]) {
+                    return crate::cssom_decl::parse_and_serialize_declaration("width", toks[0]);
+                }
+                return None;
+            }
+            if is_page_size(toks[0]) && is_orient(toks[1]) {
+                return Some(format!("{} {}", toks[0], toks[1]));
+            }
+            if is_orient(toks[0]) && is_page_size(toks[1]) {
+                return Some(format!("{} {}", toks[1], toks[0]));
+            }
+            if is_len(toks[0]) && is_len(toks[1]) {
+                let a = crate::cssom_decl::parse_and_serialize_declaration("width", toks[0])?;
+                let b = crate::cssom_decl::parse_and_serialize_declaration("width", toks[1])?;
+                return Some(if a == b { a } else { format!("{a} {b}") });
+            }
+            None
+        }
+        "margin" | "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
+            crate::cssom_decl::parse_and_serialize_declaration(&key, trimmed)
+        }
+        _ => None,
     }
 }
 
@@ -2451,6 +2821,23 @@ pub fn parse_single_cssom_rule_with_context(
                 declarations_text,
                 rules: Vec::new(),
             });
+        }
+    }
+
+    // Handle `@media {}` (empty media query list) which lightningcss rejects in strict mode.
+    if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("@media") {
+        if let Some((prelude, body)) = split_single_style_rule(trimmed) {
+            if prelude[6..].trim().is_empty() {
+                let rules = if body.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    parse_cssom_rules(body)
+                };
+                return Ok(CssomRuleKind::Media {
+                    condition_text: String::new(),
+                    rules,
+                });
+            }
         }
     }
 

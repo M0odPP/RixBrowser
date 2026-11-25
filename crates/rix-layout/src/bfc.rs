@@ -428,7 +428,42 @@ pub fn layout_block_box(
     let mut collapsed_top = resolved_margin.top;
     let mut collapsed_bottom = resolved_margin.bottom;
 
+    let is_x_start_right = (!is_vert_box && style.text.direction == rix_css::DirectionMode::Rtl)
+        || matches!(
+            style.text.writing_mode,
+            rix_css::WritingMode::VerticalRl | rix_css::WritingMode::SidewaysRl
+        );
+    let is_y_start_bottom = is_vert_box && style.text.direction == rix_css::DirectionMode::Rtl;
+    let all_children_oof = !children_ids.is_empty()
+        && children_ids
+            .iter()
+            .all(|&cid| ctx.tree.get(cid).is_out_of_flow);
+
     let content_height = if children_ids.is_empty() {
+        0.0
+    } else if all_children_oof {
+        let static_x = if is_x_start_right {
+            content_origin_x + content_width
+        } else {
+            content_origin_x
+        };
+        let static_y = if is_y_start_bottom {
+            content_origin_y + definite_height.unwrap_or(0.0)
+        } else {
+            content_origin_y
+        };
+        for cid in children_ids {
+            let child_box = ctx.tree.get(cid);
+            ctx.pending_oof.push(PendingOof {
+                box_id: cid,
+                static_pos: Point::new(static_x, static_y),
+                is_fixed: child_box.style.position == PositionMode::Fixed,
+                static_x_is_end: is_x_start_right,
+                static_y_is_end: is_y_start_bottom,
+                flex_hint: None,
+                grid_hint: None,
+            });
+        }
         0.0
     } else if !has_in_flow_blocks {
         // Pure Inline Formatting Context inside this block container!
@@ -493,11 +528,22 @@ pub fn layout_block_box(
         for cid in children_ids {
             let child_box = ctx.tree.get(cid);
             if child_box.is_out_of_flow {
-                let static_y = content_origin_y + cursor_y + prev_margin_bottom.unwrap_or(0.0);
+                let static_x = if is_x_start_right {
+                    content_origin_x + content_width
+                } else {
+                    content_origin_x
+                };
+                let static_y = if is_y_start_bottom {
+                    content_origin_y + definite_height.unwrap_or(cursor_y)
+                } else {
+                    content_origin_y + cursor_y + prev_margin_bottom.unwrap_or(0.0)
+                };
                 ctx.pending_oof.push(PendingOof {
                     box_id: cid,
-                    static_pos: Point::new(content_origin_x, static_y),
+                    static_pos: Point::new(static_x, static_y),
                     is_fixed: child_box.style.position == PositionMode::Fixed,
+                    static_x_is_end: is_x_start_right,
+                    static_y_is_end: is_y_start_bottom,
                     flex_hint: None,
                     grid_hint: None,
                 });
@@ -591,7 +637,18 @@ pub fn layout_block_box(
                 cursor_y = local_floats.clear_y(child_clear, cursor_y);
             }
 
-            let mut x_offset = frag.margin.left;
+            let child_m_auto_x = matches!(
+                child_box.style.box_model.margin.left,
+                LengthPercentageAuto::Auto
+            ) || matches!(
+                child_box.style.box_model.margin.right,
+                LengthPercentageAuto::Auto
+            );
+            let mut x_offset = if is_x_start_right && !child_m_auto_x {
+                content_width - frag.margin.right - frag.border_rect.size.width
+            } else {
+                frag.margin.left
+            };
             if child_is_bfc && !local_floats.is_empty() {
                 let (lx, _) = local_floats.available_band(
                     cursor_y,
@@ -600,9 +657,18 @@ pub fn layout_block_box(
                 );
                 x_offset = lx + frag.margin.left;
             }
+            let y_offset = if is_y_start_bottom {
+                if let Some(dh) = definite_height {
+                    dh - frag.margin.bottom - frag.border_rect.size.height
+                } else {
+                    cursor_y
+                }
+            } else {
+                cursor_y
+            };
 
             frag.border_rect.origin =
-                Point::new(content_origin_x + x_offset, content_origin_y + cursor_y);
+                Point::new(content_origin_x + x_offset, content_origin_y + y_offset);
             apply_relative_offset(&mut frag, child_space);
             offset_pending_oof(
                 &mut ctx.pending_oof,

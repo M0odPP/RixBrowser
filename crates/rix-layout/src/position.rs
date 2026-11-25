@@ -31,6 +31,10 @@ pub struct PendingOof {
     /// Hypothetical static position relative to the current ancestor's border-box origin.
     pub static_pos: Point,
     pub is_fixed: bool,
+    /// True when `static_pos.x` anchors the box's physical right margin edge (horizontal RTL / vertical-rl).
+    pub static_x_is_end: bool,
+    /// True when `static_pos.y` anchors the box's physical bottom margin edge (vertical-lr/rl + RTL).
+    pub static_y_is_end: bool,
     /// Optional CSS Flexbox L1 §4.1 static-position alignment hint when direct child of a flex container.
     pub flex_hint: Option<crate::flex::FlexAbsposHint>,
     /// Optional CSS Grid L1 §9 grid-area CB & static-position hint when direct child of a grid container.
@@ -154,6 +158,7 @@ enum AxisAnchor {
     Start(f32),
     End(f32),
     Static(f32),
+    StaticEnd(f32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +220,7 @@ fn compute_imcb_axis(
     lo_inset: Option<f32>,
     hi_inset: Option<f32>,
     static_pos: f32,
+    static_is_end: bool,
     align: ResolvedAlign,
 ) -> ImcbAxis {
     match (lo_inset, hi_inset) {
@@ -255,16 +261,30 @@ fn compute_imcb_axis(
             anchor: AxisAnchor::End(cb_size - hi),
         },
         (None, None) => {
-            let avail = if static_pos >= 0.0 && static_pos <= cb_size {
-                (cb_size - static_pos).max(0.0)
+            if static_is_end {
+                let avail = if static_pos >= 0.0 && static_pos <= cb_size {
+                    static_pos.max(0.0)
+                } else {
+                    cb_size.max(0.0)
+                };
+                ImcbAxis {
+                    start: 0.0,
+                    size: avail,
+                    both_specified: false,
+                    anchor: AxisAnchor::StaticEnd(static_pos),
+                }
             } else {
-                cb_size.max(0.0)
-            };
-            ImcbAxis {
-                start: static_pos,
-                size: avail,
-                both_specified: false,
-                anchor: AxisAnchor::Static(static_pos),
+                let avail = if static_pos >= 0.0 && static_pos <= cb_size {
+                    (cb_size - static_pos).max(0.0)
+                } else {
+                    cb_size.max(0.0)
+                };
+                ImcbAxis {
+                    start: static_pos,
+                    size: avail,
+                    both_specified: false,
+                    anchor: AxisAnchor::Static(static_pos),
+                }
             }
         }
     }
@@ -329,6 +349,11 @@ fn solve_axis_position(
             let rl = if m_lo_auto { 0.0 } else { m_lo };
             let rh = if m_hi_auto { 0.0 } else { m_hi };
             (st + rl, rl, rh)
+        }
+        AxisAnchor::StaticEnd(st) => {
+            let rl = if m_lo_auto { 0.0 } else { m_lo };
+            let rh = if m_hi_auto { 0.0 } else { m_hi };
+            (st - rh - box_size, rl, rh)
         }
     }
 }
@@ -419,8 +444,22 @@ pub fn layout_out_of_flow_box(
     let static_rel_x = entry.static_pos.x - cb.rect.origin.x;
     let static_rel_y = entry.static_pos.y - cb.rect.origin.y;
 
-    let imcb_x = compute_imcb_axis(cb_w, left, right, static_rel_x, x_align);
-    let imcb_y = compute_imcb_axis(cb_h, top, bottom, static_rel_y, y_align);
+    let imcb_x = compute_imcb_axis(
+        cb_w,
+        left,
+        right,
+        static_rel_x,
+        entry.static_x_is_end,
+        x_align,
+    );
+    let imcb_y = compute_imcb_axis(
+        cb_h,
+        top,
+        bottom,
+        static_rel_y,
+        entry.static_y_is_end,
+        y_align,
+    );
 
     let m_left_auto = matches!(style.box_model.margin.left, LengthPercentageAuto::Auto);
     let m_right_auto = matches!(style.box_model.margin.right, LengthPercentageAuto::Auto);
@@ -592,10 +631,16 @@ pub fn layout_out_of_flow_box(
             style.text.writing_mode,
             style.text.direction,
         );
-        if matches!(final_imcb_x.anchor, AxisAnchor::Static(_)) {
+        if matches!(
+            final_imcb_x.anchor,
+            AxisAnchor::Static(_) | AxisAnchor::StaticEnd(_)
+        ) {
             final_imcb_x.anchor = AxisAnchor::Static(flex_static.x - cb.rect.origin.x);
         }
-        if matches!(final_imcb_y.anchor, AxisAnchor::Static(_)) {
+        if matches!(
+            final_imcb_y.anchor,
+            AxisAnchor::Static(_) | AxisAnchor::StaticEnd(_)
+        ) {
             final_imcb_y.anchor = AxisAnchor::Static(flex_static.y - cb.rect.origin.y);
         }
     } else if let Some(gh) = entry.grid_hint {
@@ -623,10 +668,16 @@ pub fn layout_out_of_flow_box(
             style.text.writing_mode,
             style.text.direction,
         );
-        if matches!(final_imcb_x.anchor, AxisAnchor::Static(_)) {
+        if matches!(
+            final_imcb_x.anchor,
+            AxisAnchor::Static(_) | AxisAnchor::StaticEnd(_)
+        ) {
             final_imcb_x.anchor = AxisAnchor::Static(grid_static.x - cb.rect.origin.x);
         }
-        if matches!(final_imcb_y.anchor, AxisAnchor::Static(_)) {
+        if matches!(
+            final_imcb_y.anchor,
+            AxisAnchor::Static(_) | AxisAnchor::StaticEnd(_)
+        ) {
             final_imcb_y.anchor = AxisAnchor::Static(grid_static.y - cb.rect.origin.y);
         }
     }
