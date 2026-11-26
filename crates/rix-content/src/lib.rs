@@ -42,6 +42,7 @@ mod streams_transform;
 mod streams_writable;
 pub(crate) mod structured_clone;
 pub mod trusted_types;
+pub mod url_pattern;
 pub mod web_animations;
 mod web_animations_core;
 mod web_animations_timing;
@@ -828,6 +829,14 @@ impl ContentRuntime {
         let mut errors = Vec::new();
         let mut deferred_scripts: Vec<PendingScript> = Vec::new();
         let mut inline_module_idx: usize = 0;
+        let html_has_dsd = html
+            .as_bytes()
+            .windows(14)
+            .any(|w| w.eq_ignore_ascii_case(b"shadowrootmode"));
+        let html_has_iframe = html
+            .as_bytes()
+            .windows(7)
+            .any(|w| w.eq_ignore_ascii_case(b"<iframe"));
 
         loop {
             let step = parser.borrow_mut().step();
@@ -922,22 +931,37 @@ impl ContentRuntime {
                     } else {
                         // Attach any declarative shadow roots and upgrade parser-created
                         // custom elements parsed prior to this inline script (HTML §13.2.6.1).
-                        let doc_root = {
+                        if html_has_dsd {
                             let doc_cell = Rc::clone(&self.host.borrow().document);
                             let mut doc = doc_cell.borrow_mut();
                             attach_declarative_shadow_roots(&mut doc);
-                            doc.root()
-                        };
-                        custom_elements::upgrade_subtree(&mut self.vm, &self.host, doc_root, false);
-                        sync_all_iframes_in_document(
-                            &mut self.vm,
-                            &self.host,
-                            &self.events,
-                            &self.event_loop,
-                            &self.web_apis,
-                            &self.net,
-                            &self.frames,
-                        );
+                        }
+                        if self
+                            .host
+                            .borrow()
+                            .custom_elements_state
+                            .borrow()
+                            .has_any_definitions()
+                        {
+                            let doc_root = self.host.borrow().document.borrow().root();
+                            custom_elements::upgrade_subtree(
+                                &mut self.vm,
+                                &self.host,
+                                doc_root,
+                                false,
+                            );
+                        }
+                        if html_has_iframe {
+                            sync_all_iframes_in_document(
+                                &mut self.vm,
+                                &self.host,
+                                &self.events,
+                                &self.event_loop,
+                                &self.web_apis,
+                                &self.net,
+                                &self.frames,
+                            );
+                        }
                         self.host.borrow_mut().current_script = Some(script_id);
                         let res = self.eval_script_cached(&code);
                         self.host.borrow_mut().current_script = None;
@@ -1055,14 +1079,20 @@ impl ContentRuntime {
     }
 
     /// Evaluates a JavaScript script using the persistent `StorageEngine`-backed
-    /// [`BytecodeCache`] to bypass lexing, parsing, and bytecode compilation on warm loads.
+    /// [`BytecodeCache`] for medium/large scripts (`>= 8 KiB`) while compiling small
+    /// inline scripts directly in RAM (matching SpiderMonkey JSBC / V8 CodeCache thresholds).
     pub fn eval_script_cached(&mut self, source: &str) -> Result<JsValue, EvalError> {
-        let compiled = {
-            let wa = self.web_apis.borrow();
-            let cache = BytecodeCache::new(&wa.storage);
-            cache.compile_or_load(source, SourceType::Script)
+        let program = if source.len() < 8_192 {
+            rix_js::compile(source, SourceType::Script).map_err(EvalError::Compile)?
+        } else {
+            let compiled = {
+                let wa = self.web_apis.borrow();
+                let cache = BytecodeCache::new(&wa.storage);
+                cache.compile_or_load(source, SourceType::Script)
+            };
+            let (prog, _status) = compiled.map_err(EvalError::Compile)?;
+            prog
         };
-        let (program, _status) = compiled.map_err(EvalError::Compile)?;
         let val = self
             .vm
             .execute_program(program)

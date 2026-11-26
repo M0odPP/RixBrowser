@@ -129,6 +129,11 @@ pub enum AsyncNetEvent {
         link_nid: rix_dom::NodeId,
         css: Option<String>,
     },
+    XhrCompleted {
+        xhr_h: HeapHandle,
+        override_mime: Option<String>,
+        result: Option<FetchResponse>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +266,8 @@ pub struct NetworkBridge {
     pub(crate) header_iterators: HashMap<HeapHandle, HeaderIterState>,
     requests: HashMap<HeapHandle, RequestEntry>,
     responses: HashMap<HeapHandle, ResponseEntry>,
+    xhrs: Rc<RefCell<HashMap<HeapHandle, XhrState>>>,
+    pending_xhrs: HashMap<HeapHandle, ()>,
     pub(crate) protos: NetPrototypes,
 }
 
@@ -311,6 +318,8 @@ impl NetworkBridge {
             header_iterators: HashMap::new(),
             requests: HashMap::new(),
             responses: HashMap::new(),
+            xhrs: Rc::new(RefCell::new(HashMap::new())),
+            pending_xhrs: HashMap::new(),
             protos: NetPrototypes::default(),
         }
     }
@@ -365,6 +374,9 @@ impl NetworkBridge {
         }
         for hi in self.header_iterators.values() {
             out.push(JsValue::from_object(hi.target));
+        }
+        for &xhr_h in self.pending_xhrs.keys() {
+            out.push(JsValue::from_object(xhr_h));
         }
         for req in self.requests.values() {
             out.push(JsValue::from_object(req.headers_h));
@@ -804,6 +816,65 @@ pub fn deliver_async_net_event(
             crate::dom_sanitizer::dispatch_simple_element_event(
                 vm, host, events, event_loop, link_nid, ev_type,
             );
+        }
+        AsyncNetEvent::XhrCompleted {
+            xhr_h,
+            override_mime,
+            result,
+        } => {
+            let xhrs = {
+                let mut nb = net.borrow_mut();
+                nb.pending_xhrs.remove(&xhr_h);
+                Rc::clone(&nb.xhrs)
+            };
+            let ok = if let Some(resp) = result {
+                let ct = override_mime.or_else(|| {
+                    resp.headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, v)| v.clone())
+                });
+                let http_charset = ct.as_deref().and_then(|c| {
+                    c.split(';').skip(1).find_map(|p| {
+                        let (k, v) = p.trim().split_once('=')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("charset")
+                            .then(|| v.trim().trim_matches('"').trim_matches('\'').to_string())
+                    })
+                });
+                let (decoded, _) = rix_html::decode_html_bytes(&resp.body, http_charset.as_deref());
+                if let Some(st) = xhrs.borrow_mut().get_mut(&xhr_h) {
+                    st.status = resp.status;
+                    st.status_text = resp.status_text;
+                    st.response_url = resp.url;
+                    st.response_bytes = resp.body;
+                    st.response_text = decoded;
+                    st.resp_headers = resp.headers;
+                    st.ready_state = 4;
+                }
+                true
+            } else {
+                if let Some(st) = xhrs.borrow_mut().get_mut(&xhr_h) {
+                    st.status = 0;
+                    st.status_text.clear();
+                    st.ready_state = 4;
+                }
+                false
+            };
+            let this_val = JsValue::from_object(xhr_h);
+            let handlers: [&str; 3] = if ok {
+                ["onreadystatechange", "onload", "onloadend"]
+            } else {
+                ["onreadystatechange", "onerror", "onloadend"]
+            };
+            for ev_name in handlers {
+                let k = vm.heap.intern_key(ev_name);
+                if let Ok(cb) = vm.get_property_by_key(xhr_h, k) {
+                    if cb.as_object().is_some_and(|ch| vm.is_callable_handle(ch)) {
+                        let _ = vm.call_value(cb, this_val, &[]);
+                    }
+                }
+            }
         }
     }
 }
@@ -3196,7 +3267,7 @@ fn install_xml_http_request(
     vm.heap.object_set_prototype(xp, Some(etp), &mut vm.shapes);
     vm.heap.get_object_mut(xp).unwrap().is_prototype = true;
 
-    let xhrs: Rc<RefCell<HashMap<HeapHandle, XhrState>>> = Rc::new(RefCell::new(HashMap::new()));
+    let xhrs = Rc::clone(&net.borrow().xhrs);
 
     let define_xhr_consts = |vm: &mut JsVm, obj: HeapHandle| {
         for (name, v) in [
@@ -3375,7 +3446,7 @@ fn install_xml_http_request(
             } else {
                 extract_bytes_from_js(vm, &wa, arg(args, 0))?
             };
-            let (method, url, headers, override_mime) = {
+            let (method, url, async_flag, headers, override_mime) = {
                 let map = xm.borrow();
                 let st = map.get(&h).unwrap();
                 if st.ready_state != 1 {
@@ -3388,6 +3459,7 @@ fn install_xml_http_request(
                 (
                     st.method.clone(),
                     st.url.clone(),
+                    st.async_flag,
                     st.req_headers.clone(),
                     st.override_mime.clone(),
                 )
@@ -3406,6 +3478,33 @@ fn install_xml_http_request(
                 origin,
                 abort_signal: None,
             };
+            // WHATWG XHR §4.5.7: Asynchronous `XMLHttpRequest.send()` MUST return immediately
+            // without blocking the main JS thread, delivering `readystatechange`/`load`/`error`
+            // on the event loop once the background fetch finishes.
+            if async_flag {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let tx = {
+                        let mut bridge = nb.borrow_mut();
+                        bridge.pending_xhrs.insert(h, ());
+                        bridge.async_tx.clone()
+                    };
+                    handle.spawn(async move {
+                        let res = tokio::time::timeout(
+                            std::time::Duration::from_secs(6),
+                            engine.fetch(req),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok());
+                        let _ = tx.send(AsyncNetEvent::XhrCompleted {
+                            xhr_h: h,
+                            override_mime,
+                            result: res,
+                        });
+                    });
+                    return Ok(JsValue::UNDEFINED);
+                }
+            }
             let fetched = if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
                     std::thread::spawn(move || {

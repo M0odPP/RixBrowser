@@ -25,6 +25,7 @@ pub struct HtmlParserStream {
     encoding: Option<&'static Encoding>,
     decoder: Option<Decoder>,
     sniff_buf: Vec<u8>,
+    has_declarative_shadow: bool,
 }
 
 impl Default for HtmlParserStream {
@@ -51,6 +52,7 @@ impl HtmlParserStream {
             encoding: None,
             decoder: None,
             sniff_buf: Vec::new(),
+            has_declarative_shadow: false,
         }
     }
 
@@ -72,6 +74,14 @@ impl HtmlParserStream {
             self.encoding = Some(UTF_8);
             self.decoder = Some(UTF_8.new_decoder_without_bom_handling());
         }
+        if !self.has_declarative_shadow
+            && chunk
+                .as_bytes()
+                .windows(14)
+                .any(|w| w.eq_ignore_ascii_case(b"shadowrootmode"))
+        {
+            self.has_declarative_shadow = true;
+        }
         self.parser
             .input_buffer
             .push_back(StrTendril::from_slice(chunk));
@@ -80,6 +90,13 @@ impl HtmlParserStream {
     pub fn feed_bytes(&mut self, bytes: &[u8]) {
         if bytes.is_empty() || self.finished {
             return;
+        }
+        if !self.has_declarative_shadow
+            && bytes
+                .windows(14)
+                .any(|w| w.eq_ignore_ascii_case(b"shadowrootmode"))
+        {
+            self.has_declarative_shadow = true;
         }
         if let Some(decoder) = self.decoder.as_mut() {
             decode_into_buffer(decoder, bytes, false, &mut self.parser);
@@ -141,7 +158,9 @@ impl HtmlParserStream {
         loop {
             match self.parser.tokenizer.feed(&self.parser.input_buffer) {
                 TokenizerResult::Script(node_id) => {
-                    attach_declarative_shadow_roots(&mut self.document.borrow_mut());
+                    if self.has_declarative_shadow {
+                        attach_declarative_shadow_roots(&mut self.document.borrow_mut());
+                    }
                     return ParserStreamStep::Script(node_id);
                 }
                 TokenizerResult::Done => return ParserStreamStep::Done,

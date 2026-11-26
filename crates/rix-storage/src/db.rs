@@ -4,11 +4,12 @@ use crate::idb_cache::{TABLE_CACHE_STORAGE, TABLE_INDEXED_DB};
 use crate::models::{current_time_secs, Bookmark, Cookie, HistoryEntry, SessionState};
 use crate::secrets::{profile_key, SecretStoreError};
 use crate::StorageError;
-use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefinition};
 use rix_core::url::RixUrl;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
 
@@ -25,11 +26,28 @@ const TABLE_LOCAL_STORAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("
 const TABLE_BYTECODE_CACHE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("js_bytecode_cache_v1");
 
+struct FlushGuard {
+    db: Arc<Database>,
+    dirty: AtomicBool,
+}
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        if self.dirty.swap(false, Ordering::AcqRel) {
+            if let Ok(mut tx) = self.db.begin_write() {
+                tx.set_durability(Durability::Eventual);
+                let _ = tx.commit();
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StorageEngine {
     pub(crate) db: Arc<Database>,
     pub(crate) profile_id: [u8; 16],
     cookies: Arc<CookieState>,
+    flush_guard: Arc<FlushGuard>,
 }
 
 struct CookieState {
@@ -38,15 +56,40 @@ struct CookieState {
 }
 
 impl StorageEngine {
+    fn begin_fast_write(&self) -> Result<redb::WriteTransaction> {
+        let mut tx = self.db.begin_write()?;
+        tx.set_durability(Durability::None);
+        self.flush_guard.dirty.store(true, Ordering::Release);
+        Ok(tx)
+    }
+
+    /// Flushes any buffered non-blocking writes (`bytecode_cache`, `localStorage`, `cookies`,
+    /// `history`) in a single atomic superblock checkpoint.
+    pub fn flush(&self) -> Result<()> {
+        if self.flush_guard.dirty.swap(false, Ordering::AcqRel) {
+            let mut tx = self.db.begin_write()?;
+            tx.set_durability(Durability::Eventual);
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
     pub fn in_memory() -> Result<Self> {
-        let db = Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?;
+        let db = Arc::new(
+            Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?,
+        );
+        let flush_guard = Arc::new(FlushGuard {
+            db: Arc::clone(&db),
+            dirty: AtomicBool::new(false),
+        });
         let mut engine = Self {
-            db: Arc::new(db),
+            db,
             profile_id: [0; 16],
             cookies: Arc::new(CookieState {
                 cipher: None,
                 memory: Mutex::new(HashMap::new()),
             }),
+            flush_guard,
         };
         engine.init_tables()?;
         engine.profile_id = engine.load_profile_id()?;
@@ -58,14 +101,19 @@ impl StorageEngine {
             fs::create_dir_all(parent)?;
         }
 
-        let db = Database::create(path)?;
+        let db = Arc::new(Database::create(path)?);
+        let flush_guard = Arc::new(FlushGuard {
+            db: Arc::clone(&db),
+            dirty: AtomicBool::new(false),
+        });
         let mut engine = Self {
-            db: Arc::new(db),
+            db,
             profile_id: [0; 16],
             cookies: Arc::new(CookieState {
                 cipher: None,
                 memory: Mutex::new(HashMap::new()),
             }),
+            flush_guard,
         };
         engine.init_tables()?;
         engine.profile_id = engine.load_profile_id()?;
@@ -231,7 +279,7 @@ impl StorageEngine {
 
     pub fn add_history_entry(&self, url: &str, title: &str) -> Result<u64> {
         let now = current_time_secs();
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_fast_write()?;
         let id = {
             let mut meta_table = write_txn.open_table(TABLE_METADATA)?;
             let mut hist_table = write_txn.open_table(TABLE_HISTORY)?;
@@ -353,7 +401,7 @@ impl StorageEngine {
         memory.insert(row.clone(), cookie);
         let encrypted = encrypted?;
         if self.cookies.cipher.is_some() {
-            let tx = self.db.begin_write()?;
+            let tx = self.begin_fast_write()?;
             {
                 let mut table = tx.open_table(TABLE_PROTECTED_COOKIES)?;
                 match encrypted {
@@ -421,7 +469,7 @@ impl StorageEngine {
             .map(|(row, _)| row.clone())
             .collect();
         if self.cookies.cipher.is_some() {
-            let tx = self.db.begin_write()?;
+            let tx = self.begin_fast_write()?;
             {
                 let mut table = tx.open_table(TABLE_PROTECTED_COOKIES)?;
                 for row in &expired {
@@ -576,7 +624,7 @@ impl StorageEngine {
 
     pub fn set_local_storage(&self, origin: &str, key: &str, value: &str) -> Result<()> {
         let composite = Self::storage_composite_key(origin, key);
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_fast_write()?;
         {
             let mut table = write_txn.open_table(TABLE_LOCAL_STORAGE)?;
             table.insert(composite.as_str(), value.as_bytes())?;
@@ -597,7 +645,7 @@ impl StorageEngine {
 
     pub fn remove_local_storage(&self, origin: &str, key: &str) -> Result<()> {
         let composite = Self::storage_composite_key(origin, key);
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_fast_write()?;
         {
             let mut table = write_txn.open_table(TABLE_LOCAL_STORAGE)?;
             let _ = table.remove(composite.as_str())?;
@@ -608,7 +656,7 @@ impl StorageEngine {
 
     pub fn clear_local_storage(&self, origin: &str) -> Result<()> {
         let prefix = format!("{origin}\0");
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_fast_write()?;
         {
             let mut table = write_txn.open_table(TABLE_LOCAL_STORAGE)?;
             let keys_to_delete: Vec<String> = table
@@ -627,7 +675,7 @@ impl StorageEngine {
     }
 
     pub fn clear_all_local_storage(&self) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_fast_write()?;
         {
             let mut table = write_txn.open_table(TABLE_LOCAL_STORAGE)?;
             let keys_to_delete: Vec<String> = table
@@ -662,7 +710,7 @@ impl StorageEngine {
     }
 
     pub fn put_bytecode_cache(&self, key: &str, bytes: &[u8]) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_fast_write()?;
         {
             let mut table = write_txn.open_table(TABLE_BYTECODE_CACHE)?;
             table.insert(key, bytes)?;
@@ -678,7 +726,7 @@ impl StorageEngine {
     }
 
     pub fn remove_bytecode_cache(&self, key: &str) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_fast_write()?;
         {
             let mut table = write_txn.open_table(TABLE_BYTECODE_CACHE)?;
             let _ = table.remove(key)?;
@@ -688,7 +736,7 @@ impl StorageEngine {
     }
 
     pub fn clear_bytecode_cache(&self) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_fast_write()?;
         {
             let mut table = write_txn.open_table(TABLE_BYTECODE_CACHE)?;
             let keys: Vec<String> = table

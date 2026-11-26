@@ -192,29 +192,248 @@ pub fn install_cssom(
 
 fn install_document_fonts(vm: &mut JsVm, host: &SharedHost) {
     let dp = host.borrow().prototypes.document_proto;
-    let g_fonts = vm.alloc_host_fn("get fonts", move |vm, _, _| {
-        let fonts_obj = vm.alloc_ordinary_object();
-        let ready_p = alloc_promise(vm);
-        resolve_promise(vm, ready_p, JsValue::from_object(fonts_obj));
-        let k_ready = vm.heap.intern_key("ready");
-        vm.heap.object_define_data(
-            fonts_obj,
-            k_ready,
-            JsValue::from_object(ready_p),
-            PropertyAttrs::DEFAULT,
-            &mut vm.shapes,
-        );
-        let k_status = vm.heap.intern_key("status");
-        let loaded_s = vm.heap.alloc_string("loaded".to_string());
-        vm.heap.object_define_data(
-            fonts_obj,
-            k_status,
-            JsValue::from_string(loaded_s),
-            PropertyAttrs::DEFAULT,
-            &mut vm.shapes,
-        );
-        Ok(JsValue::from_object(fonts_obj))
+
+    // Global `FontFace` constructor (CSS Font Loading L3 §2).
+    let ff_proto = vm.alloc_ordinary_object();
+    if let Some(o) = vm.heap.get_object_mut(ff_proto) {
+        o.is_prototype = true;
+    }
+    define_host_method(vm, ff_proto, "load", move |vm, this_val, _| {
+        if let Some(h) = this_val.as_object() {
+            let k_status = vm.heap.intern_key("status");
+            let loaded_s = JsValue::from_string(vm.heap.alloc_string("loaded"));
+            let _ = vm.set_property_by_key(h, k_status, loaded_s);
+        }
+        let p = alloc_promise(vm);
+        resolve_promise(vm, p, this_val);
+        Ok(JsValue::from_object(p))
     });
+    let ff_ctor = vm.alloc_host_fn("FontFace", move |vm, _, args| {
+        let family = vm.value_to_rust_string(arg(args, 0));
+        let face = vm
+            .heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(ff_proto)));
+        let loaded_p = alloc_promise(vm);
+        resolve_promise(vm, loaded_p, JsValue::from_object(face));
+        for (k, v) in [
+            (
+                "family",
+                JsValue::from_string(vm.heap.alloc_string(&family)),
+            ),
+            (
+                "style",
+                JsValue::from_string(vm.heap.alloc_string("normal")),
+            ),
+            (
+                "weight",
+                JsValue::from_string(vm.heap.alloc_string("normal")),
+            ),
+            (
+                "stretch",
+                JsValue::from_string(vm.heap.alloc_string("normal")),
+            ),
+            (
+                "unicodeRange",
+                JsValue::from_string(vm.heap.alloc_string("U+0-10FFFF")),
+            ),
+            (
+                "variant",
+                JsValue::from_string(vm.heap.alloc_string("normal")),
+            ),
+            (
+                "display",
+                JsValue::from_string(vm.heap.alloc_string("auto")),
+            ),
+            (
+                "status",
+                JsValue::from_string(vm.heap.alloc_string("loaded")),
+            ),
+            ("loaded", JsValue::from_object(loaded_p)),
+        ] {
+            let key = vm.heap.intern_key(k);
+            vm.heap
+                .object_define_data(face, key, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        }
+        Ok(JsValue::from_object(face))
+    });
+    vm.mark_constructor(ff_ctor);
+    let k_proto = vm.heap.intern_key("prototype");
+    let k_ctor = vm.heap.intern_key("constructor");
+    vm.heap.object_define_data(
+        ff_ctor,
+        k_proto,
+        JsValue::from_object(ff_proto),
+        PropertyAttrs::empty(),
+        &mut vm.shapes,
+    );
+    vm.heap.object_define_data(
+        ff_proto,
+        k_ctor,
+        JsValue::from_object(ff_ctor),
+        PropertyAttrs::CONFIGURABLE | PropertyAttrs::WRITABLE,
+        &mut vm.shapes,
+    );
+    define_global(vm, "FontFace", JsValue::from_object(ff_ctor));
+
+    // Per-document `FontFaceSet` (`document.fonts`, CSS Font Loading L3 §3).
+    let ffs_proto = vm.alloc_ordinary_object();
+    if let Some(o) = vm.heap.get_object_mut(ffs_proto) {
+        o.is_prototype = true;
+    }
+    let fonts_list: Rc<RefCell<Vec<JsValue>>> = Rc::new(RefCell::new(Vec::new()));
+    let fonts_obj = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(ffs_proto)));
+    let ready_p = alloc_promise(vm);
+    resolve_promise(vm, ready_p, JsValue::from_object(fonts_obj));
+    let k_ready = vm.heap.intern_key("ready");
+    vm.heap.object_define_data(
+        fonts_obj,
+        k_ready,
+        JsValue::from_object(ready_p),
+        PropertyAttrs::DEFAULT,
+        &mut vm.shapes,
+    );
+    let k_status = vm.heap.intern_key("status");
+    let loaded_s = vm.heap.alloc_string("loaded".to_string());
+    vm.heap.object_define_data(
+        fonts_obj,
+        k_status,
+        JsValue::from_string(loaded_s),
+        PropertyAttrs::DEFAULT,
+        &mut vm.shapes,
+    );
+    {
+        let fl = Rc::clone(&fonts_list);
+        let g_size = vm.alloc_host_fn("get size", move |_, _, _| {
+            Ok(JsValue::from_i32(fl.borrow().len() as i32))
+        });
+        define_host_accessor(vm, ffs_proto, "size", Some(g_size), None);
+    }
+    {
+        let fl = Rc::clone(&fonts_list);
+        define_host_method(vm, ffs_proto, "load", move |vm, _, _| {
+            let arr = vm.alloc_array();
+            for &face in fl.borrow().iter() {
+                vm.heap.object_push_element(arr, face);
+            }
+            let p = alloc_promise(vm);
+            resolve_promise(vm, p, JsValue::from_object(arr));
+            Ok(JsValue::from_object(p))
+        });
+    }
+    define_host_method(vm, ffs_proto, "check", move |_, _, _| Ok(JsValue::TRUE));
+    {
+        let fl = Rc::clone(&fonts_list);
+        define_host_method(vm, ffs_proto, "add", move |_, this_val, args| {
+            let face = arg(args, 0);
+            let mut list = fl.borrow_mut();
+            if !list.contains(&face) {
+                list.push(face);
+            }
+            Ok(this_val)
+        });
+    }
+    {
+        let fl = Rc::clone(&fonts_list);
+        define_host_method(vm, ffs_proto, "delete", move |_, _, args| {
+            let face = arg(args, 0);
+            let mut list = fl.borrow_mut();
+            if let Some(pos) = list.iter().position(|v| *v == face) {
+                list.remove(pos);
+                Ok(JsValue::TRUE)
+            } else {
+                Ok(JsValue::FALSE)
+            }
+        });
+    }
+    {
+        let fl = Rc::clone(&fonts_list);
+        define_host_method(vm, ffs_proto, "clear", move |_, _, _| {
+            fl.borrow_mut().clear();
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+    {
+        let fl = Rc::clone(&fonts_list);
+        define_host_method(vm, ffs_proto, "forEach", move |vm, this_val, args| {
+            let cb = arg(args, 0);
+            let this_arg = arg(args, 1);
+            let items: Vec<JsValue> = fl.borrow().clone();
+            for item in items {
+                vm.call_value(cb, this_arg, &[item, item, this_val])?;
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+    {
+        let fl = Rc::clone(&fonts_list);
+        let values_fn = vm.alloc_host_fn("values", move |vm, _, _| {
+            let arr = vm.alloc_array();
+            for &face in fl.borrow().iter() {
+                vm.heap.object_push_element(arr, face);
+            }
+            let iter_fn = vm.get_property_by_key(arr, vm.key_symbol_iterator)?;
+            vm.call_value(iter_fn, JsValue::from_object(arr), &[])
+        });
+        for name in ["values", "keys", "entries"] {
+            let k = vm.heap.intern_key(name);
+            vm.heap.object_define_data(
+                ffs_proto,
+                k,
+                JsValue::from_object(values_fn),
+                PropertyAttrs::DEFAULT,
+                &mut vm.shapes,
+            );
+        }
+        let k_iter = vm.key_symbol_iterator;
+        vm.heap.object_define_data(
+            ffs_proto,
+            k_iter,
+            JsValue::from_object(values_fn),
+            PropertyAttrs::DEFAULT,
+            &mut vm.shapes,
+        );
+    }
+    define_host_method(vm, ffs_proto, "addEventListener", |_, _, _| {
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_method(vm, ffs_proto, "removeEventListener", |_, _, _| {
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_method(vm, ffs_proto, "dispatchEvent", |_, _, _| Ok(JsValue::TRUE));
+
+    let ffs_ctor = vm.alloc_host_fn("FontFaceSet", |vm, _, _| {
+        Err(vm.type_error("Illegal constructor: FontFaceSet"))
+    });
+    vm.mark_constructor(ffs_ctor);
+    vm.heap.object_define_data(
+        ffs_ctor,
+        k_proto,
+        JsValue::from_object(ffs_proto),
+        PropertyAttrs::empty(),
+        &mut vm.shapes,
+    );
+    vm.heap.object_define_data(
+        ffs_proto,
+        k_ctor,
+        JsValue::from_object(ffs_ctor),
+        PropertyAttrs::CONFIGURABLE | PropertyAttrs::WRITABLE,
+        &mut vm.shapes,
+    );
+    define_global(vm, "FontFaceSet", JsValue::from_object(ffs_ctor));
+
+    let fl_root = Rc::clone(&fonts_list);
+    vm.add_host_root_collector(move |roots| {
+        roots.push(JsValue::from_object(fonts_obj));
+        roots.push(JsValue::from_object(ffs_proto));
+        roots.push(JsValue::from_object(ff_proto));
+        for &v in fl_root.borrow().iter() {
+            roots.push(v);
+        }
+    });
+    let fonts_val = JsValue::from_object(fonts_obj);
+    let g_fonts = vm.alloc_host_fn("get fonts", move |_, _, _| Ok(fonts_val));
     define_host_accessor(vm, dp, "fonts", Some(g_fonts), None);
 }
 

@@ -284,6 +284,8 @@ pub struct ModuleEnv {
     pub export_cells: Vec<HeapHandle>,
     pub export_by_name: HashMap<String, HeapHandle>,
     pub namespace_obj: HeapHandle,
+    /// Lazily created `import.meta` null-prototype object (`{ url, resolve }`, ECMA-262 §13.3.12.1.1).
+    pub import_meta_obj: Option<HeapHandle>,
 }
 
 impl ModuleEnv {
@@ -303,6 +305,9 @@ impl ModuleEnv {
             out.push(JsValue::from_object(c));
         }
         out.push(JsValue::from_object(self.namespace_obj));
+        if let Some(meta) = self.import_meta_obj {
+            out.push(JsValue::from_object(meta));
+        }
     }
 }
 
@@ -546,6 +551,7 @@ impl ModuleLoader {
                         export_cells,
                         export_by_name,
                         namespace_obj,
+                        import_meta_obj: None,
                     },
                 );
 
@@ -727,12 +733,35 @@ impl ModuleLoader {
             return None;
         }
         let rec = self.records.get(url)?;
-        if let Some(cell) = vm
-            .module_env(rec.program_id)
-            .and_then(|e| e.export_by_name.get(name).copied())
-        {
-            return Some(cell);
+        // Check local (non-reexport) bindings first so unlinked re-export placeholder
+        // cells do not shadow the true target cell during recursive resolution.
+        let is_local_export = rec
+            .blueprint
+            .exports
+            .iter()
+            .any(|e| e.reexport_from.is_none() && e.exported_name == name);
+        if is_local_export {
+            if let Some(cell) = vm
+                .module_env(rec.program_id)
+                .and_then(|e| e.export_by_name.get(name).copied())
+            {
+                return Some(cell);
+            }
         }
+        // Named re-exports (`export { a as b } from "..."`).
+        for exp in &rec.blueprint.exports {
+            if !exp.is_star && exp.exported_name == name {
+                if let Some(ref spec) = exp.reexport_from {
+                    if let Ok(target) = self.import_map.resolve(spec, Some(url)) {
+                        let lookup = exp.local_name.as_deref().unwrap_or(&exp.exported_name);
+                        if let Some(c) = self.resolve_export_cell(vm, &target, lookup, visited) {
+                            return Some(c);
+                        }
+                    }
+                }
+            }
+        }
+        // Star re-exports (`export * from "..."`).
         for exp in &rec.blueprint.exports {
             if exp.is_star {
                 if let Some(ref spec) = exp.reexport_from {
@@ -744,7 +773,9 @@ impl ModuleLoader {
                 }
             }
         }
-        None
+        // Fallback for already-linked `export * as ns` / namespace entries.
+        vm.module_env(rec.program_id)
+            .and_then(|e| e.export_by_name.get(name).copied())
     }
 
     fn collect_all_exports(
