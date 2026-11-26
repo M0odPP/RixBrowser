@@ -20,6 +20,7 @@ use crate::firefox_bidi::{
     default_firefox_bin, run_firefox_site, sample_process_tree_stats, FirefoxInteractiveReport,
     FirefoxRunConfig,
 };
+use crate::replay_archive::{record_site_archive, ReplayServer};
 
 #[derive(Debug, Clone)]
 pub struct CompareFirefoxOptions {
@@ -34,6 +35,8 @@ pub struct CompareFirefoxOptions {
     pub interactive: bool,
     pub warm: bool,
     pub self_consistency: bool,
+    pub record_dir: Option<PathBuf>,
+    pub replay_dir: Option<PathBuf>,
     pub limit: Option<usize>,
     pub report_json: Option<PathBuf>,
 }
@@ -140,6 +143,8 @@ pub struct FirefoxSiteComparison {
 pub struct CompareFirefoxReport {
     pub cohort: String,
     pub viewport: String,
+    #[serde(default)]
+    pub replay_mode: bool,
     pub sites_total: usize,
     pub rix_succeeded: usize,
     pub firefox_succeeded: usize,
@@ -152,7 +157,13 @@ pub struct CompareFirefoxReport {
     pub median_rix_cpu_ms: f64,
     pub median_firefox_cpu_ms: f64,
     pub avg_visual_ssim_pct: f64,
+    #[serde(default)]
+    pub avg_exact_pixel_match_pct: f64,
     pub avg_style_match_pct: f64,
+    #[serde(default)]
+    pub avg_layout_1px_match_pct: f64,
+    #[serde(default)]
+    pub avg_size_1px_match_pct: f64,
     pub avg_layout_match_pct: f64,
     pub total_extra_js_errors: usize,
     pub idle_zero_hz_sites: usize,
@@ -264,15 +275,59 @@ pub fn run_compare_firefox(opts: &CompareFirefoxOptions) -> Result<CompareFirefo
     let rix_phys_h =
         ((f64::from(opts.height + chrome_height_logical) * opts.dpr).round() as u32).max(64);
 
+    let replay_active = opts.replay_dir.is_some() || opts.record_dir.is_some();
     let mut report = CompareFirefoxReport {
         cohort: opts.cohort_path.display().to_string(),
         viewport: format!("{}x{}@{:.1}x", opts.width, opts.height, opts.dpr),
+        replay_mode: replay_active,
         sites_total: urls.len(),
         ..CompareFirefoxReport::default()
     };
 
     for (idx, url) in urls.iter().enumerate() {
         let slug = sanitize_slug(url, idx + 1);
+        let mut _replay_server: Option<ReplayServer> = None;
+        let effective_url: String = if let Some(ref rec_root) = opts.record_dir {
+            let site_archive = rec_root.join(&slug);
+            if let Err(err) = record_site_archive(url, &site_archive) {
+                eprintln!(
+                    "[{:02}/{:02}] record failed for {url}: {err:#}",
+                    idx + 1,
+                    urls.len()
+                );
+            }
+            if site_archive.join("manifest.json").exists() {
+                match ReplayServer::start(&site_archive) {
+                    Ok(srv) => {
+                        let u = srv.entry_url.clone();
+                        _replay_server = Some(srv);
+                        u
+                    }
+                    Err(err) => {
+                        eprintln!("replay start failed for {slug}: {err:#}");
+                        url.clone()
+                    }
+                }
+            } else {
+                url.clone()
+            }
+        } else if let Some(ref rep_root) = opts.replay_dir {
+            let site_archive = rep_root.join(&slug);
+            match ReplayServer::start(&site_archive) {
+                Ok(srv) => {
+                    let u = srv.entry_url.clone();
+                    _replay_server = Some(srv);
+                    u
+                }
+                Err(err) => {
+                    eprintln!("replay archive missing for {slug}: {err:#}");
+                    url.clone()
+                }
+            }
+        } else {
+            url.clone()
+        };
+
         let rix_png = opts.out_dir.join(format!("{slug}_rix.png"));
         let rix_json = opts.out_dir.join(format!("{slug}_rix.json"));
         let rix_dom_json = opts.out_dir.join(format!("{slug}_rix_dom.json"));
@@ -286,7 +341,7 @@ pub fn run_compare_firefox(opts: &CompareFirefoxOptions) -> Result<CompareFirefo
         // 1. Run RixBrowser headless.
         let mut rix_cmd = Command::new(&opts.rix_bin);
         rix_cmd
-            .arg(format!("--render-url={url}"))
+            .arg(format!("--render-url={effective_url}"))
             .arg(format!("--out={}", rix_png.display()))
             .arg(format!("--metrics-json={}", rix_json.display()))
             .arg(format!("--dump-dom-layout={}", rix_dom_json.display()))
@@ -316,7 +371,7 @@ pub fn run_compare_firefox(opts: &CompareFirefoxOptions) -> Result<CompareFirefo
         // 2. Run Mozilla Firefox via W3C WebDriver BiDi.
         let ff_cfg = FirefoxRunConfig {
             firefox_bin: opts.firefox_bin.clone(),
-            url: url.clone(),
+            url: effective_url.clone(),
             out_png: ff_png.clone(),
             self_check_png: opts.self_consistency.then(|| ff_self_png.clone()),
             post_action_png: opts.interactive.then(|| ff_post_png.clone()),
@@ -428,6 +483,10 @@ pub fn run_compare_firefox(opts: &CompareFirefoxOptions) -> Result<CompareFirefo
             .as_ref()
             .map(|d| format!("{:.1}%", d.style_match_pct))
             .unwrap_or_else(|| "n/a".into());
+        let lay1_str = diff
+            .as_ref()
+            .map(|d| format!("{:.1}%", d.layout_1px_match_pct))
+            .unwrap_or_else(|| "n/a".into());
         let lay_str = diff
             .as_ref()
             .map(|d| format!("{:.1}%", d.layout_match_pct))
@@ -437,12 +496,13 @@ pub fn run_compare_firefox(opts: &CompareFirefoxOptions) -> Result<CompareFirefo
             .map_or("n/a", |d| d.primary_subsystem.as_str());
 
         eprintln!(
-            "[{:02}/{:02}] {:<40} | SSIM {:>6} | CSS {:>6} | Lay<=2px {:>6} | Rix {:>6.0}ms/{:>5.0}MiB vs FF {:>6.0}ms/{:>5.0}MiB | JSerr {}/{} | {}",
+            "[{:02}/{:02}] {:<36} | SSIM {:>6} | CSS {:>6} | Lay<=1/2px {:>6}/{:>6} | Rix {:>6.0}ms/{:>5.0}MiB vs FF {:>6.0}ms/{:>5.0}MiB | JSerr {}/{} | {}",
             idx + 1,
             urls.len(),
-            url.chars().take(40).collect::<String>(),
+            url.chars().take(36).collect::<String>(),
             ssim_str,
             style_str,
+            lay1_str,
             lay_str,
             rix_total_ms,
             rix_peak_kib as f64 / 1024.0,
@@ -520,12 +580,33 @@ pub fn run_compare_firefox(opts: &CompareFirefoxOptions) -> Result<CompareFirefo
     if !ssims.is_empty() {
         report.avg_visual_ssim_pct = ssims.iter().sum::<f64>() / ssims.len() as f64;
     }
+    let exact_px: Vec<f64> = ok_pairs
+        .iter()
+        .filter_map(|s| s.visual.map(|v| v.exact_pixel_match_pct))
+        .collect();
+    if !exact_px.is_empty() {
+        report.avg_exact_pixel_match_pct = exact_px.iter().sum::<f64>() / exact_px.len() as f64;
+    }
     let styles: Vec<f64> = ok_pairs
         .iter()
         .filter_map(|s| s.diff.as_ref().map(|d| d.style_match_pct))
         .collect();
     if !styles.is_empty() {
         report.avg_style_match_pct = styles.iter().sum::<f64>() / styles.len() as f64;
+    }
+    let layouts1: Vec<f64> = ok_pairs
+        .iter()
+        .filter_map(|s| s.diff.as_ref().map(|d| d.layout_1px_match_pct))
+        .collect();
+    if !layouts1.is_empty() {
+        report.avg_layout_1px_match_pct = layouts1.iter().sum::<f64>() / layouts1.len() as f64;
+    }
+    let sizes1: Vec<f64> = ok_pairs
+        .iter()
+        .filter_map(|s| s.diff.as_ref().map(|d| d.size_1px_match_pct))
+        .collect();
+    if !sizes1.is_empty() {
+        report.avg_size_1px_match_pct = sizes1.iter().sum::<f64>() / sizes1.len() as f64;
     }
     let layouts: Vec<f64> = ok_pairs
         .iter()
@@ -590,8 +671,12 @@ pub fn print_report(report: &CompareFirefoxReport) {
         report.rix_succeeded, report.sites_total, report.firefox_succeeded, report.sites_total
     );
     println!(
-        "Visual:   avg SSIM {:.2}% | avg CSS match {:.2}% | avg Layout <=2px {:.2}%",
-        report.avg_visual_ssim_pct, report.avg_style_match_pct, report.avg_layout_match_pct
+        "Visual:   avg SSIM {:.2}% | ExactPx<=2 {:.2}% | avg CSS match {:.2}%",
+        report.avg_visual_ssim_pct, report.avg_exact_pixel_match_pct, report.avg_style_match_pct
+    );
+    println!(
+        "Layout:   avg <=1px {:.2}% | avg Size<=1px {:.2}% | avg <=2px {:.2}%",
+        report.avg_layout_1px_match_pct, report.avg_size_1px_match_pct, report.avg_layout_match_pct
     );
     println!(
         "Speed:    median Rix {:.0} ms vs Firefox {:.0} ms | p90 Rix {:.0} ms vs Firefox {:.0} ms",

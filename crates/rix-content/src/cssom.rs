@@ -7291,6 +7291,65 @@ pub(crate) fn format_computed_property_resolved(
             format_lp(&style.visual.background_position.0, &eval),
             format_lp(&style.visual.background_position.1, &eval),
         ),
+        "background-size" => {
+            let fmt_size =
+                |sz: &rix_css::BackgroundSizeValue, cover: bool, contain: bool| -> String {
+                    if cover {
+                        return "cover".to_string();
+                    }
+                    if contain {
+                        return "contain".to_string();
+                    }
+                    match sz {
+                        rix_css::BackgroundSizeValue::Auto => "auto".to_string(),
+                        rix_css::BackgroundSizeValue::Cover => "cover".to_string(),
+                        rix_css::BackgroundSizeValue::Contain => "contain".to_string(),
+                        rix_css::BackgroundSizeValue::Explicit(w, h) => {
+                            let ws = w
+                                .as_ref()
+                                .map_or_else(|| "auto".to_string(), |lp| format_lp(lp, &eval));
+                            match h {
+                                Some(hlp) => format!("{ws} {}", format_lp(hlp, &eval)),
+                                None => ws,
+                            }
+                        }
+                    }
+                };
+            if !style.visual.background_layers.is_empty() {
+                style
+                    .visual
+                    .background_layers
+                    .iter()
+                    .map(|l| fmt_size(&l.size, l.size_cover, l.size_contain))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else if let Some(ref sz) = style.visual.background_size {
+                fmt_size(sz, false, false)
+            } else {
+                "auto".to_string()
+            }
+        }
+        "background-repeat" => {
+            let fmt_rep = |rx: bool, ry: bool| -> &'static str {
+                match (rx, ry) {
+                    (true, true) => "repeat",
+                    (true, false) => "repeat-x",
+                    (false, true) => "repeat-y",
+                    (false, false) => "no-repeat",
+                }
+            };
+            if !style.visual.background_layers.is_empty() {
+                style
+                    .visual
+                    .background_layers
+                    .iter()
+                    .map(|l| fmt_rep(l.repeat_x, l.repeat_y))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                "repeat".to_string()
+            }
+        }
         "object-position" => style.visual.object_position.as_deref().map_or_else(
             || "50% 50%".to_string(),
             |pos| pos.serialize_computed(&eval, style.text.writing_mode, style.text.direction),

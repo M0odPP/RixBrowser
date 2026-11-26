@@ -586,11 +586,16 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
     global.__rix_wpt_pending = function() { return pendingAsync; };
     global.__rix_wpt_summary = function() {
         let passed = 0, failed = 0, firstErr = "";
+        const failedList = [];
         for (let i = 0; i < results.length; i++) {
             if (results[i].pass) passed++;
             else {
                 failed++;
-                if (!firstErr) firstErr = results[i].name + " => " + results[i].message;
+                const msg = results[i].message || "";
+                if (!firstErr) firstErr = results[i].name + " => " + msg;
+                if (failedList.length < 256) {
+                    failedList.push([String(results[i].name || ""), String(msg).slice(0, 200)]);
+                }
             }
         }
         return JSON.stringify({
@@ -599,7 +604,8 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
             failed: failed,
             pending: pendingAsync,
             status: harnessStatus,
-            first_error: firstErr || (harnessErrors[0] || "")
+            first_error: firstErr || (harnessErrors[0] || ""),
+            failed_subtests: failedList
         });
     };
 })(globalThis);
@@ -619,6 +625,16 @@ pub struct OfficialWptOptions {
     pub kind: OfficialWptKind,
     pub limit: Option<usize>,
     pub report_json: Option<PathBuf>,
+    pub compare_firefox: bool,
+    pub firefox_bin: PathBuf,
+}
+
+/// A single WPT subtest that PASSES in Mozilla Firefox 161.0 while FAILING in RixBrowser.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FirefoxWptGap {
+    pub file: String,
+    pub subtest: String,
+    pub rix_error: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -643,6 +659,10 @@ pub struct OfficialWptReport {
     pub subtests_passed: usize,
     pub file_pass_rate_pct: f64,
     pub subtest_pass_rate_pct: f64,
+    pub firefox_checked_files: usize,
+    pub firefox_pass_rix_fail_files: usize,
+    pub firefox_pass_rix_fail_subtests: usize,
+    pub firefox_only_gaps: Vec<FirefoxWptGap>,
     pub top_failure_reasons: Vec<(String, usize)>,
     pub sample_failures: Vec<OfficialWptFailure>,
 }
@@ -655,6 +675,8 @@ struct JsWptSummary {
     pending: usize,
     status: i32,
     first_error: String,
+    #[serde(default)]
+    failed_subtests: Vec<(String, String)>,
 }
 
 #[must_use]
@@ -1088,6 +1110,7 @@ struct ScriptRunOutcome {
     subtests_passed: usize,
     subtests_total: usize,
     reason: Option<String>,
+    failed_subtests: Vec<(String, String)>,
 }
 
 fn wpt_font_db(wpt_root: &Path) -> Arc<rix_text::FontDatabase> {
@@ -1791,6 +1814,29 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
                     file_path = file_path.join("index.html");
                 }
                 let Ok(mut body) = tokio::fs::read(&file_path).await else {
+                    // Upstream WPT serves synthesized HTML wrappers for `*.any.html` / `*.window.html`
+                    // from their corresponding `*.any.js` / `*.window.js` source files.
+                    let synth_js = rel
+                        .strip_suffix(".any.html")
+                        .map(|p| root.join(format!("{p}.any.js")))
+                        .or_else(|| {
+                            rel.strip_suffix(".window.html")
+                                .map(|p| root.join(format!("{p}.window.js")))
+                        });
+                    if let Some(js_path) = synth_js {
+                        if let Ok(js_src) = tokio::fs::read_to_string(&js_path).await {
+                            if let Some(html) = synthesize_wpt_js_html(&js_path, &js_src) {
+                                let head = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    html.len()
+                                );
+                                let _ = stream.write_all(head.as_bytes()).await;
+                                let _ = stream.write_all(html.as_bytes()).await;
+                                let _ = stream.shutdown().await;
+                                return;
+                            }
+                        }
+                    }
                     let _ = stream
                         .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                         .await;
@@ -2126,6 +2172,7 @@ fn run_wpt_testharness_file(
                 subtests_passed: 0,
                 subtests_total: 0,
                 reason: Some(format!("summary eval failed: {e}")),
+                failed_subtests: Vec::new(),
             };
         }
     };
@@ -2140,6 +2187,7 @@ fn run_wpt_testharness_file(
             subtests_passed: 0,
             subtests_total: 0,
             reason: Some(first_err),
+            failed_subtests: Vec::new(),
         };
     };
 
@@ -2174,6 +2222,7 @@ fn run_wpt_testharness_file(
         subtests_passed: summary.passed,
         subtests_total: summary.total,
         reason,
+        failed_subtests: summary.failed_subtests,
     }
 }
 
@@ -2271,6 +2320,13 @@ pub fn run_official_wpt_suite(opts: &OfficialWptOptions) -> Result<OfficialWptRe
                 .collect()
         });
 
+    struct FailedWptForFirefox {
+        rel: String,
+        rix_total: usize,
+        rix_failed: Vec<(String, String)>,
+        rix_reason: String,
+    }
+    let mut failed_for_firefox: Vec<FailedWptForFirefox> = Vec::new();
     for (path, outcome) in script_results {
         let rel = path
             .strip_prefix(&opts.wpt_dir)
@@ -2291,6 +2347,14 @@ pub fn run_official_wpt_suite(opts: &OfficialWptOptions) -> Result<OfficialWptRe
                     let r = out.reason.unwrap_or_else(|| "subtest failure".into());
                     let bucket: String = r.chars().take(72).collect();
                     *reasons.entry(bucket).or_insert(0) += 1;
+                    if opts.compare_firefox {
+                        failed_for_firefox.push(FailedWptForFirefox {
+                            rel: rel.clone(),
+                            rix_total: out.subtests_total,
+                            rix_failed: out.failed_subtests,
+                            rix_reason: r.clone(),
+                        });
+                    }
                     if report.sample_failures.len() < 300 {
                         report.sample_failures.push(OfficialWptFailure {
                             file: format!("{rel} [{}/{}]", out.subtests_passed, out.subtests_total),
@@ -2305,6 +2369,14 @@ pub fn run_official_wpt_suite(opts: &OfficialWptOptions) -> Result<OfficialWptRe
                 report.files_panicked += 1;
                 let bucket: String = panic_msg.chars().take(72).collect();
                 *reasons.entry(bucket).or_insert(0) += 1;
+                if opts.compare_firefox {
+                    failed_for_firefox.push(FailedWptForFirefox {
+                        rel: rel.clone(),
+                        rix_total: 0,
+                        rix_failed: Vec::new(),
+                        rix_reason: panic_msg.clone(),
+                    });
+                }
                 if report.sample_failures.len() < 40 {
                     report.sample_failures.push(OfficialWptFailure {
                         file: rel,
@@ -2312,6 +2384,69 @@ pub fn run_official_wpt_suite(opts: &OfficialWptOptions) -> Result<OfficialWptRe
                         reason: panic_msg,
                     });
                 }
+            }
+        }
+    }
+
+    // Optional Firefox-reference WPT differential pass: execute every Rix-failing testharness
+    // file in a single reusable headless Firefox BiDi session to identify the exact
+    // Firefox-superset gap (`firefox_pass_rix_fail == 0` target).
+    if opts.compare_firefox && !failed_for_firefox.is_empty() {
+        let mut ff = crate::firefox_bidi::PersistentFirefoxBidi::launch(&opts.firefox_bin)
+            .with_context(|| {
+                format!(
+                    "launch Firefox WPT differential reference at {}",
+                    opts.firefox_bin.display()
+                )
+            })?;
+        for item in failed_for_firefox {
+            let FailedWptForFirefox {
+                rel,
+                rix_total,
+                rix_failed,
+                rix_reason,
+            } = item;
+            let web_rel = if let Some(stem) = rel.strip_suffix(".any.js") {
+                format!("{stem}.any.html")
+            } else if let Some(stem) = rel.strip_suffix(".window.js") {
+                format!("{stem}.window.html")
+            } else {
+                rel.clone()
+            };
+            let url = format!("http://127.0.0.1:{}/{}", local_server.port, web_rel);
+            let Ok(ff_res) = ff.run_wpt_testharness(&url, Duration::from_secs(12)) else {
+                continue;
+            };
+            report.firefox_checked_files += 1;
+            let rix_failed_map: HashMap<&str, &str> = rix_failed
+                .iter()
+                .map(|(n, m)| (n.as_str(), m.as_str()))
+                .collect();
+            let mut file_has_gap = false;
+            for st in &ff_res.subtests {
+                if !st.pass {
+                    continue;
+                }
+                let rix_missed = rix_total == 0 || rix_failed_map.contains_key(st.name.as_str());
+                if rix_missed {
+                    file_has_gap = true;
+                    report.firefox_pass_rix_fail_subtests += 1;
+                    if report.firefox_only_gaps.len() < 300 {
+                        let err = rix_failed_map
+                            .get(st.name.as_str())
+                            .copied()
+                            .unwrap_or(&rix_reason)
+                            .to_string();
+                        report.firefox_only_gaps.push(FirefoxWptGap {
+                            file: rel.clone(),
+                            subtest: st.name.clone(),
+                            rix_error: err,
+                        });
+                    }
+                }
+            }
+            if file_has_gap {
+                report.firefox_pass_rix_fail_files += 1;
             }
         }
     }
@@ -2432,6 +2567,20 @@ pub fn print_report(report: &OfficialWptReport) {
         report.subtest_pass_rate_pct,
         report.files_panicked,
     );
+    if report.firefox_checked_files > 0 {
+        println!(
+            "  Firefox-Superset Diff: checked {} Rix-failing files | FF-PASS/Rix-FAIL: {} files, {} subtests",
+            report.firefox_checked_files,
+            report.firefox_pass_rix_fail_files,
+            report.firefox_pass_rix_fail_subtests,
+        );
+        for gap in report.firefox_only_gaps.iter().take(10) {
+            println!(
+                "    [FF-ONLY] {} :: {} => {}",
+                gap.file, gap.subtest, gap.rix_error
+            );
+        }
+    }
     if !report.top_failure_reasons.is_empty() {
         println!("  Top failure reasons:");
         for (reason, cnt) in report.top_failure_reasons.iter().take(10) {

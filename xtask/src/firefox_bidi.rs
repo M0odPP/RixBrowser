@@ -322,12 +322,18 @@ impl BidiClient {
 const FIREFOX_INSPECTOR_JS: &str = r#"(() => {
   const PROPS = [
     "display","position","visibility","opacity","z-index","overflow-x","overflow-y",
-    "box-sizing","flex-direction","flex-wrap","justify-content","align-items",
-    "grid-template-columns","color","background-color","background-image",
-    "font-family","font-size","font-weight","line-height","text-align","white-space",
+    "box-sizing","top","right","bottom","left","float","clear",
+    "width","height","min-width","max-width","min-height","max-height","aspect-ratio",
+    "flex-direction","flex-wrap","flex-grow","flex-shrink","justify-content","align-items","align-self",
+    "row-gap","column-gap","grid-template-columns","grid-template-rows",
+    "color","background-color","background-image","background-size","background-position","background-repeat",
+    "font-family","font-size","font-weight","font-style","line-height","letter-spacing","word-spacing",
+    "text-align","text-transform","text-decoration-line","white-space","vertical-align","direction","writing-mode",
     "margin-top","margin-right","margin-bottom","margin-left",
     "padding-top","padding-right","padding-bottom","padding-left",
-    "border-top-width","border-top-left-radius","width","height"
+    "border-top-width","border-right-width","border-bottom-width","border-left-width",
+    "border-top-style","border-top-color","border-top-left-radius",
+    "transform","filter","box-shadow","pointer-events","cursor"
   ];
   const SKIP = new Set(["script","style","meta","link","head","title","noscript","br"]);
   const round10 = (v) => (Number.isFinite(v) ? Math.round(v * 10) / 10 : 0);
@@ -913,6 +919,212 @@ async fn run_firefox_site_async(cfg: &FirefoxRunConfig) -> FirefoxSiteOutput {
     drop(_child_guard);
     let _ = fs::remove_dir_all(&profile_dir);
     out
+}
+
+/// Single subtest result returned by upstream WPT `testharness.js` inside Firefox.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FirefoxWptSubtest {
+    pub name: String,
+    pub pass: bool,
+    pub message: Option<String>,
+}
+
+/// Outcome of executing a WPT testharness test file inside Mozilla Firefox.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FirefoxWptResult {
+    pub harness_ok: bool,
+    pub subtests: Vec<FirefoxWptSubtest>,
+}
+
+const FIREFOX_WPT_COLLECT_JS: &str = r#"new Promise((resolve) => {
+  let settled = false;
+  const finish = (tests, status) => {
+    if (settled) return;
+    settled = true;
+    resolve(JSON.stringify({
+      harness_ok: !status || status.status === 0,
+      subtests: (tests || []).map((t) => ({
+        name: String(t.name || ""),
+        pass: t.status === 0,
+        message: t.message ? String(t.message) : null,
+      })),
+    }));
+  };
+  if (typeof add_completion_callback === "function") {
+    add_completion_callback(finish);
+    setTimeout(() => finish([], { status: 2 }), 6000);
+  } else {
+    finish([], { status: 1 });
+  }
+})"#;
+
+/// Reusable headless Mozilla Firefox WebDriver BiDi session for fast multi-test WPT differential
+/// verification (`0` tests passing in Firefox while failing in RixBrowser).
+pub struct PersistentFirefoxBidi {
+    rt: tokio::runtime::Runtime,
+    _guard: ChildGuard,
+    profile_dir: PathBuf,
+    bidi: BidiClient,
+    context: String,
+}
+
+impl PersistentFirefoxBidi {
+    /// Launches one headless Firefox instance with a clean temporary profile and opens a tab.
+    pub fn launch(firefox_bin: &Path) -> Result<Self> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let profile_dir = std::env::temp_dir().join(format!(
+            "rix_ff_wpt_ref_{}_{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&profile_dir);
+        write_clean_firefox_profile(&profile_dir, false)?;
+
+        let mut cmd = Command::new(firefox_bin);
+        cmd.arg("--headless")
+            .arg("--no-remote")
+            .arg("--profile")
+            .arg(&profile_dir)
+            .arg("--remote-debugging-port=0")
+            .env("MOZ_HEADLESS_WIDTH", "800")
+            .env("MOZ_HEADLESS_HEIGHT", "600")
+            .env("MOZ_REMOTE_ALLOW_SYSTEM_ACCESS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow!("failed to launch Firefox at {}: {e}", firefox_bin.display()))?;
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_dir_all(&profile_dir);
+            bail!("failed to capture Firefox stderr");
+        };
+        let guard = ChildGuard(child);
+
+        let (ws_tx, ws_rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Some(pos) = line.find("WebDriver BiDi listening on ") {
+                    let url = line[pos + "WebDriver BiDi listening on ".len()..]
+                        .trim()
+                        .to_string();
+                    let _ = ws_tx.send(url);
+                }
+            }
+        });
+
+        let ws_base = ws_rx
+            .recv_timeout(Duration::from_secs(12))
+            .map_err(|_| anyhow!("timed out waiting for Firefox WebDriver BiDi endpoint"))?;
+        let ws_url = format!("{}/session", ws_base.trim_end_matches('/'));
+
+        let (bidi, context) = rt.block_on(async {
+            let mut bidi = BidiClient::connect(&ws_url).await?;
+            let _ = bidi
+                .call(
+                    "session.new",
+                    json!({ "capabilities": { "alwaysMatch": { "acceptInsecureCerts": true } } }),
+                    Duration::from_secs(10),
+                )
+                .await?;
+            let created = bidi
+                .call(
+                    "browsingContext.create",
+                    json!({ "type": "tab" }),
+                    Duration::from_secs(5),
+                )
+                .await;
+            let context = match created
+                .ok()
+                .and_then(|v| v.get("context").and_then(Value::as_str).map(String::from))
+            {
+                Some(ctx) => ctx,
+                None => {
+                    let tree = bidi
+                        .call("browsingContext.getTree", json!({}), Duration::from_secs(5))
+                        .await?;
+                    tree.get("contexts")
+                        .and_then(Value::as_array)
+                        .and_then(|arr| arr.first())
+                        .and_then(|c| c.get("context"))
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("Firefox BiDi returned no browsing context"))?
+                        .to_string()
+                }
+            };
+            let _ = bidi
+                .call(
+                    "browsingContext.setViewport",
+                    json!({
+                        "context": context,
+                        "viewport": { "width": 800, "height": 600 },
+                        "devicePixelRatio": 1.0,
+                    }),
+                    Duration::from_secs(5),
+                )
+                .await;
+            Ok::<_, anyhow::Error>((bidi, context))
+        })?;
+
+        Ok(Self {
+            rt,
+            _guard: guard,
+            profile_dir,
+            bidi,
+            context,
+        })
+    }
+
+    /// Navigates the reusable Firefox tab to a local WPT testharness URL and collects subtests.
+    pub fn run_wpt_testharness(
+        &mut self,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<FirefoxWptResult> {
+        let context = self.context.clone();
+        self.rt.block_on(async {
+            let _ = self
+                .bidi
+                .call(
+                    "browsingContext.navigate",
+                    json!({
+                        "context": context,
+                        "url": url,
+                        "wait": "complete",
+                    }),
+                    timeout,
+                )
+                .await?;
+            let eval_res = self
+                .bidi
+                .call(
+                    "script.evaluate",
+                    json!({
+                        "expression": FIREFOX_WPT_COLLECT_JS,
+                        "target": { "context": context },
+                        "awaitPromise": true,
+                        "resultOwnership": "none",
+                    }),
+                    timeout,
+                )
+                .await?;
+            let Some(raw) = extract_eval_string(&eval_res) else {
+                return Ok(FirefoxWptResult::default());
+            };
+            Ok(serde_json::from_str::<FirefoxWptResult>(&raw).unwrap_or_default())
+        })
+    }
+}
+
+impl Drop for PersistentFirefoxBidi {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.profile_dir);
+    }
 }
 
 #[cfg(test)]
