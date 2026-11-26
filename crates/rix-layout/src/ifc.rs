@@ -107,8 +107,10 @@ fn line_box_metrics(
         (raw_asc, raw_desc, lh)
     } else {
         // CSS 2.1 §10.8.1: leading = line-height - (ascent + descent), split equally top/bottom.
+        // Negative half-leading is valid when `line-height < font-size`: do NOT clamp components
+        // to `0.0`, so `(raw_asc + half) + (raw_desc + half)` preserves exact `lh`.
         let half = (lh - (raw_asc + raw_desc)) * 0.5;
-        ((raw_asc + half).max(0.0), (raw_desc + half).max(0.0), lh)
+        (raw_asc + half, raw_desc + half, lh)
     }
 }
 
@@ -1260,7 +1262,7 @@ fn finish_line(
         }
     }
 
-    let natural_h = (max_ascent + max_descent).max(max_top_bottom_h);
+    let natural_h = (max_ascent + max_descent).max(max_top_bottom_h).max(0.0);
     let leading = (natural_h - (max_ascent + max_descent)).max(0.0);
     let baseline = max_ascent + leading * 0.5;
     let line_height = natural_h;
@@ -2303,15 +2305,13 @@ fn shape_word_glyphs(
     font_size: f32,
     style: &ComputedStyle,
 ) -> (Vec<PositionedGlyph>, f32) {
-    let letter_sp = style
-        .text
-        .letter_spacing
-        .resolve_px(font_size, &EvalContext::default());
+    let eval_ctx = EvalContext {
+        font_size_px: font_size,
+        ..style.text.eval_ctx
+    };
+    let letter_sp = style.text.letter_spacing.resolve_px(font_size, &eval_ctx);
     let word_sp = if text == " " {
-        style
-            .text
-            .word_spacing
-            .resolve_px(font_size, &EvalContext::default())
+        style.text.word_spacing.resolve_px(font_size, &eval_ctx)
     } else {
         0.0
     };
@@ -2339,7 +2339,8 @@ fn shape_word_glyphs(
     let runs = ctx.shaper.shape_text(&shaped_input, font_id, font_size);
     if runs.is_empty() {
         // Deterministic fallback width when running in an environment with no system fonts installed.
-        let approx = shaped_input.chars().count() as f32 * (font_size * 0.56) + word_sp;
+        let char_adv = (font_size * 0.56 + letter_sp).max(0.0);
+        let approx = (shaped_input.chars().count() as f32 * char_adv + word_sp).max(0.0);
         return (Vec::new(), approx);
     }
 

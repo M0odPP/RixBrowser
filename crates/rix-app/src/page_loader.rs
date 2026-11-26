@@ -1344,8 +1344,8 @@ fn fetch_batch(
                     SubresourceRole::Stylesheet | SubresourceRole::Script => {
                         Duration::from_millis(3200)
                     }
-                    SubresourceRole::Font => Duration::from_millis(2000),
-                    SubresourceRole::Image => Duration::from_millis(1600),
+                    SubresourceRole::Font => Duration::from_millis(2800),
+                    SubresourceRole::Image => Duration::from_millis(3000),
                 };
                 let rm = resource_manager.clone();
                 let sem = Arc::clone(&sem);

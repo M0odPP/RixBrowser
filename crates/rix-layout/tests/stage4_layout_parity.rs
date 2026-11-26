@@ -216,3 +216,86 @@ fn svg_gradient_href_inherits_stops_from_template_gradient() {
         Some(rix_css::ColorRgba::rgb(0xff, 0x33, 0x66))
     );
 }
+
+#[test]
+fn empty_self_collapsing_first_block_does_not_shift_following_float() {
+    let (doc, root) = layout_html(
+        r#"<!doctype html><html><body style="margin:0;">
+            <div style="height:60px;"></div>
+            <div id="content">
+                <div id="empty" style="margin: 20px 0;"></div>
+                <div id="flt" style="float:left; width:100%; height:120px;"></div>
+            </div>
+        </body></html>"#,
+        "",
+        1280.0,
+        800.0,
+    );
+    let content_r = find_abs_rect(&root, rix_core::Point::ZERO, find_id(&doc, "content")).unwrap();
+    let flt_r = find_abs_rect(&root, rix_core::Point::ZERO, find_id(&doc, "flt")).unwrap();
+    assert!(
+        (content_r.origin.y - 80.0).abs() < 0.5,
+        "Empty first child margin should collapse into parent top (y=80), got {content_r:?}"
+    );
+    assert!(
+        (flt_r.origin.y - content_r.origin.y).abs() < 0.5,
+        "CSS 2.1 §8.3.1: following float must start at parent content edge (y=80), got {flt_r:?}"
+    );
+}
+
+#[test]
+fn negative_half_leading_preserves_exact_line_height_when_smaller_than_font_size() {
+    let (doc, root) = layout_html(
+        r#"<!doctype html><html><body style="margin:0;">
+            <h1 id="h" style="margin:0; font-size:62.4px; line-height:20.8px;">The Linux Kernel Archives</h1>
+        </body></html>"#,
+        "",
+        1280.0,
+        800.0,
+    );
+    let h_r = find_abs_rect(&root, rix_core::Point::ZERO, find_id(&doc, "h")).unwrap();
+    assert!(
+        (h_r.size.height - 20.8).abs() < 0.5,
+        "CSS 2.1 §10.8.1: negative half-leading must yield exact 20.8px line box, got {h_r:?}"
+    );
+}
+
+#[test]
+fn em_letter_spacing_resolves_against_element_font_size() {
+    let (doc, root) = layout_html(
+        r#"<!doctype html><html><body style="margin:0;">
+            <span id="normal" style="display:inline-block; font-size:80px; letter-spacing:0;">Speed you can trust</span>
+            <span id="tight" style="display:inline-block; font-size:80px; letter-spacing:-0.05em;">Speed you can trust</span>
+        </body></html>"#,
+        "",
+        1280.0,
+        800.0,
+    );
+    let normal_r = find_abs_rect(&root, rix_core::Point::ZERO, find_id(&doc, "normal")).unwrap();
+    let tight_r = find_abs_rect(&root, rix_core::Point::ZERO, find_id(&doc, "tight")).unwrap();
+    let delta = normal_r.size.width - tight_r.size.width;
+    // 19 chars * (-0.05 * 80px = -4px/char) = ~76px narrower (vs ~15px if resolved against 16px default!).
+    assert!(
+        delta > 45.0,
+        "CSS Text L3: -0.05em letter-spacing at 80px must tighten width by >45px (got delta={delta:.1}, normal={normal_r:?}, tight={tight_r:?})"
+    );
+}
+
+#[test]
+fn replaced_img_honors_css_aspect_ratio_without_intrinsic_dimensions() {
+    let (doc, root) = layout_html(
+        r#"<!doctype html><html><body style="margin:0;">
+            <div style="width:1232px;">
+                <img id="hero" src="placeholder.webp" style="display:block; width:100%; height:auto; aspect-ratio:1240/618;">
+            </div>
+        </body></html>"#,
+        "",
+        1280.0,
+        800.0,
+    );
+    let hero_r = find_abs_rect(&root, rix_core::Point::ZERO, find_id(&doc, "hero")).unwrap();
+    assert!(
+        (hero_r.size.width - 1232.0).abs() < 0.5 && (hero_r.size.height - 614.0).abs() < 1.0,
+        "CSS Sizing L4 §6.1: replaced img with aspect-ratio 1240/618 must size to 1232x614, got {hero_r:?}"
+    );
+}

@@ -538,7 +538,11 @@ pub fn run_compare_firefox(opts: &CompareFirefoxOptions) -> Result<CompareFirefo
         .iter()
         .map(|s| s.rix_js_errors.saturating_sub(s.firefox_js_errors))
         .sum();
-    report.idle_zero_hz_sites = ok_pairs.iter().filter(|s| s.rix_idle_frames == 0).count();
+    report.idle_zero_hz_sites = report
+        .sites
+        .iter()
+        .filter(|s| s.rix_ok && s.rix_idle_frames == 0)
+        .count();
 
     let rx_fps: Vec<f64> = ok_pairs.iter().filter_map(|s| s.rix_scroll_fps).collect();
     if !rx_fps.is_empty() {
