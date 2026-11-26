@@ -1052,7 +1052,7 @@ impl<'a> Painter<'a> {
         }
         let style = &frag.style;
         let radii = resolve_radii(style, abs_rect);
-        let eval = EvalContext::default();
+        let eval = style.text.eval_ctx;
 
         // Outset box shadows behind background.
         if let Some(effects) = &style.effects {
@@ -1116,6 +1116,71 @@ impl<'a> Painter<'a> {
                 match &layer.image {
                     BackgroundImageValue::None => {}
                     BackgroundImageValue::LinearGradient { angle_deg, stops } => {
+                        let effective_size =
+                            style.visual.background_size.as_ref().unwrap_or(&layer.size);
+                        let (tile_w, tile_h) = match effective_size {
+                            BackgroundSizeValue::Explicit(w_opt, h_opt) => (
+                                w_opt.as_ref().map_or(abs_rect.size.width, |w| {
+                                    w.resolve_px(abs_rect.size.width, &eval).max(1.0)
+                                }),
+                                h_opt.as_ref().map_or(abs_rect.size.height, |h| {
+                                    h.resolve_px(abs_rect.size.height, &eval).max(1.0)
+                                }),
+                            ),
+                            _ => (abs_rect.size.width, abs_rect.size.height),
+                        };
+                        let is_tiled = (layer.repeat_x && tile_w < abs_rect.size.width - 0.5)
+                            || (layer.repeat_y && tile_h < abs_rect.size.height - 0.5);
+                        if is_tiled && tile_w >= 4.0 && tile_h >= 4.0 {
+                            let cols = if layer.repeat_x {
+                                (abs_rect.size.width / tile_w).ceil() as usize
+                            } else {
+                                1
+                            };
+                            let rows = if layer.repeat_y {
+                                (abs_rect.size.height / tile_h).ceil() as usize
+                            } else {
+                                1
+                            };
+                            if cols.saturating_mul(rows) <= 512 {
+                                self.list.push(DisplayItem::PushClip {
+                                    spatial,
+                                    rect: abs_rect,
+                                    radii,
+                                });
+                                for r in 0..rows {
+                                    for c in 0..cols {
+                                        let cell = Rect::new(
+                                            abs_rect.min_x() + c as f32 * tile_w,
+                                            abs_rect.min_y() + r as f32 * tile_h,
+                                            tile_w,
+                                            tile_h,
+                                        );
+                                        let (start, end) =
+                                            linear_gradient_endpoints(cell, *angle_deg);
+                                        let grad_len =
+                                            (end.x - start.x).hypot(end.y - start.y).max(1.0);
+                                        let resolved = resolve_gradient_stops(
+                                            stops,
+                                            grad_len,
+                                            style.text.color,
+                                            self.dark_mode,
+                                        );
+                                        if resolved.len() >= 2 {
+                                            self.list.push(DisplayItem::LinearGradient {
+                                                bounds: cell,
+                                                start,
+                                                end,
+                                                stops: resolved,
+                                                radii: [0.0; 4],
+                                            });
+                                        }
+                                    }
+                                }
+                                self.list.push(DisplayItem::PopClip);
+                                continue;
+                            }
+                        }
                         let (start, end) = linear_gradient_endpoints(abs_rect, *angle_deg);
                         let grad_len = (end.x - start.x).hypot(end.y - start.y).max(1.0);
                         let resolved = resolve_gradient_stops(
@@ -1140,6 +1205,88 @@ impl<'a> Painter<'a> {
                         cy,
                         stops,
                     } => {
+                        let effective_size =
+                            style.visual.background_size.as_ref().unwrap_or(&layer.size);
+                        let (tile_w, tile_h) = match effective_size {
+                            BackgroundSizeValue::Explicit(w_opt, h_opt) => (
+                                w_opt.as_ref().map_or(abs_rect.size.width, |w| {
+                                    w.resolve_px(abs_rect.size.width, &eval).max(1.0)
+                                }),
+                                h_opt.as_ref().map_or(abs_rect.size.height, |h| {
+                                    h.resolve_px(abs_rect.size.height, &eval).max(1.0)
+                                }),
+                            ),
+                            _ => (abs_rect.size.width, abs_rect.size.height),
+                        };
+                        let is_tiled = (layer.repeat_x && tile_w < abs_rect.size.width - 0.5)
+                            || (layer.repeat_y && tile_h < abs_rect.size.height - 0.5);
+                        if is_tiled {
+                            let cols = if layer.repeat_x {
+                                (abs_rect.size.width / tile_w).ceil() as usize
+                            } else {
+                                1
+                            };
+                            let rows = if layer.repeat_y {
+                                (abs_rect.size.height / tile_h).ceil() as usize
+                            } else {
+                                1
+                            };
+                            if cols.saturating_mul(rows) <= 512 && tile_w >= 4.0 && tile_h >= 4.0 {
+                                self.list.push(DisplayItem::PushClip {
+                                    spatial,
+                                    rect: abs_rect,
+                                    radii,
+                                });
+                                for r in 0..rows {
+                                    for c in 0..cols {
+                                        let cell = Rect::new(
+                                            abs_rect.min_x() + c as f32 * tile_w,
+                                            abs_rect.min_y() + r as f32 * tile_h,
+                                            tile_w,
+                                            tile_h,
+                                        );
+                                        let center = Point::new(
+                                            cell.min_x() + cx.resolve_px(cell.size.width, &eval),
+                                            cell.min_y() + cy.resolve_px(cell.size.height, &eval),
+                                        );
+                                        let dx = (center.x - cell.min_x())
+                                            .abs()
+                                            .max((cell.max_x() - center.x).abs());
+                                        let dy = (center.y - cell.min_y())
+                                            .abs()
+                                            .max((cell.max_y() - center.y).abs());
+                                        let radius = if *shape_circle {
+                                            (dx * dx + dy * dy).sqrt().max(1.0)
+                                        } else {
+                                            dx.max(dy).max(1.0)
+                                        };
+                                        let resolved = resolve_gradient_stops(
+                                            stops,
+                                            radius,
+                                            style.text.color,
+                                            self.dark_mode,
+                                        );
+                                        if resolved.len() >= 2 {
+                                            self.list.push(DisplayItem::RadialGradient {
+                                                bounds: cell,
+                                                center,
+                                                radius,
+                                                stops: resolved,
+                                                radii: [0.0; 4],
+                                            });
+                                        }
+                                    }
+                                }
+                                self.list.push(DisplayItem::PopClip);
+                                continue;
+                            } else if tile_w < abs_rect.size.width * 0.25
+                                && tile_h < abs_rect.size.height * 0.25
+                            {
+                                // Tiny high-frequency micro-grid pattern (> 512 tiles): avoid stretching
+                                // a single tile across the full box as a giant central blob.
+                                continue;
+                            }
+                        }
                         let center = Point::new(
                             abs_rect.min_x() + cx.resolve_px(abs_rect.size.width, &eval),
                             abs_rect.min_y() + cy.resolve_px(abs_rect.size.height, &eval),
@@ -1186,8 +1333,8 @@ impl<'a> Painter<'a> {
                         };
                         if let Some(decoded) = self.assets.get_by_src(url.as_str()) {
                             let img_id = decoded.image_id;
-                            let iw = decoded.width.max(1) as f32;
-                            let ih = decoded.height.max(1) as f32;
+                            let iw = decoded.intrinsic_width.max(1) as f32;
+                            let ih = decoded.intrinsic_height.max(1) as f32;
                             if self.ensure_image_registered(img_id) {
                                 let img_bounds = match effective_size {
                                     BackgroundSizeValue::Cover => {
@@ -1247,8 +1394,102 @@ impl<'a> Painter<'a> {
                                             dh,
                                         )
                                     }
-                                    BackgroundSizeValue::Auto => abs_rect,
+                                    // CSS Backgrounds L3 §3.9: `background-size: auto` renders the
+                                    // image at its intrinsic size, positioned by `background-position`.
+                                    BackgroundSizeValue::Auto => Rect::new(
+                                        abs_rect.min_x()
+                                            + px.resolve_px(abs_rect.size.width - iw, &eval),
+                                        abs_rect.min_y()
+                                            + py.resolve_px(abs_rect.size.height - ih, &eval),
+                                        iw,
+                                        ih,
+                                    ),
                                 };
+                                let tw = img_bounds.size.width;
+                                let th = img_bounds.size.height;
+                                let tile_x =
+                                    layer.repeat_x && tw >= 1.0 && tw < abs_rect.size.width - 0.5;
+                                let tile_y =
+                                    layer.repeat_y && th >= 1.0 && th < abs_rect.size.height - 0.5;
+                                if tile_x || tile_y {
+                                    let start_x = if tile_x {
+                                        let mut sx = img_bounds.min_x();
+                                        while sx > abs_rect.min_x() {
+                                            sx -= tw;
+                                        }
+                                        sx
+                                    } else {
+                                        img_bounds.min_x()
+                                    };
+                                    let start_y = if tile_y {
+                                        let mut sy = img_bounds.min_y();
+                                        while sy > abs_rect.min_y() {
+                                            sy -= th;
+                                        }
+                                        sy
+                                    } else {
+                                        img_bounds.min_y()
+                                    };
+                                    let cols = if tile_x {
+                                        ((abs_rect.max_x() - start_x) / tw).ceil().max(1.0) as usize
+                                    } else {
+                                        1
+                                    };
+                                    let rows = if tile_y {
+                                        ((abs_rect.max_y() - start_y) / th).ceil().max(1.0) as usize
+                                    } else {
+                                        1
+                                    };
+                                    let tile_count = cols.saturating_mul(rows);
+                                    if tile_count <= 1024 {
+                                        self.list.push(DisplayItem::PushClip {
+                                            spatial,
+                                            rect: abs_rect,
+                                            radii,
+                                        });
+                                        for r in 0..rows {
+                                            for c in 0..cols {
+                                                self.list.push(DisplayItem::Image {
+                                                    bounds: Rect::new(
+                                                        start_x + c as f32 * tw,
+                                                        start_y + r as f32 * th,
+                                                        tw,
+                                                        th,
+                                                    ),
+                                                    image_id: img_id,
+                                                    sampling: ImageSampling::Bilinear,
+                                                    radii: [0.0; 4],
+                                                });
+                                            }
+                                        }
+                                        self.list.push(DisplayItem::PopClip);
+                                        continue;
+                                    } else if tw <= 4.0 && th <= 4.0 {
+                                        // Ultra-small repeating pixel/micro-tile (> 1024 tiles):
+                                        // cover the repeated axes in a single clipped draw call.
+                                        let fill_rect = Rect::new(
+                                            if tile_x {
+                                                abs_rect.min_x()
+                                            } else {
+                                                img_bounds.min_x()
+                                            },
+                                            if tile_y {
+                                                abs_rect.min_y()
+                                            } else {
+                                                img_bounds.min_y()
+                                            },
+                                            if tile_x { abs_rect.size.width } else { tw },
+                                            if tile_y { abs_rect.size.height } else { th },
+                                        );
+                                        self.list.push(DisplayItem::Image {
+                                            bounds: fill_rect,
+                                            image_id: img_id,
+                                            sampling: ImageSampling::Bilinear,
+                                            radii,
+                                        });
+                                        continue;
+                                    }
+                                }
                                 // CSS Backgrounds L3 §3.7: background images are always clipped to
                                 // the element's background-clip box (default border-box `abs_rect`).
                                 let needs_bg_clip = img_bounds.min_x() < abs_rect.min_x() - 0.5

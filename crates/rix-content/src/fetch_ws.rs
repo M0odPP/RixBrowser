@@ -802,10 +802,29 @@ pub fn deliver_async_net_event(
                     dark_mode: hb.dark_mode,
                     ..rix_css::MediaContext::default()
                 };
-                let sheet = rix_css::Stylesheet::parse_cached(
+                let base_url = {
+                    let doc = hb.document.borrow();
+                    let raw_href = match doc.get(link_nid) {
+                        Some(rix_dom::NodeData::Element(el)) => {
+                            el.get_attribute("href").unwrap_or("").trim().to_string()
+                        }
+                        _ => String::new(),
+                    };
+                    if !raw_href.is_empty() {
+                        url::Url::parse(&hb.main_document_url)
+                            .ok()
+                            .and_then(|b| b.join(&raw_href).ok())
+                            .map_or(raw_href, |u| u.to_string())
+                    } else {
+                        hb.main_document_url.clone()
+                    }
+                };
+                let base_opt = (!base_url.is_empty()).then_some(base_url.as_str());
+                let sheet = rix_css::Stylesheet::parse_cached_with_base(
                     &css_text,
                     rix_css::CascadeOrigin::Author,
                     &media,
+                    base_opt,
                 );
                 hb.add_external_stylesheet(sheet);
                 true

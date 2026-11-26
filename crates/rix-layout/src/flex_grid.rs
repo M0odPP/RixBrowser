@@ -636,30 +636,32 @@ fn to_taffy_container_style(
     ts.align_content = map_align_content(fg.align_content);
     ts.justify_content = map_align_content(fg.justify_content);
     ts.justify_items = map_align_items(fg.justify_items);
+    let cb_w = space.containing_block_width;
+    let cb_h = space.containing_block_height;
     ts.gap = tp::Size {
-        width: lp_to_taffy(&fg.column_gap, eval),
-        height: lp_to_taffy(&fg.row_gap, eval),
+        width: lp_to_taffy(&fg.column_gap, cb_w, eval),
+        height: lp_to_taffy(&fg.row_gap, cb_h, eval),
     };
 
     ts.grid_template_columns = fg
         .grid_template_columns
         .iter()
-        .map(|t| tp::GridTemplateComponent::Single(grid_track_to_taffy(t, eval)))
+        .map(|t| tp::GridTemplateComponent::Single(grid_track_to_taffy(t, cb_w, eval)))
         .collect();
     ts.grid_template_rows = fg
         .grid_template_rows
         .iter()
-        .map(|t| tp::GridTemplateComponent::Single(grid_track_to_taffy(t, eval)))
+        .map(|t| tp::GridTemplateComponent::Single(grid_track_to_taffy(t, cb_h, eval)))
         .collect();
     ts.grid_auto_columns = fg
         .grid_auto_columns
         .iter()
-        .map(|t| grid_track_to_taffy(t, eval))
+        .map(|t| grid_track_to_taffy(t, cb_w, eval))
         .collect();
     ts.grid_auto_rows = fg
         .grid_auto_rows
         .iter()
-        .map(|t| grid_track_to_taffy(t, eval))
+        .map(|t| grid_track_to_taffy(t, cb_h, eval))
         .collect();
     ts.grid_auto_flow = match fg.grid_auto_flow {
         GridAutoFlowMode::Row => tp::GridAutoFlow::Row,
@@ -680,6 +682,8 @@ fn to_taffy_item_style(
 ) -> tp::Style {
     let bm = &style.box_model;
     let metrics = BoxMetrics::resolve_with_eval(style, space, *eval);
+    let cb_w = space.containing_block_width;
+    let cb_h = space.containing_block_height;
     let mut ts = tp::Style {
         box_sizing: match style.box_sizing {
             BoxSizingMode::BorderBox => tp::BoxSizing::BorderBox,
@@ -690,22 +694,22 @@ fn to_taffy_item_style(
             y: map_overflow(style.overflow.y),
         },
         size: tp::Size {
-            width: size_to_dimension(&bm.width, eval),
-            height: size_to_dimension(&bm.height, eval),
+            width: size_to_dimension(&bm.width, cb_w, eval),
+            height: size_to_dimension(&bm.height, cb_h, eval),
         },
         min_size: tp::Size {
-            width: size_to_lpa(&bm.min_width, eval),
-            height: size_to_lpa(&bm.min_height, eval),
+            width: size_to_lpa(&bm.min_width, cb_w, eval),
+            height: size_to_lpa(&bm.min_height, cb_h, eval),
         },
         max_size: tp::Size {
-            width: size_to_lpa(&bm.max_width, eval),
-            height: size_to_lpa(&bm.max_height, eval),
+            width: size_to_lpa(&bm.max_width, cb_w, eval),
+            height: size_to_lpa(&bm.max_height, cb_h, eval),
         },
         margin: tp::Rect {
-            left: lpa_to_taffy(&bm.margin.left, eval),
-            right: lpa_to_taffy(&bm.margin.right, eval),
-            top: lpa_to_taffy(&bm.margin.top, eval),
-            bottom: lpa_to_taffy(&bm.margin.bottom, eval),
+            left: lpa_to_taffy(&bm.margin.left, cb_w, eval),
+            right: lpa_to_taffy(&bm.margin.right, cb_w, eval),
+            top: lpa_to_taffy(&bm.margin.top, cb_w, eval),
+            bottom: lpa_to_taffy(&bm.margin.bottom, cb_w, eval),
         },
         padding: tp::Rect {
             left: tp::length(metrics.padding.left),
@@ -725,7 +729,7 @@ fn to_taffy_item_style(
     if let Some(fg) = &style.flex_grid {
         ts.flex_grow = fg.flex_grow.max(0.0);
         ts.flex_shrink = fg.flex_shrink.max(0.0);
-        ts.flex_basis = lpa_to_dimension(&fg.flex_basis, eval);
+        ts.flex_basis = lpa_to_dimension(&fg.flex_basis, if is_row { cb_w } else { cb_h }, eval);
         ts.align_self = map_align_items(fg.align_self);
         ts.justify_self = map_align_items(fg.justify_self);
 
@@ -825,39 +829,43 @@ fn placement_to_taffy(
     }
 }
 
-fn lp_to_taffy(lp: &LengthPercentage, eval: &EvalContext) -> tp::LengthPercentage {
+fn lp_to_taffy(lp: &LengthPercentage, cb_px: f32, eval: &EvalContext) -> tp::LengthPercentage {
     match lp {
         LengthPercentage::Zero => tp::length(0.0),
         LengthPercentage::Length(v, unit) => tp::length(unit.resolve_px(*v, eval)),
         LengthPercentage::Percent(p) => tp::percent(*p),
-        LengthPercentage::Calc(expr) => tp::length(expr.resolve_px(eval.container_width_px, eval)),
+        LengthPercentage::Calc(expr) => tp::length(expr.resolve_px(cb_px, eval)),
     }
 }
 
-fn lpa_to_taffy(lpa: &LengthPercentageAuto, eval: &EvalContext) -> tp::LengthPercentageAuto {
+fn lpa_to_taffy(
+    lpa: &LengthPercentageAuto,
+    cb_px: f32,
+    eval: &EvalContext,
+) -> tp::LengthPercentageAuto {
     match lpa {
         LengthPercentageAuto::Auto => tp::auto(),
-        LengthPercentageAuto::Value(lp) => lp_to_taffy(lp, eval).into(),
+        LengthPercentageAuto::Value(lp) => lp_to_taffy(lp, cb_px, eval).into(),
     }
 }
 
-fn lpa_to_dimension(lpa: &LengthPercentageAuto, eval: &EvalContext) -> tp::Dimension {
+fn lpa_to_dimension(lpa: &LengthPercentageAuto, cb_px: f32, eval: &EvalContext) -> tp::Dimension {
     match lpa {
         LengthPercentageAuto::Auto => tp::auto(),
-        LengthPercentageAuto::Value(lp) => lp_to_taffy(lp, eval).into(),
+        LengthPercentageAuto::Value(lp) => lp_to_taffy(lp, cb_px, eval).into(),
     }
 }
 
-fn size_to_dimension(size: &SizeValue, eval: &EvalContext) -> tp::Dimension {
+fn size_to_dimension(size: &SizeValue, cb_px: f32, eval: &EvalContext) -> tp::Dimension {
     match size {
-        SizeValue::Length(lp) => lp_to_taffy(lp, eval).into(),
+        SizeValue::Length(lp) => lp_to_taffy(lp, cb_px, eval).into(),
         _ => tp::auto(),
     }
 }
 
-fn size_to_lpa(size: &SizeValue, eval: &EvalContext) -> tp::LengthPercentageAuto {
+fn size_to_lpa(size: &SizeValue, cb_px: f32, eval: &EvalContext) -> tp::LengthPercentageAuto {
     match size {
-        SizeValue::Length(lp) => lp_to_taffy(lp, eval).into(),
+        SizeValue::Length(lp) => lp_to_taffy(lp, cb_px, eval).into(),
         _ => tp::auto(),
     }
 }
@@ -904,20 +912,24 @@ fn map_align_content(val: AlignValue) -> Option<tp::AlignContent> {
     }
 }
 
-fn grid_track_to_taffy(track: &GridTrackSize, eval: &EvalContext) -> tp::TrackSizingFunction {
+fn grid_track_to_taffy(
+    track: &GridTrackSize,
+    cb_px: f32,
+    eval: &EvalContext,
+) -> tp::TrackSizingFunction {
     match track {
         GridTrackSize::Auto => tp::auto(),
         GridTrackSize::MinContent => tp::min_content(),
         GridTrackSize::MaxContent => tp::max_content(),
         GridTrackSize::Length(lp) => match lp {
             LengthPercentage::Percent(p) => tp::percent(*p),
-            other => tp::length(other.resolve_px(eval.container_width_px, eval)),
+            other => tp::length(other.resolve_px(cb_px, eval)),
         },
         GridTrackSize::Fr(f) => tp::fr(*f),
         GridTrackSize::FrMath(n) => tp::fr((n.eval_scalar(eval, None) as f32).max(0.0)),
         GridTrackSize::FitContent(lp) => match lp {
             LengthPercentage::Percent(p) => tp::fit_content(tp::percent(*p)),
-            other => tp::fit_content(tp::length(other.resolve_px(eval.container_width_px, eval))),
+            other => tp::fit_content(tp::length(other.resolve_px(cb_px, eval))),
         },
         GridTrackSize::MinMax(min_t, max_t) => {
             let min_fn = match min_t.as_ref() {
@@ -925,7 +937,7 @@ fn grid_track_to_taffy(track: &GridTrackSize, eval: &EvalContext) -> tp::TrackSi
                 GridTrackSize::MaxContent => tp::max_content(),
                 GridTrackSize::Length(lp) => match lp {
                     LengthPercentage::Percent(p) => tp::percent(*p),
-                    other => tp::length(other.resolve_px(eval.container_width_px, eval)),
+                    other => tp::length(other.resolve_px(cb_px, eval)),
                 },
                 _ => tp::auto(),
             };
@@ -936,7 +948,7 @@ fn grid_track_to_taffy(track: &GridTrackSize, eval: &EvalContext) -> tp::TrackSi
                 GridTrackSize::FrMath(n) => tp::fr((n.eval_scalar(eval, None) as f32).max(0.0)),
                 GridTrackSize::Length(lp) => match lp {
                     LengthPercentage::Percent(p) => tp::percent(*p),
-                    other => tp::length(other.resolve_px(eval.container_width_px, eval)),
+                    other => tp::length(other.resolve_px(cb_px, eval)),
                 },
                 _ => tp::auto(),
             };

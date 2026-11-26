@@ -22,11 +22,11 @@ fn is_generic(family: &str) -> bool {
 
 fn generic_defaults(generic: &str) -> &'static [&'static str] {
     match generic {
-        "serif" => &["Times New Roman", "serif"],
-        "sans-serif" => &["Arial", "sans-serif"],
+        "serif" => &["serif", "Times New Roman"],
+        "sans-serif" => &["sans-serif", "Arial"],
         "monospace" => &["monospace"],
-        "cursive" => &["Comic Sans MS", "cursive", "sans-serif"],
-        "fantasy" => &["Impact", "fantasy", "sans-serif"],
+        "cursive" => &["cursive", "Comic Sans MS", "sans-serif"],
+        "fantasy" => &["fantasy", "Impact", "sans-serif"],
         "system-ui" => &["sans-serif"],
         "emoji" => &["emoji"],
         "math" => &["math", "serif"],

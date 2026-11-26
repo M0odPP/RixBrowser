@@ -801,7 +801,9 @@ pub fn layout_flex_container(
             intr_w_fn,
         )
     });
-    let definite_w: Option<f32> = if let Some(sw) = spec_w {
+    let definite_w: Option<f32> = if let Some(ov_w) = space.definite_width_override {
+        Some(ov_w.max(0.0))
+    } else if let Some(sw) = spec_w {
         Some(sw.min(c_max_w).max(c_min_w).max(0.0))
     } else if !shrink_w {
         Some(avail_w_content.min(c_max_w).max(c_min_w).max(0.0))

@@ -557,12 +557,12 @@ pub fn layout_out_of_flow_box(
     sub_space.available_height = sub_avail_h;
     sub_space.containing_block_width = cb_w;
     sub_space.containing_block_height = cb_h;
-    sub_space.definite_width_override = if stretch_w {
+    let mut def_w_ov = if stretch_w {
         Some((imcb_avail_w - pb_w).max(0.0).min(eff_max_w).max(eff_min_w))
     } else {
         None
     };
-    sub_space.definite_height_override = if stretch_h {
+    let mut def_h_ov = if stretch_h {
         Some(
             (imcb_avail_h - pb_h)
                 .max(0.0)
@@ -573,13 +573,79 @@ pub fn layout_out_of_flow_box(
         None
     };
 
+    // CSS Sizing L4 §6.1 / CSS Position L3 §5.1: apply `aspect-ratio` to non-replaced
+    // out-of-flow boxes when one axis is definite and the opposite axis is `auto`.
+    let mut ratio_derived_w: Option<f32> = None;
+    let mut ratio_derived_h: Option<f32> = None;
+    if !is_replaced && !is_table {
+        if let Some((num, den)) = style
+            .effects
+            .as_ref()
+            .and_then(|e| e.aspect_ratio_math.as_ref())
+        {
+            let n = num.eval_scalar(&eval, None);
+            let d = den.as_ref().map_or(1.0, |x| x.eval_scalar(&eval, None));
+            let ratio = n / d;
+            if ratio.is_finite() && ratio > 0.0 {
+                let ratio_f = ratio as f32;
+                let known_w = def_w_ov.or_else(|| {
+                    metrics
+                        .specified_width
+                        .map(|w| w.min(eff_max_w).max(eff_min_w).max(0.0))
+                });
+                let known_h = def_h_ov.or_else(|| {
+                    metrics
+                        .specified_height
+                        .map(|h| h.min(metrics.max_height).max(metrics.min_height).max(0.0))
+                });
+                if height_is_auto && !stretch_h {
+                    if let Some(cw) = known_w {
+                        let box_w = if is_bb { cw + pb_w } else { cw };
+                        let box_h = box_w / ratio_f;
+                        let ch = if is_bb {
+                            (box_h - pb_h).max(0.0)
+                        } else {
+                            box_h
+                        }
+                        .min(metrics.max_height)
+                        .max(metrics.min_height)
+                        .max(0.0);
+                        def_h_ov = Some(ch);
+                        ratio_derived_h = Some(ch);
+                    }
+                } else if width_is_auto && !stretch_w {
+                    if let Some(ch) = known_h {
+                        let box_h = if is_bb { ch + pb_h } else { ch };
+                        let box_w = box_h * ratio_f;
+                        let cw = if is_bb {
+                            (box_w - pb_w).max(0.0)
+                        } else {
+                            box_w
+                        }
+                        .min(eff_max_w)
+                        .max(eff_min_w)
+                        .max(0.0);
+                        def_w_ov = Some(cw);
+                        ratio_derived_w = Some(cw);
+                        sub_space.available_width = (cw + pb_w + fixed_mx).max(0.0);
+                    }
+                }
+            }
+        }
+    }
+    sub_space.definite_width_override = def_w_ov;
+    sub_space.definite_height_override = def_h_ov;
+
     let mut frag = layout_box(ctx, entry.box_id, sub_space);
 
-    // Enforce exact stretched border-box dimensions (clamped by min/max) for non-replaced stretch.
+    // Enforce exact stretched / ratio-derived border-box dimensions (clamped by min/max).
     if stretch_w {
         let cw = (imcb_avail_w - pb_w).max(0.0).min(eff_max_w).max(eff_min_w);
         let bw = cw + pb_w;
         frag.border_rect.size.width = bw;
+        frag.content_rect.size.width = cw;
+    } else if let Some(cw) = ratio_derived_w {
+        frag.border_rect.size.width = cw + pb_w;
         frag.content_rect.size.width = cw;
     } else if fit_content_w && !is_table {
         // Ensure fit-content respects IMCB available width (even when both insets are set with non-stretch align).
@@ -599,6 +665,12 @@ pub fn layout_out_of_flow_box(
         let bh = ch + pb_h;
         frag.border_rect.size.height = bh;
         frag.content_rect.size.height = ch;
+    } else if let Some(ch) = ratio_derived_h {
+        // Respect aspect-ratio height as minimum height while still allowing explicit min/max clamping.
+        if frag.content_rect.size.height < ch {
+            frag.border_rect.size.height = ch + pb_h;
+            frag.content_rect.size.height = ch;
+        }
     }
 
     // CSS Flexbox L1 §4.1: If this out-of-flow box is a direct child of a flex container,

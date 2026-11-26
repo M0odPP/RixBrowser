@@ -2064,6 +2064,15 @@ pub fn resolve_element_style_with_context(
     }
     let self_lh_px =
         compute_line_height_px(&style.text.line_height, style.text.font_size_px, &lh_eval);
+    // CSS 2.1 §10.8.1 / CSS Inline Layout L3: `<length>` and `<percentage>` `line-height`
+    // values compute to an absolute pixel length on the declaring element and inherit that
+    // computed pixel length to descendants (unlike `normal` and `<number>`).
+    if matches!(style.text.line_height, LineHeightValue::Length(_)) {
+        let resolved_lh = LineHeightValue::Length(LengthPercentage::px(self_lh_px));
+        if style.text.line_height != resolved_lh {
+            Arc::make_mut(&mut style.text).line_height = resolved_lh;
+        }
+    }
     let eff_root_lh = if parent_style.is_none() {
         self_lh_px
     } else {
@@ -4922,7 +4931,12 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
             }
         }
         PropertyIdKind::FontFamily => {
-            Arc::make_mut(&mut style.text).font_family = init.text.font_family.clone();
+            // CSS Fonts L3 §3.1: initial `font-family` depends on UA default (`serif`).
+            Arc::make_mut(&mut style.text).font_family = if init.text.font_family.is_empty() {
+                smallvec::smallvec![rix_core::intern_str("serif")]
+            } else {
+                init.text.font_family.clone()
+            };
         }
         PropertyIdKind::ListStyleType => {
             Arc::make_mut(&mut style.text).list_style_type = init.text.list_style_type;

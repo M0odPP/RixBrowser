@@ -958,6 +958,7 @@ pub struct Stylesheet {
 struct StylesheetCacheKey {
     hash: u64,
     len: usize,
+    base_url_hash: u64,
     origin: u8,
     viewport_w: u32,
     viewport_h: u32,
@@ -974,11 +975,146 @@ fn hash_css_bytes(bytes: &[u8]) -> u64 {
     h
 }
 
+/// Resolves a CSS relative `url(...)` against a stylesheet base URL per CSS Values L3 §4.5
+/// and RFC 3986 §5.2, leaving absolute, `data:`, `blob:`, and fragment-only URLs untouched.
+pub(crate) fn resolve_css_relative_url(base_url: &str, raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("data:")
+        || lower.starts_with("blob:")
+        || lower.starts_with("file://")
+        || lower.starts_with("about:")
+    {
+        return None;
+    }
+    let scheme_end = base_url.find("://")?;
+    let scheme = &base_url[..scheme_end];
+    let after_scheme = &base_url[scheme_end + 3..];
+    if let Some(rest) = trimmed.strip_prefix("//") {
+        return Some(format!("{scheme}://{rest}"));
+    }
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let origin = &base_url[..scheme_end + 3 + authority_end];
+    let base_path_raw = &after_scheme[authority_end..];
+    let base_path = base_path_raw.split(['?', '#']).next().unwrap_or("/");
+
+    let (rel_path, suffix) = match trimmed.find(['?', '#']) {
+        Some(idx) => (&trimmed[..idx], &trimmed[idx..]),
+        None => (trimmed, ""),
+    };
+    let merged = if rel_path.starts_with('/') {
+        rel_path.to_string()
+    } else if rel_path.is_empty() {
+        base_path.to_string()
+    } else {
+        let dir = match base_path.rfind('/') {
+            Some(slash) => &base_path[..=slash],
+            None => "/",
+        };
+        format!("{dir}{rel_path}")
+    };
+
+    // Normalize dot segments (RFC 3986 §5.2.4).
+    let trailing_slash =
+        merged.ends_with('/') || rel_path.ends_with("/.") || rel_path.ends_with("/..");
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in merged.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            other => segs.push(other),
+        }
+    }
+    let mut norm = String::with_capacity(origin.len() + merged.len() + suffix.len() + 2);
+    norm.push_str(origin);
+    norm.push('/');
+    for (i, seg) in segs.iter().enumerate() {
+        if i > 0 {
+            norm.push('/');
+        }
+        norm.push_str(seg);
+    }
+    if trailing_slash && !segs.is_empty() {
+        norm.push('/');
+    }
+    norm.push_str(suffix);
+    Some(norm)
+}
+
+fn rewrite_stylesheet_relative_urls(rules: &mut [CompiledRule], base_url: &str) {
+    fn rewrite_tokens(tokens: &mut [crate::properties::CssToken], base_url: &str) {
+        for tok in tokens {
+            match tok {
+                crate::properties::CssToken::Url(u) => {
+                    if let Some(abs) = resolve_css_relative_url(base_url, u.as_str()) {
+                        *u = intern_str(&abs);
+                    }
+                }
+                crate::properties::CssToken::Function { args, .. } => {
+                    rewrite_tokens(args, base_url);
+                }
+                crate::properties::CssToken::Var {
+                    fallback: Some(fb), ..
+                } => {
+                    rewrite_tokens(fb, base_url);
+                }
+                _ => {}
+            }
+        }
+    }
+    for rule in rules {
+        let mut changed = false;
+        let mut decls: Vec<SpecifiedDeclaration> = rule.declarations.iter().cloned().collect();
+        for decl in &mut decls {
+            match &mut decl.value {
+                PropertyValue::BackgroundLayers(layers) => {
+                    for layer in layers.iter_mut() {
+                        if let BackgroundImageValue::Url(u) = &mut layer.image {
+                            if let Some(abs) = resolve_css_relative_url(base_url, u.as_str()) {
+                                let interned = intern_str(&abs);
+                                *u = interned.clone();
+                                layer.image_url = Some(interned);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                PropertyValue::MaskImage(BackgroundImageValue::Url(u)) => {
+                    if let Some(abs) = resolve_css_relative_url(base_url, u.as_str()) {
+                        *u = intern_str(&abs);
+                        changed = true;
+                    }
+                }
+                PropertyValue::Unresolved(tokens) => {
+                    let before = tokens.clone();
+                    rewrite_tokens(tokens, base_url);
+                    if *tokens != before {
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if changed {
+            rule.declarations = Arc::from(decls);
+        }
+    }
+}
+
 impl Stylesheet {
     /// Parses and compiles a CSS stylesheet against the given origin and media environment.
     #[must_use]
     pub fn parse(css: &str, origin: CascadeOrigin, media: &MediaContext) -> Self {
-        Self::parse_with_owner(css, origin, media, None)
+        Self::parse_with_owner_and_base(css, origin, media, None, None)
     }
 
     /// Parses and compiles a CSS stylesheet with an optional owner `<style>` parent node
@@ -989,6 +1125,19 @@ impl Stylesheet {
         origin: CascadeOrigin,
         media: &MediaContext,
         owner_parent: Option<rix_dom::NodeId>,
+    ) -> Self {
+        Self::parse_with_owner_and_base(css, origin, media, owner_parent, None)
+    }
+
+    /// Parses and compiles a CSS stylesheet with optional `@scope` owner and base URL for
+    /// resolving relative `url(...)` values per CSS Values L3 §4.5.
+    #[must_use]
+    pub fn parse_with_owner_and_base(
+        css: &str,
+        origin: CascadeOrigin,
+        media: &MediaContext,
+        owner_parent: Option<rix_dom::NodeId>,
+        base_url: Option<&str>,
     ) -> Self {
         let rewritten = crate::properties::rewrite_dynamic_var_names(css);
         let wrapped = wrap_top_level_scope_rules(&rewritten);
@@ -1007,19 +1156,36 @@ impl Stylesheet {
                 );
             }
         }));
-        compiler.finish()
+        let mut sheet = compiler.finish();
+        if let Some(base) = base_url {
+            rewrite_stylesheet_relative_urls(&mut sheet.rules, base);
+        }
+        sheet
     }
 
     /// Parses a stylesheet through a process-wide shared compiled cache keyed by content hash
     /// and active media environment, avoiding redundant CSS parsing across navigations & tabs.
     #[must_use]
     pub fn parse_cached(css: &str, origin: CascadeOrigin, media: &MediaContext) -> Arc<Self> {
+        Self::parse_cached_with_base(css, origin, media, None)
+    }
+
+    /// Parses a stylesheet through the shared cache while resolving relative `url(...)` values
+    /// against `base_url` per CSS Values L3 §4.5.
+    #[must_use]
+    pub fn parse_cached_with_base(
+        css: &str,
+        origin: CascadeOrigin,
+        media: &MediaContext,
+        base_url: Option<&str>,
+    ) -> Arc<Self> {
         static CACHE: OnceLock<RwLock<HashMap<StylesheetCacheKey, Arc<Stylesheet>>>> =
             OnceLock::new();
         let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
         let key = StylesheetCacheKey {
             hash: hash_css_bytes(css.as_bytes()),
             len: css.len(),
+            base_url_hash: base_url.map_or(0, |b| hash_css_bytes(b.as_bytes())),
             origin: origin as u8,
             viewport_w: media.viewport_width.round().max(0.0) as u32,
             viewport_h: media.viewport_height.round().max(0.0) as u32,
@@ -1031,7 +1197,9 @@ impl Stylesheet {
                 return Arc::clone(hit);
             }
         }
-        let compiled = Arc::new(Self::parse(css, origin, media));
+        let compiled = Arc::new(Self::parse_with_owner_and_base(
+            css, origin, media, None, base_url,
+        ));
         if let Ok(mut guard) = cache.write() {
             if guard.len() >= 256 {
                 guard.clear();

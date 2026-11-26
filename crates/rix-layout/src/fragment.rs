@@ -116,8 +116,15 @@ impl ConstraintSpace {
         ctx.root_font_size_px = self.root_font_size_px;
         ctx.viewport_width_px = self.viewport_size.width;
         ctx.viewport_height_px = self.viewport_size.height;
-        ctx.container_width_px = self.containing_block_width;
-        ctx.container_height_px = self.containing_block_height;
+        // CSS Containment L3 §5: preserve query container dimensions populated during cascade
+        // for `cqw`/`cqh`/`cqi`/`cqb`/`cqmin`/`cqmax`; only fall back to the containing block
+        // when no query container size was established.
+        if ctx.container_width_px <= 0.0 {
+            ctx.container_width_px = self.containing_block_width;
+        }
+        if ctx.container_height_px <= 0.0 {
+            ctx.container_height_px = self.containing_block_height;
+        }
         ctx
     }
 

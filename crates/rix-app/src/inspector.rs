@@ -262,6 +262,7 @@ struct FragmentSnapshotInfo {
     margin: rix_layout::EdgeInsets,
     style: std::sync::Arc<ComputedStyle>,
     resolved_grid_cols: Option<String>,
+    is_replaced: bool,
 }
 
 fn collect_fragment_rects_and_styles(
@@ -270,6 +271,13 @@ fn collect_fragment_rects_and_styles(
     out: &mut HashMap<NodeId, FragmentSnapshotInfo>,
 ) {
     let abs = frag.absolute_border_rect(parent_origin);
+    let is_replaced = !matches!(
+        frag.kind,
+        rix_layout::FragmentKind::Box
+            | rix_layout::FragmentKind::InlineBox { .. }
+            | rix_layout::FragmentKind::LineBox { .. }
+            | rix_layout::FragmentKind::TextRun(_)
+    );
     if let Some(nid) = frag.dom_node {
         out.entry(nid)
             .and_modify(|existing| {
@@ -283,6 +291,7 @@ fn collect_fragment_rects_and_styles(
                     (max_x - min_x).max(0.0),
                     (max_y - min_y).max(0.0),
                 );
+                existing.is_replaced |= is_replaced;
             })
             .or_insert_with(|| FragmentSnapshotInfo {
                 rect: abs,
@@ -295,6 +304,7 @@ fn collect_fragment_rects_and_styles(
                     .as_ref()
                     .filter(|g| !g.columns.is_empty())
                     .map(|g| g.columns.clone()),
+                is_replaced,
             });
     }
     for child in frag.children.iter() {
@@ -363,8 +373,15 @@ fn format_px_cssom(v: f32) -> String {
 /// `width`/`height`/`margin-*`/`padding-*`, matching Firefox `window.getComputedStyle()`.
 fn format_resolved_property(info: &FragmentSnapshotInfo, prop: &str) -> String {
     let is_border_box = matches!(info.style.box_sizing, rix_css::BoxSizingMode::BorderBox);
+    let is_non_replaced_inline =
+        matches!(info.style.display, rix_css::DisplayMode::Inline) && !info.is_replaced;
     match prop {
         "width" => {
+            // CSSOM §6.7.3: non-replaced inline elements do not have a used width/height box,
+            // so `getComputedStyle(el).width` returns `"auto"`.
+            if is_non_replaced_inline {
+                return "auto".to_string();
+            }
             let v = if is_border_box {
                 info.rect.size.width
             } else {
@@ -373,6 +390,9 @@ fn format_resolved_property(info: &FragmentSnapshotInfo, prop: &str) -> String {
             format_px_cssom(v)
         }
         "height" => {
+            if is_non_replaced_inline {
+                return "auto".to_string();
+            }
             let v = if is_border_box {
                 info.rect.size.height
             } else {

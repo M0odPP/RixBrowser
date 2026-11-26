@@ -888,19 +888,22 @@ impl HostState {
                 == self.cached_inline_sheet_hashes[..];
         if is_pure_append {
             let prev_len = self.cached_inline_sheet_hashes.len();
+            let base_opt =
+                (!self.main_document_url.is_empty()).then_some(self.main_document_url.as_str());
             let mut doc = self.document.borrow_mut();
             for (css, owner_parent) in &maybe_sheets[prev_len..] {
                 let sheet = if owner_parent.is_some()
                     && (css.contains("@scope") || css.contains("@SCOPE"))
                 {
-                    Arc::new(Stylesheet::parse_with_owner(
+                    Arc::new(Stylesheet::parse_with_owner_and_base(
                         css,
                         CascadeOrigin::Author,
                         &media,
                         *owner_parent,
+                        base_opt,
                     ))
                 } else {
-                    Stylesheet::parse_cached(css, CascadeOrigin::Author, &media)
+                    Stylesheet::parse_cached_with_base(css, CascadeOrigin::Author, &media, base_opt)
                 };
                 let _ = self
                     .style_ctx
@@ -929,19 +932,23 @@ impl HostState {
         for ext in &self.external_stylesheets {
             ctx.add_stylesheet(Arc::clone(ext));
         }
+        let base_opt =
+            (!self.main_document_url.is_empty()).then_some(self.main_document_url.as_str());
         for (css, owner_parent) in maybe_sheets {
             if owner_parent.is_some() && (css.contains("@scope") || css.contains("@SCOPE")) {
-                ctx.add_stylesheet(Arc::new(Stylesheet::parse_with_owner(
+                ctx.add_stylesheet(Arc::new(Stylesheet::parse_with_owner_and_base(
                     &css,
                     CascadeOrigin::Author,
                     &media,
                     owner_parent,
+                    base_opt,
                 )));
             } else {
-                ctx.add_stylesheet(Stylesheet::parse_cached(
+                ctx.add_stylesheet(Stylesheet::parse_cached_with_base(
                     &css,
                     CascadeOrigin::Author,
                     &media,
+                    base_opt,
                 ));
             }
         }
@@ -950,7 +957,14 @@ impl HostState {
             for (sr_id, blocks) in shadow_adopted_blocks {
                 let sheets = blocks
                     .into_iter()
-                    .map(|css| Stylesheet::parse_cached(&css, CascadeOrigin::Author, &media))
+                    .map(|css| {
+                        Stylesheet::parse_cached_with_base(
+                            &css,
+                            CascadeOrigin::Author,
+                            &media,
+                            base_opt,
+                        )
+                    })
                     .collect();
                 compiled_shadow.insert(sr_id, sheets);
             }

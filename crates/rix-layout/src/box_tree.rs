@@ -528,9 +528,23 @@ impl<'a> BoxTreeBuilder<'a> {
         let is_out_of_flow = matches!(style.position, PositionMode::Absolute | PositionMode::Fixed);
         let is_float = !is_out_of_flow && style.float_mode != FloatMode::None;
         let kind = classify_element_box_kind(tag, elem, &style, is_float, is_out_of_flow);
-        // CSS 2.2 §9.4.1: The root element of the document establishes a block formatting context.
-        let establishes_bfc =
-            parent_style.is_none() || box_establishes_bfc(&kind, &style, is_float, is_out_of_flow);
+        // CSS 2.2 §9.4.1 / CSS Flexbox L1 §4 / CSS Grid L1 §6: The document root and every
+        // flex item or grid item establishes an independent block formatting context so child
+        // margins cannot collapse out of the item.
+        let parent_is_flex_or_grid = parent_style.is_some_and(|p| {
+            matches!(
+                p.display,
+                DisplayMode::Flex
+                    | DisplayMode::InlineFlex
+                    | DisplayMode::Grid
+                    | DisplayMode::InlineGrid
+                    | DisplayMode::GridLanes
+                    | DisplayMode::InlineGridLanes
+            )
+        });
+        let establishes_bfc = parent_style.is_none()
+            || parent_is_flex_or_grid
+            || box_establishes_bfc(&kind, &style, is_float, is_out_of_flow);
 
         let mut raw_children = Vec::new();
 

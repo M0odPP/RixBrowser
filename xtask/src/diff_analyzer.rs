@@ -332,11 +332,60 @@ pub fn css_values_equivalent(prop: &str, firefox: &str, rix: &str) -> bool {
             return true;
         }
     }
-    false
+    // CSS Color 4 (`oklch`/`oklab`/`lab`/`lch`) floating-point serialization tolerance
+    // (e.g. Gecko 6-sig-fig `0.00166669` vs Rix `0.001667` represent identical colors).
+    (prop == "color" || prop == "background-color") && color4_values_close(&ff, &rx)
+}
+
+fn color4_values_close(a: &str, b: &str) -> bool {
+    let Some((fa, ia)) = a
+        .split_once('(')
+        .and_then(|(f, r)| Some((f, r.strip_suffix(')')?)))
+    else {
+        return false;
+    };
+    let Some((fb, ib)) = b
+        .split_once('(')
+        .and_then(|(f, r)| Some((f, r.strip_suffix(')')?)))
+    else {
+        return false;
+    };
+    if fa != fb || !matches!(fa, "oklch" | "oklab" | "lab" | "lch" | "color") {
+        return false;
+    }
+    let ta: Vec<&str> = ia.split_whitespace().collect();
+    let tb: Vec<&str> = ib.split_whitespace().collect();
+    if ta.len() != tb.len() {
+        return false;
+    }
+    ta.iter().zip(tb.iter()).all(|(&xa, &xb)| {
+        if xa == xb {
+            return true;
+        }
+        match (xa.parse::<f64>(), xb.parse::<f64>()) {
+            (Ok(na), Ok(nb)) => {
+                let tol = if na.abs().max(nb.abs()) > 10.0 {
+                    0.5
+                } else {
+                    0.003
+                };
+                (na - nb).abs() <= tol
+            }
+            _ => false,
+        }
+    })
 }
 
 fn normalize_css_val(prop: &str, raw: &str) -> String {
     let s = raw.trim().to_ascii_lowercase();
+    if prop == "text-align" {
+        match s.as_str() {
+            "-moz-center" => return "center".to_string(),
+            "-moz-left" => return "left".to_string(),
+            "-moz-right" => return "right".to_string(),
+            _ => {}
+        }
+    }
     if s == "transparent" || s == "rgba(0, 0, 0, 0)" || s == "rgb(0, 0, 0, 0)" {
         return "rgba(0, 0, 0, 0)".to_string();
     }

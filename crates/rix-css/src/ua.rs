@@ -32,6 +32,7 @@ hr {
     color: gray;
     border-style: inset;
     border-width: 1px;
+    overflow: hidden;
 }
 table {
     display: table;
@@ -156,6 +157,10 @@ pre {
 ul, ol {
     padding-left: 40px;
 }
+ul ul, ul ol, ol ul, ol ol {
+    margin-top: 0;
+    margin-bottom: 0;
+}
 ul {
     list-style-type: disc;
 }
@@ -180,10 +185,18 @@ button, input, select, textarea {
     box-sizing: border-box;
     border: 1px solid #a0a6b2;
     border-radius: 0;
+    font-family: sans-serif;
     font-size: 13.3333px;
 }
 input, textarea, select {
     background-color: #ffffff;
+}
+input, textarea {
+    overflow: clip;
+}
+input[type="checkbox" i], input[type="radio" i] {
+    background-color: transparent;
+    border: 0;
 }
 button, input[type="submit"], input[type="button"], input[type="reset"] {
     background-color: #eceef2;
