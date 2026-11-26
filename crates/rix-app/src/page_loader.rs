@@ -589,6 +589,12 @@ pub fn load_page_subresources(
                     }
                 }
             }
+            if let BackgroundImageValue::Url(u) = &st.visual.mask_image {
+                let trimmed = u.as_str().trim();
+                if !trimmed.is_empty() {
+                    used_bg_urls.insert(trimmed.to_string());
+                }
+            }
             for fam in &st.text.font_family {
                 let lower = fam
                     .as_str()

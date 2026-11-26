@@ -295,7 +295,11 @@ pub fn layout_block_box(
 
     let (mut content_width, resolved_margin_left, resolved_margin_right) =
         if let Some(spec_w) = resolved_spec_w {
-            let cw = clamp_w(spec_w);
+            let cw = if space.definite_width_override.is_some() {
+                spec_w.max(0.0)
+            } else {
+                clamp_w(spec_w)
+            };
             let remaining = (space.available_width - cw - pb_w).max(0.0);
             let (ml, mr) = match (metrics.margin_left_auto, metrics.margin_right_auto) {
                 (true, true) => (remaining * 0.5, remaining * 0.5),

@@ -871,16 +871,26 @@ impl<'a> BoxTreeBuilder<'a> {
                     "radio" => (FormControlKind::Radio, Size::new(16.0, 16.0)),
                     "submit" | "button" | "reset" => {
                         let label_w =
-                            (value.len().max(6) as f32 * style.text.font_size_px * 0.56).max(64.0);
+                            (value.len().max(4) as f32 * style.text.font_size_px * 0.56).max(48.0);
                         (
                             FormControlKind::Button,
-                            Size::new(label_w + 16.0, style.text.font_size_px * 1.8),
+                            Size::new(label_w + 14.0, (style.text.font_size_px * 1.3).max(18.0)),
                         )
                     }
-                    _ => (
-                        FormControlKind::TextInput,
-                        Size::new(180.0, (style.text.font_size_px * 1.9).max(28.0)),
-                    ),
+                    _ => {
+                        let size_chars = elem
+                            .get_attribute("size")
+                            .and_then(|v| v.trim().parse::<f32>().ok())
+                            .filter(|v| v.is_finite() && *v > 0.0)
+                            .unwrap_or(20.0);
+                        (
+                            FormControlKind::TextInput,
+                            Size::new(
+                                (size_chars * style.text.font_size_px * 0.56).max(40.0),
+                                (style.text.font_size_px * 1.25).max(18.0),
+                            ),
+                        )
+                    }
                 };
                 Some(ReplacedKind::FormControl {
                     kind,
@@ -898,8 +908,8 @@ impl<'a> BoxTreeBuilder<'a> {
                     text,
                     placeholder: String::new(),
                     intrinsic_size: Size::new(
-                        label_w + 20.0,
-                        (style.text.font_size_px * 1.9).max(28.0),
+                        label_w + 16.0,
+                        (style.text.font_size_px * 1.3).max(18.0),
                     ),
                 })
             }

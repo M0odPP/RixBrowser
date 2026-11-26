@@ -737,6 +737,24 @@ impl DisplayMode {
             other => other,
         }
     }
+
+    /// Returns true if the outer display type is block-level (CSS Display L3 §2.1).
+    #[must_use]
+    pub const fn is_block_level(self) -> bool {
+        matches!(
+            self,
+            Self::Block
+                | Self::FlowRoot
+                | Self::Flex
+                | Self::Grid
+                | Self::GridLanes
+                | Self::Table
+                | Self::ListItem
+                | Self::FlowRootListItem
+                | Self::BlockRuby
+                | Self::BlockMath
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -1811,6 +1829,15 @@ pub enum ClipPathValue {
         fill_odd: bool,
         points: Vec<(LengthPercentage, LengthPercentage)>,
     },
+}
+
+/// CSS 2.1 §11.1.2 `clip: rect(top, right, bottom, left)` rectangle (`None` = `auto`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct CssClipRect {
+    pub top: Option<LengthPercentage>,
+    pub right: Option<LengthPercentage>,
+    pub bottom: Option<LengthPercentage>,
+    pub left: Option<LengthPercentage>,
 }
 
 /// W3C CSS Easing Level 1 step position keyword.

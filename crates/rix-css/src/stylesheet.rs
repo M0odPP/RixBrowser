@@ -581,6 +581,13 @@ impl Stylesheet {
                             }
                         }
                     }
+                } else if decl.property == PropertyIdKind::MaskImage {
+                    if let PropertyValue::MaskImage(BackgroundImageValue::Url(url)) = &decl.value {
+                        let trimmed = url.as_str().trim();
+                        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                            out.push(trimmed.to_string());
+                        }
+                    }
                 }
             }
         }

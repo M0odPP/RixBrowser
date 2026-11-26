@@ -14,8 +14,8 @@ use crate::properties::{
 use crate::stylesheet::{CascadeOrigin, CompiledRule, LayerId, MediaContext, RegisteredProperty};
 use crate::values::{
     AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
-    AnimationPlayStateMode, AnimationSpec, BackgroundLayerValue, BorderCollapseMode,
-    BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue,
+    AnimationPlayStateMode, AnimationSpec, BackgroundImageValue, BackgroundLayerValue,
+    BorderCollapseMode, BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue,
     ColorInterpolationFiltersMode, ColorRgba, ContentVisibilityMode, CornerRadii, CssColor,
     CursorKind, DirectionMode, DisplayMode, EdgeValues, EmptyCellsMode, EvalContext, FilterOp,
     FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
@@ -85,6 +85,7 @@ pub struct VisualStyle {
     pub background_layers: Vec<BackgroundLayerValue>,
     pub background_image_raw: Option<String>,
     pub background_position: (LengthPercentage, LengthPercentage),
+    pub mask_image: BackgroundImageValue,
     pub object_position: Option<Box<crate::values_math::PositionSpec>>,
     pub border_style: EdgeValues<LineStyle>,
     pub border_color: EdgeValues<CssColor>,
@@ -119,6 +120,7 @@ impl Default for VisualStyle {
                 LengthPercentage::Percent(0.0),
                 LengthPercentage::Percent(0.0),
             ),
+            mask_image: BackgroundImageValue::None,
             object_position: None,
             border_style: EdgeValues::all(LineStyle::None),
             border_color: EdgeValues::all(CssColor::CurrentColor),
@@ -393,6 +395,7 @@ pub struct EffectsStyle {
     pub filter: Vec<FilterOp>,
     pub backdrop_filter: Vec<FilterOp>,
     pub clip_path: ClipPathValue,
+    pub clip_rect: Option<crate::values::CssClipRect>,
     pub mix_blend_mode: MixBlendMode,
     pub transitions: Vec<TransitionSpec>,
     pub transition_delay_math: Option<crate::values_math::MathNode>,
@@ -2619,6 +2622,9 @@ pub fn apply_declaration(
             v.background_layers.clear();
             v.background_image_raw = Some(raw.clone());
         }
+        (PropertyIdKind::MaskImage, PropertyValue::MaskImage(img)) => {
+            Arc::make_mut(&mut style.visual).mask_image = img.clone();
+        }
         (PropertyIdKind::ViewTransitionName, PropertyValue::ViewTransitionName(v)) => {
             style.effects_mut().view_transition_name = v.clone();
         }
@@ -3323,6 +3329,9 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::ClipPath, PropertyValue::ClipPath(v)) => {
             style.effects_mut().clip_path = v.clone();
+        }
+        (PropertyIdKind::Clip, PropertyValue::ClipRect(v)) => {
+            style.effects_mut().clip_rect = v.clone();
         }
         (PropertyIdKind::MixBlendMode, PropertyValue::MixBlendMode(v)) => {
             style.effects_mut().mix_blend_mode = *v;
@@ -4252,6 +4261,13 @@ fn copy_property_from_parent(
                 .map(|e| e.clip_path.clone())
                 .unwrap_or_default();
         }
+        PropertyIdKind::Clip => {
+            style.effects_mut().clip_rect =
+                parent.effects.as_ref().and_then(|e| e.clip_rect.clone());
+        }
+        PropertyIdKind::MaskImage => {
+            Arc::make_mut(&mut style.visual).mask_image = parent.visual.mask_image.clone();
+        }
         PropertyIdKind::MixBlendMode => {
             style.effects_mut().mix_blend_mode = parent
                 .effects
@@ -4521,6 +4537,9 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
             let v = Arc::make_mut(&mut style.visual);
             v.background_layers.clear();
             v.background_image_raw = None;
+        }
+        PropertyIdKind::MaskImage => {
+            Arc::make_mut(&mut style.visual).mask_image = BackgroundImageValue::None;
         }
         PropertyIdKind::ViewTransitionName => {
             if let Some(eff) = &mut style.effects {
@@ -5014,6 +5033,11 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         PropertyIdKind::ClipPath => {
             if let Some(eff) = &mut style.effects {
                 Arc::make_mut(eff).clip_path = ClipPathValue::None;
+            }
+        }
+        PropertyIdKind::Clip => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).clip_rect = None;
             }
         }
         PropertyIdKind::MixBlendMode => {

@@ -58,11 +58,19 @@ pub fn resolve_font_for_style(
         }
     }
 
-    let fallback = FontDescriptor::new("sans-serif")
+    // HTML5 / CSS Fonts L3 default generic family is `serif` when no author `font-family`
+    // is declared, falling back to `sans-serif` when an explicit family list has no match.
+    let default_generic = if style.text.font_family.is_empty() {
+        "serif"
+    } else {
+        "sans-serif"
+    };
+    let fallback = FontDescriptor::new(default_generic)
         .with_weight(weight)
         .with_style(font_style);
     font_db
-        .match_family("sans-serif", &fallback)
+        .match_family(default_generic, &fallback)
+        .or_else(|| font_db.match_family("sans-serif", &fallback))
         .or_else(|| font_db.match_font(&fallback))
         .unwrap_or(FontId(0))
 }

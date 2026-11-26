@@ -1332,6 +1332,34 @@ pub fn layout_replaced(
 
     let border_w = content_w + pb_w;
     let border_h = content_h + pb_h;
+    // CSS 2.1 §10.3.4: block-level replaced elements in normal flow honor `margin: auto` centering.
+    let resolved_margin = if b.style.display.is_block_level()
+        && !b.is_float
+        && !b.is_out_of_flow
+        && (metrics.margin_left_auto || metrics.margin_right_auto)
+    {
+        let remaining = (space.available_width - border_w).max(0.0);
+        let (ml, mr) = match (metrics.margin_left_auto, metrics.margin_right_auto) {
+            (true, true) => (remaining * 0.5, remaining * 0.5),
+            (true, false) => (
+                (remaining - metrics.margin.right).max(0.0),
+                metrics.margin.right,
+            ),
+            (false, true) => (
+                metrics.margin.left,
+                (remaining - metrics.margin.left).max(0.0),
+            ),
+            (false, false) => (metrics.margin.left, metrics.margin.right),
+        };
+        EdgeInsets {
+            top: metrics.margin.top,
+            right: mr,
+            bottom: metrics.margin.bottom,
+            left: ml,
+        }
+    } else {
+        metrics.margin
+    };
     let baseline = match &b.style.text.line_height {
         LineHeightValue::Normal => Some(border_h),
         _ => Some(border_h),
@@ -1343,7 +1371,7 @@ pub fn layout_replaced(
         border_rect: Rect::new(0.0, 0.0, border_w, border_h),
         padding: metrics.padding,
         border: metrics.border,
-        margin: metrics.margin,
+        margin: resolved_margin,
         content_rect: Rect::new(
             metrics.border.left + metrics.padding.left,
             metrics.border.top + metrics.padding.top,
@@ -1357,8 +1385,8 @@ pub fn layout_replaced(
         children: Arc::new(Vec::new()),
         is_float: b.is_float,
         is_out_of_flow: b.is_out_of_flow,
-        collapsed_margin_top: metrics.margin.top,
-        collapsed_margin_bottom: metrics.margin.bottom,
+        collapsed_margin_top: resolved_margin.top,
+        collapsed_margin_bottom: resolved_margin.bottom,
         resolved_grid_tracks: None,
     }
 }
@@ -1375,39 +1403,47 @@ fn resolve_replaced_size_styled(
     let pb_h = metrics.padding.vertical() + metrics.border.vertical();
     let is_bb = style.box_sizing == BoxSizingMode::BorderBox;
     let avail_w = (space.available_width - metrics.margin.horizontal() - pb_w).max(0.0);
-    let spec_w = metrics.specified_width.or_else(|| {
-        resolve_size_with_intrinsic(
-            &style.box_model.width,
-            Some(space.containing_block_width),
-            pb_w,
-            metrics.margin.horizontal(),
-            is_bb,
-            &eval,
-            |b| {
-                if matches!(b, CalcSizeBasis::Stretch) {
-                    avail_w
-                } else {
-                    intrinsic.width
-                }
-            },
-        )
-    });
-    let spec_h = metrics.specified_height.or_else(|| {
-        resolve_size_with_intrinsic(
-            &style.box_model.height,
-            space.available_height,
-            pb_h,
-            metrics.margin.vertical(),
-            is_bb,
-            &eval,
-            |b| match b {
-                CalcSizeBasis::Stretch => space.available_height.map_or(intrinsic.height, |ah| {
-                    (ah - metrics.margin.vertical() - pb_h).max(0.0)
-                }),
-                _ => intrinsic.height,
-            },
-        )
-    });
+    let spec_w = space
+        .definite_width_override
+        .or(metrics.specified_width)
+        .or_else(|| {
+            resolve_size_with_intrinsic(
+                &style.box_model.width,
+                Some(space.containing_block_width),
+                pb_w,
+                metrics.margin.horizontal(),
+                is_bb,
+                &eval,
+                |b| {
+                    if matches!(b, CalcSizeBasis::Stretch) {
+                        avail_w
+                    } else {
+                        intrinsic.width
+                    }
+                },
+            )
+        });
+    let spec_h = space
+        .definite_height_override
+        .or(metrics.specified_height)
+        .or_else(|| {
+            resolve_size_with_intrinsic(
+                &style.box_model.height,
+                space.available_height,
+                pb_h,
+                metrics.margin.vertical(),
+                is_bb,
+                &eval,
+                |b| match b {
+                    CalcSizeBasis::Stretch => {
+                        space.available_height.map_or(intrinsic.height, |ah| {
+                            (ah - metrics.margin.vertical() - pb_h).max(0.0)
+                        })
+                    }
+                    _ => intrinsic.height,
+                },
+            )
+        });
     resolve_replaced_pair(intrinsic, spec_w, spec_h, metrics)
 }
 
