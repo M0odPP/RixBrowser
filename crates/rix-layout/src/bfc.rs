@@ -424,8 +424,14 @@ pub fn layout_block_box(
 
     let has_in_flow_blocks = children_ids.iter().any(|&cid| {
         let c = ctx.tree.get(cid);
-        c.is_block_level() || c.is_float
-    });
+        c.is_block_level() && !c.is_float
+    }) || (!children_ids.is_empty()
+        && children_ids.iter().all(|&cid| {
+            let c = ctx.tree.get(cid);
+            c.is_float
+                || c.is_out_of_flow
+                || matches!(&c.kind, BoxKind::Text(t) if t.chars().all(char::is_whitespace))
+        }));
 
     let mut placed_children: Vec<Fragment> = Vec::with_capacity(children_ids.len());
     let my_oof_start = ctx.pending_oof.len();
@@ -491,35 +497,59 @@ pub fn layout_block_box(
                 ctx,
                 box_id,
                 ifc_space,
-                &local_floats,
+                &mut local_floats,
                 Point::new(content_origin_x, content_origin_y),
             );
             if resolved_spec_w.is_none() {
                 content_width = clamp_w(vert_blk_w);
             }
             for lf in &mut ifc_result.fragments {
-                lf.border_rect.size.width = vert_blk_w.min(content_width.max(vert_blk_w));
-                lf.border_rect.size.height = vert_inline_h;
-                lf.content_rect.size = lf.border_rect.size;
-                lf.overflow_rect = Rect::new(
-                    0.0,
-                    0.0,
-                    lf.border_rect.size.width,
-                    lf.border_rect.size.height,
-                );
+                if !lf.is_float {
+                    lf.border_rect.size.width = vert_blk_w.min(content_width.max(vert_blk_w));
+                    lf.border_rect.size.height = vert_inline_h;
+                    lf.content_rect.size = lf.border_rect.size;
+                    lf.overflow_rect = Rect::new(
+                        0.0,
+                        0.0,
+                        lf.border_rect.size.width,
+                        lf.border_rect.size.height,
+                    );
+                }
             }
             placed_children.extend(ifc_result.fragments);
             vert_inline_h
         } else {
+            let pre_len = local_floats.floats.len();
             let ifc_result = layout_ifc(
                 ctx,
                 box_id,
                 child_space,
-                &local_floats,
+                &mut local_floats,
                 Point::new(content_origin_x, content_origin_y),
             );
             placed_children.extend(ifc_result.fragments);
-            ifc_result.height
+            let mut h = ifc_result.height;
+            if local_floats.floats.len() > pre_len {
+                if establishes_bfc {
+                    h = h.max(local_floats.max_float_bottom());
+                } else {
+                    for f in &local_floats.floats[pre_len..] {
+                        let translated = FloatBand {
+                            rect: Rect::new(
+                                f.rect.origin.x + content_origin_x,
+                                f.rect.origin.y + content_origin_y,
+                                f.rect.size.width,
+                                f.rect.size.height,
+                            ),
+                            is_left: f.is_left,
+                        };
+                        if !parent_floats.floats.contains(&translated) {
+                            parent_floats.floats.push(translated);
+                        }
+                    }
+                }
+            }
+            h
         }
     } else {
         let can_collapse_top_with_first =

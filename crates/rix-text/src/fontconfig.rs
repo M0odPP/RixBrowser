@@ -110,6 +110,7 @@ fn load_path(
                 }
             }
             "alias" => read_alias(node, aliases),
+            "match" => read_match_alias(node, aliases),
             _ => {}
         }
     }
@@ -156,5 +157,51 @@ fn read_alias(node: roxmltree::Node<'_, '_>, aliases: &mut HashMap<String, Alias
         lists.prefer.extend(prefer.iter().cloned());
         lists.accept.extend(accept.iter().cloned());
         lists.default.extend(default.iter().cloned());
+    }
+}
+
+fn read_match_alias(node: roxmltree::Node<'_, '_>, aliases: &mut HashMap<String, AliasLists>) {
+    let mut tested_families = Vec::new();
+    let mut has_non_family_test = false;
+    for test in node.children().filter(|c| c.has_tag_name("test")) {
+        if test.attribute("name") != Some("family") {
+            has_non_family_test = true;
+            continue;
+        }
+        for s in test.children().filter(|c| c.has_tag_name("string")) {
+            if let Some(txt) = s.text().map(str::trim).filter(|t| !t.is_empty()) {
+                tested_families.push(txt.to_lowercase());
+            }
+        }
+    }
+    if tested_families.is_empty() || has_non_family_test {
+        return;
+    }
+    for edit in node.children().filter(|c| c.has_tag_name("edit")) {
+        if edit.attribute("name") != Some("family") {
+            continue;
+        }
+        let mode = edit.attribute("mode").unwrap_or("assign");
+        let replacements: Vec<String> = edit
+            .children()
+            .filter(|c| c.has_tag_name("string"))
+            .filter_map(|c| c.text())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if replacements.is_empty() {
+            continue;
+        }
+        for fam in &tested_families {
+            let lists = aliases.entry(fam.clone()).or_default();
+            match mode {
+                "prepend" | "prepend_first" | "assign" | "assign_replace" => {
+                    lists.prefer.extend(replacements.iter().cloned());
+                }
+                _ => {
+                    lists.accept.extend(replacements.iter().cloned());
+                }
+            }
+        }
     }
 }

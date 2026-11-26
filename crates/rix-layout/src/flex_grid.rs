@@ -507,8 +507,8 @@ fn measure_content_intrinsic_height(
         }
         h
     } else {
-        let floats = crate::bfc::FloatContext::new();
-        crate::ifc::layout_ifc(ctx, box_id, space, &floats, Point::ZERO).height
+        let mut floats = crate::bfc::FloatContext::new();
+        crate::ifc::layout_ifc(ctx, box_id, space, &mut floats, Point::ZERO).height
     };
     ctx.pending_oof.truncate(saved_oof);
     res

@@ -1496,6 +1496,66 @@ pub struct BorderEdge {
     pub color: CssColor,
 }
 
+/// CSS Lists Level 3 `list-style-type` counter/bullet style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ListStyleTypeMode {
+    #[default]
+    Disc,
+    Circle,
+    Square,
+    Decimal,
+    DecimalLeadingZero,
+    LowerAlpha,
+    UpperAlpha,
+    LowerRoman,
+    UpperRoman,
+    DisclosureOpen,
+    DisclosureClosed,
+    None,
+}
+
+impl ListStyleTypeMode {
+    #[must_use]
+    pub fn from_css_keyword(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "disc" => Some(Self::Disc),
+            "circle" => Some(Self::Circle),
+            "square" => Some(Self::Square),
+            "decimal" => Some(Self::Decimal),
+            "decimal-leading-zero" => Some(Self::DecimalLeadingZero),
+            "lower-alpha" | "lower-latin" => Some(Self::LowerAlpha),
+            "upper-alpha" | "upper-latin" => Some(Self::UpperAlpha),
+            "lower-roman" => Some(Self::LowerRoman),
+            "upper-roman" => Some(Self::UpperRoman),
+            "disclosure-open" => Some(Self::DisclosureOpen),
+            "disclosure-closed" => Some(Self::DisclosureClosed),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+/// CSS Lists Level 3 `list-style-position` (`outside | inside`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ListStylePositionMode {
+    #[default]
+    Outside,
+    Inside,
+}
+
+impl ListStylePositionMode {
+    #[must_use]
+    pub fn from_css_keyword(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "outside" => Some(Self::Outside),
+            "inside" => Some(Self::Inside),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct CornerRadius {
     pub x: LengthPercentage,
