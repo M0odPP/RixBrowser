@@ -15,12 +15,12 @@ use std::collections::HashSet;
 
 use rix_core::{Point, Rect, Size, Vec2};
 use rix_css::{
-    AnimationDirectionMode, AnimationFillModeKind, AnimationPlayStateMode, BackgroundImageValue,
-    BackgroundSizeValue, ClipPathValue, ClipRadius, ColorRgba, ComputedStyle, CssGradientStop,
-    DisplayMode, EvalContext, FilterOp as CssFilterOp, KeyframesRule, LengthPercentage,
-    LengthPercentageAuto, LineStyle, ListStylePositionMode, ListStyleTypeMode, MixBlendMode,
-    OverflowMode, PositionMode, PropertyIdKind, PropertyValue, TextDecorationLine, TimingFunction,
-    TransformOp, VisibilityMode, ZIndexValue,
+    AnimationDirectionMode, AnimationFillModeKind, AnimationPlayStateMode, BackgroundClipMode,
+    BackgroundImageValue, BackgroundSizeValue, ClipPathValue, ClipRadius, ColorRgba, ComputedStyle,
+    CssGradientStop, DisplayMode, EvalContext, FilterOp as CssFilterOp, KeyframesRule,
+    LengthPercentage, LengthPercentageAuto, LineStyle, ListStylePositionMode, ListStyleTypeMode,
+    MixBlendMode, OverflowMode, PositionMode, PropertyIdKind, PropertyValue, TextDecorationLine,
+    TimingFunction, TransformOp, VisibilityMode, ZIndexValue,
 };
 use rix_ipc::{FontResourceId, ImageId, PathResourceId, PipelineId, ScrollId, SpatialNodeId};
 use rix_render::animations::{
@@ -542,8 +542,10 @@ impl<'a> Painter<'a> {
             &mut order_counter,
         );
 
-        // Step 2 (Appendix E): Child stacking contexts with negative z-index (ascending).
-        neg_z.sort_by_key(|c| (c.z_index, c.order));
+        // Step 2 (Appendix E): Child stacking contexts with negative z-index (ascending,
+        // tied by pre-order DOM tree order via `box_id` so out-of-flow `::before` children
+        // paint strictly in document order rather than OOF append order).
+        neg_z.sort_by_key(|c| (c.z_index, c.frag.box_id.0, c.order));
         for child in neg_z {
             self.paint_stacking_context(
                 child.frag,
@@ -581,7 +583,10 @@ impl<'a> Painter<'a> {
             FlowPhase::Inlines,
         );
 
-        // Step 6 (Appendix E): Positioned z-index: auto | 0 and non-positioned stacking contexts.
+        // Step 6 (Appendix E): Positioned z-index: auto | 0 and non-positioned stacking contexts
+        // in pre-order DOM tree order (so `::before { position: absolute }` stays behind sibling
+        // `position: relative` content).
+        zero_z.sort_by_key(|c| (c.frag.box_id.0, c.order));
         for child in zero_z {
             self.paint_stacking_context(
                 child.frag,
@@ -593,7 +598,7 @@ impl<'a> Painter<'a> {
         }
 
         // Step 7 (Appendix E): Child stacking contexts with positive z-index (ascending).
-        pos_z.sort_by_key(|c| (c.z_index, c.order));
+        pos_z.sort_by_key(|c| (c.z_index, c.frag.box_id.0, c.order));
         for child in pos_z {
             self.paint_stacking_context(
                 child.frag,
@@ -1074,6 +1079,10 @@ impl<'a> Painter<'a> {
             }
         }
 
+        // CSS Backgrounds L4 §3.7: `background-clip: text` clips the element's background to the
+        // foreground text glyphs (never painting a solid/gradient box rectangle behind the text).
+        let is_bg_clip_text = style.visual.background_clip == BackgroundClipMode::Text;
+
         // Solid background fill (or CSS Masking L1 `mask-image: url(...)` tinted vector icon).
         let bg = style.visual.background_color;
         if let BackgroundImageValue::Url(mask_url) = &style.visual.mask_image {
@@ -1091,7 +1100,7 @@ impl<'a> Painter<'a> {
                     );
                 }
             }
-        } else if bg.a > 0 {
+        } else if bg.a > 0 && !is_bg_clip_text {
             self.list.push(DisplayItem::Rect {
                 bounds: abs_rect,
                 color: to_rgba8(bg),
@@ -1101,30 +1110,35 @@ impl<'a> Painter<'a> {
 
         // Multi-layer `background-image` (`url(...)`, `linear-gradient(...)`, `radial-gradient(...)`)
         // painted bottom-to-top per CSS Backgrounds Level 3 (last listed layer paints first).
-        for layer in style.visual.background_layers.iter().rev() {
-            match &layer.image {
-                BackgroundImageValue::None => {}
-                BackgroundImageValue::LinearGradient { angle_deg, stops } => {
-                    let resolved = resolve_gradient_stops(stops, style.text.color, self.dark_mode);
-                    if resolved.len() >= 2 {
+        if !is_bg_clip_text {
+            for layer in style.visual.background_layers.iter().rev() {
+                match &layer.image {
+                    BackgroundImageValue::None => {}
+                    BackgroundImageValue::LinearGradient { angle_deg, stops } => {
                         let (start, end) = linear_gradient_endpoints(abs_rect, *angle_deg);
-                        self.list.push(DisplayItem::LinearGradient {
-                            bounds: abs_rect,
-                            start,
-                            end,
-                            stops: resolved,
-                            radii,
-                        });
+                        let grad_len = (end.x - start.x).hypot(end.y - start.y).max(1.0);
+                        let resolved = resolve_gradient_stops(
+                            stops,
+                            grad_len,
+                            style.text.color,
+                            self.dark_mode,
+                        );
+                        if resolved.len() >= 2 {
+                            self.list.push(DisplayItem::LinearGradient {
+                                bounds: abs_rect,
+                                start,
+                                end,
+                                stops: resolved,
+                                radii,
+                            });
+                        }
                     }
-                }
-                BackgroundImageValue::RadialGradient {
-                    shape_circle,
-                    cx,
-                    cy,
-                    stops,
-                } => {
-                    let resolved = resolve_gradient_stops(stops, style.text.color, self.dark_mode);
-                    if resolved.len() >= 2 {
+                    BackgroundImageValue::RadialGradient {
+                        shape_circle,
+                        cx,
+                        cy,
+                        stops,
+                    } => {
                         let center = Point::new(
                             abs_rect.min_x() + cx.resolve_px(abs_rect.size.width, &eval),
                             abs_rect.min_y() + cy.resolve_px(abs_rect.size.height, &eval),
@@ -1140,112 +1154,135 @@ impl<'a> Painter<'a> {
                         } else {
                             dx.max(dy).max(1.0)
                         };
-                        self.list.push(DisplayItem::RadialGradient {
-                            bounds: abs_rect,
-                            center,
-                            radius,
-                            stops: resolved,
-                            radii,
-                        });
-                    }
-                }
-                BackgroundImageValue::Url(url) => {
-                    let effective_size =
-                        style.visual.background_size.as_ref().unwrap_or(&layer.size);
-                    let px = if matches!(layer.pos_x, LengthPercentage::Zero)
-                        && !matches!(style.visual.background_position.0, LengthPercentage::Zero)
-                    {
-                        &style.visual.background_position.0
-                    } else {
-                        &layer.pos_x
-                    };
-                    let py = if matches!(layer.pos_y, LengthPercentage::Zero)
-                        && !matches!(style.visual.background_position.1, LengthPercentage::Zero)
-                    {
-                        &style.visual.background_position.1
-                    } else {
-                        &layer.pos_y
-                    };
-                    if let Some(decoded) = self.assets.get_by_src(url.as_str()) {
-                        let img_id = decoded.image_id;
-                        let iw = decoded.width.max(1) as f32;
-                        let ih = decoded.height.max(1) as f32;
-                        if self.ensure_image_registered(img_id) {
-                            let img_bounds = match effective_size {
-                                BackgroundSizeValue::Cover => {
-                                    let scale =
-                                        (abs_rect.size.width / iw).max(abs_rect.size.height / ih);
-                                    let dw = iw * scale;
-                                    let dh = ih * scale;
-                                    Rect::new(
-                                        abs_rect.min_x()
-                                            + px.resolve_px(abs_rect.size.width - dw, &eval),
-                                        abs_rect.min_y()
-                                            + py.resolve_px(abs_rect.size.height - dh, &eval),
-                                        dw,
-                                        dh,
-                                    )
-                                }
-                                BackgroundSizeValue::Contain => {
-                                    let scale =
-                                        (abs_rect.size.width / iw).min(abs_rect.size.height / ih);
-                                    let dw = iw * scale;
-                                    let dh = ih * scale;
-                                    Rect::new(
-                                        abs_rect.min_x()
-                                            + px.resolve_px(abs_rect.size.width - dw, &eval),
-                                        abs_rect.min_y()
-                                            + py.resolve_px(abs_rect.size.height - dh, &eval),
-                                        dw,
-                                        dh,
-                                    )
-                                }
-                                BackgroundSizeValue::Explicit(w_opt, h_opt) => {
-                                    let (dw, dh) = match (w_opt, h_opt) {
-                                        (Some(w), Some(h)) => (
-                                            w.resolve_px(abs_rect.size.width, &eval).max(0.0),
-                                            h.resolve_px(abs_rect.size.height, &eval).max(0.0),
-                                        ),
-                                        (Some(w), None) => {
-                                            let rw =
-                                                w.resolve_px(abs_rect.size.width, &eval).max(0.0);
-                                            (rw, rw * (ih / iw))
-                                        }
-                                        (None, Some(h)) => {
-                                            let rh =
-                                                h.resolve_px(abs_rect.size.height, &eval).max(0.0);
-                                            (rh * (iw / ih), rh)
-                                        }
-                                        (None, None) => (iw, ih),
-                                    };
-                                    Rect::new(
-                                        abs_rect.min_x()
-                                            + px.resolve_px(abs_rect.size.width - dw, &eval),
-                                        abs_rect.min_y()
-                                            + py.resolve_px(abs_rect.size.height - dh, &eval),
-                                        dw,
-                                        dh,
-                                    )
-                                }
-                                BackgroundSizeValue::Auto => abs_rect,
-                            };
-                            self.list.push(DisplayItem::Image {
-                                bounds: img_bounds,
-                                image_id: img_id,
-                                sampling: ImageSampling::Bilinear,
+                        let resolved =
+                            resolve_gradient_stops(stops, radius, style.text.color, self.dark_mode);
+                        if resolved.len() >= 2 {
+                            self.list.push(DisplayItem::RadialGradient {
+                                bounds: abs_rect,
+                                center,
+                                radius,
+                                stops: resolved,
                                 radii,
                             });
                         }
-                    } else if let Some(svg) = self.assets.get_svg_by_src(url.as_str()).cloned() {
-                        self.paint_svg_asset_in_rect(
-                            &svg,
-                            abs_rect,
-                            spatial,
-                            effective_size,
-                            px,
-                            py,
-                            None,
-                        );
+                    }
+                    BackgroundImageValue::Url(url) => {
+                        let effective_size =
+                            style.visual.background_size.as_ref().unwrap_or(&layer.size);
+                        let px = if matches!(layer.pos_x, LengthPercentage::Zero)
+                            && !matches!(style.visual.background_position.0, LengthPercentage::Zero)
+                        {
+                            &style.visual.background_position.0
+                        } else {
+                            &layer.pos_x
+                        };
+                        let py = if matches!(layer.pos_y, LengthPercentage::Zero)
+                            && !matches!(style.visual.background_position.1, LengthPercentage::Zero)
+                        {
+                            &style.visual.background_position.1
+                        } else {
+                            &layer.pos_y
+                        };
+                        if let Some(decoded) = self.assets.get_by_src(url.as_str()) {
+                            let img_id = decoded.image_id;
+                            let iw = decoded.width.max(1) as f32;
+                            let ih = decoded.height.max(1) as f32;
+                            if self.ensure_image_registered(img_id) {
+                                let img_bounds = match effective_size {
+                                    BackgroundSizeValue::Cover => {
+                                        let scale = (abs_rect.size.width / iw)
+                                            .max(abs_rect.size.height / ih);
+                                        let dw = iw * scale;
+                                        let dh = ih * scale;
+                                        Rect::new(
+                                            abs_rect.min_x()
+                                                + px.resolve_px(abs_rect.size.width - dw, &eval),
+                                            abs_rect.min_y()
+                                                + py.resolve_px(abs_rect.size.height - dh, &eval),
+                                            dw,
+                                            dh,
+                                        )
+                                    }
+                                    BackgroundSizeValue::Contain => {
+                                        let scale = (abs_rect.size.width / iw)
+                                            .min(abs_rect.size.height / ih);
+                                        let dw = iw * scale;
+                                        let dh = ih * scale;
+                                        Rect::new(
+                                            abs_rect.min_x()
+                                                + px.resolve_px(abs_rect.size.width - dw, &eval),
+                                            abs_rect.min_y()
+                                                + py.resolve_px(abs_rect.size.height - dh, &eval),
+                                            dw,
+                                            dh,
+                                        )
+                                    }
+                                    BackgroundSizeValue::Explicit(w_opt, h_opt) => {
+                                        let (dw, dh) = match (w_opt, h_opt) {
+                                            (Some(w), Some(h)) => (
+                                                w.resolve_px(abs_rect.size.width, &eval).max(0.0),
+                                                h.resolve_px(abs_rect.size.height, &eval).max(0.0),
+                                            ),
+                                            (Some(w), None) => {
+                                                let rw = w
+                                                    .resolve_px(abs_rect.size.width, &eval)
+                                                    .max(0.0);
+                                                (rw, rw * (ih / iw))
+                                            }
+                                            (None, Some(h)) => {
+                                                let rh = h
+                                                    .resolve_px(abs_rect.size.height, &eval)
+                                                    .max(0.0);
+                                                (rh * (iw / ih), rh)
+                                            }
+                                            (None, None) => (iw, ih),
+                                        };
+                                        Rect::new(
+                                            abs_rect.min_x()
+                                                + px.resolve_px(abs_rect.size.width - dw, &eval),
+                                            abs_rect.min_y()
+                                                + py.resolve_px(abs_rect.size.height - dh, &eval),
+                                            dw,
+                                            dh,
+                                        )
+                                    }
+                                    BackgroundSizeValue::Auto => abs_rect,
+                                };
+                                // CSS Backgrounds L3 §3.7: background images are always clipped to
+                                // the element's background-clip box (default border-box `abs_rect`).
+                                let needs_bg_clip = img_bounds.min_x() < abs_rect.min_x() - 0.5
+                                    || img_bounds.min_y() < abs_rect.min_y() - 0.5
+                                    || img_bounds.max_x() > abs_rect.max_x() + 0.5
+                                    || img_bounds.max_y() > abs_rect.max_y() + 0.5;
+                                if needs_bg_clip {
+                                    self.list.push(DisplayItem::PushClip {
+                                        spatial,
+                                        rect: abs_rect,
+                                        radii,
+                                    });
+                                }
+                                self.list.push(DisplayItem::Image {
+                                    bounds: img_bounds,
+                                    image_id: img_id,
+                                    sampling: ImageSampling::Bilinear,
+                                    radii: if needs_bg_clip { [0.0; 4] } else { radii },
+                                });
+                                if needs_bg_clip {
+                                    self.list.push(DisplayItem::PopClip);
+                                }
+                            }
+                        } else if let Some(svg) = self.assets.get_svg_by_src(url.as_str()).cloned()
+                        {
+                            self.paint_svg_asset_in_rect(
+                                &svg,
+                                abs_rect,
+                                spatial,
+                                effective_size,
+                                px,
+                                py,
+                                None,
+                            );
+                        }
                     }
                 }
             }
@@ -1348,11 +1385,23 @@ impl<'a> Painter<'a> {
 
         match &frag.kind {
             FragmentKind::TextRun(run) => {
-                if run.glyphs.is_empty() || run.color.a == 0 {
+                if run.glyphs.is_empty() {
+                    return;
+                }
+                // CSS Backgrounds L4 §3.7: When `background-clip: text` is active with a gradient
+                // or opaque background, paint the glyphs using the background clip fill color
+                // (especially when author CSS sets `color: transparent` or `-webkit-text-fill-color`).
+                let effective_color =
+                    if frag.style.visual.background_clip == BackgroundClipMode::Text {
+                        extract_text_clip_color(&frag.style, self.dark_mode).unwrap_or(run.color)
+                    } else {
+                        run.color
+                    };
+                if effective_color.a == 0 {
                     return;
                 }
                 let baseline_y = abs_rect.min_y() + run.baseline_y;
-                let color = to_rgba8(run.color);
+                let color = to_rgba8(effective_color);
 
                 // Emit glyphs grouped by each glyph's true fallback `font_id` so multi-script runs
                 // (Latin + Arabic + CJK + Emoji) ALWAYS use the exact font whose glyph IDs were shaped!
@@ -1530,9 +1579,6 @@ impl<'a> Painter<'a> {
             return;
         }
         let font_id = crate::ifc::resolve_font_for_style(self.font_db, None, &frag.style);
-        let Some(font_res_id) = self.register_font(font_id) else {
-            return;
-        };
         let font_size = frag.style.text.font_size_px.max(11.0);
         let shaper = rix_text::TextShaper::new(self.font_db);
         let runs = shaper.shape_text(display_text, font_id, font_size);
@@ -1544,9 +1590,17 @@ impl<'a> Painter<'a> {
             _ => content_abs.min_x() + 6.0,
         };
         let baseline_y = content_abs.min_y() + (content_abs.size.height + font_size * 0.72) * 0.5;
+        let color = if text.is_empty() {
+            Rgba8::new(130, 136, 148, 255)
+        } else {
+            to_rgba8(frag.style.text.color)
+        };
         let mut pen_x = start_x;
-        let mut instances = Vec::new();
         for run in runs {
+            if run.glyphs.is_empty() {
+                continue;
+            }
+            let mut instances = Vec::with_capacity(run.glyphs.len());
             for g in run.glyphs {
                 instances.push(GlyphInstance {
                     glyph_id: g.glyph_id,
@@ -1555,15 +1609,12 @@ impl<'a> Painter<'a> {
                 });
                 pen_x += g.x_advance;
             }
-        }
-        if !instances.is_empty() {
-            let color = if text.is_empty() {
-                Rgba8::new(130, 136, 148, 255)
-            } else {
-                to_rgba8(frag.style.text.color)
-            };
-            self.list
-                .push_glyph_run(content_abs, font_res_id, font_size, color, &instances);
+            // Register each shaped run's actual fallback `run.font_id` so glyph IDs ALWAYS match
+            // the font face that produced them (never garbling fallback glyphs into another font!).
+            if let Some(font_res_id) = self.register_font(run.font_id) {
+                self.list
+                    .push_glyph_run(content_abs, font_res_id, font_size, color, &instances);
+            }
         }
     }
 }
@@ -2087,8 +2138,38 @@ fn resolve_clip_path(cp: &ClipPathValue, rect: Rect) -> Option<ClipPathShape> {
     }
 }
 
+fn extract_text_clip_color(style: &ComputedStyle, dark_mode: bool) -> Option<ColorRgba> {
+    for layer in &style.visual.background_layers {
+        let stops = match &layer.image {
+            BackgroundImageValue::LinearGradient { stops, .. }
+            | BackgroundImageValue::RadialGradient { stops, .. } => stops.as_slice(),
+            _ => continue,
+        };
+        if !stops.is_empty() {
+            // Prefer the midpoint stop (or first opaque stop) as a crisp representative fill.
+            let mid = stops.len() / 2;
+            let cand = stops[mid].color.resolve(style.text.color, dark_mode);
+            if cand.a > 0 {
+                return Some(cand);
+            }
+            for s in stops {
+                let c = s.color.resolve(style.text.color, dark_mode);
+                if c.a > 0 {
+                    return Some(c);
+                }
+            }
+        }
+    }
+    if style.visual.background_color.a > 0 {
+        Some(style.visual.background_color)
+    } else {
+        None
+    }
+}
+
 fn resolve_gradient_stops(
     stops: &[CssGradientStop],
+    grad_len: f32,
     current_color: ColorRgba,
     dark_mode: bool,
 ) -> SmallVec<[ColorStop; 4]> {
@@ -2097,19 +2178,62 @@ fn resolve_gradient_stops(
     }
     let eval = EvalContext::default();
     let n = stops.len();
-    let mut out = SmallVec::with_capacity(n);
-    for (i, stop) in stops.iter().enumerate() {
-        let color = to_rgba8(stop.color.resolve(current_color, dark_mode));
-        let offset = match &stop.position {
-            Some(lp) => lp.resolve_px(1.0, &eval).clamp(0.0, 1.0),
-            None => {
-                if n <= 1 {
-                    0.0
-                } else {
-                    i as f32 / (n - 1) as f32
-                }
+    let len = grad_len.max(1.0);
+
+    // CSS Images L3 §3.4.3 (Color Stop Fixup):
+    // 1. Resolve explicit `<length-percentage>` stop positions against the gradient line length.
+    let mut positions: SmallVec<[Option<f32>; 8]> = stops
+        .iter()
+        .map(|s| {
+            s.position
+                .as_ref()
+                .map(|lp| lp.resolve_px(len, &eval) / len)
+        })
+        .collect();
+
+    // 2. Default first stop to 0% and last stop to 100% if unspecified.
+    if positions[0].is_none() {
+        positions[0] = Some(0.0);
+    }
+    if n > 1 && positions[n - 1].is_none() {
+        positions[n - 1] = Some(1.0);
+    }
+
+    // 3. Enforce monotonic non-decreasing stop positions (`calc(100% - 1px), color 0` -> hard stop).
+    let mut max_so_far = positions[0].unwrap_or(0.0);
+    for p in positions.iter_mut().skip(1).flatten() {
+        if *p < max_so_far {
+            *p = max_so_far;
+        } else {
+            max_so_far = *p;
+        }
+    }
+
+    // 4. Linearly distribute any runs of unspecified stop positions.
+    let mut i = 0;
+    while i < n {
+        if positions[i].is_none() {
+            let start = i - 1;
+            let mut end = i + 1;
+            while end < n && positions[end].is_none() {
+                end += 1;
             }
-        };
+            let p0 = positions[start].unwrap_or(0.0);
+            let p1 = positions[end].unwrap_or(1.0);
+            let span = (end - start) as f32;
+            for k in (start + 1)..end {
+                positions[k] = Some(p0 + (p1 - p0) * ((k - start) as f32 / span));
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+
+    let mut out = SmallVec::with_capacity(n);
+    for (idx, stop) in stops.iter().enumerate() {
+        let color = to_rgba8(stop.color.resolve(current_color, dark_mode));
+        let offset = positions[idx].unwrap_or(0.0).clamp(0.0, 1.0);
         out.push(ColorStop { offset, color });
     }
     out

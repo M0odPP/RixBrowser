@@ -1535,3 +1535,241 @@ fn css_var_inherit_in_font_family_falls_back_to_serif_generic() {
         family
     );
 }
+
+#[test]
+fn positioned_before_overlay_paints_behind_following_relative_sibling() {
+    // CSS 2.1 Appendix E: An out-of-flow `::before { position: absolute; }` precedes a
+    // `position: relative` child in document tree order, so it MUST paint BEFORE (behind)
+    // that child even though OOF fragments are resolved after in-flow children.
+    let css = r#"
+        body { margin: 0; }
+        .hero { position: relative; width: 400px; height: 200px; }
+        .hero::before {
+            content: "";
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #222222;
+        }
+        .content { position: relative; background-color: #ffffff; width: 200px; height: 80px; }
+    "#;
+    let html = r#"<!doctype html><html><body>
+        <section class="hero"><div class="content">Hero Title</div></section>
+    </body></html>"#;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let mut font_db = FontDatabase::new();
+    font_db.scan_system_fonts();
+    let mut resources = ResourceRegistry::default();
+    let frame = engine.layout_and_paint(
+        &doc,
+        &styles,
+        Size::new(600.0, 300.0),
+        &font_db,
+        PipelineId(1),
+        &mut resources,
+    );
+
+    let overlay_idx = frame
+        .display_list
+        .items
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                DisplayItem::Rect { color, .. } if color.r == 0x22 && color.g == 0x22 && color.b == 0x22
+            )
+        })
+        .expect("::before overlay must paint");
+    let content_idx = frame
+        .display_list
+        .items
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                DisplayItem::Rect { color, .. } if color.r == 0xff && color.g == 0xff && color.b == 0xff
+            )
+        })
+        .expect(".content sibling must paint");
+    assert!(
+        overlay_idx < content_idx,
+        "::before absolute overlay (idx={overlay_idx}) must paint BEFORE sibling .content (idx={content_idx})"
+    );
+}
+
+#[test]
+fn raster_background_size_cover_clips_to_element_border_box() {
+    // CSS Backgrounds L3 §3.7: A raster `background-size: cover` image larger than its
+    // container must push a border-box clip so it never spills over adjacent headers/cards.
+    let css = r#"
+        body { margin: 0; }
+        .hero { width: 400px; height: 100px; background-image: url("bg.png"); background-size: cover; }
+    "#;
+    let html = r#"<!doctype html><html><body><div class="hero"></div></body></html>"#;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    // 400x400 square image in 400x100 container -> cover scales to 400x400 (overflows Y!).
+    engine
+        .assets
+        .register_rgba8("bg.png", 400, 400, vec![0x80u8; 400 * 400 * 4])
+        .unwrap();
+
+    let font_db = FontDatabase::new();
+    let mut resources = ResourceRegistry::default();
+    let frame = engine.layout_and_paint(
+        &doc,
+        &styles,
+        Size::new(600.0, 300.0),
+        &font_db,
+        PipelineId(1),
+        &mut resources,
+    );
+
+    let has_clip_before_img = frame.display_list.items.windows(2).any(|w| {
+        matches!(
+            (&w[0], &w[1]),
+            (
+                DisplayItem::PushClip { rect, .. },
+                DisplayItem::Image { .. }
+            ) if (rect.size.width - 400.0).abs() < 1.0 && (rect.size.height - 100.0).abs() < 1.0
+        )
+    });
+    assert!(
+        has_clip_before_img,
+        "overflowing cover background-image must be wrapped in border-box PushClip(400x100)"
+    );
+}
+
+#[test]
+fn background_clip_text_skips_box_gradient_and_tints_transparent_text() {
+    // CSS Backgrounds L4 §3.7: `background-clip: text; -webkit-background-clip: text;`
+    // must NOT paint a solid gradient box behind the text, and must paint opaque glyphs
+    // even when `color: transparent` is set.
+    let css = r#"
+        body { margin: 0; }
+        .grad-text {
+            background: linear-gradient(90deg, #42b883, #35495e);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            font-size: 32px;
+        }
+    "#;
+    let html =
+        r#"<!doctype html><html><body><span class="grad-text">Progressive</span></body></html>"#;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let mut font_db = FontDatabase::new();
+    font_db.scan_system_fonts();
+    let mut resources = ResourceRegistry::default();
+    let frame = engine.layout_and_paint(
+        &doc,
+        &styles,
+        Size::new(600.0, 200.0),
+        &font_db,
+        PipelineId(1),
+        &mut resources,
+    );
+
+    let has_grad_rect = frame
+        .display_list
+        .items
+        .iter()
+        .any(|i| matches!(i, DisplayItem::LinearGradient { .. }));
+    assert!(
+        !has_grad_rect,
+        "background-clip: text must not emit an unclipped LinearGradient box behind text"
+    );
+    let has_visible_glyphs = frame
+        .display_list
+        .items
+        .iter()
+        .any(|i| matches!(i, DisplayItem::GlyphRun { color, .. } if color.a > 0));
+    assert!(
+        has_visible_glyphs,
+        "background-clip: text with color: transparent must still emit visible tinted GlyphRun"
+    );
+}
+
+#[test]
+fn linear_gradient_calc_px_stop_and_zero_hard_stop_follow_css_images_l3() {
+    // CSS Images L3 §3.4.3: `linear-gradient(180deg, transparent calc(100% - 1px), #ff0000 0)`
+    // on a 20px-tall box must resolve stop 0 to 19/20 = 0.95 and clamp stop 1 (`0`) up to 0.95
+    // (producing a crisp 1px bottom underline instead of a solid red box!).
+    let css = r#"
+        body { margin: 0; }
+        .u {
+            width: 100px;
+            height: 20px;
+            background: linear-gradient(180deg, transparent calc(100% - 1px), #ff0000 0);
+        }
+    "#;
+    let html = r#"<!doctype html><html><body><div class="u"></div></body></html>"#;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let font_db = FontDatabase::new();
+    let mut resources = ResourceRegistry::default();
+    let frame = engine.layout_and_paint(
+        &doc,
+        &styles,
+        Size::new(400.0, 200.0),
+        &font_db,
+        PipelineId(1),
+        &mut resources,
+    );
+
+    let stops = frame
+        .display_list
+        .items
+        .iter()
+        .find_map(|i| match i {
+            DisplayItem::LinearGradient { stops, .. } => Some(stops.clone()),
+            _ => None,
+        })
+        .expect("must emit LinearGradient");
+    assert_eq!(stops.len(), 2);
+    assert!(
+        (stops[0].offset - 0.95).abs() < 0.02 && (stops[1].offset - 0.95).abs() < 0.02,
+        "calc(100% - 1px) on 20px height + `0` hard stop must both resolve to 0.95, got {stops:?}"
+    );
+}

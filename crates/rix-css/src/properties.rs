@@ -21,29 +21,30 @@ use crate::values::{
     angle_to_deg, convert_align_content, convert_align_items, convert_align_self, convert_alpha,
     convert_animation, convert_animation_direction, convert_animation_fill,
     convert_animation_iteration, convert_animation_name, convert_animation_play_state,
-    convert_background_layer, convert_background_size, convert_blend_mode, convert_border_width_lp,
-    convert_box_shadow, convert_clip_path, convert_color, convert_corner_radius, convert_cursor,
-    convert_direction, convert_display, convert_easing, convert_filter, convert_flex_direction,
-    convert_flex_wrap, convert_font_family_name, convert_font_size, convert_font_style,
-    convert_font_weight, convert_grid_auto_flow, convert_image, convert_justify_content,
-    convert_justify_items, convert_justify_self, convert_length, convert_length_percentage,
-    convert_length_percentage_or_auto, convert_length_value, convert_line_height,
-    convert_line_style, convert_max_size, convert_overflow, convert_overflow_wrap,
-    convert_position, convert_size, convert_spacing, convert_text_align,
-    convert_text_decoration_line, convert_text_transform, convert_track_size, convert_track_sizing,
-    convert_transform, convert_transform_origin, convert_transition, convert_user_select,
-    convert_visibility, convert_white_space, convert_word_break, convert_z_index, time_to_ms,
-    AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
-    AnimationPlayStateMode, AnimationSpec, BackgroundImageValue, BackgroundLayerValue,
-    BackgroundSizeValue, BorderCollapseMode, BoxShadowValue, BoxSizingMode, CaptionSideMode,
-    ClearMode, ClipPathValue, ColorInterpolationFiltersMode, ContentVisibilityMode, CornerRadius,
-    CssColor, CursorKind, DirectionMode, DisplayMode, EmptyCellsMode, FilterOp, FilterSpecOp,
-    FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
-    GridPlacementValue, GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode,
-    LengthPercentage, LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle,
-    ListStylePositionMode, ListStyleTypeMode, MixBlendMode, OverflowMode, OverflowWrapMode,
-    OverlayMode, OverscrollBehaviorMode, PointerEventsMode, PositionMode, ReadingFlowMode,
-    ResizeMode, ScrollBehaviorMode, SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode,
+    convert_background_clip, convert_background_layer, convert_background_size, convert_blend_mode,
+    convert_border_width_lp, convert_box_shadow, convert_clip_path, convert_color,
+    convert_corner_radius, convert_cursor, convert_direction, convert_display, convert_easing,
+    convert_filter, convert_flex_direction, convert_flex_wrap, convert_font_family_name,
+    convert_font_size, convert_font_style, convert_font_weight, convert_grid_auto_flow,
+    convert_image, convert_justify_content, convert_justify_items, convert_justify_self,
+    convert_length, convert_length_percentage, convert_length_percentage_or_auto,
+    convert_length_value, convert_line_height, convert_line_style, convert_max_size,
+    convert_overflow, convert_overflow_wrap, convert_position, convert_size, convert_spacing,
+    convert_text_align, convert_text_decoration_line, convert_text_transform, convert_track_size,
+    convert_track_sizing, convert_transform, convert_transform_origin, convert_transition,
+    convert_user_select, convert_visibility, convert_white_space, convert_word_break,
+    convert_z_index, time_to_ms, AlignValue, AnimationCompositionMode, AnimationDirectionMode,
+    AnimationFillModeKind, AnimationPlayStateMode, AnimationSpec, BackgroundClipMode,
+    BackgroundImageValue, BackgroundLayerValue, BackgroundSizeValue, BorderCollapseMode,
+    BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue,
+    ColorInterpolationFiltersMode, ContentVisibilityMode, CornerRadius, CssColor, CursorKind,
+    DirectionMode, DisplayMode, EmptyCellsMode, FilterOp, FilterSpecOp, FlexDirectionMode,
+    FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode, GridPlacementValue,
+    GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode, LengthPercentage,
+    LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, ListStylePositionMode,
+    ListStyleTypeMode, MixBlendMode, OverflowMode, OverflowWrapMode, OverlayMode,
+    OverscrollBehaviorMode, PointerEventsMode, PositionMode, ReadingFlowMode, ResizeMode,
+    ScrollBehaviorMode, SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode,
     TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode, TextTransformMode,
     TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec,
     UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode,
@@ -464,6 +465,7 @@ pub enum PropertyIdKind {
     BackgroundColor,
     BackgroundLayers,
     BackgroundSize,
+    BackgroundClip,
     BackgroundPosition,
     BackgroundPositionX,
     BackgroundPositionY,
@@ -850,6 +852,7 @@ impl PropertyIdKind {
             "background-color" => Self::BackgroundColor,
             "background-image" => Self::BackgroundLayers,
             "background-size" => Self::BackgroundSize,
+            "background-clip" | "-webkit-background-clip" => Self::BackgroundClip,
             "background-position" => Self::BackgroundPosition,
             "background-position-x" => Self::BackgroundPositionX,
             "background-position-y" => Self::BackgroundPositionY,
@@ -1100,6 +1103,7 @@ impl PropertyIdKind {
             Self::BackgroundColor => "background-color",
             Self::BackgroundLayers => "background-image",
             Self::BackgroundSize => "background-size",
+            Self::BackgroundClip => "background-clip",
             Self::BackgroundPosition => "background-position",
             Self::BackgroundPositionX => "background-position-x",
             Self::BackgroundPositionY => "background-position-y",
@@ -1605,6 +1609,7 @@ impl PropertyIdKind {
                 Self::BackgroundColor,
                 Self::BackgroundLayers,
                 Self::BackgroundSize,
+                Self::BackgroundClip,
             ]),
             Self::Outline => {
                 SmallVec::from_slice(&[Self::OutlineWidth, Self::OutlineStyle, Self::OutlineColor])
@@ -1947,6 +1952,7 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::BackgroundColor,
     PropertyIdKind::BackgroundLayers,
     PropertyIdKind::BackgroundSize,
+    PropertyIdKind::BackgroundClip,
     PropertyIdKind::BackgroundPosition,
     PropertyIdKind::ObjectPosition,
     PropertyIdKind::BoxShadow,
@@ -2364,6 +2370,7 @@ pub enum PropertyValue {
     BoxShadow(Vec<BoxShadowValue>),
     BackgroundLayers(Vec<BackgroundLayerValue>),
     BackgroundSize(BackgroundSizeValue),
+    BackgroundClip(BackgroundClipMode),
     MaskImage(BackgroundImageValue),
     ClipRect(Option<crate::values::CssClipRect>),
     Transform(Vec<TransformOp>),
@@ -4896,6 +4903,17 @@ fn compile_property(
                 PropertyValue::BackgroundSize(first_size),
                 imp,
             );
+            let first_clip = bgs
+                .first()
+                .map(|b| convert_background_clip(&b.clip))
+                .unwrap_or(BackgroundClipMode::BorderBox);
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BackgroundClip,
+                PropertyValue::BackgroundClip(first_clip),
+                imp,
+            );
         }
         Property::BackgroundSize(sizes) => {
             let sz = sizes
@@ -4907,6 +4925,19 @@ fn compile_property(
                 ord,
                 PropertyIdKind::BackgroundSize,
                 PropertyValue::BackgroundSize(sz),
+                imp,
+            );
+        }
+        Property::BackgroundClip(clips, _) => {
+            let clip = clips
+                .first()
+                .map(convert_background_clip)
+                .unwrap_or(BackgroundClipMode::BorderBox);
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BackgroundClip,
+                PropertyValue::BackgroundClip(clip),
                 imp,
             );
         }

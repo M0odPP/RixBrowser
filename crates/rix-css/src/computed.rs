@@ -14,12 +14,12 @@ use crate::properties::{
 use crate::stylesheet::{CascadeOrigin, CompiledRule, LayerId, MediaContext, RegisteredProperty};
 use crate::values::{
     AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
-    AnimationPlayStateMode, AnimationSpec, BackgroundImageValue, BackgroundLayerValue,
-    BackgroundSizeValue, BorderCollapseMode, BoxShadowValue, BoxSizingMode, CaptionSideMode,
-    ClearMode, ClipPathValue, ColorInterpolationFiltersMode, ColorRgba, ContentVisibilityMode,
-    CornerRadii, CssColor, CursorKind, DirectionMode, DisplayMode, EdgeValues, EmptyCellsMode,
-    EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
-    GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
+    AnimationPlayStateMode, AnimationSpec, BackgroundClipMode, BackgroundImageValue,
+    BackgroundLayerValue, BackgroundSizeValue, BorderCollapseMode, BoxShadowValue, BoxSizingMode,
+    CaptionSideMode, ClearMode, ClipPathValue, ColorInterpolationFiltersMode, ColorRgba,
+    ContentVisibilityMode, CornerRadii, CssColor, CursorKind, DirectionMode, DisplayMode,
+    EdgeValues, EmptyCellsMode, EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode,
+    FontStyleMode, GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
     InterpolateSizeMode, LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle,
     MixBlendMode, OverflowMode, OverflowPair, OverflowWrapMode, OverlayMode,
     OverscrollBehaviorMode, PointerEventsMode, PositionMode, ReadingFlowMode, ResizeMode,
@@ -86,6 +86,7 @@ pub struct VisualStyle {
     pub background_layers: Vec<BackgroundLayerValue>,
     pub background_image_raw: Option<String>,
     pub background_size: Option<BackgroundSizeValue>,
+    pub background_clip: BackgroundClipMode,
     pub background_position: (LengthPercentage, LengthPercentage),
     pub mask_image: BackgroundImageValue,
     pub object_position: Option<Box<crate::values_math::PositionSpec>>,
@@ -119,6 +120,7 @@ impl Default for VisualStyle {
             background_layers: Vec::new(),
             background_image_raw: None,
             background_size: None,
+            background_clip: BackgroundClipMode::BorderBox,
             background_position: (
                 LengthPercentage::Percent(0.0),
                 LengthPercentage::Percent(0.0),
@@ -2645,6 +2647,9 @@ pub fn apply_declaration(
         (PropertyIdKind::BackgroundSize, PropertyValue::BackgroundSize(sz)) => {
             Arc::make_mut(&mut style.visual).background_size = Some(sz.clone());
         }
+        (PropertyIdKind::BackgroundClip, PropertyValue::BackgroundClip(clip)) => {
+            Arc::make_mut(&mut style.visual).background_clip = *clip;
+        }
         (PropertyIdKind::MaskImage, PropertyValue::MaskImage(img)) => {
             Arc::make_mut(&mut style.visual).mask_image = img.clone();
         }
@@ -3768,6 +3773,9 @@ fn copy_property_from_parent(
             Arc::make_mut(&mut style.visual).background_size =
                 parent.visual.background_size.clone();
         }
+        PropertyIdKind::BackgroundClip => {
+            Arc::make_mut(&mut style.visual).background_clip = parent.visual.background_clip;
+        }
         PropertyIdKind::FontSize => {
             Arc::make_mut(&mut style.text).font_size_px = parent.text.font_size_px;
         }
@@ -4585,6 +4593,9 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         }
         PropertyIdKind::BackgroundSize => {
             Arc::make_mut(&mut style.visual).background_size = None;
+        }
+        PropertyIdKind::BackgroundClip => {
+            Arc::make_mut(&mut style.visual).background_clip = BackgroundClipMode::BorderBox;
         }
         PropertyIdKind::MaskImage => {
             Arc::make_mut(&mut style.visual).mask_image = BackgroundImageValue::None;
