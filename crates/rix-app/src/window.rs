@@ -339,6 +339,8 @@ pub struct RenderUrlMetrics {
     pub settle_ms: f32,
     pub render_ms: f32,
     pub total_ms: f32,
+    #[serde(default)]
+    pub warm_total_ms: Option<f32>,
     pub wave1_ms: f32,
     pub wave2_ms: f32,
     pub css_parse_ms: f32,
@@ -350,6 +352,27 @@ pub struct RenderUrlMetrics {
     pub js_errors: Vec<String>,
     pub peak_rss_kib: u64,
     pub current_rss_kib: u64,
+    #[serde(default)]
+    pub cpu_time_ms: f64,
+    #[serde(default)]
+    pub idle_frames: u64,
+    #[serde(default)]
+    pub scenario: Option<crate::inspector::ScenarioReport>,
+}
+
+/// Configuration for [`render_url_with_options`].
+#[derive(Debug, Clone)]
+pub struct RenderUrlOptions {
+    pub url: String,
+    pub out_path: std::path::PathBuf,
+    pub dump_dom_layout: Option<std::path::PathBuf>,
+    pub post_action_png: Option<std::path::PathBuf>,
+    pub run_interactive: bool,
+    pub measure_warm: bool,
+    pub width: u32,
+    pub height: u32,
+    pub dpr: f32,
+    pub theme: ThemeMode,
 }
 
 fn read_proc_status_kib(key: &str) -> u64 {
@@ -366,6 +389,47 @@ fn read_proc_status_kib(key: &str) -> u64 {
         }
     }
     0
+}
+
+/// Reads total process CPU time (`utime + stime`) in milliseconds from `/proc/self/stat`.
+fn read_proc_self_cpu_ms() -> f64 {
+    let Ok(text) = std::fs::read_to_string("/proc/self/stat") else {
+        return 0.0;
+    };
+    let Some(rparen) = text.rfind(')') else {
+        return 0.0;
+    };
+    let fields: Vec<&str> = text[rparen + 1..].split_whitespace().collect();
+    // After `comm)`, field 0 is state (3rd overall), so utime (14th) is index 11 and stime (15th) is 12.
+    let utime: u64 = fields.get(11).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let stime: u64 = fields.get(12).and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Standard Linux USER_HZ is 100 ticks/sec => 10 ms per tick.
+    (utime + stime) as f64 * 10.0
+}
+
+fn settle_active_tab(controller: &mut BrowserController) -> f32 {
+    let t_settle = Instant::now();
+    let fast_deadline = t_settle + Duration::from_millis(250);
+    let io_deadline = t_settle + Duration::from_millis(1200);
+    for _ in 0..160 {
+        let Some(delay) = controller.tick_active_tab() else {
+            break;
+        };
+        let now = Instant::now();
+        let has_io = controller
+            .active_tab_doc()
+            .and_then(|d| d.runtime.as_ref())
+            .is_some_and(|rt| rt.net.borrow().has_pending_io());
+        let deadline = if has_io { io_deadline } else { fast_deadline };
+        if now >= deadline {
+            break;
+        }
+        let sleep_for = delay.min(Duration::from_millis(10));
+        if !sleep_for.is_zero() {
+            std::thread::sleep(sleep_for);
+        }
+    }
+    t_settle.elapsed().as_secs_f32() * 1000.0
 }
 
 /// Navigates a headless [`BrowserController`] to `url` (executing external CSS, images, SVGs,
@@ -391,14 +455,43 @@ pub fn render_url_to_png_with_metrics(
     height: u32,
     theme: ThemeMode,
 ) -> Result<RenderUrlMetrics, Box<dyn std::error::Error>> {
+    render_url_with_options(&RenderUrlOptions {
+        url: url.to_string(),
+        out_path: out_path.as_ref().to_path_buf(),
+        dump_dom_layout: None,
+        post_action_png: None,
+        run_interactive: false,
+        measure_warm: false,
+        width,
+        height,
+        dpr: 1.0,
+        theme,
+    })
+}
+
+/// Full-featured headless render, DOM/computed-style/layout inspector, warm-reload, and
+/// interactive smooth-scroll GPU frame-pacing runner.
+pub fn render_url_with_options(
+    opts: &RenderUrlOptions,
+) -> Result<RenderUrlMetrics, Box<dyn std::error::Error>> {
+    let cpu_start = read_proc_self_cpu_ms();
     let t_total = Instant::now();
-    let width = width.max(1);
-    let height = height.max(1);
+    let width = opts.width.max(1);
+    let height = opts.height.max(1);
+    let dpr = opts.dpr.clamp(0.5, 4.0);
 
     // Overlap GPU device initialization and Vello compute shader pipeline compilation with
-    // initial browser setup and network I/O on a dedicated GPU thread (mirroring a browser GPU
-    // process booting in parallel with the network/content pipeline).
-    let (gpu_tx, gpu_rx) = std::sync::mpsc::sync_channel(1);
+    // initial browser setup and network I/O on a dedicated GPU worker thread. Keeping
+    // `VelloRenderer` owned solely by the worker avoids moving wgpu handles across threads.
+    type GpuJob = (
+        rix_render::Scene,
+        u32,
+        u32,
+        rix_render::Color,
+        Option<std::path::PathBuf>,
+        std::sync::mpsc::SyncSender<Result<(), String>>,
+    );
+    let (gpu_tx, gpu_rx) = std::sync::mpsc::sync_channel::<GpuJob>(1);
     let gpu_worker = std::thread::Builder::new()
         .name("rix-gpu-headless".to_string())
         .spawn(move || -> Result<(), String> {
@@ -406,85 +499,138 @@ pub fn render_url_to_png_with_metrics(
             renderer
                 .warm_up_headless_blocking()
                 .map_err(|e| e.to_string())?;
-            if let Ok((scene, w, h, clear, path)) = gpu_rx.recv() {
-                renderer
-                    .render_scene_to_png_warm(&scene, w, h, clear, path)
-                    .map_err(|e| e.to_string())?;
+            while let Ok((scene, w, h, clear, path, done_tx)) = gpu_rx.recv() {
+                let res = match path {
+                    Some(p) => renderer
+                        .render_scene_to_png_warm(&scene, w, h, clear, p)
+                        .map_err(|e| e.to_string()),
+                    None => renderer
+                        .render_to_rgba_blocking(&scene, w, h, clear)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                };
+                let _ = done_tx.send(res);
             }
             Ok(())
         })?;
 
+    let submit_gpu = |scene: rix_render::Scene,
+                      w: u32,
+                      h: u32,
+                      clear: rix_render::Color,
+                      path: Option<std::path::PathBuf>|
+     -> Result<(), String> {
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        gpu_tx
+            .send((scene, w, h, clear, path, done_tx))
+            .map_err(|_| "headless GPU worker channel closed".to_string())?;
+        done_rx
+            .recv()
+            .map_err(|_| "headless GPU worker stopped".to_string())?
+    };
+
     let t_start = Instant::now();
-    let mut controller = BrowserController::new(Size::new(width as f32, height as f32), 1.0);
-    controller.set_theme(theme);
+    let logical_size = Size::new(width as f32 / dpr, height as f32 / dpr);
+    let mut controller = BrowserController::new(logical_size, dpr);
+    controller.set_theme(opts.theme);
     let startup_ms = t_start.elapsed().as_secs_f32() * 1000.0;
 
     let t_nav = Instant::now();
-    controller.navigate_active(url);
+    controller.navigate_active(&opts.url);
     let navigate_ms = t_nav.elapsed().as_secs_f32() * 1000.0;
 
-    // Allow initial async `fetch()` / dynamic ES module hydration / short timers / first rAF
-    // frame to settle cleanly. Static pages with no pending work exit immediately (~0 ms);
-    // SPAs with active network I/O get a bounded settle window up to 1200 ms.
-    let t_settle = Instant::now();
-    let fast_deadline = t_settle + Duration::from_millis(250);
-    let io_deadline = t_settle + Duration::from_millis(1200);
-    for _ in 0..160 {
-        let Some(delay) = controller.tick_active_tab() else {
-            break;
-        };
-        let now = Instant::now();
-        let has_io = controller
-            .active_tab_doc()
-            .and_then(|d| d.runtime.as_ref())
-            .is_some_and(|rt| rt.net.borrow().has_pending_io());
-        let deadline = if has_io { io_deadline } else { fast_deadline };
-        if now >= deadline {
-            break;
-        }
-        let sleep_for = delay.min(Duration::from_millis(10));
-        if !sleep_for.is_zero() {
-            std::thread::sleep(sleep_for);
-        }
-    }
-    let settle_ms = t_settle.elapsed().as_secs_f32() * 1000.0;
+    let settle_ms = settle_active_tab(&mut controller);
 
     let t_render = Instant::now();
     controller.sync_layers();
     let clear = controller.clear_color();
     let scene = controller.compositor.compose_force().clone();
-    let _ = gpu_tx.send((scene, width, height, clear, out_path.as_ref().to_path_buf()));
+    if let Err(err) = submit_gpu(scene, width, height, clear, Some(opts.out_path.clone())) {
+        drop(gpu_tx);
+        let _ = gpu_worker.join();
+        return Err(err.into());
+    }
+    let render_ms = t_render.elapsed().as_secs_f32() * 1000.0;
+    let total_ms = t_total.elapsed().as_secs_f32() * 1000.0;
+    let cpu_time_ms = (read_proc_self_cpu_ms() - cpu_start).max(0.0);
+
+    // Measure strict IDLE 0 Hz right after clean compose before running optional interactive steps.
+    let frames_before_idle = controller.compositor.frames_rendered();
+    for _ in 0..5 {
+        let _ = controller.compositor.compose();
+    }
+    let idle_frames = controller
+        .compositor
+        .frames_rendered()
+        .saturating_sub(frames_before_idle);
+
+    // Dump structured DOM/Style/Layout snapshot BEFORE interactive mutations so it matches
+    // the rendered PNG 1-to-1 and adds zero time to `total_ms`.
+    if let Some(ref dump_path) = opts.dump_dom_layout {
+        let snapshot = crate::inspector::capture_page_snapshot(&controller);
+        let json = serde_json::to_string_pretty(&snapshot)?;
+        std::fs::write(dump_path, json)?;
+    }
+
+    let peak_rss_kib = read_proc_status_kib("VmHWM:");
+    let current_rss_kib = read_proc_status_kib("VmRSS:");
+    let web_rect = controller.web_viewport_rect();
+    let active_tab_url = controller.chrome.active().url.clone();
+    let active_tab_title = controller.chrome.active().title.clone();
+    let (stats, js_errors) = controller
+        .active_tab_doc()
+        .map(|d| (d.last_load_stats, d.last_js_errors.clone()))
+        .unwrap_or_default();
+
+    let scenario = if opts.run_interactive {
+        Some(crate::inspector::run_interactive_scenario(
+            &mut controller,
+            width,
+            height,
+            opts.post_action_png.as_deref(),
+            |sc, w, h, clr, path| {
+                submit_gpu(sc, w, h, clr, path.map(std::path::Path::to_path_buf)).is_ok()
+            },
+        ))
+    } else {
+        None
+    };
+
+    let warm_total_ms = if opts.measure_warm {
+        let t_warm = Instant::now();
+        controller.navigate_active(&opts.url);
+        let _ = settle_active_tab(&mut controller);
+        controller.sync_layers();
+        let warm_scene = controller.compositor.compose_force().clone();
+        let _ = submit_gpu(warm_scene, width, height, clear, None);
+        Some(t_warm.elapsed().as_secs_f32() * 1000.0)
+    } else {
+        None
+    };
+
     drop(gpu_tx);
     match gpu_worker.join() {
         Ok(Ok(())) => {}
         Ok(Err(err)) => return Err(err.into()),
         Err(_) => return Err("headless GPU render thread panicked".into()),
     }
-    let render_ms = t_render.elapsed().as_secs_f32() * 1000.0;
-    let total_ms = t_total.elapsed().as_secs_f32() * 1000.0;
-
-    let web_rect = controller.web_viewport_rect();
-    let active_tab = controller.chrome.active();
-    let (stats, js_errors) = controller
-        .active_tab_doc()
-        .map(|d| (d.last_load_stats, d.last_js_errors.clone()))
-        .unwrap_or_default();
 
     Ok(RenderUrlMetrics {
-        url: url.to_string(),
-        final_url: active_tab.url.clone(),
-        title: active_tab.title.clone(),
+        url: opts.url.clone(),
+        final_url: active_tab_url,
+        title: active_tab_title,
         width,
         height,
-        web_viewport_x: web_rect.origin.x.max(0.0).round() as u32,
-        web_viewport_y: web_rect.origin.y.max(0.0).round() as u32,
-        web_viewport_width: web_rect.size.width.max(0.0).round() as u32,
-        web_viewport_height: web_rect.size.height.max(0.0).round() as u32,
+        web_viewport_x: (web_rect.origin.x * dpr).max(0.0).round() as u32,
+        web_viewport_y: (web_rect.origin.y * dpr).max(0.0).round() as u32,
+        web_viewport_width: (web_rect.size.width * dpr).max(0.0).round() as u32,
+        web_viewport_height: (web_rect.size.height * dpr).max(0.0).round() as u32,
         startup_ms,
         navigate_ms,
         settle_ms,
         render_ms,
         total_ms,
+        warm_total_ms,
         wave1_ms: stats.wave1_ms,
         wave2_ms: stats.wave2_ms,
         css_parse_ms: stats.css_parse_ms,
@@ -494,7 +640,10 @@ pub fn render_url_to_png_with_metrics(
         cache_hits: stats.network_cache_hits + stats.decoded_asset_cache_hits,
         js_error_count: stats.js_error_count,
         js_errors,
-        peak_rss_kib: read_proc_status_kib("VmHWM:"),
-        current_rss_kib: read_proc_status_kib("VmRSS:"),
+        peak_rss_kib,
+        current_rss_kib,
+        cpu_time_ms,
+        idle_frames,
+        scenario,
     })
 }

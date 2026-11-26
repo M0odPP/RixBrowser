@@ -21,16 +21,75 @@ for lib in crates/*/src/lib.rs; do
   fi
 done
 
-echo "==> 2/5 Checking zero site-specific hardcodes and placeholder stubs..."
+echo "==> 2/5 Checking zero site-specific hardcodes, UA spoofing, and placeholder stubs..."
 if grep -rnE 'youtube\.com|youtu\.be|SOCS=|PENDING\+999|signature_cipher|youtube_hydrator' crates/; then
   echo "ERROR: Site-specific hardcode detected in crates/."
   exit 1
 fi
-ENGINE_SRC_DIRS="crates/rix-html/src crates/rix-dom/src crates/rix-css/src crates/rix-text/src crates/rix-layout/src crates/rix-render/src crates/rix-js/src crates/rix-jit/src crates/rix-content/src crates/rix-media/src crates/rix-net/src crates/rix-storage/src"
-if grep -rnE '\b(google|github|wikipedia|reddit|twitter|facebook|instagram|amazon|netflix|tiktok|discord|telegram|ycombinator|stackoverflow|nytimes|bbc|twitch|spotify|linkedin)\.(com|org|tv)\b' $ENGINE_SRC_DIRS; then
-  echo "ERROR: Site-specific domain hardcode detected in core engine crates."
-  exit 1
-fi
+python3 - <<'PY'
+import pathlib, re, sys
+
+# Universal anti-hardcode & anti-UA-spoofing scanner across ALL crates/ non-test source files.
+# Forbids domain-specific checks, URL literals to real external websites, or browser UA spoofing
+# outside unit tests (`#[cfg(test)]`), doc comments, W3C/WHATWG spec namespace URIs, RFC examples,
+# and `rix-chrome` built-in default bookmarks / user-configurable search engines.
+DOMAIN_RE = re.compile(
+    r'"[^"\n]*\b([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.(?:com|org|net|io|dev|tv|co|sh|ai|gg|ru|uk|de|fr|jp|edu|gov|news|app|run|build))\b[^"\n]*"',
+    re.IGNORECASE,
+)
+UA_SPOOF_RE = re.compile(r'"[^"\n]*(Firefox/|Chrome/|Chromium/|Edg/|Safari/[0-9])[^"\n]*"')
+SPEC_NAMESPACE_URIS = {
+    "http://www.mozilla.org/newlayout/xml/parsererror.xml",
+}
+CANONICAL_UA_FILES = {
+    "crates/rix-core/src/browser_profile.rs",
+    "crates/rix-content/src/web_apis.rs",
+    "crates/rix-content/src/workers.rs",
+}
+CHROME_DEFAULTS_FILES = {
+    "crates/rix-chrome/src/settings.rs",
+    "crates/rix-chrome/src/state.rs",
+}
+
+violations = []
+for path in sorted(pathlib.Path("crates").rglob("*.rs")):
+    rel = path.as_posix()
+    if "/tests/" in rel or "/benches/" in rel or rel.endswith("_tests.rs"):
+        continue
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    # Truncate at the start of inline `#[cfg(test)]` module at file tail.
+    cfg_test_idx = text.find("#[cfg(test)]")
+    code = text[:cfg_test_idx] if cfg_test_idx != -1 else text
+
+    for lineno, raw_line in enumerate(code.splitlines(), start=1):
+        stripped = raw_line.strip()
+        if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
+            continue
+        line = raw_line
+        if rel not in CHROME_DEFAULTS_FILES:
+            for m in DOMAIN_RE.finditer(line):
+                dom = m.group(1).lower()
+                full_lit = m.group(0)
+                if full_lit.strip('"') in SPEC_NAMESPACE_URIS:
+                    continue
+                # Ignore W3C/WHATWG XML namespace URLs and RFC example domains.
+                if dom in ("w3.org", "example.com", "example.org", "example.net", "whatwg.org", "iana.org", "ietf.org"):
+                    continue
+                if dom.endswith((".sh", ".co", ".io", ".ai", ".tv", ".app", ".run", ".build", ".news")) and (
+                    "/" not in full_lit and "http" not in full_lit and not full_lit.startswith(('".', '"www.'))
+                ):
+                    continue
+                violations.append(f"{rel}:{lineno}: disallowed site/domain literal `{full_lit}`")
+        # Forbid per-site or ad-hoc User-Agent spoofing outside canonical UA definition files.
+        if UA_SPOOF_RE.search(line) and rel not in CANONICAL_UA_FILES:
+            violations.append(f"{rel}:{lineno}: disallowed User-Agent spoof string `{stripped}`")
+
+if violations:
+    print("ERROR: Anti-hardcode CI gate failed:")
+    for v in violations[:40]:
+        print("  ", v)
+    sys.exit(1)
+PY
 if grep -rnE '\b(todo|unimplemented)!\(' crates/; then
   echo "ERROR: Placeholder macro (todo!/unimplemented!) detected in crates/."
   exit 1

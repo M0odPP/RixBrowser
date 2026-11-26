@@ -1,0 +1,32 @@
+# 30-Site Blind Holdout Cohort (SEALED - NEVER INSPECT OR TUNE BEFORE FINAL ZERO-SHOT GATE)
+# Completely disjoint from top50_firefox_audit.txt to prove pure architectural generality.
+https://www.debian.org/
+https://fedoraproject.org/
+https://nixos.org/
+https://ziglang.org/
+https://elixir-lang.org/
+https://gleam.run/
+https://www.ruby-lang.org/en/
+https://www.php.net/
+https://kotlinlang.org/
+https://swift.org/
+https://astro.build/
+https://vite.dev/
+https://webpack.js.org/
+https://esbuild.github.io/
+https://www.solidjs.com/
+https://nuxt.com/
+https://remix.run/
+https://getbootstrap.com/
+https://grafana.com/
+https://prometheus.io/
+https://www.elastic.co/
+https://www.mongodb.com/
+https://duckdb.org/
+https://www.nginx.com/
+https://www.blender.org/
+https://www.gimp.org/
+https://inkscape.org/
+https://godotengine.org/
+https://www.openstreetmap.org/
+https://archive.org/
