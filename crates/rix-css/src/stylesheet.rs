@@ -1283,6 +1283,7 @@ struct StylesheetCompiler<'a> {
     media: MediaContext,
     owner_parent: Option<rix_dom::NodeId>,
     source_css: &'a str,
+    line_index: LineIndex,
     rules: Vec<CompiledRule>,
     layers: Vec<InternedStr>,
     layer_paths: Vec<Vec<LayerSeg>>,
@@ -1313,6 +1314,7 @@ impl<'a> StylesheetCompiler<'a> {
             media,
             owner_parent,
             source_css,
+            line_index: LineIndex::new(source_css),
             rules: Vec::new(),
             layers: Vec::new(),
             layer_paths: Vec::new(),
@@ -1608,8 +1610,12 @@ impl<'a> StylesheetCompiler<'a> {
                 ParseRelative::No,
             ),
             CompileNesting::ScopeRule => {
-                let raw_src =
-                    extract_raw_selector_at_loc(self.source_css, style.loc.line, style.loc.column);
+                let raw_src = extract_raw_selector_at_loc(
+                    self.source_css,
+                    &self.line_index,
+                    style.loc.line,
+                    style.loc.column,
+                );
                 let cleaned = strip_synthetic_scope_ampersands(&raw, raw_src);
                 // CSSWG #9740: `&` inside `@scope` behaves like `:where(:scope)` (0 specificity).
                 let replaced = replace_ampersand_in_selector(&cleaned, ":where(:scope)");
@@ -2578,17 +2584,29 @@ fn serialize_lightning_decl_block_cssom(
     parts.join(" ")
 }
 
-fn loc_to_byte_offset(css: &str, line: u32, col: u32) -> usize {
-    let mut offset = 0usize;
-    let mut cur_line = 0u32;
-    let bytes = css.as_bytes();
-    while cur_line < line && offset < bytes.len() {
-        if bytes[offset] == b'\n' {
-            cur_line += 1;
+/// Precomputed O(1) line-start byte index for a CSS source string so repeated
+/// `(line, col) -> byte_offset` lookups across thousands of rules never degrade to O(N^2).
+struct LineIndex {
+    starts: Vec<usize>,
+}
+
+impl LineIndex {
+    fn new(css: &str) -> Self {
+        let mut starts = Vec::with_capacity(64);
+        starts.push(0);
+        for (idx, &b) in css.as_bytes().iter().enumerate() {
+            if b == b'\n' {
+                starts.push(idx + 1);
+            }
         }
-        offset += 1;
+        Self { starts }
     }
-    (offset + col.saturating_sub(1) as usize).min(bytes.len())
+
+    #[inline]
+    fn byte_offset(&self, css_len: usize, line: u32, col: u32) -> usize {
+        let base = self.starts.get(line as usize).copied().unwrap_or(css_len);
+        (base + col.saturating_sub(1) as usize).min(css_len)
+    }
 }
 
 /// Wraps non-nested `@scope ... { ... }` blocks in `.__rix_top_scope__ { ... }` so
@@ -2705,8 +2723,13 @@ fn find_at_rule_block_end(css: &str, start: usize) -> Option<usize> {
     saw_open.then_some(bytes.len())
 }
 
-fn extract_raw_selector_at_loc(css: &str, line: u32, col: u32) -> Option<&str> {
-    let rest = &css[loc_to_byte_offset(css, line, col)..];
+fn extract_raw_selector_at_loc<'a>(
+    css: &'a str,
+    line_index: &LineIndex,
+    line: u32,
+    col: u32,
+) -> Option<&'a str> {
+    let rest = &css[line_index.byte_offset(css.len(), line, col)..];
     let bytes = rest.as_bytes();
     let (mut i, mut in_str, mut depth) = (0, None, 0usize);
     while i < bytes.len() {
@@ -2750,8 +2773,14 @@ fn strip_synthetic_scope_ampersands(lightning_sel: &str, raw_sel: Option<&str>) 
     out.join(", ")
 }
 
-fn extract_rule_decls_slice(css: &str, line: u32, col: u32, is_nested_decls: bool) -> Option<&str> {
-    let mut i = loc_to_byte_offset(css, line, col);
+fn extract_rule_decls_slice<'a>(
+    css: &'a str,
+    line_index: &LineIndex,
+    line: u32,
+    col: u32,
+    is_nested_decls: bool,
+) -> Option<&'a str> {
+    let mut i = line_index.byte_offset(css.len(), line, col);
     let bytes = css.as_bytes();
     if !is_nested_decls {
         let (mut in_str, mut paren, mut open) = (None, 0usize, None);
@@ -2800,8 +2829,13 @@ fn find_raw_decl_value<'a>(decls_slice: &'a str, prop_name: &str) -> Option<&'a 
     matched
 }
 
-fn extract_raw_import_supports(css: &str, line: u32, col: u32) -> Option<String> {
-    let rest = &css[loc_to_byte_offset(css, line, col)..];
+fn extract_raw_import_supports(
+    css: &str,
+    line_index: &LineIndex,
+    line: u32,
+    col: u32,
+) -> Option<String> {
+    let rest = &css[line_index.byte_offset(css.len(), line, col)..];
     let stmt = &rest[..rest.find(';').unwrap_or(rest.len())];
     let bytes = stmt.as_bytes();
     let (mut i, mut in_str) = (0, None);
@@ -2821,8 +2855,13 @@ fn extract_raw_import_supports(css: &str, line: u32, col: u32) -> Option<String>
     None
 }
 
-fn extract_raw_at_rule_prelude(css: &str, line: u32, col: u32) -> Option<&str> {
-    let rest = &css[loc_to_byte_offset(css, line, col)..];
+fn extract_raw_at_rule_prelude<'a>(
+    css: &'a str,
+    line_index: &LineIndex,
+    line: u32,
+    col: u32,
+) -> Option<&'a str> {
+    let rest = &css[line_index.byte_offset(css.len(), line, col)..];
     let after_at = &rest[rest.find('@')? + 1..];
     let name_end = after_at
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
@@ -2933,18 +2972,21 @@ fn convert_lightning_rule_list_to_cssom(
     namespaces: &mut SelectorNamespaceMap,
     nesting: CssomNestingContext,
     source_css: &str,
+    line_index: &LineIndex,
 ) -> Vec<CssomRuleKind> {
     let mut out = Vec::new();
     for r in &list.0 {
         if let CssRule::Style(sr) = r {
             if lightning_to_css_string(&sr.selectors) == ".__rix_top_scope__" {
                 out.extend(convert_lightning_rule_list_to_cssom(
-                    &sr.rules, namespaces, nesting, source_css,
+                    &sr.rules, namespaces, nesting, source_css, line_index,
                 ));
                 continue;
             }
         }
-        if let Ok(rule) = convert_lightning_rule_to_cssom(r, namespaces, nesting, source_css) {
+        if let Ok(rule) =
+            convert_lightning_rule_to_cssom(r, namespaces, nesting, source_css, line_index)
+        {
             out.push(rule);
         }
     }
@@ -2970,6 +3012,7 @@ fn convert_lightning_rule_to_cssom(
     namespaces: &mut SelectorNamespaceMap,
     nesting: CssomNestingContext,
     source_css: &str,
+    line_index: &LineIndex,
 ) -> Result<CssomRuleKind, CssomParseError> {
     if nesting == CssomNestingContext::InsideStyleRule && is_disallowed_in_style_nesting(rule) {
         return Err(CssomParseError::HierarchyRequestError(
@@ -2995,9 +3038,12 @@ fn convert_lightning_rule_to_cssom(
                 .as_ref()
                 .map(|inner| inner.as_ref().map(join_layer_name));
             let supports = imp.supports.as_ref().map(|sup| {
-                if let Some(raw) =
-                    extract_raw_import_supports(source_css, imp.loc.line, imp.loc.column)
-                {
+                if let Some(raw) = extract_raw_import_supports(
+                    source_css,
+                    line_index,
+                    imp.loc.line,
+                    imp.loc.column,
+                ) {
                     return raw;
                 }
                 let s = lightning_to_css_string(sup);
@@ -3030,8 +3076,12 @@ fn convert_lightning_rule_to_cssom(
                     serialize_selector_list(&parsed)
                 }
                 CssomNestingContext::InsideStyleRule => {
-                    let raw_src =
-                        extract_raw_selector_at_loc(source_css, sr.loc.line, sr.loc.column);
+                    let raw_src = extract_raw_selector_at_loc(
+                        source_css,
+                        line_index,
+                        sr.loc.line,
+                        sr.loc.column,
+                    );
                     let normalized = normalize_nested_selector_text(&raw_sel);
                     let parsed = parse_selector_list_relative(
                         &normalized,
@@ -3052,8 +3102,12 @@ fn convert_lightning_rule_to_cssom(
                     }
                 }
                 CssomNestingContext::InsideScopeRule => {
-                    let raw_src =
-                        extract_raw_selector_at_loc(source_css, sr.loc.line, sr.loc.column);
+                    let raw_src = extract_raw_selector_at_loc(
+                        source_css,
+                        line_index,
+                        sr.loc.line,
+                        sr.loc.column,
+                    );
                     let cleaned = strip_synthetic_scope_ampersands(&raw_sel, raw_src);
                     let parsed = parse_selector_list_relative(
                         &cleaned,
@@ -3065,7 +3119,8 @@ fn convert_lightning_rule_to_cssom(
                     serialize_selector_list(&parsed)
                 }
             };
-            let decl_hint = extract_rule_decls_slice(source_css, sr.loc.line, sr.loc.column, false);
+            let decl_hint =
+                extract_rule_decls_slice(source_css, line_index, sr.loc.line, sr.loc.column, false);
             let declarations_text =
                 serialize_lightning_decl_block_cssom(&sr.declarations, decl_hint);
             let rules = convert_lightning_rule_list_to_cssom(
@@ -3073,6 +3128,7 @@ fn convert_lightning_rule_to_cssom(
                 namespaces,
                 CssomNestingContext::InsideStyleRule,
                 source_css,
+                line_index,
             );
             Ok(CssomRuleKind::Style {
                 selector_text,
@@ -3085,20 +3141,25 @@ fn convert_lightning_rule_to_cssom(
             namespaces,
             nesting,
             source_css,
+            line_index,
         ),
         CssRule::NestedDeclarations(nd) => Ok(CssomRuleKind::NestedDeclarations {
             declarations_text: serialize_lightning_decl_block_cssom(
                 &nd.declarations,
-                extract_rule_decls_slice(source_css, nd.loc.line, nd.loc.column, true),
+                extract_rule_decls_slice(source_css, line_index, nd.loc.line, nd.loc.column, true),
             ),
         }),
         CssRule::Media(mr) => Ok(CssomRuleKind::Media {
             condition_text: lightning_to_css_string(&mr.query),
-            rules: convert_lightning_rule_list_to_cssom(&mr.rules, namespaces, nesting, source_css),
+            rules: convert_lightning_rule_list_to_cssom(
+                &mr.rules, namespaces, nesting, source_css, line_index,
+            ),
         }),
         CssRule::Supports(sr) => Ok(CssomRuleKind::Supports {
             condition_text: lightning_to_css_string(&sr.condition),
-            rules: convert_lightning_rule_list_to_cssom(&sr.rules, namespaces, nesting, source_css),
+            rules: convert_lightning_rule_list_to_cssom(
+                &sr.rules, namespaces, nesting, source_css, line_index,
+            ),
         }),
         CssRule::Container(cr) => {
             let container_name = cr.name.as_ref().map(lightning_to_css_string);
@@ -3112,13 +3173,15 @@ fn convert_lightning_rule_to_cssom(
                 container_query,
                 condition_text,
                 rules: convert_lightning_rule_list_to_cssom(
-                    &cr.rules, namespaces, nesting, source_css,
+                    &cr.rules, namespaces, nesting, source_css, line_index,
                 ),
             })
         }
         CssRule::LayerBlock(lb) => Ok(CssomRuleKind::LayerBlock {
             name: lb.name.as_ref().map(join_layer_name).unwrap_or_default(),
-            rules: convert_lightning_rule_list_to_cssom(&lb.rules, namespaces, nesting, source_css),
+            rules: convert_lightning_rule_list_to_cssom(
+                &lb.rules, namespaces, nesting, source_css, line_index,
+            ),
         }),
         CssRule::LayerStatement(ls) => Ok(CssomRuleKind::LayerStatement {
             names: ls.names.iter().map(join_layer_name).collect(),
@@ -3126,7 +3189,7 @@ fn convert_lightning_rule_to_cssom(
         CssRule::Scope(sc) => {
             let ns_opt = (!namespaces.is_empty()).then_some(&*namespaces);
             let (start, end) = if let Some(raw_prelude) =
-                extract_raw_at_rule_prelude(source_css, sc.loc.line, sc.loc.column)
+                extract_raw_at_rule_prelude(source_css, line_index, sc.loc.line, sc.loc.column)
             {
                 validate_raw_scope_prelude(raw_prelude, ns_opt)
                     .map_err(CssomParseError::SyntaxError)?
@@ -3178,6 +3241,7 @@ fn convert_lightning_rule_to_cssom(
                     namespaces,
                     CssomNestingContext::InsideScopeRule,
                     source_css,
+                    line_index,
                 ),
             })
         }
@@ -3192,7 +3256,8 @@ fn convert_lightning_rule_to_cssom(
         }
         CssRule::Page(pr) => {
             let raw_prelude =
-                extract_raw_at_rule_prelude(source_css, pr.loc.line, pr.loc.column).unwrap_or("");
+                extract_raw_at_rule_prelude(source_css, line_index, pr.loc.line, pr.loc.column)
+                    .unwrap_or("");
             let selector_text =
                 parse_and_serialize_page_selector(raw_prelude).unwrap_or_else(|| {
                     pr.selectors
@@ -3201,7 +3266,8 @@ fn convert_lightning_rule_to_cssom(
                         .collect::<Vec<_>>()
                         .join(", ")
                 });
-            let decl_hint = extract_rule_decls_slice(source_css, pr.loc.line, pr.loc.column, false);
+            let decl_hint =
+                extract_rule_decls_slice(source_css, line_index, pr.loc.line, pr.loc.column, false);
             let declarations_text = serialize_page_decl_block(&pr.declarations, decl_hint);
             Ok(CssomRuleKind::Page {
                 selector_text,
@@ -3406,11 +3472,13 @@ pub fn parse_cssom_rules(css: &str) -> Vec<CssomRuleKind> {
             return Vec::new();
         };
         let mut namespaces = SelectorNamespaceMap::default();
+        let line_index = LineIndex::new(&wrapped);
         convert_lightning_rule_list_to_cssom(
             &parsed.rules,
             &mut namespaces,
             CssomNestingContext::TopLevel,
             &wrapped,
+            &line_index,
         )
     }))
     .unwrap_or_default()
@@ -3645,7 +3713,14 @@ pub fn parse_single_cssom_rule_with_context(
                 )));
             }
             let mut ns = namespaces.cloned().unwrap_or_default();
-            return convert_lightning_rule_to_cssom(&outer.rules.0[0], &mut ns, nesting, wrapped);
+            let li = LineIndex::new(wrapped);
+            return convert_lightning_rule_to_cssom(
+                &outer.rules.0[0],
+                &mut ns,
+                nesting,
+                wrapped,
+                &li,
+            );
         }
         let parsed = StyleSheet::parse(&rewritten, opts).map_err(|e| {
             CssomParseError::SyntaxError(format!("Failed to parse CSS rule '{trimmed}': {e}"))
@@ -3657,7 +3732,8 @@ pub fn parse_single_cssom_rule_with_context(
             )));
         }
         let mut ns = namespaces.cloned().unwrap_or_default();
-        convert_lightning_rule_to_cssom(&parsed.rules.0[0], &mut ns, nesting, &rewritten)
+        let li = LineIndex::new(&rewritten);
+        convert_lightning_rule_to_cssom(&parsed.rules.0[0], &mut ns, nesting, &rewritten, &li)
     }))
     .unwrap_or_else(|_| {
         Err(CssomParseError::SyntaxError(format!(
@@ -3675,11 +3751,13 @@ fn parse_cssom_import_rule(trimmed: &str) -> Option<CssomRuleKind> {
         if parsed.rules.0.len() == 1 {
             if let CssRule::Import(imp) = &parsed.rules.0[0] {
                 let mut ns = SelectorNamespaceMap::default();
+                let li = LineIndex::new(trimmed);
                 return convert_lightning_rule_to_cssom(
                     &CssRule::Import(imp.clone()),
                     &mut ns,
                     CssomNestingContext::TopLevel,
                     trimmed,
+                    &li,
                 )
                 .ok();
             }

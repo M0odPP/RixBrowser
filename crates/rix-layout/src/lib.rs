@@ -22,8 +22,9 @@ pub mod text_transform;
 
 pub use assets::{
     collect_svg_paths_from_dom, decode_raster_batch_parallel, decode_single_raster,
-    extract_svg_from_document, parse_best_srcset_url, parse_html_dimension_attr, parse_svg_color,
-    AssetError, AssetRegistry, DecodedImage, DecodedRasterBytes, DecodedSvg,
+    extract_svg_from_document, is_supported_image_mime, parse_best_srcset_url,
+    parse_html_dimension_attr, parse_svg_color, select_picture_source_for_img, AssetError,
+    AssetRegistry, DecodedImage, DecodedRasterBytes, DecodedSvg, SelectedPictureSource,
 };
 pub use bfc::{collapse_margins, layout_bfc_root, layout_block_box, FloatBand, FloatContext};
 pub use box_tree::{

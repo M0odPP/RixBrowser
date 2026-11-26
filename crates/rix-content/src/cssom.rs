@@ -525,7 +525,7 @@ fn install_css_namespace(vm: &mut JsVm, host: &SharedHost) {
         }
         st.registered_properties
             .insert(name, (syntax, inherits, initial_value));
-        st.mark_sheets_dirty();
+        st.mark_full_sheets_rebuild();
         Ok(JsValue::UNDEFINED)
     });
 

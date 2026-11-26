@@ -897,6 +897,7 @@ fn set_inner_html_spec(
             }
             Ok(())
         });
+        crate::dom_bridge::notify_connected_subresources(vm, host, &added);
     } else if !is_template_el {
         let _ = crate::custom_elements::with_ce_reactions(vm, host, |vm| {
             for &n in &added {
@@ -997,6 +998,7 @@ fn set_outer_html_spec(
         for &n in &added {
             notify_custom_element_subtree(vm, host, n, true);
         }
+        crate::dom_bridge::notify_connected_subresources(vm, host, &added);
     }
     if run_scripts {
         maybe_run_fragment_scripts(vm, host, &added, is_conn);
@@ -1142,6 +1144,7 @@ fn insert_adjacent_html_spec(
         for &n in &added {
             notify_custom_element_subtree(vm, host, n, true);
         }
+        crate::dom_bridge::notify_connected_subresources(vm, host, &added);
     }
     if run_scripts {
         maybe_run_fragment_scripts(vm, host, &added, is_conn);

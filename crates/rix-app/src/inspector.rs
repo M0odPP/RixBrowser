@@ -319,6 +319,11 @@ fn audit_images(
     viewport_w: f32,
     viewport_h: f32,
 ) -> ImageAuditSummary {
+    let media = rix_css::MediaContext {
+        viewport_width: viewport_w,
+        viewport_height: viewport_h,
+        ..rix_css::MediaContext::default()
+    };
     let mut summary = ImageAuditSummary::default();
     for nid in doc.descendants(doc.root()) {
         let Some(NodeData::Element(el)) = doc.get(nid) else {
@@ -327,18 +332,28 @@ fn audit_images(
         if !el.name.local.as_str().eq_ignore_ascii_case("img") {
             continue;
         }
-        let raw_src = el
-            .get_attribute("src")
-            .or_else(|| el.get_attribute("srcset"))
-            .unwrap_or("")
-            .trim();
-        if raw_src.is_empty() {
+        let pic_url = rix_layout::select_picture_source_for_img(doc, nid, &media).map(|s| s.url);
+        let raw_src = el.get_attribute("src").unwrap_or("").trim();
+        let srcset_url = el
+            .get_attribute("srcset")
+            .and_then(rix_layout::parse_best_srcset_url);
+        let effective = pic_url
+            .as_deref()
+            .or((!raw_src.is_empty()).then_some(raw_src))
+            .or(srcset_url.as_deref())
+            .unwrap_or("");
+        if effective.is_empty() {
             continue;
         }
         summary.total += 1;
-        let is_loaded = assets.get_by_src(raw_src).is_some()
-            || assets.get_svg_by_src(raw_src).is_some()
-            || raw_src.starts_with("data:");
+        let check_loaded = |u: &str| {
+            assets.get_by_src(u).is_some()
+                || assets.get_svg_by_src(u).is_some()
+                || u.starts_with("data:")
+        };
+        let is_loaded = check_loaded(effective)
+            || (!raw_src.is_empty() && check_loaded(raw_src))
+            || srcset_url.as_deref().is_some_and(check_loaded);
         if is_loaded {
             summary.loaded += 1;
         } else {

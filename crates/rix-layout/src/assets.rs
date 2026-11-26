@@ -525,6 +525,7 @@ impl SvgExtractContext {
             viewport_w: viewport_w.max(1.0),
             viewport_h: viewport_h.max(1.0),
         };
+        let mut grad_nodes: Vec<(String, NodeId)> = Vec::new();
         for nid in doc.descendants(root) {
             let Some(NodeData::Element(el)) = doc.get(nid) else {
                 continue;
@@ -539,9 +540,7 @@ impl SvgExtractContext {
                 if tag.eq_ignore_ascii_case("lineargradient")
                     || tag.eq_ignore_ascii_case("radialgradient")
                 {
-                    if let Some(color) = extract_gradient_first_stop(doc, nid, current_color) {
-                        ctx.gradient_colors.insert(id.to_string(), color);
-                    }
+                    grad_nodes.push((id.to_string(), nid));
                 }
             }
             if tag.eq_ignore_ascii_case("style") {
@@ -552,6 +551,15 @@ impl SvgExtractContext {
                     }
                 }
                 parse_svg_style_sheet(&css, &mut ctx);
+            }
+        }
+        // SVG 2 §14.2: Resolve `<linearGradient>`/`<radialGradient>` stops including `href` /
+        // `xlink:href` template inheritance chains (used extensively by Inkscape/Illustrator/Figma).
+        for (id, nid) in grad_nodes {
+            if let Some(color) =
+                extract_gradient_stop_with_href(doc, nid, &ctx.by_id, current_color, 0)
+            {
+                ctx.gradient_colors.insert(id, color);
             }
         }
         ctx
@@ -573,6 +581,34 @@ impl SvgExtractContext {
         }
         parse_svg_color(trimmed, current_color)
     }
+}
+
+fn extract_gradient_stop_with_href(
+    doc: &Document,
+    grad_node: NodeId,
+    by_id: &HashMap<String, NodeId>,
+    current_color: ColorRgba,
+    depth: u8,
+) -> Option<ColorRgba> {
+    if let Some(c) = extract_gradient_first_stop(doc, grad_node, current_color) {
+        return Some(c);
+    }
+    if depth >= 4 {
+        return None;
+    }
+    let Some(NodeData::Element(el)) = doc.get(grad_node) else {
+        return None;
+    };
+    let href = el
+        .get_attribute("href")
+        .or_else(|| el.get_attribute("xlink:href"))
+        .map(str::trim)?;
+    let target_id = href.strip_prefix('#')?;
+    let &target_node = by_id.get(target_id)?;
+    if target_node == grad_node {
+        return None;
+    }
+    extract_gradient_stop_with_href(doc, target_node, by_id, current_color, depth + 1)
 }
 
 fn extract_gradient_first_stop(
@@ -1071,6 +1107,99 @@ fn collect_svg_element(
         }
     }
     collect_svg_paths_inner(doc, node, ctx, child_state, use_depth, out);
+}
+
+/// Returns `true` if `mime` is an image format supported by our raster/SVG decoder pipeline.
+#[must_use]
+pub fn is_supported_image_mime(mime: &str) -> bool {
+    let lower = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "image/png"
+            | "image/jpeg"
+            | "image/jpg"
+            | "image/webp"
+            | "image/gif"
+            | "image/svg+xml"
+            | "image/apng"
+    )
+}
+
+/// Resolved `<picture><source>` match per HTML Living Standard §4.8.4.2.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectedPictureSource {
+    pub url: String,
+    pub attr_width: Option<f32>,
+    pub attr_height: Option<f32>,
+}
+
+/// HTML Living Standard §4.8.4.2 ("update the source set"): if `img_node`'s parent is a
+/// `<picture>` element, inspects preceding `<source>` siblings in DOM order and returns the
+/// first candidate whose `media` query matches `media`, whose `type` (if present) is a
+/// supported image MIME type, and whose `srcset` yields a valid URL.
+#[must_use]
+pub fn select_picture_source_for_img(
+    doc: &Document,
+    img_node: NodeId,
+    media: &rix_css::MediaContext,
+) -> Option<SelectedPictureSource> {
+    let parent = doc.parent(img_node)?;
+    let is_picture = matches!(
+        doc.get(parent),
+        Some(NodeData::Element(pe)) if pe.name.local.as_str().eq_ignore_ascii_case("picture")
+    );
+    if !is_picture {
+        return None;
+    }
+    for sib in doc.children(parent) {
+        if sib == img_node {
+            break;
+        }
+        let Some(NodeData::Element(se)) = doc.get(sib) else {
+            continue;
+        };
+        if !se.name.local.as_str().eq_ignore_ascii_case("source") {
+            continue;
+        }
+        let media_ok = se
+            .get_attribute("media")
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .is_none_or(|m| media.evaluate_media_query_str(m));
+        if !media_ok {
+            continue;
+        }
+        let type_ok = se
+            .get_attribute("type")
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .is_none_or(is_supported_image_mime);
+        if !type_ok {
+            continue;
+        }
+        let Some(srcset) = se.get_attribute("srcset") else {
+            continue;
+        };
+        if let Some(url) = parse_best_srcset_url(srcset) {
+            let attr_width = se
+                .get_attribute("width")
+                .and_then(parse_html_dimension_attr);
+            let attr_height = se
+                .get_attribute("height")
+                .and_then(parse_html_dimension_attr);
+            return Some(SelectedPictureSource {
+                url,
+                attr_width,
+                attr_height,
+            });
+        }
+    }
+    None
 }
 
 /// Parses an HTML `srcset` attribute and returns the best candidate URL (preferring 1x/2x or

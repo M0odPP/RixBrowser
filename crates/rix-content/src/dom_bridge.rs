@@ -180,6 +180,7 @@ pub struct HostState {
     external_stylesheets: Vec<Arc<Stylesheet>>,
     cached_inline_sheet_hashes: Vec<u64>,
     sheets_dirty: bool,
+    full_sheets_rebuild: bool,
     last_inline_style_hash: u64,
     last_style_revs: Option<(u64, u64)>,
     last_layout_revs: Option<(u64, u64)>,
@@ -229,6 +230,8 @@ pub struct HostState {
     pub pending_dynamic_images: HashSet<NodeId>,
     /// `<img>` nodes whose dynamic `src` networking task has completed (loaded or broken).
     pub completed_images: HashSet<NodeId>,
+    /// Number of dynamically connected `loading="lazy"` images scheduled in this document.
+    pub dynamic_lazy_images_scheduled: usize,
 }
 
 /// Callback invoked when an `<iframe>` element is connected into a live document.
@@ -324,6 +327,7 @@ impl HostState {
             external_stylesheets: Vec::new(),
             cached_inline_sheet_hashes: Vec::new(),
             sheets_dirty: true,
+            full_sheets_rebuild: true,
             last_inline_style_hash: 0,
             last_style_revs: None,
             last_layout_revs: None,
@@ -370,12 +374,23 @@ impl HostState {
             initial_assets_loaded: false,
             pending_dynamic_images: HashSet::new(),
             completed_images: HashSet::new(),
+            dynamic_lazy_images_scheduled: 0,
         }
     }
 
-    /// Marks document stylesheets dirty so the next style/layout read rebuilds the cascade.
+    /// Marks document inline/CSSOM stylesheets dirty so the next style read checks for
+    /// no-op or pure-append incremental stylesheet updates before falling back to a full rebuild.
     pub fn mark_sheets_dirty(&mut self) {
         self.sheets_dirty = true;
+        self.last_layout_revs = None;
+        self.last_paint_revs = None;
+    }
+
+    /// Marks document stylesheets as requiring a complete `StyleContext` rebuild (e.g. viewport,
+    /// color scheme, external stylesheets, or `@property` registration changes).
+    pub fn mark_full_sheets_rebuild(&mut self) {
+        self.sheets_dirty = true;
+        self.full_sheets_rebuild = true;
         self.last_style_revs = None;
         self.last_layout_revs = None;
         self.last_paint_revs = None;
@@ -656,10 +671,7 @@ impl HostState {
     /// Installs pre-parsed external `<link rel="stylesheet">` stylesheets and triggers a style refresh.
     pub fn set_external_stylesheets(&mut self, sheets: Vec<Arc<Stylesheet>>) {
         self.external_stylesheets = sheets;
-        self.sheets_dirty = true;
-        self.last_style_revs = None;
-        self.last_layout_revs = None;
-        self.last_paint_revs = None;
+        self.mark_full_sheets_rebuild();
     }
 
     /// Updates viewport dimensions and marks styles/layout dirty when size changed.
@@ -668,10 +680,7 @@ impl HostState {
             || (self.viewport.height - viewport.height).abs() > 0.5
         {
             self.viewport = viewport;
-            self.sheets_dirty = true;
-            self.last_style_revs = None;
-            self.last_layout_revs = None;
-            self.last_paint_revs = None;
+            self.mark_full_sheets_rebuild();
         }
     }
 
@@ -680,10 +689,7 @@ impl HostState {
         if self.dark_mode != dark_mode {
             self.dark_mode = dark_mode;
             self.layout_engine.dark_mode = dark_mode;
-            self.sheets_dirty = true;
-            self.last_style_revs = None;
-            self.last_layout_revs = None;
-            self.last_paint_revs = None;
+            self.mark_full_sheets_rebuild();
         }
     }
 
@@ -704,10 +710,7 @@ impl HostState {
     /// Appends a dynamically fetched external `<link rel="stylesheet">` and marks styles dirty.
     pub fn add_external_stylesheet(&mut self, sheet: Arc<Stylesheet>) {
         self.external_stylesheets.push(sheet);
-        self.sheets_dirty = true;
-        self.last_style_revs = None;
-        self.last_layout_revs = None;
-        self.last_paint_revs = None;
+        self.mark_full_sheets_rebuild();
     }
 
     #[must_use]
@@ -842,7 +845,7 @@ impl HostState {
             (h, css_blocks, shadow_adopted_blocks)
         };
 
-        if !self.sheets_dirty
+        if !self.full_sheets_rebuild
             && self.last_style_revs.is_some()
             && inline_hash == self.last_inline_style_hash
         {
@@ -855,6 +858,7 @@ impl HostState {
                 let doc = self.document.borrow();
                 (doc.revision(), doc.style_revision())
             };
+            self.sheets_dirty = false;
             self.last_style_revs = Some(post_revs);
             self.style_recalc_count += 1;
             return &self.style_ctx;
@@ -880,7 +884,7 @@ impl HostState {
                 sh
             })
             .collect();
-        let is_pure_append = !self.sheets_dirty
+        let is_pure_append = !self.full_sheets_rebuild
             && self.last_style_revs.is_some()
             && shadow_adopted_blocks.is_empty()
             && new_sheet_hashes.len() > self.cached_inline_sheet_hashes.len()
@@ -909,7 +913,9 @@ impl HostState {
                     .style_ctx
                     .append_stylesheet_incremental(&mut doc, sheet);
             }
+            let _ = self.style_ctx.restyle_dirty(&mut doc);
             let post_revs = (doc.revision(), doc.style_revision());
+            self.sheets_dirty = false;
             self.cached_inline_sheet_hashes = new_sheet_hashes;
             self.last_inline_style_hash = inline_hash;
             self.last_style_revs = Some(post_revs);
@@ -980,6 +986,7 @@ impl HostState {
         };
         self.style_ctx = ctx;
         self.sheets_dirty = false;
+        self.full_sheets_rebuild = false;
         self.cached_inline_sheet_hashes = new_sheet_hashes;
         self.last_inline_style_hash = inline_hash;
         self.last_style_revs = Some(post_revs);
@@ -3287,26 +3294,7 @@ pub(crate) fn insert_node_into_parent(
                     hook(vm, fid);
                 }
             }
-            let subres_hook = host.borrow().subresource_connect_hook.clone();
-            if let Some(ref hook) = subres_hook {
-                let subres_nodes: Vec<NodeId> = {
-                    let doc_rc = Rc::clone(&host.borrow().document);
-                    let doc = doc_rc.borrow();
-                    doc.descendants(n)
-                        .filter(|&id| {
-                            matches!(
-                                doc.get(id),
-                                Some(NodeData::Element(e))
-                                    if e.name.local.as_str().eq_ignore_ascii_case("img")
-                                        || e.name.local.as_str().eq_ignore_ascii_case("link")
-                            )
-                        })
-                        .collect()
-                };
-                for sid in subres_nodes {
-                    hook(vm, sid);
-                }
-            }
+            notify_connected_subresources(vm, host, &[n]);
         }
     } else {
         for &n in &to_insert {
@@ -3323,8 +3311,36 @@ pub(crate) fn insert_node_into_parent(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Element.prototype & HTMLElement.prototype
+/// Invokes the dynamic subresource connection hook for every `<img>` and `<link>` element
+/// in `roots` (including `roots` themselves and their descendants), used after `appendChild`,
+/// `insertBefore`, `innerHTML`, `outerHTML`, and `insertAdjacentHTML`.
+pub(crate) fn notify_connected_subresources(vm: &mut JsVm, host: &SharedHost, roots: &[NodeId]) {
+    let subres_hook = host.borrow().subresource_connect_hook.clone();
+    let Some(hook) = subres_hook else {
+        return;
+    };
+    let subres_nodes: Vec<NodeId> = {
+        let doc_rc = Rc::clone(&host.borrow().document);
+        let doc = doc_rc.borrow();
+        let mut out = Vec::new();
+        for &root in roots {
+            for id in doc.descendants(root) {
+                if matches!(
+                    doc.get(id),
+                    Some(NodeData::Element(e))
+                        if e.name.local.as_str().eq_ignore_ascii_case("img")
+                            || e.name.local.as_str().eq_ignore_ascii_case("link")
+                ) {
+                    out.push(id);
+                }
+            }
+        }
+        out
+    };
+    for sid in subres_nodes {
+        hook(vm, sid);
+    }
+}
 // ---------------------------------------------------------------------------
 
 fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
@@ -4607,6 +4623,52 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
             Ok(JsValue::UNDEFINED)
         });
         define_host_accessor(vm, label_proto, "htmlFor", Some(g), Some(s));
+    }
+
+    // HTML Living Standard §4.10.5.3.13: `HTMLInputElement.prototype.list` resolves the first
+    // `<datalist>` element in the same tree whose `id` matches the input's `list` attribute,
+    // and `HTMLInputElement.prototype.showPicker()` provides the browser picker API.
+    if let Some(&input_proto) = host.borrow().interface_protos.get("HTMLInputElement") {
+        let h_list = Rc::clone(host);
+        let g_list = vm.alloc_host_fn("get list", move |vm, t, _| {
+            let nid = require_node(vm, &h_list, t)?;
+            let found = {
+                let doc_rc = Rc::clone(&h_list.borrow().document);
+                let doc = doc_rc.borrow();
+                let list_id = match doc.get(nid) {
+                    Some(NodeData::Element(e)) => e
+                        .get_attribute("list")
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    _ => None,
+                };
+                if let Some(target_id) = list_id {
+                    let mut tree_root = nid;
+                    while let Some(p) = doc.parent(tree_root) {
+                        tree_root = p;
+                    }
+                    doc.descendants(tree_root).find(|&cand| {
+                        matches!(
+                            doc.get(cand),
+                            Some(NodeData::Element(e))
+                                if e.name.local.as_str().eq_ignore_ascii_case("datalist")
+                                    && e.get_attribute("id") == Some(target_id.as_str())
+                        )
+                    })
+                } else {
+                    None
+                }
+            };
+            match found {
+                Some(dl) => Ok(wrap_node(vm, &h_list, dl)),
+                None => Ok(JsValue::NULL),
+            }
+        });
+        define_host_accessor(vm, input_proto, "list", Some(g_list), None);
+        define_host_method(vm, input_proto, "showPicker", move |_vm, _t, _args| {
+            Ok(JsValue::UNDEFINED)
+        });
     }
 
     // `popover` enumerated attribute (HTML5 Popover API: "auto" | "manual" | null).
@@ -7166,6 +7228,19 @@ pub(crate) fn set_element_attr(
         let hook = host.borrow().body_attr_handler_hook.clone();
         if let Some(f) = hook {
             f(vm, nid, &attr_local, val);
+        }
+    }
+    // HTML §4.8.4.2 & §4.2.4: `img.setAttribute("src"|"srcset", ...)` and connected
+    // `link.setAttribute("href", ...)` trigger live subresource fetching (used by React/Svelte/Vue).
+    if attr_ns.is_empty()
+        && ((tag_lower == "img" && (attr_local == "src" || attr_local == "srcset"))
+            || (tag_lower == "link"
+                && attr_local == "href"
+                && host.borrow().document.borrow().is_connected(nid)))
+    {
+        let subres_hook = host.borrow().subresource_connect_hook.clone();
+        if let Some(hook) = subres_hook {
+            hook(vm, nid);
         }
     }
     host.borrow().emit_mutation(DomMutation::Attributes {

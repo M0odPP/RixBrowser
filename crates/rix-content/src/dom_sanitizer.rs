@@ -2373,17 +2373,19 @@ fn schedule_connected_subresource(
             Some(NodeData::Element(el)) => {
                 let tag = el.name.local.as_str().to_ascii_lowercase();
                 if tag == "img" {
-                    let src = el
-                        .get_attribute("src")
-                        .or_else(|| el.get_attribute("srcset"))
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
+                    let raw_src = el.get_attribute("src").unwrap_or("").trim();
+                    let src = if !raw_src.is_empty() {
+                        raw_src.to_string()
+                    } else {
+                        el.get_attribute("srcset")
+                            .and_then(rix_layout::parse_best_srcset_url)
+                            .unwrap_or_default()
+                    };
                     let is_lazy = el
                         .get_attribute("loading")
                         .is_some_and(|v| v.trim().eq_ignore_ascii_case("lazy"));
-                    if !src.is_empty() && !is_lazy {
-                        Some(("img", src))
+                    if !src.is_empty() {
+                        Some(("img", src, is_lazy))
                     } else {
                         None
                     }
@@ -2397,7 +2399,7 @@ fn schedule_connected_subresource(
                         .any(|t| t.eq_ignore_ascii_case("alternate"));
                     let href = el.get_attribute("href").unwrap_or("").trim().to_string();
                     if is_sheet && !is_alt && !el.has_attribute("disabled") && !href.is_empty() {
-                        Some(("link", href))
+                        Some(("link", href, false))
                     } else {
                         None
                     }
@@ -2409,10 +2411,17 @@ fn schedule_connected_subresource(
         }
     };
     match info {
-        Some(("img", src)) => {
+        Some(("img", src, is_lazy)) => {
+            if is_lazy {
+                let mut hb = host.borrow_mut();
+                if hb.dynamic_lazy_images_scheduled >= 24 {
+                    return;
+                }
+                hb.dynamic_lazy_images_scheduled += 1;
+            }
             schedule_dynamic_image_load(host, events, event_loop, web_apis, net, nid, &src);
         }
-        Some(("link", href)) => {
+        Some(("link", href, _)) => {
             schedule_dynamic_stylesheet_load(host, web_apis, net, nid, &href);
         }
         _ => {}
@@ -2561,10 +2570,16 @@ fn schedule_dynamic_image_load(
                         .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
                         .map(|(_, v)| v.to_ascii_lowercase())
                         .unwrap_or_default();
+                    let clean_url = resolved_owned
+                        .split(['?', '#'])
+                        .next()
+                        .unwrap_or(&resolved_owned);
                     let is_svg = ct.contains("image/svg")
-                        || resolved_owned.to_ascii_lowercase().contains(".svg")
+                        || clean_url.to_ascii_lowercase().ends_with(".svg")
                         || resp.body.starts_with(b"<svg")
-                        || resp.body.starts_with(b"<?xml");
+                        || (resp.body.starts_with(b"<?xml")
+                            && std::str::from_utf8(&resp.body[..resp.body.len().min(256)])
+                                .is_ok_and(|s| s.contains("<svg")));
                     if is_svg {
                         let markup = String::from_utf8_lossy(&resp.body);
                         let doc = rix_html::parse_html(&markup);

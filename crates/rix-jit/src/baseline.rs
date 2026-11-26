@@ -123,7 +123,7 @@ fn check_eligibility(func: &FunctionBytecode) -> Result<(), JitCompileError> {
             "async/generator functions execute on suspendable Tier-1 frames",
         ));
     }
-    if func.code.is_empty() || func.code.len() > 8_192 || func.register_count > 128 {
+    if func.code.is_empty() || func.code.len() > 4_096 || func.register_count > 96 {
         return Err(JitCompileError::UnsupportedFunction(
             "function exceeds Baseline JIT bytecode/register budget",
         ));
@@ -179,10 +179,14 @@ pub fn compile_baseline_function(
     check_eligibility(func)?;
 
     let mut flag_builder = settings::builder();
-    // Tier-1 Baseline JIT prioritizes near-instant compilation; Tier-2 Optimizing JIT
-    // uses `opt_level = "speed"` for hot functions.
+    // Tier-2 Baseline JIT uses Cranelift's linear-time single-pass register allocator
+    // (`Fastalloc`) + `opt_level = "none"` for sub-millisecond compile times on real-world
+    // bundles; Tier-3 Optimizing JIT uses `opt_level = "speed"` + Ion for hot functions.
     flag_builder
         .set("opt_level", "none")
+        .map_err(|e| JitCompileError::Cranelift(e.to_string()))?;
+    flag_builder
+        .set("regalloc_algorithm", "single_pass")
         .map_err(|e| JitCompileError::Cranelift(e.to_string()))?;
     #[cfg(not(debug_assertions))]
     flag_builder

@@ -740,26 +740,58 @@ impl<'a> BoxTreeBuilder<'a> {
                 })
             }
             "img" => {
+                // HTML Living Standard §4.8.4.2: when `<img>` is inside `<picture>`, select the
+                // first preceding `<source>` matching `media` and supported `type`, overriding
+                // both source URL and presentation `width`/`height` attributes.
+                let picture_pick = crate::assets::select_picture_source_for_img(
+                    self.doc,
+                    node,
+                    self.styles.media(),
+                );
                 let raw_src = elem.get_attribute("src").unwrap_or_default().trim();
                 let srcset_pick = elem.get_attribute("srcset").and_then(parse_best_srcset_url);
-                let src = if !raw_src.is_empty() {
+                let src = if let Some(ref pic) = picture_pick {
+                    pic.url.clone()
+                } else if !raw_src.is_empty() {
                     raw_src.to_string()
                 } else {
                     srcset_pick.clone().unwrap_or_default()
                 };
-                let attr_w = elem
-                    .get_attribute("width")
-                    .and_then(parse_html_dimension_attr);
-                let attr_h = elem
-                    .get_attribute("height")
-                    .and_then(parse_html_dimension_attr);
+                let fallback_src = if picture_pick.is_some() && !raw_src.is_empty() {
+                    Some(raw_src)
+                } else {
+                    None
+                };
+                let (attr_w, attr_h) = if let Some(ref pic) = picture_pick {
+                    if pic.attr_width.is_some() || pic.attr_height.is_some() {
+                        (pic.attr_width, pic.attr_height)
+                    } else {
+                        (
+                            elem.get_attribute("width")
+                                .and_then(parse_html_dimension_attr),
+                            elem.get_attribute("height")
+                                .and_then(parse_html_dimension_attr),
+                        )
+                    }
+                } else {
+                    (
+                        elem.get_attribute("width")
+                            .and_then(parse_html_dimension_attr),
+                        elem.get_attribute("height")
+                            .and_then(parse_html_dimension_attr),
+                    )
+                };
 
                 // Pure-Rust SVG-in-`<img>` support (`.svg` and `data:image/svg+xml`).
-                let svg_asset = self.assets.get_svg_by_src(&src).or_else(|| {
-                    srcset_pick
-                        .as_deref()
-                        .and_then(|s| self.assets.get_svg_by_src(s))
-                });
+                let svg_asset = self
+                    .assets
+                    .get_svg_by_src(&src)
+                    .or_else(|| fallback_src.and_then(|s| self.assets.get_svg_by_src(s)))
+                    .or_else(|| {
+                        srcset_pick
+                            .as_deref()
+                            .and_then(|s| self.assets.get_svg_by_src(s))
+                    });
                 if let Some(svg) = svg_asset {
                     let nat_w = svg.intrinsic_size.width.max(1.0);
                     let nat_h = svg.intrinsic_size.height.max(1.0);
@@ -794,22 +826,30 @@ impl<'a> BoxTreeBuilder<'a> {
                     });
                 }
 
-                let decoded = self.assets.get_by_src(&src).or_else(|| {
-                    srcset_pick
-                        .as_deref()
-                        .and_then(|s| self.assets.get_by_src(s))
-                });
+                let decoded = self
+                    .assets
+                    .get_by_src(&src)
+                    .or_else(|| fallback_src.and_then(|s| self.assets.get_by_src(s)))
+                    .or_else(|| {
+                        srcset_pick
+                            .as_deref()
+                            .and_then(|s| self.assets.get_by_src(s))
+                    });
                 let (iw, ih) = match (decoded, attr_w, attr_h) {
                     (Some(_), Some(w), Some(h)) => (w, h),
                     (Some(img), Some(w), None) => {
-                        let ratio = img.height as f32 / (img.width.max(1) as f32);
+                        let ratio =
+                            img.intrinsic_height as f32 / (img.intrinsic_width.max(1) as f32);
                         (w, (w * ratio).max(1.0))
                     }
                     (Some(img), None, Some(h)) => {
-                        let ratio = img.width as f32 / (img.height.max(1) as f32);
+                        let ratio =
+                            img.intrinsic_width as f32 / (img.intrinsic_height.max(1) as f32);
                         ((h * ratio).max(1.0), h)
                     }
-                    (Some(img), None, None) => (img.width as f32, img.height as f32),
+                    (Some(img), None, None) => {
+                        (img.intrinsic_width as f32, img.intrinsic_height as f32)
+                    }
                     (None, Some(w), Some(h)) => (w, h),
                     (None, Some(w), None) => (w, w),
                     (None, None, Some(h)) => (h, h),
