@@ -846,9 +846,14 @@ impl<'a> Painter<'a> {
             let Ok(mut bez) = parse_svg_path(&entry.path_d) else {
                 continue;
             };
-            bez.apply_affine(xf);
-            let path_id =
-                hash_svg_path_id(&entry.path_d, abs_rect.size.width, abs_rect.size.height);
+            let elem_xf = xf * Affine::new(entry.transform);
+            bez.apply_affine(elem_xf);
+            let path_id = hash_svg_path_id(
+                &entry.path_d,
+                abs_rect.size.width,
+                abs_rect.size.height,
+                &entry.transform,
+            );
             self.resources.register_path(path_id, bez);
             let fill = match tint_override {
                 Some(tint) => entry.fill.map(|_| to_rgba8(tint)),
@@ -1251,11 +1256,13 @@ impl<'a> Painter<'a> {
                     let Ok(mut bez) = parse_svg_path(&entry.path_d) else {
                         continue;
                     };
-                    bez.apply_affine(xf);
+                    let elem_xf = xf * Affine::new(entry.transform);
+                    bez.apply_affine(elem_xf);
                     let path_id = hash_svg_path_id(
                         &entry.path_d,
                         content_abs.size.width,
                         content_abs.size.height,
+                        &entry.transform,
                     );
                     self.resources.register_path(path_id, bez);
                     self.list.push(DisplayItem::VectorPath {
@@ -2020,7 +2027,7 @@ fn extract_opacity_keyframes(rule: &KeyframesRule, base_opacity: f32) -> Vec<Opa
     kfs
 }
 
-fn hash_svg_path_id(d: &str, w: f32, h: f32) -> PathResourceId {
+fn hash_svg_path_id(d: &str, w: f32, h: f32, transform: &[f64; 6]) -> PathResourceId {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in w.to_bits().to_le_bytes() {
         hash ^= u64::from(b);
@@ -2029,6 +2036,12 @@ fn hash_svg_path_id(d: &str, w: f32, h: f32) -> PathResourceId {
     for b in h.to_bits().to_le_bytes() {
         hash ^= u64::from(b);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    for &c in transform {
+        for b in c.to_bits().to_le_bytes() {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
     }
     for &b in d.as_bytes() {
         hash ^= u64::from(b);

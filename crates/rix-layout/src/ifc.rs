@@ -942,11 +942,12 @@ pub fn layout_ifc(
                     cur_x = 0.0;
                 }
 
-                // If floats narrow the band too much for this atomic inline, shift below floats.
+                // CSS 2.1 §9.5: if floats narrow the current band too much for this atomic inline,
+                // shift below the intruding floats so it receives the wider un-floated band.
                 if !floats.is_empty()
                     && cur_pieces.is_empty()
                     && total_w > (band_right - band_left) + 0.05
-                    && total_w <= container_width + 0.05
+                    && (band_right - band_left) < container_width - 0.5
                 {
                     let cleared = floats.clear_y(rix_css::ClearMode::Both, cursor_y);
                     if cleared > cursor_y {

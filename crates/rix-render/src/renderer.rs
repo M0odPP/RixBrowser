@@ -920,21 +920,56 @@ impl VelloRenderer {
         pollster::block_on(self.readback_gpu_surface_rgba(surface_id))
     }
 
+    /// Pre-warms the GPU adapter/device and Vello compute shader pipelines for off-screen
+    /// rendering so GPU shader compilation overlaps with network I/O during cold navigation.
+    pub fn warm_up_headless_blocking(&mut self) -> Result<(), RenderError> {
+        pollster::block_on(async {
+            let device_id = match &self.surface {
+                Some(surface) => surface.dev_id,
+                None => self
+                    .context
+                    .device(None)
+                    .await
+                    .ok_or(RenderError::NoDevice)?,
+            };
+            if self.renderer_device_id != Some(device_id) {
+                let handle = &self.context.devices[device_id];
+                self.renderer = Some(
+                    Renderer::new(&handle.device, RendererOptions::default())
+                        .map_err(|e| RenderError::Vello(format!("{e:?}")))?,
+                );
+                self.renderer_device_id = Some(device_id);
+            }
+            Ok(())
+        })
+    }
+
     pub fn save_rgba_png(
         path: impl AsRef<Path>,
         pixels: &[u8],
         width: u32,
         height: u32,
     ) -> Result<(), RenderError> {
-        image::save_buffer_with_format(
-            path,
-            pixels,
-            width,
-            height,
-            image::ColorType::Rgba8,
-            image::ImageFormat::Png,
-        )?;
+        use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+        use image::ImageEncoder;
+        let file = std::fs::File::create(path).map_err(image::ImageError::IoError)?;
+        let writer = std::io::BufWriter::new(file);
+        let encoder = PngEncoder::new_with_quality(writer, CompressionType::Fast, FilterType::Sub);
+        encoder.write_image(pixels, width, height, image::ExtendedColorType::Rgba8)?;
         Ok(())
+    }
+
+    /// Renders `scene` using this already-warmed renderer and saves the result to PNG.
+    pub fn render_scene_to_png_warm(
+        &mut self,
+        scene: &Scene,
+        width: u32,
+        height: u32,
+        base_color: Color,
+        path: impl AsRef<Path>,
+    ) -> Result<(), RenderError> {
+        let pixels = self.render_to_rgba_blocking(scene, width, height, base_color)?;
+        Self::save_rgba_png(path, &pixels, width, height)
     }
 
     pub fn render_scene_to_png(
@@ -945,8 +980,7 @@ impl VelloRenderer {
         path: impl AsRef<Path>,
     ) -> Result<(), RenderError> {
         let mut renderer = Self::new();
-        let pixels = renderer.render_to_rgba_blocking(scene, width, height, base_color)?;
-        Self::save_rgba_png(path, &pixels, width, height)
+        renderer.render_scene_to_png_warm(scene, width, height, base_color, path)
     }
 }
 

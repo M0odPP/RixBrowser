@@ -615,7 +615,15 @@ pub fn layout_block_box(
                 BoxKind::Block { .. } | BoxKind::AnonymousBlock
             ) && !child_is_bfc
             {
-                let mut child_floats = local_floats.translated(0.0, -cursor_y);
+                // CSS 2.1 §9.5.2: if this child clears floats, translate the active float
+                // context relative to its cleared Y position so its inline lines do not get
+                // indented by floats it is clearing!
+                let layout_y = if child_clear != ClearMode::None {
+                    local_floats.clear_y(child_clear, cursor_y)
+                } else {
+                    cursor_y
+                };
+                let mut child_floats = local_floats.translated(0.0, -layout_y);
                 let pre_len = child_floats.floats.len();
                 let f = layout_block_box(ctx, cid, child_space, &mut child_floats);
                 if child_floats.floats.len() > pre_len {

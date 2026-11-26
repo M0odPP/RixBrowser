@@ -26,10 +26,7 @@ pub fn surface_id_for_node(node: NodeId) -> SurfaceId {
 }
 
 pub use crate::assets::SvgPathEntry;
-use crate::assets::{
-    collect_svg_paths_from_dom, parse_best_srcset_url, parse_html_dimension_attr, parse_svg_color,
-    AssetRegistry,
-};
+use crate::assets::{parse_best_srcset_url, parse_html_dimension_attr, AssetRegistry};
 
 /// Dense index identifying a [`LayoutBox`] in a [`BoxTree`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -829,26 +826,9 @@ impl<'a> BoxTreeBuilder<'a> {
                         h_opt.or_else(|| vb_opt.map(|vb| vb.height)).unwrap_or(16.0),
                     ),
                 };
-                let mut paths = Vec::new();
-                let inherited_fill = elem
-                    .get_attribute("fill")
-                    .map(|raw| parse_svg_color(raw, style.text.color));
-                let inherited_stroke = elem
-                    .get_attribute("stroke")
-                    .and_then(|raw| parse_svg_color(raw, style.text.color));
-                let inherited_stroke_w = elem
-                    .get_attribute("stroke-width")
-                    .and_then(parse_html_dimension_attr)
-                    .unwrap_or(1.5);
-                collect_svg_paths_from_dom(
-                    self.doc,
-                    node,
-                    style.text.color,
-                    inherited_fill,
-                    inherited_stroke,
-                    inherited_stroke_w,
-                    &mut paths,
-                );
+                let paths = crate::assets::extract_svg_from_node(self.doc, node, style.text.color)
+                    .map(|d| d.paths)
+                    .unwrap_or_default();
                 Some(ReplacedKind::Svg {
                     view_box,
                     intrinsic_size: Size::new(iw, ih),
@@ -897,20 +877,6 @@ impl<'a> BoxTreeBuilder<'a> {
                     text: value,
                     placeholder,
                     intrinsic_size: size,
-                })
-            }
-            "button" => {
-                let text = self.collect_plain_text(node);
-                let label_w =
-                    (text.chars().count().max(4) as f32 * style.text.font_size_px * 0.56).max(48.0);
-                Some(ReplacedKind::FormControl {
-                    kind: FormControlKind::Button,
-                    text,
-                    placeholder: String::new(),
-                    intrinsic_size: Size::new(
-                        label_w + 16.0,
-                        (style.text.font_size_px * 1.3).max(18.0),
-                    ),
                 })
             }
             "textarea" => {

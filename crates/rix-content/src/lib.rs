@@ -752,15 +752,20 @@ impl ContentRuntime {
                                 let ty = e.get_attribute("type").unwrap_or("").trim().to_string();
                                 let src = e.get_attribute("src").map(|s| s.trim().to_string());
                                 let is_defer = e.has_attribute("defer");
+                                let is_nomodule = e.has_attribute("nomodule");
                                 let text = doc.inner_text(script_id);
-                                Some((ty, src, is_defer, text))
+                                Some((ty, src, is_defer, is_nomodule, text))
                             }
                             _ => None,
                         }
                     };
-                    let Some((ty, src, is_defer, inline_text)) = info else {
+                    let Some((ty, src, is_defer, is_nomodule, inline_text)) = info else {
                         continue;
                     };
+                    // HTML5 §4.12.1.1: module-capable user agents MUST NOT execute `<script nomodule>`.
+                    if is_nomodule && !ty.eq_ignore_ascii_case("module") {
+                        continue;
+                    }
                     if ty.eq_ignore_ascii_case("importmap") {
                         match ImportMap::from_json(&inline_text, doc_url.as_str()) {
                             Ok(parsed) => module_loader.borrow_mut().set_import_map(parsed),
