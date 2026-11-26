@@ -286,7 +286,8 @@ impl MediaContext {
         }
     }
 
-    /// Evaluates a CSS media query string (e.g. `if(media(height <= 999999px): ...)`).
+    /// Evaluates a CSS media query string (e.g. `if(media(height <= 999999px): ...)` or
+    /// `<link media="screen, print">`).
     #[must_use]
     pub fn evaluate_media_query_str(&self, query: &str) -> bool {
         let trimmed = query.trim();
@@ -294,14 +295,18 @@ impl MediaContext {
             return false;
         }
         let lower = trimmed.to_ascii_lowercase();
+        let first_word = lower
+            .split(|c: char| c.is_ascii_whitespace() || c == ',' || c == '(')
+            .next();
+        // CSS Media Queries L4 §3: comma-separated `<media-query-list>` (`screen, print`) and
+        // queries starting with a media type or `not`/`only`/`(` are already complete media
+        // queries. Only wrap bare single `<media-feature>` strings (e.g. `height <= 999999px`).
         let needs_parens = !trimmed.starts_with('(')
+            && !trimmed.contains(',')
             && !lower.starts_with("not ")
             && !lower.starts_with("not(")
             && !lower.starts_with("only ")
-            && !matches!(
-                lower.split_ascii_whitespace().next(),
-                Some("all" | "screen" | "print")
-            );
+            && !matches!(first_word, Some("all" | "screen" | "print" | "speech"));
         let wrapped = if needs_parens {
             format!("@media ({trimmed}) {{ a {{ color: red; }} }}")
         } else {

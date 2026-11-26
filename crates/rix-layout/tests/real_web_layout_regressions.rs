@@ -1767,9 +1767,21 @@ fn linear_gradient_calc_px_stop_and_zero_hard_stop_follow_css_images_l3() {
             _ => None,
         })
         .expect("must emit LinearGradient");
-    assert_eq!(stops.len(), 2);
-    assert!(
-        (stops[0].offset - 0.95).abs() < 0.02 && (stops[1].offset - 0.95).abs() < 0.02,
-        "calc(100% - 1px) on 20px height + `0` hard stop must both resolve to 0.95, got {stops:?}"
+    assert_eq!(
+        stops.len(),
+        4,
+        "must include 0.0 & 1.0 clamp stops: {stops:?}"
     );
+    assert_eq!(stops[0].offset, 0.0);
+    assert_eq!(stops[0].color.a, 0);
+    assert!(
+        (stops[1].offset - 0.95).abs() < 0.02 && stops[1].color.a == 0,
+        "calc(100% - 1px) on 20px height must resolve transparent stop to 0.95, got {stops:?}"
+    );
+    assert!(
+        (stops[2].offset - 0.95).abs() < 0.02 && stops[2].color.r == 255 && stops[2].color.a == 255,
+        "`0` hard stop must clamp up to 0.95 with red color, got {stops:?}"
+    );
+    assert_eq!(stops[3].offset, 1.0);
+    assert_eq!(stops[3].color.r, 255);
 }

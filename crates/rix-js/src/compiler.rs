@@ -100,13 +100,20 @@ enum VarResolution {
     Global(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlKind {
+    Loop,
+    Switch,
+    LabeledStmt,
+}
+
 #[derive(Debug, Clone)]
 struct LoopControl {
-    label: Option<String>,
+    labels: Vec<String>,
     continue_target: Option<usize>,
     continue_jumps: Vec<usize>,
     break_jumps: Vec<usize>,
-    is_switch: bool,
+    kind: ControlKind,
 }
 
 struct FunctionCompiler {
@@ -132,7 +139,7 @@ struct FunctionCompiler {
     completion_reg: Option<u8>,
     loops: Vec<LoopControl>,
     loop_counter: u8,
-    pending_label: Option<String>,
+    pending_labels: Vec<String>,
     chain_exits: Vec<Vec<(usize, u8)>>,
     active_finalizers: Vec<Vec<Statement>>,
     active_iter_closes: Vec<(u8, bool)>,
@@ -175,7 +182,7 @@ impl FunctionCompiler {
             completion_reg: None,
             loops: Vec::new(),
             loop_counter: 0,
-            pending_label: None,
+            pending_labels: Vec::new(),
             chain_exits: Vec::new(),
             active_finalizers: Vec::new(),
             active_iter_closes: Vec::new(),
@@ -1118,40 +1125,49 @@ impl Compiler {
     // -----------------------------------------------------------------------
 
     fn compile_stmt(&mut self, stmt: &Statement) -> Result<(), CompileError> {
-        let label = self.cur().pending_label.take();
+        // ECMA-262 §14.13 Labelled Statements: accumulate nested labels (`a: b: stmt`).
+        if let Statement::Labeled { label, body, .. } = stmt {
+            self.cur().pending_labels.push(label.clone());
+            return self.compile_stmt(body);
+        }
+        let labels = std::mem::take(&mut self.cur().pending_labels);
+        let is_loop_or_switch = matches!(
+            stmt,
+            Statement::While { .. }
+                | Statement::DoWhile { .. }
+                | Statement::For { .. }
+                | Statement::ForIn { .. }
+                | Statement::ForOf { .. }
+                | Statement::Switch { .. }
+        );
+        if !labels.is_empty() && !is_loop_or_switch {
+            self.cur().loops.push(LoopControl {
+                labels,
+                continue_target: None,
+                continue_jumps: Vec::new(),
+                break_jumps: Vec::new(),
+                kind: ControlKind::LabeledStmt,
+            });
+            self.compile_stmt(stmt)?;
+            let ctrl = self.cur().loops.pop().expect("labeled stmt frame");
+            let end_pc = self.cur().code.len();
+            for j in ctrl.break_jumps {
+                self.cur().patch_jump(j, end_pc)?;
+            }
+            return Ok(());
+        }
         match stmt {
             Statement::Empty { .. } => {}
             Statement::Debugger { .. } => {
                 self.cur().emit(Instruction::abc(Opcode::Debugger, 0, 0, 0));
             }
             Statement::Block { body, .. } => {
-                if let Some(lbl) = label {
-                    self.cur().loops.push(LoopControl {
-                        label: Some(lbl),
-                        continue_target: None,
-                        continue_jumps: Vec::new(),
-                        break_jumps: Vec::new(),
-                        is_switch: true,
-                    });
-                    self.cur().begin_scope();
-                    self.hoist_block_declarations(body)?;
-                    for s in body {
-                        self.compile_stmt(s)?;
-                    }
-                    self.cur().end_scope();
-                    let ctrl = self.cur().loops.pop().expect("label frame");
-                    let end_pc = self.cur().code.len();
-                    for j in ctrl.break_jumps {
-                        self.cur().patch_jump(j, end_pc)?;
-                    }
-                } else {
-                    self.cur().begin_scope();
-                    self.hoist_block_declarations(body)?;
-                    for s in body {
-                        self.compile_stmt(s)?;
-                    }
-                    self.cur().end_scope();
+                self.cur().begin_scope();
+                self.hoist_block_declarations(body)?;
+                for s in body {
+                    self.compile_stmt(s)?;
                 }
+                self.cur().end_scope();
             }
             Statement::Expr { expr, .. } => {
                 let saved = self.cur().next_reg;
@@ -1198,11 +1214,11 @@ impl Compiler {
                 }
                 let loop_start = self.cur().code.len();
                 self.cur().loops.push(LoopControl {
-                    label,
+                    labels,
                     continue_target: Some(loop_start),
                     continue_jumps: Vec::new(),
                     break_jumps: Vec::new(),
-                    is_switch: false,
+                    kind: ControlKind::Loop,
                 });
 
                 let saved = self.cur().next_reg;
@@ -1228,11 +1244,11 @@ impl Compiler {
                 }
                 let loop_start = self.cur().code.len();
                 self.cur().loops.push(LoopControl {
-                    label,
+                    labels,
                     continue_target: None,
                     continue_jumps: Vec::new(),
                     break_jumps: Vec::new(),
-                    is_switch: false,
+                    kind: ControlKind::Loop,
                 });
 
                 self.compile_stmt(body)?;
@@ -1287,11 +1303,11 @@ impl Compiler {
                 }
                 let loop_start = self.cur().code.len();
                 self.cur().loops.push(LoopControl {
-                    label,
+                    labels,
                     continue_target: None,
                     continue_jumps: Vec::new(),
                     break_jumps: Vec::new(),
-                    is_switch: false,
+                    kind: ControlKind::Loop,
                 });
 
                 let jmp_exit = if let Some(test) = test {
@@ -1348,7 +1364,7 @@ impl Compiler {
                     self.cur()
                         .emit(Instruction::abc(Opcode::LoadUndef, comp, 0, 0));
                 }
-                self.compile_for_each(label, left, right, body, ForEachKind::In)?;
+                self.compile_for_each(labels, left, right, body, ForEachKind::In)?;
             }
             Statement::ForOf {
                 is_await,
@@ -1371,7 +1387,7 @@ impl Compiler {
                 } else {
                     ForEachKind::Of
                 };
-                self.compile_for_each(label, left, right, body, kind)?;
+                self.compile_for_each(labels, left, right, body, kind)?;
             }
             Statement::Switch {
                 discriminant,
@@ -1387,11 +1403,11 @@ impl Compiler {
                 }
                 self.hoist_block_declarations(&case_stmts)?;
                 self.cur().loops.push(LoopControl {
-                    label,
+                    labels,
                     continue_target: None,
                     continue_jumps: Vec::new(),
                     break_jumps: Vec::new(),
-                    is_switch: true,
+                    kind: ControlKind::Switch,
                 });
 
                 let mut case_jumps = Vec::with_capacity(cases.len());
@@ -1608,9 +1624,8 @@ impl Compiler {
                 self.cur().emit(Instruction::abc(Opcode::PopWith, 0, 0, 0));
                 self.cur().free_to(saved);
             }
-            Statement::Labeled { label, body, .. } => {
-                self.cur().pending_label = Some(label.clone());
-                self.compile_stmt(body)?;
+            Statement::Labeled { .. } => {
+                unreachable!("handled at top of compile_stmt")
             }
             Statement::FunctionDecl(func) => {
                 // Annex B §B.3.3: copy the block-local function binding's current value to the
@@ -1892,18 +1907,20 @@ impl Compiler {
         idx
     }
 
-    fn find_loop_index(
-        &self,
-        label: Option<&str>,
-        allow_switch: bool,
-    ) -> Result<usize, CompileError> {
+    fn find_loop_index(&self, label: Option<&str>, is_break: bool) -> Result<usize, CompileError> {
         let loops = &self.frames.last().expect("frame").loops;
         for (i, l) in loops.iter().enumerate().rev() {
             if let Some(target) = label {
-                if l.label.as_deref() == Some(target) {
-                    return Ok(i);
+                if l.labels.iter().any(|lbl| lbl == target) {
+                    if is_break || l.kind == ControlKind::Loop {
+                        return Ok(i);
+                    }
+                    return Err(CompileError::Limit(
+                        "Illegal continue target: label does not denote an iteration statement"
+                            .into(),
+                    ));
                 }
-            } else if allow_switch || !l.is_switch {
+            } else if l.kind == ControlKind::Loop || (is_break && l.kind == ControlKind::Switch) {
                 return Ok(i);
             }
         }
@@ -1914,7 +1931,7 @@ impl Compiler {
 
     fn compile_for_each(
         &mut self,
-        label: Option<String>,
+        labels: Vec<String>,
         left: &ForEachLeft,
         right: &Expr,
         body: &Statement,
@@ -1948,7 +1965,7 @@ impl Compiler {
 
         let loop_start = self.cur().code.len();
         self.cur().loops.push(LoopControl {
-            label,
+            labels,
             continue_target: if per_iter_close.is_some() {
                 None
             } else {
@@ -1956,7 +1973,7 @@ impl Compiler {
             },
             continue_jumps: Vec::new(),
             break_jumps: Vec::new(),
-            is_switch: false,
+            kind: ControlKind::Loop,
         });
 
         if kind == ForEachKind::AsyncOf {

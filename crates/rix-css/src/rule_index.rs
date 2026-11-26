@@ -60,16 +60,103 @@ pub struct RuleBucketEntry {
     pub ancestor_hashes: AncestorHashes,
 }
 
+/// Rightmost selector hash buckets (`ID > class > tag > attribute > universal`) shared by
+/// both originating element rules and per-pseudo-element rule tables.
+#[derive(Debug, Default)]
+struct SelectorBuckets {
+    by_id: FastU64Map<Vec<RuleBucketEntry>>,
+    by_class: FastU64Map<Vec<RuleBucketEntry>>,
+    by_tag: FastU64Map<Vec<RuleBucketEntry>>,
+    by_attr: FastU64Map<Vec<RuleBucketEntry>>,
+    universal: Vec<RuleBucketEntry>,
+}
+
+impl SelectorBuckets {
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+            && self.by_class.is_empty()
+            && self.by_tag.is_empty()
+            && self.by_attr.is_empty()
+            && self.universal.is_empty()
+    }
+
+    fn insert(
+        &mut self,
+        best_id: Option<u64>,
+        best_class: Option<u64>,
+        best_tag: Option<u64>,
+        best_attr: Option<u64>,
+        entry: RuleBucketEntry,
+    ) {
+        if let Some(id_hash) = best_id {
+            self.by_id.entry(id_hash).or_default().push(entry);
+        } else if let Some(cls_hash) = best_class {
+            self.by_class.entry(cls_hash).or_default().push(entry);
+        } else if let Some(tag_hash) = best_tag {
+            self.by_tag.entry(tag_hash).or_default().push(entry);
+        } else if let Some(attr_hash) = best_attr {
+            self.by_attr.entry(attr_hash).or_default().push(entry);
+        } else {
+            self.universal.push(entry);
+        }
+    }
+
+    fn collect<const N: usize>(
+        &self,
+        elem: &ElementData,
+        bloom: Option<&BloomFilter>,
+        out: &mut SmallVec<[u32; N]>,
+    ) {
+        let mut push_bucket = |entries: &[RuleBucketEntry]| {
+            if let Some(bf) = bloom {
+                for entry in entries {
+                    if selector_may_match(&entry.ancestor_hashes, bf) {
+                        out.push(entry.rule_idx);
+                    }
+                }
+            } else {
+                for entry in entries {
+                    out.push(entry.rule_idx);
+                }
+            }
+        };
+
+        if let Some(ref id) = elem.cached_id {
+            let id_hash = hash_ident(id.as_str());
+            if let Some(bucket) = self.by_id.get(&id_hash) {
+                push_bucket(bucket);
+            }
+        }
+        for &cls_hash in &elem.class_hashes {
+            if let Some(bucket) = self.by_class.get(&cls_hash) {
+                push_bucket(bucket);
+            }
+        }
+        if let Some(bucket) = self.by_tag.get(&elem.tag_hash) {
+            push_bucket(bucket);
+        }
+        if !self.by_attr.is_empty() && !elem.attributes.is_empty() {
+            for (q, _) in &elem.attributes {
+                let attr_hash = hash_ident_ascii_lower(q.local.as_str());
+                if let Some(bucket) = self.by_attr.get(&attr_hash) {
+                    push_bucket(bucket);
+                }
+            }
+        }
+        if !self.universal.is_empty() {
+            push_bucket(&self.universal);
+        }
+    }
+}
+
 /// Bucketed rule index for O(1) candidate lookup per element.
 #[derive(Debug, Default)]
 pub struct RuleIndex {
     pub rules: Vec<CompiledRule>,
-    by_id: FastU64Map<Vec<RuleBucketEntry>>,
-    by_class: FastU64Map<Vec<RuleBucketEntry>>,
-    by_tag: FastU64Map<Vec<RuleBucketEntry>>,
-    universal: Vec<RuleBucketEntry>,
+    elements: SelectorBuckets,
     host_rules: Vec<RuleBucketEntry>,
-    pseudo_by_kind: HashMap<RixPseudoElement, Vec<RuleBucketEntry>>,
+    pseudo_by_kind: HashMap<RixPseudoElement, SelectorBuckets>,
     /// Global flag indicating whether any rule contains a `:has(...)` selector.
     pub has_relative_selectors: bool,
     /// True when any rule contains a `:has(...)` selector in a non-subject compound
@@ -120,10 +207,7 @@ impl RuleIndex {
         let total_rules: usize = stylesheets.iter().map(|s| s.rules.len()).sum();
         let mut index = Self {
             rules: Vec::with_capacity(total_rules),
-            by_id: FastU64Map::default(),
-            by_class: FastU64Map::default(),
-            by_tag: FastU64Map::default(),
-            universal: Vec::new(),
+            elements: SelectorBuckets::default(),
             host_rules: Vec::new(),
             pseudo_by_kind: HashMap::new(),
             has_relative_selectors: false,
@@ -314,61 +398,23 @@ impl RuleIndex {
         out: &mut SmallVec<[u32; 32]>,
     ) {
         out.clear();
-        let mut push_bucket = |entries: &[RuleBucketEntry]| {
-            if let Some(bf) = bloom {
-                for entry in entries {
-                    if selector_may_match(&entry.ancestor_hashes, bf) {
-                        out.push(entry.rule_idx);
-                    }
-                }
-            } else {
-                for entry in entries {
-                    out.push(entry.rule_idx);
-                }
-            }
-        };
-
-        if let Some(ref id) = elem.cached_id {
-            let id_hash = hash_ident(id.as_str());
-            if let Some(bucket) = self.by_id.get(&id_hash) {
-                push_bucket(bucket);
-            }
-        }
-        for &cls_hash in &elem.class_hashes {
-            if let Some(bucket) = self.by_class.get(&cls_hash) {
-                push_bucket(bucket);
-            }
-        }
-        if let Some(bucket) = self.by_tag.get(&elem.tag_hash) {
-            push_bucket(bucket);
-        }
-        if !self.universal.is_empty() {
-            push_bucket(&self.universal);
-        }
+        self.elements.collect(elem, bloom, out);
     }
 
-    /// Collects candidate rule indices for a pseudo-element on an originating element.
+    /// Collects candidate rule indices for a pseudo-element on an originating element,
+    /// using the originating element's ID/class/tag/attribute buckets + BloomFilter pruning.
     pub fn collect_pseudo_candidates(
         &self,
         pseudo: RixPseudoElement,
+        elem: &ElementData,
         bloom: Option<&BloomFilter>,
         out: &mut SmallVec<[u32; 16]>,
     ) {
         out.clear();
-        let Some(entries) = self.pseudo_by_kind.get(&pseudo) else {
+        let Some(buckets) = self.pseudo_by_kind.get(&pseudo) else {
             return;
         };
-        if let Some(bf) = bloom {
-            for entry in entries {
-                if selector_may_match(&entry.ancestor_hashes, bf) {
-                    out.push(entry.rule_idx);
-                }
-            }
-        } else {
-            for entry in entries {
-                out.push(entry.rule_idx);
-            }
-        }
+        buckets.collect(elem, bloom, out);
     }
 
     /// Returns true if any rule targets `:host` or `:host(...)`.
@@ -390,7 +436,7 @@ impl RuleIndex {
     pub fn has_pseudo_rules(&self, pseudo: RixPseudoElement) -> bool {
         self.pseudo_by_kind
             .get(&pseudo)
-            .is_some_and(|v| !v.is_empty())
+            .is_some_and(|b| !b.is_empty())
     }
 
     fn insert_bucket(&mut self, selector: &Selector<RixSelectorImpl>, entry: RuleBucketEntry) {
@@ -398,13 +444,14 @@ impl RuleIndex {
         let mut best_id: Option<u64> = None;
         let mut best_class: Option<u64> = None;
         let mut best_tag: Option<u64> = None;
+        let mut best_attr: Option<u64> = None;
         let mut is_host_subject = false;
+        let mut pseudo_kind: Option<RixPseudoElement> = None;
 
         for comp in iter.by_ref() {
             match comp {
                 Component::PseudoElement(pe) => {
-                    self.pseudo_by_kind.entry(*pe).or_default().push(entry);
-                    return;
+                    pseudo_kind = Some(*pe);
                 }
                 Component::Host(_) => {
                     is_host_subject = true;
@@ -414,28 +461,81 @@ impl RuleIndex {
                 Component::LocalName(ln) if best_tag.is_none() => {
                     best_tag = Some(ln.lower_name.hash64);
                 }
+                Component::AttributeInNoNamespace { local_name, .. } if best_attr.is_none() => {
+                    best_attr = Some(local_name.hash64);
+                }
+                Component::AttributeInNoNamespaceExists {
+                    local_name_lower, ..
+                } if best_attr.is_none() => {
+                    best_attr = Some(local_name_lower.hash64);
+                }
+                Component::AttributeOther(attr) if best_attr.is_none() => {
+                    best_attr = Some(attr.local_name_lower.hash64);
+                }
                 Component::Is(list) | Component::Where(list) if list.slice().len() == 1 => {
                     extract_simple_key(
                         &list.slice()[0],
                         &mut best_id,
                         &mut best_class,
                         &mut best_tag,
+                        &mut best_attr,
                     );
                 }
                 _ => {}
             }
         }
 
+        // In the `selectors` crate, `.foo::before` separates `[PseudoElement(Before)]` from the
+        // originating element's compound (`[Class("foo")]`) with `Combinator::PseudoElement`.
+        if let Some(pe) = pseudo_kind {
+            if matches!(iter.next_sequence(), Some(Combinator::PseudoElement)) {
+                for comp in iter.by_ref() {
+                    match comp {
+                        Component::ID(id) if best_id.is_none() => best_id = Some(id.hash64),
+                        Component::Class(cls) if best_class.is_none() => {
+                            best_class = Some(cls.hash64);
+                        }
+                        Component::LocalName(ln) if best_tag.is_none() => {
+                            best_tag = Some(ln.lower_name.hash64);
+                        }
+                        Component::AttributeInNoNamespace { local_name, .. }
+                            if best_attr.is_none() =>
+                        {
+                            best_attr = Some(local_name.hash64);
+                        }
+                        Component::AttributeInNoNamespaceExists {
+                            local_name_lower, ..
+                        } if best_attr.is_none() => {
+                            best_attr = Some(local_name_lower.hash64);
+                        }
+                        Component::AttributeOther(attr) if best_attr.is_none() => {
+                            best_attr = Some(attr.local_name_lower.hash64);
+                        }
+                        Component::Is(list) | Component::Where(list) if list.slice().len() == 1 => {
+                            extract_simple_key(
+                                &list.slice()[0],
+                                &mut best_id,
+                                &mut best_class,
+                                &mut best_tag,
+                                &mut best_attr,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            self.pseudo_by_kind
+                .entry(pe)
+                .or_default()
+                .insert(best_id, best_class, best_tag, best_attr, entry);
+            return;
+        }
+
         if is_host_subject {
             self.host_rules.push(entry);
-        } else if let Some(id_hash) = best_id {
-            self.by_id.entry(id_hash).or_default().push(entry);
-        } else if let Some(cls_hash) = best_class {
-            self.by_class.entry(cls_hash).or_default().push(entry);
-        } else if let Some(tag_hash) = best_tag {
-            self.by_tag.entry(tag_hash).or_default().push(entry);
         } else {
-            self.universal.push(entry);
+            self.elements
+                .insert(best_id, best_class, best_tag, best_attr, entry);
         }
     }
 }
@@ -445,6 +545,7 @@ fn extract_simple_key(
     best_id: &mut Option<u64>,
     best_class: &mut Option<u64>,
     best_tag: &mut Option<u64>,
+    best_attr: &mut Option<u64>,
 ) {
     for comp in sel.iter() {
         match comp {
@@ -452,6 +553,17 @@ fn extract_simple_key(
             Component::Class(cls) if best_class.is_none() => *best_class = Some(cls.hash64),
             Component::LocalName(ln) if best_tag.is_none() => {
                 *best_tag = Some(ln.lower_name.hash64);
+            }
+            Component::AttributeInNoNamespace { local_name, .. } if best_attr.is_none() => {
+                *best_attr = Some(local_name.hash64);
+            }
+            Component::AttributeInNoNamespaceExists {
+                local_name_lower, ..
+            } if best_attr.is_none() => {
+                *best_attr = Some(local_name_lower.hash64);
+            }
+            Component::AttributeOther(attr) if best_attr.is_none() => {
+                *best_attr = Some(attr.local_name_lower.hash64);
             }
             _ => {}
         }

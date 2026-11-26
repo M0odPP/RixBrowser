@@ -567,7 +567,19 @@ pub fn load_page_subresources(
 
     let mut used_bg_urls: HashSet<String> = HashSet::new();
     let mut used_font_families: HashSet<String> = HashSet::new();
-    {
+    let has_inline_bg_url = discovered.doc.descendants(discovered.doc.root()).any(|n| {
+        matches!(
+            discovered.doc.get(n),
+            Some(NodeData::Element(e))
+                if e.get_attribute("style")
+                    .is_some_and(|s| s.to_ascii_lowercase().contains("url("))
+        )
+    });
+    let needs_wave2_probe = has_inline_bg_url
+        || all_sheets_with_base
+            .iter()
+            .any(|(_, s)| !s.font_faces.is_empty() || !s.referenced_image_urls().is_empty());
+    if needs_wave2_probe {
         let mut probe_doc = discovered.doc;
         let mut probe_styles = StyleContext::new(*media);
         for (_, sheet) in &all_sheets_with_base {

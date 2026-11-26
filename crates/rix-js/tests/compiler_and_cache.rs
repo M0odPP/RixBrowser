@@ -346,3 +346,67 @@ fn large_argument_call_and_new_spill_cleanly_without_hitting_250_reg_limit() {
     // sum(0..130) + sum(0..50) + 180 = 8385 + 1225 + 180 = 9790
     assert_eq!(val.as_number(), Some(9_790.0));
 }
+
+#[test]
+fn labeled_statements_nested_labels_and_unlabeled_break_follow_ecma262() {
+    // ECMA-262 §14.13, §14.8, §14.9: labeled `if`, `try`, nested labels (`a: b: ...`),
+    // and unlabeled `break` inside a labeled block inside a loop must all resolve cleanly.
+    let src = r#"
+        let r = 0;
+        // 1. Labeled `if` statement (`react.dev` / Terser pattern)
+        lblIf: if (true) {
+            r += 1;
+            break lblIf;
+            r += 1000;
+        }
+        // 2. Labeled `try` statement
+        lblTry: try {
+            r += 2;
+            break lblTry;
+            r += 1000;
+        } catch (e) {
+            r += 1000;
+        }
+        // 3. Nested labels on a loop (both labels valid for continue and break)
+        let loopSum = 0;
+        outerA: outerB: for (let i = 0; i < 5; i++) {
+            if (i === 1) continue outerA;
+            if (i === 3) break outerB;
+            loopSum += i + 1;
+        }
+        // i=0 -> +1, i=1 -> skip, i=2 -> +3, i=3 -> break => loopSum = 4
+        r += loopSum * 10;
+
+        // 4. Nested labels on a block
+        b1: b2: {
+            r += 100;
+            break b1;
+            r += 10000;
+        }
+
+        // 5. Unlabeled `break` inside a labeled block inside a loop breaks the LOOP, not the block
+        let iters = 0;
+        while (iters < 10) {
+            iters++;
+            innerLbl: {
+                if (iters === 2) break;
+            }
+            if (iters === 2) r += 10000; // must NOT execute!
+        }
+        r += iters * 1000;
+        r
+    "#;
+    let mut vm = rix_js::JsVm::new();
+    let val = vm
+        .eval_script(src)
+        .expect("ECMA-262 §14.13 labeled statements must compile and execute");
+    // 1 + 2 + 40 + 100 + 2000 = 2143
+    assert_eq!(val.as_number(), Some(2_143.0));
+
+    // `continue` targeting a non-iteration labeled statement must be rejected.
+    let bad = vm.eval_script("blk: { continue blk; }");
+    assert!(
+        bad.is_err(),
+        "ECMA-262 §14.8: continue targeting a non-loop label must fail"
+    );
+}

@@ -475,6 +475,11 @@ impl CustomPropEntry {
 pub struct CustomPropertyMap {
     parent: Option<Arc<CustomPropertyMap>>,
     depth: u16,
+    /// Number of `@property` registrations seeded into this map's ancestry (`0` = unseeded).
+    registered_seed_count: u32,
+    /// Non-inherited (`inherits: false`) registered properties explicitly written on this element
+    /// so direct children only reset these O(k) keys instead of scanning all `@property` rules.
+    dirty_non_inherited: SmallVec<[InternedStr; 4]>,
     local: HashMap<InternedStr, Option<CustomPropEntry>>,
 }
 
@@ -511,12 +516,17 @@ impl CustomPropertyMap {
     #[must_use]
     pub fn child_of(parent: &Arc<Self>) -> Self {
         if parent.parent.is_none() && parent.local.is_empty() {
-            return Self::default();
+            return Self {
+                registered_seed_count: parent.registered_seed_count,
+                ..Self::default()
+            };
         }
         if parent.depth < 24 {
             return Self {
                 parent: Some(Arc::clone(parent)),
                 depth: parent.depth + 1,
+                registered_seed_count: parent.registered_seed_count,
+                dirty_non_inherited: SmallVec::new(),
                 local: HashMap::new(),
             };
         }
@@ -532,7 +542,17 @@ impl CustomPropertyMap {
         Self {
             parent: None,
             depth: 0,
+            registered_seed_count: parent.registered_seed_count,
+            dirty_non_inherited: SmallVec::new(),
             local: flat,
+        }
+    }
+
+    /// Marks `name` as a non-inherited registered property written on this element so child
+    /// elements reset it back to its registered initial value.
+    pub fn mark_dirty_non_inherited(&mut self, name: InternedStr) {
+        if !self.dirty_non_inherited.contains(&name) {
+            self.dirty_non_inherited.push(name);
         }
     }
 
@@ -1223,7 +1243,15 @@ pub fn resolve_element_style_with_context(
         Some(p) => ComputedStyle::inherit_from(p),
         None => ComputedStyle::default(),
     };
-    let has_registered = registered_props.is_some_and(|m| !m.is_empty());
+    let reg_count = registered_props.map_or(0, |m| m.len() as u32);
+    let has_registered = reg_count > 0;
+    let needs_reg_seed = has_registered
+        && parent_style.is_none_or(|p| p.custom_properties.registered_seed_count != reg_count);
+    let parent_dirty_non_inherited: &[InternedStr] = if !needs_reg_seed {
+        parent_style.map_or(&[], |p| p.custom_properties.dirty_non_inherited.as_slice())
+    } else {
+        &[]
+    };
 
     let mut candidates: Vec<CandidateDecl<'_>> =
         Vec::with_capacity(matched_rules.len() * 4 + pres_hint_decls.len() + inline_decls.len());
@@ -1279,7 +1307,7 @@ pub fn resolve_element_style_with_context(
         });
     }
 
-    if candidates.is_empty() && !has_registered {
+    if candidates.is_empty() && !needs_reg_seed && parent_dirty_non_inherited.is_empty() {
         let mut ctx = media.eval_context(style.text.font_size_px, root_font_size_px);
         if let Some(p) = parent_style {
             ctx.root_line_height_px = p.text.eval_ctx.root_line_height_px;
@@ -1361,26 +1389,51 @@ pub fn resolve_element_style_with_context(
                 .push((c.key, c.decl));
         }
     }
-    if !raw_custom.is_empty() || has_registered {
+    if !raw_custom.is_empty() || needs_reg_seed || !parent_dirty_non_inherited.is_empty() {
         let mut custom_map = CustomPropertyMap::child_of(&style.custom_properties);
-        if let Some(regs) = registered_props {
-            for (name, reg) in regs {
-                let canonical_iv = reg.initial_value.as_ref().map(|iv| {
-                    if is_registered_url_syntax(&reg.syntax) {
-                        canonicalize_registered_url_tokens(iv)
-                    } else {
-                        iv.clone()
+        if needs_reg_seed {
+            // Seed all `@property` initial values ONCE at the root (or when registration set changes).
+            // Descendants inherit both inherited and already-at-initial non-inherited values in O(1)!
+            if let Some(regs) = registered_props {
+                for (name, reg) in regs {
+                    let canonical_iv = reg.initial_value.as_ref().map(|iv| {
+                        if is_registered_url_syntax(&reg.syntax) {
+                            canonicalize_registered_url_tokens(iv)
+                        } else {
+                            iv.clone()
+                        }
+                    });
+                    if !reg.inherits {
+                        if let Some(iv) = canonical_iv {
+                            custom_map.insert(name.clone(), iv);
+                        } else {
+                            custom_map.remove(name);
+                        }
+                    } else if !custom_map.contains_key(name) {
+                        if let Some(iv) = canonical_iv {
+                            custom_map.insert(name.clone(), iv);
+                        }
                     }
-                });
-                if !reg.inherits {
-                    if let Some(iv) = canonical_iv {
-                        custom_map.insert(name.clone(), iv);
-                    } else {
-                        custom_map.remove(name);
-                    }
-                } else if !custom_map.contains_key(name) {
-                    if let Some(iv) = canonical_iv {
-                        custom_map.insert(name.clone(), iv);
+                }
+            }
+            custom_map.registered_seed_count = reg_count;
+        } else if !parent_dirty_non_inherited.is_empty() {
+            // Reset ONLY the O(k) non-inherited registered properties modified by the parent.
+            if let Some(regs) = registered_props {
+                for name in parent_dirty_non_inherited {
+                    if let Some(reg) = regs.get(name) {
+                        if !reg.inherits {
+                            if let Some(iv) = reg.initial_value.as_ref() {
+                                let canonical_iv = if is_registered_url_syntax(&reg.syntax) {
+                                    canonicalize_registered_url_tokens(iv)
+                                } else {
+                                    iv.clone()
+                                };
+                                custom_map.insert(name.clone(), canonical_iv);
+                            } else {
+                                custom_map.remove(name);
+                            }
+                        }
                     }
                 }
             }
@@ -1443,6 +1496,11 @@ pub fn resolve_element_style_with_context(
                 }
                 if matches!(winner.value, PropertyValue::Global(GlobalKeyword::Inherit)) {
                     style.uses_explicit_inherit = true;
+                }
+                if let Some(reg) = registered_props.and_then(|m| m.get(name)) {
+                    if !reg.inherits {
+                        custom_map.mark_dirty_non_inherited(name.clone());
+                    }
                 }
                 match &winner.value {
                     PropertyValue::Custom(tokens) => {
@@ -2111,7 +2169,11 @@ pub fn resolve_element_style_with_context(
     }
 
     if let Some(regs) = registered_props {
-        compute_registered_custom_properties(&mut style, regs, &eval_ctx);
+        if needs_reg_seed {
+            compute_registered_custom_properties(&mut style, regs, None, &eval_ctx);
+        } else if !raw_custom.is_empty() {
+            compute_registered_custom_properties(&mut style, regs, Some(&raw_custom), &eval_ctx);
+        }
     }
 
     // CSS 2.1 §9.7 & CSS Display L3 §2.7: Blockification for root, out-of-flow, floated,
@@ -2144,12 +2206,13 @@ pub fn resolve_element_style_with_context(
 fn compute_registered_custom_properties(
     style: &mut ComputedStyle,
     regs: &HashMap<InternedStr, RegisteredProperty>,
+    only_declared: Option<&HashMap<InternedStr, Vec<(CascadeKey, &SpecifiedDeclaration)>>>,
     eval: &EvalContext,
 ) {
     use crate::values_math::{parse_math_value, parse_math_value_from_parser, ValueKind};
     let mut updates: Vec<(InternedStr, Vec<CssToken>)> = Vec::new();
-    for (name, reg) in regs {
-        let Some(toks) = style.custom_properties.get(name) else { continue; };
+    let compute_one = |name: &InternedStr, reg: &RegisteredProperty, updates: &mut Vec<(InternedStr, Vec<CssToken>)>| {
+        let Some(toks) = style.custom_properties.get(name) else { return; };
         let syn = reg.syntax.trim().trim_matches(|c| c == '"' || c == '\'').trim();
         let is_list = syn.ends_with('+') || syn.ends_with('#');
         let base = syn.trim_end_matches(['+', '#']).trim();
@@ -2164,10 +2227,10 @@ fn compute_registered_custom_properties(
             "<resolution>" => Some(ValueKind::Resolution),
             _ => None,
         };
-        let Some(vk) = kind else { continue; };
+        let Some(vk) = kind else { return; };
         let raw = serialize_css_tokens(toks);
         let trimmed = raw.trim();
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() { return; }
         let mut rc = 0u32;
         let formatted = if is_list {
             let sep = if syn.ends_with('#') { ", " } else { " " };
@@ -2195,6 +2258,17 @@ fn compute_registered_custom_properties(
             if s != trimmed {
                 updates.push((name.clone(), crate::properties::tokenize_custom_value_str(&s)));
             }
+        }
+    };
+    if let Some(declared) = only_declared {
+        for name in declared.keys() {
+            if let Some(reg) = regs.get(name) {
+                compute_one(name, reg, &mut updates);
+            }
+        }
+    } else {
+        for (name, reg) in regs {
+            compute_one(name, reg, &mut updates);
         }
     }
     if !updates.is_empty() {

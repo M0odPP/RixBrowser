@@ -1371,27 +1371,45 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_labeled_stmt(&mut self) -> Result<Statement, SyntaxError> {
-        let (label, span) = self.parse_ident_name()?;
-        self.expect(TokenKind::Colon)?;
-        if self.ctx.labels.iter().any(|(l, _)| l == &label) {
-            return Err(SyntaxError::new(
-                format!("Label '{label}' has already been declared"),
-                span,
-            ));
+        // ECMA-262 §14.13: consecutive labels (`a: b: for (...)`) all label the same inner
+        // statement, so `is_loop` applies to every label in the chain when the body is a loop.
+        let mut chain: Vec<(String, Span)> = Vec::new();
+        loop {
+            let (label, span) = self.parse_ident_name()?;
+            self.expect(TokenKind::Colon)?;
+            if self.ctx.labels.iter().any(|(l, _)| l == &label)
+                || chain.iter().any(|(l, _)| l == &label)
+            {
+                return Err(SyntaxError::new(
+                    format!("Label '{label}' has already been declared"),
+                    span,
+                ));
+            }
+            chain.push((label, span));
+            if !(self.can_be_label_name() && self.peek_token()?.kind == TokenKind::Colon) {
+                break;
+            }
         }
         let is_loop = matches!(
             self.cur.kind,
             TokenKind::Keyword(Keyword::For | Keyword::While | Keyword::Do)
         );
-        self.ctx.labels.push((label.clone(), is_loop));
-        let body = Box::new(self.parse_sub_statement(true)?);
-        self.ctx.labels.pop();
-        let end = body.span().end;
-        Ok(Statement::Labeled {
-            label,
-            body,
-            span: Span::new(span.start, end),
-        })
+        for (label, _) in &chain {
+            self.ctx.labels.push((label.clone(), is_loop));
+        }
+        let mut stmt = self.parse_sub_statement(true)?;
+        for _ in 0..chain.len() {
+            self.ctx.labels.pop();
+        }
+        let end = stmt.span().end;
+        for (label, span) in chain.into_iter().rev() {
+            stmt = Statement::Labeled {
+                label,
+                body: Box::new(stmt),
+                span: Span::new(span.start, end),
+            };
+        }
+        Ok(stmt)
     }
 
     fn parse_expr_statement(&mut self) -> Result<Statement, SyntaxError> {

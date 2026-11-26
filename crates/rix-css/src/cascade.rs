@@ -2621,10 +2621,10 @@ fn collect_pseudo_element_styles(
     caches: &mut SelectorCaches,
     out_pseudos: &mut Vec<((NodeId, RixPseudoElement), Arc<ComputedStyle>)>,
 ) {
-    let elem_attrs: &[(rix_dom::QualName, String)] = match doc.get(node) {
-        Some(NodeData::Element(e)) => &e.attributes,
-        _ => &[],
+    let Some(NodeData::Element(orig_elem)) = doc.get(node) else {
+        return;
     };
+    let elem_attrs: &[(rix_dom::QualName, String)] = &orig_elem.attributes;
     for pseudo in [
         RixPseudoElement::Before,
         RixPseudoElement::After,
@@ -2640,7 +2640,7 @@ fn collect_pseudo_element_styles(
             continue;
         }
         let mut cands = SmallVec::<[u32; 16]>::new();
-        rule_index.collect_pseudo_candidates(pseudo, bloom, &mut cands);
+        rule_index.collect_pseudo_candidates(pseudo, orig_elem, bloom, &mut cands);
         if cands.is_empty() {
             continue;
         }
