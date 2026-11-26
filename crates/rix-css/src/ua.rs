@@ -185,6 +185,9 @@ button {
 img, svg, canvas, video {
     display: inline-block;
 }
+svg:not(:root) {
+    overflow: hidden;
+}
 [dir="rtl" i] {
     direction: rtl;
 }

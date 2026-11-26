@@ -711,6 +711,8 @@ pub struct LayoutContext<'a> {
     pub cache: &'a mut LayoutCache,
     /// Per-pass memo for `measure_intrinsic_widths` eliminating exponential recursion in nested Flex/Grid/Tables.
     pub(crate) pass_intrinsic_memo: HashMap<(BoxId, u32, u32), (f32, f32)>,
+    /// Per-pass memo for `measure_content_intrinsic_widths` called directly by Flex/BFC/Table passes.
+    pub(crate) pass_content_intrinsic_memo: HashMap<(BoxId, u32), (f32, f32)>,
     /// Per-pass memo for `layout_box` keyed by full constraint overrides (including Flex/Grid definite sizes).
     /// Also records any out-of-flow (`position: absolute | fixed`) descendants propagated to an ancestor
     /// containing block so memo hits replay them in O(1) instead of forcing exponential re-layout.
@@ -736,6 +738,7 @@ impl<'a> LayoutContext<'a> {
             shaper: TextShaper::with_cache(font_db, shaping_cache),
             cache,
             pass_intrinsic_memo: HashMap::with_capacity(256),
+            pass_content_intrinsic_memo: HashMap::with_capacity(256),
             pass_fragment_memo: HashMap::with_capacity(256),
             pending_oof: Vec::new(),
         }
@@ -991,7 +994,24 @@ pub fn measure_intrinsic_widths(
 
 /// Measures the raw intrinsic content widths `(min_content_px, max_content_px)` of `box_id`'s
 /// children without applying `box_id`'s own `width`/`min-width`/`max-width`/padding/border.
+/// Memoized per layout pass in `O(1)`.
 pub(crate) fn measure_content_intrinsic_widths(
+    ctx: &mut LayoutContext<'_>,
+    box_id: BoxId,
+    space: ConstraintSpace,
+) -> (f32, f32) {
+    let key = (box_id, LayoutContext::quantize_px(space.available_width));
+    if let Some(&hit) = ctx.pass_content_intrinsic_memo.get(&key) {
+        return hit;
+    }
+    let result = measure_content_intrinsic_widths_uncached(ctx, box_id, space);
+    if ctx.pass_content_intrinsic_memo.len() < 32_768 {
+        ctx.pass_content_intrinsic_memo.insert(key, result);
+    }
+    result
+}
+
+fn measure_content_intrinsic_widths_uncached(
     ctx: &mut LayoutContext<'_>,
     box_id: BoxId,
     space: ConstraintSpace,

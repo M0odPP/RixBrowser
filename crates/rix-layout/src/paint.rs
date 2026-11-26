@@ -525,7 +525,7 @@ impl<'a> Painter<'a> {
         }
 
         // Paint intrinsic replaced content (Image, SVG, FormControl, TextRun) of this fragment itself.
-        self.paint_leaf_content(frag, abs_rect);
+        self.paint_leaf_content(frag, abs_rect, active_spatial);
 
         // Collect descendant stacking contexts belonging to THIS stacking context.
         let mut neg_z: Vec<CollectedStackingChild<'f>> = Vec::new();
@@ -763,7 +763,7 @@ impl<'a> Painter<'a> {
             });
         }
 
-        self.paint_leaf_content(frag, abs_rect);
+        self.paint_leaf_content(frag, abs_rect, spatial);
         self.paint_flow_phase(frag, abs_rect.origin, spatial, scroll_parent, phase);
 
         if clips {
@@ -794,14 +794,14 @@ impl<'a> Painter<'a> {
             FragmentKind::TextRun(_) => {
                 // Text runs inherit their parent element's computed style for typography only;
                 // never re-paint box backgrounds, borders, shadows, or outlines per text run.
-                self.paint_leaf_content(frag, abs_rect);
+                self.paint_leaf_content(frag, abs_rect, spatial);
             }
             FragmentKind::Image { .. }
             | FragmentKind::Svg { .. }
             | FragmentKind::FormControl { .. }
             | FragmentKind::ExternalSurface { .. } => {
                 self.paint_box_decorations(frag, abs_rect, spatial);
-                self.paint_leaf_content(frag, abs_rect);
+                self.paint_leaf_content(frag, abs_rect, spatial);
             }
             FragmentKind::Box => {
                 // Atomic inline (`inline-block`, `inline-flex`, `inline-grid`, `inline-table`)
@@ -1373,7 +1373,7 @@ impl<'a> Painter<'a> {
         }
     }
 
-    fn paint_leaf_content(&mut self, frag: &Fragment, abs_rect: Rect) {
+    fn paint_leaf_content(&mut self, frag: &Fragment, abs_rect: Rect, spatial: SpatialNodeId) {
         if frag.style.visibility != VisibilityMode::Visible {
             return;
         }
@@ -1526,6 +1526,15 @@ impl<'a> Painter<'a> {
                         * 0.5;
                 let xf = Affine::translate((tx, ty)) * Affine::scale(scale);
 
+                let clip_svg = frag.style.overflow.x != OverflowMode::Visible
+                    || frag.style.overflow.y != OverflowMode::Visible;
+                if clip_svg {
+                    self.list.push(DisplayItem::PushClip {
+                        spatial,
+                        rect: content_abs,
+                        radii: [0.0; 4],
+                    });
+                }
                 for entry in paths {
                     let Ok(mut bez) = parse_svg_path(&entry.path_d) else {
                         continue;
@@ -1548,6 +1557,9 @@ impl<'a> Painter<'a> {
                             .map(|(c, w)| (to_rgba8(c), (w * scale as f32).max(0.5))),
                         fill_rule_even_odd: entry.fill_rule_even_odd,
                     });
+                }
+                if clip_svg {
+                    self.list.push(DisplayItem::PopClip);
                 }
             }
             FragmentKind::FormControl {

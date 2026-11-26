@@ -755,6 +755,83 @@ fn regexp_builtin_exec(
     Ok(JsValue::from_object(arr))
 }
 
+/// Returns `(flags, compiled)` if `rx` is an ordinary `%RegExp.prototype%` instance with
+/// untouched built-in `.exec` and `.flags` (and optionally untouched `Symbol.species`), enabling
+/// linear O(N) scanning in `[Symbol.split]`, `[Symbol.match]`, and `[Symbol.replace]`.
+fn try_fast_builtin_regexp(
+    vm: &mut JsVm,
+    rx: HeapHandle,
+    check_species: bool,
+) -> Result<Option<(String, Arc<regress::Regex>)>, JsException> {
+    let (pat, flags, compiled_opt) = match vm.heap.get_object(rx) {
+        Some(obj) if obj.prototype == Some(vm.regexp_proto) => match &obj.kind {
+            ObjectKind::RegExp(r) => (r.pattern.clone(), r.flags.clone(), r.compiled.clone()),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let k_exec = vm.heap.intern_key("exec");
+    let k_flags = vm.heap.intern_key("flags");
+    if vm.heap.object_get_own(rx, k_exec, &vm.shapes).is_some()
+        || vm.heap.object_get_own(rx, k_flags, &vm.shapes).is_some()
+    {
+        return Ok(None);
+    }
+    let proto_exec = vm
+        .heap
+        .object_get_own(vm.regexp_proto, k_exec, &vm.shapes)
+        .and_then(|p| p.value.as_object());
+    if !proto_exec.is_some_and(|h| vm.is_native_static_fn(h, regexp_exec)) {
+        return Ok(None);
+    }
+    if check_species {
+        if vm
+            .heap
+            .object_get_own(rx, vm.key_constructor, &vm.shapes)
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let default_ctor = regexp_ctor_handle(vm);
+        let c = species_constructor(vm, rx, default_ctor)?;
+        if c != JsValue::from_object(default_ctor) {
+            return Ok(None);
+        }
+    }
+    let compiled = match compiled_opt {
+        Some(c) => c,
+        None => {
+            let (_, c) = compile_checked(vm, &pat, &flags)?;
+            if let Some(ObjectKind::RegExp(r)) = vm.heap.get_object_mut(rx).map(|o| &mut o.kind) {
+                r.compiled = Some(Arc::clone(&c));
+            }
+            c
+        }
+    };
+    Ok(Some((flags, compiled)))
+}
+
+fn update_legacy_statics_from_match(vm: &mut JsVm, input: &str, units: &[u16], m: &regress::Match) {
+    let mut statics = RegExpLegacyStatics {
+        input: input.to_string(),
+        last_match: String::from_utf16_lossy(&units[m.start()..m.end()]),
+        last_paren: String::new(),
+        left_context: String::from_utf16_lossy(&units[..m.start()]),
+        right_context: String::from_utf16_lossy(&units[m.end()..]),
+        parens: Default::default(),
+    };
+    for (i, cap) in m.captures.iter().enumerate() {
+        if let Some(r) = cap {
+            let s = String::from_utf16_lossy(&units[r.start..r.end]);
+            if i < 9 {
+                statics.parens[i] = s.clone();
+            }
+            statics.last_paren = s;
+        }
+    }
+    vm.regexp_statics = statics;
+}
+
 fn regexp_symbol_match(
     vm: &mut JsVm,
     this_val: JsValue,
@@ -764,6 +841,50 @@ fn regexp_symbol_match(
         return Err(vm.type_error("RegExp.prototype[Symbol.match] requires an object receiver"));
     };
     let s = vm.to_js_string(arg(args, 0))?;
+    if let Some((flags, compiled)) = try_fast_builtin_regexp(vm, rx, false)? {
+        if flags.contains('g') {
+            let full_unicode = flags.contains('u') || flags.contains('v');
+            set_last_index_strict(vm, rx, JsValue::from_i32(0))?;
+            let units: Vec<u16> = s.encode_utf16().collect();
+            let arr = vm.alloc_array();
+            let mut n = 0u64;
+            let mut pos = 0usize;
+            let mut last_match: Option<regress::Match> = None;
+            while pos <= units.len() {
+                let m_opt = if full_unicode {
+                    compiled.find_from_utf16(&units, pos).next()
+                } else {
+                    compiled.find_from_ucs2(&units, pos).next()
+                };
+                let Some(m) = m_opt else {
+                    break;
+                };
+                let piece = String::from_utf16_lossy(&units[m.start()..m.end()]);
+                let is_empty = piece.is_empty();
+                let mv = JsValue::from_string(vm.heap.alloc_string(piece));
+                vm.array_create_data_prop(arr, n, mv)?;
+                n += 1;
+                pos = if is_empty {
+                    advance_string_index_u16(&units, m.end(), full_unicode)
+                } else {
+                    m.end()
+                };
+                last_match = Some(m);
+                if n > 1_000_000 {
+                    return Err(vm.range_error("Script execution iteration limit exceeded"));
+                }
+            }
+            if let Some(lm) = last_match {
+                update_legacy_statics_from_match(vm, &s, &units, &lm);
+            }
+            set_last_index_strict(vm, rx, JsValue::from_i32(0))?;
+            return Ok(if n == 0 {
+                JsValue::NULL
+            } else {
+                JsValue::from_object(arr)
+            });
+        }
+    }
     let sv = JsValue::from_string(vm.heap.alloc_string(s.clone()));
     let k_flags = vm.heap.intern_key("flags");
     let flags_v = vm.get_property_by_key(rx, k_flags)?;
@@ -1006,6 +1127,58 @@ fn regexp_symbol_replace(
     } else {
         vm.to_js_string(repl_val)?
     };
+    if !functional && !repl_str.contains('$') {
+        if let Some((flags, compiled)) = try_fast_builtin_regexp(vm, rx, false)? {
+            let global = flags.contains('g');
+            let sticky = flags.contains('y');
+            let full_unicode = flags.contains('u') || flags.contains('v');
+            if !sticky {
+                if global {
+                    set_last_index_strict(vm, rx, JsValue::from_i32(0))?;
+                }
+                let mut out = String::with_capacity(s.len());
+                let mut next_pos = 0usize;
+                let mut pos = 0usize;
+                let mut count = 0usize;
+                let mut last_match: Option<regress::Match> = None;
+                while pos <= units.len() {
+                    let m_opt = if full_unicode {
+                        compiled.find_from_utf16(&units, pos).next()
+                    } else {
+                        compiled.find_from_ucs2(&units, pos).next()
+                    };
+                    let Some(m) = m_opt else {
+                        break;
+                    };
+                    out.push_str(&String::from_utf16_lossy(&units[next_pos..m.start()]));
+                    out.push_str(&repl_str);
+                    next_pos = m.end();
+                    let is_empty = m.start() == m.end();
+                    last_match = Some(m);
+                    count += 1;
+                    if !global {
+                        break;
+                    }
+                    pos = if is_empty {
+                        advance_string_index_u16(&units, next_pos, full_unicode)
+                    } else {
+                        next_pos
+                    };
+                    if count > 1_000_000 {
+                        return Err(vm.range_error("Script execution iteration limit exceeded"));
+                    }
+                }
+                if let Some(lm) = last_match {
+                    update_legacy_statics_from_match(vm, &s, &units, &lm);
+                }
+                if global {
+                    set_last_index_strict(vm, rx, JsValue::from_i32(0))?;
+                }
+                out.push_str(&String::from_utf16_lossy(&units[next_pos..]));
+                return Ok(JsValue::from_string(vm.heap.alloc_string(out)));
+            }
+        }
+    }
     let k_flags = vm.heap.intern_key("flags");
     let flags_v = vm.get_property_by_key(rx, k_flags)?;
     let flags = vm.to_js_string(flags_v)?;
@@ -1139,6 +1312,87 @@ fn regexp_symbol_split(
     };
     let s = vm.to_js_string(arg(args, 0))?;
     let units: Vec<u16> = s.encode_utf16().collect();
+    // Fast O(N) path for ordinary built-in RegExp objects (untouched `.exec` and `Symbol.species`):
+    // scans UTF-16 code units once directly via `regress` instead of O(N^2) per-code-unit `exec`.
+    if let Some((flags, compiled)) = try_fast_builtin_regexp(vm, rx, true)? {
+        let unicode_matching = flags.contains('u') || flags.contains('v');
+        let lim = if arg(args, 1).is_undefined() {
+            u32::MAX
+        } else {
+            vm.to_u32(arg(args, 1))?
+        };
+        let out = vm.alloc_array();
+        if lim == 0 {
+            return Ok(JsValue::from_object(out));
+        }
+        let size = units.len();
+        if size == 0 {
+            let m_opt = if unicode_matching {
+                compiled.find_from_utf16(&units, 0).next()
+            } else {
+                compiled.find_from_ucs2(&units, 0).next()
+            };
+            if m_opt.is_none() {
+                let sv = JsValue::from_string(vm.heap.alloc_string(s));
+                vm.array_create_data_prop(out, 0, sv)?;
+            }
+            return Ok(JsValue::from_object(out));
+        }
+        let (mut p, mut q, mut len_a) = (0usize, 0usize, 0u32);
+        let mut last_match: Option<regress::Match> = None;
+        while q < size {
+            let m_opt = if unicode_matching {
+                compiled.find_from_utf16(&units, q).next()
+            } else {
+                compiled.find_from_ucs2(&units, q).next()
+            };
+            let Some(m) = m_opt else {
+                break;
+            };
+            let m_start = m.start().min(size);
+            let e = m.end().min(size);
+            if m_start >= size {
+                break;
+            }
+            if e == p {
+                q = advance_string_index_u16(&units, m_start, unicode_matching);
+                continue;
+            }
+            let piece = String::from_utf16_lossy(&units[p..m_start]);
+            let pv = JsValue::from_string(vm.heap.alloc_string(piece));
+            vm.array_create_data_prop(out, u64::from(len_a), pv)?;
+            len_a += 1;
+            if len_a == lim {
+                update_legacy_statics_from_match(vm, &s, &units, &m);
+                return Ok(JsValue::from_object(out));
+            }
+            p = e;
+            for cap in &m.captures {
+                let cv = match cap {
+                    Some(r) => JsValue::from_string(
+                        vm.heap
+                            .alloc_string(String::from_utf16_lossy(&units[r.start..r.end])),
+                    ),
+                    None => JsValue::UNDEFINED,
+                };
+                vm.array_create_data_prop(out, u64::from(len_a), cv)?;
+                len_a += 1;
+                if len_a == lim {
+                    update_legacy_statics_from_match(vm, &s, &units, &m);
+                    return Ok(JsValue::from_object(out));
+                }
+            }
+            q = p;
+            last_match = Some(m);
+        }
+        if let Some(lm) = last_match {
+            update_legacy_statics_from_match(vm, &s, &units, &lm);
+        }
+        let tail = String::from_utf16_lossy(&units[p..size]);
+        let tv = JsValue::from_string(vm.heap.alloc_string(tail));
+        vm.array_create_data_prop(out, u64::from(len_a), tv)?;
+        return Ok(JsValue::from_object(out));
+    }
     let default_ctor = regexp_ctor_handle(vm);
     let c = species_constructor(vm, rx, default_ctor)?;
     let k_flags = vm.heap.intern_key("flags");

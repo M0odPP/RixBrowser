@@ -1714,7 +1714,8 @@ pub fn layout_flex_container(
                 .min(max_c)
                 .max(min_c);
             let target_cross_b = target_cross_c + pb_c;
-            let need_relayout_for_pct = !had_def_c && !ctx.tree.get(box_id).children.is_empty();
+            let need_relayout_for_pct =
+                !had_def_c && subtree_has_percent_cross(ctx.tree, box_id, axes.main_is_x, 0);
             if (target_cross_b - items[idx].used_cross_border).abs() > 0.25 || need_relayout_for_pct
             {
                 // Re-layout item at definite stretched cross size so percentage cross descendants resolve accurately!
@@ -2423,4 +2424,60 @@ fn resolve_flexible_lengths(
             }
         }
     }
+}
+
+/// Returns `true` if any descendant (up to 3 levels deep) inside `box_id` depends on a
+/// definite cross-axis containing block size (`%`/`calc` size, aspect ratio, or flex/grid
+/// cross stretch), avoiding exponential `2^depth` stretch re-layouts on nested auto-height
+/// flex containers whose Pass-1 height already matches `target_cross_b`.
+fn subtree_has_percent_cross(
+    tree: &crate::box_tree::BoxTree,
+    box_id: BoxId,
+    main_is_x: bool,
+    depth: u8,
+) -> bool {
+    if depth >= 3 {
+        return false;
+    }
+    let has_pct = |sv: &SizeValue| {
+        matches!(
+            sv,
+            SizeValue::Length(LengthPercentage::Percent(_) | LengthPercentage::Calc(_))
+        )
+    };
+    for &cid in &tree.get(box_id).children {
+        let cb = tree.get(cid);
+        let bm = &cb.style.box_model;
+        if main_is_x {
+            if has_pct(&bm.height)
+                || has_pct(&bm.min_height)
+                || has_pct(&bm.max_height)
+                || matches!(
+                    bm.inset.top,
+                    LengthPercentageAuto::Value(
+                        LengthPercentage::Percent(_) | LengthPercentage::Calc(_)
+                    )
+                )
+                || matches!(
+                    bm.inset.bottom,
+                    LengthPercentageAuto::Value(
+                        LengthPercentage::Percent(_) | LengthPercentage::Calc(_)
+                    )
+                )
+            {
+                return true;
+            }
+        } else if has_pct(&bm.width) || has_pct(&bm.min_width) || has_pct(&bm.max_width) {
+            return true;
+        }
+        if matches!(
+            cb.formatting_context(),
+            crate::box_tree::FormattingContextKind::Flex
+                | crate::box_tree::FormattingContextKind::Grid
+        ) && subtree_has_percent_cross(tree, cid, main_is_x, depth + 1)
+        {
+            return true;
+        }
+    }
+    false
 }

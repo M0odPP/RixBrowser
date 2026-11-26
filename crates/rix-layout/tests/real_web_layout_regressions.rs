@@ -1939,3 +1939,65 @@ fn nested_flex_grid_with_propagated_absolute_descendants_memoizes_and_svg_em_uni
         "all 12 propagated position:absolute badges must still be painted after memo replay"
     );
 }
+
+#[test]
+fn svg_use_referencing_symbol_viewbox_scales_into_1em_viewport_and_clips_overflow() {
+    // SVG 2 §5.7.1 & §14.3.2: `<svg width="1em" height="1em">` containing
+    // `<symbol id="icon" viewBox="0 0 256 256">` instantiated by `<use href="#icon">` must
+    // scale the 256x256 symbol coordinates into 16x16 (`scale = 1/16`) and clip via UA
+    // `svg:not(:root) { overflow: hidden; }`.
+    let html = r##"<!doctype html><html><body>
+        <svg width="1em" height="1em" style="font-size:16px;">
+            <symbol id="caret" viewBox="0 0 256 256">
+                <path d="M0 0 L256 256 L0 256 Z" fill="#112233"/>
+            </symbol>
+            <use href="#caret"></use>
+        </svg>
+    </body></html>"##;
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.cascade_full(&mut doc);
+
+    let font_db = FontDatabase::new();
+    let mut engine = LayoutEngine::new();
+    let mut resources = ResourceRegistry::default();
+    let frame = engine.layout_and_paint(
+        &doc,
+        &styles,
+        Size::new(800.0, 600.0),
+        &font_db,
+        PipelineId(1),
+        &mut resources,
+    );
+
+    fn find_svg_transform(f: &rix_layout::Fragment) -> Option<([f64; 6], f32)> {
+        if let rix_layout::FragmentKind::Svg { paths, .. } = &f.kind {
+            if let Some(p) = paths.first() {
+                return Some((p.transform, f.border_rect.size.width));
+            }
+        }
+        for c in f.children.iter() {
+            if let Some(hit) = find_svg_transform(c) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+    let root = frame.fragment_tree.root.as_ref().expect("root");
+    let (xf, width) = find_svg_transform(root).expect("SVG path from <use><symbol> must exist");
+    assert!((width - 16.0).abs() < 1.0, "expected 16px SVG, got {width}");
+    let expected_scale = 16.0 / 256.0;
+    assert!(
+        (xf[0] - expected_scale).abs() < 1e-4 && (xf[3] - expected_scale).abs() < 1e-4,
+        "expected <symbol viewBox='0 0 256 256'> scale {expected_scale}, got transform {xf:?}"
+    );
+    assert!(
+        frame
+            .display_list
+            .items
+            .iter()
+            .any(|item| matches!(item, DisplayItem::PushClip { .. })),
+        "svg:not(:root) must clip overflow per SVG 2 §14.3.2"
+    );
+}
