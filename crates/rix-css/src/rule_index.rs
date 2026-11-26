@@ -180,6 +180,8 @@ pub struct RuleIndex {
     pub random_doc_seed: u64,
     /// True when any rule is enclosed in an `@scope` block.
     pub has_scope_rules: bool,
+    /// True when any rule is enclosed in an `@container` block.
+    pub has_container_queries: bool,
     /// Merged `@property` / `CSS.registerProperty` custom property registrations (layer-ordered).
     pub registered_properties: HashMap<InternedStr, RegisteredProperty>,
     /// Merged `@keyframes` rules by name (layer-ordered per CSS Cascade L5).
@@ -229,6 +231,7 @@ impl RuleIndex {
             has_attr_custom_props: false,
             random_doc_seed: crate::values::EvalContext::default().random_doc_seed,
             has_scope_rules: false,
+            has_container_queries: false,
             registered_properties: HashMap::new(),
             keyframes: HashMap::new(),
             font_faces: Vec::new(),
@@ -338,6 +341,10 @@ impl RuleIndex {
                     ancestor_hashes: compiled.ancestor_hashes.clone(),
                 };
                 index.insert_bucket(&compiled.selector, entry);
+                if compiled.container_queries.is_some() {
+                    index.has_container_queries = true;
+                    index.allows_sibling_sharing = false;
+                }
                 if let Some(ref scopes) = compiled.scopes {
                     index.has_scope_rules = true;
                     index.allows_sibling_sharing = false;
@@ -463,6 +470,152 @@ impl RuleIndex {
         self.pseudo_by_kind
             .get(&pseudo)
             .is_some_and(|b| !b.is_empty())
+    }
+
+    /// Marks ONLY DOM elements potentially affected by a newly appended `sheet` as
+    /// `SELF_STYLE_DIRTY` (propagating `DESCENDANT_STYLE_DIRTY` to the document root).
+    /// Returns `true` if incremental marking succeeded, or `false` if a full restyle is required
+    /// (e.g. `sheet` contains universal `*` / `:root` rules, `@property`, `@keyframes`, or `@layer`).
+    pub fn mark_affected_nodes_dirty_for_sheet(
+        doc: &mut rix_dom::Document,
+        sheet: &Stylesheet,
+    ) -> bool {
+        if !sheet.registered_properties.is_empty()
+            || !sheet.keyframes.is_empty()
+            || !sheet.layers.is_empty()
+            || !sheet.font_faces.is_empty()
+        {
+            return false;
+        }
+        let mut target_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut target_classes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut target_tags: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut target_attrs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let html_hash = hash_ident_ascii_lower("html");
+        let body_hash = hash_ident_ascii_lower("body");
+
+        for rule in &sheet.rules {
+            if rule.scopes.is_some() || rule.container_queries.is_some() {
+                return false;
+            }
+            let mut iter = rule.selector.iter();
+            let mut best_id: Option<u64> = None;
+            let mut best_class: Option<u64> = None;
+            let mut best_tag: Option<u64> = None;
+            let mut best_attr: Option<u64> = None;
+            let mut pseudo_kind: Option<RixPseudoElement> = None;
+            for comp in iter.by_ref() {
+                match comp {
+                    Component::PseudoElement(pe) => pseudo_kind = Some(*pe),
+                    Component::ID(id) if best_id.is_none() => best_id = Some(id.hash64),
+                    Component::Class(cls) if best_class.is_none() => best_class = Some(cls.hash64),
+                    Component::LocalName(ln) if best_tag.is_none() => {
+                        best_tag = Some(ln.lower_name.hash64);
+                    }
+                    Component::AttributeInNoNamespace { local_name, .. } if best_attr.is_none() => {
+                        best_attr = Some(local_name.hash64);
+                    }
+                    Component::AttributeInNoNamespaceExists {
+                        local_name_lower, ..
+                    } if best_attr.is_none() => {
+                        best_attr = Some(local_name_lower.hash64);
+                    }
+                    Component::AttributeOther(attr) if best_attr.is_none() => {
+                        best_attr = Some(attr.local_name_lower.hash64);
+                    }
+                    Component::Is(list) | Component::Where(list) if list.slice().len() == 1 => {
+                        extract_simple_key(
+                            &list.slice()[0],
+                            &mut best_id,
+                            &mut best_class,
+                            &mut best_tag,
+                            &mut best_attr,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            if pseudo_kind.is_some()
+                && matches!(iter.next_sequence(), Some(Combinator::PseudoElement))
+            {
+                for comp in iter.by_ref() {
+                    match comp {
+                        Component::ID(id) if best_id.is_none() => best_id = Some(id.hash64),
+                        Component::Class(cls) if best_class.is_none() => {
+                            best_class = Some(cls.hash64);
+                        }
+                        Component::LocalName(ln) if best_tag.is_none() => {
+                            best_tag = Some(ln.lower_name.hash64);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(h) = best_id {
+                target_ids.insert(h);
+            } else if let Some(h) = best_class {
+                target_classes.insert(h);
+            } else if let Some(h) = best_tag {
+                if h == html_hash || h == body_hash {
+                    // Inherited/custom properties on html/body affect the entire document.
+                    return false;
+                }
+                target_tags.insert(h);
+            } else if let Some(h) = best_attr {
+                target_attrs.insert(h);
+            } else {
+                // Universal selector (`*`, `:root`, `:is(...)`) -> fall back to full restyle.
+                return false;
+            }
+        }
+
+        let affected: Vec<rix_dom::NodeId> = doc
+            .descendants(doc.root())
+            .filter(|&nid| {
+                let Some(rix_dom::NodeData::Element(el)) = doc.get(nid) else {
+                    return false;
+                };
+                if !target_ids.is_empty() {
+                    if let Some(ref id) = el.cached_id {
+                        if target_ids.contains(&hash_ident(id.as_str())) {
+                            return true;
+                        }
+                    }
+                }
+                if !target_classes.is_empty()
+                    && el.class_hashes.iter().any(|h| target_classes.contains(h))
+                {
+                    return true;
+                }
+                if !target_tags.is_empty() && target_tags.contains(&el.tag_hash) {
+                    return true;
+                }
+                if !target_attrs.is_empty()
+                    && el.attributes.iter().any(|(q, _)| {
+                        target_attrs.contains(&hash_ident_ascii_lower(q.local.as_str()))
+                    })
+                {
+                    return true;
+                }
+                false
+            })
+            .collect();
+
+        for nid in affected {
+            doc.mark_node_dirty(nid, rix_dom::DirtyFlags::SELF_STYLE_DIRTY);
+            let mut cur = doc.parent(nid);
+            while let Some(anc) = cur {
+                if doc
+                    .dirty_flags(anc)
+                    .contains(rix_dom::DirtyFlags::DESCENDANT_STYLE_DIRTY)
+                {
+                    break;
+                }
+                doc.mark_node_dirty(anc, rix_dom::DirtyFlags::DESCENDANT_STYLE_DIRTY);
+                cur = doc.parent(anc);
+            }
+        }
+        true
     }
 
     fn insert_bucket(&mut self, selector: &Selector<RixSelectorImpl>, entry: RuleBucketEntry) {

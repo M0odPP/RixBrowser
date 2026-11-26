@@ -199,7 +199,8 @@ fn media_supports_font_face_keyframes_nesting_and_missing_dedup() {
         }
         .badge { unknown-prop-x: 1; unknown-prop-x: 2; }
         @container (min-width: 300px) { .badge { opacity: 0.2; } }
-        @container (min-width: 400px) { .badge { opacity: 0.3; } }
+        @unknown-at-rule foo { .badge { opacity: 0.2; } }
+        @unknown-at-rule bar { .badge { opacity: 0.3; } }
     "#;
 
     let dark_wide = MediaContext {
@@ -247,13 +248,19 @@ fn media_supports_font_face_keyframes_nesting_and_missing_dedup() {
         .iter()
         .filter(|m| m.kind == MissingCssKind::Property && m.name.as_str() == "unknown-prop-x")
         .count();
-    let container_count = sheet
+    let container_missing = sheet
         .missing_features
         .iter()
         .filter(|m| m.kind == MissingCssKind::AtRule && m.name.as_str() == "@container")
         .count();
+    let unknown_at_rule_count = sheet
+        .missing_features
+        .iter()
+        .filter(|m| m.kind == MissingCssKind::AtRule && m.name.as_str() == "unknown-at-rule")
+        .count();
     assert_eq!(unknown_count, 1);
-    assert_eq!(container_count, 1);
+    assert_eq!(container_missing, 0);
+    assert_eq!(unknown_at_rule_count, 1);
 }
 
 #[test]

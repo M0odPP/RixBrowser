@@ -601,6 +601,9 @@ pub enum PropertyIdKind {
     WordSpaceTransform,
     WrapInside,
     Contain,
+    ContainerType,
+    ContainerName,
+    Container,
     // Typography
     FontSize,
     FontWeight,
@@ -991,6 +994,9 @@ impl PropertyIdKind {
             "word-space-transform" => Self::WordSpaceTransform,
             "wrap-inside" => Self::WrapInside,
             "contain" => Self::Contain,
+            "container-type" => Self::ContainerType,
+            "container-name" => Self::ContainerName,
+            "container" => Self::Container,
             "font-size" => Self::FontSize,
             "font-weight" => Self::FontWeight,
             "font-style" => Self::FontStyle,
@@ -1245,6 +1251,9 @@ impl PropertyIdKind {
             Self::WordSpaceTransform => "word-space-transform",
             Self::WrapInside => "wrap-inside",
             Self::Contain => "contain",
+            Self::ContainerType => "container-type",
+            Self::ContainerName => "container-name",
+            Self::Container => "container",
             Self::FontSize => "font-size",
             Self::FontWeight => "font-weight",
             Self::FontStyle => "font-style",
@@ -2073,6 +2082,8 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::WordSpaceTransform,
     PropertyIdKind::WrapInside,
     PropertyIdKind::Contain,
+    PropertyIdKind::ContainerType,
+    PropertyIdKind::ContainerName,
     PropertyIdKind::FontSize,
     PropertyIdKind::FontWeight,
     PropertyIdKind::FontStyle,
@@ -2506,6 +2517,10 @@ pub enum PropertyValue {
     WordSpaceTransform(crate::text_css::WordSpaceTransformMode),
     WrapInside(crate::text_css::WrapInsideMode),
     Contain(u8),
+    /// CSS Containment L3 `container-type`: 0=normal, 1=size, 2=inline-size, 4=scroll-state.
+    ContainerType(u8),
+    /// CSS Containment L3 `container-name`: empty = `none`, otherwise ordered custom-idents.
+    ContainerName(Vec<InternedStr>),
     BackgroundImageRaw(String),
     FontStyleObliqueMath(Box<crate::values_math::MathNode>),
     ListStyleType(ListStyleTypeMode),
@@ -2965,6 +2980,9 @@ pub fn is_values4_native_property(prop: PropertyIdKind) -> bool {
             | PropertyIdKind::TextTransform
             | PropertyIdKind::WordBreak
             | PropertyIdKind::Contain
+            | PropertyIdKind::ContainerType
+            | PropertyIdKind::ContainerName
+            | PropertyIdKind::Container
             | PropertyIdKind::Display
             | PropertyIdKind::GridTemplateColumns
             | PropertyIdKind::GridTemplateRows
@@ -3650,6 +3668,82 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
                 parts.push("paint");
             }
             return Some((PropertyValue::Contain(bits), parts.join(" ")));
+        }
+        PropertyIdKind::ContainerType => {
+            let lower = trimmed.to_ascii_lowercase();
+            let toks: Vec<&str> = lower.split_ascii_whitespace().collect();
+            if toks.is_empty() {
+                return None;
+            }
+            if toks.len() == 1 && toks[0] == "normal" {
+                return Some((PropertyValue::ContainerType(0), "normal".to_string()));
+            }
+            let mut bits = 0u8;
+            for t in toks {
+                let bit = match t {
+                    "size" => 0x01,
+                    "inline-size" => 0x02,
+                    "scroll-state" => 0x04,
+                    _ => return None,
+                };
+                if bits & bit != 0 {
+                    return None;
+                }
+                bits |= bit;
+            }
+            if bits & 0x03 == 0x03 {
+                return None;
+            }
+            let mut parts = Vec::new();
+            if bits & 0x01 != 0 {
+                parts.push("size");
+            }
+            if bits & 0x02 != 0 {
+                parts.push("inline-size");
+            }
+            if bits & 0x04 != 0 {
+                parts.push("scroll-state");
+            }
+            return Some((PropertyValue::ContainerType(bits), parts.join(" ")));
+        }
+        PropertyIdKind::ContainerName => {
+            let toks: Vec<&str> = trimmed.split_ascii_whitespace().collect();
+            if toks.is_empty() {
+                return None;
+            }
+            if toks.len() == 1 && toks[0].eq_ignore_ascii_case("none") {
+                return Some((PropertyValue::ContainerName(Vec::new()), "none".to_string()));
+            }
+            let mut names = Vec::with_capacity(toks.len());
+            for tok in &toks {
+                let lower = tok.to_ascii_lowercase();
+                if matches!(lower.as_str(), "none" | "and" | "or" | "not")
+                    || GlobalKeyword::from_ident(&lower).is_some()
+                {
+                    return None;
+                }
+                names.push(intern_str(tok));
+            }
+            return Some((PropertyValue::ContainerName(names), toks.join(" ")));
+        }
+        PropertyIdKind::Container => {
+            let (name_part, type_part) = if let Some((l, r)) = trimmed.split_once('/') {
+                (l.trim(), Some(r.trim()))
+            } else {
+                (trimmed, None)
+            };
+            let (_, name_ser) = parse_values4_property(PropertyIdKind::ContainerName, name_part)?;
+            let type_ser = if let Some(tp) = type_part {
+                parse_values4_property(PropertyIdKind::ContainerType, tp)?.1
+            } else {
+                "normal".to_string()
+            };
+            let ser = if type_ser == "normal" {
+                name_ser
+            } else {
+                format!("{name_ser} / {type_ser}")
+            };
+            return Some((PropertyValue::ContainerType(0), ser));
         }
         PropertyIdKind::ViewTransitionName => {
             if trimmed.eq_ignore_ascii_case("none") {
@@ -4877,6 +4971,31 @@ pub(crate) fn property_has_disallowed_value(prop: &Property<'_>) -> bool {
     }
 }
 
+/// Converts a `lightningcss` color into a [`PropertyValue`], preserving CSS Color 4
+/// wide-gamut/perceptual spaces (`oklch()`, `oklab()`, `lab()`, `lch()`, `color(...)`)
+/// as [`PropertyValue::Color4`] per CSS Color 4 §14.1 instead of eagerly collapsing them
+/// to legacy sRGB `rgb(...)` or dropping colors whose `.to_rgb()` fails.
+fn convert_color_prop(c: &lightningcss::values::color::CssColor) -> Option<PropertyValue> {
+    use lightningcss::values::color::CssColor as LcColor;
+    match c {
+        LcColor::CurrentColor
+        | LcColor::RGBA(_)
+        | LcColor::LightDark(_, _)
+        | LcColor::System(_) => convert_color(c).map(PropertyValue::Color),
+        other => {
+            if let Ok(css_str) = lightningcss::traits::ToCss::to_css_string(
+                other,
+                lightningcss::printer::PrinterOptions::default(),
+            ) {
+                if let Some(expr) = crate::color::parse_css_color(&css_str) {
+                    return Some(PropertyValue::Color4(Box::new(expr)));
+                }
+            }
+            convert_color(other).map(PropertyValue::Color)
+        }
+    }
+}
+
 fn compile_property(
     prop: &Property<'_>,
     imp: bool,
@@ -4990,37 +5109,19 @@ fn compile_property(
             );
         }
         Property::Color(c) => {
-            if let Some(color) = convert_color(c) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::Color,
-                    PropertyValue::Color(color),
-                    imp,
-                );
+            if let Some(val) = convert_color_prop(c) {
+                push_decl(out, ord, PropertyIdKind::Color, val, imp);
             }
         }
         Property::BackgroundColor(c) => {
-            if let Some(color) = convert_color(c) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BackgroundColor,
-                    PropertyValue::Color(color),
-                    imp,
-                );
+            if let Some(val) = convert_color_prop(c) {
+                push_decl(out, ord, PropertyIdKind::BackgroundColor, val, imp);
             }
         }
         Property::Background(bgs) => {
             if let Some(last) = bgs.last() {
-                if let Some(color) = convert_color(&last.color) {
-                    push_decl(
-                        out,
-                        ord,
-                        PropertyIdKind::BackgroundColor,
-                        PropertyValue::Color(color),
-                        imp,
-                    );
+                if let Some(val) = convert_color_prop(&last.color) {
+                    push_decl(out, ord, PropertyIdKind::BackgroundColor, val, imp);
                 }
             }
             let layers: Vec<BackgroundLayerValue> =
@@ -5781,85 +5882,37 @@ fn compile_property(
             );
         }
         Property::BorderTopColor(c) => {
-            if let Some(v) = convert_color(c) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderTopColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(c) {
+                push_decl(out, ord, PropertyIdKind::BorderTopColor, v, imp);
             }
         }
         Property::BorderRightColor(c) => {
-            if let Some(v) = convert_color(c) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderRightColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(c) {
+                push_decl(out, ord, PropertyIdKind::BorderRightColor, v, imp);
             }
         }
         Property::BorderBottomColor(c) => {
-            if let Some(v) = convert_color(c) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderBottomColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(c) {
+                push_decl(out, ord, PropertyIdKind::BorderBottomColor, v, imp);
             }
         }
         Property::BorderLeftColor(c) => {
-            if let Some(v) = convert_color(c) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderLeftColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(c) {
+                push_decl(out, ord, PropertyIdKind::BorderLeftColor, v, imp);
             }
         }
         Property::BorderColor(bc) => {
-            if let Some(v) = convert_color(&bc.top) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderTopColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(&bc.top) {
+                push_decl(out, ord, PropertyIdKind::BorderTopColor, v, imp);
             }
-            if let Some(v) = convert_color(&bc.right) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderRightColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(&bc.right) {
+                push_decl(out, ord, PropertyIdKind::BorderRightColor, v, imp);
             }
-            if let Some(v) = convert_color(&bc.bottom) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderBottomColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(&bc.bottom) {
+                push_decl(out, ord, PropertyIdKind::BorderBottomColor, v, imp);
             }
-            if let Some(v) = convert_color(&bc.left) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderLeftColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(&bc.left) {
+                push_decl(out, ord, PropertyIdKind::BorderLeftColor, v, imp);
             }
         }
         Property::Border(b) => {
@@ -6395,14 +6448,8 @@ fn compile_property(
             imp,
         ),
         Property::OutlineColor(c) => {
-            if let Some(v) = convert_color(c) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::OutlineColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(c) {
+                push_decl(out, ord, PropertyIdKind::OutlineColor, v, imp);
             }
         }
         Property::Outline(o) => {
@@ -6413,14 +6460,8 @@ fn compile_property(
                 PropertyValue::Length(convert_border_width_lp(&o.width)),
                 imp,
             );
-            if let Some(c) = convert_color(&o.color) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::OutlineColor,
-                    PropertyValue::Color(c),
-                    imp,
-                );
+            if let Some(c) = convert_color_prop(&o.color) {
+                push_decl(out, ord, PropertyIdKind::OutlineColor, c, imp);
             }
             let st = match &o.style {
                 lightningcss::properties::outline::OutlineStyle::Auto => LineStyle::Solid,
@@ -6619,14 +6660,8 @@ fn compile_property(
             imp,
         ),
         Property::TextDecorationColor(c, _) => {
-            if let Some(v) = convert_color(c) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::TextDecorationColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(c) {
+                push_decl(out, ord, PropertyIdKind::TextDecorationColor, v, imp);
             }
         }
         Property::TextDecoration(td, _) => {
@@ -6637,14 +6672,8 @@ fn compile_property(
                 PropertyValue::TextDecorationLine(convert_text_decoration_line(&td.line)),
                 imp,
             );
-            if let Some(c) = convert_color(&td.color) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::TextDecorationColor,
-                    PropertyValue::Color(c),
-                    imp,
-                );
+            if let Some(c) = convert_color_prop(&td.color) {
+                push_decl(out, ord, PropertyIdKind::TextDecorationColor, c, imp);
             }
         }
         Property::TextTransform(tt) => push_decl(
@@ -7781,10 +7810,46 @@ fn compile_property(
         },
         other => {
             let prop_id = other.property_id();
-            missing.push(MissingCssFeature::new(
-                MissingCssKind::Property,
-                prop_id.name(),
-            ));
+            let pname = prop_id.name();
+            if let Some(
+                kind @ (PropertyIdKind::ContainerType
+                | PropertyIdKind::ContainerName
+                | PropertyIdKind::Container),
+            ) = PropertyIdKind::from_name(pname)
+            {
+                if let Ok(val_str) =
+                    other.value_to_css_string(lightningcss::stylesheet::PrinterOptions::default())
+                {
+                    if kind == PropertyIdKind::Container {
+                        let trimmed = val_str.trim();
+                        let (name_part, type_part) = if let Some((l, r)) = trimmed.split_once('/') {
+                            (l.trim(), Some(r.trim()))
+                        } else {
+                            (trimmed, None)
+                        };
+                        if let Some((nv, _)) =
+                            parse_values4_property(PropertyIdKind::ContainerName, name_part)
+                        {
+                            let tv = match type_part {
+                                Some(tp) => {
+                                    parse_values4_property(PropertyIdKind::ContainerType, tp)
+                                        .map(|(v, _)| v)
+                                }
+                                None => Some(PropertyValue::ContainerType(0)),
+                            };
+                            if let Some(tv) = tv {
+                                push_decl(out, ord, PropertyIdKind::ContainerName, nv, imp);
+                                push_decl(out, ord, PropertyIdKind::ContainerType, tv, imp);
+                                return;
+                            }
+                        }
+                    } else if let Some((v, _)) = parse_values4_property(kind, val_str.trim()) {
+                        push_decl(out, ord, kind, v, imp);
+                        return;
+                    }
+                }
+            }
+            missing.push(MissingCssFeature::new(MissingCssKind::Property, pname));
         }
     }
 }
@@ -7825,6 +7890,29 @@ fn parse_values4_property_decls(
     out: &mut Vec<SpecifiedDeclaration>,
 ) -> bool {
     match prop {
+        PropertyIdKind::Container => {
+            let trimmed = raw.trim();
+            let (name_part, type_part) = if let Some((l, r)) = trimmed.split_once('/') {
+                (l.trim(), Some(r.trim()))
+            } else {
+                (trimmed, None)
+            };
+            if let Some((nv, _)) = parse_values4_property(PropertyIdKind::ContainerName, name_part)
+            {
+                let tv = match type_part {
+                    Some(tp) => {
+                        parse_values4_property(PropertyIdKind::ContainerType, tp).map(|(v, _)| v)
+                    }
+                    None => Some(PropertyValue::ContainerType(0)),
+                };
+                if let Some(tv) = tv {
+                    push_decl(out, ord, PropertyIdKind::ContainerName, nv, imp);
+                    push_decl(out, ord, PropertyIdKind::ContainerType, tv, imp);
+                    return true;
+                }
+            }
+            false
+        }
         PropertyIdKind::GridRow => {
             if let Some((s, e)) = crate::grid_css::parse_grid_row_or_col_shorthand(raw) {
                 push_decl(

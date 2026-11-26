@@ -178,6 +178,7 @@ pub struct HostState {
     pub layout_engine: LayoutEngine,
     pub(crate) style_ctx: StyleContext,
     external_stylesheets: Vec<Arc<Stylesheet>>,
+    cached_inline_sheet_hashes: Vec<u64>,
     sheets_dirty: bool,
     last_inline_style_hash: u64,
     last_style_revs: Option<(u64, u64)>,
@@ -242,6 +243,33 @@ pub(crate) type ScriptConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
 /// Callback invoked when a dynamic `<img src>` or `<link rel="stylesheet" href>` becomes connected.
 pub(crate) type SubresourceConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
 
+/// Recursively collects `(content_width, content_height)` for every CSS Containment Level 3
+/// size query container (`container-type: size | inline-size`) in a laid-out [`FragmentTree`].
+fn collect_size_container_rects(
+    frag: &rix_layout::Fragment,
+    out: &mut HashMap<NodeId, (f32, f32)>,
+) {
+    if let Some(nid) = frag.dom_node {
+        if frag
+            .style
+            .effects
+            .as_ref()
+            .is_some_and(|e| e.container_type & 0x03 != 0)
+        {
+            out.insert(
+                nid,
+                (
+                    frag.content_rect.size.width.max(0.0),
+                    frag.content_rect.size.height.max(0.0),
+                ),
+            );
+        }
+    }
+    for child in frag.children.iter() {
+        collect_size_container_rects(child, out);
+    }
+}
+
 /// Shared handle to [`HostState`].
 pub type SharedHost = Rc<RefCell<HostState>>;
 
@@ -294,6 +322,7 @@ impl HostState {
             layout_engine: LayoutEngine::new(),
             style_ctx: StyleContext::new(media),
             external_stylesheets: Vec::new(),
+            cached_inline_sheet_hashes: Vec::new(),
             sheets_dirty: true,
             last_inline_style_hash: 0,
             last_style_revs: None,
@@ -837,6 +866,54 @@ impl HostState {
             dark_mode: self.dark_mode,
             ..MediaContext::default()
         };
+
+        // Fast incremental path: when stylesheets were ALREADY cascaded for this viewport/theme
+        // and JS only *appended* new `<style>`/dynamic sheets (typical of CSS-in-JS / React /
+        // Next.js hydration on 10,000+ node DOMs), append and restyle ONLY affected elements!
+        let new_sheet_hashes: Vec<u64> = maybe_sheets
+            .iter()
+            .map(|(css, owner)| {
+                let mut sh = fnv_mix(0xcbf2_9ce4_8422_2325, css.as_bytes());
+                if let Some(pid) = owner {
+                    sh = fnv_mix(sh, &usize::from(*pid).to_le_bytes());
+                }
+                sh
+            })
+            .collect();
+        let is_pure_append = !self.sheets_dirty
+            && self.last_style_revs.is_some()
+            && shadow_adopted_blocks.is_empty()
+            && new_sheet_hashes.len() > self.cached_inline_sheet_hashes.len()
+            && new_sheet_hashes[..self.cached_inline_sheet_hashes.len()]
+                == self.cached_inline_sheet_hashes[..];
+        if is_pure_append {
+            let prev_len = self.cached_inline_sheet_hashes.len();
+            let mut doc = self.document.borrow_mut();
+            for (css, owner_parent) in &maybe_sheets[prev_len..] {
+                let sheet = if owner_parent.is_some()
+                    && (css.contains("@scope") || css.contains("@SCOPE"))
+                {
+                    Arc::new(Stylesheet::parse_with_owner(
+                        css,
+                        CascadeOrigin::Author,
+                        &media,
+                        *owner_parent,
+                    ))
+                } else {
+                    Stylesheet::parse_cached(css, CascadeOrigin::Author, &media)
+                };
+                let _ = self
+                    .style_ctx
+                    .append_stylesheet_incremental(&mut doc, sheet);
+            }
+            let post_revs = (doc.revision(), doc.style_revision());
+            self.cached_inline_sheet_hashes = new_sheet_hashes;
+            self.last_inline_style_hash = inline_hash;
+            self.last_style_revs = Some(post_revs);
+            self.style_recalc_count += 1;
+            return &self.style_ctx;
+        }
+
         let mut ctx = StyleContext::new(media);
         let anim_snap = self.style_ctx.take_animation_state();
         ctx.restore_animation_state(anim_snap);
@@ -889,13 +966,16 @@ impl HostState {
         };
         self.style_ctx = ctx;
         self.sheets_dirty = false;
+        self.cached_inline_sheet_hashes = new_sheet_hashes;
         self.last_inline_style_hash = inline_hash;
         self.last_style_revs = Some(post_revs);
         self.style_recalc_count += 1;
         &self.style_ctx
     }
 
-    /// Recomputes incremental layout ONLY when document structure or style revision changed.
+    /// Recomputes incremental layout ONLY when document structure or style revision changed,
+    /// performing CSS Containment Level 3 two-pass container-query resolution when size
+    /// containers (`container-type: size | inline-size`) are present.
     pub fn ensure_layout(&mut self) -> Option<&FragmentTree> {
         let revs = {
             let doc = self.document.borrow();
@@ -905,7 +985,7 @@ impl HostState {
             return self.cached_fragment_tree.as_ref();
         }
         let _ = self.ensure_styles();
-        let (tree, post_revs) = {
+        let (mut tree, mut post_revs) = {
             let doc = self.document.borrow();
             let (tree, _metrics) = self.layout_engine.layout_only_with_scroll(
                 &doc,
@@ -917,6 +997,43 @@ impl HostState {
             );
             (tree, (doc.revision(), doc.style_revision()))
         };
+
+        // CSS Containment L3: if the page has size query containers (`container-type: size | inline-size`),
+        // feed their Pass-1 laid-out content box dimensions back into `StyleContext`, restyle ONLY
+        // descendants of containers whose size changed, and run Pass-2 incremental layout!
+        if self.style_ctx.has_size_containers() {
+            let mut measured: HashMap<NodeId, (f32, f32)> = HashMap::new();
+            if let Some(ref root) = tree.root {
+                collect_size_container_rects(root, &mut measured);
+            }
+            let changed = self.style_ctx.set_container_sizes(measured);
+            if !changed.is_empty() {
+                {
+                    let mut doc = self.document.borrow_mut();
+                    for cid in changed {
+                        let desc: Vec<NodeId> = doc.descendants(cid).skip(1).collect();
+                        for d in desc {
+                            if matches!(doc.get(d), Some(NodeData::Element(_))) {
+                                doc.mark_node_dirty(d, rix_dom::DirtyFlags::SELF_STYLE_DIRTY);
+                            }
+                        }
+                    }
+                    let _ = self.style_ctx.restyle_dirty(&mut doc);
+                }
+                let doc = self.document.borrow();
+                let (tree2, _) = self.layout_engine.layout_only_with_scroll(
+                    &doc,
+                    &self.style_ctx,
+                    self.viewport,
+                    &self.font_db,
+                    &self.element_scroll_offsets,
+                    self.scroll_offset,
+                );
+                tree = tree2;
+                post_revs = (doc.revision(), doc.style_revision());
+            }
+        }
+
         self.cached_fragment_tree = Some(tree);
         self.last_layout_revs = Some(post_revs);
         self.layout_count += 1;

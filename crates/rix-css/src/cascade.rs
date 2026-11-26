@@ -248,6 +248,8 @@ pub struct StyleContext {
     css_animations_managed: bool,
     animation_clock_ms: f32,
     random_doc_seed: u64,
+    /// Laid-out `(content_width, content_height)` of CSS Containment L3 query containers.
+    container_sizes: HashMap<NodeId, (f32, f32)>,
     missing_seen: HashSet<MissingCssFeature>,
     missing_features: Vec<MissingCssFeature>,
     index_dirty: bool,
@@ -293,6 +295,7 @@ impl StyleContext {
             css_animations_managed: false,
             animation_clock_ms: 0.0,
             random_doc_seed: next_random_doc_seed(),
+            container_sizes: HashMap::new(),
             missing_seen: HashSet::new(),
             missing_features: Vec::new(),
             index_dirty: true,
@@ -333,6 +336,7 @@ impl StyleContext {
             css_animations_managed: false,
             animation_clock_ms: 0.0,
             random_doc_seed: next_random_doc_seed(),
+            container_sizes: HashMap::new(),
             missing_seen: HashSet::new(),
             missing_features: Vec::new(),
             index_dirty: true,
@@ -952,6 +956,59 @@ impl StyleContext {
         self.inline_color_exprs.retain(|&(n, _), _| n != node);
     }
 
+    /// Returns `true` if any author rule uses CSS Containment Level 3 `@container` queries.
+    #[must_use]
+    pub fn has_container_queries(&self) -> bool {
+        self.rule_index.has_container_queries
+    }
+
+    /// Returns `true` if at least one styled element establishes a CSS Containment L3 size
+    /// query container (`container-type: size | inline-size`).
+    #[must_use]
+    pub fn has_size_containers(&self) -> bool {
+        self.styles.values().any(|st| {
+            st.effects
+                .as_ref()
+                .is_some_and(|e| e.container_type & 0x03 != 0)
+        })
+    }
+
+    /// Updates laid-out `(content_width, content_height)` measurements for query container nodes
+    /// and returns all container [`NodeId`]s whose dimensions changed by `> 0.5px`.
+    pub fn set_container_sizes(&mut self, sizes: HashMap<NodeId, (f32, f32)>) -> Vec<NodeId> {
+        let mut changed = Vec::new();
+        for (&nid, &(w, h)) in &sizes {
+            let prev = self.container_sizes.get(&nid).copied();
+            let differs = prev.is_none_or(|(pw, ph)| (pw - w).abs() > 0.5 || (ph - h).abs() > 0.5);
+            if differs {
+                changed.push(nid);
+            }
+        }
+        for &old_nid in self.container_sizes.keys() {
+            if !sizes.contains_key(&old_nid) {
+                changed.push(old_nid);
+            }
+        }
+        self.container_sizes = sizes;
+        changed
+    }
+
+    /// Appends a new author stylesheet and incrementally restyles ONLY affected DOM elements
+    /// when safe (e.g. CSS-in-JS / runtime `<style>` appends on large documents), falling back
+    /// to `cascade_full` only when the stylesheet contains universal/root/layer rules.
+    pub fn append_stylesheet_incremental(
+        &mut self,
+        doc: &mut Document,
+        sheet: Arc<Stylesheet>,
+    ) -> RestyleReport {
+        self.add_stylesheet(Arc::clone(&sheet));
+        self.ensure_index();
+        if self.styles.is_empty() || !RuleIndex::mark_affected_nodes_dirty_for_sheet(doc, &sheet) {
+            return self.cascade_full(doc);
+        }
+        self.restyle_dirty(doc)
+    }
+
     /// Performs a full parallel top-down cascade over the entire document.
     pub fn cascade_full(&mut self, doc: &mut Document) -> RestyleReport {
         let root = doc.root();
@@ -978,6 +1035,7 @@ impl StyleContext {
         let mut bloom = BloomFilter::new();
         let mut caches = SelectorCaches::default();
         let mut memo = StyleMemo::with_capacity(256);
+        let mut active_containers: Vec<ActiveContainer> = Vec::new();
 
         for child in root_children {
             cascade_subtree_par(
@@ -993,6 +1051,8 @@ impl StyleContext {
                 &self.rule_index,
                 &self.inline_color_exprs,
                 &self.media,
+                &self.container_sizes,
+                &mut active_containers,
                 &mut bloom,
                 &mut caches,
                 &mut memo,
@@ -1083,6 +1143,7 @@ impl StyleContext {
             cancelled_local: Vec::new(),
         };
 
+        let mut active_containers: Vec<ActiveContainer> = Vec::new();
         for child in root_children {
             restyle_dirty_walk(
                 doc,
@@ -1099,6 +1160,8 @@ impl StyleContext {
                 &self.rule_index,
                 &self.inline_color_exprs,
                 &self.media,
+                &self.container_sizes,
+                &mut active_containers,
                 &mut bloom,
                 &mut caches,
                 &mut memo,
@@ -1279,6 +1342,87 @@ fn build_shadow_rule_index(
     index
 }
 
+/// Active ancestor CSS Containment L3 query container pushed during top-down cascade.
+#[derive(Debug, Clone)]
+struct ActiveContainer {
+    container_type: u8,
+    names: Vec<rix_core::InternedStr>,
+    width: f32,
+    height: f32,
+    custom_props: Arc<crate::computed::CustomPropertyMap>,
+}
+
+fn maybe_push_active_container(
+    node: NodeId,
+    style: &ComputedStyle,
+    media: &MediaContext,
+    container_sizes: &HashMap<NodeId, (f32, f32)>,
+    active_containers: &mut Vec<ActiveContainer>,
+) -> bool {
+    let Some(ref eff) = style.effects else {
+        return false;
+    };
+    if eff.container_type == 0 && eff.container_name.is_empty() {
+        return false;
+    }
+    let (w, h) = container_sizes
+        .get(&node)
+        .copied()
+        .unwrap_or((media.viewport_width, media.viewport_height));
+    active_containers.push(ActiveContainer {
+        container_type: eff.container_type,
+        names: eff.container_name.clone(),
+        width: w,
+        height: h,
+        custom_props: Arc::clone(&style.custom_properties),
+    });
+    true
+}
+
+fn nearest_size_container(active: &[ActiveContainer]) -> Option<(f32, f32)> {
+    active
+        .iter()
+        .rev()
+        .find(|c| c.container_type & 0x03 != 0)
+        .map(|c| (c.width, c.height))
+}
+
+fn matches_container_queries(
+    queries: &[crate::stylesheet::CompiledContainerQuery],
+    active: &[ActiveContainer],
+    root_font_size: f32,
+    elem_font_size: f32,
+) -> bool {
+    for q in queries {
+        let req_size = q.requires_size_container();
+        let matched_container = active.iter().rev().find(|c| {
+            let type_ok = if req_size {
+                c.container_type & 0x03 != 0
+            } else {
+                true
+            };
+            let name_ok = match &q.name {
+                Some(req_name) => c.names.iter().any(|n| n == req_name),
+                None => true,
+            };
+            type_ok && name_ok
+        });
+        let Some(container) = matched_container else {
+            return false;
+        };
+        if !q.matches(
+            container.width,
+            container.height,
+            root_font_size,
+            elem_font_size,
+            &container.custom_props,
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cascade_subtree_par(
     doc: &Document,
@@ -1293,6 +1437,8 @@ fn cascade_subtree_par(
     rule_index: &RuleIndex,
     inline_color_exprs: &FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
     media: &MediaContext,
+    container_sizes: &HashMap<NodeId, (f32, f32)>,
+    active_containers: &mut Vec<ActiveContainer>,
     bloom: &mut BloomFilter,
     caches: &mut SelectorCaches,
     memo: &mut StyleMemo,
@@ -1321,6 +1467,7 @@ fn cascade_subtree_par(
         rule_index,
         inline_color_exprs,
         media,
+        active_containers,
         Some(bloom),
         caches,
         memo,
@@ -1354,6 +1501,9 @@ fn cascade_subtree_par(
     );
     out_styles.push((node, Arc::clone(&style)));
 
+    let pushed_container =
+        maybe_push_active_container(node, &style, media, container_sizes, active_containers);
+
     let elem_children: SmallVec<[NodeId; 16]> = doc
         .children(node)
         .filter(|&c| matches!(doc.get(c), Some(NodeData::Element(_))))
@@ -1384,6 +1534,8 @@ fn cascade_subtree_par(
                     shadow_index,
                     inline_color_exprs,
                     media,
+                    container_sizes,
+                    active_containers,
                     &mut shadow_bloom,
                     caches,
                     &mut shadow_memo,
@@ -1397,6 +1549,9 @@ fn cascade_subtree_par(
     }
 
     if elem_children.is_empty() {
+        if pushed_container {
+            active_containers.pop();
+        }
         return;
     }
 
@@ -1406,6 +1561,7 @@ fn cascade_subtree_par(
     if allow_parallel && elem_children.len() >= PARALLEL_CHILD_THRESHOLD {
         let parent_arc = Arc::clone(&style);
         let bloom_snapshot = bloom.clone();
+        let container_snapshot = active_containers.clone();
         let threads = rayon::current_num_threads().max(1);
         let chunk_size = elem_children
             .len()
@@ -1415,6 +1571,7 @@ fn cascade_subtree_par(
             .par_chunks(chunk_size)
             .map(|chunk| {
                 let mut local_bloom = bloom_snapshot.clone();
+                let mut local_containers = container_snapshot.clone();
                 let mut local_caches = SelectorCaches::default();
                 let mut local_memo = StyleMemo::with_capacity(64);
                 let mut local_styles = Vec::with_capacity(chunk.len() * 16);
@@ -1436,6 +1593,8 @@ fn cascade_subtree_par(
                         rule_index,
                         inline_color_exprs,
                         media,
+                        container_sizes,
+                        &mut local_containers,
                         &mut local_bloom,
                         &mut local_caches,
                         &mut local_memo,
@@ -1471,6 +1630,8 @@ fn cascade_subtree_par(
                 rule_index,
                 inline_color_exprs,
                 media,
+                container_sizes,
+                active_containers,
                 bloom,
                 caches,
                 memo,
@@ -1483,6 +1644,9 @@ fn cascade_subtree_par(
     }
 
     pop_bloom_hashes(&dom_el, bloom);
+    if pushed_container {
+        active_containers.pop();
+    }
 }
 
 struct AnimWalkCtx<'a> {
@@ -1665,6 +1829,8 @@ fn restyle_dirty_walk(
     rule_index: &RuleIndex,
     inline_color_exprs: &FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
     media: &MediaContext,
+    container_sizes: &HashMap<NodeId, (f32, f32)>,
+    active_containers: &mut Vec<ActiveContainer>,
     bloom: &mut BloomFilter,
     caches: &mut SelectorCaches,
     memo: &mut StyleMemo,
@@ -1708,6 +1874,7 @@ fn restyle_dirty_walk(
             rule_index,
             inline_color_exprs,
             media,
+            active_containers,
             Some(bloom),
             caches,
             memo,
@@ -1908,6 +2075,8 @@ fn restyle_dirty_walk(
                     shadow_index,
                     inline_color_exprs,
                     media,
+                    container_sizes,
+                    active_containers,
                     &mut shadow_bloom,
                     caches,
                     &mut shadow_memo,
@@ -1924,6 +2093,13 @@ fn restyle_dirty_walk(
         }
     }
 
+    let pushed_container = maybe_push_active_container(
+        node,
+        &current_style,
+        media,
+        container_sizes,
+        active_containers,
+    );
     for child in doc.children(node) {
         if matches!(doc.get(child), Some(NodeData::Element(_))) {
             let child_force = force_children
@@ -1943,6 +2119,8 @@ fn restyle_dirty_walk(
                 rule_index,
                 inline_color_exprs,
                 media,
+                container_sizes,
+                active_containers,
                 bloom,
                 caches,
                 memo,
@@ -1956,6 +2134,9 @@ fn restyle_dirty_walk(
                 report,
             );
         }
+    }
+    if pushed_container {
+        active_containers.pop();
     }
     pop_bloom_hashes(&dom_el, bloom);
 }
@@ -1973,6 +2154,7 @@ fn compute_single_element_style(
     rule_index: &RuleIndex,
     inline_color_exprs: &FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
     media: &MediaContext,
+    active_containers: &[ActiveContainer],
     bloom: Option<&BloomFilter>,
     caches: &mut SelectorCaches,
     memo: &mut StyleMemo,
@@ -1980,8 +2162,10 @@ fn compute_single_element_style(
 ) -> (Arc<ComputedStyle>, bool) {
     let has_own_shadow_host_rules = own_shadow_index.is_some_and(RuleIndex::has_host_rules);
     let parent_ptr = parent_style.map_or(0, |p| Arc::as_ptr(p) as usize);
+    let has_active_containers = !active_containers.is_empty();
     let sibling_parent = if rule_index.allows_sibling_sharing
         && !has_own_shadow_host_rules
+        && !has_active_containers
         && parent_ptr != 0
         && elem_eligible_for_sibling_sharing(elem)
     {
@@ -1998,12 +2182,18 @@ fn compute_single_element_style(
     let mut candidate_indices = SmallVec::<[u32; 32]>::new();
     rule_index.collect_candidates(elem, bloom, &mut candidate_indices);
 
+    let elem_fs_basis = parent_style.map_or(root_font_size, |p| p.text.font_size_px);
     let dom_el = DomElement::new(doc, node);
     let mut matched_indices = SmallVec::<[u32; 16]>::new();
     let mut matched_prox = SmallVec::<[u32; 16]>::new();
     let mut any_scoped = false;
     for &idx in &candidate_indices {
         let rule = &rule_index.rules[idx as usize];
+        if let Some(ref cqs) = rule.container_queries {
+            if !matches_container_queries(cqs, active_containers, root_font_size, elem_fs_basis) {
+                continue;
+            }
+        }
         if let Some(prox) =
             match_rule_with_scopes(doc, node, &dom_el, rule, bloom, caches, shadow_host)
         {
@@ -2062,6 +2252,7 @@ fn compute_single_element_style(
     if inline_attr.is_none()
         && !has_pres_hints
         && !any_scoped
+        && !has_active_containers
         && !any_sibling_math
         && !uses_attr
         && !is_mathml
@@ -2119,13 +2310,18 @@ fn compute_single_element_style(
     } else {
         (1, 1)
     };
+    let mut eff_media = *media;
+    if let Some((cw, ch)) = nearest_size_container(active_containers) {
+        eff_media.container_width = Some(cw);
+        eff_media.container_height = Some(ch);
+    }
     let mut resolved_val = resolve_element_style_with_context(
         &matched_refs,
         &pres_decls,
         &inline_decls,
         parent_style.map(Arc::as_ref),
         root_font_size,
-        media,
+        &eff_media,
         Some(&rule_index.registered_properties),
         sib_idx,
         sib_cnt,
@@ -2170,6 +2366,7 @@ fn compute_single_element_style(
     if inline_attr.is_none()
         && !has_pres_hints
         && !any_scoped
+        && !has_active_containers
         && !any_sibling_math
         && !uses_attr
         && !is_mathml
@@ -3070,5 +3267,160 @@ fn mark_subtree_style_dirty(doc: &mut Document, root: NodeId) {
                 stack.push(c);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stage2_container_and_delta_tests {
+    use super::*;
+    use crate::stylesheet::{CascadeOrigin, MediaContext, Stylesheet};
+
+    #[test]
+    fn container_queries_and_cqw_resolve_against_query_container_size() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        let card = doc.create_element("div");
+        if let Some(NodeData::Element(e)) = doc.get_mut(card) {
+            e.set_attribute("class", "card");
+        }
+        let heading = doc.create_element("h1");
+        if let Some(NodeData::Element(e)) = doc.get_mut(heading) {
+            e.set_attribute("class", "title");
+        }
+        doc.append_child(root, html);
+        doc.append_child(html, body);
+        doc.append_child(body, card);
+        doc.append_child(card, heading);
+
+        let media = MediaContext {
+            viewport_width: 1280.0,
+            viewport_height: 800.0,
+            ..MediaContext::default()
+        };
+        let css = r#"
+            .card { container: promo / inline-size; }
+            .title { font-size: 10cqw; color: rgb(10, 20, 30); }
+            @container promo (min-width: 500px) {
+                .title { color: rgb(200, 10, 10); }
+            }
+            @container promo (width < 500px) {
+                .title { color: rgb(10, 180, 20); }
+            }
+        "#;
+        let sheet = Arc::new(Stylesheet::parse(css, CascadeOrigin::Author, &media));
+        let mut ctx = StyleContext::new(media);
+        ctx.add_stylesheet(sheet);
+        let _ = ctx.cascade_full(&mut doc);
+        assert!(ctx.has_size_containers());
+        assert!(ctx.has_container_queries());
+
+        // Narrow container (400px): 10cqw = 40px, matches `(width < 500px)` -> green!
+        let mut sizes = HashMap::new();
+        sizes.insert(card, (400.0, 300.0));
+        let changed = ctx.set_container_sizes(sizes);
+        assert!(changed.contains(&card));
+        mark_node_and_ancestors_dirty(&mut doc, heading);
+        let _ = ctx.restyle_dirty(&mut doc);
+        let st_narrow = ctx.style_for(heading).unwrap();
+        assert!((st_narrow.text.font_size_px - 40.0).abs() < 0.2);
+        assert_eq!(
+            st_narrow.text.color,
+            crate::values::ColorRgba::rgb(10, 180, 20)
+        );
+
+        // Wide container (600px): 10cqw = 60px, matches `(min-width: 500px)` -> red!
+        let mut sizes2 = HashMap::new();
+        sizes2.insert(card, (600.0, 300.0));
+        let _ = ctx.set_container_sizes(sizes2);
+        mark_node_and_ancestors_dirty(&mut doc, heading);
+        let _ = ctx.restyle_dirty(&mut doc);
+        let st_wide = ctx.style_for(heading).unwrap();
+        assert!((st_wide.text.font_size_px - 60.0).abs() < 0.2);
+        assert_eq!(
+            st_wide.text.color,
+            crate::values::ColorRgba::rgb(200, 10, 10)
+        );
+    }
+
+    #[test]
+    fn incremental_stylesheet_append_restyles_only_matching_nodes() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(root, html);
+        doc.append_child(html, body);
+        let mut target_node = body;
+        for i in 0..300 {
+            let d = doc.create_element("div");
+            if let Some(NodeData::Element(e)) = doc.get_mut(d) {
+                e.set_attribute("class", if i == 42 { "target-only" } else { "other" });
+            }
+            doc.append_child(body, d);
+            if i == 42 {
+                target_node = d;
+            }
+        }
+        let media = MediaContext::default();
+        let mut ctx = StyleContext::new(media);
+        let _ = ctx.cascade_full(&mut doc);
+
+        let delta = Arc::new(Stylesheet::parse(
+            ".target-only { color: rgb(255, 0, 128); }",
+            CascadeOrigin::Author,
+            &media,
+        ));
+        let rep = ctx.append_stylesheet_incremental(&mut doc, delta);
+        // Only the 1 matching `.target-only` node (out of 302 elements!) should be restyled!
+        assert_eq!(rep.restyled_elements, 1);
+        assert_eq!(
+            ctx.style_for(target_node).unwrap().text.color,
+            crate::values::ColorRgba::rgb(255, 0, 128)
+        );
+    }
+
+    #[test]
+    fn color4_preserves_oklch_and_lab_and_ua_li_text_align_resolves_left() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        let ul = doc.create_element("ul");
+        let li = doc.create_element("li");
+        doc.append_child(root, html);
+        doc.append_child(html, body);
+        doc.append_child(body, ul);
+        doc.append_child(ul, li);
+
+        let css = r#"
+            body { color: oklch(0.707 0.022 261.325); background-color: lab(88.8292 0 0); }
+        "#;
+        let media = MediaContext::default();
+        let mut ctx = StyleContext::new(media);
+        ctx.add_stylesheet(Arc::new(Stylesheet::parse(
+            css,
+            CascadeOrigin::Author,
+            &media,
+        )));
+        let _ = ctx.cascade_full(&mut doc);
+
+        let body_st = ctx.style_for(body).unwrap();
+        assert!(
+            body_st.text.color_computed.is_some(),
+            "oklch() must retain CSS Color 4 computed value"
+        );
+        assert!(
+            body_st.visual.background_color_computed.is_some(),
+            "lab() must retain CSS Color 4 computed value"
+        );
+        assert!(
+            body_st.visual.background_color.r > 200,
+            "lab(88.8 0 0) must resolve to light gray, got {:?}",
+            body_st.visual.background_color
+        );
+        let li_st = ctx.style_for(li).unwrap();
+        assert_eq!(li_st.text.text_align, crate::values::TextAlignMode::Left);
     }
 }
