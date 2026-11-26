@@ -1336,38 +1336,157 @@ fn num_to_string(
     let Some(n) = prim.as_number() else {
         return Err(vm.type_error("Number.prototype.toString requires that 'this' be a Number"));
     };
-    let radix = args
-        .first()
-        .filter(|v| !v.is_undefined())
-        .map(|&v| vm.to_i32(v))
-        .transpose()?
-        .unwrap_or(10);
-    if !(2..=36).contains(&radix) {
+    let radix_f = match args.first().copied() {
+        None => 10.0,
+        Some(v) if v.is_undefined() => 10.0,
+        Some(v) => vm.to_integer_or_infinity(v)?,
+    };
+    if !radix_f.is_finite() || !(2.0..=36.0).contains(&radix_f) {
         return Err(vm.range_error("toString() radix must be between 2 and 36"));
     }
+    let radix = radix_f as u32;
     if radix == 10 || !n.is_finite() {
         return Ok(JsValue::from_string(
             vm.heap
                 .alloc_string(vm.value_to_rust_string(JsValue::from_f64(n))),
         ));
     }
-    let neg = n < 0.0;
-    let mut int = n.abs().trunc() as u64;
-    if int == 0 {
-        return Ok(JsValue::from_string(vm.heap.alloc_string("0")));
-    }
-    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let mut buf = Vec::new();
-    let r = radix as u64;
-    while int > 0 {
-        buf.push(DIGITS[(int % r) as usize] as char);
-        int /= r;
-    }
-    if neg {
-        buf.push('-');
-    }
-    let s: String = buf.into_iter().rev().collect();
+    let s = format_f64_radix(n, radix);
     Ok(JsValue::from_string(vm.heap.alloc_string(s)))
+}
+
+/// Formats a finite IEEE-754 `f64` in any base `radix` in `2..=36` per ECMA-262 §6.1.6.1.20
+/// (`Number::toString`), preserving exact integer parts (including `>= 2^64`) and shortest
+/// round-tripping fractional digits.
+fn format_f64_radix(n: f64, radix: u32) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n == 0.0 {
+        return "0".to_string();
+    }
+    let neg = n < 0.0;
+    let x = n.abs();
+    let bits = x.to_bits();
+    let next_up = f64::from_bits(bits + 1);
+    let mut delta = ((next_up - x) * 0.5).max(f64::MIN_POSITIVE);
+
+    // Format fractional part first so rounding carry can propagate into integer part if needed.
+    let mut frac = x.fract();
+    let mut frac_digits: Vec<u8> = Vec::new();
+    let mut carry_into_int = false;
+    if frac != 0.0 {
+        let r = f64::from(radix);
+        for _ in 0..120 {
+            frac *= r;
+            delta *= r;
+            let digit = (frac.floor() as u32).min(radix - 1);
+            frac -= f64::from(digit);
+            if frac < delta {
+                frac_digits.push(digit as u8);
+                break;
+            }
+            if 1.0 - frac < delta {
+                let next_d = digit + 1;
+                if next_d < radix {
+                    frac_digits.push(next_d as u8);
+                } else {
+                    // Propagate carry back through fractional digits.
+                    let mut c = true;
+                    for d in frac_digits.iter_mut().rev() {
+                        if u32::from(*d) + 1 < radix {
+                            *d += 1;
+                            c = false;
+                            break;
+                        }
+                        *d = 0;
+                    }
+                    if c {
+                        carry_into_int = true;
+                    }
+                }
+                break;
+            }
+            frac_digits.push(digit as u8);
+        }
+        while frac_digits.last() == Some(&0) {
+            frac_digits.pop();
+        }
+    }
+
+    // Format integer part (exact for both `< 2^64` and arbitrarily large IEEE-754 floats).
+    let int_f = x.trunc() + if carry_into_int { 1.0 } else { 0.0 };
+    let mut int_digits: Vec<u8> = Vec::new();
+    if int_f == 0.0 {
+        int_digits.push(b'0');
+    } else if int_f < 18_446_744_073_709_551_616.0 {
+        let mut int = int_f as u64;
+        let r = u64::from(radix);
+        while int > 0 {
+            int_digits.push(DIGITS[(int % r) as usize]);
+            int /= r;
+        }
+        int_digits.reverse();
+    } else {
+        // Exact IEEE-754 integer mantissa * 2^exp via base-2^32 limbs.
+        let ibits = int_f.to_bits();
+        let exp = (((ibits >> 52) & 0x7ff) as i32) - 1023 - 52;
+        let mant = (1u64 << 52) | (ibits & ((1u64 << 52) - 1));
+        let shift = exp.max(0) as u32;
+        let word_shift = (shift / 32) as usize;
+        let bit_shift = shift % 32;
+        let mut limbs: Vec<u32> = vec![0; word_shift + 3];
+        let lo = mant as u32;
+        let hi = (mant >> 32) as u32;
+        limbs[word_shift] = lo << bit_shift;
+        limbs[word_shift + 1] = (hi << bit_shift)
+            | if bit_shift > 0 {
+                lo >> (32 - bit_shift)
+            } else {
+                0
+            };
+        if bit_shift > 0 {
+            limbs[word_shift + 2] = hi >> (32 - bit_shift);
+        }
+        while limbs.last() == Some(&0) {
+            limbs.pop();
+        }
+        let r = u64::from(radix);
+        while !limbs.is_empty() {
+            let mut rem = 0u64;
+            for limb in limbs.iter_mut().rev() {
+                let cur = (rem << 32) | u64::from(*limb);
+                *limb = (cur / r) as u32;
+                rem = cur % r;
+            }
+            int_digits.push(DIGITS[rem as usize]);
+            while limbs.last() == Some(&0) {
+                limbs.pop();
+            }
+        }
+        int_digits.reverse();
+    }
+
+    let mut out = String::with_capacity(
+        usize::from(neg)
+            + int_digits.len()
+            + if frac_digits.is_empty() {
+                0
+            } else {
+                1 + frac_digits.len()
+            },
+    );
+    if neg {
+        out.push('-');
+    }
+    for b in int_digits {
+        out.push(b as char);
+    }
+    if !frac_digits.is_empty() {
+        out.push('.');
+        for d in frac_digits {
+            out.push(DIGITS[d as usize] as char);
+        }
+    }
+    out
 }
 
 fn num_value_of(

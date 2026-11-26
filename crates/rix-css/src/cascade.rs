@@ -1273,6 +1273,7 @@ fn cascade_subtree_par(
         media,
         Some(bloom),
         caches,
+        memo,
         out_pseudos,
     );
     out_styles.push((node, Arc::clone(&style)));
@@ -1654,6 +1655,7 @@ fn restyle_dirty_walk(
             media,
             Some(bloom),
             caches,
+            memo,
             &mut pseudos,
         );
         for pe in [
@@ -2619,12 +2621,29 @@ fn collect_pseudo_element_styles(
     media: &MediaContext,
     bloom: Option<&BloomFilter>,
     caches: &mut SelectorCaches,
+    memo: &mut StyleMemo,
     out_pseudos: &mut Vec<((NodeId, RixPseudoElement), Arc<ComputedStyle>)>,
 ) {
     let Some(NodeData::Element(orig_elem)) = doc.get(node) else {
         return;
     };
     let elem_attrs: &[(rix_dom::QualName, String)] = &orig_elem.attributes;
+    let tag: &str = orig_elem.name.local.as_ref();
+    let is_input = tag.eq_ignore_ascii_case("input");
+    let is_textarea = tag.eq_ignore_ascii_case("textarea");
+    let is_details = tag.eq_ignore_ascii_case("details");
+    let is_top_layer = orig_elem
+        .pseudo_state
+        .intersects(ElementState::MODAL | ElementState::POPOVER_OPEN | ElementState::FULLSCREEN);
+    let is_list_item = matches!(
+        originating_style.display,
+        crate::values::DisplayMode::ListItem
+            | crate::values::DisplayMode::InlineListItem
+            | crate::values::DisplayMode::FlowRootListItem
+            | crate::values::DisplayMode::InlineFlowRootListItem
+    );
+    let orig_ptr = Arc::as_ptr(originating_style) as usize;
+
     for pseudo in [
         RixPseudoElement::Before,
         RixPseudoElement::After,
@@ -2636,6 +2655,15 @@ fn collect_pseudo_element_styles(
         RixPseudoElement::FileSelectorButton,
         RixPseudoElement::DetailsContent,
     ] {
+        // Skip pseudo-elements that cannot exist on this originating element per CSS Pseudo-Elements L4.
+        match pseudo {
+            RixPseudoElement::Placeholder if !is_input && !is_textarea => continue,
+            RixPseudoElement::FileSelectorButton if !is_input => continue,
+            RixPseudoElement::DetailsContent if !is_details => continue,
+            RixPseudoElement::Backdrop if !is_top_layer => continue,
+            RixPseudoElement::Marker if !is_list_item => continue,
+            _ => {}
+        }
         if !rule_index.has_pseudo_rules(pseudo) {
             continue;
         }
@@ -2646,6 +2674,8 @@ fn collect_pseudo_element_styles(
         }
         let pseudo_el = DomElement::with_pseudo(doc, node, pseudo);
         let mut matched: SmallVec<[MatchedRule<'_>; 8]> = SmallVec::new();
+        let mut matched_indices: SmallVec<[u32; 8]> = SmallVec::new();
+        let mut any_scoped = false;
         for &idx in &cands {
             let rule = &rule_index.rules[idx as usize];
             if let Some(scope_proximity) =
@@ -2656,6 +2686,10 @@ fn collect_pseudo_element_styles(
                     scope_proximity,
                     is_shadow_host_rule: false,
                 });
+                matched_indices.push(idx);
+                if scope_proximity != u32::MAX {
+                    any_scoped = true;
+                }
             }
         }
         if !matched.is_empty() {
@@ -2665,6 +2699,32 @@ fn collect_pseudo_element_styles(
                     .iter()
                     .any(|d| d.value.contains_sibling_fn())
             });
+            let memo_parent_ptr = orig_ptr ^ (((pseudo as usize) + 1) << 56);
+            if !any_scoped && !needs_sib && elem_attrs.is_empty() {
+                if let Some(cached) =
+                    memo.lookup(memo_parent_ptr, layout_parent_flex_grid, &matched_indices)
+                {
+                    out_pseudos.push(((node, pseudo), cached));
+                    continue;
+                }
+            } else if !any_scoped && !needs_sib {
+                let uses_attr = matched.iter().any(|m| {
+                    m.rule.declarations.iter().any(|d| {
+                        matches!(
+                            d.value,
+                            PropertyValue::Unresolved(_) | PropertyValue::Custom(_)
+                        )
+                    })
+                });
+                if !uses_attr {
+                    if let Some(cached) =
+                        memo.lookup(memo_parent_ptr, layout_parent_flex_grid, &matched_indices)
+                    {
+                        out_pseudos.push(((node, pseudo), cached));
+                        continue;
+                    }
+                }
+            }
             let (si, sc) = if needs_sib {
                 element_sibling_position(doc, node)
             } else {
@@ -2715,6 +2775,14 @@ fn collect_pseudo_element_styles(
                 _ => {}
             }
             let style = Arc::new(pstyle);
+            if !any_scoped && !needs_sib {
+                memo.insert(
+                    memo_parent_ptr,
+                    layout_parent_flex_grid,
+                    &matched_indices,
+                    Arc::clone(&style),
+                );
+            }
             out_pseudos.push(((node, pseudo), style));
         }
     }

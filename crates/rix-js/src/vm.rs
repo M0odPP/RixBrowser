@@ -2976,7 +2976,7 @@ impl JsVm {
                 {
                     return Err(self.range_error("Execution interrupted: loop budget exceeded"));
                 }
-                if self.heap.should_collect_minor() {
+                if self.heap.should_collect_minor() || self.heap.should_collect_major() {
                     self.collect_minor_gc();
                 }
                 let cur_pc = self.frames[frame_idx].pc as isize;
@@ -3369,10 +3369,10 @@ impl JsVm {
         self.heap.object_set_slot(cell, 0, val);
     }
 
-    /// Collects all live VM roots and runs a sub-millisecond generational minor GC.
+    /// Collects all live VM roots and runs generational minor (and major when threshold exceeded) GC.
     pub fn collect_minor_gc(&mut self) {
         let roots = self.collect_roots();
-        let _ = self.heap.collect_minor(&roots);
+        let _ = self.heap.maybe_collect(&roots);
     }
 
     // -----------------------------------------------------------------------
@@ -5587,7 +5587,10 @@ impl JsVm {
                 return Ok(JsValue::from_f64(a + f64::from(b)));
             }
             (JsValueKind::String(a), JsValueKind::String(b)) => {
-                let rope = self.heap.alloc_rope(a, b).unwrap_or(a);
+                let rope = self
+                    .heap
+                    .alloc_rope(a, b)
+                    .ok_or_else(|| self.range_error("Invalid string length"))?;
                 return Ok(JsValue::from_string(rope));
             }
             _ => {}
@@ -6965,7 +6968,7 @@ impl JsVm {
         {
             return Err(self.range_error("Execution interrupted: loop budget exceeded"));
         }
-        if self.heap.should_collect_minor() {
+        if self.heap.should_collect_minor() || self.heap.should_collect_major() {
             self.collect_minor_gc();
         }
         Ok(())

@@ -410,3 +410,85 @@ fn labeled_statements_nested_labels_and_unlabeled_break_follow_ecma262() {
         "ECMA-262 §14.8: continue targeting a non-loop label must fail"
     );
 }
+
+#[test]
+fn number_to_string_radix_formats_fractions_and_large_floats_per_ecma262() {
+    // ECMA-262 §21.1.3.6 / §6.1.6.1.20: non-decimal radix formatting must emit fractional digits
+    // (critical for `Math.random().toString(36).slice(2)` ID generators) and large floats >= 2^64.
+    let src = r#"
+        const checks = [
+            (0.5).toString(2) === "0.1",
+            (0.25).toString(16) === "0.4",
+            (0.1).toString(16) === "0.1999999999999a",
+            (-255.5).toString(16) === "-ff.8",
+            (-0).toString(36) === "0",
+            (255).toString(16) === "ff",
+            (0.75).toString(36) === "0.r",
+            (1e25).toString(16).length > 16,
+        ];
+        // Random base-36 ID generator loop must terminate quickly (< 10 iterations).
+        let id = "";
+        let loops = 0;
+        while (id.length < 16 && loops < 10) {
+            id += Math.random().toString(36).slice(2);
+            loops++;
+        }
+        checks.push(id.length >= 16 && loops < 10);
+        let badRadix = 0;
+        for (const r of [1, 1.9, 37, NaN, Infinity]) {
+            try { (10).toString(r); } catch (e) { if (e instanceof RangeError) badRadix++; }
+        }
+        checks.push(badRadix === 5);
+        checks.every(Boolean)
+    "#;
+    let mut vm = rix_js::JsVm::new();
+    let val = vm
+        .eval_script(src)
+        .expect("Number.prototype.toString(radix) must succeed");
+    assert_eq!(val.as_bool(), Some(true));
+}
+
+#[test]
+fn sparse_array_object_keys_is_linear_in_present_entries() {
+    // ECMA-262 §10.1.11.1: `Object.keys` on a sparse array with index 10,000,000 must iterate
+    // only present entries rather than scanning 0..length.
+    let src = r#"
+        const a = [];
+        a[10000000] = "hi";
+        a[5] = "lo";
+        a.extra = 1;
+        Object.keys(a).join(",")
+    "#;
+    let mut vm = rix_js::JsVm::new();
+    let t0 = std::time::Instant::now();
+    let val = vm
+        .eval_script(src)
+        .expect("sparse Object.keys must succeed");
+    assert!(
+        t0.elapsed().as_millis() < 500,
+        "sparse Object.keys took too long: {:?}",
+        t0.elapsed()
+    );
+    let s = vm.value_to_rust_string(val);
+    assert_eq!(s, "5,10000000,extra");
+}
+
+#[test]
+fn compiler_o1_local_and_upvalue_lookup_handles_shadowing_and_1200_locals() {
+    let mut src = String::from("(function() {\n");
+    for i in 0..1200 {
+        src.push_str(&format!("  let v{i} = {i};\n"));
+    }
+    src.push_str("  let shadow = 10;\n");
+    src.push_str("  let innerRes = 0;\n");
+    src.push_str("  { let shadow = 99; innerRes = shadow; }\n");
+    src.push_str("  const f = () => v0 + v599 + v1199 + shadow;\n");
+    src.push_str("  return f() + innerRes;\n})()");
+
+    let mut vm = rix_js::JsVm::new();
+    let val = vm
+        .eval_script(&src)
+        .expect("1200 locals with shadowing must compile & execute quickly");
+    // 0 + 599 + 1199 + 10 + 99 = 1907
+    assert_eq!(val.as_number(), Some(1_907.0));
+}

@@ -1064,12 +1064,7 @@ pub fn mop_own_property_keys(
                     }
                 }
             }
-            let elen = o.elements.len();
-            for i in 0..elen {
-                if o.elements.has(i) && !indices.contains(&i) {
-                    indices.push(i);
-                }
-            }
+            indices.extend(o.elements.present_indices());
         }
         let raw_keys: Vec<PropertyKey> = if o.is_dictionary() {
             o.rare
@@ -1093,9 +1088,7 @@ pub fn mop_own_property_keys(
                     sym_keys.push((SymbolId(sym_num), pk));
                 } else if let Ok(idx) = name.parse::<u32>() {
                     if idx < u32::MAX && idx.to_string() == name {
-                        if !indices.contains(&idx) {
-                            indices.push(idx);
-                        }
+                        indices.push(idx);
                     } else if seen_str.insert(pk) {
                         str_keys.push((name, pk));
                     }
@@ -1109,6 +1102,7 @@ pub fn mop_own_property_keys(
         }
     }
     indices.sort_unstable();
+    indices.dedup();
     let mut out = Vec::with_capacity(indices.len() + str_keys.len() + sym_keys.len());
     for i in indices {
         let s = i.to_string();

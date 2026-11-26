@@ -1244,20 +1244,31 @@ impl GcHeap {
 
     /// Allocates an O(1) rope string referencing `left` and `right` heap string handles.
     pub fn alloc_rope(&mut self, left: HeapHandle, right: HeapHandle) -> Option<HeapHandle> {
+        const MAX_ROPE_BYTES: usize = 256 * 1024 * 1024;
         let (lb, lu) = {
             let s = self.get_string(left)?;
             (s.byte_len(), s.utf16_len())
         };
+        if lb == 0 {
+            return Some(right);
+        }
         let (rb, ru) = {
             let s = self.get_string(right)?;
             (s.byte_len(), s.utf16_len())
         };
+        if rb == 0 {
+            return Some(left);
+        }
+        let total_bytes = lb.checked_add(rb)?;
+        if total_bytes > MAX_ROPE_BYTES {
+            return None;
+        }
         Some(self.alloc_cell(
             HeapCell::String(JsString::Rope {
                 left,
                 right,
-                byte_len: lb + rb,
-                utf16_len: lu + ru,
+                byte_len: total_bytes,
+                utf16_len: lu.saturating_add(ru),
             }),
             Generation::Young,
         ))

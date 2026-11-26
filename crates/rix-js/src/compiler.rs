@@ -130,8 +130,10 @@ struct FunctionCompiler {
     string_consts: HashMap<String, u32>,
     ic_slots: Vec<IcSlotDescriptor>,
     upvalues: Vec<UpvalueDescriptor>,
+    upvalue_index: HashMap<(bool, u16), u16>,
     exception_handlers: Vec<ExceptionHandler>,
     locals: Vec<LocalVar>,
+    local_index: HashMap<String, smallvec::SmallVec<[usize; 2]>>,
     scope_depth: u32,
     next_reg: u8,
     next_spill: u16,
@@ -173,8 +175,10 @@ impl FunctionCompiler {
             string_consts: HashMap::new(),
             ic_slots: Vec::new(),
             upvalues: Vec::new(),
+            upvalue_index: HashMap::new(),
             exception_handlers: Vec::new(),
             locals: Vec::new(),
+            local_index: HashMap::new(),
             scope_depth: 0,
             next_reg: 0,
             next_spill: WIDE_LOCAL_BASE,
@@ -355,8 +359,9 @@ impl FunctionCompiler {
         if let Some(slot) = lowest_captured_wide {
             self.emit(Instruction::abx(Opcode::CloseUpvaluesWide, 0, slot));
         }
-        let new_len = self.locals.len() - pop_count;
-        self.locals.truncate(new_len);
+        for _ in 0..pop_count {
+            self.pop_local();
+        }
         if let Some(new_top) = min_popped_fast {
             if new_top < self.next_reg {
                 self.next_reg = new_top;
@@ -383,9 +388,29 @@ impl FunctionCompiler {
         Ok(slot)
     }
 
+    fn push_local_var(&mut self, var: LocalVar) {
+        let idx = self.locals.len();
+        self.local_index
+            .entry(var.name.clone())
+            .or_default()
+            .push(idx);
+        self.locals.push(var);
+    }
+
+    fn pop_local(&mut self) {
+        if let Some(removed) = self.locals.pop() {
+            if let Some(stack) = self.local_index.get_mut(&removed.name) {
+                stack.pop();
+                if stack.is_empty() {
+                    self.local_index.remove(&removed.name);
+                }
+            }
+        }
+    }
+
     fn declare_param_local(&mut self, name: &str) -> Result<u16, CompileError> {
         let reg = u16::from(self.alloc_reg()?);
-        self.locals.push(LocalVar {
+        self.push_local_var(LocalVar {
             name: name.to_owned(),
             reg,
             depth: self.scope_depth,
@@ -409,7 +434,7 @@ impl FunctionCompiler {
         } else {
             self.alloc_spill_slot()?
         };
-        self.locals.push(LocalVar {
+        self.push_local_var(LocalVar {
             name: name.to_owned(),
             reg,
             depth: self.scope_depth,
@@ -545,21 +570,16 @@ impl FunctionCompiler {
         }
     }
 
+    #[inline]
     fn find_local(&self, name: &str) -> Option<(usize, &LocalVar)> {
-        self.locals
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, l)| l.name == name)
+        let &idx = self.local_index.get(name)?.last()?;
+        Some((idx, &self.locals[idx]))
     }
 
     fn add_upvalue(&mut self, desc: UpvalueDescriptor) -> Result<u16, CompileError> {
-        if let Some(pos) = self
-            .upvalues
-            .iter()
-            .position(|u| u.is_local == desc.is_local && u.index == desc.index)
-        {
-            return Ok(pos as u16);
+        let key = (desc.is_local, desc.index);
+        if let Some(&pos) = self.upvalue_index.get(&key) {
+            return Ok(pos);
         }
         if self.upvalues.len() >= usize::from(u16::MAX) {
             return Err(CompileError::Limit(
@@ -568,6 +588,7 @@ impl FunctionCompiler {
         }
         let idx = self.upvalues.len() as u16;
         self.upvalues.push(desc);
+        self.upvalue_index.insert(key, idx);
         Ok(idx)
     }
 
@@ -3147,7 +3168,7 @@ impl Compiler {
                     if self.cur().locals.last().is_some_and(|l| l.is_captured) {
                         self.cur().emit_close_local(self_reg);
                     }
-                    self.cur().locals.pop();
+                    self.cur().pop_local();
                     self.cur().scope_depth -= 1;
                     self.cur().free_to(saved_reg);
                     self.cur().next_spill = saved_spill;
