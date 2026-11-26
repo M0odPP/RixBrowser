@@ -1038,6 +1038,7 @@ impl<'a> Painter<'a> {
                 path_id,
                 fill,
                 stroke,
+                fill_rule_even_odd: entry.fill_rule_even_odd,
             });
         }
         if needs_clip {
@@ -1545,6 +1546,7 @@ impl<'a> Painter<'a> {
                         stroke: entry
                             .stroke
                             .map(|(c, w)| (to_rgba8(c), (w * scale as f32).max(0.5))),
+                        fill_rule_even_odd: entry.fill_rule_even_odd,
                     });
                 }
             }

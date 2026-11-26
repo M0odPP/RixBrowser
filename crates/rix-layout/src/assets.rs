@@ -32,6 +32,8 @@ pub struct SvgPathEntry {
     pub stroke: Option<(ColorRgba, f32)>,
     /// Accumulated 2D affine transform `[a, b, c, d, e, f]` (Kurbo / SVG matrix convention).
     pub transform: [f64; 6],
+    /// SVG 2 `fill-rule`: `true` for `evenodd`, `false` for `nonzero` (default).
+    pub fill_rule_even_odd: bool,
 }
 
 /// Decoded external SVG vector asset ready for `<img src="*.svg">` rendering.
@@ -254,6 +256,20 @@ pub fn extract_svg_from_node(
     svg_node: NodeId,
     current_color: ColorRgba,
 ) -> Option<DecodedSvg> {
+    extract_svg_from_node_with_css(doc, svg_node, current_color, None, None, false)
+}
+
+/// Extracts vector paths from `<svg>` applying inherited CSS presentation properties (`fill`,
+/// `stroke`, `fill-rule`) from the host stylesheet per SVG 2 §13.
+#[must_use]
+pub fn extract_svg_from_node_with_css(
+    doc: &Document,
+    svg_node: NodeId,
+    current_color: ColorRgba,
+    css_fill: Option<Option<ColorRgba>>,
+    css_stroke: Option<Option<ColorRgba>>,
+    css_fill_rule_even_odd: bool,
+) -> Option<DecodedSvg> {
     let Some(NodeData::Element(elem)) = doc.get(svg_node) else {
         return None;
     };
@@ -275,19 +291,45 @@ pub fn extract_svg_from_node(
     let mut paths = Vec::new();
     let ctx = SvgExtractContext::build(doc, svg_node, current_color);
     let root_style = parse_inline_svg_style(elem.get_attribute("style").unwrap_or(""));
-    let inherited_fill = elem
-        .get_attribute("fill")
-        .or_else(|| root_style.get("fill").copied())
-        .map(|raw| ctx.resolve_paint(raw, current_color));
-    let inherited_stroke = elem
-        .get_attribute("stroke")
-        .or_else(|| root_style.get("stroke").copied())
-        .and_then(|raw| ctx.resolve_paint(raw, current_color));
-    let inherited_stroke_w = elem
-        .get_attribute("stroke-width")
-        .or_else(|| root_style.get("stroke-width").copied())
+    let inherited_fill = root_style
+        .get("fill")
+        .copied()
+        .map(|raw| ctx.resolve_paint(raw, current_color))
+        .or(css_fill)
+        .or_else(|| {
+            elem.get_attribute("fill")
+                .map(|raw| ctx.resolve_paint(raw, current_color))
+        });
+    let inherited_stroke = root_style
+        .get("stroke")
+        .copied()
+        .map(|raw| ctx.resolve_paint(raw, current_color))
+        .or(css_stroke)
+        .or_else(|| {
+            elem.get_attribute("stroke")
+                .map(|raw| ctx.resolve_paint(raw, current_color))
+        })
+        .flatten();
+    let inherited_stroke_w = root_style
+        .get("stroke-width")
+        .copied()
+        .or_else(|| elem.get_attribute("stroke-width"))
         .and_then(parse_html_dimension_attr)
         .unwrap_or(1.5);
+    let inherited_fill_rule_even_odd = root_style
+        .get("fill-rule")
+        .copied()
+        .map(|v| v.trim().eq_ignore_ascii_case("evenodd"))
+        .or(if css_fill_rule_even_odd {
+            Some(true)
+        } else {
+            None
+        })
+        .or_else(|| {
+            elem.get_attribute("fill-rule")
+                .map(|v| v.trim().eq_ignore_ascii_case("evenodd"))
+        })
+        .unwrap_or(false);
     let root_opacity = parse_opacity_attr(
         root_style
             .get("opacity")
@@ -306,6 +348,7 @@ pub fn extract_svg_from_node(
             stroke_w: inherited_stroke_w,
             opacity: root_opacity,
             transform: root_xf,
+            fill_rule_even_odd: inherited_fill_rule_even_odd,
         },
         0,
         &mut paths,
@@ -342,6 +385,7 @@ pub fn collect_svg_paths_from_dom(
             stroke_w: inherited_stroke_w,
             opacity: 1.0,
             transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            fill_rule_even_odd: false,
         },
         0,
         out,
@@ -356,6 +400,7 @@ struct SvgInheritState {
     stroke_w: f32,
     opacity: f32,
     transform: [f64; 6],
+    fill_rule_even_odd: bool,
 }
 
 #[derive(Default)]
@@ -809,6 +854,14 @@ fn collect_svg_element(
         transform = affine_mul(transform, parse_svg_transform(tf_raw));
     }
 
+    let fill_rule_even_odd = inline
+        .get("fill-rule")
+        .copied()
+        .or_else(|| elem.get_attribute("fill-rule"))
+        .map_or(inherited.fill_rule_even_odd, |v| {
+            v.trim().eq_ignore_ascii_case("evenodd")
+        });
+
     let child_state = SvgInheritState {
         current_color: inherited.current_color,
         fill,
@@ -816,6 +869,7 @@ fn collect_svg_element(
         stroke_w,
         opacity: elem_opacity,
         transform,
+        fill_rule_even_odd,
     };
 
     if tag.eq_ignore_ascii_case("use") {
@@ -878,6 +932,7 @@ fn collect_svg_element(
                 fill: resolved_fill,
                 stroke: resolved_stroke,
                 transform,
+                fill_rule_even_odd,
             });
         }
     }

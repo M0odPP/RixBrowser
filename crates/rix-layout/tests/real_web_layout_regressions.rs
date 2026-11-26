@@ -1785,3 +1785,73 @@ fn linear_gradient_calc_px_stop_and_zero_hard_stop_follow_css_images_l3() {
     assert_eq!(stops[3].offset, 1.0);
     assert_eq!(stops[3].color.r, 255);
 }
+
+#[test]
+fn nested_flex_grid_layout_memoizes_in_linear_time_and_svg_inherits_css_fill_and_evenodd() {
+    // 1. Deeply nested Flex/Grid containers must finish in O(N) via `pass_fragment_memo`
+    //    even with definite Flex/Grid item size overrides.
+    // 2. Inline `<svg>` inheriting CSS `fill` + `<path fill-rule="evenodd">` must emit a
+    //    `VectorPath` with the CSS fill color and `fill_rule_even_odd: true`.
+    let css = r#"
+        .f { display: flex; flex-direction: column; width: 100%; }
+        .g { display: grid; grid-template-columns: 1fr 1fr; }
+        .wrap svg { fill: #ff1f8f; }
+    "#;
+    let mut html = String::from("<!doctype html><html><body>");
+    for i in 0..12 {
+        html.push_str(if i % 2 == 0 {
+            r#"<div class="f">"#
+        } else {
+            r#"<div class="g">"#
+        });
+    }
+    html.push_str(
+        r#"<div class="wrap"><svg width="40" height="40" viewBox="0 0 40 40"><path d="M0,0H40V40H0ZM10,10H30V30H10Z" fill-rule="evenodd"/></svg></div>"#,
+    );
+    for _ in 0..12 {
+        html.push_str("</div>");
+    }
+    html.push_str("</body></html>");
+
+    let mut doc = parse_html(&html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let font_db = FontDatabase::new();
+    let mut resources = ResourceRegistry::default();
+    let t0 = std::time::Instant::now();
+    let frame = engine.layout_and_paint(
+        &doc,
+        &styles,
+        Size::new(800.0, 600.0),
+        &font_db,
+        PipelineId(1),
+        &mut resources,
+    );
+    assert!(
+        t0.elapsed().as_millis() < 1000,
+        "12-level nested Flex/Grid layout must stay linear via memoization, took {:?}",
+        t0.elapsed()
+    );
+    let has_pink_evenodd = frame.display_list.items.iter().any(|item| {
+        matches!(
+            item,
+            DisplayItem::VectorPath {
+                fill: Some(c),
+                fill_rule_even_odd: true,
+                ..
+            } if c.r == 0xff && c.g == 0x1f && c.b == 0x8f
+        )
+    });
+    assert!(
+        has_pink_evenodd,
+        "inline <svg> must inherit CSS `fill: #ff1f8f` and honor `fill-rule=\"evenodd\"`"
+    );
+}

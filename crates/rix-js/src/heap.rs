@@ -1291,13 +1291,128 @@ impl GcHeap {
             if slot.generation != handle.generation {
                 return None;
             }
-            slot.cell = Some(HeapCell::String(JsString::Flat { data, utf16_len }));
+            slot.cell = Some(HeapCell::String(JsString::Flat {
+                data,
+                utf16_len,
+                utf16_cache: None,
+            }));
         }
         match self.get_string(handle)? {
-            JsString::Flat { data, utf16_len } => Some((data.as_str(), *utf16_len)),
+            JsString::Flat {
+                data, utf16_len, ..
+            } => Some((data.as_str(), *utf16_len)),
             JsString::Interned {
                 data, utf16_len, ..
             } => Some((data.as_ref(), *utf16_len)),
+            _ => None,
+        }
+    }
+
+    /// Ensures a non-ASCII flat string >= 128 bytes has its UTF-16 code unit table cached so
+    /// repeated indexed accesses (`charCodeAt`, `charAt`, `slice`) run in O(1) instead of O(N^2).
+    fn ensure_utf16_cache(&mut self, handle: HeapHandle) {
+        let _ = self.flatten_string(handle);
+        let Some(slot) = self.slots.get_mut(handle.index as usize) else {
+            return;
+        };
+        if slot.generation != handle.generation {
+            return;
+        }
+        match slot.cell.as_mut() {
+            Some(HeapCell::String(JsString::Flat {
+                data,
+                utf16_len,
+                utf16_cache,
+            })) if data.len() != *utf16_len && data.len() >= 128 && utf16_cache.is_none() => {
+                let units: Vec<u16> = data.encode_utf16().collect();
+                *utf16_cache = Some(std::sync::Arc::from(units));
+            }
+            Some(HeapCell::String(JsString::Interned {
+                data, utf16_len, ..
+            })) if data.len() != *utf16_len && data.len() >= 128 => {
+                let units: Vec<u16> = data.encode_utf16().collect();
+                let owned = data.to_string();
+                let u16_len = *utf16_len;
+                slot.cell = Some(HeapCell::String(JsString::Flat {
+                    data: owned,
+                    utf16_len: u16_len,
+                    utf16_cache: Some(std::sync::Arc::from(units)),
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    /// Reads the UTF-16 code unit at `idx` in O(1) amortized time for both ASCII and non-ASCII strings.
+    pub fn string_utf16_at(&mut self, handle: HeapHandle, idx: usize) -> Option<u16> {
+        self.ensure_utf16_cache(handle);
+        match self.get_string(handle)? {
+            JsString::Flat {
+                data,
+                utf16_len,
+                utf16_cache,
+            } => {
+                if idx >= *utf16_len {
+                    return None;
+                }
+                if data.len() == *utf16_len {
+                    return data.as_bytes().get(idx).map(|&b| u16::from(b));
+                }
+                if let Some(cache) = utf16_cache {
+                    return cache.get(idx).copied();
+                }
+                data.encode_utf16().nth(idx)
+            }
+            JsString::Interned {
+                data, utf16_len, ..
+            } => {
+                if idx >= *utf16_len {
+                    return None;
+                }
+                if data.len() == *utf16_len {
+                    return data.as_bytes().get(idx).map(|&b| u16::from(b));
+                }
+                data.encode_utf16().nth(idx)
+            }
+            _ => None,
+        }
+    }
+
+    /// Slices `[start..end)` in UTF-16 code-unit coordinates in O(end - start) amortized time.
+    pub fn string_utf16_slice(
+        &mut self,
+        handle: HeapHandle,
+        start: usize,
+        end: usize,
+    ) -> Option<String> {
+        if start >= end {
+            return Some(String::new());
+        }
+        self.ensure_utf16_cache(handle);
+        match self.get_string(handle)? {
+            JsString::Flat {
+                data,
+                utf16_len,
+                utf16_cache,
+            } => {
+                if data.len() == *utf16_len {
+                    return data.get(start..end).map(str::to_owned);
+                }
+                if let Some(cache) = utf16_cache {
+                    return cache.get(start..end).map(String::from_utf16_lossy);
+                }
+                let units: Vec<u16> = data.encode_utf16().collect();
+                units.get(start..end).map(String::from_utf16_lossy)
+            }
+            JsString::Interned {
+                data, utf16_len, ..
+            } => {
+                if data.len() == *utf16_len {
+                    return data.get(start..end).map(str::to_owned);
+                }
+                let units: Vec<u16> = data.encode_utf16().collect();
+                units.get(start..end).map(String::from_utf16_lossy)
+            }
             _ => None,
         }
     }

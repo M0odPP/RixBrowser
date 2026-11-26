@@ -831,9 +831,23 @@ impl<'a> BoxTreeBuilder<'a> {
                         h_opt.or_else(|| vb_opt.map(|vb| vb.height)).unwrap_or(16.0),
                     ),
                 };
-                let paths = crate::assets::extract_svg_from_node(self.doc, node, style.text.color)
-                    .map(|d| d.paths)
-                    .unwrap_or_default();
+                let resolve_svg_css_paint = |opt: Option<Option<rix_css::CssColor>>| {
+                    opt.map(|inner| {
+                        inner.map(|c| c.resolve(style.text.color, style.color_scheme_dark))
+                    })
+                };
+                let css_fill = resolve_svg_css_paint(style.text.svg_fill);
+                let css_stroke = resolve_svg_css_paint(style.text.svg_stroke);
+                let paths = crate::assets::extract_svg_from_node_with_css(
+                    self.doc,
+                    node,
+                    style.text.color,
+                    css_fill,
+                    css_stroke,
+                    style.text.svg_fill_rule_even_odd,
+                )
+                .map(|d| d.paths)
+                .unwrap_or_default();
                 Some(ReplacedKind::Svg {
                     view_box,
                     intrinsic_size: Size::new(iw, ih),
