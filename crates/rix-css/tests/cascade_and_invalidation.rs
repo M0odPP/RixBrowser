@@ -390,3 +390,68 @@ fn bucketed_pseudo_elements_and_attribute_rules_match_accurately() {
         ColorRgba::rgb(0x00, 0x00, 0xff)
     );
 }
+
+#[test]
+fn universal_noop_custom_properties_preserve_o1_arc_sharing() {
+    // Tailwind v4 pattern: `*, ::before, ::after, ::backdrop` re-declares 100+ `--tw-*` custom
+    // properties identical to `@property` initial values (`0` / `initial`). Unchanged elements
+    // must preserve O(1) `Arc` sharing of `CustomPropertyMap` without allocating per-element maps.
+    let mut css = String::new();
+    for i in 0..80 {
+        css.push_str(&format!(
+            "@property --tw-n-{i} {{ syntax: \"*\"; inherits: false; initial-value: 0; }}\n"
+        ));
+    }
+    for i in 0..20 {
+        css.push_str(&format!(
+            "@property --tw-u-{i} {{ syntax: \"*\"; inherits: false; }}\n"
+        ));
+    }
+    css.push_str("*, ::before, ::after, ::backdrop {\n");
+    for i in 0..80 {
+        css.push_str(&format!("  --tw-n-{i}: 0;\n"));
+    }
+    for i in 0..20 {
+        css.push_str(&format!("  --tw-u-{i}: initial;\n"));
+    }
+    css.push_str("}\n#override { --tw-n-0: 42px; }\n");
+
+    let html = r#"<!doctype html><html><body><div id="a"><span id="b"></span></div><div id="override"><span id="reset"></span></div></body></html>"#;
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let sheet = Arc::new(Stylesheet::parse(&css, CascadeOrigin::Author, &media));
+    let mut ctx = StyleContext::new(media);
+    ctx.add_stylesheet(sheet);
+    ctx.cascade_full(&mut doc);
+
+    let a = find_by_id(&doc, "a");
+    let b = find_by_id(&doc, "b");
+    let ov = find_by_id(&doc, "override");
+    let rst = find_by_id(&doc, "reset");
+
+    let a_st = ctx.style_for(a).unwrap();
+    let b_st = ctx.style_for(b).unwrap();
+    let ov_st = ctx.style_for(ov).unwrap();
+    let rst_st = ctx.style_for(rst).unwrap();
+
+    assert!(
+        Arc::ptr_eq(&a_st.custom_properties, &b_st.custom_properties),
+        "universal no-op custom property re-declarations must keep O(1) Arc sharing"
+    );
+    assert_eq!(
+        ov_st
+            .custom_properties
+            .get_serialized(&rix_core::intern_str("--tw-n-0")),
+        Some("42px")
+    );
+    assert_eq!(
+        rst_st
+            .custom_properties
+            .get_serialized(&rix_core::intern_str("--tw-n-0")),
+        Some("0")
+    );
+    // `::backdrop` on a non-top-layer `<div>` must not be eagerly materialized.
+    assert!(ctx
+        .pseudo_style_for(a, rix_css::RixPseudoElement::Backdrop)
+        .is_none());
+}

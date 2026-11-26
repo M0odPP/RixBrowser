@@ -485,6 +485,9 @@ pub struct CustomPropertyMap {
 
 impl PartialEq for CustomPropertyMap {
     fn eq(&self, other: &Self) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
         if self.parent.is_none() && other.parent.is_none() {
             let mut a_count = 0usize;
             for (k, v) in &self.local {
@@ -497,6 +500,21 @@ impl PartialEq for CustomPropertyMap {
             }
             let b_count = other.local.values().filter(|v| v.is_some()).count();
             return a_count == b_count;
+        }
+        if let (Some(p1), Some(p2)) = (&self.parent, &other.parent) {
+            if Arc::ptr_eq(p1, p2) {
+                for k in self.local.keys() {
+                    if self.get_entry(k) != other.get_entry(k) {
+                        return false;
+                    }
+                }
+                for k in other.local.keys() {
+                    if !self.local.contains_key(k) && self.get_entry(k) != other.get_entry(k) {
+                        return false;
+                    }
+                }
+                return true;
+            }
         }
         let mut a_keys = std::collections::HashSet::new();
         self.collect_visible_keys(&mut a_keys);
@@ -1389,7 +1407,59 @@ pub fn resolve_element_style_with_context(
                 .push((c.key, c.decl));
         }
     }
-    if !raw_custom.is_empty() || needs_reg_seed || !parent_dirty_non_inherited.is_empty() {
+    // Pre-select winning custom declarations and filter out exact no-ops (e.g. Tailwind v4's
+    // `*, ::before, ::after { --tw-*: 0 / initial }` re-declaring values already identical to
+    // the inherited parent map!) so unchanged elements preserve O(1) `Arc` sharing with zero
+    // HashMap or token-serialization allocations.
+    let can_skip_noop_custom = !needs_reg_seed && parent_dirty_non_inherited.is_empty();
+    let mut active_custom: Vec<(InternedStr, &SpecifiedDeclaration)> = Vec::new();
+    for (name, stack) in &raw_custom {
+        if let Some(winner) = select_winning_candidate(stack) {
+            if winner.important {
+                important_props_acc.push((PropertyIdKind::Custom, Some(name.clone())));
+            }
+            if matches!(winner.value, PropertyValue::Global(GlobalKeyword::Inherit)) {
+                style.uses_explicit_inherit = true;
+            }
+            if can_skip_noop_custom {
+                let reg = registered_props.and_then(|m| m.get(name));
+                let is_noop = match &winner.value {
+                    PropertyValue::Custom(tokens)
+                        if !crate::substitution::tokens_contain_subst(tokens)
+                            && style.custom_properties.get(name).is_some_and(|cur| {
+                                trim_css_tokens(cur) == trim_css_tokens(tokens)
+                            }) =>
+                    {
+                        reg.is_none_or(|r| {
+                            let syn = r
+                                .syntax
+                                .trim()
+                                .trim_matches(|c| c == '"' || c == '\'')
+                                .trim();
+                            syn == "*" || !tokens_may_depend_on_element_context(tokens)
+                        })
+                    }
+                    PropertyValue::Global(GlobalKeyword::Initial) => match reg {
+                        None => style.custom_properties.get(name).is_none(),
+                        Some(r) if !is_registered_url_syntax(&r.syntax) => match &r.initial_value {
+                            None => style.custom_properties.get(name).is_none(),
+                            Some(iv) => style
+                                .custom_properties
+                                .get(name)
+                                .is_some_and(|cur| trim_css_tokens(cur) == trim_css_tokens(iv)),
+                        },
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if is_noop {
+                    continue;
+                }
+            }
+            active_custom.push((name.clone(), winner));
+        }
+    }
+    if !active_custom.is_empty() || needs_reg_seed || !parent_dirty_non_inherited.is_empty() {
         let mut custom_map = CustomPropertyMap::child_of(&style.custom_properties);
         if needs_reg_seed {
             // Seed all `@property` initial values ONCE at the root (or when registration set changes).
@@ -1489,35 +1559,22 @@ pub fn resolve_element_style_with_context(
                     map.remove(name);
                 }
             };
-        for (name, stack) in &raw_custom {
-            if let Some(winner) = select_winning_candidate(stack) {
-                if winner.important {
-                    important_props_acc.push((PropertyIdKind::Custom, Some(name.clone())));
+        for (name, winner) in &active_custom {
+            match &winner.value {
+                PropertyValue::Custom(tokens) => {
+                    custom_map.insert(name.clone(), tokens.clone());
                 }
-                if matches!(winner.value, PropertyValue::Global(GlobalKeyword::Inherit)) {
-                    style.uses_explicit_inherit = true;
+                PropertyValue::Global(kw) => {
+                    apply_custom_kw(&mut custom_map, name, *kw);
                 }
-                if let Some(reg) = registered_props.and_then(|m| m.get(name)) {
-                    if !reg.inherits {
-                        custom_map.mark_dirty_non_inherited(name.clone());
-                    }
-                }
-                match &winner.value {
-                    PropertyValue::Custom(tokens) => {
-                        custom_map.insert(name.clone(), tokens.clone());
-                    }
-                    PropertyValue::Global(kw) => {
-                        apply_custom_kw(&mut custom_map, name, *kw);
-                    }
-                    _ => {}
-                }
+                _ => {}
             }
         }
         // Substitute `var()`, `inherit()`, `attr()`, `if()`, `random-item()`, `ident()`
         // inside declared custom properties using Dynamic Tarjan SCC (CSSWG #11500) + taint tracking.
-        let keys_with_subst: Vec<(InternedStr, bool)> = raw_custom
-            .keys()
-            .map(|k| {
+        let keys_with_subst: Vec<(InternedStr, bool)> = active_custom
+            .iter()
+            .map(|(k, _)| {
                 let has_subst = custom_map
                     .get(k)
                     .is_some_and(crate::substitution::tokens_contain_subst);
@@ -1623,6 +1680,24 @@ pub fn resolve_element_style_with_context(
                             apply_custom_kw(&mut custom_map, &name, GlobalKeyword::Unset);
                         } else {
                             custom_map.remove(&name);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(regs) = registered_props {
+            for (name, _) in &active_custom {
+                if let Some(reg) = regs.get(name) {
+                    if !reg.inherits {
+                        let is_initial = match (custom_map.get(name), reg.initial_value.as_ref()) {
+                            (None, None) => true,
+                            (Some(cur), Some(iv)) if !is_registered_url_syntax(&reg.syntax) => {
+                                trim_css_tokens(cur) == trim_css_tokens(iv)
+                            }
+                            _ => false,
+                        };
+                        if !is_initial {
+                            custom_map.mark_dirty_non_inherited(name.clone());
                         }
                     }
                 }
@@ -2171,8 +2246,10 @@ pub fn resolve_element_style_with_context(
     if let Some(regs) = registered_props {
         if needs_reg_seed {
             compute_registered_custom_properties(&mut style, regs, None, &eval_ctx);
-        } else if !raw_custom.is_empty() {
-            compute_registered_custom_properties(&mut style, regs, Some(&raw_custom), &eval_ctx);
+        } else if !active_custom.is_empty() {
+            let names: SmallVec<[InternedStr; 8]> =
+                active_custom.iter().map(|(n, _)| n.clone()).collect();
+            compute_registered_custom_properties(&mut style, regs, Some(&names), &eval_ctx);
         }
     }
 
@@ -2202,11 +2279,31 @@ pub fn resolve_element_style_with_context(
     style
 }
 
+#[inline]
+fn trim_css_tokens(mut toks: &[CssToken]) -> &[CssToken] {
+    while matches!(toks.first(), Some(CssToken::Space)) {
+        toks = &toks[1..];
+    }
+    while matches!(toks.last(), Some(CssToken::Space)) {
+        toks = &toks[..toks.len() - 1];
+    }
+    toks
+}
+
+#[inline]
+fn tokens_may_depend_on_element_context(tokens: &[CssToken]) -> bool {
+    tokens.iter().any(|t| match t {
+        CssToken::Function { .. } => true,
+        CssToken::Dimension(_, unit) => !unit.as_str().eq_ignore_ascii_case("px"),
+        _ => false,
+    })
+}
+
 #[rustfmt::skip]
 fn compute_registered_custom_properties(
     style: &mut ComputedStyle,
     regs: &HashMap<InternedStr, RegisteredProperty>,
-    only_declared: Option<&HashMap<InternedStr, Vec<(CascadeKey, &SpecifiedDeclaration)>>>,
+    only_names: Option<&[InternedStr]>,
     eval: &EvalContext,
 ) {
     use crate::values_math::{parse_math_value, parse_math_value_from_parser, ValueKind};
@@ -2260,8 +2357,8 @@ fn compute_registered_custom_properties(
             }
         }
     };
-    if let Some(declared) = only_declared {
-        for name in declared.keys() {
+    if let Some(names) = only_names {
+        for name in names {
             if let Some(reg) = regs.get(name) {
                 compute_one(name, reg, &mut updates);
             }
