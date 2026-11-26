@@ -63,10 +63,10 @@ pub fn collect_eval_var_declared_names(stmts: &[Statement]) -> Vec<String> {
     out
 }
 
-/// Maximum fast 8-bit register index reserved for local variables (`0..180`), leaving
-/// `180..250` (70 registers) permanently available for expression temporaries and call frames.
+/// Maximum fast 8-bit register index reserved for local variables (`0..96`), leaving
+/// `96..250` (154 registers) permanently available for expression temporaries and call frames.
 /// Locals beyond this threshold spill transparently into extended 16-bit frame slots (`>= 256`).
-const LOCAL_FAST_REG_LIMIT: u8 = 180;
+const LOCAL_FAST_REG_LIMIT: u8 = 96;
 /// First 16-bit extended frame slot index for spilled local variables (`256..=65534`).
 const WIDE_LOCAL_BASE: u16 = 256;
 
@@ -92,7 +92,7 @@ enum VarResolution {
         is_tdz: bool,
     },
     Upvalue {
-        index: u8,
+        index: u16,
         is_const: bool,
         is_fn_expr_name: bool,
     },
@@ -546,20 +546,20 @@ impl FunctionCompiler {
             .find(|(_, l)| l.name == name)
     }
 
-    fn add_upvalue(&mut self, desc: UpvalueDescriptor) -> Result<u8, CompileError> {
+    fn add_upvalue(&mut self, desc: UpvalueDescriptor) -> Result<u16, CompileError> {
         if let Some(pos) = self
             .upvalues
             .iter()
             .position(|u| u.is_local == desc.is_local && u.index == desc.index)
         {
-            return Ok(pos as u8);
+            return Ok(pos as u16);
         }
-        if self.upvalues.len() >= 255 {
+        if self.upvalues.len() >= usize::from(u16::MAX) {
             return Err(CompileError::Limit(
-                "Function exceeded 255 upvalue limit".into(),
+                "Function exceeded 65535 upvalue limit".into(),
             ));
         }
-        let idx = self.upvalues.len() as u8;
+        let idx = self.upvalues.len() as u16;
         self.upvalues.push(desc);
         Ok(idx)
     }
@@ -988,7 +988,7 @@ impl Compiler {
                 } => {
                     let uv_idx = self.frames[frame_idx].add_upvalue(UpvalueDescriptor {
                         is_local: false,
-                        index: u16::from(index),
+                        index,
                         is_const,
                     })?;
                     return Ok(VarResolution::Upvalue {
@@ -1022,7 +1022,7 @@ impl Compiler {
             }
             VarResolution::Upvalue { index, .. } => {
                 self.cur()
-                    .emit(Instruction::abx(Opcode::GetUpvalue, dst, u16::from(index)));
+                    .emit(Instruction::abx(Opcode::GetUpvalue, dst, index));
             }
             VarResolution::ModuleImport(idx) => {
                 self.cur()
@@ -1081,7 +1081,7 @@ impl Compiler {
                     self.cur().free_to(tmp);
                 } else {
                     self.cur()
-                        .emit(Instruction::abx(Opcode::SetUpvalue, src, u16::from(index)));
+                        .emit(Instruction::abx(Opcode::SetUpvalue, src, index));
                 }
             }
             VarResolution::ModuleImport(_) => {
@@ -2876,7 +2876,8 @@ impl Compiler {
                 let has_spread_or_hole = elements
                     .iter()
                     .any(|e| matches!(e, None | Some(ArrayElement::Spread(_))));
-                if !has_spread_or_hole && elements.len() <= 32 {
+                let avail_regs = 240usize.saturating_sub(usize::from(self.cur().next_reg));
+                if !has_spread_or_hole && elements.len() <= 32 && elements.len() + 4 <= avail_regs {
                     let saved = self.cur().next_reg;
                     let base = self.cur().alloc_regs(elements.len() as u8)?;
                     for (i, el) in elements.iter().enumerate() {
@@ -3372,8 +3373,11 @@ impl Compiler {
         let saved = self.cur().next_reg;
 
         // `super(args...)` constructor call.
+        let avail_regs = 240usize.saturating_sub(usize::from(self.cur().next_reg));
+        let spill_args_to_array = has_spread || args.len() > 64 || args.len() + 6 > avail_regs;
+
         if matches!(callee.kind, ExprKind::Super) {
-            if has_spread {
+            if spill_args_to_array {
                 let args_arr = self.cur().alloc_reg()?;
                 self.compile_spread_args_array(args, args_arr)?;
                 self.cur().emit(Instruction::abc(
@@ -3406,7 +3410,7 @@ impl Compiler {
         }
 
         // Fast-path IC `CallMethod`: `obj.method(a, b)` (without spread, non-optional callee).
-        if !has_spread && !optional {
+        if !spill_args_to_array && !optional {
             if let ExprKind::Member {
                 object,
                 property: MemberProp::Ident(prop_name),
@@ -3438,7 +3442,8 @@ impl Compiler {
             }
         }
 
-        if has_spread {
+        let is_direct_eval = !optional && matches!(&callee.kind, ExprKind::Ident(n) if n == "eval");
+        if spill_args_to_array && (!is_direct_eval || has_spread) {
             let base = self.cur().alloc_regs(2)?; // base = callee, base+1 = receiver
             let args_arr = self.cur().alloc_reg()?;
             self.compile_callee_and_receiver(callee, base, base + 1, optional, dst)?;
@@ -3469,7 +3474,6 @@ impl Compiler {
         }
 
         // Ordinary function call `f(a, b)` — check syntactic direct `eval(...)` call.
-        let is_direct_eval = !optional && matches!(&callee.kind, ExprKind::Ident(n) if n == "eval");
         let base = self.cur().alloc_regs((1 + args.len()) as u8)?;
         self.compile_expr(callee, base)?;
         if optional {
@@ -3587,7 +3591,8 @@ impl Compiler {
     ) -> Result<(), CompileError> {
         let saved = self.cur().next_reg;
         let has_spread = args.iter().any(|a| matches!(a, CallArg::Spread(_)));
-        if has_spread {
+        let avail_regs = 240usize.saturating_sub(usize::from(self.cur().next_reg));
+        if has_spread || args.len() > 64 || args.len() + 4 > avail_regs {
             let callee_reg = self.cur().alloc_reg()?;
             let args_arr = self.cur().alloc_reg()?;
             self.compile_expr(callee, callee_reg)?;
@@ -3775,6 +3780,39 @@ impl Compiler {
         dst: u8,
     ) -> Result<(), CompileError> {
         if op == AssignOp::Assign {
+            // ECMA-262 §13.15.2: Evaluate LeftHandSideExpression (member base object and computed
+            // property key) BEFORE evaluating the right-hand AssignmentExpression.
+            if let AssignTarget::Member {
+                object, property, ..
+            } = left
+            {
+                let saved = self.cur().next_reg;
+                let obj_reg = self.cur().alloc_reg()?;
+                self.compile_expr(object, obj_reg)?;
+                match property {
+                    MemberProp::Ident(name) => {
+                        self.compile_expr(right, dst)?;
+                        let c = self.cur().add_string_const(name)?;
+                        let ic = self.cur().add_ic_slot(IcKind::SetProp, c, 0)?;
+                        self.cur().emit_ic_abc(Opcode::SetProp, obj_reg, dst, ic);
+                    }
+                    MemberProp::Private(name) => {
+                        self.compile_expr(right, dst)?;
+                        let c = self.cur().add_string_const(name)?;
+                        let ic = self.cur().add_ic_slot(IcKind::SetProp, c, 0)?;
+                        self.cur().emit_ic_abc(Opcode::SetPrivate, obj_reg, dst, ic);
+                    }
+                    MemberProp::Computed(key_expr) => {
+                        let key_reg = self.cur().alloc_reg()?;
+                        self.compile_expr(key_expr, key_reg)?;
+                        self.compile_expr(right, dst)?;
+                        self.cur()
+                            .emit(Instruction::abc(Opcode::SetElem, obj_reg, key_reg, dst));
+                    }
+                }
+                self.cur().free_to(saved);
+                return Ok(());
+            }
             let inferred = match left {
                 AssignTarget::Ident { name, .. } => Some(name.as_str()),
                 _ => None,
@@ -3785,10 +3823,68 @@ impl Compiler {
         }
 
         // Logical short-circuit assignments (`&&=`, `||=`, `??=`).
+        // ECMA-262 §13.15.2: Evaluate member base & computed key once before testing & storing.
         if matches!(
             op,
             AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign
         ) {
+            if let AssignTarget::Member {
+                object, property, ..
+            } = left
+            {
+                let saved = self.cur().next_reg;
+                let obj_reg = self.cur().alloc_reg()?;
+                self.compile_expr(object, obj_reg)?;
+                let key_reg = match property {
+                    MemberProp::Computed(key_expr) => {
+                        let kr = self.cur().alloc_reg()?;
+                        self.compile_expr(key_expr, kr)?;
+                        self.cur()
+                            .emit(Instruction::abc(Opcode::GetElem, dst, obj_reg, kr));
+                        Some(kr)
+                    }
+                    _ => {
+                        self.emit_member_load(dst, obj_reg, property)?;
+                        None
+                    }
+                };
+                let store_member = |this: &mut Self| -> Result<(), CompileError> {
+                    match (property, key_reg) {
+                        (MemberProp::Computed(_), Some(kr)) => {
+                            this.cur()
+                                .emit(Instruction::abc(Opcode::SetElem, obj_reg, kr, dst));
+                        }
+                        _ => this.emit_member_store(obj_reg, property, dst)?,
+                    }
+                    Ok(())
+                };
+                match op {
+                    AssignOp::NullishAssign => {
+                        let j_eval = self.cur().emit_jump(Opcode::JumpIfNullish, dst);
+                        let j_done = self.cur().emit_jump(Opcode::Jump, 0);
+                        let rhs_pc = self.cur().code.len();
+                        self.cur().patch_jump(j_eval, rhs_pc)?;
+                        self.compile_expr(right, dst)?;
+                        store_member(self)?;
+                        let end_pc = self.cur().code.len();
+                        self.cur().patch_jump(j_done, end_pc)?;
+                    }
+                    AssignOp::AndAssign | AssignOp::OrAssign => {
+                        let skip_jump = if op == AssignOp::AndAssign {
+                            self.cur().emit_jump(Opcode::JumpIfFalse, dst)
+                        } else {
+                            self.cur().emit_jump(Opcode::JumpIfTrue, dst)
+                        };
+                        self.compile_expr(right, dst)?;
+                        store_member(self)?;
+                        let end_pc = self.cur().code.len();
+                        self.cur().patch_jump(skip_jump, end_pc)?;
+                    }
+                    _ => unreachable!(),
+                }
+                self.cur().free_to(saved);
+                return Ok(());
+            }
             self.load_assign_target(left, dst)?;
             let skip_jump = match op {
                 AssignOp::AndAssign => self.cur().emit_jump(Opcode::JumpIfFalse, dst),
@@ -3844,10 +3940,21 @@ impl Compiler {
             } => {
                 let obj = self.cur().alloc_reg()?;
                 self.compile_expr(object, obj)?;
-                self.emit_member_load(lhs, obj, property)?;
-                self.compile_expr(right, rhs)?;
-                self.cur().emit(Instruction::abc(bin_op, dst, lhs, rhs));
-                self.emit_member_store(obj, property, dst)?;
+                if let MemberProp::Computed(key_expr) = property {
+                    let key_reg = self.cur().alloc_reg()?;
+                    self.compile_expr(key_expr, key_reg)?;
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::GetElem, lhs, obj, key_reg));
+                    self.compile_expr(right, rhs)?;
+                    self.cur().emit(Instruction::abc(bin_op, dst, lhs, rhs));
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::SetElem, obj, key_reg, dst));
+                } else {
+                    self.emit_member_load(lhs, obj, property)?;
+                    self.compile_expr(right, rhs)?;
+                    self.cur().emit(Instruction::abc(bin_op, dst, lhs, rhs));
+                    self.emit_member_store(obj, property, dst)?;
+                }
             }
             AssignTarget::Pattern(_) => {
                 return Err(CompileError::Limit(

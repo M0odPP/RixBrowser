@@ -14,7 +14,7 @@ use lightningcss::properties::{
         AnimationFillMode as LightningAnimFill, AnimationIterationCount as LightningAnimIter,
         AnimationName as LightningAnimName, AnimationPlayState as LightningAnimPlay,
     },
-    background::{Background, BackgroundRepeatKeyword, BackgroundSize},
+    background::{Background, BackgroundClip, BackgroundRepeatKeyword, BackgroundSize},
     border::{BorderSideWidth, LineStyle as LightningLineStyle},
     box_shadow::BoxShadow,
     display::{Display, DisplayInside, DisplayKeyword, DisplayOutside, Visibility},
@@ -1603,6 +1603,15 @@ pub enum BackgroundImageValue {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackgroundClipMode {
+    #[default]
+    BorderBox,
+    PaddingBox,
+    ContentBox,
+    Text,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum BackgroundSizeValue {
     #[default]
@@ -2975,6 +2984,16 @@ pub fn convert_image(img: &Image<'_>) -> BackgroundImageValue {
             _ => BackgroundImageValue::None,
         },
         _ => BackgroundImageValue::None,
+    }
+}
+
+#[must_use]
+pub fn convert_background_clip(clip: &BackgroundClip) -> BackgroundClipMode {
+    match clip {
+        BackgroundClip::BorderBox | BackgroundClip::Border => BackgroundClipMode::BorderBox,
+        BackgroundClip::PaddingBox => BackgroundClipMode::PaddingBox,
+        BackgroundClip::ContentBox => BackgroundClipMode::ContentBox,
+        BackgroundClip::Text => BackgroundClipMode::Text,
     }
 }
 

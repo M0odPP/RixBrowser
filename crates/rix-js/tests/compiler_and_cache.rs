@@ -274,3 +274,75 @@ fn allow_in_resets_inside_function_and_nested_delimiters_in_for_init() {
     let val = vm.eval_script(src).expect("nested +In in for-init parses");
     assert_eq!(val.as_number(), Some(3.0));
 }
+
+#[test]
+fn member_assignment_evaluates_lhs_object_and_key_before_rhs_per_ecma262() {
+    // ECMA-262 §13.15.2: LeftHandSideExpression (member base object and computed key) MUST
+    // evaluate before the right-hand AssignmentExpression, and only once in compound/logical
+    // assignments.
+    let src = r#"
+        let b, ce = {};
+        (b = ce.expr = { pseudos: { eq: 42 } }).pseudos.nth = b.pseudos.eq;
+        let arr = [0, 0, 0];
+        let i = 0;
+        arr[i++] = i; // LHS key evaluates to 0 first, then RHS evaluates to 1 -> arr[0] = 1
+        let keyCalls = 0;
+        let obj = { k0: 10, k1: 0 };
+        function nextKey() { return "k" + (keyCalls++); }
+        obj[nextKey()] += 5;  // keyCalls increments once (k0 -> 15)
+        obj[nextKey()] ||= 7; // keyCalls increments once (k1 -> 7)
+        b.pseudos.nth * 1000 + arr[0] * 100 + obj.k0 + obj.k1 + keyCalls * 100000
+    "#;
+    let mut vm = rix_js::JsVm::new();
+    let val = vm
+        .eval_script(src)
+        .expect("ECMA-262 §13.15.2 member assignment order");
+    // 2*100000 + 42*1000 + 1*100 + 15 + 7 = 242122
+    assert_eq!(val.as_number(), Some(242_122.0));
+}
+
+#[test]
+fn closure_captures_more_than_255_upvalues_with_16bit_indices() {
+    // Production webpack/Rollup bundles routinely capture > 255 upvalues in a single IIFE.
+    let mut src = String::from("(function() {\n");
+    for i in 0..310 {
+        src.push_str(&format!("  let u{i} = {i};\n"));
+    }
+    src.push_str("  const f = () => {\n    let s = 0;\n");
+    for i in 0..310 {
+        src.push_str(&format!("    s += u{i};\n"));
+    }
+    src.push_str("    u309 += 1000;\n    return s + u309;\n  };\n  return f();\n})()");
+
+    let mut vm = rix_js::JsVm::new();
+    let val = vm
+        .eval_script(&src)
+        .expect("310 captured upvalues must compile and execute");
+    // sum(0..310) = 309 * 310 / 2 = 47895; + 1309 = 49204
+    assert_eq!(val.as_number(), Some(49_204.0));
+}
+
+#[test]
+fn large_argument_call_and_new_spill_cleanly_without_hitting_250_reg_limit() {
+    // Calling a function or constructor with > 150 arguments inside a function with > 120 locals
+    // must transparently spill arguments via CallSpread / ConstructSpread without hitting the
+    // 250-register window limit.
+    let mut src = String::from("(function() {\n");
+    for i in 0..130 {
+        src.push_str(&format!("  let x{i} = {i};\n"));
+    }
+    src.push_str("  function sum() { let t = 0; for (let i = 0; i < arguments.length; i++) t += arguments[i]; return t; }\n");
+    src.push_str("  function Box() { this.n = arguments.length; }\n");
+    let args: Vec<String> = (0..180).map(|i| format!("x{}", i % 130)).collect();
+    let arg_list = args.join(", ");
+    src.push_str(&format!("  const s = sum({arg_list});\n"));
+    src.push_str(&format!("  const b = new Box({arg_list});\n"));
+    src.push_str("  return s + b.n;\n})()");
+
+    let mut vm = rix_js::JsVm::new();
+    let val = vm
+        .eval_script(&src)
+        .expect("large call/new arg lists with many locals must compile and run");
+    // sum(0..130) + sum(0..50) + 180 = 8385 + 1225 + 180 = 9790
+    assert_eq!(val.as_number(), Some(9_790.0));
+}
