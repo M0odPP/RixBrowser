@@ -94,11 +94,15 @@ impl FrameTimingStats {
     }
 }
 
-/// Visual comparison output including optional normalized score vs Firefox self-consistency.
+/// Visual comparison output including exact-pixel accuracy and optional Firefox self-consistency.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct VisualDiffMetrics {
     pub ssim_pct: f64,
     pub mean_rgb_delta: f64,
+    #[serde(default)]
+    pub p95_rgb_delta: f64,
+    #[serde(default)]
+    pub exact_pixel_match_pct: f64,
     pub hot_blocks_pct: f64,
     pub firefox_self_ssim_pct: Option<f64>,
     pub normalized_ssim_pct: Option<f64>,
@@ -135,6 +139,14 @@ pub struct SiteDiffAnalysis {
     pub style_checks: usize,
     pub style_matches: usize,
     pub style_match_pct: f64,
+    #[serde(default)]
+    pub layout_within_1px: usize,
+    #[serde(default)]
+    pub layout_1px_match_pct: f64,
+    #[serde(default)]
+    pub size_within_1px: usize,
+    #[serde(default)]
+    pub size_1px_match_pct: f64,
     pub layout_within_2px: usize,
     pub layout_match_pct: f64,
     pub scroll_height_ratio: f64,
@@ -194,6 +206,9 @@ pub fn compare_pngs_with_heatmap(
     let mut heatmap = heatmap_out.map(|_| RgbImage::new(w, h));
     let mut abs_delta_sum = 0.0f64;
     let mut px_count = 0u64;
+    let mut total_pixels = 0u64;
+    let mut exact_pixels = 0u64;
+    let mut delta_hist = [0u64; 256];
     let luma = |r: u8, g: u8, b: u8| -> f64 {
         0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b)
     };
@@ -221,9 +236,16 @@ pub fn compare_pngs_with_heatmap(
                     let y = by * 8 + dy;
                     let rp = rix_img.get_pixel(rx + x, ry + y).0;
                     let fp = ref_img.get_pixel(x, y).0;
-                    let d = (f64::from(rp[0]) - f64::from(fp[0])).abs()
-                        + (f64::from(rp[1]) - f64::from(fp[1])).abs()
-                        + (f64::from(rp[2]) - f64::from(fp[2])).abs();
+                    let dr = (i16::from(rp[0]) - i16::from(fp[0])).unsigned_abs() as u8;
+                    let dg = (i16::from(rp[1]) - i16::from(fp[1])).unsigned_abs() as u8;
+                    let db = (i16::from(rp[2]) - i16::from(fp[2])).unsigned_abs() as u8;
+                    let max_ch = dr.max(dg).max(db);
+                    total_pixels += 1;
+                    if max_ch <= 2 {
+                        exact_pixels += 1;
+                    }
+                    delta_hist[usize::from(max_ch)] += 1;
+                    let d = f64::from(dr) + f64::from(dg) + f64::from(db);
                     abs_delta_sum += d;
                     block_delta += d / 3.0;
                     px_count += 3;
@@ -289,10 +311,29 @@ pub fn compare_pngs_with_heatmap(
     } else {
         (hot_blocks as f64 / blocks as f64) * 100.0
     };
+    let exact_pixel_match_pct = if total_pixels == 0 {
+        0.0
+    } else {
+        (exact_pixels as f64 / total_pixels as f64) * 100.0
+    };
+    let mut p95_rgb_delta = 0.0f64;
+    if total_pixels > 0 {
+        let target = ((total_pixels as f64) * 0.95).ceil() as u64;
+        let mut acc = 0u64;
+        for (val, &cnt) in delta_hist.iter().enumerate() {
+            acc += cnt;
+            if acc >= target {
+                p95_rgb_delta = val as f64;
+                break;
+            }
+        }
+    }
 
     Some(VisualDiffMetrics {
         ssim_pct,
         mean_rgb_delta,
+        p95_rgb_delta,
+        exact_pixel_match_pct,
         hot_blocks_pct,
         firefox_self_ssim_pct: None,
         normalized_ssim_pct: None,
@@ -412,6 +453,24 @@ fn normalize_css_val(prop: &str, raw: &str) -> String {
     if prop == "z-index" && s == "auto" {
         return "auto".to_string();
     }
+    if prop == "background-repeat" {
+        match s.as_str() {
+            "repeat repeat" => return "repeat".to_string(),
+            "no-repeat no-repeat" => return "no-repeat".to_string(),
+            "repeat no-repeat" => return "repeat-x".to_string(),
+            "no-repeat repeat" => return "repeat-y".to_string(),
+            _ => {}
+        }
+    }
+    if prop == "background-position" && (s == "0px 0px" || s == "0% 0%") {
+        return "0% 0%".to_string();
+    }
+    if prop == "background-size" && (s == "auto auto" || s == "auto") {
+        return "auto".to_string();
+    }
+    if prop == "border-top-color" && s == "currentcolor" {
+        return s;
+    }
     // Normalize `rgb(r, g, b)` vs `rgba(r, g, b, 1)`.
     if let Some(inner) = s.strip_prefix("rgba(").and_then(|x| x.strip_suffix(')')) {
         let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
@@ -514,6 +573,13 @@ pub fn analyze_page_diff(
         let dw = (ff_el.rect.width - rx_el.rect.width).abs();
         let dh = (ff_el.rect.height - rx_el.rect.height).abs();
         let max_d = dx.max(dy).max(dw).max(dh);
+        let size_d = dw.max(dh);
+        if size_d <= 1.0 {
+            analysis.size_within_1px += 1;
+        }
+        if max_d <= 1.0 {
+            analysis.layout_within_1px += 1;
+        }
         if max_d <= 2.0 {
             analysis.layout_within_2px += 1;
         } else {
@@ -570,6 +636,16 @@ pub fn analyze_page_diff(
         0.0
     } else {
         (analysis.layout_within_2px as f64 / analysis.matched_elements as f64) * 100.0
+    };
+    analysis.layout_1px_match_pct = if analysis.matched_elements == 0 {
+        0.0
+    } else {
+        (analysis.layout_within_1px as f64 / analysis.matched_elements as f64) * 100.0
+    };
+    analysis.size_1px_match_pct = if analysis.matched_elements == 0 {
+        0.0
+    } else {
+        (analysis.size_within_1px as f64 / analysis.matched_elements as f64) * 100.0
     };
 
     if let Some(vis) = visual {
@@ -800,6 +876,58 @@ mod tests {
         let diff = analyze_page_diff(&ff, &rx, 0, 0, None);
         assert_eq!(diff.style_match_pct, 100.0);
         assert_eq!(diff.layout_match_pct, 0.0);
+        assert_eq!(diff.layout_1px_match_pct, 0.0);
+        assert_eq!(diff.size_1px_match_pct, 0.0);
         assert_eq!(diff.primary_subsystem, "rix-layout/geometry");
+    }
+
+    #[test]
+    fn analyzer_distinguishes_1px_position_vs_size_match() {
+        let styles = BTreeMap::new();
+        let ff = PageInspectionSnapshot {
+            elements: vec![ElementSnapshot {
+                path: "html>body>p:nth-of-type(1)".into(),
+                tag: "p".into(),
+                rect: RectSnapshot {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 300.0,
+                    height: 40.0,
+                },
+                styles: styles.clone(),
+                ..ElementSnapshot::default()
+            }],
+            ..PageInspectionSnapshot::default()
+        };
+        let rx = PageInspectionSnapshot {
+            elements: vec![ElementSnapshot {
+                path: "html>body>p:nth-of-type(1)".into(),
+                tag: "p".into(),
+                rect: RectSnapshot {
+                    x: 10.0,
+                    y: 21.5,
+                    width: 300.4,
+                    height: 40.0,
+                },
+                styles,
+                ..ElementSnapshot::default()
+            }],
+            ..PageInspectionSnapshot::default()
+        };
+        let diff = analyze_page_diff(&ff, &rx, 0, 0, None);
+        assert_eq!(diff.layout_within_2px, 1);
+        assert_eq!(diff.layout_within_1px, 0);
+        assert_eq!(diff.size_within_1px, 1);
+        assert_eq!(diff.size_1px_match_pct, 100.0);
+        assert!(css_values_equivalent(
+            "background-repeat",
+            "no-repeat no-repeat",
+            "no-repeat"
+        ));
+        assert!(css_values_equivalent(
+            "background-position",
+            "0% 0%",
+            "0px 0px"
+        ));
     }
 }

@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::browser_controller::BrowserController;
 
-/// Canonical set of 34 computed CSS properties captured in both RixBrowser and Firefox
-/// for element-by-element differential parity analysis.
+/// Canonical set of 72 computed CSS properties captured identically in both RixBrowser and
+/// Mozilla Firefox for exhaustive element-by-element differential parity analysis.
 pub const INSPECTED_CSS_PROPERTIES: &[&str] = &[
     "display",
     "position",
@@ -25,20 +25,50 @@ pub const INSPECTED_CSS_PROPERTIES: &[&str] = &[
     "overflow-x",
     "overflow-y",
     "box-sizing",
+    "top",
+    "right",
+    "bottom",
+    "left",
+    "float",
+    "clear",
+    "width",
+    "height",
+    "min-width",
+    "max-width",
+    "min-height",
+    "max-height",
+    "aspect-ratio",
     "flex-direction",
     "flex-wrap",
+    "flex-grow",
+    "flex-shrink",
     "justify-content",
     "align-items",
+    "align-self",
+    "row-gap",
+    "column-gap",
     "grid-template-columns",
+    "grid-template-rows",
     "color",
     "background-color",
     "background-image",
+    "background-size",
+    "background-position",
+    "background-repeat",
     "font-family",
     "font-size",
     "font-weight",
+    "font-style",
     "line-height",
+    "letter-spacing",
+    "word-spacing",
     "text-align",
+    "text-transform",
+    "text-decoration-line",
     "white-space",
+    "vertical-align",
+    "direction",
+    "writing-mode",
     "margin-top",
     "margin-right",
     "margin-bottom",
@@ -48,9 +78,17 @@ pub const INSPECTED_CSS_PROPERTIES: &[&str] = &[
     "padding-bottom",
     "padding-left",
     "border-top-width",
+    "border-right-width",
+    "border-bottom-width",
+    "border-left-width",
+    "border-top-style",
+    "border-top-color",
     "border-top-left-radius",
-    "width",
-    "height",
+    "transform",
+    "filter",
+    "box-shadow",
+    "pointer-events",
+    "cursor",
 ];
 
 /// Maximum visible elements serialized per page snapshot (covers full above-the-fold + near-fold).
@@ -262,6 +300,7 @@ struct FragmentSnapshotInfo {
     margin: rix_layout::EdgeInsets,
     style: std::sync::Arc<ComputedStyle>,
     resolved_grid_cols: Option<String>,
+    resolved_grid_rows: Option<String>,
     is_replaced: bool,
 }
 
@@ -304,6 +343,11 @@ fn collect_fragment_rects_and_styles(
                     .as_ref()
                     .filter(|g| !g.columns.is_empty())
                     .map(|g| g.columns.clone()),
+                resolved_grid_rows: frag
+                    .resolved_grid_tracks
+                    .as_ref()
+                    .filter(|g| !g.rows.is_empty())
+                    .map(|g| g.rows.clone()),
                 is_replaced,
             });
     }
@@ -426,6 +470,13 @@ fn format_resolved_property(info: &FragmentSnapshotInfo, prop: &str) -> String {
         "grid-template-columns" => {
             if let Some(ref cols) = info.resolved_grid_cols {
                 cols.clone()
+            } else {
+                rix_content::cssom::format_computed_property(&info.style, prop)
+            }
+        }
+        "grid-template-rows" => {
+            if let Some(ref rows) = info.resolved_grid_rows {
+                rows.clone()
             } else {
                 rix_content::cssom::format_computed_property(&info.style, prop)
             }

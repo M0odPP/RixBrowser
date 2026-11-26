@@ -9,6 +9,7 @@ pub mod diff_analyzer;
 pub mod firefox_bidi;
 pub mod html5lib;
 pub mod reftest;
+pub mod replay_archive;
 pub mod test262;
 pub mod wpt;
 pub mod wpt_official;

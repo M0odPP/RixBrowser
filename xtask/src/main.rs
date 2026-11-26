@@ -17,11 +17,11 @@ fn print_usage() {
         "Usage:\n  \
          cargo xtask reftest [--dir <path>] [--update-refs]\n  \
          cargo xtask wpt --subset <all|css2|flexbox|grid|selectors|html> [--wpt-dir <path>] [--update-baseline]\n  \
-         cargo xtask wpt-official --suite <subpath> [--wpt-dir <path>] [--kind <all|testharness|reftest>] [--limit <n>] [--report-json <path>]\n  \
+         cargo xtask wpt-official --suite <subpath> [--wpt-dir <path>] [--kind <all|testharness|reftest>] [--limit <n>] [--compare-firefox] [--firefox-bin <path>] [--report-json <path>]\n  \
          cargo xtask html5lib [--dir <path>] [--filter <substr>] [--report-json <path>]\n  \
          cargo xtask test262 [--test262-dir <path>] [--official] [--filter <substr>] [--limit <n>] [--always-jit] [--report-json <path>] [--update-baseline]\n  \
          cargo xtask compare-chrome --cohort <path> [--out-dir <path>] [--rix-bin <path>] [--chrome-bin <path>] [--limit <n>] [--report-json <path>]\n  \
-         cargo xtask compare-firefox --cohort <path> [--out-dir <path>] [--rix-bin <path>] [--firefox-bin <path>] [--width <px>] [--height <px>] [--dpr <f>] [--dark] [--interactive] [--warm] [--self-consistency] [--limit <n>] [--report-json <path>]\n  \
+         cargo xtask compare-firefox --cohort <path> [--out-dir <path>] [--rix-bin <path>] [--firefox-bin <path>] [--width <px>] [--height <px>] [--dpr <f>] [--dark] [--interactive] [--warm] [--self-consistency] [--record <dir>] [--replay <dir>] [--limit <n>] [--report-json <path>]\n  \
          cargo xtask bench [--quick]"
     );
 }
@@ -103,6 +103,8 @@ fn dispatch(args: &[String]) -> Result<()> {
             let mut kind = xtask::wpt_official::OfficialWptKind::All;
             let mut limit = None;
             let mut report_json = None;
+            let mut compare_firefox = false;
+            let mut firefox_bin = xtask::compare_firefox::CompareFirefoxOptions::default_firefox();
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -139,6 +141,14 @@ fn dispatch(args: &[String]) -> Result<()> {
                             .ok_or_else(|| anyhow::anyhow!("missing value for --limit"))?;
                         limit = Some(val.parse::<usize>()?);
                     }
+                    "--compare-firefox" => compare_firefox = true,
+                    "--firefox-bin" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --firefox-bin"))?;
+                        firefox_bin = PathBuf::from(val);
+                    }
                     "--report-json" => {
                         i += 1;
                         let val = args
@@ -156,6 +166,8 @@ fn dispatch(args: &[String]) -> Result<()> {
                 kind,
                 limit,
                 report_json,
+                compare_firefox,
+                firefox_bin,
             };
             let report = xtask::wpt_official::run_official_wpt_suite(&opts)?;
             xtask::wpt_official::print_report(&report);
@@ -357,6 +369,8 @@ fn dispatch(args: &[String]) -> Result<()> {
             let mut interactive = false;
             let mut warm = false;
             let mut self_consistency = false;
+            let mut record_dir = None;
+            let mut replay_dir = None;
             let mut limit = None;
             let mut report_json = None;
             let mut i = 1;
@@ -415,6 +429,20 @@ fn dispatch(args: &[String]) -> Result<()> {
                     "--interactive" => interactive = true,
                     "--warm" => warm = true,
                     "--self-consistency" => self_consistency = true,
+                    "--record" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --record"))?;
+                        record_dir = Some(PathBuf::from(val));
+                    }
+                    "--replay" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --replay"))?;
+                        replay_dir = Some(PathBuf::from(val));
+                    }
                     "--limit" => {
                         i += 1;
                         let val = args
@@ -448,6 +476,8 @@ fn dispatch(args: &[String]) -> Result<()> {
                 interactive,
                 warm,
                 self_consistency,
+                record_dir,
+                replay_dir,
                 limit,
                 report_json,
             };
