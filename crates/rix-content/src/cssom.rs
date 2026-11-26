@@ -5071,8 +5071,8 @@ fn kebab_to_camel(kebab: &str) -> String {
 fn computed_custom_keys(style: &ComputedStyle) -> Vec<String> {
     let mut keys: Vec<String> = style
         .custom_properties
-        .entries
-        .keys()
+        .visible_keys()
+        .into_iter()
         .map(|k| k.as_str().to_string())
         .collect();
     keys.sort();
@@ -5250,7 +5250,7 @@ pub(crate) fn create_computed_style_proxy(
         }
         if let Ok(idx) = prop.parse::<usize>() {
             let style = live_style_for(&h_has, nid, pseudo);
-            let total = COMPUTED_STYLE_LONGHANDS.len() + style.custom_properties.entries.len();
+            let total = COMPUTED_STYLE_LONGHANDS.len() + style.custom_properties.len();
             return Ok(JsValue::from_bool(idx < total));
         }
         let css_key = camel_to_kebab(&prop);
@@ -5268,7 +5268,7 @@ pub(crate) fn create_computed_style_proxy(
             let prop = vm.value_to_rust_string(arg(args, 1));
             let val = if prop == "length" {
                 let style = live_style_for(&h_desc, nid, pseudo);
-                let total = COMPUTED_STYLE_LONGHANDS.len() + style.custom_properties.entries.len();
+                let total = COMPUTED_STYLE_LONGHANDS.len() + style.custom_properties.len();
                 Some(JsValue::from_i32(total as i32))
             } else if let Ok(idx) = prop.parse::<usize>() {
                 if let Some(&name) = COMPUTED_STYLE_LONGHANDS.get(idx) {
@@ -5368,7 +5368,7 @@ pub(crate) fn create_computed_style_proxy(
                 crate::css_animations_api::flush_and_sync_css_animations(vm, &h_get, wa_ref);
             }
             let style = live_style_for(&h_get, nid, pseudo);
-            let total = COMPUTED_STYLE_LONGHANDS.len() + style.custom_properties.entries.len();
+            let total = COMPUTED_STYLE_LONGHANDS.len() + style.custom_properties.len();
             return Ok(JsValue::from_i32(total as i32));
         }
         if let Ok(idx) = prop.parse::<usize>() {

@@ -404,14 +404,23 @@ pub fn render_url_to_png_with_metrics(
     controller.navigate_active(url);
     let navigate_ms = t_nav.elapsed().as_secs_f32() * 1000.0;
 
-    // Allow initial async `fetch()` / short timers / first rAF frame to settle cleanly (bounded).
+    // Allow initial async `fetch()` / dynamic ES module hydration / short timers / first rAF
+    // frame to settle cleanly. Static pages with no pending work exit immediately (~0 ms);
+    // SPAs with active network I/O get a bounded settle window up to 1200 ms.
     let t_settle = Instant::now();
-    let settle_deadline = t_settle + Duration::from_millis(250);
-    for _ in 0..32 {
+    let fast_deadline = t_settle + Duration::from_millis(250);
+    let io_deadline = t_settle + Duration::from_millis(1200);
+    for _ in 0..160 {
         let Some(delay) = controller.tick_active_tab() else {
             break;
         };
-        if Instant::now() >= settle_deadline {
+        let now = Instant::now();
+        let has_io = controller
+            .active_tab_doc()
+            .and_then(|d| d.runtime.as_ref())
+            .is_some_and(|rt| rt.net.borrow().has_pending_io());
+        let deadline = if has_io { io_deadline } else { fast_deadline };
+        if now >= deadline {
             break;
         }
         let sleep_for = delay.min(Duration::from_millis(10));

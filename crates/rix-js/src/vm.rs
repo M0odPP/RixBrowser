@@ -1792,6 +1792,14 @@ impl JsVm {
                 let b = base + usize::from(inst.b());
                 self.registers[a] = self.registers[b];
             }
+            Opcode::MoveFromWide => {
+                let src = base + usize::from(inst.bx());
+                self.registers[a] = self.registers[src];
+            }
+            Opcode::MoveToWide => {
+                let dst = base + usize::from(inst.bx());
+                self.registers[dst] = self.registers[a];
+            }
             Opcode::LoadUndef => self.registers[a] = JsValue::UNDEFINED,
             Opcode::LoadNull => self.registers[a] = JsValue::NULL,
             Opcode::LoadTrue => self.registers[a] = JsValue::TRUE,
@@ -1925,7 +1933,13 @@ impl JsVm {
                 self.write_upvalue_cell(cell, val);
             }
             Opcode::CloseUpvalues => {
-                self.close_upvalues_from(a);
+                // Close only the fast register range `[base + a .. base + 256)` so inner fast
+                // scopes never prematurely close outer-scope extended spill locals (`>= 256`).
+                self.close_upvalues_range(a, base + 256);
+            }
+            Opcode::CloseUpvaluesWide => {
+                let cutoff = base + usize::from(inst.bx());
+                self.close_upvalues_from(cutoff);
             }
             Opcode::NewClosure => {
                 let const_idx = self.resolve_abx_idx(inst, prog_id, func_idx, frame_idx);
@@ -3297,10 +3311,14 @@ impl JsVm {
     }
 
     fn close_upvalues_from(&mut self, cutoff_reg: usize) {
+        self.close_upvalues_range(cutoff_reg, usize::MAX);
+    }
+
+    fn close_upvalues_range(&mut self, lo_reg: usize, hi_reg: usize) {
         let mut i = 0;
         while i < self.open_upvalues.len() {
             let (abs_reg, cell) = self.open_upvalues[i];
-            if abs_reg >= cutoff_reg {
+            if abs_reg >= lo_reg && abs_reg < hi_reg {
                 let val = self
                     .registers
                     .get(abs_reg)
