@@ -605,20 +605,19 @@ pub fn measure_grid_intrinsic_widths(
         intr_fn,
     )
     .unwrap_or(metrics.min_width);
-    let max_w = resolve_size_with_intrinsic(
-        &style.box_model.max_width,
-        Some(space.containing_block_width),
-        pb_w,
-        metrics.margin.horizontal(),
-        is_bb,
-        &eval,
-        intr_fn,
-    )
-    .unwrap_or(metrics.max_width);
-
-    if let Some(sw) = metrics.specified_width.or_else(|| {
+    let is_percent_width = match &style.box_model.width {
+        SizeValue::Length(lp) => lp.has_percentage(),
+        _ => false,
+    };
+    let is_percent_max_w = match &style.box_model.max_width {
+        SizeValue::Length(lp) => lp.has_percentage(),
+        _ => false,
+    };
+    let max_w = if is_percent_max_w {
+        f32::INFINITY
+    } else {
         resolve_size_with_intrinsic(
-            &style.box_model.width,
+            &style.box_model.max_width,
             Some(space.containing_block_width),
             pb_w,
             metrics.margin.horizontal(),
@@ -626,9 +625,24 @@ pub fn measure_grid_intrinsic_widths(
             &eval,
             intr_fn,
         )
-    }) {
-        let clamped = sw.min(max_w).max(min_w).max(0.0) + pb_w;
-        return (clamped, clamped);
+        .unwrap_or(metrics.max_width)
+    };
+
+    if !is_percent_width {
+        if let Some(sw) = metrics.specified_width.or_else(|| {
+            resolve_size_with_intrinsic(
+                &style.box_model.width,
+                Some(space.containing_block_width),
+                pb_w,
+                metrics.margin.horizontal(),
+                is_bb,
+                &eval,
+                intr_fn,
+            )
+        }) {
+            let clamped = sw.min(max_w).max(min_w).max(0.0) + pb_w;
+            return (clamped, clamped);
+        }
     }
 
     (

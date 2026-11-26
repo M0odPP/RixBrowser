@@ -568,3 +568,292 @@ fn html5_ua_hides_closed_popover_dialog_and_details_body() {
         "non-summary content inside closed <details> must be display: none"
     );
 }
+
+#[test]
+fn bfc_clear_both_does_not_indent_lines_by_cleared_float() {
+    // CSS 2.1 §9.5.2: a non-BFC block with `clear: both` must clear preceding floats BEFORE
+    // laying out its own inline lines so text is not indented by the cleared float's width.
+    let css = r#"
+        body { margin: 0; }
+        .fl { float: left; width: 140px; height: 30px; }
+        .fr { float: right; width: 200px; height: 30px; }
+        .cleared { clear: both; }
+        .item { display: inline-block; width: 100px; height: 20px; }
+    "#;
+    let html = r#"<!doctype html><html><body>
+        <div class="fl">Left</div>
+        <div class="fr">Right</div>
+        <div class="cleared" id="nav">
+            <span class="item" id="i1">One</span>
+            <span class="item" id="i2">Two</span>
+            <span class="item" id="i3">Three</span>
+            <span class="item" id="i4">Four</span>
+            <span class="item" id="i5">Five</span>
+        </div>
+    </body></html>"#;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let mut font_db = FontDatabase::new();
+    font_db.scan_system_fonts();
+    let (tree, _) = engine.layout_only(&doc, &styles, Size::new(700.0, 400.0), &font_db);
+    let root = tree.root.as_ref().unwrap();
+
+    let i1 = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("i1").unwrap()).unwrap();
+    let i5 = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("i5").unwrap()).unwrap();
+    assert!(
+        i1.min_x() < 5.0,
+        "cleared block's first item must start at x=0 (not indented past left float), got {i1:?}"
+    );
+    assert!(
+        i1.min_y() >= 29.0,
+        "cleared block must sit below 30px floats, got y={}",
+        i1.min_y()
+    );
+    assert!(
+        (i5.min_y() - i1.min_y()).abs() < 2.0,
+        "all 5 items (500px total) must stay on one row inside 700px cleared block, got i1={i1:?} i5={i5:?}"
+    );
+}
+
+#[test]
+fn ifc_atomic_inline_drops_below_narrowing_float_even_when_wider_than_container() {
+    // CSS 2.1 §9.5: an atomic inline (`display: inline-block`) inside a narrow container whose
+    // current band is narrowed by a float must shift below the float to x=0 rather than sitting
+    // beside the float and overflowing into adjacent columns.
+    let css = r#"
+        body { margin: 0; }
+        #sidebar { width: 150px; }
+        .logo { float: left; width: 110px; height: 60px; }
+        .navbox { display: inline-block; width: 160px; height: 40px; }
+    "#;
+    let html = r#"<!doctype html><html><body>
+        <div id="sidebar">
+            <div class="logo">Logo</div>
+            <div class="navbox" id="nav">Menu</div>
+        </div>
+    </body></html>"#;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let font_db = FontDatabase::new();
+    let (tree, _) = engine.layout_only(&doc, &styles, Size::new(800.0, 400.0), &font_db);
+    let root = tree.root.as_ref().unwrap();
+
+    let nav = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("nav").unwrap()).unwrap();
+    assert!(
+        nav.min_x() < 5.0 && nav.min_y() >= 59.0,
+        "inline-block wider than narrowed band must drop below 60px float to x=0, got {nav:?}"
+    );
+}
+
+#[test]
+fn flex_auto_sized_item_with_100pct_child_does_not_inflate_to_viewport() {
+    // CSS Sizing L3 §5.2.1: an `inline-flex` item with `flex: none` containing an `inline-flex`
+    // anchor with `width: 100%` must size to the anchor's content width, not 100% of viewport.
+    let css = r#"
+        body { margin: 0; }
+        .menu { display: flex; justify-content: flex-end; width: 800px; }
+        .item { display: inline-flex; flex: none; margin: 0 5px; }
+        .item > a { display: inline-flex; width: 100%; padding: 0 12px; }
+    "#;
+    let html = r##"<!doctype html><html><body>
+        <div class="menu">
+            <div class="item" id="m1"><a href="#">Alpha</a></div>
+            <div class="item" id="m2"><a href="#">Beta</a></div>
+            <div class="item" id="m3"><a href="#">Gamma</a></div>
+        </div>
+    </body></html>"##;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let mut font_db = FontDatabase::new();
+    font_db.scan_system_fonts();
+    let (tree, _) = engine.layout_only(&doc, &styles, Size::new(800.0, 400.0), &font_db);
+    let root = tree.root.as_ref().unwrap();
+
+    let m1 = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("m1").unwrap()).unwrap();
+    let m3 = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("m3").unwrap()).unwrap();
+    assert!(
+        m1.size.width < 200.0,
+        "auto-sized flex item with width:100% flex child must not inflate to 800px, got {m1:?}"
+    );
+    assert!(
+        m1.min_x() >= 0.0 && m3.max_x() <= 801.0,
+        "right-aligned flex menu items must stay inside 800px viewport, got m1={m1:?} m3={m3:?}"
+    );
+}
+
+#[test]
+fn flex_wrap_row_with_compressible_max_width_percent_img_stays_side_by_side() {
+    // CSS Sizing L3 §5.2.1: a replaced `<img>` with `max-width: 96%` inside a `flex: 1; width: 50%`
+    // column in a `flex-wrap: wrap` row has 0 min-content contribution so two columns fit side-by-side.
+    let css = r#"
+        body { margin: 0; }
+        .row { display: flex; flex-direction: row; flex-wrap: wrap; width: 1000px; }
+        .col { display: flex; flex-direction: column; flex: 1; padding: 20px; width: 50%; }
+        .col img { max-width: 96%; height: auto; }
+    "#;
+    let html = r#"<!doctype html><html><body>
+        <div class="row">
+            <div class="col" id="left"><img src="/wide.png" width="700" height="300"></div>
+            <div class="col" id="right"><p>Right column</p></div>
+        </div>
+    </body></html>"#;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let font_db = FontDatabase::new();
+    let (tree, _) = engine.layout_only(&doc, &styles, Size::new(1000.0, 600.0), &font_db);
+    let root = tree.root.as_ref().unwrap();
+
+    let left = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("left").unwrap()).unwrap();
+    let right = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("right").unwrap()).unwrap();
+    assert!(
+        (left.min_y() - right.min_y()).abs() < 2.0 && right.min_x() >= left.max_x() - 1.0,
+        "two flex:1 columns with max-width:96% img must stay side by side, got left={left:?} right={right:?}"
+    );
+}
+
+#[test]
+fn button_renders_dom_children_and_honors_clipped_sr_only_span() {
+    // HTML5 §15.5.4: `<button>` is a container box whose DOM children receive full CSS styling
+    // (such as `.sr-only` `clip: rect(1px,1px,1px,1px)` hiding accessible text inside icon buttons).
+    let css = r#"
+        .icon-btn { width: 24px; height: 24px; padding: 0; }
+        .icon-btn span + span {
+            display: block;
+            position: absolute;
+            clip: rect(1px, 1px, 1px, 1px);
+            width: 1px;
+            height: 1px;
+            overflow: hidden;
+        }
+    "#;
+    let html = r#"<!doctype html><html><body>
+        <button class="icon-btn" id="btn">
+            <span class="ico"></span>
+            <span id="sr">Toggle subsection</span>
+        </button>
+    </body></html>"#;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let mut font_db = FontDatabase::new();
+    font_db.scan_system_fonts();
+    let mut resources = ResourceRegistry::default();
+    let frame = engine.layout_and_paint(
+        &doc,
+        &styles,
+        Size::new(800.0, 400.0),
+        &font_db,
+        PipelineId(1),
+        &mut resources,
+    );
+
+    let root = frame.fragment_tree.root.as_ref().unwrap();
+    let sr = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("sr").unwrap());
+    assert!(
+        sr.is_some(),
+        "<button> must lay out its child <span> elements instead of flattening to a leaf FormControl"
+    );
+    let has_zero_clip = frame.display_list.items.iter().any(|item| {
+        matches!(
+            item,
+            DisplayItem::PushClip { rect, .. }
+                if rect.size.width <= 0.01 && rect.size.height <= 0.01
+        )
+    });
+    assert!(
+        has_zero_clip,
+        "child sr-only <span> inside <button> must emit zero-area clip: rect(1px,1px,1px,1px)"
+    );
+}
+
+#[test]
+fn svg_extractor_skips_defs_clippath_and_applies_group_transforms() {
+    // SVG 2: non-rendering containers (`<defs>`, `<clipPath>`, `<mask>`) must not emit visible
+    // paths, `<g transform="...">` must accumulate onto descendant paths, and `<use href="#id">`
+    // must instantiate referenced definitions.
+    let svg_markup = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+        <defs>
+            <clipPath id="cp"><rect x="0" y="0" width="100" height="100" fill="#000"/></clipPath>
+            <linearGradient id="g1"><stop offset="0%" stop-color="#1188ff"/></linearGradient>
+            <rect id="dot" x="0" y="0" width="10" height="10"/>
+        </defs>
+        <g transform="translate(20, 30)" fill="url(#g1)">
+            <rect x="0" y="0" width="20" height="20"/>
+        </g>
+        <use href="#dot" x="50" y="10" fill="#ff0000"/>
+    </svg>"##;
+    let svg_doc = parse_html(svg_markup);
+    let decoded = extract_svg_from_document(&svg_doc, ColorRgba::BLACK).expect("extract svg");
+    assert_eq!(
+        decoded.paths.len(),
+        2,
+        "must emit only the visible transformed rect and <use> instance (skipping <defs>/<clipPath>), got {}",
+        decoded.paths.len()
+    );
+    assert_eq!(
+        decoded.paths[0].fill,
+        Some(ColorRgba::rgb(0x11, 0x88, 0xff)),
+        "url(#g1) fill must resolve to gradient first stop color instead of black"
+    );
+    assert!(
+        (decoded.paths[0].transform[4] - 20.0).abs() < 0.01
+            && (decoded.paths[0].transform[5] - 30.0).abs() < 0.01,
+        "group translate(20, 30) must accumulate onto child path transform, got {:?}",
+        decoded.paths[0].transform
+    );
+    assert!(
+        (decoded.paths[1].transform[4] - 50.0).abs() < 0.01
+            && (decoded.paths[1].transform[5] - 10.0).abs() < 0.01,
+        "<use x=50 y=10> must translate instantiated def, got {:?}",
+        decoded.paths[1].transform
+    );
+}

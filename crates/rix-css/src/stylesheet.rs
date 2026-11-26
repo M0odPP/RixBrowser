@@ -24,7 +24,7 @@ use selectors::parser::{AncestorHashes, ParseRelative, Selector, SelectorList};
 
 use crate::properties::{
     compile_declaration_block, restore_revert_rule_sentinel, MissingCssFeature, MissingCssKind,
-    PropertyIdKind, PropertyValue, SpecifiedDeclaration,
+    PropertyValue, SpecifiedDeclaration,
 };
 use crate::selector::{
     compile_lightning_selector_list_with_namespaces, parse_selector_list_non_forgiving,
@@ -563,15 +563,42 @@ impl Stylesheet {
         compiled
     }
 
-    /// Returns all unique `background-image: url(...)` references compiled in this stylesheet.
+    /// Returns all unique image `url(...)` references compiled in this stylesheet, including
+    /// `background-image`, `mask-image`, and `url(...)` values stored inside custom properties
+    /// (`--logo: url(...)`) or unparsed `var()` declarations.
     #[must_use]
     pub fn referenced_image_urls(&self) -> Vec<String> {
+        fn collect_urls_from_tokens(
+            tokens: &[crate::properties::CssToken],
+            seen: &mut HashSet<String>,
+            out: &mut Vec<String>,
+        ) {
+            for tok in tokens {
+                match tok {
+                    crate::properties::CssToken::Url(url) => {
+                        let trimmed = url.as_str().trim();
+                        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                            out.push(trimmed.to_string());
+                        }
+                    }
+                    crate::properties::CssToken::Function { args, .. } => {
+                        collect_urls_from_tokens(args, seen, out);
+                    }
+                    crate::properties::CssToken::Var {
+                        fallback: Some(fb), ..
+                    } => {
+                        collect_urls_from_tokens(fb, seen, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for rule in &self.rules {
             for decl in rule.declarations.iter() {
-                if decl.property == PropertyIdKind::BackgroundLayers {
-                    if let PropertyValue::BackgroundLayers(layers) = &decl.value {
+                match &decl.value {
+                    PropertyValue::BackgroundLayers(layers) => {
                         for layer in layers {
                             if let BackgroundImageValue::Url(url) = &layer.image {
                                 let trimmed = url.as_str().trim();
@@ -581,13 +608,16 @@ impl Stylesheet {
                             }
                         }
                     }
-                } else if decl.property == PropertyIdKind::MaskImage {
-                    if let PropertyValue::MaskImage(BackgroundImageValue::Url(url)) = &decl.value {
+                    PropertyValue::MaskImage(BackgroundImageValue::Url(url)) => {
                         let trimmed = url.as_str().trim();
                         if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
                             out.push(trimmed.to_string());
                         }
                     }
+                    PropertyValue::Custom(tokens) | PropertyValue::Unresolved(tokens) => {
+                        collect_urls_from_tokens(tokens, &mut seen, &mut out);
+                    }
+                    _ => {}
                 }
             }
         }

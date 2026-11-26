@@ -683,7 +683,10 @@ impl HostState {
             let doc = self.document.borrow();
             let mut h: u64 = 0xcbf2_9ce4_8422_2325;
             let mut css_blocks: Vec<(String, Option<NodeId>)> = Vec::new();
-            for node in doc.descendants_with_shadow_roots(doc.root()) {
+            // Collect ONLY light-DOM `<style>` elements for document-level sheets; `<style>`
+            // elements inside a `ShadowRoot` are compiled per-shadow-root by `cascade.rs` per
+            // CSS Scoping L1 (never leaked globally!), though we still hash them for invalidation.
+            for node in doc.descendants(doc.root()) {
                 if let Some(NodeData::Element(el)) = doc.get(node) {
                     if el.name.local.as_str().eq_ignore_ascii_case("style") {
                         let is_disabled = self
@@ -703,6 +706,18 @@ impl HostState {
                                 }
                             }
                             css_blocks.push((text, owner_parent));
+                        }
+                    }
+                }
+            }
+            for node in doc.descendants_with_shadow_roots(doc.root()) {
+                if let Some(NodeData::ShadowRoot { .. }) = doc.get(node) {
+                    for snode in doc.descendants(node) {
+                        if let Some(NodeData::Element(el)) = doc.get(snode) {
+                            if el.name.local.as_str().eq_ignore_ascii_case("style") {
+                                let text = doc.inner_text(snode);
+                                h = fnv_mix(h, text.as_bytes());
+                            }
                         }
                     }
                 }
@@ -1057,7 +1072,7 @@ impl HostState {
         }
         {
             let doc = self.document.borrow();
-            for n in doc.descendants_with_shadow_roots(doc_id) {
+            for n in doc.descendants(doc_id) {
                 if let Some(NodeData::Element(el)) = doc.get(n) {
                     if el.name.local.as_str().eq_ignore_ascii_case("style") {
                         let text = doc.inner_text(n);
@@ -1677,7 +1692,7 @@ impl HostState {
             let css_blocks: Vec<(String, Option<NodeId>)> = {
                 let doc = self.document.borrow();
                 let mut blocks = Vec::new();
-                for n in doc.descendants_with_shadow_roots(owner_doc) {
+                for n in doc.descendants(owner_doc) {
                     if let Some(NodeData::Element(el)) = doc.get(n) {
                         if el.name.local.as_str().eq_ignore_ascii_case("style") {
                             let text = doc.inner_text(n);

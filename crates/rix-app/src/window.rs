@@ -395,6 +395,25 @@ pub fn render_url_to_png_with_metrics(
     let width = width.max(1);
     let height = height.max(1);
 
+    // Overlap GPU device initialization and Vello compute shader pipeline compilation with
+    // initial browser setup and network I/O on a dedicated GPU thread (mirroring a browser GPU
+    // process booting in parallel with the network/content pipeline).
+    let (gpu_tx, gpu_rx) = std::sync::mpsc::sync_channel(1);
+    let gpu_worker = std::thread::Builder::new()
+        .name("rix-gpu-headless".to_string())
+        .spawn(move || -> Result<(), String> {
+            let mut renderer = VelloRenderer::new();
+            renderer
+                .warm_up_headless_blocking()
+                .map_err(|e| e.to_string())?;
+            if let Ok((scene, w, h, clear, path)) = gpu_rx.recv() {
+                renderer
+                    .render_scene_to_png_warm(&scene, w, h, clear, path)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })?;
+
     let t_start = Instant::now();
     let mut controller = BrowserController::new(Size::new(width as f32, height as f32), 1.0);
     controller.set_theme(theme);
@@ -433,8 +452,14 @@ pub fn render_url_to_png_with_metrics(
     let t_render = Instant::now();
     controller.sync_layers();
     let clear = controller.clear_color();
-    let scene = controller.compositor.compose_force();
-    VelloRenderer::render_scene_to_png(scene, width, height, clear, out_path)?;
+    let scene = controller.compositor.compose_force().clone();
+    let _ = gpu_tx.send((scene, width, height, clear, out_path.as_ref().to_path_buf()));
+    drop(gpu_tx);
+    match gpu_worker.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(err.into()),
+        Err(_) => return Err("headless GPU render thread panicked".into()),
+    }
     let render_ms = t_render.elapsed().as_secs_f32() * 1000.0;
     let total_ms = t_total.elapsed().as_secs_f32() * 1000.0;
 

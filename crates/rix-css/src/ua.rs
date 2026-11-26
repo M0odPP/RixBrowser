@@ -147,6 +147,12 @@ pre {
 ul, ol {
     padding-left: 40px;
 }
+ul {
+    list-style-type: disc;
+}
+ol {
+    list-style-type: decimal;
+}
 a:link {
     color: #0000ee;
     text-decoration: underline;
@@ -171,6 +177,10 @@ input, textarea, select {
 }
 button, input[type="submit"], input[type="button"], input[type="reset"] {
     background-color: #eceef2;
+}
+button {
+    padding: 2px 6px;
+    text-align: center;
 }
 img, svg, canvas, video {
     display: inline-block;

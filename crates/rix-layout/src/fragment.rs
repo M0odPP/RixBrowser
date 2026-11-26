@@ -878,7 +878,8 @@ pub fn layout_box(ctx: &mut LayoutContext<'_>, box_id: BoxId, space: ConstraintS
     let b = ctx.tree.get(box_id);
     // Only reuse cached fragments for boxes that establish an independent formatting context
     // or have no incoming external floats (BFC roots, Flex, Grid, Table, Replaced).
-    let cacheable = space.definite_height_override.is_none()
+    let cacheable = space.definite_width_override.is_none()
+        && space.definite_height_override.is_none()
         && !space.ignore_specified_height
         && (b.establishes_bfc || matches!(b.kind, BoxKind::Block { .. } | BoxKind::Table));
     let pass_key = (
@@ -1078,6 +1079,10 @@ fn measure_intrinsic_widths_uncached(
         SizeValue::Length(lp) => lp.has_percentage(),
         _ => false,
     };
+    let is_percent_max_width = match &b.style.box_model.max_width {
+        SizeValue::Length(lp) => lp.has_percentage(),
+        _ => false,
+    };
     if !is_percent_width
         && !size_value_needs_intrinsic(&b.style.box_model.min_width)
         && !size_value_needs_intrinsic(&b.style.box_model.max_width)
@@ -1091,10 +1096,15 @@ fn measure_intrinsic_widths_uncached(
     match &b.kind {
         BoxKind::Replaced(replaced) => {
             let frag = layout_replaced(b, replaced, space);
-            if is_percent_width {
-                // CSS Sizing L3 / CSS Tables L3: a replaced element with a percentage width
-                // contributes `0` (plus border/padding) to min-content width during table sizing.
-                (pb_w, frag.border_rect.size.width)
+            if is_percent_width || is_percent_max_width {
+                // CSS Sizing L3 §5.2.1 / CSS Tables L3: a replaced element with a percentage
+                // `width` or `max-width` (e.g. `img { max-width: 100% }`) is compressible and
+                // contributes `0` (clamped by `min-width`, plus border/padding) to min-content.
+                let min_w = metrics.min_width.max(0.0) + pb_w;
+                (
+                    min_w.min(frag.border_rect.size.width),
+                    frag.border_rect.size.width,
+                )
             } else {
                 (frag.border_rect.size.width, frag.border_rect.size.width)
             }

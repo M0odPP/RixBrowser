@@ -609,11 +609,13 @@ pub fn load_page_subresources(
         }
     }
 
+    let mut matched_bg_urls: HashSet<String> = HashSet::new();
     for (base_url, sheet) in &all_sheets_with_base {
         for raw_img in sheet.referenced_image_urls() {
             if !used_bg_urls.contains(&raw_img) {
                 continue;
             }
+            matched_bg_urls.insert(raw_img.clone());
             let Some(resolved) = resolve_url(base_url, &raw_img) else {
                 continue;
             };
@@ -696,6 +698,48 @@ pub fn load_page_subresources(
             {
                 wave2_queue.push((resolved, ResourcePriority::Font, SubresourceRole::Font));
             }
+        }
+    }
+
+    // Also fetch any matched `background-image` / `mask-image` URLs originating from inline
+    // `style="..."` attributes (not listed in any external/inline stylesheet).
+    for raw_img in &used_bg_urls {
+        if matched_bg_urls.contains(raw_img) {
+            continue;
+        }
+        let Some(resolved) = resolve_url(&doc_base_str, raw_img) else {
+            continue;
+        };
+        if is_non_image_media_url(&resolved) {
+            continue;
+        }
+        let aliases = image_aliases.entry(resolved.clone()).or_default();
+        if !aliases.contains(raw_img) {
+            aliases.push(raw_img.clone());
+        }
+        if cached_rasters.contains_key(&resolved) || cached_svgs.contains_key(&resolved) {
+            continue;
+        }
+        if let Some(hit) = asset_cache.get(&resolved) {
+            match hit {
+                CachedAsset::Raster(r) => {
+                    cached_rasters.insert(resolved.clone(), r);
+                    out.stats.decoded_asset_cache_hits += 1;
+                    continue;
+                }
+                CachedAsset::Svg(s) => {
+                    cached_svgs.insert(resolved.clone(), s);
+                    out.stats.decoded_asset_cache_hits += 1;
+                    continue;
+                }
+                CachedAsset::WebFont(_) => {}
+            }
+        }
+        if wave2_queue.len() < MAX_SUBRESOURCES_PER_PAGE
+            && is_fetchable_url(&resolved, allow_file_scheme)
+            && seen_wave2.insert(resolved.clone())
+        {
+            wave2_queue.push((resolved, ResourcePriority::Media, SubresourceRole::Image));
         }
     }
 
@@ -861,6 +905,10 @@ fn discover_wave1_refs(document_url: &str, html: &str, media: &MediaContext) -> 
                 }
             }
         } else if tag.eq_ignore_ascii_case("script") {
+            let ty = el.get_attribute("type").unwrap_or("").trim();
+            if el.has_attribute("nomodule") && !ty.eq_ignore_ascii_case("module") {
+                continue;
+            }
             if let Some(src) = el.get_attribute("src").map(str::trim) {
                 if !src.is_empty() {
                     if let Some(resolved) = resolve_url(base_str, src) {
@@ -915,6 +963,17 @@ fn discover_wave1_refs(document_url: &str, html: &str, media: &MediaContext) -> 
                 }
             }
         } else if tag.eq_ignore_ascii_case("style") {
+            // Skip `<style>` elements inside `<template>` (inert or declarative shadow DOM,
+            // which is scoped to its shadow root per CSS Scoping L1 rather than global light DOM).
+            let inside_template = doc.ancestors(node).any(|anc| {
+                matches!(
+                    doc.get(anc),
+                    Some(NodeData::Element(ae)) if ae.name.local.eq_str_ignore_ascii_case("template")
+                )
+            });
+            if inside_template {
+                continue;
+            }
             let mut css = String::new();
             for ch in doc.children(node) {
                 if let Some(NodeData::Text(t)) = doc.get(ch) {
@@ -927,25 +986,17 @@ fn discover_wave1_refs(document_url: &str, html: &str, media: &MediaContext) -> 
         }
     }
 
-    // Incorporate any additional `<link rel="preload">` hints from PreloadScanner (decoding `&amp;`
-    // entities and skipping non-image media streams like `.webm`/`.mp4`).
+    // Incorporate any additional `<link rel="preload" as="image">` hints from PreloadScanner.
+    // Do NOT promote `PreloadKind::Style` hints here: `<link rel="preload" as="style">` is a
+    // preload hint rather than an active stylesheet, and active `<link rel="stylesheet">` tags
+    // (already filtered by `media`, `disabled`, and `alternate`) were collected above.
     for hint in hints {
         let clean_url = hint.url.replace("&amp;", "&");
-        match hint.kind {
-            PreloadKind::Image => {
-                if !is_non_image_media_url(&clean_url)
-                    && seen_img.insert((clean_url.clone(), clean_url.clone()))
-                {
-                    images.push((clean_url.clone(), clean_url));
-                }
-            }
-            PreloadKind::Style => {
-                if seen_css.insert(clean_url.clone()) {
-                    stylesheets.push((clean_url.clone(), clean_url));
-                }
-            }
-            PreloadKind::Script | PreloadKind::Module => {}
-            PreloadKind::Font => {}
+        if hint.kind == PreloadKind::Image
+            && !is_non_image_media_url(&clean_url)
+            && seen_img.insert((clean_url.clone(), clean_url.clone()))
+        {
+            images.push((clean_url.clone(), clean_url));
         }
     }
 

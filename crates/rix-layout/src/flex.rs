@@ -632,6 +632,14 @@ pub fn measure_flex_intrinsic_widths(
             _ => stf,
         }
     };
+    let is_percent_width = match &style.box_model.width {
+        SizeValue::Length(lp) => lp.has_percentage(),
+        _ => false,
+    };
+    let is_percent_max_w = match &style.box_model.max_width {
+        SizeValue::Length(lp) => lp.has_percentage(),
+        _ => false,
+    };
     let eff_min = resolve_size_with_intrinsic(
         &style.box_model.min_width,
         Some(space.containing_block_width),
@@ -642,19 +650,14 @@ pub fn measure_flex_intrinsic_widths(
         intr_fn,
     )
     .unwrap_or(metrics.min_width);
-    let eff_max = resolve_size_with_intrinsic(
-        &style.box_model.max_width,
-        Some(space.containing_block_width),
-        pb_w,
-        metrics.margin.horizontal(),
-        is_bb,
-        &eval,
-        intr_fn,
-    )
-    .unwrap_or(metrics.max_width);
-    let spec_w = metrics.specified_width.or_else(|| {
+    // CSS Sizing L3 §5.2.1: percentage `width` and `max-width` behave as `auto`/`none` during
+    // intrinsic sizing so a child with `width: 100%` inside an auto-sized flex item does not
+    // inflate the flex item to the viewport width.
+    let eff_max = if is_percent_max_w {
+        f32::INFINITY
+    } else {
         resolve_size_with_intrinsic(
-            &style.box_model.width,
+            &style.box_model.max_width,
             Some(space.containing_block_width),
             pb_w,
             metrics.margin.horizontal(),
@@ -662,7 +665,23 @@ pub fn measure_flex_intrinsic_widths(
             &eval,
             intr_fn,
         )
-    });
+        .unwrap_or(metrics.max_width)
+    };
+    let spec_w = if is_percent_width {
+        None
+    } else {
+        metrics.specified_width.or_else(|| {
+            resolve_size_with_intrinsic(
+                &style.box_model.width,
+                Some(space.containing_block_width),
+                pb_w,
+                metrics.margin.horizontal(),
+                is_bb,
+                &eval,
+                intr_fn,
+            )
+        })
+    };
     let final_min = spec_w.unwrap_or(min_c).min(eff_max).max(eff_min).max(0.0) + pb_w;
     let final_max = spec_w.unwrap_or(max_c).min(eff_max).max(eff_min).max(0.0) + pb_w;
     (final_min, final_max.max(final_min))
