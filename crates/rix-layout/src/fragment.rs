@@ -1084,6 +1084,7 @@ fn measure_intrinsic_widths_uncached(
         _ => false,
     };
     if !is_percent_width
+        && !is_percent_max_width
         && !size_value_needs_intrinsic(&b.style.box_model.min_width)
         && !size_value_needs_intrinsic(&b.style.box_model.max_width)
     {
@@ -1176,13 +1177,28 @@ fn measure_intrinsic_widths_uncached(
             }
             if let Some(spec_w) = metrics.specified_width {
                 if !is_percent_width {
-                    let total = spec_w.min(max_w).max(min_w).max(0.0) + pb_w;
-                    return (total, total);
+                    let eff_max = if is_percent_max_width {
+                        f32::INFINITY
+                    } else {
+                        max_w
+                    };
+                    let max_total = spec_w.min(eff_max).max(min_w).max(0.0) + pb_w;
+                    let min_total = if is_percent_max_width {
+                        content_min.min(spec_w).max(min_w).max(0.0) + pb_w
+                    } else {
+                        max_total
+                    };
+                    return (min_total, max_total);
                 }
             }
+            let eff_max = if is_percent_max_width {
+                f32::INFINITY
+            } else {
+                max_w
+            };
             (
-                content_min.min(max_w).max(min_w).max(0.0) + pb_w,
-                content_max.min(max_w).max(min_w).max(0.0) + pb_w,
+                content_min.min(eff_max).max(min_w).max(0.0) + pb_w,
+                content_max.min(eff_max).max(min_w).max(0.0) + pb_w,
             )
         }
     }
@@ -1474,16 +1490,72 @@ fn resolve_replaced_pair(
 ) -> (f32, f32) {
     let ratio = (intrinsic.height > 0.0 && intrinsic.width > 0.0)
         .then(|| intrinsic.width / intrinsic.height);
-    let (w, h) = match (spec_w, spec_h, ratio) {
-        (Some(w), Some(h), _) => (w, h),
-        (Some(w), None, Some(r)) => (w, (w / r).max(0.0)),
-        (None, Some(h), Some(r)) => ((h * r).max(0.0), h),
-        (Some(w), None, None) => (w, intrinsic.height),
-        (None, Some(h), None) => (intrinsic.width, h),
-        (None, None, _) => (intrinsic.width, intrinsic.height),
-    };
-    (
-        metrics.clamp_content_width(w),
-        metrics.clamp_content_height(h),
-    )
+    let min_w = metrics.min_width.max(0.0);
+    let max_w = metrics.max_width.max(min_w);
+    let min_h = metrics.min_height.max(0.0);
+    let max_h = metrics.max_height.max(min_h);
+
+    match (spec_w, spec_h, ratio) {
+        (Some(w), Some(h), _) => (w.min(max_w).max(min_w), h.min(max_h).max(min_h)),
+        (Some(w), None, Some(r)) => {
+            let cw = w.min(max_w).max(min_w);
+            let ch = (cw / r).max(0.0).min(max_h).max(min_h);
+            (cw, ch)
+        }
+        (None, Some(h), Some(r)) => {
+            let ch = h.min(max_h).max(min_h);
+            let cw = (ch * r).max(0.0).min(max_w).max(min_w);
+            (cw, ch)
+        }
+        (None, None, Some(r)) => {
+            // W3C CSS 2.1 §10.4 constraint resolution table for replaced elements with
+            // intrinsic aspect ratio `r = w / h` and both `width: auto; height: auto`.
+            let w = intrinsic.width;
+            let h = intrinsic.height;
+            let over_w = w > max_w;
+            let under_w = w < min_w;
+            let over_h = h > max_h;
+            let under_h = h < min_h;
+            let (rw, rh) = if over_w && over_h {
+                if max_w / w <= max_h / h {
+                    (max_w, (max_w / r).max(min_h))
+                } else {
+                    ((max_h * r).max(min_w), max_h)
+                }
+            } else if under_w && under_h {
+                if min_w / w <= min_h / h {
+                    ((min_h * r).min(max_w), min_h)
+                } else {
+                    (min_w, (min_w / r).min(max_h))
+                }
+            } else if over_w && under_h {
+                (max_w, min_h)
+            } else if under_w && over_h {
+                (min_w, max_h)
+            } else if over_w {
+                (max_w, (max_w / r).max(min_h))
+            } else if under_w {
+                (min_w, (min_w / r).min(max_h))
+            } else if over_h {
+                ((max_h * r).max(min_w), max_h)
+            } else if under_h {
+                ((min_h * r).min(max_w), min_h)
+            } else {
+                (w, h)
+            };
+            (rw.min(max_w).max(min_w), rh.min(max_h).max(min_h))
+        }
+        (Some(w), None, None) => (
+            w.min(max_w).max(min_w),
+            intrinsic.height.min(max_h).max(min_h),
+        ),
+        (None, Some(h), None) => (
+            intrinsic.width.min(max_w).max(min_w),
+            h.min(max_h).max(min_h),
+        ),
+        (None, None, None) => (
+            intrinsic.width.min(max_w).max(min_w),
+            intrinsic.height.min(max_h).max(min_h),
+        ),
+    }
 }

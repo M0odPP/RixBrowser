@@ -2112,8 +2112,13 @@ pub fn parse_background_position(input: &str) -> Option<(LengthPercentage, Lengt
         let st = p.state();
         if let Ok(id) = p.try_parse(|p| p.expect_ident().map(|s| s.to_ascii_lowercase())) {
             let (pct, kw) = match (id.as_str(), is_y) {
-                ("left", false) | ("top", true) => (0.0, 0.0), ("center", _) => (0.5, 50.0), ("right", false) | ("bottom", true) => (1.0, 100.0),
-                _ => { p.reset(&st); return None; }
+                ("left", false) | ("top", true) => (0.0, 0.0),
+                ("center", _) => (0.5, 50.0),
+                ("right", false) | ("bottom", true) => (1.0, 100.0),
+                _ => {
+                    p.reset(&st);
+                    return None;
+                }
             };
             return Some((LengthPercentage::Percent(pct), format!("{}%", format_math_f64(kw))));
         }
@@ -2121,8 +2126,41 @@ pub fn parse_background_position(input: &str) -> Option<(LengthPercentage, Lengt
         let spec = pm.node.serialize_specified(pm.was_math_fn);
         Some((LengthPercentage::Calc(Box::new(crate::values::CalcExpr::Math(Box::new(pm.node)))), spec))
     };
+    // CSS Backgrounds L3 §3.6: `<bg-position>` accepts vertical keyword first
+    // (`top`, `bottom`, `top center`, `bottom right`, etc.) in addition to `x y`.
+    let st_start = p.state();
+    if let Ok(first_kw) = p.try_parse(|p| p.expect_ident().map(|s| s.to_ascii_lowercase())) {
+        if matches!(first_kw.as_str(), "top" | "bottom") {
+            let (yp, ys) = if first_kw == "top" {
+                (LengthPercentage::Percent(0.0), "0%".to_string())
+            } else {
+                (LengthPercentage::Percent(1.0), "100%".to_string())
+            };
+            if p.is_exhausted() {
+                return Some((LengthPercentage::Percent(0.5), yp, format!("50% {ys}")));
+            }
+            if let Ok(second_kw) = p.try_parse(|p| p.expect_ident().map(|s| s.to_ascii_lowercase())) {
+                let x_opt = match second_kw.as_str() {
+                    "left" => Some((LengthPercentage::Percent(0.0), "0%".to_string())),
+                    "center" => Some((LengthPercentage::Percent(0.5), "50%".to_string())),
+                    "right" => Some((LengthPercentage::Percent(1.0), "100%".to_string())),
+                    _ => None,
+                };
+                if let Some((xp, xs)) = x_opt {
+                    if p.is_exhausted() {
+                        return Some((xp, yp, format!("{xs} {ys}")));
+                    }
+                }
+            }
+            p.reset(&st_start);
+            return None;
+        }
+        p.reset(&st_start);
+    }
     let (x, xs) = parse_part(&mut p, false)?;
-    if p.is_exhausted() { return Some((x, LengthPercentage::Percent(0.5), format!("{xs} 50%"))); }
+    if p.is_exhausted() {
+        return Some((x, LengthPercentage::Percent(0.5), format!("{xs} 50%")));
+    }
     let (y, ys) = parse_part(&mut p, true)?;
     p.is_exhausted().then_some((x, y, format!("{xs} {ys}")))
 }

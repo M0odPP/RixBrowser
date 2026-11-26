@@ -199,6 +199,8 @@ pub struct InheritedTextStyle {
     pub word_space_transform: crate::text_css::WordSpaceTransformMode,
     pub interpolate_size: InterpolateSizeMode,
     pub color_interpolation_filters: ColorInterpolationFiltersMode,
+    pub list_style_type: crate::values::ListStyleTypeMode,
+    pub list_style_position: crate::values::ListStylePositionMode,
     pub text_shadow: Vec<BoxShadowValue>,
     /// Full CSS Values L4/L5 evaluation context snapshot for this element (`em`/`rem`/`lh`/`rlh`/viewport/container/sibling).
     pub eval_ctx: EvalContext,
@@ -256,6 +258,8 @@ impl Default for InheritedTextStyle {
             word_space_transform: crate::text_css::WordSpaceTransformMode::None,
             interpolate_size: InterpolateSizeMode::NumericOnly,
             color_interpolation_filters: ColorInterpolationFiltersMode::LinearRgb,
+            list_style_type: crate::values::ListStyleTypeMode::Disc,
+            list_style_position: crate::values::ListStylePositionMode::Outside,
             text_shadow: Vec::new(),
             eval_ctx: EvalContext::default(),
         }
@@ -288,6 +292,8 @@ impl InheritedTextStyle {
             && self.direction == other.direction
             && self.writing_mode == other.writing_mode
             && self.text_orientation == other.text_orientation
+            && self.list_style_type == other.list_style_type
+            && self.list_style_position == other.list_style_position
             && self.caption_side == other.caption_side
             && self.border_collapse == other.border_collapse
             && self.border_spacing_x == other.border_spacing_x
@@ -981,6 +987,11 @@ fn expand_var_tokens(
 pub struct MatchedRule<'a> {
     pub rule: &'a CompiledRule,
     pub scope_proximity: u32,
+    /// True when matched from the element's own inner `ShadowRoot` stylesheet via `:host` /
+    /// `:host(...)`. Per CSS Cascade L4 §6.1 (Encapsulation Context), inner normal declarations
+    /// have lower cascade priority than outer author declarations, while inner `!important`
+    /// declarations have higher priority than outer author `!important` declarations.
+    pub is_shadow_host_rule: bool,
 }
 
 /// Cascade Level 5/6 ordering key (strictly ascending priority; highest wins).
@@ -999,6 +1010,7 @@ impl CascadeKey {
     fn new(
         origin: CascadeOrigin,
         is_inline: bool,
+        is_shadow_host_rule: bool,
         important: bool,
         layer_id: LayerId,
         specificity: u32,
@@ -1006,17 +1018,19 @@ impl CascadeKey {
         rule_order: u32,
         decl_order: u32,
     ) -> Self {
-        let band = match (important, is_inline, origin) {
-            (false, false, CascadeOrigin::UserAgent) => 0,
-            (false, false, CascadeOrigin::User) => 1,
+        let band = match (important, is_inline, is_shadow_host_rule, origin) {
+            (false, false, _, CascadeOrigin::UserAgent) => 0,
+            (false, false, _, CascadeOrigin::User) => 1,
             // band 2 is reserved for HTML5 §15.3 presentational hints (Author origin for `revert`,
             // independent pre-author layer for `revert-layer` per CSS Cascade L5 §6.4.4).
-            (false, false, CascadeOrigin::Author) => 3,
-            (false, true, _) => 4,
-            (true, false, CascadeOrigin::Author) => 5,
-            (true, true, _) => 6,
-            (true, false, CascadeOrigin::User) => 7,
-            (true, false, CascadeOrigin::UserAgent) => 8,
+            (false, false, true, CascadeOrigin::Author) => 3,
+            (false, false, false, CascadeOrigin::Author) => 4,
+            (false, true, _, _) => 5,
+            (true, false, false, CascadeOrigin::Author) => 6,
+            (true, true, _, _) => 7,
+            (true, false, true, CascadeOrigin::Author) => 8,
+            (true, false, _, CascadeOrigin::User) => 9,
+            (true, false, _, CascadeOrigin::UserAgent) => 10,
         };
         let layer_rank = if !important {
             layer_id.0
@@ -1105,6 +1119,7 @@ pub fn resolve_element_style_full(
         .map(|&rule| MatchedRule {
             rule,
             scope_proximity: u32::MAX,
+            is_shadow_host_rule: false,
         })
         .collect();
     resolve_element_style_scoped(
@@ -1230,6 +1245,7 @@ pub fn resolve_element_style_with_context(
                 key: CascadeKey::new(
                     rule.origin,
                     false,
+                    mr.is_shadow_host_rule,
                     decl.important,
                     rule.layer_id,
                     rule.specificity,
@@ -1246,6 +1262,7 @@ pub fn resolve_element_style_with_context(
             key: CascadeKey::new(
                 CascadeOrigin::Author,
                 true,
+                false,
                 decl.important,
                 LayerId::UNLAYERED,
                 u32::MAX,
@@ -2820,6 +2837,12 @@ pub fn apply_declaration(
         (PropertyIdKind::FontFamily, PropertyValue::FontFamily(f)) => {
             Arc::make_mut(&mut style.text).font_family = f.clone();
         }
+        (PropertyIdKind::ListStyleType, PropertyValue::ListStyleType(lst)) => {
+            Arc::make_mut(&mut style.text).list_style_type = *lst;
+        }
+        (PropertyIdKind::ListStylePosition, PropertyValue::ListStylePosition(lsp)) => {
+            Arc::make_mut(&mut style.text).list_style_position = *lsp;
+        }
         (PropertyIdKind::LineHeight, PropertyValue::LineHeight(lh)) => {
             Arc::make_mut(&mut style.text).line_height = lh.clone();
         }
@@ -3067,6 +3090,12 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::BackgroundPosition, PropertyValue::BgPosition(x, y)) => {
             Arc::make_mut(&mut style.visual).background_position = (x.clone(), y.clone());
+        }
+        (PropertyIdKind::BackgroundPositionX, PropertyValue::Length(x)) => {
+            Arc::make_mut(&mut style.visual).background_position.0 = x.clone();
+        }
+        (PropertyIdKind::BackgroundPositionY, PropertyValue::Length(y)) => {
+            Arc::make_mut(&mut style.visual).background_position.1 = y.clone();
         }
         (PropertyIdKind::ObjectPosition, PropertyValue::ObjectPos(pos)) => {
             Arc::make_mut(&mut style.visual).object_position = Some(pos.clone());
@@ -3740,6 +3769,12 @@ fn copy_property_from_parent(
         }
         PropertyIdKind::FontFamily => {
             Arc::make_mut(&mut style.text).font_family = parent.text.font_family.clone();
+        }
+        PropertyIdKind::ListStyleType => {
+            Arc::make_mut(&mut style.text).list_style_type = parent.text.list_style_type;
+        }
+        PropertyIdKind::ListStylePosition => {
+            Arc::make_mut(&mut style.text).list_style_position = parent.text.list_style_position;
         }
         PropertyIdKind::LineHeight => {
             Arc::make_mut(&mut style.text).line_height = parent.text.line_height.clone();
@@ -4548,6 +4583,12 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         }
         PropertyIdKind::FontFamily => {
             Arc::make_mut(&mut style.text).font_family = init.text.font_family.clone();
+        }
+        PropertyIdKind::ListStyleType => {
+            Arc::make_mut(&mut style.text).list_style_type = init.text.list_style_type;
+        }
+        PropertyIdKind::ListStylePosition => {
+            Arc::make_mut(&mut style.text).list_style_position = init.text.list_style_position;
         }
         PropertyIdKind::LineHeight => {
             Arc::make_mut(&mut style.text).line_height = init.text.line_height.clone();

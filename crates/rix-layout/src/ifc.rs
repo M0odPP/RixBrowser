@@ -125,6 +125,7 @@ enum InlineItem {
     PushInline(ActiveInline),
     PopInline(BoxId),
     OutOfFlow(BoxId),
+    Float(BoxId),
     Word {
         text: String,
         style: Arc<ComputedStyle>,
@@ -210,7 +211,7 @@ pub fn measure_vertical_ifc_dims(
                     cur_line_block = cur_line_block.max(strut_line_h);
                 }
             }
-            InlineItem::PopInline(_) | InlineItem::OutOfFlow(_) => {}
+            InlineItem::PopInline(_) | InlineItem::OutOfFlow(_) | InlineItem::Float(_) => {}
             InlineItem::Word {
                 text,
                 style,
@@ -438,6 +439,15 @@ pub fn measure_ifc_inline_min_max(
                 max_w = max_w.max(current_line_w);
             }
             InlineItem::OutOfFlow(_) => {}
+            InlineItem::Float(box_id) => {
+                let b = ctx.tree.get(*box_id);
+                let m = BoxMetrics::resolve(&b.style, &space);
+                let (cmin, cmax) = measure_intrinsic_widths(ctx, *box_id, space);
+                min_w = min_w.max(cmin + m.margin.horizontal());
+                current_line_w += pending_space_w + cmax + m.margin.horizontal();
+                pending_space_w = 0.0;
+                max_w = max_w.max(current_line_w);
+            }
         }
     }
     (min_w, max_w.max(min_w))
@@ -448,7 +458,7 @@ pub fn layout_ifc(
     ctx: &mut LayoutContext<'_>,
     container_id: BoxId,
     space: ConstraintSpace,
-    floats: &FloatContext,
+    floats: &mut FloatContext,
     content_origin: Point,
 ) -> IfcLayoutOutput {
     let container_style = Arc::clone(&ctx.tree.get(container_id).style);
@@ -472,6 +482,7 @@ pub fn layout_ifc(
         && !allow_wrap;
 
     let mut lines: Vec<FinishedLine> = Vec::new();
+    let mut float_fragments: Vec<Fragment> = Vec::new();
     let mut cur_pieces: Vec<LinePiece> = Vec::new();
     let mut cursor_y = 0.0f32;
     let mut pending_left_edge = 0.0f32;
@@ -539,6 +550,56 @@ pub fn layout_ifc(
                     flex_hint: None,
                     grid_hint: None,
                 });
+            }
+            InlineItem::Float(float_id) => {
+                // CSS 2.1 §9.5.1: A float appearing in an inline formatting context is
+                // positioned on the current line box's top edge if it fits beside the
+                // already-placed inline content on this line; otherwise it shifts below the
+                // current line.
+                let float_oof_start = ctx.pending_oof.len();
+                let mut frag = layout_box(ctx, float_id, space);
+                let margin_box = rix_core::Size::new(
+                    frag.border_rect.size.width + frag.margin.horizontal(),
+                    frag.border_rect.size.height + frag.margin.vertical(),
+                );
+                let is_left = matches!(
+                    frag.style.float_mode,
+                    rix_css::FloatMode::Left | rix_css::FloatMode::InlineStart
+                );
+                let clear = frag.style.clear_mode;
+                let band_w = (band_right - band_left).max(0.0);
+                let fits_on_current_line = cur_pieces.is_empty()
+                    || cur_x + pending_left_edge + margin_box.width <= band_w + 0.5;
+                let cur_line_h = cur_pieces
+                    .iter()
+                    .map(|p| p.height)
+                    .fold(strut_line_h, f32::max);
+                let mut start_y = if fits_on_current_line {
+                    cursor_y
+                } else {
+                    cursor_y + cur_line_h
+                };
+                if clear != rix_css::ClearMode::None {
+                    start_y = floats.clear_y(clear, start_y);
+                }
+                let pos = floats.place_float(is_left, margin_box, start_y, container_width);
+                frag.border_rect.origin = Point::new(
+                    content_origin.x + pos.x + frag.margin.left,
+                    content_origin.y + pos.y + frag.margin.top,
+                );
+                apply_relative_offset(&mut frag, space);
+                crate::position::offset_pending_oof(
+                    &mut ctx.pending_oof,
+                    float_oof_start,
+                    frag.border_rect.origin.x,
+                    frag.border_rect.origin.y,
+                );
+                if pos.y <= cursor_y + 0.5 {
+                    let (bl, br) = floats.available_band(cursor_y, strut_line_h, container_width);
+                    band_left = bl;
+                    band_right = br;
+                }
+                float_fragments.push(frag);
             }
             InlineItem::HardBreak(br_box_id) => {
                 if let Some(bid) = br_box_id {
@@ -1019,7 +1080,8 @@ pub fn layout_ifc(
     // Mark `is_last` accurately on split inline box fragments across all emitted lines.
     mark_last_inline_fragments(&mut lines);
 
-    let mut fragments = Vec::with_capacity(lines.len());
+    let mut fragments = Vec::with_capacity(lines.len() + float_fragments.len());
+    fragments.extend(float_fragments);
     for line in lines {
         let mut line_frag = Fragment {
             box_id: container_id,
@@ -1662,7 +1724,9 @@ fn apply_white_space_trim(items: &mut Vec<InlineItem>) {
                                     is_preserved_space: false,
                                     ..
                                 } => remove[j] = true,
-                                InlineItem::PopInline(_) | InlineItem::OutOfFlow(_) => {}
+                                InlineItem::PopInline(_)
+                                | InlineItem::OutOfFlow(_)
+                                | InlineItem::Float(_) => {}
                                 _ => break,
                             }
                         }
@@ -1734,6 +1798,7 @@ fn collect_inline_recursive(
         return;
     }
     if b.is_float {
+        out.push(InlineItem::Float(box_id));
         return;
     }
     match &b.kind {

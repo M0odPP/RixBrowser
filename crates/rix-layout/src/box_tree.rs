@@ -1205,9 +1205,10 @@ impl<'a> BoxTreeBuilder<'a> {
         // dropped by IFC!
         let children = self.split_inline_containing_blocks(children);
 
-        let has_block = children
-            .iter()
-            .any(|&cid| self.tree.get(cid).is_block_level());
+        let has_block = children.iter().any(|&cid| {
+            let c = self.tree.get(cid);
+            c.is_block_level() && !c.is_float
+        });
         if !has_block {
             return children;
         }
@@ -1215,7 +1216,7 @@ impl<'a> BoxTreeBuilder<'a> {
         let mut inline_run = Vec::new();
         for cid in children {
             let child = self.tree.get(cid);
-            if child.is_block_level() || child.is_out_of_flow || child.is_float {
+            if (child.is_block_level() && !child.is_float) || child.is_out_of_flow {
                 if !inline_run.is_empty() {
                     let has_visible = inline_run.iter().any(|&id| !self.is_whitespace_only(id));
                     let run = std::mem::take(&mut inline_run);

@@ -68,6 +68,7 @@ pub struct RuleIndex {
     by_class: FastU64Map<Vec<RuleBucketEntry>>,
     by_tag: FastU64Map<Vec<RuleBucketEntry>>,
     universal: Vec<RuleBucketEntry>,
+    host_rules: Vec<RuleBucketEntry>,
     pseudo_by_kind: HashMap<RixPseudoElement, Vec<RuleBucketEntry>>,
     /// Global flag indicating whether any rule contains a `:has(...)` selector.
     pub has_relative_selectors: bool,
@@ -123,6 +124,7 @@ impl RuleIndex {
             by_class: FastU64Map::default(),
             by_tag: FastU64Map::default(),
             universal: Vec::new(),
+            host_rules: Vec::new(),
             pseudo_by_kind: HashMap::new(),
             has_relative_selectors: false,
             has_non_subject_has: false,
@@ -369,6 +371,20 @@ impl RuleIndex {
         }
     }
 
+    /// Returns true if any rule targets `:host` or `:host(...)`.
+    #[must_use]
+    pub fn has_host_rules(&self) -> bool {
+        !self.host_rules.is_empty()
+    }
+
+    /// Collects candidate `:host` / `:host(...)` rule indices for a shadow host element.
+    pub fn collect_host_candidates(&self, out: &mut SmallVec<[u32; 16]>) {
+        out.clear();
+        for entry in &self.host_rules {
+            out.push(entry.rule_idx);
+        }
+    }
+
     /// Returns true if any rule targets `pseudo`.
     #[must_use]
     pub fn has_pseudo_rules(&self, pseudo: RixPseudoElement) -> bool {
@@ -382,12 +398,16 @@ impl RuleIndex {
         let mut best_id: Option<u64> = None;
         let mut best_class: Option<u64> = None;
         let mut best_tag: Option<u64> = None;
+        let mut is_host_subject = false;
 
         for comp in iter.by_ref() {
             match comp {
                 Component::PseudoElement(pe) => {
                     self.pseudo_by_kind.entry(*pe).or_default().push(entry);
                     return;
+                }
+                Component::Host(_) => {
+                    is_host_subject = true;
                 }
                 Component::ID(id) if best_id.is_none() => best_id = Some(id.hash64),
                 Component::Class(cls) if best_class.is_none() => best_class = Some(cls.hash64),
@@ -406,7 +426,9 @@ impl RuleIndex {
             }
         }
 
-        if let Some(id_hash) = best_id {
+        if is_host_subject {
+            self.host_rules.push(entry);
+        } else if let Some(id_hash) = best_id {
             self.by_id.entry(id_hash).or_default().push(entry);
         } else if let Some(cls_hash) = best_class {
             self.by_class.entry(cls_hash).or_default().push(entry);
@@ -445,6 +467,7 @@ fn selector_prevents_sibling_sharing(sel: &Selector<RixSelectorImpl>) -> bool {
                 | Component::NthOf(_)
                 | Component::Empty
                 | Component::Has(_)
+                | Component::Host(_)
                 | Component::Slotted(_) => return true,
                 Component::Is(list) | Component::Where(list) | Component::Negation(list)
                     if list.slice().iter().any(selector_prevents_sibling_sharing) =>

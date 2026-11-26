@@ -857,3 +857,376 @@ fn svg_extractor_skips_defs_clippath_and_applies_group_transforms() {
         decoded.paths[1].transform
     );
 }
+
+#[test]
+fn shadow_host_rules_and_host_descendant_selectors_match_per_css_scoping_l1() {
+    // CSS Scoping L1 §3.1.1 & CSS Cascade L4 §6.1:
+    // `:host` / `:host(...)` inside a ShadowRoot styles the host element (lower normal
+    // priority than outer author rules, higher `!important` priority) AND `:host(...) <desc>`
+    // matches shadow-tree descendants against the shadow host element.
+    let mut doc = parse_html(
+        r#"<!doctype html><html><body>
+            <my-menu id="closed"></my-menu>
+            <my-menu id="opened" loaded></my-menu>
+        </body></html>"#,
+    );
+    let closed_host = doc.get_element_by_id("closed").unwrap();
+    let opened_host = doc.get_element_by_id("opened").unwrap();
+
+    let shadow_css = r#"
+        :host { display: block; padding-top: 12px; margin-top: 20px !important; }
+        :host(:not([loaded])) .dropdown { display: none; }
+        :host([loaded]) .dropdown { display: block; }
+    "#;
+    let attach = |doc: &mut rix_dom::Document, host: rix_dom::NodeId| -> rix_dom::NodeId {
+        let sr = doc.new_node(rix_dom::NodeData::ShadowRoot {
+            host,
+            mode: "open".into(),
+            delegates_focus: false,
+            clonable: false,
+            serializable: false,
+            slot_assignment: "named".into(),
+            declarative: false,
+            null_registry: false,
+        });
+        if let Some(rix_dom::NodeData::Element(el)) = doc.get_mut(host) {
+            el.shadow_root = Some(sr);
+        }
+        let style_el = doc.create_element("style");
+        let style_txt = doc.create_text(shadow_css);
+        doc.append_child(style_el, style_txt);
+        doc.append_child(sr, style_el);
+        let dd = doc.create_element("div");
+        if let Some(rix_dom::NodeData::Element(el)) = doc.get_mut(dd) {
+            el.set_attribute("class", "dropdown");
+        }
+        let dd_txt = doc.create_text("Menu panel");
+        doc.append_child(dd, dd_txt);
+        doc.append_child(sr, dd);
+        dd
+    };
+    let closed_dd = attach(&mut doc, closed_host);
+    let opened_dd = attach(&mut doc, opened_host);
+
+    let outer_css = "my-menu { padding-top: 4px; margin-top: 6px !important; }";
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        outer_css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let closed_host_style = styles.style_for(closed_host).unwrap();
+    assert_eq!(
+        closed_host_style.display,
+        rix_css::DisplayMode::Block,
+        ":host display:block must apply to the shadow host element"
+    );
+    assert_eq!(
+        closed_host_style.box_model.padding.top,
+        rix_css::LengthPercentage::px(4.0),
+        "outer author normal rule must override inner :host normal rule per CSS Cascade L4 §6.1"
+    );
+    assert_eq!(
+        closed_host_style.box_model.margin.top,
+        rix_css::LengthPercentageAuto::Value(rix_css::LengthPercentage::px(20.0)),
+        "inner :host !important rule must override outer author !important rule per CSS Cascade L4 §6.1"
+    );
+
+    assert_eq!(
+        styles.style_for(closed_dd).unwrap().display,
+        rix_css::DisplayMode::None,
+        ":host(:not([loaded])) .dropdown must hide dropdown inside unloaded host"
+    );
+    assert_eq!(
+        styles.style_for(opened_dd).unwrap().display,
+        rix_css::DisplayMode::Block,
+        ":host([loaded]) .dropdown must show dropdown inside loaded host"
+    );
+}
+
+#[test]
+fn replaced_element_with_width_attr_and_percent_max_width_is_compressible_in_flex_wrap() {
+    // CSS Sizing L3 §5.2.1 & CSS Flexbox L1 §4.5: `<img width="1024" height="751">` with
+    // `max-width: 95%` is compressible (`min-content` = 0 + border/padding) so two
+    // `.column { flex: 1; width: 50%; padding: 20px; }` items stay side-by-side in a
+    // `flex-wrap: wrap` row instead of wrapping vertically.
+    let css = r#"
+        body { margin: 0; }
+        .row { display: flex; flex-direction: row; flex-wrap: wrap; width: 1000px; }
+        .column { display: flex; flex-direction: column; flex: 1; padding: 20px; border: 1px solid #ccc; width: 50%; }
+        .slider { width: 100%; overflow: hidden; }
+        .slider img { max-width: 95%; height: auto; }
+    "#;
+    let html = r#"<!doctype html><html><body>
+        <div class="row">
+            <div class="column" id="c1">
+                <div class="slider">
+                    <img src="photo.jpg" width="1024" height="751">
+                </div>
+            </div>
+            <div class="column" id="c2">
+                <p>Second column content</p>
+            </div>
+        </div>
+    </body></html>"#;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let mut font_db = FontDatabase::new();
+    font_db.scan_system_fonts();
+    let (tree, _) = engine.layout_only(&doc, &styles, Size::new(1000.0, 800.0), &font_db);
+    let root = tree.root.as_ref().unwrap();
+
+    let c1 = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("c1").unwrap()).unwrap();
+    let c2 = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("c2").unwrap()).unwrap();
+    assert!(
+        (c1.min_y() - c2.min_y()).abs() < 2.0 && c2.min_x() >= c1.max_x() - 1.0,
+        "two flex:1 columns with width-attr + percent max-width <img> must stay side-by-side, got c1={c1:?} c2={c2:?}"
+    );
+}
+
+#[test]
+fn replaced_element_max_height_preserves_aspect_ratio_per_css21_10_4() {
+    // CSS 2.1 §10.4: when a replaced element with intrinsic aspect ratio (`378x203`) has
+    // `width: auto; height: auto; max-height: 64px; max-width: 176px;`, clamping height to
+    // 64px must proportionally shrink width to `64 * 378 / 203 ≈ 119.2px`.
+    let css = r#"
+        body { margin: 0; }
+        svg { width: auto; height: auto; max-height: 64px; max-width: 176px; }
+    "#;
+    let html = r##"<!doctype html><html><body>
+        <svg id="logo" width="378" height="203" viewBox="0 0 378 203">
+            <rect x="0" y="0" width="378" height="203" fill="#000"/>
+        </svg>
+    </body></html>"##;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let font_db = FontDatabase::new();
+    let (tree, _) = engine.layout_only(&doc, &styles, Size::new(800.0, 400.0), &font_db);
+    let root = tree.root.as_ref().unwrap();
+
+    let logo = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("logo").unwrap()).unwrap();
+    let expected_w = 64.0 * 378.0 / 203.0;
+    assert!(
+        (logo.size.height - 64.0).abs() < 0.5 && (logo.size.width - expected_w).abs() < 1.0,
+        "max-height clamp must preserve intrinsic aspect ratio (~{expected_w:.1}x64), got {logo:?}"
+    );
+}
+
+#[test]
+fn svg_background_size_auto_uses_intrinsic_size_and_background_position() {
+    // CSS Backgrounds L3 §3.9 & §3.6: an SVG `background-image` with `background-size: auto`
+    // and `width="600" height="120" viewBox="0 0 150 30"` must render at `600x120` (scale 4.0)
+    // instead of clamping to `1.0` in viewBox units (`150x30`).
+    let css = r#"
+        body { margin: 0; }
+        #banner {
+            width: 1000px;
+            height: 120px;
+            background-image: url("hero.svg");
+            background-position: top center;
+            background-repeat: no-repeat;
+        }
+    "#;
+    let html = r#"<!doctype html><html><body><div id="banner"></div></body></html>"#;
+    let svg_markup = r##"<svg xmlns="http://www.w3.org/2000/svg" width="600" height="120" viewBox="0 0 150 30">
+        <rect x="0" y="0" width="150" height="30" fill="#2266aa"/>
+    </svg>"##;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let svg_doc = parse_html(svg_markup);
+    let decoded = extract_svg_from_document(&svg_doc, ColorRgba::BLACK).unwrap();
+    engine.assets.register_svg("hero.svg", decoded);
+
+    let font_db = FontDatabase::new();
+    let mut resources = ResourceRegistry::default();
+    let frame = engine.layout_and_paint(
+        &doc,
+        &styles,
+        Size::new(1000.0, 300.0),
+        &font_db,
+        PipelineId(1),
+        &mut resources,
+    );
+
+    let path_id = frame
+        .display_list
+        .items
+        .iter()
+        .find_map(|item| match item {
+            DisplayItem::VectorPath { path_id, .. } => Some(*path_id),
+            _ => None,
+        })
+        .expect("SVG background-image must emit a VectorPath");
+    let bez = resources.get_path(path_id).expect("registered path");
+    let bbox = vello::kurbo::Shape::bounding_box(bez);
+    assert!(
+        (bbox.width() - 600.0).abs() < 2.0 && (bbox.height() - 120.0).abs() < 2.0,
+        "SVG background-size: auto must scale viewBox (150x30) to intrinsic_size (600x120), got bbox={bbox:?}"
+    );
+    assert!(
+        (bbox.x0 - 200.0).abs() < 2.0,
+        "background-position: top center in 1000px box must place 600px SVG at x=200, got bbox={bbox:?}"
+    );
+}
+
+#[test]
+fn inline_float_stays_on_same_line_as_preceding_inline_label() {
+    // CSS 2.1 §9.5.1: a floated element following inline content inside a block container
+    // must float on the same line box top edge when it fits, rather than forcing an anonymous
+    // block break onto the next line.
+    let css = r#"
+        body { margin: 0; }
+        .bar { width: 320px; padding: 8px; }
+        .bar label { font-size: 14px; }
+        .bar input { float: right; width: 120px; height: 22px; }
+    "#;
+    let html = r#"<!doctype html><html><body>
+        <div class="bar">
+            <label id="lbl">Package Search:</label>
+            <input id="inp" type="text">
+        </div>
+    </body></html>"#;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let mut font_db = FontDatabase::new();
+    font_db.scan_system_fonts();
+    let (tree, _) = engine.layout_only(&doc, &styles, Size::new(800.0, 400.0), &font_db);
+    let root = tree.root.as_ref().unwrap();
+
+    let lbl = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("lbl").unwrap()).unwrap();
+    let inp = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("inp").unwrap()).unwrap();
+    assert!(
+        (inp.min_y() - lbl.min_y()).abs() < 6.0 && inp.min_x() > lbl.max_x(),
+        "inline float:right <input> must sit on the same line to the right of <label>, got lbl={lbl:?} inp={inp:?}"
+    );
+}
+
+#[test]
+fn list_style_type_paints_disc_and_decimal_markers_and_honors_none() {
+    // CSS Lists L3: `<ul>` paints disc bullet markers, `<ol>` paints decimal numeral markers,
+    // and `list-style: none` suppresses markers.
+    let css = "ul.nav { list-style: none; }";
+    let html = r#"<!doctype html><html><body>
+        <ul><li>Bullet item</li></ul>
+        <ol><li>First ordered</li><li>Second ordered</li></ol>
+        <ul class="nav"><li>Nav link</li></ul>
+    </body></html>"#;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let mut font_db = FontDatabase::new();
+    font_db.scan_system_fonts();
+    let mut resources = ResourceRegistry::default();
+    let frame = engine.layout_and_paint(
+        &doc,
+        &styles,
+        Size::new(600.0, 400.0),
+        &font_db,
+        PipelineId(1),
+        &mut resources,
+    );
+
+    let disc_rects = frame
+        .display_list
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                DisplayItem::Rect { bounds, radii, .. }
+                    if bounds.size.width >= 3.0
+                        && bounds.size.width <= 8.0
+                        && (bounds.size.width - bounds.size.height).abs() < 0.5
+                        && radii[0] > 1.0
+            )
+        })
+        .count();
+    assert_eq!(
+        disc_rects, 1,
+        "exactly one disc bullet marker must paint (for <ul>, not <ol> or ul.nav), got {disc_rects}"
+    );
+
+    let glyph_runs = frame
+        .display_list
+        .items
+        .iter()
+        .filter(|item| matches!(item, DisplayItem::GlyphRun { .. }))
+        .count();
+    assert!(
+        glyph_runs >= 6,
+        "4 list item texts + 2 decimal markers ('1.' and '2.') must emit >= 6 GlyphRuns, got {glyph_runs}"
+    );
+}
+
+#[test]
+fn system_font_db_default_serif_covers_basic_latin() {
+    // CSS Fonts L3: system `default_serif` must cover Basic Latin so `font-family: serif`
+    // renders genuine serif glyphs rather than falling back to sans-serif.
+    let mut font_db = FontDatabase::new();
+    let count = font_db.scan_system_fonts();
+    if count == 0 {
+        return;
+    }
+    let serif_id = font_db
+        .default_serif
+        .expect("system fonts must resolve default_serif");
+    let font = font_db.get_font(serif_id).expect("default_serif font data");
+    assert!(
+        (font.coverage_mask & 1) != 0,
+        "default_serif '{}' must cover Basic Latin (coverage_mask bit 0), got mask={:#x}",
+        font.descriptor.family,
+        font.coverage_mask
+    );
+}

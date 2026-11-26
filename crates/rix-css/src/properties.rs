@@ -40,13 +40,14 @@ use crate::values::{
     DirectionMode, DisplayMode, EmptyCellsMode, FilterOp, FilterSpecOp, FlexDirectionMode,
     FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode, GridPlacementValue,
     GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode, LengthPercentage,
-    LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
-    OverflowWrapMode, OverlayMode, OverscrollBehaviorMode, PointerEventsMode, PositionMode,
-    ReadingFlowMode, ResizeMode, ScrollBehaviorMode, SizeValue, TableLayoutMode, TextAlignLastMode,
-    TextAlignMode, TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode,
-    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode,
-    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
-    WordBreakMode, WritingMode, ZIndexValue,
+    LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, ListStylePositionMode,
+    ListStyleTypeMode, MixBlendMode, OverflowMode, OverflowWrapMode, OverlayMode,
+    OverscrollBehaviorMode, PointerEventsMode, PositionMode, ReadingFlowMode, ResizeMode,
+    ScrollBehaviorMode, SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode,
+    TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode, TextTransformMode,
+    TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec,
+    UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode,
+    ZIndexValue,
 };
 
 /// Category of an unsupported CSS feature recorded during compilation.
@@ -2435,6 +2436,8 @@ pub enum PropertyValue {
     Contain(u8),
     BackgroundImageRaw(String),
     FontStyleObliqueMath(Box<crate::values_math::MathNode>),
+    ListStyleType(ListStyleTypeMode),
+    ListStylePosition(ListStylePositionMode),
 }
 
 impl PropertyValue {
@@ -2531,6 +2534,54 @@ pub struct SpecifiedDeclaration {
     pub value: PropertyValue,
     pub important: bool,
     pub order: u32,
+}
+
+fn convert_bg_horiz_pos(
+    pos: &lightningcss::values::position::HorizontalPosition,
+) -> LengthPercentage {
+    use lightningcss::values::position::{HorizontalPosition, HorizontalPositionKeyword};
+    match pos {
+        HorizontalPosition::Center => LengthPercentage::Percent(0.5),
+        HorizontalPosition::Length(lp) => convert_length_percentage(lp),
+        HorizontalPosition::Side { side, offset } => {
+            if let Some(lp) = offset {
+                let l = convert_length_percentage(lp);
+                if matches!(side, HorizontalPositionKeyword::Left) {
+                    l
+                } else {
+                    LengthPercentage::Percent(1.0)
+                }
+            } else {
+                match side {
+                    HorizontalPositionKeyword::Left => LengthPercentage::Zero,
+                    HorizontalPositionKeyword::Right => LengthPercentage::Percent(1.0),
+                }
+            }
+        }
+    }
+}
+
+fn convert_bg_vert_pos(pos: &lightningcss::values::position::VerticalPosition) -> LengthPercentage {
+    use lightningcss::values::position::{VerticalPosition, VerticalPositionKeyword};
+    match pos {
+        VerticalPosition::Center => LengthPercentage::Percent(0.5),
+        VerticalPosition::Length(lp) => convert_length_percentage(lp),
+        VerticalPosition::Side { side, offset } => {
+            if let Some(lp) = offset {
+                let l = convert_length_percentage(lp);
+                if matches!(side, VerticalPositionKeyword::Top) {
+                    l
+                } else {
+                    LengthPercentage::Percent(1.0)
+                }
+            } else {
+                match side {
+                    VerticalPositionKeyword::Top => LengthPercentage::Zero,
+                    VerticalPositionKeyword::Bottom => LengthPercentage::Percent(1.0),
+                }
+            }
+        }
+    }
 }
 
 fn push_decl(
@@ -4853,6 +4904,41 @@ fn compile_property(
                 imp,
             );
         }
+        Property::BackgroundPosition(positions) => {
+            if let Some(pos) = positions.first() {
+                let x = convert_bg_horiz_pos(&pos.x);
+                let y = convert_bg_vert_pos(&pos.y);
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::BackgroundPosition,
+                    PropertyValue::BgPosition(x, y),
+                    imp,
+                );
+            }
+        }
+        Property::BackgroundPositionX(xs) => {
+            if let Some(x) = xs.first() {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::BackgroundPositionX,
+                    PropertyValue::Length(convert_bg_horiz_pos(x)),
+                    imp,
+                );
+            }
+        }
+        Property::BackgroundPositionY(ys) => {
+            if let Some(y) = ys.first() {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::BackgroundPositionY,
+                    PropertyValue::Length(convert_bg_vert_pos(y)),
+                    imp,
+                );
+            }
+        }
         Property::Width(s) => {
             push_decl(
                 out,
@@ -7012,6 +7098,68 @@ fn compile_property(
                 PropertyValue::BorderSpacing(x, y),
                 imp,
             );
+        }
+        Property::ListStyleType(lst) => {
+            if let Ok(s) = lightningcss::traits::ToCss::to_css_string(
+                lst,
+                lightningcss::printer::PrinterOptions::default(),
+            ) {
+                if let Some(mode) = ListStyleTypeMode::from_css_keyword(&s) {
+                    push_decl(
+                        out,
+                        ord,
+                        PropertyIdKind::ListStyleType,
+                        PropertyValue::ListStyleType(mode),
+                        imp,
+                    );
+                }
+            }
+        }
+        Property::ListStylePosition(lsp) => {
+            if let Ok(s) = lightningcss::traits::ToCss::to_css_string(
+                lsp,
+                lightningcss::printer::PrinterOptions::default(),
+            ) {
+                if let Some(mode) = ListStylePositionMode::from_css_keyword(&s) {
+                    push_decl(
+                        out,
+                        ord,
+                        PropertyIdKind::ListStylePosition,
+                        PropertyValue::ListStylePosition(mode),
+                        imp,
+                    );
+                }
+            }
+        }
+        Property::ListStyle(ls) => {
+            if let Ok(s) = lightningcss::traits::ToCss::to_css_string(
+                &ls.list_style_type,
+                lightningcss::printer::PrinterOptions::default(),
+            ) {
+                if let Some(mode) = ListStyleTypeMode::from_css_keyword(&s) {
+                    push_decl(
+                        out,
+                        ord,
+                        PropertyIdKind::ListStyleType,
+                        PropertyValue::ListStyleType(mode),
+                        imp,
+                    );
+                }
+            }
+            if let Ok(s) = lightningcss::traits::ToCss::to_css_string(
+                &ls.position,
+                lightningcss::printer::PrinterOptions::default(),
+            ) {
+                if let Some(mode) = ListStylePositionMode::from_css_keyword(&s) {
+                    push_decl(
+                        out,
+                        ord,
+                        PropertyIdKind::ListStylePosition,
+                        PropertyValue::ListStylePosition(mode),
+                        imp,
+                    );
+                }
+            }
         }
         Property::All(kw) => {
             let gk = match kw {

@@ -754,25 +754,135 @@ impl FontDatabase {
     }
 
     fn finalize_default_fallbacks(&mut self, count: usize) {
-        if let Some(id) = self.best_fallback_matching(|font| {
-            let family = font.descriptor.family.to_lowercase();
-            (family.contains("sans") || family.contains("adwaita") || family.contains("dejavu"))
-                && !family.contains("mono")
-                && !family.contains("serif")
-                && !family.contains("cjk")
-        }) {
+        const BASIC_LATIN_BIT: u64 = 1u64 << 0;
+        let sans_id = {
+            let pick = |preferred: &[&str]| -> Option<FontId> {
+                for &target in preferred {
+                    if let Some(id) = self.best_fallback_matching(|font| {
+                        (font.coverage_mask & BASIC_LATIN_BIT) != 0
+                            && font.descriptor.family.eq_ignore_ascii_case(target)
+                    }) {
+                        return Some(id);
+                    }
+                }
+                None
+            };
+            pick(&[
+                "noto sans",
+                "liberation sans",
+                "dejavu sans",
+                "adwaita sans",
+                "arial",
+                "helvetica",
+                "cantarell",
+            ])
+            .or_else(|| {
+                self.best_fallback_matching(|font| {
+                    let family = font.descriptor.family.to_lowercase();
+                    (font.coverage_mask & BASIC_LATIN_BIT) != 0
+                        && (family.contains("sans")
+                            || family.contains("adwaita")
+                            || family.contains("dejavu"))
+                        && !family.contains("mono")
+                        && !family.contains("serif")
+                        && !family.contains("cjk")
+                })
+            })
+            .or_else(|| {
+                self.best_fallback_matching(|font| {
+                    let family = font.descriptor.family.to_lowercase();
+                    (family.contains("sans")
+                        || family.contains("adwaita")
+                        || family.contains("dejavu"))
+                        && !family.contains("mono")
+                        && !family.contains("serif")
+                        && !family.contains("cjk")
+                })
+            })
+        };
+        if let Some(id) = sans_id {
             self.default_sans_serif = Some(id);
         }
-        if let Some(id) = self.best_fallback_matching(|font| {
-            let family = font.descriptor.family.to_lowercase();
-            family.contains("serif") && !family.contains("sans") && !family.contains("cjk")
-        }) {
+        let serif_id = {
+            let pick = |preferred: &[&str]| -> Option<FontId> {
+                for &target in preferred {
+                    if let Some(id) = self.best_fallback_matching(|font| {
+                        (font.coverage_mask & BASIC_LATIN_BIT) != 0
+                            && font.descriptor.family.eq_ignore_ascii_case(target)
+                    }) {
+                        return Some(id);
+                    }
+                }
+                None
+            };
+            pick(&[
+                "noto serif",
+                "liberation serif",
+                "dejavu serif",
+                "times new roman",
+                "georgia",
+                "nimbus roman",
+                "free serif",
+                "freeserif",
+            ])
+            .or_else(|| {
+                self.best_fallback_matching(|font| {
+                    let family = font.descriptor.family.to_lowercase();
+                    (font.coverage_mask & BASIC_LATIN_BIT) != 0
+                        && family.contains("serif")
+                        && !family.contains("sans")
+                        && !family.contains("cjk")
+                })
+            })
+            .or_else(|| {
+                self.best_fallback_matching(|font| {
+                    let family = font.descriptor.family.to_lowercase();
+                    family.contains("serif") && !family.contains("sans") && !family.contains("cjk")
+                })
+            })
+        };
+        if let Some(id) = serif_id {
             self.default_serif = Some(id);
         }
-        if let Some(id) = self.best_fallback_matching(|font| {
-            let family = font.descriptor.family.to_lowercase();
-            family.contains("mono") || family.contains("console") || family.contains("typewriter")
-        }) {
+        let mono_id = {
+            let pick = |preferred: &[&str]| -> Option<FontId> {
+                for &target in preferred {
+                    if let Some(id) = self.best_fallback_matching(|font| {
+                        (font.coverage_mask & BASIC_LATIN_BIT) != 0
+                            && font.descriptor.family.eq_ignore_ascii_case(target)
+                    }) {
+                        return Some(id);
+                    }
+                }
+                None
+            };
+            pick(&[
+                "noto sans mono",
+                "liberation mono",
+                "dejavu sans mono",
+                "adwaita mono",
+                "courier new",
+                "ubuntu mono",
+            ])
+            .or_else(|| {
+                self.best_fallback_matching(|font| {
+                    let family = font.descriptor.family.to_lowercase();
+                    (font.coverage_mask & BASIC_LATIN_BIT) != 0
+                        && (family.contains("mono")
+                            || family.contains("console")
+                            || family.contains("typewriter"))
+                })
+            })
+            .or_else(|| {
+                self.best_fallback_matching(|font| {
+                    let family = font.descriptor.family.to_lowercase();
+                    family.contains("mono")
+                        || family.contains("console")
+                        || family.contains("typewriter")
+                })
+            })
+        };
+        if let Some(id) = mono_id {
             self.default_monospace = Some(id);
         }
         if let Some(id) = self.best_fallback_matching(|font| {

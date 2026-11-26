@@ -16,10 +16,11 @@ use std::collections::HashSet;
 use rix_core::{Point, Rect, Size, Vec2};
 use rix_css::{
     AnimationDirectionMode, AnimationFillModeKind, AnimationPlayStateMode, BackgroundImageValue,
-    ClipPathValue, ClipRadius, ColorRgba, ComputedStyle, CssGradientStop, EvalContext,
-    FilterOp as CssFilterOp, KeyframesRule, LengthPercentageAuto, LineStyle, MixBlendMode,
-    OverflowMode, PositionMode, PropertyIdKind, PropertyValue, TextDecorationLine, TimingFunction,
-    TransformOp, VisibilityMode, ZIndexValue,
+    ClipPathValue, ClipRadius, ColorRgba, ComputedStyle, CssGradientStop, DisplayMode, EvalContext,
+    FilterOp as CssFilterOp, KeyframesRule, LengthPercentage, LengthPercentageAuto, LineStyle,
+    ListStylePositionMode, ListStyleTypeMode, MixBlendMode, OverflowMode, PositionMode,
+    PropertyIdKind, PropertyValue, TextDecorationLine, TimingFunction, TransformOp, VisibilityMode,
+    ZIndexValue,
 };
 use rix_ipc::{FontResourceId, ImageId, PathResourceId, PipelineId, ScrollId, SpatialNodeId};
 use rix_render::animations::{
@@ -478,7 +479,7 @@ impl<'a> Painter<'a> {
         }
 
         // Step 1 (Appendix E): Paint background, shadows, and borders of this root.
-        self.paint_box_decorations(frag, abs_rect);
+        self.paint_box_decorations(frag, abs_rect, active_spatial);
 
         // 4. Overflow clip / ScrollFrame for children.
         let clips_x = style.overflow.x != OverflowMode::Visible;
@@ -625,7 +626,15 @@ impl<'a> Painter<'a> {
         scroll_parent: Option<SpatialNodeId>,
         phase: FlowPhase,
     ) {
+        let mut list_ordinal: usize = 0;
         for child in parent.children.iter() {
+            let is_list_item = matches!(
+                child.style.display,
+                DisplayMode::ListItem | DisplayMode::FlowRootListItem
+            );
+            if is_list_item {
+                list_ordinal += 1;
+            }
             // Skip child stacking contexts & positioned elements (handled in Steps 2, 6, 7).
             if creates_stacking_context(child) || is_positioned(child) {
                 continue;
@@ -689,6 +698,9 @@ impl<'a> Painter<'a> {
                     if is_inline_level_fragment(child) {
                         self.paint_inline_subtree(child, child_abs, spatial, scroll_parent);
                     } else {
+                        if is_list_item {
+                            self.paint_list_marker(child, child_abs, list_ordinal);
+                        }
                         let clips = child.style.overflow.x != OverflowMode::Visible
                             || child.style.overflow.y != OverflowMode::Visible;
                         if clips {
@@ -728,7 +740,7 @@ impl<'a> Painter<'a> {
         scroll_parent: Option<SpatialNodeId>,
         phase: FlowPhase,
     ) {
-        self.paint_box_decorations(frag, abs_rect);
+        self.paint_box_decorations(frag, abs_rect, spatial);
 
         let clips = frag.style.overflow.x != OverflowMode::Visible
             || frag.style.overflow.y != OverflowMode::Visible;
@@ -772,7 +784,7 @@ impl<'a> Painter<'a> {
                 }
             }
             FragmentKind::InlineBox { .. } => {
-                self.paint_box_decorations(frag, abs_rect);
+                self.paint_box_decorations(frag, abs_rect, spatial);
             }
             FragmentKind::TextRun(_) => {
                 // Text runs inherit their parent element's computed style for typography only;
@@ -783,7 +795,7 @@ impl<'a> Painter<'a> {
             | FragmentKind::Svg { .. }
             | FragmentKind::FormControl { .. }
             | FragmentKind::ExternalSurface { .. } => {
-                self.paint_box_decorations(frag, abs_rect);
+                self.paint_box_decorations(frag, abs_rect, spatial);
                 self.paint_leaf_content(frag, abs_rect);
             }
             FragmentKind::Box => {
@@ -803,12 +815,118 @@ impl<'a> Painter<'a> {
         }
     }
 
+    fn paint_list_marker(&mut self, frag: &Fragment, abs_rect: Rect, ordinal: usize) {
+        if frag.style.visibility != VisibilityMode::Visible || abs_rect.is_empty() {
+            return;
+        }
+        let lst = frag.style.text.list_style_type;
+        if lst == ListStyleTypeMode::None {
+            return;
+        }
+        let color = frag.style.text.color;
+        if color.a == 0 {
+            return;
+        }
+        let font_size = frag.style.text.font_size_px.max(1.0);
+        let baseline_y = abs_rect.min_y()
+            + frag
+                .baseline
+                .unwrap_or(frag.border.top + frag.padding.top + font_size * 0.85);
+        let is_inside = frag.style.text.list_style_position == ListStylePositionMode::Inside;
+        let anchor_x = if is_inside {
+            abs_rect.min_x() + frag.border.left + frag.padding.left + font_size * 0.35
+        } else {
+            abs_rect.min_x() - font_size * 0.6
+        };
+        let rgba = to_rgba8(color);
+
+        match lst {
+            ListStyleTypeMode::Disc => {
+                let d = (font_size * 0.34).clamp(3.0, 8.0);
+                let r = d * 0.5;
+                let cy = baseline_y - font_size * 0.32;
+                let rect = Rect::new(anchor_x - r, cy - r, d, d);
+                self.list.push(DisplayItem::Rect {
+                    bounds: rect,
+                    color: rgba,
+                    radii: [r; 4],
+                });
+            }
+            ListStyleTypeMode::Circle => {
+                let d = (font_size * 0.34).clamp(3.0, 8.0);
+                let r = d * 0.5;
+                let cy = baseline_y - font_size * 0.32;
+                let rect = Rect::new(anchor_x - r, cy - r, d, d);
+                self.list.push(DisplayItem::Border {
+                    bounds: rect,
+                    widths: [1.0; 4],
+                    colors: [rgba; 4],
+                    radii: [r; 4],
+                });
+            }
+            ListStyleTypeMode::Square => {
+                let d = (font_size * 0.32).clamp(3.0, 8.0);
+                let r = d * 0.5;
+                let cy = baseline_y - font_size * 0.32;
+                let rect = Rect::new(anchor_x - r, cy - r, d, d);
+                self.list.push(DisplayItem::Rect {
+                    bounds: rect,
+                    color: rgba,
+                    radii: [0.0; 4],
+                });
+            }
+            _ => {
+                let marker_text = format_list_marker(lst, ordinal);
+                if marker_text.is_empty() {
+                    return;
+                }
+                let font_id = crate::ifc::resolve_font_for_style(self.font_db, None, &frag.style);
+                let Some(font_res_id) = self.register_font(font_id) else {
+                    return;
+                };
+                let shaper = rix_text::TextShaper::new(self.font_db);
+                let runs = shaper.shape_text(&marker_text, font_id, font_size);
+                let total_w: f32 = runs.iter().map(|r| r.width).sum();
+                if total_w <= 0.0 {
+                    return;
+                }
+                let start_x = if is_inside {
+                    abs_rect.min_x() + frag.border.left + frag.padding.left
+                } else {
+                    abs_rect.min_x() - total_w - font_size * 0.25
+                };
+                let mut pen_x = start_x;
+                let mut instances = Vec::new();
+                for run in runs {
+                    for g in run.glyphs {
+                        instances.push(GlyphInstance {
+                            glyph_id: g.glyph_id,
+                            x: pen_x + g.x_offset,
+                            y: baseline_y - g.y_offset,
+                        });
+                        pen_x += g.x_advance;
+                    }
+                }
+                if !instances.is_empty() {
+                    let bounds =
+                        Rect::new(start_x, baseline_y - font_size, total_w, font_size * 1.25);
+                    self.list
+                        .push_glyph_run(bounds, font_res_id, font_size, rgba, &instances);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn paint_svg_asset_in_rect(
         &mut self,
         svg: &crate::assets::DecodedSvg,
         abs_rect: Rect,
+        spatial: SpatialNodeId,
         size_cover: bool,
         size_contain: bool,
+        pos_x: &LengthPercentage,
+        pos_y: &LengthPercentage,
         tint_override: Option<ColorRgba>,
     ) {
         if abs_rect.is_empty() || svg.paths.is_empty() {
@@ -832,15 +950,31 @@ impl<'a> Painter<'a> {
         } else if size_contain {
             sx.min(sy)
         } else {
-            // Preserve aspect ratio within container bounds (fitting naturally when SVG is larger
-            // than the target box or honoring intrinsic size centered inside larger boxes).
-            sx.min(sy).min(1.0)
+            // CSS Backgrounds L3 §3.9: `background-size: auto` renders at the SVG's intrinsic
+            // pixel dimensions (`width`/`height` attributes, falling back to `viewBox` size).
+            let target_w = f64::from(svg.intrinsic_size.width.max(1.0));
+            let target_h = f64::from(svg.intrinsic_size.height.max(1.0));
+            (target_w / f64::from(vb.size.width)).min(target_h / f64::from(vb.size.height))
         };
-        let tx = -f64::from(vb.origin.x) * scale
-            + f64::from(abs_rect.size.width - vb.size.width * scale as f32) * 0.5;
-        let ty = -f64::from(vb.origin.y) * scale
-            + f64::from(abs_rect.size.height - vb.size.height * scale as f32) * 0.5;
+        let rendered_w = vb.size.width * scale as f32;
+        let rendered_h = vb.size.height * scale as f32;
+        let eval = EvalContext::default();
+        let off_x = pos_x.resolve_px(abs_rect.size.width - rendered_w, &eval);
+        let off_y = pos_y.resolve_px(abs_rect.size.height - rendered_h, &eval);
+        let tx = -f64::from(vb.origin.x) * scale + f64::from(off_x);
+        let ty = -f64::from(vb.origin.y) * scale + f64::from(off_y);
         let xf = Affine::translate((tx, ty)) * Affine::scale(scale);
+        let needs_clip = rendered_w > abs_rect.size.width + 0.5
+            || rendered_h > abs_rect.size.height + 0.5
+            || off_x < -0.5
+            || off_y < -0.5;
+        if needs_clip {
+            self.list.push(DisplayItem::PushClip {
+                spatial,
+                rect: abs_rect,
+                radii: [0.0; 4],
+            });
+        }
 
         for entry in &svg.paths {
             let Ok(mut bez) = parse_svg_path(&entry.path_d) else {
@@ -874,9 +1008,12 @@ impl<'a> Painter<'a> {
                 stroke,
             });
         }
+        if needs_clip {
+            self.list.push(DisplayItem::PopClip);
+        }
     }
 
-    fn paint_box_decorations(&mut self, frag: &Fragment, abs_rect: Rect) {
+    fn paint_box_decorations(&mut self, frag: &Fragment, abs_rect: Rect, spatial: SpatialNodeId) {
         if frag.style.visibility != VisibilityMode::Visible || abs_rect.is_empty() {
             return;
         }
@@ -915,7 +1052,17 @@ impl<'a> Painter<'a> {
         if let BackgroundImageValue::Url(mask_url) = &style.visual.mask_image {
             if bg.a > 0 {
                 if let Some(svg) = self.assets.get_svg_by_src(mask_url.as_str()).cloned() {
-                    self.paint_svg_asset_in_rect(&svg, abs_rect, false, true, Some(bg));
+                    let center = LengthPercentage::Percent(0.5);
+                    self.paint_svg_asset_in_rect(
+                        &svg,
+                        abs_rect,
+                        spatial,
+                        false,
+                        true,
+                        &center,
+                        &center,
+                        Some(bg),
+                    );
                 }
             }
         } else if bg.a > 0 {
@@ -1015,11 +1162,28 @@ impl<'a> Painter<'a> {
                             });
                         }
                     } else if let Some(svg) = self.assets.get_svg_by_src(url.as_str()).cloned() {
+                        let px = if matches!(layer.pos_x, LengthPercentage::Zero)
+                            && !matches!(style.visual.background_position.0, LengthPercentage::Zero)
+                        {
+                            &style.visual.background_position.0
+                        } else {
+                            &layer.pos_x
+                        };
+                        let py = if matches!(layer.pos_y, LengthPercentage::Zero)
+                            && !matches!(style.visual.background_position.1, LengthPercentage::Zero)
+                        {
+                            &style.visual.background_position.1
+                        } else {
+                            &layer.pos_y
+                        };
                         self.paint_svg_asset_in_rect(
                             &svg,
                             abs_rect,
+                            spatial,
                             layer.size_cover,
                             layer.size_contain,
+                            px,
+                            py,
                             None,
                         );
                     }
@@ -2025,6 +2189,71 @@ fn extract_opacity_keyframes(rule: &KeyframesRule, base_opacity: f32) -> Vec<Opa
         });
     }
     kfs
+}
+
+fn format_list_marker(mode: ListStyleTypeMode, ordinal: usize) -> String {
+    let n = ordinal.max(1);
+    match mode {
+        ListStyleTypeMode::Decimal => format!("{n}."),
+        ListStyleTypeMode::DecimalLeadingZero => {
+            if n < 10 {
+                format!("0{n}.")
+            } else {
+                format!("{n}.")
+            }
+        }
+        ListStyleTypeMode::LowerAlpha => format!("{}.", to_alphabetic(n, false)),
+        ListStyleTypeMode::UpperAlpha => format!("{}.", to_alphabetic(n, true)),
+        ListStyleTypeMode::LowerRoman => format!("{}.", to_roman(n, false)),
+        ListStyleTypeMode::UpperRoman => format!("{}.", to_roman(n, true)),
+        ListStyleTypeMode::DisclosureOpen => "\u{25BE}".to_string(),
+        ListStyleTypeMode::DisclosureClosed => "\u{25B8}".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn to_alphabetic(mut n: usize, upper: bool) -> String {
+    let mut chars = Vec::new();
+    let base = if upper { b'A' } else { b'a' };
+    while n > 0 {
+        n -= 1;
+        chars.push((base + (n % 26) as u8) as char);
+        n /= 26;
+    }
+    chars.into_iter().rev().collect()
+}
+
+fn to_roman(mut n: usize, upper: bool) -> String {
+    if n > 3999 {
+        return n.to_string();
+    }
+    const TABLE: &[(usize, &str)] = &[
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    let mut out = String::new();
+    for &(val, sym) in TABLE {
+        while n >= val {
+            out.push_str(sym);
+            n -= val;
+        }
+    }
+    if upper {
+        out.to_ascii_uppercase()
+    } else {
+        out
+    }
 }
 
 fn hash_svg_path_id(d: &str, w: f32, h: f32, transform: &[f64; 6]) -> PathResourceId {
