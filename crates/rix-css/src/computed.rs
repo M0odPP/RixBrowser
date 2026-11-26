@@ -417,27 +417,230 @@ pub struct EffectsStyle {
     pub contain: u8,
 }
 
-/// Inherited map of CSS custom properties (`--*`) stored as owned token streams,
+/// Single CSS custom property value with pre-serialized CSS text and optional
+/// `attr()`-tainted byte ranges (CSS Values L5 §9.4.1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomPropEntry {
+    pub tokens: Arc<[CssToken]>,
+    pub serialized: Arc<str>,
+    pub tainted_ranges: Option<Arc<[(usize, usize)]>>,
+}
+
+impl CustomPropEntry {
+    #[must_use]
+    pub fn from_tokens(tokens: Vec<CssToken>, tainted: Option<Vec<(usize, usize)>>) -> Self {
+        let serialized: Arc<str> = Arc::from(serialize_css_tokens(&tokens));
+        Self {
+            tokens: Arc::from(tokens),
+            serialized,
+            tainted_ranges: tainted.filter(|v| !v.is_empty()).map(Arc::from),
+        }
+    }
+
+    #[must_use]
+    pub fn from_parts(
+        tokens: Vec<CssToken>,
+        serialized: String,
+        tainted: Vec<(usize, usize)>,
+    ) -> Self {
+        Self {
+            tokens: Arc::from(tokens),
+            serialized: Arc::from(serialized),
+            tainted_ranges: (!tainted.is_empty()).then(|| Arc::from(tainted)),
+        }
+    }
+}
+
+/// Parent-linked persistent map of inherited CSS custom properties (`--*`),
 /// together with token-level `attr()`-tainted byte ranges (CSS Values L5 §9.4.1).
-#[derive(Debug, Clone, PartialEq, Default)]
+///
+/// Elements declaring a handful of local custom properties inherit ancestor maps
+/// in O(1) time and memory via `Arc` parent pointers (flattening with cheap `Arc`
+/// refcount bumps only when chain depth reaches 24).
+#[derive(Debug, Clone, Default)]
 pub struct CustomPropertyMap {
-    pub entries: HashMap<InternedStr, Vec<CssToken>>,
-    pub tainted_ranges: HashMap<InternedStr, Vec<(usize, usize)>>,
+    parent: Option<Arc<CustomPropertyMap>>,
+    depth: u16,
+    local: HashMap<InternedStr, Option<CustomPropEntry>>,
+}
+
+impl PartialEq for CustomPropertyMap {
+    fn eq(&self, other: &Self) -> bool {
+        if self.parent.is_none() && other.parent.is_none() {
+            let mut a_count = 0usize;
+            for (k, v) in &self.local {
+                if let Some(entry) = v {
+                    a_count += 1;
+                    if other.get_entry(k) != Some(entry) {
+                        return false;
+                    }
+                }
+            }
+            let b_count = other.local.values().filter(|v| v.is_some()).count();
+            return a_count == b_count;
+        }
+        let mut a_keys = std::collections::HashSet::new();
+        self.collect_visible_keys(&mut a_keys);
+        let mut b_keys = std::collections::HashSet::new();
+        other.collect_visible_keys(&mut b_keys);
+        if a_keys.len() != b_keys.len() {
+            return false;
+        }
+        a_keys
+            .iter()
+            .all(|k| self.get_entry(k) == other.get_entry(k))
+    }
 }
 
 impl CustomPropertyMap {
+    /// Creates an empty child map inheriting from `parent` in O(1) without cloning ancestor entries.
+    #[must_use]
+    pub fn child_of(parent: &Arc<Self>) -> Self {
+        if parent.parent.is_none() && parent.local.is_empty() {
+            return Self::default();
+        }
+        if parent.depth < 24 {
+            return Self {
+                parent: Some(Arc::clone(parent)),
+                depth: parent.depth + 1,
+                local: HashMap::new(),
+            };
+        }
+        let mut flat: HashMap<InternedStr, Option<CustomPropEntry>> = HashMap::new();
+        let mut cur: Option<&CustomPropertyMap> = Some(parent.as_ref());
+        while let Some(map) = cur {
+            for (k, v) in &map.local {
+                flat.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            cur = map.parent.as_deref();
+        }
+        flat.retain(|_, v| v.is_some());
+        Self {
+            parent: None,
+            depth: 0,
+            local: flat,
+        }
+    }
+
+    fn collect_visible_keys(&self, out: &mut std::collections::HashSet<InternedStr>) {
+        let mut tombstones = std::collections::HashSet::new();
+        let mut cur: Option<&CustomPropertyMap> = Some(self);
+        while let Some(map) = cur {
+            for (k, v) in &map.local {
+                if tombstones.contains(k) || out.contains(k) {
+                    continue;
+                }
+                if v.is_some() {
+                    out.insert(k.clone());
+                } else {
+                    tombstones.insert(k.clone());
+                }
+            }
+            cur = map.parent.as_deref();
+        }
+    }
+
+    #[must_use]
+    pub fn get_entry(&self, name: &InternedStr) -> Option<&CustomPropEntry> {
+        let mut cur: Option<&Self> = Some(self);
+        while let Some(map) = cur {
+            if let Some(slot) = map.local.get(name) {
+                return slot.as_ref();
+            }
+            cur = map.parent.as_deref();
+        }
+        None
+    }
+
     #[must_use]
     pub fn get(&self, name: &InternedStr) -> Option<&[CssToken]> {
-        self.entries.get(name).map(Vec::as_slice)
+        self.get_entry(name).map(|e| e.tokens.as_ref())
+    }
+
+    #[must_use]
+    pub fn get_serialized(&self, name: &InternedStr) -> Option<&str> {
+        self.get_entry(name).map(|e| e.serialized.as_ref())
+    }
+
+    #[must_use]
+    pub fn get_tainted(&self, name: &InternedStr) -> Option<&[(usize, usize)]> {
+        self.get_entry(name)
+            .and_then(|e| e.tainted_ranges.as_deref())
+    }
+
+    #[must_use]
+    pub fn contains_key(&self, name: &InternedStr) -> bool {
+        self.get_entry(name).is_some()
     }
 
     pub fn insert(&mut self, name: InternedStr, value: Vec<CssToken>) {
-        self.entries.insert(name, value);
+        self.local
+            .insert(name, Some(CustomPropEntry::from_tokens(value, None)));
+    }
+
+    pub fn insert_entry(&mut self, name: InternedStr, entry: CustomPropEntry) {
+        self.local.insert(name, Some(entry));
+    }
+
+    pub fn insert_with_parts(
+        &mut self,
+        name: InternedStr,
+        tokens: Vec<CssToken>,
+        serialized: String,
+        tainted: Vec<(usize, usize)>,
+    ) {
+        self.local.insert(
+            name,
+            Some(CustomPropEntry::from_parts(tokens, serialized, tainted)),
+        );
+    }
+
+    pub fn remove(&mut self, name: &InternedStr) {
+        if self.parent.as_ref().is_some_and(|p| p.contains_key(name)) {
+            self.local.insert(name.clone(), None);
+        } else {
+            self.local.remove(name);
+        }
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        if self.parent.is_none() {
+            return !self.local.values().any(Option::is_some);
+        }
+        if self.local.values().any(Option::is_some) {
+            return false;
+        }
+        let mut visible = std::collections::HashSet::new();
+        self.collect_visible_keys(&mut visible);
+        visible.is_empty()
+    }
+
+    /// Returns the number of visible custom properties on this element.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        if self.parent.is_none() {
+            return self.local.values().filter(|v| v.is_some()).count();
+        }
+        let mut visible = std::collections::HashSet::new();
+        self.collect_visible_keys(&mut visible);
+        visible.len()
+    }
+
+    /// Returns all visible custom property names on this element.
+    #[must_use]
+    pub fn visible_keys(&self) -> Vec<InternedStr> {
+        if self.parent.is_none() {
+            return self
+                .local
+                .iter()
+                .filter(|(_, v)| v.is_some())
+                .map(|(k, _)| k.clone())
+                .collect();
+        }
+        let mut visible = std::collections::HashSet::new();
+        self.collect_visible_keys(&mut visible);
+        visible.into_iter().collect()
     }
 }
 
@@ -1134,7 +1337,7 @@ pub fn resolve_element_style_with_context(
         }
     }
     if !raw_custom.is_empty() || has_registered {
-        let mut custom_map = (*style.custom_properties).clone();
+        let mut custom_map = CustomPropertyMap::child_of(&style.custom_properties);
         if let Some(regs) = registered_props {
             for (name, reg) in regs {
                 let canonical_iv = reg.initial_value.as_ref().map(|iv| {
@@ -1145,13 +1348,12 @@ pub fn resolve_element_style_with_context(
                     }
                 });
                 if !reg.inherits {
-                    custom_map.tainted_ranges.remove(name);
                     if let Some(iv) = canonical_iv {
                         custom_map.insert(name.clone(), iv);
                     } else {
-                        custom_map.entries.remove(name);
+                        custom_map.remove(name);
                     }
-                } else if !custom_map.entries.contains_key(name) {
+                } else if !custom_map.contains_key(name) {
                     if let Some(iv) = canonical_iv {
                         custom_map.insert(name.clone(), iv);
                     }
@@ -1163,14 +1365,7 @@ pub fn resolve_element_style_with_context(
                 let reg = registered_props.and_then(|m| m.get(name));
                 let inherit_val = || {
                     parent_style
-                        .and_then(|p| {
-                            p.custom_properties.get(name).map(|v| {
-                                (
-                                    v.to_vec(),
-                                    p.custom_properties.tainted_ranges.get(name).cloned(),
-                                )
-                            })
-                        })
+                        .and_then(|p| p.custom_properties.get_entry(name).cloned())
                         .or_else(|| {
                             reg.and_then(|r| {
                                 r.initial_value.clone().map(|v| {
@@ -1179,7 +1374,7 @@ pub fn resolve_element_style_with_context(
                                     } else {
                                         v
                                     };
-                                    (v, None)
+                                    CustomPropEntry::from_tokens(v, None)
                                 })
                             })
                         })
@@ -1192,7 +1387,7 @@ pub fn resolve_element_style_with_context(
                             } else {
                                 v
                             };
-                            (v, None)
+                            CustomPropEntry::from_tokens(v, None)
                         })
                     })
                 };
@@ -1210,16 +1405,10 @@ pub fn resolve_element_style_with_context(
                         }
                     }
                 };
-                if let Some((v, t)) = val {
-                    map.insert(name.clone(), v);
-                    if let Some(tr) = t {
-                        map.tainted_ranges.insert(name.clone(), tr);
-                    } else {
-                        map.tainted_ranges.remove(name);
-                    }
+                if let Some(entry) = val {
+                    map.insert_entry(name.clone(), entry);
                 } else {
-                    map.entries.remove(name);
-                    map.tainted_ranges.remove(name);
+                    map.remove(name);
                 }
             };
         for (name, stack) in &raw_custom {
@@ -1233,7 +1422,6 @@ pub fn resolve_element_style_with_context(
                 match &winner.value {
                     PropertyValue::Custom(tokens) => {
                         custom_map.insert(name.clone(), tokens.clone());
-                        custom_map.tainted_ranges.remove(name);
                     }
                     PropertyValue::Global(kw) => {
                         apply_custom_kw(&mut custom_map, name, *kw);
@@ -1244,33 +1432,37 @@ pub fn resolve_element_style_with_context(
         }
         // Substitute `var()`, `inherit()`, `attr()`, `if()`, `random-item()`, `ident()`
         // inside declared custom properties using Dynamic Tarjan SCC (CSSWG #11500) + taint tracking.
-        let raw_entries = custom_map.entries.clone();
-        let keys: Vec<InternedStr> = raw_custom.keys().cloned().collect();
-        let any_subst = keys.iter().any(|k| {
-            raw_entries
-                .get(k)
-                .is_some_and(|t| crate::substitution::tokens_contain_subst(t))
-        });
-        let resolved_map = if any_subst {
-            crate::substitution::resolve_custom_properties_l5(&custom_map, &keys, &subst_env)
+        let keys_with_subst: Vec<(InternedStr, bool)> = raw_custom
+            .keys()
+            .map(|k| {
+                let has_subst = custom_map
+                    .get(k)
+                    .is_some_and(crate::substitution::tokens_contain_subst);
+                (k.clone(), has_subst)
+            })
+            .collect();
+        let subst_keys: Vec<InternedStr> = keys_with_subst
+            .iter()
+            .filter(|(_, has_s)| *has_s)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let resolved_map = if !subst_keys.is_empty() {
+            crate::substitution::resolve_custom_properties_l5(&custom_map, &subst_keys, &subst_env)
         } else {
             HashMap::new()
         };
-        for name in keys {
-            let has_subst = raw_entries
-                .get(&name)
-                .is_some_and(|t| crate::substitution::tokens_contain_subst(t));
+        for (name, has_subst) in keys_with_subst {
             let resolved_opt = if has_subst {
                 resolved_map.get(&name).cloned().flatten()
             } else {
                 custom_map
-                    .get(&name)
-                    .map(|t| crate::substitution::SubstOutput {
-                        text: serialize_css_tokens(t),
-                        tainted_ranges: custom_map
+                    .get_entry(&name)
+                    .map(|e| crate::substitution::SubstOutput {
+                        text: e.serialized.to_string(),
+                        tainted_ranges: e
                             .tainted_ranges
-                            .get(&name)
-                            .cloned()
+                            .as_deref()
+                            .map(<[(usize, usize)]>::to_vec)
                             .unwrap_or_default(),
                     })
             };
@@ -1298,7 +1490,6 @@ pub fn resolve_element_style_with_context(
                                             if let Some(sub) = resolve_var_tokens(toks, &custom_map)
                                             {
                                                 custom_map.insert(name.clone(), sub);
-                                                custom_map.tainted_ranges.remove(&name);
                                             } else {
                                                 apply_custom_kw(
                                                     &mut custom_map,
@@ -1335,14 +1526,12 @@ pub fn resolve_element_style_with_context(
                         }
                     }
                     if has_subst {
-                        custom_map.insert(name.clone(), resolved);
-                        if sub_out.is_tainted() {
-                            custom_map
-                                .tainted_ranges
-                                .insert(name, sub_out.tainted_ranges);
-                        } else {
-                            custom_map.tainted_ranges.remove(&name);
-                        }
+                        custom_map.insert_with_parts(
+                            name,
+                            resolved,
+                            sub_out.text,
+                            sub_out.tainted_ranges,
+                        );
                     }
                 }
                 None => {
@@ -1350,8 +1539,7 @@ pub fn resolve_element_style_with_context(
                         if registered_props.and_then(|m| m.get(&name)).is_some() {
                             apply_custom_kw(&mut custom_map, &name, GlobalKeyword::Unset);
                         } else {
-                            custom_map.entries.remove(&name);
-                            custom_map.tainted_ranges.remove(&name);
+                            custom_map.remove(&name);
                         }
                     }
                 }

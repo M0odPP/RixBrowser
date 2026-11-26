@@ -10,7 +10,7 @@ use crate::ast::{MethodKind, SourceType};
 use serde::{Deserialize, Serialize};
 
 /// Monotonically bumped whenever instruction encoding or bytecode metadata changes.
-pub const BYTECODE_VERSION: u32 = 1;
+pub const BYTECODE_VERSION: u32 = 2;
 
 /// Magic header baked into serialized bytecode cache payloads.
 pub const BYTECODE_CACHE_MAGIC: [u8; 4] = *b"RXBC";
@@ -238,6 +238,12 @@ pub enum Opcode {
     DirectEval = 114,
     /// Annex B §B.3.1 object literal `__proto__: value` (`A = obj`, `B = proto_val`).
     SetProto = 115,
+    /// Loads from a 16-bit extended frame local slot `Bx` into 8-bit register `A`.
+    MoveFromWide = 116,
+    /// Stores from 8-bit register `A` into a 16-bit extended frame local slot `Bx`.
+    MoveToWide = 117,
+    /// Closes open upvalues in the extended spill range `[base + Bx .. frame_end)`.
+    CloseUpvaluesWide = 118,
 }
 
 impl Opcode {
@@ -359,6 +365,9 @@ impl Opcode {
             113 => Some(Self::DefineClassSetter),
             114 => Some(Self::DirectEval),
             115 => Some(Self::SetProto),
+            116 => Some(Self::MoveFromWide),
+            117 => Some(Self::MoveToWide),
+            118 => Some(Self::CloseUpvaluesWide),
             _ => None,
         }
     }
@@ -403,7 +412,7 @@ pub struct UpvalueDescriptor {
     /// True if capturing a register directly in the enclosing function frame;
     /// false if forwarding an upvalue from the enclosing closure.
     pub is_local: bool,
-    pub index: u8,
+    pub index: u16,
     pub is_const: bool,
 }
 

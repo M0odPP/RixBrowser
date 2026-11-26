@@ -219,3 +219,43 @@ fn custom_property_revert_rolls_back_entire_author_origin_and_post_var_keywords(
     let post_initial = resolve_inline("--empty: ; --x: var(--empty) initial;", Some(&parent));
     assert_eq!(custom_prop_str(&post_initial, "--x"), None);
 }
+
+#[test]
+fn persistent_custom_property_map_scales_with_many_inherited_vars_and_overrides() {
+    // Regression test for CSS Variables L1 inheritance with large design-system token sets:
+    // overriding/removing a local custom property must preserve inherited vars, honor tombstones,
+    // and support deep inheritance chains beyond the flattening threshold.
+    let mut root_css = String::new();
+    for i in 0..400 {
+        root_css.push_str(&format!("--tok-{i}: {i}px; "));
+    }
+    let root = resolve_inline(&root_css, None);
+    assert_eq!(root.custom_properties.len(), 400);
+
+    let child = resolve_inline(
+        "--tok-7: 777px; --tok-9: initial; --derived: var(--tok-399); width: var(--tok-7);",
+        Some(&root),
+    );
+    assert_eq!(custom_prop_str(&child, "--tok-7").as_deref(), Some("777px"));
+    assert_eq!(custom_prop_str(&child, "--tok-9"), None);
+    assert_eq!(
+        custom_prop_str(&child, "--derived").as_deref(),
+        Some("399px")
+    );
+    assert_eq!(child.custom_properties.len(), 400); // -1 tombstone +1 --derived
+    assert_eq!(
+        child.box_model.width,
+        SizeValue::Length(LengthPercentage::px(777.0))
+    );
+
+    // Deep chain (30 hops > 24 flatten threshold) keeps exact semantics.
+    let mut cur = child;
+    for hop in 0..30 {
+        let decl = format!("--hop-{hop}: {hop}px;");
+        cur = resolve_inline(&decl, Some(&cur));
+    }
+    assert_eq!(custom_prop_str(&cur, "--tok-0").as_deref(), Some("0px"));
+    assert_eq!(custom_prop_str(&cur, "--tok-9"), None);
+    assert_eq!(custom_prop_str(&cur, "--hop-29").as_deref(), Some("29px"));
+    assert_eq!(cur.custom_properties.len(), 430);
+}

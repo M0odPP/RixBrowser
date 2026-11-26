@@ -607,8 +607,7 @@ enum EvalStatus {
 }
 
 struct SubstEngine<'a> {
-    raw_map: &'a HashMap<InternedStr, String>,
-    raw_tainted: &'a HashMap<InternedStr, Vec<(usize, usize)>>,
+    custom_props: &'a CustomPropertyMap,
     env: &'a SubstEnv<'a>,
     next_index: usize,
     indices: HashMap<InternedStr, usize>,
@@ -624,15 +623,12 @@ struct SubstEngine<'a> {
 
 #[rustfmt::skip]
 impl<'a> SubstEngine<'a> {
-    fn new(raw_map: &'a HashMap<InternedStr, String>,
-        raw_tainted: &'a HashMap<InternedStr, Vec<(usize, usize)>>, env: &'a SubstEnv<'a>,
-    ) -> Self {
-        let cap = raw_map.len();
+    fn new(custom_props: &'a CustomPropertyMap, env: &'a SubstEnv<'a>) -> Self {
         Self {
-            raw_map, raw_tainted, env, next_index: 0,
-            indices: HashMap::with_capacity(cap), lowlink: HashMap::with_capacity(cap),
-            on_stack: HashMap::with_capacity(cap), tarjan_stack: Vec::with_capacity(cap),
-            resolved: HashMap::with_capacity(cap), active_attrs: Vec::new(),
+            custom_props, env, next_index: 0,
+            indices: HashMap::new(), lowlink: HashMap::new(),
+            on_stack: HashMap::new(), tarjan_stack: Vec::new(),
+            resolved: HashMap::new(), active_attrs: Vec::new(),
             random_item_counter: 0, early_attr_random_counter: 0, cond_random_counter: 0,
         }
     }
@@ -658,9 +654,13 @@ impl<'a> SubstEngine<'a> {
 
     fn resolve_prop(&mut self, name: &InternedStr, depth: u8) -> Option<SubstOutput> {
         if let Some(res) = self.resolved.get(name) { return res.clone(); }
-        let raw = self.raw_map.get(name)?;
+        let entry = self.custom_props.get_entry(name)?;
+        let raw = entry.serialized.as_ref();
         if !contains_subst_fn_str(raw) {
-            let out = SubstOutput { text: raw.clone(), tainted_ranges: self.raw_tainted.get(name).cloned().unwrap_or_default(), };
+            let out = SubstOutput {
+                text: raw.to_string(),
+                tainted_ranges: entry.tainted_ranges.as_deref().map(<[(usize, usize)]>::to_vec).unwrap_or_default(),
+            };
             self.resolved.insert(name.clone(), Some(out.clone()));
             return Some(out);
         }
@@ -676,7 +676,7 @@ impl<'a> SubstEngine<'a> {
         self.on_stack.insert(name.clone(), true);
         self.tarjan_stack.push(name.clone());
 
-        let raw = self.raw_map.get(name).map_or("", String::as_str);
+        let raw = self.custom_props.get_serialized(name).unwrap_or("");
         let (mut out, mut budget) = (SubstOutput::default(), MAX_SUBST_BYTES);
         let saved = (self.random_item_counter, self.early_attr_random_counter, self.cond_random_counter,
             std::mem::take(&mut self.active_attrs), );
@@ -809,10 +809,12 @@ impl<'a> SubstEngine<'a> {
             if let Some(cur) = owner.and_then(|ow| self.lowlink.get_mut(ow)) { *cur = (*cur).min(dep_idx); }
             return EvalStatus::PropCycle(dep_idx);
         }
-        let Some(dep_raw) = self.raw_map.get(dep) else { return EvalStatus::Invalid; };
+        let Some(entry) = self.custom_props.get_entry(dep) else { return EvalStatus::Invalid; };
+        let dep_raw = entry.serialized.as_ref();
         if !contains_subst_fn_str(dep_raw) {
             let val = SubstOutput {
-                text: dep_raw.clone(), tainted_ranges: self.raw_tainted.get(dep).cloned().unwrap_or_default(),
+                text: dep_raw.to_string(),
+                tainted_ranges: entry.tainted_ranges.as_deref().map(<[(usize, usize)]>::to_vec).unwrap_or_default(),
             };
             self.resolved.insert(dep.clone(), Some(val.clone()));
             return Self::append_budgeted(out, &val, budget, false);
@@ -883,12 +885,11 @@ impl<'a> SubstEngine<'a> {
         let nt = name_sub.text.trim();
         if is_valid_custom_prop_ident(nt) {
             let key = rix_core::intern_str(nt);
-            if let Some(toks) = self.env.parent_style.and_then(|p| p.custom_properties.get(&key))
+            if let Some(entry) = self.env.parent_style.and_then(|p| p.custom_properties.get_entry(&key))
             {
                 let mut pval = SubstOutput {
-                    text: serialize_css_tokens(toks), tainted_ranges: self.env
-                        .parent_style.and_then(|p| p.custom_properties.tainted_ranges.get(&key))
-                        .cloned().unwrap_or_default(),
+                    text: entry.serialized.to_string(),
+                    tainted_ranges: entry.tainted_ranges.as_deref().map(<[(usize, usize)]>::to_vec).unwrap_or_default(),
                 };
                 if name_sub.is_tainted() { pval.mark_all_tainted(); }
                 out.append_sub(&pval, false);
@@ -902,7 +903,7 @@ impl<'a> SubstEngine<'a> {
         let Some(reg) = self.env.registered_props.and_then(|m| m.get(dep)) else { return false; };
         let syn_l = reg.syntax.to_ascii_lowercase();
         if !syn_l.contains("<length>") && !syn_l.contains("<length-percentage>") { return false; }
-        let Some(raw) = self.raw_map.get(dep) else { return false; };
+        let Some(raw) = self.custom_props.get_serialized(dep) else { return false; };
         let mut pi = ParserInput::new(raw);
         let mut p = Parser::new(&mut pi);
         while let Ok(tok) = p.next() {
@@ -1708,9 +1709,7 @@ fn build_ident_from_args(args_str: &str, prop_name: &str, eval: &EvalContext) ->
 #[rustfmt::skip]
 pub fn resolve_custom_properties_l5(custom_map: &CustomPropertyMap, declared_keys: &[InternedStr], env: &SubstEnv<'_>,
 ) -> HashMap<InternedStr, Option<SubstOutput>> {
-    let raw_map: HashMap<InternedStr, String> = custom_map.entries
-        .iter().map(|(k, toks)| (k.clone(), serialize_css_tokens(toks))).collect();
-    let mut engine = SubstEngine::new(&raw_map, &custom_map.tainted_ranges, env);
+    let mut engine = SubstEngine::new(custom_map, env);
     declared_keys.iter().map(|key| (key.clone(), engine.resolve_prop(key, 0))).collect()
 }
 
@@ -1722,9 +1721,7 @@ pub fn substitute_standard_property_l5(tokens: &[CssToken], prop: PropertyIdKind
     env: &SubstEnv<'_>,
 ) -> Option<SubstOutput> {
     let raw_src = serialize_css_tokens(tokens);
-    let raw_map: HashMap<InternedStr, String> = custom_props.entries
-        .iter().map(|(k, toks)| (k.clone(), serialize_css_tokens(toks))).collect();
-    let mut engine = SubstEngine::new(&raw_map, &custom_props.tainted_ranges, env);
+    let mut engine = SubstEngine::new(custom_props, env);
     let (mut out, mut budget) = (SubstOutput::default(), MAX_SUBST_BYTES);
     let st = engine.eval_str(None, prop.css_name(), &raw_src, 0, &mut out, &mut budget);
     (st == EvalStatus::Valid && !is_tainted_url_violation(prop, &out)).then_some(out)

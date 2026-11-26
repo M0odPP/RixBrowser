@@ -267,7 +267,7 @@ pub fn load_page_subresources(
 ) -> LoadedPageAssets {
     let mut out = LoadedPageAssets::default();
     let allow_file_scheme = document_url.starts_with("file://");
-    let discovered = discover_wave1_refs(document_url, html);
+    let discovered = discover_wave1_refs(document_url, html, media);
 
     // Collect image alias map (resolved_url -> Vec<raw_alias>).
     let mut image_aliases: HashMap<String, Vec<String>> = HashMap::new();
@@ -788,7 +788,7 @@ pub fn load_page_subresources(
     out
 }
 
-fn discover_wave1_refs(document_url: &str, html: &str) -> DiscoveredRefs {
+fn discover_wave1_refs(document_url: &str, html: &str, media: &MediaContext) -> DiscoveredRefs {
     // 1. Run the streaming HTML PreloadScanner to discover `<base>`, preload links, etc.
     let mut scanner = PreloadScanner::new(Some(document_url));
     scanner.push_bytes(html.as_bytes());
@@ -820,12 +820,35 @@ fn discover_wave1_refs(document_url: &str, html: &str) -> DiscoveredRefs {
             let is_stylesheet = rel
                 .split_ascii_whitespace()
                 .any(|tok| tok.eq_ignore_ascii_case("stylesheet"));
-            if is_stylesheet {
+            let is_alternate = rel
+                .split_ascii_whitespace()
+                .any(|tok| tok.eq_ignore_ascii_case("alternate"));
+            let is_modulepreload = rel
+                .split_ascii_whitespace()
+                .any(|tok| tok.eq_ignore_ascii_case("modulepreload"));
+            if is_stylesheet && !is_alternate && !el.has_attribute("disabled") {
+                let media_ok = el
+                    .get_attribute("media")
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .is_none_or(|m| media.evaluate_media_query_str(m));
+                if media_ok {
+                    if let Some(href) = el.get_attribute("href").map(str::trim) {
+                        if !href.is_empty() {
+                            if let Some(resolved) = resolve_url(base_str, href) {
+                                if seen_css.insert(resolved.clone()) {
+                                    stylesheets.push((href.to_string(), resolved));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if is_modulepreload {
                 if let Some(href) = el.get_attribute("href").map(str::trim) {
                     if !href.is_empty() {
                         if let Some(resolved) = resolve_url(base_str, href) {
-                            if seen_css.insert(resolved.clone()) {
-                                stylesheets.push((href.to_string(), resolved));
+                            if seen_js.insert((href.to_string(), resolved.clone())) {
+                                scripts.push((href.to_string(), resolved));
                             }
                         }
                     }

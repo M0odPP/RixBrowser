@@ -63,10 +63,17 @@ pub fn collect_eval_var_declared_names(stmts: &[Statement]) -> Vec<String> {
     out
 }
 
+/// Maximum fast 8-bit register index reserved for local variables (`0..180`), leaving
+/// `180..250` (70 registers) permanently available for expression temporaries and call frames.
+/// Locals beyond this threshold spill transparently into extended 16-bit frame slots (`>= 256`).
+const LOCAL_FAST_REG_LIMIT: u8 = 180;
+/// First 16-bit extended frame slot index for spilled local variables (`256..=65534`).
+const WIDE_LOCAL_BASE: u16 = 256;
+
 #[derive(Debug, Clone)]
 struct LocalVar {
     name: String,
-    reg: u8,
+    reg: u16,
     depth: u32,
     is_const: bool,
     /// `true` for a named function expression's self-binding (ECMA-262 §15.2.5):
@@ -80,7 +87,7 @@ struct LocalVar {
 #[derive(Debug, Clone)]
 enum VarResolution {
     Local {
-        reg: u8,
+        reg: u16,
         is_const: bool,
         is_tdz: bool,
     },
@@ -120,6 +127,7 @@ struct FunctionCompiler {
     locals: Vec<LocalVar>,
     scope_depth: u32,
     next_reg: u8,
+    next_spill: u16,
     max_regs: u16,
     completion_reg: Option<u8>,
     loops: Vec<LoopControl>,
@@ -162,6 +170,7 @@ impl FunctionCompiler {
             locals: Vec::new(),
             scope_depth: 0,
             next_reg: 0,
+            next_spill: WIDE_LOCAL_BASE,
             max_regs: 0,
             completion_reg: None,
             loops: Vec::new(),
@@ -309,28 +318,77 @@ impl FunctionCompiler {
     fn end_scope(&mut self) {
         let depth = self.scope_depth;
         self.scope_depth = self.scope_depth.saturating_sub(1);
-        let mut lowest_captured: Option<u8> = None;
+        let mut lowest_captured_fast: Option<u8> = None;
+        let mut lowest_captured_wide: Option<u16> = None;
+        let mut min_popped_fast: Option<u8> = None;
+        let mut min_popped_wide: Option<u16> = None;
         let mut pop_count = 0usize;
         for local in self.locals.iter().rev() {
             if local.depth < depth {
                 break;
             }
-            if local.is_captured {
-                lowest_captured = Some(lowest_captured.map_or(local.reg, |c| c.min(local.reg)));
+            if local.reg < WIDE_LOCAL_BASE {
+                let r = local.reg as u8;
+                min_popped_fast = Some(min_popped_fast.map_or(r, |c| c.min(r)));
+                if local.is_captured {
+                    lowest_captured_fast = Some(lowest_captured_fast.map_or(r, |c| c.min(r)));
+                }
+            } else {
+                min_popped_wide = Some(min_popped_wide.map_or(local.reg, |c| c.min(local.reg)));
+                if local.is_captured {
+                    lowest_captured_wide =
+                        Some(lowest_captured_wide.map_or(local.reg, |c| c.min(local.reg)));
+                }
             }
             pop_count += 1;
         }
-        if let Some(reg) = lowest_captured {
+        if let Some(reg) = lowest_captured_fast {
             self.emit(Instruction::abc(Opcode::CloseUpvalues, reg, 0, 0));
         }
+        if let Some(slot) = lowest_captured_wide {
+            self.emit(Instruction::abx(Opcode::CloseUpvaluesWide, 0, slot));
+        }
         let new_len = self.locals.len() - pop_count;
-        if let Some(first_popped) = self.locals.get(new_len) {
-            let new_top = first_popped.reg;
-            self.locals.truncate(new_len);
+        self.locals.truncate(new_len);
+        if let Some(new_top) = min_popped_fast {
             if new_top < self.next_reg {
                 self.next_reg = new_top;
             }
         }
+        if let Some(new_spill) = min_popped_wide {
+            if new_spill < self.next_spill {
+                self.next_spill = new_spill;
+            }
+        }
+    }
+
+    fn alloc_spill_slot(&mut self) -> Result<u16, CompileError> {
+        if self.next_spill >= u16::MAX - 1 {
+            return Err(CompileError::Limit(
+                "Function exceeded 65278 local variable limit".into(),
+            ));
+        }
+        let slot = self.next_spill;
+        self.next_spill += 1;
+        if self.next_spill > self.max_regs {
+            self.max_regs = self.next_spill;
+        }
+        Ok(slot)
+    }
+
+    fn declare_param_local(&mut self, name: &str) -> Result<u16, CompileError> {
+        let reg = u16::from(self.alloc_reg()?);
+        self.locals.push(LocalVar {
+            name: name.to_owned(),
+            reg,
+            depth: self.scope_depth,
+            is_const: false,
+            is_fn_expr_name: false,
+            is_captured: false,
+            is_tdz: false,
+            is_lex: false,
+        });
+        Ok(reg)
     }
 
     fn declare_local(
@@ -338,8 +396,12 @@ impl FunctionCompiler {
         name: &str,
         is_const: bool,
         is_tdz: bool,
-    ) -> Result<u8, CompileError> {
-        let reg = self.alloc_reg()?;
+    ) -> Result<u16, CompileError> {
+        let reg = if self.next_reg < LOCAL_FAST_REG_LIMIT {
+            u16::from(self.alloc_reg()?)
+        } else {
+            self.alloc_spill_slot()?
+        };
         self.locals.push(LocalVar {
             name: name.to_owned(),
             reg,
@@ -351,6 +413,129 @@ impl FunctionCompiler {
             is_lex: is_tdz || is_const,
         });
         Ok(reg)
+    }
+
+    fn emit_load_local(&mut self, dst: u8, local_reg: u16) {
+        if local_reg < WIDE_LOCAL_BASE {
+            let r = local_reg as u8;
+            if dst != r {
+                self.emit(Instruction::abc(Opcode::Move, dst, r, 0));
+            }
+        } else {
+            self.emit(Instruction::abx(Opcode::MoveFromWide, dst, local_reg));
+        }
+    }
+
+    fn emit_store_local(&mut self, local_reg: u16, src: u8) {
+        if local_reg < WIDE_LOCAL_BASE {
+            let r = local_reg as u8;
+            if r != src {
+                self.emit(Instruction::abc(Opcode::Move, r, src, 0));
+            }
+        } else {
+            self.emit(Instruction::abx(Opcode::MoveToWide, src, local_reg));
+        }
+    }
+
+    fn emit_init_local_undef(&mut self, local_reg: u16) -> Result<(), CompileError> {
+        if local_reg < WIDE_LOCAL_BASE {
+            self.emit(Instruction::abc(Opcode::LoadUndef, local_reg as u8, 0, 0));
+        } else {
+            let tmp = self.alloc_reg()?;
+            self.emit(Instruction::abc(Opcode::LoadUndef, tmp, 0, 0));
+            self.emit(Instruction::abx(Opcode::MoveToWide, tmp, local_reg));
+            self.free_to(tmp);
+        }
+        Ok(())
+    }
+
+    fn emit_init_local_tdz(&mut self, local_reg: u16) -> Result<(), CompileError> {
+        if local_reg < WIDE_LOCAL_BASE {
+            self.emit(Instruction::abc(Opcode::LoadTdz, local_reg as u8, 0, 0));
+        } else {
+            let tmp = self.alloc_reg()?;
+            self.emit(Instruction::abc(Opcode::LoadTdz, tmp, 0, 0));
+            self.emit(Instruction::abx(Opcode::MoveToWide, tmp, local_reg));
+            self.free_to(tmp);
+        }
+        Ok(())
+    }
+
+    fn emit_check_tdz_local(
+        &mut self,
+        local_reg: u16,
+        name_const: u32,
+    ) -> Result<(), CompileError> {
+        if local_reg < WIDE_LOCAL_BASE {
+            self.emit_abx_wide(Opcode::CheckTdz, local_reg as u8, name_const);
+        } else {
+            let tmp = self.alloc_reg()?;
+            self.emit(Instruction::abx(Opcode::MoveFromWide, tmp, local_reg));
+            self.emit_abx_wide(Opcode::CheckTdz, tmp, name_const);
+            self.free_to(tmp);
+        }
+        Ok(())
+    }
+
+    fn emit_new_closure_local(
+        &mut self,
+        local_reg: u16,
+        const_idx: u32,
+    ) -> Result<(), CompileError> {
+        if local_reg < WIDE_LOCAL_BASE {
+            self.emit_abx_wide(Opcode::NewClosure, local_reg as u8, const_idx);
+        } else {
+            let tmp = self.alloc_reg()?;
+            self.emit_abx_wide(Opcode::NewClosure, tmp, const_idx);
+            self.emit(Instruction::abx(Opcode::MoveToWide, tmp, local_reg));
+            self.free_to(tmp);
+        }
+        Ok(())
+    }
+
+    fn emit_copy_local(&mut self, dst_local: u16, src_local: u16) -> Result<(), CompileError> {
+        if dst_local == src_local {
+            return Ok(());
+        }
+        if dst_local < WIDE_LOCAL_BASE && src_local < WIDE_LOCAL_BASE {
+            self.emit(Instruction::abc(
+                Opcode::Move,
+                dst_local as u8,
+                src_local as u8,
+                0,
+            ));
+        } else if dst_local < WIDE_LOCAL_BASE {
+            self.emit(Instruction::abx(
+                Opcode::MoveFromWide,
+                dst_local as u8,
+                src_local,
+            ));
+        } else if src_local < WIDE_LOCAL_BASE {
+            self.emit(Instruction::abx(
+                Opcode::MoveToWide,
+                src_local as u8,
+                dst_local,
+            ));
+        } else {
+            let tmp = self.alloc_reg()?;
+            self.emit(Instruction::abx(Opcode::MoveFromWide, tmp, src_local));
+            self.emit(Instruction::abx(Opcode::MoveToWide, tmp, dst_local));
+            self.free_to(tmp);
+        }
+        Ok(())
+    }
+
+    fn emit_close_local(&mut self, local_reg: u16) {
+        if local_reg < WIDE_LOCAL_BASE {
+            self.emit(Instruction::abc(
+                Opcode::CloseUpvalues,
+                local_reg as u8,
+                0,
+                0,
+            ));
+        } else {
+            self.emit(Instruction::abx(Opcode::CloseUpvaluesWide, 0, local_reg));
+        }
     }
 
     fn find_local(&self, name: &str) -> Option<(usize, &LocalVar)> {
@@ -573,8 +758,7 @@ impl Compiler {
                 self.cur().free_to(tmp);
             } else if self.cur().find_local(name).is_none() {
                 let reg = self.cur().declare_local(name, false, false)?;
-                self.cur()
-                    .emit(Instruction::abc(Opcode::LoadUndef, reg, 0, 0));
+                self.cur().emit_init_local_undef(reg)?;
             }
         }
 
@@ -599,8 +783,7 @@ impl Compiler {
                     }
                 } else if self.cur().find_local(name).is_none() {
                     let reg = self.cur().declare_local(name, false, false)?;
-                    self.cur()
-                        .emit(Instruction::abc(Opcode::LoadUndef, reg, 0, 0));
+                    self.cur().emit_init_local_undef(reg)?;
                 }
             }
         }
@@ -636,8 +819,7 @@ impl Compiler {
                                 .any(|l| l.depth == cur_depth && l.name == *name);
                             if !already {
                                 let reg = self.cur().declare_local(name, false, true)?;
-                                self.cur()
-                                    .emit(Instruction::abc(Opcode::LoadTdz, reg, 0, 0));
+                                self.cur().emit_init_local_tdz(reg)?;
                             }
                         }
                     }
@@ -654,8 +836,7 @@ impl Compiler {
                 if let Some(ref name) = func.name {
                     if self.cur().find_local(name).is_none() {
                         let reg = self.cur().declare_local(name, false, false)?;
-                        self.cur()
-                            .emit(Instruction::abc(Opcode::LoadUndef, reg, 0, 0));
+                        self.cur().emit_init_local_undef(reg)?;
                     }
                 }
             }
@@ -676,7 +857,7 @@ impl Compiler {
                         Some((_, l)) => l.reg,
                         None => self.cur().declare_local(name, false, false)?,
                     };
-                    self.cur().emit_abx_wide(Opcode::NewClosure, reg, const_idx);
+                    self.cur().emit_new_closure_local(reg, const_idx)?;
                 }
             }
         }
@@ -710,8 +891,7 @@ impl Compiler {
                             .any(|l| l.depth == cur_depth && l.name == *name);
                         if !already {
                             let reg = self.cur().declare_local(name, false, true)?;
-                            self.cur()
-                                .emit(Instruction::abc(Opcode::LoadTdz, reg, 0, 0));
+                            self.cur().emit_init_local_tdz(reg)?;
                         }
                     }
                 }
@@ -742,8 +922,7 @@ impl Compiler {
                             last.is_lex = true;
                         }
                     }
-                    self.cur()
-                        .emit(Instruction::abc(Opcode::LoadUndef, reg, 0, 0));
+                    self.cur().emit_init_local_undef(reg)?;
                 }
             }
         }
@@ -762,7 +941,7 @@ impl Compiler {
                     Some(r) => r,
                     None => self.cur().declare_local(name, false, false)?,
                 };
-                self.cur().emit_abx_wide(Opcode::NewClosure, reg, const_idx);
+                self.cur().emit_new_closure_local(reg, const_idx)?;
             }
         }
         Ok(())
@@ -809,7 +988,7 @@ impl Compiler {
                 } => {
                     let uv_idx = self.frames[frame_idx].add_upvalue(UpvalueDescriptor {
                         is_local: false,
-                        index,
+                        index: u16::from(index),
                         is_const,
                     })?;
                     return Ok(VarResolution::Upvalue {
@@ -837,11 +1016,9 @@ impl Compiler {
             VarResolution::Local { reg, is_tdz, .. } => {
                 if is_tdz {
                     let c = self.cur().add_string_const(name)?;
-                    self.cur().emit_abx_wide(Opcode::CheckTdz, reg, c);
+                    self.cur().emit_check_tdz_local(reg, c)?;
                 }
-                if dst != reg {
-                    self.cur().emit(Instruction::abc(Opcode::Move, dst, reg, 0));
-                }
+                self.cur().emit_load_local(dst, reg);
             }
             VarResolution::Upvalue { index, .. } => {
                 self.cur()
@@ -872,7 +1049,7 @@ impl Compiler {
                 let (reg, is_const, is_tdz) = (*reg, *is_const, *is_tdz);
                 if is_tdz {
                     let c = self.cur().add_string_const(name)?;
-                    self.cur().emit_abx_wide(Opcode::CheckTdz, reg, c);
+                    self.cur().emit_check_tdz_local(reg, c)?;
                 }
                 if is_const {
                     let msg = self
@@ -882,8 +1059,8 @@ impl Compiler {
                     self.cur().emit_abx_wide(Opcode::LoadConst, tmp, msg);
                     self.cur().emit(Instruction::abc(Opcode::Throw, tmp, 0, 0));
                     self.cur().free_to(tmp);
-                } else if src != reg {
-                    self.cur().emit(Instruction::abc(Opcode::Move, reg, src, 0));
+                } else {
+                    self.cur().emit_store_local(reg, src);
                 }
             }
             VarResolution::Upvalue {
@@ -1089,14 +1266,15 @@ impl Compiler {
                         .emit(Instruction::abc(Opcode::LoadUndef, comp, 0, 0));
                 }
                 self.cur().begin_scope();
-                let mut per_iter_close_reg: Option<u8> = None;
+                let mut per_iter_close: Option<(u8, u16)> = None;
                 if let Some(init) = init {
                     match init {
                         ForInit::VarDecl { kind, decls, .. } => {
                             let start_reg = self.cur().next_reg;
+                            let start_spill = self.cur().next_spill;
                             self.compile_var_decl(*kind, decls)?;
                             if matches!(kind, VarKind::Let | VarKind::Const) {
-                                per_iter_close_reg = Some(start_reg);
+                                per_iter_close = Some((start_reg, start_spill));
                             }
                         }
                         ForInit::Expr(e) => {
@@ -1129,9 +1307,18 @@ impl Compiler {
 
                 self.compile_stmt(body)?;
                 let update_pc = self.cur().code.len();
-                if let Some(close_reg) = per_iter_close_reg {
-                    self.cur()
-                        .emit(Instruction::abc(Opcode::CloseUpvalues, close_reg, 0, 0));
+                if let Some((close_reg, close_spill)) = per_iter_close {
+                    if self.cur().next_reg > close_reg {
+                        self.cur()
+                            .emit(Instruction::abc(Opcode::CloseUpvalues, close_reg, 0, 0));
+                    }
+                    if self.cur().next_spill > close_spill {
+                        self.cur().emit(Instruction::abx(
+                            Opcode::CloseUpvaluesWide,
+                            0,
+                            close_spill,
+                        ));
+                    }
                 }
                 if let Some(upd) = update {
                     let saved = self.cur().next_reg;
@@ -1451,24 +1638,24 @@ impl Compiler {
                                         .find(|l| l.depth == 0 && l.name == *name)
                                         .map(|l| l.reg)
                                     {
-                                        if outer_reg != block_reg {
-                                            self.cur().emit(Instruction::abc(
-                                                Opcode::Move,
-                                                outer_reg,
-                                                block_reg,
-                                                0,
-                                            ));
-                                        }
+                                        self.cur().emit_copy_local(outer_reg, block_reg)?;
                                     } else if self.frames.len() == 1
                                         && self.source_type == SourceType::Script
                                         && self.eval_mode != EvalScopeMode::LocalAll
                                     {
                                         let c = self.cur().add_string_const(name)?;
-                                        self.cur().emit_abx_wide(
-                                            Opcode::DeclareGlobal,
-                                            block_reg,
-                                            c,
-                                        );
+                                        if block_reg < WIDE_LOCAL_BASE {
+                                            self.cur().emit_abx_wide(
+                                                Opcode::DeclareGlobal,
+                                                block_reg as u8,
+                                                c,
+                                            );
+                                        } else {
+                                            let tmp = self.cur().alloc_reg()?;
+                                            self.cur().emit_load_local(tmp, block_reg);
+                                            self.cur().emit_abx_wide(Opcode::DeclareGlobal, tmp, c);
+                                            self.cur().free_to(tmp);
+                                        }
                                     }
                                 }
                             }
@@ -1506,7 +1693,14 @@ impl Compiler {
                         self.cur().declare_local(&name, false, false)?
                     }
                 };
-                self.compile_class(cls, dst)?;
+                if dst < WIDE_LOCAL_BASE {
+                    self.compile_class(cls, dst as u8)?;
+                } else {
+                    let tmp = self.cur().alloc_reg()?;
+                    self.compile_class(cls, tmp)?;
+                    self.cur().emit_store_local(dst, tmp);
+                    self.cur().free_to(tmp);
+                }
             }
             Statement::ImportDecl(_) => {
                 // Static imports collected during module pre-pass.
@@ -1739,22 +1933,23 @@ impl Compiler {
         self.cur()
             .emit(Instruction::abc(iter_op, iter_reg, iter_reg, 0));
 
-        let mut per_iter_close_reg: Option<u8> = None;
+        let mut per_iter_close: Option<(u8, u16)> = None;
         if let ForEachLeft::VarDecl {
             kind: var_kind, id, ..
         } = left
         {
             if *var_kind != VarKind::Var {
                 let start_reg = self.cur().next_reg;
+                let start_spill = self.cur().next_spill;
                 self.declare_pattern_locals(id, *var_kind)?;
-                per_iter_close_reg = Some(start_reg);
+                per_iter_close = Some((start_reg, start_spill));
             }
         }
 
         let loop_start = self.cur().code.len();
         self.cur().loops.push(LoopControl {
             label,
-            continue_target: if per_iter_close_reg.is_some() {
+            continue_target: if per_iter_close.is_some() {
                 None
             } else {
                 Some(loop_start)
@@ -1811,9 +2006,15 @@ impl Compiler {
             self.cur().active_iter_closes.pop();
         }
         let continue_pc = self.cur().code.len();
-        if let Some(close_reg) = per_iter_close_reg {
-            self.cur()
-                .emit(Instruction::abc(Opcode::CloseUpvalues, close_reg, 0, 0));
+        if let Some((close_reg, close_spill)) = per_iter_close {
+            if self.cur().next_reg > close_reg {
+                self.cur()
+                    .emit(Instruction::abc(Opcode::CloseUpvalues, close_reg, 0, 0));
+            }
+            if self.cur().next_spill > close_spill {
+                self.cur()
+                    .emit(Instruction::abx(Opcode::CloseUpvaluesWide, 0, close_spill));
+            }
         }
         let body_try_end = self.cur().code.len() as u32;
         self.cur().emit_loop_back(loop_start)?;
@@ -1946,8 +2147,7 @@ impl Compiler {
                 .any(|l| l.depth == cur_depth && l.name == name);
             if !already {
                 let reg = self.cur().declare_local(&name, is_const, true)?;
-                self.cur()
-                    .emit(Instruction::abc(Opcode::LoadTdz, reg, 0, 0));
+                self.cur().emit_init_local_tdz(reg)?;
             }
         }
         Ok(())
@@ -1968,10 +2168,7 @@ impl Compiler {
                 } else if let Some((idx, l)) = self.cur().find_local(name) {
                     let reg = l.reg;
                     self.cur().locals[idx].is_tdz = false;
-                    if reg != val_reg {
-                        self.cur()
-                            .emit(Instruction::abc(Opcode::Move, reg, val_reg, 0));
-                    }
+                    self.cur().emit_store_local(reg, val_reg);
                 } else {
                     self.emit_store_var(name, val_reg)?;
                 }
@@ -2254,13 +2451,25 @@ impl Compiler {
         if !has_complex_params {
             for pat in &func.params {
                 if let Pattern::Ident { name, .. } = pat {
-                    let _ = self.cur().declare_local(name, false, false)?;
+                    let _ = self.cur().declare_param_local(name)?;
                 }
             }
             if !is_arrow && !param_binds_arguments && function_uses_arguments(func) {
                 let args_reg = self.cur().declare_local("arguments", false, false)?;
-                self.cur()
-                    .emit(Instruction::abc(Opcode::LoadArguments, args_reg, 0, 0));
+                if args_reg < WIDE_LOCAL_BASE {
+                    self.cur().emit(Instruction::abc(
+                        Opcode::LoadArguments,
+                        args_reg as u8,
+                        0,
+                        0,
+                    ));
+                } else {
+                    let tmp = self.cur().alloc_reg()?;
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::LoadArguments, tmp, 0, 0));
+                    self.cur().emit_store_local(args_reg, tmp);
+                    self.cur().free_to(tmp);
+                }
             }
         } else {
             // Reserve incoming argument registers `0..params.len()`, materialize `arguments`
@@ -2271,8 +2480,20 @@ impl Compiler {
             }
             if !is_arrow && !param_binds_arguments && function_uses_arguments(func) {
                 let args_reg = self.cur().declare_local("arguments", false, false)?;
-                self.cur()
-                    .emit(Instruction::abc(Opcode::LoadArguments, args_reg, 0, 0));
+                if args_reg < WIDE_LOCAL_BASE {
+                    self.cur().emit(Instruction::abc(
+                        Opcode::LoadArguments,
+                        args_reg as u8,
+                        0,
+                        0,
+                    ));
+                } else {
+                    let tmp = self.cur().alloc_reg()?;
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::LoadArguments, tmp, 0, 0));
+                    self.cur().emit_store_local(args_reg, tmp);
+                    self.cur().free_to(tmp);
+                }
             }
             for pat in &func.params {
                 self.declare_pattern_locals(pat, VarKind::Let)?;
@@ -2894,6 +3115,7 @@ impl Compiler {
                     // ECMA-262 §15.2.5: Named function expressions introduce an immutable
                     // self-binding visible ONLY within the function body (not enclosing scope).
                     let saved_reg = self.cur().next_reg;
+                    let saved_spill = self.cur().next_spill;
                     self.cur().scope_depth += 1;
                     let self_reg = self.cur().declare_local(self_name, true, false)?;
                     if let Some(last) = self.cur().locals.last_mut() {
@@ -2903,15 +3125,14 @@ impl Compiler {
                         self.compile_function_body_ex(func, false, false, inferred_name)?;
                     let c = self.cur().add_const(ConstantEntry::Function(fn_idx))?;
                     self.cur().emit_abx_wide(Opcode::NewClosure, dst, c);
-                    self.cur()
-                        .emit(Instruction::abc(Opcode::Move, self_reg, dst, 0));
+                    self.cur().emit_store_local(self_reg, dst);
                     if self.cur().locals.last().is_some_and(|l| l.is_captured) {
-                        self.cur()
-                            .emit(Instruction::abc(Opcode::CloseUpvalues, self_reg, 0, 0));
+                        self.cur().emit_close_local(self_reg);
                     }
                     self.cur().locals.pop();
                     self.cur().scope_depth -= 1;
                     self.cur().free_to(saved_reg);
+                    self.cur().next_spill = saved_spill;
                     Ok(())
                 } else {
                     let fn_idx =

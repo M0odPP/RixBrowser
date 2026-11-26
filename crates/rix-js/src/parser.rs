@@ -1726,6 +1726,7 @@ impl<'a> Parser<'a> {
         in_derived_constructor: bool,
     ) -> Result<Function, SyntaxError> {
         let saved_ctx = self.ctx.clone();
+        self.ctx.allow_in = true;
         self.ctx.in_function = true;
         self.ctx.in_async = is_async;
         self.ctx.in_generator = is_generator;
@@ -2181,6 +2182,8 @@ impl<'a> Parser<'a> {
 
     fn parse_object_binding_pattern(&mut self) -> Result<Pattern, SyntaxError> {
         let start = self.expect(TokenKind::LBrace)?.span.start;
+        let saved_in = self.ctx.allow_in;
+        self.ctx.allow_in = true;
         let mut props = Vec::new();
         let mut rest = None;
 
@@ -2243,6 +2246,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        self.ctx.allow_in = saved_in;
         let end = self.expect(TokenKind::RBrace)?.span.end;
         Ok(Pattern::Object {
             props,
@@ -2508,6 +2512,7 @@ impl<'a> Parser<'a> {
 
         let (body, end, strict) = if self.cur.kind == TokenKind::LBrace {
             self.advance()?;
+            self.ctx.allow_in = true;
             let (stmts, saw_strict) = self.parse_statement_list(TokenKind::RBrace, false)?;
             let end = self.expect(TokenKind::RBrace)?.span.end;
             if saw_strict && !has_simple_params {
@@ -2887,7 +2892,10 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::LBracket => {
                     self.advance()?;
+                    let saved_in = self.ctx.allow_in;
+                    self.ctx.allow_in = true;
                     let index = self.parse_expr()?;
+                    self.ctx.allow_in = saved_in;
                     let end = self.expect(TokenKind::RBracket)?.span.end;
                     let span = Span::new(expr.span.start, end);
                     expr = Expr::new(
@@ -2920,7 +2928,10 @@ impl<'a> Parser<'a> {
                             span,
                         );
                     } else if self.eat(TokenKind::LBracket)? {
+                        let saved_in = self.ctx.allow_in;
+                        self.ctx.allow_in = true;
                         let index = self.parse_expr()?;
+                        self.ctx.allow_in = saved_in;
                         let end = self.expect(TokenKind::RBracket)?.span.end;
                         let span = Span::new(expr.span.start, end);
                         expr = Expr::new(
@@ -3000,6 +3011,8 @@ impl<'a> Parser<'a> {
 
     fn parse_call_args(&mut self) -> Result<(Vec<CallArg>, u32), SyntaxError> {
         self.expect(TokenKind::LParen)?;
+        let saved_in = self.ctx.allow_in;
+        self.ctx.allow_in = true;
         let mut args = Vec::new();
         while self.cur.kind != TokenKind::RParen && self.cur.kind != TokenKind::Eof {
             if self.eat(TokenKind::Ellipsis)? {
@@ -3011,6 +3024,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        self.ctx.allow_in = saved_in;
         let end = self.expect(TokenKind::RParen)?.span.end;
         Ok((args, end))
     }
@@ -3189,6 +3203,8 @@ impl<'a> Parser<'a> {
 
     fn parse_array_literal(&mut self) -> Result<Expr, SyntaxError> {
         let start = self.expect(TokenKind::LBracket)?.span.start;
+        let saved_in = self.ctx.allow_in;
+        self.ctx.allow_in = true;
         let mut elements = Vec::new();
         let mut rest_had_trailing_comma = false;
         while self.cur.kind != TokenKind::RBracket && self.cur.kind != TokenKind::Eof {
@@ -3209,6 +3225,7 @@ impl<'a> Parser<'a> {
                 rest_had_trailing_comma = true;
             }
         }
+        self.ctx.allow_in = saved_in;
         let end = self.expect(TokenKind::RBracket)?.span.end;
         let span = Span::new(start, end);
         if rest_had_trailing_comma {
@@ -3219,6 +3236,8 @@ impl<'a> Parser<'a> {
 
     fn parse_object_literal(&mut self) -> Result<Expr, SyntaxError> {
         let start = self.expect(TokenKind::LBrace)?.span.start;
+        let saved_in = self.ctx.allow_in;
+        self.ctx.allow_in = true;
         let mut props = Vec::new();
         let mut rest_had_trailing_comma = false;
         while self.cur.kind != TokenKind::RBrace && self.cur.kind != TokenKind::Eof {
@@ -3379,6 +3398,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        self.ctx.allow_in = saved_in;
         let end = self.expect(TokenKind::RBrace)?.span.end;
         let span = Span::new(start, end);
         if rest_had_trailing_comma {

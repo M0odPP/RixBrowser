@@ -234,3 +234,43 @@ fn const_str(func: &rix_js::FunctionBytecode, idx: u32) -> Option<&str> {
         _ => None,
     }
 }
+
+#[test]
+fn wide_local_spill_slots_execute_and_capture_upvalues_above_250_locals() {
+    // ECMA-262 imposes no 250-local limit; minified production bundles routinely exceed 300 locals.
+    let mut src = String::from("(function() {\n");
+    for i in 0..320 {
+        src.push_str(&format!("  let v{i} = {i};\n"));
+    }
+    src.push_str("  const reader = () => v0 + v179 + v180 + v250 + v319;\n");
+    src.push_str("  v250 += 1000;\n");
+    src.push_str("  return reader() + v319;\n");
+    src.push_str("})()");
+
+    let mut vm = rix_js::JsVm::new();
+    let val = vm.eval_script(&src).expect("320 locals must compile & run");
+    // 0 + 179 + 180 + 1250 + 319 + 319 = 2247
+    assert_eq!(val.as_number(), Some(2247.0));
+}
+
+#[test]
+fn allow_in_resets_inside_function_and_nested_delimiters_in_for_init() {
+    // ECMA-262 §13-15: `FunctionBody`, `(...)`, `[...]`, `{...}`, and call args restore `[+In]`
+    // even when syntactically nested inside a `for (...)` initializer (`[~In]`).
+    let src = r#"
+        let out = 0;
+        for (
+            !function(obj) {
+                if ("a" in obj && ("b" in obj)) out += 1;
+                const fn2 = () => { return "a" in obj ? 2 : 0; };
+                out += fn2();
+            }({ a: 1, b: 2 }),
+            [{ k: "a" in { a: 1 } }][0].k;
+            false;
+        ) {}
+        out
+    "#;
+    let mut vm = rix_js::JsVm::new();
+    let val = vm.eval_script(src).expect("nested +In in for-init parses");
+    assert_eq!(val.as_number(), Some(3.0));
+}

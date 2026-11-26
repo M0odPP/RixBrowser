@@ -64,8 +64,8 @@ use rix_dom::{Document, NodeData, NodeId};
 use rix_html::{attach_declarative_shadow_roots, HtmlParserStream, ParserStreamStep};
 use rix_ipc::{ContentToBrowser, MessagePortId, PipelineId};
 use rix_js::{
-    BytecodeCache, EvalError, GcCycleStats, ImportMap, JsValue, JsVm, MemoryModuleProvider,
-    ModuleLoader, SourceType,
+    BytecodeCache, EvalError, GcCycleStats, ImportMap, JsValue, JsVm, ModuleLoader,
+    ModuleSourceProvider, SourceType,
 };
 use rix_net::FetchEngine;
 use rix_render::{Compositor, DisplayList, LayerRole, ResourceRegistry, VelloRenderer};
@@ -152,6 +152,73 @@ pub struct ContentRuntime {
     pub webgl2: SharedWebGl2,
     pub jit: Rc<rix_jit::TieredJit>,
     pub wasm: rix_jit::SharedWasmHost,
+}
+
+/// Document-scoped ES Module source provider backed by preloaded Wave-1 `<script>` /
+/// `<link rel="modulepreload">` sources, inline module scripts, and live [`FetchEngine`]
+/// network fallback for transitive static `import`s and dynamic `import(...)` expressions.
+struct DocumentModuleProvider {
+    sources: Rc<RefCell<HashMap<String, String>>>,
+    fetch_engine: Option<Arc<FetchEngine>>,
+    doc_origin: String,
+    doc_url: String,
+}
+
+impl ModuleSourceProvider for DocumentModuleProvider {
+    fn load_source(&self, url: &str) -> Result<String, String> {
+        if let Some(code) = self.sources.borrow().get(url).cloned() {
+            return Ok(code);
+        }
+        if let Some(file_path) = url.strip_prefix("file://") {
+            let clean = file_path.split(['?', '#']).next().unwrap_or(file_path);
+            let bytes = std::fs::read(clean)
+                .map_err(|e| format!("failed to read module file '{url}': {e}"))?;
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            self.sources
+                .borrow_mut()
+                .insert(url.to_string(), text.clone());
+            return Ok(text);
+        }
+        if let Some(ref engine) = self.fetch_engine {
+            if url.starts_with("http://") || url.starts_with("https://") {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let mut headers = HashMap::new();
+                    headers.insert("referer".to_string(), self.doc_url.clone());
+                    headers.insert("accept".to_string(), "*/*".to_string());
+                    let req = rix_net::FetchRequest {
+                        url: url.to_string(),
+                        method: "GET".to_string(),
+                        headers,
+                        body: Vec::new(),
+                        mode: rix_net::FetchMode::Cors,
+                        credentials: rix_net::FetchCredentials::SameOrigin,
+                        cache: rix_net::FetchCache::Default,
+                        redirect: rix_net::FetchRedirect::Follow,
+                        origin: self.doc_origin.clone(),
+                        abort_signal: None,
+                    };
+                    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                    let eng = Arc::clone(engine);
+                    handle.spawn(async move {
+                        let _ = tx.send(eng.fetch(req).await);
+                    });
+                    let resp = rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|_| format!("module fetch timed out: {url}"))?
+                        .map_err(|e| format!("module fetch failed for '{url}': {e}"))?;
+                    if !(200..300).contains(&resp.status) {
+                        return Err(format!("module HTTP {}: {url}", resp.status));
+                    }
+                    let text = String::from_utf8_lossy(&resp.body).into_owned();
+                    self.sources
+                        .borrow_mut()
+                        .insert(url.to_string(), text.clone());
+                    return Ok(text);
+                }
+            }
+        }
+        Err(format!("module not found: {url}"))
+    }
 }
 
 impl ContentRuntime {
@@ -622,12 +689,14 @@ impl ContentRuntime {
         external_scripts: &HashMap<String, String>,
     ) -> Vec<String> {
         struct PendingScript {
+            node_id: NodeId,
             url: String,
             code: String,
             is_module: bool,
         }
 
         let doc_url = self.web_apis.borrow().location_url.clone();
+        let doc_origin = doc_url.origin().ascii_serialization();
         let doc_rc = Rc::clone(&self.host.borrow().document);
         doc_rc
             .borrow_mut()
@@ -637,12 +706,38 @@ impl ContentRuntime {
         self.host.borrow_mut().active_parser = Some(Rc::clone(&parser));
         self.host.borrow_mut().ready_state = "loading".to_string();
 
-        let mut errors = Vec::new();
-        let mut deferred_scripts: Vec<PendingScript> = Vec::new();
-        let mut import_map = ImportMap {
+        // Install a live FetchEngine-backed ES ModuleLoader BEFORE executing any inline scripts
+        // so dynamic `import(...)` inside classic scripts (SvelteKit, Vite, webpack chunks) and
+        // transitive static ES module imports resolve seamlessly.
+        let module_sources: Rc<RefCell<HashMap<String, String>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        {
+            let mut src_map = module_sources.borrow_mut();
+            for (k, v) in external_scripts {
+                src_map.insert(k.clone(), v.clone());
+                if let Ok(resolved) = Url::parse(doc_url.as_str()).and_then(|b| b.join(k)) {
+                    src_map.insert(resolved.to_string(), v.clone());
+                }
+            }
+        }
+        let initial_import_map = ImportMap {
             base_url: doc_url.as_str().to_string(),
             ..ImportMap::default()
         };
+        let fetch_engine = self.net.borrow().fetch_engine.clone();
+        let module_loader = Rc::new(RefCell::new(ModuleLoader::new(
+            Box::new(DocumentModuleProvider {
+                sources: Rc::clone(&module_sources),
+                fetch_engine: Some(fetch_engine),
+                doc_origin,
+                doc_url: doc_url.as_str().to_string(),
+            }),
+            initial_import_map,
+        )));
+        ModuleLoader::install_on_vm(&module_loader, &mut self.vm);
+
+        let mut errors = Vec::new();
+        let mut deferred_scripts: Vec<PendingScript> = Vec::new();
         let mut inline_module_idx: usize = 0;
 
         loop {
@@ -668,7 +763,7 @@ impl ContentRuntime {
                     };
                     if ty.eq_ignore_ascii_case("importmap") {
                         match ImportMap::from_json(&inline_text, doc_url.as_str()) {
-                            Ok(parsed) => import_map = parsed,
+                            Ok(parsed) => module_loader.borrow_mut().set_import_map(parsed),
                             Err(err) => {
                                 let msg = format!("ImportMap error: {err}");
                                 self.web_apis
@@ -719,7 +814,13 @@ impl ContentRuntime {
                     }
 
                     if is_module || (is_defer && src.is_some()) {
+                        if is_module {
+                            module_sources
+                                .borrow_mut()
+                                .insert(script_url.clone(), code.clone());
+                        }
                         deferred_scripts.push(PendingScript {
+                            node_id: script_id,
                             url: script_url,
                             code,
                             is_module,
@@ -769,51 +870,32 @@ impl ContentRuntime {
         custom_elements::upgrade_subtree(&mut self.vm, &self.host, finished_root, false);
         self.host.borrow_mut().active_parser = None;
 
-        // Execute deferred classic scripts and ES modules in document order before DOMContentLoaded.
-        let has_modules = deferred_scripts.iter().any(|s| s.is_module);
-        let module_loader = if has_modules {
-            let mut provider = MemoryModuleProvider::new();
-            for (k, v) in external_scripts {
-                provider.insert(k.clone(), v.clone());
-                if let Ok(resolved) = Url::parse(doc_url.as_str()).and_then(|b| b.join(k)) {
-                    provider.insert(resolved.to_string(), v.clone());
-                }
-            }
-            for s in &deferred_scripts {
-                if s.is_module {
-                    provider.insert(s.url.clone(), s.code.clone());
-                }
-            }
-            let loader = Rc::new(RefCell::new(ModuleLoader::new(
-                Box::new(provider),
-                import_map,
-            )));
-            ModuleLoader::install_on_vm(&loader, &mut self.vm);
-            Some(loader)
-        } else {
-            None
-        };
-
+        // Execute deferred classic scripts (with `document.currentScript` bound per HTML §4.12.1.1)
+        // and ES modules in document order before DOMContentLoaded.
         for script in deferred_scripts {
             if script.is_module {
-                if let Some(ref loader) = module_loader {
-                    match ModuleLoader::load_and_evaluate(loader, &mut self.vm, &script.url) {
-                        Ok(_) => self.microtask_checkpoint(),
-                        Err(err) => {
-                            let msg = format!("Module error ({}): {err}", script.url);
-                            self.web_apis
-                                .borrow_mut()
-                                .record_console("error", msg.clone());
-                            errors.push(msg);
-                        }
+                self.host.borrow_mut().current_script = None;
+                match ModuleLoader::load_and_evaluate(&module_loader, &mut self.vm, &script.url) {
+                    Ok(_) => self.microtask_checkpoint(),
+                    Err(err) => {
+                        let msg = format!("Module error ({}): {err}", script.url);
+                        self.web_apis
+                            .borrow_mut()
+                            .record_console("error", msg.clone());
+                        errors.push(msg);
                     }
                 }
-            } else if let Err(err) = self.eval_script_cached(&script.code) {
-                let msg = format_eval_error(&self.vm, &err);
-                self.web_apis
-                    .borrow_mut()
-                    .record_console("error", msg.clone());
-                errors.push(msg);
+            } else {
+                self.host.borrow_mut().current_script = Some(script.node_id);
+                let res = self.eval_script_cached(&script.code);
+                self.host.borrow_mut().current_script = None;
+                if let Err(err) = res {
+                    let msg = format_eval_error(&self.vm, &err);
+                    self.web_apis
+                        .borrow_mut()
+                        .record_console("error", msg.clone());
+                    errors.push(msg);
+                }
             }
         }
 

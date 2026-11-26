@@ -184,3 +184,45 @@ fn external_scripts_modules_events_console_and_incremental_restyle() {
         "idle runtime must report 0 Hz wakeup"
     );
 }
+
+#[test]
+fn deferred_classic_script_sets_current_script_and_classic_dynamic_import_works() {
+    let storage = StorageEngine::in_memory().expect("in-memory storage");
+    let doc = Rc::new(RefCell::new(Document::new()));
+    let font_db = Arc::new(FontDatabase::new());
+    let mut rt = ContentRuntime::with_origin_and_storage(
+        doc,
+        Size::new(1280.0, 800.0),
+        font_db,
+        "https://example.test/index.html",
+        storage,
+    );
+    let mut external = HashMap::new();
+    external.insert(
+        "https://example.test/defer.js".to_string(),
+        r#"
+            window.__deferSrc = document.currentScript ? document.currentScript.getAttribute("src") : null;
+        "#
+        .to_string(),
+    );
+    external.insert(
+        "https://example.test/app.mjs".to_string(),
+        r#"export const answer = 42;"#.to_string(),
+    );
+    let html = r#"<!doctype html><html><head>
+        <script defer src="/defer.js"></script>
+    </head><body>
+        <script>
+            import("/app.mjs").then((m) => { window.__dynImport = m.answer; });
+        </script>
+    </body></html>"#;
+
+    let errors = rt.load_document_with_external_scripts(html, &external);
+    assert!(errors.is_empty(), "unexpected script errors: {errors:?}");
+    rt.microtask_checkpoint();
+
+    let defer_src = rt.eval_script("window.__deferSrc").expect("deferSrc");
+    assert_eq!(rt.vm.value_to_rust_string(defer_src), "/defer.js");
+    let dyn_val = rt.eval_script("window.__dynImport").expect("dynImport");
+    assert_eq!(dyn_val.as_number(), Some(42.0));
+}

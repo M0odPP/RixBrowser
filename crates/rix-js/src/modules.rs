@@ -340,6 +340,11 @@ impl ModuleLoader {
         }
     }
 
+    /// Replaces the active document Import Map (HTML §8.1.6.7 `<script type="importmap">`).
+    pub fn set_import_map(&mut self, import_map: ImportMap) {
+        self.import_map = import_map;
+    }
+
     /// Installs this loader into `vm` so `import(specifier)` (`Opcode::DynamicImport`)
     /// resolves and evaluates modules asynchronously through the same graph & Import Map.
     pub fn install_on_vm(loader: &Rc<RefCell<Self>>, vm: &mut JsVm) {
