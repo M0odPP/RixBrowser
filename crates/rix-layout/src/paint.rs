@@ -16,11 +16,11 @@ use std::collections::HashSet;
 use rix_core::{Point, Rect, Size, Vec2};
 use rix_css::{
     AnimationDirectionMode, AnimationFillModeKind, AnimationPlayStateMode, BackgroundImageValue,
-    ClipPathValue, ClipRadius, ColorRgba, ComputedStyle, CssGradientStop, DisplayMode, EvalContext,
-    FilterOp as CssFilterOp, KeyframesRule, LengthPercentage, LengthPercentageAuto, LineStyle,
-    ListStylePositionMode, ListStyleTypeMode, MixBlendMode, OverflowMode, PositionMode,
-    PropertyIdKind, PropertyValue, TextDecorationLine, TimingFunction, TransformOp, VisibilityMode,
-    ZIndexValue,
+    BackgroundSizeValue, ClipPathValue, ClipRadius, ColorRgba, ComputedStyle, CssGradientStop,
+    DisplayMode, EvalContext, FilterOp as CssFilterOp, KeyframesRule, LengthPercentage,
+    LengthPercentageAuto, LineStyle, ListStylePositionMode, ListStyleTypeMode, MixBlendMode,
+    OverflowMode, PositionMode, PropertyIdKind, PropertyValue, TextDecorationLine, TimingFunction,
+    TransformOp, VisibilityMode, ZIndexValue,
 };
 use rix_ipc::{FontResourceId, ImageId, PathResourceId, PipelineId, ScrollId, SpatialNodeId};
 use rix_render::animations::{
@@ -923,8 +923,7 @@ impl<'a> Painter<'a> {
         svg: &crate::assets::DecodedSvg,
         abs_rect: Rect,
         spatial: SpatialNodeId,
-        size_cover: bool,
-        size_contain: bool,
+        size: &BackgroundSizeValue,
         pos_x: &LengthPercentage,
         pos_y: &LengthPercentage,
         tint_override: Option<ColorRgba>,
@@ -945,25 +944,57 @@ impl<'a> Painter<'a> {
         );
         let sx = f64::from(abs_rect.size.width / vb.size.width);
         let sy = f64::from(abs_rect.size.height / vb.size.height);
-        let scale = if size_cover {
-            sx.max(sy)
-        } else if size_contain {
-            sx.min(sy)
-        } else {
-            // CSS Backgrounds L3 §3.9: `background-size: auto` renders at the SVG's intrinsic
-            // pixel dimensions (`width`/`height` attributes, falling back to `viewBox` size).
-            let target_w = f64::from(svg.intrinsic_size.width.max(1.0));
-            let target_h = f64::from(svg.intrinsic_size.height.max(1.0));
-            (target_w / f64::from(vb.size.width)).min(target_h / f64::from(vb.size.height))
-        };
-        let rendered_w = vb.size.width * scale as f32;
-        let rendered_h = vb.size.height * scale as f32;
         let eval = EvalContext::default();
+        let nat_w = f64::from(svg.intrinsic_size.width.max(1.0));
+        let nat_h = f64::from(svg.intrinsic_size.height.max(1.0));
+        let (scale_x, scale_y) = match size {
+            BackgroundSizeValue::Cover => {
+                let s = sx.max(sy);
+                (s, s)
+            }
+            BackgroundSizeValue::Contain => {
+                let s = sx.min(sy);
+                (s, s)
+            }
+            BackgroundSizeValue::Auto => {
+                // CSS Backgrounds L3 §3.9: `background-size: auto` renders at the SVG's intrinsic
+                // pixel dimensions (`width`/`height` attributes, falling back to `viewBox` size).
+                let s = (nat_w / f64::from(vb.size.width)).min(nat_h / f64::from(vb.size.height));
+                (s, s)
+            }
+            BackgroundSizeValue::Explicit(w_opt, h_opt) => {
+                let (tw, th) = match (w_opt, h_opt) {
+                    (Some(w), Some(h)) => (
+                        f64::from(w.resolve_px(abs_rect.size.width, &eval).max(0.0)),
+                        f64::from(h.resolve_px(abs_rect.size.height, &eval).max(0.0)),
+                    ),
+                    (Some(w), None) => {
+                        let rw = f64::from(w.resolve_px(abs_rect.size.width, &eval).max(0.0));
+                        (rw, rw * (nat_h / nat_w))
+                    }
+                    (None, Some(h)) => {
+                        let rh = f64::from(h.resolve_px(abs_rect.size.height, &eval).max(0.0));
+                        (rh * (nat_w / nat_h), rh)
+                    }
+                    (None, None) => (nat_w, nat_h),
+                };
+                if tw <= 0.0 || th <= 0.0 {
+                    return;
+                }
+                (
+                    tw / f64::from(vb.size.width),
+                    th / f64::from(vb.size.height),
+                )
+            }
+        };
+        let rendered_w = vb.size.width * scale_x as f32;
+        let rendered_h = vb.size.height * scale_y as f32;
         let off_x = pos_x.resolve_px(abs_rect.size.width - rendered_w, &eval);
         let off_y = pos_y.resolve_px(abs_rect.size.height - rendered_h, &eval);
-        let tx = -f64::from(vb.origin.x) * scale + f64::from(off_x);
-        let ty = -f64::from(vb.origin.y) * scale + f64::from(off_y);
-        let xf = Affine::translate((tx, ty)) * Affine::scale(scale);
+        let tx = -f64::from(vb.origin.x) * scale_x + f64::from(off_x);
+        let ty = -f64::from(vb.origin.y) * scale_y + f64::from(off_y);
+        let xf = Affine::translate((tx, ty)) * Affine::scale_non_uniform(scale_x, scale_y);
+        let stroke_scale = ((scale_x + scale_y) * 0.5) as f32;
         let needs_clip = rendered_w > abs_rect.size.width + 0.5
             || rendered_h > abs_rect.size.height + 0.5
             || off_x < -0.5
@@ -982,12 +1013,8 @@ impl<'a> Painter<'a> {
             };
             let elem_xf = xf * Affine::new(entry.transform);
             bez.apply_affine(elem_xf);
-            let path_id = hash_svg_path_id(
-                &entry.path_d,
-                abs_rect.size.width,
-                abs_rect.size.height,
-                &entry.transform,
-            );
+            let coeffs = elem_xf.as_coeffs();
+            let path_id = hash_svg_path_id(&entry.path_d, rendered_w, rendered_h, &coeffs);
             self.resources.register_path(path_id, bez);
             let fill = match tint_override {
                 Some(tint) => entry.fill.map(|_| to_rgba8(tint)),
@@ -996,10 +1023,10 @@ impl<'a> Painter<'a> {
             let stroke = match tint_override {
                 Some(tint) => entry
                     .stroke
-                    .map(|(_, w)| (to_rgba8(tint), (w * scale as f32).max(0.5))),
+                    .map(|(_, w)| (to_rgba8(tint), (w * stroke_scale).max(0.5))),
                 None => entry
                     .stroke
-                    .map(|(c, w)| (to_rgba8(c), (w * scale as f32).max(0.5))),
+                    .map(|(c, w)| (to_rgba8(c), (w * stroke_scale).max(0.5))),
             };
             self.list.push(DisplayItem::VectorPath {
                 bounds: abs_rect,
@@ -1057,8 +1084,7 @@ impl<'a> Painter<'a> {
                         &svg,
                         abs_rect,
                         spatial,
-                        false,
-                        true,
+                        &BackgroundSizeValue::Contain,
                         &center,
                         &center,
                         Some(bg),
@@ -1124,35 +1150,84 @@ impl<'a> Painter<'a> {
                     }
                 }
                 BackgroundImageValue::Url(url) => {
+                    let effective_size =
+                        style.visual.background_size.as_ref().unwrap_or(&layer.size);
+                    let px = if matches!(layer.pos_x, LengthPercentage::Zero)
+                        && !matches!(style.visual.background_position.0, LengthPercentage::Zero)
+                    {
+                        &style.visual.background_position.0
+                    } else {
+                        &layer.pos_x
+                    };
+                    let py = if matches!(layer.pos_y, LengthPercentage::Zero)
+                        && !matches!(style.visual.background_position.1, LengthPercentage::Zero)
+                    {
+                        &style.visual.background_position.1
+                    } else {
+                        &layer.pos_y
+                    };
                     if let Some(decoded) = self.assets.get_by_src(url.as_str()) {
                         let img_id = decoded.image_id;
                         let iw = decoded.width.max(1) as f32;
                         let ih = decoded.height.max(1) as f32;
                         if self.ensure_image_registered(img_id) {
-                            let img_bounds = if layer.size_cover {
-                                let scale =
-                                    (abs_rect.size.width / iw).max(abs_rect.size.height / ih);
-                                let dw = iw * scale;
-                                let dh = ih * scale;
-                                Rect::new(
-                                    abs_rect.min_x() + (abs_rect.size.width - dw) * 0.5,
-                                    abs_rect.min_y() + (abs_rect.size.height - dh) * 0.5,
-                                    dw,
-                                    dh,
-                                )
-                            } else if layer.size_contain {
-                                let scale =
-                                    (abs_rect.size.width / iw).min(abs_rect.size.height / ih);
-                                let dw = iw * scale;
-                                let dh = ih * scale;
-                                Rect::new(
-                                    abs_rect.min_x() + (abs_rect.size.width - dw) * 0.5,
-                                    abs_rect.min_y() + (abs_rect.size.height - dh) * 0.5,
-                                    dw,
-                                    dh,
-                                )
-                            } else {
-                                abs_rect
+                            let img_bounds = match effective_size {
+                                BackgroundSizeValue::Cover => {
+                                    let scale =
+                                        (abs_rect.size.width / iw).max(abs_rect.size.height / ih);
+                                    let dw = iw * scale;
+                                    let dh = ih * scale;
+                                    Rect::new(
+                                        abs_rect.min_x()
+                                            + px.resolve_px(abs_rect.size.width - dw, &eval),
+                                        abs_rect.min_y()
+                                            + py.resolve_px(abs_rect.size.height - dh, &eval),
+                                        dw,
+                                        dh,
+                                    )
+                                }
+                                BackgroundSizeValue::Contain => {
+                                    let scale =
+                                        (abs_rect.size.width / iw).min(abs_rect.size.height / ih);
+                                    let dw = iw * scale;
+                                    let dh = ih * scale;
+                                    Rect::new(
+                                        abs_rect.min_x()
+                                            + px.resolve_px(abs_rect.size.width - dw, &eval),
+                                        abs_rect.min_y()
+                                            + py.resolve_px(abs_rect.size.height - dh, &eval),
+                                        dw,
+                                        dh,
+                                    )
+                                }
+                                BackgroundSizeValue::Explicit(w_opt, h_opt) => {
+                                    let (dw, dh) = match (w_opt, h_opt) {
+                                        (Some(w), Some(h)) => (
+                                            w.resolve_px(abs_rect.size.width, &eval).max(0.0),
+                                            h.resolve_px(abs_rect.size.height, &eval).max(0.0),
+                                        ),
+                                        (Some(w), None) => {
+                                            let rw =
+                                                w.resolve_px(abs_rect.size.width, &eval).max(0.0);
+                                            (rw, rw * (ih / iw))
+                                        }
+                                        (None, Some(h)) => {
+                                            let rh =
+                                                h.resolve_px(abs_rect.size.height, &eval).max(0.0);
+                                            (rh * (iw / ih), rh)
+                                        }
+                                        (None, None) => (iw, ih),
+                                    };
+                                    Rect::new(
+                                        abs_rect.min_x()
+                                            + px.resolve_px(abs_rect.size.width - dw, &eval),
+                                        abs_rect.min_y()
+                                            + py.resolve_px(abs_rect.size.height - dh, &eval),
+                                        dw,
+                                        dh,
+                                    )
+                                }
+                                BackgroundSizeValue::Auto => abs_rect,
                             };
                             self.list.push(DisplayItem::Image {
                                 bounds: img_bounds,
@@ -1162,26 +1237,11 @@ impl<'a> Painter<'a> {
                             });
                         }
                     } else if let Some(svg) = self.assets.get_svg_by_src(url.as_str()).cloned() {
-                        let px = if matches!(layer.pos_x, LengthPercentage::Zero)
-                            && !matches!(style.visual.background_position.0, LengthPercentage::Zero)
-                        {
-                            &style.visual.background_position.0
-                        } else {
-                            &layer.pos_x
-                        };
-                        let py = if matches!(layer.pos_y, LengthPercentage::Zero)
-                            && !matches!(style.visual.background_position.1, LengthPercentage::Zero)
-                        {
-                            &style.visual.background_position.1
-                        } else {
-                            &layer.pos_y
-                        };
                         self.paint_svg_asset_in_rect(
                             &svg,
                             abs_rect,
                             spatial,
-                            layer.size_cover,
-                            layer.size_contain,
+                            effective_size,
                             px,
                             py,
                             None,

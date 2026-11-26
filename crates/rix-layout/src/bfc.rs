@@ -623,6 +623,10 @@ pub fn layout_block_box(
                 continue;
             }
 
+            if matches!(&child_box.kind, BoxKind::Text(t) if t.chars().all(char::is_whitespace)) {
+                continue;
+            }
+
             // In-flow block-level child
             let child_clear = child_box.style.clear_mode;
             let child_is_bfc = child_box.establishes_bfc;
