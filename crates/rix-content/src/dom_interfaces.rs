@@ -950,7 +950,108 @@ pub fn install_all_dom_interfaces(vm: &mut JsVm, host: &SharedHost) {
     install_document_type_prototype(vm, host);
     install_dom_implementation_prototype(vm, host);
     install_extra_node_methods(vm, host);
+    install_html_element_reflected_attrs(vm, host);
     crate::dom_collections::install_collections_and_traversal(vm, host);
+}
+
+/// Installs standard HTML5 §4 reflected string attributes on element interface prototypes
+/// (`HTMLLinkElement`, `HTMLAnchorElement`, `HTMLAreaElement`, `HTMLMetaElement`,
+/// `HTMLBaseElement`) so accessing `link.hreflang`, `a.rel`, `meta.content`, etc. reflects
+/// the underlying content attribute (defaulting to `""`) identically to Firefox/Chrome.
+fn install_html_element_reflected_attrs(vm: &mut JsVm, host: &SharedHost) {
+    let protos: Vec<(HeapHandle, &[(&str, &str)])> = {
+        let hb = host.borrow();
+        let mut list: Vec<(HeapHandle, &[(&str, &str)])> = Vec::new();
+        if let Some(&link_p) = hb.interface_protos.get("HTMLLinkElement") {
+            list.push((
+                link_p,
+                &[
+                    ("hreflang", "hreflang"),
+                    ("rel", "rel"),
+                    ("media", "media"),
+                    ("type", "type"),
+                    ("as", "as"),
+                    ("crossOrigin", "crossorigin"),
+                    ("referrerPolicy", "referrerpolicy"),
+                    ("integrity", "integrity"),
+                    ("charset", "charset"),
+                    ("rev", "rev"),
+                    ("imageSrcset", "imagesrcset"),
+                    ("imageSizes", "imagesizes"),
+                ],
+            ));
+        }
+        for iface in ["HTMLAnchorElement", "HTMLAreaElement"] {
+            if let Some(&ap) = hb.interface_protos.get(iface) {
+                list.push((
+                    ap,
+                    &[
+                        ("hreflang", "hreflang"),
+                        ("rel", "rel"),
+                        ("target", "target"),
+                        ("download", "download"),
+                        ("ping", "ping"),
+                        ("type", "type"),
+                        ("referrerPolicy", "referrerpolicy"),
+                        ("rev", "rev"),
+                        ("charset", "charset"),
+                    ],
+                ));
+            }
+        }
+        if let Some(&meta_p) = hb.interface_protos.get("HTMLMetaElement") {
+            list.push((
+                meta_p,
+                &[
+                    ("name", "name"),
+                    ("httpEquiv", "http-equiv"),
+                    ("content", "content"),
+                    ("media", "media"),
+                    ("scheme", "scheme"),
+                ],
+            ));
+        }
+        if let Some(&base_p) = hb.interface_protos.get("HTMLBaseElement") {
+            list.push((base_p, &[("target", "target")]));
+        }
+        list
+    };
+
+    for (proto, pairs) in protos {
+        for &(prop_name, attr_name) in pairs {
+            let h_g = Rc::clone(host);
+            let g_name = format!("get {prop_name}");
+            let g = vm.alloc_host_fn(&g_name, move |vm, this_val, _| {
+                let nid = require_node(vm, &h_g, this_val)?;
+                let val = {
+                    let doc_rc = Rc::clone(&h_g.borrow().document);
+                    let doc = doc_rc.borrow();
+                    match doc.get(nid) {
+                        Some(NodeData::Element(el)) => {
+                            el.get_attribute(attr_name).unwrap_or("").to_string()
+                        }
+                        _ => String::new(),
+                    }
+                };
+                Ok(JsValue::from_string(vm.heap.alloc_string(&val)))
+            });
+            let h_s = Rc::clone(host);
+            let s_name = format!("set {prop_name}");
+            let s = vm.alloc_host_fn(&s_name, move |vm, this_val, args| {
+                let nid = require_node(vm, &h_s, this_val)?;
+                let val = vm.value_to_rust_string(arg(args, 0));
+                {
+                    let doc_rc = Rc::clone(&h_s.borrow().document);
+                    let mut doc = doc_rc.borrow_mut();
+                    if let Some(NodeData::Element(el)) = doc.get_mut(nid) {
+                        el.set_attribute(attr_name, &val);
+                    }
+                }
+                Ok(JsValue::UNDEFINED)
+            });
+            define_host_accessor(vm, proto, prop_name, Some(g), Some(s));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

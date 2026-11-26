@@ -2687,6 +2687,7 @@ fn install_url_and_search_params(vm: &mut JsVm, web_apis: &SharedWebApis) {
     }
     bind_ctor_proto(vm, url_ctor, up);
     define_global(vm, "URL", JsValue::from_object(url_ctor));
+    crate::url_pattern::install_url_pattern(vm);
 }
 
 fn require_url(
@@ -4349,8 +4350,32 @@ fn require_abort_signal(
 // Location & History
 // ---------------------------------------------------------------------------
 
+fn make_webidl_interface(vm: &mut JsVm, name: &str) -> (HeapHandle, HeapHandle) {
+    let proto = vm.alloc_ordinary_object();
+    if let Some(o) = vm.heap.get_object_mut(proto) {
+        o.is_prototype = true;
+    }
+    let tag_v = JsValue::from_string(vm.heap.alloc_string(name));
+    let k_tag = vm.key_symbol_to_string_tag;
+    vm.heap.object_define_data(
+        proto,
+        k_tag,
+        tag_v,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+    let err_msg = format!("Illegal constructor: {name}");
+    let ctor = vm.alloc_host_fn(name, move |vm, _, _| Err(vm.type_error(err_msg.clone())));
+    bind_ctor_proto(vm, ctor, proto);
+    define_global(vm, name, JsValue::from_object(ctor));
+    (ctor, proto)
+}
+
 fn install_location_and_history(vm: &mut JsVm, host: &SharedHost, web_apis: &SharedWebApis) {
-    let loc = vm.alloc_ordinary_object();
+    let (_loc_ctor, loc_proto) = make_webidl_interface(vm, "Location");
+    let loc = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(loc_proto)));
 
     let wa = Rc::clone(web_apis);
     let h_href = Rc::clone(host);
@@ -4512,15 +4537,24 @@ fn install_location_and_history(vm: &mut JsVm, host: &SharedHost, web_apis: &Sha
     });
     define_global(vm, "location", JsValue::from_object(loc));
 
-    // --- History ---
-    let hist = vm.alloc_ordinary_object();
+    // --- History (WebIDL attributes/methods on `History.prototype`) ---
+    let (_hist_ctor, hist_proto) = make_webidl_interface(vm, "History");
+    let hist = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(hist_proto)));
+    vm.add_host_root_collector(move |roots| {
+        roots.push(JsValue::from_object(loc_proto));
+        roots.push(JsValue::from_object(loc));
+        roots.push(JsValue::from_object(hist_proto));
+        roots.push(JsValue::from_object(hist));
+    });
     let wa = Rc::clone(web_apis);
-    define_host_getter(vm, hist, "length", move |_, _, _| {
+    define_host_getter(vm, hist_proto, "length", move |_, _, _| {
         Ok(JsValue::from_i32(wa.borrow().history.len() as i32))
     });
 
     let wa = Rc::clone(web_apis);
-    define_host_getter(vm, hist, "state", move |_, _, _| {
+    define_host_getter(vm, hist_proto, "state", move |_, _, _| {
         let st = wa.borrow();
         let v = st
             .history
@@ -4529,14 +4563,31 @@ fn install_location_and_history(vm: &mut JsVm, host: &SharedHost, web_apis: &Sha
         Ok(v)
     });
 
-    let k_sr = vm.heap.intern_key("scrollRestoration");
-    let auto_val = JsValue::from_string(vm.heap.alloc_string("auto"));
-    vm.heap
-        .object_define_data(hist, k_sr, auto_val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    let sr_val = Rc::new(RefCell::new(String::from("auto")));
+    {
+        let sr_g = Rc::clone(&sr_val);
+        let sr_s = Rc::clone(&sr_val);
+        define_host_accessor(
+            vm,
+            hist_proto,
+            "scrollRestoration",
+            move |vm, _, _| {
+                let s = sr_g.borrow().clone();
+                Ok(JsValue::from_string(vm.heap.alloc_string(&s)))
+            },
+            move |vm, _, args| {
+                let v = vm.value_to_rust_string(arg(args, 0));
+                if v == "auto" || v == "manual" {
+                    *sr_s.borrow_mut() = v;
+                }
+                Ok(JsValue::UNDEFINED)
+            },
+        );
+    }
 
     let wa = Rc::clone(web_apis);
     let h_ps = Rc::clone(host);
-    define_host_method(vm, hist, "pushState", move |vm, _, args| {
+    define_host_method(vm, hist_proto, "pushState", move |vm, _, args| {
         let state_val = arg(args, 0);
         let url_arg = arg(args, 2);
         let mut memo = HashMap::new();
@@ -4573,7 +4624,7 @@ fn install_location_and_history(vm: &mut JsVm, host: &SharedHost, web_apis: &Sha
 
     let wa = Rc::clone(web_apis);
     let h_rs = Rc::clone(host);
-    define_host_method(vm, hist, "replaceState", move |vm, _, args| {
+    define_host_method(vm, hist_proto, "replaceState", move |vm, _, args| {
         let state_val = arg(args, 0);
         let url_arg = arg(args, 2);
         let mut memo = HashMap::new();
@@ -4607,7 +4658,7 @@ fn install_location_and_history(vm: &mut JsVm, host: &SharedHost, web_apis: &Sha
     });
 
     let wa = Rc::clone(web_apis);
-    define_host_method(vm, hist, "go", move |vm, _, args| {
+    define_host_method(vm, hist_proto, "go", move |vm, _, args| {
         let delta = if arg(args, 0).is_undefined() {
             0
         } else {
@@ -4623,7 +4674,7 @@ fn install_location_and_history(vm: &mut JsVm, host: &SharedHost, web_apis: &Sha
     });
 
     let wa = Rc::clone(web_apis);
-    define_host_method(vm, hist, "back", move |_, _, _| {
+    define_host_method(vm, hist_proto, "back", move |_, _, _| {
         let mut st = wa.borrow_mut();
         if st.history_index > 0 {
             st.history_index -= 1;
@@ -4633,7 +4684,7 @@ fn install_location_and_history(vm: &mut JsVm, host: &SharedHost, web_apis: &Sha
     });
 
     let wa = Rc::clone(web_apis);
-    define_host_method(vm, hist, "forward", move |_, _, _| {
+    define_host_method(vm, hist_proto, "forward", move |_, _, _| {
         let mut st = wa.borrow_mut();
         if st.history_index + 1 < st.history.len() {
             st.history_index += 1;
@@ -4650,152 +4701,140 @@ fn install_location_and_history(vm: &mut JsVm, host: &SharedHost, web_apis: &Sha
 // ---------------------------------------------------------------------------
 
 fn install_web_storage(vm: &mut JsVm, web_apis: &SharedWebApis) {
-    // localStorage
-    let ls = vm.alloc_ordinary_object();
-    let wa = Rc::clone(web_apis);
-    define_host_getter(vm, ls, "length", move |_, _, _| {
-        let st = wa.borrow();
-        let origin = st.current_origin();
-        let n = st
-            .storage
-            .get_all_local_storage(&origin)
-            .map_or(0, |m| m.len());
-        Ok(JsValue::from_i32(n as i32))
+    let (_storage_ctor, storage_proto) = make_webidl_interface(vm, "Storage");
+    let ls = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Ordinary,
+        Some(storage_proto),
+    ));
+    let ss = vm.heap.alloc_object(JsObject::with_kind(
+        ObjectKind::Ordinary,
+        Some(storage_proto),
+    ));
+    vm.add_host_root_collector(move |roots| {
+        roots.push(JsValue::from_object(storage_proto));
+        roots.push(JsValue::from_object(ls));
+        roots.push(JsValue::from_object(ss));
     });
 
-    let wa = Rc::clone(web_apis);
-    define_host_method(vm, ls, "getItem", move |vm, _, args| {
-        let key = vm.value_to_rust_string(arg(args, 0));
-        let st = wa.borrow();
-        let origin = st.current_origin();
-        let val = st.storage.get_local_storage(&origin, &key).ok().flatten();
-        Ok(match val {
-            Some(s) => JsValue::from_string(vm.heap.alloc_string(&s)),
-            None => JsValue::NULL,
-        })
-    });
+    let is_session = move |this_val: JsValue| -> bool { this_val.as_object() == Some(ss) };
 
     let wa = Rc::clone(web_apis);
-    define_host_method(vm, ls, "setItem", move |vm, _, args| {
-        let key = vm.value_to_rust_string(arg(args, 0));
-        let val = vm.value_to_rust_string(arg(args, 1));
+    define_host_getter(vm, storage_proto, "length", move |_, this_val, _| {
         let st = wa.borrow();
         let origin = st.current_origin();
-        st.storage
-            .set_local_storage(&origin, &key, &val)
-            .map_err(|e| create_dom_exception(vm, "QuotaExceededError", &e.to_string()))?;
-        Ok(JsValue::UNDEFINED)
-    });
-
-    let wa = Rc::clone(web_apis);
-    define_host_method(vm, ls, "removeItem", move |vm, _, args| {
-        let key = vm.value_to_rust_string(arg(args, 0));
-        let st = wa.borrow();
-        let origin = st.current_origin();
-        let _ = st.storage.remove_local_storage(&origin, &key);
-        Ok(JsValue::UNDEFINED)
-    });
-
-    let wa = Rc::clone(web_apis);
-    define_host_method(vm, ls, "clear", move |_, _, _| {
-        let st = wa.borrow();
-        let origin = st.current_origin();
-        let _ = st.storage.clear_local_storage(&origin);
-        Ok(JsValue::UNDEFINED)
-    });
-
-    let wa = Rc::clone(web_apis);
-    define_host_method(vm, ls, "key", move |vm, _, args| {
-        let idx = vm.to_u32(arg(args, 0))? as usize;
-        let st = wa.borrow();
-        let origin = st.current_origin();
-        let mut keys: Vec<String> = st
-            .storage
-            .get_all_local_storage(&origin)
-            .map(|m| m.into_keys().collect())
-            .unwrap_or_default();
-        keys.sort();
-        Ok(match keys.get(idx) {
-            Some(k) => JsValue::from_string(vm.heap.alloc_string(k)),
-            None => JsValue::NULL,
-        })
-    });
-    define_global(vm, "localStorage", JsValue::from_object(ls));
-
-    // sessionStorage
-    let ss = vm.alloc_ordinary_object();
-    let wa = Rc::clone(web_apis);
-    define_host_getter(vm, ss, "length", move |_, _, _| {
-        let st = wa.borrow();
-        let origin = st.current_origin();
-        let n = st.session_storage.get(&origin).map_or(0, Vec::len);
-        Ok(JsValue::from_i32(n as i32))
-    });
-
-    let wa = Rc::clone(web_apis);
-    define_host_method(vm, ss, "getItem", move |vm, _, args| {
-        let key = vm.value_to_rust_string(arg(args, 0));
-        let st = wa.borrow();
-        let origin = st.current_origin();
-        let val = st
-            .session_storage
-            .get(&origin)
-            .and_then(|list| list.iter().find(|(k, _)| k == &key).map(|(_, v)| v.clone()));
-        Ok(match val {
-            Some(s) => JsValue::from_string(vm.heap.alloc_string(&s)),
-            None => JsValue::NULL,
-        })
-    });
-
-    let wa = Rc::clone(web_apis);
-    define_host_method(vm, ss, "setItem", move |vm, _, args| {
-        let key = vm.value_to_rust_string(arg(args, 0));
-        let val = vm.value_to_rust_string(arg(args, 1));
-        let mut st = wa.borrow_mut();
-        let origin = st.current_origin();
-        let list = st.session_storage.entry(origin).or_default();
-        if let Some((_, existing)) = list.iter_mut().find(|(k, _)| k == &key) {
-            *existing = val;
+        let n = if is_session(this_val) {
+            st.session_storage.get(&origin).map_or(0, Vec::len)
         } else {
-            list.push((key, val));
-        }
-        Ok(JsValue::UNDEFINED)
+            st.storage
+                .get_all_local_storage(&origin)
+                .map_or(0, |m| m.len())
+        };
+        Ok(JsValue::from_i32(n as i32))
     });
 
     let wa = Rc::clone(web_apis);
-    define_host_method(vm, ss, "removeItem", move |vm, _, args| {
+    define_host_method(vm, storage_proto, "getItem", move |vm, this_val, args| {
         let key = vm.value_to_rust_string(arg(args, 0));
-        let mut st = wa.borrow_mut();
+        let st = wa.borrow();
         let origin = st.current_origin();
-        if let Some(list) = st.session_storage.get_mut(&origin) {
-            list.retain(|(k, _)| k != &key);
+        let val = if is_session(this_val) {
+            st.session_storage
+                .get(&origin)
+                .and_then(|list| list.iter().find(|(k, _)| k == &key).map(|(_, v)| v.clone()))
+        } else {
+            st.storage.get_local_storage(&origin, &key).ok().flatten()
+        };
+        Ok(match val {
+            Some(s) => JsValue::from_string(vm.heap.alloc_string(&s)),
+            None => JsValue::NULL,
+        })
+    });
+
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, storage_proto, "setItem", move |vm, this_val, args| {
+        let key = vm.value_to_rust_string(arg(args, 0));
+        let val = vm.value_to_rust_string(arg(args, 1));
+        if is_session(this_val) {
+            let mut st = wa.borrow_mut();
+            let origin = st.current_origin();
+            let list = st.session_storage.entry(origin).or_default();
+            if let Some((_, existing)) = list.iter_mut().find(|(k, _)| k == &key) {
+                *existing = val;
+            } else {
+                list.push((key, val));
+            }
+        } else {
+            let st = wa.borrow();
+            let origin = st.current_origin();
+            st.storage
+                .set_local_storage(&origin, &key, &val)
+                .map_err(|e| create_dom_exception(vm, "QuotaExceededError", &e.to_string()))?;
         }
         Ok(JsValue::UNDEFINED)
     });
 
     let wa = Rc::clone(web_apis);
-    define_host_method(vm, ss, "clear", move |_, _, _| {
-        let mut st = wa.borrow_mut();
-        let origin = st.current_origin();
-        st.session_storage.remove(&origin);
+    define_host_method(
+        vm,
+        storage_proto,
+        "removeItem",
+        move |vm, this_val, args| {
+            let key = vm.value_to_rust_string(arg(args, 0));
+            if is_session(this_val) {
+                let mut st = wa.borrow_mut();
+                let origin = st.current_origin();
+                if let Some(list) = st.session_storage.get_mut(&origin) {
+                    list.retain(|(k, _)| k != &key);
+                }
+            } else {
+                let st = wa.borrow();
+                let origin = st.current_origin();
+                let _ = st.storage.remove_local_storage(&origin, &key);
+            }
+            Ok(JsValue::UNDEFINED)
+        },
+    );
+
+    let wa = Rc::clone(web_apis);
+    define_host_method(vm, storage_proto, "clear", move |_, this_val, _| {
+        if is_session(this_val) {
+            let mut st = wa.borrow_mut();
+            let origin = st.current_origin();
+            st.session_storage.remove(&origin);
+        } else {
+            let st = wa.borrow();
+            let origin = st.current_origin();
+            let _ = st.storage.clear_local_storage(&origin);
+        }
         Ok(JsValue::UNDEFINED)
     });
 
     let wa = Rc::clone(web_apis);
-    define_host_method(vm, ss, "key", move |vm, _, args| {
+    define_host_method(vm, storage_proto, "key", move |vm, this_val, args| {
         let idx = vm.to_u32(arg(args, 0))? as usize;
         let st = wa.borrow();
         let origin = st.current_origin();
-        let found = st
-            .session_storage
-            .get(&origin)
-            .and_then(|list| list.get(idx))
-            .map(|(k, _)| k.clone());
+        let found = if is_session(this_val) {
+            st.session_storage
+                .get(&origin)
+                .and_then(|list| list.get(idx))
+                .map(|(k, _)| k.clone())
+        } else {
+            let mut keys: Vec<String> = st
+                .storage
+                .get_all_local_storage(&origin)
+                .map(|m| m.into_keys().collect())
+                .unwrap_or_default();
+            keys.sort();
+            keys.get(idx).cloned()
+        };
         Ok(match found {
             Some(k) => JsValue::from_string(vm.heap.alloc_string(&k)),
             None => JsValue::NULL,
         })
     });
+
+    define_global(vm, "localStorage", JsValue::from_object(ls));
     define_global(vm, "sessionStorage", JsValue::from_object(ss));
 }
 
@@ -4821,27 +4860,29 @@ fn perf_entry_to_js(vm: &mut JsVm, e: &PerfEntry) -> JsValue {
 }
 
 fn install_performance(vm: &mut JsVm, event_loop: &SharedEventLoop, web_apis: &SharedWebApis) {
-    let perf = vm.alloc_ordinary_object();
+    let (_perf_ctor, perf_proto) = make_webidl_interface(vm, "Performance");
+    let perf = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(perf_proto)));
+    vm.add_host_root_collector(move |roots| {
+        roots.push(JsValue::from_object(perf_proto));
+        roots.push(JsValue::from_object(perf));
+    });
     let time_origin = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64() * 1000.0);
-    let k_to = vm.heap.intern_key("timeOrigin");
-    vm.heap.object_define_data(
-        perf,
-        k_to,
-        JsValue::from_f64(time_origin),
-        PropertyAttrs::DEFAULT,
-        &mut vm.shapes,
-    );
+    define_host_getter(vm, perf_proto, "timeOrigin", move |_, _, _| {
+        Ok(JsValue::from_f64(time_origin))
+    });
 
     let el = Rc::clone(event_loop);
-    define_host_method(vm, perf, "now", move |_, _, _| {
+    define_host_method(vm, perf_proto, "now", move |_, _, _| {
         Ok(JsValue::from_f64(el.borrow().now_ms()))
     });
 
     let el = Rc::clone(event_loop);
     let wa = Rc::clone(web_apis);
-    define_host_method(vm, perf, "mark", move |vm, _, args| {
+    define_host_method(vm, perf_proto, "mark", move |vm, _, args| {
         let name = vm.value_to_rust_string(arg(args, 0));
         let now = el.borrow().now_ms();
         let entry = PerfEntry {
@@ -4857,7 +4898,7 @@ fn install_performance(vm: &mut JsVm, event_loop: &SharedEventLoop, web_apis: &S
 
     let el = Rc::clone(event_loop);
     let wa = Rc::clone(web_apis);
-    define_host_method(vm, perf, "measure", move |vm, _, args| {
+    define_host_method(vm, perf_proto, "measure", move |vm, _, args| {
         let name = vm.value_to_rust_string(arg(args, 0));
         let start_arg = arg(args, 1);
         let end_arg = arg(args, 2);
@@ -4894,7 +4935,7 @@ fn install_performance(vm: &mut JsVm, event_loop: &SharedEventLoop, web_apis: &S
     });
 
     let wa = Rc::clone(web_apis);
-    define_host_method(vm, perf, "getEntries", move |vm, _, _| {
+    define_host_method(vm, perf_proto, "getEntries", move |vm, _, _| {
         let list = wa.borrow().perf_entries.clone();
         let arr = vm.alloc_array();
         for e in &list {
@@ -4905,7 +4946,7 @@ fn install_performance(vm: &mut JsVm, event_loop: &SharedEventLoop, web_apis: &S
     });
 
     let wa = Rc::clone(web_apis);
-    define_host_method(vm, perf, "getEntriesByType", move |vm, _, args| {
+    define_host_method(vm, perf_proto, "getEntriesByType", move |vm, _, args| {
         let ty = vm.value_to_rust_string(arg(args, 0));
         let list: Vec<PerfEntry> = wa
             .borrow()
@@ -4923,7 +4964,7 @@ fn install_performance(vm: &mut JsVm, event_loop: &SharedEventLoop, web_apis: &S
     });
 
     let wa = Rc::clone(web_apis);
-    define_host_method(vm, perf, "getEntriesByName", move |vm, _, args| {
+    define_host_method(vm, perf_proto, "getEntriesByName", move |vm, _, args| {
         let name = vm.value_to_rust_string(arg(args, 0));
         let ty = if arg(args, 1).is_undefined() {
             None
@@ -4946,7 +4987,7 @@ fn install_performance(vm: &mut JsVm, event_loop: &SharedEventLoop, web_apis: &S
     });
 
     let wa = Rc::clone(web_apis);
-    define_host_method(vm, perf, "clearMarks", move |vm, _, args| {
+    define_host_method(vm, perf_proto, "clearMarks", move |vm, _, args| {
         let filter = if arg(args, 0).is_undefined() {
             None
         } else {
@@ -4959,7 +5000,7 @@ fn install_performance(vm: &mut JsVm, event_loop: &SharedEventLoop, web_apis: &S
     });
 
     let wa = Rc::clone(web_apis);
-    define_host_method(vm, perf, "clearMeasures", move |vm, _, args| {
+    define_host_method(vm, perf_proto, "clearMeasures", move |vm, _, args| {
         let filter = if arg(args, 0).is_undefined() {
             None
         } else {
@@ -5100,7 +5141,25 @@ fn install_window_and_navigator(
     });
 
     // navigator object (preserved & extended by service_worker.rs and webgpu.rs).
-    let nav = vm.alloc_ordinary_object();
+    // Per WebIDL §3.7.4, Navigator attributes live on `Navigator.prototype` as accessor
+    // getters so `Object.getOwnPropertyDescriptor(Navigator.prototype, 'languages').get`
+    // and prototype patching work identically to Firefox/Chrome.
+    let nav_proto = vm.alloc_ordinary_object();
+    if let Some(o) = vm.heap.get_object_mut(nav_proto) {
+        o.is_prototype = true;
+    }
+    let nav_tag_v = JsValue::from_string(vm.heap.alloc_string("Navigator"));
+    let k_tag = vm.key_symbol_to_string_tag;
+    vm.heap.object_define_data(
+        nav_proto,
+        k_tag,
+        nav_tag_v,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
+    let nav = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(nav_proto)));
     let app_code_name = JsValue::from_string(vm.heap.alloc_string("Mozilla"));
     let app_name = JsValue::from_string(vm.heap.alloc_string("Netscape"));
     let app_version = JsValue::from_string(
@@ -5116,28 +5175,47 @@ fn install_window_and_navigator(
     let lang = JsValue::from_string(vm.heap.alloc_string("en-US"));
     let langs = vm.alloc_array();
     vm.heap.object_push_element(langs, lang);
+    let langs_val = JsValue::from_object(langs);
     let plat = JsValue::from_string(vm.heap.alloc_string("Linux x86_64"));
+    let empty_s = JsValue::from_string(vm.heap.alloc_string(""));
+    let product_sub = JsValue::from_string(vm.heap.alloc_string("20100101"));
     let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get) as f64;
-    for (k, v) in [
+    let nav_attr_vals: [(&str, JsValue); 18] = [
         ("appCodeName", app_code_name),
         ("appName", app_name),
         ("appVersion", app_version),
         ("product", product),
+        ("productSub", product_sub),
+        ("vendor", empty_s),
+        ("vendorSub", empty_s),
         ("userAgent", ua),
         ("language", lang),
-        ("languages", JsValue::from_object(langs)),
+        ("languages", langs_val),
         ("platform", plat),
         ("hardwareConcurrency", JsValue::from_number(cores)),
+        ("maxTouchPoints", JsValue::from_i32(0)),
         ("onLine", JsValue::TRUE),
         ("cookieEnabled", JsValue::TRUE),
-    ] {
-        let key = vm.heap.intern_key(k);
-        vm.heap
-            .object_define_data(nav, key, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
+        ("pdfViewerEnabled", JsValue::FALSE),
+        ("webdriver", JsValue::FALSE),
+        ("doNotTrack", JsValue::NULL),
+    ];
+    let nav_rooted_vals: Vec<JsValue> = nav_attr_vals.iter().map(|(_, v)| *v).collect();
+    vm.add_host_root_collector(move |roots| {
+        roots.push(JsValue::from_object(nav_proto));
+        roots.push(JsValue::from_object(nav));
+        for &v in &nav_rooted_vals {
+            roots.push(v);
+        }
+    });
+    for (k, v) in nav_attr_vals {
+        define_host_getter(vm, nav_proto, k, move |_, _, _| Ok(v));
     }
+    define_host_method(vm, nav_proto, "javaEnabled", |_, _, _| Ok(JsValue::FALSE));
+    define_host_method(vm, nav_proto, "vibrate", |_, _, _| Ok(JsValue::FALSE));
     {
         let wa_sb = Rc::clone(web_apis);
-        define_host_method(vm, nav, "sendBeacon", move |vm, _, args| {
+        define_host_method(vm, nav_proto, "sendBeacon", move |vm, _, args| {
             if args.is_empty() {
                 return Err(vm.type_error("navigator.sendBeacon requires a url argument"));
             }
@@ -5152,6 +5230,11 @@ fn install_window_and_navigator(
             Ok(JsValue::TRUE)
         });
     }
+    let nav_ctor = vm.alloc_host_fn("Navigator", |vm, _, _| {
+        Err(vm.type_error("Illegal constructor: Navigator"))
+    });
+    bind_ctor_proto(vm, nav_ctor, nav_proto);
+    define_global(vm, "Navigator", JsValue::from_object(nav_ctor));
     define_global(vm, "navigator", JsValue::from_object(nav));
     {
         let wa_coi = Rc::clone(web_apis);

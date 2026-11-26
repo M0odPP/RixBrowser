@@ -63,10 +63,14 @@ pub fn collect_eval_var_declared_names(stmts: &[Statement]) -> Vec<String> {
     out
 }
 
-/// Maximum fast 8-bit register index reserved for local variables (`0..96`), leaving
-/// `96..250` (154 registers) permanently available for expression temporaries and call frames.
+/// Maximum fast 8-bit register index reserved for local variables (`0..64`), leaving
+/// `64..250` (186 registers) permanently available for expression temporaries and call frames.
 /// Locals beyond this threshold spill transparently into extended 16-bit frame slots (`>= 256`).
-const LOCAL_FAST_REG_LIMIT: u8 = 96;
+const LOCAL_FAST_REG_LIMIT: u8 = 64;
+/// Fast-register high-water mark beyond which nested calls/expressions spill intermediate
+/// temporaries into 16-bit extended frame slots (`>= 256`) so arbitrarily deep expressions
+/// (e.g. deeply nested JSX / bundler call trees) never exhaust the 250-register window.
+const WIDE_TEMP_SPILL_THRESHOLD: u8 = 140;
 /// First 16-bit extended frame slot index for spilled local variables (`256..=65534`).
 const WIDE_LOCAL_BASE: u16 = 256;
 
@@ -90,11 +94,13 @@ enum VarResolution {
         reg: u16,
         is_const: bool,
         is_tdz: bool,
+        is_module_root: bool,
     },
     Upvalue {
         index: u16,
         is_const: bool,
         is_fn_expr_name: bool,
+        is_module_root: bool,
     },
     ModuleImport(u16),
     Global(String),
@@ -229,6 +235,15 @@ impl FunctionCompiler {
     fn free_to(&mut self, mark: u8) {
         debug_assert!(mark <= self.next_reg);
         self.next_reg = mark;
+    }
+
+    /// Returns `true` if fast register `r` holds a live local variable or parameter
+    /// (so it must not be reused as scratch space before writing its final value).
+    fn is_fast_local_reg(&self, r: u8) -> bool {
+        let r16 = u16::from(r);
+        r16 < self.param_count
+            || self.locals.iter().any(|l| l.reg == r16)
+            || self.completion_reg == Some(r)
     }
 
     fn add_const(&mut self, entry: ConstantEntry) -> Result<u32, CompileError> {
@@ -982,13 +997,19 @@ impl Compiler {
                 reg: local.reg,
                 is_const: local.is_const,
                 is_tdz: local.is_tdz,
+                is_module_root: frame_idx == 0 && local.depth == 0,
             });
         }
 
         if frame_idx > 0 {
             let parent_res = self.resolve_var(frame_idx - 1, name)?;
             match parent_res {
-                VarResolution::Local { reg, is_const, .. } => {
+                VarResolution::Local {
+                    reg,
+                    is_const,
+                    is_module_root,
+                    ..
+                } => {
                     let is_fn_expr_name = if let Some((idx, flag)) = self.frames[frame_idx - 1]
                         .find_local(name)
                         .map(|(idx, l)| (idx, l.is_fn_expr_name))
@@ -1007,12 +1028,14 @@ impl Compiler {
                         index: uv_idx,
                         is_const,
                         is_fn_expr_name,
+                        is_module_root,
                     });
                 }
                 VarResolution::Upvalue {
                     index,
                     is_const,
                     is_fn_expr_name,
+                    is_module_root,
                 } => {
                     let uv_idx = self.frames[frame_idx].add_upvalue(UpvalueDescriptor {
                         is_local: false,
@@ -1023,6 +1046,7 @@ impl Compiler {
                         index: uv_idx,
                         is_const,
                         is_fn_expr_name,
+                        is_module_root,
                     });
                 }
                 other => return Ok(other),
@@ -1073,6 +1097,7 @@ impl Compiler {
                 reg,
                 is_const,
                 is_tdz,
+                ..
             } => {
                 let (reg, is_const, is_tdz) = (*reg, *is_const, *is_tdz);
                 if is_tdz {
@@ -1095,6 +1120,7 @@ impl Compiler {
                 index,
                 is_const,
                 is_fn_expr_name,
+                ..
             } => {
                 let (index, is_const, is_fn_expr_name) = (*index, *is_const, *is_fn_expr_name);
                 if is_fn_expr_name && !self.cur().is_strict {
@@ -1128,11 +1154,20 @@ impl Compiler {
                 self.cur().emit_abx_wide(Opcode::SetGlobal, src, ic);
             }
         }
-        // Propagate live module export binding update when writing a module-root binding
-        // either directly at top-level or via an upvalue from an inner module function.
+        // Propagate live module export binding update ONLY when writing the true
+        // module-root binding (`frame_idx == 0 && depth == 0`) — never when writing
+        // a shadowed inner block local or an upvalue captured from an inner function.
         if let Some(&export_idx) = self.module_exports.get(name) {
-            let writes_root =
-                self.frames.len() == 1 || matches!(res, VarResolution::Upvalue { .. });
+            let writes_root = matches!(
+                res,
+                VarResolution::Local {
+                    is_module_root: true,
+                    ..
+                } | VarResolution::Upvalue {
+                    is_module_root: true,
+                    ..
+                }
+            );
             if writes_root {
                 self.cur()
                     .emit(Instruction::abx(Opcode::SetModuleExport, src, export_idx));
@@ -1783,11 +1818,7 @@ impl Compiler {
             ExportKind::Named { specifiers, source } => {
                 for spec in specifiers {
                     let idx = self.register_module_export(
-                        if source.is_none() {
-                            Some(spec.local.clone())
-                        } else {
-                            None
-                        },
+                        Some(spec.local.clone()),
                         spec.exported.clone(),
                         source.clone(),
                         false,
@@ -1916,8 +1947,10 @@ impl Compiler {
             }
         }
         let idx = module.exports.len() as u16;
-        if let Some(ref local) = local_name {
-            self.module_exports.insert(local.clone(), idx);
+        if reexport_from.is_none() {
+            if let Some(ref local) = local_name {
+                self.module_exports.insert(local.clone(), idx);
+            }
         }
         module.exports.push(ModuleExportEntry {
             local_name,
@@ -2154,6 +2187,14 @@ impl Compiler {
         }
 
         for d in decls {
+            // ECMA-262 §14.3.2.1: A `var` declaration without an initializer is a
+            // runtime no-op because the binding was already hoisted and initialized
+            // to `undefined` during declaration instantiation. Overwriting it here
+            // would clobber earlier assignments or formal parameters (e.g.
+            // `x = 1; var x;` or `function f(a) { var a; return a; }`).
+            if kind == VarKind::Var && d.init.is_none() {
+                continue;
+            }
             let saved = self.cur().next_reg;
             let val_reg = self.cur().alloc_reg()?;
             let inferred = match &d.id {
@@ -2594,6 +2635,7 @@ impl Compiler {
         inferred_name: Option<&str>,
     ) -> Result<(), CompileError> {
         let saved = self.cur().next_reg;
+        let saved_spill = self.cur().next_spill;
         let super_reg = self.cur().alloc_reg()?;
         if let Some(ref sup) = cls.super_class {
             self.compile_expr(sup, super_reg)?;
@@ -2601,6 +2643,18 @@ impl Compiler {
             self.cur()
                 .emit(Instruction::abc(Opcode::LoadUndef, super_reg, 0, 0));
         }
+
+        // ECMA-262 §15.7.14: Named class expressions and declarations introduce an inner
+        // immutable lexical binding for the class's own name visible throughout the class
+        // body (constructor, methods, fields, and static blocks), shadowing outer bindings.
+        let cls_self_reg = if let Some(ref cls_name) = cls.name {
+            self.cur().begin_scope();
+            let reg = self.cur().declare_local(cls_name, true, true)?;
+            self.cur().emit_init_local_tdz(reg)?;
+            Some(reg)
+        } else {
+            None
+        };
 
         let mut constructor_idx = None;
         let mut methods = Vec::new();
@@ -2698,7 +2752,8 @@ impl Compiler {
             None
         };
 
-        let defer_static_init = !computed_methods.is_empty() && static_init_idx.is_some();
+        let defer_static_init =
+            (!computed_methods.is_empty() || cls_self_reg.is_some()) && static_init_idx.is_some();
         let blueprint = ClassBlueprint {
             name: cls
                 .name
@@ -2717,6 +2772,10 @@ impl Compiler {
         let c = self.cur().add_const(ConstantEntry::Class(blueprint))?;
         self.cur()
             .emit_ic_abc(Opcode::CreateClass, dst, super_reg, c);
+
+        if let Some(self_reg) = cls_self_reg {
+            self.cur().emit_store_local(self_reg, dst);
+        }
 
         if !computed_methods.is_empty() {
             let proto_reg = self.cur().alloc_reg()?;
@@ -2739,20 +2798,25 @@ impl Compiler {
                 self.cur()
                     .emit(Instruction::abc(def_op, target_reg, key_reg, fn_reg));
             }
-            if let Some(si_idx) = static_init_idx.filter(|_| defer_static_init) {
-                let call_base = self.cur().alloc_reg()?;
-                let this_slot = self.cur().alloc_reg()?;
-                let fc = self.cur().add_const(ConstantEntry::Function(si_idx))?;
-                self.cur().emit_abx_wide(Opcode::NewClosure, call_base, fc);
-                self.cur()
-                    .emit(Instruction::abc(Opcode::Move, this_slot, dst, 0));
-                self.cur().emit(Instruction::abc(
-                    Opcode::CallWithThis,
-                    key_reg,
-                    call_base,
-                    0,
-                ));
-            }
+        }
+        if let Some(si_idx) = static_init_idx.filter(|_| defer_static_init) {
+            let call_base = self.cur().alloc_reg()?;
+            let this_slot = self.cur().alloc_reg()?;
+            let res_reg = self.cur().alloc_reg()?;
+            let fc = self.cur().add_const(ConstantEntry::Function(si_idx))?;
+            self.cur().emit_abx_wide(Opcode::NewClosure, call_base, fc);
+            self.cur()
+                .emit(Instruction::abc(Opcode::Move, this_slot, dst, 0));
+            self.cur().emit(Instruction::abc(
+                Opcode::CallWithThis,
+                res_reg,
+                call_base,
+                0,
+            ));
+        }
+        if cls_self_reg.is_some() {
+            self.cur().end_scope();
+            self.cur().next_spill = saved_spill;
         }
         self.cur().free_to(saved);
         Ok(())
@@ -2915,7 +2979,8 @@ impl Compiler {
                     .iter()
                     .any(|e| matches!(e, None | Some(ArrayElement::Spread(_))));
                 let avail_regs = 240usize.saturating_sub(usize::from(self.cur().next_reg));
-                if !has_spread_or_hole && elements.len() <= 32 && elements.len() + 4 <= avail_regs {
+                if !has_spread_or_hole && elements.len() <= 16 && elements.len() + 32 <= avail_regs
+                {
                     let saved = self.cur().next_reg;
                     let base = self.cur().alloc_regs(elements.len() as u8)?;
                     for (i, el) in elements.iter().enumerate() {
@@ -3110,6 +3175,54 @@ impl Compiler {
             ExprKind::TaggedTemplate { tag, quasis, exprs } => {
                 let saved = self.cur().next_reg;
                 let argc = 1 + exprs.len();
+                let avail_regs = 240usize.saturating_sub(usize::from(self.cur().next_reg));
+                let spill_to_array = argc > 16 || argc + 32 > avail_regs;
+                if spill_to_array {
+                    let base = self.cur().alloc_regs(2)?; // base = tag, base+1 = receiver (undef)
+                    let args_arr = self.cur().alloc_reg()?;
+                    let tpl_reg = self.cur().alloc_reg()?;
+                    let raw_reg = self.cur().alloc_reg()?;
+                    let tmp = self.cur().alloc_reg()?;
+                    self.compile_expr(tag, base)?;
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::LoadUndef, base + 1, 0, 0));
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::NewArray, args_arr, 0, 0));
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::NewArray, tpl_reg, 0, 0));
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::NewArray, raw_reg, 0, 0));
+                    for q in quasis {
+                        if let Some(ref cooked) = q.cooked {
+                            let c = self.cur().add_string_const(cooked)?;
+                            self.cur().emit_abx_wide(Opcode::LoadConst, tmp, c);
+                        } else {
+                            self.cur()
+                                .emit(Instruction::abc(Opcode::LoadUndef, tmp, 0, 0));
+                        }
+                        self.cur()
+                            .emit(Instruction::abc(Opcode::ArrayPush, tpl_reg, tmp, 0));
+                        let rc = self.cur().add_string_const(&q.raw)?;
+                        self.cur().emit_abx_wide(Opcode::LoadConst, tmp, rc);
+                        self.cur()
+                            .emit(Instruction::abc(Opcode::ArrayPush, raw_reg, tmp, 0));
+                    }
+                    let raw_key = self.cur().add_string_const("raw")?;
+                    let raw_ic = self.cur().add_ic_slot(IcKind::DefineProp, raw_key, 0)?;
+                    self.cur()
+                        .emit_ic_abc(Opcode::DefineProp, tpl_reg, raw_reg, raw_ic);
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::ArrayPush, args_arr, tpl_reg, 0));
+                    for e in exprs {
+                        self.compile_expr(e, tmp)?;
+                        self.cur()
+                            .emit(Instruction::abc(Opcode::ArrayPush, args_arr, tmp, 0));
+                    }
+                    self.cur()
+                        .emit(Instruction::abc(Opcode::CallSpread, dst, base, args_arr));
+                    self.cur().free_to(saved);
+                    return Ok(());
+                }
                 let base = self.cur().alloc_regs((1 + argc) as u8)?;
                 self.compile_expr(tag, base)?;
 
@@ -3277,50 +3390,7 @@ impl Compiler {
             ExprKind::Unary { op, arg } => self.compile_unary(*op, arg, dst),
             ExprKind::Update { op, arg, prefix } => self.compile_update(*op, arg, *prefix, dst),
             ExprKind::Binary { op, left, right } => {
-                if *op == BinaryOp::In {
-                    if let ExprKind::PrivateIdent(ref priv_name) = left.kind {
-                        let saved = self.cur().next_reg;
-                        let obj_reg = self.cur().alloc_reg()?;
-                        self.compile_expr(right, obj_reg)?;
-                        let c = self.cur().add_string_const(priv_name)?;
-                        let ic = self.cur().add_ic_slot(IcKind::GetProp, c, 0)?;
-                        self.cur().emit_ic_abc(Opcode::InPrivate, dst, obj_reg, ic);
-                        self.cur().free_to(saved);
-                        return Ok(());
-                    }
-                }
-                let saved = self.cur().next_reg;
-                let lhs = self.cur().alloc_reg()?;
-                let rhs = self.cur().alloc_reg()?;
-                self.compile_expr(left, lhs)?;
-                self.compile_expr(right, rhs)?;
-                let opcode = match op {
-                    BinaryOp::Add => Opcode::Add,
-                    BinaryOp::Sub => Opcode::Sub,
-                    BinaryOp::Mul => Opcode::Mul,
-                    BinaryOp::Div => Opcode::Div,
-                    BinaryOp::Rem => Opcode::Rem,
-                    BinaryOp::Exp => Opcode::Exp,
-                    BinaryOp::BitAnd => Opcode::BitAnd,
-                    BinaryOp::BitOr => Opcode::BitOr,
-                    BinaryOp::BitXor => Opcode::BitXor,
-                    BinaryOp::Shl => Opcode::Shl,
-                    BinaryOp::Shr => Opcode::Shr,
-                    BinaryOp::UShr => Opcode::UShr,
-                    BinaryOp::Eq => Opcode::Eq,
-                    BinaryOp::NotEq => Opcode::NotEq,
-                    BinaryOp::StrictEq => Opcode::StrictEq,
-                    BinaryOp::StrictNotEq => Opcode::StrictNotEq,
-                    BinaryOp::Lt => Opcode::Lt,
-                    BinaryOp::LtEq => Opcode::LtEq,
-                    BinaryOp::Gt => Opcode::Gt,
-                    BinaryOp::GtEq => Opcode::GtEq,
-                    BinaryOp::In => Opcode::In,
-                    BinaryOp::InstanceOf => Opcode::InstanceOf,
-                };
-                self.cur().emit(Instruction::abc(opcode, dst, lhs, rhs));
-                self.cur().free_to(saved);
-                Ok(())
+                self.compile_binary_into(*op, left, right, dst, false)
             }
             ExprKind::Logical { op, left, right } => {
                 self.compile_expr(left, dst)?;
@@ -3400,6 +3470,121 @@ impl Compiler {
         }
     }
 
+    fn compile_binary_into(
+        &mut self,
+        op: BinaryOp,
+        left: &Expr,
+        right: &Expr,
+        dst: u8,
+        dst_is_fresh_temp: bool,
+    ) -> Result<(), CompileError> {
+        if op == BinaryOp::In {
+            if let ExprKind::PrivateIdent(ref priv_name) = left.kind {
+                let saved = self.cur().next_reg;
+                let obj_reg = self.cur().alloc_reg()?;
+                self.compile_expr(right, obj_reg)?;
+                let c = self.cur().add_string_const(priv_name)?;
+                let ic = self.cur().add_ic_slot(IcKind::GetProp, c, 0)?;
+                self.cur().emit_ic_abc(Opcode::InPrivate, dst, obj_reg, ic);
+                self.cur().free_to(saved);
+                return Ok(());
+            }
+        }
+        let saved = self.cur().next_reg;
+        if saved >= WIDE_TEMP_SPILL_THRESHOLD {
+            let saved_spill = self.cur().next_spill;
+            let lhs_spill = self.cur().alloc_spill_slot()?;
+            let work_reg = if !self.cur().is_fast_local_reg(dst) {
+                dst
+            } else {
+                self.cur().alloc_reg()?
+            };
+            self.compile_expr(left, work_reg)?;
+            self.cur()
+                .emit(Instruction::abx(Opcode::MoveToWide, work_reg, lhs_spill));
+            self.compile_expr(right, work_reg)?;
+            let rhs_tmp = self.cur().alloc_reg()?;
+            self.cur()
+                .emit(Instruction::abc(Opcode::Move, rhs_tmp, work_reg, 0));
+            let lhs_tmp = self.cur().alloc_reg()?;
+            self.cur()
+                .emit(Instruction::abx(Opcode::MoveFromWide, lhs_tmp, lhs_spill));
+            let opcode = match op {
+                BinaryOp::Add => Opcode::Add,
+                BinaryOp::Sub => Opcode::Sub,
+                BinaryOp::Mul => Opcode::Mul,
+                BinaryOp::Div => Opcode::Div,
+                BinaryOp::Rem => Opcode::Rem,
+                BinaryOp::Exp => Opcode::Exp,
+                BinaryOp::BitAnd => Opcode::BitAnd,
+                BinaryOp::BitOr => Opcode::BitOr,
+                BinaryOp::BitXor => Opcode::BitXor,
+                BinaryOp::Shl => Opcode::Shl,
+                BinaryOp::Shr => Opcode::Shr,
+                BinaryOp::UShr => Opcode::UShr,
+                BinaryOp::Eq => Opcode::Eq,
+                BinaryOp::NotEq => Opcode::NotEq,
+                BinaryOp::StrictEq => Opcode::StrictEq,
+                BinaryOp::StrictNotEq => Opcode::StrictNotEq,
+                BinaryOp::Lt => Opcode::Lt,
+                BinaryOp::LtEq => Opcode::LtEq,
+                BinaryOp::Gt => Opcode::Gt,
+                BinaryOp::GtEq => Opcode::GtEq,
+                BinaryOp::In => Opcode::In,
+                BinaryOp::InstanceOf => Opcode::InstanceOf,
+            };
+            self.cur()
+                .emit(Instruction::abc(opcode, dst, lhs_tmp, rhs_tmp));
+            self.cur().free_to(saved);
+            self.cur().next_spill = saved_spill;
+            return Ok(());
+        }
+        let lhs = if dst_is_fresh_temp {
+            dst
+        } else {
+            self.cur().alloc_reg()?
+        };
+        if let ExprKind::Binary {
+            op: lop,
+            left: lleft,
+            right: lright,
+        } = &left.kind
+        {
+            self.compile_binary_into(*lop, lleft, lright, lhs, true)?;
+        } else {
+            self.compile_expr(left, lhs)?;
+        }
+        let rhs = self.cur().alloc_reg()?;
+        self.compile_expr(right, rhs)?;
+        let opcode = match op {
+            BinaryOp::Add => Opcode::Add,
+            BinaryOp::Sub => Opcode::Sub,
+            BinaryOp::Mul => Opcode::Mul,
+            BinaryOp::Div => Opcode::Div,
+            BinaryOp::Rem => Opcode::Rem,
+            BinaryOp::Exp => Opcode::Exp,
+            BinaryOp::BitAnd => Opcode::BitAnd,
+            BinaryOp::BitOr => Opcode::BitOr,
+            BinaryOp::BitXor => Opcode::BitXor,
+            BinaryOp::Shl => Opcode::Shl,
+            BinaryOp::Shr => Opcode::Shr,
+            BinaryOp::UShr => Opcode::UShr,
+            BinaryOp::Eq => Opcode::Eq,
+            BinaryOp::NotEq => Opcode::NotEq,
+            BinaryOp::StrictEq => Opcode::StrictEq,
+            BinaryOp::StrictNotEq => Opcode::StrictNotEq,
+            BinaryOp::Lt => Opcode::Lt,
+            BinaryOp::LtEq => Opcode::LtEq,
+            BinaryOp::Gt => Opcode::Gt,
+            BinaryOp::GtEq => Opcode::GtEq,
+            BinaryOp::In => Opcode::In,
+            BinaryOp::InstanceOf => Opcode::InstanceOf,
+        };
+        self.cur().emit(Instruction::abc(opcode, dst, lhs, rhs));
+        self.cur().free_to(saved);
+        Ok(())
+    }
+
     fn compile_call(
         &mut self,
         callee: &Expr,
@@ -3412,7 +3597,7 @@ impl Compiler {
 
         // `super(args...)` constructor call.
         let avail_regs = 240usize.saturating_sub(usize::from(self.cur().next_reg));
-        let spill_args_to_array = has_spread || args.len() > 64 || args.len() + 6 > avail_regs;
+        let spill_args_to_array = has_spread || args.len() > 16 || args.len() + 32 > avail_regs;
 
         if matches!(callee.kind, ExprKind::Super) {
             if spill_args_to_array {
@@ -3448,7 +3633,7 @@ impl Compiler {
         }
 
         // Fast-path IC `CallMethod`: `obj.method(a, b)` (without spread, non-optional callee).
-        if !spill_args_to_array && !optional {
+        if !spill_args_to_array && !optional && self.cur().next_reg < WIDE_TEMP_SPILL_THRESHOLD {
             if let ExprKind::Member {
                 object,
                 property: MemberProp::Ident(prop_name),
@@ -3481,7 +3666,82 @@ impl Compiler {
         }
 
         let is_direct_eval = !optional && matches!(&callee.kind, ExprKind::Ident(n) if n == "eval");
-        if spill_args_to_array && (!is_direct_eval || has_spread) {
+        let deep_spill = self.cur().next_reg >= WIDE_TEMP_SPILL_THRESHOLD;
+        if (spill_args_to_array || deep_spill) && (!is_direct_eval || has_spread) {
+            if deep_spill {
+                let saved_spill = self.cur().next_spill;
+                let callee_spill = self.cur().alloc_spill_slot()?;
+                let recv_spill = self.cur().alloc_spill_slot()?;
+                let args_spill = self.cur().alloc_spill_slot()?;
+                let work_reg = if !self.cur().is_fast_local_reg(dst) {
+                    dst
+                } else {
+                    self.cur().alloc_reg()?
+                };
+                let after_work = self.cur().next_reg;
+                // Evaluate callee + receiver and spill immediately so fast regs stay flat.
+                let pair = self.cur().alloc_regs(2)?;
+                self.compile_callee_and_receiver(callee, pair, pair + 1, optional, dst)?;
+                self.cur()
+                    .emit(Instruction::abx(Opcode::MoveToWide, pair, callee_spill));
+                self.cur()
+                    .emit(Instruction::abx(Opcode::MoveToWide, pair + 1, recv_spill));
+                self.cur()
+                    .emit(Instruction::abc(Opcode::NewArray, pair, 0, 0));
+                self.cur()
+                    .emit(Instruction::abx(Opcode::MoveToWide, pair, args_spill));
+                self.cur().free_to(after_work);
+
+                for a in args {
+                    match a {
+                        CallArg::Expr(e) => {
+                            self.compile_expr(e, work_reg)?;
+                            let arr_r = self.cur().alloc_reg()?;
+                            self.cur().emit(Instruction::abx(
+                                Opcode::MoveFromWide,
+                                arr_r,
+                                args_spill,
+                            ));
+                            self.cur().emit(Instruction::abc(
+                                Opcode::ArrayPush,
+                                arr_r,
+                                work_reg,
+                                0,
+                            ));
+                            self.cur().free_to(after_work);
+                        }
+                        CallArg::Spread(e) => {
+                            self.compile_expr(e, work_reg)?;
+                            let arr_r = self.cur().alloc_reg()?;
+                            self.cur().emit(Instruction::abx(
+                                Opcode::MoveFromWide,
+                                arr_r,
+                                args_spill,
+                            ));
+                            self.cur().emit(Instruction::abc(
+                                Opcode::ArrayAppendIterable,
+                                arr_r,
+                                work_reg,
+                                0,
+                            ));
+                            self.cur().free_to(after_work);
+                        }
+                    }
+                }
+                let base = self.cur().alloc_regs(2)?;
+                let args_arr = self.cur().alloc_reg()?;
+                self.cur()
+                    .emit(Instruction::abx(Opcode::MoveFromWide, base, callee_spill));
+                self.cur()
+                    .emit(Instruction::abx(Opcode::MoveFromWide, base + 1, recv_spill));
+                self.cur()
+                    .emit(Instruction::abx(Opcode::MoveFromWide, args_arr, args_spill));
+                self.cur()
+                    .emit(Instruction::abc(Opcode::CallSpread, dst, base, args_arr));
+                self.cur().free_to(saved);
+                self.cur().next_spill = saved_spill;
+                return Ok(());
+            }
             let base = self.cur().alloc_regs(2)?; // base = callee, base+1 = receiver
             let args_arr = self.cur().alloc_reg()?;
             self.compile_callee_and_receiver(callee, base, base + 1, optional, dst)?;
@@ -3630,7 +3890,72 @@ impl Compiler {
         let saved = self.cur().next_reg;
         let has_spread = args.iter().any(|a| matches!(a, CallArg::Spread(_)));
         let avail_regs = 240usize.saturating_sub(usize::from(self.cur().next_reg));
-        if has_spread || args.len() > 64 || args.len() + 4 > avail_regs {
+        let deep_spill = self.cur().next_reg >= WIDE_TEMP_SPILL_THRESHOLD;
+        if deep_spill {
+            let saved_spill = self.cur().next_spill;
+            let callee_spill = self.cur().alloc_spill_slot()?;
+            let args_spill = self.cur().alloc_spill_slot()?;
+            let work_reg = if !self.cur().is_fast_local_reg(dst) {
+                dst
+            } else {
+                self.cur().alloc_reg()?
+            };
+            let after_work = self.cur().next_reg;
+            self.compile_expr(callee, work_reg)?;
+            self.cur()
+                .emit(Instruction::abx(Opcode::MoveToWide, work_reg, callee_spill));
+            let tmp_arr = self.cur().alloc_reg()?;
+            self.cur()
+                .emit(Instruction::abc(Opcode::NewArray, tmp_arr, 0, 0));
+            self.cur()
+                .emit(Instruction::abx(Opcode::MoveToWide, tmp_arr, args_spill));
+            self.cur().free_to(after_work);
+            for a in args {
+                match a {
+                    CallArg::Expr(e) => {
+                        self.compile_expr(e, work_reg)?;
+                        let arr_r = self.cur().alloc_reg()?;
+                        self.cur()
+                            .emit(Instruction::abx(Opcode::MoveFromWide, arr_r, args_spill));
+                        self.cur()
+                            .emit(Instruction::abc(Opcode::ArrayPush, arr_r, work_reg, 0));
+                        self.cur().free_to(after_work);
+                    }
+                    CallArg::Spread(e) => {
+                        self.compile_expr(e, work_reg)?;
+                        let arr_r = self.cur().alloc_reg()?;
+                        self.cur()
+                            .emit(Instruction::abx(Opcode::MoveFromWide, arr_r, args_spill));
+                        self.cur().emit(Instruction::abc(
+                            Opcode::ArrayAppendIterable,
+                            arr_r,
+                            work_reg,
+                            0,
+                        ));
+                        self.cur().free_to(after_work);
+                    }
+                }
+            }
+            let callee_reg = self.cur().alloc_reg()?;
+            let args_arr = self.cur().alloc_reg()?;
+            self.cur().emit(Instruction::abx(
+                Opcode::MoveFromWide,
+                callee_reg,
+                callee_spill,
+            ));
+            self.cur()
+                .emit(Instruction::abx(Opcode::MoveFromWide, args_arr, args_spill));
+            self.cur().emit(Instruction::abc(
+                Opcode::ConstructSpread,
+                dst,
+                callee_reg,
+                args_arr,
+            ));
+            self.cur().free_to(saved);
+            self.cur().next_spill = saved_spill;
+            return Ok(());
+        }
+        if has_spread || args.len() > 16 || args.len() + 32 > avail_regs {
             let callee_reg = self.cur().alloc_reg()?;
             let args_arr = self.cur().alloc_reg()?;
             self.compile_expr(callee, callee_reg)?;
@@ -4693,5 +5018,268 @@ fn collect_annex_b_block_funcs(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod stage3_register_window_tests {
+    use crate::vm::JsVm;
+
+    #[test]
+    fn compiler_handles_300_locals_long_binary_chain_deep_calls_and_large_tagged_template() {
+        let mut src = String::from("function stress() {\n");
+        for i in 0..300 {
+            src.push_str(&format!("  let v{i} = {i};\n"));
+        }
+        src.push_str("  let sum = 0");
+        for i in 0..300 {
+            src.push_str(&format!(" + v{i}"));
+        }
+        src.push_str(";\n");
+        src.push_str("  function add8(a,b,c,d,e,f,g,h){ return a+b+c+d+e+f+g+h; }\n");
+        let mut nested = String::from("1");
+        for _ in 0..32 {
+            nested = format!("add8(1,1,1,1,1,1,1,{nested})");
+        }
+        src.push_str(&format!("  let deep = {nested};\n"));
+        src.push_str("  function tag(parts, ...vals){ return parts.length + vals.length; }\n");
+        src.push_str("  let tpl = tag`");
+        for i in 0..60 {
+            src.push_str(&format!("p{i}${{v{i}}}"));
+        }
+        src.push_str("end`;\n");
+        src.push_str("  return sum + ':' + deep + ':' + tpl;\n");
+        src.push_str("}\nstress();");
+
+        let mut vm = JsVm::new();
+        let out = vm
+            .eval_script(&src)
+            .expect("large function must compile without hitting 250-reg window limit");
+        // sum(0..300) = 44850; deep = 1 + 32*7 = 225; tpl = 61 + 60 = 121.
+        assert_eq!(vm.value_to_rust_string(out), "44850:225:121");
+    }
+
+    #[test]
+    fn named_class_expression_inner_binding_shadows_outer_variable_for_static_privates() {
+        let mut vm = JsVm::new();
+        let out = vm
+            .eval_script(
+                r#"
+                (({ protect: a }) => {
+                    var c = class a {
+                        #v;
+                        constructor() {
+                            this.#v = a.#secret() + a.#val;
+                        }
+                        get value() {
+                            return this.#v;
+                        }
+                        static #val = 10;
+                        static #secret() {
+                            return 32;
+                        }
+                    };
+                    return new c().value;
+                })({ protect: ["outer"] });
+                "#,
+            )
+            .expect("named class expression must shadow outer binding");
+        assert_eq!(vm.value_to_rust_string(out), "42");
+    }
+
+    #[test]
+    fn hoisted_var_without_initializer_does_not_clobber_earlier_assignment() {
+        let mut vm = JsVm::new();
+        let out = vm
+            .eval_script(
+                r#"
+                function testFn(param) {
+                    var param;
+                    arr = [10, 20, 30];
+                    var arr;
+                    var o = { k: 7 };
+                    with (o) { var k; }
+                    return param + ':' + arr[1] + ':' + o.k;
+                }
+                g = 99;
+                var g;
+                testFn(5) + ':' + g;
+                "#,
+            )
+            .expect("hoisted var without initializer must be a runtime no-op");
+        assert_eq!(vm.value_to_rust_string(out), "5:20:7:99");
+    }
+
+    #[test]
+    fn array_iterator_prototype_next_dispatches_on_receiver() {
+        let mut vm = JsVm::new();
+        let out = vm
+            .eval_script(
+                r#"
+                const next = [][Symbol.iterator]().next;
+                const proto = Object.getPrototypeOf([][Symbol.iterator]());
+                const sameFn = next === proto.next && !Object.prototype.hasOwnProperty.call([][Symbol.iterator](), 'next');
+                const it = ['a', 'b', 'c'][Symbol.iterator]();
+                const res = [];
+                for (let step = next.call(it); !step.done; step = next.call(it)) {
+                    res.push(step.value);
+                }
+                const tag = Object.prototype.toString.call(it);
+                sameFn + ':' + res.join(',') + ':' + tag;
+                "#,
+            )
+            .expect("%ArrayIteratorPrototype%.next must dispatch on receiver");
+        assert_eq!(
+            vm.value_to_rust_string(out),
+            "true:a,b,c:[object Array Iterator]"
+        );
+    }
+
+    #[test]
+    fn import_meta_provides_url_and_resolve_with_null_prototype() {
+        use crate::modules::{ImportMap, MemoryModuleProvider, ModuleLoader};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut provider = MemoryModuleProvider::new();
+        provider.insert(
+            "https://example.test/app/entry.js",
+            r#"
+            globalThis.__meta_out = [
+                Object.getPrototypeOf(import.meta) === null,
+                import.meta === import.meta,
+                import.meta.url,
+                import.meta.resolve('../chunks/a.js'),
+            ].join('|');
+            "#,
+        );
+        let mut vm = JsVm::new();
+        let loader = Rc::new(RefCell::new(ModuleLoader::new(
+            Box::new(provider),
+            ImportMap {
+                base_url: "https://example.test/".to_string(),
+                ..ImportMap::default()
+            },
+        )));
+        let _ =
+            ModuleLoader::load_and_evaluate(&loader, &mut vm, "https://example.test/app/entry.js")
+                .expect("module should evaluate");
+        vm.drain_microtasks();
+        let out = vm
+            .eval_script("globalThis.__meta_out")
+            .expect("read __meta_out");
+        assert_eq!(
+            vm.value_to_rust_string(out),
+            "true|true|https://example.test/app/entry.js|https://example.test/chunks/a.js"
+        );
+    }
+
+    #[test]
+    fn aliased_reexport_chain_resolves_remote_local_binding() {
+        use crate::modules::{ImportMap, MemoryModuleProvider, ModuleLoader};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut provider = MemoryModuleProvider::new();
+        provider.insert(
+            "https://example.test/c.js",
+            "const internal = 42; export { internal as a };",
+        );
+        provider.insert(
+            "https://example.test/b.js",
+            "export { a as load_css } from './c.js';",
+        );
+        provider.insert(
+            "https://example.test/a.js",
+            "import { load_css } from './b.js'; globalThis.__reexp = load_css;",
+        );
+        let mut vm = JsVm::new();
+        let loader = Rc::new(RefCell::new(ModuleLoader::new(
+            Box::new(provider),
+            ImportMap {
+                base_url: "https://example.test/".to_string(),
+                ..ImportMap::default()
+            },
+        )));
+        let _ = ModuleLoader::load_and_evaluate(&loader, &mut vm, "https://example.test/a.js")
+            .expect("aliased re-export chain must link and evaluate");
+        vm.drain_microtasks();
+        let out = vm.eval_script("globalThis.__reexp").expect("read __reexp");
+        assert_eq!(vm.value_to_rust_string(out), "42");
+    }
+
+    #[test]
+    fn shadowed_inner_upvalue_does_not_corrupt_module_export() {
+        use crate::modules::{ImportMap, MemoryModuleProvider, ModuleLoader};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut provider = MemoryModuleProvider::new();
+        provider.insert(
+            "https://example.test/preload.js",
+            r#"
+            var i = function(x) {
+                if (x) {
+                    let i;
+                    (() => { i = { notCallable: true }; })();
+                }
+                return x + 1;
+            };
+            export { i as t };
+            "#,
+        );
+        provider.insert(
+            "https://example.test/main.js",
+            r#"
+            import { t as e } from './preload.js';
+            const r1 = e(10);
+            const r2 = e(20);
+            globalThis.__mod_out = r1 + ':' + r2;
+            "#,
+        );
+        let mut vm = JsVm::new();
+        let loader = Rc::new(RefCell::new(ModuleLoader::new(
+            Box::new(provider),
+            ImportMap {
+                base_url: "https://example.test/".to_string(),
+                ..ImportMap::default()
+            },
+        )));
+        let _ = ModuleLoader::load_and_evaluate(&loader, &mut vm, "https://example.test/main.js")
+            .expect("shadowed inner upvalue must not clobber module export");
+        vm.drain_microtasks();
+        let out = vm
+            .eval_script("globalThis.__mod_out")
+            .expect("read __mod_out");
+        assert_eq!(vm.value_to_rust_string(out), "11:21");
+    }
+
+    #[test]
+    fn object_define_property_accessor_write_barrier_survives_minor_gc() {
+        let mut vm = JsVm::new();
+        vm.eval_script("globalThis.__oldProto = {}; Object.defineProperty(__oldProto, 'x', { get() { return 1; }, configurable: true });")
+            .expect("init old proto");
+        // Promote `__oldProto` to Old generation.
+        vm.collect_garbage();
+        // Install a brand-new Young-generation getter & setter onto Old-generation `__oldProto`,
+        // then churn the nursery to trigger Minor GC before invoking them.
+        let out = vm
+            .eval_script(
+                r#"
+                let backing = 7;
+                Object.defineProperty(globalThis.__oldProto, 'x', {
+                    get() { return backing; },
+                    set(v) { backing = v; },
+                    configurable: true,
+                });
+                for (let i = 0; i < 40000; i++) {
+                    const tmp = { a: i, b: i + 1 };
+                }
+                globalThis.__oldProto.x = 42;
+                globalThis.__oldProto.x;
+                "#,
+            )
+            .expect("replaced accessor on Old object must survive Minor GC");
+        assert_eq!(vm.value_to_rust_string(out), "42");
     }
 }

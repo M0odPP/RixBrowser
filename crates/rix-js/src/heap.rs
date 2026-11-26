@@ -18,10 +18,10 @@ use crate::value::{HeapHandle, JsValue, SymbolId};
 const PROMOTE_AGE: u8 = 2;
 
 /// Default nursery object budget before automatic minor collection.
-pub const DEFAULT_NURSERY_LIMIT: usize = 4_096;
+pub const DEFAULT_NURSERY_LIMIT: usize = 8_192;
 
 /// Default old-generation object growth threshold before major collection.
-pub const DEFAULT_OLD_GC_THRESHOLD: usize = 32_768;
+pub const DEFAULT_OLD_GC_THRESHOLD: usize = 131_072;
 
 /// Generational residence of a heap allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2308,6 +2308,12 @@ impl GcHeap {
 
         if is_proto {
             shapes.bump_prototype_epoch();
+        }
+        if let Some(g) = getter {
+            self.write_barrier(owner, JsValue::from_object(g));
+        }
+        if let Some(s) = setter {
+            self.write_barrier(owner, JsValue::from_object(s));
         }
         true
     }

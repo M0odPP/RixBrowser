@@ -1627,27 +1627,34 @@ fn install_media_query_and_screen(
         Ok(JsValue::from_object(mql))
     });
 
-    // window.screen (CSSOM View §4.2 Screen interface)
-    let screen = alloc_screen_object(vm, host);
-    define_global(vm, "screen", JsValue::from_object(screen));
-}
-
-fn alloc_screen_object(vm: &mut JsVm, host: &SharedHost) -> HeapHandle {
-    let screen = vm.alloc_ordinary_object();
+    // window.screen (CSSOM View §4.2 Screen interface on `Screen.prototype`)
+    let screen_proto = vm.alloc_ordinary_object();
+    if let Some(o) = vm.heap.get_object_mut(screen_proto) {
+        o.is_prototype = true;
+    }
+    let tag_v = JsValue::from_string(vm.heap.alloc_string("Screen"));
+    let k_tag = vm.key_symbol_to_string_tag;
+    vm.heap.object_define_data(
+        screen_proto,
+        k_tag,
+        tag_v,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
     let h1 = Rc::clone(host);
-    define_host_getter(vm, screen, "width", move |_, _, _| {
+    define_host_getter(vm, screen_proto, "width", move |_, _, _| {
         Ok(JsValue::from_f64(f64::from(h1.borrow().viewport.width)))
     });
     let h2 = Rc::clone(host);
-    define_host_getter(vm, screen, "height", move |_, _, _| {
+    define_host_getter(vm, screen_proto, "height", move |_, _, _| {
         Ok(JsValue::from_f64(f64::from(h2.borrow().viewport.height)))
     });
     let h3 = Rc::clone(host);
-    define_host_getter(vm, screen, "availWidth", move |_, _, _| {
+    define_host_getter(vm, screen_proto, "availWidth", move |_, _, _| {
         Ok(JsValue::from_f64(f64::from(h3.borrow().viewport.width)))
     });
     let h4 = Rc::clone(host);
-    define_host_getter(vm, screen, "availHeight", move |_, _, _| {
+    define_host_getter(vm, screen_proto, "availHeight", move |_, _, _| {
         Ok(JsValue::from_f64(f64::from(h4.borrow().viewport.height)))
     });
     for (k, v) in [
@@ -1656,8 +1663,59 @@ fn alloc_screen_object(vm: &mut JsVm, host: &SharedHost) -> HeapHandle {
         ("colorDepth", 24.0),
         ("pixelDepth", 24.0),
     ] {
-        define_host_getter(vm, screen, k, move |_, _, _| Ok(JsValue::from_f64(v)));
+        define_host_getter(vm, screen_proto, k, move |_, _, _| Ok(JsValue::from_f64(v)));
     }
+    let screen_ctor = vm.alloc_host_fn("Screen", |vm, _, _| {
+        Err(vm.type_error("Illegal constructor: Screen"))
+    });
+    crate::web_apis::bind_ctor_proto(vm, screen_ctor, screen_proto);
+    define_global(vm, "Screen", JsValue::from_object(screen_ctor));
+    {
+        let st = host.borrow();
+        let mut cv = st.cssom_view_state.borrow_mut();
+        cv.extra_roots.push(screen_proto);
+        cv.extra_roots.push(screen_ctor);
+    }
+    let screen = alloc_screen_object(vm, host, Some(screen_proto));
+    define_global(vm, "screen", JsValue::from_object(screen));
+}
+
+fn alloc_screen_object(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    screen_proto: Option<HeapHandle>,
+) -> HeapHandle {
+    let screen = if let Some(sp) = screen_proto {
+        vm.heap
+            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(sp)))
+    } else {
+        let s = vm.alloc_ordinary_object();
+        let h1 = Rc::clone(host);
+        define_host_getter(vm, s, "width", move |_, _, _| {
+            Ok(JsValue::from_f64(f64::from(h1.borrow().viewport.width)))
+        });
+        let h2 = Rc::clone(host);
+        define_host_getter(vm, s, "height", move |_, _, _| {
+            Ok(JsValue::from_f64(f64::from(h2.borrow().viewport.height)))
+        });
+        let h3 = Rc::clone(host);
+        define_host_getter(vm, s, "availWidth", move |_, _, _| {
+            Ok(JsValue::from_f64(f64::from(h3.borrow().viewport.width)))
+        });
+        let h4 = Rc::clone(host);
+        define_host_getter(vm, s, "availHeight", move |_, _, _| {
+            Ok(JsValue::from_f64(f64::from(h4.borrow().viewport.height)))
+        });
+        for (k, v) in [
+            ("availLeft", 0.0),
+            ("availTop", 0.0),
+            ("colorDepth", 24.0),
+            ("pixelDepth", 24.0),
+        ] {
+            define_host_getter(vm, s, k, move |_, _, _| Ok(JsValue::from_f64(v)));
+        }
+        s
+    };
     let orient = vm.alloc_ordinary_object();
     set_f64_prop(vm, orient, "angle", 0.0);
     let kt = vm.heap.intern_key("type");
@@ -1927,7 +1985,7 @@ pub(crate) fn install_child_window_cssom_view(
         let mql = create_media_query_list_for_doc(vm, &h_mm, doc_id, &query);
         Ok(JsValue::from_object(mql))
     });
-    let screen = alloc_screen_object(vm, host);
+    let screen = alloc_screen_object(vm, host, None);
     let k_sc = vm.heap.intern_key("screen");
     vm.heap.object_define_data(
         proxy_h,

@@ -195,6 +195,19 @@ pub fn install_core_intrinsics(vm: &mut JsVm) {
     vm.default_array_iter_fn = Some(array_values_fn);
     define_method_len(vm, arr_proto, "keys", 0, array_keys);
     define_method_len(vm, arr_proto, "entries", 0, array_entries);
+    // %ArrayIteratorPrototype% (ECMA-262 §23.1.5.2): shared `next()` dispatching on `this`
+    // and `[Symbol.toStringTag] = "Array Iterator"`.
+    let aip = vm.array_iter_proto;
+    define_method_len(vm, aip, "next", 0, array_iter_next);
+    let ai_tag = JsValue::from_string(vm.heap.alloc_string("Array Iterator"));
+    let k_tag = vm.key_symbol_to_string_tag;
+    vm.heap.object_define_data(
+        aip,
+        k_tag,
+        ai_tag,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
     // Array.prototype[Symbol.unscopables] (ECMA-262 §23.1.3.37)
     let unscopables = vm
         .heap
@@ -1609,29 +1622,44 @@ fn alloc_array_iterator(
     if this_val.is_null() || this_val.is_undefined() {
         return Err(vm.type_error("Cannot convert undefined or null to object"));
     }
-    let Some(target) = this_val.as_object() else {
-        return Err(vm.type_error("Array iterator requires an object"));
-    };
+    let target = vm.to_object(this_val)?;
     let iter_obj = vm.heap.alloc_object(JsObject::with_kind(
         ObjectKind::Ordinary,
         Some(vm.array_iter_proto),
     ));
-    let idx_cell = std::rc::Rc::new(std::cell::Cell::new(0u32));
-    let done_cell = std::rc::Rc::new(std::cell::Cell::new(false));
-    let next_fn = vm.alloc_host_fn("next", move |vm, _this, _args| {
-        if done_cell.get() {
-            return Ok(crate::promise::make_iter_result(
-                vm,
-                JsValue::UNDEFINED,
-                true,
-            ));
-        }
-        let len: u32 = if matches!(
-            vm.heap.get_object(target).map(|o| &o.kind),
-            Some(ObjectKind::Array)
-        ) {
-            vm.heap.get_object(target).map_or(0, |o| o.elements.len())
-        } else {
+    let kind_code: u8 = match kind {
+        ArrayIterKind::Values => 0,
+        ArrayIterKind::Keys => 1,
+        ArrayIterKind::Entries => 2,
+    };
+    vm.array_iter_states
+        .insert(iter_obj, (target, 0, kind_code, false));
+    Ok(JsValue::from_object(iter_obj))
+}
+
+/// ECMA-262 §23.1.5.2.1 `%ArrayIteratorPrototype%.next()` dispatching on receiver `this_val`.
+fn array_iter_next(
+    vm: &mut JsVm,
+    this_val: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, JsException> {
+    let Some(iter_h) = this_val.as_object() else {
+        return Err(vm.type_error("ArrayIterator.prototype.next requires an Array Iterator"));
+    };
+    let Some(&(target, idx, kind_code, done)) = vm.array_iter_states.get(&iter_h) else {
+        return Err(vm.type_error("ArrayIterator.prototype.next requires an Array Iterator"));
+    };
+    if done {
+        return Ok(crate::promise::make_iter_result(
+            vm,
+            JsValue::UNDEFINED,
+            true,
+        ));
+    }
+    let len: u32 = match vm.heap.get_object(target).map(|o| &o.kind) {
+        Some(ObjectKind::Array) => vm.heap.get_object(target).map_or(0, |o| o.elements.len()),
+        Some(ObjectKind::TypedArray(ta)) => ta.length,
+        _ => {
             let lv = vm.get_property_by_key(target, vm.key_length)?;
             let n = vm.to_number(lv)?;
             if !n.is_finite() || n <= 0.0 {
@@ -1639,51 +1667,35 @@ fn alloc_array_iterator(
             } else {
                 n.trunc().min(f64::from(u32::MAX)) as u32
             }
-        };
-        let i = idx_cell.get();
-        if i >= len {
-            done_cell.set(true);
-            return Ok(crate::promise::make_iter_result(
-                vm,
-                JsValue::UNDEFINED,
-                true,
-            ));
         }
-        idx_cell.set(i + 1);
-        let item = match kind {
-            ArrayIterKind::Keys => JsValue::from_f64(f64::from(i)),
-            ArrayIterKind::Values => vm.get_elem(this_val, JsValue::from_f64(f64::from(i)))?,
-            ArrayIterKind::Entries => {
-                let val = vm.get_elem(this_val, JsValue::from_f64(f64::from(i)))?;
-                let pair = vm.alloc_array();
-                vm.heap
-                    .object_push_element(pair, JsValue::from_f64(f64::from(i)));
-                vm.heap.object_push_element(pair, val);
-                JsValue::from_object(pair)
-            }
-        };
-        Ok(crate::promise::make_iter_result(vm, item, false))
-    });
-    vm.heap.object_define_data(
-        iter_obj,
-        vm.key_next,
-        JsValue::from_object(next_fn),
-        PropertyAttrs::METHOD,
-        &mut vm.shapes,
-    );
-    let self_iter = vm.alloc_native_fn("[Symbol.iterator]", |_vm, t, _| Ok(t));
-    let sym_key = vm.key_symbol_iterator;
-    vm.heap.object_define_data(
-        iter_obj,
-        sym_key,
-        JsValue::from_object(self_iter),
-        PropertyAttrs::METHOD,
-        &mut vm.shapes,
-    );
-    if let Some(o) = vm.heap.get_object_mut(iter_obj) {
-        o.extra_refs.push(target);
+    };
+    if idx >= len {
+        if let Some(st) = vm.array_iter_states.get_mut(&iter_h) {
+            st.3 = true;
+        }
+        return Ok(crate::promise::make_iter_result(
+            vm,
+            JsValue::UNDEFINED,
+            true,
+        ));
     }
-    Ok(JsValue::from_object(iter_obj))
+    if let Some(st) = vm.array_iter_states.get_mut(&iter_h) {
+        st.1 = idx + 1;
+    }
+    let target_val = JsValue::from_object(target);
+    let item = match kind_code {
+        1 => JsValue::from_f64(f64::from(idx)),
+        2 => {
+            let val = vm.get_elem(target_val, JsValue::from_f64(f64::from(idx)))?;
+            let pair = vm.alloc_array();
+            vm.heap
+                .object_push_element(pair, JsValue::from_f64(f64::from(idx)));
+            vm.heap.object_push_element(pair, val);
+            JsValue::from_object(pair)
+        }
+        _ => vm.get_elem(target_val, JsValue::from_f64(f64::from(idx)))?,
+    };
+    Ok(crate::promise::make_iter_result(vm, item, false))
 }
 
 fn array_values(

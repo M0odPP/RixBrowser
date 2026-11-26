@@ -2400,11 +2400,18 @@ pub fn install_dom_bridge(
     install_window_and_cssom(vm, &host);
     crate::selection::install_selection_and_range(vm, &host);
 
-    // Pin root document wrapper on global `document`.
+    // Pin root document wrapper and expose `window.document` as an HTML5 §7.2.2
+    // accessor getter so `Object.getOwnPropertyDescriptor(window, 'document').get`
+    // matches Firefox/Chrome identically.
     let doc_root = host.borrow().document.borrow().root();
     let doc_val = wrap_node(vm, &host, doc_root);
     host.borrow_mut().wrappers.set_pinned(&doc_root, true);
-    define_global(vm, "document", doc_val);
+    let g_doc = vm.alloc_host_fn("get document", move |_, _, _| Ok(doc_val));
+    vm.add_host_root_collector(move |roots| {
+        roots.push(doc_val);
+    });
+    let global_h = vm.global;
+    define_host_accessor(vm, global_h, "document", Some(g_doc), None);
     let gv = JsValue::from_object(vm.global);
     define_global(vm, "window", gv);
     define_global(vm, "self", gv);
@@ -3381,26 +3388,63 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
     });
     define_host_accessor(vm, ep, "classList", Some(g), Some(s));
 
-    // style (live CSSStyleDeclaration Proxy + [PutForwards=cssText] setter)
-    let h = Rc::clone(host);
-    let g = vm.alloc_host_fn("get style", move |vm, t, _| {
-        let nid = require_node(vm, &h, t)?;
-        Ok(crate::cssom::create_inline_style_proxy(vm, &h, nid))
-    });
-    let h2 = Rc::clone(host);
-    let s = vm.alloc_host_fn("set style", move |vm, t, args| {
-        let nid = require_node(vm, &h2, t)?;
-        let raw = if arg(args, 0).is_null() || arg(args, 0).is_undefined() {
-            String::new()
-        } else {
-            vm.value_to_rust_string(arg(args, 0))
-        };
-        crate::cssom::set_inline_style_css_text(vm, &h2, nid, &raw);
-        Ok(JsValue::UNDEFINED)
-    });
-    define_host_accessor(vm, ep, "style", Some(g), Some(s));
+    // CSSOM `ElementCSSInlineStyle` (`style`) and HTML §3.2.6 `HTMLOrForeignElement` (`dataset`):
+    // Defined on `HTMLElement.prototype`, `SVGElement.prototype`, and `MathMLElement.prototype`
+    // (NOT on generic XML `Element.prototype`) so `Object.getOwnPropertyDescriptor(HTMLElement.prototype, ...)`
+    // matches Firefox/Chrome WebIDL identically.
+    let (html_p, svg_p, mathml_p) = {
+        let p = host.borrow().prototypes;
+        (
+            p.html_element_proto,
+            p.svg_element_proto,
+            p.mathml_element_proto,
+        )
+    };
+    for target_proto in [html_p, svg_p, mathml_p] {
+        let h = Rc::clone(host);
+        let g = vm.alloc_host_fn("get style", move |vm, t, _| {
+            let nid = require_node(vm, &h, t)?;
+            Ok(crate::cssom::create_inline_style_proxy(vm, &h, nid))
+        });
+        let h2 = Rc::clone(host);
+        let s = vm.alloc_host_fn("set style", move |vm, t, args| {
+            let nid = require_node(vm, &h2, t)?;
+            let raw = if arg(args, 0).is_null() || arg(args, 0).is_undefined() {
+                String::new()
+            } else {
+                vm.value_to_rust_string(arg(args, 0))
+            };
+            crate::cssom::set_inline_style_css_text(vm, &h2, nid, &raw);
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, target_proto, "style", Some(g), Some(s));
 
-    // innerText (getter + setter, HTML §4.4 / CSSOM View)
+        // dataset (live Proxy over `data-*` attributes)
+        let h = Rc::clone(host);
+        let g = vm.alloc_host_fn("get dataset", move |vm, t, _| {
+            let nid = require_node(vm, &h, t)?;
+            Ok(create_dataset_proxy(vm, &h, nid))
+        });
+        define_host_accessor(vm, target_proto, "dataset", Some(g), None);
+
+        // nonce (HTMLOrForeignElement reflected string attribute)
+        let h1 = Rc::clone(host);
+        let g = vm.alloc_host_fn("get nonce", move |vm, t, _| {
+            let nid = require_node(vm, &h1, t)?;
+            let val = get_attr_string(&h1, nid, "nonce").unwrap_or_default();
+            Ok(JsValue::from_string(vm.heap.alloc_string(val)))
+        });
+        let h2 = Rc::clone(host);
+        let s = vm.alloc_host_fn("set nonce", move |vm, t, args| {
+            let nid = require_node(vm, &h2, t)?;
+            let val = vm.value_to_rust_string(arg(args, 0));
+            set_element_attr(vm, &h2, nid, "nonce", &val);
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, target_proto, "nonce", Some(g), Some(s));
+    }
+
+    // innerText & outerText (getter + setter, HTML §4.4 / CSSOM View, on `HTMLElement.prototype`)
     let h1 = Rc::clone(host);
     let g_it = vm.alloc_host_fn("get innerText", move |vm, t, _| {
         let nid = require_node(vm, &h1, t)?;
@@ -3440,15 +3484,8 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         });
         Ok(JsValue::UNDEFINED)
     });
-    define_host_accessor(vm, ep, "innerText", Some(g_it), Some(s_it));
-
-    // dataset (live Proxy over `data-*` attributes)
-    let h = Rc::clone(host);
-    let g = vm.alloc_host_fn("get dataset", move |vm, t, _| {
-        let nid = require_node(vm, &h, t)?;
-        Ok(create_dataset_proxy(vm, &h, nid))
-    });
-    define_host_accessor(vm, ep, "dataset", Some(g), None);
+    define_host_accessor(vm, html_p, "innerText", Some(g_it), Some(s_it));
+    define_host_accessor(vm, html_p, "outerText", Some(g_it), Some(s_it));
 
     // namespaceURI / localName / prefix (WHATWG DOM §4.9)
     let h = Rc::clone(host);
@@ -5582,6 +5619,36 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         define_host_accessor(vm, dp, prop, Some(g), None);
     }
 
+    // HTML5 §3.1.1 `Document.prototype.{referrer, lastModified, visibilityState, hidden, designMode}`
+    // and HTML5 §6.6.3 `Document.prototype.hasFocus()`.
+    let g_ref = vm.alloc_host_fn("get referrer", |vm, _, _| {
+        Ok(JsValue::from_string(vm.heap.alloc_string("")))
+    });
+    define_host_accessor(vm, dp, "referrer", Some(g_ref), None);
+
+    let g_lm = vm.alloc_host_fn("get lastModified", |vm, _, _| {
+        Ok(JsValue::from_string(
+            vm.heap.alloc_string("01/01/1970 00:00:00"),
+        ))
+    });
+    define_host_accessor(vm, dp, "lastModified", Some(g_lm), None);
+
+    let g_vis = vm.alloc_host_fn("get visibilityState", |vm, _, _| {
+        Ok(JsValue::from_string(vm.heap.alloc_string("visible")))
+    });
+    define_host_accessor(vm, dp, "visibilityState", Some(g_vis), None);
+
+    let g_hid = vm.alloc_host_fn("get hidden", |_, _, _| Ok(JsValue::FALSE));
+    define_host_accessor(vm, dp, "hidden", Some(g_hid), None);
+
+    let g_dm = vm.alloc_host_fn("get designMode", |vm, _, _| {
+        Ok(JsValue::from_string(vm.heap.alloc_string("off")))
+    });
+    let s_dm = vm.alloc_host_fn("set designMode", |_, _, _| Ok(JsValue::UNDEFINED));
+    define_host_accessor(vm, dp, "designMode", Some(g_dm), Some(s_dm));
+
+    define_host_method(vm, dp, "hasFocus", |_, _, _| Ok(JsValue::TRUE));
+
     let h = Rc::clone(host);
     let g = vm.alloc_host_fn("get compatMode", move |vm, t, _| {
         let doc_id = require_node(vm, &h, t)?;
@@ -6330,6 +6397,28 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
                 classes,
                 quirks,
             },
+        ))
+    });
+    // HTML5 §3.1.2 `Document.prototype.getElementsByName(elementName)`
+    let h = Rc::clone(host);
+    define_host_method(vm, dp, "getElementsByName", move |vm, t, args| {
+        let doc_id = require_node(vm, &h, t)?;
+        let target_name = vm.value_to_rust_string(arg(args, 0));
+        let matched: Vec<NodeId> = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            doc.descendants(doc_id)
+                .filter(|&nid| {
+                    matches!(
+                        doc.get(nid),
+                        Some(NodeData::Element(el))
+                            if el.get_attribute("name") == Some(target_name.as_str())
+                    )
+                })
+                .collect()
+        };
+        Ok(crate::dom_collections::create_static_node_list(
+            vm, &h, matched,
         ))
     });
 

@@ -305,6 +305,8 @@ pub struct JsVm {
     pub(crate) temp_roots: Vec<JsValue>,
     with_stack: Vec<(usize, HeapHandle)>,
     iterators: HashMap<HeapHandle, IteratorState>,
+    /// Internal slots for ECMA-262 §23.1.5 Array Iterator instances (`(target, next_idx, kind, done)`).
+    pub(crate) array_iter_states: HashMap<HeapHandle, (HeapHandle, u32, u8, bool)>,
     /// Optional cooperative loop back-edge budget (`None` = unlimited).
     pub max_loop_iterations: Option<u64>,
     pub loop_iterations: u64,
@@ -665,6 +667,7 @@ impl JsVm {
             temp_roots: Vec::new(),
             with_stack: Vec::new(),
             iterators: HashMap::new(),
+            array_iter_states: HashMap::new(),
             max_loop_iterations: None,
             loop_iterations: 0,
             native_call_depth: 0,
@@ -859,6 +862,10 @@ impl JsVm {
                 IteratorState::String { .. } | IteratorState::Keys { .. } => {}
             }
         }
+        for (&iter_h, &(target, _, _, _)) in &self.array_iter_states {
+            roots.push(JsValue::from_object(iter_h));
+            roots.push(JsValue::from_object(target));
+        }
         for &(_, _, p) in &self.atomic_async_waiters {
             roots.push(JsValue::from_object(p));
         }
@@ -884,6 +891,7 @@ impl JsVm {
         let roots = self.collect_roots();
         let stats = self.heap.collect_major(&roots);
         self.iterators.retain(|&h, _| self.heap.is_alive(h));
+        self.array_iter_states.retain(|&h, _| self.heap.is_alive(h));
         stats
     }
 
@@ -1828,7 +1836,51 @@ impl JsVm {
                 self.registers[a] = self.frames[frame_idx].new_target;
             }
             Opcode::LoadImportMeta => {
-                let meta = self.alloc_ordinary_object();
+                let existing = self
+                    .module_envs
+                    .get(&(prog_id as u32))
+                    .and_then(|e| e.import_meta_obj);
+                let meta = if let Some(h) = existing {
+                    h
+                } else {
+                    let mod_url = self
+                        .module_envs
+                        .get(&(prog_id as u32))
+                        .map(|e| e.url.clone())
+                        .unwrap_or_default();
+                    let obj = self
+                        .heap
+                        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, None));
+                    let k_url = self.heap.intern_key("url");
+                    let url_val = JsValue::from_string(self.heap.alloc_string(&mod_url));
+                    self.heap.object_define_data(
+                        obj,
+                        k_url,
+                        url_val,
+                        PropertyAttrs::DEFAULT,
+                        &mut self.shapes,
+                    );
+                    let base_for_resolve = mod_url.clone();
+                    let resolve_fn = self.alloc_host_fn("resolve", move |vm, _, args| {
+                        let spec =
+                            vm.to_js_string(args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
+                        let resolved = crate::modules::resolve_url_like(&spec, &base_for_resolve);
+                        Ok(JsValue::from_string(vm.heap.alloc_string(&resolved)))
+                    });
+                    self.set_fn_length(resolve_fn, 1);
+                    let k_resolve = self.heap.intern_key("resolve");
+                    self.heap.object_define_data(
+                        obj,
+                        k_resolve,
+                        JsValue::from_object(resolve_fn),
+                        PropertyAttrs::DEFAULT,
+                        &mut self.shapes,
+                    );
+                    if let Some(env) = self.module_envs.get_mut(&(prog_id as u32)) {
+                        env.import_meta_obj = Some(obj);
+                    }
+                    obj
+                };
                 self.registers[a] = JsValue::from_object(meta);
             }
             Opcode::GetGlobal => {
@@ -2346,7 +2398,10 @@ impl JsVm {
                     .and_then(|o| o.rare.as_ref())
                     .and_then(|r| r.private_fields.get(&key).copied())
                     .ok_or_else(|| {
-                        self.type_error("Cannot read private member from object without it")
+                        let name = self.heap.resolve_key(key).unwrap_or("?").to_owned();
+                        self.type_error(format!(
+                            "Cannot read private member '#{name}' from object without it"
+                        ))
                     })?;
                 let val = match entry {
                     PrivateEntry::Field(v) => v,
@@ -2376,7 +2431,10 @@ impl JsVm {
                     .and_then(|o| o.rare.as_ref())
                     .and_then(|r| r.private_fields.get(&key).copied())
                     .ok_or_else(|| {
-                        self.type_error("Cannot write private member to object without it")
+                        let name = self.heap.resolve_key(key).unwrap_or("?").to_owned();
+                        self.type_error(format!(
+                            "Cannot write private member '#{name}' to object without it"
+                        ))
                     })?;
                 match entry {
                     PrivateEntry::Field(_) => {
@@ -2480,8 +2538,8 @@ impl JsVm {
                     let call_pc = self.frames[frame_idx].pc.saturating_sub(1);
                     self.record_call_feedback(prog_id as u32, func_idx as u32, call_pc, callee);
                 }
-                let res = if argc <= 4 {
-                    let mut buf = [JsValue::UNDEFINED; 4];
+                let res = if argc <= 8 {
+                    let mut buf = [JsValue::UNDEFINED; 8];
                     for (i, slot) in buf.iter_mut().take(argc).enumerate() {
                         *slot = self.registers[call_base + 1 + i];
                     }
@@ -2560,10 +2618,25 @@ impl JsVm {
                 let key = self.ic_key(prog_id, func_idx, ic_idx);
                 let recv = self.registers[call_base];
                 let method = self.get_prop_cached(recv, prog_id, func_idx, ic_idx, key)?;
-                let args: Vec<JsValue> = (0..argc)
-                    .map(|i| self.registers[call_base + 1 + i])
-                    .collect();
-                let res = self.call_value(method, recv, &args)?;
+                if method.as_object().is_none() {
+                    let prop = self.heap.resolve_key(key).unwrap_or("?").to_owned();
+                    let got = self.value_to_rust_string(method);
+                    return Err(
+                        self.type_error(format!("Property '{prop}' is not a function (got {got})"))
+                    );
+                }
+                let res = if argc <= 8 {
+                    let mut buf = [JsValue::UNDEFINED; 8];
+                    for (i, slot) in buf.iter_mut().take(argc).enumerate() {
+                        *slot = self.registers[call_base + 1 + i];
+                    }
+                    self.call_value(method, recv, &buf[..argc])?
+                } else {
+                    let args: Vec<JsValue> = (0..argc)
+                        .map(|i| self.registers[call_base + 1 + i])
+                        .collect();
+                    self.call_value(method, recv, &args)?
+                };
                 self.registers[a] = res;
             }
             Opcode::CallWithThis => {
@@ -2571,10 +2644,18 @@ impl JsVm {
                 let argc = usize::from(inst.c());
                 let callee = self.registers[call_base];
                 let recv = self.registers[call_base + 1];
-                let args: Vec<JsValue> = (0..argc)
-                    .map(|i| self.registers[call_base + 2 + i])
-                    .collect();
-                let res = self.call_value(callee, recv, &args)?;
+                let res = if argc <= 8 {
+                    let mut buf = [JsValue::UNDEFINED; 8];
+                    for (i, slot) in buf.iter_mut().take(argc).enumerate() {
+                        *slot = self.registers[call_base + 2 + i];
+                    }
+                    self.call_value(callee, recv, &buf[..argc])?
+                } else {
+                    let args: Vec<JsValue> = (0..argc)
+                        .map(|i| self.registers[call_base + 2 + i])
+                        .collect();
+                    self.call_value(callee, recv, &args)?
+                };
                 self.registers[a] = res;
             }
             Opcode::CallSpread => {
@@ -2590,10 +2671,18 @@ impl JsVm {
                 let call_base = base + usize::from(inst.b());
                 let argc = usize::from(inst.c());
                 let callee = self.registers[call_base];
-                let args: Vec<JsValue> = (0..argc)
-                    .map(|i| self.registers[call_base + 1 + i])
-                    .collect();
-                let res = self.construct_value(callee, &args, callee)?;
+                let res = if argc <= 8 {
+                    let mut buf = [JsValue::UNDEFINED; 8];
+                    for (i, slot) in buf.iter_mut().take(argc).enumerate() {
+                        *slot = self.registers[call_base + 1 + i];
+                    }
+                    self.construct_value(callee, &buf[..argc], callee)?
+                } else {
+                    let args: Vec<JsValue> = (0..argc)
+                        .map(|i| self.registers[call_base + 1 + i])
+                        .collect();
+                    self.construct_value(callee, &args, callee)?
+                };
                 self.registers[a] = res;
             }
             Opcode::ConstructSpread => {
@@ -3495,7 +3584,15 @@ impl JsVm {
         key: PropertyKey,
     ) -> Result<JsValue, JsException> {
         if obj_val.is_null() || obj_val.is_undefined() {
-            return Err(self.type_error("Cannot read properties of null or undefined"));
+            let kind = if obj_val.is_null() {
+                "null"
+            } else {
+                "undefined"
+            };
+            let prop = self.heap.resolve_key(key).unwrap_or("?").to_owned();
+            return Err(self.type_error(format!(
+                "Cannot read properties of {kind} (reading '{prop}')"
+            )));
         }
         // Primitive string `.length` & prototype lookup.
         if let Some(str_h) = obj_val.as_string() {
@@ -4172,7 +4269,15 @@ impl JsVm {
 
     pub fn get_elem(&mut self, obj_val: JsValue, key_val: JsValue) -> Result<JsValue, JsException> {
         if obj_val.is_null() || obj_val.is_undefined() {
-            return Err(self.type_error("Cannot read properties of null or undefined"));
+            let kind = if obj_val.is_null() {
+                "null"
+            } else {
+                "undefined"
+            };
+            let prop = self.value_to_rust_string(key_val);
+            return Err(self.type_error(format!(
+                "Cannot read properties of {kind} (reading '{prop}')"
+            )));
         }
         // Convert object keys via ECMA-262 `ToPropertyKey` before indexing.
         let key_val = if key_val.is_object() {
@@ -4586,7 +4691,11 @@ impl JsVm {
                 bp.name.as_deref().unwrap_or(""),
                 move |vm, this_val, args| {
                     if let Some(sup) = sup_copy {
-                        let nt = ctor_cell_clone.get().map_or(this_val, JsValue::from_object);
+                        let nt = if !vm.native_new_target.is_undefined() {
+                            vm.native_new_target
+                        } else {
+                            ctor_cell_clone.get().map_or(this_val, JsValue::from_object)
+                        };
                         let sup_res =
                             vm.call_handle(sup, this_val, args, this_val.as_object(), nt)?;
                         let actual_this = if let Some(res_h) = sup_res.as_object() {
@@ -6339,6 +6448,25 @@ impl JsVm {
         } else {
             format!("{name}: {msg}")
         };
+        let mut stack_str = formatted.clone();
+        for frame in self.frames.iter().rev().take(8) {
+            let fn_name = self
+                .programs
+                .get(frame.program_id as usize)
+                .and_then(|p| p.functions.get(frame.func_idx as usize))
+                .and_then(|f| f.name.as_deref())
+                .unwrap_or("<anonymous>");
+            stack_str.push_str(&format!("\n    at {fn_name} (pc:{})", frame.pc));
+        }
+        let k_stack = self.heap.intern_key("stack");
+        let sv = JsValue::from_string(self.heap.alloc_string(stack_str));
+        self.heap.object_define_data(
+            err_obj,
+            k_stack,
+            sv,
+            PropertyAttrs::METHOD,
+            &mut self.shapes,
+        );
         JsException {
             value: JsValue::from_object(err_obj),
             message: formatted,
