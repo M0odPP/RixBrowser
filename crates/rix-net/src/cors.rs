@@ -378,7 +378,10 @@ impl FetchEngine {
                 wire_headers.insert("Origin".to_string(), req.origin.clone());
                 let mut unsafe_headers: Vec<String> = base_headers
                     .iter()
-                    .filter(|(k, v)| !is_cors_safelisted_request_header(k, v))
+                    .filter(|(k, v)| {
+                        !is_browser_internal_request_header(k)
+                            && !is_cors_safelisted_request_header(k, v)
+                    })
                     .map(|(k, _)| k.to_ascii_lowercase())
                     .collect();
                 unsafe_headers.sort();
@@ -776,6 +779,25 @@ pub fn is_cors_safelisted_method(method: &str) -> bool {
     matches!(method, "GET" | "HEAD" | "POST")
 }
 
+/// Returns `true` if `name` is a browser-managed transport header (e.g. `Referer`, `Origin`,
+/// `User-Agent`, `Sec-Fetch-*`) that is set by the user agent rather than author code and
+/// therefore MUST NOT trigger a CORS `OPTIONS` preflight per WHATWG Fetch §2.2.5 / §4.5.
+#[must_use]
+pub fn is_browser_internal_request_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "referer"
+            | "origin"
+            | "user-agent"
+            | "accept-encoding"
+            | "host"
+            | "connection"
+            | "dnt"
+            | "upgrade-insecure-requests"
+    ) || lower.starts_with("sec-fetch-")
+}
+
 /// Returns `true` if `(name, value)` is a CORS-safelisted request header per Fetch spec.
 #[must_use]
 pub fn is_cors_safelisted_request_header(name: &str, value: &str) -> bool {
@@ -898,5 +920,20 @@ fn reason_phrase(status: u16) -> &'static str {
         404 => "Not Found",
         500 => "Internal Server Error",
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod stage1_cors_tests {
+    use super::*;
+
+    #[test]
+    fn browser_internal_headers_do_not_trigger_preflight() {
+        assert!(is_browser_internal_request_header("Referer"));
+        assert!(is_browser_internal_request_header("referer"));
+        assert!(is_browser_internal_request_header("Sec-Fetch-Mode"));
+        assert!(is_browser_internal_request_header("User-Agent"));
+        assert!(!is_browser_internal_request_header("X-Custom-Auth"));
+        assert!(!is_browser_internal_request_header("Authorization"));
     }
 }

@@ -44,19 +44,25 @@ pub struct DecodedSvg {
     pub paths: Vec<SvgPathEntry>,
 }
 
+/// Maximum decoded raster texture dimension on either axis (caps 4K/8K photos to ~10 MiB RGBA8
+/// while preserving exact original CSS `intrinsic_width`/`intrinsic_height` for layout & DOM).
+pub const MAX_RASTER_TEX_DIM: u32 = 1600;
+
 /// Decoded RGBA8 image ready for intrinsic sizing and GPU upload.
 #[derive(Debug, Clone)]
 pub struct DecodedImage {
     pub image_id: ImageId,
     pub width: u32,
     pub height: u32,
+    pub intrinsic_width: u32,
+    pub intrinsic_height: u32,
     pub rgba: Arc<Vec<u8>>,
 }
 
 impl DecodedImage {
     #[must_use]
     pub fn intrinsic_size(&self) -> Size {
-        Size::new(self.width as f32, self.height as f32)
+        Size::new(self.intrinsic_width as f32, self.intrinsic_height as f32)
     }
 }
 
@@ -65,7 +71,16 @@ impl DecodedImage {
 pub struct DecodedRasterBytes {
     pub width: u32,
     pub height: u32,
+    pub intrinsic_width: u32,
+    pub intrinsic_height: u32,
     pub rgba: Arc<Vec<u8>>,
+}
+
+impl DecodedRasterBytes {
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        self.rgba.len()
+    }
 }
 
 /// Decodes a batch of `(key, encoded_bytes)` raster images (`png`, `jpeg`, `webp`, `gif`)
@@ -86,21 +101,36 @@ pub fn decode_raster_batch_parallel(
         .collect()
 }
 
-/// Decodes a single encoded raster image into an [`Arc`]-wrapped RGBA8 buffer.
+/// Decodes a single encoded raster image into an [`Arc`]-wrapped RGBA8 buffer, downscaling
+/// oversized (> [`MAX_RASTER_TEX_DIM`]) textures to bound RAM/VRAM while preserving true
+/// original `intrinsic_width` / `intrinsic_height` for CSS layout and `HTMLImageElement.naturalWidth`.
 pub fn decode_single_raster(bytes: &[u8]) -> Result<DecodedRasterBytes, AssetError> {
-    let decoded = image::load_from_memory(bytes)?.into_rgba8();
-    let (width, height) = decoded.dimensions();
-    if width == 0 || height == 0 {
+    let dyn_img = image::load_from_memory(bytes)?;
+    let (orig_w, orig_h) = (dyn_img.width(), dyn_img.height());
+    if orig_w == 0 || orig_h == 0 {
         return Err(AssetError::InvalidRgbaSize {
-            width,
-            height,
+            width: orig_w,
+            height: orig_h,
             actual: 0,
         });
     }
+    let rgba_img = if orig_w > MAX_RASTER_TEX_DIM || orig_h > MAX_RASTER_TEX_DIM {
+        let scale = (MAX_RASTER_TEX_DIM as f64 / f64::from(orig_w.max(orig_h))).clamp(0.01, 1.0);
+        let target_w = ((f64::from(orig_w) * scale).round() as u32).max(1);
+        let target_h = ((f64::from(orig_h) * scale).round() as u32).max(1);
+        dyn_img
+            .resize_exact(target_w, target_h, image::imageops::FilterType::Triangle)
+            .into_rgba8()
+    } else {
+        dyn_img.into_rgba8()
+    };
+    let (width, height) = rgba_img.dimensions();
     Ok(DecodedRasterBytes {
         width,
         height,
-        rgba: Arc::new(decoded.into_raw()),
+        intrinsic_width: orig_w,
+        intrinsic_height: orig_h,
+        rgba: Arc::new(rgba_img.into_raw()),
     })
 }
 
@@ -131,7 +161,14 @@ impl AssetRegistry {
         bytes: &[u8],
     ) -> Result<ImageId, AssetError> {
         let decoded = decode_single_raster(bytes)?;
-        self.register_rgba8_shared(src, decoded.width, decoded.height, decoded.rgba)
+        self.register_rgba8_shared_with_intrinsic(
+            src,
+            decoded.width,
+            decoded.height,
+            decoded.intrinsic_width,
+            decoded.intrinsic_height,
+            decoded.rgba,
+        )
     }
 
     /// Registers a pre-decoded RGBA8 image buffer under `src`.
@@ -151,6 +188,20 @@ impl AssetRegistry {
         src: impl Into<String>,
         width: u32,
         height: u32,
+        rgba: Arc<Vec<u8>>,
+    ) -> Result<ImageId, AssetError> {
+        self.register_rgba8_shared_with_intrinsic(src, width, height, width, height, rgba)
+    }
+
+    /// Registers a shared `Arc<Vec<u8>>` RGBA8 image buffer with distinct original CSS intrinsic
+    /// dimensions (when oversized textures were downscaled to cap RSS/VRAM).
+    pub fn register_rgba8_shared_with_intrinsic(
+        &mut self,
+        src: impl Into<String>,
+        width: u32,
+        height: u32,
+        intrinsic_width: u32,
+        intrinsic_height: u32,
         rgba: Arc<Vec<u8>>,
     ) -> Result<ImageId, AssetError> {
         let expected = (width as usize)
@@ -174,6 +225,8 @@ impl AssetRegistry {
             image_id,
             width,
             height,
+            intrinsic_width: intrinsic_width.max(1),
+            intrinsic_height: intrinsic_height.max(1),
             rgba,
         };
         let src_key = src.into();
@@ -1215,5 +1268,35 @@ pub fn parse_svg_color(raw: &str, current_color: ColorRgba) -> Option<ColorRgba>
         "gray" | "grey" => Some(ColorRgba::rgb(128, 128, 128)),
         "transparent" => Some(ColorRgba::TRANSPARENT),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod stage1_asset_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_raster_is_downscaled_while_preserving_intrinsic_dimensions() {
+        let mut png_bytes = Vec::new();
+        let img = image::RgbaImage::from_pixel(3200, 1600, image::Rgba([24, 128, 220, 255]));
+        {
+            use image::ImageEncoder;
+            let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
+            encoder
+                .write_image(&img, 3200, 1600, image::ExtendedColorType::Rgba8)
+                .unwrap();
+        }
+        let decoded = decode_single_raster(&png_bytes).unwrap();
+        assert_eq!(decoded.intrinsic_width, 3200);
+        assert_eq!(decoded.intrinsic_height, 1600);
+        assert!(decoded.width <= MAX_RASTER_TEX_DIM);
+        assert!(decoded.height <= MAX_RASTER_TEX_DIM);
+        assert_eq!(decoded.width, 1600);
+        assert_eq!(decoded.height, 800);
+
+        let mut reg = AssetRegistry::new();
+        reg.register_encoded("hero.png", &png_bytes).unwrap();
+        let entry = reg.get_by_src("hero.png").unwrap();
+        assert_eq!(entry.intrinsic_size(), Size::new(3200.0, 1600.0));
     }
 }

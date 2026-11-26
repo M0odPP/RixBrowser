@@ -1456,7 +1456,7 @@ fn install_html_reflecting_idl_properties(vm: &mut JsVm, host: &SharedHost) {
                 .assets
                 .get_by_src(&raw_src)
                 .or_else(|| hb.layout_engine.assets.get_by_src(&resolved))
-                .map(|img| (img.width, img.height))
+                .map(|img| (img.intrinsic_width, img.intrinsic_height))
                 .or_else(|| {
                     hb.layout_engine
                         .assets

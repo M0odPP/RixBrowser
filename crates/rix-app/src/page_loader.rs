@@ -39,9 +39,13 @@ use rix_text::{FontDatabase, FontFaceSet, FontStyle, UnicodeRange};
 use url::Url;
 
 /// Upper bound on subresources fetched per navigation to bound memory and tail latency.
-const MAX_SUBRESOURCES_PER_PAGE: usize = 96;
-/// Maximum cached decoded assets shared across tabs.
-const MAX_DECODED_ASSET_CACHE_ENTRIES: usize = 256;
+const MAX_SUBRESOURCES_PER_PAGE: usize = 160;
+/// Maximum eager `loading="lazy"` images fetched during initial navigation (above-the-fold safety).
+const MAX_INITIAL_LAZY_IMAGES: usize = 6;
+/// Byte budget for the cross-tab decoded asset LRU cache (128 MiB, mirroring Firefox SurfaceCache).
+const MAX_DECODED_ASSET_CACHE_BYTES: usize = 128 * 1024 * 1024;
+/// Maximum entry count in the decoded asset LRU cache.
+const MAX_DECODED_ASSET_CACHE_ENTRIES: usize = 512;
 /// TTL before an origin is eligible for speculative preconnect again.
 const PRECONNECT_TTL: Duration = Duration::from_secs(30);
 /// Maximum distinct origins tracked in the speculative preconnector table.
@@ -55,10 +59,28 @@ pub enum CachedAsset {
     WebFont(Arc<Vec<u8>>),
 }
 
-/// Thread-safe decoded raster/SVG/web-font cache shared across tabs and navigations.
+impl CachedAsset {
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::Raster(r) => r.byte_len(),
+            Self::Svg(s) => s.paths.len().saturating_mul(128).max(512),
+            Self::WebFont(b) => b.len(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct DecodedAssetCacheInner {
+    entries: HashMap<String, (CachedAsset, usize, u64)>,
+    total_bytes: usize,
+    tick: u64,
+}
+
+/// Thread-safe byte-budget LRU decoded raster/SVG/web-font cache shared across tabs and navigations.
 #[derive(Clone, Default)]
 pub struct DecodedAssetCache {
-    entries: Arc<RwLock<HashMap<String, CachedAsset>>>,
+    inner: Arc<RwLock<DecodedAssetCacheInner>>,
 }
 
 impl DecodedAssetCache {
@@ -69,21 +91,66 @@ impl DecodedAssetCache {
 
     #[must_use]
     pub fn get(&self, url: &str) -> Option<CachedAsset> {
-        self.entries.read().ok()?.get(url).cloned()
+        // Fast read check first; bump LRU sequence only on hit.
+        let found = self
+            .inner
+            .read()
+            .ok()?
+            .entries
+            .get(url)
+            .map(|(a, _, _)| a.clone())?;
+        if let Ok(mut guard) = self.inner.write() {
+            guard.tick = guard.tick.wrapping_add(1);
+            let tick = guard.tick;
+            if let Some(entry) = guard.entries.get_mut(url) {
+                entry.2 = tick;
+            }
+        }
+        Some(found)
     }
 
     pub fn insert(&self, url: String, asset: CachedAsset) {
-        if let Ok(mut guard) = self.entries.write() {
-            if guard.len() >= MAX_DECODED_ASSET_CACHE_ENTRIES {
-                guard.clear();
+        let bytes = asset.estimated_bytes();
+        // Never let a single oversized entry wipe the entire cache.
+        if bytes > MAX_DECODED_ASSET_CACHE_BYTES / 2 {
+            return;
+        }
+        if let Ok(mut guard) = self.inner.write() {
+            if let Some((_, old_bytes, _)) = guard.entries.remove(&url) {
+                guard.total_bytes = guard.total_bytes.saturating_sub(old_bytes);
             }
-            guard.insert(url, asset);
+            while (guard.total_bytes + bytes > MAX_DECODED_ASSET_CACHE_BYTES
+                || guard.entries.len() >= MAX_DECODED_ASSET_CACHE_ENTRIES)
+                && !guard.entries.is_empty()
+            {
+                let victim = guard
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, (_, _, seq))| *seq)
+                    .map(|(k, _)| k.clone());
+                if let Some(key) = victim {
+                    if let Some((_, b, _)) = guard.entries.remove(&key) {
+                        guard.total_bytes = guard.total_bytes.saturating_sub(b);
+                    }
+                } else {
+                    break;
+                }
+            }
+            guard.tick = guard.tick.wrapping_add(1);
+            let tick = guard.tick;
+            guard.total_bytes = guard.total_bytes.saturating_add(bytes);
+            guard.entries.insert(url, (asset, bytes, tick));
         }
     }
 
     #[must_use]
+    pub fn total_bytes(&self) -> usize {
+        self.inner.read().map_or(0, |g| g.total_bytes)
+    }
+
+    #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.read().map_or(0, |g| g.len())
+        self.inner.read().map_or(0, |g| g.entries.len())
     }
 
     #[must_use]
@@ -184,10 +251,12 @@ impl LoadedPageAssets {
     /// Registers all loaded raster and SVG assets (including raw attribute aliases) into `assets`.
     pub fn register_into_assets(&self, assets: &mut AssetRegistry) {
         for (url, aliases, decoded) in &self.rasters {
-            let _ = assets.register_rgba8_shared(
+            let _ = assets.register_rgba8_shared_with_intrinsic(
                 url,
                 decoded.width,
                 decoded.height,
+                decoded.intrinsic_width,
+                decoded.intrinsic_height,
                 Arc::clone(&decoded.rgba),
             );
             for alias in aliases {
@@ -363,11 +432,18 @@ pub fn load_page_subresources(
         };
         match role {
             SubresourceRole::Stylesheet => {
-                fetched_css_by_url.insert(url, String::from_utf8_lossy(&res.data).into_owned());
+                let css = String::from_utf8_lossy(&res.data).into_owned();
+                if !is_html_error_document(&res.mime_type, &css) {
+                    fetched_css_by_url.insert(url, css);
+                }
             }
             SubresourceRole::Script => {
+                // HTML §4.12.1.1: Never execute HTML error/challenge pages or non-script MIME
+                // payloads as JavaScript.
                 let code = String::from_utf8_lossy(&res.data).into_owned();
-                out.external_scripts.insert(url, code);
+                if is_valid_script_response(&res.mime_type, &code) {
+                    out.external_scripts.insert(url, code);
+                }
             }
             SubresourceRole::Image => {
                 raw_image_payloads.push((url, res.mime_type, res.data));
@@ -1059,6 +1135,14 @@ fn discover_wave1_refs(document_url: &str, html: &str, media: &MediaContext) -> 
                 }
             }
         } else if tag.eq_ignore_ascii_case("img") {
+            // HTML §4.8.4.2: defer offscreen `loading="lazy"` images beyond the initial above-the-fold
+            // window so huge image galleries do not stall first paint or inflate memory.
+            let is_lazy = el
+                .get_attribute("loading")
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("lazy"));
+            if is_lazy && images.len() >= MAX_INITIAL_LAZY_IMAGES {
+                continue;
+            }
             if let Some(srcset) = el.get_attribute("srcset") {
                 if let Some(best) = parse_best_srcset_url(srcset) {
                     if let Some(resolved) = resolve_url(base_str, &best) {
@@ -1082,7 +1166,9 @@ fn discover_wave1_refs(document_url: &str, html: &str, media: &MediaContext) -> 
                 }
             }
         } else if tag.eq_ignore_ascii_case("source") {
-            // Only fetch `<source srcset>` when inside `<picture>` (NEVER `<video>`/`<audio>` streams!).
+            // HTML §4.8.4.2: Only fetch `<picture><source>` matching `media` and a supported
+            // decoded image MIME type (skip unsupported `image/avif`/`image/jxl` so `<picture>`
+            // cleanly falls back to WebP/JPEG/PNG!).
             let in_picture = doc.parent(node).is_some_and(|p| {
                 matches!(
                     doc.get(p),
@@ -1090,13 +1176,25 @@ fn discover_wave1_refs(document_url: &str, html: &str, media: &MediaContext) -> 
                 )
             });
             if in_picture {
-                if let Some(srcset) = el.get_attribute("srcset") {
-                    if let Some(best) = parse_best_srcset_url(srcset) {
-                        if let Some(resolved) = resolve_url(base_str, &best) {
-                            if !is_non_image_media_url(&resolved)
-                                && seen_img.insert((best.clone(), resolved.clone()))
-                            {
-                                images.push((best, resolved));
+                let media_ok = el
+                    .get_attribute("media")
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .is_none_or(|m| media.evaluate_media_query_str(m));
+                let type_ok = el
+                    .get_attribute("type")
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .is_none_or(is_supported_picture_source_mime);
+                if media_ok && type_ok {
+                    if let Some(srcset) = el.get_attribute("srcset") {
+                        if let Some(best) = parse_best_srcset_url(srcset) {
+                            if let Some(resolved) = resolve_url(base_str, &best) {
+                                if !is_non_image_media_url(&resolved)
+                                    && seen_img.insert((best.clone(), resolved.clone()))
+                                {
+                                    images.push((best, resolved));
+                                }
                             }
                         }
                     }
@@ -1207,24 +1305,30 @@ fn fetch_batch(
 
     if !net_reqs.is_empty() {
         let start = Instant::now();
-        // Run all subresources concurrently with a PER-REQUEST 4s timeout so a single lagging CDN
-        // host NEVER discards already-completed stylesheets, scripts, or images!
+        // Run subresources concurrently with per-role progressive timeouts so render-blocking
+        // CSS/scripts finish cleanly while a single slow third-party image/tracker never stalls
+        // first paint for 4-6 seconds!
         let fetched = runtime.block_on(async {
-            let sem = Arc::new(tokio::sync::Semaphore::new(16));
+            let sem = Arc::new(tokio::sync::Semaphore::new(24));
             let mut handles = Vec::with_capacity(net_reqs.len());
-            for (url, prio) in net_reqs {
+            for (req_pos, (url, prio)) in net_reqs.into_iter().enumerate() {
+                let role = queue[net_indices[req_pos]].2;
+                let per_req_timeout = match role {
+                    SubresourceRole::Stylesheet | SubresourceRole::Script => {
+                        Duration::from_millis(3200)
+                    }
+                    SubresourceRole::Font => Duration::from_millis(2000),
+                    SubresourceRole::Image => Duration::from_millis(1600),
+                };
                 let rm = resource_manager.clone();
                 let sem = Arc::clone(&sem);
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire_owned().await.ok();
-                    match tokio::time::timeout(
-                        Duration::from_secs(4),
-                        rm.load_prioritized(&url, prio),
-                    )
-                    .await
+                    match tokio::time::timeout(per_req_timeout, rm.load_prioritized(&url, prio))
+                        .await
                     {
                         Ok(res) => res,
-                        Err(_) => Err(rix_net::NetError::Timeout(Duration::from_secs(4))),
+                        Err(_) => Err(rix_net::NetError::Timeout(per_req_timeout)),
                     }
                 }));
             }
@@ -1285,6 +1389,64 @@ fn fetch_batch(
     }
 
     results
+}
+
+fn is_html_error_document(mime: &str, body: &str) -> bool {
+    let lower_mime = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if lower_mime == "text/html" || lower_mime == "application/xhtml+xml" {
+        return true;
+    }
+    let trimmed = body.trim_start();
+    trimmed.starts_with("<!DOCTYPE")
+        || trimmed.starts_with("<!doctype")
+        || trimmed.starts_with("<html")
+        || trimmed.starts_with("<HTML")
+}
+
+/// HTML Living Standard §4.12.1.1: validates that a fetched script response is not an HTML
+/// error/challenge page or non-script media/CSS/image payload.
+fn is_valid_script_response(mime: &str, body: &str) -> bool {
+    let lower_mime = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if lower_mime.starts_with("image/")
+        || lower_mime.starts_with("video/")
+        || lower_mime.starts_with("audio/")
+        || lower_mime == "text/css"
+        || lower_mime == "text/html"
+        || lower_mime == "application/xhtml+xml"
+    {
+        return false;
+    }
+    !is_html_error_document(mime, body)
+}
+
+/// Returns `true` if `mime` is an image format supported by our raster/SVG decoder pipeline.
+fn is_supported_picture_source_mime(mime: &str) -> bool {
+    let lower = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "image/png"
+            | "image/jpeg"
+            | "image/jpg"
+            | "image/webp"
+            | "image/gif"
+            | "image/svg+xml"
+            | "image/apng"
+    )
 }
 
 fn resolve_url(base_url: &str, raw: &str) -> Option<String> {
@@ -1413,5 +1575,62 @@ fn guess_mime_from_path(path: &str) -> String {
         "font/otf".to_string()
     } else {
         "application/octet-stream".to_string()
+    }
+}
+
+#[cfg(test)]
+mod stage1_page_loader_tests {
+    use super::*;
+
+    #[test]
+    fn script_mime_gate_rejects_html_error_pages_and_media() {
+        assert!(!is_valid_script_response(
+            "text/html; charset=utf-8",
+            "console.log(1);"
+        ));
+        assert!(!is_valid_script_response(
+            "application/javascript",
+            "<!DOCTYPE html><html>403</html>"
+        ));
+        assert!(!is_valid_script_response("image/png", "PNG"));
+        assert!(is_valid_script_response(
+            "application/javascript; charset=utf-8",
+            "export const x = 1;"
+        ));
+        assert!(is_valid_script_response(
+            "text/javascript",
+            "window.ok = true;"
+        ));
+    }
+
+    #[test]
+    fn picture_source_mime_filters_unsupported_formats() {
+        assert!(is_supported_picture_source_mime("image/webp"));
+        assert!(is_supported_picture_source_mime("image/png"));
+        assert!(is_supported_picture_source_mime("image/jpeg"));
+        assert!(is_supported_picture_source_mime("image/svg+xml"));
+        assert!(!is_supported_picture_source_mime("image/avif"));
+        assert!(!is_supported_picture_source_mime("image/jxl"));
+    }
+
+    #[test]
+    fn decoded_asset_cache_enforces_lru_byte_budget() {
+        let cache = DecodedAssetCache::new();
+        let big = Arc::new(DecodedRasterBytes {
+            width: 1000,
+            height: 1000,
+            intrinsic_width: 1000,
+            intrinsic_height: 1000,
+            rgba: Arc::new(vec![0u8; 4_000_000]),
+        });
+        for i in 0..40 {
+            cache.insert(
+                format!("https://example.com/{i}.png"),
+                CachedAsset::Raster(Arc::clone(&big)),
+            );
+        }
+        assert!(cache.total_bytes() <= MAX_DECODED_ASSET_CACHE_BYTES);
+        assert!(cache.get("https://example.com/0.png").is_none());
+        assert!(cache.get("https://example.com/39.png").is_some());
     }
 }
