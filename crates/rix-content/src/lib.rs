@@ -165,6 +165,77 @@ struct DocumentModuleProvider {
 }
 
 impl ModuleSourceProvider for DocumentModuleProvider {
+    fn prefetch_sources(&self, urls: &[String]) {
+        let Some(ref engine) = self.fetch_engine else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let missing: Vec<String> = {
+            let cache = self.sources.borrow();
+            urls.iter()
+                .filter(|u| {
+                    (u.starts_with("http://") || u.starts_with("https://"))
+                        && !cache.contains_key(u.as_str())
+                })
+                .cloned()
+                .collect()
+        };
+        if missing.len() <= 1 {
+            return;
+        }
+        let count = missing.len();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for url in missing {
+            let eng = Arc::clone(engine);
+            let tx_c = tx.clone();
+            let doc_url = self.doc_url.clone();
+            let doc_origin = self.doc_origin.clone();
+            handle.spawn(async move {
+                let mut headers = HashMap::new();
+                headers.insert("referer".to_string(), doc_url);
+                headers.insert("accept".to_string(), "*/*".to_string());
+                let req = rix_net::FetchRequest {
+                    url: url.clone(),
+                    method: "GET".to_string(),
+                    headers,
+                    body: Vec::new(),
+                    mode: rix_net::FetchMode::Cors,
+                    credentials: rix_net::FetchCredentials::SameOrigin,
+                    cache: rix_net::FetchCache::Default,
+                    redirect: rix_net::FetchRedirect::Follow,
+                    origin: doc_origin,
+                    abort_signal: None,
+                };
+                let fetched = eng.fetch(req).await.ok().and_then(|resp| {
+                    (200..300)
+                        .contains(&resp.status)
+                        .then(|| String::from_utf8_lossy(&resp.body).into_owned())
+                });
+                let _ = tx_c.send((url, fetched));
+            });
+        }
+        drop(tx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        let mut received = 0usize;
+        while received < count {
+            let Some(rem) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            match rx.recv_timeout(rem) {
+                Ok((url, Some(text))) => {
+                    self.sources.borrow_mut().insert(url, text);
+                    received += 1;
+                }
+                Ok((_, None)) => {
+                    received += 1;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
     fn load_source(&self, url: &str) -> Result<String, String> {
         if let Some(code) = self.sources.borrow().get(url).cloned() {
             return Ok(code);

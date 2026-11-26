@@ -295,17 +295,21 @@ fn map_set_entry(vm: &mut JsVm, map_h: HeapHandle, key: JsValue, val: JsValue) {
     } else {
         key
     };
+    let hash = vm.heap.same_value_zero_hash(norm_key);
     let existing_idx = match vm.heap.get_object(map_h).map(|o| &o.kind) {
-        Some(ObjectKind::Map(entries)) => entries
-            .iter()
-            .position(|(k, _)| same_value_zero(vm, *k, norm_key)),
+        Some(ObjectKind::Map(map)) => map.bucket_indices(hash).iter().copied().find(|&idx| {
+            map.entries
+                .get(idx)
+                .and_then(|e| *e)
+                .is_some_and(|(k, _)| same_value_zero(vm, k, norm_key))
+        }),
         _ => None,
     };
-    if let Some(ObjectKind::Map(entries)) = vm.heap.get_object_mut(map_h).map(|o| &mut o.kind) {
+    if let Some(ObjectKind::Map(map)) = vm.heap.get_object_mut(map_h).map(|o| &mut o.kind) {
         if let Some(i) = existing_idx {
-            entries[i].1 = val;
+            map.update_at(i, val);
         } else {
-            entries.push((norm_key, val));
+            map.push_new(hash, norm_key, val);
         }
     }
     vm.heap.write_barrier(map_h, norm_key);
@@ -344,11 +348,18 @@ fn norm_zero(v: JsValue) -> JsValue {
 }
 
 fn map_find(vm: &JsVm, map_h: HeapHandle, key: JsValue) -> Option<JsValue> {
+    let hash = vm.heap.same_value_zero_hash(key);
     match vm.heap.get_object(map_h).map(|o| &o.kind) {
-        Some(ObjectKind::Map(e)) => e
-            .iter()
-            .find(|(k, _)| same_value_zero(vm, *k, key))
-            .map(|(_, v)| *v),
+        Some(ObjectKind::Map(map)) => {
+            for &idx in map.bucket_indices(hash) {
+                if let Some((k, v)) = map.entries.get(idx).and_then(|e| *e) {
+                    if same_value_zero(vm, k, key) {
+                        return Some(v);
+                    }
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -405,13 +416,19 @@ fn install_map(vm: &mut JsVm) {
     define_method_len(vm, mp, "delete", 1, |vm, this_val, args| {
         let h = require_map(vm, this_val)?;
         let key = arg(args, 0);
+        let hash = vm.heap.same_value_zero_hash(key);
         let pos = match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::Map(e)) => e.iter().position(|(k, _)| same_value_zero(vm, *k, key)),
+            Some(ObjectKind::Map(map)) => map.bucket_indices(hash).iter().copied().find(|&idx| {
+                map.entries
+                    .get(idx)
+                    .and_then(|e| *e)
+                    .is_some_and(|(k, _)| same_value_zero(vm, k, key))
+            }),
             _ => None,
         };
         if let Some(i) = pos {
-            if let Some(ObjectKind::Map(e)) = vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
-                e.remove(i);
+            if let Some(ObjectKind::Map(map)) = vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
+                map.remove_at(hash, i);
             }
             Ok(JsValue::TRUE)
         } else {
@@ -433,7 +450,7 @@ fn install_map(vm: &mut JsVm) {
         }
         let this_arg = arg(args, 1);
         let snapshot: Vec<(JsValue, JsValue)> = match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::Map(e)) => (**e).clone(),
+            Some(ObjectKind::Map(e)) => e.snapshot_entries(),
             _ => Vec::new(),
         };
         for (k, v) in snapshot {
@@ -444,7 +461,7 @@ fn install_map(vm: &mut JsVm) {
     define_method_len(vm, mp, "keys", 0, |vm, this_val, _| {
         let h = require_map(vm, this_val)?;
         let items: Vec<JsValue> = match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::Map(e)) => e.iter().map(|(k, _)| *k).collect(),
+            Some(ObjectKind::Map(e)) => e.snapshot_keys(),
             _ => Vec::new(),
         };
         Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
@@ -452,7 +469,7 @@ fn install_map(vm: &mut JsVm) {
     define_method_len(vm, mp, "values", 0, |vm, this_val, _| {
         let h = require_map(vm, this_val)?;
         let items: Vec<JsValue> = match vm.heap.get_object(h).map(|o| &o.kind) {
-            Some(ObjectKind::Map(e)) => e.iter().map(|(_, v)| *v).collect(),
+            Some(ObjectKind::Map(e)) => e.snapshot_values(),
             _ => Vec::new(),
         };
         Ok(JsValue::from_object(alloc_values_iterator(vm, items)))
@@ -570,7 +587,7 @@ fn map_entries_fn(
 ) -> Result<JsValue, JsException> {
     let h = require_map(vm, this_val)?;
     let snapshot: Vec<(JsValue, JsValue)> = match vm.heap.get_object(h).map(|o| &o.kind) {
-        Some(ObjectKind::Map(e)) => (**e).clone(),
+        Some(ObjectKind::Map(e)) => e.snapshot_entries(),
         _ => Vec::new(),
     };
     let mut pairs = Vec::with_capacity(snapshot.len());
@@ -603,33 +620,51 @@ fn require_set(vm: &mut JsVm, this_val: JsValue) -> Result<HeapHandle, JsExcepti
 
 fn set_add_entry(vm: &mut JsVm, set_h: HeapHandle, val: JsValue) {
     let norm = norm_zero(val);
+    let hash = vm.heap.same_value_zero_hash(norm);
     let exists = match vm.heap.get_object(set_h).map(|o| &o.kind) {
-        Some(ObjectKind::Set(e)) => e.iter().any(|v| same_value_zero(vm, *v, norm)),
+        Some(ObjectKind::Set(set)) => set.bucket_indices(hash).iter().copied().any(|idx| {
+            set.entries
+                .get(idx)
+                .and_then(|e| *e)
+                .is_some_and(|v| same_value_zero(vm, v, norm))
+        }),
         _ => false,
     };
     if !exists {
-        if let Some(ObjectKind::Set(e)) = vm.heap.get_object_mut(set_h).map(|o| &mut o.kind) {
-            e.push(norm);
+        if let Some(ObjectKind::Set(set)) = vm.heap.get_object_mut(set_h).map(|o| &mut o.kind) {
+            set.push_new(hash, norm);
         }
         vm.heap.write_barrier(set_h, norm);
     }
 }
 
 fn set_has_entry(vm: &JsVm, set_h: HeapHandle, val: JsValue) -> bool {
+    let hash = vm.heap.same_value_zero_hash(val);
     match vm.heap.get_object(set_h).map(|o| &o.kind) {
-        Some(ObjectKind::Set(e)) => e.iter().any(|v| same_value_zero(vm, *v, val)),
+        Some(ObjectKind::Set(set)) => set.bucket_indices(hash).iter().copied().any(|idx| {
+            set.entries
+                .get(idx)
+                .and_then(|e| *e)
+                .is_some_and(|v| same_value_zero(vm, v, val))
+        }),
         _ => false,
     }
 }
 
 fn set_delete_entry(vm: &mut JsVm, set_h: HeapHandle, val: JsValue) -> bool {
+    let hash = vm.heap.same_value_zero_hash(val);
     let pos = match vm.heap.get_object(set_h).map(|o| &o.kind) {
-        Some(ObjectKind::Set(e)) => e.iter().position(|v| same_value_zero(vm, *v, val)),
+        Some(ObjectKind::Set(set)) => set.bucket_indices(hash).iter().copied().find(|&idx| {
+            set.entries
+                .get(idx)
+                .and_then(|e| *e)
+                .is_some_and(|v| same_value_zero(vm, v, val))
+        }),
         _ => None,
     };
     if let Some(i) = pos {
-        if let Some(ObjectKind::Set(e)) = vm.heap.get_object_mut(set_h).map(|o| &mut o.kind) {
-            e.remove(i);
+        if let Some(ObjectKind::Set(set)) = vm.heap.get_object_mut(set_h).map(|o| &mut o.kind) {
+            set.remove_at(hash, i);
         }
         true
     } else {
@@ -646,7 +681,7 @@ fn set_len(vm: &JsVm, set_h: HeapHandle) -> usize {
 
 fn set_snapshot(vm: &JsVm, h: HeapHandle) -> Vec<JsValue> {
     match vm.heap.get_object(h).map(|o| &o.kind) {
-        Some(ObjectKind::Set(e)) => (**e).clone(),
+        Some(ObjectKind::Set(e)) => e.snapshot_values(),
         _ => Vec::new(),
     }
 }
@@ -827,11 +862,10 @@ fn install_set(vm: &mut JsVm) {
             let mut idx = 0usize;
             loop {
                 let item = match vm.heap.get_object(h).map(|o| &o.kind) {
-                    Some(ObjectKind::Set(e)) => e.get(idx).copied(),
+                    Some(ObjectKind::Set(e)) => e.next_live(&mut idx),
                     _ => None,
                 };
                 let Some(e) = item else { break };
-                idx += 1;
                 let in_other = vm.call_value(rec.has_fn, rec.obj, &[e])?;
                 if vm.to_boolean(in_other) && set_has_entry(vm, h, e) {
                     set_add_entry(vm, out, e);

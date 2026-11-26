@@ -1855,3 +1855,87 @@ fn nested_flex_grid_layout_memoizes_in_linear_time_and_svg_inherits_css_fill_and
         "inline <svg> must inherit CSS `fill: #ff1f8f` and honor `fill-rule=\"evenodd\"`"
     );
 }
+
+#[test]
+fn nested_flex_grid_with_propagated_absolute_descendants_memoizes_and_svg_em_units_resolve() {
+    // 1. Nested Flex/Grid subtrees containing `position: absolute` descendants whose containing
+    //    block is an outer ancestor must still memoize in `pass_fragment_memo` (O(N)) AND replay
+    //    their propagated OOF boxes so they render at the expected coordinates.
+    // 2. SVG 2 §4.2 `<svg width="1em" height="1em" viewBox="0 0 256 256">` must resolve `1em`
+    //    against the element's computed font-size (16px), not fall back to the 256x256 viewBox.
+    let mut nested = String::from(
+        r#"<div style="display:flex;flex-direction:column;position:relative;width:600px;">"#,
+    );
+    for i in 0..12 {
+        nested.push_str(&format!(
+            r#"<div style="display:grid;grid-template-columns:1fr;width:100%;"><div style="display:flex;flex-direction:column;"><span class="badge" style="position:absolute;top:{}px;left:10px;width:8px;height:8px;background:#ff0000;"></span>"#,
+            i * 10
+        ));
+    }
+    nested.push_str(
+        r#"<svg id="icon" width="1em" height="1em" viewBox="0 0 256 256" style="font-size:16px;"><path d="M0 0 L256 256"/></svg>"#,
+    );
+    for _ in 0..12 {
+        nested.push_str("</div></div>");
+    }
+    nested.push_str("</div>");
+    let html = format!("<!doctype html><html><body>{nested}</body></html>");
+    let mut doc = parse_html(&html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.cascade_full(&mut doc);
+
+    let font_db = FontDatabase::new();
+    let mut engine = LayoutEngine::new();
+    let mut resources = ResourceRegistry::default();
+    let t0 = std::time::Instant::now();
+    let frame = engine.layout_and_paint(
+        &doc,
+        &styles,
+        Size::new(800.0, 600.0),
+        &font_db,
+        PipelineId(1),
+        &mut resources,
+    );
+    assert!(
+        t0.elapsed().as_millis() < 1000,
+        "12-level nested Flex/Grid with propagated OOFs took too long: {:?}",
+        t0.elapsed()
+    );
+
+    fn find_svg_size(f: &rix_layout::Fragment) -> Option<(f32, f32)> {
+        if matches!(f.kind, rix_layout::FragmentKind::Svg { .. }) {
+            return Some((f.border_rect.size.width, f.border_rect.size.height));
+        }
+        for c in f.children.iter() {
+            if let Some(sz) = find_svg_size(c) {
+                return Some(sz);
+            }
+        }
+        None
+    }
+    let root = frame.fragment_tree.root.as_ref().expect("root fragment");
+    let svg_sz = find_svg_size(root).expect("inline SVG fragment must exist");
+    assert!(
+        (svg_sz.0 - 16.0).abs() < 1.0 && (svg_sz.1 - 16.0).abs() < 1.0,
+        "expected 1em inline SVG to resolve to 16x16 (not 256x256 viewBox), got {svg_sz:?}"
+    );
+
+    let red_badges = frame
+        .display_list
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                DisplayItem::Rect { color, bounds, .. }
+                    if color.r == 255 && color.g == 0 && color.b == 0
+                    && (bounds.size.width - 8.0).abs() < 1.0
+            )
+        })
+        .count();
+    assert_eq!(
+        red_badges, 12,
+        "all 12 propagated position:absolute badges must still be painted after memo replay"
+    );
+}

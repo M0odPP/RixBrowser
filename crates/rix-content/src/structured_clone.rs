@@ -1190,7 +1190,7 @@ fn serialize_value(
             nodes.push(CloneNode::Placeholder);
             memo.insert(h, idx);
             let raw_entries = match vm.heap.get_object(h).map(|o| &o.kind) {
-                Some(ObjectKind::Map(m)) => (**m).clone(),
+                Some(ObjectKind::Map(m)) => m.snapshot_entries(),
                 _ => Vec::new(),
             };
             let mut entries = Vec::with_capacity(raw_entries.len());
@@ -1207,7 +1207,7 @@ fn serialize_value(
             nodes.push(CloneNode::Placeholder);
             memo.insert(h, idx);
             let raw_items = match vm.heap.get_object(h).map(|o| &o.kind) {
-                Some(ObjectKind::Set(s)) => (**s).clone(),
+                Some(ObjectKind::Set(s)) => s.snapshot_values(),
                 _ => Vec::new(),
             };
             let mut items = Vec::with_capacity(raw_items.len());
@@ -1738,22 +1738,30 @@ fn deserialize_payload_ref(
             CloneNode::Map { entries } => {
                 let mut pairs = Vec::with_capacity(entries.len());
                 for (ck, cv) in entries {
-                    pairs.push((
-                        materialize_value(vm, ck, &handles),
-                        materialize_value(vm, cv, &handles),
-                    ));
+                    let k = materialize_value(vm, ck, &handles);
+                    let v = materialize_value(vm, cv, &handles);
+                    let hash = vm.heap.same_value_zero_hash(k);
+                    pairs.push((hash, k, v));
                 }
                 if let Some(ObjectKind::Map(m)) = vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
-                    **m = pairs;
+                    m.clear();
+                    for (hash, k, v) in pairs {
+                        m.push_new(hash, k, v);
+                    }
                 }
             }
             CloneNode::Set { items } => {
                 let mut vals = Vec::with_capacity(items.len());
                 for ci in items {
-                    vals.push(materialize_value(vm, ci, &handles));
+                    let v = materialize_value(vm, ci, &handles);
+                    let hash = vm.heap.same_value_zero_hash(v);
+                    vals.push((hash, v));
                 }
                 if let Some(ObjectKind::Set(s)) = vm.heap.get_object_mut(h).map(|o| &mut o.kind) {
-                    **s = vals;
+                    s.clear();
+                    for (hash, v) in vals {
+                        s.push_new(hash, v);
+                    }
                 }
             }
             CloneNode::Error {

@@ -5189,7 +5189,7 @@ pub(crate) fn create_computed_style_proxy(
     let wa1 = wa.clone();
     define_host_method(vm, target, "getPropertyValue", move |vm, _, args| {
         if let Some(ref wa_ref) = wa1 {
-            crate::css_animations_api::flush_and_sync_css_animations(vm, &h1, wa_ref);
+            crate::css_animations_api::flush_if_styles_dirty(vm, &h1, wa_ref);
         }
         let prop = vm.value_to_rust_string(arg(args, 0));
         let val = live_computed_property(&h1, nid, pseudo, &prop);
@@ -5365,7 +5365,7 @@ pub(crate) fn create_computed_style_proxy(
         let prop = vm.value_to_rust_string(key_val);
         if prop == "length" {
             if let Some(ref wa_ref) = wa_get {
-                crate::css_animations_api::flush_and_sync_css_animations(vm, &h_get, wa_ref);
+                crate::css_animations_api::flush_if_styles_dirty(vm, &h_get, wa_ref);
             }
             let style = live_style_for(&h_get, nid, pseudo);
             let total = COMPUTED_STYLE_LONGHANDS.len() + style.custom_properties.len();
@@ -5389,7 +5389,7 @@ pub(crate) fn create_computed_style_proxy(
             }
         }
         if let Some(ref wa_ref) = wa_get {
-            crate::css_animations_api::flush_and_sync_css_animations(vm, &h_get, wa_ref);
+            crate::css_animations_api::flush_if_styles_dirty(vm, &h_get, wa_ref);
         }
         let css_key = camel_to_kebab(&prop);
         let val = live_computed_property(&h_get, nid, pseudo, &css_key);

@@ -712,7 +712,10 @@ pub struct LayoutContext<'a> {
     /// Per-pass memo for `measure_intrinsic_widths` eliminating exponential recursion in nested Flex/Grid/Tables.
     pub(crate) pass_intrinsic_memo: HashMap<(BoxId, u32, u32), (f32, f32)>,
     /// Per-pass memo for `layout_box` keyed by full constraint overrides (including Flex/Grid definite sizes).
-    pub(crate) pass_fragment_memo: HashMap<PassFragmentKey, Fragment>,
+    /// Also records any out-of-flow (`position: absolute | fixed`) descendants propagated to an ancestor
+    /// containing block so memo hits replay them in O(1) instead of forcing exponential re-layout.
+    pub(crate) pass_fragment_memo:
+        HashMap<PassFragmentKey, (Fragment, Vec<crate::position::PendingOof>)>,
     /// Out-of-flow (`position: absolute | fixed`) boxes propagating upward to their true CSS containing block.
     pub(crate) pending_oof: Vec<crate::position::PendingOof>,
 }
@@ -908,8 +911,11 @@ pub fn layout_box(ctx: &mut LayoutContext<'_>, box_id: BoxId, space: ConstraintS
         ignore_h: space.ignore_specified_height,
     };
     if pass_cacheable {
-        if let Some(hit) = ctx.pass_fragment_memo.get(&pass_key) {
-            return hit.clone();
+        if let Some((hit_frag, hit_oofs)) = ctx.pass_fragment_memo.get(&pass_key) {
+            if !hit_oofs.is_empty() {
+                ctx.pending_oof.extend(hit_oofs.iter().cloned());
+            }
+            return hit_frag.clone();
         }
         if cross_frame_cacheable {
             if let Some(cached) = ctx.cache.get_fragment(b, &space) {
@@ -941,11 +947,17 @@ pub fn layout_box(ctx: &mut LayoutContext<'_>, box_id: BoxId, space: ConstraintS
     };
     let propagated_oof = ctx.pending_oof.len() > oof_before;
 
-    if pass_cacheable && !propagated_oof {
+    if pass_cacheable {
         if ctx.pass_fragment_memo.len() < 32_768 {
-            ctx.pass_fragment_memo.insert(pass_key, frag.clone());
+            let oof_delta = if propagated_oof {
+                ctx.pending_oof[oof_before..].to_vec()
+            } else {
+                Vec::new()
+            };
+            ctx.pass_fragment_memo
+                .insert(pass_key, (frag.clone(), oof_delta));
         }
-        if cross_frame_cacheable {
+        if cross_frame_cacheable && !propagated_oof {
             ctx.cache
                 .store_fragment(ctx.tree.get(box_id), &space, &frag);
         }

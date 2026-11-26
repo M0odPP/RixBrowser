@@ -226,19 +226,26 @@ pub fn layout_flex_grid_container(
             ignore_h: false,
         };
         let reused_frag = if !has_percent_height_direct_child(ctx.tree, cid) {
-            ctx.pass_fragment_memo.get(&probe_key).and_then(|f| {
-                if (f.border_rect.size.height - item_h).abs() < 0.75 {
-                    Some(f.clone())
-                } else {
-                    None
-                }
-            })
+            ctx.pass_fragment_memo
+                .get(&probe_key)
+                .and_then(|(f, oofs)| {
+                    if (f.border_rect.size.height - item_h).abs() < 0.75 {
+                        Some((f.clone(), oofs.clone()))
+                    } else {
+                        None
+                    }
+                })
         } else {
             None
         };
         let child_oof_start = ctx.pending_oof.len();
         let mut frag = match reused_frag {
-            Some(f) => f,
+            Some((f, oofs)) => {
+                if !oofs.is_empty() {
+                    ctx.pending_oof.extend(oofs);
+                }
+                f
+            }
             None => {
                 let item_space = space.with_available(item_w, Some(item_h));
                 layout_box(ctx, cid, item_space)

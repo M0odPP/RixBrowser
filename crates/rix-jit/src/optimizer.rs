@@ -154,6 +154,10 @@ pub fn compile_optimizing_function(
     flag_builder
         .set("opt_level", "speed")
         .map_err(|e| JitCompileError::Cranelift(e.to_string()))?;
+    #[cfg(not(debug_assertions))]
+    flag_builder
+        .set("enable_verifier", "false")
+        .map_err(|e| JitCompileError::Cranelift(e.to_string()))?;
     flag_builder
         .set("is_pic", "true")
         .map_err(|e| JitCompileError::Cranelift(e.to_string()))?;

@@ -36,9 +36,9 @@ const PARALLEL_CHILD_THRESHOLD: usize = 32;
 const MIN_PARALLEL_CHUNK_SIZE: usize = 8;
 const SIBLING_CACHE_SLOTS: usize = 32;
 
-/// Fast FNV-1a hasher for internal per-document `NodeId` and memo maps.
+/// Fast FNV-1a hasher for internal per-document `NodeId`, custom property, and memo maps.
 #[derive(Default)]
-struct FastFnvHasher(u64);
+pub(crate) struct FastFnvHasher(u64);
 
 impl Hasher for FastFnvHasher {
     #[inline]
@@ -77,7 +77,7 @@ impl Hasher for FastFnvHasher {
     }
 }
 
-type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastFnvHasher>>;
+pub(crate) type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastFnvHasher>>;
 
 /// Summary metrics produced by [`StyleContext::restyle_dirty`] or [`StyleContext::cascade_full`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -709,6 +709,82 @@ impl StyleContext {
         pseudo: RixPseudoElement,
     ) -> Option<&Arc<ComputedStyle>> {
         self.pseudo_styles.get(&(node, pseudo))
+    }
+
+    /// Resolves a pseudo-element's [`ComputedStyle`] on demand (for `getComputedStyle(el, '::before')`
+    /// when a non-generated `::before`/`::after` without `content` was skipped during bulk cascade).
+    #[must_use]
+    pub fn resolve_pseudo_style_on_demand(
+        &self,
+        doc: &Document,
+        node: NodeId,
+        pseudo: RixPseudoElement,
+    ) -> Option<Arc<ComputedStyle>> {
+        if let Some(cached) = self.pseudo_styles.get(&(node, pseudo)) {
+            return Some(Arc::clone(cached));
+        }
+        let orig_style = self.styles.get(&node)?;
+        let Some(NodeData::Element(orig_elem)) = doc.get(node) else {
+            return None;
+        };
+        if !self.rule_index.has_pseudo_rules(pseudo) {
+            return None;
+        }
+        let mut cands = SmallVec::<[u32; 16]>::new();
+        self.rule_index
+            .collect_pseudo_candidates(pseudo, orig_elem, None, &mut cands);
+        if cands.is_empty() {
+            return None;
+        }
+        let pseudo_el = DomElement::with_pseudo(doc, node, pseudo);
+        let mut caches = SelectorCaches::default();
+        let mut matched: SmallVec<[MatchedRule<'_>; 8]> = SmallVec::new();
+        for &idx in &cands {
+            let rule = &self.rule_index.rules[idx as usize];
+            if let Some(scope_proximity) =
+                match_rule_with_scopes(doc, node, &pseudo_el, rule, None, &mut caches, None)
+            {
+                matched.push(MatchedRule {
+                    rule,
+                    scope_proximity,
+                    is_shadow_host_rule: false,
+                });
+            }
+        }
+        if matched.is_empty() {
+            return None;
+        }
+        let root_font_size = doc
+            .children(doc.root())
+            .find_map(|c| self.styles.get(&c).map(|s| s.text.font_size_px))
+            .unwrap_or(16.0);
+        let (si, sc) = element_sibling_position(doc, node);
+        let pseudo_nid = (usize::from(node) as u64) ^ (((pseudo as u64) + 1) << 48);
+        let mut pstyle = resolve_element_style_with_context(
+            &matched,
+            &[],
+            &[],
+            Some(orig_style.as_ref()),
+            root_font_size,
+            &self.media,
+            Some(&self.rule_index.registered_properties),
+            si,
+            sc,
+            pseudo_nid,
+            self.rule_index.random_doc_seed,
+            &orig_elem.attributes,
+        );
+        if matches!(
+            orig_style.display,
+            crate::values::DisplayMode::Flex
+                | crate::values::DisplayMode::InlineFlex
+                | crate::values::DisplayMode::Grid
+                | crate::values::DisplayMode::InlineGrid
+        ) && matches!(pseudo, RixPseudoElement::Before | RixPseudoElement::After)
+        {
+            pstyle.display = pstyle.display.blockify();
+        }
+        Some(Arc::new(pstyle))
     }
 
     /// Returns the deduplicated unsupported CSS features recorded for F12 telemetry.
@@ -2537,7 +2613,12 @@ fn collect_presentational_hint_decls(
                 || tag.eq_ignore_ascii_case("iframe")
                 || tag.eq_ignore_ascii_case("hr"))
         {
-            if let Some(dim) = normalize_html_dimension(trimmed) {
+            let dim = if tag.eq_ignore_ascii_case("svg") {
+                normalize_svg_dimension(trimmed)
+            } else {
+                normalize_html_dimension(trimmed)
+            };
+            if let Some(dim) = dim {
                 css.push_str("width:");
                 css.push_str(&dim);
                 css.push(';');
@@ -2555,7 +2636,12 @@ fn collect_presentational_hint_decls(
                 || tag.eq_ignore_ascii_case("canvas")
                 || tag.eq_ignore_ascii_case("iframe"))
         {
-            if let Some(dim) = normalize_html_dimension(trimmed) {
+            let dim = if tag.eq_ignore_ascii_case("svg") {
+                normalize_svg_dimension(trimmed)
+            } else {
+                normalize_html_dimension(trimmed)
+            };
+            if let Some(dim) = dim {
                 css.push_str("height:");
                 css.push_str(&dim);
                 css.push(';');
@@ -2632,6 +2718,35 @@ fn normalize_html_dimension(raw: &str) -> Option<String> {
         return Some(format!("{stripped}px"));
     }
     None
+}
+
+/// Normalizes an SVG 2 §4.2 `width`/`height` presentation attribute (accepting unitless user
+/// units, `%`, and CSS `<length>` units such as `em`, `rem`, `ex`, `ch`, `pt`, `pc`, `cm`, `mm`,
+/// `in`, `vw`, `vh`) into a CSS `<length-percentage>` presentational hint.
+fn normalize_svg_dimension(raw: &str) -> Option<String> {
+    if let Some(basic) = normalize_html_dimension(raw) {
+        return Some(basic);
+    }
+    let trimmed = raw.trim();
+    let split = trimmed
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '+' || c == '-'))
+        .unwrap_or(trimmed.len());
+    let num = trimmed[..split].trim();
+    if !num
+        .parse::<f32>()
+        .ok()
+        .is_some_and(|v| v.is_finite() && v >= 0.0)
+    {
+        return None;
+    }
+    let unit = trimmed[split..].trim().to_ascii_lowercase();
+    match unit.as_str() {
+        "em" | "rem" | "ex" | "ch" | "pt" | "pc" | "cm" | "mm" | "in" | "q" | "vw" | "vh"
+        | "vmin" | "vmax" | "svw" | "svh" | "lvw" | "lvh" | "dvw" | "dvh" => {
+            Some(format!("{num}{unit}"))
+        }
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2718,6 +2833,26 @@ fn collect_pseudo_element_styles(
             }
         }
         if !matched.is_empty() {
+            // CSS Pseudo-Elements L4 §2.2 / CSS Display L3: `::before` and `::after` do not
+            // generate boxes unless a matched rule declares `content` (or `all`). Skipping
+            // universal non-generated pseudo-element resets (`*, ::before, ::after { ... }`,
+            // specificity <= 1) during bulk cascade avoids 2x full-DOM style work while
+            // `getComputedStyle(el, '::before')` resolves them lazily via
+            // `resolve_pseudo_style_on_demand`.
+            if matches!(pseudo, RixPseudoElement::Before | RixPseudoElement::After)
+                && matched.iter().all(|m| m.rule.specificity <= 1)
+                && !matched.iter().any(|m| {
+                    m.rule.declarations.iter().any(|d| {
+                        matches!(
+                            d.property,
+                            crate::properties::PropertyIdKind::Content
+                                | crate::properties::PropertyIdKind::All
+                        )
+                    })
+                })
+            {
+                continue;
+            }
             let needs_sib = rule_index.has_sibling_or_random_rules
                 && matched.iter().any(|m| {
                     m.rule.declarations.iter().any(|d| {

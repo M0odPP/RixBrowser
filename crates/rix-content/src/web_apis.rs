@@ -3880,7 +3880,7 @@ pub(crate) fn structured_clone_inner(
         }
         Some(5) => {
             let entries = match vm.heap.get_object(h).map(|o| &o.kind) {
-                Some(ObjectKind::Map(m)) => (**m).clone(),
+                Some(ObjectKind::Map(m)) => m.snapshot_entries(),
                 _ => Vec::new(),
             };
             let cloned = vm.heap.alloc_object(JsObject::with_kind(
@@ -3892,16 +3892,19 @@ pub(crate) fn structured_clone_inner(
             for (k, v) in entries {
                 let ck = structured_clone_inner(vm, web_apis, k, memo)?;
                 let cv = structured_clone_inner(vm, web_apis, v, memo)?;
-                new_entries.push((ck, cv));
+                let hash = vm.heap.same_value_zero_hash(ck);
+                new_entries.push((hash, ck, cv));
             }
             if let Some(ObjectKind::Map(m)) = vm.heap.get_object_mut(cloned).map(|o| &mut o.kind) {
-                **m = new_entries;
+                for (hash, ck, cv) in new_entries {
+                    m.push_new(hash, ck, cv);
+                }
             }
             Ok(JsValue::from_object(cloned))
         }
         Some(6) => {
             let items = match vm.heap.get_object(h).map(|o| &o.kind) {
-                Some(ObjectKind::Set(s)) => (**s).clone(),
+                Some(ObjectKind::Set(s)) => s.snapshot_values(),
                 _ => Vec::new(),
             };
             let cloned = vm.heap.alloc_object(JsObject::with_kind(
@@ -3911,10 +3914,14 @@ pub(crate) fn structured_clone_inner(
             memo.insert(h, cloned);
             let mut new_items = Vec::with_capacity(items.len());
             for v in items {
-                new_items.push(structured_clone_inner(vm, web_apis, v, memo)?);
+                let cv = structured_clone_inner(vm, web_apis, v, memo)?;
+                let hash = vm.heap.same_value_zero_hash(cv);
+                new_items.push((hash, cv));
             }
             if let Some(ObjectKind::Set(s)) = vm.heap.get_object_mut(cloned).map(|o| &mut o.kind) {
-                **s = new_items;
+                for (hash, cv) in new_items {
+                    s.push_new(hash, cv);
+                }
             }
             Ok(JsValue::from_object(cloned))
         }
