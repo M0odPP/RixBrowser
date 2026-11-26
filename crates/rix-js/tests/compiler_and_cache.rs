@@ -492,3 +492,39 @@ fn compiler_o1_local_and_upvalue_lookup_handles_shadowing_and_1200_locals() {
     // 0 + 599 + 1199 + 10 + 99 = 1907
     assert_eq!(val.as_number(), Some(1_907.0));
 }
+
+#[test]
+fn string_computed_property_access_handles_length_and_utf16_indices() {
+    // ECMA-262 §10.4.3.5: primitive string computed access `s["length"]` and `s["1"]` must resolve
+    // own exotic properties (`utf16_len` and UTF-16 code units), not fall through to
+    // `String.prototype.length === 0`.
+    let src = r#"
+        const k = "length";
+        let r = "";
+        let steps = 0;
+        while (r[k] < 6 && steps < 20) {
+            r += "ABCDEF"[steps];
+            steps++;
+        }
+        const checks = [
+            "hello"["length"] === 5,
+            ""["length"] === 0,
+            "😀"["length"] === 2,
+            "hello"["1"] === "e",
+            "hello"[1] === "e",
+            "hello"[1.0] === "e",
+            "hello"[-0.0] === "h",
+            "hello"["-0"] === undefined,
+            "hello"[99] === undefined,
+            r === "ABCDEF",
+            steps === 6,
+            typeof "hello"["slice"] === "function",
+        ];
+        checks.every(Boolean)
+    "#;
+    let mut vm = rix_js::JsVm::new();
+    let val = vm
+        .eval_script(src)
+        .expect("ECMA-262 §10.4.3.5 string computed property access must succeed");
+    assert_eq!(val.as_bool(), Some(true));
+}

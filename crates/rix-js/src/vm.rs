@@ -4181,17 +4181,31 @@ impl JsVm {
         } else {
             key_val
         };
-        // Fast string indexing `"hello"[1] === "e"`.
+        // ECMA-262 §10.4.3.5 String Exotic Object own properties (`length` and UTF-16 indices).
         if let Some(str_h) = obj_val.as_string() {
-            if let Some(idx) = key_val.as_i32().and_then(|i| u32::try_from(i).ok()) {
+            if let Some(idx) = self.as_array_index(key_val) {
                 let s = self.heap.materialize_string(str_h).unwrap_or_default();
-                if let Some(ch) = s.chars().nth(idx as usize) {
-                    return Ok(JsValue::from_string(self.heap.alloc_string(ch.to_string())));
+                let idx_usize = idx as usize;
+                if s.is_ascii() {
+                    if let Some(&b) = s.as_bytes().get(idx_usize) {
+                        let ch = (b as char).to_string();
+                        return Ok(JsValue::from_string(self.heap.alloc_string(ch)));
+                    }
+                    return Ok(JsValue::UNDEFINED);
+                }
+                if let Some(unit) = s.encode_utf16().nth(idx_usize) {
+                    let ch = char::from_u32(u32::from(unit))
+                        .map_or_else(|| "\u{FFFD}".to_string(), |c| c.to_string());
+                    return Ok(JsValue::from_string(self.heap.alloc_string(ch)));
                 }
                 return Ok(JsValue::UNDEFINED);
             }
             let ks = self.to_property_key(key_val)?;
             let k = self.heap.intern_key(&ks);
+            if k == self.key_length {
+                let len = self.heap.get_string(str_h).map_or(0, |s| s.utf16_len()) as f64;
+                return Ok(JsValue::from_f64(len));
+            }
             return self.get_property_with_receiver(self.string_proto, k, obj_val);
         }
         let Some(obj) = obj_val.as_object() else {

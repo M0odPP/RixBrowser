@@ -1676,7 +1676,7 @@ fn restyle_dirty_walk(
         }
 
         styles.insert(node, Arc::clone(&new_style));
-        let final_style = anim_ctx
+        let mut final_style = anim_ctx
             .apply_node(
                 doc,
                 node,
@@ -1698,43 +1698,59 @@ fn restyle_dirty_walk(
                 report.paint_only_count += 1;
                 style_changed = true;
             }
-            let text_changed = !Arc::ptr_eq(&old_style.text, &final_style.text)
-                && old_style.text != final_style.text;
-            let vars_changed =
-                !Arc::ptr_eq(&old_style.custom_properties, &final_style.custom_properties)
-                    && old_style.custom_properties != final_style.custom_properties;
-            let inherited_scalar_changed = old_style.visibility != final_style.visibility
-                || old_style.pointer_events != final_style.pointer_events
-                || old_style.cursor != final_style.cursor;
-            let display_none_toggled = (old_style.display == crate::values::DisplayMode::None)
-                != (final_style.display == crate::values::DisplayMode::None);
-            let blockify_changed = old_style.display != final_style.display
-                && (matches!(
-                    old_style.display,
-                    crate::values::DisplayMode::Flex
-                        | crate::values::DisplayMode::InlineFlex
-                        | crate::values::DisplayMode::Grid
-                        | crate::values::DisplayMode::InlineGrid
-                        | crate::values::DisplayMode::GridLanes
-                        | crate::values::DisplayMode::InlineGridLanes
-                        | crate::values::DisplayMode::InlineGridLanesMulti
-                        | crate::values::DisplayMode::Contents
-                ) || matches!(
-                    final_style.display,
-                    crate::values::DisplayMode::Flex
-                        | crate::values::DisplayMode::InlineFlex
-                        | crate::values::DisplayMode::Grid
-                        | crate::values::DisplayMode::InlineGrid
-                        | crate::values::DisplayMode::GridLanes
-                        | crate::values::DisplayMode::InlineGridLanes
-                        | crate::values::DisplayMode::InlineGridLanesMulti
-                        | crate::values::DisplayMode::Contents
-                ));
-            propagate_inherited = text_changed
-                || vars_changed
-                || inherited_scalar_changed
-                || blockify_changed
-                || display_none_toggled;
+            if !style_changed {
+                // Restore the identical previous `Arc<ComputedStyle>` so descendants retain
+                // `Arc::ptr_eq` on `parent_style` and `custom_properties`, preserving `StyleMemo`
+                // hits and O(1) `CustomPropertyMap::eq` across incremental restyles.
+                styles.insert(node, Arc::clone(&old_style));
+                final_style = old_style;
+            } else {
+                let text_changed = !Arc::ptr_eq(&old_style.text, &final_style.text)
+                    && old_style.text != final_style.text;
+                let vars_changed =
+                    !Arc::ptr_eq(&old_style.custom_properties, &final_style.custom_properties)
+                        && old_style.custom_properties != final_style.custom_properties;
+                if !vars_changed
+                    && !Arc::ptr_eq(&old_style.custom_properties, &final_style.custom_properties)
+                {
+                    let mut shared = (*final_style).clone();
+                    shared.custom_properties = Arc::clone(&old_style.custom_properties);
+                    final_style = Arc::new(shared);
+                    styles.insert(node, Arc::clone(&final_style));
+                }
+                let inherited_scalar_changed = old_style.visibility != final_style.visibility
+                    || old_style.pointer_events != final_style.pointer_events
+                    || old_style.cursor != final_style.cursor;
+                let display_none_toggled = (old_style.display == crate::values::DisplayMode::None)
+                    != (final_style.display == crate::values::DisplayMode::None);
+                let blockify_changed = old_style.display != final_style.display
+                    && (matches!(
+                        old_style.display,
+                        crate::values::DisplayMode::Flex
+                            | crate::values::DisplayMode::InlineFlex
+                            | crate::values::DisplayMode::Grid
+                            | crate::values::DisplayMode::InlineGrid
+                            | crate::values::DisplayMode::GridLanes
+                            | crate::values::DisplayMode::InlineGridLanes
+                            | crate::values::DisplayMode::InlineGridLanesMulti
+                            | crate::values::DisplayMode::Contents
+                    ) || matches!(
+                        final_style.display,
+                        crate::values::DisplayMode::Flex
+                            | crate::values::DisplayMode::InlineFlex
+                            | crate::values::DisplayMode::Grid
+                            | crate::values::DisplayMode::InlineGrid
+                            | crate::values::DisplayMode::GridLanes
+                            | crate::values::DisplayMode::InlineGridLanes
+                            | crate::values::DisplayMode::InlineGridLanesMulti
+                            | crate::values::DisplayMode::Contents
+                    ));
+                propagate_inherited = text_changed
+                    || vars_changed
+                    || inherited_scalar_changed
+                    || blockify_changed
+                    || display_none_toggled;
+            }
         } else {
             layout_dirty.push(node);
             report.layout_dirty_count += 1;
@@ -1947,12 +1963,19 @@ fn compute_single_element_style(
         .map(|(_, v)| v.as_str());
     let has_pres_hints = has_presentational_hint_attrs(doc, node, elem);
 
-    let any_sibling_math = !rule_index.allows_sibling_sharing
+    let any_sibling_math = rule_index.has_sibling_or_random_rules
         && matched_indices.iter().any(|&idx| {
-            rule_index.rules[idx as usize]
-                .declarations
-                .iter()
-                .any(|d| d.value.contains_sibling_fn())
+            rule_index.rules[idx as usize].declarations.iter().any(|d| {
+                d.value.contains_sibling_fn()
+                    || (rule_index.has_sibling_or_random_custom_props && d.value.contains_var_fn())
+            })
+        });
+    let uses_attr = rule_index.has_attr_fn_rules
+        && matched_indices.iter().any(|&idx| {
+            rule_index.rules[idx as usize].declarations.iter().any(|d| {
+                d.value.contains_attr_fn()
+                    || (rule_index.has_attr_custom_props && d.value.contains_var_fn())
+            })
         });
 
     let is_mathml = &*elem.name.ns == "http://www.w3.org/1998/Math/MathML";
@@ -1964,6 +1987,7 @@ fn compute_single_element_style(
         && !has_pres_hints
         && !any_scoped
         && !any_sibling_math
+        && !uses_attr
         && !is_mathml
         && !is_top_layer
         && host_matched.is_empty()
@@ -2071,6 +2095,7 @@ fn compute_single_element_style(
         && !has_pres_hints
         && !any_scoped
         && !any_sibling_math
+        && !uses_attr
         && !is_mathml
         && !is_top_layer
         && host_matched.is_empty()
@@ -2693,36 +2718,28 @@ fn collect_pseudo_element_styles(
             }
         }
         if !matched.is_empty() {
-            let needs_sib = matched.iter().any(|m| {
-                m.rule
-                    .declarations
-                    .iter()
-                    .any(|d| d.value.contains_sibling_fn())
-            });
+            let needs_sib = rule_index.has_sibling_or_random_rules
+                && matched.iter().any(|m| {
+                    m.rule.declarations.iter().any(|d| {
+                        d.value.contains_sibling_fn()
+                            || (rule_index.has_sibling_or_random_custom_props
+                                && d.value.contains_var_fn())
+                    })
+                });
+            let uses_attr = rule_index.has_attr_fn_rules
+                && matched.iter().any(|m| {
+                    m.rule.declarations.iter().any(|d| {
+                        d.value.contains_attr_fn()
+                            || (rule_index.has_attr_custom_props && d.value.contains_var_fn())
+                    })
+                });
             let memo_parent_ptr = orig_ptr ^ (((pseudo as usize) + 1) << 56);
-            if !any_scoped && !needs_sib && elem_attrs.is_empty() {
+            if !any_scoped && !needs_sib && !uses_attr {
                 if let Some(cached) =
                     memo.lookup(memo_parent_ptr, layout_parent_flex_grid, &matched_indices)
                 {
                     out_pseudos.push(((node, pseudo), cached));
                     continue;
-                }
-            } else if !any_scoped && !needs_sib {
-                let uses_attr = matched.iter().any(|m| {
-                    m.rule.declarations.iter().any(|d| {
-                        matches!(
-                            d.value,
-                            PropertyValue::Unresolved(_) | PropertyValue::Custom(_)
-                        )
-                    })
-                });
-                if !uses_attr {
-                    if let Some(cached) =
-                        memo.lookup(memo_parent_ptr, layout_parent_flex_grid, &matched_indices)
-                    {
-                        out_pseudos.push(((node, pseudo), cached));
-                        continue;
-                    }
                 }
             }
             let (si, sc) = if needs_sib {
@@ -2775,7 +2792,7 @@ fn collect_pseudo_element_styles(
                 _ => {}
             }
             let style = Arc::new(pstyle);
-            if !any_scoped && !needs_sib {
+            if !any_scoped && !needs_sib && !uses_attr {
                 memo.insert(
                     memo_parent_ptr,
                     layout_parent_flex_grid,

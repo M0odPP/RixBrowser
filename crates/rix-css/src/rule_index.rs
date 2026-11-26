@@ -166,6 +166,16 @@ pub struct RuleIndex {
     /// True when no rule uses sibling combinators, `:nth-*` / `:empty`, `:has()`, or `@scope`,
     /// enabling O(1) Stylo-style sibling style sharing for attribute-free siblings.
     pub allows_sibling_sharing: bool,
+    /// True when any rule or keyframe declaration uses `sibling-index()`, `sibling-count()`,
+    /// `random()`, or `random-item()`.
+    pub has_sibling_or_random_rules: bool,
+    /// True when any custom property (`--*`) declaration uses `sibling-index()`, `sibling-count()`,
+    /// `random()`, or `random-item()`.
+    pub has_sibling_or_random_custom_props: bool,
+    /// True when any rule declaration invokes CSS Values L5 `attr(...)`.
+    pub has_attr_fn_rules: bool,
+    /// True when any custom property (`--*`) declaration invokes `attr(...)`.
+    pub has_attr_custom_props: bool,
     /// Per-document deterministic seed for CSS Values L5 `random()`.
     pub random_doc_seed: u64,
     /// True when any rule is enclosed in an `@scope` block.
@@ -213,6 +223,10 @@ impl RuleIndex {
             has_relative_selectors: false,
             has_non_subject_has: false,
             allows_sibling_sharing: true,
+            has_sibling_or_random_rules: false,
+            has_sibling_or_random_custom_props: false,
+            has_attr_fn_rules: false,
+            has_attr_custom_props: false,
             random_doc_seed: crate::values::EvalContext::default().random_doc_seed,
             has_scope_rules: false,
             registered_properties: HashMap::new(),
@@ -300,6 +314,7 @@ impl RuleIndex {
                             .any(|d| d.value.contains_sibling_fn())
                     }) {
                         index.allows_sibling_sharing = false;
+                        index.has_sibling_or_random_rules = true;
                     }
                     index.keyframes.insert(kf.name.clone(), kf_copy);
                 }
@@ -340,12 +355,23 @@ impl RuleIndex {
                         }
                     }
                 }
-                if selector_prevents_sibling_sharing(&compiled.selector)
-                    || compiled
-                        .declarations
-                        .iter()
-                        .any(|d| d.value.contains_sibling_fn())
-                {
+                let mut rule_has_sib = false;
+                for d in compiled.declarations.iter() {
+                    if d.value.contains_sibling_fn() {
+                        rule_has_sib = true;
+                        index.has_sibling_or_random_rules = true;
+                        if d.property == crate::properties::PropertyIdKind::Custom {
+                            index.has_sibling_or_random_custom_props = true;
+                        }
+                    }
+                    if d.value.contains_attr_fn() {
+                        index.has_attr_fn_rules = true;
+                        if d.property == crate::properties::PropertyIdKind::Custom {
+                            index.has_attr_custom_props = true;
+                        }
+                    }
+                }
+                if selector_prevents_sibling_sharing(&compiled.selector) || rule_has_sib {
                     index.allows_sibling_sharing = false;
                 }
                 let mut attr_refs = Vec::new();

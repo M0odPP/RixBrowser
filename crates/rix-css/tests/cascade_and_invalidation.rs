@@ -455,3 +455,83 @@ fn universal_noop_custom_properties_preserve_o1_arc_sharing() {
         .pseudo_style_for(a, rix_css::RixPseudoElement::Backdrop)
         .is_none());
 }
+
+#[test]
+fn typed_length_zero_noop_and_pseudo_memo_preserve_arc_sharing_and_restyle_identity() {
+    // CSS Properties & Values API L1 + StyleMemo:
+    // 1. `@property --tw-len { syntax: "<length>"; inherits: false; initial-value: 0; }`
+    //    canonicalizes to `0px` at root; descendants re-declaring `--tw-len: 0` must remain O(1)
+    //    no-ops sharing the same `Arc<CustomPropertyMap>`.
+    // 2. Pseudo-elements (`::before`) declaring `var(...)` and custom props (without `attr()`)
+    //    must hit `StyleMemo` and share identical `Arc<ComputedStyle>` across matching elements.
+    // 3. Incremental `restyle_dirty` on an unchanged element must preserve `Arc::ptr_eq` on
+    //    `ComputedStyle` and `custom_properties`.
+    let css = r#"
+        @property --tw-len { syntax: "<length>"; inherits: false; initial-value: 0; }
+        @property --tw-ang { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
+        :root { --accent: #112233; }
+        *, ::before, ::after {
+            --tw-len: 0;
+            --tw-ang: 0;
+            border-color: var(--accent);
+        }
+        .item::before { content: ""; color: var(--accent); }
+        .item:nth-child(even) { opacity: 0.9; }
+        [data-noop="yes"] { color: #ff0000; }
+    "#;
+    let html = r#"<!doctype html><html><body>
+        <div id="p">
+            <span id="i1" class="item" data-id="1"></span>
+            <span id="i2" class="item" data-id="2"></span>
+            <span id="i3" class="item" data-id="3"></span>
+        </div>
+    </body></html>"#;
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let sheet = Arc::new(Stylesheet::parse(css, CascadeOrigin::Author, &media));
+    let mut ctx = StyleContext::new(media);
+    ctx.add_stylesheet(sheet);
+    ctx.cascade_full(&mut doc);
+
+    let p = find_by_id(&doc, "p");
+    let i1 = find_by_id(&doc, "i1");
+    let i3 = find_by_id(&doc, "i3");
+
+    let p_st = ctx.style_for(p).unwrap().clone();
+    let i1_st = ctx.style_for(i1).unwrap().clone();
+    let i3_st = ctx.style_for(i3).unwrap().clone();
+    assert!(
+        Arc::ptr_eq(&p_st.custom_properties, &i1_st.custom_properties),
+        "typed `<length>` 0 vs 0px universal re-declaration must keep O(1) Arc sharing"
+    );
+    assert!(
+        Arc::ptr_eq(&i1_st, &i3_st),
+        "elements using `var(...)` with identical matched rules must hit StyleMemo"
+    );
+    let b1 = ctx
+        .pseudo_style_for(i1, rix_css::RixPseudoElement::Before)
+        .unwrap()
+        .clone();
+    let b3 = ctx
+        .pseudo_style_for(i3, rix_css::RixPseudoElement::Before)
+        .unwrap()
+        .clone();
+    assert!(
+        Arc::ptr_eq(&b1, &b3),
+        "pseudo-elements using `var(...)` without `attr()` must share Arc via StyleMemo"
+    );
+
+    // Trigger an incremental no-op restyle on `#p` and verify `Arc::ptr_eq` is preserved.
+    ctx.invalidate_attribute_change(&mut doc, p, "data-noop");
+    let report = ctx.restyle_dirty(&mut doc);
+    assert!(
+        report.restyled_elements >= 1,
+        "expected `#p` to be restyled by `restyle_dirty`"
+    );
+    assert_eq!(report.layout_dirty_count, 0);
+    assert_eq!(report.paint_only_count, 0);
+    assert!(
+        Arc::ptr_eq(&p_st, ctx.style_for(p).unwrap()),
+        "unchanged restyle_dirty must preserve the existing Arc<ComputedStyle>"
+    );
+}
