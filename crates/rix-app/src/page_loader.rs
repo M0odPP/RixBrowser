@@ -41,7 +41,7 @@ use url::Url;
 /// Upper bound on subresources fetched per navigation to bound memory and tail latency.
 const MAX_SUBRESOURCES_PER_PAGE: usize = 160;
 /// Maximum eager `loading="lazy"` images fetched during initial navigation (above-the-fold safety).
-const MAX_INITIAL_LAZY_IMAGES: usize = 6;
+const MAX_INITIAL_LAZY_IMAGES: usize = 24;
 /// Byte budget for the cross-tab decoded asset LRU cache (128 MiB, mirroring Firefox SurfaceCache).
 const MAX_DECODED_ASSET_CACHE_BYTES: usize = 128 * 1024 * 1024;
 /// Maximum entry count in the decoded asset LRU cache.
@@ -1097,6 +1097,7 @@ fn discover_wave1_refs(document_url: &str, html: &str, media: &MediaContext) -> 
     let mut seen_css = HashSet::new();
     let mut seen_js = HashSet::new();
     let mut seen_img = HashSet::new();
+    let mut lazy_img_count = 0usize;
 
     for node in doc.descendants(doc.root()) {
         let Some(NodeData::Element(el)) = doc.get(node) else {
@@ -1158,12 +1159,16 @@ fn discover_wave1_refs(document_url: &str, html: &str, media: &MediaContext) -> 
             }
         } else if tag.eq_ignore_ascii_case("img") {
             // HTML §4.8.4.2: defer offscreen `loading="lazy"` images beyond the initial above-the-fold
-            // window so huge image galleries do not stall first paint or inflate memory.
+            // window (counted independently of eager header icons!) so huge galleries do not stall
+            // first paint while above-the-fold lazy logos/thumbnails always load cleanly.
             let is_lazy = el
                 .get_attribute("loading")
                 .is_some_and(|v| v.trim().eq_ignore_ascii_case("lazy"));
-            if is_lazy && images.len() >= MAX_INITIAL_LAZY_IMAGES {
-                continue;
+            if is_lazy {
+                if lazy_img_count >= MAX_INITIAL_LAZY_IMAGES {
+                    continue;
+                }
+                lazy_img_count += 1;
             }
             if let Some(srcset) = el.get_attribute("srcset") {
                 if let Some(best) = parse_best_srcset_url(srcset) {

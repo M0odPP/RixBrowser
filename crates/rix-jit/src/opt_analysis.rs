@@ -127,7 +127,7 @@ pub fn check_opt_eligibility(func: &FunctionBytecode) -> Result<(), JitCompileEr
             "async/generator functions stay on Tier-1",
         ));
     }
-    if func.code.is_empty() || func.code.len() > 8_192 || func.register_count > 128 {
+    if func.code.is_empty() || func.code.len() > 2_048 || func.register_count > 64 {
         return Err(JitCompileError::UnsupportedFunction(
             "function exceeds Tier-3 bytecode/register budget",
         ));

@@ -165,3 +165,54 @@ fn eval_context_for_preserves_query_container_dimensions() {
     assert!((ctx.container_width_px - 420.0).abs() < 0.01);
     assert!((ctx.container_height_px - 240.0).abs() < 0.01);
 }
+
+#[test]
+fn picture_source_selects_matching_media_and_supported_mime_with_dimensions() {
+    let html = r#"<!doctype html><html><body style="margin:0;">
+        <picture>
+            <source media="(min-width: 800px)" type="image/avif" srcset="hero.avif 1x" width="3795" height="993">
+            <source media="(min-width: 800px)" type="image/webp" srcset="hero.webp 1x, hero@2x.webp 2x" width="3795" height="993">
+            <img id="hero" src="mobile.png" width="1200" height="508" style="display:block; width:100%; height:auto;">
+        </picture>
+    </body></html>"#;
+
+    // Desktop viewport (1280px): skips unsupported AVIF, selects WebP `<source>` (3795x993 -> 334.9px tall).
+    let (doc_d, root_d) = layout_html(html, "", 1280.0, 800.0);
+    let hero_d = find_abs_rect(&root_d, rix_core::Point::ZERO, find_id(&doc_d, "hero")).unwrap();
+    let expected_d = 1280.0 * (993.0 / 3795.0);
+    assert!(
+        (hero_d.size.height - expected_d).abs() < 1.5,
+        "Desktop <picture><source> must size to {expected_d:.1}px, got {hero_d:?}"
+    );
+
+    // Mobile viewport (500px): media query fails, falls back to <img> (1200x508 -> 211.7px tall).
+    let (doc_m, root_m) = layout_html(html, "", 500.0, 800.0);
+    let hero_m = find_abs_rect(&root_m, rix_core::Point::ZERO, find_id(&doc_m, "hero")).unwrap();
+    let expected_m = 500.0 * (508.0 / 1200.0);
+    assert!(
+        (hero_m.size.height - expected_m).abs() < 1.5,
+        "Mobile <picture> fallback must size to {expected_m:.1}px, got {hero_m:?}"
+    );
+}
+
+#[test]
+fn svg_gradient_href_inherits_stops_from_template_gradient() {
+    let svg_markup = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+        <defs>
+            <linearGradient id="baseGrad">
+                <stop offset="0%" stop-color="#ff3366"/>
+                <stop offset="100%" stop-color="#3366ff"/>
+            </linearGradient>
+            <linearGradient id="derivedGrad" href="#baseGrad" x1="0" y1="0" x2="1" y2="1"/>
+        </defs>
+        <rect x="0" y="0" width="100" height="100" fill="url(#derivedGrad)"/>
+    </svg>"##;
+    let doc = rix_html::parse_html(svg_markup);
+    let decoded = rix_layout::extract_svg_from_document(&doc, rix_css::ColorRgba::BLACK)
+        .expect("SVG with href-inherited gradient must decode cleanly");
+    assert_eq!(decoded.paths.len(), 1);
+    assert_eq!(
+        decoded.paths[0].fill,
+        Some(rix_css::ColorRgba::rgb(0xff, 0x33, 0x66))
+    );
+}

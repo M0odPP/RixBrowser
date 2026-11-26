@@ -628,6 +628,12 @@ impl StyleContext {
         self.media = media;
     }
 
+    /// Returns the active viewport/media query evaluation context.
+    #[must_use]
+    pub const fn media(&self) -> &MediaContext {
+        &self.media
+    }
+
     /// Looks up the winning `@keyframes <name>` rule across author & UA stylesheets
     /// respecting CSS Cascade Level 5 `@layer` precedence.
     #[must_use]
