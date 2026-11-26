@@ -1717,6 +1717,13 @@ impl PropertyIdKind {
             Self::AnimationRange => {
                 SmallVec::from_slice(&[Self::AnimationRangeStart, Self::AnimationRangeEnd])
             }
+            Self::Font => SmallVec::from_slice(&[
+                Self::FontStyle,
+                Self::FontWeight,
+                Self::FontSize,
+                Self::LineHeight,
+                Self::FontFamily,
+            ]),
             other => {
                 let mut v = SmallVec::new();
                 v.push(other);

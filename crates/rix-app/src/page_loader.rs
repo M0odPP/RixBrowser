@@ -473,12 +473,23 @@ pub fn load_page_subresources(
         })
         .collect();
 
+    let doc_base_str = discovered
+        .effective_base
+        .as_ref()
+        .map_or(document_url, Url::as_str)
+        .to_string();
+
     let compiled_ext: Vec<(String, Arc<Stylesheet>)> = ordered_ext_sources
         .par_iter()
         .map(|(url, css)| {
             (
                 url.clone(),
-                Stylesheet::parse_cached(css, CascadeOrigin::Author, media),
+                Stylesheet::parse_cached_with_base(
+                    css,
+                    CascadeOrigin::Author,
+                    media,
+                    Some(url.as_str()),
+                ),
             )
         })
         .collect();
@@ -488,7 +499,14 @@ pub fn load_page_subresources(
     let compiled_inline: Vec<Arc<Stylesheet>> = discovered
         .inline_styles
         .par_iter()
-        .map(|css| Stylesheet::parse_cached(css, CascadeOrigin::Author, media))
+        .map(|css| {
+            Stylesheet::parse_cached_with_base(
+                css,
+                CascadeOrigin::Author,
+                media,
+                Some(doc_base_str.as_str()),
+            )
+        })
         .collect();
 
     // Resolve up to 2 levels of `@import` stylesheets in parallel batches.
@@ -497,12 +515,6 @@ pub fn load_page_subresources(
     let mut imported_sheets_by_parent: HashMap<String, Vec<(String, Arc<Stylesheet>)>> =
         HashMap::new();
     let mut inline_imported_sheets: Vec<(String, Arc<Stylesheet>)> = Vec::new();
-
-    let doc_base_str = discovered
-        .effective_base
-        .as_ref()
-        .map_or(document_url, Url::as_str)
-        .to_string();
 
     // Collect level-1 `@import`s from external stylesheets and inline `<style>` tags.
     let mut import_requests: Vec<(Option<String>, String)> = Vec::new(); // (parent_css_url_or_None_for_inline, resolved_import_url)
@@ -555,7 +567,12 @@ pub fn load_page_subresources(
             .filter_map(|((parent, url), res_opt)| {
                 let res = res_opt?;
                 let css = String::from_utf8_lossy(&res.data);
-                let sheet = Stylesheet::parse_cached(&css, CascadeOrigin::Author, media);
+                let sheet = Stylesheet::parse_cached_with_base(
+                    &css,
+                    CascadeOrigin::Author,
+                    media,
+                    Some(url.as_str()),
+                );
                 Some((parent, url, sheet))
             })
             .collect();
@@ -596,7 +613,12 @@ pub fn load_page_subresources(
             for ((parent, url), res_opt) in level2_reqs.into_iter().zip(r2) {
                 if let Some(res) = res_opt {
                     let css = String::from_utf8_lossy(&res.data);
-                    let sheet = Stylesheet::parse_cached(&css, CascadeOrigin::Author, media);
+                    let sheet = Stylesheet::parse_cached_with_base(
+                        &css,
+                        CascadeOrigin::Author,
+                        media,
+                        Some(url.as_str()),
+                    );
                     match parent {
                         Some(p) => imported_sheets_by_parent
                             .entry(p)

@@ -300,18 +300,24 @@ pub fn layout_block_box(
             } else {
                 clamp_w(spec_w)
             };
-            let remaining = (space.available_width - cw - pb_w).max(0.0);
-            let (ml, mr) = match (metrics.margin_left_auto, metrics.margin_right_auto) {
-                (true, true) => (remaining * 0.5, remaining * 0.5),
-                (true, false) => (
-                    (remaining - metrics.margin.right).max(0.0),
-                    metrics.margin.right,
-                ),
-                (false, true) => (
-                    metrics.margin.left,
-                    (remaining - metrics.margin.left).max(0.0),
-                ),
-                (false, false) => (metrics.margin.left, metrics.margin.right),
+            // CSS 2.1 §10.3.5 / §10.3.9: `margin-left: auto` and `margin-right: auto` on
+            // floats and inline-blocks (shrink-to-fit boxes) always compute to `0`.
+            let (ml, mr) = if shrink_to_fit {
+                (metrics.margin.left, metrics.margin.right)
+            } else {
+                let remaining = (space.available_width - cw - pb_w).max(0.0);
+                match (metrics.margin_left_auto, metrics.margin_right_auto) {
+                    (true, true) => (remaining * 0.5, remaining * 0.5),
+                    (true, false) => (
+                        (remaining - metrics.margin.right).max(0.0),
+                        metrics.margin.right,
+                    ),
+                    (false, true) => (
+                        metrics.margin.left,
+                        (remaining - metrics.margin.left).max(0.0),
+                    ),
+                    (false, false) => (metrics.margin.left, metrics.margin.right),
+                }
             };
             (cw, ml, mr)
         } else if shrink_to_fit {
@@ -377,7 +383,7 @@ pub fn layout_block_box(
                         .min(metrics.max_height)
                         .max(metrics.min_height)
                 })
-            } else if resolved_spec_w.is_some()
+            } else if (resolved_spec_w.is_some() || !shrink_to_fit)
                 && matches!(style.box_model.height, rix_css::SizeValue::Auto)
             {
                 style
