@@ -2515,10 +2515,26 @@ impl PropertyValue {
             Self::AspectRatioMath(Some((a, b))) => {
                 node_has(a) || b.as_deref().is_some_and(node_has)
             }
-            Self::Custom(toks) | Self::Unresolved(toks) => {
-                tokens_contain_sibling_fn(toks) || crate::substitution::tokens_contain_subst(toks)
-            }
+            Self::Custom(toks) | Self::Unresolved(toks) => tokens_contain_sibling_fn(toks),
             Self::FontStyleObliqueMath(n) => node_has(n),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if this declaration's value directly invokes CSS Values L5 `attr(...)`.
+    #[must_use]
+    pub fn contains_attr_fn(&self) -> bool {
+        match self {
+            Self::Custom(toks) | Self::Unresolved(toks) => tokens_contain_attr_fn(toks),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if this declaration's value contains a `var(...)` or `inherit(...)` reference.
+    #[must_use]
+    pub fn contains_var_fn(&self) -> bool {
+        match self {
+            Self::Custom(toks) | Self::Unresolved(toks) => tokens_contain_var_fn(toks),
             _ => false,
         }
     }
@@ -2531,11 +2547,36 @@ fn tokens_contain_sibling_fn(toks: &[CssToken]) -> bool {
             l == "sibling-index"
                 || l == "sibling-count"
                 || l == "random"
+                || l == "random-item"
                 || tokens_contain_sibling_fn(args)
         }
         CssToken::Var {
             fallback: Some(fb), ..
         } => tokens_contain_sibling_fn(fb),
+        _ => false,
+    })
+}
+
+fn tokens_contain_attr_fn(toks: &[CssToken]) -> bool {
+    toks.iter().any(|t| match t {
+        CssToken::Function { name, args } => {
+            name.as_str().eq_ignore_ascii_case("attr") || tokens_contain_attr_fn(args)
+        }
+        CssToken::Var {
+            fallback: Some(fb), ..
+        } => tokens_contain_attr_fn(fb),
+        _ => false,
+    })
+}
+
+fn tokens_contain_var_fn(toks: &[CssToken]) -> bool {
+    toks.iter().any(|t| match t {
+        CssToken::Var { .. } => true,
+        CssToken::Function { name, args } => {
+            name.as_str().eq_ignore_ascii_case("var")
+                || name.as_str().eq_ignore_ascii_case("inherit")
+                || tokens_contain_var_fn(args)
+        }
         _ => false,
     })
 }

@@ -488,28 +488,47 @@ impl PartialEq for CustomPropertyMap {
         if std::ptr::eq(self, other) {
             return true;
         }
-        if self.parent.is_none() && other.parent.is_none() {
+        // Unwrap empty local-map wrappers in O(depth) so unchanged chains hit `ptr_eq`
+        // without allocating key HashSets.
+        let mut a = self;
+        while a.local.is_empty() {
+            match &a.parent {
+                Some(p) => a = p.as_ref(),
+                None => break,
+            }
+        }
+        let mut b = other;
+        while b.local.is_empty() {
+            match &b.parent {
+                Some(p) => b = p.as_ref(),
+                None => break,
+            }
+        }
+        if std::ptr::eq(a, b) {
+            return true;
+        }
+        if a.parent.is_none() && b.parent.is_none() {
             let mut a_count = 0usize;
-            for (k, v) in &self.local {
+            for (k, v) in &a.local {
                 if let Some(entry) = v {
                     a_count += 1;
-                    if other.get_entry(k) != Some(entry) {
+                    if b.get_entry(k) != Some(entry) {
                         return false;
                     }
                 }
             }
-            let b_count = other.local.values().filter(|v| v.is_some()).count();
+            let b_count = b.local.values().filter(|v| v.is_some()).count();
             return a_count == b_count;
         }
-        if let (Some(p1), Some(p2)) = (&self.parent, &other.parent) {
+        if let (Some(p1), Some(p2)) = (&a.parent, &b.parent) {
             if Arc::ptr_eq(p1, p2) {
-                for k in self.local.keys() {
-                    if self.get_entry(k) != other.get_entry(k) {
+                for k in a.local.keys() {
+                    if a.get_entry(k) != b.get_entry(k) {
                         return false;
                     }
                 }
-                for k in other.local.keys() {
-                    if !self.local.contains_key(k) && self.get_entry(k) != other.get_entry(k) {
+                for k in b.local.keys() {
+                    if !a.local.contains_key(k) && a.get_entry(k) != b.get_entry(k) {
                         return false;
                     }
                 }
@@ -517,15 +536,13 @@ impl PartialEq for CustomPropertyMap {
             }
         }
         let mut a_keys = std::collections::HashSet::new();
-        self.collect_visible_keys(&mut a_keys);
+        a.collect_visible_keys(&mut a_keys);
         let mut b_keys = std::collections::HashSet::new();
-        other.collect_visible_keys(&mut b_keys);
+        b.collect_visible_keys(&mut b_keys);
         if a_keys.len() != b_keys.len() {
             return false;
         }
-        a_keys
-            .iter()
-            .all(|k| self.get_entry(k) == other.get_entry(k))
+        a_keys.iter().all(|k| a.get_entry(k) == b.get_entry(k))
     }
 }
 
@@ -1427,7 +1444,7 @@ pub fn resolve_element_style_with_context(
                     PropertyValue::Custom(tokens)
                         if !crate::substitution::tokens_contain_subst(tokens)
                             && style.custom_properties.get(name).is_some_and(|cur| {
-                                trim_css_tokens(cur) == trim_css_tokens(tokens)
+                                tokens_match_registered_computed(cur, tokens, reg)
                             }) =>
                     {
                         reg.is_none_or(|r| {
@@ -1443,10 +1460,9 @@ pub fn resolve_element_style_with_context(
                         None => style.custom_properties.get(name).is_none(),
                         Some(r) if !is_registered_url_syntax(&r.syntax) => match &r.initial_value {
                             None => style.custom_properties.get(name).is_none(),
-                            Some(iv) => style
-                                .custom_properties
-                                .get(name)
-                                .is_some_and(|cur| trim_css_tokens(cur) == trim_css_tokens(iv)),
+                            Some(iv) => style.custom_properties.get(name).is_some_and(|cur| {
+                                tokens_match_registered_computed(cur, iv, Some(r))
+                            }),
                         },
                         _ => false,
                     },
@@ -1692,7 +1708,7 @@ pub fn resolve_element_style_with_context(
                         let is_initial = match (custom_map.get(name), reg.initial_value.as_ref()) {
                             (None, None) => true,
                             (Some(cur), Some(iv)) if !is_registered_url_syntax(&reg.syntax) => {
-                                trim_css_tokens(cur) == trim_css_tokens(iv)
+                                tokens_match_registered_computed(cur, iv, Some(reg))
                             }
                             _ => false,
                         };
@@ -2288,6 +2304,46 @@ fn trim_css_tokens(mut toks: &[CssToken]) -> &[CssToken] {
         toks = &toks[..toks.len() - 1];
     }
     toks
+}
+
+/// Returns `true` when `cur` (already computed/canonicalized) matches `specified` under an
+/// optional `@property` registration (including unitless `0` matching canonical `0px`/`0deg`/`0s`
+/// for typed numeric/dimension syntaxes such as Tailwind v4's `<length>` properties).
+#[inline]
+fn tokens_match_registered_computed(
+    cur: &[CssToken],
+    specified: &[CssToken],
+    reg: Option<&RegisteredProperty>,
+) -> bool {
+    let a = trim_css_tokens(cur);
+    let b = trim_css_tokens(specified);
+    if a == b {
+        return true;
+    }
+    let Some(r) = reg else {
+        return false;
+    };
+    if a.len() != 1 || b.len() != 1 {
+        return false;
+    }
+    let syn = r
+        .syntax
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim();
+    let is_zero_num = |t: &CssToken| matches!(t, CssToken::Number(n) if *n == 0.0);
+    let is_zero_canon = |t: &CssToken| match (syn, t) {
+        ("<length>" | "<length-percentage>", CssToken::Dimension(v, u)) => {
+            *v == 0.0 && u.as_str().eq_ignore_ascii_case("px")
+        }
+        ("<angle>", CssToken::Dimension(v, u)) => {
+            *v == 0.0 && u.as_str().eq_ignore_ascii_case("deg")
+        }
+        ("<time>", CssToken::Dimension(v, u)) => *v == 0.0 && u.as_str().eq_ignore_ascii_case("s"),
+        ("<percentage>", CssToken::Percentage(v)) => *v == 0.0,
+        _ => false,
+    };
+    (is_zero_canon(&a[0]) && is_zero_num(&b[0])) || (is_zero_num(&a[0]) && is_zero_canon(&b[0]))
 }
 
 #[inline]
