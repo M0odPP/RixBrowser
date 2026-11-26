@@ -183,10 +183,16 @@ input[type="hidden"] {
 button, input, select, textarea {
     display: inline-block;
     box-sizing: border-box;
-    border: 1px solid #a0a6b2;
+    border: 2px solid #a0a6b2;
     border-radius: 0;
     font-family: sans-serif;
     font-size: 13.3333px;
+}
+input, textarea {
+    box-sizing: content-box;
+}
+input[type="submit" i], input[type="button" i], input[type="reset" i], input[type="checkbox" i], input[type="radio" i] {
+    box-sizing: border-box;
 }
 input, textarea, select {
     background-color: #ffffff;

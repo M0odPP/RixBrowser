@@ -681,17 +681,35 @@ pub fn layout_block_box(
                 && frag.padding.vertical() == 0.0
                 && frag.children.is_empty();
 
-            if !saw_in_flow_child {
+            // CSS 2.1 §8.3.1: An empty self-collapsing block's own top & bottom margins collapse
+            // together; when it appears before any non-empty in-flow child of a margin-collapsing
+            // parent (`can_collapse_top_with_first`), the combined margin collapses directly into
+            // `collapsed_top` without advancing `cursor_y` or `prev_margin_bottom` (so subsequent
+            // floats and sibling blocks are not pushed down by a duplicate margin!).
+            let collapsed_into_parent_top = is_empty_self_collapsing
+                && !saw_in_flow_child
+                && can_collapse_top_with_first
+                && child_clear == ClearMode::None;
+
+            if collapsed_into_parent_top {
+                let combined = collapse_margins(child_top_margin, child_bottom_margin);
+                collapsed_top = collapse_margins(collapsed_top, combined);
+            } else if !saw_in_flow_child {
                 saw_in_flow_child = true;
-                if can_collapse_top_with_first && child_clear == ClearMode::None {
+                if is_empty_self_collapsing {
+                    // Do not add `child_top_margin` to `cursor_y` here — it will be folded into
+                    // `prev_margin_bottom` below so it collapses cleanly with the next sibling.
+                } else if can_collapse_top_with_first && child_clear == ClearMode::None {
                     collapsed_top = collapse_margins(collapsed_top, child_top_margin);
                 } else {
                     cursor_y += child_top_margin;
                 }
-            } else if let Some(prev_mb) = prev_margin_bottom {
-                cursor_y += collapse_margins(prev_mb, child_top_margin);
-            } else {
-                cursor_y += child_top_margin;
+            } else if !is_empty_self_collapsing {
+                if let Some(prev_mb) = prev_margin_bottom {
+                    cursor_y += collapse_margins(prev_mb, child_top_margin);
+                } else {
+                    cursor_y += child_top_margin;
+                }
             }
 
             if child_clear != ClearMode::None {
@@ -752,7 +770,9 @@ pub fn layout_block_box(
                 frag.border_rect.origin.y,
             );
 
-            if is_empty_self_collapsing {
+            if collapsed_into_parent_top {
+                // Already merged into `collapsed_top`; leave `prev_margin_bottom` untouched.
+            } else if is_empty_self_collapsing {
                 let combined = collapse_margins(child_top_margin, child_bottom_margin);
                 prev_margin_bottom = Some(match prev_margin_bottom {
                     Some(prev) => collapse_margins(prev, combined),

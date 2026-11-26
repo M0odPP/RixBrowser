@@ -562,14 +562,18 @@ struct FragmentCacheKey {
     avail_h_bits: u32,
     cb_w_bits: u32,
     cb_h_bits: u32,
+    def_w_bits: u32,
+    def_h_bits: u32,
+    ignore_h: bool,
 }
 
 /// Per-document retained layout cache storing unchanged subtree fragments,
-/// font-match memo entries, and retained per-container `taffy::TaffyTree`
-/// instances for Flex/Grid contexts.
+/// intrinsic width measurements, font-match memo entries, and retained per-container
+/// `taffy::TaffyTree` instances for Flex/Grid contexts.
 #[derive(Default)]
 pub struct LayoutCache {
     fragments: FastMap<FragmentCacheKey, Arc<Fragment>>,
+    intrinsic_widths: FastMap<(u64, u64, u32, u32), (f32, f32)>,
     font_matches: FastMap<(usize, usize), FontId>,
     ch_advances: FastMap<(FontId, u32), f32>,
     pub(crate) taffy_containers: HashMap<u64, RetainedTaffyContainer>,
@@ -590,6 +594,7 @@ impl LayoutCache {
 
     pub fn clear(&mut self) {
         self.fragments.clear();
+        self.intrinsic_widths.clear();
         self.font_matches.clear();
         self.ch_advances.clear();
         self.taffy_containers.clear();
@@ -657,11 +662,52 @@ impl LayoutCache {
         Some(FragmentCacheKey {
             dom_node_id: usize::from(dom) as u64,
             subtree_hash: b.subtree_hash,
-            avail_w_bits: space.available_width.to_bits(),
-            avail_h_bits: space.available_height.map_or(u32::MAX, f32::to_bits),
-            cb_w_bits: space.containing_block_width.to_bits(),
-            cb_h_bits: space.containing_block_height.to_bits(),
+            avail_w_bits: LayoutContext::quantize_px(space.available_width),
+            avail_h_bits: LayoutContext::quantize_opt_px(space.available_height),
+            cb_w_bits: LayoutContext::quantize_px(space.containing_block_width),
+            cb_h_bits: LayoutContext::quantize_px(space.containing_block_height),
+            def_w_bits: LayoutContext::quantize_opt_px(space.definite_width_override),
+            def_h_bits: LayoutContext::quantize_opt_px(space.definite_height_override),
+            ignore_h: space.ignore_specified_height,
         })
+    }
+
+    pub fn get_intrinsic(
+        &mut self,
+        b: &crate::box_tree::LayoutBox,
+        space: &ConstraintSpace,
+    ) -> Option<(f32, f32)> {
+        if b.subtree_dirty {
+            return None;
+        }
+        let dom = b.dom_node?;
+        let key = (
+            usize::from(dom) as u64,
+            b.subtree_hash,
+            LayoutContext::quantize_px(space.available_width),
+            LayoutContext::quantize_opt_px(space.available_height),
+        );
+        self.intrinsic_widths.get(&key).copied()
+    }
+
+    pub fn store_intrinsic(
+        &mut self,
+        b: &crate::box_tree::LayoutBox,
+        space: &ConstraintSpace,
+        val: (f32, f32),
+    ) {
+        if let Some(dom) = b.dom_node {
+            if self.intrinsic_widths.len() > 32_768 {
+                self.intrinsic_widths.clear();
+            }
+            let key = (
+                usize::from(dom) as u64,
+                b.subtree_hash,
+                LayoutContext::quantize_px(space.available_width),
+                LayoutContext::quantize_opt_px(space.available_height),
+            );
+            self.intrinsic_widths.insert(key, val);
+        }
     }
 
     pub fn get_fragment(
@@ -908,10 +954,9 @@ pub fn layout_box(ctx: &mut LayoutContext<'_>, box_id: BoxId, space: ConstraintS
             b.kind,
             BoxKind::Block { .. } | BoxKind::InlineBlock { .. } | BoxKind::Table
         );
-    let cross_frame_cacheable = pass_cacheable
-        && space.definite_width_override.is_none()
-        && space.definite_height_override.is_none()
-        && !space.ignore_specified_height;
+    // Cross-frame cache keys now include `def_w_bits`/`def_h_bits`/`ignore_h`, so unchanged
+    // Flex and Grid subtrees reuse cached fragments in O(1) across repeated DOM/layout reads!
+    let cross_frame_cacheable = pass_cacheable;
     let pass_key = PassFragmentKey {
         box_id,
         avail_w: LayoutContext::quantize_px(space.available_width),
@@ -992,7 +1037,15 @@ pub fn measure_intrinsic_widths(
     if let Some(&hit) = ctx.pass_intrinsic_memo.get(&memo_key) {
         return hit;
     }
+    if let Some(hit) = ctx.cache.get_intrinsic(ctx.tree.get(box_id), &space) {
+        if ctx.pass_intrinsic_memo.len() < 32_768 {
+            ctx.pass_intrinsic_memo.insert(memo_key, hit);
+        }
+        return hit;
+    }
     let result = measure_intrinsic_widths_uncached(ctx, box_id, space);
+    ctx.cache
+        .store_intrinsic(ctx.tree.get(box_id), &space, result);
     if ctx.pass_intrinsic_memo.len() < 32_768 {
         ctx.pass_intrinsic_memo.insert(memo_key, result);
     }
@@ -1274,11 +1327,17 @@ fn measure_text_intrinsic(
 ) -> (f32, f32) {
     let font_id = ctx.resolve_font(style);
     let font_size = style.text.font_size_px.max(1.0);
+    let eval_ctx = rix_css::EvalContext {
+        font_size_px: font_size,
+        ..style.text.eval_ctx
+    };
+    let letter_sp = style.text.letter_spacing.resolve_px(font_size, &eval_ctx);
     let shape_w = |ctx: &mut LayoutContext<'_>, s: &str| -> f32 {
         ctx.shaper
             .shape_text(s, font_id, font_size)
             .iter()
-            .map(|r| r.width)
+            .flat_map(|r| r.glyphs.iter())
+            .map(|g| (g.x_advance + letter_sp).max(0.0))
             .sum()
     };
 
@@ -1533,26 +1592,42 @@ fn resolve_replaced_size_styled(
                 },
             )
         });
-    resolve_replaced_pair(intrinsic, spec_w, spec_h, metrics)
+    // CSS Sizing L4 §6.1: an explicit CSS `aspect-ratio` on a replaced element overrides the
+    // natural ratio when `auto` is absent, or supplies a fallback preferred ratio when the image
+    // has no intrinsic dimensions yet (e.g. `aspect-ratio: 1240/618; width: 100%; height: auto`).
+    let css_ratio = style
+        .effects
+        .as_ref()
+        .and_then(|e| e.aspect_ratio_math.as_ref())
+        .and_then(|(num, den)| {
+            let n = num.eval_scalar(&eval, None);
+            let d = den.as_ref().map_or(1.0, |x| x.eval_scalar(&eval, None));
+            let r = (n / d) as f32;
+            (r.is_finite() && r > 0.0).then_some(r)
+        });
+    resolve_replaced_pair_with_ratio(intrinsic, spec_w, spec_h, metrics, css_ratio)
 }
 
 fn resolve_replaced_size(intrinsic: Size, metrics: &BoxMetrics) -> (f32, f32) {
-    resolve_replaced_pair(
+    resolve_replaced_pair_with_ratio(
         intrinsic,
         metrics.specified_width,
         metrics.specified_height,
         metrics,
+        None,
     )
 }
 
-fn resolve_replaced_pair(
+fn resolve_replaced_pair_with_ratio(
     intrinsic: Size,
     spec_w: Option<f32>,
     spec_h: Option<f32>,
     metrics: &BoxMetrics,
+    css_ratio: Option<f32>,
 ) -> (f32, f32) {
-    let ratio = (intrinsic.height > 0.0 && intrinsic.width > 0.0)
+    let intrinsic_ratio = (intrinsic.height > 0.0 && intrinsic.width > 0.0)
         .then(|| intrinsic.width / intrinsic.height);
+    let ratio = css_ratio.or(intrinsic_ratio);
     let min_w = metrics.min_width.max(0.0);
     let max_w = metrics.max_width.max(min_w);
     let min_h = metrics.min_height.max(0.0);
