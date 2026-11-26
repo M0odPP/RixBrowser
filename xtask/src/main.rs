@@ -21,6 +21,7 @@ fn print_usage() {
          cargo xtask html5lib [--dir <path>] [--filter <substr>] [--report-json <path>]\n  \
          cargo xtask test262 [--test262-dir <path>] [--official] [--filter <substr>] [--limit <n>] [--always-jit] [--report-json <path>] [--update-baseline]\n  \
          cargo xtask compare-chrome --cohort <path> [--out-dir <path>] [--rix-bin <path>] [--chrome-bin <path>] [--limit <n>] [--report-json <path>]\n  \
+         cargo xtask compare-firefox --cohort <path> [--out-dir <path>] [--rix-bin <path>] [--firefox-bin <path>] [--width <px>] [--height <px>] [--dpr <f>] [--dark] [--interactive] [--warm] [--self-consistency] [--limit <n>] [--report-json <path>]\n  \
          cargo xtask bench [--quick]"
     );
 }
@@ -342,6 +343,116 @@ fn dispatch(args: &[String]) -> Result<()> {
             };
             let report = xtask::compare_chrome::run_compare_chrome(&opts)?;
             xtask::compare_chrome::print_report(&report);
+            Ok(())
+        }
+        "compare-firefox" => {
+            let mut cohort_path: Option<PathBuf> = None;
+            let mut out_dir = PathBuf::from("/tmp/rix-compare-firefox");
+            let mut rix_bin = root.join("target/release/rix-app");
+            let mut firefox_bin = xtask::compare_firefox::CompareFirefoxOptions::default_firefox();
+            let mut width = 1280u32;
+            let mut height = 800u32;
+            let mut dpr = 1.0f64;
+            let mut dark_mode = false;
+            let mut interactive = false;
+            let mut warm = false;
+            let mut self_consistency = false;
+            let mut limit = None;
+            let mut report_json = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--cohort" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --cohort"))?;
+                        cohort_path = Some(PathBuf::from(val));
+                    }
+                    "--out-dir" | "--out" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --out-dir"))?;
+                        out_dir = PathBuf::from(val);
+                    }
+                    "--rix-bin" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --rix-bin"))?;
+                        rix_bin = PathBuf::from(val);
+                    }
+                    "--firefox-bin" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --firefox-bin"))?;
+                        firefox_bin = PathBuf::from(val);
+                    }
+                    "--width" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --width"))?;
+                        width = val.parse::<u32>()?;
+                    }
+                    "--height" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --height"))?;
+                        height = val.parse::<u32>()?;
+                    }
+                    "--dpr" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --dpr"))?;
+                        dpr = val.parse::<f64>()?;
+                    }
+                    "--dark" => dark_mode = true,
+                    "--interactive" => interactive = true,
+                    "--warm" => warm = true,
+                    "--self-consistency" => self_consistency = true,
+                    "--limit" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --limit"))?;
+                        limit = Some(val.parse::<usize>()?);
+                    }
+                    "--report-json" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --report-json"))?;
+                        report_json = Some(PathBuf::from(val));
+                    }
+                    other => bail!("unknown compare-firefox flag: {other}"),
+                }
+                i += 1;
+            }
+            let Some(cohort_path) = cohort_path else {
+                bail!("missing required --cohort <path> argument");
+            };
+            let opts = xtask::compare_firefox::CompareFirefoxOptions {
+                cohort_path,
+                out_dir,
+                rix_bin,
+                firefox_bin,
+                width,
+                height,
+                dpr,
+                dark_mode,
+                interactive,
+                warm,
+                self_consistency,
+                limit,
+                report_json,
+            };
+            let report = xtask::compare_firefox::run_compare_firefox(&opts)?;
+            xtask::compare_firefox::print_report(&report);
             Ok(())
         }
         "bench" => {

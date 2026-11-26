@@ -4,6 +4,9 @@
 
 pub mod bench;
 pub mod compare_chrome;
+pub mod compare_firefox;
+pub mod diff_analyzer;
+pub mod firefox_bidi;
 pub mod html5lib;
 pub mod reftest;
 pub mod test262;
