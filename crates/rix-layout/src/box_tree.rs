@@ -814,10 +814,10 @@ impl<'a> BoxTreeBuilder<'a> {
                     .and_then(SvgViewBox::parse);
                 let attr_w = elem
                     .get_attribute("width")
-                    .and_then(parse_html_dimension_attr);
+                    .and_then(|v| crate::assets::parse_svg_dimension_attr(v, &style.text.eval_ctx));
                 let attr_h = elem
                     .get_attribute("height")
-                    .and_then(parse_html_dimension_attr);
+                    .and_then(|v| crate::assets::parse_svg_dimension_attr(v, &style.text.eval_ctx));
                 let (iw, ih) = match (attr_w, attr_h, view_box) {
                     (Some(w), Some(h), _) => (w, h),
                     (Some(w), None, Some(vb)) if vb.width > 0.0 && vb.height > 0.0 => {

@@ -489,7 +489,7 @@ pub struct CustomPropertyMap {
     /// Non-inherited (`inherits: false`) registered properties explicitly written on this element
     /// so direct children only reset these O(k) keys instead of scanning all `@property` rules.
     dirty_non_inherited: SmallVec<[InternedStr; 4]>,
-    local: HashMap<InternedStr, Option<CustomPropEntry>>,
+    local: crate::cascade::FastMap<InternedStr, Option<CustomPropEntry>>,
 }
 
 impl PartialEq for CustomPropertyMap {
@@ -559,9 +559,16 @@ impl CustomPropertyMap {
     /// Creates an empty child map inheriting from `parent` in O(1) without cloning ancestor entries.
     #[must_use]
     pub fn child_of(parent: &Arc<Self>) -> Self {
+        Self::child_of_with_capacity(parent, 0)
+    }
+
+    /// Creates a child map inheriting from `parent` with pre-sized local storage.
+    #[must_use]
+    pub fn child_of_with_capacity(parent: &Arc<Self>, cap: usize) -> Self {
         if parent.parent.is_none() && parent.local.is_empty() {
             return Self {
                 registered_seed_count: parent.registered_seed_count,
+                local: crate::cascade::FastMap::with_capacity_and_hasher(cap, Default::default()),
                 ..Self::default()
             };
         }
@@ -571,10 +578,14 @@ impl CustomPropertyMap {
                 depth: parent.depth + 1,
                 registered_seed_count: parent.registered_seed_count,
                 dirty_non_inherited: SmallVec::new(),
-                local: HashMap::new(),
+                local: crate::cascade::FastMap::with_capacity_and_hasher(cap, Default::default()),
             };
         }
-        let mut flat: HashMap<InternedStr, Option<CustomPropEntry>> = HashMap::new();
+        let mut flat: crate::cascade::FastMap<InternedStr, Option<CustomPropEntry>> =
+            crate::cascade::FastMap::with_capacity_and_hasher(
+                parent.local.len() + cap + 16,
+                Default::default(),
+            );
         let mut cur: Option<&CustomPropertyMap> = Some(parent.as_ref());
         while let Some(map) = cur {
             for (k, v) in &map.local {
@@ -1423,8 +1434,10 @@ pub fn resolve_element_style_with_context(
 
     // Pass 1: Resolve CSS custom properties (`--*`) & `@property` registrations.
     let mut important_props_acc: Vec<(PropertyIdKind, Option<InternedStr>)> = Vec::new();
-    let mut raw_custom: HashMap<InternedStr, Vec<(CascadeKey, &SpecifiedDeclaration)>> =
-        HashMap::new();
+    let mut raw_custom: crate::cascade::FastMap<
+        InternedStr,
+        SmallVec<[(CascadeKey, &SpecifiedDeclaration); 2]>,
+    > = crate::cascade::FastMap::default();
     for c in &candidates {
         if let (PropertyIdKind::Custom, Some(name)) = (c.decl.property, &c.decl.custom_name) {
             raw_custom
@@ -1485,7 +1498,10 @@ pub fn resolve_element_style_with_context(
         }
     }
     if !active_custom.is_empty() || needs_reg_seed || !parent_dirty_non_inherited.is_empty() {
-        let mut custom_map = CustomPropertyMap::child_of(&style.custom_properties);
+        let mut custom_map = CustomPropertyMap::child_of_with_capacity(
+            &style.custom_properties,
+            active_custom.len() + parent_dirty_non_inherited.len(),
+        );
         if needs_reg_seed {
             // Seed all `@property` initial values ONCE at the root (or when registration set changes).
             // Descendants inherit both inherited and already-at-initial non-inherited values in O(1)!
@@ -1953,8 +1969,15 @@ pub fn resolve_element_style_with_context(
         }
     };
 
-    let mut per_prop: HashMap<PropertyIdKind, Vec<(CascadeKey, &SpecifiedDeclaration)>> =
-        HashMap::new();
+    let mut all_expanded: Vec<(PropertyIdKind, CascadeKey, SpecifiedDeclaration)> = Vec::new();
+    let mut remapped_owned: Vec<(PropertyIdKind, CascadeKey, SpecifiedDeclaration)> = Vec::new();
+    let mut per_prop: crate::cascade::FastMap<
+        PropertyIdKind,
+        SmallVec<[(CascadeKey, &SpecifiedDeclaration); 2]>,
+    > = crate::cascade::FastMap::with_capacity_and_hasher(
+        standard_candidates.len().min(32),
+        Default::default(),
+    );
     for (k, d) in &standard_candidates {
         if !expand_anim_tr(*k, d) {
             per_prop.entry(d.property).or_default().push((*k, *d));
@@ -1971,7 +1994,6 @@ pub fn resolve_element_style_with_context(
 
     // CSS Cascade L5 §3.1: Expand `all: <css-wide-keyword>` into every physical longhand
     // property (except `direction`, `unicode-bidi`, and custom properties), preserving `CascadeKey`.
-    let mut all_expanded: Vec<(PropertyIdKind, CascadeKey, SpecifiedDeclaration)> = Vec::new();
     if let Some(all_stack) = per_prop.remove(&PropertyIdKind::All) {
         for (k, d) in all_stack {
             for &target_prop in crate::properties::ALL_RESETTABLE_LONGHANDS {
@@ -2060,7 +2082,6 @@ pub fn resolve_element_style_with_context(
         .copied()
         .filter(|&p| is_logical_property(p))
         .collect();
-    let mut remapped_owned: Vec<(PropertyIdKind, CascadeKey, SpecifiedDeclaration)> = Vec::new();
     for lprop in logical_keys {
         let phys = resolve_logical_to_physical(lprop, resolved_wm, resolved_dir);
         if let Some(stack) = per_prop.remove(&lprop) {

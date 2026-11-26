@@ -995,6 +995,50 @@ pub fn parse_html_dimension_attr(value: &str) -> Option<f32> {
         .filter(|v| v.is_finite() && *v >= 0.0)
 }
 
+/// Parses an SVG 2 §4.2 presentation length attribute (`width`/`height`) supporting unitless
+/// user units as well as CSS `<length>` units (`px`, `em`, `rem`, `ex`, `ch`, `pt`, `pc`,
+/// `cm`, `mm`, `in`, `vw`, `vh`, `vmin`, `vmax`) against `eval`.
+///
+/// Percentage attributes (`"100%"`) return `None` so intrinsic sizing falls back to `viewBox`
+/// aspect ratio while CSS layout resolves percentage sizing against the containing block.
+#[must_use]
+pub fn parse_svg_dimension_attr(value: &str, eval: &rix_css::EvalContext) -> Option<f32> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.ends_with('%') {
+        return None;
+    }
+    if let Some(px) = parse_html_dimension_attr(trimmed) {
+        return Some(px);
+    }
+    let split = trimmed
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '+' || c == '-'))
+        .unwrap_or(trimmed.len());
+    let num: f32 = trimmed[..split].trim().parse().ok()?;
+    if !num.is_finite() || num < 0.0 {
+        return None;
+    }
+    let unit = trimmed[split..].trim().to_ascii_lowercase();
+    let px = match unit.as_str() {
+        "" | "px" => num,
+        "em" => num * eval.font_size_px,
+        "rem" => num * eval.root_font_size_px,
+        "ex" => num * eval.font_size_px * 0.5,
+        "ch" => num * eval.font_size_px * 0.5,
+        "pt" => num * (96.0 / 72.0),
+        "pc" => num * 16.0,
+        "in" => num * 96.0,
+        "cm" => num * (96.0 / 2.54),
+        "mm" => num * (96.0 / 25.4),
+        "q" => num * (96.0 / 101.6),
+        "vw" | "vi" | "svw" | "lvw" | "dvw" => num * eval.viewport_width_px * 0.01,
+        "vh" | "vb" | "svh" | "lvh" | "dvh" => num * eval.viewport_height_px * 0.01,
+        "vmin" => num * eval.viewport_width_px.min(eval.viewport_height_px) * 0.01,
+        "vmax" => num * eval.viewport_width_px.max(eval.viewport_height_px) * 0.01,
+        _ => return None,
+    };
+    px.is_finite().then_some(px.max(0.0))
+}
+
 /// Parses an inline SVG color attribute (`#rrggbb`, `#rgb`, `none`, `currentColor`, named basics).
 #[must_use]
 pub fn parse_svg_color(raw: &str, current_color: ColorRgba) -> Option<ColorRgba> {

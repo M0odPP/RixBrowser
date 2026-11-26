@@ -1737,20 +1737,37 @@ impl HostState {
                 let _ = ctx.cascade_full_from(&mut doc, owner_doc);
             }
             return match pseudo {
-                Some(pe) => ctx.pseudo_style_for(node, pe).cloned().or_else(|| {
-                    ctx.style_for(node)
-                        .map(|orig| Arc::new(ComputedStyle::inherit_from(orig)))
-                }),
+                Some(pe) => {
+                    let doc = self.document.borrow();
+                    ctx.pseudo_style_for(node, pe)
+                        .cloned()
+                        .or_else(|| ctx.resolve_pseudo_style_on_demand(&doc, node, pe))
+                        .or_else(|| {
+                            ctx.style_for(node)
+                                .map(|orig| Arc::new(ComputedStyle::inherit_from(orig)))
+                        })
+                }
                 None => ctx.style_for(node).cloned(),
             };
         }
-        let ctx = self.ensure_styles();
+        let _ = self.ensure_styles();
         match pseudo {
-            Some(pe) => ctx.pseudo_style_for(node, pe).cloned().or_else(|| {
-                ctx.style_for(node)
-                    .map(|orig| Arc::new(ComputedStyle::inherit_from(orig)))
-            }),
-            None => ctx.style_for(node).cloned(),
+            Some(pe) => {
+                let doc = self.document.borrow();
+                self.style_ctx
+                    .pseudo_style_for(node, pe)
+                    .cloned()
+                    .or_else(|| {
+                        self.style_ctx
+                            .resolve_pseudo_style_on_demand(&doc, node, pe)
+                    })
+                    .or_else(|| {
+                        self.style_ctx
+                            .style_for(node)
+                            .map(|orig| Arc::new(ComputedStyle::inherit_from(orig)))
+                    })
+            }
+            None => self.style_ctx.style_for(node).cloned(),
         }
     }
 

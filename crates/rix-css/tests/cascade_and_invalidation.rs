@@ -600,3 +600,47 @@ fn unresolved_rgb_hsl_var_alpha_and_svg_fill_cascade_accurately() {
     );
     assert!(s_st.text.svg_fill_rule_even_odd);
 }
+
+#[test]
+fn non_generated_before_after_skipped_in_bulk_cascade_but_resolved_on_demand() {
+    // CSS Pseudo-Elements L4 §2.2: `*, ::before, ::after { border-color: rgb(1, 2, 3); }`
+    // does not generate pseudo-element boxes unless `content` is declared, so bulk cascade
+    // skips storing it while `resolve_pseudo_style_on_demand` still serves `getComputedStyle`.
+    let css = r#"
+        *, ::before, ::after { border-color: rgb(1, 2, 3); --tw-x: 0; }
+        .with-content::before { content: "hi"; color: rgb(10, 20, 30); }
+    "#;
+    let html = r#"<!doctype html><html><body>
+        <div id="plain"></div>
+        <div id="gen" class="with-content"></div>
+    </body></html>"#;
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let sheet = Arc::new(Stylesheet::parse(css, CascadeOrigin::Author, &media));
+    let mut ctx = StyleContext::new(media);
+    ctx.add_stylesheet(sheet);
+    ctx.cascade_full(&mut doc);
+
+    let plain = find_by_id(&doc, "plain");
+    let gen = find_by_id(&doc, "gen");
+    assert!(
+        ctx.pseudo_style_for(plain, rix_css::RixPseudoElement::Before)
+            .is_none(),
+        "non-generated ::before without `content` must be skipped during bulk cascade"
+    );
+    let on_demand = ctx
+        .resolve_pseudo_style_on_demand(&doc, plain, rix_css::RixPseudoElement::Before)
+        .expect("on-demand ::before lookup must still match reset rules");
+    assert_eq!(
+        on_demand
+            .visual
+            .border_color
+            .top
+            .resolve(on_demand.text.color, false),
+        ColorRgba::rgb(1, 2, 3)
+    );
+    let gen_before = ctx
+        .pseudo_style_for(gen, rix_css::RixPseudoElement::Before)
+        .expect("generated ::before with `content` must be populated eagerly");
+    assert_eq!(gen_before.text.color, ColorRgba::rgb(10, 20, 30));
+}

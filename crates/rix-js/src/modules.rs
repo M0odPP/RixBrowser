@@ -233,6 +233,10 @@ fn normalize_posix_path(path: &str) -> String {
 /// Pluggable host module source provider (in-memory, VFS, or async network cache).
 pub trait ModuleSourceProvider {
     fn load_source(&self, url: &str) -> Result<String, String>;
+
+    /// Optional batch prefetch hook invoked before compiling a wave of sibling module imports
+    /// so network-backed providers can fetch all dependencies in parallel instead of serially.
+    fn prefetch_sources(&self, _urls: &[String]) {}
 }
 
 /// In-memory module source registry (ideal for unit tests and bundled apps).
@@ -434,111 +438,138 @@ impl ModuleLoader {
     fn fetch_and_compile_graph(
         &mut self,
         vm: &mut JsVm,
-        url: &str,
+        entry_url: &str,
         newly_loaded: &mut Vec<String>,
     ) -> Result<(), ModuleError> {
-        if self.records.contains_key(url) {
-            return Ok(());
-        }
-        let raw_source = self
-            .provider
-            .load_source(url)
-            .map_err(|reason| ModuleError::Load {
-                url: url.to_string(),
-                reason,
-            })?;
-        let source = if url.ends_with(".json") {
-            let _: serde_json::Value =
-                serde_json::from_str(&raw_source).map_err(|e| ModuleError::Load {
-                    url: url.to_string(),
-                    reason: format!("SyntaxError: invalid JSON module: {e}"),
-                })?;
-            let escaped = serde_json::to_string(&raw_source).unwrap_or_else(|_| "\"\"".into());
-            format!("export default JSON.parse({escaped});")
-        } else {
-            raw_source
-        };
-        let compiled: CompiledProgram =
-            compile(&source, SourceType::Module).map_err(|e| ModuleError::Compile {
-                url: url.to_string(),
-                source: e,
-            })?;
-        let blueprint = compiled.module.clone().unwrap_or_default();
-        let entry_func = compiled.entry_func;
+        let mut wave: Vec<String> = vec![entry_url.to_string()];
+        let mut queued: HashSet<String> = HashSet::new();
+        queued.insert(entry_url.to_string());
 
-        // Collect hoisted zero-upvalue exported functions so cyclic top-level calls resolve.
-        let mut hoisted_exports = Vec::new();
-        for exp in &blueprint.exports {
-            if exp.reexport_from.is_none() && !exp.is_star {
-                if let Some(ref local) = exp.local_name {
-                    if let Some((fi, _)) = compiled.functions.iter().enumerate().find(|(_, f)| {
-                        f.name.as_deref() == Some(local.as_str()) && f.upvalues.is_empty()
-                    }) {
-                        hoisted_exports.push((exp.exported_name.clone(), fi as u32));
+        while !wave.is_empty() {
+            // Prefetch all uncompiled modules in this dependency level concurrently
+            // (eliminating N-round-trip serial waterfalls on large ES module graphs).
+            let to_prefetch: Vec<String> = wave
+                .iter()
+                .filter(|u| !self.records.contains_key(u.as_str()))
+                .cloned()
+                .collect();
+            if to_prefetch.len() > 1 {
+                self.provider.prefetch_sources(&to_prefetch);
+            }
+
+            let mut next_wave: Vec<String> = Vec::new();
+            for url in wave {
+                if self.records.contains_key(&url) {
+                    continue;
+                }
+                let raw_source =
+                    self.provider
+                        .load_source(&url)
+                        .map_err(|reason| ModuleError::Load {
+                            url: url.clone(),
+                            reason,
+                        })?;
+                let source = if url.ends_with(".json") {
+                    let _: serde_json::Value =
+                        serde_json::from_str(&raw_source).map_err(|e| ModuleError::Load {
+                            url: url.clone(),
+                            reason: format!("SyntaxError: invalid JSON module: {e}"),
+                        })?;
+                    let escaped =
+                        serde_json::to_string(&raw_source).unwrap_or_else(|_| "\"\"".into());
+                    format!("export default JSON.parse({escaped});")
+                } else {
+                    raw_source
+                };
+                let compiled: CompiledProgram =
+                    compile(&source, SourceType::Module).map_err(|e| ModuleError::Compile {
+                        url: url.clone(),
+                        source: e,
+                    })?;
+                let blueprint = compiled.module.clone().unwrap_or_default();
+                let entry_func = compiled.entry_func;
+
+                // Collect hoisted zero-upvalue exported functions so cyclic top-level calls resolve.
+                let mut hoisted_exports = Vec::new();
+                for exp in &blueprint.exports {
+                    if exp.reexport_from.is_none() && !exp.is_star {
+                        if let Some(ref local) = exp.local_name {
+                            if let Some((fi, _)) =
+                                compiled.functions.iter().enumerate().find(|(_, f)| {
+                                    f.name.as_deref() == Some(local.as_str())
+                                        && f.upvalues.is_empty()
+                                })
+                            {
+                                hoisted_exports.push((exp.exported_name.clone(), fi as u32));
+                            }
+                        }
                     }
                 }
-            }
-        }
 
-        // Resolve all static dependency URLs in source order (deduplicated).
-        let mut dependencies = Vec::new();
-        let mut seen_deps = HashSet::new();
-        for imp in &blueprint.imports {
-            let dep_url = self.import_map.resolve(&imp.specifier, Some(url))?;
-            if seen_deps.insert(dep_url.clone()) {
-                dependencies.push(dep_url);
-            }
-        }
-        for exp in &blueprint.exports {
-            if let Some(ref spec) = exp.reexport_from {
-                let dep_url = self.import_map.resolve(spec, Some(url))?;
-                if seen_deps.insert(dep_url.clone()) {
-                    dependencies.push(dep_url);
+                // Resolve all static dependency URLs in source order (deduplicated).
+                let mut dependencies = Vec::new();
+                let mut seen_deps = HashSet::new();
+                for imp in &blueprint.imports {
+                    let dep_url = self.import_map.resolve(&imp.specifier, Some(&url))?;
+                    if seen_deps.insert(dep_url.clone()) {
+                        dependencies.push(dep_url);
+                    }
                 }
+                for exp in &blueprint.exports {
+                    if let Some(ref spec) = exp.reexport_from {
+                        let dep_url = self.import_map.resolve(spec, Some(&url))?;
+                        if seen_deps.insert(dep_url.clone()) {
+                            dependencies.push(dep_url);
+                        }
+                    }
+                }
+
+                let program_id = vm.load_program(compiled);
+
+                // Allocate live export cells (`UpvalueCell`) and empty namespace object right now
+                // so cycles can point at them during the Link pass.
+                let mut export_cells = Vec::with_capacity(blueprint.exports.len());
+                let mut export_by_name = HashMap::new();
+                for exp in &blueprint.exports {
+                    let cell = alloc_module_cell(vm, JsValue::UNDEFINED);
+                    export_cells.push(cell);
+                    if !exp.is_star {
+                        export_by_name.insert(exp.exported_name.clone(), cell);
+                    }
+                }
+                let namespace_obj = vm.alloc_ordinary_object();
+                vm.register_module_env(
+                    program_id,
+                    ModuleEnv {
+                        url: url.clone(),
+                        import_bindings: vec![ImportBinding::None; blueprint.imports.len()],
+                        export_cells,
+                        export_by_name,
+                        namespace_obj,
+                    },
+                );
+
+                for dep in &dependencies {
+                    if !self.records.contains_key(dep) && queued.insert(dep.clone()) {
+                        next_wave.push(dep.clone());
+                    }
+                }
+
+                self.records.insert(
+                    url.clone(),
+                    ModuleRecord {
+                        program_id,
+                        entry_func,
+                        blueprint,
+                        dependencies,
+                        hoisted_exports,
+                        status: ModuleEvalStatus::Linked,
+                        eval_promise: None,
+                    },
+                );
+                newly_loaded.push(url);
             }
-        }
-
-        let program_id = vm.load_program(compiled);
-
-        // Allocate live export cells (`UpvalueCell`) and empty namespace object right now
-        // so cycles can point at them during the Link pass.
-        let mut export_cells = Vec::with_capacity(blueprint.exports.len());
-        let mut export_by_name = HashMap::new();
-        for exp in &blueprint.exports {
-            let cell = alloc_module_cell(vm, JsValue::UNDEFINED);
-            export_cells.push(cell);
-            if !exp.is_star {
-                export_by_name.insert(exp.exported_name.clone(), cell);
-            }
-        }
-        let namespace_obj = vm.alloc_ordinary_object();
-        vm.register_module_env(
-            program_id,
-            ModuleEnv {
-                url: url.to_string(),
-                import_bindings: vec![ImportBinding::None; blueprint.imports.len()],
-                export_cells,
-                export_by_name,
-                namespace_obj,
-            },
-        );
-
-        self.records.insert(
-            url.to_string(),
-            ModuleRecord {
-                program_id,
-                entry_func,
-                blueprint,
-                dependencies: dependencies.clone(),
-                hoisted_exports,
-                status: ModuleEvalStatus::Linked,
-                eval_promise: None,
-            },
-        );
-        newly_loaded.push(url.to_string());
-
-        for dep in dependencies {
-            self.fetch_and_compile_graph(vm, &dep, newly_loaded)?;
+            wave = next_wave;
         }
         Ok(())
     }

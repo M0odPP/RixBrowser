@@ -3,7 +3,7 @@
 //! (`WeakHeapHandle` / `WeakTable`) ready for DOM wrappers.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::Hash;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::time::Instant;
 
 use smallvec::SmallVec;
@@ -510,6 +510,286 @@ pub enum TemporalValue {
     ZonedDateTime(temporal_rs::ZonedDateTime),
 }
 
+/// Identity hasher for pre-hashed `u64` keys in [`JsMapStorage`] and [`JsSetStorage`].
+#[derive(Default)]
+pub struct U64PassHasher(u64);
+
+impl Hasher for U64PassHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = if self.0 == 0 {
+            0xcbf2_9ce4_8422_2325
+        } else {
+            self.0
+        };
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        self.0 = h;
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+}
+
+/// Fast FNV-1a byte-stream hasher for canonical ECMAScript `SameValueZero` key hashing.
+struct SvzFnvHasher(u64);
+
+impl Default for SvzFnvHasher {
+    #[inline]
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for SvzFnvHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        self.0 = h;
+    }
+}
+
+type HashBuckets = HashMap<u64, SmallVec<[usize; 2]>, BuildHasherDefault<U64PassHasher>>;
+
+/// Sublinear O(1) hash-indexed, insertion-order-preserving backing storage for ECMAScript `Map`
+/// (ECMA-262 §24.1).
+#[derive(Debug, Clone, Default)]
+pub struct JsMapStorage {
+    /// Insertion-ordered entries (`None` marks a deleted tombstone).
+    pub entries: Vec<Option<(JsValue, JsValue)>>,
+    len: usize,
+    buckets: HashBuckets,
+}
+
+impl JsMapStorage {
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn bucket_indices(&self, hash: u64) -> &[usize] {
+        self.buckets.get(&hash).map_or(&[], SmallVec::as_slice)
+    }
+
+    /// Inserts a brand-new `(key, val)` pair known not to exist under `hash`.
+    pub fn push_new(&mut self, hash: u64, key: JsValue, val: JsValue) {
+        let idx = self.entries.len();
+        self.entries.push(Some((key, val)));
+        self.len += 1;
+        self.buckets.entry(hash).or_default().push(idx);
+    }
+
+    /// Updates the value of an existing live entry at slot `idx`.
+    #[inline]
+    pub fn update_at(&mut self, idx: usize, val: JsValue) {
+        if let Some(Some((_, slot_val))) = self.entries.get_mut(idx) {
+            *slot_val = val;
+        }
+    }
+
+    /// Removes the live entry at slot `idx` under `hash`, compacting tombstones if sparse.
+    pub fn remove_at(&mut self, hash: u64, idx: usize) -> bool {
+        if self.entries.get(idx).and_then(|e| e.as_ref()).is_none() {
+            return false;
+        }
+        self.entries[idx] = None;
+        self.len = self.len.saturating_sub(1);
+        if let Some(bucket) = self.buckets.get_mut(&hash) {
+            if let Some(pos) = bucket.iter().position(|&i| i == idx) {
+                bucket.swap_remove(pos);
+            }
+            if bucket.is_empty() {
+                self.buckets.remove(&hash);
+            }
+        }
+        if self.entries.len() > 1024 && self.len.saturating_mul(4) < self.entries.len() {
+            self.compact();
+        }
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.len = 0;
+        self.buckets.clear();
+    }
+
+    /// Compacts deleted tombstones while preserving insertion order and bucket hashes.
+    fn compact(&mut self) {
+        let mut remap: Vec<usize> = vec![usize::MAX; self.entries.len()];
+        let mut new_entries = Vec::with_capacity(self.len);
+        for (old_idx, slot) in self.entries.drain(..).enumerate() {
+            if let Some(pair) = slot {
+                remap[old_idx] = new_entries.len();
+                new_entries.push(Some(pair));
+            }
+        }
+        self.entries = new_entries;
+        for bucket in self.buckets.values_mut() {
+            for idx in bucket.iter_mut() {
+                *idx = remap[*idx];
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot_entries(&self) -> Vec<(JsValue, JsValue)> {
+        let mut out = Vec::with_capacity(self.len);
+        for pair in self.entries.iter().flatten() {
+            out.push(*pair);
+        }
+        out
+    }
+
+    #[must_use]
+    pub fn snapshot_keys(&self) -> Vec<JsValue> {
+        let mut out = Vec::with_capacity(self.len);
+        for &(k, _) in self.entries.iter().flatten() {
+            out.push(k);
+        }
+        out
+    }
+
+    #[must_use]
+    pub fn snapshot_values(&self) -> Vec<JsValue> {
+        let mut out = Vec::with_capacity(self.len);
+        for &(_, v) in self.entries.iter().flatten() {
+            out.push(v);
+        }
+        out
+    }
+}
+
+/// Sublinear O(1) hash-indexed, insertion-order-preserving backing storage for ECMAScript `Set`
+/// (ECMA-262 §24.2).
+#[derive(Debug, Clone, Default)]
+pub struct JsSetStorage {
+    /// Insertion-ordered values (`None` marks a deleted tombstone).
+    pub entries: Vec<Option<JsValue>>,
+    len: usize,
+    buckets: HashBuckets,
+}
+
+impl JsSetStorage {
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn bucket_indices(&self, hash: u64) -> &[usize] {
+        self.buckets.get(&hash).map_or(&[], SmallVec::as_slice)
+    }
+
+    /// Appends a brand-new value known not to exist under `hash`.
+    pub fn push_new(&mut self, hash: u64, val: JsValue) {
+        let idx = self.entries.len();
+        self.entries.push(Some(val));
+        self.len += 1;
+        self.buckets.entry(hash).or_default().push(idx);
+    }
+
+    /// Removes the live value at slot `idx` under `hash`, compacting tombstones if sparse.
+    pub fn remove_at(&mut self, hash: u64, idx: usize) -> bool {
+        if self.entries.get(idx).and_then(|e| e.as_ref()).is_none() {
+            return false;
+        }
+        self.entries[idx] = None;
+        self.len = self.len.saturating_sub(1);
+        if let Some(bucket) = self.buckets.get_mut(&hash) {
+            if let Some(pos) = bucket.iter().position(|&i| i == idx) {
+                bucket.swap_remove(pos);
+            }
+            if bucket.is_empty() {
+                self.buckets.remove(&hash);
+            }
+        }
+        if self.entries.len() > 1024 && self.len.saturating_mul(4) < self.entries.len() {
+            self.compact();
+        }
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.len = 0;
+        self.buckets.clear();
+    }
+
+    fn compact(&mut self) {
+        let mut remap: Vec<usize> = vec![usize::MAX; self.entries.len()];
+        let mut new_entries = Vec::with_capacity(self.len);
+        for (old_idx, slot) in self.entries.drain(..).enumerate() {
+            if let Some(v) = slot {
+                remap[old_idx] = new_entries.len();
+                new_entries.push(Some(v));
+            }
+        }
+        self.entries = new_entries;
+        for bucket in self.buckets.values_mut() {
+            for idx in bucket.iter_mut() {
+                *idx = remap[*idx];
+            }
+        }
+    }
+
+    /// Advances `cursor` to the next live element for spec-compliant live `Set` iteration.
+    pub fn next_live(&self, cursor: &mut usize) -> Option<JsValue> {
+        while *cursor < self.entries.len() {
+            let slot = self.entries[*cursor];
+            *cursor += 1;
+            if let Some(v) = slot {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    #[must_use]
+    pub fn snapshot_values(&self) -> Vec<JsValue> {
+        let mut out = Vec::with_capacity(self.len);
+        for &v in self.entries.iter().flatten() {
+            out.push(v);
+        }
+        out
+    }
+}
+
 /// Specialized runtime tag for a [`JsObject`].
 #[derive(Debug, Clone, Default)]
 pub enum ObjectKind {
@@ -523,8 +803,8 @@ pub enum ObjectKind {
     UpvalueCell,
     RegExp(Box<RegExpObject>),
     Date(f64),
-    Map(Box<Vec<(JsValue, JsValue)>>),
-    Set(Box<Vec<JsValue>>),
+    Map(Box<JsMapStorage>),
+    Set(Box<JsSetStorage>),
     WeakMap(Box<HashMap<HeapHandle, JsValue>>),
     WeakSet(Box<HashSet<HeapHandle>>),
     WeakRef(HeapHandle),
@@ -763,8 +1043,8 @@ impl JsObject {
                 visit(p.target);
                 visit(p.handler);
             }
-            ObjectKind::Map(entries) => {
-                for &(k, v) in entries.iter() {
+            ObjectKind::Map(map) => {
+                for &(k, v) in map.entries.iter().flatten() {
                     if let Some(h) = k.as_heap_handle() {
                         visit(h);
                     }
@@ -773,8 +1053,8 @@ impl JsObject {
                     }
                 }
             }
-            ObjectKind::Set(entries) => {
-                for &v in entries.iter() {
+            ObjectKind::Set(set) => {
+                for &v in set.entries.iter().flatten() {
                     if let Some(h) = v.as_heap_handle() {
                         visit(h);
                     }
@@ -1522,6 +1802,94 @@ impl GcHeap {
             HeapCell::BigInt(b) => Some(b),
             _ => None,
         }
+    }
+
+    fn collect_string_bytes(&self, handle: HeapHandle, out: &mut Vec<u8>) {
+        if let Some(s) = self.get_string(handle) {
+            match s {
+                JsString::Flat { data, .. } => out.extend_from_slice(data.as_bytes()),
+                JsString::Interned { data, .. } => out.extend_from_slice(data.as_bytes()),
+                JsString::Rope { left, right, .. } => {
+                    self.collect_string_bytes(*left, out);
+                    self.collect_string_bytes(*right, out);
+                }
+                JsString::Slice {
+                    parent,
+                    byte_start,
+                    byte_end,
+                    ..
+                } => {
+                    let mut tmp = Vec::new();
+                    self.collect_string_bytes(*parent, &mut tmp);
+                    let end = (*byte_end).min(tmp.len());
+                    let start = (*byte_start).min(end);
+                    out.extend_from_slice(&tmp[start..end]);
+                }
+            }
+        }
+    }
+
+    fn hash_string_into(&self, handle: HeapHandle, hasher: &mut SvzFnvHasher) {
+        if let Some(s) = self.get_string(handle) {
+            match s {
+                JsString::Flat { data, .. } => hasher.write(data.as_bytes()),
+                JsString::Interned { data, .. } => hasher.write(data.as_bytes()),
+                JsString::Rope { left, right, .. } => {
+                    self.hash_string_into(*left, hasher);
+                    self.hash_string_into(*right, hasher);
+                }
+                JsString::Slice {
+                    parent,
+                    byte_start,
+                    byte_end,
+                    ..
+                } => {
+                    let mut tmp = Vec::new();
+                    self.collect_string_bytes(*parent, &mut tmp);
+                    let end = (*byte_end).min(tmp.len());
+                    let start = (*byte_start).min(end);
+                    hasher.write(&tmp[start..end]);
+                }
+            }
+        }
+    }
+
+    /// Computes a canonical 64-bit hash compatible with ECMAScript `SameValueZero`:
+    /// - `-0.0` and `+0.0` (and `Int32(0)`) produce identical hashes
+    /// - All `Int32` and equivalent `f64` values produce identical hashes
+    /// - All `NaN` values produce the same canonical hash
+    /// - Strings with identical content (Flat/Interned/Rope/Slice) produce identical hashes
+    #[inline]
+    #[must_use]
+    pub fn same_value_zero_hash(&self, val: JsValue) -> u64 {
+        if let Some(n) = val.as_number() {
+            let canonical_bits = if n.is_nan() {
+                crate::value::CANONICAL_NAN_BITS
+            } else if n == 0.0 {
+                0u64
+            } else {
+                n.to_bits()
+            };
+            return canonical_bits
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .rotate_left(17)
+                ^ 0x1111_2222_3333_4444;
+        }
+        if let Some(sh) = val.as_string() {
+            let mut h = SvzFnvHasher::default();
+            self.hash_string_into(sh, &mut h);
+            return h.finish() ^ 0x5555_6666_7777_8888;
+        }
+        if let Some(bh) = val.as_bigint() {
+            let mut h = SvzFnvHasher::default();
+            if let Some(bi) = self.get_bigint(bh) {
+                bi.hash(&mut h);
+            }
+            return h.finish() ^ 0x9999_aaaa_bbbb_cccc;
+        }
+        val.to_raw()
+            .wrapping_mul(0x517c_c1b7_2722_0a95)
+            .rotate_left(23)
     }
 
     /// Generational & incremental tri-color write barrier.

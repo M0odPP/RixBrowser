@@ -595,3 +595,118 @@ fn non_ascii_large_string_char_code_at_loop_is_linear_via_utf16_cache() {
     );
     assert_eq!(val.as_bool(), Some(true));
 }
+
+#[test]
+fn map_and_set_are_sublinear_and_obey_same_value_zero() {
+    // ECMA-262 §24.1 & §24.2: Map and Set must provide sublinear (hash-table) access
+    // while strictly honoring SameValueZero (`-0 === +0`, `NaN === NaN`, rope === flat string)
+    // and insertion-order iteration across deletions and compaction.
+    let src = r#"
+        const m = new Map();
+        m.set(-0, "zero");
+        m.set(NaN, "nan");
+        m.set(42, "int");
+        m.set("hel" + "lo", "rope");
+        m.set(100n, "big");
+        const sameChecks = [
+            m.get(+0) === "zero",
+            m.get(0.0) === "zero",
+            m.get(NaN) === "nan",
+            m.get(42.0) === "int",
+            m.get("hello") === "rope",
+            m.get(100n) === "big",
+            m.size === 5,
+        ].every(Boolean);
+
+        // 15,000 inserts + lookups + deletes + compaction must stay strictly O(N).
+        const bigMap = new Map();
+        const bigSet = new Set();
+        for (let i = 0; i < 15000; i++) {
+            const k = "k" + i;
+            bigMap.set(k, i);
+            bigSet.add(k);
+        }
+        let ok = bigMap.size === 15000 && bigSet.size === 15000;
+        for (let i = 0; i < 14000; i++) {
+            const k = "k" + i;
+            ok = ok && bigMap.get(k) === i && bigSet.has(k);
+            bigMap.delete(k);
+            bigSet.delete(k);
+        }
+        ok = ok && bigMap.size === 1000 && bigSet.size === 1000;
+        ok = ok && bigMap.get("k14999") === 14999 && !bigMap.has("k0");
+        ok = ok && bigSet.has("k14999") && !bigSet.has("k0");
+        const firstRemainingKey = Array.from(bigMap.keys())[0];
+        sameChecks && ok && firstRemainingKey === "k14000"
+    "#;
+    let mut vm = rix_js::JsVm::new();
+    let t0 = std::time::Instant::now();
+    let val = vm.eval_script(src).expect("Map/Set stress test must pass");
+    assert!(
+        t0.elapsed().as_millis() < 1500,
+        "15,000-entry Map/Set benchmark took too long: {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(val.as_bool(), Some(true));
+}
+
+#[test]
+fn module_loader_prefetches_sibling_dependencies_in_wave_batches() {
+    use rix_js::modules::{ImportMap, ModuleLoader, ModuleSourceProvider};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct CountingProvider {
+        sources: std::collections::HashMap<String, String>,
+        prefetched_waves: Rc<RefCell<Vec<Vec<String>>>>,
+    }
+
+    impl ModuleSourceProvider for CountingProvider {
+        fn load_source(&self, url: &str) -> Result<String, String> {
+            self.sources
+                .get(url)
+                .cloned()
+                .ok_or_else(|| format!("missing {url}"))
+        }
+
+        fn prefetch_sources(&self, urls: &[String]) {
+            self.prefetched_waves.borrow_mut().push(urls.to_vec());
+        }
+    }
+
+    let mut sources = std::collections::HashMap::new();
+    sources.insert(
+        "https://example.test/main.js".to_string(),
+        "import { a } from './a.js'; import { b } from './b.js'; export const sum = a + b;"
+            .to_string(),
+    );
+    sources.insert(
+        "https://example.test/a.js".to_string(),
+        "export const a = 20;".to_string(),
+    );
+    sources.insert(
+        "https://example.test/b.js".to_string(),
+        "export const b = 22;".to_string(),
+    );
+    let waves = Rc::new(RefCell::new(Vec::new()));
+    let provider = CountingProvider {
+        sources,
+        prefetched_waves: Rc::clone(&waves),
+    };
+    let loader = Rc::new(RefCell::new(ModuleLoader::new(
+        Box::new(provider),
+        ImportMap {
+            base_url: "https://example.test/".to_string(),
+            ..ImportMap::default()
+        },
+    )));
+    let mut vm = rix_js::JsVm::new();
+    let _p = ModuleLoader::load_and_evaluate(&loader, &mut vm, "https://example.test/main.js")
+        .expect("module graph must load");
+    vm.drain_microtasks();
+    let recorded = waves.borrow();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].len(), 2);
+    assert!(recorded[0].contains(&"https://example.test/a.js".to_string()));
+    assert!(recorded[0].contains(&"https://example.test/b.js".to_string()));
+}

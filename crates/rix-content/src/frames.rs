@@ -603,7 +603,7 @@ fn encode_structured_json_impl(
         }
         Some(5) => {
             let entries: Vec<(JsValue, JsValue)> = match vm.heap.get_object(h).map(|o| &o.kind) {
-                Some(ObjectKind::Map(m)) => (**m).clone(),
+                Some(ObjectKind::Map(m)) => m.snapshot_entries(),
                 _ => Vec::new(),
             };
             let mut pairs = Vec::with_capacity(entries.len());
@@ -617,7 +617,7 @@ fn encode_structured_json_impl(
         }
         Some(6) => {
             let items: Vec<JsValue> = match vm.heap.get_object(h).map(|o| &o.kind) {
-                Some(ObjectKind::Set(s)) => (**s).clone(),
+                Some(ObjectKind::Set(s)) => s.snapshot_values(),
                 _ => Vec::new(),
             };
             let mut arr = Vec::with_capacity(items.len());

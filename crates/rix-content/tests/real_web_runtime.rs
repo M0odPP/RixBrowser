@@ -275,8 +275,11 @@ fn html_image_element_complete_natural_dimensions_and_current_src_follow_html_sp
                 img.naturalWidth === 120,
                 img.naturalHeight === 48,
                 img.currentSrc === "https://example.test/img/logo.png",
+                img.src === "https://example.test/img/logo.png",
+                img.getAttribute("src") === "/img/logo.png",
                 empty.complete === true,
                 empty.naturalWidth === 0,
+                empty.src === "",
                 dynEmptyComplete === true,
                 dynPendingComplete === false,
             ].every(Boolean)
@@ -284,4 +287,44 @@ fn html_image_element_complete_natural_dimensions_and_current_src_follow_html_sp
         )
         .expect("HTMLImageElement spec checks must succeed");
     assert_eq!(res.as_bool(), Some(true));
+}
+
+#[test]
+fn html_script_element_src_reflects_resolved_absolute_url() {
+    // HTML §4.12.1.1 / §2.6.10: `HTMLScriptElement.prototype.src` must reflect as a resolved
+    // URL against the document base URL so `new URL(document.currentScript.src)` succeeds.
+    let doc = Rc::new(RefCell::new(Document::new()));
+    let font_db = Arc::new(FontDatabase::new());
+    let storage = StorageEngine::in_memory().expect("in-memory storage");
+    let mut rt = ContentRuntime::with_origin_and_storage(
+        doc,
+        Size::new(1280.0, 800.0),
+        font_db,
+        "https://example.test/app/page.html",
+        storage,
+    );
+    let mut ext = HashMap::new();
+    ext.insert(
+        "https://example.test/js/events.js".to_string(),
+        r#"
+            const s = document.currentScript;
+            window.__scriptSrc = s.src;
+            window.__scriptAttr = s.getAttribute("src");
+            window.__parsedHost = new URL(s.src).hostname;
+        "#
+        .to_string(),
+    );
+    let html = r#"<!doctype html><html><head><script defer src="/js/events.js"></script></head><body></body></html>"#;
+    let errors = rt.load_document_with_external_scripts(html, &ext);
+    assert!(errors.is_empty(), "unexpected script errors: {errors:?}");
+    let ok = rt
+        .eval_script(
+            r#"
+            window.__scriptSrc === "https://example.test/js/events.js"
+                && window.__scriptAttr === "/js/events.js"
+                && window.__parsedHost === "example.test"
+            "#,
+        )
+        .expect("script.src reflection check must pass");
+    assert_eq!(ok.as_bool(), Some(true));
 }

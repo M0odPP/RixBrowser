@@ -179,8 +179,14 @@ pub fn compile_baseline_function(
     check_eligibility(func)?;
 
     let mut flag_builder = settings::builder();
+    // Tier-1 Baseline JIT prioritizes near-instant compilation; Tier-2 Optimizing JIT
+    // uses `opt_level = "speed"` for hot functions.
     flag_builder
-        .set("opt_level", "speed")
+        .set("opt_level", "none")
+        .map_err(|e| JitCompileError::Cranelift(e.to_string()))?;
+    #[cfg(not(debug_assertions))]
+    flag_builder
+        .set("enable_verifier", "false")
         .map_err(|e| JitCompileError::Cranelift(e.to_string()))?;
     flag_builder
         .set("is_pic", "true")

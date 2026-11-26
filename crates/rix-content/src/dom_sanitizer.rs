@@ -1161,7 +1161,44 @@ fn install_html_helper_reflections(vm: &mut JsVm, host: &SharedHost, event_loop:
         install_str_attr_prop(vm, ogp, host, "label", "label");
     }
     if let Some(&sp) = protos.get("HTMLScriptElement") {
-        install_str_attr_prop(vm, sp, host, "src", "src");
+        // HTML §4.12.1.1 / §2.6.10: `HTMLScriptElement.prototype.src` reflects as a resolved URL
+        // against the document's base URL (or `""` when absent/empty).
+        let h_src_g = Rc::clone(host);
+        let src_g = vm.alloc_host_fn("get src", move |vm, t, _| {
+            let nid = require_node(vm, &h_src_g, t)?;
+            let hb = h_src_g.borrow();
+            let raw = match hb.document.borrow().get(nid) {
+                Some(NodeData::Element(e)) => e.get_attribute("src").map(ToString::to_string),
+                _ => None,
+            };
+            let resolved = match raw {
+                Some(ref r) => {
+                    let trimmed = r.trim();
+                    if trimmed.is_empty() {
+                        hb.main_document_url.clone()
+                    } else if let Ok(base) = url::Url::parse(&hb.main_document_url) {
+                        base.join(trimmed)
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|_| trimmed.to_string())
+                    } else {
+                        trimmed.to_string()
+                    }
+                }
+                None => String::new(),
+            };
+            Ok(JsValue::from_string(vm.heap.alloc_string(resolved)))
+        });
+        let h_src_s = Rc::clone(host);
+        let src_s = vm.alloc_host_fn("set src", move |vm, t, args| {
+            let nid = require_node(vm, &h_src_s, t)?;
+            let val = to_dom_string(vm, arg(args, 0))?;
+            if let Some(NodeData::Element(e)) = h_src_s.borrow().document.borrow_mut().get_mut(nid)
+            {
+                e.set_attribute("src", &val);
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, sp, "src", Some(src_g), Some(src_s));
         install_str_attr_prop(vm, sp, host, "type", "type");
         for attr in ["defer", "async"] {
             let h1 = Rc::clone(host);
@@ -1200,9 +1237,25 @@ fn install_html_helper_reflections(vm: &mut JsVm, host: &SharedHost, event_loop:
         let h1 = Rc::clone(host);
         let g = vm.alloc_host_fn("get src", move |vm, t, _| {
             let nid = require_node(vm, &h1, t)?;
-            let v = match h1.borrow().document.borrow().get(nid) {
-                Some(NodeData::Element(e)) => e.get_attribute("src").unwrap_or("").to_string(),
-                _ => String::new(),
+            let hb = h1.borrow();
+            let raw = match hb.document.borrow().get(nid) {
+                Some(NodeData::Element(e)) => e.get_attribute("src").map(ToString::to_string),
+                _ => None,
+            };
+            let v = match raw {
+                Some(ref r) => {
+                    let trimmed = r.trim();
+                    if trimmed.is_empty() {
+                        hb.main_document_url.clone()
+                    } else if let Ok(base) = url::Url::parse(&hb.main_document_url) {
+                        base.join(trimmed)
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|_| trimmed.to_string())
+                    } else {
+                        trimmed.to_string()
+                    }
+                }
+                None => String::new(),
             };
             Ok(JsValue::from_string(vm.heap.alloc_string(v)))
         });
