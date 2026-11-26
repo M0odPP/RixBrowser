@@ -1431,6 +1431,90 @@ fn install_html_reflecting_idl_properties(vm: &mut JsVm, host: &SharedHost) {
         install_uint(vm, p, "height", "height", 0);
         install_uint(vm, p, "hspace", "hspace", 0);
         install_uint(vm, p, "vspace", "vspace", 0);
+        // `HTMLImageElement.prototype.{naturalWidth, naturalHeight, complete, currentSrc}`
+        // (WHATWG HTML §4.8.4.3).
+        fn resolve_img_info(h: &SharedHost, nid: NodeId) -> (u32, u32, bool, String) {
+            let hb = h.borrow();
+            let (raw_src, has_srcset) = match hb.document.borrow().get(nid) {
+                Some(NodeData::Element(e)) => (
+                    e.get_attribute("src").unwrap_or("").trim().to_string(),
+                    e.get_attribute("srcset")
+                        .is_some_and(|s| !s.trim().is_empty()),
+                ),
+                _ => (String::new(), false),
+            };
+            if raw_src.is_empty() && !has_srcset {
+                return (0, 0, true, String::new());
+            }
+            let resolved = url::Url::parse(&hb.main_document_url)
+                .ok()
+                .and_then(|base| base.join(&raw_src).ok())
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| raw_src.clone());
+            let dims = hb
+                .layout_engine
+                .assets
+                .get_by_src(&raw_src)
+                .or_else(|| hb.layout_engine.assets.get_by_src(&resolved))
+                .map(|img| (img.width, img.height))
+                .or_else(|| {
+                    hb.layout_engine
+                        .assets
+                        .get_svg_by_src(&raw_src)
+                        .or_else(|| hb.layout_engine.assets.get_svg_by_src(&resolved))
+                        .map(|svg| {
+                            (
+                                svg.intrinsic_size.width.round().max(0.0) as u32,
+                                svg.intrinsic_size.height.round().max(0.0) as u32,
+                            )
+                        })
+                });
+            let is_pending = hb.pending_dynamic_images.contains(&nid);
+            let complete = if is_pending {
+                false
+            } else {
+                dims.is_some() || hb.completed_images.contains(&nid) || hb.initial_assets_loaded
+            };
+            let (nw, nh) = dims.unwrap_or((0, 0));
+            let cur_src = if dims.is_some() {
+                resolved
+            } else {
+                String::new()
+            };
+            (nw, nh, complete, cur_src)
+        }
+        let h_nw = Rc::clone(host);
+        let g_nw = vm.alloc_host_fn("get naturalWidth", move |vm, t, _| {
+            let nid = require_node(vm, &h_nw, t)?;
+            let (nw, _, _, _) = resolve_img_info(&h_nw, nid);
+            Ok(JsValue::from_f64(f64::from(nw)))
+        });
+        define_host_accessor(vm, p, "naturalWidth", Some(g_nw), None);
+
+        let h_nh = Rc::clone(host);
+        let g_nh = vm.alloc_host_fn("get naturalHeight", move |vm, t, _| {
+            let nid = require_node(vm, &h_nh, t)?;
+            let (_, nh, _, _) = resolve_img_info(&h_nh, nid);
+            Ok(JsValue::from_f64(f64::from(nh)))
+        });
+        define_host_accessor(vm, p, "naturalHeight", Some(g_nh), None);
+
+        let h_cmp = Rc::clone(host);
+        let g_cmp = vm.alloc_host_fn("get complete", move |vm, t, _| {
+            let nid = require_node(vm, &h_cmp, t)?;
+            let (_, _, complete, _) = resolve_img_info(&h_cmp, nid);
+            Ok(JsValue::from_bool(complete))
+        });
+        define_host_accessor(vm, p, "complete", Some(g_cmp), None);
+
+        let h_cs = Rc::clone(host);
+        let g_cs = vm.alloc_host_fn("get currentSrc", move |vm, t, _| {
+            let nid = require_node(vm, &h_cs, t)?;
+            let (_, _, _, cur_src) = resolve_img_info(&h_cs, nid);
+            Ok(JsValue::from_string(vm.heap.alloc_string(cur_src)))
+        });
+        define_host_accessor(vm, p, "currentSrc", Some(g_cs), None);
+
         // `HTMLImageElement.prototype.decode()` (HTML §4.8.4.3.7)
         define_host_method(vm, p, "decode", move |vm, _, _| {
             let p = rix_js::promise::promise_resolve_value(vm, JsValue::UNDEFINED);

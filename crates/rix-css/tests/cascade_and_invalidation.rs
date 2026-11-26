@@ -535,3 +535,23 @@ fn typed_length_zero_noop_and_pseudo_memo_preserve_arc_sharing_and_restyle_ident
         "unchanged restyle_dirty must preserve the existing Arc<ComputedStyle>"
     );
 }
+
+#[test]
+fn font_face_parses_unicode_ranges_per_css_fonts_l4() {
+    let css = r#"
+        @font-face {
+            font-family: "TestSans";
+            font-weight: 100 900;
+            src: url("/fonts/latin.woff2") format("woff2");
+            unicode-range: U+0000-00FF, U+0131, U+20??;
+        }
+    "#;
+    let sheet = Stylesheet::parse(css, CascadeOrigin::Author, &MediaContext::default());
+    assert_eq!(sheet.font_faces.len(), 1);
+    let ff = &sheet.font_faces[0];
+    assert_eq!(ff.weight_range, (100.0, 900.0));
+    assert_eq!(
+        ff.unicode_ranges,
+        vec![(0x0000, 0x00FF), (0x0131, 0x0131), (0x2000, 0x20FF)]
+    );
+}

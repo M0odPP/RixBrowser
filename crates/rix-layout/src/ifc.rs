@@ -44,8 +44,9 @@ pub fn resolve_font_for_style(
 
     for family in &style.text.font_family {
         if let Some(wf) = web_fonts {
-            if let Some(id) =
-                wf.match_face_for_char(font_db, family.as_str(), weight, font_style, 'a')
+            if let Some(id) = wf
+                .match_face_for_char(font_db, family.as_str(), weight, font_style, 'a')
+                .or_else(|| wf.match_face(family.as_str(), weight, font_style))
             {
                 return id;
             }

@@ -424,6 +424,8 @@ pub struct FontFaceRule {
     pub sources: Vec<FontFaceSource>,
     pub weight_range: (f32, f32),
     pub italic: bool,
+    /// Optional `unicode-range` inclusive codepoint intervals `(start, end)` (CSS Fonts L4 §4.5).
+    pub unicode_ranges: Vec<(u32, u32)>,
     pub layer_id: LayerId,
 }
 
@@ -1073,6 +1075,7 @@ impl<'a> StylesheetCompiler<'a> {
         let mut sources = Vec::new();
         let mut weight_range = (400.0, 400.0);
         let mut italic = false;
+        let mut unicode_ranges = Vec::new();
         for prop in &ff.properties {
             match prop {
                 FontFaceProperty::FontFamily(f) => family = Some(convert_font_family_name(f)),
@@ -1107,6 +1110,9 @@ impl<'a> StylesheetCompiler<'a> {
                 FontFaceProperty::FontStyle(st) => {
                     italic = !matches!(st, lightningcss::rules::font_face::FontStyle::Normal);
                 }
+                FontFaceProperty::UnicodeRange(ranges) => {
+                    unicode_ranges = ranges.iter().map(|r| (r.start, r.end)).collect();
+                }
                 _ => {}
             }
         }
@@ -1115,6 +1121,7 @@ impl<'a> StylesheetCompiler<'a> {
             sources,
             weight_range,
             italic,
+            unicode_ranges,
             layer_id,
         });
     }

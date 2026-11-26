@@ -802,6 +802,7 @@ impl BrowserController {
             host.set_dark_mode(dark_mode);
             host.device_pixel_ratio = dpr;
             loaded.register_into_assets(&mut host.layout_engine.assets);
+            host.initial_assets_loaded = true;
             host.layout_engine.web_fonts = web_fonts;
             host.set_external_stylesheets(loaded.external_stylesheets.clone());
         }
