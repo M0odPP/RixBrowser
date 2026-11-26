@@ -438,6 +438,10 @@ pub struct EffectsStyle {
     pub reading_order: i32,
     /// CSS Containment L2 bitmask: 0x01=size, 0x02=inline-size, 0x04=layout, 0x08=style, 0x10=paint.
     pub contain: u8,
+    /// CSS Containment L3 `container-type`: 0=normal, 1=size, 2=inline-size, 4=scroll-state.
+    pub container_type: u8,
+    /// CSS Containment L3 `container-name` list (empty = `none`).
+    pub container_name: Vec<InternedStr>,
 }
 
 /// Single CSS custom property value with pre-serialized CSS text and optional
@@ -4023,6 +4027,12 @@ pub fn apply_declaration(
         (PropertyIdKind::Contain, PropertyValue::Contain(bits)) => {
             style.effects_mut().contain = *bits;
         }
+        (PropertyIdKind::ContainerType, PropertyValue::ContainerType(bits)) => {
+            style.effects_mut().container_type = *bits;
+        }
+        (PropertyIdKind::ContainerName, PropertyValue::ContainerName(names)) => {
+            style.effects_mut().container_name = names.clone();
+        }
         _ => {}
     }
 }
@@ -4383,6 +4393,16 @@ fn copy_property_from_parent(
         }
         PropertyIdKind::Contain => {
             style.effects_mut().contain = parent.effects.as_ref().map_or(0, |e| e.contain);
+        }
+        PropertyIdKind::ContainerType => {
+            style.effects_mut().container_type =
+                parent.effects.as_ref().map_or(0, |e| e.container_type);
+        }
+        PropertyIdKind::ContainerName => {
+            style.effects_mut().container_name = parent
+                .effects
+                .as_ref()
+                .map_or_else(Vec::new, |e| e.container_name.clone());
         }
         PropertyIdKind::FlexDirection => {
             style.flex_grid_mut().flex_direction = parent
@@ -5365,6 +5385,16 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         PropertyIdKind::Contain => {
             if let Some(eff) = &mut style.effects {
                 Arc::make_mut(eff).contain = 0;
+            }
+        }
+        PropertyIdKind::ContainerType => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).container_type = 0;
+            }
+        }
+        PropertyIdKind::ContainerName => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).container_name.clear();
             }
         }
         PropertyIdKind::Filter => {

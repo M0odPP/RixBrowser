@@ -261,6 +261,7 @@ struct FragmentSnapshotInfo {
     padding: rix_layout::EdgeInsets,
     margin: rix_layout::EdgeInsets,
     style: std::sync::Arc<ComputedStyle>,
+    resolved_grid_cols: Option<String>,
 }
 
 fn collect_fragment_rects_and_styles(
@@ -289,6 +290,11 @@ fn collect_fragment_rects_and_styles(
                 padding: frag.padding,
                 margin: frag.margin,
                 style: std::sync::Arc::clone(&frag.style),
+                resolved_grid_cols: frag
+                    .resolved_grid_tracks
+                    .as_ref()
+                    .filter(|g| !g.columns.is_empty())
+                    .map(|g| g.columns.clone()),
             });
     }
     for child in frag.children.iter() {
@@ -382,6 +388,13 @@ fn format_resolved_property(info: &FragmentSnapshotInfo, prop: &str) -> String {
         "padding-right" => format_px_cssom(info.padding.right),
         "padding-bottom" => format_px_cssom(info.padding.bottom),
         "padding-left" => format_px_cssom(info.padding.left),
+        "grid-template-columns" => {
+            if let Some(ref cols) = info.resolved_grid_cols {
+                cols.clone()
+            } else {
+                rix_content::cssom::format_computed_property(&info.style, prop)
+            }
+        }
         _ => rix_content::cssom::format_computed_property(&info.style, prop),
     }
 }

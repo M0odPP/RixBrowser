@@ -74,6 +74,9 @@ pub struct MediaContext {
     pub dark_mode: bool,
     pub reduced_motion: bool,
     pub media_type: MediaTypeKind,
+    /// Optional nearest CSS Containment L3 size-query container dimensions (for `cqw`/`cqh`/`cqi`/`cqb`).
+    pub container_width: Option<f32>,
+    pub container_height: Option<f32>,
 }
 
 impl Default for MediaContext {
@@ -85,6 +88,8 @@ impl Default for MediaContext {
             dark_mode: false,
             reduced_motion: false,
             media_type: MediaTypeKind::Screen,
+            container_width: None,
+            container_height: None,
         }
     }
 }
@@ -97,8 +102,8 @@ impl MediaContext {
             root_font_size_px,
             viewport_width_px: self.viewport_width,
             viewport_height_px: self.viewport_height,
-            container_width_px: self.viewport_width,
-            container_height_px: self.viewport_height,
+            container_width_px: self.container_width.unwrap_or(self.viewport_width),
+            container_height_px: self.container_height.unwrap_or(self.viewport_height),
             ..EvalContext::default()
         }
     }
@@ -444,6 +449,471 @@ pub struct KeyframesRule {
     pub layer_id: LayerId,
 }
 
+/// Comparison operator for CSS Containment Level 3 `@container` size/ratio queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerCmpOp {
+    Lt,
+    Le,
+    Eq,
+    Ge,
+    Gt,
+}
+
+impl ContainerCmpOp {
+    #[inline]
+    #[must_use]
+    pub fn eval(self, actual: f32, target: f32) -> bool {
+        match self {
+            Self::Lt => actual < target - 0.001,
+            Self::Le => actual <= target + 0.001,
+            Self::Eq => (actual - target).abs() <= 0.5,
+            Self::Ge => actual >= target - 0.001,
+            Self::Gt => actual > target + 0.001,
+        }
+    }
+}
+
+/// Dimension axis targeted by a CSS `@container` size feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerAxis {
+    Width,
+    Height,
+    InlineSize,
+    BlockSize,
+    AspectRatio,
+}
+
+/// Parsed CSS Containment L3 `@container` query condition AST.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContainerCondition {
+    And(Vec<ContainerCondition>),
+    Or(Vec<ContainerCondition>),
+    Not(Box<ContainerCondition>),
+    SizeCmp {
+        axis: ContainerAxis,
+        op: ContainerCmpOp,
+        value: f32,
+        unit: crate::values::LengthUnit,
+    },
+    OrientationPortrait,
+    OrientationLandscape,
+    StyleCustomProp {
+        name: InternedStr,
+        expected: Option<String>,
+    },
+    Unsupported,
+}
+
+/// Compiled `@container [<name>] <condition>` constraint attached to a [`CompiledRule`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledContainerQuery {
+    pub name: Option<InternedStr>,
+    pub condition: ContainerCondition,
+}
+
+impl CompiledContainerQuery {
+    /// Parses a CSS Containment L3 `@container` query string (name + condition).
+    #[must_use]
+    pub fn parse(name: Option<&str>, cond_str: &str) -> Self {
+        let cname = name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(intern_str);
+        let condition = parse_container_condition(cond_str);
+        Self {
+            name: cname,
+            condition,
+        }
+    }
+
+    /// Returns `true` if this query uses a size-containment axis (requiring `container-type: size | inline-size`).
+    #[must_use]
+    pub fn requires_size_container(&self) -> bool {
+        self.condition.requires_size_container()
+    }
+
+    /// Evaluates this `@container` query against a candidate container's laid-out `(width, height)`,
+    /// typography basis, and custom properties.
+    #[must_use]
+    pub fn matches(
+        &self,
+        width: f32,
+        height: f32,
+        root_font_size: f32,
+        elem_font_size: f32,
+        custom_props: &crate::computed::CustomPropertyMap,
+    ) -> bool {
+        self.condition
+            .eval(width, height, root_font_size, elem_font_size, custom_props)
+    }
+}
+
+impl ContainerCondition {
+    #[must_use]
+    pub fn requires_size_container(&self) -> bool {
+        match self {
+            Self::And(v) | Self::Or(v) => v.iter().any(Self::requires_size_container),
+            Self::Not(inner) => inner.requires_size_container(),
+            Self::SizeCmp { .. } | Self::OrientationPortrait | Self::OrientationLandscape => true,
+            Self::StyleCustomProp { .. } | Self::Unsupported => false,
+        }
+    }
+
+    #[must_use]
+    pub fn eval(
+        &self,
+        width: f32,
+        height: f32,
+        root_font_size: f32,
+        elem_font_size: f32,
+        custom_props: &crate::computed::CustomPropertyMap,
+    ) -> bool {
+        match self {
+            Self::And(items) => items
+                .iter()
+                .all(|c| c.eval(width, height, root_font_size, elem_font_size, custom_props)),
+            Self::Or(items) => items
+                .iter()
+                .any(|c| c.eval(width, height, root_font_size, elem_font_size, custom_props)),
+            Self::Not(inner) => {
+                !inner.eval(width, height, root_font_size, elem_font_size, custom_props)
+            }
+            Self::SizeCmp {
+                axis,
+                op,
+                value,
+                unit,
+            } => {
+                let eval_ctx = EvalContext {
+                    font_size_px: elem_font_size,
+                    root_font_size_px: root_font_size,
+                    viewport_width_px: width,
+                    viewport_height_px: height,
+                    container_width_px: width,
+                    container_height_px: height,
+                    ..EvalContext::default()
+                };
+                match axis {
+                    ContainerAxis::Width | ContainerAxis::InlineSize => {
+                        op.eval(width, unit.resolve_px(*value, &eval_ctx))
+                    }
+                    ContainerAxis::Height | ContainerAxis::BlockSize => {
+                        op.eval(height, unit.resolve_px(*value, &eval_ctx))
+                    }
+                    ContainerAxis::AspectRatio => {
+                        let actual = if height > 0.001 { width / height } else { 0.0 };
+                        op.eval(actual, *value)
+                    }
+                }
+            }
+            Self::OrientationPortrait => height >= width,
+            Self::OrientationLandscape => width > height,
+            Self::StyleCustomProp { name, expected } => {
+                let actual = custom_props
+                    .get_entry(name)
+                    .map(|e| e.serialized.trim().to_string());
+                match (actual, expected) {
+                    (Some(a), Some(exp)) => a.eq_ignore_ascii_case(exp.trim()),
+                    (Some(a), None) => !a.is_empty(),
+                    (None, _) => false,
+                }
+            }
+            Self::Unsupported => false,
+        }
+    }
+}
+
+fn strip_outer_parens(s: &str) -> &str {
+    let mut cur = s.trim();
+    loop {
+        if !(cur.starts_with('(') && cur.ends_with(')')) {
+            return cur;
+        }
+        let mut depth = 0i32;
+        let mut wraps_whole = true;
+        for (idx, b) in cur.bytes().enumerate() {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 && idx + 1 < cur.len() {
+                        wraps_whole = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if wraps_whole && depth == 0 {
+            cur = cur[1..cur.len() - 1].trim();
+        } else {
+            return cur;
+        }
+    }
+}
+
+fn split_top_level_keyword<'a>(s: &'a str, kw: &str) -> Vec<&'a str> {
+    let bytes = s.as_bytes();
+    let kw_len = kw.len();
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth = (depth - 1).max(0),
+            _ if depth == 0 && i + kw_len <= bytes.len() => {
+                let prev_ok = i == 0 || bytes[i - 1].is_ascii_whitespace() || bytes[i - 1] == b')';
+                let next_ok = i + kw_len == bytes.len()
+                    || bytes[i + kw_len].is_ascii_whitespace()
+                    || bytes[i + kw_len] == b'(';
+                if prev_ok && next_ok && s[i..i + kw_len].eq_ignore_ascii_case(kw) {
+                    out.push(s[start..i].trim());
+                    start = i + kw_len;
+                    i = start;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if !out.is_empty() {
+        out.push(s[start..].trim());
+    }
+    out
+}
+
+fn parse_container_length(raw: &str) -> Option<(f32, crate::values::LengthUnit)> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s == "0" {
+        return Some((0.0, crate::values::LengthUnit::Px));
+    }
+    let split_idx = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-' && c != '+')
+        .unwrap_or(s.len());
+    let num: f32 = s[..split_idx].parse().ok()?;
+    let unit_str = s[split_idx..].trim();
+    let unit = match unit_str {
+        "" | "px" => crate::values::LengthUnit::Px,
+        "em" => crate::values::LengthUnit::Em,
+        "rem" => crate::values::LengthUnit::Rem,
+        "ch" => crate::values::LengthUnit::Ch,
+        "vw" => crate::values::LengthUnit::Vw,
+        "vh" => crate::values::LengthUnit::Vh,
+        "cqw" => crate::values::LengthUnit::Cqw,
+        "cqh" => crate::values::LengthUnit::Cqh,
+        "cqi" => crate::values::LengthUnit::Cqi,
+        "cqb" => crate::values::LengthUnit::Cqb,
+        _ => return None,
+    };
+    Some((num, unit))
+}
+
+fn parse_ratio_val(raw: &str) -> Option<f32> {
+    let s = raw.trim();
+    if let Some((a, b)) = s.split_once('/') {
+        let num: f32 = a.trim().parse().ok()?;
+        let den: f32 = b.trim().parse().ok()?;
+        (den > 0.0).then_some(num / den)
+    } else {
+        s.parse::<f32>().ok()
+    }
+}
+
+fn parse_container_axis(name: &str) -> Option<ContainerAxis> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "width" => Some(ContainerAxis::Width),
+        "height" => Some(ContainerAxis::Height),
+        "inline-size" => Some(ContainerAxis::InlineSize),
+        "block-size" => Some(ContainerAxis::BlockSize),
+        "aspect-ratio" => Some(ContainerAxis::AspectRatio),
+        _ => None,
+    }
+}
+
+fn invert_cmp(op: ContainerCmpOp) -> ContainerCmpOp {
+    match op {
+        ContainerCmpOp::Lt => ContainerCmpOp::Gt,
+        ContainerCmpOp::Le => ContainerCmpOp::Ge,
+        ContainerCmpOp::Eq => ContainerCmpOp::Eq,
+        ContainerCmpOp::Ge => ContainerCmpOp::Le,
+        ContainerCmpOp::Gt => ContainerCmpOp::Lt,
+    }
+}
+
+/// Parses a CSS Containment Level 3 `@container` condition string into [`ContainerCondition`].
+#[must_use]
+pub fn parse_container_condition(raw: &str) -> ContainerCondition {
+    let s = strip_outer_parens(raw);
+    if s.is_empty() {
+        return ContainerCondition::Unsupported;
+    }
+    let or_parts = split_top_level_keyword(s, "or");
+    if or_parts.len() > 1 {
+        return ContainerCondition::Or(
+            or_parts
+                .into_iter()
+                .map(parse_container_condition)
+                .collect(),
+        );
+    }
+    let and_parts = split_top_level_keyword(s, "and");
+    if and_parts.len() > 1 {
+        return ContainerCondition::And(
+            and_parts
+                .into_iter()
+                .map(parse_container_condition)
+                .collect(),
+        );
+    }
+    if s.len() > 3
+        && s[..3].eq_ignore_ascii_case("not")
+        && s.as_bytes()
+            .get(3)
+            .is_some_and(|b| b.is_ascii_whitespace() || *b == b'(')
+    {
+        return ContainerCondition::Not(Box::new(parse_container_condition(&s[3..])));
+    }
+    // `style(--prop: value)` / `style(--prop)`
+    if s.len() > 6 && s[..6].eq_ignore_ascii_case("style(") && s.ends_with(')') {
+        let inner = s[6..s.len() - 1].trim();
+        if let Some((prop, val)) = inner.split_once(':') {
+            let p = prop.trim();
+            if p.starts_with("--") {
+                return ContainerCondition::StyleCustomProp {
+                    name: intern_str(p),
+                    expected: Some(val.trim().to_string()),
+                };
+            }
+        } else if inner.starts_with("--") {
+            return ContainerCondition::StyleCustomProp {
+                name: intern_str(inner),
+                expected: None,
+            };
+        }
+        return ContainerCondition::Unsupported;
+    }
+    // Traditional colon syntax: `min-width: 400px`, `max-inline-size: 60rem`, `orientation: landscape`
+    if let Some((lhs, rhs)) = s.split_once(':') {
+        let name = lhs.trim().to_ascii_lowercase();
+        let val = rhs.trim();
+        if name == "orientation" {
+            return if val.eq_ignore_ascii_case("portrait") {
+                ContainerCondition::OrientationPortrait
+            } else if val.eq_ignore_ascii_case("landscape") {
+                ContainerCondition::OrientationLandscape
+            } else {
+                ContainerCondition::Unsupported
+            };
+        }
+        let (op, axis_name) = if let Some(rest) = name.strip_prefix("min-") {
+            (ContainerCmpOp::Ge, rest)
+        } else if let Some(rest) = name.strip_prefix("max-") {
+            (ContainerCmpOp::Le, rest)
+        } else {
+            (ContainerCmpOp::Eq, name.as_str())
+        };
+        let Some(axis) = parse_container_axis(axis_name) else {
+            return ContainerCondition::Unsupported;
+        };
+        if axis == ContainerAxis::AspectRatio {
+            let Some(ratio) = parse_ratio_val(val) else {
+                return ContainerCondition::Unsupported;
+            };
+            return ContainerCondition::SizeCmp {
+                axis,
+                op,
+                value: ratio,
+                unit: crate::values::LengthUnit::Px,
+            };
+        }
+        let Some((num, unit)) = parse_container_length(val) else {
+            return ContainerCondition::Unsupported;
+        };
+        return ContainerCondition::SizeCmp {
+            axis,
+            op,
+            value: num,
+            unit,
+        };
+    }
+    // Range syntax: `width >= 400px`, `400px <= width <= 800px`, `inline-size > 30rem`
+    let mut tokens: Vec<&str> = Vec::new();
+    let mut ops: Vec<ContainerCmpOp> = Vec::new();
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let matched = if bytes[i] == b'<' && bytes.get(i + 1) == Some(&b'=') {
+            Some((ContainerCmpOp::Le, 2))
+        } else if bytes[i] == b'>' && bytes.get(i + 1) == Some(&b'=') {
+            Some((ContainerCmpOp::Ge, 2))
+        } else if bytes[i] == b'<' {
+            Some((ContainerCmpOp::Lt, 1))
+        } else if bytes[i] == b'>' {
+            Some((ContainerCmpOp::Gt, 1))
+        } else if bytes[i] == b'=' {
+            Some((ContainerCmpOp::Eq, 1))
+        } else {
+            None
+        };
+        if let Some((op, len)) = matched {
+            tokens.push(s[start..i].trim());
+            ops.push(op);
+            i += len;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    tokens.push(s[start..].trim());
+
+    let make_cmp =
+        |axis: ContainerAxis, op: ContainerCmpOp, val_str: &str| -> Option<ContainerCondition> {
+            if axis == ContainerAxis::AspectRatio {
+                let ratio = parse_ratio_val(val_str)?;
+                Some(ContainerCondition::SizeCmp {
+                    axis,
+                    op,
+                    value: ratio,
+                    unit: crate::values::LengthUnit::Px,
+                })
+            } else {
+                let (num, unit) = parse_container_length(val_str)?;
+                Some(ContainerCondition::SizeCmp {
+                    axis,
+                    op,
+                    value: num,
+                    unit,
+                })
+            }
+        };
+
+    if ops.len() == 1 && tokens.len() == 2 {
+        if let Some(axis) = parse_container_axis(tokens[0]) {
+            if let Some(c) = make_cmp(axis, ops[0], tokens[1]) {
+                return c;
+            }
+        } else if let Some(axis) = parse_container_axis(tokens[1]) {
+            if let Some(c) = make_cmp(axis, invert_cmp(ops[0]), tokens[0]) {
+                return c;
+            }
+        }
+    } else if ops.len() == 2 && tokens.len() == 3 {
+        if let Some(axis) = parse_container_axis(tokens[1]) {
+            if let (Some(c1), Some(c2)) = (
+                make_cmp(axis, invert_cmp(ops[0]), tokens[0]),
+                make_cmp(axis, ops[1], tokens[2]),
+            ) {
+                return ContainerCondition::And(vec![c1, c2]);
+            }
+        }
+    }
+    ContainerCondition::Unsupported
+}
+
 /// A compiled single-selector CSS style rule ready for indexing and matching.
 #[derive(Debug, Clone)]
 pub struct CompiledRule {
@@ -455,6 +925,7 @@ pub struct CompiledRule {
     pub source_order: u32,
     pub declarations: Arc<[SpecifiedDeclaration]>,
     pub scopes: Option<Arc<[CompiledScope]>>,
+    pub container_queries: Option<Arc<[CompiledContainerQuery]>>,
 }
 
 /// Compiled `@property` / `CSS.registerProperty` custom property registration
@@ -650,6 +1121,7 @@ struct StylesheetCompiler<'a> {
     layer_path_map: HashMap<Vec<LayerSeg>, LayerId>,
     anon_layer_counter: u32,
     scope_stack: Vec<CompiledScope>,
+    container_stack: Vec<CompiledContainerQuery>,
     font_faces: Vec<FontFaceRule>,
     keyframes: Vec<KeyframesRule>,
     registered_properties: Vec<RegisteredProperty>,
@@ -679,6 +1151,7 @@ impl<'a> StylesheetCompiler<'a> {
             layer_path_map: HashMap::new(),
             anon_layer_counter: 0,
             scope_stack: Vec::new(),
+            container_stack: Vec::new(),
             font_faces: Vec::new(),
             keyframes: Vec::new(),
             registered_properties: Vec::new(),
@@ -837,11 +1310,13 @@ impl<'a> StylesheetCompiler<'a> {
                         self.scope_stack.pop();
                     }
                 }
-                CssRule::Container(_) => {
-                    self.record_missing(MissingCssFeature::new(
-                        MissingCssKind::AtRule,
-                        "@container",
-                    ));
+                CssRule::Container(cr) => {
+                    let cname = cr.name.as_ref().map(lightning_to_css_string);
+                    let cond_str = lightning_to_css_string(&cr.condition);
+                    let compiled_cq = CompiledContainerQuery::parse(cname.as_deref(), &cond_str);
+                    self.container_stack.push(compiled_cq);
+                    self.compile_rule_list(&cr.rules, nesting, current_layer, prefix_layer);
+                    self.container_stack.pop();
                 }
                 CssRule::FontFace(ff) if !in_style_nesting => {
                     self.compile_font_face(ff, current_layer);
@@ -1053,6 +1528,13 @@ impl<'a> StylesheetCompiler<'a> {
         } else {
             Some(Arc::<[CompiledScope]>::from(self.scope_stack.as_slice()))
         };
+        let container_queries = if self.container_stack.is_empty() {
+            None
+        } else {
+            Some(Arc::<[CompiledContainerQuery]>::from(
+                self.container_stack.as_slice(),
+            ))
+        };
         for sel in selectors {
             let source_order = self.next_source_order;
             self.next_source_order = self.next_source_order.saturating_add(1);
@@ -1066,6 +1548,7 @@ impl<'a> StylesheetCompiler<'a> {
                 source_order,
                 declarations: Arc::clone(&shared_decls),
                 scopes: scopes.clone(),
+                container_queries: container_queries.clone(),
             });
         }
     }

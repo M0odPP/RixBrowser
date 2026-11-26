@@ -26,6 +26,12 @@ center > table {
 }
 li {
     display: list-item;
+    text-align: match-parent;
+}
+hr {
+    color: gray;
+    border-style: inset;
+    border-width: 1px;
 }
 table {
     display: table;
@@ -85,6 +91,9 @@ th {
     right: 0;
     bottom: 0;
     left: 0;
+}
+html {
+    font-family: serif;
 }
 body {
     margin: 8px;
@@ -170,7 +179,8 @@ button, input, select, textarea {
     display: inline-block;
     box-sizing: border-box;
     border: 1px solid #a0a6b2;
-    border-radius: 4px;
+    border-radius: 0;
+    font-size: 13.3333px;
 }
 input, textarea, select {
     background-color: #ffffff;
@@ -183,7 +193,10 @@ button {
     text-align: center;
 }
 img, svg, canvas, video {
-    display: inline-block;
+    display: inline;
+}
+img, video, canvas {
+    overflow: clip;
 }
 svg:not(:root) {
     overflow: hidden;

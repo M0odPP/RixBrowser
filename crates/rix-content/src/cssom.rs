@@ -5921,6 +5921,49 @@ pub(crate) fn format_computed_property_resolved(
                 parts.join(" ")
             }
         }
+        "container-type" => {
+            let bits = style.effects.as_ref().map_or(0, |e| e.container_type);
+            if bits == 0 {
+                "normal".into()
+            } else {
+                let mut parts = Vec::new();
+                if bits & 0x01 != 0 {
+                    parts.push("size");
+                }
+                if bits & 0x02 != 0 {
+                    parts.push("inline-size");
+                }
+                if bits & 0x04 != 0 {
+                    parts.push("scroll-state");
+                }
+                parts.join(" ")
+            }
+        }
+        "container-name" => {
+            let names = style
+                .effects
+                .as_ref()
+                .map(|e| e.container_name.as_slice())
+                .unwrap_or(&[]);
+            if names.is_empty() {
+                "none".into()
+            } else {
+                names
+                    .iter()
+                    .map(|n| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        }
+        "container" => {
+            let name = format_computed_property(style, "container-name");
+            let ty = format_computed_property(style, "container-type");
+            if ty == "normal" {
+                name
+            } else {
+                format!("{name} / {ty}")
+            }
+        }
         "position" => match style.position {
             PositionMode::Static => "static",
             PositionMode::Relative => "relative",
