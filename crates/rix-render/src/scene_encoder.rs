@@ -1064,6 +1064,22 @@ fn encode_box_shadow(
         f64::from(sx + sw),
         f64::from(sy + sh),
     );
+    // CSS Backgrounds L3 §7.1.2: An outset box-shadow is clipped out of the element's
+    // border-box so transparent elements never fill their interior with shadow color.
+    let blur_pad = blur_radius.max(0.0) * 3.0 + 4.0;
+    let clip_min_x = bounds.min_x().min(sx - blur_pad) - 2.0;
+    let clip_min_y = bounds.min_y().min(sy - blur_pad) - 2.0;
+    let clip_max_x = bounds.max_x().max(sx + sw + blur_pad) + 2.0;
+    let clip_max_y = bounds.max_y().max(sy + sh + blur_pad) + 2.0;
+    let outer_clip = KurboRect::new(
+        f64::from(clip_min_x),
+        f64::from(clip_min_y),
+        f64::from(clip_max_x),
+        f64::from(clip_max_y),
+    );
+    let mut cutout = outer_clip.to_path(0.1);
+    cutout.extend(rounded_rect(bounds, radii).path_elements(0.1));
+    scene.push_clip_layer(Fill::EvenOdd, transform, &cutout);
     if std_dev > 0.01 {
         scene.draw_blurred_rounded_rect(
             transform,
@@ -1082,4 +1098,5 @@ fn encode_box_shadow(
             adjusted_radii,
         );
     }
+    scene.pop_layer();
 }

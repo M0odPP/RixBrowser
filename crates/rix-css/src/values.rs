@@ -1604,6 +1604,15 @@ pub enum BackgroundImageValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
+pub enum BackgroundSizeValue {
+    #[default]
+    Auto,
+    Cover,
+    Contain,
+    Explicit(Option<LengthPercentage>, Option<LengthPercentage>),
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct BackgroundLayerValue {
     pub image_url: Option<InternedStr>,
     pub image: BackgroundImageValue,
@@ -1613,6 +1622,7 @@ pub struct BackgroundLayerValue {
     pub pos_y: LengthPercentage,
     pub size_cover: bool,
     pub size_contain: bool,
+    pub size: BackgroundSizeValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2969,6 +2979,29 @@ pub fn convert_image(img: &Image<'_>) -> BackgroundImageValue {
 }
 
 #[must_use]
+pub fn convert_background_size(size: &BackgroundSize) -> BackgroundSizeValue {
+    match size {
+        BackgroundSize::Cover => BackgroundSizeValue::Cover,
+        BackgroundSize::Contain => BackgroundSizeValue::Contain,
+        BackgroundSize::Explicit { width, height } => {
+            let w = match width {
+                LengthPercentageOrAuto::Auto => None,
+                LengthPercentageOrAuto::LengthPercentage(lp) => Some(convert_length_percentage(lp)),
+            };
+            let h = match height {
+                LengthPercentageOrAuto::Auto => None,
+                LengthPercentageOrAuto::LengthPercentage(lp) => Some(convert_length_percentage(lp)),
+            };
+            if w.is_none() && h.is_none() {
+                BackgroundSizeValue::Auto
+            } else {
+                BackgroundSizeValue::Explicit(w, h)
+            }
+        }
+    }
+}
+
+#[must_use]
 pub fn convert_background_layer(bg: &Background<'_>) -> BackgroundLayerValue {
     let image = convert_image(&bg.image);
     let image_url = match &image {
@@ -2976,6 +3009,7 @@ pub fn convert_background_layer(bg: &Background<'_>) -> BackgroundLayerValue {
         _ => None,
     };
     let (pos_x, pos_y) = convert_hv_axes(&bg.position.x, &bg.position.y);
+    let size = convert_background_size(&bg.size);
     BackgroundLayerValue {
         image_url,
         image,
@@ -2983,8 +3017,9 @@ pub fn convert_background_layer(bg: &Background<'_>) -> BackgroundLayerValue {
         repeat_y: !matches!(bg.repeat.y, BackgroundRepeatKeyword::NoRepeat),
         pos_x,
         pos_y,
-        size_cover: matches!(bg.size, BackgroundSize::Cover),
-        size_contain: matches!(bg.size, BackgroundSize::Contain),
+        size_cover: matches!(size, BackgroundSizeValue::Cover),
+        size_contain: matches!(size, BackgroundSizeValue::Contain),
+        size,
     }
 }
 

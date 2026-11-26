@@ -756,7 +756,12 @@ impl<'a> BoxTreeBuilder<'a> {
                         (None, None) => (nat_w, nat_h),
                     };
                     return Some(ReplacedKind::Svg {
-                        view_box: svg.view_box,
+                        view_box: svg.view_box.or(Some(rix_dom::SvgViewBox {
+                            min_x: 0.0,
+                            min_y: 0.0,
+                            width: nat_w,
+                            height: nat_h,
+                        })),
                         intrinsic_size: Size::new(iw, ih),
                         paths: svg.paths.clone(),
                     });
@@ -1210,6 +1215,21 @@ impl<'a> BoxTreeBuilder<'a> {
             c.is_block_level() && !c.is_float
         });
         if !has_block {
+            // CSS 2.1 §9.2.2.1 / §9.5.1: If a block container holds only floats, out-of-flow
+            // boxes, and collapsible whitespace text nodes (no visible inline content), strip
+            // whitespace text nodes so the container runs a clean BFC without laying out
+            // whitespace `BoxKind::Text` nodes as styled block boxes.
+            let only_floats_oof_ws = !children.is_empty()
+                && children.iter().all(|&cid| {
+                    let c = self.tree.get(cid);
+                    c.is_float || c.is_out_of_flow || self.is_whitespace_only(cid)
+                });
+            if only_floats_oof_ws {
+                return children
+                    .into_iter()
+                    .filter(|&cid| !self.is_whitespace_only(cid))
+                    .collect();
+            }
             return children;
         }
         let mut out = Vec::with_capacity(children.len());
@@ -1230,6 +1250,16 @@ impl<'a> BoxTreeBuilder<'a> {
                     }
                 }
                 out.push(cid);
+            } else if child.is_float {
+                // Keep a float inside an active inline run only when visible inline content
+                // precedes it on the same line; otherwise emit it directly as a BFC float.
+                let has_visible = inline_run.iter().any(|&id| !self.is_whitespace_only(id));
+                if has_visible {
+                    inline_run.push(cid);
+                } else {
+                    inline_run.clear();
+                    out.push(cid);
+                }
             } else {
                 inline_run.push(cid);
             }

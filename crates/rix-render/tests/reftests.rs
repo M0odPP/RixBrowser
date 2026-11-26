@@ -579,3 +579,51 @@ fn oopif_subframe_compositing_and_inline_crash_fallback() {
         "inline crashed frame alert badge expected at center: {crash_badge:?}"
     );
 }
+
+#[test]
+fn reftest_outset_box_shadow_clips_transparent_border_box_interior() {
+    // CSS Backgrounds L3 §7.1.2: An outset `box-shadow: -4px 0 0 #000` on a transparent
+    // element must paint ONLY the 4px strip outside the left border-box edge and keep the
+    // element's interior untouched (background color).
+    let pipeline = PipelineId(10);
+    let mut resources = ResourceRegistry::default();
+    let mut list = DisplayList::new(Rect::new(0.0, 0.0, 120.0, 60.0));
+    list.push(DisplayItem::Rect {
+        bounds: Rect::new(0.0, 0.0, 120.0, 60.0),
+        color: Rgba8::new(255, 255, 255, 255),
+        radii: [0.0; 4],
+    });
+    list.push(DisplayItem::BoxShadow {
+        bounds: Rect::new(20.0, 10.0, 80.0, 40.0),
+        offset: Vec2::new(-4.0, 0.0),
+        blur_radius: 0.0,
+        spread_radius: 0.0,
+        color: Rgba8::new(0, 0, 0, 255),
+        radii: [0.0; 4],
+        inset: false,
+    });
+
+    let mut scene = Scene::new();
+    encode_display_list(
+        pipeline,
+        &list,
+        &mut resources,
+        &EncodeOptions::default(),
+        &mut scene,
+    );
+    let pixels = render_rgba(&scene, 120, 60, BG_COLOR);
+
+    // Left shadow strip at x=18, y=30 must be dark/black.
+    let strip = pixel_at(&pixels, 120, 18, 30);
+    assert!(
+        strip[0] < 20 && strip[1] < 20 && strip[2] < 20,
+        "outset shadow strip outside left edge must paint black, got {strip:?}"
+    );
+
+    // Interior of transparent element at x=50, y=30 must stay pure white!
+    let interior = pixel_at(&pixels, 120, 50, 30);
+    assert!(
+        interior[0] > 240 && interior[1] > 240 && interior[2] > 240,
+        "transparent element border-box interior must be clipped out of outset box-shadow, got {interior:?}"
+    );
+}

@@ -1230,3 +1230,308 @@ fn system_font_db_default_serif_covers_basic_latin() {
         font.coverage_mask
     );
 }
+
+#[test]
+fn float_only_list_with_whitespace_lays_out_horizontally_without_phantom_blocks() {
+    // CSS 2.1 §9.2.2.1 / §9.5.1: Inter-element whitespace inside a container whose only
+    // non-whitespace children are floats must NOT generate styled block boxes or force
+    // vertical stacking.
+    let css = r#"
+        body { margin: 0; }
+        ul.bar { margin: 0; padding: 0; list-style: none; background-color: #222; min-height: 40px; }
+        ul.bar li { float: left; width: 100px; height: 30px; }
+    "#;
+    let html = r#"<!doctype html><html><body>
+        <ul class="bar" id="bar">
+            <li id="a">One</li>
+            <li id="b">Two</li>
+            <li id="c">Three</li>
+        </ul>
+    </body></html>"#;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let mut font_db = FontDatabase::new();
+    font_db.scan_system_fonts();
+    let mut resources = ResourceRegistry::default();
+    let frame = engine.layout_and_paint(
+        &doc,
+        &styles,
+        Size::new(800.0, 300.0),
+        &font_db,
+        PipelineId(1),
+        &mut resources,
+    );
+    let root = frame.fragment_tree.root.as_ref().unwrap();
+
+    let a = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("a").unwrap()).unwrap();
+    let b = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("b").unwrap()).unwrap();
+    let c = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("c").unwrap()).unwrap();
+    assert!(
+        (a.min_y() - b.min_y()).abs() < 1.0 && (b.min_y() - c.min_y()).abs() < 1.0,
+        "floated <li> items separated by whitespace must align horizontally, got a={a:?} b={b:?} c={c:?}"
+    );
+    assert!(
+        b.min_x() >= a.max_x() - 1.0 && c.min_x() >= b.max_x() - 1.0,
+        "floated <li> items must sit side-by-side horizontally, got a={a:?} b={b:?} c={c:?}"
+    );
+    let bg_rects = frame
+        .display_list
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                DisplayItem::Rect { color, .. } if color.r == 0x22 && color.g == 0x22 && color.b == 0x22
+            )
+        })
+        .count();
+    assert_eq!(
+        bg_rects, 1,
+        "whitespace text nodes inside float-only container must not paint duplicate parent backgrounds, got {bg_rects}"
+    );
+}
+
+#[test]
+fn mixed_float_and_block_with_leading_whitespace_does_not_duplicate_parent_bar() {
+    // CSS 2.1 §9.2.1.1 / §9.5.1: A container with leading whitespace, a `float: left` header,
+    // and an in-flow block child must place the float directly in the BFC without wrapping
+    // it in a decorated anonymous block.
+    let css = r#"
+        body { margin: 0; }
+        #nav { height: 40px; padding: 10px 15px; background-color: #333; border-bottom: 5px solid #08c; }
+        #logo { float: left; width: 190px; height: 40px; }
+        #menu { display: block; margin: 0; padding: 0; list-style: none; }
+        #menu li { float: right; width: 80px; height: 30px; }
+    "#;
+    let html = r#"<!doctype html><html><body>
+        <div id="nav">
+            <div id="logo">Logo</div>
+            <ul id="menu">
+                <li id="m1">Home</li>
+                <li id="m2">Docs</li>
+            </ul>
+        </div>
+    </body></html>"#;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let mut font_db = FontDatabase::new();
+    font_db.scan_system_fonts();
+    let mut resources = ResourceRegistry::default();
+    let frame = engine.layout_and_paint(
+        &doc,
+        &styles,
+        Size::new(1000.0, 300.0),
+        &font_db,
+        PipelineId(1),
+        &mut resources,
+    );
+    let root = frame.fragment_tree.root.as_ref().unwrap();
+    let logo = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("logo").unwrap()).unwrap();
+    let m1 = find_abs_rect(root, Point::ZERO, doc.get_element_by_id("m1").unwrap()).unwrap();
+    assert!(
+        (logo.min_y() - m1.min_y()).abs() < 2.0,
+        "float:left logo and float:right nav item must sit on the same bar row, got logo={logo:?} m1={m1:?}"
+    );
+    let bg_rects = frame
+        .display_list
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                DisplayItem::Rect { color, .. } if color.r == 0x33 && color.g == 0x33 && color.b == 0x33
+            )
+        })
+        .count();
+    assert_eq!(
+        bg_rects, 1,
+        "#nav must paint its #333 background exactly once, got {bg_rects}"
+    );
+}
+
+#[test]
+fn background_size_explicit_percentage_scales_svg_background_to_box_width() {
+    // CSS Backgrounds L3 §3.9: `background-size: 100% !important` must override the shorthand
+    // `background: url(...) no-repeat` auto size and scale a 740x240 SVG down to 190px wide.
+    let css = r#"
+        body { margin: 0; }
+        #logo {
+            width: 190px;
+            height: 62px;
+            background: url("brand.svg") no-repeat;
+            background-size: 100% !important;
+        }
+    "#;
+    let html = r#"<!doctype html><html><body><div id="logo"></div></body></html>"#;
+    let svg_markup = r##"<svg xmlns="http://www.w3.org/2000/svg" width="740" height="240" viewBox="0 0 740 240">
+        <rect x="0" y="0" width="740" height="240" fill="#1793d1"/>
+    </svg>"##;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let svg_doc = parse_html(svg_markup);
+    let decoded = extract_svg_from_document(&svg_doc, ColorRgba::BLACK).unwrap();
+    engine.assets.register_svg("brand.svg", decoded);
+
+    let font_db = FontDatabase::new();
+    let mut resources = ResourceRegistry::default();
+    let frame = engine.layout_and_paint(
+        &doc,
+        &styles,
+        Size::new(600.0, 200.0),
+        &font_db,
+        PipelineId(1),
+        &mut resources,
+    );
+
+    let path_id = frame
+        .display_list
+        .items
+        .iter()
+        .find_map(|item| match item {
+            DisplayItem::VectorPath { path_id, .. } => Some(*path_id),
+            _ => None,
+        })
+        .expect("SVG background must emit VectorPath");
+    let bbox = vello::kurbo::Shape::bounding_box(resources.get_path(path_id).unwrap());
+    let expected_h = 190.0 * (240.0 / 740.0);
+    assert!(
+        (bbox.width() - 190.0).abs() < 2.0 && (bbox.height() - expected_h).abs() < 2.0,
+        "background-size: 100% must scale 740x240 SVG to 190x{expected_h:.1}, got bbox={bbox:?}"
+    );
+}
+
+#[test]
+fn img_with_height_attr_scales_no_viewbox_svg_coordinates() {
+    // SVG 2: An `<img height="48" src="mark.svg">` referencing an SVG with `width="378" height="203"`
+    // and NO `viewBox` must preserve the SVG's natural 378x203 coordinate space when scaling down
+    // to 89.4x48 so vector geometry never overflows the <img> box.
+    let html = r#"<!doctype html><html><body style="margin:0"><img id="m" height="48" src="mark.svg"></body></html>"#;
+    let svg_markup = r##"<svg xmlns="http://www.w3.org/2000/svg" width="378" height="203">
+        <rect x="0" y="0" width="378" height="203" fill="#ee6123"/>
+    </svg>"##;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.cascade_full(&mut doc);
+
+    let mut engine = LayoutEngine::new();
+    let svg_doc = parse_html(svg_markup);
+    let decoded = extract_svg_from_document(&svg_doc, ColorRgba::BLACK).unwrap();
+    assert!(decoded.view_box.is_none(), "fixture SVG must lack viewBox");
+    engine.assets.register_svg("mark.svg", decoded);
+
+    let font_db = FontDatabase::new();
+    let mut resources = ResourceRegistry::default();
+    let frame = engine.layout_and_paint(
+        &doc,
+        &styles,
+        Size::new(600.0, 200.0),
+        &font_db,
+        PipelineId(1),
+        &mut resources,
+    );
+
+    let path_id = frame
+        .display_list
+        .items
+        .iter()
+        .find_map(|item| match item {
+            DisplayItem::VectorPath { path_id, .. } => Some(*path_id),
+            _ => None,
+        })
+        .expect("<img> SVG must emit VectorPath");
+    let bbox = vello::kurbo::Shape::bounding_box(resources.get_path(path_id).unwrap());
+    let expected_w = 48.0 * (378.0 / 203.0);
+    assert!(
+        (bbox.width() - expected_w).abs() < 2.0 && (bbox.height() - 48.0).abs() < 2.0,
+        "no-viewBox SVG in <img height=48> must scale to ~{expected_w:.1}x48, got bbox={bbox:?}"
+    );
+}
+
+#[test]
+fn css_var_inherit_in_font_family_falls_back_to_serif_generic() {
+    // CSS Fonts L3 §3.1 & CSS Variables L1: `:root { --f: inherit; } html { font-family: inherit; font: normal; }
+    // body { font-family: var(--f), serif; }` must resolve to a Latin serif face, NOT sans-serif.
+    let css = r#"
+        :root { --FontFamily: inherit; }
+        html { font-family: inherit; font: normal; }
+        body { font-family: var(--FontFamily), serif; }
+    "#;
+    let html = r#"<!doctype html><html><body><p id="p">Hello Serif</p></body></html>"#;
+
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let mut styles = StyleContext::new(media);
+    styles.add_stylesheet(Arc::new(Stylesheet::parse(
+        css,
+        CascadeOrigin::Author,
+        &media,
+    )));
+    styles.cascade_full(&mut doc);
+
+    let p_id = doc.get_element_by_id("p").unwrap();
+    let p_style = styles.style_for(p_id).unwrap();
+    let mut font_db = FontDatabase::new();
+    if font_db.scan_system_fonts() == 0 {
+        return;
+    }
+    let mut engine = LayoutEngine::new();
+    let (tree, _) = engine.layout_only(&doc, &styles, Size::new(600.0, 200.0), &font_db);
+    fn find_first_text_font(frag: &rix_layout::Fragment) -> Option<rix_text::FontId> {
+        if let rix_layout::FragmentKind::TextRun(run) = &frag.kind {
+            if !run.text.trim().is_empty() {
+                return Some(run.font_id);
+            }
+        }
+        for child in frag.children.iter() {
+            if let Some(id) = find_first_text_font(child) {
+                return Some(id);
+            }
+        }
+        None
+    }
+    let resolved_id = find_first_text_font(tree.root.as_ref().unwrap())
+        .expect("paragraph text must shape into a TextRun fragment");
+    let family = &font_db.get_font(resolved_id).unwrap().descriptor.family;
+    let lower = family.to_ascii_lowercase();
+    assert!(
+        (lower.contains("serif") && !lower.contains("sans"))
+            || lower.contains("times")
+            || lower.contains("roman")
+            || lower.contains("georgia"),
+        "var(--FontFamily: inherit), serif must resolve to a serif font (p_style.font_family={:?}), got '{}'",
+        p_style.text.font_family,
+        family
+    );
+}

@@ -161,20 +161,35 @@ fn read_alias(node: roxmltree::Node<'_, '_>, aliases: &mut HashMap<String, Alias
 }
 
 fn read_match_alias(node: roxmltree::Node<'_, '_>, aliases: &mut HashMap<String, AliasLists>) {
+    if node
+        .attribute("target")
+        .is_some_and(|target| target != "pattern")
+    {
+        return;
+    }
     let mut tested_families = Vec::new();
-    let mut has_non_family_test = false;
+    let mut family_test_count = 0usize;
+    let mut has_non_family_or_negated_test = false;
     for test in node.children().filter(|c| c.has_tag_name("test")) {
         if test.attribute("name") != Some("family") {
-            has_non_family_test = true;
+            has_non_family_or_negated_test = true;
             continue;
         }
+        if test
+            .attribute("compare")
+            .is_some_and(|cmp| !cmp.eq_ignore_ascii_case("eq"))
+        {
+            has_non_family_or_negated_test = true;
+            continue;
+        }
+        family_test_count += 1;
         for s in test.children().filter(|c| c.has_tag_name("string")) {
             if let Some(txt) = s.text().map(str::trim).filter(|t| !t.is_empty()) {
                 tested_families.push(txt.to_lowercase());
             }
         }
     }
-    if tested_families.is_empty() || has_non_family_test {
+    if tested_families.is_empty() || has_non_family_or_negated_test || family_test_count != 1 {
         return;
     }
     for edit in node.children().filter(|c| c.has_tag_name("edit")) {

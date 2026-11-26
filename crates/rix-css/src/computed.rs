@@ -15,18 +15,19 @@ use crate::stylesheet::{CascadeOrigin, CompiledRule, LayerId, MediaContext, Regi
 use crate::values::{
     AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
     AnimationPlayStateMode, AnimationSpec, BackgroundImageValue, BackgroundLayerValue,
-    BorderCollapseMode, BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue,
-    ColorInterpolationFiltersMode, ColorRgba, ContentVisibilityMode, CornerRadii, CssColor,
-    CursorKind, DirectionMode, DisplayMode, EdgeValues, EmptyCellsMode, EvalContext, FilterOp,
-    FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
-    GridPlacementValue, GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode,
-    LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
-    OverflowPair, OverflowWrapMode, OverlayMode, OverscrollBehaviorMode, PointerEventsMode,
-    PositionMode, ReadingFlowMode, ResizeMode, ScrollBehaviorMode, SizeValue, TableLayoutMode,
-    TextAlignLastMode, TextAlignMode, TextDecorationLine, TextJustifyMode, TextOrientationMode,
-    TextOverflowMode, TextTransformMode, TimingFunction, TransformOp, TransformOrigin,
-    TransitionBehaviorMode, TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode,
-    WhiteSpaceMode, WordBreakMode, WritingMode, ZIndexValue,
+    BackgroundSizeValue, BorderCollapseMode, BoxShadowValue, BoxSizingMode, CaptionSideMode,
+    ClearMode, ClipPathValue, ColorInterpolationFiltersMode, ColorRgba, ContentVisibilityMode,
+    CornerRadii, CssColor, CursorKind, DirectionMode, DisplayMode, EdgeValues, EmptyCellsMode,
+    EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
+    GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
+    InterpolateSizeMode, LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle,
+    MixBlendMode, OverflowMode, OverflowPair, OverflowWrapMode, OverlayMode,
+    OverscrollBehaviorMode, PointerEventsMode, PositionMode, ReadingFlowMode, ResizeMode,
+    ScrollBehaviorMode, SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode,
+    TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode, TextTransformMode,
+    TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec,
+    UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode,
+    ZIndexValue,
 };
 
 const MAX_VAR_DEPTH: u8 = 64;
@@ -84,6 +85,7 @@ pub struct VisualStyle {
     pub background_color_computed: Option<Arc<crate::color::CssColorExpr>>,
     pub background_layers: Vec<BackgroundLayerValue>,
     pub background_image_raw: Option<String>,
+    pub background_size: Option<BackgroundSizeValue>,
     pub background_position: (LengthPercentage, LengthPercentage),
     pub mask_image: BackgroundImageValue,
     pub object_position: Option<Box<crate::values_math::PositionSpec>>,
@@ -116,6 +118,7 @@ impl Default for VisualStyle {
             background_color_computed: None,
             background_layers: Vec::new(),
             background_image_raw: None,
+            background_size: None,
             background_position: (
                 LengthPercentage::Percent(0.0),
                 LengthPercentage::Percent(0.0),
@@ -2328,9 +2331,9 @@ fn single_global_keyword_token(tokens: &[CssToken]) -> Option<GlobalKeyword> {
 #[inline]
 const fn cascade_origin_group(band: u8) -> u8 {
     match band {
-        0 | 8 => 0, // UserAgent (normal / !important)
-        1 | 7 => 1, // User (normal / !important)
-        2..=6 => 2, // Presentational Hints + Author (stylesheet & inline, normal & !important)
+        0 | 10 => 0, // UserAgent (normal / !important)
+        1 | 9 => 1,  // User (normal / !important)
+        2..=8 => 2,  // Presentational Hints + Author (inner/outer/inline, normal & !important)
         _ => 2,
     }
 }
@@ -2357,7 +2360,7 @@ fn select_winning_candidate_from<'a>(
         match decl.value {
             PropertyValue::Global(GlobalKeyword::RevertRule) => {
                 reverted_rules.push(rule_id);
-                if key.band == 5 && key.layer_rank != 0 {
+                if (key.band == 6 || key.band == 8) && key.layer_rank != 0 {
                     let normal_layer = u32::MAX - key.layer_rank;
                     reverted_imp_layer_normal = Some(
                         reverted_imp_layer_normal.map_or(normal_layer, |p| p.min(normal_layer)),
@@ -2367,7 +2370,7 @@ fn select_winning_candidate_from<'a>(
             PropertyValue::Global(GlobalKeyword::RevertLayer) => {
                 // CSSWG #13916: `!important revert-rule` in an earlier layer cascading into
                 // normal `revert-layer` in a later layer forms a cascade cycle -> `unset`.
-                if key.band == 3
+                if (key.band == 3 || key.band == 4)
                     && reverted_imp_layer_normal.is_some_and(|imp_l| key.layer_rank > imp_l)
                 {
                     return None;
@@ -2638,6 +2641,9 @@ pub fn apply_declaration(
             let v = Arc::make_mut(&mut style.visual);
             v.background_layers.clear();
             v.background_image_raw = Some(raw.clone());
+        }
+        (PropertyIdKind::BackgroundSize, PropertyValue::BackgroundSize(sz)) => {
+            Arc::make_mut(&mut style.visual).background_size = Some(sz.clone());
         }
         (PropertyIdKind::MaskImage, PropertyValue::MaskImage(img)) => {
             Arc::make_mut(&mut style.visual).mask_image = img.clone();
@@ -3758,6 +3764,10 @@ fn copy_property_from_parent(
             vis.background_color = parent.visual.background_color;
             vis.background_color_computed = parent.visual.background_color_computed.clone();
         }
+        PropertyIdKind::BackgroundSize => {
+            Arc::make_mut(&mut style.visual).background_size =
+                parent.visual.background_size.clone();
+        }
         PropertyIdKind::FontSize => {
             Arc::make_mut(&mut style.text).font_size_px = parent.text.font_size_px;
         }
@@ -4572,6 +4582,9 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
             let v = Arc::make_mut(&mut style.visual);
             v.background_layers.clear();
             v.background_image_raw = None;
+        }
+        PropertyIdKind::BackgroundSize => {
+            Arc::make_mut(&mut style.visual).background_size = None;
         }
         PropertyIdKind::MaskImage => {
             Arc::make_mut(&mut style.visual).mask_image = BackgroundImageValue::None;

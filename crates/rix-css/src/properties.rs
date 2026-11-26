@@ -21,12 +21,12 @@ use crate::values::{
     angle_to_deg, convert_align_content, convert_align_items, convert_align_self, convert_alpha,
     convert_animation, convert_animation_direction, convert_animation_fill,
     convert_animation_iteration, convert_animation_name, convert_animation_play_state,
-    convert_background_layer, convert_blend_mode, convert_border_width_lp, convert_box_shadow,
-    convert_clip_path, convert_color, convert_corner_radius, convert_cursor, convert_direction,
-    convert_display, convert_easing, convert_filter, convert_flex_direction, convert_flex_wrap,
-    convert_font_family_name, convert_font_size, convert_font_style, convert_font_weight,
-    convert_grid_auto_flow, convert_image, convert_justify_content, convert_justify_items,
-    convert_justify_self, convert_length, convert_length_percentage,
+    convert_background_layer, convert_background_size, convert_blend_mode, convert_border_width_lp,
+    convert_box_shadow, convert_clip_path, convert_color, convert_corner_radius, convert_cursor,
+    convert_direction, convert_display, convert_easing, convert_filter, convert_flex_direction,
+    convert_flex_wrap, convert_font_family_name, convert_font_size, convert_font_style,
+    convert_font_weight, convert_grid_auto_flow, convert_image, convert_justify_content,
+    convert_justify_items, convert_justify_self, convert_length, convert_length_percentage,
     convert_length_percentage_or_auto, convert_length_value, convert_line_height,
     convert_line_style, convert_max_size, convert_overflow, convert_overflow_wrap,
     convert_position, convert_size, convert_spacing, convert_text_align,
@@ -35,15 +35,15 @@ use crate::values::{
     convert_visibility, convert_white_space, convert_word_break, convert_z_index, time_to_ms,
     AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
     AnimationPlayStateMode, AnimationSpec, BackgroundImageValue, BackgroundLayerValue,
-    BorderCollapseMode, BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue,
-    ColorInterpolationFiltersMode, ContentVisibilityMode, CornerRadius, CssColor, CursorKind,
-    DirectionMode, DisplayMode, EmptyCellsMode, FilterOp, FilterSpecOp, FlexDirectionMode,
-    FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode, GridPlacementValue,
-    GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode, LengthPercentage,
-    LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, ListStylePositionMode,
-    ListStyleTypeMode, MixBlendMode, OverflowMode, OverflowWrapMode, OverlayMode,
-    OverscrollBehaviorMode, PointerEventsMode, PositionMode, ReadingFlowMode, ResizeMode,
-    ScrollBehaviorMode, SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode,
+    BackgroundSizeValue, BorderCollapseMode, BoxShadowValue, BoxSizingMode, CaptionSideMode,
+    ClearMode, ClipPathValue, ColorInterpolationFiltersMode, ContentVisibilityMode, CornerRadius,
+    CssColor, CursorKind, DirectionMode, DisplayMode, EmptyCellsMode, FilterOp, FilterSpecOp,
+    FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
+    GridPlacementValue, GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode,
+    LengthPercentage, LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle,
+    ListStylePositionMode, ListStyleTypeMode, MixBlendMode, OverflowMode, OverflowWrapMode,
+    OverlayMode, OverscrollBehaviorMode, PointerEventsMode, PositionMode, ReadingFlowMode,
+    ResizeMode, ScrollBehaviorMode, SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode,
     TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode, TextTransformMode,
     TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec,
     UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode,
@@ -463,6 +463,7 @@ pub enum PropertyIdKind {
     Color,
     BackgroundColor,
     BackgroundLayers,
+    BackgroundSize,
     BackgroundPosition,
     BackgroundPositionX,
     BackgroundPositionY,
@@ -848,6 +849,7 @@ impl PropertyIdKind {
             "color" => Self::Color,
             "background-color" => Self::BackgroundColor,
             "background-image" => Self::BackgroundLayers,
+            "background-size" => Self::BackgroundSize,
             "background-position" => Self::BackgroundPosition,
             "background-position-x" => Self::BackgroundPositionX,
             "background-position-y" => Self::BackgroundPositionY,
@@ -1097,6 +1099,7 @@ impl PropertyIdKind {
             Self::Color => "color",
             Self::BackgroundColor => "background-color",
             Self::BackgroundLayers => "background-image",
+            Self::BackgroundSize => "background-size",
             Self::BackgroundPosition => "background-position",
             Self::BackgroundPositionX => "background-position-x",
             Self::BackgroundPositionY => "background-position-y",
@@ -1598,9 +1601,11 @@ impl PropertyIdKind {
                 Self::GridLanesDirection,
             ]),
             Self::Overflow => SmallVec::from_slice(&[Self::OverflowX, Self::OverflowY]),
-            Self::Background => {
-                SmallVec::from_slice(&[Self::BackgroundColor, Self::BackgroundLayers])
-            }
+            Self::Background => SmallVec::from_slice(&[
+                Self::BackgroundColor,
+                Self::BackgroundLayers,
+                Self::BackgroundSize,
+            ]),
             Self::Outline => {
                 SmallVec::from_slice(&[Self::OutlineWidth, Self::OutlineStyle, Self::OutlineColor])
             }
@@ -1941,6 +1946,7 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::Color,
     PropertyIdKind::BackgroundColor,
     PropertyIdKind::BackgroundLayers,
+    PropertyIdKind::BackgroundSize,
     PropertyIdKind::BackgroundPosition,
     PropertyIdKind::ObjectPosition,
     PropertyIdKind::BoxShadow,
@@ -2357,6 +2363,7 @@ pub enum PropertyValue {
     GridLanesPack(crate::grid_css::GridLanesPackMode),
     BoxShadow(Vec<BoxShadowValue>),
     BackgroundLayers(Vec<BackgroundLayerValue>),
+    BackgroundSize(BackgroundSizeValue),
     MaskImage(BackgroundImageValue),
     ClipRect(Option<crate::values::CssClipRect>),
     Transform(Vec<TransformOp>),
@@ -4869,12 +4876,37 @@ fn compile_property(
                     );
                 }
             }
-            let layers = bgs.iter().map(convert_background_layer).collect();
+            let layers: Vec<BackgroundLayerValue> =
+                bgs.iter().map(convert_background_layer).collect();
+            let first_size = layers
+                .first()
+                .map(|l| l.size.clone())
+                .unwrap_or(BackgroundSizeValue::Auto);
             push_decl(
                 out,
                 ord,
                 PropertyIdKind::BackgroundLayers,
                 PropertyValue::BackgroundLayers(layers),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BackgroundSize,
+                PropertyValue::BackgroundSize(first_size),
+                imp,
+            );
+        }
+        Property::BackgroundSize(sizes) => {
+            let sz = sizes
+                .first()
+                .map(convert_background_size)
+                .unwrap_or(BackgroundSizeValue::Auto);
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BackgroundSize,
+                PropertyValue::BackgroundSize(sz),
                 imp,
             );
         }
@@ -6270,14 +6302,54 @@ fn compile_property(
             imp,
         ),
         Property::FontFamily(fams) => {
-            let names = fams.iter().map(convert_font_family_name).collect();
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::FontFamily,
-                PropertyValue::FontFamily(names),
-                imp,
-            );
+            use lightningcss::properties::font::{FontFamily as LcFontFamily, GenericFontFamily};
+            if fams.len() == 1 {
+                if let LcFontFamily::Generic(g) = &fams[0] {
+                    let global_kw = match g {
+                        GenericFontFamily::Initial => Some(GlobalKeyword::Initial),
+                        GenericFontFamily::Inherit => Some(GlobalKeyword::Inherit),
+                        GenericFontFamily::Unset => Some(GlobalKeyword::Unset),
+                        GenericFontFamily::Revert => Some(GlobalKeyword::Revert),
+                        GenericFontFamily::RevertLayer => Some(GlobalKeyword::RevertLayer),
+                        _ => None,
+                    };
+                    if let Some(kw) = global_kw {
+                        push_decl(
+                            out,
+                            ord,
+                            PropertyIdKind::FontFamily,
+                            PropertyValue::Global(kw),
+                            imp,
+                        );
+                        return;
+                    }
+                }
+            }
+            // CSS Fonts L3 §3.1 & CSS Values L4 §3.1.2: CSS-wide keywords and `default` are
+            // invalid as unquoted `<family-name>` inside a `font-family` list.
+            let has_reserved_kw = fams.iter().any(|f| {
+                matches!(
+                    f,
+                    LcFontFamily::Generic(
+                        GenericFontFamily::Initial
+                            | GenericFontFamily::Inherit
+                            | GenericFontFamily::Unset
+                            | GenericFontFamily::Default
+                            | GenericFontFamily::Revert
+                            | GenericFontFamily::RevertLayer
+                    )
+                )
+            });
+            if !has_reserved_kw {
+                let names = fams.iter().map(convert_font_family_name).collect();
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::FontFamily,
+                    PropertyValue::FontFamily(names),
+                    imp,
+                );
+            }
         }
         Property::LineHeight(lh) => push_decl(
             out,
@@ -6287,42 +6359,58 @@ fn compile_property(
             imp,
         ),
         Property::Font(f) => {
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::FontSize,
-                PropertyValue::Length(convert_font_size(&f.size)),
-                imp,
-            );
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::FontWeight,
-                PropertyValue::Number(convert_font_weight(&f.weight)),
-                imp,
-            );
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::FontStyle,
-                PropertyValue::FontStyle(convert_font_style(&f.style)),
-                imp,
-            );
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::LineHeight,
-                PropertyValue::LineHeight(convert_line_height(&f.line_height)),
-                imp,
-            );
-            let names = f.family.iter().map(convert_font_family_name).collect();
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::FontFamily,
-                PropertyValue::FontFamily(names),
-                imp,
-            );
+            use lightningcss::properties::font::{FontFamily as LcFontFamily, GenericFontFamily};
+            let has_reserved_kw = f.family.iter().any(|fam| {
+                matches!(
+                    fam,
+                    LcFontFamily::Generic(
+                        GenericFontFamily::Initial
+                            | GenericFontFamily::Inherit
+                            | GenericFontFamily::Unset
+                            | GenericFontFamily::Default
+                            | GenericFontFamily::Revert
+                            | GenericFontFamily::RevertLayer
+                    )
+                )
+            });
+            if !has_reserved_kw {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::FontSize,
+                    PropertyValue::Length(convert_font_size(&f.size)),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::FontWeight,
+                    PropertyValue::Number(convert_font_weight(&f.weight)),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::FontStyle,
+                    PropertyValue::FontStyle(convert_font_style(&f.style)),
+                    imp,
+                );
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::LineHeight,
+                    PropertyValue::LineHeight(convert_line_height(&f.line_height)),
+                    imp,
+                );
+                let names = f.family.iter().map(convert_font_family_name).collect();
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::FontFamily,
+                    PropertyValue::FontFamily(names),
+                    imp,
+                );
+            }
         }
         Property::LetterSpacing(sp) => push_decl(
             out,
