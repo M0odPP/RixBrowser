@@ -245,9 +245,53 @@ fn convert_token_or_value(item: &TokenOrValue<'_>, out: &mut Vec<CssToken>) {
             };
             out.push(CssToken::Dimension(dppx, intern_str("dppx")));
         }
-        TokenOrValue::Env(_)
-        | TokenOrValue::UnresolvedColor(_)
-        | TokenOrValue::AnimationName(_) => {}
+        TokenOrValue::UnresolvedColor(uc) => match uc {
+            lightningcss::properties::custom::UnresolvedColor::RGB { r, g, b, alpha } => {
+                let mut args = vec![
+                    CssToken::Number(*r),
+                    CssToken::Space,
+                    CssToken::Number(*g),
+                    CssToken::Space,
+                    CssToken::Number(*b),
+                    CssToken::Space,
+                    CssToken::Delim('/'),
+                    CssToken::Space,
+                ];
+                args.extend(convert_token_list(alpha));
+                out.push(CssToken::Function {
+                    name: intern_str("rgb"),
+                    args,
+                });
+            }
+            lightningcss::properties::custom::UnresolvedColor::HSL { h, s, l, alpha } => {
+                let mut args = vec![
+                    CssToken::Number(*h),
+                    CssToken::Space,
+                    CssToken::Percentage(*s / 100.0),
+                    CssToken::Space,
+                    CssToken::Percentage(*l / 100.0),
+                    CssToken::Space,
+                    CssToken::Delim('/'),
+                    CssToken::Space,
+                ];
+                args.extend(convert_token_list(alpha));
+                out.push(CssToken::Function {
+                    name: intern_str("hsl"),
+                    args,
+                });
+            }
+            lightningcss::properties::custom::UnresolvedColor::LightDark { light, dark } => {
+                let mut args = convert_token_list(light);
+                args.push(CssToken::Comma);
+                args.push(CssToken::Space);
+                args.extend(convert_token_list(dark));
+                out.push(CssToken::Function {
+                    name: intern_str("light-dark"),
+                    args,
+                });
+            }
+        },
+        TokenOrValue::Env(_) | TokenOrValue::AnimationName(_) => {}
     }
 }
 
@@ -476,6 +520,9 @@ pub enum PropertyIdKind {
     StrokeWidth,
     StrokeDashoffset,
     StrokeDasharray,
+    SvgFill,
+    SvgStroke,
+    SvgFillRule,
     ScrollPaddingTop,
     ScrollPaddingRight,
     ScrollPaddingBottom,
@@ -863,6 +910,9 @@ impl PropertyIdKind {
             "stroke-width" => Self::StrokeWidth,
             "stroke-dashoffset" => Self::StrokeDashoffset,
             "stroke-dasharray" => Self::StrokeDasharray,
+            "fill" => Self::SvgFill,
+            "stroke" => Self::SvgStroke,
+            "fill-rule" => Self::SvgFillRule,
             "scroll-padding-top" => Self::ScrollPaddingTop,
             "scroll-padding-right" => Self::ScrollPaddingRight,
             "scroll-padding-bottom" => Self::ScrollPaddingBottom,
@@ -1114,6 +1164,9 @@ impl PropertyIdKind {
             Self::StrokeWidth => "stroke-width",
             Self::StrokeDashoffset => "stroke-dashoffset",
             Self::StrokeDasharray => "stroke-dasharray",
+            Self::SvgFill => "fill",
+            Self::SvgStroke => "stroke",
+            Self::SvgFillRule => "fill-rule",
             Self::ScrollPaddingTop => "scroll-padding-top",
             Self::ScrollPaddingRight => "scroll-padding-right",
             Self::ScrollPaddingBottom => "scroll-padding-bottom",
@@ -1364,6 +1417,9 @@ impl PropertyIdKind {
             self,
             Self::Color
                 | Self::ColorScheme
+                | Self::SvgFill
+                | Self::SvgStroke
+                | Self::SvgFillRule
                 | Self::Visibility
                 | Self::PointerEvents
                 | Self::Cursor
@@ -2339,6 +2395,8 @@ pub enum PropertyValue {
     Integer(i32),
     Color(CssColor),
     Color4(Box<crate::color::CssColorExpr>),
+    SvgPaint(Option<CssColor>),
+    SvgFillRuleEvenOdd(bool),
     Size(SizeValue),
     Length(LengthPercentage),
     LengthAuto(LengthPercentageAuto),
@@ -4512,6 +4570,47 @@ pub fn parse_property_from_str(
                 order: 0,
             })
             .collect();
+    }
+    if matches!(prop, PropertyIdKind::SvgFill | PropertyIdKind::SvgStroke) {
+        if trimmed.eq_ignore_ascii_case("none") {
+            return vec![SpecifiedDeclaration {
+                property: prop,
+                custom_name: None,
+                value: PropertyValue::SvgPaint(None),
+                important,
+                order: 0,
+            }];
+        }
+        if let Some(mut expr) = crate::color::parse_css_color(trimmed) {
+            expr.bind_random_property(prop.css_name());
+            return vec![SpecifiedDeclaration {
+                property: prop,
+                custom_name: None,
+                value: PropertyValue::Color4(Box::new(expr)),
+                important,
+                order: 0,
+            }];
+        }
+        return Vec::new();
+    }
+    if prop == PropertyIdKind::SvgFillRule {
+        let even_odd = if trimmed.eq_ignore_ascii_case("evenodd") {
+            Some(true)
+        } else if trimmed.eq_ignore_ascii_case("nonzero") {
+            Some(false)
+        } else {
+            None
+        };
+        if let Some(v) = even_odd {
+            return vec![SpecifiedDeclaration {
+                property: prop,
+                custom_name: None,
+                value: PropertyValue::SvgFillRuleEvenOdd(v),
+                important,
+                order: 0,
+            }];
+        }
+        return Vec::new();
     }
     if crate::cssom_decl::is_color_longhand(prop) {
         if let Some(mut expr) = crate::color::parse_css_color(trimmed) {
@@ -7334,6 +7433,90 @@ fn compile_property(
                 ord,
                 PropertyIdKind::All,
                 PropertyValue::Global(gk),
+                imp,
+            );
+        }
+        Property::Fill(paint) => match paint {
+            lightningcss::properties::svg::SVGPaint::None => {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::SvgFill,
+                    PropertyValue::SvgPaint(None),
+                    imp,
+                );
+            }
+            lightningcss::properties::svg::SVGPaint::Color(c) => {
+                if let Some(col) = convert_color(c) {
+                    push_decl(
+                        out,
+                        ord,
+                        PropertyIdKind::SvgFill,
+                        PropertyValue::SvgPaint(Some(col)),
+                        imp,
+                    );
+                }
+            }
+            lightningcss::properties::svg::SVGPaint::Url {
+                fallback: Some(lightningcss::properties::svg::SVGPaintFallback::Color(c)),
+                ..
+            } => {
+                if let Some(col) = convert_color(c) {
+                    push_decl(
+                        out,
+                        ord,
+                        PropertyIdKind::SvgFill,
+                        PropertyValue::SvgPaint(Some(col)),
+                        imp,
+                    );
+                }
+            }
+            _ => {}
+        },
+        Property::Stroke(paint) => match paint {
+            lightningcss::properties::svg::SVGPaint::None => {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::SvgStroke,
+                    PropertyValue::SvgPaint(None),
+                    imp,
+                );
+            }
+            lightningcss::properties::svg::SVGPaint::Color(c) => {
+                if let Some(col) = convert_color(c) {
+                    push_decl(
+                        out,
+                        ord,
+                        PropertyIdKind::SvgStroke,
+                        PropertyValue::SvgPaint(Some(col)),
+                        imp,
+                    );
+                }
+            }
+            lightningcss::properties::svg::SVGPaint::Url {
+                fallback: Some(lightningcss::properties::svg::SVGPaintFallback::Color(c)),
+                ..
+            } => {
+                if let Some(col) = convert_color(c) {
+                    push_decl(
+                        out,
+                        ord,
+                        PropertyIdKind::SvgStroke,
+                        PropertyValue::SvgPaint(Some(col)),
+                        imp,
+                    );
+                }
+            }
+            _ => {}
+        },
+        Property::FillRule(rule) => {
+            let even_odd = matches!(rule, lightningcss::values::shape::FillRule::Evenodd);
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::SvgFillRule,
+                PropertyValue::SvgFillRuleEvenOdd(even_odd),
                 imp,
             );
         }

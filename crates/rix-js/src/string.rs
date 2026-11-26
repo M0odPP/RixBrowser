@@ -19,6 +19,9 @@ pub enum JsString {
     Flat {
         data: String,
         utf16_len: usize,
+        /// Lazily materialized UTF-16 code units for non-ASCII strings so repeated
+        /// `charCodeAt(i)` / `charAt(i)` / `slice()` calls remain O(1) instead of O(N^2).
+        utf16_cache: Option<Arc<[u16]>>,
     },
     Interned {
         data: Arc<str>,
@@ -43,7 +46,11 @@ impl JsString {
     #[must_use]
     pub fn from_owned(data: String) -> Self {
         let utf16_len = data.encode_utf16().count();
-        Self::Flat { data, utf16_len }
+        Self::Flat {
+            data,
+            utf16_len,
+            utf16_cache: None,
+        }
     }
 
     #[must_use]

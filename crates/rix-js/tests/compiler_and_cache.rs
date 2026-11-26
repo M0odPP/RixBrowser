@@ -571,3 +571,27 @@ fn string_char_code_at_and_slice_are_o1_on_large_ropes_and_exact_on_utf16() {
     );
     assert_eq!(val.as_bool(), Some(true));
 }
+
+#[test]
+fn non_ascii_large_string_char_code_at_loop_is_linear_via_utf16_cache() {
+    // ECMA-262 §22.1.3: repeated `charCodeAt(i)` over a 40,000-unit non-ASCII string must run in
+    // O(N) total time via lazy UTF-16 caching instead of O(N^2) UTF-8 decoding per call.
+    let src = r#"
+        let s = "©";
+        for (let i = 0; i < 4000; i++) s += "0123456789";
+        let sum = 0;
+        for (let i = 0; i < s.length; i++) sum += s.charCodeAt(i);
+        s.charCodeAt(0) === 169 && s.slice(0, 4) === "©012" && s.length === 40001 && sum > 0
+    "#;
+    let mut vm = rix_js::JsVm::new();
+    let t0 = std::time::Instant::now();
+    let val = vm
+        .eval_script(src)
+        .expect("large non-ASCII charCodeAt loop must succeed");
+    assert!(
+        t0.elapsed().as_millis() < 1500,
+        "40,000-iteration non-ASCII charCodeAt loop took too long: {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(val.as_bool(), Some(true));
+}

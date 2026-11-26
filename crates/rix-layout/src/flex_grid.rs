@@ -217,7 +217,14 @@ pub fn layout_flex_grid_container(
     for (cid, item_layout) in item_layouts {
         let item_w = item_layout.size.width.max(0.0);
         let item_h = item_layout.size.height.max(0.0);
-        let probe_key = (cid, LayoutContext::quantize_px(item_w), u32::MAX);
+        let probe_key = crate::fragment::PassFragmentKey {
+            box_id: cid,
+            avail_w: LayoutContext::quantize_px(item_w),
+            avail_h: u32::MAX,
+            def_w: u32::MAX,
+            def_h: u32::MAX,
+            ignore_h: false,
+        };
         let reused_frag = if !has_percent_height_direct_child(ctx.tree, cid) {
             ctx.pass_fragment_memo.get(&probe_key).and_then(|f| {
                 if (f.border_rect.size.height - item_h).abs() < 0.75 {

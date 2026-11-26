@@ -555,3 +555,48 @@ fn font_face_parses_unicode_ranges_per_css_fonts_l4() {
         vec![(0x0000, 0x00FF), (0x0131, 0x0131), (0x2000, 0x20FF)]
     );
 }
+
+#[test]
+fn unresolved_rgb_hsl_var_alpha_and_svg_fill_cascade_accurately() {
+    // CSS Color 4 / Tailwind v3: `rgb(R G B / var(--op, 1))`, `hsl(H S% L% / var(--op))`, and
+    // `light-dark(var(--l), var(--d))` parsed by lightningcss as `TokenOrValue::UnresolvedColor`
+    // must preserve all channels across `var()` substitution, and SVG `fill`/`fill-rule` must
+    // inherit per SVG 2 §13.
+    let css = r#"
+        :root { --tw-bg-opacity: 1; --tw-text-opacity: 0.5; --l: #112233; --d: #abcdef; }
+        .hero {
+            background-color: rgb(6 9 19/var(--tw-bg-opacity,1));
+            color: rgb(255 255 255/var(--tw-text-opacity,1));
+            border-color: hsl(120 100% 50% / var(--tw-bg-opacity, 1));
+        }
+        .ripples svg { fill: #ff1f8f; fill-rule: evenodd; }
+    "#;
+    let html = r#"<!doctype html><html><body>
+        <div id="h" class="hero"></div>
+        <div class="ripples"><svg id="s"></svg></div>
+    </body></html>"#;
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let sheet = Arc::new(Stylesheet::parse(css, CascadeOrigin::Author, &media));
+    let mut ctx = StyleContext::new(media);
+    ctx.add_stylesheet(sheet);
+    ctx.cascade_full(&mut doc);
+
+    let h = find_by_id(&doc, "h");
+    let s = find_by_id(&doc, "s");
+    let h_st = ctx.style_for(h).unwrap();
+    assert_eq!(h_st.visual.background_color, ColorRgba::rgb(6, 9, 19));
+    assert_eq!(h_st.text.color, ColorRgba::rgba(255, 255, 255, 128));
+    assert_eq!(
+        h_st.visual.border_color.top.resolve(h_st.text.color, false),
+        ColorRgba::rgb(0, 255, 0)
+    );
+    let s_st = ctx.style_for(s).unwrap();
+    assert_eq!(
+        s_st.text.svg_fill,
+        Some(Some(rix_css::CssColor::Rgba(ColorRgba::rgb(
+            0xff, 0x1f, 0x8f
+        ))))
+    );
+    assert!(s_st.text.svg_fill_rule_even_odd);
+}

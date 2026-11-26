@@ -461,6 +461,8 @@ pub enum DisplayItem {
         path_id: PathResourceId,
         fill: Option<Rgba8>,
         stroke: Option<(Rgba8, f32)>,
+        #[serde(default)]
+        fill_rule_even_odd: bool,
     },
     ExternalSurface {
         bounds: Rect,

@@ -95,6 +95,7 @@ fn headless_gpu_shapes_gradient_border_shadow_and_svg() {
         path_id,
         fill: Some(Rgba8::new(210, 80, 220, 255)),
         stroke: None,
+        fill_rule_even_odd: false,
     });
 
     let mut scene = Scene::new();

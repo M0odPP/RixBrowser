@@ -204,6 +204,12 @@ pub struct InheritedTextStyle {
     pub word_space_transform: crate::text_css::WordSpaceTransformMode,
     pub interpolate_size: InterpolateSizeMode,
     pub color_interpolation_filters: ColorInterpolationFiltersMode,
+    /// Inherited SVG 2 presentation `fill` (`None` = unspecified/default black, `Some(None)` = `none`, `Some(Some(c))` = color).
+    pub svg_fill: Option<Option<CssColor>>,
+    /// Inherited SVG 2 presentation `stroke`.
+    pub svg_stroke: Option<Option<CssColor>>,
+    /// Inherited SVG 2 presentation `fill-rule` (`true` = `evenodd`, `false` = `nonzero`).
+    pub svg_fill_rule_even_odd: bool,
     pub list_style_type: crate::values::ListStyleTypeMode,
     pub list_style_position: crate::values::ListStylePositionMode,
     pub text_shadow: Vec<BoxShadowValue>,
@@ -263,6 +269,9 @@ impl Default for InheritedTextStyle {
             word_space_transform: crate::text_css::WordSpaceTransformMode::None,
             interpolate_size: InterpolateSizeMode::NumericOnly,
             color_interpolation_filters: ColorInterpolationFiltersMode::LinearRgb,
+            svg_fill: None,
+            svg_stroke: None,
+            svg_fill_rule_even_odd: false,
             list_style_type: crate::values::ListStyleTypeMode::Disc,
             list_style_position: crate::values::ListStylePositionMode::Outside,
             text_shadow: Vec::new(),
@@ -3594,6 +3603,35 @@ pub fn apply_declaration(
         ) => {
             Arc::make_mut(&mut style.text).color_interpolation_filters = *v;
         }
+        (PropertyIdKind::SvgFill, PropertyValue::SvgPaint(v)) => {
+            Arc::make_mut(&mut style.text).svg_fill = Some(*v);
+        }
+        (PropertyIdKind::SvgFill, PropertyValue::Color4(expr)) => {
+            let resolved = expr
+                .resolve(
+                    crate::color::ResolvedColor::from_rgba(current_color),
+                    effective_dark,
+                    eval,
+                )
+                .to_srgb_u8();
+            Arc::make_mut(&mut style.text).svg_fill = Some(Some(CssColor::Rgba(resolved)));
+        }
+        (PropertyIdKind::SvgStroke, PropertyValue::SvgPaint(v)) => {
+            Arc::make_mut(&mut style.text).svg_stroke = Some(*v);
+        }
+        (PropertyIdKind::SvgStroke, PropertyValue::Color4(expr)) => {
+            let resolved = expr
+                .resolve(
+                    crate::color::ResolvedColor::from_rgba(current_color),
+                    effective_dark,
+                    eval,
+                )
+                .to_srgb_u8();
+            Arc::make_mut(&mut style.text).svg_stroke = Some(Some(CssColor::Rgba(resolved)));
+        }
+        (PropertyIdKind::SvgFillRule, PropertyValue::SvgFillRuleEvenOdd(v)) => {
+            Arc::make_mut(&mut style.text).svg_fill_rule_even_odd = *v;
+        }
         (PropertyIdKind::ClipPath, PropertyValue::ClipPath(v)) => {
             style.effects_mut().clip_path = v.clone();
         }
@@ -4508,6 +4546,16 @@ fn copy_property_from_parent(
             Arc::make_mut(&mut style.text).color_interpolation_filters =
                 parent.text.color_interpolation_filters;
         }
+        PropertyIdKind::SvgFill => {
+            Arc::make_mut(&mut style.text).svg_fill = parent.text.svg_fill;
+        }
+        PropertyIdKind::SvgStroke => {
+            Arc::make_mut(&mut style.text).svg_stroke = parent.text.svg_stroke;
+        }
+        PropertyIdKind::SvgFillRule => {
+            Arc::make_mut(&mut style.text).svg_fill_rule_even_odd =
+                parent.text.svg_fill_rule_even_odd;
+        }
         PropertyIdKind::BoxShadow => {
             style.effects_mut().box_shadow = parent
                 .effects
@@ -5311,6 +5359,15 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         PropertyIdKind::ColorInterpolationFilters => {
             Arc::make_mut(&mut style.text).color_interpolation_filters =
                 ColorInterpolationFiltersMode::LinearRgb;
+        }
+        PropertyIdKind::SvgFill => {
+            Arc::make_mut(&mut style.text).svg_fill = None;
+        }
+        PropertyIdKind::SvgStroke => {
+            Arc::make_mut(&mut style.text).svg_stroke = None;
+        }
+        PropertyIdKind::SvgFillRule => {
+            Arc::make_mut(&mut style.text).svg_fill_rule_even_odd = false;
         }
         PropertyIdKind::BoxShadow => {
             if let Some(eff) = &mut style.effects {

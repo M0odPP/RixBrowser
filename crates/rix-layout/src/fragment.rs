@@ -691,6 +691,17 @@ impl LayoutCache {
     }
 }
 
+/// Per-pass layout memo key capturing definite override dimensions used by Flex/Grid passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PassFragmentKey {
+    pub(crate) box_id: BoxId,
+    pub(crate) avail_w: u32,
+    pub(crate) avail_h: u32,
+    pub(crate) def_w: u32,
+    pub(crate) def_h: u32,
+    pub(crate) ignore_h: bool,
+}
+
 /// Shared layout execution context threaded through all formatting contexts.
 pub struct LayoutContext<'a> {
     pub tree: &'a BoxTree,
@@ -700,8 +711,8 @@ pub struct LayoutContext<'a> {
     pub cache: &'a mut LayoutCache,
     /// Per-pass memo for `measure_intrinsic_widths` eliminating exponential recursion in nested Flex/Grid/Tables.
     pub(crate) pass_intrinsic_memo: HashMap<(BoxId, u32, u32), (f32, f32)>,
-    /// Per-pass memo for `layout_box` keyed by `(box_id, avail_w_q, avail_h_q)` (active even on initial dirty passes!).
-    pub(crate) pass_fragment_memo: HashMap<(BoxId, u32, u32), Fragment>,
+    /// Per-pass memo for `layout_box` keyed by full constraint overrides (including Flex/Grid definite sizes).
+    pub(crate) pass_fragment_memo: HashMap<PassFragmentKey, Fragment>,
     /// Out-of-flow (`position: absolute | fixed`) boxes propagating upward to their true CSS containing block.
     pub(crate) pending_oof: Vec<crate::position::PendingOof>,
 }
@@ -876,23 +887,34 @@ pub fn layout_tree_with_scroll(
 /// per-pass memoization and [`LayoutCache`] first to keep nested Flex/Grid/Table passes strictly linear.
 pub fn layout_box(ctx: &mut LayoutContext<'_>, box_id: BoxId, space: ConstraintSpace) -> Fragment {
     let b = ctx.tree.get(box_id);
-    // Only reuse cached fragments for boxes that establish an independent formatting context
-    // or have no incoming external floats (BFC roots, Flex, Grid, Table, Replaced).
-    let cacheable = space.definite_width_override.is_none()
+    // Per-pass memoization covers ALL BFC/Block/Flex/Grid/Table/InlineBlock boxes including
+    // Flex and Grid items sized with definite overrides (preventing O(2^depth) exponential
+    // re-layout in deeply nested Flex/Grid trees).
+    let pass_cacheable = b.establishes_bfc
+        || matches!(
+            b.kind,
+            BoxKind::Block { .. } | BoxKind::InlineBlock { .. } | BoxKind::Table
+        );
+    let cross_frame_cacheable = pass_cacheable
+        && space.definite_width_override.is_none()
         && space.definite_height_override.is_none()
-        && !space.ignore_specified_height
-        && (b.establishes_bfc || matches!(b.kind, BoxKind::Block { .. } | BoxKind::Table));
-    let pass_key = (
+        && !space.ignore_specified_height;
+    let pass_key = PassFragmentKey {
         box_id,
-        LayoutContext::quantize_px(space.available_width),
-        LayoutContext::quantize_opt_px(space.available_height),
-    );
-    if cacheable {
+        avail_w: LayoutContext::quantize_px(space.available_width),
+        avail_h: LayoutContext::quantize_opt_px(space.available_height),
+        def_w: LayoutContext::quantize_opt_px(space.definite_width_override),
+        def_h: LayoutContext::quantize_opt_px(space.definite_height_override),
+        ignore_h: space.ignore_specified_height,
+    };
+    if pass_cacheable {
         if let Some(hit) = ctx.pass_fragment_memo.get(&pass_key) {
             return hit.clone();
         }
-        if let Some(cached) = ctx.cache.get_fragment(b, &space) {
-            return cached;
+        if cross_frame_cacheable {
+            if let Some(cached) = ctx.cache.get_fragment(b, &space) {
+                return cached;
+            }
         }
     }
 
@@ -919,12 +941,14 @@ pub fn layout_box(ctx: &mut LayoutContext<'_>, box_id: BoxId, space: ConstraintS
     };
     let propagated_oof = ctx.pending_oof.len() > oof_before;
 
-    if cacheable && !propagated_oof {
-        if ctx.pass_fragment_memo.len() < 16_384 {
+    if pass_cacheable && !propagated_oof {
+        if ctx.pass_fragment_memo.len() < 32_768 {
             ctx.pass_fragment_memo.insert(pass_key, frag.clone());
         }
-        ctx.cache
-            .store_fragment(ctx.tree.get(box_id), &space, &frag);
+        if cross_frame_cacheable {
+            ctx.cache
+                .store_fragment(ctx.tree.get(box_id), &space, &frag);
+        }
     }
     frag
 }

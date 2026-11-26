@@ -4185,21 +4185,12 @@ impl JsVm {
         if let Some(str_h) = obj_val.as_string() {
             if let Some(idx) = self.as_array_index(key_val) {
                 let idx_usize = idx as usize;
-                let ch_opt: Option<String> =
-                    self.heap.flatten_string(str_h).and_then(|(s, utf16_len)| {
-                        if s.len() == utf16_len {
-                            s.as_bytes()
-                                .get(idx_usize)
-                                .map(|&b| (b as char).to_string())
-                        } else {
-                            s.encode_utf16().nth(idx_usize).map(|unit| {
-                                char::from_u32(u32::from(unit))
-                                    .map_or_else(|| "\u{FFFD}".to_string(), |c| c.to_string())
-                            })
-                        }
-                    });
-                return match ch_opt {
-                    Some(ch) => Ok(JsValue::from_string(self.heap.alloc_string(ch))),
+                return match self.heap.string_utf16_at(str_h, idx_usize) {
+                    Some(unit) => {
+                        let ch = char::from_u32(u32::from(unit))
+                            .map_or_else(|| "\u{FFFD}".to_string(), |c| c.to_string());
+                        Ok(JsValue::from_string(self.heap.alloc_string(ch)))
+                    }
                     None => Ok(JsValue::UNDEFINED),
                 };
             }

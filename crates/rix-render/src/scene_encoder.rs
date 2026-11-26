@@ -818,6 +818,7 @@ pub fn encode_display_list_ranges(
                 path_id,
                 fill,
                 stroke,
+                fill_rule_even_odd,
             } => {
                 if bounds.is_empty() {
                     idx += 1;
@@ -837,7 +838,11 @@ pub fn encode_display_list_ranges(
                         * Affine::translate((f64::from(bounds.min_x()), f64::from(bounds.min_y())));
                     if let Some(fill_color) = fill {
                         scene.fill(
-                            Fill::NonZero,
+                            if *fill_rule_even_odd {
+                                Fill::EvenOdd
+                            } else {
+                                Fill::NonZero
+                            },
                             path_transform,
                             fill_color.to_vello_color(),
                             None,
