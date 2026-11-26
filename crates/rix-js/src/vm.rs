@@ -6144,6 +6144,18 @@ impl JsVm {
         }
     }
 
+    /// Returns `true` if `h` is the untouched built-in static native function `f`.
+    #[must_use]
+    pub fn is_native_static_fn(&self, h: HeapHandle, f: NativeFnPtr) -> bool {
+        let Some(ObjectKind::NativeFunction(id)) = self.heap.get_object(h).map(|o| &o.kind) else {
+            return false;
+        };
+        matches!(
+            self.native_fns.get(*id as usize),
+            Some(NativeCallable::Static(ptr)) if (*ptr as usize) == (f as usize)
+        )
+    }
+
     pub fn value_to_rust_string(&self, val: JsValue) -> String {
         let mut visited = Vec::new();
         self.value_to_rust_string_inner(val, &mut visited)

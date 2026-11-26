@@ -270,26 +270,58 @@ pub fn extract_svg_from_node_with_css(
     css_stroke: Option<Option<ColorRgba>>,
     css_fill_rule_even_odd: bool,
 ) -> Option<DecodedSvg> {
+    extract_svg_from_node_with_css_and_viewport(
+        doc,
+        svg_node,
+        current_color,
+        css_fill,
+        css_stroke,
+        css_fill_rule_even_odd,
+        None,
+    )
+}
+
+/// Extracts vector paths from `<svg>` with an explicit resolved host viewport `(iw, ih)` so
+/// `<use href="#sym">` referencing `<symbol viewBox="...">` scales accurately per SVG 2 §5.7.1.
+#[must_use]
+pub fn extract_svg_from_node_with_css_and_viewport(
+    doc: &Document,
+    svg_node: NodeId,
+    current_color: ColorRgba,
+    css_fill: Option<Option<ColorRgba>>,
+    css_stroke: Option<Option<ColorRgba>>,
+    css_fill_rule_even_odd: bool,
+    resolved_viewport: Option<Size>,
+) -> Option<DecodedSvg> {
     let Some(NodeData::Element(elem)) = doc.get(svg_node) else {
         return None;
     };
-    let view_box = elem.get_attribute("viewBox").and_then(SvgViewBox::parse);
+    let view_box = elem
+        .get_attribute("viewBox")
+        .or_else(|| elem.get_attribute("viewbox"))
+        .and_then(SvgViewBox::parse);
     let attr_w = elem
         .get_attribute("width")
         .and_then(parse_html_dimension_attr);
     let attr_h = elem
         .get_attribute("height")
         .and_then(parse_html_dimension_attr);
-    let iw = attr_w
+    let iw = resolved_viewport
+        .map(|s| s.width)
+        .or(attr_w)
         .or_else(|| view_box.map(|vb| vb.width))
         .unwrap_or(32.0)
         .max(1.0);
-    let ih = attr_h
+    let ih = resolved_viewport
+        .map(|s| s.height)
+        .or(attr_h)
         .or_else(|| view_box.map(|vb| vb.height))
         .unwrap_or(32.0)
         .max(1.0);
     let mut paths = Vec::new();
-    let ctx = SvgExtractContext::build(doc, svg_node, current_color);
+    let coord_w = view_box.map_or(iw, |vb| vb.width.max(1.0));
+    let coord_h = view_box.map_or(ih, |vb| vb.height.max(1.0));
+    let ctx = SvgExtractContext::build(doc, svg_node, current_color, coord_w, coord_h);
     let root_style = parse_inline_svg_style(elem.get_attribute("style").unwrap_or(""));
     let inherited_fill = root_style
         .get("fill")
@@ -373,7 +405,7 @@ pub fn collect_svg_paths_from_dom(
     inherited_stroke_w: f32,
     out: &mut Vec<SvgPathEntry>,
 ) {
-    let ctx = SvgExtractContext::build(doc, parent, current_color);
+    let ctx = SvgExtractContext::build(doc, parent, current_color, 32.0, 32.0);
     collect_svg_paths_inner(
         doc,
         parent,
@@ -419,16 +451,26 @@ struct SvgExtractContext {
     class_rules: HashMap<String, SvgStyleRule>,
     tag_rules: HashMap<String, SvgStyleRule>,
     id_rules: HashMap<String, SvgStyleRule>,
+    viewport_w: f32,
+    viewport_h: f32,
 }
 
 impl SvgExtractContext {
-    fn build(doc: &Document, root: NodeId, current_color: ColorRgba) -> Self {
+    fn build(
+        doc: &Document,
+        root: NodeId,
+        current_color: ColorRgba,
+        viewport_w: f32,
+        viewport_h: f32,
+    ) -> Self {
         let mut ctx = Self {
             by_id: HashMap::new(),
             gradient_colors: HashMap::new(),
             class_rules: HashMap::new(),
             tag_rules: HashMap::new(),
             id_rules: HashMap::new(),
+            viewport_w: viewport_w.max(1.0),
+            viewport_h: viewport_h.max(1.0),
         };
         for nid in doc.descendants(root) {
             let Some(NodeData::Element(el)) = doc.get(nid) else {
@@ -879,7 +921,16 @@ fn collect_svg_element(
                 .or_else(|| elem.get_attribute("xlink:href"))
                 .map(str::trim);
             if let Some(id) = href.and_then(|h| h.strip_prefix('#')) {
-                if let Some(&target_id) = ctx.by_id.get(id) {
+                let target_opt = ctx.by_id.get(id).copied().or_else(|| {
+                    doc.descendants(doc.root()).find(|&nid| {
+                        matches!(
+                            doc.get(nid),
+                            Some(NodeData::Element(e))
+                                if e.get_attribute("id").map(str::trim) == Some(id)
+                        )
+                    })
+                });
+                if let Some(target_id) = target_opt {
                     let ux = elem
                         .get_attribute("x")
                         .and_then(parse_html_dimension_attr)
@@ -897,6 +948,36 @@ fn collect_svg_element(
                     }
                     if let Some(NodeData::Element(target_el)) = doc.get(target_id) {
                         if target_el.name.local.as_str().eq_ignore_ascii_case("symbol") {
+                            // SVG 2 §5.7.1: `<use>` instantiating `<symbol viewBox="...">`
+                            // maps the symbol's `viewBox` into the `<use>` viewport (defaulting
+                            // to 100% of the host `<svg>` coordinate space).
+                            if let Some(sym_vb) = target_el
+                                .get_attribute("viewBox")
+                                .or_else(|| target_el.get_attribute("viewbox"))
+                                .and_then(SvgViewBox::parse)
+                            {
+                                if sym_vb.width > 0.0 && sym_vb.height > 0.0 {
+                                    let uw = elem
+                                        .get_attribute("width")
+                                        .and_then(parse_html_dimension_attr)
+                                        .unwrap_or(ctx.viewport_w);
+                                    let uh = elem
+                                        .get_attribute("height")
+                                        .and_then(parse_html_dimension_attr)
+                                        .unwrap_or(ctx.viewport_h);
+                                    let sx = f64::from(uw / sym_vb.width);
+                                    let sy = f64::from(uh / sym_vb.height);
+                                    let scale = sx.min(sy);
+                                    let tx = -f64::from(sym_vb.min_x) * scale
+                                        + (f64::from(uw) - f64::from(sym_vb.width) * scale) * 0.5;
+                                    let ty = -f64::from(sym_vb.min_y) * scale
+                                        + (f64::from(uh) - f64::from(sym_vb.height) * scale) * 0.5;
+                                    use_state.transform = affine_mul(
+                                        use_state.transform,
+                                        [scale, 0.0, 0.0, scale, tx, ty],
+                                    );
+                                }
+                            }
                             collect_svg_paths_inner(
                                 doc,
                                 target_id,

@@ -710,3 +710,46 @@ fn module_loader_prefetches_sibling_dependencies_in_wave_batches() {
     assert!(recorded[0].contains(&"https://example.test/a.js".to_string()));
     assert!(recorded[0].contains(&"https://example.test/b.js".to_string()));
 }
+
+#[test]
+fn regexp_split_match_replace_are_linear_on_large_inputs_and_respect_custom_exec() {
+    // ECMA-262 §22.2.6.13 / §22.2.6.8 / §22.2.6.11: splitting, matching, and replacing a
+    // 100,000-character string with a Unicode property RegExp `/[^\p{L}\p{N}]+/u` must run
+    // in linear O(N) time while preserving custom `.exec` override semantics.
+    let src = r#"
+        const big = "alpha beta-gamma! delta123 ".repeat(4000);
+        const parts = big.split(/[^\p{L}\p{N}]+/u);
+        const matches = big.match(/[a-z0-9]+/g);
+        const replaced = big.replace(/beta/g, "BETA");
+
+        // Verify overridden `.exec` still takes the spec slow path.
+        let customCalls = 0;
+        const customRe = /,/g;
+        customRe.exec = function(s) {
+            customCalls++;
+            return RegExp.prototype.exec.call(this, s);
+        };
+        const customMatches = "a,b,c".match(customRe);
+
+        parts.length === 16001
+            && parts[0] === "alpha"
+            && parts[1] === "beta"
+            && parts[2] === "gamma"
+            && parts[3] === "delta123"
+            && matches.length === 16000
+            && replaced.startsWith("alpha BETA-gamma!")
+            && customCalls === 3
+            && customMatches.length === 2
+    "#;
+    let mut vm = rix_js::JsVm::new();
+    let t0 = std::time::Instant::now();
+    let val = vm
+        .eval_script(src)
+        .expect("large RegExp split/match/replace must succeed");
+    assert!(
+        t0.elapsed().as_millis() < 1500,
+        "100,000-char RegExp split/match/replace took too long: {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(val.as_bool(), Some(true));
+}

@@ -838,13 +838,14 @@ impl<'a> BoxTreeBuilder<'a> {
                 };
                 let css_fill = resolve_svg_css_paint(style.text.svg_fill);
                 let css_stroke = resolve_svg_css_paint(style.text.svg_stroke);
-                let paths = crate::assets::extract_svg_from_node_with_css(
+                let paths = crate::assets::extract_svg_from_node_with_css_and_viewport(
                     self.doc,
                     node,
                     style.text.color,
                     css_fill,
                     css_stroke,
                     style.text.svg_fill_rule_even_odd,
+                    Some(Size::new(iw, ih)),
                 )
                 .map(|d| d.paths)
                 .unwrap_or_default();

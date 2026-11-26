@@ -393,7 +393,14 @@ impl HostState {
                     Some(NodeData::Element(e)) if e.name.local.as_str().eq_ignore_ascii_case("style")
                 )
             };
-            is_style(parent) || child.is_some_and(is_style)
+            is_style(parent)
+                || child.is_some_and(|c| {
+                    is_style(c)
+                        || doc
+                            .descendants_with_shadow_roots(c)
+                            .into_iter()
+                            .any(is_style)
+                })
         };
         if touches_style {
             self.mark_sheets_dirty();
@@ -687,6 +694,21 @@ impl HostState {
             (doc.revision(), doc.style_revision())
         };
         if !self.sheets_dirty && self.last_style_revs == Some(revs) {
+            return &self.style_ctx;
+        }
+        // Fast path: stylesheets unchanged — skip walking the entire DOM to re-hash `<style>`
+        // blocks and run targeted incremental `restyle_dirty` directly!
+        if !self.sheets_dirty && self.last_style_revs.is_some() {
+            {
+                let mut doc = self.document.borrow_mut();
+                let _ = self.style_ctx.restyle_dirty(&mut doc);
+            }
+            let post_revs = {
+                let doc = self.document.borrow();
+                (doc.revision(), doc.style_revision())
+            };
+            self.last_style_revs = Some(post_revs);
+            self.style_recalc_count += 1;
             return &self.style_ctx;
         }
 
