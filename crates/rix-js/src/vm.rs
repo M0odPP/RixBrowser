@@ -4184,21 +4184,24 @@ impl JsVm {
         // ECMA-262 §10.4.3.5 String Exotic Object own properties (`length` and UTF-16 indices).
         if let Some(str_h) = obj_val.as_string() {
             if let Some(idx) = self.as_array_index(key_val) {
-                let s = self.heap.materialize_string(str_h).unwrap_or_default();
                 let idx_usize = idx as usize;
-                if s.is_ascii() {
-                    if let Some(&b) = s.as_bytes().get(idx_usize) {
-                        let ch = (b as char).to_string();
-                        return Ok(JsValue::from_string(self.heap.alloc_string(ch)));
-                    }
-                    return Ok(JsValue::UNDEFINED);
-                }
-                if let Some(unit) = s.encode_utf16().nth(idx_usize) {
-                    let ch = char::from_u32(u32::from(unit))
-                        .map_or_else(|| "\u{FFFD}".to_string(), |c| c.to_string());
-                    return Ok(JsValue::from_string(self.heap.alloc_string(ch)));
-                }
-                return Ok(JsValue::UNDEFINED);
+                let ch_opt: Option<String> =
+                    self.heap.flatten_string(str_h).and_then(|(s, utf16_len)| {
+                        if s.len() == utf16_len {
+                            s.as_bytes()
+                                .get(idx_usize)
+                                .map(|&b| (b as char).to_string())
+                        } else {
+                            s.encode_utf16().nth(idx_usize).map(|unit| {
+                                char::from_u32(u32::from(unit))
+                                    .map_or_else(|| "\u{FFFD}".to_string(), |c| c.to_string())
+                            })
+                        }
+                    });
+                return match ch_opt {
+                    Some(ch) => Ok(JsValue::from_string(self.heap.alloc_string(ch))),
+                    None => Ok(JsValue::UNDEFINED),
+                };
             }
             let ks = self.to_property_key(key_val)?;
             let k = self.heap.intern_key(&ks);

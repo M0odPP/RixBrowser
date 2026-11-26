@@ -226,3 +226,62 @@ fn deferred_classic_script_sets_current_script_and_classic_dynamic_import_works(
     let dyn_val = rt.eval_script("window.__dynImport").expect("dynImport");
     assert_eq!(dyn_val.as_number(), Some(42.0));
 }
+
+#[test]
+fn html_image_element_complete_natural_dimensions_and_current_src_follow_html_spec() {
+    // WHATWG HTML §4.8.4.3: decoded images report real `naturalWidth`/`naturalHeight`,
+    // `currentSrc`, and `complete === true`; empty `src` images report `complete === true`.
+    let storage = StorageEngine::in_memory().expect("in-memory storage");
+    let doc = Rc::new(RefCell::new(Document::new()));
+    let font_db = Arc::new(FontDatabase::new());
+    let mut rt = ContentRuntime::with_origin_and_storage(
+        doc,
+        Size::new(1280.0, 800.0),
+        font_db,
+        "https://example.test/page/",
+        storage,
+    );
+    {
+        let mut host = rt.host.borrow_mut();
+        host.layout_engine
+            .assets
+            .register_rgba8(
+                "https://example.test/img/logo.png",
+                120,
+                48,
+                vec![255u8; 120 * 48 * 4],
+            )
+            .expect("register test image");
+        host.initial_assets_loaded = true;
+    }
+    let html = r#"<!doctype html><html><body>
+        <img id="loaded" src="/img/logo.png">
+        <img id="empty">
+    </body></html>"#;
+    let errors = rt.load_document_with_external_scripts(html, &HashMap::new());
+    assert!(errors.is_empty(), "unexpected script errors: {errors:?}");
+
+    let res = rt
+        .eval_script(
+            r#"
+            const img = document.getElementById("loaded");
+            const empty = document.getElementById("empty");
+            const dyn = new Image();
+            const dynEmptyComplete = dyn.complete;
+            dyn.src = "/img/pending.png";
+            const dynPendingComplete = dyn.complete;
+            [
+                img.complete === true,
+                img.naturalWidth === 120,
+                img.naturalHeight === 48,
+                img.currentSrc === "https://example.test/img/logo.png",
+                empty.complete === true,
+                empty.naturalWidth === 0,
+                dynEmptyComplete === true,
+                dynPendingComplete === false,
+            ].every(Boolean)
+            "#,
+        )
+        .expect("HTMLImageElement spec checks must succeed");
+    assert_eq!(res.as_bool(), Some(true));
+}

@@ -35,7 +35,7 @@ use rix_layout::{
     DecodedRasterBytes, DecodedSvg,
 };
 use rix_net::{HttpClient, Resource, ResourceManager, ResourcePriority};
-use rix_text::{FontDatabase, FontFaceSet, FontStyle};
+use rix_text::{FontDatabase, FontFaceSet, FontStyle, UnicodeRange};
 use url::Url;
 
 /// Upper bound on subresources fetched per navigation to bound memory and tail latency.
@@ -150,6 +150,7 @@ pub struct LoadedWebFont {
     pub family: String,
     pub weight_range: (u16, u16),
     pub italic: bool,
+    pub unicode_ranges: Vec<(u32, u32)>,
     pub bytes: Arc<Vec<u8>>,
 }
 
@@ -219,13 +220,18 @@ impl LoadedPageAssets {
             } else {
                 FontStyle::Normal
             };
+            let unicode_ranges: Vec<UnicodeRange> = font
+                .unicode_ranges
+                .iter()
+                .map(|&(s, e)| UnicodeRange::new(s, e))
+                .collect();
             if face_set
                 .register_font_bytes(
                     font_db,
                     font.family.clone(),
                     font.weight_range,
                     style,
-                    Vec::new(),
+                    unicode_ranges,
                     &font.bytes,
                 )
                 .is_ok()
@@ -561,12 +567,20 @@ pub fn load_page_subresources(
     // Wave 2 Discovery (Used-Only!): resolve styles on the parsed DOM (~2 ms) so we ONLY fetch
     // `background-image: url(...)` and `@font-face` families ACTUALLY matched by visible DOM
     // elements instead of downloading hundreds of unused framework CSS sprites & banners!
+    struct PendingFontSpec {
+        url: String,
+        family: String,
+        weight_range: (u16, u16),
+        italic: bool,
+        unicode_ranges: Vec<(u32, u32)>,
+    }
     let mut wave2_queue: Vec<(String, ResourcePriority, SubresourceRole)> = Vec::new();
     let mut seen_wave2: HashSet<String> = seen_wave1;
-    let mut pending_font_specs: Vec<(String, String, (u16, u16), bool)> = Vec::new(); // (url, family, weight_range, italic)
+    let mut pending_font_specs: Vec<PendingFontSpec> = Vec::new();
 
     let mut used_bg_urls: HashSet<String> = HashSet::new();
-    let mut used_font_families: HashSet<String> = HashSet::new();
+    let mut used_font_specs: HashMap<String, Vec<(u16, bool)>> = HashMap::new();
+    let mut doc_chars: HashSet<char> = HashSet::new();
     let has_inline_bg_url = discovered.doc.descendants(discovered.doc.root()).any(|n| {
         matches!(
             discovered.doc.get(n),
@@ -586,38 +600,141 @@ pub fn load_page_subresources(
             probe_styles.add_stylesheet(Arc::clone(sheet));
         }
         probe_styles.cascade_full(&mut probe_doc);
+        let record_style_assets =
+            |st: &rix_css::ComputedStyle,
+             used_bg_urls: &mut HashSet<String>,
+             used_font_specs: &mut HashMap<String, Vec<(u16, bool)>>,
+             doc_chars: &mut HashSet<char>| {
+                for layer in &st.visual.background_layers {
+                    if let BackgroundImageValue::Url(u) = &layer.image {
+                        let trimmed = u.as_str().trim();
+                        if !trimmed.is_empty() {
+                            used_bg_urls.insert(trimmed.to_string());
+                        }
+                    }
+                }
+                if let BackgroundImageValue::Url(u) = &st.visual.mask_image {
+                    let trimmed = u.as_str().trim();
+                    if !trimmed.is_empty() {
+                        used_bg_urls.insert(trimmed.to_string());
+                    }
+                }
+                if let Some(ref c) = st.box_model.content {
+                    for ch in c.as_str().chars() {
+                        doc_chars.insert(ch);
+                    }
+                }
+                let weight = st.text.font_weight.round().clamp(100.0, 900.0) as u16;
+                let italic = !matches!(st.text.font_style, rix_css::FontStyleMode::Normal);
+                for fam in &st.text.font_family {
+                    let lower = fam
+                        .as_str()
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_ascii_lowercase();
+                    if !lower.is_empty() {
+                        let specs = used_font_specs.entry(lower).or_default();
+                        if !specs.contains(&(weight, italic)) {
+                            specs.push((weight, italic));
+                        }
+                    }
+                }
+            };
         for node in probe_doc.descendants(probe_doc.root()) {
+            if let Some(NodeData::Text(t)) = probe_doc.get(node) {
+                let skip_text = probe_doc.parent(node).is_some_and(|p| {
+                    matches!(
+                        probe_doc.get(p),
+                        Some(NodeData::Element(e))
+                            if e.name.local.as_str().eq_ignore_ascii_case("script")
+                                || e.name.local.as_str().eq_ignore_ascii_case("style")
+                    )
+                });
+                if !skip_text {
+                    for ch in t.chars() {
+                        doc_chars.insert(ch);
+                    }
+                }
+                continue;
+            }
             let Some(st) = probe_styles.style_for(node) else {
                 continue;
             };
             if st.display == rix_css::DisplayMode::None {
                 continue;
             }
-            for layer in &st.visual.background_layers {
-                if let BackgroundImageValue::Url(u) = &layer.image {
-                    let trimmed = u.as_str().trim();
-                    if !trimmed.is_empty() {
-                        used_bg_urls.insert(trimmed.to_string());
+            record_style_assets(st, &mut used_bg_urls, &mut used_font_specs, &mut doc_chars);
+            for pe in [
+                rix_css::RixPseudoElement::Before,
+                rix_css::RixPseudoElement::After,
+            ] {
+                if let Some(pst) = probe_styles.pseudo_style_for(node, pe) {
+                    if pst.display != rix_css::DisplayMode::None {
+                        record_style_assets(
+                            pst,
+                            &mut used_bg_urls,
+                            &mut used_font_specs,
+                            &mut doc_chars,
+                        );
                     }
                 }
             }
-            if let BackgroundImageValue::Url(u) = &st.visual.mask_image {
-                let trimmed = u.as_str().trim();
-                if !trimmed.is_empty() {
-                    used_bg_urls.insert(trimmed.to_string());
-                }
+        }
+    }
+
+    // Group candidate `@font-face` rules by family (CSS Fonts L4 §4.5 `unicode-range` + §5.2
+    // weight/style matching) so we only download faces actually needed for rendered text instead
+    // of exhausting Wave 2 with dozens of unused weights or CJK/Cyrillic subsets.
+    struct FontCandidate<'a> {
+        base_url: &'a str,
+        family: &'a str,
+        raw_url: &'a str,
+        weight_range: (u16, u16),
+        italic: bool,
+        unicode_ranges: &'a [(u32, u32)],
+    }
+    let mut font_candidates_by_fam: HashMap<String, Vec<FontCandidate<'_>>> = HashMap::new();
+    for (base_url, sheet) in &all_sheets_with_base {
+        for ff in &sheet.font_faces {
+            let Some(ref family) = ff.family else {
+                continue;
+            };
+            let fam_lower = family
+                .as_str()
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_ascii_lowercase();
+            if !used_font_specs.contains_key(&fam_lower) {
+                continue;
             }
-            for fam in &st.text.font_family {
-                let lower = fam
-                    .as_str()
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_ascii_lowercase();
-                if !lower.is_empty() {
-                    used_font_families.insert(lower);
-                }
+            if !ff.unicode_ranges.is_empty()
+                && !doc_chars.is_empty()
+                && !doc_chars.iter().any(|&ch| {
+                    let cp = ch as u32;
+                    ff.unicode_ranges.iter().any(|&(s, e)| cp >= s && cp <= e)
+                })
+            {
+                continue;
             }
+            let Some(raw_url) = pick_best_font_face_url(&ff.sources) else {
+                continue;
+            };
+            let w_min = ff.weight_range.0.round().clamp(100.0, 900.0) as u16;
+            let w_max = ff.weight_range.1.round().clamp(100.0, 900.0) as u16;
+            let weight_range = (w_min.min(w_max), w_min.max(w_max));
+            font_candidates_by_fam
+                .entry(fam_lower)
+                .or_default()
+                .push(FontCandidate {
+                    base_url: base_url.as_str(),
+                    family: family.as_str(),
+                    raw_url,
+                    weight_range,
+                    italic: ff.italic,
+                    unicode_ranges: &ff.unicode_ranges,
+                });
         }
     }
 
@@ -663,47 +780,57 @@ pub fn load_page_subresources(
                 wave2_queue.push((resolved, ResourcePriority::Media, SubresourceRole::Image));
             }
         }
+    }
 
-        for ff in &sheet.font_faces {
-            let Some(ref family) = ff.family else {
-                continue;
+    for (fam_lower, cands) in &font_candidates_by_fam {
+        let Some(req_specs) = used_font_specs.get(fam_lower) else {
+            continue;
+        };
+        let mut selected = vec![false; cands.len()];
+        for &(req_w, req_italic) in req_specs {
+            let score_of = |c: &FontCandidate<'_>| -> (u8, u16) {
+                let sp = u8::from(c.italic != req_italic);
+                let wd = if req_w < c.weight_range.0 {
+                    c.weight_range.0 - req_w
+                } else {
+                    req_w.saturating_sub(c.weight_range.1)
+                };
+                (sp, wd)
             };
-            let fam_lower = family
-                .as_str()
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'')
-                .to_ascii_lowercase();
-            if !used_font_families.contains(&fam_lower) {
+            if let Some(best_score) = cands.iter().map(score_of).min() {
+                for (i, c) in cands.iter().enumerate() {
+                    if score_of(c) == best_score {
+                        selected[i] = true;
+                    }
+                }
+            }
+        }
+        for (i, c) in cands.iter().enumerate() {
+            if !selected[i] {
                 continue;
             }
-            let Some(raw_font_url) = pick_best_font_face_url(&ff.sources) else {
+            let Some(resolved) = resolve_url(c.base_url, c.raw_url) else {
                 continue;
             };
-            let Some(resolved) = resolve_url(base_url, raw_font_url) else {
-                continue;
-            };
-            let w_min = ff.weight_range.0.round().clamp(100.0, 900.0) as u16;
-            let w_max = ff.weight_range.1.round().clamp(100.0, 900.0) as u16;
-            let weight_range = (w_min.min(w_max), w_min.max(w_max));
-
+            let uranges = c.unicode_ranges.to_vec();
             if let Some(CachedAsset::WebFont(bytes)) = asset_cache.get(&resolved) {
                 out.web_fonts.push(LoadedWebFont {
-                    family: family.as_str().to_string(),
-                    weight_range,
-                    italic: ff.italic,
+                    family: c.family.to_string(),
+                    weight_range: c.weight_range,
+                    italic: c.italic,
+                    unicode_ranges: uranges,
                     bytes,
                 });
                 out.stats.decoded_asset_cache_hits += 1;
                 continue;
             }
-
-            pending_font_specs.push((
-                resolved.clone(),
-                family.as_str().to_string(),
-                weight_range,
-                ff.italic,
-            ));
+            pending_font_specs.push(PendingFontSpec {
+                url: resolved.clone(),
+                family: c.family.to_string(),
+                weight_range: c.weight_range,
+                italic: c.italic,
+                unicode_ranges: uranges,
+            });
             if wave2_queue.len() < MAX_SUBRESOURCES_PER_PAGE
                 && is_fetchable_url(&resolved, allow_file_scheme)
                 && seen_wave2.insert(resolved.clone())
@@ -783,12 +910,13 @@ pub fn load_page_subresources(
     }
     out.stats.wave2_ms = t_wave2.elapsed().as_secs_f32() * 1000.0;
 
-    for (url, family, weight_range, italic) in pending_font_specs {
-        if let Some(bytes) = fetched_fonts_by_url.get(&url) {
+    for spec in pending_font_specs {
+        if let Some(bytes) = fetched_fonts_by_url.get(&spec.url) {
             out.web_fonts.push(LoadedWebFont {
-                family,
-                weight_range,
-                italic,
+                family: spec.family,
+                weight_range: spec.weight_range,
+                italic: spec.italic,
+                unicode_ranges: spec.unicode_ranges,
                 bytes: Arc::clone(bytes),
             });
         }

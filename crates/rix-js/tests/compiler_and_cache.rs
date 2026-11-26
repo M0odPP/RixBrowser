@@ -528,3 +528,46 @@ fn string_computed_property_access_handles_length_and_utf16_indices() {
         .expect("ECMA-262 §10.4.3.5 string computed property access must succeed");
     assert_eq!(val.as_bool(), Some(true));
 }
+
+#[test]
+fn string_char_code_at_and_slice_are_o1_on_large_ropes_and_exact_on_utf16() {
+    // ECMA-262 §22.1.3: iterating `charCodeAt(i)` across a 50,000-byte rope string must flatten
+    // once and index in O(1) (rather than O(N^2) UTF-16 conversion per call), while preserving
+    // exact UTF-16 surrogate-pair semantics on non-ASCII strings.
+    let src = r#"
+        let s = "";
+        for (let i = 0; i < 5000; i++) s += "0123456789";
+        let sum = 0;
+        for (let i = 0; i < s.length; i++) sum += s.charCodeAt(i);
+        const emoji = "A😀B";
+        const checks = [
+            s.length === 50000,
+            sum === 5000 * (48 + 49 + 50 + 51 + 52 + 53 + 54 + 55 + 56 + 57),
+            s.slice(10, 15) === "01234",
+            s.substring(15, 10) === "01234",
+            s.indexOf("56789", 100) === 105,
+            s.lastIndexOf("01234", 500) === 500,
+            s.includes("3456", 49990) === true,
+            s.startsWith("234", 2) === true,
+            s.endsWith("789", 10) === true,
+            emoji.charCodeAt(0) === 65,
+            emoji.charCodeAt(1) === 0xD83D,
+            emoji.charCodeAt(2) === 0xDE00,
+            emoji.codePointAt(1) === 0x1F600,
+            emoji.charAt(3) === "B",
+            emoji.slice(1, 3) === "😀",
+        ];
+        checks.every(Boolean)
+    "#;
+    let mut vm = rix_js::JsVm::new();
+    let t0 = std::time::Instant::now();
+    let val = vm
+        .eval_script(src)
+        .expect("O(1) String.prototype methods must succeed");
+    assert!(
+        t0.elapsed().as_millis() < 1500,
+        "50,000-iteration charCodeAt loop took too long: {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(val.as_bool(), Some(true));
+}

@@ -530,6 +530,111 @@ impl FontDatabase {
         )
     }
 
+    /// Registers decoded `@font-face` SFNT bytes honoring variable `wght` axis instances across
+    /// `weight_range` (CSS Fonts L4 §4.3) so variable web fonts render at the requested weight
+    /// instead of falling back to the font's raw default axis weight (often `100` Thin).
+    pub fn add_web_font_bytes_range(
+        &mut self,
+        bytes: Vec<u8>,
+        face_index: u32,
+        family_override: &str,
+        weight_range: (u16, u16),
+        style_override: FontStyle,
+    ) -> Result<Vec<(u16, FontId)>, String> {
+        use read_fonts::TableProvider;
+        let read_font = read_fonts::FontRef::from_index(&bytes, face_index)
+            .map_err(|e| format!("Failed to parse font data (read-fonts): {e:?}"))?;
+        let _ = read_font
+            .head()
+            .map_err(|e| format!("Missing head table: {e:?}"))?;
+        let swash_font = swash::FontRef::from_index(&bytes, face_index as usize)
+            .ok_or_else(|| "Failed to parse font data (swash)".to_string())?;
+
+        let variations = swash_font.variations();
+        let wght = swash::tag_from_bytes(b"wght");
+        let Some(axis) = variations.find_by_tag(wght) else {
+            let id = self.add_web_font_bytes(
+                bytes,
+                face_index,
+                family_override,
+                FontWeight(weight_range.0),
+                style_override,
+            )?;
+            return Ok(vec![(weight_range.0, id)]);
+        };
+        let (axis_min, axis_max) = (axis.min_value(), axis.max_value());
+        if axis_min.partial_cmp(&axis_max) != Some(std::cmp::Ordering::Less) {
+            let id = self.add_web_font_bytes(
+                bytes,
+                face_index,
+                family_override,
+                FontWeight(weight_range.0),
+                style_override,
+            )?;
+            return Ok(vec![(weight_range.0, id)]);
+        }
+
+        let r_lo = weight_range.0.min(weight_range.1);
+        let r_hi = weight_range.0.max(weight_range.1);
+        let mut target_weights: Vec<u16> = (1..=9u16)
+            .map(|step| step * 100)
+            .filter(|&w| w >= r_lo && w <= r_hi)
+            .collect();
+        if target_weights.is_empty() {
+            target_weights.push(r_lo);
+        }
+
+        let family = family_override.to_owned();
+        let family_lower = family.to_lowercase();
+        let metrics = extract_metrics(&swash_font, &read_font);
+        let coverage_mask = compute_coverage_mask(&swash_font, &read_font);
+        let weight_coords: Vec<(u16, f32, Vec<i16>)> = target_weights
+            .into_iter()
+            .map(|w| {
+                let clamped = f32::from(w).clamp(axis_min, axis_max);
+                let coords: Vec<i16> = variations.normalized_coords([(wght, clamped)]).collect();
+                (w, clamped, coords)
+            })
+            .collect();
+
+        let bytes = Arc::new(bytes);
+        let blob_cell = Arc::new(OnceLock::new());
+        let _ = blob_cell.set(linebender_resource_handle::Blob::new(bytes.clone()));
+
+        let mut registered = Vec::with_capacity(weight_coords.len());
+        for (w, clamped, coords) in weight_coords {
+            let var_tags = vec![(*b"wght", clamped)];
+            let ident = compute_identity_for_memory(&bytes, face_index, &var_tags);
+            let id = FontId(self.fonts.len());
+            self.fonts.push(FontData {
+                id,
+                descriptor: FontDescriptor {
+                    family: family.clone(),
+                    weight: FontWeight(w),
+                    style: style_override,
+                },
+                source: FontSource::Memory(Arc::clone(&bytes)),
+                cache_identity: ident,
+                face_index,
+                metrics,
+                coverage_mask,
+                blob: Arc::clone(&blob_cell),
+                variations: var_tags,
+                normalized_coords: coords,
+            });
+            self.family_index
+                .entry(family_lower.clone())
+                .or_default()
+                .push(id);
+            registered.push((w, id));
+        }
+        if let Some(&(_, first_id)) = registered.first() {
+            self.index_coverage(first_id, coverage_mask);
+            self.auto_assign_fallback(first_id, &family);
+        }
+        Ok(registered)
+    }
+
     fn add_memory_font_internal(
         &mut self,
         bytes: Vec<u8>,

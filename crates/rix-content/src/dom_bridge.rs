@@ -219,6 +219,14 @@ pub struct HostState {
     pub(crate) iframe_connect_hook: Option<IframeConnectHook>,
     pub(crate) body_attr_handler_hook: Option<BodyAttrHandlerHook>,
     pub(crate) script_connect_hook: Option<ScriptConnectHook>,
+    /// True once initial page subresources (Wave 1 & 2 images/SVGs) have been registered into
+    /// `layout_engine.assets` (used by `HTMLImageElement.prototype.complete` per HTML §4.8.4.3.6).
+    pub initial_assets_loaded: bool,
+    /// `<img>` nodes whose `src` was dynamically assigned via JS and whose networking task is
+    /// still pending.
+    pub pending_dynamic_images: HashSet<NodeId>,
+    /// `<img>` nodes whose dynamic `src` networking task has completed (loaded or broken).
+    pub completed_images: HashSet<NodeId>,
 }
 
 /// Callback invoked when an `<iframe>` element is connected into a live document.
@@ -325,6 +333,9 @@ impl HostState {
             iframe_connect_hook: None,
             body_attr_handler_hook: None,
             script_connect_hook: None,
+            initial_assets_loaded: false,
+            pending_dynamic_images: HashSet::new(),
+            completed_images: HashSet::new(),
         }
     }
 

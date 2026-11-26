@@ -184,19 +184,53 @@ impl FontFaceSet {
     ) -> Result<FontId, WebFontError> {
         let (format, sfnt) = decode_web_font(raw_bytes)?;
         let family_str = family.into();
-        let font_id = db
-            .add_web_font_bytes(sfnt, 0, &family_str, FontWeight(weight_range.0), style)
+        let family_lower = family_str.to_ascii_lowercase();
+        let instances = db
+            .add_web_font_bytes_range(sfnt, 0, &family_str, weight_range, style)
             .map_err(WebFontError::FontParse)?;
-        self.faces.push(WebFontFace {
-            family_lower: family_str.to_ascii_lowercase(),
-            family: family_str,
-            weight_range,
-            style,
-            unicode_ranges,
-            font_id,
-            format,
-        });
-        Ok(font_id)
+        let is_multi = instances.len() > 1;
+        let mut primary_id = instances[0].1;
+        let mut best_dist = u16::MAX;
+        for (w, font_id) in instances {
+            let dist = w.abs_diff(400);
+            if dist < best_dist {
+                best_dist = dist;
+                primary_id = font_id;
+            }
+            self.faces.push(WebFontFace {
+                family_lower: family_lower.clone(),
+                family: family_str.clone(),
+                weight_range: if is_multi { (w, w) } else { weight_range },
+                style,
+                unicode_ranges: unicode_ranges.clone(),
+                font_id,
+                format,
+            });
+        }
+        Ok(primary_id)
+    }
+
+    /// Resolves the best registered `@font-face` matching `(family, weight, style)` regardless of
+    /// whether the face covers ASCII `'a'` (essential for PUA / ligature icon fonts).
+    #[must_use]
+    pub fn match_face(&self, family: &str, weight: FontWeight, style: FontStyle) -> Option<FontId> {
+        let target = family
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_ascii_lowercase();
+        let mut best: Option<((u8, u16, usize), FontId)> = None;
+        for (idx, face) in self.faces.iter().enumerate() {
+            if face.family_lower != target {
+                continue;
+            }
+            let style_penalty = if face.style == style { 0 } else { 1 };
+            let key = (style_penalty, face.weight_distance(weight), idx);
+            if best.is_none_or(|(b, _)| key < b) {
+                best = Some((key, face.font_id));
+            }
+        }
+        best.map(|(_, id)| id)
     }
 
     /// Resolves the best registered `@font-face` matching `(family, weight, style)` whose

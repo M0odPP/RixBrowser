@@ -1215,9 +1215,16 @@ fn install_html_helper_reflections(vm: &mut JsVm, host: &SharedHost, event_loop:
                 e.set_attribute("src", &val);
             }
             if !val.is_empty() {
+                h2.borrow_mut().pending_dynamic_images.insert(nid);
+                h2.borrow_mut().completed_images.remove(&nid);
                 let h_cb = Rc::clone(&h2);
                 el2.borrow_mut()
                     .post_host_task(TaskPriority::Networking, move |vm| {
+                        {
+                            let mut hmut = h_cb.borrow_mut();
+                            hmut.pending_dynamic_images.remove(&nid);
+                            hmut.completed_images.insert(nid);
+                        }
                         let w = wrap_node(vm, &h_cb, nid);
                         if let Some(wh) = w.as_object() {
                             let ke = vm.heap.intern_key("onerror");
@@ -1228,6 +1235,10 @@ fn install_html_helper_reflections(vm: &mut JsVm, host: &SharedHost, event_loop:
                             }
                         }
                     });
+            } else {
+                let mut hmut = h2.borrow_mut();
+                hmut.pending_dynamic_images.remove(&nid);
+                hmut.completed_images.remove(&nid);
             }
             Ok(JsValue::UNDEFINED)
         });

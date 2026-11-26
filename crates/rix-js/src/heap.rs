@@ -1274,6 +1274,34 @@ impl GcHeap {
         ))
     }
 
+    /// Flattens any [`JsString`] (including ropes and slices) in place and borrows its UTF-8 data
+    /// along with its precomputed UTF-16 code unit length in O(1) amortized time.
+    ///
+    /// Because valid UTF-8 satisfies `str.len() == utf16_len` if and only if every byte is ASCII,
+    /// callers can check pure-ASCII strings in O(1) without scanning a single byte.
+    pub fn flatten_string(&mut self, handle: HeapHandle) -> Option<(&str, usize)> {
+        let needs_flatten = matches!(
+            self.get_string(handle),
+            Some(JsString::Rope { .. } | JsString::Slice { .. })
+        );
+        if needs_flatten {
+            let utf16_len = self.get_string(handle)?.utf16_len();
+            let data = self.materialize_string(handle)?;
+            let slot = self.slots.get_mut(handle.index as usize)?;
+            if slot.generation != handle.generation {
+                return None;
+            }
+            slot.cell = Some(HeapCell::String(JsString::Flat { data, utf16_len }));
+        }
+        match self.get_string(handle)? {
+            JsString::Flat { data, utf16_len } => Some((data.as_str(), *utf16_len)),
+            JsString::Interned {
+                data, utf16_len, ..
+            } => Some((data.as_ref(), *utf16_len)),
+            _ => None,
+        }
+    }
+
     /// Flattens any [`JsString`] (including ropes and slices) into an owned Rust `String`.
     #[must_use]
     pub fn materialize_string(&self, handle: HeapHandle) -> Option<String> {

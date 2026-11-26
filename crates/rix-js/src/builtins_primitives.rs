@@ -442,12 +442,45 @@ fn str_to_string(
     Err(vm.type_error("String.prototype.toString requires that 'this' be a String"))
 }
 
+enum StringSource {
+    Handle(HeapHandle),
+    Owned(String, usize),
+}
+
+fn require_string_source(vm: &mut JsVm, this_val: JsValue) -> Result<StringSource, JsException> {
+    require_coercible(vm, this_val)?;
+    if let Some(h) = this_val.as_string() {
+        return Ok(StringSource::Handle(h));
+    }
+    let s = vm.to_js_string(this_val)?;
+    let u16_len = s.encode_utf16().count();
+    Ok(StringSource::Owned(s, u16_len))
+}
+
+fn resolve_string_source<'a>(
+    heap: &'a mut crate::GcHeap,
+    src: &'a StringSource,
+) -> (&'a str, usize) {
+    match src {
+        StringSource::Handle(h) => heap.flatten_string(*h).unwrap_or(("", 0)),
+        StringSource::Owned(s, u16_len) => (s.as_str(), *u16_len),
+    }
+}
+
 fn str_char_at(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let s = require_string_this(vm, this_val)?;
+    let src = require_string_source(vm, this_val)?;
     let pos = vm.to_integer_or_infinity(arg0(args))?;
-    let units: Vec<u16> = s.encode_utf16().collect();
-    let out = if pos >= 0.0 && pos < units.len() as f64 {
-        String::from_utf16_lossy(&units[pos as usize..pos as usize + 1])
+    let (s, u16_len) = resolve_string_source(&mut vm.heap, &src);
+    let out = if pos >= 0.0 && pos < u16_len as f64 {
+        let idx = pos as usize;
+        if s.len() == u16_len {
+            (s.as_bytes()[idx] as char).to_string()
+        } else {
+            s.encode_utf16()
+                .nth(idx)
+                .map(|u| String::from_utf16_lossy(&[u]))
+                .unwrap_or_default()
+        }
     } else {
         String::new()
     };
@@ -459,13 +492,22 @@ fn str_char_code_at(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = require_string_this(vm, this_val)?;
+    let src = require_string_source(vm, this_val)?;
     let pos = vm.to_integer_or_infinity(arg0(args))?;
-    let units: Vec<u16> = s.encode_utf16().collect();
-    if pos < 0.0 || pos >= units.len() as f64 {
+    let (s, u16_len) = resolve_string_source(&mut vm.heap, &src);
+    if pos < 0.0 || pos >= u16_len as f64 {
         return Ok(JsValue::NAN);
     }
-    Ok(JsValue::from_i32(i32::from(units[pos as usize])))
+    let idx = pos as usize;
+    let code = if s.len() == u16_len {
+        u16::from(s.as_bytes()[idx])
+    } else {
+        match s.encode_utf16().nth(idx) {
+            Some(u) => u,
+            None => return Ok(JsValue::NAN),
+        }
+    };
+    Ok(JsValue::from_i32(i32::from(code)))
 }
 
 fn str_code_point_at(
@@ -473,18 +515,28 @@ fn str_code_point_at(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = require_string_this(vm, this_val)?;
+    let src = require_string_source(vm, this_val)?;
     let pos = vm.to_integer_or_infinity(arg0(args))?;
-    let units: Vec<u16> = s.encode_utf16().collect();
-    if pos < 0.0 || pos >= units.len() as f64 {
+    let (s, u16_len) = resolve_string_source(&mut vm.heap, &src);
+    if pos < 0.0 || pos >= u16_len as f64 {
         return Ok(JsValue::UNDEFINED);
     }
     let idx = pos as usize;
-    let first = units[idx];
-    let cp = if (0xD800..=0xDBFF).contains(&first) && idx + 1 < units.len() {
-        let second = units[idx + 1];
-        if (0xDC00..=0xDFFF).contains(&second) {
-            (((u32::from(first) - 0xD800) << 10) + (u32::from(second) - 0xDC00) + 0x10000) as i32
+    if s.len() == u16_len {
+        return Ok(JsValue::from_i32(i32::from(s.as_bytes()[idx])));
+    }
+    let mut it = s.encode_utf16().skip(idx);
+    let Some(first) = it.next() else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let cp = if (0xD800..=0xDBFF).contains(&first) {
+        if let Some(second) = it.next() {
+            if (0xDC00..=0xDFFF).contains(&second) {
+                (((u32::from(first) - 0xD800) << 10) + (u32::from(second) - 0xDC00) + 0x10000)
+                    as i32
+            } else {
+                i32::from(first)
+            }
         } else {
             i32::from(first)
         }
@@ -495,19 +547,28 @@ fn str_code_point_at(
 }
 
 fn str_slice(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let s = require_string_this(vm, this_val)?;
-    let units: Vec<u16> = s.encode_utf16().collect();
-    let len = units.len() as u64;
+    let src = require_string_source(vm, this_val)?;
+    let len_u16 = match &src {
+        StringSource::Handle(h) => vm.heap.get_string(*h).map_or(0, |s| s.utf16_len()),
+        StringSource::Owned(_, l) => *l,
+    };
+    let len = len_u16 as u64;
     let start = match args.first().copied() {
         Some(v) if !v.is_undefined() => clamp_rel_f64(vm.to_integer_or_infinity(v)?, len) as usize,
         _ => 0,
     };
     let end = match args.get(1).copied() {
         Some(v) if !v.is_undefined() => clamp_rel_f64(vm.to_integer_or_infinity(v)?, len) as usize,
-        _ => units.len(),
+        _ => len_u16,
     };
     let out = if start < end {
-        String::from_utf16_lossy(&units[start..end])
+        let (s, u16_len) = resolve_string_source(&mut vm.heap, &src);
+        if s.len() == u16_len {
+            s[start..end].to_string()
+        } else {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            String::from_utf16_lossy(&units[start..end])
+        }
     } else {
         String::new()
     };
@@ -519,9 +580,11 @@ fn str_substring(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = require_string_this(vm, this_val)?;
-    let units: Vec<u16> = s.encode_utf16().collect();
-    let len = units.len();
+    let src = require_string_source(vm, this_val)?;
+    let len = match &src {
+        StringSource::Handle(h) => vm.heap.get_string(*h).map_or(0, |s| s.utf16_len()),
+        StringSource::Owned(_, l) => *l,
+    };
     let start = match args.first().copied() {
         Some(v) if !v.is_undefined() => clamp_u16_idx(vm.to_integer_or_infinity(v)?, len),
         _ => 0,
@@ -535,19 +598,30 @@ fn str_substring(
     } else {
         (end, start)
     };
-    Ok(JsValue::from_string(
-        vm.heap
-            .alloc_string(String::from_utf16_lossy(&units[lo..hi])),
-    ))
+    let out = if lo < hi {
+        let (s, u16_len) = resolve_string_source(&mut vm.heap, &src);
+        if s.len() == u16_len {
+            s[lo..hi].to_string()
+        } else {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            String::from_utf16_lossy(&units[lo..hi])
+        }
+    } else {
+        String::new()
+    };
+    Ok(JsValue::from_string(vm.heap.alloc_string(out)))
 }
 
 fn str_substr(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsValue, JsException> {
-    let s = require_string_this(vm, this_val)?;
-    let units: Vec<u16> = s.encode_utf16().collect();
-    let len = units.len() as u64;
+    let src = require_string_source(vm, this_val)?;
+    let len_u16 = match &src {
+        StringSource::Handle(h) => vm.heap.get_string(*h).map_or(0, |s| s.utf16_len()),
+        StringSource::Owned(_, l) => *l,
+    };
+    let len = len_u16 as u64;
     let start_f = vm.to_integer_or_infinity(arg0(args))?;
     let start = if start_f == f64::INFINITY {
-        len as usize
+        len_u16
     } else {
         clamp_rel_f64(start_f, len) as usize
     };
@@ -557,14 +631,23 @@ fn str_substr(vm: &mut JsVm, this_val: JsValue, args: &[JsValue]) -> Result<JsVa
             if l <= 0.0 {
                 0
             } else {
-                l.min((units.len() - start) as f64) as usize
+                l.min((len_u16 - start) as f64) as usize
             }
         }
-        _ => units.len() - start,
+        _ => len_u16 - start,
     };
-    Ok(JsValue::from_string(vm.heap.alloc_string(
-        String::from_utf16_lossy(&units[start..start + count]),
-    )))
+    let out = if count > 0 {
+        let (s, u16_len) = resolve_string_source(&mut vm.heap, &src);
+        if s.len() == u16_len {
+            s[start..start + count].to_string()
+        } else {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            String::from_utf16_lossy(&units[start..start + count])
+        }
+    } else {
+        String::new()
+    };
+    Ok(JsValue::from_string(vm.heap.alloc_string(out)))
 }
 
 fn str_index_of(
@@ -572,12 +655,22 @@ fn str_index_of(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = require_string_this(vm, this_val)?;
+    let src = require_string_source(vm, this_val)?;
     let needle = vm.to_js_string(arg0(args))?;
     let pos_f = match args.get(1).copied() {
         Some(v) if !v.is_undefined() => vm.to_integer_or_infinity(v)?,
         _ => 0.0,
     };
+    let (s, u16_len) = resolve_string_source(&mut vm.heap, &src);
+    if s.len() == u16_len && needle.is_ascii() {
+        let from = clamp_u16_idx(pos_f, u16_len);
+        let found = if needle.is_empty() {
+            Some(from)
+        } else {
+            s[from..].find(needle.as_str()).map(|rel| from + rel)
+        };
+        return Ok(JsValue::from_f64(found.map_or(-1.0, |i| i as f64)));
+    }
     let hay: Vec<u16> = s.encode_utf16().collect();
     let ndl: Vec<u16> = needle.encode_utf16().collect();
     let from = clamp_u16_idx(pos_f, hay.len());
@@ -590,12 +683,31 @@ fn str_last_index_of(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = require_string_this(vm, this_val)?;
+    let src = require_string_source(vm, this_val)?;
     let needle = vm.to_js_string(arg0(args))?;
     let num_pos = match args.get(1).copied() {
         Some(v) => vm.to_number(v)?,
         None => f64::NAN,
     };
+    let (s, u16_len) = resolve_string_source(&mut vm.heap, &src);
+    if s.len() == u16_len && needle.is_ascii() {
+        let start = if num_pos.is_nan() {
+            u16_len
+        } else {
+            clamp_u16_idx(num_pos.trunc(), u16_len)
+        };
+        if needle.is_empty() {
+            return Ok(JsValue::from_f64(start as f64));
+        }
+        if needle.len() > u16_len {
+            return Ok(JsValue::from_i32(-1));
+        }
+        let end_bound = (start + needle.len()).min(u16_len);
+        return match s[..end_bound].rfind(needle.as_str()) {
+            Some(i) => Ok(JsValue::from_f64(i as f64)),
+            None => Ok(JsValue::from_i32(-1)),
+        };
+    }
     let hay: Vec<u16> = s.encode_utf16().collect();
     let ndl: Vec<u16> = needle.encode_utf16().collect();
     let start = if num_pos.is_nan() {
@@ -623,7 +735,7 @@ fn str_includes(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = require_string_this(vm, this_val)?;
+    let src = require_string_source(vm, this_val)?;
     let search = arg0(args);
     if is_regexp(vm, search)? {
         return Err(vm.type_error(
@@ -635,6 +747,11 @@ fn str_includes(
         Some(v) if !v.is_undefined() => vm.to_integer_or_infinity(v)?,
         _ => 0.0,
     };
+    let (s, u16_len) = resolve_string_source(&mut vm.heap, &src);
+    if s.len() == u16_len && needle.is_ascii() {
+        let from = clamp_u16_idx(pos_f, u16_len);
+        return Ok(JsValue::from_bool(s[from..].contains(needle.as_str())));
+    }
     let hay: Vec<u16> = s.encode_utf16().collect();
     let ndl: Vec<u16> = needle.encode_utf16().collect();
     let from = clamp_u16_idx(pos_f, hay.len());
@@ -648,7 +765,7 @@ fn str_starts_with(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = require_string_this(vm, this_val)?;
+    let src = require_string_source(vm, this_val)?;
     let search = arg0(args);
     if is_regexp(vm, search)? {
         return Err(vm.type_error(
@@ -660,6 +777,11 @@ fn str_starts_with(
         Some(v) if !v.is_undefined() => vm.to_integer_or_infinity(v)?,
         _ => 0.0,
     };
+    let (s, u16_len) = resolve_string_source(&mut vm.heap, &src);
+    if s.len() == u16_len && prefix.is_ascii() {
+        let start = clamp_u16_idx(pos_f, u16_len);
+        return Ok(JsValue::from_bool(s[start..].starts_with(prefix.as_str())));
+    }
     let hay: Vec<u16> = s.encode_utf16().collect();
     let pfx: Vec<u16> = prefix.encode_utf16().collect();
     let start = clamp_u16_idx(pos_f, hay.len());
@@ -673,7 +795,7 @@ fn str_ends_with(
     this_val: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, JsException> {
-    let s = require_string_this(vm, this_val)?;
+    let src = require_string_source(vm, this_val)?;
     let search = arg0(args);
     if is_regexp(vm, search)? {
         return Err(vm.type_error(
@@ -681,11 +803,19 @@ fn str_ends_with(
         ));
     }
     let suffix = vm.to_js_string(search)?;
-    let hay: Vec<u16> = s.encode_utf16().collect();
-    let end = match args.get(1).copied() {
-        Some(v) if !v.is_undefined() => clamp_u16_idx(vm.to_integer_or_infinity(v)?, hay.len()),
-        _ => hay.len(),
+    let len_u16 = match &src {
+        StringSource::Handle(h) => vm.heap.get_string(*h).map_or(0, |s| s.utf16_len()),
+        StringSource::Owned(_, l) => *l,
     };
+    let end = match args.get(1).copied() {
+        Some(v) if !v.is_undefined() => clamp_u16_idx(vm.to_integer_or_infinity(v)?, len_u16),
+        _ => len_u16,
+    };
+    let (s, u16_len) = resolve_string_source(&mut vm.heap, &src);
+    if s.len() == u16_len && suffix.is_ascii() {
+        return Ok(JsValue::from_bool(s[..end].ends_with(suffix.as_str())));
+    }
+    let hay: Vec<u16> = s.encode_utf16().collect();
     let sfx: Vec<u16> = suffix.encode_utf16().collect();
     Ok(JsValue::from_bool(
         sfx.len() <= end && hay[end - sfx.len()..end] == sfx[..],
