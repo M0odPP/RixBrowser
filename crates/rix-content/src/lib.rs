@@ -209,9 +209,27 @@ impl ModuleSourceProvider for DocumentModuleProvider {
                     abort_signal: None,
                 };
                 let fetched = eng.fetch(req).await.ok().and_then(|resp| {
-                    (200..300)
-                        .contains(&resp.status)
-                        .then(|| String::from_utf8_lossy(&resp.body).into_owned())
+                    if !(200..300).contains(&resp.status) {
+                        return None;
+                    }
+                    let ct = resp
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, v)| v.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    if ct.contains("text/html") || ct.contains("application/xhtml+xml") {
+                        return None;
+                    }
+                    let text = String::from_utf8_lossy(&resp.body).into_owned();
+                    let trimmed = text.trim_start();
+                    if trimmed.starts_with("<!DOCTYPE")
+                        || trimmed.starts_with("<!doctype")
+                        || trimmed.starts_with("<html")
+                    {
+                        return None;
+                    }
+                    Some(text)
                 });
                 let _ = tx_c.send((url, fetched));
             });

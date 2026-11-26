@@ -219,6 +219,7 @@ pub struct HostState {
     pub(crate) iframe_connect_hook: Option<IframeConnectHook>,
     pub(crate) body_attr_handler_hook: Option<BodyAttrHandlerHook>,
     pub(crate) script_connect_hook: Option<ScriptConnectHook>,
+    pub(crate) subresource_connect_hook: Option<SubresourceConnectHook>,
     /// True once initial page subresources (Wave 1 & 2 images/SVGs) have been registered into
     /// `layout_engine.assets` (used by `HTMLImageElement.prototype.complete` per HTML §4.8.4.3.6).
     pub initial_assets_loaded: bool,
@@ -237,6 +238,9 @@ pub(crate) type BodyAttrHandlerHook = Rc<dyn Fn(&mut JsVm, NodeId, &str, &str)>;
 
 /// Callback invoked when an executable fragment-created `<script>` element becomes connected.
 pub(crate) type ScriptConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
+
+/// Callback invoked when a dynamic `<img src>` or `<link rel="stylesheet" href>` becomes connected.
+pub(crate) type SubresourceConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
 
 /// Shared handle to [`HostState`].
 pub type SharedHost = Rc<RefCell<HostState>>;
@@ -333,6 +337,7 @@ impl HostState {
             iframe_connect_hook: None,
             body_attr_handler_hook: None,
             script_connect_hook: None,
+            subresource_connect_hook: None,
             initial_assets_loaded: false,
             pending_dynamic_images: HashSet::new(),
             completed_images: HashSet::new(),
@@ -656,6 +661,22 @@ impl HostState {
     /// Forces the next `paint_if_dirty*` call to repaint even if DOM revisions did not change
     /// (for example after async images or web fonts finish loading).
     pub fn invalidate_paint(&mut self) {
+        self.last_layout_revs = None;
+        self.last_paint_revs = None;
+    }
+
+    /// Alias for [`Self::invalidate_paint`] called after dynamic subresource decode finishes.
+    pub fn invalidate_layout_cache(&mut self) {
+        self.last_layout_revs = None;
+        self.last_paint_revs = None;
+        self.cached_fragment_tree = None;
+    }
+
+    /// Appends a dynamically fetched external `<link rel="stylesheet">` and marks styles dirty.
+    pub fn add_external_stylesheet(&mut self, sheet: Arc<Stylesheet>) {
+        self.external_stylesheets.push(sheet);
+        self.sheets_dirty = true;
+        self.last_style_revs = None;
         self.last_layout_revs = None;
         self.last_paint_revs = None;
     }
@@ -3126,6 +3147,26 @@ pub(crate) fn insert_node_into_parent(
                 };
                 for fid in iframes {
                     hook(vm, fid);
+                }
+            }
+            let subres_hook = host.borrow().subresource_connect_hook.clone();
+            if let Some(ref hook) = subres_hook {
+                let subres_nodes: Vec<NodeId> = {
+                    let doc_rc = Rc::clone(&host.borrow().document);
+                    let doc = doc_rc.borrow();
+                    doc.descendants(n)
+                        .filter(|&id| {
+                            matches!(
+                                doc.get(id),
+                                Some(NodeData::Element(e))
+                                    if e.name.local.as_str().eq_ignore_ascii_case("img")
+                                        || e.name.local.as_str().eq_ignore_ascii_case("link")
+                            )
+                        })
+                        .collect()
+                };
+                for sid in subres_nodes {
+                    hook(vm, sid);
                 }
             }
         }

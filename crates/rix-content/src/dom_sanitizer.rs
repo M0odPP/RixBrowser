@@ -323,8 +323,27 @@ pub fn install_dom_sanitizer_and_streaming(
             run_fragment_script_now(vm, &h, &el, &wa, &n, sid);
         }));
     }
+    {
+        let wh = Rc::downgrade(host);
+        let wev = Rc::downgrade(events);
+        let wel = Rc::downgrade(event_loop);
+        let wwa = Rc::downgrade(web_apis);
+        let wn = Rc::downgrade(net);
+        host.borrow_mut().subresource_connect_hook = Some(Rc::new(move |_vm, nid| {
+            let (Some(h), Some(ev), Some(el), Some(wa), Some(n)) = (
+                wh.upgrade(),
+                wev.upgrade(),
+                wel.upgrade(),
+                wwa.upgrade(),
+                wn.upgrade(),
+            ) else {
+                return;
+            };
+            schedule_connected_subresource(&h, &ev, &el, &wa, &n, nid);
+        }));
+    }
     install_sanitizer_ctor(vm, host);
-    install_html_helper_reflections(vm, host, event_loop);
+    install_html_helper_reflections(vm, host, events, event_loop, web_apis, net);
     install_positional_html_methods(vm, host, events, event_loop, web_apis, net);
     install_streaming_html_methods(vm, host, events, event_loop, web_apis, streams, net);
 }
@@ -856,7 +875,14 @@ fn install_str_attr_prop(
     define_host_accessor(vm, proto, prop, Some(g), Some(s));
 }
 
-fn install_html_helper_reflections(vm: &mut JsVm, host: &SharedHost, event_loop: &SharedEventLoop) {
+fn install_html_helper_reflections(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
+    net: &SharedNetBridge,
+) {
     let protos = host.borrow().interface_protos.clone();
 
     // `HTMLTableElement.prototype.rows`
@@ -1260,34 +1286,18 @@ fn install_html_helper_reflections(vm: &mut JsVm, host: &SharedHost, event_loop:
             Ok(JsValue::from_string(vm.heap.alloc_string(v)))
         });
         let h2 = Rc::clone(host);
+        let ev2 = Rc::clone(events);
         let el2 = Rc::clone(event_loop);
+        let wa2 = Rc::clone(web_apis);
+        let n2 = Rc::clone(net);
         let s = vm.alloc_host_fn("set src", move |vm, t, args| {
             let nid = require_node(vm, &h2, t)?;
             let val = to_dom_string(vm, arg(args, 0))?;
             if let Some(NodeData::Element(e)) = h2.borrow().document.borrow_mut().get_mut(nid) {
                 e.set_attribute("src", &val);
             }
-            if !val.is_empty() {
-                h2.borrow_mut().pending_dynamic_images.insert(nid);
-                h2.borrow_mut().completed_images.remove(&nid);
-                let h_cb = Rc::clone(&h2);
-                el2.borrow_mut()
-                    .post_host_task(TaskPriority::Networking, move |vm| {
-                        {
-                            let mut hmut = h_cb.borrow_mut();
-                            hmut.pending_dynamic_images.remove(&nid);
-                            hmut.completed_images.insert(nid);
-                        }
-                        let w = wrap_node(vm, &h_cb, nid);
-                        if let Some(wh) = w.as_object() {
-                            let ke = vm.heap.intern_key("onerror");
-                            if let Ok(cb) = vm.get_property_by_key(wh, ke) {
-                                if cb.as_object().is_some_and(|ch| vm.is_callable_handle(ch)) {
-                                    let _ = vm.call_value(cb, w, &[]);
-                                }
-                            }
-                        }
-                    });
+            if !val.trim().is_empty() {
+                schedule_dynamic_image_load(&h2, &ev2, &el2, &wa2, &n2, nid, &val);
             } else {
                 let mut hmut = h2.borrow_mut();
                 hmut.pending_dynamic_images.remove(&nid);
@@ -2271,6 +2281,7 @@ fn schedule_async_external_script(
         let engine = Arc::clone(&net.borrow().fetch_engine);
         let tx = net.borrow().async_tx.clone();
         let origin = web_apis.borrow().current_origin();
+        net.borrow_mut().pending_subresources += 1;
         rt_handle.spawn(async move {
             let req = rix_net::FetchRequest {
                 url: resolved,
@@ -2284,14 +2295,35 @@ fn schedule_async_external_script(
                 origin,
                 abort_signal: None,
             };
-            if let Ok(resp) = engine.fetch(req).await {
-                let code = String::from_utf8_lossy(&resp.body).into_owned();
-                let _ = tx.send(AsyncNetEvent::ExternalScriptLoaded {
-                    script_nid,
-                    is_module,
-                    code,
-                });
-            }
+            let (ok, code) = match engine.fetch(req).await {
+                Ok(resp) if (200..300).contains(&resp.status) => {
+                    let ct = resp
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, v)| v.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    let text = String::from_utf8_lossy(&resp.body).into_owned();
+                    let trimmed = text.trim_start();
+                    let is_html = ct.contains("text/html")
+                        || ct.contains("application/xhtml+xml")
+                        || trimmed.starts_with("<!DOCTYPE")
+                        || trimmed.starts_with("<!doctype")
+                        || trimmed.starts_with("<html");
+                    if is_html {
+                        (false, String::new())
+                    } else {
+                        (true, text)
+                    }
+                }
+                _ => (false, String::new()),
+            };
+            let _ = tx.send(AsyncNetEvent::ExternalScriptLoaded {
+                script_nid,
+                is_module,
+                code,
+                ok,
+            });
         });
     } else if let Some(code) = fetch_script_source_sync(web_apis, net, &resolved) {
         let h_cb = Rc::clone(host);
@@ -2301,6 +2333,281 @@ fn schedule_async_external_script(
                 eval_script_node(vm, &h_cb, script_nid, &code, is_module);
             });
     }
+}
+
+/// Dispatches a non-bubbling `load` or `error` event on an element (invoking both DOM
+/// `addEventListener` listeners and IDL `el.onload`/`el.onerror` handlers).
+pub(crate) fn dispatch_simple_element_event(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    nid: NodeId,
+    ev_type: &str,
+) {
+    let _ = crate::events::fire_dom_node_event(
+        vm,
+        host,
+        events,
+        event_loop,
+        nid,
+        ev_type,
+        false,
+        false,
+        &[],
+    );
+}
+
+fn schedule_connected_subresource(
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
+    net: &SharedNetBridge,
+    nid: NodeId,
+) {
+    let info = {
+        let hb = host.borrow();
+        let doc = hb.document.borrow();
+        match doc.get(nid) {
+            Some(NodeData::Element(el)) => {
+                let tag = el.name.local.as_str().to_ascii_lowercase();
+                if tag == "img" {
+                    let src = el
+                        .get_attribute("src")
+                        .or_else(|| el.get_attribute("srcset"))
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let is_lazy = el
+                        .get_attribute("loading")
+                        .is_some_and(|v| v.trim().eq_ignore_ascii_case("lazy"));
+                    if !src.is_empty() && !is_lazy {
+                        Some(("img", src))
+                    } else {
+                        None
+                    }
+                } else if tag == "link" {
+                    let rel = el.get_attribute("rel").unwrap_or("");
+                    let is_sheet = rel
+                        .split_ascii_whitespace()
+                        .any(|t| t.eq_ignore_ascii_case("stylesheet"));
+                    let is_alt = rel
+                        .split_ascii_whitespace()
+                        .any(|t| t.eq_ignore_ascii_case("alternate"));
+                    let href = el.get_attribute("href").unwrap_or("").trim().to_string();
+                    if is_sheet && !is_alt && !el.has_attribute("disabled") && !href.is_empty() {
+                        Some(("link", href))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    };
+    match info {
+        Some(("img", src)) => {
+            schedule_dynamic_image_load(host, events, event_loop, web_apis, net, nid, &src);
+        }
+        Some(("link", href)) => {
+            schedule_dynamic_stylesheet_load(host, web_apis, net, nid, &href);
+        }
+        _ => {}
+    }
+}
+
+fn schedule_dynamic_stylesheet_load(
+    host: &SharedHost,
+    web_apis: &SharedWebApis,
+    net: &SharedNetBridge,
+    link_nid: NodeId,
+    raw_href: &str,
+) {
+    let resolved = url::Url::parse(&host.borrow().main_document_url)
+        .ok()
+        .and_then(|base| base.join(raw_href.trim()).ok())
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| raw_href.trim().to_string());
+    if !resolved.starts_with("http://") && !resolved.starts_with("https://") {
+        return;
+    }
+    let Ok(rt_handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let engine = Arc::clone(&net.borrow().fetch_engine);
+    let tx = net.borrow().async_tx.clone();
+    let origin = web_apis.borrow().current_origin();
+    net.borrow_mut().pending_subresources += 1;
+    rt_handle.spawn(async move {
+        let req = rix_net::FetchRequest {
+            url: resolved,
+            method: "GET".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+            mode: rix_net::FetchMode::NoCors,
+            credentials: rix_net::FetchCredentials::SameOrigin,
+            cache: rix_net::FetchCache::Default,
+            redirect: rix_net::FetchRedirect::Follow,
+            origin,
+            abort_signal: None,
+        };
+        let css = match tokio::time::timeout(std::time::Duration::from_secs(3), engine.fetch(req))
+            .await
+        {
+            Ok(Ok(resp)) if (200..300).contains(&resp.status) => {
+                let text = String::from_utf8_lossy(&resp.body).into_owned();
+                let trimmed = text.trim_start();
+                if trimmed.starts_with("<!DOCTYPE")
+                    || trimmed.starts_with("<!doctype")
+                    || trimmed.starts_with("<html")
+                {
+                    None
+                } else {
+                    Some(text)
+                }
+            }
+            _ => None,
+        };
+        let _ = tx.send(AsyncNetEvent::DynamicStylesheetLoaded { link_nid, css });
+    });
+}
+
+fn schedule_dynamic_image_load(
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
+    net: &SharedNetBridge,
+    img_nid: NodeId,
+    raw_src: &str,
+) {
+    let trimmed = raw_src.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let resolved = url::Url::parse(&host.borrow().main_document_url)
+        .ok()
+        .and_then(|base| base.join(trimmed).ok())
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| trimmed.to_string());
+
+    // Fast path: already decoded in this document's AssetRegistry.
+    let already_loaded = {
+        let hb = host.borrow();
+        hb.layout_engine.assets.get_by_src(trimmed).is_some()
+            || hb.layout_engine.assets.get_by_src(&resolved).is_some()
+            || hb.layout_engine.assets.get_svg_by_src(trimmed).is_some()
+            || hb.layout_engine.assets.get_svg_by_src(&resolved).is_some()
+    };
+    if already_loaded {
+        {
+            let mut hb = host.borrow_mut();
+            hb.pending_dynamic_images.remove(&img_nid);
+            hb.completed_images.insert(img_nid);
+        }
+        let h_cb = Rc::clone(host);
+        let ev_cb = Rc::clone(events);
+        let el_cb = Rc::clone(event_loop);
+        event_loop
+            .borrow_mut()
+            .post_host_task(TaskPriority::Networking, move |vm| {
+                dispatch_simple_element_event(vm, &h_cb, &ev_cb, &el_cb, img_nid, "load");
+            });
+        return;
+    }
+
+    // Live HTTP(S) async fetch + off-thread raster/SVG decode when tokio runtime is active.
+    if (resolved.starts_with("http://") || resolved.starts_with("https://"))
+        && tokio::runtime::Handle::try_current().is_ok()
+    {
+        let rt_handle = tokio::runtime::Handle::current();
+        {
+            let mut hb = host.borrow_mut();
+            hb.pending_dynamic_images.insert(img_nid);
+            hb.completed_images.remove(&img_nid);
+        }
+        let engine = Arc::clone(&net.borrow().fetch_engine);
+        let tx = net.borrow().async_tx.clone();
+        let origin = web_apis.borrow().current_origin();
+        let raw_owned = trimmed.to_string();
+        let resolved_owned = resolved;
+        net.borrow_mut().pending_subresources += 1;
+        rt_handle.spawn(async move {
+            let req = rix_net::FetchRequest {
+                url: resolved_owned.clone(),
+                method: "GET".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+                mode: rix_net::FetchMode::NoCors,
+                credentials: rix_net::FetchCredentials::SameOrigin,
+                cache: rix_net::FetchCache::Default,
+                redirect: rix_net::FetchRedirect::Follow,
+                origin,
+                abort_signal: None,
+            };
+            let (raster, svg) = match tokio::time::timeout(
+                std::time::Duration::from_millis(2500),
+                engine.fetch(req),
+            )
+            .await
+            {
+                Ok(Ok(resp)) if (200..300).contains(&resp.status) && !resp.body.is_empty() => {
+                    let ct = resp
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, v)| v.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    let is_svg = ct.contains("image/svg")
+                        || resolved_owned.to_ascii_lowercase().contains(".svg")
+                        || resp.body.starts_with(b"<svg")
+                        || resp.body.starts_with(b"<?xml");
+                    if is_svg {
+                        let markup = String::from_utf8_lossy(&resp.body);
+                        let doc = rix_html::parse_html(&markup);
+                        let parsed =
+                            rix_layout::extract_svg_from_document(&doc, rix_css::ColorRgba::BLACK);
+                        (None, parsed)
+                    } else {
+                        (rix_layout::decode_single_raster(&resp.body).ok(), None)
+                    }
+                }
+                _ => (None, None),
+            };
+            let _ = tx.send(AsyncNetEvent::DynamicImageLoaded {
+                img_nid,
+                raw_src: raw_owned,
+                resolved_url: resolved_owned,
+                raster,
+                svg,
+            });
+        });
+        return;
+    }
+
+    // Offline / non-HTTP / invalid image URL fallback (e.g. unit/WPT tests without server):
+    // mark pending, then complete with `error` event asynchronously per HTML §4.8.4.3.
+    {
+        let mut hb = host.borrow_mut();
+        hb.pending_dynamic_images.insert(img_nid);
+        hb.completed_images.remove(&img_nid);
+    }
+    let h_cb = Rc::clone(host);
+    let ev_cb = Rc::clone(events);
+    let el_cb = Rc::clone(event_loop);
+    event_loop
+        .borrow_mut()
+        .post_host_task(TaskPriority::Networking, move |vm| {
+            {
+                let mut hmut = h_cb.borrow_mut();
+                hmut.pending_dynamic_images.remove(&img_nid);
+                hmut.completed_images.insert(img_nid);
+            }
+            dispatch_simple_element_event(vm, &h_cb, &ev_cb, &el_cb, img_nid, "error");
+        });
 }
 
 pub(crate) fn eval_script_node(

@@ -116,6 +116,18 @@ pub enum AsyncNetEvent {
         script_nid: rix_dom::NodeId,
         is_module: bool,
         code: String,
+        ok: bool,
+    },
+    DynamicImageLoaded {
+        img_nid: rix_dom::NodeId,
+        raw_src: String,
+        resolved_url: String,
+        raster: Option<rix_layout::DecodedRasterBytes>,
+        svg: Option<rix_layout::DecodedSvg>,
+    },
+    DynamicStylesheetLoaded {
+        link_nid: rix_dom::NodeId,
+        css: Option<String>,
     },
 }
 
@@ -238,6 +250,7 @@ pub struct NetworkBridge {
     pub(crate) async_rx: RefCell<Option<mpsc::UnboundedReceiver<AsyncNetEvent>>>,
     next_id: u64,
     pending_fetches: HashMap<u64, PendingFetch>,
+    pub(crate) pending_subresources: usize,
     keepalive_inflight_bytes: usize,
     websockets: HashMap<u64, JsWebSocketEntry>,
     ws_handle_to_id: HashMap<HeapHandle, u64>,
@@ -270,6 +283,7 @@ impl NetworkBridge {
     #[must_use]
     pub fn has_pending_io(&self) -> bool {
         !self.pending_fetches.is_empty()
+            || self.pending_subresources > 0
             || !self.websockets.is_empty()
             || self
                 .ws_streams
@@ -286,6 +300,7 @@ impl NetworkBridge {
             async_rx: RefCell::new(Some(async_rx)),
             next_id: 1,
             pending_fetches: HashMap::new(),
+            pending_subresources: 0,
             keepalive_inflight_bytes: 0,
             websockets: HashMap::new(),
             ws_handle_to_id: HashMap::new(),
@@ -304,6 +319,7 @@ impl NetworkBridge {
     #[must_use]
     pub fn has_active_io(&self) -> bool {
         !self.pending_fetches.is_empty()
+            || self.pending_subresources > 0
             || self.websockets.values().any(|ws| ws.ready_state < 3)
             || self
                 .ws_streams
@@ -682,8 +698,112 @@ pub fn deliver_async_net_event(
             script_nid,
             is_module,
             code,
+            ok,
         } => {
-            crate::dom_sanitizer::eval_script_node(vm, host, script_nid, &code, is_module);
+            {
+                let mut nb = net.borrow_mut();
+                nb.pending_subresources = nb.pending_subresources.saturating_sub(1);
+            }
+            if ok {
+                crate::dom_sanitizer::eval_script_node(vm, host, script_nid, &code, is_module);
+                crate::dom_sanitizer::dispatch_simple_element_event(
+                    vm, host, events, event_loop, script_nid, "load",
+                );
+            } else {
+                crate::dom_sanitizer::dispatch_simple_element_event(
+                    vm, host, events, event_loop, script_nid, "error",
+                );
+            }
+        }
+        AsyncNetEvent::DynamicImageLoaded {
+            img_nid,
+            raw_src,
+            resolved_url,
+            raster,
+            svg,
+        } => {
+            {
+                let mut nb = net.borrow_mut();
+                nb.pending_subresources = nb.pending_subresources.saturating_sub(1);
+            }
+            let mut loaded_ok = false;
+            {
+                let mut hb = host.borrow_mut();
+                hb.pending_dynamic_images.remove(&img_nid);
+                hb.completed_images.insert(img_nid);
+                if let Some(r) = raster {
+                    if hb
+                        .layout_engine
+                        .assets
+                        .register_rgba8_shared_with_intrinsic(
+                            resolved_url.clone(),
+                            r.width,
+                            r.height,
+                            r.intrinsic_width,
+                            r.intrinsic_height,
+                            r.rgba,
+                        )
+                        .is_ok()
+                    {
+                        if raw_src != resolved_url {
+                            hb.layout_engine
+                                .assets
+                                .register_alias(raw_src, &resolved_url);
+                        }
+                        loaded_ok = true;
+                    }
+                } else if let Some(s) = svg {
+                    hb.layout_engine
+                        .assets
+                        .register_svg(resolved_url.clone(), s);
+                    if raw_src != resolved_url {
+                        hb.layout_engine
+                            .assets
+                            .register_alias(raw_src, &resolved_url);
+                    }
+                    loaded_ok = true;
+                }
+                if loaded_ok {
+                    let doc_rc = Rc::clone(&hb.document);
+                    doc_rc.borrow_mut().mark_node_dirty(
+                        img_nid,
+                        rix_dom::DirtyFlags::SELF_LAYOUT_DIRTY | rix_dom::DirtyFlags::PAINT_DIRTY,
+                    );
+                    hb.invalidate_layout_cache();
+                }
+            }
+            let ev_type = if loaded_ok { "load" } else { "error" };
+            crate::dom_sanitizer::dispatch_simple_element_event(
+                vm, host, events, event_loop, img_nid, ev_type,
+            );
+        }
+        AsyncNetEvent::DynamicStylesheetLoaded { link_nid, css } => {
+            {
+                let mut nb = net.borrow_mut();
+                nb.pending_subresources = nb.pending_subresources.saturating_sub(1);
+            }
+            let loaded_ok = if let Some(css_text) = css {
+                let mut hb = host.borrow_mut();
+                let media = rix_css::MediaContext {
+                    viewport_width: hb.viewport.width,
+                    viewport_height: hb.viewport.height,
+                    dark_mode: hb.dark_mode,
+                    ..rix_css::MediaContext::default()
+                };
+                let sheet = rix_css::Stylesheet::parse_cached(
+                    &css_text,
+                    rix_css::CascadeOrigin::Author,
+                    &media,
+                );
+                hb.add_external_stylesheet(sheet);
+                true
+            } else {
+                false
+            };
+            let ev_type = if loaded_ok { "load" } else { "error" };
+            crate::dom_sanitizer::dispatch_simple_element_event(
+                vm, host, events, event_loop, link_nid, ev_type,
+            );
         }
     }
 }
