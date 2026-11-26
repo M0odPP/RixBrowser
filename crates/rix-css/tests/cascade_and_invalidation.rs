@@ -240,3 +240,153 @@ fn parallel_cascade_and_style_memo_on_large_sibling_list() {
     );
     assert_incremental_matches_full(&mut doc, &ctx, &sheet, media);
 }
+
+#[test]
+fn media_query_comma_lists_evaluate_per_mq_l4() {
+    // CSS Media Queries L4 §3: comma-separated media query lists match if ANY query matches.
+    let media = MediaContext::default();
+    assert!(media.evaluate_media_query_str("screen, print"));
+    assert!(media.evaluate_media_query_str("print, screen"));
+    assert!(media.evaluate_media_query_str("screen,projection"));
+    assert!(media.evaluate_media_query_str("(min-width: 600px), print"));
+    assert!(media.evaluate_media_query_str("height <= 999999px"));
+    assert!(!media.evaluate_media_query_str("print"));
+    assert!(!media.evaluate_media_query_str("print, speech"));
+}
+
+#[test]
+fn registered_properties_o1_inheritance_and_non_inherited_reset() {
+    // CSS Properties and Values API L1: non-inherited `@property` declarations reset to
+    // `initial-value` (or absent when omitted) on children without re-cloning all registrations
+    // on every descendant element.
+    let mut css = String::new();
+    for i in 0..100 {
+        css.push_str(&format!(
+            "@property --reg-ni-{i} {{ syntax: \"*\"; inherits: false; initial-value: {i}px; }}\n"
+        ));
+    }
+    css.push_str(
+        r#"
+        @property --reg-no-init { syntax: "*"; inherits: false; }
+        @property --reg-len { syntax: "<length>"; inherits: true; initial-value: 10px; }
+        #parent { --reg-ni-0: 99px; --reg-no-init: active; font-size: 20px; --reg-len: 2em; }
+        #child { font-size: 10px; }
+        "#,
+    );
+    let html = r#"<!doctype html><html><body><div id="parent"><div id="child"><span id="grand"></span></div></div><div id="sib"></div></body></html>"#;
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let sheet = Arc::new(Stylesheet::parse(&css, CascadeOrigin::Author, &media));
+    let mut ctx = StyleContext::new(media);
+    ctx.add_stylesheet(sheet);
+    ctx.cascade_full(&mut doc);
+
+    let parent = find_by_id(&doc, "parent");
+    let child = find_by_id(&doc, "child");
+    let grand = find_by_id(&doc, "grand");
+    let sib = find_by_id(&doc, "sib");
+
+    let p_st = ctx.style_for(parent).unwrap();
+    let c_st = ctx.style_for(child).unwrap();
+    let g_st = ctx.style_for(grand).unwrap();
+    let s_st = ctx.style_for(sib).unwrap();
+
+    assert_eq!(
+        p_st.custom_properties
+            .get_serialized(&rix_core::intern_str("--reg-ni-0")),
+        Some("99px")
+    );
+    assert_eq!(
+        p_st.custom_properties
+            .get_serialized(&rix_core::intern_str("--reg-no-init")),
+        Some("active")
+    );
+    assert_eq!(
+        p_st.custom_properties
+            .get_serialized(&rix_core::intern_str("--reg-len")),
+        Some("40px")
+    );
+
+    // Child resets non-inherited `--reg-ni-0` and `--reg-no-init`, while inheriting computed `--reg-len: 40px`!
+    assert_eq!(
+        c_st.custom_properties
+            .get_serialized(&rix_core::intern_str("--reg-ni-0")),
+        Some("0px")
+    );
+    assert_eq!(
+        c_st.custom_properties
+            .get_serialized(&rix_core::intern_str("--reg-no-init")),
+        None
+    );
+    assert_eq!(
+        c_st.custom_properties
+            .get_serialized(&rix_core::intern_str("--reg-len")),
+        Some("40px")
+    );
+
+    // Grandchild shares `CustomPropertyMap` pointer directly with child in O(1)!
+    assert!(
+        Arc::ptr_eq(&c_st.custom_properties, &g_st.custom_properties),
+        "unchanged descendant must share CustomPropertyMap in O(1) even with 100+ @property rules"
+    );
+    // Sibling shares untouched root-seeded initial values.
+    assert_eq!(
+        s_st.custom_properties
+            .get_serialized(&rix_core::intern_str("--reg-ni-42")),
+        Some("42px")
+    );
+    assert_eq!(
+        s_st.custom_properties
+            .get_serialized(&rix_core::intern_str("--reg-len")),
+        Some("10px")
+    );
+}
+
+#[test]
+fn bucketed_pseudo_elements_and_attribute_rules_match_accurately() {
+    let css = r#"
+        .card::before { content: "A"; color: #ff0000; }
+        #hero::after { content: "B"; color: #00ff00; }
+        [data-badge]::before { content: "C"; color: #0000ff; }
+        [data-state="open"] { background-color: #123456; }
+    "#;
+    let html = r#"<!doctype html><html><body>
+        <div id="hero" class="card" data-state="open"></div>
+        <span id="badge" data-badge="1"></span>
+    </body></html>"#;
+    let mut doc = parse_html(html);
+    let media = MediaContext::default();
+    let sheet = Arc::new(Stylesheet::parse(css, CascadeOrigin::Author, &media));
+    let mut ctx = StyleContext::new(media);
+    ctx.add_stylesheet(sheet);
+    ctx.cascade_full(&mut doc);
+
+    let hero = find_by_id(&doc, "hero");
+    let badge = find_by_id(&doc, "badge");
+
+    assert_eq!(
+        ctx.style_for(hero).unwrap().visual.background_color,
+        ColorRgba::rgb(0x12, 0x34, 0x56)
+    );
+    assert_eq!(
+        ctx.pseudo_style_for(hero, rix_css::RixPseudoElement::Before)
+            .unwrap()
+            .text
+            .color,
+        ColorRgba::rgb(0xff, 0x00, 0x00)
+    );
+    assert_eq!(
+        ctx.pseudo_style_for(hero, rix_css::RixPseudoElement::After)
+            .unwrap()
+            .text
+            .color,
+        ColorRgba::rgb(0x00, 0xff, 0x00)
+    );
+    assert_eq!(
+        ctx.pseudo_style_for(badge, rix_css::RixPseudoElement::Before)
+            .unwrap()
+            .text
+            .color,
+        ColorRgba::rgb(0x00, 0x00, 0xff)
+    );
+}

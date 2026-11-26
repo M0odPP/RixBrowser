@@ -2230,11 +2230,34 @@ fn resolve_gradient_stops(
         }
     }
 
-    let mut out = SmallVec::with_capacity(n);
+    let mut out: SmallVec<[ColorStop; 4]> = SmallVec::with_capacity(n + 2);
     for (idx, stop) in stops.iter().enumerate() {
         let color = to_rgba8(stop.color.resolve(current_color, dark_mode));
         let offset = positions[idx].unwrap_or(0.0).clamp(0.0, 1.0);
         out.push(ColorStop { offset, color });
+    }
+    // CSS Images L3 §3.4.3: Before the first stop the gradient has the color of the first stop,
+    // and after the last stop it has the color of the last stop. Explicit 0.0 / 1.0 clamping
+    // stops ensure GPU ramp builders (e.g. vello_encoding) preserve shifted hard-stop transitions
+    // like `linear-gradient(180deg, transparent calc(100% - 1px), red 0)`.
+    if let Some(first) = out.first().copied() {
+        if first.offset > 0.0 {
+            out.insert(
+                0,
+                ColorStop {
+                    offset: 0.0,
+                    color: first.color,
+                },
+            );
+        }
+    }
+    if let Some(last) = out.last().copied() {
+        if last.offset < 1.0 {
+            out.push(ColorStop {
+                offset: 1.0,
+                color: last.color,
+            });
+        }
     }
     out
 }

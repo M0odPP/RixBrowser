@@ -1021,8 +1021,15 @@ fn apply_custom_prop_tokens(
             crate::color::parse_css_color(trimmed).map(|c| c.resolve(ResolvedColor::from_rgba(style.text.color), false, eval).to_computed_css_string())
         } else { None };
         if let Some(s) = eval_str {
-            Arc::make_mut(&mut style.custom_properties).insert(cname.clone(), crate::properties::tokenize_custom_value_str(&s));
+            let cmap = Arc::make_mut(&mut style.custom_properties);
+            cmap.insert(cname.clone(), crate::properties::tokenize_custom_value_str(&s));
+            if !reg.inherits {
+                cmap.mark_dirty_non_inherited(cname.clone());
+            }
             return;
+        }
+        if !reg.inherits {
+            Arc::make_mut(&mut style.custom_properties).mark_dirty_non_inherited(cname.clone());
         }
     }
     Arc::make_mut(&mut style.custom_properties).insert(cname.clone(), toks.to_vec());
