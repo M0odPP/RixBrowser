@@ -6,7 +6,9 @@ use crate::stylesheet::{CascadeOrigin, MediaContext, Stylesheet};
 
 /// Standard HTML5 User-Agent stylesheet rules.
 pub const UA_CSS: &str = r#"
-head, title, meta, link, style, script, template, noscript, [hidden] {
+head, title, meta, link, style, script, template, noscript, [hidden],
+[popover]:not(:popover-open), dialog:not([open]),
+details:not([open]) > :not(summary) {
     display: none;
 }
 html, body, div, p, section, article, main, header, footer, nav, aside,
@@ -90,6 +92,10 @@ body {
 p, ul, ol, dl, blockquote, pre, figure {
     margin-top: 1em;
     margin-bottom: 1em;
+}
+blockquote, figure {
+    margin-left: 40px;
+    margin-right: 40px;
 }
 h1 {
     font-size: 2em;

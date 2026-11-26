@@ -1426,6 +1426,13 @@ pub fn layout_flex_container(
             let mut ispace = cb_for_items;
             ispace.available_width = item_avail_w.max(0.0);
             ispace.available_height = item_avail_h;
+            // CSS Flexbox §9.4/§9.8: a flex item's resolved main size (or definite cross size)
+            // overrides its specified percentage/auto width when laying out its children.
+            ispace.definite_width_override = if axes.main_is_x {
+                Some((main_b - pb_m).max(0.0))
+            } else {
+                derived_cross_c
+            };
             // CSS Flexbox §9.8: a flex item's resolved main size in a definite-height column flex
             // (or explicit flex-basis/height), or definite cross size in a row flex, is definite for its children.
             ispace.definite_height_override = if axes.main_is_x {
@@ -1701,6 +1708,11 @@ pub fn layout_flex_container(
                 let mut rspace = cb_for_items;
                 rspace.available_width = rw.max(0.0);
                 rspace.available_height = rh;
+                rspace.definite_width_override = if axes.main_is_x {
+                    Some((main_b - items[idx].pb_main).max(0.0))
+                } else {
+                    Some(target_cross_c)
+                };
                 rspace.definite_height_override = if axes.main_is_x {
                     Some(target_cross_c)
                 } else if c_def_main.is_some()

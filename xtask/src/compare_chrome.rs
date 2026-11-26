@@ -324,14 +324,15 @@ pub fn run_compare_chrome(opts: &CompareChromeOptions) -> Result<CompareChromeRe
         let chrome_profile = opts.out_dir.join(format!("{slug}_chrome_profile"));
         let _ = fs::remove_dir_all(&chrome_profile);
 
-        // 1. Run RixBrowser headless in Light mode (matching Chromium default).
+        // 1. Run RixBrowser headless in Light mode (matching Chromium default) with an exact
+        // 1280x800 web viewport (`800 + 117px` top chrome = `917px` total window height).
         let mut rix_cmd = Command::new(&opts.rix_bin);
         rix_cmd
             .arg(format!("--render-url={url}"))
             .arg(format!("--out={}", rix_png.display()))
             .arg(format!("--metrics-json={}", rix_json.display()))
             .arg("--width=1280")
-            .arg("--height=880")
+            .arg("--height=917")
             .arg("--light");
         let (rix_ok, rix_wall_ms, rix_tree_rss_kib) =
             run_monitored_command(rix_cmd, Duration::from_secs(25));

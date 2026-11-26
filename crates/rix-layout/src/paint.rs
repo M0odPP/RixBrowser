@@ -423,7 +423,7 @@ impl<'a> Painter<'a> {
             }
         }
 
-        // 3b. CSS `clip-path` (clips the element's own background, border, AND descendants).
+        // 3b. CSS `clip-path` and CSS 2.1 `clip: rect(...)` (clips background, border, AND descendants).
         if let Some(effects) = &style.effects {
             if let Some(shape) = resolve_clip_path(&effects.clip_path, abs_rect) {
                 self.list.push(DisplayItem::PushClipPath {
@@ -431,6 +431,40 @@ impl<'a> Painter<'a> {
                     shape,
                 });
                 pushed_clip_path = true;
+            }
+            if matches!(style.position, PositionMode::Absolute | PositionMode::Fixed) {
+                if let Some(cr) = &effects.clip_rect {
+                    let eval = EvalContext {
+                        font_size_px: style.text.font_size_px,
+                        ..EvalContext::default()
+                    };
+                    let top = cr
+                        .top
+                        .as_ref()
+                        .map_or(0.0, |v| v.resolve_px(abs_rect.size.height, &eval));
+                    let left = cr
+                        .left
+                        .as_ref()
+                        .map_or(0.0, |v| v.resolve_px(abs_rect.size.width, &eval));
+                    let right = cr.right.as_ref().map_or(abs_rect.size.width, |v| {
+                        v.resolve_px(abs_rect.size.width, &eval)
+                    });
+                    let bottom = cr.bottom.as_ref().map_or(abs_rect.size.height, |v| {
+                        v.resolve_px(abs_rect.size.height, &eval)
+                    });
+                    let clip_r = Rect::new(
+                        abs_rect.min_x() + left,
+                        abs_rect.min_y() + top,
+                        (right - left).max(0.0),
+                        (bottom - top).max(0.0),
+                    );
+                    self.list.push(DisplayItem::PushClip {
+                        spatial: active_spatial,
+                        rect: clip_r,
+                        radii: [0.0; 4],
+                    });
+                    pushed_clip = true;
+                }
             }
         }
 
@@ -452,6 +486,7 @@ impl<'a> Painter<'a> {
         let is_scroll_container =
             matches!(style.overflow.x, OverflowMode::Scroll | OverflowMode::Auto)
                 || matches!(style.overflow.y, OverflowMode::Scroll | OverflowMode::Auto);
+        let mut pushed_overflow_clip = false;
         if clips_x || clips_y {
             let clip_rect = Rect::new(
                 abs_rect.min_x() + frag.border.left,
@@ -485,7 +520,7 @@ impl<'a> Painter<'a> {
                 rect: clip_rect,
                 radii,
             });
-            pushed_clip = true;
+            pushed_overflow_clip = true;
         }
 
         // Paint intrinsic replaced content (Image, SVG, FormControl, TextRun) of this fragment itself.
@@ -568,6 +603,9 @@ impl<'a> Painter<'a> {
             );
         }
 
+        if pushed_overflow_clip {
+            self.list.push(DisplayItem::PopClip);
+        }
         if pushed_clip {
             self.list.push(DisplayItem::PopClip);
         }
@@ -617,6 +655,21 @@ impl<'a> Painter<'a> {
                             scroll_parent,
                         );
                     } else if !is_inline_level_fragment(child) {
+                        let clips = child.style.overflow.x != OverflowMode::Visible
+                            || child.style.overflow.y != OverflowMode::Visible;
+                        if clips {
+                            let clip_rect = Rect::new(
+                                child_abs.min_x() + child.border.left,
+                                child_abs.min_y() + child.border.top,
+                                (child_abs.size.width - child.border.horizontal()).max(0.0),
+                                (child_abs.size.height - child.border.vertical()).max(0.0),
+                            );
+                            self.list.push(DisplayItem::PushClip {
+                                spatial,
+                                rect: clip_rect,
+                                radii: resolve_radii(&child.style, clip_rect),
+                            });
+                        }
                         self.paint_flow_phase(
                             child,
                             child_abs.origin,
@@ -624,6 +677,9 @@ impl<'a> Painter<'a> {
                             scroll_parent,
                             FlowPhase::Floats,
                         );
+                        if clips {
+                            self.list.push(DisplayItem::PopClip);
+                        }
                     }
                 }
                 FlowPhase::Inlines => {
@@ -633,6 +689,21 @@ impl<'a> Painter<'a> {
                     if is_inline_level_fragment(child) {
                         self.paint_inline_subtree(child, child_abs, spatial, scroll_parent);
                     } else {
+                        let clips = child.style.overflow.x != OverflowMode::Visible
+                            || child.style.overflow.y != OverflowMode::Visible;
+                        if clips {
+                            let clip_rect = Rect::new(
+                                child_abs.min_x() + child.border.left,
+                                child_abs.min_y() + child.border.top,
+                                (child_abs.size.width - child.border.horizontal()).max(0.0),
+                                (child_abs.size.height - child.border.vertical()).max(0.0),
+                            );
+                            self.list.push(DisplayItem::PushClip {
+                                spatial,
+                                rect: clip_rect,
+                                radii: resolve_radii(&child.style, clip_rect),
+                            });
+                        }
                         self.paint_flow_phase(
                             child,
                             child_abs.origin,
@@ -640,6 +711,9 @@ impl<'a> Painter<'a> {
                             scroll_parent,
                             FlowPhase::Inlines,
                         );
+                        if clips {
+                            self.list.push(DisplayItem::PopClip);
+                        }
                     }
                 }
             }
@@ -729,6 +803,74 @@ impl<'a> Painter<'a> {
         }
     }
 
+    fn paint_svg_asset_in_rect(
+        &mut self,
+        svg: &crate::assets::DecodedSvg,
+        abs_rect: Rect,
+        size_cover: bool,
+        size_contain: bool,
+        tint_override: Option<ColorRgba>,
+    ) {
+        if abs_rect.is_empty() || svg.paths.is_empty() {
+            return;
+        }
+        let vb = svg.view_box.map_or_else(
+            || {
+                Rect::new(
+                    0.0,
+                    0.0,
+                    svg.intrinsic_size.width.max(1.0),
+                    svg.intrinsic_size.height.max(1.0),
+                )
+            },
+            |v| Rect::new(v.min_x, v.min_y, v.width.max(1.0), v.height.max(1.0)),
+        );
+        let sx = f64::from(abs_rect.size.width / vb.size.width);
+        let sy = f64::from(abs_rect.size.height / vb.size.height);
+        let scale = if size_cover {
+            sx.max(sy)
+        } else if size_contain {
+            sx.min(sy)
+        } else {
+            // Preserve aspect ratio within container bounds (fitting naturally when SVG is larger
+            // than the target box or honoring intrinsic size centered inside larger boxes).
+            sx.min(sy).min(1.0)
+        };
+        let tx = -f64::from(vb.origin.x) * scale
+            + f64::from(abs_rect.size.width - vb.size.width * scale as f32) * 0.5;
+        let ty = -f64::from(vb.origin.y) * scale
+            + f64::from(abs_rect.size.height - vb.size.height * scale as f32) * 0.5;
+        let xf = Affine::translate((tx, ty)) * Affine::scale(scale);
+
+        for entry in &svg.paths {
+            let Ok(mut bez) = parse_svg_path(&entry.path_d) else {
+                continue;
+            };
+            bez.apply_affine(xf);
+            let path_id =
+                hash_svg_path_id(&entry.path_d, abs_rect.size.width, abs_rect.size.height);
+            self.resources.register_path(path_id, bez);
+            let fill = match tint_override {
+                Some(tint) => entry.fill.map(|_| to_rgba8(tint)),
+                None => entry.fill.map(to_rgba8),
+            };
+            let stroke = match tint_override {
+                Some(tint) => entry
+                    .stroke
+                    .map(|(_, w)| (to_rgba8(tint), (w * scale as f32).max(0.5))),
+                None => entry
+                    .stroke
+                    .map(|(c, w)| (to_rgba8(c), (w * scale as f32).max(0.5))),
+            };
+            self.list.push(DisplayItem::VectorPath {
+                bounds: abs_rect,
+                path_id,
+                fill,
+                stroke,
+            });
+        }
+    }
+
     fn paint_box_decorations(&mut self, frag: &Fragment, abs_rect: Rect) {
         if frag.style.visibility != VisibilityMode::Visible || abs_rect.is_empty() {
             return;
@@ -763,9 +905,15 @@ impl<'a> Painter<'a> {
             }
         }
 
-        // Solid background fill.
+        // Solid background fill (or CSS Masking L1 `mask-image: url(...)` tinted vector icon).
         let bg = style.visual.background_color;
-        if bg.a > 0 {
+        if let BackgroundImageValue::Url(mask_url) = &style.visual.mask_image {
+            if bg.a > 0 {
+                if let Some(svg) = self.assets.get_svg_by_src(mask_url.as_str()).cloned() {
+                    self.paint_svg_asset_in_rect(&svg, abs_rect, false, true, Some(bg));
+                }
+            }
+        } else if bg.a > 0 {
             self.list.push(DisplayItem::Rect {
                 bounds: abs_rect,
                 color: to_rgba8(bg),
@@ -861,6 +1009,14 @@ impl<'a> Painter<'a> {
                                 radii,
                             });
                         }
+                    } else if let Some(svg) = self.assets.get_svg_by_src(url.as_str()).cloned() {
+                        self.paint_svg_asset_in_rect(
+                            &svg,
+                            abs_rect,
+                            layer.size_cover,
+                            layer.size_contain,
+                            None,
+                        );
                     }
                 }
             }

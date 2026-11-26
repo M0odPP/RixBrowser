@@ -465,6 +465,7 @@ pub enum PropertyIdKind {
     BackgroundPosition,
     BackgroundPositionX,
     BackgroundPositionY,
+    MaskImage,
     ObjectPosition,
     OffsetDistance,
     ShapeMargin,
@@ -849,6 +850,7 @@ impl PropertyIdKind {
             "background-position" => Self::BackgroundPosition,
             "background-position-x" => Self::BackgroundPositionX,
             "background-position-y" => Self::BackgroundPositionY,
+            "mask-image" | "-webkit-mask-image" | "mask" | "-webkit-mask" => Self::MaskImage,
             "object-position" => Self::ObjectPosition,
             "offset-distance" => Self::OffsetDistance,
             "shape-margin" => Self::ShapeMargin,
@@ -1097,6 +1099,7 @@ impl PropertyIdKind {
             Self::BackgroundPosition => "background-position",
             Self::BackgroundPositionX => "background-position-x",
             Self::BackgroundPositionY => "background-position-y",
+            Self::MaskImage => "mask-image",
             Self::ObjectPosition => "object-position",
             Self::OffsetDistance => "offset-distance",
             Self::ShapeMargin => "shape-margin",
@@ -2353,6 +2356,8 @@ pub enum PropertyValue {
     GridLanesPack(crate::grid_css::GridLanesPackMode),
     BoxShadow(Vec<BoxShadowValue>),
     BackgroundLayers(Vec<BackgroundLayerValue>),
+    MaskImage(BackgroundImageValue),
+    ClipRect(Option<crate::values::CssClipRect>),
     Transform(Vec<TransformOp>),
     TransformOrigin(TransformOrigin),
     Filter(Vec<FilterOp>),
@@ -6765,6 +6770,32 @@ fn compile_property(
                 imp,
             );
         }
+        Property::MaskImage(imgs, _) => {
+            let img = imgs
+                .first()
+                .map(convert_image)
+                .unwrap_or(BackgroundImageValue::None);
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::MaskImage,
+                PropertyValue::MaskImage(img),
+                imp,
+            );
+        }
+        Property::Mask(masks, _) => {
+            let img = masks
+                .first()
+                .map(|m| convert_image(&m.image))
+                .unwrap_or(BackgroundImageValue::None);
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::MaskImage,
+                PropertyValue::MaskImage(img),
+                imp,
+            );
+        }
         Property::MixBlendMode(bm) => {
             push_decl(
                 out,
@@ -7690,6 +7721,60 @@ pub(crate) fn compile_extra_standard_property(
         }
     }
     match lower.as_str() {
+        "clip" => {
+            if single_ident.is_some_and(|s| s.eq_ignore_ascii_case("auto")) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::Clip,
+                    PropertyValue::ClipRect(None),
+                    imp,
+                );
+                return;
+            }
+            if let Some(CssToken::Function { name: fname, args }) = non_ws.first() {
+                if fname.as_str().eq_ignore_ascii_case("rect") && non_ws.len() == 1 {
+                    let parts: Vec<&CssToken> = args
+                        .iter()
+                        .filter(|t| !matches!(t, CssToken::Space | CssToken::Comma))
+                        .collect();
+                    if parts.len() == 4 {
+                        let parse_edge = |tok: &CssToken| -> Option<Option<LengthPercentage>> {
+                            match tok {
+                                CssToken::Ident(id) if id.as_str().eq_ignore_ascii_case("auto") => {
+                                    Some(None)
+                                }
+                                CssToken::Number(n) if *n == 0.0 => {
+                                    Some(Some(LengthPercentage::Zero))
+                                }
+                                CssToken::Dimension(v, u) => LengthUnit::from_unit_str(u.as_str())
+                                    .map(|lu| Some(LengthPercentage::Length(*v, lu))),
+                                _ => None,
+                            }
+                        };
+                        if let (Some(top), Some(right), Some(bottom), Some(left)) = (
+                            parse_edge(parts[0]),
+                            parse_edge(parts[1]),
+                            parse_edge(parts[2]),
+                            parse_edge(parts[3]),
+                        ) {
+                            push_decl(
+                                out,
+                                ord,
+                                PropertyIdKind::Clip,
+                                PropertyValue::ClipRect(Some(crate::values::CssClipRect {
+                                    top,
+                                    right,
+                                    bottom,
+                                    left,
+                                })),
+                                imp,
+                            );
+                        }
+                    }
+                }
+            }
+        }
         "grid-gap" | "grid-row-gap" | "grid-column-gap" => {
             let canonical = match lower.as_str() {
                 "grid-gap" => PropertyIdKind::Gap,
