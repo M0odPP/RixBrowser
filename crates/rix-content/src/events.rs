@@ -7,16 +7,18 @@
 //! Reference: WHATWG DOM §2, §4.5, WHATWG HTML §8.1.7.2, Spec 06 §3 & Issue #16.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Instant;
 
-use rix_dom::{NodeData, NodeId};
+use rix_dom::{ElementState, NodeData, NodeId};
 use rix_js::{HeapHandle, JsException, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs};
 
-use crate::dom_bridge::{wrap_node, SharedHost};
+use crate::dom_bridge::{
+    remove_element_attr, require_node, set_element_attr, tree_scope_root, wrap_node, SharedHost,
+};
 use crate::dom_interfaces::define_to_string_tag;
-use crate::event_loop::{run_microtask_checkpoint, SharedEventLoop};
+use crate::event_loop::{run_microtask_checkpoint, SharedEventLoop, TaskPriority};
 use crate::web_apis::create_dom_exception;
 
 /// Unique target key supporting `window`, DOM `NodeId`s, and standalone `new EventTarget()`.
@@ -70,6 +72,8 @@ pub struct EventSystem {
     pub event_proto: Option<HeapHandle>,
     pub event_protos: HashMap<&'static str, HeapHandle>,
     pub(crate) on_uncaught_error: Option<crate::event_loop::UncaughtErrorHook>,
+    pending_toggle_events: HashMap<NodeId, (&'static str, &'static str, Option<NodeId>)>,
+    active_request_close: HashSet<NodeId>,
     start_instant: Instant,
 }
 
@@ -96,6 +100,8 @@ impl EventSystem {
             event_proto: None,
             event_protos: HashMap::new(),
             on_uncaught_error: None,
+            pending_toggle_events: HashMap::new(),
+            active_request_close: HashSet::new(),
             start_instant: Instant::now(),
         }
     }
@@ -437,15 +443,17 @@ pub fn install_event_system(
     let events = Rc::new(RefCell::new(EventSystem::new()));
     let etp = host.borrow().prototypes.event_target_proto;
 
-    // HTMLElement.prototype.click() dispatches a real bubbling, cancelable MouseEvent.
+    // HTMLElement.prototype.click() dispatches a real bubbling, cancelable MouseEvent
+    // followed by HTML5 native activation behavior if not defaultPrevented.
     let ep = host.borrow().prototypes.element_proto;
+    let hep = host.borrow().prototypes.html_element_proto;
     let h_click = Rc::clone(host);
     let evs_click = Rc::clone(&events);
     let el_click = Rc::clone(event_loop);
     define_host_method(vm, ep, "click", move |vm, this_val, _| {
         let nid = h_click.borrow().node_for_value(vm, this_val);
         if let Some(nid) = nid {
-            let _ = fire_dom_node_event(
+            let not_prevented = fire_dom_node_event(
                 vm,
                 &h_click,
                 &evs_click,
@@ -455,10 +463,132 @@ pub fn install_event_system(
                 true,
                 true,
                 &[],
-            );
+            )?;
+            if not_prevented {
+                run_click_activation_behavior(vm, &h_click, &evs_click, &el_click, nid)?;
+            }
         }
         Ok(JsValue::UNDEFINED)
     });
+
+    // HTML Living Standard §4.11.1: wire `<details>` `open` toggle hook to queue `ToggleEvent`.
+    {
+        let h_det = Rc::clone(host);
+        let evs_det = Rc::clone(&events);
+        let el_det = Rc::clone(event_loop);
+        host.borrow_mut().details_toggle_hook =
+            Some(Rc::new(move |_vm, nid, old_state, new_state| {
+                queue_toggle_event(
+                    &h_det, &evs_det, &el_det, nid, "toggle", old_state, new_state, None,
+                );
+            }));
+    }
+
+    // HTML Living Standard §6.11: Popover API (`showPopover`, `hidePopover`, `togglePopover`)
+    // on `HTMLElement.prototype`, dispatching `beforetoggle` / `toggle` `ToggleEvent`s,
+    // enforcing light-dismiss for `popover="auto"` / `"hint"`, and toggling `ElementState::POPOVER_OPEN`.
+    {
+        let h = Rc::clone(host);
+        let evs = Rc::clone(&events);
+        let el = Rc::clone(event_loop);
+        define_host_method(vm, hep, "showPopover", move |vm, t, args| {
+            let nid = require_node(vm, &h, t)?;
+            let source = extract_popover_source_option(vm, &h, args.first().copied())?;
+            let _ = show_popover_node(vm, &h, &evs, &el, nid, source)?;
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+    {
+        let h = Rc::clone(host);
+        let evs = Rc::clone(&events);
+        let el = Rc::clone(event_loop);
+        define_host_method(vm, hep, "hidePopover", move |vm, t, _| {
+            let nid = require_node(vm, &h, t)?;
+            let _ = hide_popover_node(vm, &h, &evs, &el, nid, false)?;
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+    {
+        let h = Rc::clone(host);
+        let evs = Rc::clone(&events);
+        let el = Rc::clone(event_loop);
+        define_host_method(vm, hep, "togglePopover", move |vm, t, args| {
+            let nid = require_node(vm, &h, t)?;
+            let (force_opt, source) = if let Some(&a0) = args.first() {
+                if a0.is_undefined() {
+                    (None, None)
+                } else if let Some(obj_h) = a0.as_object() {
+                    let k_force = vm.heap.intern_key("force");
+                    let fv = vm.get_property_by_key(obj_h, k_force)?;
+                    let f = if fv.is_undefined() {
+                        None
+                    } else {
+                        Some(vm.to_boolean(fv))
+                    };
+                    let src = extract_popover_source_option(vm, &h, Some(a0))?;
+                    (f, src)
+                } else {
+                    (Some(vm.to_boolean(a0)), None)
+                }
+            } else {
+                (None, None)
+            };
+            let is_now_open = toggle_popover_node(vm, &h, &evs, &el, nid, force_opt, source)?;
+            Ok(JsValue::from_bool(is_now_open))
+        });
+    }
+
+    // HTML Living Standard §4.11.4: `<dialog>` `show()`, `showModal()`, `close(returnValue?)`,
+    // `requestClose(returnValue?)` with `beforetoggle`/`toggle`/`cancel`/`close` events and
+    // dialog initial focusing steps.
+    {
+        let h = Rc::clone(host);
+        let evs = Rc::clone(&events);
+        let el = Rc::clone(event_loop);
+        define_host_method(vm, ep, "show", move |vm, t, _| {
+            let nid = require_node(vm, &h, t)?;
+            dialog_show(vm, &h, &evs, &el, nid, false)?;
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+    {
+        let h = Rc::clone(host);
+        let evs = Rc::clone(&events);
+        let el = Rc::clone(event_loop);
+        define_host_method(vm, ep, "showModal", move |vm, t, _| {
+            let nid = require_node(vm, &h, t)?;
+            dialog_show(vm, &h, &evs, &el, nid, true)?;
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+    {
+        let h = Rc::clone(host);
+        let evs = Rc::clone(&events);
+        let el = Rc::clone(event_loop);
+        define_host_method(vm, ep, "close", move |vm, t, args| {
+            let nid = require_node(vm, &h, t)?;
+            let rv = args
+                .first()
+                .filter(|v| !v.is_undefined())
+                .map(|&v| vm.value_to_rust_string(v));
+            dialog_close(vm, &h, &evs, &el, nid, rv)?;
+            Ok(JsValue::UNDEFINED)
+        });
+    }
+    {
+        let h = Rc::clone(host);
+        let evs = Rc::clone(&events);
+        let el = Rc::clone(event_loop);
+        define_host_method(vm, ep, "requestClose", move |vm, t, args| {
+            let nid = require_node(vm, &h, t)?;
+            let rv = args
+                .first()
+                .filter(|v| !v.is_undefined())
+                .map(|&v| vm.value_to_rust_string(v));
+            dialog_request_close(vm, &h, &evs, &el, nid, rv)?;
+            Ok(JsValue::UNDEFINED)
+        });
+    }
 
     // EventTarget.prototype.addEventListener(type, listener, options?)
     let h = Rc::clone(host);
@@ -1340,6 +1470,25 @@ fn install_event_constructors(vm: &mut JsVm, host: &SharedHost, events: &SharedE
         |vm, obj, init| {
             let v = read_init_prop(vm, init, "persisted", JsValue::FALSE)?;
             define_data(vm, obj, "persisted", JsValue::from_bool(vm.to_boolean(v)));
+            Ok(())
+        },
+    );
+    let _ = register_event_subclass_with_proto(
+        vm,
+        events,
+        "ToggleEvent",
+        ep,
+        Some(ev_ctor),
+        |vm, obj, init| {
+            let empty = JsValue::from_string(vm.heap.alloc_string(""));
+            for prop in ["oldState", "newState"] {
+                let v = read_init_prop(vm, init, prop, empty)?;
+                let s = vm.value_to_rust_string(v);
+                let js = JsValue::from_string(vm.heap.alloc_string(s));
+                define_data(vm, obj, prop, js);
+            }
+            let src = read_init_prop(vm, init, "source", JsValue::NULL)?;
+            define_data(vm, obj, "source", src);
             Ok(())
         },
     );
@@ -2423,6 +2572,1052 @@ fn invoke_listeners_at(
             run_microtask_checkpoint(event_loop, vm);
         }
     }
+}
+
+/// Dispatches a trusted `ToggleEvent` (`beforetoggle` or `toggle`) on `node`.
+#[allow(clippy::too_many_arguments)]
+fn fire_toggle_event(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    node: NodeId,
+    ev_type: &str,
+    cancelable: bool,
+    old_state: &str,
+    new_state: &str,
+    source: Option<NodeId>,
+) -> Result<bool, JsException> {
+    let proto = events
+        .borrow()
+        .event_protos
+        .get("ToggleEvent")
+        .copied()
+        .or_else(|| events.borrow().event_proto)
+        .unwrap_or(vm.object_proto);
+    let old_val = JsValue::from_string(vm.heap.alloc_string(old_state));
+    let new_val = JsValue::from_string(vm.heap.alloc_string(new_state));
+    let src_val = match source {
+        Some(sn) => wrap_node(vm, host, sn),
+        None => JsValue::NULL,
+    };
+    fire_dom_node_event_with_proto(
+        vm,
+        host,
+        events,
+        event_loop,
+        node,
+        ev_type,
+        false,
+        cancelable,
+        proto,
+        &[
+            ("oldState", old_val),
+            ("newState", new_val),
+            ("source", src_val),
+        ],
+    )
+}
+
+/// Queues an asynchronous non-cancelable `ToggleEvent` task on the event loop with HTML Living
+/// Standard §4.11.1 / §6.11.1 coalescing (preserving original `oldState` while updating `newState`
+/// and `source` if a toggle task is already pending for `node`).
+#[allow(clippy::too_many_arguments)]
+fn queue_toggle_event(
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    node: NodeId,
+    ev_type: &'static str,
+    old_state: &'static str,
+    new_state: &'static str,
+    source: Option<NodeId>,
+) {
+    let already_pending = {
+        let mut es = events.borrow_mut();
+        if let Some(entry) = es.pending_toggle_events.get_mut(&node) {
+            entry.1 = new_state;
+            entry.2 = source;
+            true
+        } else {
+            es.pending_toggle_events
+                .insert(node, (old_state, new_state, source));
+            false
+        }
+    };
+    if already_pending {
+        return;
+    }
+    let h = Rc::clone(host);
+    let evs = Rc::clone(events);
+    let el = Rc::clone(event_loop);
+    event_loop
+        .borrow_mut()
+        .post_host_task(TaskPriority::Input, move |vm| {
+            let pending = evs.borrow_mut().pending_toggle_events.remove(&node);
+            if let Some((os, ns, src)) = pending {
+                let _ = fire_toggle_event(vm, &h, &evs, &el, node, ev_type, false, os, ns, src);
+            }
+        });
+}
+
+fn extract_popover_source_option(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    opt: Option<JsValue>,
+) -> Result<Option<NodeId>, JsException> {
+    let Some(val) = opt else {
+        return Ok(None);
+    };
+    let Some(obj_h) = val.as_object() else {
+        return Ok(None);
+    };
+    let k_src = vm.heap.intern_key("source");
+    let sv = vm.get_property_by_key(obj_h, k_src)?;
+    if sv.is_undefined() || sv.is_null() {
+        return Ok(None);
+    }
+    Ok(host.borrow().node_for_value(vm, sv))
+}
+
+fn popover_mode_of(doc: &rix_dom::Document, nid: NodeId) -> Option<&'static str> {
+    match doc.get(nid) {
+        Some(NodeData::Element(e)) => e.get_attribute("popover").map(|raw| {
+            if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+                "auto"
+            } else if raw.eq_ignore_ascii_case("hint") {
+                "hint"
+            } else {
+                "manual"
+            }
+        }),
+        _ => None,
+    }
+}
+
+/// Walks parent & ShadowRoot-host chains to check whether `nid` is connected to the active document.
+fn is_node_connected_to_doc(doc: &rix_dom::Document, nid: NodeId) -> bool {
+    let root = doc.root();
+    let mut cur = Some(nid);
+    let mut guard = 0usize;
+    while let Some(n) = cur {
+        guard += 1;
+        if guard > 4096 {
+            return false;
+        }
+        if n == root {
+            return true;
+        }
+        if let Some(NodeData::ShadowRoot { host, .. }) = doc.get(n) {
+            cur = Some(*host);
+        } else {
+            cur = doc.parent(n);
+        }
+    }
+    false
+}
+
+fn is_shadow_including_ancestor(doc: &rix_dom::Document, anc: NodeId, desc: NodeId) -> bool {
+    let mut cur = doc.parent(desc);
+    let mut guard = 0usize;
+    while let Some(p) = cur {
+        guard += 1;
+        if guard > 4096 {
+            return false;
+        }
+        if p == anc {
+            return true;
+        }
+        if let Some(NodeData::ShadowRoot { host, .. }) = doc.get(p) {
+            cur = Some(*host);
+        } else {
+            cur = doc.parent(p);
+        }
+    }
+    false
+}
+
+fn is_disabled_form_control(doc: &rix_dom::Document, nid: NodeId) -> bool {
+    let Some(NodeData::Element(e)) = doc.get(nid) else {
+        return false;
+    };
+    if e.has_attribute("disabled") {
+        return true;
+    }
+    // HTML §4.10.16: disabled `<fieldset>` ancestor disables descendants except inside its first `<legend>`.
+    let mut prev = nid;
+    let mut cur = doc.parent(nid);
+    while let Some(p) = cur {
+        if let Some(NodeData::Element(pe)) = doc.get(p) {
+            if pe.name.local.as_str().eq_ignore_ascii_case("fieldset")
+                && pe.has_attribute("disabled")
+            {
+                let first_legend = doc.children(p).find(|&ch| {
+                    matches!(
+                        doc.get(ch),
+                        Some(NodeData::Element(le))
+                            if le.name.local.as_str().eq_ignore_ascii_case("legend")
+                    )
+                });
+                if first_legend != Some(prev) {
+                    return true;
+                }
+            }
+        }
+        prev = p;
+        cur = doc.parent(p);
+    }
+    false
+}
+
+fn show_popover_node(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    nid: NodeId,
+    source: Option<NodeId>,
+) -> Result<bool, JsException> {
+    let (mode, connected, already_open) = {
+        let hs = host.borrow();
+        let doc = hs.document.borrow();
+        let mode = popover_mode_of(&doc, nid);
+        let connected = is_node_connected_to_doc(&doc, nid);
+        let open = matches!(
+            doc.get(nid),
+            Some(NodeData::Element(e)) if e.pseudo_state.contains(ElementState::POPOVER_OPEN)
+        );
+        (mode, connected, open)
+    };
+    let Some(mode) = mode else {
+        return Err(create_dom_exception(
+            vm,
+            "NotSupportedError",
+            "Element does not have popover attribute",
+        ));
+    };
+    if !connected {
+        return Err(create_dom_exception(
+            vm,
+            "InvalidStateError",
+            "Cannot show a disconnected popover element",
+        ));
+    }
+    if already_open {
+        return Ok(true);
+    }
+    // Cancelable synchronous `beforetoggle` event per HTML Living Standard §6.11.1.
+    let allowed = fire_toggle_event(
+        vm,
+        host,
+        events,
+        event_loop,
+        nid,
+        "beforetoggle",
+        true,
+        "closed",
+        "open",
+        source,
+    )?;
+    if !allowed {
+        return Ok(false);
+    }
+    // Re-check connectedness and popover state after JS listeners ran (`hide-other-popover-side-effects`).
+    let (still_has_popover, still_connected) = {
+        let hs = host.borrow();
+        let doc = hs.document.borrow();
+        (
+            popover_mode_of(&doc, nid).is_some(),
+            is_node_connected_to_doc(&doc, nid),
+        )
+    };
+    if !still_has_popover {
+        return Err(create_dom_exception(
+            vm,
+            "NotSupportedError",
+            "Element lost popover attribute during beforetoggle",
+        ));
+    }
+    if !still_connected {
+        return Err(create_dom_exception(
+            vm,
+            "InvalidStateError",
+            "Popover element was disconnected during beforetoggle",
+        ));
+    }
+    // Light-dismiss rules per HTML Living Standard §6.11.1:
+    // - `auto` closes all non-ancestor open `auto` AND `hint` popovers (not `manual`).
+    // - `hint` closes only non-ancestor open `hint` popovers (not `auto` or `manual`).
+    if mode == "auto" || mode == "hint" {
+        let to_dismiss: Vec<NodeId> = {
+            let hs = host.borrow();
+            let doc = hs.document.borrow();
+            hs.open_popovers
+                .iter()
+                .copied()
+                .filter(|&other| {
+                    if other == nid || is_shadow_including_ancestor(&doc, other, nid) {
+                        return false;
+                    }
+                    let om = popover_mode_of(&doc, other);
+                    if mode == "auto" {
+                        matches!(om, Some("auto" | "hint"))
+                    } else {
+                        om == Some("hint")
+                    }
+                })
+                .collect()
+        };
+        for other in to_dismiss {
+            let _ = hide_popover_node(vm, host, events, event_loop, other, false);
+        }
+        // Re-check connectedness after light-dismiss `beforetoggle` handlers ran!
+        let still_conn = {
+            let hs = host.borrow();
+            let doc = hs.document.borrow();
+            is_node_connected_to_doc(&doc, nid)
+        };
+        if !still_conn {
+            return Err(create_dom_exception(
+                vm,
+                "InvalidStateError",
+                "Popover element was disconnected while hiding other popovers",
+            ));
+        }
+    }
+    {
+        let mut hs = host.borrow_mut();
+        {
+            let mut doc = hs.document.borrow_mut();
+            if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
+                e.pseudo_state.insert(ElementState::POPOVER_OPEN);
+            }
+        }
+        if !hs.open_popovers.contains(&nid) {
+            hs.open_popovers.push(nid);
+        }
+        hs.mark_node_style_dirty(nid);
+    }
+    queue_toggle_event(
+        host, events, event_loop, nid, "toggle", "closed", "open", source,
+    );
+    Ok(true)
+}
+
+fn hide_popover_node(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    nid: NodeId,
+    require_connected: bool,
+) -> Result<bool, JsException> {
+    let (has_popover, connected, is_open) = {
+        let hs = host.borrow();
+        let doc = hs.document.borrow();
+        let has_p = popover_mode_of(&doc, nid).is_some();
+        let conn = is_node_connected_to_doc(&doc, nid);
+        let open = matches!(
+            doc.get(nid),
+            Some(NodeData::Element(e)) if e.pseudo_state.contains(ElementState::POPOVER_OPEN)
+        );
+        (has_p, conn, open)
+    };
+    if !has_popover {
+        return Err(create_dom_exception(
+            vm,
+            "NotSupportedError",
+            "Element does not have popover attribute",
+        ));
+    }
+    if require_connected && !connected {
+        return Err(create_dom_exception(
+            vm,
+            "InvalidStateError",
+            "Cannot toggle a disconnected popover element",
+        ));
+    }
+    if !is_open {
+        return Ok(false);
+    }
+    let _ = fire_toggle_event(
+        vm,
+        host,
+        events,
+        event_loop,
+        nid,
+        "beforetoggle",
+        false,
+        "open",
+        "closed",
+        None,
+    );
+    {
+        let mut hs = host.borrow_mut();
+        {
+            let mut doc = hs.document.borrow_mut();
+            if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
+                e.pseudo_state.remove(ElementState::POPOVER_OPEN);
+            }
+        }
+        hs.open_popovers.retain(|&p| p != nid);
+        hs.mark_node_style_dirty(nid);
+    }
+    queue_toggle_event(
+        host, events, event_loop, nid, "toggle", "open", "closed", None,
+    );
+    Ok(false)
+}
+
+fn toggle_popover_node(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    nid: NodeId,
+    force: Option<bool>,
+    source: Option<NodeId>,
+) -> Result<bool, JsException> {
+    let (has_popover, connected, is_open) = {
+        let hs = host.borrow();
+        let doc = hs.document.borrow();
+        let has_p = popover_mode_of(&doc, nid).is_some();
+        let conn = is_node_connected_to_doc(&doc, nid);
+        let open = matches!(
+            doc.get(nid),
+            Some(NodeData::Element(e)) if e.pseudo_state.contains(ElementState::POPOVER_OPEN)
+        );
+        (has_p, conn, open)
+    };
+    if !has_popover {
+        return Err(create_dom_exception(
+            vm,
+            "NotSupportedError",
+            "Element does not have popover attribute",
+        ));
+    }
+    if !connected {
+        return Err(create_dom_exception(
+            vm,
+            "InvalidStateError",
+            "Cannot toggle a disconnected popover element",
+        ));
+    }
+    let want_open = force.unwrap_or(!is_open);
+    if want_open {
+        show_popover_node(vm, host, events, event_loop, nid, source)
+    } else {
+        hide_popover_node(vm, host, events, event_loop, nid, true)
+    }
+}
+
+/// HTML Living Standard §4.11.4.2 dialog initial focusing steps.
+fn run_dialog_initial_focus(host: &SharedHost, dialog_nid: NodeId) {
+    let target = {
+        let hs = host.borrow();
+        let doc = hs.document.borrow();
+        // If the dialog itself or any ancestor is `inert`, dialog focusing steps must not move focus.
+        {
+            let mut cur = Some(dialog_nid);
+            while let Some(c) = cur {
+                if let Some(NodeData::Element(ce)) = doc.get(c) {
+                    if ce.has_attribute("inert") {
+                        return;
+                    }
+                }
+                cur = doc.parent(c);
+            }
+        }
+        let is_inert_or_hidden = |n: NodeId| -> bool {
+            let mut cur = Some(n);
+            while let Some(c) = cur {
+                if let Some(NodeData::Element(ce)) = doc.get(c) {
+                    if ce.has_attribute("inert") || ce.has_attribute("hidden") {
+                        return true;
+                    }
+                }
+                if c == dialog_nid {
+                    break;
+                }
+                cur = doc.parent(c);
+            }
+            false
+        };
+        let is_keyboard_focusable = |n: NodeId| -> bool {
+            if is_inert_or_hidden(n) || is_disabled_form_control(&doc, n) {
+                return false;
+            }
+            let Some(NodeData::Element(e)) = doc.get(n) else {
+                return false;
+            };
+            if let Some(ti) = e.get_attribute("tabindex") {
+                return ti.trim().parse::<i32>().is_ok_and(|v| v >= 0);
+            }
+            let tag = e.name.local.as_str();
+            match tag {
+                "button" | "select" | "textarea" | "summary" => true,
+                "input" => !e
+                    .get_attribute("type")
+                    .is_some_and(|t| t.trim().eq_ignore_ascii_case("hidden")),
+                "a" | "area" => e.has_attribute("href"),
+                _ => false,
+            }
+        };
+        // 1. Check `autofocus` on dialog itself or any non-inert descendant.
+        let mut autofocus_target = None;
+        for cand in doc.descendants(dialog_nid) {
+            if !is_inert_or_hidden(cand) {
+                if let Some(NodeData::Element(e)) = doc.get(cand) {
+                    if e.has_attribute("autofocus") {
+                        autofocus_target = Some(cand);
+                        break;
+                    }
+                }
+            }
+        }
+        // 2. Otherwise first keyboard-focusable descendant (not dialog itself).
+        autofocus_target
+            .or_else(|| {
+                doc.descendants(dialog_nid)
+                    .skip(1)
+                    .find(|&cand| is_keyboard_focusable(cand))
+            })
+            .or(Some(dialog_nid))
+    };
+    if let Some(focus_nid) = target {
+        host.borrow_mut()
+            .set_focused_element(Some(focus_nid), false);
+    }
+}
+
+/// HTML Living Standard §4.11.4 `dialog.show()` / `dialog.showModal()`.
+fn dialog_show(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    nid: NodeId,
+    modal: bool,
+) -> Result<(), JsException> {
+    let (is_open, connected, is_popover_open) = {
+        let hs = host.borrow();
+        let doc = hs.document.borrow();
+        let open = matches!(
+            doc.get(nid),
+            Some(NodeData::Element(e)) if e.has_attribute("open")
+        );
+        let pop_open = matches!(
+            doc.get(nid),
+            Some(NodeData::Element(e)) if e.pseudo_state.contains(ElementState::POPOVER_OPEN)
+        );
+        (open, is_node_connected_to_doc(&doc, nid), pop_open)
+    };
+    if modal {
+        if is_open {
+            return Err(create_dom_exception(
+                vm,
+                "InvalidStateError",
+                "Dialog is already open",
+            ));
+        }
+        if !connected {
+            return Err(create_dom_exception(
+                vm,
+                "InvalidStateError",
+                "Dialog is not connected to an active document",
+            ));
+        }
+        if is_popover_open {
+            return Err(create_dom_exception(
+                vm,
+                "InvalidStateError",
+                "Dialog is already open as a popover",
+            ));
+        }
+    } else if is_open {
+        return Ok(());
+    }
+    // Fire synchronous cancelable `beforetoggle` event (`closed -> open`).
+    let allowed = fire_toggle_event(
+        vm,
+        host,
+        events,
+        event_loop,
+        nid,
+        "beforetoggle",
+        true,
+        "closed",
+        "open",
+        None,
+    )?;
+    if !allowed {
+        return Ok(());
+    }
+    if modal {
+        // HTML §4.11.4: opening a modal dialog light-dismisses all open `auto` and `hint` popovers.
+        let popovers_to_close: Vec<NodeId> = {
+            let hs = host.borrow();
+            let doc = hs.document.borrow();
+            hs.open_popovers
+                .iter()
+                .copied()
+                .filter(|&p| matches!(popover_mode_of(&doc, p), Some("auto" | "hint")))
+                .collect()
+        };
+        for p in popovers_to_close {
+            let _ = hide_popover_node(vm, host, events, event_loop, p, false);
+        }
+    }
+    set_element_attr(vm, host, nid, "open", "");
+    if modal {
+        {
+            let doc_rc = Rc::clone(&host.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
+                e.pseudo_state.insert(ElementState::MODAL);
+            }
+        }
+        host.borrow_mut().mark_node_style_dirty(nid);
+    }
+    queue_toggle_event(
+        host, events, event_loop, nid, "toggle", "closed", "open", None,
+    );
+    if connected {
+        run_dialog_initial_focus(host, nid);
+    }
+    Ok(())
+}
+
+/// HTML Living Standard §4.11.4 `dialog.close(returnValue?)`.
+fn dialog_close(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    nid: NodeId,
+    return_value: Option<String>,
+) -> Result<(), JsException> {
+    let is_open = host
+        .borrow()
+        .document
+        .borrow()
+        .get(nid)
+        .is_some_and(|d| matches!(d, NodeData::Element(e) if e.has_attribute("open")));
+    if !is_open {
+        return Ok(());
+    }
+    if let Some(rv) = return_value {
+        host.borrow_mut().dialog_return_values.insert(nid, rv);
+    }
+    let _ = fire_toggle_event(
+        vm,
+        host,
+        events,
+        event_loop,
+        nid,
+        "beforetoggle",
+        false,
+        "open",
+        "closed",
+        None,
+    );
+    {
+        let doc_rc = Rc::clone(&host.borrow().document);
+        let mut doc = doc_rc.borrow_mut();
+        if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
+            e.pseudo_state.remove(ElementState::MODAL);
+        }
+    }
+    remove_element_attr(vm, host, nid, "open");
+    host.borrow_mut().mark_node_style_dirty(nid);
+    queue_toggle_event(
+        host, events, event_loop, nid, "toggle", "open", "closed", None,
+    );
+    let h = Rc::clone(host);
+    let evs = Rc::clone(events);
+    let el = Rc::clone(event_loop);
+    event_loop
+        .borrow_mut()
+        .post_host_task(TaskPriority::Input, move |vm| {
+            let _ = fire_dom_node_event(vm, &h, &evs, &el, nid, "close", false, false, &[]);
+        });
+    Ok(())
+}
+
+/// HTML Living Standard §4.11.4 `dialog.requestClose(returnValue?)`.
+fn dialog_request_close(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    nid: NodeId,
+    return_value: Option<String>,
+) -> Result<(), JsException> {
+    let (is_open, connected) = {
+        let hs = host.borrow();
+        let doc = hs.document.borrow();
+        let open = matches!(
+            doc.get(nid),
+            Some(NodeData::Element(e)) if e.has_attribute("open")
+        );
+        (open, is_node_connected_to_doc(&doc, nid))
+    };
+    if !is_open || !connected {
+        return Ok(());
+    }
+    if !events.borrow_mut().active_request_close.insert(nid) {
+        return Ok(());
+    }
+    let res = fire_dom_node_event(
+        vm,
+        host,
+        events,
+        event_loop,
+        nid,
+        "cancel",
+        false,
+        true,
+        &[],
+    );
+    events.borrow_mut().active_request_close.remove(&nid);
+    let allowed = res?;
+    if !allowed {
+        return Ok(());
+    }
+    dialog_close(vm, host, events, event_loop, nid, return_value)
+}
+
+/// Runs HTML Living Standard native activation behaviors after an uncanceled `click`:
+/// - `<input type="checkbox|radio">` checkedness toggle & radio-group exclusivity
+/// - `<summary>` inside `<details>` (exclusive `name` accordion & `ToggleEvent` via attr hooks)
+/// - `<button>` / `<input>` form `submit`/`reset` priority and `popovertarget` / `popovertargetaction`
+fn run_click_activation_behavior(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    nid: NodeId,
+) -> Result<(), JsException> {
+    enum ClickAction {
+        None,
+        Checkbox(NodeId),
+        Radio(NodeId, Option<String>, Option<NodeId>),
+        DetailsSummary(NodeId, bool),
+        FormReset(NodeId),
+        FormSubmit(NodeId),
+        PopoverTarget(NodeId, String, NodeId),
+    }
+
+    let action = {
+        let hs = host.borrow();
+        let doc = hs.document.borrow();
+        let mut act = ClickAction::None;
+        if let Some(NodeData::Element(e)) = doc.get(nid) {
+            let tag = e.name.local.as_str();
+            let disabled = is_disabled_form_control(&doc, nid);
+            if !disabled && tag.eq_ignore_ascii_case("input") {
+                let ty = e
+                    .get_attribute("type")
+                    .unwrap_or("text")
+                    .trim()
+                    .to_ascii_lowercase();
+                if ty == "checkbox" {
+                    act = ClickAction::Checkbox(nid);
+                } else if ty == "radio" {
+                    let rname = e
+                        .get_attribute("name")
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    act = ClickAction::Radio(nid, rname, e.form_owner);
+                }
+            }
+            if matches!(act, ClickAction::None)
+                && !disabled
+                && (tag.eq_ignore_ascii_case("button")
+                    || (tag.eq_ignore_ascii_case("input")
+                        && matches!(
+                            e.get_attribute("type")
+                                .unwrap_or("text")
+                                .trim()
+                                .to_ascii_lowercase()
+                                .as_str(),
+                            "button" | "submit" | "reset" | "image"
+                        )))
+            {
+                // Find associated form (via `form` attribute or ancestor `<form>`).
+                let assoc_form = e
+                    .get_attribute("form")
+                    .filter(|s| !s.is_empty())
+                    .and_then(|fid| {
+                        let root = tree_scope_root(&doc, nid);
+                        doc.descendants(root).find(|&cand| {
+                            matches!(
+                                doc.get(cand),
+                                Some(NodeData::Element(fe))
+                                    if fe.name.local.as_str().eq_ignore_ascii_case("form")
+                                        && fe.get_attribute("id") == Some(fid)
+                            )
+                        })
+                    })
+                    .or_else(|| {
+                        let mut cur = doc.parent(nid);
+                        while let Some(p) = cur {
+                            if matches!(
+                                doc.get(p),
+                                Some(NodeData::Element(fe))
+                                    if fe.name.local.as_str().eq_ignore_ascii_case("form")
+                            ) {
+                                return Some(p);
+                            }
+                            cur = doc.parent(p);
+                        }
+                        None
+                    });
+                let btn_type = if tag.eq_ignore_ascii_case("button") {
+                    match e
+                        .get_attribute("type")
+                        .unwrap_or("submit")
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str()
+                    {
+                        "button" => "button",
+                        "reset" => "reset",
+                        _ => "submit",
+                    }
+                } else {
+                    match e
+                        .get_attribute("type")
+                        .unwrap_or("text")
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str()
+                    {
+                        "reset" => "reset",
+                        "submit" | "image" => "submit",
+                        _ => "button",
+                    }
+                };
+                if let Some(form_nid) = assoc_form {
+                    if btn_type == "reset" {
+                        act = ClickAction::FormReset(form_nid);
+                    } else if btn_type == "submit" {
+                        act = ClickAction::FormSubmit(form_nid);
+                    }
+                }
+                if matches!(act, ClickAction::None) {
+                    if let Some(target_id) =
+                        e.get_attribute("popovertarget").filter(|s| !s.is_empty())
+                    {
+                        let root = tree_scope_root(&doc, nid);
+                        if let Some(target_nid) = doc.descendants(root).find(|&cand| {
+                            matches!(
+                                doc.get(cand),
+                                Some(NodeData::Element(te))
+                                    if te.get_attribute("id") == Some(target_id)
+                            )
+                        }) {
+                            let paction = e
+                                .get_attribute("popovertargetaction")
+                                .unwrap_or("toggle")
+                                .trim()
+                                .to_ascii_lowercase();
+                            act = ClickAction::PopoverTarget(target_nid, paction, nid);
+                        }
+                    }
+                }
+            }
+        }
+        // Check `<summary>` (first `<summary>` child of a `<details>` element) along ancestor chain.
+        if matches!(act, ClickAction::None) {
+            let mut cur = Some(nid);
+            while let Some(c) = cur {
+                if let Some(NodeData::Element(ce)) = doc.get(c) {
+                    if ce.name.local.as_str().eq_ignore_ascii_case("summary") {
+                        if let Some(parent) = doc.parent(c) {
+                            if let Some(NodeData::Element(pe)) = doc.get(parent) {
+                                if pe.name.local.as_str().eq_ignore_ascii_case("details") {
+                                    let first_summary = doc.children(parent).find(|&ch| {
+                                        matches!(
+                                            doc.get(ch),
+                                            Some(NodeData::Element(se))
+                                                if se.name.local.as_str().eq_ignore_ascii_case("summary")
+                                        )
+                                    });
+                                    if first_summary == Some(c) {
+                                        act = ClickAction::DetailsSummary(
+                                            parent,
+                                            pe.has_attribute("open"),
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                cur = doc.parent(c);
+            }
+        }
+        act
+    };
+
+    match action {
+        ClickAction::None => {}
+        ClickAction::Checkbox(node) => {
+            {
+                let mut hs = host.borrow_mut();
+                {
+                    let mut doc = hs.document.borrow_mut();
+                    if let Some(NodeData::Element(e)) = doc.get_mut(node) {
+                        let next = !e.pseudo_state.contains(ElementState::CHECKED);
+                        if next {
+                            e.pseudo_state.insert(ElementState::CHECKED);
+                        } else {
+                            e.pseudo_state.remove(ElementState::CHECKED);
+                        }
+                        e.pseudo_state.remove(ElementState::INDETERMINATE);
+                    }
+                }
+                hs.mark_node_style_dirty(node);
+            }
+            let _ = fire_dom_node_event(
+                vm,
+                host,
+                events,
+                event_loop,
+                node,
+                "input",
+                true,
+                false,
+                &[],
+            );
+            let _ = fire_dom_node_event(
+                vm,
+                host,
+                events,
+                event_loop,
+                node,
+                "change",
+                true,
+                false,
+                &[],
+            );
+        }
+        ClickAction::Radio(node, rname, form_owner) => {
+            let mut dirty_nodes = vec![node];
+            {
+                let mut hs = host.borrow_mut();
+                {
+                    let mut doc = hs.document.borrow_mut();
+                    if let Some(ref name) = rname {
+                        let root = tree_scope_root(&doc, node);
+                        let peers: Vec<NodeId> = doc
+                            .descendants(root)
+                            .filter(|&cand| {
+                                cand != node
+                                    && matches!(
+                                        doc.get(cand),
+                                        Some(NodeData::Element(ce))
+                                            if ce.name.local.as_str().eq_ignore_ascii_case("input")
+                                                && ce.get_attribute("type").is_some_and(|ty| {
+                                                    ty.trim().eq_ignore_ascii_case("radio")
+                                                })
+                                                && ce.get_attribute("name") == Some(name.as_str())
+                                                && ce.form_owner == form_owner
+                                    )
+                            })
+                            .collect();
+                        for peer in peers {
+                            if let Some(NodeData::Element(pe)) = doc.get_mut(peer) {
+                                pe.pseudo_state.remove(ElementState::CHECKED);
+                            }
+                            dirty_nodes.push(peer);
+                        }
+                    }
+                    if let Some(NodeData::Element(e)) = doc.get_mut(node) {
+                        e.pseudo_state.insert(ElementState::CHECKED);
+                    }
+                }
+                for dn in dirty_nodes {
+                    hs.mark_node_style_dirty(dn);
+                }
+            }
+            let _ = fire_dom_node_event(
+                vm,
+                host,
+                events,
+                event_loop,
+                node,
+                "input",
+                true,
+                false,
+                &[],
+            );
+            let _ = fire_dom_node_event(
+                vm,
+                host,
+                events,
+                event_loop,
+                node,
+                "change",
+                true,
+                false,
+                &[],
+            );
+        }
+        ClickAction::DetailsSummary(details_nid, was_open) => {
+            if was_open {
+                remove_element_attr(vm, host, details_nid, "open");
+            } else {
+                set_element_attr(vm, host, details_nid, "open", "");
+            }
+        }
+        ClickAction::FormReset(form_nid) => {
+            let _ = fire_dom_node_event(
+                vm,
+                host,
+                events,
+                event_loop,
+                form_nid,
+                "reset",
+                true,
+                true,
+                &[],
+            );
+        }
+        ClickAction::FormSubmit(form_nid) => {
+            let _ = fire_dom_node_event(
+                vm,
+                host,
+                events,
+                event_loop,
+                form_nid,
+                "submit",
+                true,
+                true,
+                &[],
+            );
+        }
+        ClickAction::PopoverTarget(target_nid, paction, invoker_nid) => {
+            let _ = match paction.as_str() {
+                "show" => {
+                    show_popover_node(vm, host, events, event_loop, target_nid, Some(invoker_nid))
+                }
+                "hide" => hide_popover_node(vm, host, events, event_loop, target_nid, false),
+                _ => toggle_popover_node(
+                    vm,
+                    host,
+                    events,
+                    event_loop,
+                    target_nid,
+                    None,
+                    Some(invoker_nid),
+                ),
+            };
+        }
+    }
+    Ok(())
 }
 
 /// Dispatches a trusted W3C DOM event on `node` (executing capture listeners,

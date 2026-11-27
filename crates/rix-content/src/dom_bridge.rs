@@ -226,6 +226,7 @@ pub struct HostState {
     pub(crate) body_attr_handler_hook: Option<BodyAttrHandlerHook>,
     pub(crate) script_connect_hook: Option<ScriptConnectHook>,
     pub(crate) subresource_connect_hook: Option<SubresourceConnectHook>,
+    pub(crate) details_toggle_hook: Option<DetailsToggleHook>,
     /// True once initial page subresources (Wave 1 & 2 images/SVGs) have been registered into
     /// `layout_engine.assets` (used by `HTMLImageElement.prototype.complete` per HTML §4.8.4.3.6).
     pub initial_assets_loaded: bool,
@@ -249,6 +250,9 @@ pub(crate) type ScriptConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
 
 /// Callback invoked when a dynamic `<img src>` or `<link rel="stylesheet" href>` becomes connected.
 pub(crate) type SubresourceConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
+
+/// Callback invoked when a `<details>` element's `open` attribute changes (queues `ToggleEvent`).
+pub(crate) type DetailsToggleHook = Rc<dyn Fn(&mut JsVm, NodeId, &'static str, &'static str)>;
 
 /// Updates `Fragment.style` pointers in-place from `style_ctx` after a paint-only incremental
 /// restyle (`layout_dirty_count == 0`), avoiding a full layout rebuild when only compositor/paint
@@ -458,6 +462,7 @@ impl HostState {
             body_attr_handler_hook: None,
             script_connect_hook: None,
             subresource_connect_hook: None,
+            details_toggle_hook: None,
             initial_assets_loaded: false,
             pending_dynamic_images: HashSet::new(),
             completed_images: HashSet::new(),
@@ -981,6 +986,7 @@ impl HostState {
             viewport_width: self.viewport.width,
             viewport_height: self.viewport.height,
             dark_mode: self.dark_mode,
+            quirks_mode: self.document.borrow().quirks_mode() == 2,
             ..MediaContext::default()
         };
 
@@ -1346,6 +1352,7 @@ impl HostState {
             viewport_width: vp.width,
             viewport_height: vp.height,
             dark_mode: self.dark_mode,
+            quirks_mode: self.is_doc_quirks_mode(doc_id),
             ..MediaContext::default()
         };
         let sub_scroll = self
@@ -2023,10 +2030,12 @@ impl HostState {
         let main_root = self.document.borrow().root();
         if owner_doc != main_root {
             let vp = self.viewport_for_doc(owner_doc);
+            let sub_quirks_code = self.doc_meta.get(&owner_doc).map_or(0, |m| m.quirks_mode);
             let media = MediaContext {
                 viewport_width: vp.width,
                 viewport_height: vp.height,
                 dark_mode: self.dark_mode,
+                quirks_mode: sub_quirks_code == 2,
                 ..MediaContext::default()
             };
             let css_blocks: Vec<(String, Option<NodeId>)> = {
@@ -2063,7 +2072,10 @@ impl HostState {
             }
             {
                 let mut doc = self.document.borrow_mut();
+                let saved_q = doc.quirks_mode();
+                doc.set_quirks_mode(sub_quirks_code);
                 let _ = ctx.cascade_full_from(&mut doc, owner_doc);
+                doc.set_quirks_mode(saved_q);
             }
             return match pseudo {
                 Some(pe) => {
@@ -3257,6 +3269,28 @@ pub(crate) fn remove_node_from_parent(
         next_sibling: next_sib,
     });
     if was_connected {
+        let mut removed_popovers = Vec::new();
+        {
+            let doc_rc = Rc::clone(&host.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            let nodes: Vec<NodeId> = doc.descendants(child).collect();
+            for nid in nodes {
+                if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
+                    if e.pseudo_state.contains(rix_dom::ElementState::MODAL) {
+                        e.pseudo_state.remove(rix_dom::ElementState::MODAL);
+                    }
+                    if e.pseudo_state.contains(rix_dom::ElementState::POPOVER_OPEN) {
+                        e.pseudo_state.remove(rix_dom::ElementState::POPOVER_OPEN);
+                        removed_popovers.push(nid);
+                    }
+                }
+            }
+        }
+        if !removed_popovers.is_empty() {
+            host.borrow_mut()
+                .open_popovers
+                .retain(|p| !removed_popovers.contains(p));
+        }
         notify_custom_element_subtree(vm, host, child, false);
     } else {
         crate::custom_elements::sync_form_associated_subtree(vm, host, child);
@@ -3392,7 +3426,7 @@ pub(crate) fn insert_node_into_parent(
     });
     if parent_connected {
         let iframe_hook = host.borrow().iframe_connect_hook.clone();
-        for n in to_insert {
+        for &n in &to_insert {
             notify_custom_element_subtree(vm, host, n, true);
             // Execute any `<script>` nodes created by `Range.prototype.createContextualFragment()`
             // or disconnected `*HTMLUnsafe({ runScripts: true })` / `stream*HTMLUnsafe({ runScripts: true })`.
@@ -3465,7 +3499,132 @@ pub(crate) fn insert_node_into_parent(
     if parent_is_fieldset {
         crate::custom_elements::sync_form_associated_subtree(vm, host, parent);
     }
+    // HTML Living Standard §4.11.1: enforce `<details name="...">` mutual exclusivity on insertion
+    // (including `DocumentFragment`, `innerHTML`, `appendChild`, `insertBefore`).
+    enforce_details_exclusivity_for_inserted(vm, host, &to_insert);
     Ok(())
+}
+
+/// Returns the tree root (`Document`, `ShadowRoot`, or disconnected root) containing `nid`.
+pub(crate) fn tree_scope_root(doc: &Document, nid: NodeId) -> NodeId {
+    let mut cur = nid;
+    while let Some(p) = doc.parent(cur) {
+        if matches!(
+            doc.get(p),
+            Some(NodeData::ShadowRoot { .. } | NodeData::Document)
+        ) {
+            return p;
+        }
+        cur = p;
+    }
+    cur
+}
+
+/// Enforces HTML Living Standard §4.11.1 `<details name="...">` mutual exclusivity when `target`
+/// becomes `open` (closes other open `<details>` in the same tree scope with the same `name`).
+pub(crate) fn enforce_details_exclusivity_on_open(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    target: NodeId,
+) {
+    let (group_name, peers): (Option<String>, Vec<NodeId>) = {
+        let doc_rc = Rc::clone(&host.borrow().document);
+        let doc = doc_rc.borrow();
+        let gname = match doc.get(target) {
+            Some(NodeData::Element(e))
+                if e.name.local.as_str().eq_ignore_ascii_case("details")
+                    && e.has_attribute("open") =>
+            {
+                e.get_attribute("name")
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            }
+            _ => None,
+        };
+        if let Some(ref name) = gname {
+            let root = tree_scope_root(&doc, target);
+            let list: Vec<NodeId> = doc
+                .descendants(root)
+                .filter(|&cand| {
+                    cand != target
+                        && matches!(
+                            doc.get(cand),
+                            Some(NodeData::Element(ce))
+                                if ce.name.local.as_str().eq_ignore_ascii_case("details")
+                                    && ce.has_attribute("open")
+                                    && ce.get_attribute("name") == Some(name.as_str())
+                        )
+                })
+                .collect();
+            (gname, list)
+        } else {
+            (None, Vec::new())
+        }
+    };
+    if group_name.is_some() {
+        for peer in peers {
+            remove_element_attr(vm, host, peer, "open");
+        }
+    }
+}
+
+/// Enforces HTML Living Standard §4.11.1 exclusivity when `<details>` nodes are inserted or have
+/// their `name` changed while already `open`: if an earlier open `<details>` in the same tree
+/// scope already shares the same non-empty `name`, closes the newly-inserted/changed `<details>`.
+pub(crate) fn enforce_details_exclusivity_for_inserted(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    roots: &[NodeId],
+) {
+    let to_close: Vec<NodeId> = {
+        let doc_rc = Rc::clone(&host.borrow().document);
+        let doc = doc_rc.borrow();
+        let mut inserted_open_details = Vec::new();
+        for &r in roots {
+            for id in doc.descendants(r) {
+                if let Some(NodeData::Element(e)) = doc.get(id) {
+                    if e.name.local.as_str().eq_ignore_ascii_case("details")
+                        && e.has_attribute("open")
+                    {
+                        if let Some(name) = e.get_attribute("name").filter(|s| !s.is_empty()) {
+                            inserted_open_details.push((id, name.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        let inserted_set: HashSet<NodeId> =
+            inserted_open_details.iter().map(|(id, _)| *id).collect();
+        let mut kept_inserted: HashSet<NodeId> = HashSet::new();
+        let mut close_list = Vec::new();
+        for (id, name) in inserted_open_details {
+            let scope_root = tree_scope_root(&doc, id);
+            // HTML Living Standard §4.11.1: if another open `<details>` with the same `name`
+            // already exists in the same tree scope (either pre-existing outside this batch or
+            // an earlier element in this batch that stayed open), close `id`.
+            let has_other_open = doc.descendants(scope_root).any(|cand| {
+                cand != id
+                    && !close_list.contains(&cand)
+                    && (!inserted_set.contains(&cand) || kept_inserted.contains(&cand))
+                    && matches!(
+                        doc.get(cand),
+                        Some(NodeData::Element(ce))
+                            if ce.name.local.as_str().eq_ignore_ascii_case("details")
+                                && ce.has_attribute("open")
+                                && ce.get_attribute("name") == Some(name.as_str())
+                    )
+            });
+            if has_other_open {
+                close_list.push(id);
+            } else {
+                kept_inserted.insert(id);
+            }
+        }
+        close_list
+    };
+    for cid in to_close {
+        remove_element_attr(vm, host, cid, "open");
+    }
 }
 
 /// Invokes the dynamic subresource connection hook for every `<img>` and `<link>` element
@@ -4830,104 +4989,142 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
         define_host_method(vm, input_proto, "showPicker", move |_vm, _t, _args| {
             Ok(JsValue::UNDEFINED)
         });
-    }
-
-    // `popover` enumerated attribute (HTML5 Popover API: "auto" | "manual" | null).
-    let h1 = Rc::clone(host);
-    let g = vm.alloc_host_fn("get popover", move |vm, t, _| {
-        let nid = require_node(vm, &h1, t)?;
-        let val = {
-            let doc_rc = Rc::clone(&h1.borrow().document);
-            let doc = doc_rc.borrow();
-            match doc.get(nid) {
-                Some(NodeData::Element(e)) => e.get_attribute("popover").map(|raw| {
-                    if raw.eq_ignore_ascii_case("manual") {
-                        "manual".to_string()
-                    } else {
-                        "auto".to_string()
+        // HTML Living Standard §4.10.5.3: `HTMLInputElement.prototype.checked` reflects the
+        // live checkedness state (`ElementState::CHECKED`), independent of `defaultChecked`.
+        {
+            let h1 = Rc::clone(host);
+            let g_chk = vm.alloc_host_fn("get checked", move |vm, t, _| {
+                let nid = require_node(vm, &h1, t)?;
+                let is_chk = h1.borrow().document.borrow().get(nid).is_some_and(|d| {
+                    matches!(
+                        d,
+                        NodeData::Element(e) if e.pseudo_state.contains(rix_dom::ElementState::CHECKED)
+                    )
+                });
+                Ok(JsValue::from_bool(is_chk))
+            });
+            let h2 = Rc::clone(host);
+            let s_chk = vm.alloc_host_fn("set checked", move |vm, t, args| {
+                let nid = require_node(vm, &h2, t)?;
+                let on = vm.to_boolean(arg(args, 0));
+                {
+                    let doc_rc = Rc::clone(&h2.borrow().document);
+                    let mut doc = doc_rc.borrow_mut();
+                    let radio_name = match doc.get(nid) {
+                        Some(NodeData::Element(e))
+                            if on
+                                && e.name.local.as_str().eq_ignore_ascii_case("input")
+                                && e.get_attribute("type")
+                                    .is_some_and(|ty| ty.trim().eq_ignore_ascii_case("radio")) =>
+                        {
+                            e.get_attribute("name")
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                        }
+                        _ => None,
+                    };
+                    if let Some(ref rname) = radio_name {
+                        let mut root = nid;
+                        while let Some(p) = doc.parent(root) {
+                            root = p;
+                        }
+                        let form_owner = match doc.get(nid) {
+                            Some(NodeData::Element(e)) => e.form_owner,
+                            _ => None,
+                        };
+                        let peers: Vec<NodeId> = doc
+                            .descendants(root)
+                            .filter(|&cand| {
+                                cand != nid
+                                    && matches!(
+                                        doc.get(cand),
+                                        Some(NodeData::Element(ce))
+                                            if ce.name.local.as_str().eq_ignore_ascii_case("input")
+                                                && ce.get_attribute("type").is_some_and(|ty| {
+                                                    ty.trim().eq_ignore_ascii_case("radio")
+                                                })
+                                                && ce.get_attribute("name") == Some(rname.as_str())
+                                                && ce.form_owner == form_owner
+                                    )
+                            })
+                            .collect();
+                        for peer in peers {
+                            if let Some(NodeData::Element(pe)) = doc.get_mut(peer) {
+                                pe.pseudo_state.remove(rix_dom::ElementState::CHECKED);
+                            }
+                        }
                     }
-                }),
-                _ => None,
-            }
-        };
-        Ok(match val {
-            Some(s) => JsValue::from_string(vm.heap.alloc_string(s)),
-            None => JsValue::NULL,
-        })
-    });
-    let h2 = Rc::clone(host);
-    let s = vm.alloc_host_fn("set popover", move |vm, t, args| {
-        let nid = require_node(vm, &h2, t)?;
-        let a = arg(args, 0);
-        if a.is_null() {
-            remove_element_attr(vm, &h2, nid, "popover");
-        } else {
-            let v = vm.value_to_rust_string(a);
-            set_element_attr(vm, &h2, nid, "popover", &v);
+                    if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
+                        if on {
+                            e.pseudo_state.insert(rix_dom::ElementState::CHECKED);
+                        } else {
+                            e.pseudo_state.remove(rix_dom::ElementState::CHECKED);
+                        }
+                    }
+                }
+                h2.borrow_mut().mark_node_style_dirty(nid);
+                Ok(JsValue::UNDEFINED)
+            });
+            define_host_accessor(vm, input_proto, "checked", Some(g_chk), Some(s_chk));
         }
-        Ok(JsValue::UNDEFINED)
-    });
-    define_host_accessor(vm, ep, "popover", Some(g), Some(s));
-
-    // `showPopover()`, `hidePopover()`, `togglePopover(force?)`
-    let h = Rc::clone(host);
-    define_host_method(vm, ep, "showPopover", move |vm, t, _| {
-        let nid = require_node(vm, &h, t)?;
-        let is_popover = h
-            .borrow()
-            .document
-            .borrow()
-            .get(nid)
-            .is_some_and(|d| matches!(d, NodeData::Element(e) if e.has_attribute("popover")));
-        if !is_popover {
-            return Err(crate::web_apis::create_dom_exception(
-                vm,
-                "NotSupportedError",
-                "Element does not have popover attribute",
-            ));
+        // HTML Living Standard §4.10.5.3: `HTMLInputElement.prototype.defaultChecked` reflects
+        // the `checked` content attribute.
+        {
+            let h1 = Rc::clone(host);
+            let g_dc = vm.alloc_host_fn("get defaultChecked", move |vm, t, _| {
+                let nid = require_node(vm, &h1, t)?;
+                let present = h1.borrow().document.borrow().get(nid).is_some_and(
+                    |d| matches!(d, NodeData::Element(e) if e.has_attribute("checked")),
+                );
+                Ok(JsValue::from_bool(present))
+            });
+            let h2 = Rc::clone(host);
+            let s_dc = vm.alloc_host_fn("set defaultChecked", move |vm, t, args| {
+                let nid = require_node(vm, &h2, t)?;
+                if vm.to_boolean(arg(args, 0)) {
+                    set_element_attr(vm, &h2, nid, "checked", "");
+                } else {
+                    remove_element_attr(vm, &h2, nid, "checked");
+                }
+                Ok(JsValue::UNDEFINED)
+            });
+            define_host_accessor(vm, input_proto, "defaultChecked", Some(g_dc), Some(s_dc));
         }
-        let mut hs = h.borrow_mut();
-        if !hs.open_popovers.contains(&nid) {
-            hs.open_popovers.push(nid);
+        // HTML Living Standard §4.10.5.3: `HTMLInputElement.prototype.indeterminate` IDL boolean
+        // toggling `ElementState::INDETERMINATE` (matches CSS `:indeterminate`).
+        {
+            let h1 = Rc::clone(host);
+            let g_ind = vm.alloc_host_fn("get indeterminate", move |vm, t, _| {
+                let nid = require_node(vm, &h1, t)?;
+                let is_ind = h1.borrow().document.borrow().get(nid).is_some_and(|d| {
+                    matches!(
+                        d,
+                        NodeData::Element(e) if e.pseudo_state.contains(rix_dom::ElementState::INDETERMINATE)
+                    )
+                });
+                Ok(JsValue::from_bool(is_ind))
+            });
+            let h2 = Rc::clone(host);
+            let s_ind = vm.alloc_host_fn("set indeterminate", move |vm, t, args| {
+                let nid = require_node(vm, &h2, t)?;
+                let on = vm.to_boolean(arg(args, 0));
+                {
+                    let doc_rc = Rc::clone(&h2.borrow().document);
+                    let mut doc = doc_rc.borrow_mut();
+                    if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
+                        if on {
+                            e.pseudo_state.insert(rix_dom::ElementState::INDETERMINATE);
+                        } else {
+                            e.pseudo_state.remove(rix_dom::ElementState::INDETERMINATE);
+                        }
+                    }
+                }
+                h2.borrow_mut().mark_node_style_dirty(nid);
+                Ok(JsValue::UNDEFINED)
+            });
+            define_host_accessor(vm, input_proto, "indeterminate", Some(g_ind), Some(s_ind));
         }
-        Ok(JsValue::UNDEFINED)
-    });
-    let h = Rc::clone(host);
-    define_host_method(vm, ep, "hidePopover", move |vm, t, _| {
-        let nid = require_node(vm, &h, t)?;
-        h.borrow_mut().open_popovers.retain(|&p| p != nid);
-        Ok(JsValue::UNDEFINED)
-    });
-    let h = Rc::clone(host);
-    define_host_method(vm, ep, "togglePopover", move |vm, t, args| {
-        let nid = require_node(vm, &h, t)?;
-        let is_popover = h
-            .borrow()
-            .document
-            .borrow()
-            .get(nid)
-            .is_some_and(|d| matches!(d, NodeData::Element(e) if e.has_attribute("popover")));
-        if !is_popover {
-            return Err(crate::web_apis::create_dom_exception(
-                vm,
-                "NotSupportedError",
-                "Element does not have popover attribute",
-            ));
-        }
-        let mut hs = h.borrow_mut();
-        let was_open = hs.open_popovers.contains(&nid);
-        let next = if args.first().is_some_and(|v| !v.is_undefined()) {
-            vm.to_boolean(args[0])
-        } else {
-            !was_open
-        };
-        if next && !was_open {
-            hs.open_popovers.push(nid);
-        } else if !next && was_open {
-            hs.open_popovers.retain(|&p| p != nid);
-        }
-        Ok(JsValue::from_bool(next))
-    });
+    }
 
     // `tabIndex`
     let h1 = Rc::clone(host);
@@ -5083,60 +5280,6 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
         Ok(JsValue::UNDEFINED)
     });
     define_host_accessor(vm, ep, "returnValue", Some(g), Some(s));
-
-    let h = Rc::clone(host);
-    define_host_method(vm, ep, "show", move |vm, t, _| {
-        let nid = require_node(vm, &h, t)?;
-        set_element_attr(vm, &h, nid, "open", "");
-        Ok(JsValue::UNDEFINED)
-    });
-    let h = Rc::clone(host);
-    define_host_method(vm, ep, "showModal", move |vm, t, _| {
-        let nid = require_node(vm, &h, t)?;
-        let is_open = h
-            .borrow()
-            .document
-            .borrow()
-            .get(nid)
-            .is_some_and(|d| matches!(d, NodeData::Element(e) if e.has_attribute("open")));
-        if is_open {
-            return Err(crate::web_apis::create_dom_exception(
-                vm,
-                "InvalidStateError",
-                "Dialog is already open",
-            ));
-        }
-        set_element_attr(vm, &h, nid, "open", "");
-        {
-            let doc_rc = Rc::clone(&h.borrow().document);
-            let mut doc = doc_rc.borrow_mut();
-            if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
-                e.pseudo_state.insert(rix_dom::ElementState::MODAL);
-            }
-        }
-        h.borrow_mut().mark_node_style_dirty(nid);
-        Ok(JsValue::UNDEFINED)
-    });
-    let h = Rc::clone(host);
-    define_host_method(vm, ep, "close", move |vm, t, args| {
-        let nid = require_node(vm, &h, t)?;
-        if let Some(&rv) = args.first() {
-            if !rv.is_undefined() {
-                let s = vm.value_to_rust_string(rv);
-                h.borrow_mut().dialog_return_values.insert(nid, s);
-            }
-        }
-        {
-            let doc_rc = Rc::clone(&h.borrow().document);
-            let mut doc = doc_rc.borrow_mut();
-            if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
-                e.pseudo_state.remove(rix_dom::ElementState::MODAL);
-            }
-        }
-        remove_element_attr(vm, &h, nid, "open");
-        h.borrow_mut().mark_node_style_dirty(nid);
-        Ok(JsValue::UNDEFINED)
-    });
 
     // HTML5 Constraint Validation API (`validity`, `validationMessage`, `willValidate`,
     // `setCustomValidity`, `checkValidity`, `reportValidity`) and `<form>` (`elements`, `reset`).
@@ -5686,10 +5829,11 @@ fn set_inner_html(vm: &mut JsVm, host: &SharedHost, nid: NodeId, html: &str) {
         next_sibling: None,
     });
     if is_conn {
-        for n in added {
+        for &n in &added {
             notify_custom_element_subtree(vm, host, n, true);
         }
     }
+    enforce_details_exclusivity_for_inserted(vm, host, &added);
 }
 
 fn insert_adjacent_html(vm: &mut JsVm, host: &SharedHost, nid: NodeId, pos: &str, html: &str) {
@@ -5767,10 +5911,11 @@ fn insert_adjacent_html(vm: &mut JsVm, host: &SharedHost, nid: NodeId, pos: &str
         next_sibling: None,
     });
     if is_conn {
-        for n in added {
+        for &n in &added {
             notify_custom_element_subtree(vm, host, n, true);
         }
     }
+    enforce_details_exclusivity_for_inserted(vm, host, &added);
 }
 
 fn fnv_mix(mut h: u64, bytes: &[u8]) -> u64 {
@@ -7715,20 +7860,40 @@ pub(crate) fn set_element_attr(
     }
     host.borrow().emit_mutation(DomMutation::Attributes {
         target: nid,
-        attribute_name: attr_local,
+        attribute_name: attr_local.clone(),
         attribute_namespace: if attr_ns.is_empty() {
             None
         } else {
-            Some(attr_ns)
+            Some(attr_ns.clone())
         },
-        old_value: old_val,
+        old_value: old_val.clone(),
     });
+    // HTML Living Standard §4.11.1: `<details>` `open` / `name` attribute reactions.
+    if attr_ns.is_empty() && tag_lower == "details" {
+        if attr_local == "open" && old_val.is_none() {
+            let hook = host.borrow().details_toggle_hook.clone();
+            if let Some(f) = hook {
+                f(vm, nid, "closed", "open");
+            }
+            enforce_details_exclusivity_on_open(vm, host, nid);
+        } else if attr_local == "name" && !val.is_empty() {
+            let is_open = host
+                .borrow()
+                .document
+                .borrow()
+                .get(nid)
+                .is_some_and(|d| matches!(d, NodeData::Element(e) if e.has_attribute("open")));
+            if is_open {
+                enforce_details_exclusivity_for_inserted(vm, host, &[nid]);
+            }
+        }
+    }
     crate::custom_elements::drain_backup_queue(vm, host);
 }
 
 pub(crate) fn remove_element_attr(vm: &mut JsVm, host: &SharedHost, nid: NodeId, name: &str) {
     let is_html_doc = !host.borrow().is_xml_doc_for_node(nid);
-    let removed = {
+    let (removed, tag_lower) = {
         let _doc_rc = Rc::clone(&host.borrow().document);
         let mut doc = _doc_rc.borrow_mut();
         match doc.get_mut_untracked(nid) {
@@ -7739,7 +7904,8 @@ pub(crate) fn remove_element_attr(vm: &mut JsVm, host: &SharedHost, nid: NodeId,
                 } else {
                     std::borrow::Cow::Borrowed(name)
                 };
-                e.remove_attribute_by_qname(&effective_name)
+                let tag = e.name.local.as_str().to_ascii_lowercase();
+                (e.remove_attribute_by_qname(&effective_name), tag)
             }
             _ => return,
         }
@@ -7760,10 +7926,20 @@ pub(crate) fn remove_element_attr(vm: &mut JsVm, host: &SharedHost, nid: NodeId,
         }
         host.borrow().emit_mutation(DomMutation::Attributes {
             target: nid,
-            attribute_name: local,
-            attribute_namespace: if ns.is_empty() { None } else { Some(ns) },
+            attribute_name: local.clone(),
+            attribute_namespace: if ns.is_empty() {
+                None
+            } else {
+                Some(ns.clone())
+            },
             old_value: Some(old_val),
         });
+        if ns.is_empty() && tag_lower == "details" && local == "open" {
+            let hook = host.borrow().details_toggle_hook.clone();
+            if let Some(f) = hook {
+                f(vm, nid, "open", "closed");
+            }
+        }
         crate::custom_elements::drain_backup_queue(vm, host);
     }
 }
