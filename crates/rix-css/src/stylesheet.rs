@@ -77,6 +77,9 @@ pub struct MediaContext {
     /// Optional nearest CSS Containment L3 size-query container dimensions (for `cqw`/`cqh`/`cqi`/`cqb`).
     pub container_width: Option<f32>,
     pub container_height: Option<f32>,
+    /// True when the owning document is in HTML Quirks Mode (`doc.quirks_mode() == 2`),
+    /// enabling Quirks Mode Living Standard §3.1 (hashless hex colors) and §3.2 (unitless lengths).
+    pub quirks_mode: bool,
 }
 
 impl Default for MediaContext {
@@ -90,6 +93,7 @@ impl Default for MediaContext {
             media_type: MediaTypeKind::Screen,
             container_width: None,
             container_height: None,
+            quirks_mode: false,
         }
     }
 }
@@ -964,6 +968,7 @@ struct StylesheetCacheKey {
     viewport_h: u32,
     dark_mode: bool,
     reduced_motion: bool,
+    quirks_mode: bool,
 }
 
 fn hash_css_bytes(bytes: &[u8]) -> u64 {
@@ -1139,7 +1144,12 @@ impl Stylesheet {
         owner_parent: Option<rix_dom::NodeId>,
         base_url: Option<&str>,
     ) -> Self {
-        let rewritten = crate::properties::rewrite_dynamic_var_names(css);
+        let quirks_norm = if origin == CascadeOrigin::Author {
+            crate::properties::preprocess_quirks_and_strict_lengths(css, media.quirks_mode)
+        } else {
+            std::borrow::Cow::Borrowed(css)
+        };
+        let rewritten = crate::properties::rewrite_dynamic_var_names(&quirks_norm);
         let wrapped = wrap_top_level_scope_rules(&rewritten);
         let opts = ParserOptions {
             error_recovery: true,
@@ -1191,6 +1201,7 @@ impl Stylesheet {
             viewport_h: media.viewport_height.round().max(0.0) as u32,
             dark_mode: media.dark_mode,
             reduced_motion: media.reduced_motion,
+            quirks_mode: media.quirks_mode,
         };
         if let Ok(guard) = cache.read() {
             if let Some(hit) = guard.get(&key) {

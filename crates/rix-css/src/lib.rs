@@ -46,10 +46,10 @@ pub use grid_css::{
 };
 pub use properties::{
     compile_declaration_block, is_logical_property, is_sizing_property, parse_inline_style,
-    parse_property_from_tokens, parse_single_timing_function, resolve_logical_to_physical,
-    serialize_css_tokens, tokenize_custom_value_str, CssToken, GlobalKeyword, MissingCssFeature,
-    MissingCssKind, PropertyIdKind, PropertyValue, SpecifiedDeclaration, ALL_RESETTABLE_LONGHANDS,
-    COMPUTED_STYLE_LONGHANDS,
+    parse_inline_style_quirks, parse_property_from_tokens, parse_single_timing_function,
+    resolve_logical_to_physical, serialize_css_tokens, tokenize_custom_value_str, CssToken,
+    GlobalKeyword, MissingCssFeature, MissingCssKind, PropertyIdKind, PropertyValue,
+    SpecifiedDeclaration, ALL_RESETTABLE_LONGHANDS, COMPUTED_STYLE_LONGHANDS,
 };
 pub use rule_index::{InvalidationMap, InvalidationScope, RuleBucketEntry, RuleIndex};
 pub use selector::{
@@ -82,19 +82,20 @@ pub use text_css::{
 pub use ua::{default_ua_stylesheet, UA_CSS};
 pub use values::{
     AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
-    AnimationPlayStateMode, AnimationSpec, BackgroundClipMode, BackgroundImageValue,
-    BackgroundLayerValue, BackgroundSizeValue, BorderCollapseMode, BorderEdge, BoxShadowValue,
-    BoxSizingMode, CalcExpr, CaptionSideMode, ClearMode, ClipPathValue, ClipRadius,
-    ColorInterpolationFiltersMode, ColorRgba, ContentVisibilityMode, CornerRadii, CornerRadius,
-    CssColor, CssGradientStop, CursorKind, DirectionMode, DisplayMode, EdgeValues, EmptyCellsMode,
-    EvalContext, FilterOp, FilterScalar, FilterSpecOp, FlexDirectionMode, FlexWrapMode, FloatMode,
-    FontStyleMode, GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
-    InterpolateSizeMode, LengthPercentage, LengthPercentageAuto, LengthUnit, LineHeightValue,
-    LineStyle, ListStylePositionMode, ListStyleTypeMode, MixBlendMode, OverflowMode, OverflowPair,
-    OverflowWrapMode, OverlayMode, OverscrollBehaviorMode, PointerEventsMode, PositionMode,
-    ReadingFlowMode, ResizeMode, ScrollBehaviorMode, SizeValue, StepPositionMode, TableLayoutMode,
-    TextAlignLastMode, TextAlignMode, TextDecorationLine, TextJustifyMode, TextOrientationMode,
-    TextOverflowMode, TextTransformMode, TimingFunction, TransformOp, TransformOrigin,
-    TransitionBehaviorMode, TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode,
-    WhiteSpaceMode, WordBreakMode, WritingMode, ZIndexValue,
+    AnimationPlayStateMode, AnimationSpec, AppearanceMode, BackgroundClipMode,
+    BackgroundImageValue, BackgroundLayerValue, BackgroundSizeValue, BorderCollapseMode,
+    BorderEdge, BoxShadowValue, BoxSizingMode, CalcExpr, CaptionSideMode, ClearMode, ClipPathValue,
+    ClipRadius, ColorInterpolationFiltersMode, ColorRgba, ContentVisibilityMode, CornerRadii,
+    CornerRadius, CssColor, CssGradientStop, CursorKind, DirectionMode, DisplayMode, EdgeValues,
+    EmptyCellsMode, EvalContext, FilterOp, FilterScalar, FilterSpecOp, FlexDirectionMode,
+    FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode, GridPlacementValue,
+    GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode, LengthPercentage,
+    LengthPercentageAuto, LengthUnit, LineHeightValue, LineStyle, ListStylePositionMode,
+    ListStyleTypeMode, MixBlendMode, OverflowMode, OverflowPair, OverflowWrapMode, OverlayMode,
+    OverscrollBehaviorMode, PointerEventsMode, PositionMode, ReadingFlowMode, ResizeMode,
+    ScrollBehaviorMode, SizeValue, StepPositionMode, TableLayoutMode, TextAlignLastMode,
+    TextAlignMode, TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode,
+    TextTransformMode, TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode,
+    TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode,
+    WordBreakMode, WritingMode, ZIndexValue,
 };

@@ -14,20 +14,20 @@ use crate::properties::{
 use crate::stylesheet::{CascadeOrigin, CompiledRule, LayerId, MediaContext, RegisteredProperty};
 use crate::values::{
     AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
-    AnimationPlayStateMode, AnimationSpec, BackgroundClipMode, BackgroundImageValue,
-    BackgroundLayerValue, BackgroundSizeValue, BorderCollapseMode, BoxShadowValue, BoxSizingMode,
-    CaptionSideMode, ClearMode, ClipPathValue, ColorInterpolationFiltersMode, ColorRgba,
-    ContentVisibilityMode, CornerRadii, CssColor, CursorKind, DirectionMode, DisplayMode,
-    EdgeValues, EmptyCellsMode, EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode,
-    FontStyleMode, GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
-    InterpolateSizeMode, LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle,
-    MixBlendMode, OverflowMode, OverflowPair, OverflowWrapMode, OverlayMode,
-    OverscrollBehaviorMode, PointerEventsMode, PositionMode, ReadingFlowMode, ResizeMode,
-    ScrollBehaviorMode, SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode,
-    TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode, TextTransformMode,
-    TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec,
-    UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode,
-    ZIndexValue,
+    AnimationPlayStateMode, AnimationSpec, AppearanceMode, BackgroundClipMode,
+    BackgroundImageValue, BackgroundLayerValue, BackgroundSizeValue, BorderCollapseMode,
+    BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue,
+    ColorInterpolationFiltersMode, ColorRgba, ContentVisibilityMode, CornerRadii, CssColor,
+    CursorKind, DirectionMode, DisplayMode, EdgeValues, EmptyCellsMode, EvalContext, FilterOp,
+    FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
+    GridPlacementValue, GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode,
+    LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
+    OverflowPair, OverflowWrapMode, OverlayMode, OverscrollBehaviorMode, PointerEventsMode,
+    PositionMode, ReadingFlowMode, ResizeMode, ScrollBehaviorMode, SizeValue, TableLayoutMode,
+    TextAlignLastMode, TextAlignMode, TextDecorationLine, TextJustifyMode, TextOrientationMode,
+    TextOverflowMode, TextTransformMode, TimingFunction, TransformOp, TransformOrigin,
+    TransitionBehaviorMode, TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode,
+    WhiteSpaceMode, WordBreakMode, WritingMode, ZIndexValue,
 };
 
 const MAX_VAR_DEPTH: u8 = 64;
@@ -105,6 +105,7 @@ pub struct VisualStyle {
     pub text_decoration_inset: crate::anim_css::TextDecorationInsetValue,
     pub user_select: UserSelectMode,
     pub resize: ResizeMode,
+    pub appearance: AppearanceMode,
     pub overscroll_behavior_x: OverscrollBehaviorMode,
     pub overscroll_behavior_y: OverscrollBehaviorMode,
     pub scroll_behavior: ScrollBehaviorMode,
@@ -142,6 +143,7 @@ impl Default for VisualStyle {
             text_decoration_inset: crate::anim_css::TextDecorationInsetValue::Auto,
             user_select: UserSelectMode::Auto,
             resize: ResizeMode::None,
+            appearance: AppearanceMode::None,
             overscroll_behavior_x: OverscrollBehaviorMode::Auto,
             overscroll_behavior_y: OverscrollBehaviorMode::Auto,
             scroll_behavior: ScrollBehaviorMode::Auto,
@@ -223,6 +225,8 @@ pub struct InheritedTextStyle {
     pub svg_fill_rule_even_odd: bool,
     pub list_style_type: crate::values::ListStyleTypeMode,
     pub list_style_position: crate::values::ListStylePositionMode,
+    /// Inherited CSS UI L4 `accent-color` (`None` = `auto`).
+    pub accent_color: Option<CssColor>,
     pub text_shadow: Vec<BoxShadowValue>,
     /// Full CSS Values L4/L5 evaluation context snapshot for this element (`em`/`rem`/`lh`/`rlh`/viewport/container/sibling).
     pub eval_ctx: EvalContext,
@@ -285,6 +289,7 @@ impl Default for InheritedTextStyle {
             svg_fill_rule_even_odd: false,
             list_style_type: crate::values::ListStyleTypeMode::Disc,
             list_style_position: crate::values::ListStylePositionMode::Outside,
+            accent_color: None,
             text_shadow: Vec::new(),
             eval_ctx: EvalContext::default(),
         }
@@ -4099,6 +4104,12 @@ pub fn apply_declaration(
         (PropertyIdKind::Overlay, PropertyValue::Overlay(v)) => {
             style.overlay = *v;
         }
+        (PropertyIdKind::Appearance, PropertyValue::Appearance(v)) => {
+            Arc::make_mut(&mut style.visual).appearance = *v;
+        }
+        (PropertyIdKind::AccentColor, PropertyValue::AccentColor(v)) => {
+            Arc::make_mut(&mut style.text).accent_color = *v;
+        }
         (PropertyIdKind::ReadingFlow, PropertyValue::ReadingFlow(v)) => {
             style.effects_mut().reading_flow = *v;
         }
@@ -4499,6 +4510,12 @@ fn copy_property_from_parent(
                 parent.visual.border_radius.bottom_left.clone();
         }
         PropertyIdKind::Overlay => style.overlay = parent.overlay,
+        PropertyIdKind::Appearance => {
+            Arc::make_mut(&mut style.visual).appearance = parent.visual.appearance;
+        }
+        PropertyIdKind::AccentColor => {
+            Arc::make_mut(&mut style.text).accent_color = parent.text.accent_color;
+        }
         PropertyIdKind::ReadingFlow => {
             style.effects_mut().reading_flow = parent
                 .effects
@@ -5497,6 +5514,12 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         }
         PropertyIdKind::ColumnCount => Arc::make_mut(&mut style.box_model).column_count = None,
         PropertyIdKind::Overlay => style.overlay = OverlayMode::None,
+        PropertyIdKind::Appearance => {
+            Arc::make_mut(&mut style.visual).appearance = AppearanceMode::None;
+        }
+        PropertyIdKind::AccentColor => {
+            Arc::make_mut(&mut style.text).accent_color = None;
+        }
         PropertyIdKind::ReadingFlow => {
             if let Some(eff) = &mut style.effects {
                 Arc::make_mut(eff).reading_flow = ReadingFlowMode::Normal;

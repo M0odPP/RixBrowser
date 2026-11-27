@@ -973,40 +973,35 @@ impl<'a> Element for DomElement<'a> {
             RixPseudoClass::Focus => st.contains(ElementState::FOCUS),
             RixPseudoClass::FocusVisible => st.contains(ElementState::FOCUS_VISIBLE),
             RixPseudoClass::FocusWithin => st.contains(ElementState::FOCUS_WITHIN),
-            RixPseudoClass::Disabled => {
-                st.contains(ElementState::DISABLED) || self.attr_value("disabled").is_some()
-            }
+            RixPseudoClass::Disabled => self.is_actually_disabled(),
             RixPseudoClass::Enabled => {
-                !st.contains(ElementState::DISABLED) && self.attr_value("disabled").is_none()
+                self.is_disableable_element() && !self.is_actually_disabled()
             }
-            RixPseudoClass::Checked => {
-                st.contains(ElementState::CHECKED)
-                    || self.attr_value("checked").is_some()
-                    || (tag.eq_ignore_ascii_case("option") && self.attr_value("selected").is_some())
-            }
-            RixPseudoClass::Indeterminate => st.contains(ElementState::INDETERMINATE),
+            RixPseudoClass::Checked => self.is_checked_element(),
+            RixPseudoClass::Indeterminate => self.is_indeterminate_element(),
             RixPseudoClass::ReadOnly => !self.is_read_write(),
             RixPseudoClass::ReadWrite => self.is_read_write(),
             RixPseudoClass::Link => self.is_link() && !st.contains(ElementState::VISITED),
             RixPseudoClass::Visited => self.is_link() && st.contains(ElementState::VISITED),
             RixPseudoClass::AnyLink => self.is_link(),
-            RixPseudoClass::PlaceholderShown => {
-                self.attr_value("placeholder").is_some()
-                    && self.attr_value("value").unwrap_or("").is_empty()
+            RixPseudoClass::PlaceholderShown => self.is_placeholder_shown(),
+            RixPseudoClass::Default => self.is_default_control(),
+            RixPseudoClass::Required => {
+                self.is_requireable_control() && self.attr_value("required").is_some()
             }
-            RixPseudoClass::Default => {
-                self.attr_value("checked").is_some() || self.attr_value("selected").is_some()
+            RixPseudoClass::Optional => {
+                self.is_requireable_control() && self.attr_value("required").is_none()
             }
-            RixPseudoClass::Required => self.attr_value("required").is_some(),
-            RixPseudoClass::Optional => self.attr_value("required").is_none(),
-            RixPseudoClass::Valid => !st.contains(ElementState::INVALID),
-            RixPseudoClass::Invalid => st.contains(ElementState::INVALID),
+            RixPseudoClass::Valid => {
+                self.is_constraint_candidate() && !self.is_constraint_invalid()
+            }
+            RixPseudoClass::Invalid => {
+                self.is_constraint_candidate() && self.is_constraint_invalid()
+            }
             RixPseudoClass::UserValid => st.contains(ElementState::USER_VALID),
             RixPseudoClass::UserInvalid => st.contains(ElementState::USER_INVALID),
-            RixPseudoClass::InRange => {
-                self.attr_value("min").is_some() || self.attr_value("max").is_some()
-            }
-            RixPseudoClass::OutOfRange => false,
+            RixPseudoClass::InRange => self.range_check() == Some(true),
+            RixPseudoClass::OutOfRange => self.range_check() == Some(false),
             RixPseudoClass::Defined => self
                 .element_data()
                 .is_some_and(rix_dom::ElementData::is_defined),
@@ -1095,10 +1090,16 @@ impl<'a> Element for DomElement<'a> {
         };
         match case_sensitivity {
             CaseSensitivity::CaseSensitive => elem.has_class_hash(name.hash64),
-            CaseSensitivity::AsciiCaseInsensitive => self.attr_value("class").is_some_and(|cls| {
-                cls.split_ascii_whitespace()
-                    .any(|token| token.eq_ignore_ascii_case(name.as_str()))
-            }),
+            CaseSensitivity::AsciiCaseInsensitive => {
+                let lower_h = hash_ident_ascii_lower(name.as_str());
+                if !elem.has_class_hash_lower(lower_h) {
+                    return false;
+                }
+                self.attr_value("class").is_some_and(|cls| {
+                    cls.split_ascii_whitespace()
+                        .any(|token| token.eq_ignore_ascii_case(name.as_str()))
+                })
+            }
         }
     }
 
@@ -1149,6 +1150,344 @@ impl<'a> Element for DomElement<'a> {
 }
 
 impl DomElement<'_> {
+    fn is_html_tag(&self, expected: &str) -> bool {
+        self.element_data().is_some_and(|e| {
+            &*e.name.ns == "http://www.w3.org/1999/xhtml"
+                && e.name.local.eq_str_ignore_ascii_case(expected)
+        })
+    }
+
+    fn input_type_lower(&self) -> Option<String> {
+        let elem = self.element_data()?;
+        if &*elem.name.ns != "http://www.w3.org/1999/xhtml"
+            || !elem.name.local.eq_str_ignore_ascii_case("input")
+        {
+            return None;
+        }
+        Some(
+            self.attr_value("type")
+                .unwrap_or("text")
+                .trim()
+                .to_ascii_lowercase(),
+        )
+    }
+
+    /// HTML5 §4.16.3: elements that can be `:disabled` or `:enabled`.
+    fn is_disableable_element(&self) -> bool {
+        let Some(elem) = self.element_data() else {
+            return false;
+        };
+        if &*elem.name.ns != "http://www.w3.org/1999/xhtml" {
+            return false;
+        }
+        matches!(
+            elem.name.local.as_ref(),
+            "button" | "input" | "select" | "textarea" | "optgroup" | "option" | "fieldset"
+        ) || elem.pseudo_state.contains(ElementState::DISABLED)
+            || elem.pseudo_state.contains(ElementState::ENABLED)
+    }
+
+    /// HTML5 §4.16.3: `:disabled` includes `<fieldset disabled>` ancestry (except inside its
+    /// first `<legend>` child) and `<optgroup disabled>` for `<option>`.
+    fn is_actually_disabled(&self) -> bool {
+        if !self.is_disableable_element() {
+            return false;
+        }
+        let Some(elem) = self.element_data() else {
+            return false;
+        };
+        if elem.pseudo_state.contains(ElementState::DISABLED)
+            || self.attr_value("disabled").is_some()
+        {
+            return true;
+        }
+        if self.is_html_tag("option") {
+            if let Some(p) = self.doc.parent(self.node_id) {
+                if let Some(NodeData::Element(pe)) = self.doc.get(p) {
+                    if pe.name.local.eq_str_ignore_ascii_case("optgroup")
+                        && pe.has_attribute("disabled")
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        if matches!(
+            elem.name.local.as_ref(),
+            "button" | "input" | "select" | "textarea" | "fieldset"
+        ) {
+            let mut prev = self.node_id;
+            let mut cur = self.doc.parent(self.node_id);
+            while let Some(anc) = cur {
+                if let Some(NodeData::Element(ae)) = self.doc.get(anc) {
+                    if &*ae.name.ns == "http://www.w3.org/1999/xhtml"
+                        && ae.name.local.eq_str_ignore_ascii_case("fieldset")
+                        && ae.has_attribute("disabled")
+                    {
+                        let first_legend = self.doc.children(anc).find(|&c| {
+                            matches!(
+                                self.doc.get(c),
+                                Some(NodeData::Element(le))
+                                    if &*le.name.ns == "http://www.w3.org/1999/xhtml"
+                                        && le.name.local.eq_str_ignore_ascii_case("legend")
+                            )
+                        });
+                        if first_legend != Some(prev) {
+                            return true;
+                        }
+                    }
+                }
+                prev = anc;
+                cur = self.doc.parent(anc);
+            }
+        }
+        false
+    }
+
+    fn is_checked_element(&self) -> bool {
+        let Some(elem) = self.element_data() else {
+            return false;
+        };
+        if let Some(ty) = self.input_type_lower() {
+            if ty == "checkbox" || ty == "radio" {
+                return elem.pseudo_state.contains(ElementState::CHECKED)
+                    || self.attr_value("checked").is_some();
+            }
+            return false;
+        }
+        if self.is_html_tag("option") {
+            return elem.pseudo_state.contains(ElementState::CHECKED)
+                || self.attr_value("selected").is_some();
+        }
+        false
+    }
+
+    fn is_indeterminate_element(&self) -> bool {
+        let Some(elem) = self.element_data() else {
+            return false;
+        };
+        if elem.pseudo_state.contains(ElementState::INDETERMINATE) {
+            return true;
+        }
+        if self.is_html_tag("progress") {
+            return self.attr_value("value").is_none();
+        }
+        if self.input_type_lower().as_deref() == Some("radio") {
+            let name = self.attr_value("name").unwrap_or("");
+            if name.is_empty() {
+                return !self.is_checked_element();
+            }
+            let mut root = self.node_id;
+            while let Some(p) = self.doc.parent(root) {
+                root = p;
+            }
+            let any_checked = self.doc.descendants(root).any(|cand| {
+                let Some(NodeData::Element(ce)) = self.doc.get(cand) else {
+                    return false;
+                };
+                &*ce.name.ns == "http://www.w3.org/1999/xhtml"
+                    && ce.name.local.eq_str_ignore_ascii_case("input")
+                    && ce
+                        .get_attribute("type")
+                        .is_some_and(|t| t.eq_ignore_ascii_case("radio"))
+                    && ce.get_attribute("name") == Some(name)
+                    && (ce.pseudo_state.contains(ElementState::CHECKED)
+                        || ce.has_attribute("checked"))
+            });
+            return !any_checked;
+        }
+        false
+    }
+
+    fn is_placeholder_shown(&self) -> bool {
+        let Some(ph) = self.attr_value("placeholder") else {
+            return false;
+        };
+        if ph.is_empty() {
+            return false;
+        }
+        if self.is_html_tag("textarea") {
+            return self.attr_value("value").map_or_else(
+                || self.doc.inner_text(self.node_id).is_empty(),
+                str::is_empty,
+            );
+        }
+        if let Some(ty) = self.input_type_lower() {
+            if matches!(
+                ty.as_str(),
+                "text" | "search" | "url" | "tel" | "email" | "password" | "number"
+            ) {
+                return self.attr_value("value").unwrap_or("").is_empty();
+            }
+        }
+        false
+    }
+
+    fn is_requireable_control(&self) -> bool {
+        if self.is_html_tag("select") || self.is_html_tag("textarea") {
+            return true;
+        }
+        if let Some(ty) = self.input_type_lower() {
+            return !matches!(
+                ty.as_str(),
+                "hidden" | "range" | "color" | "button" | "submit" | "reset" | "image"
+            );
+        }
+        false
+    }
+
+    fn is_constraint_candidate(&self) -> bool {
+        if self.is_html_tag("form") || self.is_html_tag("fieldset") {
+            return true;
+        }
+        if self.is_html_tag("select") || self.is_html_tag("textarea") {
+            return !self.is_actually_disabled() && self.attr_value("readonly").is_none();
+        }
+        if let Some(ty) = self.input_type_lower() {
+            return !matches!(ty.as_str(), "hidden" | "reset" | "button")
+                && !self.is_actually_disabled()
+                && self.attr_value("readonly").is_none();
+        }
+        false
+    }
+
+    fn is_constraint_invalid(&self) -> bool {
+        let Some(elem) = self.element_data() else {
+            return false;
+        };
+        if elem.pseudo_state.contains(ElementState::INVALID) {
+            return true;
+        }
+        if self.is_html_tag("form") || self.is_html_tag("fieldset") {
+            return self.doc.descendants(self.node_id).any(|d| {
+                d != self.node_id && {
+                    let child = DomElement::new(self.doc, d);
+                    child.is_constraint_candidate()
+                        && !child.is_html_tag("form")
+                        && !child.is_html_tag("fieldset")
+                        && child.is_constraint_invalid()
+                }
+            });
+        }
+        if self.is_requireable_control() && self.attr_value("required").is_some() {
+            if let Some(ty) = self.input_type_lower() {
+                if ty == "checkbox" || ty == "radio" {
+                    if !self.is_checked_element() {
+                        return true;
+                    }
+                } else if self.attr_value("value").unwrap_or("").is_empty() {
+                    return true;
+                }
+            } else if self.is_html_tag("textarea") {
+                let empty = self.attr_value("value").map_or_else(
+                    || self.doc.inner_text(self.node_id).is_empty(),
+                    str::is_empty,
+                );
+                if empty {
+                    return true;
+                }
+            }
+        }
+        self.range_check() == Some(false)
+    }
+
+    /// Returns `Some(true)` if in-range, `Some(false)` if out-of-range, `None` if not range-checked.
+    fn range_check(&self) -> Option<bool> {
+        let ty = self.input_type_lower()?;
+        if !matches!(
+            ty.as_str(),
+            "number" | "range" | "date" | "time" | "month" | "week" | "datetime-local"
+        ) {
+            return None;
+        }
+        let min_v = self
+            .attr_value("min")
+            .and_then(|s| s.trim().parse::<f64>().ok());
+        let max_v = self
+            .attr_value("max")
+            .and_then(|s| s.trim().parse::<f64>().ok());
+        if min_v.is_none() && max_v.is_none() {
+            return None;
+        }
+        let val_str = self.attr_value("value").unwrap_or("").trim();
+        if val_str.is_empty() {
+            return Some(true);
+        }
+        let Ok(v) = val_str.parse::<f64>() else {
+            return Some(true);
+        };
+        if let Some(mn) = min_v {
+            if v < mn {
+                return Some(false);
+            }
+        }
+        if let Some(mx) = max_v {
+            if v > mx {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    fn is_default_control(&self) -> bool {
+        if let Some(ty) = self.input_type_lower() {
+            if (ty == "checkbox" || ty == "radio") && self.attr_value("checked").is_some() {
+                return true;
+            }
+        }
+        if self.is_html_tag("option") && self.attr_value("selected").is_some() {
+            return true;
+        }
+        let is_submit = if self.is_html_tag("button") {
+            let ty = self.attr_value("type").unwrap_or("submit");
+            !ty.eq_ignore_ascii_case("button") && !ty.eq_ignore_ascii_case("reset")
+        } else if let Some(ty) = self.input_type_lower() {
+            ty == "submit" || ty == "image"
+        } else {
+            false
+        };
+        if !is_submit {
+            return false;
+        }
+        // HTML5 §4.16.3: first submit button in tree order belonging to a `<form>`.
+        let mut cur = self.doc.parent(self.node_id);
+        let mut form_node = None;
+        while let Some(p) = cur {
+            if matches!(
+                self.doc.get(p),
+                Some(NodeData::Element(e))
+                    if &*e.name.ns == "http://www.w3.org/1999/xhtml"
+                        && e.name.local.eq_str_ignore_ascii_case("form")
+            ) {
+                form_node = Some(p);
+                break;
+            }
+            cur = self.doc.parent(p);
+        }
+        let Some(form_id) = form_node else {
+            return false;
+        };
+        let first_submit = self.doc.descendants(form_id).find(|&cand| {
+            let Some(NodeData::Element(e)) = self.doc.get(cand) else {
+                return false;
+            };
+            if &*e.name.ns != "http://www.w3.org/1999/xhtml" {
+                return false;
+            }
+            if e.name.local.eq_str_ignore_ascii_case("button") {
+                let ty = e.get_attribute("type").unwrap_or("submit");
+                !ty.eq_ignore_ascii_case("button") && !ty.eq_ignore_ascii_case("reset")
+            } else if e.name.local.eq_str_ignore_ascii_case("input") {
+                e.get_attribute("type").is_some_and(|t| {
+                    t.eq_ignore_ascii_case("submit") || t.eq_ignore_ascii_case("image")
+                })
+            } else {
+                false
+            }
+        });
+        first_submit == Some(self.node_id)
+    }
+
     fn is_read_write(&self) -> bool {
         let Some(elem) = self.element_data() else {
             return false;
@@ -1416,6 +1755,15 @@ pub fn matches_selector_list_for_element(
     matches_selector_list_with_scope(list, element, None, bloom, caches, shadow_host)
 }
 
+#[inline]
+fn doc_quirks_mode(doc: &Document) -> QuirksMode {
+    match doc.quirks_mode() {
+        2 => QuirksMode::Quirks,
+        1 => QuirksMode::LimitedQuirks,
+        _ => QuirksMode::NoQuirks,
+    }
+}
+
 /// Matches a parsed `SelectorList` against `element` with an optional `:scope` element.
 #[must_use]
 pub fn matches_selector_list_with_scope(
@@ -1430,7 +1778,7 @@ pub fn matches_selector_list_with_scope(
         MatchingMode::Normal,
         bloom,
         caches,
-        QuirksMode::NoQuirks,
+        doc_quirks_mode(element.doc),
         NeedsSelectorFlags::No,
         MatchingForInvalidation::No,
     );
@@ -1544,7 +1892,7 @@ pub fn matches_single_selector_with_scope(
             MatchingMode::ForStatelessPseudoElement,
             bloom,
             caches,
-            QuirksMode::NoQuirks,
+            doc_quirks_mode(element.doc),
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
@@ -1558,7 +1906,7 @@ pub fn matches_single_selector_with_scope(
         MatchingMode::Normal,
         bloom,
         caches,
-        QuirksMode::NoQuirks,
+        doc_quirks_mode(element.doc),
         NeedsSelectorFlags::No,
         MatchingForInvalidation::No,
     );

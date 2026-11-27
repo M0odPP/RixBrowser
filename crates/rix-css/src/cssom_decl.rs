@@ -1011,6 +1011,16 @@ fn parse_and_serialize_extra_css2_property(
             }
             None
         }
+        PropertyIdKind::Appearance => Some(
+            crate::values::AppearanceMode::parse_css(trimmed).map(|m| m.as_css_str().to_string()),
+        ),
+        PropertyIdKind::AccentColor => {
+            if low == "auto" {
+                Some(Some("auto".to_string()))
+            } else {
+                Some(crate::color::parse_and_serialize_color_specified(trimmed))
+            }
+        }
         _ => None,
     }
 }

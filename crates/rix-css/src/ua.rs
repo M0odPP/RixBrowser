@@ -7,7 +7,7 @@ use crate::stylesheet::{CascadeOrigin, MediaContext, Stylesheet};
 /// Standard HTML5 User-Agent stylesheet rules.
 pub const UA_CSS: &str = r#"
 head, title, meta, link, style, script, template, noscript, [hidden],
-[popover]:not(:popover-open), dialog:not([open]),
+[popover]:not(:popover-open):not(dialog[open]), dialog:not([open]):not(:popover-open),
 details:not([open]) > :not(summary) {
     display: none;
 }
@@ -32,7 +32,65 @@ hr {
     color: gray;
     border-style: inset;
     border-width: 1px;
+    margin-top: 0.5em;
+    margin-bottom: 0.5em;
+    margin-left: auto;
+    margin-right: auto;
     overflow: hidden;
+}
+fieldset {
+    border: 2px groove #e9e9ed;
+    padding: 0.35em 0.75em 0.625em;
+    margin-left: 2px;
+    margin-right: 2px;
+}
+legend {
+    padding-left: 2px;
+    padding-right: 2px;
+}
+summary {
+    display: list-item;
+    list-style-type: disclosure-closed;
+}
+details[open] > summary {
+    list-style-type: disclosure-open;
+}
+dialog {
+    position: absolute;
+    left: 0;
+    right: 0;
+    margin: auto;
+    padding: 1em;
+    border: 3px solid CanvasText;
+    background-color: Canvas;
+    color: CanvasText;
+}
+dialog:modal {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    max-width: calc(100% - 2em - 6px);
+    max-height: calc(100% - 2em - 6px);
+    overflow: auto;
+    visibility: visible;
+}
+dialog::backdrop {
+    background-color: rgba(0, 0, 0, 0.1);
+}
+[popover] {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    width: fit-content;
+    height: fit-content;
+    margin: auto;
+    border: 2px solid;
+    padding: 0.25em;
+    overflow: auto;
+    color: CanvasText;
+    background-color: Canvas;
 }
 table {
     display: table;
@@ -177,39 +235,145 @@ a:visited {
     text-decoration: underline;
     cursor: pointer;
 }
-input[type="hidden"] {
+input[type="hidden" i] {
     display: none;
 }
 button, input, select, textarea {
     display: inline-block;
-    box-sizing: border-box;
-    border: 2px solid #a0a6b2;
-    border-radius: 0;
     font-family: sans-serif;
     font-size: 13.3333px;
-}
-input, textarea {
-    box-sizing: content-box;
-}
-input[type="submit" i], input[type="button" i], input[type="reset" i], input[type="checkbox" i], input[type="radio" i] {
-    box-sizing: border-box;
-}
-input, textarea, select {
-    background-color: #ffffff;
-}
-input, textarea {
-    overflow: clip;
-}
-input[type="checkbox" i], input[type="radio" i] {
-    background-color: transparent;
-    border: 0;
-}
-button, input[type="submit"], input[type="button"], input[type="reset"] {
-    background-color: #eceef2;
+    border-radius: 0;
+    appearance: auto;
 }
 button {
-    padding: 2px 6px;
+    box-sizing: border-box;
+    background-color: #e9e9ed;
+    border: 2px outset #817f84;
+    padding: 1px 4px;
     text-align: center;
+    overflow: visible;
+    cursor: default;
+}
+input {
+    box-sizing: content-box;
+    background-color: #ffffff;
+    border: 2px inset #817f84;
+    padding: 1px 2px;
+    overflow: clip;
+    cursor: text;
+}
+input[type="search" i] {
+    box-sizing: border-box;
+}
+input[type="submit" i], input[type="button" i], input[type="reset" i] {
+    box-sizing: border-box;
+    background-color: #e9e9ed;
+    border: 2px outset #817f84;
+    padding: 1px 4px;
+    text-align: center;
+    white-space: pre;
+    cursor: default;
+}
+input[type="checkbox" i] {
+    box-sizing: border-box;
+    margin: 3px 3px 3px 4px;
+    padding: 0;
+    border: 0;
+    background-color: transparent;
+    overflow: visible;
+    cursor: default;
+}
+input[type="radio" i] {
+    box-sizing: border-box;
+    margin: 3px 3px 0px 5px;
+    padding: 0;
+    border: 0;
+    background-color: transparent;
+    overflow: visible;
+    cursor: default;
+}
+input[type="range" i] {
+    box-sizing: content-box;
+    margin: 2px;
+    padding: 0;
+    border: 0;
+    background-color: #ffffff;
+    overflow: visible;
+    cursor: default;
+}
+input[type="color" i] {
+    box-sizing: border-box;
+    background-color: #e9e9ed;
+    border: 2px outset #817f84;
+    padding: 4px;
+    cursor: default;
+}
+input[type="file" i] {
+    box-sizing: content-box;
+    background-color: transparent;
+    border: 0;
+    padding: 0;
+    white-space: nowrap;
+    cursor: default;
+    appearance: none;
+}
+input[type="date" i], input[type="time" i], input[type="datetime-local" i], input[type="month" i], input[type="week" i] {
+    font-family: monospace;
+    font-size: 13.3333px;
+    cursor: default;
+}
+select {
+    box-sizing: border-box;
+    background-color: #e9e9ed;
+    border: 2px inset #817f84;
+    padding: 1px 4px;
+    overflow: clip;
+    white-space: nowrap;
+    cursor: default;
+}
+select[multiple] {
+    background-color: #ffffff;
+    padding: 1px 0;
+    vertical-align: text-bottom;
+    overflow-x: hidden;
+    overflow-y: scroll;
+}
+optgroup {
+    display: block;
+    font-weight: 700;
+    font-style: italic;
+}
+option {
+    display: block;
+    padding: 2px 0 2px 20px;
+}
+textarea {
+    box-sizing: content-box;
+    font-family: monospace;
+    font-size: 12px;
+    background-color: #ffffff;
+    border: 2px inset #817f84;
+    padding: 2px;
+    vertical-align: text-bottom;
+    white-space: pre-wrap;
+    overflow: visible;
+    cursor: text;
+}
+meter {
+    display: inline-block;
+    box-sizing: content-box;
+    vertical-align: -0.2em;
+    overflow: clip;
+    appearance: auto;
+}
+progress {
+    display: inline-block;
+    box-sizing: content-box;
+    background-color: #e6e6e6;
+    border: 1px solid #817f84;
+    vertical-align: -0.2em;
+    overflow: clip;
+    appearance: auto;
 }
 img, svg, canvas, video {
     display: inline;
