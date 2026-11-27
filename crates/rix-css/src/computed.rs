@@ -15,19 +15,20 @@ use crate::stylesheet::{CascadeOrigin, CompiledRule, LayerId, MediaContext, Regi
 use crate::values::{
     AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
     AnimationPlayStateMode, AnimationSpec, AppearanceMode, BackgroundClipMode,
-    BackgroundImageValue, BackgroundLayerValue, BackgroundSizeValue, BorderCollapseMode,
-    BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue,
-    ColorInterpolationFiltersMode, ColorRgba, ContentVisibilityMode, CornerRadii, CssColor,
-    CursorKind, DirectionMode, DisplayMode, EdgeValues, EmptyCellsMode, EvalContext, FilterOp,
-    FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode,
-    GridPlacementValue, GridTemplateAreasValue, GridTrackSize, InterpolateSizeMode,
-    LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle, MixBlendMode, OverflowMode,
-    OverflowPair, OverflowWrapMode, OverlayMode, OverscrollBehaviorMode, PointerEventsMode,
-    PositionMode, ReadingFlowMode, ResizeMode, ScrollBehaviorMode, SizeValue, TableLayoutMode,
-    TextAlignLastMode, TextAlignMode, TextDecorationLine, TextJustifyMode, TextOrientationMode,
-    TextOverflowMode, TextTransformMode, TimingFunction, TransformOp, TransformOrigin,
-    TransitionBehaviorMode, TransitionSpec, UserSelectMode, VerticalAlignMode, VisibilityMode,
-    WhiteSpaceMode, WordBreakMode, WritingMode, ZIndexValue,
+    BackgroundImageValue, BackgroundLayerValue, BackgroundRepeatKeywordMode, BackgroundRepeatPair,
+    BackgroundSizeValue, BorderCollapseMode, BoxShadowValue, BoxSizingMode, CaptionSideMode,
+    ClearMode, ClipPathValue, ColorInterpolationFiltersMode, ColorRgba, ContentVisibilityMode,
+    CornerRadii, CssColor, CursorKind, DirectionMode, DisplayMode, EdgeValues, EmptyCellsMode,
+    EvalContext, FilterOp, FlexDirectionMode, FlexWrapMode, FloatMode, FontStyleMode,
+    GridAutoFlowMode, GridPlacementValue, GridTemplateAreasValue, GridTrackSize,
+    InterpolateSizeMode, LengthPercentage, LengthPercentageAuto, LineHeightValue, LineStyle,
+    MixBlendMode, OverflowMode, OverflowPair, OverflowWrapMode, OverlayMode,
+    OverscrollBehaviorMode, PointerEventsMode, PositionMode, ReadingFlowMode, ResizeMode,
+    ScrollBehaviorMode, SizeValue, TableLayoutMode, TextAlignLastMode, TextAlignMode,
+    TextDecorationLine, TextJustifyMode, TextOrientationMode, TextOverflowMode, TextTransformMode,
+    TimingFunction, TransformOp, TransformOrigin, TransitionBehaviorMode, TransitionSpec,
+    UserSelectMode, VerticalAlignMode, VisibilityMode, WhiteSpaceMode, WordBreakMode, WritingMode,
+    ZIndexValue,
 };
 
 const MAX_VAR_DEPTH: u8 = 64;
@@ -86,8 +87,11 @@ pub struct VisualStyle {
     pub background_layers: Vec<BackgroundLayerValue>,
     pub background_image_raw: Option<String>,
     pub background_size: Option<BackgroundSizeValue>,
+    pub background_sizes: Vec<BackgroundSizeValue>,
     pub background_clip: BackgroundClipMode,
     pub background_position: (LengthPercentage, LengthPercentage),
+    pub background_positions: Vec<(LengthPercentage, LengthPercentage)>,
+    pub background_repeats: Vec<BackgroundRepeatPair>,
     pub mask_image: BackgroundImageValue,
     pub object_position: Option<Box<crate::values_math::PositionSpec>>,
     pub border_style: EdgeValues<LineStyle>,
@@ -121,11 +125,14 @@ impl Default for VisualStyle {
             background_layers: Vec::new(),
             background_image_raw: None,
             background_size: None,
+            background_sizes: Vec::new(),
             background_clip: BackgroundClipMode::BorderBox,
             background_position: (
                 LengthPercentage::Percent(0.0),
                 LengthPercentage::Percent(0.0),
             ),
+            background_positions: Vec::new(),
+            background_repeats: Vec::new(),
             mask_image: BackgroundImageValue::None,
             object_position: None,
             border_style: EdgeValues::all(LineStyle::None),
@@ -366,7 +373,9 @@ pub struct FlexGridStyle {
     pub justify_items: AlignValue,
     pub justify_self: AlignValue,
     pub row_gap: LengthPercentage,
+    pub row_gap_specified: bool,
     pub column_gap: LengthPercentage,
+    pub column_gap_specified: bool,
     pub grid_template_columns: Vec<GridTrackSize>,
     pub grid_template_rows: Vec<GridTrackSize>,
     pub grid_template_columns_list: crate::grid_css::GridTemplateTrackList,
@@ -401,7 +410,9 @@ impl Default for FlexGridStyle {
             justify_items: AlignValue::Normal,
             justify_self: AlignValue::Auto,
             row_gap: LengthPercentage::Zero,
+            row_gap_specified: false,
             column_gap: LengthPercentage::Zero,
+            column_gap_specified: false,
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
             grid_template_columns_list: crate::grid_css::GridTemplateTrackList::None,
@@ -449,6 +460,7 @@ pub struct EffectsStyle {
     pub animation_range_starts: Vec<crate::anim_css::AnimationRangePoint>,
     pub animation_range_ends: Vec<crate::anim_css::AnimationRangePoint>,
     pub extra_math_props: HashMap<PropertyIdKind, crate::values_math::MathNode>,
+    pub aspect_ratio_auto: bool,
     pub aspect_ratio_math: Option<(
         crate::values_math::MathNode,
         Option<crate::values_math::MathNode>,
@@ -485,6 +497,7 @@ impl EffectsStyle {
         self.contain == 0
             && self.container_type == 0
             && self.container_name.is_empty()
+            && !self.aspect_ratio_auto
             && self.aspect_ratio_math.is_none()
             && self.reading_flow == ReadingFlowMode::Normal
             && self.reading_order == 0
@@ -498,6 +511,7 @@ impl EffectsStyle {
         self.contain == other.contain
             && self.container_type == other.container_type
             && self.container_name == other.container_name
+            && self.aspect_ratio_auto == other.aspect_ratio_auto
             && self.aspect_ratio_math == other.aspect_ratio_math
             && self.reading_flow == other.reading_flow
             && self.reading_order == other.reading_order
@@ -2338,6 +2352,20 @@ pub fn resolve_element_style_with_context(
         Arc::make_mut(&mut style.box_model).border_width = next_bw;
     }
 
+    // CSS Overflow L3 §3.1: `visible` computes to `auto` if the other axis is neither `visible`
+    // nor `clip`; `clip` remains `clip` so single-axis scroll containers (`scroll` + `clip`) work.
+    {
+        let ox = style.overflow.x;
+        let oy = style.overflow.y;
+        let x_scroll_or_hidden = !matches!(ox, OverflowMode::Visible | OverflowMode::Clip);
+        let y_scroll_or_hidden = !matches!(oy, OverflowMode::Visible | OverflowMode::Clip);
+        if x_scroll_or_hidden && oy == OverflowMode::Visible {
+            style.overflow.y = OverflowMode::Auto;
+        } else if y_scroll_or_hidden && ox == OverflowMode::Visible {
+            style.overflow.x = OverflowMode::Auto;
+        }
+    }
+
     // Re-resolve any visual Color 4/5 expressions referencing `currentcolor` (including those
     // inherited via `background-color: inherit`) against this element's final `color`.
     let eff_dark = match style.text.color_scheme_mode {
@@ -3043,7 +3071,25 @@ pub fn apply_declaration(
             v.background_image_raw = Some(raw.clone());
         }
         (PropertyIdKind::BackgroundSize, PropertyValue::BackgroundSize(sz)) => {
-            Arc::make_mut(&mut style.visual).background_size = Some(sz.clone());
+            let v = Arc::make_mut(&mut style.visual);
+            v.background_size = Some(sz.clone());
+            v.background_sizes = vec![sz.clone()];
+        }
+        (PropertyIdKind::BackgroundSize, PropertyValue::BackgroundSizes(list)) => {
+            let v = Arc::make_mut(&mut style.visual);
+            v.background_size = list.first().cloned();
+            v.background_sizes = list.clone();
+        }
+        (PropertyIdKind::BackgroundRepeat, PropertyValue::BackgroundRepeats(list)) => {
+            let v = Arc::make_mut(&mut style.visual);
+            v.background_repeats = list.clone();
+            if !list.is_empty() {
+                for (i, layer) in v.background_layers.iter_mut().enumerate() {
+                    let rep = list[i % list.len()];
+                    layer.repeat_x = rep.x != BackgroundRepeatKeywordMode::NoRepeat;
+                    layer.repeat_y = rep.y != BackgroundRepeatKeywordMode::NoRepeat;
+                }
+            }
         }
         (PropertyIdKind::BackgroundClip, PropertyValue::BackgroundClip(clip)) => {
             Arc::make_mut(&mut style.visual).background_clip = *clip;
@@ -3226,6 +3272,30 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::FontWeight, PropertyValue::Number(w)) => {
             Arc::make_mut(&mut style.text).font_weight = *w;
+        }
+        (PropertyIdKind::FontWeight, PropertyValue::FontWeightRelative(delta)) => {
+            // CSS Fonts L4 §2.2: `bolder` / `lighter` resolve relative to the inherited weight.
+            let base = style.text.font_weight;
+            let resolved = if *delta > 0 {
+                if base < 350.0 {
+                    400.0
+                } else if base < 550.0 {
+                    700.0
+                } else if base < 750.0 {
+                    900.0
+                } else {
+                    base
+                }
+            } else if base < 100.0 {
+                base
+            } else if base < 550.0 {
+                100.0
+            } else if base < 750.0 {
+                400.0
+            } else {
+                700.0
+            };
+            Arc::make_mut(&mut style.text).font_weight = resolved;
         }
         (PropertyIdKind::FontStyle, PropertyValue::FontStyle(s)) => {
             Arc::make_mut(&mut style.text).font_style = *s;
@@ -3412,10 +3482,24 @@ pub fn apply_declaration(
             style.flex_grid_mut().justify_self = *v;
         }
         (PropertyIdKind::RowGap, PropertyValue::Length(v)) => {
-            style.flex_grid_mut().row_gap = v.clone();
+            let fg = style.flex_grid_mut();
+            fg.row_gap = v.clone();
+            fg.row_gap_specified = true;
+        }
+        (PropertyIdKind::RowGap, PropertyValue::GapNormal) => {
+            let fg = style.flex_grid_mut();
+            fg.row_gap = LengthPercentage::Zero;
+            fg.row_gap_specified = false;
         }
         (PropertyIdKind::ColumnGap, PropertyValue::Length(v)) => {
-            style.flex_grid_mut().column_gap = v.clone();
+            let fg = style.flex_grid_mut();
+            fg.column_gap = v.clone();
+            fg.column_gap_specified = true;
+        }
+        (PropertyIdKind::ColumnGap, PropertyValue::GapNormal) => {
+            let fg = style.flex_grid_mut();
+            fg.column_gap = LengthPercentage::Zero;
+            fg.column_gap_specified = false;
         }
         (PropertyIdKind::GridTemplateColumns, PropertyValue::GridTracks(v)) => {
             let fg = style.flex_grid_mut();
@@ -3498,21 +3582,50 @@ pub fn apply_declaration(
             style.effects_mut().image_resolution = Some((**n).clone());
         }
         (PropertyIdKind::BackgroundPosition, PropertyValue::BgPosition(x, y)) => {
-            Arc::make_mut(&mut style.visual).background_position = (x.clone(), y.clone());
+            let v = Arc::make_mut(&mut style.visual);
+            v.background_position = (x.clone(), y.clone());
+            v.background_positions = vec![(x.clone(), y.clone())];
+        }
+        (PropertyIdKind::BackgroundPosition, PropertyValue::BgPositions(list)) => {
+            let v = Arc::make_mut(&mut style.visual);
+            v.background_positions = list.clone();
+            if let Some((x, y)) = list.first() {
+                v.background_position = (x.clone(), y.clone());
+            }
         }
         (PropertyIdKind::BackgroundPositionX, PropertyValue::Length(x)) => {
-            Arc::make_mut(&mut style.visual).background_position.0 = x.clone();
+            let v = Arc::make_mut(&mut style.visual);
+            v.background_position.0 = x.clone();
+            if v.background_positions.is_empty() {
+                v.background_positions.push(v.background_position.clone());
+            } else {
+                v.background_positions[0].0 = x.clone();
+            }
         }
         (PropertyIdKind::BackgroundPositionY, PropertyValue::Length(y)) => {
-            Arc::make_mut(&mut style.visual).background_position.1 = y.clone();
+            let v = Arc::make_mut(&mut style.visual);
+            v.background_position.1 = y.clone();
+            if v.background_positions.is_empty() {
+                v.background_positions.push(v.background_position.clone());
+            } else {
+                v.background_positions[0].1 = y.clone();
+            }
         }
         (PropertyIdKind::ObjectPosition, PropertyValue::ObjectPos(pos)) => {
             Arc::make_mut(&mut style.visual).object_position = Some(pos.clone());
         }
         (PropertyIdKind::AspectRatio, PropertyValue::AspectRatioMath(ar)) => {
-            style.effects_mut().aspect_ratio_math = ar
-                .as_ref()
-                .map(|(a, b)| ((**a).clone(), b.as_deref().cloned()));
+            let eff = style.effects_mut();
+            match ar {
+                Some((has_auto, a, b)) => {
+                    eff.aspect_ratio_auto = *has_auto;
+                    eff.aspect_ratio_math = Some(((**a).clone(), b.as_deref().cloned()));
+                }
+                None => {
+                    eff.aspect_ratio_auto = false;
+                    eff.aspect_ratio_math = None;
+                }
+            }
         }
         (
             prop @ (PropertyIdKind::OffsetDistance
@@ -4209,8 +4322,51 @@ fn copy_property_from_parent(
             vis.background_color_computed = parent.visual.background_color_computed.clone();
         }
         PropertyIdKind::BackgroundSize => {
-            Arc::make_mut(&mut style.visual).background_size =
-                parent.visual.background_size.clone();
+            let v = Arc::make_mut(&mut style.visual);
+            v.background_size = parent.visual.background_size.clone();
+            v.background_sizes = parent.visual.background_sizes.clone();
+        }
+        PropertyIdKind::BackgroundPosition => {
+            let v = Arc::make_mut(&mut style.visual);
+            v.background_position = parent.visual.background_position.clone();
+            v.background_positions = parent.visual.background_positions.clone();
+        }
+        PropertyIdKind::BackgroundRepeat => {
+            Arc::make_mut(&mut style.visual).background_repeats =
+                parent.visual.background_repeats.clone();
+        }
+        PropertyIdKind::RowGap => {
+            if let Some(pfg) = &parent.flex_grid {
+                let fg = style.flex_grid_mut();
+                fg.row_gap = pfg.row_gap.clone();
+                fg.row_gap_specified = pfg.row_gap_specified;
+            } else if let Some(fg) = &mut style.flex_grid {
+                let fg = Arc::make_mut(fg);
+                fg.row_gap = LengthPercentage::Zero;
+                fg.row_gap_specified = false;
+            }
+        }
+        PropertyIdKind::ColumnGap => {
+            if let Some(pfg) = &parent.flex_grid {
+                let fg = style.flex_grid_mut();
+                fg.column_gap = pfg.column_gap.clone();
+                fg.column_gap_specified = pfg.column_gap_specified;
+            } else if let Some(fg) = &mut style.flex_grid {
+                let fg = Arc::make_mut(fg);
+                fg.column_gap = LengthPercentage::Zero;
+                fg.column_gap_specified = false;
+            }
+        }
+        PropertyIdKind::AspectRatio => {
+            if let Some(peff) = &parent.effects {
+                let eff = style.effects_mut();
+                eff.aspect_ratio_auto = peff.aspect_ratio_auto;
+                eff.aspect_ratio_math = peff.aspect_ratio_math.clone();
+            } else if let Some(eff) = &mut style.effects {
+                let eff = Arc::make_mut(eff);
+                eff.aspect_ratio_auto = false;
+                eff.aspect_ratio_math = None;
+            }
         }
         PropertyIdKind::BackgroundClip => {
             Arc::make_mut(&mut style.visual).background_clip = parent.visual.background_clip;
@@ -5057,7 +5213,23 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
             v.background_image_raw = None;
         }
         PropertyIdKind::BackgroundSize => {
-            Arc::make_mut(&mut style.visual).background_size = None;
+            let v = Arc::make_mut(&mut style.visual);
+            v.background_size = None;
+            v.background_sizes.clear();
+        }
+        PropertyIdKind::RowGap => {
+            if let Some(fg) = &mut style.flex_grid {
+                let fg = Arc::make_mut(fg);
+                fg.row_gap = LengthPercentage::Zero;
+                fg.row_gap_specified = false;
+            }
+        }
+        PropertyIdKind::ColumnGap => {
+            if let Some(fg) = &mut style.flex_grid {
+                let fg = Arc::make_mut(fg);
+                fg.column_gap = LengthPercentage::Zero;
+                fg.column_gap_specified = false;
+            }
         }
         PropertyIdKind::BackgroundClip => {
             Arc::make_mut(&mut style.visual).background_clip = BackgroundClipMode::BorderBox;
@@ -5300,16 +5472,29 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
             Arc::make_mut(&mut style.visual).border_style.left = LineStyle::None;
         }
         PropertyIdKind::BorderTopColor => {
-            Arc::make_mut(&mut style.visual).border_color.top = CssColor::CurrentColor;
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.border_color.top = CssColor::CurrentColor;
+            vis.border_color_computed[0] = None;
         }
         PropertyIdKind::BorderRightColor => {
-            Arc::make_mut(&mut style.visual).border_color.right = CssColor::CurrentColor;
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.border_color.right = CssColor::CurrentColor;
+            vis.border_color_computed[1] = None;
         }
         PropertyIdKind::BorderBottomColor => {
-            Arc::make_mut(&mut style.visual).border_color.bottom = CssColor::CurrentColor;
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.border_color.bottom = CssColor::CurrentColor;
+            vis.border_color_computed[2] = None;
         }
         PropertyIdKind::BorderLeftColor => {
-            Arc::make_mut(&mut style.visual).border_color.left = CssColor::CurrentColor;
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.border_color.left = CssColor::CurrentColor;
+            vis.border_color_computed[3] = None;
+        }
+        PropertyIdKind::OutlineColor => {
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.outline_color = CssColor::CurrentColor;
+            vis.outline_color_computed = None;
         }
         PropertyIdKind::BorderTopLeftRadius => {
             Arc::make_mut(&mut style.visual).border_radius.top_left =
@@ -5339,17 +5524,24 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
             e.transform_raw = None;
         }
         PropertyIdKind::BackgroundPosition => {
-            Arc::make_mut(&mut style.visual).background_position = (
+            let v = Arc::make_mut(&mut style.visual);
+            v.background_position = (
                 LengthPercentage::Percent(0.0),
                 LengthPercentage::Percent(0.0),
             );
+            v.background_positions.clear();
+        }
+        PropertyIdKind::BackgroundRepeat => {
+            Arc::make_mut(&mut style.visual).background_repeats.clear();
         }
         PropertyIdKind::ObjectPosition => {
             Arc::make_mut(&mut style.visual).object_position = None;
         }
         PropertyIdKind::AspectRatio => {
             if let Some(eff) = &mut style.effects {
-                Arc::make_mut(eff).aspect_ratio_math = None;
+                let eff = Arc::make_mut(eff);
+                eff.aspect_ratio_auto = false;
+                eff.aspect_ratio_math = None;
             }
         }
         prop @ (PropertyIdKind::OffsetDistance

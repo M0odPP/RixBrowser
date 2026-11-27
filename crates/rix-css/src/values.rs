@@ -1647,6 +1647,46 @@ pub enum BackgroundClipMode {
     Text,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum BackgroundRepeatKeywordMode {
+    #[default]
+    Repeat,
+    Space,
+    Round,
+    NoRepeat,
+}
+
+impl BackgroundRepeatKeywordMode {
+    #[must_use]
+    pub const fn as_css_str(self) -> &'static str {
+        match self {
+            Self::Repeat => "repeat",
+            Self::Space => "space",
+            Self::Round => "round",
+            Self::NoRepeat => "no-repeat",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct BackgroundRepeatPair {
+    pub x: BackgroundRepeatKeywordMode,
+    pub y: BackgroundRepeatKeywordMode,
+}
+
+impl BackgroundRepeatPair {
+    #[must_use]
+    pub fn to_css_string(self) -> String {
+        use BackgroundRepeatKeywordMode as K;
+        match (self.x, self.y) {
+            (K::Repeat, K::NoRepeat) => "repeat-x".to_string(),
+            (K::NoRepeat, K::Repeat) => "repeat-y".to_string(),
+            (a, b) if a == b => a.as_css_str().to_string(),
+            (a, b) => format!("{} {}", a.as_css_str(), b.as_css_str()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum BackgroundSizeValue {
     #[default]
@@ -3052,6 +3092,26 @@ pub fn convert_background_size(size: &BackgroundSize) -> BackgroundSizeValue {
                 BackgroundSizeValue::Explicit(w, h)
             }
         }
+    }
+}
+
+#[must_use]
+pub fn convert_background_repeat_kw(kw: &BackgroundRepeatKeyword) -> BackgroundRepeatKeywordMode {
+    match kw {
+        BackgroundRepeatKeyword::Repeat => BackgroundRepeatKeywordMode::Repeat,
+        BackgroundRepeatKeyword::Space => BackgroundRepeatKeywordMode::Space,
+        BackgroundRepeatKeyword::Round => BackgroundRepeatKeywordMode::Round,
+        BackgroundRepeatKeyword::NoRepeat => BackgroundRepeatKeywordMode::NoRepeat,
+    }
+}
+
+#[must_use]
+pub fn convert_background_repeat(
+    rep: &lightningcss::properties::background::BackgroundRepeat,
+) -> BackgroundRepeatPair {
+    BackgroundRepeatPair {
+        x: convert_background_repeat_kw(&rep.x),
+        y: convert_background_repeat_kw(&rep.y),
     }
 }
 

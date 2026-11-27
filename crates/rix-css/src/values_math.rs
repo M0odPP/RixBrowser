@@ -2103,6 +2103,235 @@ impl PositionSpec {
     }
 }
 
+/// Parses a CSS Backgrounds L3 §3.6 comma-separated `<bg-position>#` list (supporting 1, 2, 3,
+/// and 4-value syntax) into `(positions, specified_css)`.
+#[must_use]
+pub fn parse_background_position_list(
+    input: &str,
+) -> Option<(Vec<(LengthPercentage, LengthPercentage)>, String)> {
+    enum BgTok {
+        Edge(PositionEdge),
+        Len(MathNode, bool),
+    }
+    let parse_physical_edge = |ident: &str| -> Option<PositionEdge> {
+        match ident.to_ascii_lowercase().as_str() {
+            "left" => Some(PositionEdge::Left),
+            "right" => Some(PositionEdge::Right),
+            "top" => Some(PositionEdge::Top),
+            "bottom" => Some(PositionEdge::Bottom),
+            "center" => Some(PositionEdge::Center),
+            _ => None,
+        }
+    };
+    let is_h = |e: PositionEdge| matches!(e, PositionEdge::Left | PositionEdge::Right);
+    let is_v = |e: PositionEdge| matches!(e, PositionEdge::Top | PositionEdge::Bottom);
+    let comp_to_lp = |c: &PositionComponent| -> LengthPercentage {
+        match c {
+            PositionComponent::Edge(PositionEdge::Left | PositionEdge::Top) => {
+                LengthPercentage::Percent(0.0)
+            }
+            PositionComponent::Edge(PositionEdge::Center) => LengthPercentage::Percent(0.5),
+            PositionComponent::Edge(PositionEdge::Right | PositionEdge::Bottom) => {
+                LengthPercentage::Percent(1.0)
+            }
+            PositionComponent::Edge(_) => LengthPercentage::Percent(0.5),
+            PositionComponent::Length(n, _) => {
+                LengthPercentage::Calc(Box::new(crate::values::CalcExpr::Math(n.clone())))
+            }
+            PositionComponent::EdgeOffset(PositionEdge::Right | PositionEdge::Bottom, n, _) => {
+                let inv =
+                    MathNode::Sum(vec![MathNode::Percent(100.0), MathNode::Negate(n.clone())]);
+                LengthPercentage::Calc(Box::new(crate::values::CalcExpr::Math(Box::new(inv))))
+            }
+            PositionComponent::EdgeOffset(_, n, _) => {
+                LengthPercentage::Calc(Box::new(crate::values::CalcExpr::Math(n.clone())))
+            }
+        }
+    };
+    let fmt_comp = |c: &PositionComponent| -> String {
+        match c {
+            PositionComponent::Edge(PositionEdge::Left | PositionEdge::Top) => "0%".to_string(),
+            PositionComponent::Edge(PositionEdge::Center) => "50%".to_string(),
+            PositionComponent::Edge(PositionEdge::Right | PositionEdge::Bottom) => {
+                "100%".to_string()
+            }
+            PositionComponent::Edge(e) => e.as_str().to_string(),
+            PositionComponent::Length(n, m) => n.serialize_specified(*m),
+            PositionComponent::EdgeOffset(e, n, m) => {
+                format!("{} {}", e.as_str(), n.serialize_specified(*m))
+            }
+        }
+    };
+
+    let mut pi = ParserInput::new(input);
+    let mut p = Parser::new(&mut pi);
+    let parsed: Result<Vec<PositionSpec>, cssparser::ParseError<'_, ()>> =
+        p.parse_comma_separated(|p| {
+            let mut toks = Vec::with_capacity(4);
+            while !p.is_exhausted() {
+                if toks.len() >= 4 {
+                    return Err(p.new_custom_error(()));
+                }
+                if let Ok(edge) =
+                    p.try_parse(|p| -> Result<PositionEdge, cssparser::ParseError<'_, ()>> {
+                        let id = p.expect_ident()?;
+                        parse_physical_edge(id.as_ref()).ok_or_else(|| p.new_custom_error(()))
+                    })
+                {
+                    toks.push(BgTok::Edge(edge));
+                } else if let Some(pm) =
+                    parse_math_value_from_parser(p, ValueKind::LengthPercentage)
+                {
+                    toks.push(BgTok::Len(pm.node, pm.was_math_fn));
+                } else {
+                    return Err(p.new_custom_error(()));
+                }
+            }
+            let spec = match toks.len() {
+                1 => match toks.pop().ok_or_else(|| p.new_custom_error(()))? {
+                    BgTok::Edge(e) if is_v(e) => PositionSpec {
+                        x: PositionComponent::Edge(PositionEdge::Center),
+                        y: PositionComponent::Edge(e),
+                    },
+                    BgTok::Edge(e) => PositionSpec {
+                        x: PositionComponent::Edge(e),
+                        y: PositionComponent::Edge(PositionEdge::Center),
+                    },
+                    BgTok::Len(n, m) => PositionSpec {
+                        x: PositionComponent::Length(Box::new(n), m),
+                        y: PositionComponent::Edge(PositionEdge::Center),
+                    },
+                },
+                2 => {
+                    let b = toks.pop().ok_or_else(|| p.new_custom_error(()))?;
+                    let a = toks.pop().ok_or_else(|| p.new_custom_error(()))?;
+                    match (a, b) {
+                        (BgTok::Edge(e1), BgTok::Edge(e2)) => {
+                            if (is_h(e1) && is_h(e2)) || (is_v(e1) && is_v(e2)) {
+                                return Err(p.new_custom_error(()));
+                            }
+                            if is_v(e1) || is_h(e2) {
+                                PositionSpec {
+                                    x: PositionComponent::Edge(e2),
+                                    y: PositionComponent::Edge(e1),
+                                }
+                            } else {
+                                PositionSpec {
+                                    x: PositionComponent::Edge(e1),
+                                    y: PositionComponent::Edge(e2),
+                                }
+                            }
+                        }
+                        (BgTok::Edge(e), BgTok::Len(n, m))
+                            if is_h(e) || e == PositionEdge::Center =>
+                        {
+                            PositionSpec {
+                                x: PositionComponent::Edge(e),
+                                y: PositionComponent::Length(Box::new(n), m),
+                            }
+                        }
+                        (BgTok::Len(n, m), BgTok::Edge(e))
+                            if is_v(e) || e == PositionEdge::Center =>
+                        {
+                            PositionSpec {
+                                x: PositionComponent::Length(Box::new(n), m),
+                                y: PositionComponent::Edge(e),
+                            }
+                        }
+                        (BgTok::Len(nx, mx), BgTok::Len(ny, my)) => PositionSpec {
+                            x: PositionComponent::Length(Box::new(nx), mx),
+                            y: PositionComponent::Length(Box::new(ny), my),
+                        },
+                        _ => return Err(p.new_custom_error(())),
+                    }
+                }
+                3 => {
+                    let c = toks.pop().ok_or_else(|| p.new_custom_error(()))?;
+                    let b = toks.pop().ok_or_else(|| p.new_custom_error(()))?;
+                    let a = toks.pop().ok_or_else(|| p.new_custom_error(()))?;
+                    match (a, b, c) {
+                        (BgTok::Edge(e1), BgTok::Len(n1, m1), BgTok::Edge(e2)) => {
+                            if is_h(e1) && (is_v(e2) || e2 == PositionEdge::Center) {
+                                PositionSpec {
+                                    x: PositionComponent::EdgeOffset(e1, Box::new(n1), m1),
+                                    y: PositionComponent::Edge(e2),
+                                }
+                            } else if is_v(e1) && (is_h(e2) || e2 == PositionEdge::Center) {
+                                PositionSpec {
+                                    x: PositionComponent::Edge(e2),
+                                    y: PositionComponent::EdgeOffset(e1, Box::new(n1), m1),
+                                }
+                            } else {
+                                return Err(p.new_custom_error(()));
+                            }
+                        }
+                        (BgTok::Edge(e1), BgTok::Edge(e2), BgTok::Len(n2, m2)) => {
+                            if (is_h(e1) || e1 == PositionEdge::Center) && is_v(e2) {
+                                PositionSpec {
+                                    x: PositionComponent::Edge(e1),
+                                    y: PositionComponent::EdgeOffset(e2, Box::new(n2), m2),
+                                }
+                            } else if (is_v(e1) || e1 == PositionEdge::Center) && is_h(e2) {
+                                PositionSpec {
+                                    x: PositionComponent::EdgeOffset(e2, Box::new(n2), m2),
+                                    y: PositionComponent::Edge(e1),
+                                }
+                            } else {
+                                return Err(p.new_custom_error(()));
+                            }
+                        }
+                        _ => return Err(p.new_custom_error(())),
+                    }
+                }
+                4 => {
+                    let d = toks.pop().ok_or_else(|| p.new_custom_error(()))?;
+                    let c = toks.pop().ok_or_else(|| p.new_custom_error(()))?;
+                    let b = toks.pop().ok_or_else(|| p.new_custom_error(()))?;
+                    let a = toks.pop().ok_or_else(|| p.new_custom_error(()))?;
+                    match (a, b, c, d) {
+                        (
+                            BgTok::Edge(e1),
+                            BgTok::Len(n1, m1),
+                            BgTok::Edge(e2),
+                            BgTok::Len(n2, m2),
+                        ) => {
+                            if is_h(e1) && is_v(e2) {
+                                PositionSpec {
+                                    x: PositionComponent::EdgeOffset(e1, Box::new(n1), m1),
+                                    y: PositionComponent::EdgeOffset(e2, Box::new(n2), m2),
+                                }
+                            } else if is_v(e1) && is_h(e2) {
+                                PositionSpec {
+                                    x: PositionComponent::EdgeOffset(e2, Box::new(n2), m2),
+                                    y: PositionComponent::EdgeOffset(e1, Box::new(n1), m1),
+                                }
+                            } else {
+                                return Err(p.new_custom_error(()));
+                            }
+                        }
+                        _ => return Err(p.new_custom_error(())),
+                    }
+                }
+                _ => return Err(p.new_custom_error(())),
+            };
+            Ok(spec)
+        });
+    let specs = parsed.ok()?;
+    if specs.is_empty() || !p.is_exhausted() {
+        return None;
+    }
+    let lps: Vec<(LengthPercentage, LengthPercentage)> = specs
+        .iter()
+        .map(|s| (comp_to_lp(&s.x), comp_to_lp(&s.y)))
+        .collect();
+    let serialized = specs
+        .iter()
+        .map(|s| format!("{} {}", fmt_comp(&s.x), fmt_comp(&s.y)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some((lps, serialized))
+}
+
 #[must_use]
 #[rustfmt::skip]
 pub fn parse_background_position(input: &str) -> Option<(LengthPercentage, LengthPercentage, String)> {

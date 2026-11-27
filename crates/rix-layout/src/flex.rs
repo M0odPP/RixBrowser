@@ -385,19 +385,17 @@ fn box_aspect_ratio(
     style: &ComputedStyle,
     eval: &rix_css::EvalContext,
 ) -> Option<f32> {
-    if let Some((num, den)) = style
+    let css_ratio = style
         .effects
         .as_ref()
         .and_then(|e| e.aspect_ratio_math.as_ref())
-    {
-        let n = num.eval_scalar(eval, None);
-        let d = den.as_ref().map_or(1.0, |x| x.eval_scalar(eval, None));
-        let r = n / d;
-        if r.is_finite() && r > 0.0 {
-            return Some(r as f32);
-        }
-    }
-    match &ctx.tree.get(box_id).kind {
+        .and_then(|(num, den)| {
+            let n = num.eval_scalar(eval, None);
+            let d = den.as_ref().map_or(1.0, |x| x.eval_scalar(eval, None));
+            let r = n / d;
+            (r.is_finite() && r > 0.0).then_some(r as f32)
+        });
+    let intrinsic_ratio = match &ctx.tree.get(box_id).kind {
         BoxKind::Replaced(ReplacedKind::Image { intrinsic_size, .. })
         | BoxKind::Replaced(ReplacedKind::Svg { intrinsic_size, .. })
         | BoxKind::Replaced(ReplacedKind::ExternalSurface { intrinsic_size, .. }) => {
@@ -408,6 +406,11 @@ fn box_aspect_ratio(
             }
         }
         _ => None,
+    };
+    if style.effects.as_ref().is_some_and(|e| e.aspect_ratio_auto) {
+        intrinsic_ratio.or(css_ratio)
+    } else {
+        css_ratio.or(intrinsic_ratio)
     }
 }
 

@@ -5633,6 +5633,17 @@ fn format_css_color(c: CssColor, current_color: ColorRgba, dark: bool) -> String
     format_rgba(c.resolve(current_color, dark))
 }
 
+fn format_css_color_resolved(
+    c: CssColor,
+    cc_resolved: rix_css::ResolvedColor,
+    dark: bool,
+) -> String {
+    match c {
+        CssColor::CurrentColor => cc_resolved.to_computed_css_string(),
+        other => format_rgba(other.resolve(cc_resolved.to_srgb_u8(), dark)),
+    }
+}
+
 fn format_computed_color4(
     expr_opt: Option<&rix_css::CssColorExpr>,
     fallback: ColorRgba,
@@ -5867,7 +5878,7 @@ fn resolve_inset_computed(
     }
 }
 
-pub(crate) fn format_computed_property_resolved(
+pub fn format_computed_property_resolved(
     style: &ComputedStyle,
     prop: &str,
     layout_box: Option<&ResolvedLayoutBox>,
@@ -6575,25 +6586,25 @@ pub(crate) fn format_computed_property_resolved(
         "border-top-color" => style.visual.border_color_computed[0]
             .as_deref()
             .map_or_else(
-                || format_css_color(style.visual.border_color.top, cc, dark),
+                || format_css_color_resolved(style.visual.border_color.top, cc_resolved, dark),
                 |e| e.resolve(cc_resolved, dark, &eval).to_computed_css_string(),
             ),
         "border-right-color" => style.visual.border_color_computed[1]
             .as_deref()
             .map_or_else(
-                || format_css_color(style.visual.border_color.right, cc, dark),
+                || format_css_color_resolved(style.visual.border_color.right, cc_resolved, dark),
                 |e| e.resolve(cc_resolved, dark, &eval).to_computed_css_string(),
             ),
         "border-bottom-color" => style.visual.border_color_computed[2]
             .as_deref()
             .map_or_else(
-                || format_css_color(style.visual.border_color.bottom, cc, dark),
+                || format_css_color_resolved(style.visual.border_color.bottom, cc_resolved, dark),
                 |e| e.resolve(cc_resolved, dark, &eval).to_computed_css_string(),
             ),
         "border-left-color" => style.visual.border_color_computed[3]
             .as_deref()
             .map_or_else(
-                || format_css_color(style.visual.border_color.left, cc, dark),
+                || format_css_color_resolved(style.visual.border_color.left, cc_resolved, dark),
                 |e| e.resolve(cc_resolved, dark, &eval).to_computed_css_string(),
             ),
         "border-top-left-radius" => {
@@ -6609,7 +6620,7 @@ pub(crate) fn format_computed_property_resolved(
             format_corner_radius(&style.visual.border_radius.bottom_left, &eval)
         }
         "outline-color" => style.visual.outline_color_computed.as_deref().map_or_else(
-            || format_css_color(style.visual.outline_color, cc, dark),
+            || format_css_color_resolved(style.visual.outline_color, cc_resolved, dark),
             |e| e.resolve(cc_resolved, dark, &eval).to_computed_css_string(),
         ),
         "outline-style" => format_line_style(style.visual.outline_style).into(),
@@ -6620,7 +6631,7 @@ pub(crate) fn format_computed_property_resolved(
         }
         "accent-color" => match style.text.accent_color {
             None => "auto".into(),
-            Some(c) => format_css_color(c, cc, dark),
+            Some(c) => format_css_color_resolved(c, cc_resolved, dark),
         },
         "vertical-align" => match style.box_model.vertical_align {
             VerticalAlignMode::Baseline => "baseline".into(),
@@ -6849,14 +6860,26 @@ pub(crate) fn format_computed_property_resolved(
                 .map_or(AlignValue::Auto, |f| f.justify_self),
         )
         .into(),
-        "row-gap" | "grid-row-gap" => style
-            .flex_grid
-            .as_ref()
-            .map_or_else(|| "normal".into(), |f| format_lp(&f.row_gap, &eval)),
-        "column-gap" | "grid-column-gap" => style
-            .flex_grid
-            .as_ref()
-            .map_or_else(|| "normal".into(), |f| format_lp(&f.column_gap, &eval)),
+        "row-gap" | "grid-row-gap" => style.flex_grid.as_ref().map_or_else(
+            || "normal".into(),
+            |f| {
+                if f.row_gap_specified {
+                    format_lp_opts(&f.row_gap, &eval, true)
+                } else {
+                    "normal".into()
+                }
+            },
+        ),
+        "column-gap" | "grid-column-gap" => style.flex_grid.as_ref().map_or_else(
+            || "normal".into(),
+            |f| {
+                if f.column_gap_specified {
+                    format_lp_opts(&f.column_gap, &eval, true)
+                } else {
+                    "normal".into()
+                }
+            },
+        ),
         "grid-auto-flow" => rix_css::grid_css::serialize_grid_auto_flow(
             style
                 .flex_grid
@@ -7293,11 +7316,23 @@ pub(crate) fn format_computed_property_resolved(
                     )
                 },
             ),
-        "background-position" => format!(
-            "{} {}",
-            format_lp(&style.visual.background_position.0, &eval),
-            format_lp(&style.visual.background_position.1, &eval),
-        ),
+        "background-position" => {
+            if !style.visual.background_positions.is_empty() {
+                style
+                    .visual
+                    .background_positions
+                    .iter()
+                    .map(|(x, y)| format!("{} {}", format_lp(x, &eval), format_lp(y, &eval)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                format!(
+                    "{} {}",
+                    format_lp(&style.visual.background_position.0, &eval),
+                    format_lp(&style.visual.background_position.1, &eval),
+                )
+            }
+        }
         "background-size" => {
             let fmt_size =
                 |sz: &rix_css::BackgroundSizeValue, cover: bool, contain: bool| -> String {
@@ -7312,17 +7347,33 @@ pub(crate) fn format_computed_property_resolved(
                         rix_css::BackgroundSizeValue::Cover => "cover".to_string(),
                         rix_css::BackgroundSizeValue::Contain => "contain".to_string(),
                         rix_css::BackgroundSizeValue::Explicit(w, h) => {
-                            let ws = w
-                                .as_ref()
-                                .map_or_else(|| "auto".to_string(), |lp| format_lp(lp, &eval));
-                            match h {
-                                Some(hlp) => format!("{ws} {}", format_lp(hlp, &eval)),
-                                None => ws,
+                            let ws = w.as_ref().map_or_else(
+                                || "auto".to_string(),
+                                |lp| format_lp_opts(lp, &eval, true),
+                            );
+                            let hs = h.as_ref().map_or_else(
+                                || "auto".to_string(),
+                                |lp| format_lp_opts(lp, &eval, true),
+                            );
+                            if ws == "auto" && hs == "auto" {
+                                "auto".to_string()
+                            } else {
+                                format!("{ws} {hs}")
                             }
                         }
                     }
                 };
-            if !style.visual.background_layers.is_empty() {
+            if !style.visual.background_sizes.is_empty() {
+                style
+                    .visual
+                    .background_sizes
+                    .iter()
+                    .map(|sz| fmt_size(sz, false, false))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else if let Some(ref sz) = style.visual.background_size {
+                fmt_size(sz, false, false)
+            } else if !style.visual.background_layers.is_empty() {
                 style
                     .visual
                     .background_layers
@@ -7330,22 +7381,28 @@ pub(crate) fn format_computed_property_resolved(
                     .map(|l| fmt_size(&l.size, l.size_cover, l.size_contain))
                     .collect::<Vec<_>>()
                     .join(", ")
-            } else if let Some(ref sz) = style.visual.background_size {
-                fmt_size(sz, false, false)
             } else {
                 "auto".to_string()
             }
         }
         "background-repeat" => {
-            let fmt_rep = |rx: bool, ry: bool| -> &'static str {
-                match (rx, ry) {
-                    (true, true) => "repeat",
-                    (true, false) => "repeat-x",
-                    (false, true) => "repeat-y",
-                    (false, false) => "no-repeat",
-                }
-            };
-            if !style.visual.background_layers.is_empty() {
+            if !style.visual.background_repeats.is_empty() {
+                style
+                    .visual
+                    .background_repeats
+                    .iter()
+                    .map(|r| r.to_css_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else if !style.visual.background_layers.is_empty() {
+                let fmt_rep = |rx: bool, ry: bool| -> &'static str {
+                    match (rx, ry) {
+                        (true, true) => "repeat",
+                        (true, false) => "repeat-x",
+                        (false, true) => "repeat-y",
+                        (false, false) => "no-repeat",
+                    }
+                };
                 style
                     .visual
                     .background_layers
@@ -7364,10 +7421,14 @@ pub(crate) fn format_computed_property_resolved(
         "aspect-ratio" => style
             .effects
             .as_ref()
-            .and_then(|e| e.aspect_ratio_math.as_ref())
+            .and_then(|e| {
+                e.aspect_ratio_math
+                    .as_ref()
+                    .map(|m| (e.aspect_ratio_auto, m))
+            })
             .map_or_else(
                 || "auto".to_string(),
-                |(a, b)| {
+                |(has_auto, (a, b))| {
                     let sa = a.serialize_computed(
                         &eval,
                         None,
@@ -7375,7 +7436,7 @@ pub(crate) fn format_computed_property_resolved(
                         Some(0.0),
                         None,
                     );
-                    match b {
+                    let ratio = match b {
                         Some(bn) => format!(
                             "{sa} / {}",
                             bn.serialize_computed(
@@ -7387,6 +7448,11 @@ pub(crate) fn format_computed_property_resolved(
                             )
                         ),
                         None => format!("{sa} / 1"),
+                    };
+                    if has_auto {
+                        format!("auto {ratio}")
+                    } else {
+                        ratio
                     }
                 },
             ),
@@ -7705,7 +7771,7 @@ pub(crate) fn format_computed_property_resolved(
                                 &eval,
                             )
                         },
-                        |c| format_css_color(c, cc, dark),
+                        |c| format_css_color_resolved(c, cc_resolved, dark),
                     )
                 },
                 |e| e.resolve(cc_resolved, dark, &eval).to_computed_css_string(),

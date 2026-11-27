@@ -21,21 +21,22 @@ use crate::values::{
     angle_to_deg, convert_align_content, convert_align_items, convert_align_self, convert_alpha,
     convert_animation, convert_animation_direction, convert_animation_fill,
     convert_animation_iteration, convert_animation_name, convert_animation_play_state,
-    convert_background_clip, convert_background_layer, convert_background_size, convert_blend_mode,
-    convert_border_width_lp, convert_box_shadow, convert_clip_path, convert_color,
-    convert_corner_radius, convert_cursor, convert_direction, convert_display, convert_easing,
-    convert_filter, convert_flex_direction, convert_flex_wrap, convert_font_family_name,
-    convert_font_size, convert_font_style, convert_font_weight, convert_grid_auto_flow,
-    convert_image, convert_justify_content, convert_justify_items, convert_justify_self,
-    convert_length, convert_length_percentage, convert_length_percentage_or_auto,
-    convert_length_value, convert_line_height, convert_line_style, convert_max_size,
-    convert_overflow, convert_overflow_wrap, convert_position, convert_size, convert_spacing,
-    convert_text_align, convert_text_decoration_line, convert_text_transform, convert_track_size,
-    convert_track_sizing, convert_transform, convert_transform_origin, convert_transition,
-    convert_user_select, convert_visibility, convert_white_space, convert_word_break,
-    convert_z_index, time_to_ms, AlignValue, AnimationCompositionMode, AnimationDirectionMode,
-    AnimationFillModeKind, AnimationPlayStateMode, AnimationSpec, AppearanceMode,
-    BackgroundClipMode, BackgroundImageValue, BackgroundLayerValue, BackgroundSizeValue,
+    convert_background_clip, convert_background_layer, convert_background_repeat,
+    convert_background_size, convert_blend_mode, convert_border_width_lp, convert_box_shadow,
+    convert_clip_path, convert_color, convert_corner_radius, convert_cursor, convert_direction,
+    convert_display, convert_easing, convert_filter, convert_flex_direction, convert_flex_wrap,
+    convert_font_family_name, convert_font_size, convert_font_style, convert_font_weight,
+    convert_grid_auto_flow, convert_image, convert_justify_content, convert_justify_items,
+    convert_justify_self, convert_length, convert_length_percentage,
+    convert_length_percentage_or_auto, convert_length_value, convert_line_height,
+    convert_line_style, convert_max_size, convert_overflow, convert_overflow_wrap,
+    convert_position, convert_size, convert_spacing, convert_text_align,
+    convert_text_decoration_line, convert_text_transform, convert_track_size, convert_track_sizing,
+    convert_transform, convert_transform_origin, convert_transition, convert_user_select,
+    convert_visibility, convert_white_space, convert_word_break, convert_z_index, time_to_ms,
+    AlignValue, AnimationCompositionMode, AnimationDirectionMode, AnimationFillModeKind,
+    AnimationPlayStateMode, AnimationSpec, AppearanceMode, BackgroundClipMode,
+    BackgroundImageValue, BackgroundLayerValue, BackgroundRepeatPair, BackgroundSizeValue,
     BorderCollapseMode, BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue,
     ColorInterpolationFiltersMode, ContentVisibilityMode, CornerRadius, CssColor, CursorKind,
     DirectionMode, DisplayMode, EmptyCellsMode, FilterOp, FilterSpecOp, FlexDirectionMode,
@@ -154,6 +155,72 @@ pub fn tokenize_custom_value_str(raw: &str) -> Vec<CssToken> {
     .unwrap_or_default()
 }
 
+/// Tokenizes raw CSS text directly via `cssparser` into [`CssToken`]s without invoking
+/// `lightningcss` color coercion (preventing recursion and preserving CSS Color 4 functions).
+fn tokenize_raw_css_parser(parser: &mut cssparser::Parser<'_, '_>, out: &mut Vec<CssToken>) {
+    use cssparser::Token;
+    while let Ok(tok) = parser.next_including_whitespace().cloned() {
+        match tok {
+            Token::Ident(s) => out.push(CssToken::Ident(intern_str(s.as_ref()))),
+            Token::Number { value, .. } => out.push(CssToken::Number(value)),
+            Token::Percentage { unit_value, .. } => out.push(CssToken::Percentage(unit_value)),
+            Token::Dimension { value, unit, .. } => {
+                out.push(CssToken::Dimension(value, intern_str(unit.as_ref())));
+            }
+            Token::QuotedString(s) => out.push(CssToken::String(intern_str(s.as_ref()))),
+            Token::UnquotedUrl(u) => out.push(CssToken::Url(intern_str(u.as_ref()))),
+            Token::Hash(h) | Token::IDHash(h) => out.push(CssToken::Hash(intern_str(h.as_ref()))),
+            Token::Delim(c) => out.push(CssToken::Delim(c)),
+            Token::Comma => out.push(CssToken::Comma),
+            Token::Colon => out.push(CssToken::Colon),
+            Token::Semicolon => out.push(CssToken::Delim(';')),
+            Token::WhiteSpace(_) => out.push(CssToken::Space),
+            Token::Function(name) => {
+                let mut args = Vec::new();
+                let _ = parser.parse_nested_block(|nested| {
+                    tokenize_raw_css_parser(nested, &mut args);
+                    Ok::<(), cssparser::ParseError<'_, ()>>(())
+                });
+                out.push(CssToken::Function {
+                    name: intern_str(name.as_ref()),
+                    args,
+                });
+            }
+            Token::ParenthesisBlock => {
+                out.push(CssToken::ParenOpen);
+                let _ = parser.parse_nested_block(|nested| {
+                    tokenize_raw_css_parser(nested, out);
+                    Ok::<(), cssparser::ParseError<'_, ()>>(())
+                });
+                out.push(CssToken::ParenClose);
+            }
+            Token::SquareBracketBlock => {
+                out.push(CssToken::Delim('['));
+                let _ = parser.parse_nested_block(|nested| {
+                    tokenize_raw_css_parser(nested, out);
+                    Ok::<(), cssparser::ParseError<'_, ()>>(())
+                });
+                out.push(CssToken::Delim(']'));
+            }
+            Token::CurlyBracketBlock => {
+                out.push(CssToken::Delim('{'));
+                let _ = parser.parse_nested_block(|nested| {
+                    tokenize_raw_css_parser(nested, out);
+                    Ok::<(), cssparser::ParseError<'_, ()>>(())
+                });
+                out.push(CssToken::Delim('}'));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn tokenize_raw_css_str(raw: &str, out: &mut Vec<CssToken>) {
+    let mut input = cssparser::ParserInput::new(raw);
+    let mut parser = cssparser::Parser::new(&mut input);
+    tokenize_raw_css_parser(&mut parser, out);
+}
+
 /// Converts a `lightningcss` [`TokenList`] directly into owned [`CssToken`]s.
 #[must_use]
 pub fn convert_token_list(list: &TokenList<'_>) -> Vec<CssToken> {
@@ -199,8 +266,26 @@ fn convert_token_or_value(item: &TokenOrValue<'_>, out: &mut Vec<CssToken>) {
             _ => {}
         },
         TokenOrValue::Color(c) => {
-            if let Some(color) = convert_color(c) {
-                out.push(CssToken::Color(color));
+            use lightningcss::values::color::CssColor as LcColor;
+            match c {
+                LcColor::RGBA(_) | LcColor::CurrentColor | LcColor::System(_) => {
+                    if let Some(color) = convert_color(c) {
+                        out.push(CssToken::Color(color));
+                    }
+                }
+                other => {
+                    // Preserve CSS Color 4 wide-gamut / perceptual / light-dark colors as raw CSS
+                    // tokens so custom properties (`--color-white: oklch(1 0 0)`) never lose
+                    // gamut or color-space identity across `var(...)` substitution.
+                    if let Ok(css_str) = lightningcss::traits::ToCss::to_css_string(
+                        other,
+                        lightningcss::printer::PrinterOptions::default(),
+                    ) {
+                        tokenize_raw_css_str(&css_str, out);
+                    } else if let Some(color) = convert_color(other) {
+                        out.push(CssToken::Color(color));
+                    }
+                }
             }
         }
         TokenOrValue::Url(u) => out.push(CssToken::Url(intern_str(u.url.as_ref()))),
@@ -2503,9 +2588,15 @@ pub enum PropertyValue {
     Translate(crate::values_math::TranslateSpec),
     TransformRaw(String),
     BgPosition(LengthPercentage, LengthPercentage),
+    BgPositions(Vec<(LengthPercentage, LengthPercentage)>),
+    BackgroundSizes(Vec<BackgroundSizeValue>),
+    BackgroundRepeats(Vec<BackgroundRepeatPair>),
+    FontWeightRelative(i8),
+    GapNormal,
     ObjectPos(Box<crate::values_math::PositionSpec>),
     AspectRatioMath(
         Option<(
+            bool,
             Box<crate::values_math::MathNode>,
             Option<Box<crate::values_math::MathNode>>,
         )>,
@@ -2567,6 +2658,13 @@ impl PropertyValue {
             Self::Size(SizeValue::CalcSize(cs)) => cs.contains_sibling_fn(),
             Self::CornerRadius(cr) => lp_has(&cr.x) || lp_has(&cr.y),
             Self::BgPosition(x, y) => lp_has(x) || lp_has(y),
+            Self::BgPositions(list) => list.iter().any(|(x, y)| lp_has(x) || lp_has(y)),
+            Self::BackgroundSizes(list) => list.iter().any(|sz| match sz {
+                BackgroundSizeValue::Explicit(w, h) => {
+                    w.as_ref().is_some_and(lp_has) || h.as_ref().is_some_and(lp_has)
+                }
+                _ => false,
+            }),
             Self::Scale(crate::values_math::ScaleSpec::Values(v)) => v.iter().any(node_has),
             Self::Rotate(crate::values_math::RotateSpec::Angle { axis, angle }) => {
                 node_has(angle) || axis.as_ref().is_some_and(|a| a.iter().any(node_has))
@@ -2605,7 +2703,7 @@ impl PropertyValue {
                 let s = c.to_specified_css_string();
                 s.contains("sibling-") || s.contains("random(")
             }
-            Self::AspectRatioMath(Some((a, b))) => {
+            Self::AspectRatioMath(Some((_, a, b))) => {
                 node_has(a) || b.as_deref().is_some_and(node_has)
             }
             Self::Custom(toks) | Self::Unresolved(toks) => tokens_contain_sibling_fn(toks),
@@ -3178,7 +3276,7 @@ pub fn supports_values4_math(prop: PropertyIdKind) -> bool {
 pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(PropertyValue, String)> {
     use crate::values::CalcExpr;
     use crate::values_math::{
-        parse_and_serialize_transform, parse_background_position, parse_image_resolution,
+        parse_and_serialize_transform, parse_background_position_list, parse_image_resolution,
         parse_math_value, parse_math_value_from_parser, MathNode, RotateSpec, ScaleSpec,
         TranslateSpec, ValueKind,
     };
@@ -3821,28 +3919,40 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
             }
             let mut pi = cssparser::ParserInput::new(trimmed);
             let mut p = cssparser::Parser::new(&mut pi);
+            let mut has_auto = p.try_parse(|p| p.expect_ident_matching("auto")).is_ok();
             let mut rc = 0u32;
             let mut a = parse_math_value_from_parser(&mut p, ValueKind::Number)?;
             a.node.bind_random_property("aspect-ratio", &mut rc);
             let sa = a.node.serialize_specified(a.was_math_fn);
-            if p.is_exhausted() {
-                return Some((
-                    PropertyValue::AspectRatioMath(Some((Box::new(a.node), None))),
-                    sa,
-                ));
+            let mut b_opt: Option<(Box<MathNode>, String)> = None;
+            if p.try_parse(|p| p.expect_delim('/')).is_ok() {
+                let mut b = parse_math_value_from_parser(&mut p, ValueKind::Number)?;
+                b.node.bind_random_property("aspect-ratio", &mut rc);
+                let sb = b.node.serialize_specified(b.was_math_fn);
+                b_opt = Some((Box::new(b.node), sb));
             }
-            if p.expect_delim('/').is_err() {
-                return None;
+            if !has_auto && p.try_parse(|p| p.expect_ident_matching("auto")).is_ok() {
+                has_auto = true;
             }
-            let mut b = parse_math_value_from_parser(&mut p, ValueKind::Number)?;
             if !p.is_exhausted() {
                 return None;
             }
-            b.node.bind_random_property("aspect-ratio", &mut rc);
-            let sb = b.node.serialize_specified(b.was_math_fn);
+            let ratio_str = match &b_opt {
+                Some((_, sb)) => format!("{sa} / {sb}"),
+                None => sa,
+            };
+            let spec = if has_auto {
+                format!("auto {ratio_str}")
+            } else {
+                ratio_str
+            };
             return Some((
-                PropertyValue::AspectRatioMath(Some((Box::new(a.node), Some(Box::new(b.node))))),
-                format!("{sa} / {sb}"),
+                PropertyValue::AspectRatioMath(Some((
+                    has_auto,
+                    Box::new(a.node),
+                    b_opt.map(|(n, _)| n),
+                ))),
+                spec,
             ));
         }
         PropertyIdKind::Scale => {
@@ -3862,8 +3972,8 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
             return Some((PropertyValue::MathVal(Box::new(node)), s));
         }
         PropertyIdKind::BackgroundPosition => {
-            let (x, y, s) = parse_background_position(trimmed)?;
-            return Some((PropertyValue::BgPosition(x, y), s));
+            let (list, s) = parse_background_position_list(trimmed)?;
+            return Some((PropertyValue::BgPositions(list), s));
         }
         PropertyIdKind::Transform => {
             let s = parse_and_serialize_transform(trimmed, None)?;
@@ -4850,7 +4960,7 @@ pub(crate) fn preprocess_quirks_and_strict_lengths(
                             i += 1;
                         }
                     } else {
-                        i += 1;
+                        i += s[i..].chars().next().map_or(1, char::len_utf8);
                     }
                     continue;
                 }
@@ -4861,7 +4971,7 @@ pub(crate) fn preprocess_quirks_and_strict_lengths(
                 } else if paren == 0 && b.is_ascii_whitespace() {
                     break;
                 }
-                i += 1;
+                i += s[i..].chars().next().map_or(1, char::len_utf8);
             }
             out.push(&s[start..i]);
         }
@@ -4873,7 +4983,12 @@ pub(crate) fn preprocess_quirks_and_strict_lengths(
         }
         // Reject unitless `calc(1)` / `calc(2)` on pure-length properties (CSS Values L3 §8.1.2:
         // a calc() expression with no length/percentage unit resolves to `<number>`, not `<length>`).
-        if tok.len() >= 6 && tok[..5].eq_ignore_ascii_case("calc(") && tok.ends_with(')') {
+        if tok.len() >= 6
+            && tok
+                .get(..5)
+                .is_some_and(|p| p.eq_ignore_ascii_case("calc("))
+            && tok.ends_with(')')
+        {
             let inner = &tok[5..tok.len() - 1];
             let has_unit_or_ident = inner.bytes().any(|b| b.is_ascii_alphabetic() || b == b'%');
             let has_digit = inner.bytes().any(|b| b.is_ascii_digit());
@@ -4915,9 +5030,11 @@ pub(crate) fn preprocess_quirks_and_strict_lengths(
                     i += 1;
                 }
                 i = (i + 2).min(bytes.len());
+            } else if let Some(ch) = s[i..].chars().next() {
+                out.push(ch);
+                i += ch.len_utf8();
             } else {
-                out.push(bytes[i] as char);
-                i += 1;
+                break;
             }
         }
         out
@@ -5837,10 +5954,9 @@ pub(crate) fn property_has_disallowed_value(prop: &Property<'_>) -> bool {
 fn convert_color_prop(c: &lightningcss::values::color::CssColor) -> Option<PropertyValue> {
     use lightningcss::values::color::CssColor as LcColor;
     match c {
-        LcColor::CurrentColor
-        | LcColor::RGBA(_)
-        | LcColor::LightDark(_, _)
-        | LcColor::System(_) => convert_color(c).map(PropertyValue::Color),
+        LcColor::CurrentColor | LcColor::RGBA(_) | LcColor::System(_) => {
+            convert_color(c).map(PropertyValue::Color)
+        }
         other => {
             if let Ok(css_str) = lightningcss::traits::ToCss::to_css_string(
                 other,
@@ -5985,10 +6101,15 @@ fn compile_property(
             }
             let layers: Vec<BackgroundLayerValue> =
                 bgs.iter().map(convert_background_layer).collect();
-            let first_size = layers
-                .first()
-                .map(|l| l.size.clone())
-                .unwrap_or(BackgroundSizeValue::Auto);
+            let sizes: Vec<BackgroundSizeValue> = layers.iter().map(|l| l.size.clone()).collect();
+            let positions: Vec<(LengthPercentage, LengthPercentage)> = layers
+                .iter()
+                .map(|l| (l.pos_x.clone(), l.pos_y.clone()))
+                .collect();
+            let repeats: Vec<BackgroundRepeatPair> = bgs
+                .iter()
+                .map(|b| convert_background_repeat(&b.repeat))
+                .collect();
             push_decl(
                 out,
                 ord,
@@ -6000,7 +6121,21 @@ fn compile_property(
                 out,
                 ord,
                 PropertyIdKind::BackgroundSize,
-                PropertyValue::BackgroundSize(first_size),
+                PropertyValue::BackgroundSizes(sizes),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BackgroundPosition,
+                PropertyValue::BgPositions(positions),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BackgroundRepeat,
+                PropertyValue::BackgroundRepeats(repeats),
                 imp,
             );
             let first_clip = bgs
@@ -6015,16 +6150,33 @@ fn compile_property(
                 imp,
             );
         }
+        Property::BackgroundRepeat(reps) => {
+            let list: Vec<BackgroundRepeatPair> =
+                reps.iter().map(convert_background_repeat).collect();
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BackgroundRepeat,
+                PropertyValue::BackgroundRepeats(if list.is_empty() {
+                    vec![BackgroundRepeatPair::default()]
+                } else {
+                    list
+                }),
+                imp,
+            );
+        }
         Property::BackgroundSize(sizes) => {
-            let sz = sizes
-                .first()
-                .map(convert_background_size)
-                .unwrap_or(BackgroundSizeValue::Auto);
+            let converted: Vec<BackgroundSizeValue> =
+                sizes.iter().map(convert_background_size).collect();
             push_decl(
                 out,
                 ord,
                 PropertyIdKind::BackgroundSize,
-                PropertyValue::BackgroundSize(sz),
+                PropertyValue::BackgroundSizes(if converted.is_empty() {
+                    vec![BackgroundSizeValue::Auto]
+                } else {
+                    converted
+                }),
                 imp,
             );
         }
@@ -6068,14 +6220,16 @@ fn compile_property(
             );
         }
         Property::BackgroundPosition(positions) => {
-            if let Some(pos) = positions.first() {
-                let x = convert_bg_horiz_pos(&pos.x);
-                let y = convert_bg_vert_pos(&pos.y);
+            let list: Vec<(LengthPercentage, LengthPercentage)> = positions
+                .iter()
+                .map(|pos| (convert_bg_horiz_pos(&pos.x), convert_bg_vert_pos(&pos.y)))
+                .collect();
+            if !list.is_empty() {
                 push_decl(
                     out,
                     ord,
                     PropertyIdKind::BackgroundPosition,
-                    PropertyValue::BgPosition(x, y),
+                    PropertyValue::BgPositions(list),
                     imp,
                 );
             }
@@ -6777,7 +6931,8 @@ fn compile_property(
         Property::Border(b) => {
             let w = convert_border_width_lp(&b.width);
             let s = convert_line_style(&b.style);
-            let c = convert_color(&b.color).unwrap_or(CssColor::CurrentColor);
+            let c = convert_color_prop(&b.color)
+                .unwrap_or(PropertyValue::Color(CssColor::CurrentColor));
             for (wk, sk, ck) in [
                 (
                     PropertyIdKind::BorderTopWidth,
@@ -6802,7 +6957,7 @@ fn compile_property(
             ] {
                 push_decl(out, ord, wk, PropertyValue::Length(w.clone()), imp);
                 push_decl(out, ord, sk, PropertyValue::LineStyle(s), imp);
-                push_decl(out, ord, ck, PropertyValue::Color(c), imp);
+                push_decl(out, ord, ck, c.clone(), imp);
             }
         }
         Property::BorderTop(b) => {
@@ -6820,14 +6975,8 @@ fn compile_property(
                 PropertyValue::LineStyle(convert_line_style(&b.style)),
                 imp,
             );
-            if let Some(c) = convert_color(&b.color) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderTopColor,
-                    PropertyValue::Color(c),
-                    imp,
-                );
+            if let Some(c) = convert_color_prop(&b.color) {
+                push_decl(out, ord, PropertyIdKind::BorderTopColor, c, imp);
             }
         }
         Property::BorderRight(b) => {
@@ -6845,14 +6994,8 @@ fn compile_property(
                 PropertyValue::LineStyle(convert_line_style(&b.style)),
                 imp,
             );
-            if let Some(c) = convert_color(&b.color) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderRightColor,
-                    PropertyValue::Color(c),
-                    imp,
-                );
+            if let Some(c) = convert_color_prop(&b.color) {
+                push_decl(out, ord, PropertyIdKind::BorderRightColor, c, imp);
             }
         }
         Property::BorderBottom(b) => {
@@ -6870,14 +7013,8 @@ fn compile_property(
                 PropertyValue::LineStyle(convert_line_style(&b.style)),
                 imp,
             );
-            if let Some(c) = convert_color(&b.color) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderBottomColor,
-                    PropertyValue::Color(c),
-                    imp,
-                );
+            if let Some(c) = convert_color_prop(&b.color) {
+                push_decl(out, ord, PropertyIdKind::BorderBottomColor, c, imp);
             }
         }
         Property::BorderLeft(b) => {
@@ -6895,14 +7032,8 @@ fn compile_property(
                 PropertyValue::LineStyle(convert_line_style(&b.style)),
                 imp,
             );
-            if let Some(c) = convert_color(&b.color) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderLeftColor,
-                    PropertyValue::Color(c),
-                    imp,
-                );
+            if let Some(c) = convert_color_prop(&b.color) {
+                push_decl(out, ord, PropertyIdKind::BorderLeftColor, c, imp);
             }
         }
         Property::BorderBlockStartStyle(s) => push_decl(
@@ -6966,87 +7097,39 @@ fn compile_property(
             );
         }
         Property::BorderBlockStartColor(c) => {
-            if let Some(v) = convert_color(c) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderBlockStartColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(c) {
+                push_decl(out, ord, PropertyIdKind::BorderBlockStartColor, v, imp);
             }
         }
         Property::BorderBlockEndColor(c) => {
-            if let Some(v) = convert_color(c) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderBlockEndColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(c) {
+                push_decl(out, ord, PropertyIdKind::BorderBlockEndColor, v, imp);
             }
         }
         Property::BorderInlineStartColor(c) => {
-            if let Some(v) = convert_color(c) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderInlineStartColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(c) {
+                push_decl(out, ord, PropertyIdKind::BorderInlineStartColor, v, imp);
             }
         }
         Property::BorderInlineEndColor(c) => {
-            if let Some(v) = convert_color(c) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderInlineEndColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(c) {
+                push_decl(out, ord, PropertyIdKind::BorderInlineEndColor, v, imp);
             }
         }
         Property::BorderBlockColor(bc) => {
-            if let Some(v) = convert_color(&bc.start) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderBlockStartColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(&bc.start) {
+                push_decl(out, ord, PropertyIdKind::BorderBlockStartColor, v, imp);
             }
-            if let Some(v) = convert_color(&bc.end) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderBlockEndColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(&bc.end) {
+                push_decl(out, ord, PropertyIdKind::BorderBlockEndColor, v, imp);
             }
         }
         Property::BorderInlineColor(bc) => {
-            if let Some(v) = convert_color(&bc.start) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderInlineStartColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(&bc.start) {
+                push_decl(out, ord, PropertyIdKind::BorderInlineStartColor, v, imp);
             }
-            if let Some(v) = convert_color(&bc.end) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderInlineEndColor,
-                    PropertyValue::Color(v),
-                    imp,
-                );
+            if let Some(v) = convert_color_prop(&bc.end) {
+                push_decl(out, ord, PropertyIdKind::BorderInlineEndColor, v, imp);
             }
         }
         Property::BorderBlockStart(b) => {
@@ -7064,14 +7147,8 @@ fn compile_property(
                 PropertyValue::LineStyle(convert_line_style(&b.style)),
                 imp,
             );
-            if let Some(c) = convert_color(&b.color) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderBlockStartColor,
-                    PropertyValue::Color(c),
-                    imp,
-                );
+            if let Some(c) = convert_color_prop(&b.color) {
+                push_decl(out, ord, PropertyIdKind::BorderBlockStartColor, c, imp);
             }
         }
         Property::BorderBlockEnd(b) => {
@@ -7089,14 +7166,8 @@ fn compile_property(
                 PropertyValue::LineStyle(convert_line_style(&b.style)),
                 imp,
             );
-            if let Some(c) = convert_color(&b.color) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderBlockEndColor,
-                    PropertyValue::Color(c),
-                    imp,
-                );
+            if let Some(c) = convert_color_prop(&b.color) {
+                push_decl(out, ord, PropertyIdKind::BorderBlockEndColor, c, imp);
             }
         }
         Property::BorderInlineStart(b) => {
@@ -7114,14 +7185,8 @@ fn compile_property(
                 PropertyValue::LineStyle(convert_line_style(&b.style)),
                 imp,
             );
-            if let Some(c) = convert_color(&b.color) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderInlineStartColor,
-                    PropertyValue::Color(c),
-                    imp,
-                );
+            if let Some(c) = convert_color_prop(&b.color) {
+                push_decl(out, ord, PropertyIdKind::BorderInlineStartColor, c, imp);
             }
         }
         Property::BorderInlineEnd(b) => {
@@ -7139,20 +7204,14 @@ fn compile_property(
                 PropertyValue::LineStyle(convert_line_style(&b.style)),
                 imp,
             );
-            if let Some(c) = convert_color(&b.color) {
-                push_decl(
-                    out,
-                    ord,
-                    PropertyIdKind::BorderInlineEndColor,
-                    PropertyValue::Color(c),
-                    imp,
-                );
+            if let Some(c) = convert_color_prop(&b.color) {
+                push_decl(out, ord, PropertyIdKind::BorderInlineEndColor, c, imp);
             }
         }
         Property::BorderBlock(b) => {
             let w = convert_border_width_lp(&b.width);
             let s = convert_line_style(&b.style);
-            let c = convert_color(&b.color);
+            let c = convert_color_prop(&b.color);
             for (wk, sk, ck) in [
                 (
                     PropertyIdKind::BorderBlockStartWidth,
@@ -7167,15 +7226,15 @@ fn compile_property(
             ] {
                 push_decl(out, ord, wk, PropertyValue::Length(w.clone()), imp);
                 push_decl(out, ord, sk, PropertyValue::LineStyle(s), imp);
-                if let Some(col) = c {
-                    push_decl(out, ord, ck, PropertyValue::Color(col), imp);
+                if let Some(ref col) = c {
+                    push_decl(out, ord, ck, col.clone(), imp);
                 }
             }
         }
         Property::BorderInline(b) => {
             let w = convert_border_width_lp(&b.width);
             let s = convert_line_style(&b.style);
-            let c = convert_color(&b.color);
+            let c = convert_color_prop(&b.color);
             for (wk, sk, ck) in [
                 (
                     PropertyIdKind::BorderInlineStartWidth,
@@ -7190,8 +7249,8 @@ fn compile_property(
             ] {
                 push_decl(out, ord, wk, PropertyValue::Length(w.clone()), imp);
                 push_decl(out, ord, sk, PropertyValue::LineStyle(s), imp);
-                if let Some(col) = c {
-                    push_decl(out, ord, ck, PropertyValue::Color(col), imp);
+                if let Some(ref col) = c {
+                    push_decl(out, ord, ck, col.clone(), imp);
                 }
             }
         }
@@ -7405,13 +7464,15 @@ fn compile_property(
             PropertyValue::Length(convert_font_size(fs)),
             imp,
         ),
-        Property::FontWeight(fw) => push_decl(
-            out,
-            ord,
-            PropertyIdKind::FontWeight,
-            PropertyValue::Number(convert_font_weight(fw)),
-            imp,
-        ),
+        Property::FontWeight(fw) => {
+            use lightningcss::properties::font::FontWeight as LcFw;
+            let val = match fw {
+                LcFw::Bolder => PropertyValue::FontWeightRelative(1),
+                LcFw::Lighter => PropertyValue::FontWeightRelative(-1),
+                other => PropertyValue::Number(convert_font_weight(other)),
+            };
+            push_decl(out, ord, PropertyIdKind::FontWeight, val, imp);
+        }
         Property::FontStyle(fs) => push_decl(
             out,
             ord,
@@ -7795,18 +7856,14 @@ fn compile_property(
                 imp,
             );
         }
-        Property::RowGap(g) => push_decl(
-            out,
-            ord,
-            PropertyIdKind::RowGap,
-            PropertyValue::Length(convert_gap_value(g)),
-            imp,
-        ),
+        Property::RowGap(g) => {
+            push_decl(out, ord, PropertyIdKind::RowGap, convert_gap_prop(g), imp)
+        }
         Property::ColumnGap(g) => push_decl(
             out,
             ord,
             PropertyIdKind::ColumnGap,
-            PropertyValue::Length(convert_gap_value(g)),
+            convert_gap_prop(g),
             imp,
         ),
         Property::Gap(g) => {
@@ -7814,14 +7871,14 @@ fn compile_property(
                 out,
                 ord,
                 PropertyIdKind::RowGap,
-                PropertyValue::Length(convert_gap_value(&g.row)),
+                convert_gap_prop(&g.row),
                 imp,
             );
             push_decl(
                 out,
                 ord,
                 PropertyIdKind::ColumnGap,
-                PropertyValue::Length(convert_gap_value(&g.column)),
+                convert_gap_prop(&g.column),
                 imp,
             );
         }
@@ -8760,11 +8817,11 @@ fn compile_property(
     }
 }
 
-fn convert_gap_value(gap: &lightningcss::properties::align::GapValue) -> LengthPercentage {
+fn convert_gap_prop(gap: &lightningcss::properties::align::GapValue) -> PropertyValue {
     match gap {
-        lightningcss::properties::align::GapValue::Normal => LengthPercentage::Zero,
+        lightningcss::properties::align::GapValue::Normal => PropertyValue::GapNormal,
         lightningcss::properties::align::GapValue::LengthPercentage(lp) => {
-            convert_length_percentage(lp)
+            PropertyValue::Length(convert_length_percentage(lp))
         }
     }
 }

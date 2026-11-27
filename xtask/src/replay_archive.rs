@@ -310,6 +310,53 @@ fn rewrite_text_urls(
     text
 }
 
+/// Removes `integrity="..."` / `integrity='...'` attributes from HTML tags in a frozen replay
+/// document so rewritten local subresources are not rejected by browser SRI hash verification.
+fn strip_sri_integrity_attrs(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    if !lower.contains("integrity=") {
+        return html.to_string();
+    }
+    let bytes = html.as_bytes();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(rel) = lower[i..].find("integrity=") {
+            let pos = i + rel;
+            let boundary_ok = pos > 0 && bytes[pos - 1].is_ascii_whitespace();
+            if boundary_ok {
+                out.push_str(&html[i..pos]);
+                let mut k = pos + "integrity=".len();
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k < bytes.len() && (bytes[k] == b'"' || bytes[k] == b'\'') {
+                    let q = bytes[k];
+                    k += 1;
+                    while k < bytes.len() && bytes[k] != q {
+                        k += 1;
+                    }
+                    if k < bytes.len() {
+                        k += 1;
+                    }
+                } else {
+                    while k < bytes.len() && !bytes[k].is_ascii_whitespace() && bytes[k] != b'>' {
+                        k += 1;
+                    }
+                }
+                i = k;
+                continue;
+            }
+            out.push_str(&html[i..pos + "integrity=".len()]);
+            i = pos + "integrity=".len();
+        } else {
+            out.push_str(&html[i..]);
+            break;
+        }
+    }
+    out
+}
+
 /// Records `url` and its transitive static subresources into a frozen deterministic replay bundle
 /// under `archive_dir`.
 pub fn record_site_archive(url: &str, archive_dir: &Path) -> Result<ReplayManifest> {
@@ -431,7 +478,15 @@ async fn record_site_archive_async(url: &str, archive_dir: &Path) -> Result<Repl
     }
 
     // Rewrite entry HTML document so subresources resolve deterministically offline.
-    let rewritten_html = rewrite_text_urls(html_raw, &final_url, &url_to_local, &html_refs);
+    // Strip `integrity="..."` attributes because rewriting CSS `url(...)` references inside
+    // archived stylesheets alters their byte digest, which would otherwise cause strict SRI
+    // checks in Mozilla Firefox to reject frozen local stylesheets.
+    let rewritten_html = strip_sri_integrity_attrs(&rewrite_text_urls(
+        html_raw,
+        &final_url,
+        &url_to_local,
+        &html_refs,
+    ));
     let entry_file = "entry.html".to_string();
     fs::write(archive_dir.join(&entry_file), rewritten_html.as_bytes())?;
 
@@ -529,7 +584,17 @@ impl ReplayServer {
         let manifest_raw = fs::read_to_string(archive_dir.join("manifest.json"))
             .with_context(|| format!("read replay manifest in {}", archive_dir.display()))?;
         let manifest: ReplayManifest = serde_json::from_str(&manifest_raw)?;
-        let entry_bytes = Arc::new(fs::read(archive_dir.join(&manifest.entry_file))?);
+        let raw_entry = fs::read(archive_dir.join(&manifest.entry_file))?;
+        let entry_bytes = if manifest
+            .entry_content_type
+            .to_ascii_lowercase()
+            .contains("html")
+        {
+            let html = String::from_utf8_lossy(&raw_entry);
+            Arc::new(strip_sri_integrity_attrs(&html).into_bytes())
+        } else {
+            Arc::new(raw_entry)
+        };
         let entry_ct = Arc::new(manifest.entry_content_type.clone());
         let entry_path = manifest.entry_path.clone();
 

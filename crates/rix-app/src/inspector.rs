@@ -298,15 +298,24 @@ struct FragmentSnapshotInfo {
     content_rect: Rect,
     padding: rix_layout::EdgeInsets,
     margin: rix_layout::EdgeInsets,
+    layout_box: rix_content::dom_bridge::ResolvedLayoutBox,
+    parent_flex_grid: bool,
     style: std::sync::Arc<ComputedStyle>,
     resolved_grid_cols: Option<String>,
     resolved_grid_rows: Option<String>,
     is_replaced: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_fragment_rects_and_styles(
     frag: &Fragment,
     parent_origin: Point,
+    parent_content_size: rix_core::Size,
+    parent_padding_rect: Rect,
+    scroll_container_content_size: rix_core::Size,
+    viewport: rix_core::Size,
+    is_parent_root: bool,
+    parent_flex_grid: bool,
     out: &mut HashMap<NodeId, FragmentSnapshotInfo>,
 ) {
     let abs = frag.absolute_border_rect(parent_origin);
@@ -318,6 +327,33 @@ fn collect_fragment_rects_and_styles(
             | rix_layout::FragmentKind::TextRun(_)
     );
     if let Some(nid) = frag.dom_node {
+        let (cb_origin, cb_padding_size) =
+            if is_parent_root && frag.style.position == rix_css::PositionMode::Fixed {
+                (Point::ZERO, viewport)
+            } else {
+                (parent_padding_rect.origin, parent_padding_rect.size)
+            };
+        let x_rel = frag.border_rect.origin.x - cb_origin.x;
+        let y_rel = frag.border_rect.origin.y - cb_origin.y;
+        let used_insets = rix_layout::EdgeInsets {
+            top: y_rel - frag.margin.top,
+            left: x_rel - frag.margin.left,
+            bottom: cb_padding_size.height
+                - (y_rel + frag.border_rect.size.height + frag.margin.bottom),
+            right: cb_padding_size.width
+                - (x_rel + frag.border_rect.size.width + frag.margin.right),
+        };
+        let layout_box = rix_content::dom_bridge::ResolvedLayoutBox {
+            content_size: frag.content_rect.size,
+            border_size: frag.border_rect.size,
+            padding: frag.padding,
+            margin: frag.margin,
+            parent_content_size,
+            cb_padding_size,
+            scroll_container_content_size,
+            used_insets,
+            resolved_grid_tracks: frag.resolved_grid_tracks.clone(),
+        };
         out.entry(nid)
             .and_modify(|existing| {
                 let min_x = existing.rect.origin.x.min(abs.origin.x);
@@ -337,6 +373,8 @@ fn collect_fragment_rects_and_styles(
                 content_rect: frag.content_rect,
                 padding: frag.padding,
                 margin: frag.margin,
+                layout_box,
+                parent_flex_grid,
                 style: std::sync::Arc::clone(&frag.style),
                 resolved_grid_cols: frag
                     .resolved_grid_tracks
@@ -351,8 +389,47 @@ fn collect_fragment_rects_and_styles(
                 is_replaced,
             });
     }
+    let next_parent = frag.content_rect.size;
+    let next_padding_rect = Rect::new(
+        frag.border.left,
+        frag.border.top,
+        frag.content_rect.size.width + frag.padding.left + frag.padding.right,
+        frag.content_rect.size.height + frag.padding.top + frag.padding.bottom,
+    );
+    let next_scroll = if rix_layout::is_scroll_axis(frag.style.overflow.x)
+        || rix_layout::is_scroll_axis(frag.style.overflow.y)
+    {
+        frag.content_rect.size
+    } else {
+        scroll_container_content_size
+    };
+    let next_is_root = frag.dom_node.is_none() && is_parent_root;
+    let self_flex_grid = matches!(
+        frag.style.display,
+        rix_css::DisplayMode::Flex
+            | rix_css::DisplayMode::InlineFlex
+            | rix_css::DisplayMode::Grid
+            | rix_css::DisplayMode::InlineGrid
+            | rix_css::DisplayMode::GridLanes
+            | rix_css::DisplayMode::InlineGridLanes
+    );
+    let next_parent_flex_grid = if frag.dom_node.is_some() {
+        self_flex_grid
+    } else {
+        parent_flex_grid || self_flex_grid
+    };
     for child in frag.children.iter() {
-        collect_fragment_rects_and_styles(child, abs.origin, out);
+        collect_fragment_rects_and_styles(
+            child,
+            abs.origin,
+            next_parent,
+            next_padding_rect,
+            next_scroll,
+            viewport,
+            next_is_root,
+            next_parent_flex_grid,
+            out,
+        );
     }
 }
 
@@ -481,7 +558,13 @@ fn format_resolved_property(info: &FragmentSnapshotInfo, prop: &str) -> String {
                 rix_content::cssom::format_computed_property(&info.style, prop)
             }
         }
-        _ => rix_content::cssom::format_computed_property(&info.style, prop),
+        _ => rix_content::cssom::format_computed_property_resolved(
+            &info.style,
+            prop,
+            Some(&info.layout_box),
+            info.parent_flex_grid,
+            None,
+        ),
     }
 }
 
@@ -497,7 +580,18 @@ fn build_snapshot_from_parts(
     let mut rect_map: HashMap<NodeId, FragmentSnapshotInfo> = HashMap::new();
     let (scroll_w, scroll_h) = if let Some(ft) = fragment_tree {
         if let Some(ref root) = ft.root {
-            collect_fragment_rects_and_styles(root, Point::ZERO, &mut rect_map);
+            let vp = rix_core::Size::new(viewport_w, viewport_h);
+            collect_fragment_rects_and_styles(
+                root,
+                Point::ZERO,
+                vp,
+                Rect::new(0.0, 0.0, viewport_w, viewport_h),
+                vp,
+                vp,
+                true,
+                false,
+                &mut rect_map,
+            );
         }
         (
             round_tenth(ft.content_bounds.size.width.max(viewport_w)),

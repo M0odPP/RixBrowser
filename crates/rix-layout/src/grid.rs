@@ -67,15 +67,18 @@ pub(crate) fn effective_aspect_ratio(
     b: &crate::box_tree::LayoutBox,
     eval: &EvalContext,
 ) -> Option<f32> {
-    if let Some(ar) = parse_aspect_ratio_val(&b.style, eval) {
-        return Some(ar);
+    let css_ratio = parse_aspect_ratio_val(&b.style, eval);
+    let intrinsic_ratio =
+        replaced_intrinsic_dims(b).and_then(|(iw, ih)| (iw > 0.0 && ih > 0.0).then_some(iw / ih));
+    if b.style
+        .effects
+        .as_ref()
+        .is_some_and(|e| e.aspect_ratio_auto)
+    {
+        intrinsic_ratio.or(css_ratio)
+    } else {
+        css_ratio.or(intrinsic_ratio)
     }
-    if let Some((iw, ih)) = replaced_intrinsic_dims(b) {
-        if iw > 0.0 && ih > 0.0 {
-            return Some(iw / ih);
-        }
-    }
-    None
 }
 
 pub(crate) fn measure_item_block_height(
