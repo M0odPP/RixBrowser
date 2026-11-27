@@ -1605,7 +1605,15 @@ fn resolve_replaced_size_styled(
             let r = (n / d) as f32;
             (r.is_finite() && r > 0.0).then_some(r)
         });
-    resolve_replaced_pair_with_ratio(intrinsic, spec_w, spec_h, metrics, css_ratio)
+    let aspect_ratio_auto = style.effects.as_ref().is_some_and(|e| e.aspect_ratio_auto);
+    resolve_replaced_pair_with_ratio(
+        intrinsic,
+        spec_w,
+        spec_h,
+        metrics,
+        css_ratio,
+        aspect_ratio_auto,
+    )
 }
 
 fn resolve_replaced_size(intrinsic: Size, metrics: &BoxMetrics) -> (f32, f32) {
@@ -1615,6 +1623,7 @@ fn resolve_replaced_size(intrinsic: Size, metrics: &BoxMetrics) -> (f32, f32) {
         metrics.specified_height,
         metrics,
         None,
+        false,
     )
 }
 
@@ -1624,10 +1633,15 @@ fn resolve_replaced_pair_with_ratio(
     spec_h: Option<f32>,
     metrics: &BoxMetrics,
     css_ratio: Option<f32>,
+    aspect_ratio_auto: bool,
 ) -> (f32, f32) {
     let intrinsic_ratio = (intrinsic.height > 0.0 && intrinsic.width > 0.0)
         .then(|| intrinsic.width / intrinsic.height);
-    let ratio = css_ratio.or(intrinsic_ratio);
+    let ratio = if aspect_ratio_auto {
+        intrinsic_ratio.or(css_ratio)
+    } else {
+        css_ratio.or(intrinsic_ratio)
+    };
     let min_w = metrics.min_width.max(0.0);
     let max_w = metrics.max_width.max(min_w);
     let min_h = metrics.min_height.max(0.0);

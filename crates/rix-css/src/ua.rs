@@ -98,7 +98,6 @@ table {
     box-sizing: border-box;
     text-indent: initial;
     border-spacing: 2px;
-    border-color: gray;
 }
 thead {
     display: table-header-group;
@@ -200,7 +199,10 @@ h6 {
     margin-top: 2.33em;
     margin-bottom: 2.33em;
 }
-b, strong, th {
+b, strong {
+    font-weight: bolder;
+}
+th {
     font-weight: 700;
 }
 i, em, cite, dfn, var, address {
@@ -238,16 +240,24 @@ a:visited {
 input[type="hidden" i] {
     display: none;
 }
+label {
+    cursor: default;
+}
 button, input, select, textarea {
     display: inline-block;
     font-family: sans-serif;
     font-size: 13.3333px;
+    line-height: normal;
+    letter-spacing: normal;
+    word-spacing: normal;
+    color: FieldText;
     border-radius: 0;
     appearance: auto;
 }
 button {
     box-sizing: border-box;
     background-color: #e9e9ed;
+    color: ButtonText;
     border: 2px outset #817f84;
     padding: 1px 4px;
     text-align: center;
@@ -259,6 +269,7 @@ input {
     background-color: #ffffff;
     border: 2px inset #817f84;
     padding: 1px 2px;
+    text-align: start;
     overflow: clip;
     cursor: text;
 }
@@ -268,6 +279,7 @@ input[type="search" i] {
 input[type="submit" i], input[type="button" i], input[type="reset" i] {
     box-sizing: border-box;
     background-color: #e9e9ed;
+    color: ButtonText;
     border: 2px outset #817f84;
     padding: 1px 4px;
     text-align: center;

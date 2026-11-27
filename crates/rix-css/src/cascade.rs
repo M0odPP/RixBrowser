@@ -2829,7 +2829,7 @@ fn collect_presentational_hint_decls(
         };
         let border_w = border_attr.map(parse_html_table_border_attr);
         if has_valid_rules {
-            css.push_str("border-style:hidden;border-collapse:collapse;");
+            css.push_str("border-style:hidden;border-collapse:collapse;border-color:gray;");
         }
         if let Some((t, r, b, l)) = frame_sides {
             let st = |on: bool| if on { "outset" } else { "hidden" };
@@ -3053,7 +3053,7 @@ fn collect_presentational_hint_decls(
             if w > 0.0 {
                 css.push_str(&format!("border-width:{w}px;border-style:solid;"));
             } else {
-                css.push_str("border-width:0px;");
+                css.push_str("border-width:0px;border-style:solid;");
             }
         } else if attr.eq_ignore_ascii_case("hspace")
             && (tag.eq_ignore_ascii_case("img")
@@ -3200,6 +3200,63 @@ fn collect_presentational_hint_decls(
         }
     }
 
+    // HTML Living Standard §15.3.4: `img`, `video`, `canvas`, and `input[type=image]` map valid
+    // non-negative `width` and `height` HTML attributes to `aspect-ratio: auto <width> / <height>`.
+    let is_aspect_ratio_replaced = tag.eq_ignore_ascii_case("img")
+        || tag.eq_ignore_ascii_case("video")
+        || tag.eq_ignore_ascii_case("canvas")
+        || (tag.eq_ignore_ascii_case("input")
+            && elem
+                .get_attribute("type")
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("image")));
+    if is_aspect_ratio_replaced {
+        let parse_nonneg_num = |raw: &str| -> Option<f64> {
+            let s = raw.trim();
+            if s.is_empty() || s.ends_with('%') {
+                return None;
+            }
+            let mut end = 0;
+            let mut saw_dot = false;
+            for (i, b) in s.bytes().enumerate() {
+                if b.is_ascii_digit() {
+                    end = i + 1;
+                } else if b == b'.' && !saw_dot {
+                    saw_dot = true;
+                    end = i + 1;
+                } else {
+                    break;
+                }
+            }
+            if end == 0 {
+                return None;
+            }
+            let n: f64 = s[..end].parse().ok()?;
+            (n.is_finite() && n >= 0.0).then_some(n)
+        };
+        if let (Some(w_raw), Some(h_raw)) =
+            (elem.get_attribute("width"), elem.get_attribute("height"))
+        {
+            if let (Some(w), Some(h)) = (parse_nonneg_num(w_raw), parse_nonneg_num(h_raw)) {
+                if w > 0.0 && h > 0.0 {
+                    let ws = if (w - w.round()).abs() < 1e-6 {
+                        format!("{}", w.round() as u64)
+                    } else {
+                        format!("{w}")
+                    };
+                    let hs = if (h - h.round()).abs() < 1e-6 {
+                        format!("{}", h.round() as u64)
+                    } else {
+                        format!("{h}")
+                    };
+                    css.push_str("aspect-ratio:auto ");
+                    css.push_str(&ws);
+                    css.push_str(" / ");
+                    css.push_str(&hs);
+                    css.push(';');
+                }
+            }
+        }
+    }
     if css.is_empty() {
         Vec::new()
     } else {
