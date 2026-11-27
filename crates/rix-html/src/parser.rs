@@ -1,7 +1,9 @@
 use crate::sink::DomTreeSink;
+use crate::tree_builder::{TreeBuilder, TreeBuilderOpts};
 use encoding_rs::{Decoder, Encoding, UTF_8};
-use html5ever::tendril::{StrTendril, TendrilSink};
-use html5ever::{parse_document, parse_fragment, ParseOpts, Parser};
+use html5ever::interface::tree_builder::{create_element, TreeSink};
+use html5ever::tendril::StrTendril;
+use html5ever::tokenizer::{BufferQueue, Tokenizer, TokenizerOpts};
 use markup5ever::{QualName, TokenizerResult};
 use rix_dom::node::NodeData;
 use rix_dom::tree::Document;
@@ -11,6 +13,58 @@ use std::rc::Rc;
 
 const MAX_CHARSET_SNIFF_BYTES: usize = 1024;
 
+struct RixHtmlParser {
+    tokenizer: Tokenizer<TreeBuilder<NodeId, DomTreeSink>>,
+    input_buffer: BufferQueue,
+}
+
+impl RixHtmlParser {
+    fn new_document(sink: DomTreeSink, opts: TreeBuilderOpts) -> Self {
+        let tb = TreeBuilder::new(sink, opts);
+        let tokenizer = Tokenizer::new(tb, TokenizerOpts::default());
+        Self {
+            tokenizer,
+            input_buffer: BufferQueue::default(),
+        }
+    }
+
+    fn new_fragment(
+        sink: DomTreeSink,
+        context_name: QualName,
+        form_elem: Option<NodeId>,
+        scripting_enabled: bool,
+        opts: TreeBuilderOpts,
+    ) -> Self {
+        let context_elem = create_element(&sink, context_name, Vec::new());
+        let tb = TreeBuilder::new_for_fragment(sink, context_elem, form_elem, opts);
+        let tok_opts = TokenizerOpts {
+            initial_state: Some(tb.tokenizer_state_for_context_elem(scripting_enabled)),
+            ..TokenizerOpts::default()
+        };
+        let tokenizer = Tokenizer::new(tb, tok_opts);
+        Self {
+            tokenizer,
+            input_buffer: BufferQueue::default(),
+        }
+    }
+
+    fn parse_one(self, html: &str) -> Document {
+        if !html.is_empty() {
+            self.input_buffer.push_back(StrTendril::from_slice(html));
+        }
+        loop {
+            if matches!(
+                self.tokenizer.feed(&self.input_buffer),
+                TokenizerResult::Done
+            ) {
+                break;
+            }
+        }
+        self.tokenizer.end();
+        self.tokenizer.sink.sink.finish()
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParserStreamStep {
     Script(NodeId),
@@ -18,7 +72,7 @@ pub enum ParserStreamStep {
 }
 
 pub struct HtmlParserStream {
-    parser: Parser<DomTreeSink>,
+    parser: RixHtmlParser,
     document: Rc<RefCell<Document>>,
     finished: bool,
     charset_hint: Option<&'static Encoding>,
@@ -42,8 +96,7 @@ impl HtmlParserStream {
 
     pub fn with_document(document: Rc<RefCell<Document>>) -> Self {
         let sink = DomTreeSink::with_document(document.clone());
-        let opts = ParseOpts::default();
-        let parser = parse_document(sink, opts);
+        let parser = RixHtmlParser::new_document(sink, TreeBuilderOpts::default());
         Self {
             parser,
             document,
@@ -184,7 +237,11 @@ impl HtmlParserStream {
             }
         }
         self.parser.tokenizer.end();
-        attach_declarative_shadow_roots(&mut self.document.borrow_mut());
+        {
+            let mut doc = self.document.borrow_mut();
+            attach_declarative_shadow_roots(&mut doc);
+            sync_selectedcontent_elements(&mut doc);
+        }
         self.finished = true;
     }
 
@@ -208,10 +265,10 @@ impl HtmlParserStream {
     }
 }
 
-/// Incremental WHATWG HTML fragment parser backed by `html5ever::parse_fragment`,
-/// supporting chunked `write()`/`close()` streaming (WHATWG HTML §8.4 streaming methods).
+/// Incremental WHATWG HTML fragment parser supporting chunked `write()`/`close()`
+/// streaming (WHATWG HTML §8.4 streaming methods).
 pub struct HtmlFragmentParserStream {
-    parser: Parser<DomTreeSink>,
+    parser: RixHtmlParser,
     document: Rc<RefCell<Document>>,
     finished: bool,
 }
@@ -221,11 +278,8 @@ impl HtmlFragmentParserStream {
     pub fn new(context: Option<&QualName>, scripting_enabled: bool) -> Self {
         let document = Rc::new(RefCell::new(Document::new()));
         let sink = DomTreeSink::with_document(Rc::clone(&document));
-        let opts = ParseOpts {
-            tree_builder: html5ever::tree_builder::TreeBuilderOpts {
-                scripting_enabled,
-                ..Default::default()
-            },
+        let opts = TreeBuilderOpts {
+            scripting_enabled,
             ..Default::default()
         };
         let context_name = match context {
@@ -236,7 +290,7 @@ impl HtmlFragmentParserStream {
                 markup5ever::local_name!("body"),
             ),
         };
-        let parser = parse_fragment(sink, opts, context_name, Vec::new(), true);
+        let parser = RixHtmlParser::new_fragment(sink, context_name, None, true, opts);
         Self {
             parser,
             document,
@@ -329,12 +383,7 @@ pub fn is_blocking_classic_script(doc: &Document, node: NodeId) -> bool {
     true
 }
 
-fn decode_into_buffer(
-    decoder: &mut Decoder,
-    bytes: &[u8],
-    last: bool,
-    parser: &mut Parser<DomTreeSink>,
-) {
+fn decode_into_buffer(decoder: &mut Decoder, bytes: &[u8], last: bool, parser: &mut RixHtmlParser) {
     let cap = decoder
         .max_utf8_buffer_length(bytes.len())
         .unwrap_or(bytes.len().saturating_mul(4).max(16));
@@ -544,18 +593,16 @@ pub fn parse_html_with_options(
     allow_declarative_shadow: bool,
 ) -> Document {
     let sink = DomTreeSink::with_source_pi_scan(html, scripting_enabled);
-    let opts = ParseOpts {
-        tree_builder: html5ever::tree_builder::TreeBuilderOpts {
-            scripting_enabled,
-            ..Default::default()
-        },
+    let opts = TreeBuilderOpts {
+        scripting_enabled,
         ..Default::default()
     };
-    let mut doc = parse_document(sink, opts).one(html);
+    let mut doc = RixHtmlParser::new_document(sink, opts).parse_one(html);
     doc.set_character_set(detect_html_charset(html.as_bytes()));
     if allow_declarative_shadow {
         attach_declarative_shadow_roots(&mut doc);
     }
+    sync_selectedcontent_elements(&mut doc);
     doc
 }
 
@@ -577,12 +624,25 @@ pub fn parse_html_fragment_with_options(
     scripting_enabled: bool,
     allow_declarative_shadow: bool,
 ) -> (Document, Vec<NodeId>) {
+    parse_html_fragment_with_form_owner(
+        html,
+        context,
+        scripting_enabled,
+        allow_declarative_shadow,
+        false,
+    )
+}
+
+pub fn parse_html_fragment_with_form_owner(
+    html: &str,
+    context: Option<&QualName>,
+    scripting_enabled: bool,
+    allow_declarative_shadow: bool,
+    has_form_ancestor: bool,
+) -> (Document, Vec<NodeId>) {
     let sink = DomTreeSink::with_source_pi_scan(html, scripting_enabled);
-    let opts = ParseOpts {
-        tree_builder: html5ever::tree_builder::TreeBuilderOpts {
-            scripting_enabled,
-            ..Default::default()
-        },
+    let opts = TreeBuilderOpts {
+        scripting_enabled,
         ..Default::default()
     };
     let context_name = match context {
@@ -593,12 +653,27 @@ pub fn parse_html_fragment_with_options(
             markup5ever::local_name!("body"),
         ),
     };
-    let mut doc = parse_fragment(sink, opts, context_name, Vec::new(), true).one(html);
+    let form_elem = if has_form_ancestor {
+        Some(create_element(
+            &sink,
+            QualName::new(
+                None,
+                markup5ever::ns!(html),
+                markup5ever::local_name!("form"),
+            ),
+            Vec::new(),
+        ))
+    } else {
+        None
+    };
+    let mut doc =
+        RixHtmlParser::new_fragment(sink, context_name, form_elem, true, opts).parse_one(html);
     if allow_declarative_shadow {
         attach_declarative_shadow_roots(&mut doc);
     }
-    // Per html5ever `parse_fragment`, parsed fragment nodes live as children of the synthetic
-    // root `<html>` wrapper element (plus any trailing sibling nodes like comments after `</html>`).
+    sync_selectedcontent_elements(&mut doc);
+    // Parsed fragment nodes live as children of the synthetic root `<html>` wrapper element
+    // (plus any trailing sibling nodes like comments after `</html>`).
     let mut fragment_nodes = Vec::new();
     let mut found_html_wrapper = false;
     for child in doc.children(doc.root()) {
@@ -730,4 +805,86 @@ fn can_attach_declarative_shadow(doc: &Document, host: NodeId) -> bool {
     }
     let html_ns = &*elem.name.ns == "http://www.w3.org/1999/xhtml";
     html_ns && rix_dom::is_valid_shadow_host_name(&elem.name.local)
+}
+
+/// Synchronizes customizable `<select>` `<selectedcontent>` elements per WHATWG HTML §4.10.8
+/// by cloning the selected `<option>`'s child nodes into the owning `<select>`'s first
+/// `<selectedcontent>` descendant.
+pub fn sync_selectedcontent_elements(doc: &mut Document) {
+    let html_ns = "http://www.w3.org/1999/xhtml";
+    let selects: Vec<NodeId> = doc
+        .descendants(doc.root())
+        .filter(|&nid| {
+            matches!(
+                doc.get(nid),
+                Some(NodeData::Element(e))
+                    if &*e.name.ns == html_ns && &*e.name.local == "select"
+            )
+        })
+        .collect();
+
+    for sel in selects {
+        let mut selectedcontent: Option<NodeId> = None;
+        let mut first_option: Option<NodeId> = None;
+        let mut last_selected_option: Option<NodeId> = None;
+
+        // Walk descendants of `sel` without descending into nested `<select>` elements.
+        let mut stack: Vec<NodeId> = doc.children(sel).collect();
+        stack.reverse();
+        while let Some(nid) = stack.pop() {
+            if let Some(NodeData::Element(e)) = doc.get(nid) {
+                if &*e.name.ns == html_ns {
+                    match &*e.name.local {
+                        "select" => continue,
+                        "selectedcontent" => {
+                            if selectedcontent.is_none() {
+                                selectedcontent = Some(nid);
+                            }
+                            continue;
+                        }
+                        "option" => {
+                            if first_option.is_none() {
+                                first_option = Some(nid);
+                            }
+                            if e.has_attribute("selected") {
+                                last_selected_option = Some(nid);
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let mut kids: Vec<NodeId> = doc.children(nid).collect();
+            kids.reverse();
+            stack.extend(kids);
+        }
+
+        let Some(sc_nid) = selectedcontent else {
+            continue;
+        };
+        let Some(opt_nid) = last_selected_option.or(first_option) else {
+            continue;
+        };
+        let existing: Vec<NodeId> = doc.children(sc_nid).collect();
+        for old in existing {
+            doc.remove_child(old);
+        }
+        let opt_children: Vec<NodeId> = doc.children(opt_nid).collect();
+        for ch in opt_children {
+            let cloned = clone_subtree_in_place(doc, ch);
+            doc.append_child(sc_nid, cloned);
+        }
+    }
+}
+
+fn clone_subtree_in_place(doc: &mut Document, node: NodeId) -> NodeId {
+    let data = doc.get(node).cloned().expect("valid node to clone");
+    let new_node = doc.new_node(data);
+    let children: Vec<NodeId> = doc.children(node).collect();
+    for child in children {
+        let cloned_child = clone_subtree_in_place(doc, child);
+        doc.append_child(new_node, cloned_child);
+    }
+    new_node
 }

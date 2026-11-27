@@ -99,3 +99,86 @@ fn scripting_off_parses_noscript_children_as_elements() {
         .any(|c| matches!(doc.get(c), Some(NodeData::Element(e)) if &*e.name.local == "p"));
     assert!(has_p, "scripting-off must parse <p> inside <noscript>");
 }
+
+#[test]
+fn search_element_is_special_for_adoption_agency_and_list_closing() {
+    let doc = parse_html("<!doctype html><a><search>x</a>y");
+    let body = doc
+        .descendants(doc.root())
+        .find(|&n| matches!(doc.get(n), Some(NodeData::Element(e)) if &*e.name.local == "body"))
+        .expect("body");
+    let tags: Vec<&str> = doc
+        .children(body)
+        .filter_map(|c| match doc.get(c) {
+            Some(NodeData::Element(e)) => Some(e.name.local.as_ref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tags, vec!["a", "search"]);
+}
+
+#[test]
+fn template_in_head_preserves_frameset_ok_and_nested_forms() {
+    let doc = parse_html("<template>x</template><p><frameset>");
+    let html_el = doc
+        .children(doc.root())
+        .find(|&n| matches!(doc.get(n), Some(NodeData::Element(e)) if &*e.name.local == "html"))
+        .expect("html");
+    let tags: Vec<&str> = doc
+        .children(html_el)
+        .filter_map(|c| match doc.get(c) {
+            Some(NodeData::Element(e)) => Some(e.name.local.as_ref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tags, vec!["head", "frameset"]);
+
+    let ctx = QualName::new(None, ns!(html), local_name!("template"));
+    let (frag_doc, roots) = parse_html_fragment("<form><form>", Some(&ctx));
+    assert_eq!(roots.len(), 1);
+    let inner_forms: usize = frag_doc
+        .children(roots[0])
+        .filter(
+            |&c| matches!(frag_doc.get(c), Some(NodeData::Element(e)) if &*e.name.local == "form"),
+        )
+        .count();
+    assert_eq!(inner_forms, 1, "template fragment must allow nested <form>");
+}
+
+#[test]
+fn select_fragment_ignores_input_and_populates_selectedcontent() {
+    let ctx = QualName::new(None, ns!(html), local_name!("select"));
+    let (frag_doc, roots) = parse_html_fragment("<input><option>", Some(&ctx));
+    let tags: Vec<&str> = roots
+        .iter()
+        .filter_map(|&n| match frag_doc.get(n) {
+            Some(NodeData::Element(e)) => Some(e.name.local.as_ref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tags, vec!["option"]);
+
+    let doc = parse_html("<select><button><selectedcontent></button><option>X<option selected>Y");
+    let sc = doc
+        .descendants(doc.root())
+        .find(|&n| {
+            matches!(
+                doc.get(n),
+                Some(NodeData::Element(e)) if &*e.name.local == "selectedcontent"
+            )
+        })
+        .expect("selectedcontent");
+    assert_eq!(doc.inner_text(sc), "Y");
+}
+
+#[test]
+fn doctype_empty_system_id_triggers_quirks_mode() {
+    let doc = parse_html(
+        r#"<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//" ""><html></html>"#,
+    );
+    assert_eq!(doc.compat_mode(), "BackCompat");
+    let limited = parse_html(
+        r#"<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//" "http://www.w3.org/TR/html4/loose.dtd"><html></html>"#,
+    );
+    assert_eq!(limited.compat_mode(), "CSS1Compat");
+}
