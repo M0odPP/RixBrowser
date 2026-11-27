@@ -80,15 +80,16 @@ pub use frames::{
     install_frame_and_messaging_apis, mark_child_frame_crashed, sync_all_iframes_in_document,
     FrameSystem, SandboxFlags, SharedFrames,
 };
+pub use rix_jit::{new_shared_baseline_cache, SharedBaselineCache};
 
 pub use dom_bridge::{
     install_dom_bridge, wrap_node, CustomElementDef, DomMutation, DomPrototypes, HostState,
     MutationSink, SharedHost,
 };
 pub use event_loop::{
-    drain_ready_tasks, fire_vsync, install_event_loop_globals, run_microtask_checkpoint,
-    step_event_loop_once, wait_for_next_event_or_timer, EventLoopState, ExternalEvent,
-    MacrotaskAction, MicrotaskCheckpointHook, SharedEventLoop, TaskPriority,
+    drain_ready_tasks, drain_ready_tasks_with_budget, fire_vsync, install_event_loop_globals,
+    run_microtask_checkpoint, step_event_loop_once, wait_for_next_event_or_timer, EventLoopState,
+    ExternalEvent, MacrotaskAction, MicrotaskCheckpointHook, SharedEventLoop, TaskPriority,
 };
 pub use events::{
     fire_dom_node_event, fire_object_event, install_event_system, EventSystem, EventTargetKey,
@@ -963,7 +964,36 @@ impl ContentRuntime {
                             );
                         }
                         self.host.borrow_mut().current_script = Some(script_id);
+                        let t_sc = std::time::Instant::now();
+                        let (sr0, ly0) = {
+                            let h = self.host.borrow();
+                            (h.style_recalc_count, h.layout_count)
+                        };
                         let res = self.eval_script_cached(&code);
+                        let sc_ms = t_sc.elapsed().as_secs_f32() * 1000.0;
+                        if sc_ms >= 25.0 {
+                            let (sr1, ly1) = {
+                                let h = self.host.borrow();
+                                (h.style_recalc_count, h.layout_count)
+                            };
+                            let jst = self.jit.stats();
+                            tracing::debug!(
+                                phase = "sync_script",
+                                url = %script_url,
+                                bytes = code.len(),
+                                ms = format_args!("{sc_ms:.1}"),
+                                style_recalcs = sr1.saturating_sub(sr0),
+                                layouts = ly1.saturating_sub(ly0),
+                                jit_compiled = jst.compiled_functions,
+                                jit_unsup = jst.unsupported_functions,
+                                jit_entries = jst.baseline_entries,
+                                jit_osr = jst.osr_entries,
+                                gc_minor = self.vm.heap.minor_collections(),
+                                gc_major = self.vm.heap.major_collections(),
+                                heap_alloc = self.vm.heap.total_allocated(),
+                                "script profile"
+                            );
+                        }
                         self.host.borrow_mut().current_script = None;
                         if let Err(err) = res {
                             let msg = format_eval_error(&self.vm, &err);
@@ -991,6 +1021,11 @@ impl ContentRuntime {
         // Execute deferred classic scripts (with `document.currentScript` bound per HTML §4.12.1.1)
         // and ES modules in document order before DOMContentLoaded.
         for script in deferred_scripts {
+            let t_sc = std::time::Instant::now();
+            let (sr0, ly0) = {
+                let h = self.host.borrow();
+                (h.style_recalc_count, h.layout_count)
+            };
             if script.is_module {
                 self.host.borrow_mut().current_script = None;
                 match ModuleLoader::load_and_evaluate(&module_loader, &mut self.vm, &script.url) {
@@ -1015,11 +1050,54 @@ impl ContentRuntime {
                     errors.push(msg);
                 }
             }
+            let sc_ms = t_sc.elapsed().as_secs_f32() * 1000.0;
+            if sc_ms >= 25.0 {
+                let (sr1, ly1) = {
+                    let h = self.host.borrow();
+                    (h.style_recalc_count, h.layout_count)
+                };
+                let jst = self.jit.stats();
+                tracing::debug!(
+                    phase = if script.is_module { "module" } else { "defer_script" },
+                    url = %script.url,
+                    bytes = script.code.len(),
+                    ms = format_args!("{sc_ms:.1}"),
+                    style_recalcs = sr1.saturating_sub(sr0),
+                    layouts = ly1.saturating_sub(ly0),
+                    jit_compiled = jst.compiled_functions,
+                    jit_unsup = jst.unsupported_functions,
+                    jit_entries = jst.baseline_entries,
+                    jit_osr = jst.osr_entries,
+                    gc_minor = self.vm.heap.minor_collections(),
+                    gc_major = self.vm.heap.major_collections(),
+                    heap_alloc = self.vm.heap.total_allocated(),
+                    "script profile"
+                );
+            }
         }
 
+        let t_dcl = std::time::Instant::now();
+        let (sr0, ly0) = {
+            let h = self.host.borrow();
+            (h.style_recalc_count, h.layout_count)
+        };
         self.host.borrow_mut().ready_state = "interactive".to_string();
         let doc_root = self.host.borrow().document.borrow().root();
         let _ = self.dispatch_node_event(doc_root, "DOMContentLoaded", true, true, &[]);
+        let dcl_ms = t_dcl.elapsed().as_secs_f32() * 1000.0;
+        if dcl_ms >= 25.0 {
+            let (sr1, ly1) = {
+                let h = self.host.borrow();
+                (h.style_recalc_count, h.layout_count)
+            };
+            tracing::debug!(
+                phase = "DOMContentLoaded",
+                ms = format_args!("{dcl_ms:.1}"),
+                style_recalcs = sr1.saturating_sub(sr0),
+                layouts = ly1.saturating_sub(ly0),
+                "lifecycle profile"
+            );
+        }
 
         sync_all_iframes_in_document(
             &mut self.vm,
@@ -1031,6 +1109,11 @@ impl ContentRuntime {
             &self.frames,
         );
 
+        let t_load = std::time::Instant::now();
+        let (sr0, ly0) = {
+            let h = self.host.borrow();
+            (h.style_recalc_count, h.layout_count)
+        };
         self.host.borrow_mut().ready_state = "complete".to_string();
         let global = self.vm.global;
         fire_object_event(
@@ -1042,6 +1125,20 @@ impl ContentRuntime {
             "load",
             &[],
         );
+        let load_ms = t_load.elapsed().as_secs_f32() * 1000.0;
+        if load_ms >= 25.0 {
+            let (sr1, ly1) = {
+                let h = self.host.borrow();
+                (h.style_recalc_count, h.layout_count)
+            };
+            tracing::debug!(
+                phase = "load",
+                ms = format_args!("{load_ms:.1}"),
+                style_recalcs = sr1.saturating_sub(sr0),
+                layouts = ly1.saturating_sub(ly0),
+                "lifecycle profile"
+            );
+        }
 
         // Execute `<body onload="...">` attribute if present.
         let body_onload = {
@@ -1073,8 +1170,44 @@ impl ContentRuntime {
             }
         }
 
+        let t_drain = std::time::Instant::now();
+        let (sr0, ly0) = {
+            let h = self.host.borrow();
+            (h.style_recalc_count, h.layout_count)
+        };
         self.microtask_checkpoint();
-        drain_ready_tasks(&self.event_loop, &mut self.vm);
+        let tasks_ran = drain_ready_tasks_with_budget(
+            &self.event_loop,
+            &mut self.vm,
+            512,
+            Duration::from_millis(120),
+        );
+        let drain_ms = t_drain.elapsed().as_secs_f32() * 1000.0;
+        if drain_ms >= 25.0 {
+            let (sr1, ly1) = {
+                let h = self.host.borrow();
+                (h.style_recalc_count, h.layout_count)
+            };
+            let jst = self.jit.stats();
+            tracing::debug!(
+                phase = "drain_ready_tasks",
+                tasks_ran,
+                ms = format_args!("{drain_ms:.1}"),
+                style_recalcs = sr1.saturating_sub(sr0),
+                layouts = ly1.saturating_sub(ly0),
+                jit_compiled = jst.compiled_functions,
+                jit_t2l = jst.mem_backed_compiled,
+                jit_b_ms = format_args!("{:.1}", jst.baseline_compile_us as f64 / 1000.0),
+                jit_opt = jst.opt_compiled_functions,
+                jit_o_ms = format_args!("{:.1}", jst.opt_compile_us as f64 / 1000.0),
+                jit_entries = jst.baseline_entries,
+                jit_opt_entries = jst.opt_entries,
+                jit_deopts = jst.deopt_exits,
+                gc_minor = self.vm.heap.minor_collections(),
+                gc_major = self.vm.heap.major_collections(),
+                "lifecycle profile"
+            );
+        }
         errors
     }
 
@@ -1082,13 +1215,13 @@ impl ContentRuntime {
     /// [`BytecodeCache`] for medium/large scripts (`>= 8 KiB`) while compiling small
     /// inline scripts directly in RAM (matching SpiderMonkey JSBC / V8 CodeCache thresholds).
     pub fn eval_script_cached(&mut self, source: &str) -> Result<JsValue, EvalError> {
-        let program = if source.len() < 8_192 {
+        let program = if source.len() < 2_048 {
             rix_js::compile(source, SourceType::Script).map_err(EvalError::Compile)?
         } else {
             let compiled = {
                 let wa = self.web_apis.borrow();
                 let cache = BytecodeCache::new(&wa.storage);
-                cache.compile_or_load(source, SourceType::Script)
+                cache.compile_or_load_with_ram(source, SourceType::Script)
             };
             let (prog, _status) = compiled.map_err(EvalError::Compile)?;
             prog
@@ -1139,19 +1272,38 @@ impl ContentRuntime {
     /// - `(true, false)`: Tier-2 Baseline/OSR only (disables Tier-3 speculation)
     /// - `(false, _)`: pure bytecode interpreter (JIT detached for strict security hardening)
     pub fn configure_jit(&mut self, enable_baseline: bool, enable_opt: bool) {
+        self.configure_jit_with_cache(
+            enable_baseline,
+            enable_opt,
+            rix_js::BASELINE_THRESHOLD,
+            rix_js::OSR_THRESHOLD,
+            rix_js::OPT_THRESHOLD,
+            None,
+        );
+    }
+
+    /// Configures the Cranelift multi-tier JIT engine with custom tier thresholds and an optional
+    /// browser-scoped [`rix_jit::SharedBaselineCache`] for zero-recompile warm reloads.
+    pub fn configure_jit_with_cache(
+        &mut self,
+        enable_baseline: bool,
+        enable_opt: bool,
+        baseline_threshold: u32,
+        osr_threshold: u32,
+        opt_threshold: u32,
+        shared_cache: Option<rix_jit::SharedBaselineCache>,
+    ) {
         if !enable_baseline {
             self.vm.detach_jit();
             return;
         }
-        let jit = if enable_opt {
-            rix_jit::TieredJit::new()
-        } else {
-            rix_jit::TieredJit::with_tier_thresholds(
-                rix_js::BASELINE_THRESHOLD,
-                rix_js::OSR_THRESHOLD,
-                u32::MAX,
-            )
-        };
+        let eff_opt = if enable_opt { opt_threshold } else { u32::MAX };
+        let jit = rix_jit::TieredJit::with_tier_thresholds_and_cache(
+            baseline_threshold,
+            osr_threshold,
+            eff_opt,
+            shared_cache,
+        );
         self.vm.attach_jit(jit.clone());
         self.jit = jit;
     }
@@ -1239,7 +1391,12 @@ impl ContentRuntime {
             progressed = true;
         }
 
-        let ran = drain_ready_tasks(&self.event_loop, &mut self.vm);
+        let ran = drain_ready_tasks_with_budget(
+            &self.event_loop,
+            &mut self.vm,
+            256,
+            Duration::from_millis(40),
+        );
         if ran > 0 {
             progressed = true;
         }

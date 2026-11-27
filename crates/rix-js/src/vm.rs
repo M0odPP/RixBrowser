@@ -164,7 +164,7 @@ struct CallFrame {
     ret_dst: Option<usize>,
     construct_obj: Option<HeapHandle>,
     new_target: JsValue,
-    call_args: Vec<JsValue>,
+    call_args: smallvec::SmallVec<[JsValue; 4]>,
     arguments_obj: Option<HeapHandle>,
 }
 
@@ -311,6 +311,7 @@ pub struct JsVm {
     pub max_loop_iterations: Option<u64>,
     pub loop_iterations: u64,
     native_call_depth: u32,
+    jit_native_depth: u32,
     /// Active `new.target` during a `NativeFunction` constructor invocation (`undefined` if called).
     pub native_new_target: JsValue,
     /// Shared atomic flag checked on every `Opcode::LoopBack`.
@@ -671,6 +672,7 @@ impl JsVm {
             max_loop_iterations: None,
             loop_iterations: 0,
             native_call_depth: 0,
+            jit_native_depth: 0,
             native_new_target: JsValue::UNDEFINED,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             call_counts: Vec::new(),
@@ -1193,7 +1195,7 @@ impl JsVm {
             }
             None => return Err(self.type_error("newTarget is not a constructor")),
         };
-        if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(callee).map(|o| o.kind.clone()) {
+        if let Some(p) = self.heap.get_proxy(callee) {
             if p.revoked {
                 return Err(self.type_error("Cannot perform 'construct' on a revoked Proxy"));
             }
@@ -1275,7 +1277,10 @@ impl JsVm {
         construct_obj: Option<HeapHandle>,
         new_target: JsValue,
     ) -> Result<JsValue, JsException> {
-        const MAX_NATIVE_CALL_DEPTH: u32 = 160;
+        #[cfg(debug_assertions)]
+        const MAX_NATIVE_CALL_DEPTH: u32 = 64;
+        #[cfg(not(debug_assertions))]
+        const MAX_NATIVE_CALL_DEPTH: u32 = 256;
         if self.native_call_depth >= MAX_NATIVE_CALL_DEPTH {
             return Err(self.range_error("Maximum call stack size exceeded"));
         }
@@ -1283,6 +1288,73 @@ impl JsVm {
         let res = self.call_handle_inner(callee, this_val, args, construct_obj, new_target);
         self.native_call_depth -= 1;
         res
+    }
+
+    /// Fast iterative JS-to-JS closure call that pushes a heap-allocated `CallFrame`
+    /// with zero Rust stack growth (eliminating OS stack overflows on deep React/framework recursion).
+    /// Returns `Ok(true)` if a frame was pushed, or `Ok(false)` to fall back to `call_value`.
+    #[inline]
+    fn try_push_sync_closure_call(
+        &mut self,
+        callee_val: JsValue,
+        this_val: JsValue,
+        args: &[JsValue],
+        ret_dst: usize,
+    ) -> Result<bool, JsException> {
+        let Some(callee) = callee_val.as_object() else {
+            return Ok(false);
+        };
+        let (program_id, func_idx, bound_this) = {
+            let Some(o) = self.heap.get_object(callee) else {
+                return Ok(false);
+            };
+            if o.rare
+                .as_ref()
+                .and_then(|r| r.class_instance_init)
+                .is_some()
+            {
+                return Ok(false);
+            }
+            match &o.kind {
+                ObjectKind::Closure(cl) => (cl.program_id, cl.func_idx, cl.bound_this),
+                _ => return Ok(false),
+            }
+        };
+        let (is_strict, is_async, is_generator) = {
+            let f = &self.programs[program_id as usize].functions[func_idx as usize];
+            (f.is_strict, f.is_async, f.is_generator)
+        };
+        if is_async || is_generator {
+            return Ok(false);
+        }
+        let effective_this = bound_this.unwrap_or_else(|| {
+            if !is_strict && (this_val.is_undefined() || this_val.is_null()) {
+                JsValue::from_object(self.global)
+            } else {
+                this_val
+            }
+        });
+        self.push_closure_frame(
+            callee,
+            program_id,
+            func_idx,
+            effective_this,
+            args,
+            Some(ret_dst),
+            None,
+            JsValue::UNDEFINED,
+        )?;
+        Ok(true)
+    }
+
+    #[inline]
+    fn can_enter_native_jit(&self) -> bool {
+        #[cfg(debug_assertions)]
+        const MAX_JIT_NATIVE_DEPTH: u32 = 24;
+        #[cfg(not(debug_assertions))]
+        const MAX_JIT_NATIVE_DEPTH: u32 = 128;
+        self.jit_native_depth < MAX_JIT_NATIVE_DEPTH
+            && self.native_call_depth < MAX_JIT_NATIVE_DEPTH
     }
 
     fn call_handle_inner(
@@ -1293,14 +1365,33 @@ impl JsVm {
         construct_obj: Option<HeapHandle>,
         new_target: JsValue,
     ) -> Result<JsValue, JsException> {
+        enum CalleeDispatch {
+            Native(u32),
+            Closure {
+                program_id: u32,
+                func_idx: u32,
+                bound_this: Option<JsValue>,
+            },
+            Bound(Box<crate::heap::BoundFunctionObject>),
+            Proxy(ProxyObject),
+            NotCallable,
+        }
         let (kind, class_init) = self
             .heap
             .get_object(callee)
             .map(|o| {
-                (
-                    o.kind.clone(),
-                    o.rare.as_ref().and_then(|r| r.class_instance_init),
-                )
+                let d = match &o.kind {
+                    ObjectKind::NativeFunction(id) => CalleeDispatch::Native(*id),
+                    ObjectKind::Closure(c) => CalleeDispatch::Closure {
+                        program_id: c.program_id,
+                        func_idx: c.func_idx,
+                        bound_this: c.bound_this,
+                    },
+                    ObjectKind::BoundFunction(bf) => CalleeDispatch::Bound(bf.clone()),
+                    ObjectKind::Proxy(p) => CalleeDispatch::Proxy(*p),
+                    _ => CalleeDispatch::NotCallable,
+                };
+                (d, o.rare.as_ref().and_then(|r| r.class_instance_init))
             })
             .ok_or_else(|| self.type_error("Attempted to call dead object handle"))?;
 
@@ -1314,7 +1405,7 @@ impl JsVm {
         }
 
         match kind {
-            ObjectKind::NativeFunction(id) => {
+            CalleeDispatch::Native(id) => {
                 // Execute native Rust callback cleanly via temporary borrow split.
                 let callable = match self.native_fns.get(id as usize) {
                     Some(NativeCallable::Static(fp)) => NativeInv::Static(*fp),
@@ -1334,7 +1425,7 @@ impl JsVm {
                 self.native_new_target = prev_nt;
                 res
             }
-            ObjectKind::BoundFunction(bound) => {
+            CalleeDispatch::Bound(bound) => {
                 let mut combined = Vec::with_capacity(bound.bound_args.len() + args.len());
                 combined.extend_from_slice(&bound.bound_args);
                 combined.extend_from_slice(args);
@@ -1345,7 +1436,7 @@ impl JsVm {
                 };
                 self.call_handle(bound.target, eff_this, &combined, construct_obj, new_target)
             }
-            ObjectKind::Proxy(p) => {
+            CalleeDispatch::Proxy(p) => {
                 if p.revoked {
                     return Err(self.type_error("Cannot perform 'apply' on a revoked Proxy"));
                 }
@@ -1370,13 +1461,16 @@ impl JsVm {
                 }
                 self.call_handle(p.target, this_val, args, construct_obj, new_target)
             }
-            ObjectKind::Closure(closure) => {
+            CalleeDispatch::Closure {
+                program_id,
+                func_idx,
+                bound_this,
+            } => {
                 let (is_strict, is_async, is_generator) = {
-                    let f = &self.programs[closure.program_id as usize].functions
-                        [closure.func_idx as usize];
+                    let f = &self.programs[program_id as usize].functions[func_idx as usize];
                     (f.is_strict, f.is_async, f.is_generator)
                 };
-                let effective_this = closure.bound_this.unwrap_or_else(|| {
+                let effective_this = bound_this.unwrap_or_else(|| {
                     if !is_strict && (this_val.is_undefined() || this_val.is_null()) {
                         JsValue::from_object(self.global)
                     } else {
@@ -1387,8 +1481,8 @@ impl JsVm {
                     let gen_h = crate::promise::create_async_generator(
                         self,
                         callee,
-                        closure.program_id,
-                        closure.func_idx,
+                        program_id,
+                        func_idx,
                         effective_this,
                         args,
                     )?;
@@ -1398,8 +1492,8 @@ impl JsVm {
                     let gen_h = crate::promise::create_generator(
                         self,
                         callee,
-                        closure.program_id,
-                        closure.func_idx,
+                        program_id,
+                        func_idx,
                         effective_this,
                         args,
                     )?;
@@ -1409,8 +1503,8 @@ impl JsVm {
                     let prom_h = crate::promise::start_async_call(
                         self,
                         callee,
-                        closure.program_id,
-                        closure.func_idx,
+                        program_id,
+                        func_idx,
                         effective_this,
                         args,
                     );
@@ -1419,8 +1513,8 @@ impl JsVm {
                 let entry_depth = self.frames.len();
                 self.push_closure_frame(
                     callee,
-                    closure.program_id,
-                    closure.func_idx,
+                    program_id,
+                    func_idx,
                     effective_this,
                     args,
                     None,
@@ -1429,7 +1523,7 @@ impl JsVm {
                 )?;
                 self.run_loop(entry_depth)
             }
-            _ => Err(self.type_error("Object is not callable")),
+            CalleeDispatch::NotCallable => Err(self.type_error("Object is not callable")),
         }
     }
 
@@ -1445,7 +1539,7 @@ impl JsVm {
         construct_obj: Option<HeapHandle>,
         new_target: JsValue,
     ) -> Result<(), JsException> {
-        if self.frames.len() >= 1024 {
+        if self.frames.len() >= 2_048 {
             return Err(self.range_error("Maximum call stack size exceeded"));
         }
         let (reg_count, param_count) = {
@@ -1485,7 +1579,7 @@ impl JsVm {
             ret_dst,
             construct_obj,
             new_target,
-            call_args: args.to_vec(),
+            call_args: smallvec::SmallVec::from_slice(args),
             arguments_obj: None,
         });
         Ok(())
@@ -1651,7 +1745,7 @@ impl JsVm {
             };
 
             // Tier-2/3 JIT function entry hook when pc == 0 and function call count reached threshold.
-            if pc == 0 && !skip_jit_once {
+            if pc == 0 && !skip_jit_once && self.can_enter_native_jit() {
                 if let Some(jit) = self.jit.clone() {
                     let call_cnt = self
                         .call_counts
@@ -1666,14 +1760,17 @@ impl JsVm {
                         .copied()
                         .unwrap_or(0);
                     if call_cnt >= jit.baseline_threshold() || back_cnt >= jit.osr_threshold() {
-                        match jit.try_enter(
+                        self.jit_native_depth += 1;
+                        let outcome = jit.try_enter(
                             self,
                             prog_id as u32,
                             func_idx as u32,
                             0,
                             call_cnt,
                             back_cnt,
-                        ) {
+                        );
+                        self.jit_native_depth -= 1;
+                        match outcome {
                             JitOutcome::Returned(val) => {
                                 if let Some(top_ret) = self.pop_frame_with_value(val, stop_depth) {
                                     return Ok(RunOutcome::Completed(top_ret));
@@ -1715,8 +1812,9 @@ impl JsVm {
                 continue;
             };
 
-            let step_res =
-                self.dispatch_op(op, inst, prog_id, func_idx, base, frame_idx, stop_depth);
+            let step_res = self.dispatch_op(
+                op, inst, prog_id, func_idx, base, frame_idx, stop_depth, true,
+            );
             match step_res {
                 Ok(StepOutcome::Continue) => {}
                 Ok(StepOutcome::ReturnTop(val)) => return Ok(RunOutcome::Completed(val)),
@@ -1792,6 +1890,7 @@ impl JsVm {
         base: usize,
         frame_idx: usize,
         stop_depth: usize,
+        allow_iterative_call: bool,
     ) -> Result<StepOutcome, JsException> {
         let a = base + usize::from(inst.a());
         match op {
@@ -2538,19 +2637,35 @@ impl JsVm {
                     let call_pc = self.frames[frame_idx].pc.saturating_sub(1);
                     self.record_call_feedback(prog_id as u32, func_idx as u32, call_pc, callee);
                 }
-                let res = if argc <= 8 {
+                if argc <= 8 {
                     let mut buf = [JsValue::UNDEFINED; 8];
                     for (i, slot) in buf.iter_mut().take(argc).enumerate() {
                         *slot = self.registers[call_base + 1 + i];
                     }
-                    self.call_value(callee, JsValue::UNDEFINED, &buf[..argc])?
+                    if allow_iterative_call
+                        && self.try_push_sync_closure_call(
+                            callee,
+                            JsValue::UNDEFINED,
+                            &buf[..argc],
+                            a,
+                        )?
+                    {
+                        return Ok(StepOutcome::Continue);
+                    }
+                    let res = self.call_value(callee, JsValue::UNDEFINED, &buf[..argc])?;
+                    self.registers[a] = res;
                 } else {
                     let args: Vec<JsValue> = (0..argc)
                         .map(|i| self.registers[call_base + 1 + i])
                         .collect();
-                    self.call_value(callee, JsValue::UNDEFINED, &args)?
-                };
-                self.registers[a] = res;
+                    if allow_iterative_call
+                        && self.try_push_sync_closure_call(callee, JsValue::UNDEFINED, &args, a)?
+                    {
+                        return Ok(StepOutcome::Continue);
+                    }
+                    let res = self.call_value(callee, JsValue::UNDEFINED, &args)?;
+                    self.registers[a] = res;
+                }
             }
             Opcode::DirectEval => {
                 let call_base = base + usize::from(inst.b());
@@ -2625,38 +2740,60 @@ impl JsVm {
                         self.type_error(format!("Property '{prop}' is not a function (got {got})"))
                     );
                 }
-                let res = if argc <= 8 {
+                if argc <= 8 {
                     let mut buf = [JsValue::UNDEFINED; 8];
                     for (i, slot) in buf.iter_mut().take(argc).enumerate() {
                         *slot = self.registers[call_base + 1 + i];
                     }
-                    self.call_value(method, recv, &buf[..argc])?
+                    if allow_iterative_call
+                        && self.try_push_sync_closure_call(method, recv, &buf[..argc], a)?
+                    {
+                        return Ok(StepOutcome::Continue);
+                    }
+                    let res = self.call_value(method, recv, &buf[..argc])?;
+                    self.registers[a] = res;
                 } else {
                     let args: Vec<JsValue> = (0..argc)
                         .map(|i| self.registers[call_base + 1 + i])
                         .collect();
-                    self.call_value(method, recv, &args)?
-                };
-                self.registers[a] = res;
+                    if allow_iterative_call
+                        && self.try_push_sync_closure_call(method, recv, &args, a)?
+                    {
+                        return Ok(StepOutcome::Continue);
+                    }
+                    let res = self.call_value(method, recv, &args)?;
+                    self.registers[a] = res;
+                }
             }
             Opcode::CallWithThis => {
                 let call_base = base + usize::from(inst.b());
                 let argc = usize::from(inst.c());
                 let callee = self.registers[call_base];
                 let recv = self.registers[call_base + 1];
-                let res = if argc <= 8 {
+                if argc <= 8 {
                     let mut buf = [JsValue::UNDEFINED; 8];
                     for (i, slot) in buf.iter_mut().take(argc).enumerate() {
                         *slot = self.registers[call_base + 2 + i];
                     }
-                    self.call_value(callee, recv, &buf[..argc])?
+                    if allow_iterative_call
+                        && self.try_push_sync_closure_call(callee, recv, &buf[..argc], a)?
+                    {
+                        return Ok(StepOutcome::Continue);
+                    }
+                    let res = self.call_value(callee, recv, &buf[..argc])?;
+                    self.registers[a] = res;
                 } else {
                     let args: Vec<JsValue> = (0..argc)
                         .map(|i| self.registers[call_base + 2 + i])
                         .collect();
-                    self.call_value(callee, recv, &args)?
-                };
-                self.registers[a] = res;
+                    if allow_iterative_call
+                        && self.try_push_sync_closure_call(callee, recv, &args, a)?
+                    {
+                        return Ok(StepOutcome::Continue);
+                    }
+                    let res = self.call_value(callee, recv, &args)?;
+                    self.registers[a] = res;
+                }
             }
             Opcode::CallSpread => {
                 let call_base = base + usize::from(inst.b());
@@ -3073,38 +3210,45 @@ impl JsVm {
                 self.frames[frame_idx].pc = target_pc;
 
                 // Tier-2 On-Stack Replacement (OSR) at hot loop back-edges.
-                if let Some(jit) = self.jit.clone() {
-                    let back_cnt = self
-                        .back_edge_counts
-                        .get(prog_id)
-                        .and_then(|v| v.get(func_idx))
-                        .copied()
-                        .unwrap_or(0);
-                    if back_cnt >= jit.osr_threshold() {
-                        let call_cnt = self
-                            .call_counts
+                if self.can_enter_native_jit() {
+                    if let Some(jit) = self.jit.clone() {
+                        let back_cnt = self
+                            .back_edge_counts
                             .get(prog_id)
                             .and_then(|v| v.get(func_idx))
                             .copied()
                             .unwrap_or(0);
-                        match jit.try_enter(
-                            self,
-                            prog_id as u32,
-                            func_idx as u32,
-                            target_pc,
-                            call_cnt,
-                            back_cnt,
-                        ) {
-                            JitOutcome::Returned(val) => {
-                                if let Some(top_ret) = self.pop_frame_with_value(val, stop_depth) {
-                                    return Ok(StepOutcome::ReturnTop(top_ret));
+                        if back_cnt >= jit.osr_threshold() {
+                            let call_cnt = self
+                                .call_counts
+                                .get(prog_id)
+                                .and_then(|v| v.get(func_idx))
+                                .copied()
+                                .unwrap_or(0);
+                            self.jit_native_depth += 1;
+                            let outcome = jit.try_enter(
+                                self,
+                                prog_id as u32,
+                                func_idx as u32,
+                                target_pc,
+                                call_cnt,
+                                back_cnt,
+                            );
+                            self.jit_native_depth -= 1;
+                            match outcome {
+                                JitOutcome::Returned(val) => {
+                                    if let Some(top_ret) =
+                                        self.pop_frame_with_value(val, stop_depth)
+                                    {
+                                        return Ok(StepOutcome::ReturnTop(top_ret));
+                                    }
                                 }
+                                JitOutcome::Threw(exc) => return Err(exc),
+                                JitOutcome::Deopt { resume_pc } => {
+                                    self.frames[frame_idx].pc = resume_pc;
+                                }
+                                JitOutcome::Fallback => {}
                             }
-                            JitOutcome::Threw(exc) => return Err(exc),
-                            JitOutcome::Deopt { resume_pc } => {
-                                self.frames[frame_idx].pc = resume_pc;
-                            }
-                            JitOutcome::Fallback => {}
                         }
                     }
                 }
@@ -3669,7 +3813,7 @@ impl JsVm {
         ic_idx: usize,
         key: PropertyKey,
     ) -> Result<JsValue, JsException> {
-        if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
+        if let Some(p) = self.heap.get_proxy(obj) {
             return self.proxy_get(p, key, receiver);
         }
         let (receiver_shape, receiver_proto) = self
@@ -3681,8 +3825,7 @@ impl JsVm {
         let mut cur = Some(obj);
         let idx_opt = self.key_as_array_index(key);
         while let Some(holder) = cur {
-            if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(holder).map(|o| o.kind.clone())
-            {
+            if let Some(p) = self.heap.get_proxy(holder) {
                 return crate::proxy::proxy_get_trap(self, p, key, receiver);
             }
             if let Some(idx) = idx_opt {
@@ -3817,7 +3960,7 @@ impl JsVm {
         val: JsValue,
     ) -> Result<(), JsException> {
         let is_strict = self.programs[prog_id].functions[func_idx].is_strict;
-        if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
+        if let Some(p) = self.heap.get_proxy(obj) {
             let ok = self.proxy_set(p, key, val, JsValue::from_object(obj))?;
             if !ok && is_strict {
                 return Err(self.type_error("'set' on proxy returned falsy"));
@@ -3828,8 +3971,7 @@ impl JsVm {
         // Check existing own property or inherited setter on prototype chain.
         let mut cur = Some(obj);
         while let Some(holder) = cur {
-            if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(holder).map(|o| o.kind.clone())
-            {
+            if let Some(p) = self.heap.get_proxy(holder) {
                 let ok =
                     crate::proxy::proxy_set_trap(self, p, key, val, JsValue::from_object(obj))?;
                 if !ok && is_strict {
@@ -3966,7 +4108,7 @@ impl JsVm {
         key: PropertyKey,
         receiver: JsValue,
     ) -> Result<JsValue, JsException> {
-        if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
+        if let Some(p) = self.heap.get_proxy(obj) {
             return self.proxy_get(p, key, receiver);
         }
         if matches!(
@@ -3981,8 +4123,7 @@ impl JsVm {
         let mut cur = Some(obj);
         let idx_opt = self.key_as_array_index(key);
         while let Some(holder) = cur {
-            if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(holder).map(|o| o.kind.clone())
-            {
+            if let Some(p) = self.heap.get_proxy(holder) {
                 return crate::proxy::proxy_get_trap(self, p, key, receiver);
             }
             if let Some(idx) = idx_opt {
@@ -4022,7 +4163,7 @@ impl JsVm {
         val: JsValue,
         receiver: JsValue,
     ) -> Result<bool, JsException> {
-        if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
+        if let Some(p) = self.heap.get_proxy(obj) {
             return crate::proxy::proxy_set_trap(self, p, key, val, receiver);
         }
         if receiver == JsValue::from_object(obj) {
@@ -4116,7 +4257,7 @@ impl JsVm {
         {
             return Err(self.type_error("Cannot set property on WebAssembly GC object"));
         }
-        if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
+        if let Some(p) = self.heap.get_proxy(obj) {
             return crate::proxy::proxy_set_trap(self, p, key, val, JsValue::from_object(obj));
         }
         if matches!(
@@ -4128,8 +4269,7 @@ impl JsVm {
         }
         let mut cur = Some(obj);
         while let Some(holder) = cur {
-            if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(holder).map(|o| o.kind.clone())
-            {
+            if let Some(p) = self.heap.get_proxy(holder) {
                 return crate::proxy::proxy_set_trap(self, p, key, val, JsValue::from_object(obj));
             }
             if let Some(prop) = self.heap.object_get_own(holder, key, &self.shapes) {
@@ -4172,8 +4312,7 @@ impl JsVm {
         let idx_opt = self.key_as_array_index(key);
         let mut cur = Some(obj);
         while let Some(holder) = cur {
-            if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(holder).map(|o| o.kind.clone())
-            {
+            if let Some(p) = self.heap.get_proxy(holder) {
                 return crate::proxy::proxy_has_trap(self, p, key);
             }
             if let Some(o) = self.heap.get_object(holder) {
@@ -4219,7 +4358,7 @@ impl JsVm {
         {
             return Err(self.type_error("Cannot delete property on WebAssembly GC object"));
         }
-        if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
+        if let Some(p) = self.heap.get_proxy(obj) {
             return crate::proxy::proxy_delete_trap(self, p, key);
         }
         if let Some(prop) = self.heap.object_get_own(obj, key, &self.shapes) {
@@ -4319,7 +4458,7 @@ impl JsVm {
             let k = self.heap.intern_key(&ks);
             return self.get_property_with_receiver(proto, k, obj_val);
         };
-        if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
+        if let Some(p) = self.heap.get_proxy(obj) {
             let ks = self.to_property_key(key_val)?;
             let k = self.heap.intern_key(&ks);
             return self.proxy_get(p, k, obj_val);
@@ -4377,7 +4516,7 @@ impl JsVm {
         } else {
             key_val
         };
-        if let Some(ObjectKind::Proxy(p)) = self.heap.get_object(obj).map(|o| o.kind.clone()) {
+        if let Some(p) = self.heap.get_proxy(obj) {
             let ks = self.to_property_key(key_val)?;
             let k = self.heap.intern_key(&ks);
             return self.proxy_set(p, k, val, obj_val);
@@ -5984,10 +6123,11 @@ impl JsVm {
         if !self.is_callable_handle(ctor_h) {
             return Ok(false);
         }
-        while let Some(ObjectKind::BoundFunction(bf)) =
-            self.heap.get_object(ctor_h).map(|o| o.kind.clone())
-        {
-            ctor_h = bf.target;
+        while let Some(target) = self.heap.get_object(ctor_h).and_then(|o| match &o.kind {
+            ObjectKind::BoundFunction(bf) => Some(bf.target),
+            _ => None,
+        }) {
+            ctor_h = target;
         }
         let Some(lhs_h) = val.as_object() else {
             return Ok(false);
@@ -6882,7 +7022,7 @@ impl JsVm {
             return Err(self.type_error("Invalid bytecode opcode"));
         };
         let stop_depth = self.frames.len();
-        let _ = self.dispatch_op(op, inst, p, f, base, frame_idx, stop_depth)?;
+        let _ = self.dispatch_op(op, inst, p, f, base, frame_idx, stop_depth, false)?;
         Ok(self.frames[frame_idx].pc)
     }
 

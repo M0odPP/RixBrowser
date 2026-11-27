@@ -1096,9 +1096,13 @@ fn object_create(vm: &mut JsVm, _this: JsValue, args: &[JsValue]) -> Result<JsVa
     } else {
         return Err(vm.type_error("Object prototype may only be an Object or null"));
     };
-    let obj = vm
-        .heap
-        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, None));
+    let mut obj_data = JsObject::with_kind(ObjectKind::Ordinary, None);
+    // Standard JS idiom: `Object.create(null)` is widely used as a dynamic hash map; start in
+    // dictionary mode directly (matching V8/SpiderMonkey/JSC) to avoid hidden-class thrashing.
+    if proto.is_none() {
+        obj_data.shape_id = crate::shape::ShapeId::DICTIONARY.0;
+    }
+    let obj = vm.heap.alloc_object(obj_data);
     vm.heap.object_set_prototype(obj, proto, &mut vm.shapes);
     if let Some(&props_arg) = args.get(1) {
         if !props_arg.is_undefined() {

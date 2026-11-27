@@ -157,6 +157,8 @@ pub struct RuleIndex {
     elements: SelectorBuckets,
     host_rules: Vec<RuleBucketEntry>,
     pseudo_by_kind: HashMap<RixPseudoElement, SelectorBuckets>,
+    /// True when any rule is inserted into multiple selector buckets (e.g. multi-branch `:is()`/`:where()`).
+    pub has_multi_bucket_rules: bool,
     /// Global flag indicating whether any rule contains a `:has(...)` selector.
     pub has_relative_selectors: bool,
     /// True when any rule contains a `:has(...)` selector in a non-subject compound
@@ -176,6 +178,10 @@ pub struct RuleIndex {
     pub has_attr_fn_rules: bool,
     /// True when any custom property (`--*`) declaration invokes `attr(...)`.
     pub has_attr_custom_props: bool,
+    /// Specific custom property names (`--*`) whose declarations invoke `attr(...)` (up to 8;
+    /// if more than 8 distinct custom properties use `attr()`, falls back to `has_attr_custom_props`).
+    pub attr_custom_prop_names: SmallVec<[InternedStr; 8]>,
+    pub attr_custom_prop_overflow: bool,
     /// Per-document deterministic seed for CSS Values L5 `random()`.
     pub random_doc_seed: u64,
     /// True when any rule is enclosed in an `@scope` block.
@@ -222,6 +228,7 @@ impl RuleIndex {
             elements: SelectorBuckets::default(),
             host_rules: Vec::new(),
             pseudo_by_kind: HashMap::new(),
+            has_multi_bucket_rules: false,
             has_relative_selectors: false,
             has_non_subject_has: false,
             allows_sibling_sharing: true,
@@ -229,6 +236,8 @@ impl RuleIndex {
             has_sibling_or_random_custom_props: false,
             has_attr_fn_rules: false,
             has_attr_custom_props: false,
+            attr_custom_prop_names: SmallVec::new(),
+            attr_custom_prop_overflow: false,
             random_doc_seed: crate::values::EvalContext::default().random_doc_seed,
             has_scope_rules: false,
             has_container_queries: false,
@@ -375,6 +384,17 @@ impl RuleIndex {
                         index.has_attr_fn_rules = true;
                         if d.property == crate::properties::PropertyIdKind::Custom {
                             index.has_attr_custom_props = true;
+                            if let Some(ref cname) = d.custom_name {
+                                if !index.attr_custom_prop_names.contains(cname) {
+                                    if index.attr_custom_prop_names.len() < 8 {
+                                        index.attr_custom_prop_names.push(cname.clone());
+                                    } else {
+                                        index.attr_custom_prop_overflow = true;
+                                    }
+                                }
+                            } else {
+                                index.attr_custom_prop_overflow = true;
+                            }
                         }
                     }
                 }
@@ -432,6 +452,10 @@ impl RuleIndex {
     ) {
         out.clear();
         self.elements.collect(elem, bloom, out);
+        if self.has_multi_bucket_rules && out.len() > 1 {
+            out.sort_unstable();
+            out.dedup();
+        }
     }
 
     /// Collects candidate rule indices for a pseudo-element on an originating element,
@@ -448,6 +472,10 @@ impl RuleIndex {
             return;
         };
         buckets.collect(elem, bloom, out);
+        if self.has_multi_bucket_rules && out.len() > 1 {
+            out.sort_unstable();
+            out.dedup();
+        }
     }
 
     /// Returns true if any rule targets `:host` or `:host(...)`.
@@ -470,6 +498,19 @@ impl RuleIndex {
         self.pseudo_by_kind
             .get(&pseudo)
             .is_some_and(|b| !b.is_empty())
+    }
+
+    #[must_use]
+    pub fn universal_rule_count(&self) -> usize {
+        self.elements.universal.len()
+    }
+
+    #[must_use]
+    pub fn pseudo_universal_rule_count(&self) -> usize {
+        self.pseudo_by_kind
+            .values()
+            .map(|b| b.universal.len())
+            .sum()
     }
 
     /// Marks ONLY DOM elements potentially affected by a newly appended `sheet` as
@@ -619,11 +660,13 @@ impl RuleIndex {
     }
 
     fn insert_bucket(&mut self, selector: &Selector<RixSelectorImpl>, entry: RuleBucketEntry) {
+        type BucketKeyTuple = (Option<u64>, Option<u64>, Option<u64>, Option<u64>);
         let mut iter = selector.iter();
         let mut best_id: Option<u64> = None;
         let mut best_class: Option<u64> = None;
         let mut best_tag: Option<u64> = None;
         let mut best_attr: Option<u64> = None;
+        let mut multi_branch_keys: SmallVec<[BucketKeyTuple; 8]> = SmallVec::new();
         let mut is_host_subject = false;
         let mut pseudo_kind: Option<RixPseudoElement> = None;
 
@@ -660,6 +703,25 @@ impl RuleIndex {
                         &mut best_attr,
                     );
                 }
+                Component::Is(list) | Component::Where(list)
+                    if (2..=8).contains(&list.slice().len()) && multi_branch_keys.is_empty() =>
+                {
+                    let mut all_keyed = true;
+                    let mut tmp = SmallVec::<[BucketKeyTuple; 8]>::new();
+                    for sub in list.slice() {
+                        let (mut bi, mut bc, mut bt, mut ba) = (None, None, None, None);
+                        extract_simple_key(sub, &mut bi, &mut bc, &mut bt, &mut ba);
+                        if bi.is_some() || bc.is_some() || bt.is_some() || ba.is_some() {
+                            tmp.push((bi, bc, bt, ba));
+                        } else {
+                            all_keyed = false;
+                            break;
+                        }
+                    }
+                    if all_keyed {
+                        multi_branch_keys = tmp;
+                    }
+                }
                 _ => {}
             }
         }
@@ -667,6 +729,7 @@ impl RuleIndex {
         // In the `selectors` crate, `.foo::before` separates `[PseudoElement(Before)]` from the
         // originating element's compound (`[Class("foo")]`) with `Combinator::PseudoElement`.
         if let Some(pe) = pseudo_kind {
+            multi_branch_keys.clear();
             if matches!(iter.next_sequence(), Some(Combinator::PseudoElement)) {
                 for comp in iter.by_ref() {
                     match comp {
@@ -699,19 +762,62 @@ impl RuleIndex {
                                 &mut best_attr,
                             );
                         }
+                        Component::Is(list) | Component::Where(list)
+                            if (2..=8).contains(&list.slice().len())
+                                && multi_branch_keys.is_empty() =>
+                        {
+                            let mut all_keyed = true;
+                            let mut tmp = SmallVec::<[BucketKeyTuple; 8]>::new();
+                            for sub in list.slice() {
+                                let (mut bi, mut bc, mut bt, mut ba) = (None, None, None, None);
+                                extract_simple_key(sub, &mut bi, &mut bc, &mut bt, &mut ba);
+                                if bi.is_some() || bc.is_some() || bt.is_some() || ba.is_some() {
+                                    tmp.push((bi, bc, bt, ba));
+                                } else {
+                                    all_keyed = false;
+                                    break;
+                                }
+                            }
+                            if all_keyed {
+                                multi_branch_keys = tmp;
+                            }
+                        }
                         _ => {}
                     }
                 }
             }
-            self.pseudo_by_kind
-                .entry(pe)
-                .or_default()
-                .insert(best_id, best_class, best_tag, best_attr, entry);
+            if best_id.is_none()
+                && best_class.is_none()
+                && best_tag.is_none()
+                && best_attr.is_none()
+                && !multi_branch_keys.is_empty()
+            {
+                self.has_multi_bucket_rules = true;
+                let bucket_map = self.pseudo_by_kind.entry(pe).or_default();
+                for (bi, bc, bt, ba) in multi_branch_keys {
+                    bucket_map.insert(bi, bc, bt, ba, entry.clone());
+                }
+            } else {
+                self.pseudo_by_kind
+                    .entry(pe)
+                    .or_default()
+                    .insert(best_id, best_class, best_tag, best_attr, entry);
+            }
             return;
         }
 
         if is_host_subject {
             self.host_rules.push(entry);
+        } else if best_id.is_none()
+            && best_class.is_none()
+            && best_tag.is_none()
+            && best_attr.is_none()
+            && !multi_branch_keys.is_empty()
+        {
+            self.has_multi_bucket_rules = true;
+            for (bi, bc, bt, ba) in multi_branch_keys {
+                self.elements.insert(bi, bc, bt, ba, entry.clone());
+            }
         } else {
             self.elements
                 .insert(best_id, best_class, best_tag, best_attr, entry);

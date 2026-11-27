@@ -13,6 +13,7 @@ pub struct Document {
     arena: Arena<NodeData>,
     root: NodeId,
     revision: u64,
+    structural_revision: u64,
     style_revision: u64,
     script_revision: u64,
     uid: u64,
@@ -48,6 +49,7 @@ impl Document {
             arena,
             root,
             revision: 0,
+            structural_revision: 0,
             style_revision: 0,
             script_revision: 0,
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -156,6 +158,16 @@ impl Document {
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Monotonic counter incremented ONLY on structural/text/intrinsic-attribute DOM mutations
+    /// (unchanged by style-only/class/attribute edits so paint-only restyles can skip layout).
+    pub fn structural_revision(&self) -> u64 {
+        self.structural_revision
+    }
+
+    pub fn bump_structural_revision(&mut self) {
+        self.structural_revision = self.structural_revision.wrapping_add(1);
     }
 
     pub fn style_revision(&self) -> u64 {
@@ -273,6 +285,7 @@ impl Document {
 
     pub fn bump_revision(&mut self) {
         self.revision = self.revision.wrapping_add(1);
+        self.structural_revision = self.structural_revision.wrapping_add(1);
     }
 
     pub fn bump_style_revision(&mut self) {
@@ -718,6 +731,7 @@ impl Document {
         parent.append(child, &mut self.arena);
         if self.is_connected(parent) {
             self.revision = self.revision.wrapping_add(1);
+            self.structural_revision = self.structural_revision.wrapping_add(1);
             self.style_revision = self.style_revision.wrapping_add(1);
             self.mark_style(parent);
             self.mark_node_dirty(
@@ -746,6 +760,7 @@ impl Document {
         target.insert_before(new_child, &mut self.arena);
         if self.is_connected(target) {
             self.revision = self.revision.wrapping_add(1);
+            self.structural_revision = self.structural_revision.wrapping_add(1);
             self.style_revision = self.style_revision.wrapping_add(1);
             if let Some(parent) = self.parent(target) {
                 self.mark_style(parent);
@@ -796,6 +811,7 @@ impl Document {
         child.detach(&mut self.arena);
         if connected {
             self.revision = self.revision.wrapping_add(1);
+            self.structural_revision = self.structural_revision.wrapping_add(1);
             self.style_revision = self.style_revision.wrapping_add(1);
             if let Some(parent) = parent {
                 self.mark_style(parent);
@@ -826,6 +842,7 @@ impl Document {
     pub fn get_mut(&mut self, id: NodeId) -> Option<&mut NodeData> {
         if self.is_connected(id) && self.arena.get(id).is_some() {
             self.revision = self.revision.wrapping_add(1);
+            self.structural_revision = self.structural_revision.wrapping_add(1);
             self.style_revision = self.style_revision.wrapping_add(1);
             self.mark_style_dirty(id);
             self.mark_node_dirty(

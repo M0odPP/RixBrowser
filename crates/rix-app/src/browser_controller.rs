@@ -169,6 +169,7 @@ pub struct BrowserController {
     fetch_engine: Arc<FetchEngine>,
     resource_manager: ResourceManager,
     asset_cache: DecodedAssetCache,
+    jit_code_cache: rix_content::SharedBaselineCache,
     preconnector: SpeculativePreconnector,
     runtime: tokio::runtime::Runtime,
     tabs_doc: HashMap<TabId, TabDocumentState>,
@@ -210,9 +211,16 @@ impl BrowserController {
             .unwrap_or_else(|| {
                 StorageEngine::in_memory().expect("in-memory StorageEngine initializes")
             });
-        let http_cache = Arc::new(HttpCache::new(
-            data_dir.as_ref().map(|dir| dir.join("http_cache")),
-        ));
+        let http_cache_dir = data_dir
+            .as_ref()
+            .map(|dir| dir.join("http_cache"))
+            .or_else(|| {
+                std::env::var("RIX_HTTP_CACHE_DIR")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+            });
+        let http_cache = Arc::new(HttpCache::new(http_cache_dir));
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -270,6 +278,7 @@ impl BrowserController {
             fetch_engine,
             resource_manager,
             asset_cache: DecodedAssetCache::new(),
+            jit_code_cache: rix_content::new_shared_baseline_cache(),
             preconnector: SpeculativePreconnector::new(),
             runtime,
             tabs_doc,
@@ -368,6 +377,16 @@ impl BrowserController {
     /// Returns the exact delay until the next wakeup is needed, or `None` when the tab is
     /// completely idle (`IDLE 0 Hz` — allowing the window event loop to sleep in `ControlFlow::Wait`).
     pub fn tick_active_tab(&mut self) -> Option<Duration> {
+        self.tick_active_tab_inner(true)
+    }
+
+    /// Same as [`Self::tick_active_tab`], but defers `sync_layers()` so batched headless settle
+    /// loops avoid rebuilding full layout and display lists before presenting the final frame.
+    pub fn tick_active_tab_no_sync(&mut self) -> Option<Duration> {
+        self.tick_active_tab_inner(false)
+    }
+
+    fn tick_active_tab_inner(&mut self, sync_layers: bool) -> Option<Duration> {
         let active_id = self.chrome.active().id;
         let active_url = self.chrome.active().url.clone();
         let (progressed, next_delay, console_msgs, surfaces_updated) = {
@@ -409,7 +428,7 @@ impl BrowserController {
                 self.overlay_dirty = true;
             }
         }
-        if progressed || surfaces_updated > 0 {
+        if sync_layers && (progressed || surfaces_updated > 0) {
             self.sync_layers();
         }
         next_delay
@@ -429,9 +448,10 @@ impl BrowserController {
         };
         self.http_client.set_storage(storage_for_http);
         let jit_mode = self.chrome.settings.jit_mode;
+        let jit_cache = self.jit_code_cache.clone();
         for tab_doc in self.tabs_doc.values_mut() {
             if let Some(ref mut rt) = tab_doc.runtime {
-                configure_runtime_jit(rt, jit_mode);
+                configure_runtime_jit(rt, jit_mode, &jit_cache);
             }
         }
     }
@@ -796,7 +816,7 @@ impl BrowserController {
             self.storage.clone(),
             Some(Arc::clone(&self.fetch_engine)),
         );
-        configure_runtime_jit(&mut rt, self.chrome.settings.jit_mode);
+        configure_runtime_jit(&mut rt, self.chrome.settings.jit_mode, &self.jit_code_cache);
         {
             let mut host = rt.host.borrow_mut();
             host.set_dark_mode(dark_mode);
@@ -1115,18 +1135,30 @@ impl BrowserController {
         let (resp_res, cache_hit) = if method == FormMethod::Get && body.is_empty() {
             let now = now_secs();
             if let Some(entry) = self.http_cache.get(parsed_url.as_str()) {
-                if entry.is_fresh(now) {
+                if entry.meta.is_fresh_or_swr(now) {
                     (Ok(self.http_cache.to_http_response(&entry, now)), true)
                 } else {
-                    (
-                        self.runtime.block_on(self.http_client.request(
-                            &parsed_url,
-                            method_str,
-                            &headers,
-                            body,
-                        )),
-                        false,
-                    )
+                    if let Some(ref etag) = entry.meta.etag {
+                        headers.insert("If-None-Match".to_string(), etag.clone());
+                    }
+                    if let Some(ref lm) = entry.meta.last_modified {
+                        headers.insert("If-Modified-Since".to_string(), lm.clone());
+                    }
+                    match self.runtime.block_on(self.http_client.request(
+                        &parsed_url,
+                        method_str,
+                        &headers,
+                        body,
+                    )) {
+                        Ok(resp) if resp.status == 304 => {
+                            let updated = self
+                                .http_cache
+                                .update_revalidated(parsed_url.as_str(), &resp.headers, now)
+                                .unwrap_or(entry);
+                            (Ok(self.http_cache.to_http_response(&updated, now)), true)
+                        }
+                        other => (other, false),
+                    }
                 }
             } else {
                 (
@@ -2448,10 +2480,34 @@ fn wrap_web_display_list(
     out
 }
 
-fn configure_runtime_jit(rt: &mut ContentRuntime, mode: JitMode) {
+fn configure_runtime_jit(
+    rt: &mut ContentRuntime,
+    mode: JitMode,
+    shared_cache: &rix_content::SharedBaselineCache,
+) {
+    // Browser content sessions use cost-balanced JIT tier thresholds (128 calls / 384 loop edges /
+    // 2,000 calls for Tier-3) plus a session-scoped W^X code cache so warm reloads incur 0 ms
+    // Cranelift recompilation while avoiding compiling cold hydration glue functions.
+    const BROWSER_BASELINE_THRESHOLD: u32 = 128;
+    const BROWSER_OSR_THRESHOLD: u32 = 384;
+    const BROWSER_OPT_THRESHOLD: u32 = 2_000;
     match mode {
-        JitMode::FullThreeTier => rt.configure_jit(true, true),
-        JitMode::BaselineOnly => rt.configure_jit(true, false),
+        JitMode::FullThreeTier => rt.configure_jit_with_cache(
+            true,
+            true,
+            BROWSER_BASELINE_THRESHOLD,
+            BROWSER_OSR_THRESHOLD,
+            BROWSER_OPT_THRESHOLD,
+            Some(shared_cache.clone()),
+        ),
+        JitMode::BaselineOnly => rt.configure_jit_with_cache(
+            true,
+            false,
+            BROWSER_BASELINE_THRESHOLD,
+            BROWSER_OSR_THRESHOLD,
+            u32::MAX,
+            Some(shared_cache.clone()),
+        ),
         JitMode::InterpreterOnly => rt.configure_jit(false, false),
     }
 }

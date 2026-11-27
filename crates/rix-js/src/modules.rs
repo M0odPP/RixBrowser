@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::ast::SourceType;
 use crate::bytecode::{CompiledProgram, ModuleBlueprint, ModuleImportKind};
-use crate::compiler::{compile, CompileError};
+use crate::compiler::CompileError;
 use crate::heap::{ClosureObject, JsObject, ObjectKind, PromiseReaction};
 use crate::promise::{
     alloc_promise, attach_promise_reaction, create_resolving_functions, reject_promise,
@@ -487,10 +487,12 @@ impl ModuleLoader {
                     raw_source
                 };
                 let compiled: CompiledProgram =
-                    compile(&source, SourceType::Module).map_err(|e| ModuleError::Compile {
-                        url: url.clone(),
-                        source: e,
-                    })?;
+                    crate::cache::compile_cached_in_memory(&source, SourceType::Module).map_err(
+                        |e| ModuleError::Compile {
+                            url: url.clone(),
+                            source: e,
+                        },
+                    )?;
                 let blueprint = compiled.module.clone().unwrap_or_default();
                 let entry_func = compiled.entry_func;
 

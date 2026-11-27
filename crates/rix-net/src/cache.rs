@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_MAX_MEM_ENTRIES: usize = 256;
+const DEFAULT_MAX_MEM_ENTRIES: usize = 1024;
+const MAX_MEM_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CacheControlDirectives {
@@ -19,6 +20,7 @@ pub struct CacheControlDirectives {
     pub no_cache: bool,
     pub max_age: Option<u64>,
     pub s_maxage: Option<u64>,
+    pub stale_while_revalidate: Option<u64>,
     pub immutable: bool,
     pub must_revalidate: bool,
     pub public: bool,
@@ -57,6 +59,14 @@ impl CacheControlDirectives {
                         let clean = v.trim_matches('"');
                         if let Ok(secs) = clean.parse::<u64>() {
                             directives.s_maxage = Some(secs);
+                        }
+                    }
+                }
+                "stale-while-revalidate" => {
+                    if let Some(v) = val {
+                        let clean = v.trim_matches('"');
+                        if let Ok(secs) = clean.parse::<u64>() {
+                            directives.stale_while_revalidate = Some(secs);
                         }
                     }
                 }
@@ -100,10 +110,16 @@ pub struct HttpCacheMeta {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub max_age: Option<u64>,
+    #[serde(default)]
+    pub stale_while_revalidate: Option<u64>,
     pub expires: Option<u64>,
     pub immutable: bool,
     pub must_revalidate: bool,
     pub no_cache: bool,
+    #[serde(default)]
+    pub vary: Option<String>,
+    #[serde(default)]
+    pub req_headers: HashMap<String, String>,
     pub body_len: usize,
 }
 
@@ -122,18 +138,20 @@ impl HttpCacheMeta {
                 return (diff / 10).min(7 * 86400);
             }
         }
-        // RFC 9111 §4.2.2: Heuristic freshness for static assets (images, SVGs, fonts, media) or responses with ETag
+        // RFC 9111 §4.2.2: Heuristic freshness for static assets (images, SVGs, fonts, CSS/JS) or responses with ETag
+        let path_no_q = self.url.split(['?', '#']).next().unwrap_or(&self.url);
         let is_static_asset = self.content_type.starts_with("image/")
             || self.content_type.starts_with("font/")
             || self.content_type.contains("svg")
-            || self.url.ends_with(".svg")
-            || self.url.ends_with(".png")
-            || self.url.ends_with(".jpg")
-            || self.url.ends_with(".jpeg")
-            || self.url.ends_with(".webp")
-            || self.url.ends_with(".woff2")
-            || self.url.ends_with(".woff")
-            || self.url.ends_with(".ttf");
+            || path_no_q.ends_with(".svg")
+            || path_no_q.ends_with(".png")
+            || path_no_q.ends_with(".jpg")
+            || path_no_q.ends_with(".jpeg")
+            || path_no_q.ends_with(".webp")
+            || path_no_q.ends_with(".avif")
+            || path_no_q.ends_with(".woff2")
+            || path_no_q.ends_with(".woff")
+            || path_no_q.ends_with(".ttf");
         if is_static_asset {
             return 86400; // 24 hours default for images/svg/fonts without explicit headers
         }
@@ -159,6 +177,46 @@ impl HttpCacheMeta {
         let age = self.current_age(now);
         let lifetime = self.freshness_lifetime();
         age < lifetime
+    }
+
+    /// RFC 9111 + RFC 5861: returns `true` when fresh OR within the `stale-while-revalidate` window.
+    pub fn is_fresh_or_swr(&self, now: u64) -> bool {
+        if self.no_cache {
+            return false;
+        }
+        let age = self.current_age(now);
+        let lifetime = self.freshness_lifetime();
+        let swr = self.stale_while_revalidate.unwrap_or(0);
+        age < lifetime.saturating_add(swr)
+    }
+
+    /// RFC 9111 §4.1: verifies `Vary` request-header equivalence against `req_headers`.
+    pub fn vary_matches(&self, req_headers: &HashMap<String, String>) -> bool {
+        let Some(ref vary) = self.vary else {
+            return true;
+        };
+        for field in vary.split(',') {
+            let name = field.trim().to_ascii_lowercase();
+            if name.is_empty() {
+                continue;
+            }
+            if name == "*" {
+                return false;
+            }
+            let a = self
+                .req_headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+                .map_or("", |(_, v)| v.as_str());
+            let b = req_headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+                .map_or("", |(_, v)| v.as_str());
+            if a != b {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn can_revalidate(&self) -> bool {
@@ -300,6 +358,15 @@ impl HttpCache {
     }
 
     pub fn put(&self, url_str: &str, response: &HttpResponse) -> Result<()> {
+        self.put_with_req_headers(url_str, response, &HashMap::new())
+    }
+
+    pub fn put_with_req_headers(
+        &self,
+        url_str: &str,
+        response: &HttpResponse,
+        req_headers: &HashMap<String, String>,
+    ) -> Result<()> {
         if response.status != 200 && response.status != 301 && response.status != 308 {
             return Ok(());
         }
@@ -316,6 +383,7 @@ impl HttpCache {
 
         let etag = response.headers.get("etag").cloned();
         let last_modified = response.headers.get("last-modified").cloned();
+        let vary = response.headers.get("vary").cloned();
         let response_date = response
             .headers
             .get("date")
@@ -339,10 +407,13 @@ impl HttpCache {
             etag,
             last_modified,
             max_age,
+            stale_while_revalidate: cc.stale_while_revalidate,
             expires,
             immutable: cc.immutable,
             must_revalidate: cc.must_revalidate,
             no_cache: cc.no_cache,
+            vary,
+            req_headers: req_headers.clone(),
             body_len: response.body.len(),
         };
 
@@ -352,12 +423,22 @@ impl HttpCache {
         };
 
         if let Ok(mut guard) = self.l1_mem.write() {
-            if guard.len() >= self.max_mem_entries && !guard.contains_key(url_str) {
+            let mut cur_bytes: usize = guard.values().map(|e| e.body.len()).sum();
+            while (guard.len() >= self.max_mem_entries
+                || cur_bytes.saturating_add(entry.body.len()) > MAX_MEM_CACHE_BYTES)
+                && !guard.is_empty()
+            {
                 if let Some(first_key) = guard.keys().next().cloned() {
-                    guard.remove(&first_key);
+                    if let Some(evicted) = guard.remove(&first_key) {
+                        cur_bytes = cur_bytes.saturating_sub(evicted.body.len());
+                    }
+                } else {
+                    break;
                 }
             }
-            guard.insert(url_str.to_string(), entry);
+            if entry.body.len() <= MAX_MEM_CACHE_BYTES / 2 {
+                guard.insert(url_str.to_string(), entry);
+            }
         }
 
         if let Some((meta_path, body_path)) = self.paths_for(url_str) {
@@ -404,6 +485,7 @@ impl HttpCache {
         if let Some(cc_val) = meta.headers.get("cache-control") {
             let cc = CacheControlDirectives::parse(cc_val);
             meta.max_age = cc.max_age.or(cc.s_maxage);
+            meta.stale_while_revalidate = cc.stale_while_revalidate;
             meta.immutable = cc.immutable;
             meta.must_revalidate = cc.must_revalidate;
             meta.no_cache = cc.no_cache;
@@ -530,10 +612,13 @@ mod tests {
             etag: Some("\"xyz\"".to_string()),
             last_modified: None,
             max_age: Some(300),
+            stale_while_revalidate: Some(600),
             expires: None,
             immutable: false,
             must_revalidate: false,
             no_cache: false,
+            vary: Some("Accept-Encoding".to_string()),
+            req_headers: HashMap::new(),
             body_len: 1024,
         };
 
@@ -542,6 +627,7 @@ mod tests {
         assert!(meta.is_fresh(now));
 
         assert!(!meta.is_fresh(now + 250));
+        assert!(meta.is_fresh_or_swr(now + 250));
         assert!(meta.can_revalidate());
 
         meta.immutable = true;
@@ -569,10 +655,13 @@ mod tests {
             etag: None,
             last_modified: Some(lm_str),
             max_age: None,
+            stale_while_revalidate: None,
             expires: None,
             immutable: false,
             must_revalidate: false,
             no_cache: false,
+            vary: None,
+            req_headers: HashMap::new(),
             body_len: 512,
         };
 
@@ -596,10 +685,13 @@ mod tests {
             etag: None,
             last_modified: None,
             max_age: None,
+            stale_while_revalidate: None,
             expires: None,
             immutable: false,
             must_revalidate: false,
             no_cache: false,
+            vary: None,
+            req_headers: HashMap::new(),
             body_len: 2048,
         };
 

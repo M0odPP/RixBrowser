@@ -32,9 +32,19 @@ use crate::stylesheet::{
 };
 use crate::ua::default_ua_stylesheet;
 
-const PARALLEL_CHILD_THRESHOLD: usize = 32;
-const MIN_PARALLEL_CHUNK_SIZE: usize = 8;
+const PARALLEL_CHILD_THRESHOLD: usize = 4;
+const MIN_PARALLEL_CHUNK_SIZE: usize = 1;
 const SIBLING_CACHE_SLOTS: usize = 32;
+
+#[derive(Default)]
+struct CascadeDebugTimers {
+    enabled: bool,
+    match_ns: std::sync::atomic::AtomicU64,
+    resolve_ns: std::sync::atomic::AtomicU64,
+    pseudo_ns: std::sync::atomic::AtomicU64,
+    cands_total: std::sync::atomic::AtomicU64,
+    matched_total: std::sync::atomic::AtomicU64,
+}
 
 /// Fast FNV-1a hasher for internal per-document `NodeId`, custom property, and memo maps.
 #[derive(Default)]
@@ -1024,7 +1034,10 @@ impl StyleContext {
     /// Performs a full parallel top-down cascade starting at `doc_root` (supports sub-documents
     /// such as same-origin `iframe.contentDocument`).
     pub fn cascade_full_from(&mut self, doc: &mut Document, doc_root: NodeId) -> RestyleReport {
+        let t0 = std::time::Instant::now();
         self.ensure_index();
+        let idx_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        let t1 = std::time::Instant::now();
         self.styles.clear();
         self.pseudo_styles.clear();
 
@@ -1042,6 +1055,10 @@ impl StyleContext {
         let mut caches = SelectorCaches::default();
         let mut memo = StyleMemo::with_capacity(256);
         let mut active_containers: Vec<ActiveContainer> = Vec::new();
+        let dbg_timers = CascadeDebugTimers {
+            enabled: tracing::enabled!(tracing::Level::DEBUG),
+            ..CascadeDebugTimers::default()
+        };
 
         for child in root_children {
             cascade_subtree_par(
@@ -1050,7 +1067,7 @@ impl StyleContext {
                 None,
                 false,
                 16.0,
-                true,
+                3,
                 None,
                 &self.ua_sheet,
                 &self.shadow_adopted_sheets,
@@ -1066,6 +1083,7 @@ impl StyleContext {
                 &mut pseudo_results,
                 &mut missing_local,
                 &mut report,
+                &dbg_timers,
             );
         }
 
@@ -1084,7 +1102,43 @@ impl StyleContext {
         for ((id, pe), style) in pseudo_results {
             self.pseudo_styles.insert((id, pe), style);
         }
+        let walk_ms = t1.elapsed().as_secs_f32() * 1000.0;
+        let t2 = std::time::Instant::now();
         self.apply_post_cascade_animations(doc, &styled_ids, None);
+        let anim_ms = t2.elapsed().as_secs_f32() * 1000.0;
+        let total_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        if total_ms >= 25.0 {
+            use std::sync::atomic::Ordering;
+            tracing::debug!(
+                total_ms = format_args!("{total_ms:.1}"),
+                idx_ms = format_args!("{idx_ms:.1}"),
+                walk_ms = format_args!("{walk_ms:.1}"),
+                anim_ms = format_args!("{anim_ms:.1}"),
+                match_ms = format_args!(
+                    "{:.1}",
+                    dbg_timers.match_ns.load(Ordering::Relaxed) as f64 / 1e6
+                ),
+                resolve_ms = format_args!(
+                    "{:.1}",
+                    dbg_timers.resolve_ns.load(Ordering::Relaxed) as f64 / 1e6
+                ),
+                pseudo_ms = format_args!(
+                    "{:.1}",
+                    dbg_timers.pseudo_ns.load(Ordering::Relaxed) as f64 / 1e6
+                ),
+                cands = dbg_timers.cands_total.load(Ordering::Relaxed),
+                matched = dbg_timers.matched_total.load(Ordering::Relaxed),
+                elements = report.restyled_elements,
+                memo_hits = report.shared_memo_hits,
+                rules = self.rule_index.rules.len(),
+                univ = self.rule_index.universal_rule_count(),
+                pseudo_univ = self.rule_index.pseudo_universal_rule_count(),
+                has_rel = self.rule_index.has_relative_selectors,
+                has_attr_cp = self.rule_index.has_attr_custom_props,
+                sib_share = self.rule_index.allows_sibling_sharing,
+                "cascade_full profile"
+            );
+        }
         doc.clear_dirty_flags(
             doc_root,
             DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::DESCENDANT_STYLE_DIRTY,
@@ -1436,7 +1490,7 @@ fn cascade_subtree_par(
     parent_style: Option<&Arc<ComputedStyle>>,
     layout_parent_flex_grid: bool,
     root_font_size: f32,
-    allow_parallel: bool,
+    par_depth: u8,
     shadow_host: Option<selectors::OpaqueElement>,
     ua_sheet: &Arc<Stylesheet>,
     shadow_adopted: &HashMap<NodeId, Vec<Arc<Stylesheet>>>,
@@ -1452,6 +1506,7 @@ fn cascade_subtree_par(
     out_pseudos: &mut Vec<((NodeId, RixPseudoElement), Arc<ComputedStyle>)>,
     out_missing: &mut Vec<MissingCssFeature>,
     report: &mut RestyleReport,
+    dbg_timers: &CascadeDebugTimers,
 ) {
     let Some(NodeData::Element(elem)) = doc.get(node) else {
         return;
@@ -1478,6 +1533,7 @@ fn cascade_subtree_par(
         caches,
         memo,
         out_missing,
+        Some(dbg_timers),
     );
     report.restyled_elements += 1;
     if hit {
@@ -1491,6 +1547,7 @@ fn cascade_subtree_par(
     };
     let next_lp_fg = next_layout_parent_flex_grid(&style, layout_parent_flex_grid);
 
+    let t_ps = dbg_timers.enabled.then(std::time::Instant::now);
     collect_pseudo_element_styles(
         doc,
         node,
@@ -1505,6 +1562,12 @@ fn cascade_subtree_par(
         memo,
         out_pseudos,
     );
+    if let Some(tp) = t_ps {
+        dbg_timers.pseudo_ns.fetch_add(
+            tp.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     out_styles.push((node, Arc::clone(&style)));
 
     let pushed_container =
@@ -1533,7 +1596,7 @@ fn cascade_subtree_par(
                     Some(&style),
                     next_lp_fg,
                     next_root_font,
-                    false,
+                    0,
                     host_opaque,
                     ua_sheet,
                     shadow_adopted,
@@ -1549,6 +1612,7 @@ fn cascade_subtree_par(
                     out_pseudos,
                     out_missing,
                     report,
+                    dbg_timers,
                 );
             }
         }
@@ -1564,7 +1628,7 @@ fn cascade_subtree_par(
     let dom_el = DomElement::new(doc, node);
     push_bloom_hashes(&dom_el, bloom);
 
-    if allow_parallel && elem_children.len() >= PARALLEL_CHILD_THRESHOLD {
+    if par_depth > 0 && elem_children.len() >= PARALLEL_CHILD_THRESHOLD {
         let parent_arc = Arc::clone(&style);
         let bloom_snapshot = bloom.clone();
         let container_snapshot = active_containers.clone();
@@ -1573,6 +1637,7 @@ fn cascade_subtree_par(
             .len()
             .div_ceil(threads)
             .max(MIN_PARALLEL_CHUNK_SIZE);
+        let next_par_depth = par_depth - 1;
         let chunk_outputs: Vec<_> = elem_children
             .par_chunks(chunk_size)
             .map(|chunk| {
@@ -1592,7 +1657,7 @@ fn cascade_subtree_par(
                         Some(&parent_arc),
                         next_lp_fg,
                         next_root_font,
-                        false,
+                        next_par_depth,
                         shadow_host,
                         ua_sheet,
                         shadow_adopted,
@@ -1608,6 +1673,7 @@ fn cascade_subtree_par(
                         &mut local_pseudos,
                         &mut local_missing,
                         &mut local_report,
+                        dbg_timers,
                     );
                 }
                 (local_styles, local_pseudos, local_missing, local_report)
@@ -1629,7 +1695,7 @@ fn cascade_subtree_par(
                 Some(&style),
                 next_lp_fg,
                 next_root_font,
-                allow_parallel,
+                par_depth,
                 shadow_host,
                 ua_sheet,
                 shadow_adopted,
@@ -1645,6 +1711,7 @@ fn cascade_subtree_par(
                 out_pseudos,
                 out_missing,
                 report,
+                dbg_timers,
             );
         }
     }
@@ -1885,6 +1952,7 @@ fn restyle_dirty_walk(
             caches,
             memo,
             missing_out,
+            None,
         );
         report.restyled_elements += 1;
         if hit {
@@ -1907,6 +1975,8 @@ fn restyle_dirty_walk(
             memo,
             &mut pseudos,
         );
+        let mut old_pseudos: smallvec::SmallVec<[(RixPseudoElement, Arc<ComputedStyle>); 2]> =
+            smallvec::SmallVec::new();
         for pe in [
             RixPseudoElement::Before,
             RixPseudoElement::After,
@@ -1918,9 +1988,28 @@ fn restyle_dirty_walk(
             RixPseudoElement::FileSelectorButton,
             RixPseudoElement::DetailsContent,
         ] {
-            pseudo_styles.remove(&(node, pe));
+            if let Some(prev_ps) = pseudo_styles.remove(&(node, pe)) {
+                old_pseudos.push((pe, prev_ps));
+            }
+        }
+        let mut pseudo_layout_changed = false;
+        let mut pseudo_paint_changed = false;
+        if old_pseudos.len() != pseudos.len() {
+            pseudo_layout_changed = true;
         }
         for ((nid, pe), pstyle) in pseudos {
+            if !pseudo_layout_changed {
+                match old_pseudos.iter().find(|(ope, _)| *ope == pe) {
+                    Some((_, prev)) => {
+                        if !prev.layout_eq(&pstyle) {
+                            pseudo_layout_changed = true;
+                        } else if **prev != *pstyle {
+                            pseudo_paint_changed = true;
+                        }
+                    }
+                    None => pseudo_layout_changed = true,
+                }
+            }
             pseudo_styles.insert((nid, pe), pstyle);
         }
 
@@ -1938,11 +2027,11 @@ fn restyle_dirty_walk(
             .unwrap_or(new_style);
 
         if let Some(old_style) = old_style_opt {
-            if !old_style.layout_eq(&final_style) {
+            if !old_style.layout_eq(&final_style) || pseudo_layout_changed {
                 layout_dirty.push(node);
                 report.layout_dirty_count += 1;
                 style_changed = true;
-            } else if *old_style != *final_style {
+            } else if *old_style != *final_style || pseudo_paint_changed {
                 paint_dirty.push(node);
                 report.paint_only_count += 1;
                 style_changed = true;
@@ -2165,6 +2254,7 @@ fn compute_single_element_style(
     caches: &mut SelectorCaches,
     memo: &mut StyleMemo,
     missing_out: &mut Vec<MissingCssFeature>,
+    dbg_timers: Option<&CascadeDebugTimers>,
 ) -> (Arc<ComputedStyle>, bool) {
     let has_own_shadow_host_rules = own_shadow_index.is_some_and(RuleIndex::has_host_rules);
     let parent_ptr = parent_style.map_or(0, |p| Arc::as_ptr(p) as usize);
@@ -2185,6 +2275,9 @@ fn compute_single_element_style(
         }
     }
 
+    let t_match = dbg_timers
+        .filter(|t| t.enabled)
+        .map(|_| std::time::Instant::now());
     let mut candidate_indices = SmallVec::<[u32; 32]>::new();
     rule_index.collect_candidates(elem, bloom, &mut candidate_indices);
 
@@ -2209,6 +2302,15 @@ fn compute_single_element_style(
                 any_scoped = true;
             }
         }
+    }
+    if let (Some(tm), Some(dt)) = (t_match, dbg_timers) {
+        use std::sync::atomic::Ordering;
+        dt.match_ns
+            .fetch_add(tm.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        dt.cands_total
+            .fetch_add(candidate_indices.len() as u64, Ordering::Relaxed);
+        dt.matched_total
+            .fetch_add(matched_indices.len() as u64, Ordering::Relaxed);
     }
 
     let mut host_matched = SmallVec::<[(u32, u32); 8]>::new();
@@ -2244,10 +2346,21 @@ fn compute_single_element_style(
         });
     let uses_attr = rule_index.has_attr_fn_rules
         && matched_indices.iter().any(|&idx| {
-            rule_index.rules[idx as usize].declarations.iter().any(|d| {
-                d.value.contains_attr_fn()
-                    || (rule_index.has_attr_custom_props && d.value.contains_var_fn())
-            })
+            let decls = &rule_index.rules[idx as usize].declarations;
+            decls.iter().any(|d| d.value.contains_attr_fn())
+                || (rule_index.has_attr_custom_props
+                    && (rule_index.attr_custom_prop_overflow
+                        || rule_index.attr_custom_prop_names.iter().any(|name| {
+                            parent_style
+                                .is_some_and(|p| p.custom_properties.get_entry(name).is_some())
+                                || matched_indices.iter().any(|&mi| {
+                                    rule_index.rules[mi as usize]
+                                        .declarations
+                                        .iter()
+                                        .any(|cd| cd.custom_name.as_ref() == Some(name))
+                                })
+                        }))
+                    && decls.iter().any(|d| d.value.contains_var_fn()))
         });
 
     let is_mathml = &*elem.name.ns == "http://www.w3.org/1998/Math/MathML";
@@ -2255,17 +2368,27 @@ fn compute_single_element_style(
         .pseudo_state
         .intersects(ElementState::MODAL | ElementState::POPOVER_OPEN);
 
-    if inline_attr.is_none()
+    let memo_parent_key = if has_active_containers {
+        let (cw, ch) = nearest_size_container(active_containers).unwrap_or((0.0, 0.0));
+        parent_ptr
+            ^ ((cw.to_bits() as usize).wrapping_mul(0x9e37_79b9))
+            ^ ((ch.to_bits() as usize).wrapping_mul(0x85eb_ca6b))
+    } else {
+        parent_ptr
+    };
+    let can_memo = inline_attr.is_none()
         && !has_pres_hints
         && !any_scoped
-        && !has_active_containers
         && !any_sibling_math
         && !uses_attr
         && !is_mathml
         && !is_top_layer
-        && host_matched.is_empty()
-    {
-        if let Some(cached) = memo.lookup(parent_ptr, layout_parent_flex_grid, &matched_indices) {
+        && host_matched.is_empty();
+
+    if can_memo {
+        if let Some(cached) =
+            memo.lookup(memo_parent_key, layout_parent_flex_grid, &matched_indices)
+        {
             if let Some(p_node) = sibling_parent {
                 memo.insert_sibling(p_node, elem, Arc::clone(&cached));
             }
@@ -2321,6 +2444,9 @@ fn compute_single_element_style(
         eff_media.container_width = Some(cw);
         eff_media.container_height = Some(ch);
     }
+    let t_res = dbg_timers
+        .filter(|t| t.enabled)
+        .map(|_| std::time::Instant::now());
     let mut resolved_val = resolve_element_style_with_context(
         &matched_refs,
         &pres_decls,
@@ -2335,6 +2461,12 @@ fn compute_single_element_style(
         rule_index.random_doc_seed,
         &elem.attributes,
     );
+    if let (Some(tr), Some(dt)) = (t_res, dbg_timers) {
+        dt.resolve_ns.fetch_add(
+            tr.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     // CSS Display L3 §2.7: Blockify items whose layout parent (skipping `display: contents`)
     // is a flex or grid container.
     if layout_parent_flex_grid {
@@ -2369,18 +2501,9 @@ fn compute_single_element_style(
     }
     let resolved = Arc::new(resolved_val);
 
-    if inline_attr.is_none()
-        && !has_pres_hints
-        && !any_scoped
-        && !has_active_containers
-        && !any_sibling_math
-        && !uses_attr
-        && !is_mathml
-        && !is_top_layer
-        && host_matched.is_empty()
-    {
+    if can_memo {
         memo.insert(
-            parent_ptr,
+            memo_parent_key,
             layout_parent_flex_grid,
             &matched_indices,
             Arc::clone(&resolved),
@@ -3039,8 +3162,8 @@ fn collect_pseudo_element_styles(
             // CSS Pseudo-Elements L4 §2.2 / CSS Display L3: `::before` and `::after` do not
             // generate boxes unless a matched rule declares `content` (or `all`). Skipping
             // universal non-generated pseudo-element resets (`*, ::before, ::after { ... }`,
-            // specificity <= 1) during bulk cascade avoids 2x full-DOM style work while
-            // `getComputedStyle(el, '::before')` resolves them lazily via
+            // specificity <= 1) during bulk cascade avoids up to 2x full-DOM style work while
+            // `getComputedStyle(el, '::before')` still resolves them lazily via
             // `resolve_pseudo_style_on_demand`.
             if matches!(pseudo, RixPseudoElement::Before | RixPseudoElement::After)
                 && matched.iter().all(|m| m.rule.specificity <= 1)
