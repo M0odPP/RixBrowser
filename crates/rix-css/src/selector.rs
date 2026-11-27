@@ -4,7 +4,9 @@
 //! and `hash_ident_ascii_lower` for tag names) so `BloomFilter` ancestor pruning
 //! works with zero hash-mismatch false negatives.
 
+use std::collections::HashSet;
 use std::fmt;
+use std::sync::{Mutex, OnceLock};
 
 use cssparser::{
     serialize_identifier, serialize_string, CowRcStr, ParseError, Parser as CssParser, ParserInput,
@@ -27,10 +29,26 @@ use selectors::context::{
 };
 use selectors::matching::{matches_selector, ElementSelectorFlags};
 use selectors::parser::{
-    NonTSPseudoClass, ParseRelative, Parser as SelectorsParser, PseudoElement, Selector,
-    SelectorImpl, SelectorList, SelectorParseErrorKind,
+    Component, MatchesFeaturelessHost, NonTSPseudoClass, ParseRelative, Parser as SelectorsParser,
+    PseudoElement, Selector, SelectorImpl, SelectorList, SelectorParseErrorKind,
 };
 use selectors::{Element, OpaqueElement};
+
+/// Deduplicates WebKit-prefixed unknown pseudo-element names into `'static` slices so
+/// [`RixPseudoElement`] remains `Copy` without any `unsafe` code.
+fn intern_webkit_pseudo_name(name: &str) -> &'static str {
+    static POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut guard = POOL
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(&existing) = guard.get(name) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    guard.insert(leaked);
+    leaked
+}
 
 /// Case-sensitive interned CSS identifier with precomputed FNV-1a hash matching `rix-dom`.
 #[derive(Clone, Eq)]
@@ -375,6 +393,31 @@ pub enum RixPseudoElement {
     DetailsContent,
     Cue,
     TargetText,
+    /// Selectors L4 §3.7 compatibility: any unknown `::-webkit-*` pseudo-element parses as valid
+    /// (allowing user-action pseudo-classes), serializes lowercased, and never matches elements.
+    WebKitUnknown(&'static str),
+}
+
+impl RixPseudoElement {
+    /// Stable integer discriminant for pseudo-element random seed mixing.
+    #[must_use]
+    pub fn discriminant_u64(self) -> u64 {
+        match self {
+            Self::Before => 1,
+            Self::After => 2,
+            Self::Marker => 3,
+            Self::Placeholder => 4,
+            Self::Selection => 5,
+            Self::FirstLine => 6,
+            Self::FirstLetter => 7,
+            Self::Backdrop => 8,
+            Self::FileSelectorButton => 9,
+            Self::DetailsContent => 10,
+            Self::Cue => 11,
+            Self::TargetText => 12,
+            Self::WebKitUnknown(_) => 13,
+        }
+    }
 }
 
 impl ToCss for RixPseudoElement {
@@ -392,6 +435,10 @@ impl ToCss for RixPseudoElement {
             Self::DetailsContent => dest.write_str("::details-content"),
             Self::Cue => dest.write_str("::cue"),
             Self::TargetText => dest.write_str("::target-text"),
+            Self::WebKitUnknown(name) => {
+                dest.write_str("::")?;
+                serialize_identifier(name, dest)
+            }
         }
     }
 }
@@ -401,6 +448,10 @@ impl PseudoElement for RixPseudoElement {
 
     fn is_before_or_after(&self) -> bool {
         matches!(self, Self::Before | Self::After)
+    }
+
+    fn accepts_state_pseudo_classes(&self) -> bool {
+        matches!(self, Self::WebKitUnknown(_))
     }
 
     fn valid_after_slotted(&self) -> bool {
@@ -615,6 +666,9 @@ impl<'i> SelectorsParser<'i> for RixSelectorParser<'_> {
             "details-content" => RixPseudoElement::DetailsContent,
             "cue" => RixPseudoElement::Cue,
             "target-text" => RixPseudoElement::TargetText,
+            s if s.starts_with("-webkit-") => {
+                RixPseudoElement::WebKitUnknown(intern_webkit_pseudo_name(s))
+            }
             _ => {
                 return Err(location.new_custom_error(
                     SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name),
@@ -760,6 +814,10 @@ pub struct DomElement<'a> {
     pub doc: &'a Document,
     pub node_id: NodeId,
     pub target_pseudo: Option<RixPseudoElement>,
+    /// True when matching a shadow root's stylesheet against its own shadow host element.
+    /// In this mode the host is featureless per CSS Scoping L1 §3.2, has no siblings in the
+    /// shadow tree, and `:has(...)` descends into the host's shadow root children.
+    pub matching_shadow_host: bool,
 }
 
 impl<'a> DomElement<'a> {
@@ -769,6 +827,7 @@ impl<'a> DomElement<'a> {
             doc,
             node_id,
             target_pseudo: None,
+            matching_shadow_host: false,
         }
     }
 
@@ -778,6 +837,31 @@ impl<'a> DomElement<'a> {
             doc,
             node_id,
             target_pseudo: Some(pseudo),
+            matching_shadow_host: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn for_shadow_host(doc: &'a Document, node_id: NodeId) -> Self {
+        Self {
+            doc,
+            node_id,
+            target_pseudo: None,
+            matching_shadow_host: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn for_shadow_host_pseudo(
+        doc: &'a Document,
+        node_id: NodeId,
+        pseudo: RixPseudoElement,
+    ) -> Self {
+        Self {
+            doc,
+            node_id,
+            target_pseudo: Some(pseudo),
+            matching_shadow_host: true,
         }
     }
 
@@ -855,38 +939,31 @@ impl<'a> Element for DomElement<'a> {
     }
 
     fn prev_sibling_element(&self) -> Option<Self> {
-        let parent = self.doc.parent(self.node_id)?;
-        let mut prev_elem = None;
-        for child in self.doc.children(parent) {
-            if child == self.node_id {
-                return prev_elem.map(|id| Self::new(self.doc, id));
-            }
-            if matches!(self.doc.get(child), Some(NodeData::Element(_))) {
-                prev_elem = Some(child);
-            }
+        if self.matching_shadow_host {
+            return None;
         }
-        None
+        self.doc
+            .previous_element_sibling(self.node_id)
+            .map(|id| Self::new(self.doc, id))
     }
 
     fn next_sibling_element(&self) -> Option<Self> {
-        let parent = self.doc.parent(self.node_id)?;
-        let mut seen_self = false;
-        for child in self.doc.children(parent) {
-            if seen_self {
-                if matches!(self.doc.get(child), Some(NodeData::Element(_))) {
-                    return Some(Self::new(self.doc, child));
-                }
-            } else if child == self.node_id {
-                seen_self = true;
-            }
+        if self.matching_shadow_host {
+            return None;
         }
-        None
+        self.doc
+            .next_element_sibling(self.node_id)
+            .map(|id| Self::new(self.doc, id))
     }
 
     fn first_element_child(&self) -> Option<Self> {
+        let container = if self.matching_shadow_host {
+            self.element_data()?.shadow_root?
+        } else {
+            self.node_id
+        };
         self.doc
-            .children(self.node_id)
-            .into_iter()
+            .children(container)
             .find(|&c| matches!(self.doc.get(c), Some(NodeData::Element(_))))
             .map(|id| Self::new(self.doc, id))
     }
@@ -921,7 +998,9 @@ impl<'a> Element for DomElement<'a> {
 
     fn is_same_type(&self, other: &Self) -> bool {
         match (self.element_data(), other.element_data()) {
-            (Some(a), Some(b)) => a.tag_hash == b.tag_hash && a.name.local == b.name.local,
+            (Some(a), Some(b)) => {
+                a.tag_hash == b.tag_hash && a.name.local == b.name.local && a.name.ns == b.name.ns
+            }
             _ => false,
         }
     }
@@ -1016,13 +1095,28 @@ impl<'a> Element for DomElement<'a> {
             RixPseudoClass::Fullscreen => st.contains(ElementState::FULLSCREEN),
             RixPseudoClass::Autofill => st.contains(ElementState::AUTOFILL),
             RixPseudoClass::Blank => self.is_empty(),
-            RixPseudoClass::Playing
-            | RixPseudoClass::Paused
-            | RixPseudoClass::Muted
-            | RixPseudoClass::Buffering
-            | RixPseudoClass::Stalled
-            | RixPseudoClass::Seeking
-            | RixPseudoClass::VolumeLocked => false,
+            RixPseudoClass::Playing => {
+                self.is_media_element() && st.contains(ElementState::PLAYING)
+            }
+            RixPseudoClass::Paused => {
+                self.is_media_element() && !st.contains(ElementState::PLAYING)
+            }
+            RixPseudoClass::Muted => {
+                self.is_media_element()
+                    && (st.contains(ElementState::MUTED)
+                        || (!st.contains(ElementState::MUTED_DIRTY)
+                            && self.attr_value("muted").is_some()))
+            }
+            RixPseudoClass::Buffering => {
+                self.is_media_element() && st.contains(ElementState::BUFFERING)
+            }
+            RixPseudoClass::Stalled => {
+                self.is_media_element() && st.contains(ElementState::STALLED)
+            }
+            RixPseudoClass::Seeking => {
+                self.is_media_element() && st.contains(ElementState::SEEKING)
+            }
+            RixPseudoClass::VolumeLocked => false,
             RixPseudoClass::HasSlotted => {
                 tag.eq_ignore_ascii_case("slot") && self.has_assigned_slotted_nodes()
             }
@@ -1244,20 +1338,78 @@ impl DomElement<'_> {
         false
     }
 
+    fn is_media_element(&self) -> bool {
+        self.is_html_tag("video") || self.is_html_tag("audio")
+    }
+
     fn is_checked_element(&self) -> bool {
         let Some(elem) = self.element_data() else {
             return false;
         };
         if let Some(ty) = self.input_type_lower() {
             if ty == "checkbox" || ty == "radio" {
+                if elem.pseudo_state.contains(ElementState::CHECKED_DIRTY) {
+                    return elem.pseudo_state.contains(ElementState::CHECKED);
+                }
                 return elem.pseudo_state.contains(ElementState::CHECKED)
                     || self.attr_value("checked").is_some();
             }
             return false;
         }
         if self.is_html_tag("option") {
-            return elem.pseudo_state.contains(ElementState::CHECKED)
-                || self.attr_value("selected").is_some();
+            if elem.pseudo_state.contains(ElementState::CHECKED_DIRTY) {
+                return elem.pseudo_state.contains(ElementState::CHECKED);
+            }
+            if elem.pseudo_state.contains(ElementState::CHECKED)
+                || self.attr_value("selected").is_some()
+            {
+                return true;
+            }
+            // HTML §4.10.10: in a single-select `<select>` (without `multiple` or `size > 1`),
+            // if no `<option>` has explicit selectedness, the first non-disabled `<option>` is
+            // selected by default.
+            let mut anc = self.doc.parent(self.node_id);
+            while let Some(a) = anc {
+                if let Some(NodeData::Element(ae)) = self.doc.get(a) {
+                    if ae.name.local.eq_str_ignore_ascii_case("select") {
+                        let is_multi = ae.has_attribute("multiple")
+                            || ae
+                                .get_attribute("size")
+                                .and_then(|s| s.trim().parse::<u32>().ok())
+                                .is_some_and(|n| n > 1);
+                        if is_multi {
+                            return false;
+                        }
+                        let mut first_enabled = None;
+                        let mut any_explicit = false;
+                        for d in self.doc.descendants(a) {
+                            if let Some(NodeData::Element(oe)) = self.doc.get(d) {
+                                if oe.name.local.eq_str_ignore_ascii_case("option") {
+                                    let sel =
+                                        if oe.pseudo_state.contains(ElementState::CHECKED_DIRTY) {
+                                            oe.pseudo_state.contains(ElementState::CHECKED)
+                                        } else {
+                                            oe.pseudo_state.contains(ElementState::CHECKED)
+                                                || oe.has_attribute("selected")
+                                        };
+                                    if sel {
+                                        any_explicit = true;
+                                        break;
+                                    }
+                                    if first_enabled.is_none()
+                                        && !DomElement::new(self.doc, d).is_actually_disabled()
+                                    {
+                                        first_enabled = Some(d);
+                                    }
+                                }
+                            }
+                        }
+                        return !any_explicit && first_enabled == Some(self.node_id);
+                    }
+                }
+                anc = self.doc.parent(a);
+            }
+            return false;
         }
         false
     }
@@ -1300,10 +1452,7 @@ impl DomElement<'_> {
     }
 
     fn is_placeholder_shown(&self) -> bool {
-        let Some(ph) = self.attr_value("placeholder") else {
-            return false;
-        };
-        if ph.is_empty() {
+        if self.attr_value("placeholder").is_none() {
             return false;
         }
         if self.is_html_tag("textarea") {
@@ -1393,6 +1542,9 @@ impl DomElement<'_> {
 
     /// Returns `Some(true)` if in-range, `Some(false)` if out-of-range, `None` if not range-checked.
     fn range_check(&self) -> Option<bool> {
+        if self.is_actually_disabled() || self.attr_value("readonly").is_some() {
+            return None;
+        }
         let ty = self.input_type_lower()?;
         if !matches!(
             ty.as_str(),
@@ -1508,16 +1660,43 @@ impl DomElement<'_> {
     }
 
     fn heading_level(&self) -> Option<i32> {
-        let tag = self.element_data()?.name.local.as_str();
-        match tag.to_ascii_lowercase().as_str() {
-            "h1" => Some(1),
-            "h2" => Some(2),
-            "h3" => Some(3),
-            "h4" => Some(4),
-            "h5" => Some(5),
-            "h6" => Some(6),
-            _ => None,
+        let elem = self.element_data()?;
+        if &*elem.name.ns != "http://www.w3.org/1999/xhtml" {
+            return None;
         }
+        let base = match elem.name.local.as_str().to_ascii_lowercase().as_str() {
+            "h1" => 1,
+            "h2" => 2,
+            "h3" => 3,
+            "h4" => 4,
+            "h5" => 5,
+            "h6" => 6,
+            _ => return None,
+        };
+        // HTML Living Standard `headingoffset` / `headingreset` algorithm (shadow-host-chain
+        // aware; slotted headings follow DOM/host ancestors, not shadow-tree slot containers).
+        let mut offset: i32 = 0;
+        let mut cur = Some(self.node_id);
+        while let Some(id) = cur {
+            if let Some(NodeData::Element(e)) = self.doc.get(id) {
+                if let Some(raw) = e.get_attribute("headingoffset") {
+                    if let Ok(v) = raw.trim().parse::<i32>() {
+                        offset = offset.saturating_add(v.clamp(0, 8));
+                    }
+                }
+                if e.has_attribute("headingreset") {
+                    break;
+                }
+            }
+            if let Some(p) = self.doc.parent(id) {
+                cur = Some(p);
+            } else if let Some(NodeData::ShadowRoot { host, .. }) = self.doc.get(id) {
+                cur = Some(*host);
+            } else {
+                cur = None;
+            }
+        }
+        Some((base + offset).clamp(1, 9))
     }
 
     fn has_assigned_slotted_nodes(&self) -> bool {
@@ -1574,20 +1753,46 @@ impl DomElement<'_> {
                     return "ltr";
                 }
             }
-            current = self.doc.parent(id);
+            current = if let Some(p) = self.doc.parent(id) {
+                Some(p)
+            } else if let Some(NodeData::ShadowRoot { host, .. }) = self.doc.get(id) {
+                Some(*host)
+            } else {
+                None
+            };
         }
         "ltr"
     }
 
     fn auto_directionality(&self) -> &'static str {
-        // Check `value` attribute on `<input>` / `<textarea>`, otherwise inspect text descendants
-        // (skipping `<script>`, `<style>`, `<textarea>`, `<bdi>`, and elements with valid `dir`).
+        // HTML §3.2.6.4: `<input dir="auto">` only inspects `value` for textual/button/hidden
+        // input types; other types (`date`, `time`, `number`, `range`, `color`, `checkbox`,
+        // `radio`, `image`, `file`, etc.) always resolve to `"ltr"`.
         if let Some(data) = self.element_data() {
             let tag = data.name.local.as_str();
             if tag.eq_ignore_ascii_case("input") {
-                if let Some(val) = self.attr_value("value") {
-                    if let Some(d) = first_strong_bidi_dir(val) {
-                        return d;
+                let ty = self
+                    .attr_value("type")
+                    .unwrap_or("text")
+                    .trim()
+                    .to_ascii_lowercase();
+                if matches!(
+                    ty.as_str(),
+                    "text"
+                        | "search"
+                        | "tel"
+                        | "url"
+                        | "email"
+                        | "password"
+                        | "submit"
+                        | "reset"
+                        | "button"
+                        | "hidden"
+                ) {
+                    if let Some(val) = self.attr_value("value") {
+                        if let Some(d) = first_strong_bidi_dir(val) {
+                            return d;
+                        }
                     }
                 }
                 return "ltr";
@@ -1784,9 +1989,10 @@ pub fn matches_selector_list_with_scope(
     );
     ctx.current_host = shadow_host;
     ctx.scope_element = scope;
-    list.slice()
-        .iter()
-        .any(|sel| matches_selector(sel, 0, None, element, &mut ctx))
+    list.slice().iter().any(|sel| {
+        ctx.featureless = element.matching_shadow_host && !selector_is_host_with_has(sel);
+        matches_selector(sel, 0, None, element, &mut ctx)
+    })
 }
 
 /// Tests whether a single `node` matches `list` with an optional `:scope` element.
@@ -1872,6 +2078,46 @@ pub fn matches_single_selector(
     matches_single_selector_with_scope(selector, element, None, bloom, caches, shadow_host)
 }
 
+/// Returns `true` if `selector`'s subject compound targets `:host` combined with `:has(...)`
+/// (and only featureless-compatible components plus `:has(...)`).
+#[must_use]
+pub fn selector_is_host_with_has(selector: &Selector<RixSelectorImpl>) -> bool {
+    let mut iter = selector.iter();
+    let mut has_host = false;
+    let mut has_rel = false;
+    for comp in iter.by_ref() {
+        match comp {
+            Component::Host(_) => has_host = true,
+            Component::Has(_) => has_rel = true,
+            Component::PseudoElement(_) | Component::Scope | Component::ImplicitScope => {}
+            _ => return false,
+        }
+    }
+    if !has_host || !has_rel {
+        return false;
+    }
+    iter.next_sequence().is_none()
+}
+
+/// Classifies whether `selector` can match a featureless shadow host element (`MatchesFeaturelessHost`),
+/// also treating `:host:has(...)` as host-only so shadow-tree `:has()` rules match the shadow host.
+/// Selectors matching via `:scope` return `Yes` (never `Only`) so ordinary light-DOM `@scope`
+/// rules remain indexed in normal element buckets as well as shadow-host buckets.
+#[must_use]
+pub fn classify_host_selector(selector: &Selector<RixSelectorImpl>) -> MatchesFeaturelessHost {
+    let without_scope = selector.matches_featureless_host(false);
+    if without_scope != MatchesFeaturelessHost::Never {
+        return without_scope;
+    }
+    if selector.matches_featureless_host(true) != MatchesFeaturelessHost::Never {
+        return MatchesFeaturelessHost::Yes;
+    }
+    if selector_is_host_with_has(selector) {
+        return MatchesFeaturelessHost::Only;
+    }
+    MatchesFeaturelessHost::Never
+}
+
 /// Matches a single compiled `Selector` against a `DomElement` with an optional `:scope` root.
 #[must_use]
 pub fn matches_single_selector_with_scope(
@@ -1882,11 +2128,17 @@ pub fn matches_single_selector_with_scope(
     caches: &mut SelectorCaches,
     shadow_host: Option<OpaqueElement>,
 ) -> bool {
+    let use_featureless = element.matching_shadow_host && !selector_is_host_with_has(selector);
     if let Some(target_pseudo) = element.target_pseudo {
         if !selector.has_pseudo_element() {
             return false;
         }
-        let originating = DomElement::new(element.doc, element.node_id);
+        let originating = DomElement {
+            doc: element.doc,
+            node_id: element.node_id,
+            target_pseudo: None,
+            matching_shadow_host: element.matching_shadow_host,
+        };
         let matcher = |pe: &RixPseudoElement| *pe == target_pseudo;
         let mut ctx = MatchingContext::new(
             MatchingMode::ForStatelessPseudoElement,
@@ -1898,6 +2150,7 @@ pub fn matches_single_selector_with_scope(
         );
         ctx.current_host = shadow_host;
         ctx.scope_element = scope;
+        ctx.featureless = use_featureless;
         ctx.pseudo_element_matching_fn = Some(&matcher);
         return matches_selector(selector, 0, None, &originating, &mut ctx);
     }
@@ -1912,5 +2165,6 @@ pub fn matches_single_selector_with_scope(
     );
     ctx.current_host = shadow_host;
     ctx.scope_element = scope;
+    ctx.featureless = use_featureless;
     matches_selector(selector, 0, None, element, &mut ctx)
 }

@@ -242,6 +242,9 @@ a:visited {
     text-decoration: underline;
     cursor: pointer;
 }
+:focus-visible {
+    outline: auto;
+}
 input[type="hidden" i] {
     display: none;
 }

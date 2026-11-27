@@ -528,6 +528,7 @@ impl StyleContext {
                         RixPseudoElement::DetailsContent => "::details-content",
                         RixPseudoElement::Cue => "::cue",
                         RixPseudoElement::TargetText => "::target-text",
+                        RixPseudoElement::WebKitUnknown(_) => continue,
                     };
                     out.push((node, Some(pe_str.to_string()), eff.animations.clone()));
                 }
@@ -750,15 +751,24 @@ impl StyleContext {
         let Some(NodeData::Element(orig_elem)) = doc.get(node) else {
             return None;
         };
-        if !self.rule_index.has_pseudo_rules(pseudo) {
+        let own_shadow_index = orig_elem.shadow_root.map(|sr_id| {
+            build_shadow_rule_index(
+                doc,
+                sr_id,
+                &self.ua_sheet,
+                &self.shadow_adopted_sheets,
+                &self.media,
+            )
+        });
+        let has_host_pseudo = own_shadow_index
+            .as_ref()
+            .is_some_and(|s| s.has_host_pseudo_rules(pseudo));
+        if !self.rule_index.has_pseudo_rules(pseudo) && !has_host_pseudo {
             return None;
         }
         let mut cands = SmallVec::<[u32; 16]>::new();
         self.rule_index
             .collect_pseudo_candidates(pseudo, orig_elem, None, &mut cands);
-        if cands.is_empty() {
-            return None;
-        }
         let pseudo_el = DomElement::with_pseudo(doc, node, pseudo);
         let mut caches = SelectorCaches::default();
         let mut matched: SmallVec<[MatchedRule<'_>; 8]> = SmallVec::new();
@@ -774,6 +784,32 @@ impl StyleContext {
                 });
             }
         }
+        if let Some(ref s_idx) = own_shadow_index {
+            if s_idx.has_host_pseudo_rules(pseudo) {
+                let mut host_cands = SmallVec::<[u32; 16]>::new();
+                s_idx.collect_host_pseudo_candidates(pseudo, &mut host_cands);
+                let host_pseudo_el = DomElement::for_shadow_host_pseudo(doc, node, pseudo);
+                let self_host = Some(DomElement::new(doc, node).opaque());
+                for &idx in &host_cands {
+                    let rule = &s_idx.rules[idx as usize];
+                    if let Some(scope_proximity) = match_rule_with_scopes(
+                        doc,
+                        node,
+                        &host_pseudo_el,
+                        rule,
+                        None,
+                        &mut caches,
+                        self_host,
+                    ) {
+                        matched.push(MatchedRule {
+                            rule,
+                            scope_proximity,
+                            is_shadow_host_rule: true,
+                        });
+                    }
+                }
+            }
+        }
         if matched.is_empty() {
             return None;
         }
@@ -782,7 +818,7 @@ impl StyleContext {
             .find_map(|c| self.styles.get(&c).map(|s| s.text.font_size_px))
             .unwrap_or(16.0);
         let (si, sc) = element_sibling_position(doc, node);
-        let pseudo_nid = (usize::from(node) as u64) ^ (((pseudo as u64) + 1) << 48);
+        let pseudo_nid = (usize::from(node) as u64) ^ ((pseudo.discriminant_u64() + 1) << 48);
         let mut pstyle = resolve_element_style_with_context(
             &matched,
             &[],
@@ -888,27 +924,29 @@ impl StyleContext {
         mutated_child: Option<NodeId>,
     ) {
         self.ensure_index();
+        let parent_already_subtree_dirty = doc
+            .dirty_flags(parent)
+            .contains(DirtyFlags::SUBTREE_STYLE_DIRTY);
         mark_node_and_ancestors_dirty(doc, parent);
         if let Some(child) = mutated_child {
-            mark_subtree_style_dirty(doc, child);
+            if !parent_already_subtree_dirty {
+                mark_subtree_style_dirty(doc, child);
+            }
         }
-        let sibling_inline_math = doc.children(parent).any(|c| {
-            matches!(doc.get(c), Some(NodeData::Element(e)) if e.attributes.iter().any(|(q, v)| {
-                q.local.eq_str_ignore_ascii_case("style") && v.to_ascii_lowercase().contains("sibling-")
-            }))
-        });
-        if !self.rule_index.allows_sibling_sharing
-            || self.rule_index.has_relative_selectors
-            || sibling_inline_math
-        {
-            // Structural pseudo-classes (`:first-child`, `:last-child`, `:nth-child`, `:only-child`,
-            // `:empty`), sibling combinators (`+`, `~`), or `:has(...)`: invalidate siblings & subtrees.
-            let children: Vec<NodeId> = doc
-                .children(parent)
-                .filter(|&c| matches!(doc.get(c), Some(NodeData::Element(_))))
-                .collect();
-            for c in children {
-                mark_subtree_style_dirty(doc, c);
+        if !parent_already_subtree_dirty {
+            let needs_sibling_restyle = !self.rule_index.allows_sibling_sharing
+                || self.rule_index.has_relative_selectors
+                || mutated_child.is_some_and(|c| {
+                    matches!(doc.get(c), Some(NodeData::Element(e)) if e.attributes.iter().any(|(q, v)| {
+                        q.local.eq_str_ignore_ascii_case("style")
+                            && v.to_ascii_lowercase().contains("sibling-")
+                    }))
+                });
+            if needs_sibling_restyle {
+                // Structural pseudo-classes (`:first-child`, `:last-child`, `:nth-child`,
+                // `:only-child`, `:empty`), sibling combinators (`+`, `~`), or `:has(...)`:
+                // mark `parent`'s subtree dirty in O(depth) amortized time via `SUBTREE_STYLE_DIRTY`.
+                mark_subtree_style_dirty(doc, parent);
             }
         }
         if self.rule_index.has_relative_selectors {
@@ -1072,6 +1110,8 @@ impl StyleContext {
                 16.0,
                 3,
                 None,
+                None,
+                None,
                 &self.ua_sheet,
                 &self.shadow_adopted_sheets,
                 &self.rule_index,
@@ -1098,7 +1138,9 @@ impl StyleContext {
             self.styles.insert(id, style);
             doc.clear_dirty_flags(
                 id,
-                DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::DESCENDANT_STYLE_DIRTY,
+                DirtyFlags::SELF_STYLE_DIRTY
+                    | DirtyFlags::DESCENDANT_STYLE_DIRTY
+                    | DirtyFlags::SUBTREE_STYLE_DIRTY,
             );
             doc.mark_node_dirty(id, DirtyFlags::SELF_LAYOUT_DIRTY | DirtyFlags::PAINT_DIRTY);
         }
@@ -1144,7 +1186,9 @@ impl StyleContext {
         }
         doc.clear_dirty_flags(
             doc_root,
-            DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::DESCENDANT_STYLE_DIRTY,
+            DirtyFlags::SELF_STYLE_DIRTY
+                | DirtyFlags::DESCENDANT_STYLE_DIRTY
+                | DirtyFlags::SUBTREE_STYLE_DIRTY,
         );
         for feat in missing_local {
             if self.missing_seen.insert(feat.clone()) {
@@ -1155,7 +1199,7 @@ impl StyleContext {
     }
 
     /// Incrementally restyles ONLY dirty subtrees/elements marked with
-    /// `DirtyFlags::SELF_STYLE_DIRTY` or `DirtyFlags::DESCENDANT_STYLE_DIRTY`.
+    /// `DirtyFlags::SELF_STYLE_DIRTY`, `DirtyFlags::DESCENDANT_STYLE_DIRTY`, or `SUBTREE_STYLE_DIRTY`.
     pub fn restyle_dirty(&mut self, doc: &mut Document) -> RestyleReport {
         self.ensure_index();
         let mut report = RestyleReport::default();
@@ -1164,10 +1208,14 @@ impl StyleContext {
         }
 
         let root_flags = doc.dirty_flags(doc.root());
-        if !root_flags.intersects(DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::DESCENDANT_STYLE_DIRTY)
-        {
+        if !root_flags.intersects(
+            DirtyFlags::SELF_STYLE_DIRTY
+                | DirtyFlags::DESCENDANT_STYLE_DIRTY
+                | DirtyFlags::SUBTREE_STYLE_DIRTY,
+        ) {
             return report;
         }
+        let root_force_subtree = root_flags.contains(DirtyFlags::SUBTREE_STYLE_DIRTY);
 
         let root_children: Vec<NodeId> = doc
             .children(doc.root())
@@ -1218,8 +1266,11 @@ impl StyleContext {
                 false,
                 root_font_size,
                 false,
+                root_force_subtree,
                 false,
                 &[],
+                None,
+                None,
                 None,
                 &self.ua_sheet,
                 &self.shadow_adopted_sheets,
@@ -1252,12 +1303,16 @@ impl StyleContext {
         for id in cleared_nodes {
             doc.clear_dirty_flags(
                 id,
-                DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::DESCENDANT_STYLE_DIRTY,
+                DirtyFlags::SELF_STYLE_DIRTY
+                    | DirtyFlags::DESCENDANT_STYLE_DIRTY
+                    | DirtyFlags::SUBTREE_STYLE_DIRTY,
             );
         }
         doc.clear_dirty_flags(
             doc.root(),
-            DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::DESCENDANT_STYLE_DIRTY,
+            DirtyFlags::SELF_STYLE_DIRTY
+                | DirtyFlags::DESCENDANT_STYLE_DIRTY
+                | DirtyFlags::SUBTREE_STYLE_DIRTY,
         );
         for id in layout_dirty_nodes {
             doc.mark_node_dirty(id, DirtyFlags::SELF_LAYOUT_DIRTY | DirtyFlags::PAINT_DIRTY);
@@ -1380,6 +1435,25 @@ fn next_layout_parent_flex_grid(style: &ComputedStyle, inherited: bool) -> bool 
         | crate::values::DisplayMode::InlineGridLanesMulti => true,
         _ => false,
     }
+}
+
+/// Finds the assigned `<slot>` element inside `sr_id` for a light-DOM `light_child`
+/// per WHATWG DOM §4.2.2.3 (named slot assignment).
+fn find_assigned_slot_node(doc: &Document, sr_id: NodeId, light_child: NodeId) -> Option<NodeId> {
+    let slot_name = match doc.get(light_child) {
+        Some(NodeData::Element(e)) => e.get_attribute("slot").unwrap_or(""),
+        _ => "",
+    };
+    for cand in doc.descendants(sr_id) {
+        if let Some(NodeData::Element(e)) = doc.get(cand) {
+            if e.name.local.eq_str_ignore_ascii_case("slot")
+                && e.get_attribute("name").unwrap_or("") == slot_name
+            {
+                return Some(cand);
+            }
+        }
+    }
+    None
 }
 
 /// Builds a tree-scoped [`RuleIndex`] for a `ShadowRoot` containing the UA stylesheet,
@@ -1506,6 +1580,8 @@ fn cascade_subtree_par(
     root_font_size: f32,
     par_depth: u8,
     shadow_host: Option<selectors::OpaqueElement>,
+    slotted_index: Option<(&RuleIndex, selectors::OpaqueElement)>,
+    outer_part_index: Option<(&RuleIndex, Option<selectors::OpaqueElement>)>,
     ua_sheet: &Arc<Stylesheet>,
     shadow_adopted: &HashMap<NodeId, Vec<Arc<Stylesheet>>>,
     rule_index: &RuleIndex,
@@ -1540,6 +1616,8 @@ fn cascade_subtree_par(
         root_font_size,
         shadow_host,
         own_shadow_index.as_ref(),
+        slotted_index,
+        outer_part_index,
         rule_index,
         inline_color_exprs,
         media,
@@ -1570,6 +1648,7 @@ fn cascade_subtree_par(
         next_lp_fg,
         next_root_font,
         shadow_host,
+        own_shadow_index.as_ref(),
         rule_index,
         media,
         bloom_opt,
@@ -1577,11 +1656,12 @@ fn cascade_subtree_par(
         memo,
         out_pseudos,
     );
-    if let Some(tp) = t_ps {
+    if let (Some(tp), Some(dt)) = (t_ps, Some(dbg_timers)) {
         dbg_timers.pseudo_ns.fetch_add(
             tp.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+        let _ = dt;
     }
     out_styles.push((node, Arc::clone(&style)));
 
@@ -1593,7 +1673,14 @@ fn cascade_subtree_par(
         .filter(|&c| matches!(doc.get(c), Some(NodeData::Element(_))))
         .collect();
 
-    if let (Some(sr_id), Some(ref shadow_index)) = (shadow_root_id, own_shadow_index) {
+    let child_part_index = if rule_index.has_part_rules() {
+        Some((rule_index, shadow_host))
+    } else {
+        None
+    };
+
+    let shadow_styles_start = out_styles.len();
+    if let (Some(sr_id), Some(shadow_index)) = (shadow_root_id, own_shadow_index.as_ref()) {
         let shadow_children: SmallVec<[NodeId; 16]> = doc
             .children(sr_id)
             .filter(|&c| matches!(doc.get(c), Some(NodeData::Element(_))))
@@ -1613,6 +1700,8 @@ fn cascade_subtree_par(
                     next_root_font,
                     0,
                     host_opaque,
+                    None,
+                    child_part_index,
                     ua_sheet,
                     shadow_adopted,
                     shadow_index,
@@ -1640,10 +1729,37 @@ fn cascade_subtree_par(
         return;
     }
 
+    // CSS Scoping L1 §3.1: slotted light-DOM children of a shadow host inherit from their
+    // assigned `<slot>` element in the flat tree rather than directly from the shadow host.
+    let slotted_parent_styles: SmallVec<[(NodeId, Arc<ComputedStyle>); 8]> =
+        if let Some(sr_id) = shadow_root_id {
+            let shadow_slice = &out_styles[shadow_styles_start..];
+            elem_children
+                .iter()
+                .filter_map(|&child| {
+                    let slot_id = find_assigned_slot_node(doc, sr_id, child)?;
+                    let slot_st = shadow_slice
+                        .iter()
+                        .find(|(id, _)| *id == slot_id)
+                        .map(|(_, s)| Arc::clone(s))?;
+                    Some((child, slot_st))
+                })
+                .collect()
+        } else {
+            SmallVec::new()
+        };
+
     let dom_el = DomElement::new(doc, node);
+    let child_slotted_index = own_shadow_index
+        .as_ref()
+        .filter(|s| s.has_slotted_rules())
+        .map(|s| (s, dom_el.opaque()));
     push_bloom_hashes(&dom_el, bloom);
 
-    if par_depth > 0 && elem_children.len() >= PARALLEL_CHILD_THRESHOLD {
+    if par_depth > 0
+        && elem_children.len() >= PARALLEL_CHILD_THRESHOLD
+        && slotted_parent_styles.is_empty()
+    {
         let parent_arc = Arc::clone(&style);
         let bloom_snapshot = bloom.clone();
         let container_snapshot = active_containers.clone();
@@ -1674,6 +1790,8 @@ fn cascade_subtree_par(
                         next_root_font,
                         next_par_depth,
                         shadow_host,
+                        child_slotted_index,
+                        outer_part_index,
                         ua_sheet,
                         shadow_adopted,
                         rule_index,
@@ -1704,14 +1822,23 @@ fn cascade_subtree_par(
         }
     } else {
         for &child in &elem_children {
+            let slot_parent = slotted_parent_styles
+                .iter()
+                .find(|(cid, _)| *cid == child)
+                .map(|(_, s)| s);
+            let effective_parent = slot_parent.unwrap_or(&style);
+            let effective_lp_fg =
+                slot_parent.map_or(next_lp_fg, |s| next_layout_parent_flex_grid(s, next_lp_fg));
             cascade_subtree_par(
                 doc,
                 child,
-                Some(&style),
-                next_lp_fg,
+                Some(effective_parent),
+                effective_lp_fg,
                 next_root_font,
                 par_depth,
                 shadow_host,
+                child_slotted_index,
+                outer_part_index,
                 ua_sheet,
                 shadow_adopted,
                 rule_index,
@@ -1955,9 +2082,12 @@ fn restyle_dirty_walk(
     layout_parent_flex_grid: bool,
     root_font_size: f32,
     force_inherit_restyle: bool,
+    force_subtree_restyle: bool,
     hidden_ancestor: bool,
     ancestor_transitioning: &[(PropertyIdKind, Option<rix_core::InternedStr>)],
     shadow_host: Option<selectors::OpaqueElement>,
+    slotted_index: Option<(&RuleIndex, selectors::OpaqueElement)>,
+    outer_part_index: Option<(&RuleIndex, Option<selectors::OpaqueElement>)>,
     ua_sheet: &Arc<Stylesheet>,
     shadow_adopted: &HashMap<NodeId, Vec<Arc<Stylesheet>>>,
     rule_index: &RuleIndex,
@@ -1981,8 +2111,10 @@ fn restyle_dirty_walk(
         return;
     };
     let flags = elem.dirty_flags;
-    let needs_self = force_inherit_restyle || flags.contains(DirtyFlags::SELF_STYLE_DIRTY);
-    let needs_desc = flags.contains(DirtyFlags::DESCENDANT_STYLE_DIRTY);
+    let force_subtree = force_subtree_restyle || flags.contains(DirtyFlags::SUBTREE_STYLE_DIRTY);
+    let needs_self =
+        force_subtree || force_inherit_restyle || flags.contains(DirtyFlags::SELF_STYLE_DIRTY);
+    let needs_desc = force_subtree || flags.contains(DirtyFlags::DESCENDANT_STYLE_DIRTY);
 
     if !needs_self && !needs_desc {
         return;
@@ -2006,6 +2138,8 @@ fn restyle_dirty_walk(
             root_font_size,
             shadow_host,
             own_shadow_index.as_ref(),
+            slotted_index,
+            outer_part_index,
             rule_index,
             inline_color_exprs,
             media,
@@ -2030,6 +2164,7 @@ fn restyle_dirty_walk(
             next_lp_fg,
             root_font_size,
             shadow_host,
+            own_shadow_index.as_ref(),
             rule_index,
             media,
             Some(bloom),
@@ -2164,7 +2299,11 @@ fn restyle_dirty_walk(
         return;
     };
 
-    if flags.intersects(DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::DESCENDANT_STYLE_DIRTY) {
+    if flags.intersects(
+        DirtyFlags::SELF_STYLE_DIRTY
+            | DirtyFlags::DESCENDANT_STYLE_DIRTY
+            | DirtyFlags::SUBTREE_STYLE_DIRTY,
+    ) {
         cleared_nodes.push(node);
     }
 
@@ -2174,10 +2313,20 @@ fn restyle_dirty_walk(
         && doc
             .children(node)
             .any(|c| styles.get(&c).is_some_and(|s| s.uses_explicit_inherit));
+    let has_shadow_desc = elem.shadow_root.is_some()
+        && (needs_self
+            || elem.shadow_root.is_some_and(|sr| {
+                doc.dirty_flags(sr).intersects(
+                    DirtyFlags::SELF_STYLE_DIRTY
+                        | DirtyFlags::DESCENDANT_STYLE_DIRTY
+                        | DirtyFlags::SUBTREE_STYLE_DIRTY,
+                )
+            }));
     if !needs_desc
         && !propagate_inherited
         && !propagate_through_contents
         && !any_child_explicit_inherit
+        && !has_shadow_desc
     {
         return;
     }
@@ -2207,7 +2356,25 @@ fn restyle_dirty_walk(
     let next_lp_fg = next_layout_parent_flex_grid(&current_style, layout_parent_flex_grid);
     let force_children = propagate_inherited || propagate_through_contents;
 
-    if let (Some(sr_id), Some(ref shadow_index)) = (elem.shadow_root, own_shadow_index) {
+    let child_part_index = if rule_index.has_part_rules() {
+        Some((rule_index, shadow_host))
+    } else {
+        None
+    };
+
+    if let (Some(sr_id), Some(shadow_index)) = (elem.shadow_root, own_shadow_index.as_ref()) {
+        let sr_flags = doc.dirty_flags(sr_id);
+        if sr_flags.intersects(
+            DirtyFlags::SELF_STYLE_DIRTY
+                | DirtyFlags::DESCENDANT_STYLE_DIRTY
+                | DirtyFlags::SUBTREE_STYLE_DIRTY,
+        ) {
+            cleared_nodes.push(sr_id);
+        }
+        // When the shadow host itself was restyled (e.g. host class/attr mutated for
+        // `:host(.a)` inside `:has()` or `::part()`), ensure shadow children re-evaluate too.
+        let force_shadow_subtree =
+            force_subtree || sr_flags.contains(DirtyFlags::SUBTREE_STYLE_DIRTY) || needs_self;
         let host_opaque = Some(dom_el.opaque());
         let mut shadow_bloom = BloomFilter::new();
         push_bloom_hashes(&dom_el, &mut shadow_bloom);
@@ -2224,9 +2391,12 @@ fn restyle_dirty_walk(
                     next_lp_fg,
                     next_root_font,
                     sc_force,
+                    force_shadow_subtree,
                     next_hidden_ancestor,
                     &next_anc_trs,
                     host_opaque,
+                    None,
+                    child_part_index,
                     ua_sheet,
                     shadow_adopted,
                     shadow_index,
@@ -2250,6 +2420,11 @@ fn restyle_dirty_walk(
         }
     }
 
+    let child_slotted_index = own_shadow_index
+        .as_ref()
+        .filter(|s| s.has_slotted_rules())
+        .map(|s| (s, dom_el.opaque()));
+
     let pushed_container = maybe_push_active_container(
         node,
         &current_style,
@@ -2259,18 +2434,30 @@ fn restyle_dirty_walk(
     );
     for child in doc.children(node) {
         if matches!(doc.get(child), Some(NodeData::Element(_))) {
+            let slot_style = elem
+                .shadow_root
+                .and_then(|sr_id| find_assigned_slot_node(doc, sr_id, child))
+                .and_then(|slot_id| styles.get(&slot_id).cloned());
+            let effective_parent = slot_style.as_ref().unwrap_or(&current_style);
+            let effective_lp_fg = slot_style
+                .as_ref()
+                .map_or(next_lp_fg, |s| next_layout_parent_flex_grid(s, next_lp_fg));
             let child_force = force_children
+                || slot_style.is_some()
                 || (style_changed && styles.get(&child).is_some_and(|s| s.uses_explicit_inherit));
             restyle_dirty_walk(
                 doc,
                 child,
-                Some(&current_style),
-                next_lp_fg,
+                Some(effective_parent),
+                effective_lp_fg,
                 next_root_font,
                 child_force,
+                force_subtree,
                 next_hidden_ancestor,
                 &next_anc_trs,
                 shadow_host,
+                child_slotted_index,
+                outer_part_index,
                 ua_sheet,
                 shadow_adopted,
                 rule_index,
@@ -2308,6 +2495,8 @@ fn compute_single_element_style(
     root_font_size: f32,
     shadow_host: Option<selectors::OpaqueElement>,
     own_shadow_index: Option<&RuleIndex>,
+    slotted_index: Option<(&RuleIndex, selectors::OpaqueElement)>,
+    outer_part_index: Option<(&RuleIndex, Option<selectors::OpaqueElement>)>,
     rule_index: &RuleIndex,
     inline_color_exprs: &FastMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
     media: &MediaContext,
@@ -2319,10 +2508,13 @@ fn compute_single_element_style(
     dbg_timers: Option<&CascadeDebugTimers>,
 ) -> (Arc<ComputedStyle>, bool) {
     let has_own_shadow_host_rules = own_shadow_index.is_some_and(RuleIndex::has_host_rules);
+    let has_part_candidates = outer_part_index.is_some() && elem.has_attribute("part");
     let parent_ptr = parent_style.map_or(0, |p| Arc::as_ptr(p) as usize);
     let has_active_containers = !active_containers.is_empty();
     let sibling_parent = if rule_index.allows_sibling_sharing
         && !has_own_shadow_host_rules
+        && slotted_index.is_none()
+        && !has_part_candidates
         && !has_active_containers
         && parent_ptr != 0
         && elem_eligible_for_sibling_sharing(elem)
@@ -2380,13 +2572,42 @@ fn compute_single_element_style(
         if s_idx.has_host_rules() {
             let mut host_cands = SmallVec::<[u32; 16]>::new();
             s_idx.collect_host_candidates(&mut host_cands);
-            let self_host = Some(dom_el.opaque());
+            let host_dom_el = DomElement::for_shadow_host(doc, node);
+            let self_host = Some(host_dom_el.opaque());
             for &idx in &host_cands {
                 let rule = &s_idx.rules[idx as usize];
                 if let Some(prox) =
-                    match_rule_with_scopes(doc, node, &dom_el, rule, None, caches, self_host)
+                    match_rule_with_scopes(doc, node, &host_dom_el, rule, None, caches, self_host)
                 {
                     host_matched.push((idx, prox));
+                }
+            }
+        }
+    }
+    let mut slotted_matched = SmallVec::<[(u32, u32); 8]>::new();
+    if let Some((sl_idx, sl_host)) = slotted_index {
+        let mut sl_cands = SmallVec::<[u32; 16]>::new();
+        sl_idx.collect_slotted_candidates(&mut sl_cands);
+        for &idx in &sl_cands {
+            let rule = &sl_idx.rules[idx as usize];
+            if let Some(prox) =
+                match_rule_with_scopes(doc, node, &dom_el, rule, None, caches, Some(sl_host))
+            {
+                slotted_matched.push((idx, prox));
+            }
+        }
+    }
+    let mut part_matched = SmallVec::<[(u32, u32); 8]>::new();
+    if has_part_candidates {
+        if let Some((pt_idx, pt_host)) = outer_part_index {
+            let mut pt_cands = SmallVec::<[u32; 16]>::new();
+            pt_idx.collect_part_candidates(&mut pt_cands);
+            for &idx in &pt_cands {
+                let rule = &pt_idx.rules[idx as usize];
+                if let Some(prox) =
+                    match_rule_with_scopes(doc, node, &dom_el, rule, None, caches, pt_host)
+                {
+                    part_matched.push((idx, prox));
                 }
             }
         }
@@ -2445,7 +2666,9 @@ fn compute_single_element_style(
         && !uses_attr
         && !is_mathml
         && !is_top_layer
-        && host_matched.is_empty();
+        && host_matched.is_empty()
+        && slotted_matched.is_empty()
+        && part_matched.is_empty();
 
     if can_memo {
         if let Some(cached) =
@@ -2482,13 +2705,14 @@ fn compute_single_element_style(
         }
     }
 
+    let inner_demoted_by_part = !part_matched.is_empty();
     let mut matched_refs: SmallVec<[MatchedRule<'_>; 16]> = matched_indices
         .iter()
         .zip(matched_prox.iter())
         .map(|(&idx, &scope_proximity)| MatchedRule {
             rule: &rule_index.rules[idx as usize],
             scope_proximity,
-            is_shadow_host_rule: false,
+            is_shadow_host_rule: inner_demoted_by_part,
         })
         .collect();
     if let Some(s_idx) = own_shadow_index {
@@ -2497,6 +2721,24 @@ fn compute_single_element_style(
                 rule: &s_idx.rules[idx as usize],
                 scope_proximity,
                 is_shadow_host_rule: true,
+            });
+        }
+    }
+    if let Some((sl_idx, _)) = slotted_index {
+        for &(idx, scope_proximity) in &slotted_matched {
+            matched_refs.push(MatchedRule {
+                rule: &sl_idx.rules[idx as usize],
+                scope_proximity,
+                is_shadow_host_rule: true,
+            });
+        }
+    }
+    if let Some((pt_idx, _)) = outer_part_index {
+        for &(idx, scope_proximity) in &part_matched {
+            matched_refs.push(MatchedRule {
+                rule: &pt_idx.rules[idx as usize],
+                scope_proximity,
+                is_shadow_host_rule: false,
             });
         }
     }
@@ -3583,6 +3825,7 @@ fn collect_pseudo_element_styles(
     layout_parent_flex_grid: bool,
     root_font_size: f32,
     shadow_host: Option<selectors::OpaqueElement>,
+    own_shadow_index: Option<&RuleIndex>,
     rule_index: &RuleIndex,
     media: &MediaContext,
     bloom: Option<&BloomFilter>,
@@ -3630,18 +3873,17 @@ fn collect_pseudo_element_styles(
             RixPseudoElement::Marker if !is_list_item => continue,
             _ => {}
         }
-        if !rule_index.has_pseudo_rules(pseudo) {
+        let has_host_pseudo = own_shadow_index.is_some_and(|s| s.has_host_pseudo_rules(pseudo));
+        if !rule_index.has_pseudo_rules(pseudo) && !has_host_pseudo {
             continue;
         }
         let mut cands = SmallVec::<[u32; 16]>::new();
         rule_index.collect_pseudo_candidates(pseudo, orig_elem, bloom, &mut cands);
-        if cands.is_empty() {
-            continue;
-        }
         let pseudo_el = DomElement::with_pseudo(doc, node, pseudo);
         let mut matched: SmallVec<[MatchedRule<'_>; 8]> = SmallVec::new();
         let mut matched_indices: SmallVec<[u32; 8]> = SmallVec::new();
         let mut any_scoped = false;
+        let mut has_host_matched = false;
         for &idx in &cands {
             let rule = &rule_index.rules[idx as usize];
             if let Some(scope_proximity) =
@@ -3655,6 +3897,33 @@ fn collect_pseudo_element_styles(
                 matched_indices.push(idx);
                 if scope_proximity != u32::MAX {
                     any_scoped = true;
+                }
+            }
+        }
+        if let Some(s_idx) = own_shadow_index {
+            if s_idx.has_host_pseudo_rules(pseudo) {
+                let mut host_cands = SmallVec::<[u32; 16]>::new();
+                s_idx.collect_host_pseudo_candidates(pseudo, &mut host_cands);
+                let host_pseudo_el = DomElement::for_shadow_host_pseudo(doc, node, pseudo);
+                let self_host = Some(DomElement::new(doc, node).opaque());
+                for &idx in &host_cands {
+                    let rule = &s_idx.rules[idx as usize];
+                    if let Some(scope_proximity) = match_rule_with_scopes(
+                        doc,
+                        node,
+                        &host_pseudo_el,
+                        rule,
+                        None,
+                        caches,
+                        self_host,
+                    ) {
+                        matched.push(MatchedRule {
+                            rule,
+                            scope_proximity,
+                            is_shadow_host_rule: true,
+                        });
+                        has_host_matched = true;
+                    }
                 }
             }
         }
@@ -3694,8 +3963,8 @@ fn collect_pseudo_element_styles(
                             || (rule_index.has_attr_custom_props && d.value.contains_var_fn())
                     })
                 });
-            let memo_parent_ptr = orig_ptr ^ (((pseudo as usize) + 1) << 56);
-            if !any_scoped && !needs_sib && !uses_attr {
+            let memo_parent_ptr = orig_ptr ^ (((pseudo.discriminant_u64() as usize) + 1) << 56);
+            if !any_scoped && !needs_sib && !uses_attr && !has_host_matched {
                 if let Some(cached) =
                     memo.lookup(memo_parent_ptr, layout_parent_flex_grid, &matched_indices)
                 {
@@ -3708,7 +3977,7 @@ fn collect_pseudo_element_styles(
             } else {
                 (1, 1)
             };
-            let pseudo_nid = (usize::from(node) as u64) ^ (((pseudo as u64) + 1) << 48);
+            let pseudo_nid = (usize::from(node) as u64) ^ ((pseudo.discriminant_u64() + 1) << 48);
             let mut pstyle = resolve_element_style_with_context(
                 &matched,
                 &[],
@@ -3753,7 +4022,7 @@ fn collect_pseudo_element_styles(
                 _ => {}
             }
             let style = Arc::new(pstyle);
-            if !any_scoped && !needs_sib && !uses_attr {
+            if !any_scoped && !needs_sib && !uses_attr && !has_host_matched {
                 memo.insert(
                     memo_parent_ptr,
                     layout_parent_flex_grid,
@@ -3787,6 +4056,26 @@ fn apply_invalidation_scope(doc: &mut Document, node: NodeId, scope: Invalidatio
     if scope.is_empty() {
         return;
     }
+    // Check `ANCESTOR_SUBTREES` first: marking the top-level ancestor `SUBTREE_STYLE_DIRTY`
+    // subsumes every narrower scope in O(depth) time instead of scanning O(N) siblings!
+    if scope.contains(InvalidationScope::ANCESTOR_SUBTREES) {
+        let mut top_elem = node;
+        let mut cur = Some(node);
+        while let Some(id) = cur {
+            if matches!(doc.get(id), Some(NodeData::Element(_))) {
+                top_elem = id;
+            }
+            cur = if let Some(p) = doc.parent(id) {
+                Some(p)
+            } else if let Some(NodeData::ShadowRoot { host, .. }) = doc.get(id) {
+                Some(*host)
+            } else {
+                None
+            };
+        }
+        mark_subtree_style_dirty(doc, top_elem);
+        return;
+    }
     if scope.contains(InvalidationScope::SELF) {
         mark_node_and_ancestors_dirty(doc, node);
     }
@@ -3797,79 +4086,78 @@ fn apply_invalidation_scope(doc: &mut Document, node: NodeId, scope: Invalidatio
         InvalidationScope::LATER_SIBLINGS | InvalidationScope::LATER_SIBLING_DESCENDANTS,
     ) {
         let deep = scope.contains(InvalidationScope::LATER_SIBLING_DESCENDANTS);
-        if let Some(parent) = doc.parent(node) {
-            let siblings: Vec<NodeId> = doc.children(parent).collect();
-            let mut seen = false;
-            for sib in siblings {
-                if seen {
-                    if matches!(doc.get(sib), Some(NodeData::Element(_))) {
-                        if deep {
-                            mark_subtree_style_dirty(doc, sib);
-                        } else {
-                            mark_node_and_ancestors_dirty(doc, sib);
-                        }
-                    }
-                } else if sib == node {
-                    seen = true;
-                }
+        let mut cur = doc.next_element_sibling(node);
+        while let Some(sib) = cur {
+            if deep {
+                mark_subtree_style_dirty(doc, sib);
+            } else {
+                mark_node_and_ancestors_dirty(doc, sib);
             }
+            cur = doc.next_element_sibling(sib);
         }
     }
     if scope.contains(InvalidationScope::ANCESTORS) {
-        let ancestors: Vec<NodeId> = doc.ancestors(node).collect();
-        for anc in ancestors {
+        let mut cur = doc.parent(node);
+        while let Some(anc) = cur {
             if matches!(doc.get(anc), Some(NodeData::Element(_))) {
                 mark_node_and_ancestors_dirty(doc, anc);
             }
+            cur = if let Some(p) = doc.parent(anc) {
+                Some(p)
+            } else if let Some(NodeData::ShadowRoot { host, .. }) = doc.get(anc) {
+                Some(*host)
+            } else {
+                None
+            };
         }
     }
     if scope.contains(InvalidationScope::EARLIER_SIBLINGS) {
-        if let Some(parent) = doc.parent(node) {
-            let siblings: Vec<NodeId> = doc.children(parent).collect();
-            for sib in siblings {
-                if sib == node {
-                    break;
-                }
-                if matches!(doc.get(sib), Some(NodeData::Element(_))) {
-                    mark_node_and_ancestors_dirty(doc, sib);
-                }
-            }
+        let mut cur = doc.previous_element_sibling(node);
+        while let Some(sib) = cur {
+            mark_node_and_ancestors_dirty(doc, sib);
+            cur = doc.previous_element_sibling(sib);
         }
     }
     if scope.contains(InvalidationScope::ANCESTOR_EARLIER_SIBLINGS) {
-        let ancestors: Vec<NodeId> = doc.ancestors(node).collect();
-        for anc in ancestors {
-            if let Some(parent) = doc.parent(anc) {
-                let siblings: Vec<NodeId> = doc.children(parent).collect();
-                for sib in siblings {
-                    if sib == anc {
-                        break;
-                    }
-                    if matches!(doc.get(sib), Some(NodeData::Element(_))) {
-                        mark_node_and_ancestors_dirty(doc, sib);
-                    }
-                }
+        let mut anc_opt = doc.parent(node);
+        while let Some(anc) = anc_opt {
+            let mut sib_opt = doc.previous_element_sibling(anc);
+            while let Some(sib) = sib_opt {
+                mark_node_and_ancestors_dirty(doc, sib);
+                sib_opt = doc.previous_element_sibling(sib);
             }
-        }
-    }
-    if scope.contains(InvalidationScope::ANCESTOR_SUBTREES) {
-        let ancestors: Vec<NodeId> = doc.ancestors(node).collect();
-        if let Some(top_elem) = ancestors
-            .into_iter()
-            .rev()
-            .find(|&n| matches!(doc.get(n), Some(NodeData::Element(_))))
-        {
-            mark_subtree_style_dirty(doc, top_elem);
-        } else {
-            mark_subtree_style_dirty(doc, node);
+            anc_opt = if let Some(p) = doc.parent(anc) {
+                Some(p)
+            } else if let Some(NodeData::ShadowRoot { host, .. }) = doc.get(anc) {
+                Some(*host)
+            } else {
+                None
+            };
         }
     }
 }
 
 fn mark_node_and_ancestors_dirty(doc: &mut Document, node: NodeId) {
     doc.mark_node_dirty(node, DirtyFlags::SELF_STYLE_DIRTY);
-    let mut cur = doc.parent(node);
+    let mut cur = if let Some(p) = doc.parent(node) {
+        Some(p)
+    } else if let Some(NodeData::ShadowRoot { host, .. }) = doc.get(node) {
+        Some(*host)
+    } else {
+        None
+    };
     while let Some(anc) = cur {
+        if let Some(NodeData::ShadowRoot { host, .. }) = doc.get(anc) {
+            let host_id = *host;
+            doc.mark_node_dirty(anc, DirtyFlags::DESCENDANT_STYLE_DIRTY);
+            // A mutation inside a shadow tree can also affect `:host:has(...)` rules on the host.
+            doc.mark_node_dirty(
+                host_id,
+                DirtyFlags::SELF_STYLE_DIRTY | DirtyFlags::DESCENDANT_STYLE_DIRTY,
+            );
+            cur = doc.parent(host_id);
+            continue;
+        }
         if doc
             .dirty_flags(anc)
             .contains(DirtyFlags::DESCENDANT_STYLE_DIRTY)
@@ -3881,22 +4169,17 @@ fn mark_node_and_ancestors_dirty(doc: &mut Document, node: NodeId) {
     }
 }
 
+/// Marks `root` and its entire subtree dirty in O(depth) amortized time via `SUBTREE_STYLE_DIRTY`
+/// (expanded lazily on the next `restyle_dirty_walk` pass, avoiding O(N^2) DOM mutation loops).
 fn mark_subtree_style_dirty(doc: &mut Document, root: NodeId) {
-    mark_node_and_ancestors_dirty(doc, root);
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        let children: Vec<NodeId> = doc
-            .children(id)
-            .filter(|&c| matches!(doc.get(c), Some(NodeData::Element(_))))
-            .collect();
-        if !children.is_empty() {
-            doc.mark_node_dirty(id, DirtyFlags::DESCENDANT_STYLE_DIRTY);
-            for c in children {
-                doc.mark_node_dirty(c, DirtyFlags::SELF_STYLE_DIRTY);
-                stack.push(c);
-            }
-        }
+    if doc
+        .dirty_flags(root)
+        .contains(DirtyFlags::SUBTREE_STYLE_DIRTY)
+    {
+        return;
     }
+    doc.mark_node_dirty(root, DirtyFlags::SUBTREE_STYLE_DIRTY);
+    mark_node_and_ancestors_dirty(doc, root);
 }
 
 #[cfg(test)]

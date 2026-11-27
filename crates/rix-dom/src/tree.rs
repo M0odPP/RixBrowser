@@ -570,8 +570,9 @@ impl Document {
                 }
             }
             for nh in new_hosts {
-                let mut changed = self.set_element_state(nh, ElementState::FOCUS, true);
-                changed |= self.set_element_state(nh, ElementState::FOCUS_VISIBLE, visible);
+                // HTML §6.6.3 / Selectors L4 §10.2: a `delegatesFocus` shadow host receives
+                // `:focus` (and `:focus-within`), NOT `:focus-visible`.
+                let changed = self.set_element_state(nh, ElementState::FOCUS, true);
                 if changed {
                     self.mark_style(nh);
                     self.mark_node_dirty(nh, DirtyFlags::SELF_STYLE_DIRTY);

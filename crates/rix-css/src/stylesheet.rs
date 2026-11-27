@@ -1163,19 +1163,30 @@ impl Stylesheet {
         let cleaned_custom = crate::properties::strip_unbalanced_custom_decls(&quirks_norm);
         let rewritten = crate::properties::rewrite_dynamic_var_names(&cleaned_custom);
         let wrapped = wrap_top_level_scope_rules(&rewritten);
+        let warnings = Arc::new(RwLock::new(Vec::new()));
         let opts = ParserOptions {
             error_recovery: true,
+            warnings: Some(Arc::clone(&warnings)),
             ..ParserOptions::default()
         };
         let mut compiler = StylesheetCompiler::new(origin, *media, owner_parent, &wrapped);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Ok(sheet) = StyleSheet::parse(&wrapped, opts) {
-                compiler.compile_rule_list(
-                    &sheet.rules,
-                    CompileNesting::TopLevel,
-                    LayerId::UNLAYERED,
-                    None,
-                );
+                let has_selector_warning = warnings.read().is_ok_and(|w| {
+                    w.iter().any(|e| {
+                        matches!(e.kind, lightningcss::error::ParserError::SelectorError(_))
+                    })
+                });
+                if has_selector_warning {
+                    compiler.compile_top_level_with_selector_recovery(&sheet.rules);
+                } else {
+                    compiler.compile_rule_list(
+                        &sheet.rules,
+                        CompileNesting::TopLevel,
+                        LayerId::UNLAYERED,
+                        None,
+                    );
+                }
             }
         }));
         let mut sheet = compiler.finish();
@@ -1420,6 +1431,60 @@ impl<'a> StylesheetCompiler<'a> {
         }
     }
 
+    fn compile_top_level_with_selector_recovery(&mut self, list: &CssRuleList<'_>) {
+        // Recover top-level flat style rules dropped by `lightningcss`'s older `parcel_selectors`
+        // (e.g. `::part(x):dir(ltr)`) while preserving exact CSS source order and `@namespace` state.
+        let mut parsed_offsets = HashSet::new();
+        for r in &list.0 {
+            if let Some(off) = rule_start_byte_offset(r, &self.line_index, self.source_css.len()) {
+                parsed_offsets.insert(off);
+            }
+        }
+        let dropped: Vec<(usize, &str, &str)> = scan_top_level_style_blocks(self.source_css)
+            .into_iter()
+            .filter(|(off, _, body)| !parsed_offsets.contains(off) && !body.contains('{'))
+            .collect();
+        let mut drop_idx = 0usize;
+        for rule in &list.0 {
+            if let Some(rule_off) =
+                rule_start_byte_offset(rule, &self.line_index, self.source_css.len())
+            {
+                while drop_idx < dropped.len() && dropped[drop_idx].0 < rule_off {
+                    let (_, sel, body) = dropped[drop_idx];
+                    self.try_compile_recovered_style_rule(sel, body, LayerId::UNLAYERED);
+                    drop_idx += 1;
+                }
+            }
+            self.compile_single_rule(rule, CompileNesting::TopLevel, LayerId::UNLAYERED, None);
+        }
+        while drop_idx < dropped.len() {
+            let (_, sel, body) = dropped[drop_idx];
+            self.try_compile_recovered_style_rule(sel, body, LayerId::UNLAYERED);
+            drop_idx += 1;
+        }
+    }
+
+    fn try_compile_recovered_style_rule(&mut self, sel: &str, body: &str, layer: LayerId) {
+        let ns_opt = (!self.namespaces.is_empty()).then_some(&self.namespaces);
+        let Ok(parsed_sel) = parse_selector_list_with_namespaces(sel, ns_opt) else {
+            return;
+        };
+        let dummy = format!("* {{ {body} }}");
+        let opts = ParserOptions {
+            error_recovery: true,
+            ..ParserOptions::default()
+        };
+        if let Ok(sheet) = StyleSheet::parse(&dummy, opts) {
+            if let Some(CssRule::Style(sr)) = sheet.rules.0.first() {
+                if !sr.declarations.declarations.is_empty()
+                    || !sr.declarations.important_declarations.is_empty()
+                {
+                    self.emit_compiled_selectors(parsed_sel.slice(), &sr.declarations, layer);
+                }
+            }
+        };
+    }
+
     fn compile_rule_list(
         &mut self,
         list: &CssRuleList<'_>,
@@ -1427,133 +1492,133 @@ impl<'a> StylesheetCompiler<'a> {
         current_layer: LayerId,
         prefix_layer: Option<LayerId>,
     ) {
-        let in_style_nesting = matches!(nesting, CompileNesting::StyleRule { .. });
         for rule in &list.0 {
-            match rule {
-                CssRule::Style(style) => {
-                    self.compile_style_rule(style, nesting, current_layer, prefix_layer);
+            self.compile_single_rule(rule, nesting, current_layer, prefix_layer);
+        }
+    }
+
+    fn compile_single_rule(
+        &mut self,
+        rule: &CssRule<'_>,
+        nesting: CompileNesting<'_>,
+        current_layer: LayerId,
+        prefix_layer: Option<LayerId>,
+    ) {
+        let in_style_nesting = matches!(nesting, CompileNesting::StyleRule { .. });
+        match rule {
+            CssRule::Style(style) => {
+                self.compile_style_rule(style, nesting, current_layer, prefix_layer);
+            }
+            CssRule::Nesting(nest) => {
+                self.compile_style_rule(&nest.style, nesting, current_layer, prefix_layer);
+            }
+            CssRule::NestedDeclarations(nested) => match nesting {
+                CompileNesting::StyleRule { parent_selector } => {
+                    // CSS Nesting L1 §2.2: CSSNestedDeclarations inherits top-level
+                    // selector specificity (each comma-separated parent selector separately).
+                    self.emit_rules_for_selector_str(
+                        parent_selector,
+                        &nested.declarations,
+                        current_layer,
+                        ParseRelative::No,
+                    );
                 }
-                CssRule::Nesting(nest) => {
-                    self.compile_style_rule(&nest.style, nesting, current_layer, prefix_layer);
+                CompileNesting::ScopeRule => {
+                    // CSS Cascade L6 §2.5: bare declarations in `@scope` match `:where(:scope)`.
+                    self.emit_rules_for_selector_str(
+                        ":where(:scope)",
+                        &nested.declarations,
+                        current_layer,
+                        ParseRelative::No,
+                    );
                 }
-                CssRule::NestedDeclarations(nested) => match nesting {
-                    CompileNesting::StyleRule { parent_selector } => {
-                        // CSS Nesting L1 §2.2: CSSNestedDeclarations inherits top-level
-                        // selector specificity (each comma-separated parent selector separately).
-                        self.emit_rules_for_selector_str(
-                            parent_selector,
-                            &nested.declarations,
-                            current_layer,
-                            ParseRelative::No,
-                        );
-                    }
-                    CompileNesting::ScopeRule => {
-                        // CSS Cascade L6 §2.5: bare declarations in `@scope` match `:where(:scope)`.
-                        self.emit_rules_for_selector_str(
-                            ":where(:scope)",
-                            &nested.declarations,
-                            current_layer,
-                            ParseRelative::No,
-                        );
-                    }
-                    CompileNesting::TopLevel => {}
-                },
-                CssRule::Media(media_rule) => {
-                    if self.media.matches_media_list(&media_rule.query) {
-                        self.compile_rule_list(
-                            &media_rule.rules,
-                            nesting,
-                            current_layer,
-                            prefix_layer,
-                        );
-                    }
+                CompileNesting::TopLevel => {}
+            },
+            CssRule::Media(media_rule) => {
+                if self.media.matches_media_list(&media_rule.query) {
+                    self.compile_rule_list(&media_rule.rules, nesting, current_layer, prefix_layer);
                 }
-                CssRule::Supports(sup_rule) => {
-                    if evaluate_supports(&sup_rule.condition) {
-                        self.compile_rule_list(
-                            &sup_rule.rules,
-                            nesting,
-                            current_layer,
-                            prefix_layer,
-                        );
-                    }
+            }
+            CssRule::Supports(sup_rule) => {
+                if evaluate_supports(&sup_rule.condition) {
+                    self.compile_rule_list(&sup_rule.rules, nesting, current_layer, prefix_layer);
                 }
-                CssRule::LayerStatement(stmt) if !in_style_nesting => {
-                    for name in &stmt.names {
-                        let _ = self.register_layer(prefix_layer, Some(name));
-                    }
+            }
+            CssRule::LayerStatement(stmt) if !in_style_nesting => {
+                for name in &stmt.names {
+                    let _ = self.register_layer(prefix_layer, Some(name));
                 }
-                CssRule::LayerBlock(block) => {
-                    let layer_id = self.register_layer(prefix_layer, block.name.as_ref());
-                    self.compile_rule_list(&block.rules, nesting, layer_id, Some(layer_id));
+            }
+            CssRule::LayerBlock(block) => {
+                let layer_id = self.register_layer(prefix_layer, block.name.as_ref());
+                self.compile_rule_list(&block.rules, nesting, layer_id, Some(layer_id));
+            }
+            CssRule::Scope(sc) => {
+                let parent_sel = match nesting {
+                    CompileNesting::StyleRule { parent_selector } => Some(parent_selector),
+                    _ => None,
+                };
+                if let Some(compiled_scope) = self.compile_scope_prelude(sc, parent_sel) {
+                    self.scope_stack.push(compiled_scope);
+                    self.compile_rule_list(
+                        &sc.rules,
+                        CompileNesting::ScopeRule,
+                        current_layer,
+                        prefix_layer,
+                    );
+                    self.scope_stack.pop();
                 }
-                CssRule::Scope(sc) => {
-                    let parent_sel = match nesting {
-                        CompileNesting::StyleRule { parent_selector } => Some(parent_selector),
-                        _ => None,
-                    };
-                    if let Some(compiled_scope) = self.compile_scope_prelude(sc, parent_sel) {
-                        self.scope_stack.push(compiled_scope);
-                        self.compile_rule_list(
-                            &sc.rules,
-                            CompileNesting::ScopeRule,
-                            current_layer,
-                            prefix_layer,
-                        );
-                        self.scope_stack.pop();
-                    }
-                }
-                CssRule::Container(cr) => {
-                    let cname = cr.name.as_ref().map(lightning_to_css_string);
-                    let cond_str = lightning_to_css_string(&cr.condition);
-                    let compiled_cq = CompiledContainerQuery::parse(cname.as_deref(), &cond_str);
-                    self.container_stack.push(compiled_cq);
-                    self.compile_rule_list(&cr.rules, nesting, current_layer, prefix_layer);
-                    self.container_stack.pop();
-                }
-                CssRule::FontFace(ff) if !in_style_nesting => {
-                    self.compile_font_face(ff, current_layer);
-                }
-                CssRule::Keyframes(kf) if !in_style_nesting => {
-                    self.compile_keyframes(kf, current_layer);
-                }
-                CssRule::Property(pr) if !in_style_nesting => {
-                    self.compile_property_rule(pr, current_layer);
-                }
-                CssRule::Import(imp) if !in_style_nesting => {
-                    if self.media.matches_media_list(&imp.media) {
-                        let url = imp.url.as_ref().trim();
-                        if !url.is_empty() {
-                            self.imports.push(url.to_string());
-                        }
-                    }
-                }
-                CssRule::Namespace(ns) if !in_style_nesting => {
-                    let url = CssAtom::new(ns.url.as_ref());
-                    if let Some(ref pref) = ns.prefix {
-                        self.namespaces
-                            .prefixes
-                            .insert(pref.as_ref().to_string(), url);
-                    } else {
-                        self.namespaces.default_namespace = Some(url);
+            }
+            CssRule::Container(cr) => {
+                let cname = cr.name.as_ref().map(lightning_to_css_string);
+                let cond_str = lightning_to_css_string(&cr.condition);
+                let compiled_cq = CompiledContainerQuery::parse(cname.as_deref(), &cond_str);
+                self.container_stack.push(compiled_cq);
+                self.compile_rule_list(&cr.rules, nesting, current_layer, prefix_layer);
+                self.container_stack.pop();
+            }
+            CssRule::FontFace(ff) if !in_style_nesting => {
+                self.compile_font_face(ff, current_layer);
+            }
+            CssRule::Keyframes(kf) if !in_style_nesting => {
+                self.compile_keyframes(kf, current_layer);
+            }
+            CssRule::Property(pr) if !in_style_nesting => {
+                self.compile_property_rule(pr, current_layer);
+            }
+            CssRule::Import(imp) if !in_style_nesting => {
+                if self.media.matches_media_list(&imp.media) {
+                    let url = imp.url.as_ref().trim();
+                    if !url.is_empty() {
+                        self.imports.push(url.to_string());
                     }
                 }
-                CssRule::Ignored
-                | CssRule::FontFace(_)
-                | CssRule::Keyframes(_)
-                | CssRule::Property(_)
-                | CssRule::Import(_)
-                | CssRule::Namespace(_)
-                | CssRule::LayerStatement(_) => {}
-                CssRule::Unknown(u) => {
-                    self.record_missing(MissingCssFeature::new(
-                        MissingCssKind::AtRule,
-                        u.name.as_ref(),
-                    ));
+            }
+            CssRule::Namespace(ns) if !in_style_nesting => {
+                let url = CssAtom::new(ns.url.as_ref());
+                if let Some(ref pref) = ns.prefix {
+                    self.namespaces
+                        .prefixes
+                        .insert(pref.as_ref().to_string(), url);
+                } else {
+                    self.namespaces.default_namespace = Some(url);
                 }
-                _ => {
-                    self.record_missing(MissingCssFeature::new(MissingCssKind::AtRule, "@other"));
-                }
+            }
+            CssRule::Ignored
+            | CssRule::FontFace(_)
+            | CssRule::Keyframes(_)
+            | CssRule::Property(_)
+            | CssRule::Import(_)
+            | CssRule::Namespace(_)
+            | CssRule::LayerStatement(_) => {}
+            CssRule::Unknown(u) => {
+                self.record_missing(MissingCssFeature::new(
+                    MissingCssKind::AtRule,
+                    u.name.as_ref(),
+                ));
+            }
+            _ => {
+                self.record_missing(MissingCssFeature::new(MissingCssKind::AtRule, "@other"));
             }
         }
     }
@@ -1652,11 +1717,22 @@ impl<'a> StylesheetCompiler<'a> {
         {
             if matches!(nesting, CompileNesting::TopLevel) {
                 let ns_opt = (!self.namespaces.is_empty()).then_some(&self.namespaces);
-                if let Some(parsed) = compile_lightning_selector_list_with_namespaces(
-                    &style.selectors,
-                    &mut self.selector_scratch,
-                    ns_opt,
-                ) {
+                let raw_src = extract_raw_selector_at_loc(
+                    self.source_css,
+                    &self.line_index,
+                    style.loc.line,
+                    style.loc.column,
+                );
+                let parsed = if let Some(src) = raw_src {
+                    parse_selector_list_with_namespaces(src, ns_opt).ok()
+                } else {
+                    compile_lightning_selector_list_with_namespaces(
+                        &style.selectors,
+                        &mut self.selector_scratch,
+                        ns_opt,
+                    )
+                };
+                if let Some(parsed) = parsed {
                     self.emit_compiled_selectors(parsed.slice(), &style.declarations, layer);
                 } else {
                     self.record_missing(MissingCssFeature::new(
@@ -3094,7 +3170,14 @@ fn convert_lightning_rule_to_cssom(
             let ns_opt = (!namespaces.is_empty()).then_some(&*namespaces);
             let selector_text = match nesting {
                 CssomNestingContext::TopLevel => {
-                    let parsed = parse_selector_list_with_namespaces(&raw_sel, ns_opt)
+                    let raw_src = extract_raw_selector_at_loc(
+                        source_css,
+                        line_index,
+                        sr.loc.line,
+                        sr.loc.column,
+                    );
+                    let src_sel = raw_src.unwrap_or(&raw_sel);
+                    let parsed = parse_selector_list_with_namespaces(src_sel, ns_opt)
                         .map_err(CssomParseError::SyntaxError)?;
                     serialize_selector_list(&parsed)
                 }
@@ -3487,8 +3570,10 @@ pub fn parse_cssom_rules(css: &str) -> Vec<CssomRuleKind> {
     let rewritten = crate::properties::rewrite_dynamic_var_names(css);
     let wrapped = wrap_top_level_scope_rules(&rewritten);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let warnings = Arc::new(RwLock::new(Vec::new()));
         let opts = ParserOptions {
             error_recovery: true,
+            warnings: Some(Arc::clone(&warnings)),
             ..ParserOptions::default()
         };
         let Ok(parsed) = StyleSheet::parse(&wrapped, opts) else {
@@ -3496,15 +3581,214 @@ pub fn parse_cssom_rules(css: &str) -> Vec<CssomRuleKind> {
         };
         let mut namespaces = SelectorNamespaceMap::default();
         let line_index = LineIndex::new(&wrapped);
-        convert_lightning_rule_list_to_cssom(
-            &parsed.rules,
-            &mut namespaces,
-            CssomNestingContext::TopLevel,
-            &wrapped,
-            &line_index,
-        )
+        let has_selector_warning = warnings.read().is_ok_and(|w| {
+            w.iter()
+                .any(|e| matches!(e.kind, lightningcss::error::ParserError::SelectorError(_)))
+        });
+        if has_selector_warning {
+            convert_top_level_rules_to_cssom_with_recovery(
+                &parsed.rules,
+                &mut namespaces,
+                &wrapped,
+                &line_index,
+            )
+        } else {
+            convert_lightning_rule_list_to_cssom(
+                &parsed.rules,
+                &mut namespaces,
+                CssomNestingContext::TopLevel,
+                &wrapped,
+                &line_index,
+            )
+        }
     }))
     .unwrap_or_default()
+}
+
+fn rule_start_byte_offset(
+    rule: &CssRule<'_>,
+    line_index: &LineIndex,
+    css_len: usize,
+) -> Option<usize> {
+    let loc = match rule {
+        CssRule::Style(r) => Some(r.loc),
+        CssRule::Media(r) => Some(r.loc),
+        CssRule::Supports(r) => Some(r.loc),
+        CssRule::LayerBlock(r) => Some(r.loc),
+        CssRule::LayerStatement(r) => Some(r.loc),
+        CssRule::Scope(r) => Some(r.loc),
+        CssRule::Container(r) => Some(r.loc),
+        CssRule::Import(r) => Some(r.loc),
+        CssRule::Namespace(r) => Some(r.loc),
+        CssRule::FontFace(r) => Some(r.loc),
+        CssRule::Keyframes(r) => Some(r.loc),
+        CssRule::Property(r) => Some(r.loc),
+        CssRule::Page(r) => Some(r.loc),
+        _ => None,
+    }?;
+    Some(line_index.byte_offset(css_len, loc.line, loc.column))
+}
+
+/// Scans top-level non-`@` style blocks `(start_byte_offset, selector_slice, body_slice)` in `css`.
+fn scan_top_level_style_blocks(css: &str) -> Vec<(usize, &str, &str)> {
+    let bytes = css.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut in_str: Option<u8> = None;
+    while i < bytes.len() {
+        while i < bytes.len() {
+            if bytes[i].is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            break;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let rule_start = i;
+        let is_at_rule = bytes[i] == b'@';
+        let mut paren_depth = 0usize;
+        let mut open_brace: Option<usize> = None;
+        while i < bytes.len() {
+            if skip_css_ignored(bytes, &mut i, &mut in_str) {
+                continue;
+            }
+            match bytes[i] {
+                b'(' | b'[' => paren_depth += 1,
+                b')' | b']' => paren_depth = paren_depth.saturating_sub(1),
+                b';' if paren_depth == 0 => {
+                    i += 1;
+                    break;
+                }
+                b'{' if paren_depth == 0 => {
+                    open_brace = Some(i);
+                    i += 1;
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let Some(ob) = open_brace else {
+            continue;
+        };
+        let mut brace_depth = 1usize;
+        while i < bytes.len() && brace_depth > 0 {
+            if skip_css_ignored(bytes, &mut i, &mut in_str) {
+                continue;
+            }
+            match bytes[i] {
+                b'{' => brace_depth += 1,
+                b'}' => brace_depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        if brace_depth == 0 && !is_at_rule {
+            let sel = css[rule_start..ob].trim();
+            let body = css[ob + 1..i.saturating_sub(1)].trim();
+            if !sel.is_empty() {
+                out.push((rule_start, sel, body));
+            }
+        }
+    }
+    out
+}
+
+fn try_recover_cssom_style_rule(
+    sel: &str,
+    body: &str,
+    namespaces: &SelectorNamespaceMap,
+) -> Option<CssomRuleKind> {
+    let ns_opt = (!namespaces.is_empty()).then_some(namespaces);
+    let parsed_sel = parse_selector_list_with_namespaces(sel, ns_opt).ok()?;
+    let selector_text = serialize_selector_list(&parsed_sel);
+    let dummy = format!("* {{ {body} }}");
+    let opts = ParserOptions {
+        error_recovery: true,
+        ..ParserOptions::default()
+    };
+    let declarations_text = {
+        let sheet = StyleSheet::parse(&dummy, opts).ok()?;
+        let CssRule::Style(sr) = sheet.rules.0.first()? else {
+            return None;
+        };
+        serialize_lightning_decl_block_cssom(&sr.declarations, Some(body))
+    };
+    Some(CssomRuleKind::Style {
+        selector_text,
+        declarations_text,
+        rules: Vec::new(),
+    })
+}
+
+fn convert_top_level_rules_to_cssom_with_recovery(
+    list: &CssRuleList<'_>,
+    namespaces: &mut SelectorNamespaceMap,
+    source_css: &str,
+    line_index: &LineIndex,
+) -> Vec<CssomRuleKind> {
+    let mut parsed_offsets = HashSet::new();
+    for r in &list.0 {
+        if let Some(off) = rule_start_byte_offset(r, line_index, source_css.len()) {
+            parsed_offsets.insert(off);
+        }
+    }
+    let dropped: Vec<(usize, &str, &str)> = scan_top_level_style_blocks(source_css)
+        .into_iter()
+        .filter(|(off, _, body)| !parsed_offsets.contains(off) && !body.contains('{'))
+        .collect();
+    let mut out = Vec::with_capacity(list.0.len() + dropped.len());
+    let mut drop_idx = 0usize;
+    for rule in &list.0 {
+        if let Some(rule_off) = rule_start_byte_offset(rule, line_index, source_css.len()) {
+            while drop_idx < dropped.len() && dropped[drop_idx].0 < rule_off {
+                let (_, sel, body) = dropped[drop_idx];
+                if let Some(rec) = try_recover_cssom_style_rule(sel, body, namespaces) {
+                    out.push(rec);
+                }
+                drop_idx += 1;
+            }
+        }
+        if let CssRule::Style(sr) = rule {
+            if lightning_to_css_string(&sr.selectors) == ".__rix_top_scope__" {
+                out.extend(convert_lightning_rule_list_to_cssom(
+                    &sr.rules,
+                    namespaces,
+                    CssomNestingContext::TopLevel,
+                    source_css,
+                    line_index,
+                ));
+                continue;
+            }
+        }
+        if let Ok(kind) = convert_lightning_rule_to_cssom(
+            rule,
+            namespaces,
+            CssomNestingContext::TopLevel,
+            source_css,
+            line_index,
+        ) {
+            out.push(kind);
+        }
+    }
+    while drop_idx < dropped.len() {
+        let (_, sel, body) = dropped[drop_idx];
+        if let Some(rec) = try_recover_cssom_style_rule(sel, body, namespaces) {
+            out.push(rec);
+        }
+        drop_idx += 1;
+    }
+    out
 }
 
 /// Strictly parses a single CSS rule for `CSSStyleSheet.insertRule(rule, index)`.

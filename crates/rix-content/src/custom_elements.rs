@@ -1414,6 +1414,9 @@ pub(crate) fn handle_builtin_html_constructor(
                 vm.heap
                     .object_set_prototype(wh, Some(resolved_proto), &mut vm.shapes);
             }
+            // WHATWG HTML §4.13: custom elements carry a custom prototype and author-defined
+            // instance state (e.g. `attachInternals()`), so pin the wrapper against premature GC.
+            host.borrow_mut().wrappers.set_pinned(&nid, true);
             Ok(wrapper)
         }
         None => {
@@ -1453,6 +1456,7 @@ pub(crate) fn handle_builtin_html_constructor(
                 vm.heap
                     .object_set_prototype(wh, Some(resolved_proto), &mut vm.shapes);
             }
+            host.borrow_mut().wrappers.set_pinned(&nid, true);
             Ok(wrapper)
         }
     }

@@ -37,6 +37,18 @@ bitflags! {
         const USER_VALID    = 1 << 19;
         const USER_INVALID  = 1 << 20;
         const AUTOFILL      = 1 << 21;
+        /// HTML §4.10.5.3 dirty checkedness flag (once `.checked` is assigned, `checked` attr stops controlling `:checked`).
+        const CHECKED_DIRTY = 1 << 22;
+        /// Custom element `:state(...)` change invalidation sentinel.
+        const CUSTOM_STATE  = 1 << 23;
+        /// Selectors L4 §11 media playback state flags.
+        const PLAYING       = 1 << 24;
+        const PAUSED        = 1 << 25;
+        const MUTED         = 1 << 26;
+        const MUTED_DIRTY   = 1 << 27;
+        const SEEKING       = 1 << 28;
+        const BUFFERING     = 1 << 29;
+        const STALLED       = 1 << 30;
     }
 }
 

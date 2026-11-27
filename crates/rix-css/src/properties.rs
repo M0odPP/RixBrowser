@@ -7801,7 +7801,7 @@ fn compile_property(
                 push_decl(out, ord, PropertyIdKind::OutlineColor, c, imp);
             }
             let st = match &o.style {
-                lightningcss::properties::outline::OutlineStyle::Auto => LineStyle::Solid,
+                lightningcss::properties::outline::OutlineStyle::Auto => LineStyle::Auto,
                 lightningcss::properties::outline::OutlineStyle::LineStyle(ls) => {
                     convert_line_style(ls)
                 }
@@ -7816,7 +7816,7 @@ fn compile_property(
         }
         Property::OutlineStyle(os) => {
             let st = match os {
-                lightningcss::properties::outline::OutlineStyle::Auto => LineStyle::Solid,
+                lightningcss::properties::outline::OutlineStyle::Auto => LineStyle::Auto,
                 lightningcss::properties::outline::OutlineStyle::LineStyle(ls) => {
                     convert_line_style(ls)
                 }

@@ -12,10 +12,10 @@ use rix_core::InternedStr;
 use rix_dom::{hash_ident_ascii_lower, ElementData, ElementState};
 use selectors::bloom::BloomFilter;
 use selectors::matching::selector_may_match;
-use selectors::parser::{AncestorHashes, Combinator, Component, Selector};
+use selectors::parser::{AncestorHashes, Combinator, Component, MatchesFeaturelessHost, Selector};
 use smallvec::SmallVec;
 
-use crate::selector::{RixPseudoClass, RixPseudoElement, RixSelectorImpl};
+use crate::selector::{classify_host_selector, RixPseudoClass, RixPseudoElement, RixSelectorImpl};
 use crate::stylesheet::{
     CompiledRule, FontFaceRule, KeyframesRule, LayerId, LayerSeg, RegisteredProperty, Stylesheet,
 };
@@ -156,6 +156,9 @@ pub struct RuleIndex {
     pub rules: Vec<CompiledRule>,
     elements: SelectorBuckets,
     host_rules: Vec<RuleBucketEntry>,
+    host_pseudo_by_kind: HashMap<RixPseudoElement, Vec<RuleBucketEntry>>,
+    slotted_rules: Vec<RuleBucketEntry>,
+    part_rules: Vec<RuleBucketEntry>,
     pseudo_by_kind: HashMap<RixPseudoElement, SelectorBuckets>,
     /// True when any rule is inserted into multiple selector buckets (e.g. multi-branch `:is()`/`:where()`).
     pub has_multi_bucket_rules: bool,
@@ -227,6 +230,9 @@ impl RuleIndex {
             rules: Vec::with_capacity(total_rules),
             elements: SelectorBuckets::default(),
             host_rules: Vec::new(),
+            host_pseudo_by_kind: HashMap::new(),
+            slotted_rules: Vec::new(),
+            part_rules: Vec::new(),
             pseudo_by_kind: HashMap::new(),
             has_multi_bucket_rules: false,
             has_relative_selectors: false,
@@ -492,6 +498,56 @@ impl RuleIndex {
         }
     }
 
+    /// Returns true if any rule targets `:host::<pseudo>` (or `:is(:host)::<pseudo>`).
+    #[must_use]
+    pub fn has_host_pseudo_rules(&self, pseudo: RixPseudoElement) -> bool {
+        self.host_pseudo_by_kind
+            .get(&pseudo)
+            .is_some_and(|v| !v.is_empty())
+    }
+
+    /// Collects candidate `:host::<pseudo>` rule indices for a shadow host's pseudo-element.
+    pub fn collect_host_pseudo_candidates(
+        &self,
+        pseudo: RixPseudoElement,
+        out: &mut SmallVec<[u32; 16]>,
+    ) {
+        out.clear();
+        if let Some(entries) = self.host_pseudo_by_kind.get(&pseudo) {
+            for entry in entries {
+                out.push(entry.rule_idx);
+            }
+        }
+    }
+
+    /// Returns true if any rule contains `::slotted(...)`.
+    #[must_use]
+    pub fn has_slotted_rules(&self) -> bool {
+        !self.slotted_rules.is_empty()
+    }
+
+    /// Collects candidate `::slotted(...)` rule indices for slotted light-DOM children.
+    pub fn collect_slotted_candidates(&self, out: &mut SmallVec<[u32; 16]>) {
+        out.clear();
+        for entry in &self.slotted_rules {
+            out.push(entry.rule_idx);
+        }
+    }
+
+    /// Returns true if any rule contains `::part(...)`.
+    #[must_use]
+    pub fn has_part_rules(&self) -> bool {
+        !self.part_rules.is_empty()
+    }
+
+    /// Collects candidate `::part(...)` rule indices for shadow-tree part elements.
+    pub fn collect_part_candidates(&self, out: &mut SmallVec<[u32; 16]>) {
+        out.clear();
+        for entry in &self.part_rules {
+            out.push(entry.rule_idx);
+        }
+    }
+
     /// Returns true if any rule targets `pseudo`.
     #[must_use]
     pub fn has_pseudo_rules(&self, pseudo: RixPseudoElement) -> bool {
@@ -670,22 +726,21 @@ impl RuleIndex {
 
     fn insert_bucket(&mut self, selector: &Selector<RixSelectorImpl>, entry: RuleBucketEntry) {
         type BucketKeyTuple = (Option<u64>, Option<u64>, Option<u64>, Option<u64>);
+        let host_class = classify_host_selector(selector);
+        let is_slotted_subject = selector.is_slotted();
+        let is_part_subject = selector.is_part();
         let mut iter = selector.iter();
         let mut best_id: Option<u64> = None;
         let mut best_class: Option<u64> = None;
         let mut best_tag: Option<u64> = None;
         let mut best_attr: Option<u64> = None;
         let mut multi_branch_keys: SmallVec<[BucketKeyTuple; 8]> = SmallVec::new();
-        let mut is_host_subject = false;
         let mut pseudo_kind: Option<RixPseudoElement> = None;
 
         for comp in iter.by_ref() {
             match comp {
                 Component::PseudoElement(pe) => {
                     pseudo_kind = Some(*pe);
-                }
-                Component::Host(_) => {
-                    is_host_subject = true;
                 }
                 Component::ID(id) if best_id.is_none() => {
                     best_id = Some(hash_ident_ascii_lower(id.as_str()));
@@ -801,6 +856,15 @@ impl RuleIndex {
                     }
                 }
             }
+            if host_class != MatchesFeaturelessHost::Never {
+                self.host_pseudo_by_kind
+                    .entry(pe)
+                    .or_default()
+                    .push(entry.clone());
+                if host_class == MatchesFeaturelessHost::Only {
+                    return;
+                }
+            }
             if best_id.is_none()
                 && best_class.is_none()
                 && best_tag.is_none()
@@ -821,9 +885,21 @@ impl RuleIndex {
             return;
         }
 
-        if is_host_subject {
-            self.host_rules.push(entry);
-        } else if best_id.is_none()
+        if is_slotted_subject {
+            self.slotted_rules.push(entry);
+            return;
+        }
+        if is_part_subject {
+            self.part_rules.push(entry);
+            return;
+        }
+        if host_class != MatchesFeaturelessHost::Never {
+            self.host_rules.push(entry.clone());
+            if host_class == MatchesFeaturelessHost::Only {
+                return;
+            }
+        }
+        if best_id.is_none()
             && best_class.is_none()
             && best_tag.is_none()
             && best_attr.is_none()
@@ -1075,16 +1151,27 @@ impl InvalidationMap {
                         RixPseudoClass::Lang(_) => "lang",
                         _ => "placeholder",
                     };
-                    let attr_scope =
-                        if matches!(pc, RixPseudoClass::Dir(_) | RixPseudoClass::Lang(_)) {
-                            scope | InvalidationScope::DESCENDANTS
-                        } else {
-                            scope
-                        };
+                    let attr_scope = if matches!(
+                        pc,
+                        RixPseudoClass::Dir(_)
+                            | RixPseudoClass::Lang(_)
+                            | RixPseudoClass::Disabled
+                            | RixPseudoClass::Enabled
+                    ) {
+                        scope | InvalidationScope::DESCENDANTS
+                    } else {
+                        scope
+                    };
                     *self
                         .attr_deps
                         .entry(hash_ident_ascii_lower(attr))
                         .or_default() |= attr_scope;
+                    if matches!(pc, RixPseudoClass::Checked) {
+                        *self
+                            .attr_deps
+                            .entry(hash_ident_ascii_lower("selected"))
+                            .or_default() |= scope;
+                    }
                     if matches!(pc, RixPseudoClass::Dir(_)) {
                         // `<input type="tel">` and `<input dir="auto" value="...">` affect `:dir()`.
                         *self
@@ -1097,6 +1184,58 @@ impl InvalidationMap {
                             .or_default() |= scope;
                     }
                 }
+                match pc {
+                    RixPseudoClass::InRange | RixPseudoClass::OutOfRange => {
+                        for attr in ["readonly", "disabled", "min", "max", "value", "type"] {
+                            *self
+                                .attr_deps
+                                .entry(hash_ident_ascii_lower(attr))
+                                .or_default() |= scope;
+                        }
+                    }
+                    RixPseudoClass::Heading | RixPseudoClass::HeadingList(_) => {
+                        let h_scope = scope | InvalidationScope::DESCENDANTS;
+                        for attr in ["headingoffset", "headingreset"] {
+                            *self
+                                .attr_deps
+                                .entry(hash_ident_ascii_lower(attr))
+                                .or_default() |= h_scope;
+                        }
+                    }
+                    RixPseudoClass::Indeterminate => {
+                        for attr in ["value", "checked", "type", "name"] {
+                            *self
+                                .attr_deps
+                                .entry(hash_ident_ascii_lower(attr))
+                                .or_default() |= scope;
+                        }
+                    }
+                    RixPseudoClass::Muted => {
+                        *self
+                            .attr_deps
+                            .entry(hash_ident_ascii_lower("muted"))
+                            .or_default() |= scope;
+                    }
+                    RixPseudoClass::Valid | RixPseudoClass::Invalid => {
+                        let v_scope = scope | InvalidationScope::ANCESTORS;
+                        for attr in [
+                            "value", "min", "max", "required", "readonly", "disabled", "type",
+                        ] {
+                            *self
+                                .attr_deps
+                                .entry(hash_ident_ascii_lower(attr))
+                                .or_default() |= v_scope;
+                        }
+                    }
+                    _ => {}
+                }
+                (false, false)
+            }
+            Component::Part(_) => {
+                *self
+                    .attr_deps
+                    .entry(hash_ident_ascii_lower("part"))
+                    .or_default() |= scope;
                 (false, false)
             }
             Component::Is(list) | Component::Where(list) | Component::Negation(list) => {
@@ -1194,6 +1333,14 @@ fn pseudo_to_element_state(pc: &RixPseudoClass) -> Option<ElementState> {
         RixPseudoClass::UserValid => Some(ElementState::USER_VALID),
         RixPseudoClass::UserInvalid => Some(ElementState::USER_INVALID),
         RixPseudoClass::Autofill => Some(ElementState::AUTOFILL),
+        RixPseudoClass::State(_) => Some(ElementState::CUSTOM_STATE),
+        RixPseudoClass::Playing | RixPseudoClass::Paused => {
+            Some(ElementState::PLAYING | ElementState::PAUSED)
+        }
+        RixPseudoClass::Muted => Some(ElementState::MUTED),
+        RixPseudoClass::Seeking => Some(ElementState::SEEKING),
+        RixPseudoClass::Buffering => Some(ElementState::BUFFERING),
+        RixPseudoClass::Stalled => Some(ElementState::STALLED),
         _ => None,
     }
 }

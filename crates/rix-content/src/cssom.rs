@@ -5821,6 +5821,7 @@ fn format_line_style(ls: LineStyle) -> &'static str {
         LineStyle::Ridge => "ridge",
         LineStyle::Inset => "inset",
         LineStyle::Outset => "outset",
+        LineStyle::Auto => "auto",
     }
 }
 

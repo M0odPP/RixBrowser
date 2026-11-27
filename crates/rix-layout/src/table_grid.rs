@@ -156,7 +156,7 @@ fn line_style_priority(st: LineStyle) -> u8 {
         LineStyle::Outset => 3,
         LineStyle::Groove => 2,
         LineStyle::Inset => 1,
-        LineStyle::None => 0,
+        LineStyle::None | LineStyle::Auto => 0,
     }
 }
 
