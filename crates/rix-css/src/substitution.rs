@@ -350,6 +350,7 @@ fn validate_var_args(inner: &str) -> bool {
         || (has_top_level_braces(name_t) && strip_outer_pair(name_t, b'{', b'}').is_none())
     { return false; }
     let unwrapped = strip_outer_pair(name_t, b'{', b'}').map_or(name_t, str::trim);
+    if unwrapped.is_empty() { return false; }
     if contains_subst_fn_str(unwrapped) && !validate_subst_syntax(unwrapped) { return false; }
     if let Some(fb) = fb_opt {
         let fbt = fb.trim();
@@ -1728,7 +1729,90 @@ pub fn substitute_standard_property_l5(tokens: &[CssToken], prop: PropertyIdKind
 }
 
 #[rustfmt::skip]
-fn parse_bg_url_token(p: &mut Parser<'_, '_>, eval: &EvalContext, allow_gradient: bool) -> Option<String> {
+fn parse_gradient_fn_computed(fname: &str, args_raw: &str, dark_mode: bool, eval: &EvalContext) -> Option<String> {
+    let parts = split_top_level(args_raw.trim(), b',');
+    if parts.len() < 2 { return None; }
+    let mut gparts: Vec<String> = Vec::with_capacity(parts.len());
+    for gp in parts {
+        let gt = gp.trim();
+        if gt.is_empty() { return None; }
+        // Split each color-stop/prelude into top-level tokens while resolving color tokens.
+        let mut sub_tokens: Vec<String> = Vec::new();
+        let mut pi = ParserInput::new(gt);
+        let mut p = Parser::new(&mut pi);
+        while !p.is_exhausted() {
+            let st = p.position();
+            if p.next().is_err() { break; }
+            let seg = p.slice_from(st).trim();
+            if let Some(c) = crate::color::parse_css_color(seg) {
+                sub_tokens.push(c.resolve(crate::color::ResolvedColor::from_rgba(ColorRgba::BLACK), dark_mode, eval).to_computed_css_string());
+            } else {
+                sub_tokens.push(seg.to_string());
+            }
+        }
+        if sub_tokens.is_empty() { return None; }
+        gparts.push(sub_tokens.join(" "));
+    }
+    Some(format!("{}({})", fname.to_ascii_lowercase(), gparts.join(", ")))
+}
+
+/// Validates and evaluates CSS Color 5 `light-dark(<image>, <image>)` (and nested `<image>`
+/// values including `none`, `url()`, gradients, `image-set()`, `src()`, `image()`).
+#[must_use]
+#[rustfmt::skip]
+pub fn resolve_light_dark_image_fn(raw: &str, dark_mode: bool, eval: &EvalContext, allow_none: bool) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() { return None; }
+    let lower = t.to_ascii_lowercase();
+    if lower == "none" {
+        return allow_none.then(|| "image(rgba(0, 0, 0, 0))".to_string());
+    }
+    if lower.starts_with("light-dark(") && t.ends_with(')') {
+        let inner = &t[11..t.len() - 1];
+        let parts = split_top_level(inner, b',');
+        if parts.len() != 2 { return None; }
+        // Both branches must be valid `<image> | none` per CSS Color 5 §10.
+        let light_res = resolve_light_dark_image_fn(parts[0], dark_mode, eval, true)?;
+        let dark_res = resolve_light_dark_image_fn(parts[1], dark_mode, eval, true)?;
+        return Some(if dark_mode { dark_res } else { light_res });
+    }
+    if lower.starts_with("image-set(") || lower.starts_with("-webkit-image-set(")
+        || lower.starts_with("src(") || lower.starts_with("image(")
+    {
+        return parse_and_serialize_bg_image_fn_with_scheme(t, dark_mode, eval);
+    }
+    let mut pi = ParserInput::new(t);
+    let mut p = Parser::new(&mut pi);
+    let res = match p.next().ok()?.clone() {
+        Token::UnquotedUrl(u) => Some(format!("url({})", quote_css_string(u.as_ref()))),
+        Token::Function(f) if f.eq_ignore_ascii_case("url") => {
+            let s = p.parse_nested_block(|n| {
+                let st = n.expect_string()?.as_ref().to_string();
+                if !n.is_exhausted() { return Err(n.new_custom_error(())); }
+                Ok::<_, cssparser::ParseError<'_, ()>>(st)
+            }).ok()?;
+            Some(format!("url({})", quote_css_string(&s)))
+        }
+        Token::Function(f) if matches!(
+            f.to_ascii_lowercase().as_str(),
+            "linear-gradient" | "radial-gradient" | "conic-gradient"
+            | "repeating-linear-gradient" | "repeating-radial-gradient" | "repeating-conic-gradient"
+        ) => {
+            let fname = f.as_ref().to_string();
+            let args_raw = p.parse_nested_block(|n| {
+                let st = n.position();
+                while n.next().is_ok() {}
+                Ok::<_, cssparser::ParseError<'_, ()>>(n.slice_from(st).trim().to_string())
+            }).ok()?;
+            parse_gradient_fn_computed(&fname, &args_raw, dark_mode, eval)
+        }
+        _ => None,
+    }?;
+    p.is_exhausted().then_some(res)
+}
+
+#[rustfmt::skip]
+fn parse_bg_url_token(p: &mut Parser<'_, '_>, dark_mode: bool, eval: &EvalContext, allow_gradient: bool) -> Option<String> {
     match p.next().ok()?.clone() {
         Token::QuotedString(s) => Some(format!("url({})", quote_css_string(s.as_ref()))),
         Token::UnquotedUrl(u) => Some(format!("url({})", quote_css_string(u.as_ref()))),
@@ -1738,34 +1822,47 @@ fn parse_bg_url_token(p: &mut Parser<'_, '_>, eval: &EvalContext, allow_gradient
                 }).ok()?;
             Some(format!("url({})", quote_css_string(&s)))
         }
-        Token::Function(f) if allow_gradient && f.eq_ignore_ascii_case("linear-gradient") => {
+        Token::Function(f) if f.eq_ignore_ascii_case("light-dark") => {
+            let inner = p.parse_nested_block(|n| {
+                let st = n.position();
+                while n.next().is_ok() {}
+                Ok::<_, cssparser::ParseError<'_, ()>>(n.slice_from(st).trim().to_string())
+            }).ok()?;
+            resolve_light_dark_image_fn(&format!("light-dark({inner})"), dark_mode, eval, false)
+        }
+        Token::Function(f) if allow_gradient && matches!(
+            f.to_ascii_lowercase().as_str(),
+            "linear-gradient" | "radial-gradient" | "conic-gradient"
+            | "repeating-linear-gradient" | "repeating-radial-gradient" | "repeating-conic-gradient"
+        ) => {
+            let fname = f.as_ref().to_string();
             let args_raw = p.parse_nested_block(|n| {
                     let st = n.position();
                     while n.next().is_ok() {}
                     Ok::<_, cssparser::ParseError<'_, ()>>(n.slice_from(st).trim().to_string())
                 }).ok()?;
-            let gparts: Vec<String> = split_top_level(&args_raw, b',').into_iter()
-                .map(|gp| {
-                    let gt = gp.trim();
-                    crate::color::parse_css_color(gt).map_or_else( || gt.to_string(),
-                        |c| {
-                            c.resolve(crate::color::ResolvedColor::from_rgba(ColorRgba::BLACK), false, eval)
-                            .to_computed_css_string()
-                        }, )
-                }).collect();
-            Some(format!("linear-gradient({})", gparts.join(", ")))
+            parse_gradient_fn_computed(&fname, &args_raw, dark_mode, eval)
         }
         _ => None,
     }
 }
 
-/// Evaluates a CSS `background-image` `image-set(...)`, `-webkit-image-set(...)`, `src(...)`, or
-/// `image(...)` declaration into canonical CSSOM computed form.
+/// Evaluates a CSS `background-image` `light-dark(...)`, `image-set(...)`, `-webkit-image-set(...)`,
+/// `src(...)`, or `image(...)` declaration into canonical CSSOM computed form.
 #[must_use]
 #[rustfmt::skip]
 pub fn parse_and_serialize_bg_image_fn(raw: &str, eval: &EvalContext) -> Option<String> {
+    parse_and_serialize_bg_image_fn_with_scheme(raw, false, eval)
+}
+
+#[must_use]
+#[rustfmt::skip]
+pub fn parse_and_serialize_bg_image_fn_with_scheme(raw: &str, dark_mode: bool, eval: &EvalContext) -> Option<String> {
     let t = raw.trim();
     let lower = t.to_ascii_lowercase();
+    if lower.starts_with("light-dark(") && t.ends_with(')') {
+        return resolve_light_dark_image_fn(t, dark_mode, eval, false);
+    }
     if lower.starts_with("src(") && t.ends_with(')') {
         let mut pi = ParserInput::new(t[4..t.len() - 1].trim());
         let mut p = Parser::new(&mut pi);
@@ -1776,7 +1873,7 @@ pub fn parse_and_serialize_bg_image_fn(raw: &str, eval: &EvalContext) -> Option<
     if lower.starts_with("image(") && t.ends_with(')') {
         let mut pi = ParserInput::new(t[6..t.len() - 1].trim());
         let mut p = Parser::new(&mut pi);
-        let img = parse_bg_url_token(&mut p, eval, false)?;
+        let img = parse_bg_url_token(&mut p, dark_mode, eval, false)?;
         return p.is_exhausted().then(|| format!("image({img})"));
     }
     let inner = if lower.starts_with("image-set(") && t.ends_with(')') {
@@ -1790,7 +1887,7 @@ pub fn parse_and_serialize_bg_image_fn(raw: &str, eval: &EvalContext) -> Option<
         if pt.is_empty() { return None; }
         let mut pi = ParserInput::new(pt);
         let mut p = Parser::new(&mut pi);
-        let img = parse_bg_url_token(&mut p, eval, true)?;
+        let img = parse_bg_url_token(&mut p, dark_mode, eval, true)?;
         let (mut res_str, mut type_str) = ("1dppx".to_string(), None::<String>);
         while !p.is_exhausted() {
             let st = p.state();

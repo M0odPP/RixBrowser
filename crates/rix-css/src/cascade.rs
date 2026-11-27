@@ -357,6 +357,7 @@ impl StyleContext {
     /// Extracts portable animation/transition state so it survives full stylesheet rebuilds.
     pub fn take_animation_state(&mut self) -> AnimationStateSnapshot {
         AnimationStateSnapshot {
+            inline_color_exprs: self.inline_color_exprs.drain().collect(),
             before_change: self.before_change_styles.drain().collect(),
             pseudo_before_change: self.pseudo_before_change_styles.drain().collect(),
             active_transitions: self.active_transitions.drain().collect(),
@@ -373,6 +374,7 @@ impl StyleContext {
 
     /// Restores portable animation/transition state onto a newly constructed [`StyleContext`].
     pub fn restore_animation_state(&mut self, snap: AnimationStateSnapshot) {
+        self.inline_color_exprs.extend(snap.inline_color_exprs);
         self.before_change_styles.extend(snap.before_change);
         self.pseudo_before_change_styles
             .extend(snap.pseudo_before_change);
@@ -1190,6 +1192,9 @@ impl StyleContext {
             elapsed_ms: self.animation_clock_ms,
             generation: self.transition_generation,
             css_animations_managed: self.css_animations_managed,
+            root_font_size,
+            media: &self.media,
+            inline_color_exprs: &self.inline_color_exprs,
             rule_index: &self.rule_index,
             before_change_styles: &mut self.before_change_styles,
             pseudo_before_change_styles: &mut self.pseudo_before_change_styles,
@@ -1272,11 +1277,19 @@ impl StyleContext {
     fn apply_post_cascade_animations(
         &mut self, doc: &Document, node_ids: &[NodeId], mut extra_layout_dirty: Option<&mut Vec<NodeId>>,
     ) {
+        let root_font_size = doc
+            .children(doc.root())
+            .find(|&n| matches!(doc.get(n), Some(NodeData::Element(_))))
+            .and_then(|n| self.styles.get(&n))
+            .map_or(16.0, |s| s.text.font_size_px);
         let mut anim_ctx = AnimWalkCtx {
             dark_mode: self.media.dark_mode,
             elapsed_ms: self.animation_clock_ms,
             generation: self.transition_generation,
             css_animations_managed: self.css_animations_managed,
+            root_font_size,
+            media: &self.media,
+            inline_color_exprs: &self.inline_color_exprs,
             rule_index: &self.rule_index,
             before_change_styles: &mut self.before_change_styles,
             pseudo_before_change_styles: &mut self.pseudo_before_change_styles,
@@ -1729,6 +1742,9 @@ struct AnimWalkCtx<'a> {
     elapsed_ms: f32,
     generation: u64,
     css_animations_managed: bool,
+    root_font_size: f32,
+    media: &'a MediaContext,
+    inline_color_exprs: &'a FastMap<(NodeId, PropertyIdKind), Arc<crate::color::CssColorExpr>>,
     rule_index: &'a RuleIndex,
     before_change_styles: &'a mut FastMap<NodeId, Arc<ComputedStyle>>,
     pseudo_before_change_styles: &'a mut FastMap<(NodeId, RixPseudoElement), Arc<ComputedStyle>>,
@@ -1798,7 +1814,7 @@ impl AnimWalkCtx<'_> {
             self.pre_anim_styles.remove(&id);
         }
         let mut active_trs = self.active_transitions.remove(&id).unwrap_or_default();
-        let final_style = apply_animations_and_transitions(
+        let mut final_style = apply_animations_and_transitions(
             Arc::clone(&base_style),
             parent_style.as_deref(),
             self.dark_mode,
@@ -1819,6 +1835,49 @@ impl AnimWalkCtx<'_> {
             &mut self.started_any,
             &mut self.cancelled_local,
         );
+        // CSS Variables L1 / Web Animations: when an animation modifies any custom property (`--*`),
+        // re-substitute `var()`-dependent standard properties on this element against the animated
+        // `custom_properties` map, then re-apply animations so non-custom animated properties persist.
+        if !Arc::ptr_eq(&final_style.custom_properties, &base_style.custom_properties)
+            && final_style.custom_properties != base_style.custom_properties
+        {
+            if let Some(recomputed) = recompute_element_with_custom_override(
+                doc,
+                id,
+                parent_style.as_ref(),
+                self.root_font_size,
+                self.rule_index,
+                self.inline_color_exprs,
+                self.media,
+                &final_style.custom_properties,
+            ) {
+                let mut dummy_trs = active_trs.clone();
+                let mut dummy_next = *self.next_transition_id;
+                let mut dummy_started = false;
+                let mut dummy_cancelled = Vec::new();
+                final_style = apply_animations_and_transitions(
+                    recomputed,
+                    parent_style.as_deref(),
+                    self.dark_mode,
+                    self.elapsed_ms,
+                    &|name| self.rule_index.keyframes.get(&rix_core::intern_str(name)),
+                    self.css_animations_managed,
+                    managed_slice.as_deref(),
+                    web_slice.as_deref(),
+                    before.as_ref(),
+                    &mut dummy_trs,
+                    &self.rule_index.registered_properties,
+                    None,
+                    hidden_ancestor,
+                    ancestor_transitioning,
+                    self.transition_overrides,
+                    &mut dummy_next,
+                    self.generation,
+                    &mut dummy_started,
+                    &mut dummy_cancelled,
+                );
+            }
+        }
         if !active_trs.is_empty() {
             self.active_transitions.insert(id, active_trs);
         }
@@ -2736,7 +2795,156 @@ fn parse_html_table_border_attr(raw: &str) -> f32 {
     trimmed[..end].parse::<f32>().unwrap_or(1.0).max(0.0)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn recompute_element_with_custom_override(
+    doc: &Document,
+    node: NodeId,
+    parent_style: Option<&Arc<ComputedStyle>>,
+    root_font_size: f32,
+    rule_index: &RuleIndex,
+    inline_color_exprs: &FastMap<(NodeId, PropertyIdKind), Arc<crate::color::CssColorExpr>>,
+    media: &MediaContext,
+    animated_custom: &Arc<crate::computed::CustomPropertyMap>,
+) -> Option<Arc<ComputedStyle>> {
+    let Some(NodeData::Element(elem)) = doc.get(node) else {
+        return None;
+    };
+    let mut candidate_indices = SmallVec::<[u32; 32]>::new();
+    rule_index.collect_candidates(elem, None, &mut candidate_indices);
+    let dom_el = DomElement::new(doc, node);
+    let mut caches = SelectorCaches::default();
+    let mut matched_refs = SmallVec::<[MatchedRule<'_>; 16]>::new();
+    for &idx in &candidate_indices {
+        let rule = &rule_index.rules[idx as usize];
+        if let Some(prox) =
+            match_rule_with_scopes(doc, node, &dom_el, rule, None, &mut caches, None)
+        {
+            matched_refs.push(MatchedRule {
+                rule,
+                scope_proximity: prox,
+                is_shadow_host_rule: false,
+            });
+        }
+    }
+    let mut ignored_missing = Vec::new();
+    let pres_decls = if has_presentational_hint_attrs(doc, node, elem) {
+        collect_presentational_hint_decls(doc, node, elem, &mut ignored_missing)
+    } else {
+        Vec::new()
+    };
+    let inline_attr = elem
+        .attributes
+        .iter()
+        .find(|(q, _)| q.local.eq_str_ignore_ascii_case("style"))
+        .map(|(_, v)| v.as_str());
+    let mut inline_decls = match inline_attr {
+        Some(attr) if !attr.trim().is_empty() => {
+            if doc.quirks_mode() == 2 {
+                parse_inline_style_quirks(attr, &mut ignored_missing)
+            } else {
+                parse_inline_style(attr, &mut ignored_missing)
+            }
+        }
+        _ => Vec::new(),
+    };
+    if !inline_color_exprs.is_empty() && !inline_decls.is_empty() {
+        for decl in &mut inline_decls {
+            if let Some(expr) = inline_color_exprs.get(&(node, decl.property)) {
+                decl.value = PropertyValue::Color4(Box::new((**expr).clone()));
+            }
+        }
+    }
+    let (sib_idx, sib_cnt) = element_sibling_position(doc, node);
+    let mut resolved = crate::computed::resolve_element_style_with_custom_override(
+        &matched_refs,
+        &pres_decls,
+        &inline_decls,
+        parent_style.map(Arc::as_ref),
+        root_font_size,
+        media,
+        Some(&rule_index.registered_properties),
+        sib_idx,
+        sib_cnt,
+        usize::from(node) as u64,
+        rule_index.random_doc_seed,
+        &elem.attributes,
+        Some(animated_custom),
+    );
+    if parent_style.is_some_and(|p| {
+        matches!(
+            p.display,
+            crate::values::DisplayMode::Flex
+                | crate::values::DisplayMode::InlineFlex
+                | crate::values::DisplayMode::Grid
+                | crate::values::DisplayMode::InlineGrid
+        )
+    }) {
+        resolved.display = resolved.display.blockify();
+    }
+    Some(Arc::new(resolved))
+}
+
+fn is_svg_presentation_attr(name: &str) -> bool {
+    matches!(
+        name,
+        "alignment-baseline"
+            | "baseline-shift"
+            | "clip"
+            | "clip-path"
+            | "clip-rule"
+            | "color"
+            | "color-interpolation"
+            | "color-interpolation-filters"
+            | "cursor"
+            | "direction"
+            | "display"
+            | "dominant-baseline"
+            | "fill"
+            | "fill-opacity"
+            | "fill-rule"
+            | "filter"
+            | "flood-color"
+            | "flood-opacity"
+            | "font-family"
+            | "font-size"
+            | "font-size-adjust"
+            | "font-stretch"
+            | "font-style"
+            | "font-variant"
+            | "font-weight"
+            | "letter-spacing"
+            | "lighting-color"
+            | "mask"
+            | "opacity"
+            | "overflow"
+            | "pointer-events"
+            | "stop-color"
+            | "stop-opacity"
+            | "stroke"
+            | "stroke-dasharray"
+            | "stroke-dashoffset"
+            | "stroke-linecap"
+            | "stroke-linejoin"
+            | "stroke-miterlimit"
+            | "stroke-opacity"
+            | "stroke-width"
+            | "text-anchor"
+            | "text-decoration"
+            | "visibility"
+            | "word-spacing"
+            | "writing-mode"
+    )
+}
+
 fn has_presentational_hint_attrs(doc: &Document, node: NodeId, elem: &ElementData) -> bool {
+    if &*elem.name.ns == "http://www.w3.org/2000/svg"
+        && elem
+            .attributes
+            .iter()
+            .any(|(q, _)| is_svg_presentation_attr(q.local.as_ref()))
+    {
+        return true;
+    }
     let tag: &str = elem.name.local.as_ref();
     if doc.quirks_mode() == 2 && tag.eq_ignore_ascii_case("table") {
         return true;
@@ -2794,6 +3002,21 @@ fn collect_presentational_hint_decls(
 ) -> Vec<SpecifiedDeclaration> {
     let tag: &str = elem.name.local.as_ref();
     let mut css = String::new();
+
+    // SVG 2 §6.5 Presentation Attributes: map directly to zero-specificity author-level CSS
+    // declarations (including `var(...)` references!).
+    if &*elem.name.ns == "http://www.w3.org/2000/svg" {
+        for (q, val) in &elem.attributes {
+            let attr: &str = q.local.as_ref();
+            let trimmed = val.trim();
+            if !trimmed.is_empty() && is_svg_presentation_attr(attr) {
+                css.push_str(attr);
+                css.push(':');
+                css.push_str(trimmed);
+                css.push(';');
+            }
+        }
+    }
 
     // WHATWG Quirks Mode §3.4 / HTML §15.3.9: in Quirks Mode (not Limited-Quirks),
     // `<table>` resets inherited font & text properties to their initial values.

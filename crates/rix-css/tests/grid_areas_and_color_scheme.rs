@@ -45,7 +45,7 @@ fn color_scheme_light_dark_adapts_root_canvas_text_and_background() {
     );
     assert_eq!(
         ctx_dark.style_for(p_node).expect("p style").text.color,
-        ColorRgba::rgb(241, 245, 249),
+        rix_css::color::SystemColor::CanvasText.resolve(true),
         "p must inherit light CanvasText when html opts into dark color-scheme"
     );
 

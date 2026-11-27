@@ -631,6 +631,8 @@ impl ContentRuntime {
             let step = parser.borrow_mut().step();
             match step {
                 ParserStreamStep::Script(script_id) => {
+                    // Any `<style>` elements parsed since the previous script must invalidate stylesheets.
+                    self.host.borrow_mut().mark_sheets_dirty();
                     let (is_classic, code) = {
                         let doc_cell = Rc::clone(&self.host.borrow().document);
                         let doc = doc_cell.borrow();
@@ -866,6 +868,8 @@ impl ContentRuntime {
             let step = parser.borrow_mut().step();
             match step {
                 ParserStreamStep::Script(script_id) => {
+                    // Any `<style>` elements parsed since the previous script must invalidate stylesheets.
+                    self.host.borrow_mut().mark_sheets_dirty();
                     let info = {
                         let doc_cell = Rc::clone(&self.host.borrow().document);
                         let doc = doc_cell.borrow();

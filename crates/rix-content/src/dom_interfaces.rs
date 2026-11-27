@@ -540,8 +540,11 @@ pub const SVG_ELEMENT_INTERFACES: &[&str] = &[
     "SVGLineElement",
     "SVGPolylineElement",
     "SVGPolygonElement",
+    "SVGTextContentElement",
+    "SVGTextPositioningElement",
     "SVGTextElement",
     "SVGTSpanElement",
+    "SVGTextPathElement",
     "SVGImageElement",
     "SVGForeignObjectElement",
     "SVGStyleElement",
@@ -748,9 +751,28 @@ pub fn install_all_dom_interfaces(vm: &mut JsVm, host: &SharedHost) {
     );
 
     // Register SVG*Element subclasses.
+    let mut svg_geom_ctor = svg_elem_ctor;
+    let mut svg_tc_ctor = svg_elem_ctor;
+    let mut svg_tp_ctor = svg_elem_ctor;
     for &iface in SVG_ELEMENT_INTERFACES {
         if let Some(&proto) = host.borrow().interface_protos.get(iface) {
-            let _ = register_dom_interface(vm, iface, proto, Some(svg_elem_ctor), false);
+            let parent_ctor = match iface {
+                "SVGPathElement" | "SVGRectElement" | "SVGCircleElement" | "SVGEllipseElement"
+                | "SVGLineElement" | "SVGPolylineElement" | "SVGPolygonElement" => svg_geom_ctor,
+                "SVGTextPositioningElement" | "SVGTextPathElement" => svg_tc_ctor,
+                "SVGTextElement" | "SVGTSpanElement" => svg_tp_ctor,
+                _ => svg_elem_ctor,
+            };
+            let ctor = register_dom_interface(vm, iface, proto, Some(parent_ctor), false);
+            match iface {
+                "SVGGeometryElement" => svg_geom_ctor = ctor,
+                "SVGTextContentElement" => {
+                    svg_tc_ctor = ctor;
+                    install_svg_text_content_methods(vm, proto, host);
+                }
+                "SVGTextPositioningElement" => svg_tp_ctor = ctor,
+                _ => {}
+            }
         }
     }
 
@@ -2517,18 +2539,265 @@ pub fn build_element_interface_protos(
     }
     let svg_geom = make_proto(vm, svg_element_proto);
     map.insert("SVGGeometryElement", svg_geom);
+    let svg_tc = make_proto(vm, svg_element_proto);
+    map.insert("SVGTextContentElement", svg_tc);
+    let svg_tp = make_proto(vm, svg_tc);
+    map.insert("SVGTextPositioningElement", svg_tp);
     for &iface in SVG_ELEMENT_INTERFACES {
-        if iface == "SVGGeometryElement" {
+        if matches!(
+            iface,
+            "SVGGeometryElement" | "SVGTextContentElement" | "SVGTextPositioningElement"
+        ) {
             continue;
         }
         let parent = match iface {
             "SVGPathElement" | "SVGRectElement" | "SVGCircleElement" | "SVGEllipseElement"
             | "SVGLineElement" | "SVGPolylineElement" | "SVGPolygonElement" => svg_geom,
+            "SVGTextElement" | "SVGTSpanElement" => svg_tp,
+            "SVGTextPathElement" => svg_tc,
             _ => svg_element_proto,
         };
         map.insert(iface, make_proto(vm, parent));
     }
     map
+}
+
+/// Counts UTF-16 code units belonging to an `SVGTextContentElement`, traversing
+/// `display: contents` and inline `<tspan>`/`<textPath>`/`<a>` children while skipping
+/// `display: none` subtrees per SVG 2 §11.8.1 & CSS Display L3 §2.8.
+fn collect_svg_text_utf16_len(host: &mut HostState, root: NodeId) -> usize {
+    let _ = host.ensure_styles();
+    let doc = host.document.borrow();
+    if host
+        .style_ctx
+        .style_for(root)
+        .is_some_and(|s| s.display == rix_css::DisplayMode::None)
+    {
+        return 0;
+    }
+    let mut stack: Vec<NodeId> = Vec::with_capacity(16);
+    let mut cur = doc.first_child(root);
+    let mut rev_children = Vec::new();
+    while let Some(c) = cur {
+        rev_children.push(c);
+        cur = doc.next_sibling(c);
+    }
+    for c in rev_children.into_iter().rev() {
+        stack.push(c);
+    }
+    let mut total = 0usize;
+    let mut visited = 0usize;
+    while let Some(nid) = stack.pop() {
+        visited += 1;
+        if visited > 100_000 {
+            break;
+        }
+        match doc.get(nid) {
+            Some(NodeData::Text(s)) => total += s.encode_utf16().count(),
+            Some(NodeData::Element(el)) => {
+                if host
+                    .style_ctx
+                    .style_for(nid)
+                    .is_some_and(|s| s.display == rix_css::DisplayMode::None)
+                {
+                    continue;
+                }
+                let local = el.name.local.as_str();
+                if matches!(local, "tspan" | "textPath" | "tref" | "a" | "text") {
+                    let mut c = doc.first_child(nid);
+                    let mut tmp = Vec::new();
+                    while let Some(ch) = c {
+                        tmp.push(ch);
+                        c = doc.next_sibling(ch);
+                    }
+                    for ch in tmp.into_iter().rev() {
+                        stack.push(ch);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+fn svg_text_metrics(host: &mut HostState, nid: NodeId) -> (f64, f64, f64) {
+    let _ = host.ensure_styles();
+    let font_size = host
+        .style_ctx
+        .style_for(nid)
+        .map_or(16.0, |s| f64::from(s.text.font_size_px.max(1.0)));
+    let doc = host.document.borrow();
+    let (base_x, base_y) = match doc.get(nid) {
+        Some(NodeData::Element(el)) => {
+            let x = el
+                .get_attribute("x")
+                .and_then(|s| {
+                    s.split(|c: char| c.is_ascii_whitespace() || c == ',')
+                        .next()
+                })
+                .and_then(|s| s.trim_end_matches("px").parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let y = el
+                .get_attribute("y")
+                .and_then(|s| {
+                    s.split(|c: char| c.is_ascii_whitespace() || c == ',')
+                        .next()
+                })
+                .and_then(|s| s.trim_end_matches("px").parse::<f64>().ok())
+                .unwrap_or(0.0);
+            (x, y)
+        }
+        _ => (0.0, 0.0),
+    };
+    (base_x, base_y, font_size)
+}
+
+fn alloc_svg_point(vm: &mut JsVm, x: f64, y: f64) -> JsValue {
+    let pt = vm.alloc_ordinary_object();
+    let kx = vm.heap.intern_key("x");
+    let ky = vm.heap.intern_key("y");
+    vm.heap.object_define_data(
+        pt,
+        kx,
+        JsValue::from_f64(x),
+        PropertyAttrs::DEFAULT,
+        &mut vm.shapes,
+    );
+    vm.heap.object_define_data(
+        pt,
+        ky,
+        JsValue::from_f64(y),
+        PropertyAttrs::DEFAULT,
+        &mut vm.shapes,
+    );
+    JsValue::from_object(pt)
+}
+
+fn install_svg_text_content_methods(vm: &mut JsVm, proto: HeapHandle, host: &SharedHost) {
+    let h = Rc::clone(host);
+    define_host_method(vm, proto, "getNumberOfChars", move |vm, this, _| {
+        let nid = require_node(vm, &h, this)?;
+        let n = collect_svg_text_utf16_len(&mut h.borrow_mut(), nid);
+        Ok(JsValue::from_f64(n as f64))
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, proto, "getComputedTextLength", move |vm, this, _| {
+        let nid = require_node(vm, &h, this)?;
+        let mut hb = h.borrow_mut();
+        let n = collect_svg_text_utf16_len(&mut hb, nid);
+        let (_, _, fs) = svg_text_metrics(&mut hb, nid);
+        Ok(JsValue::from_f64(n as f64 * fs * 0.6))
+    });
+    let h = Rc::clone(host);
+    define_host_method(
+        vm,
+        proto,
+        "getStartPositionOfChar",
+        move |vm, this, args| {
+            let nid = require_node(vm, &h, this)?;
+            let idx_f = vm.to_number(arg(args, 0)).unwrap_or(0.0);
+            let mut hb = h.borrow_mut();
+            let n = collect_svg_text_utf16_len(&mut hb, nid);
+            if !idx_f.is_finite() || idx_f < 0.0 || (idx_f as usize) >= n {
+                return Err(create_dom_exception(
+                    vm,
+                    "IndexSizeError",
+                    "charnum out of range",
+                ));
+            }
+            let (bx, by, fs) = svg_text_metrics(&mut hb, nid);
+            let x = bx + (idx_f as usize as f64) * fs * 0.6;
+            Ok(alloc_svg_point(vm, x, by))
+        },
+    );
+    let h = Rc::clone(host);
+    define_host_method(vm, proto, "getEndPositionOfChar", move |vm, this, args| {
+        let nid = require_node(vm, &h, this)?;
+        let idx_f = vm.to_number(arg(args, 0)).unwrap_or(0.0);
+        let mut hb = h.borrow_mut();
+        let n = collect_svg_text_utf16_len(&mut hb, nid);
+        if !idx_f.is_finite() || idx_f < 0.0 || (idx_f as usize) >= n {
+            return Err(create_dom_exception(
+                vm,
+                "IndexSizeError",
+                "charnum out of range",
+            ));
+        }
+        let (bx, by, fs) = svg_text_metrics(&mut hb, nid);
+        let x = bx + ((idx_f as usize + 1) as f64) * fs * 0.6;
+        Ok(alloc_svg_point(vm, x, by))
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, proto, "getExtentOfChar", move |vm, this, args| {
+        let nid = require_node(vm, &h, this)?;
+        let idx_f = vm.to_number(arg(args, 0)).unwrap_or(0.0);
+        let mut hb = h.borrow_mut();
+        let n = collect_svg_text_utf16_len(&mut hb, nid);
+        if !idx_f.is_finite() || idx_f < 0.0 || (idx_f as usize) >= n {
+            return Err(create_dom_exception(
+                vm,
+                "IndexSizeError",
+                "charnum out of range",
+            ));
+        }
+        let (bx, by, fs) = svg_text_metrics(&mut hb, nid);
+        let adv = fs * 0.6;
+        let rect = vm.alloc_ordinary_object();
+        for (k, v) in [
+            ("x", bx + (idx_f as usize as f64) * adv),
+            ("y", (by - fs * 0.8).max(0.0)),
+            ("width", adv),
+            ("height", fs),
+        ] {
+            let key = vm.heap.intern_key(k);
+            vm.heap.object_define_data(
+                rect,
+                key,
+                JsValue::from_f64(v),
+                PropertyAttrs::DEFAULT,
+                &mut vm.shapes,
+            );
+        }
+        Ok(JsValue::from_object(rect))
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, proto, "getSubStringLength", move |vm, this, args| {
+        let nid = require_node(vm, &h, this)?;
+        let start_f = vm.to_number(arg(args, 0)).unwrap_or(0.0);
+        let count_f = vm.to_number(arg(args, 1)).unwrap_or(0.0);
+        let mut hb = h.borrow_mut();
+        let n = collect_svg_text_utf16_len(&mut hb, nid);
+        if !start_f.is_finite() || start_f < 0.0 || (start_f as usize) >= n {
+            return Err(create_dom_exception(
+                vm,
+                "IndexSizeError",
+                "charnum out of range",
+            ));
+        }
+        let (_, _, fs) = svg_text_metrics(&mut hb, nid);
+        let count = (count_f.max(0.0) as usize).min(n.saturating_sub(start_f as usize));
+        Ok(JsValue::from_f64(count as f64 * fs * 0.6))
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, proto, "getRotationOfChar", move |vm, this, args| {
+        let nid = require_node(vm, &h, this)?;
+        let idx_f = vm.to_number(arg(args, 0)).unwrap_or(0.0);
+        let n = collect_svg_text_utf16_len(&mut h.borrow_mut(), nid);
+        if !idx_f.is_finite() || idx_f < 0.0 || (idx_f as usize) >= n {
+            return Err(create_dom_exception(
+                vm,
+                "IndexSizeError",
+                "charnum out of range",
+            ));
+        }
+        Ok(JsValue::from_f64(0.0))
+    });
+    let h = Rc::clone(host);
+    define_host_method(vm, proto, "getCharNumAtPosition", move |vm, this, _| {
+        let _ = require_node(vm, &h, this)?;
+        Ok(JsValue::from_i32(-1))
+    });
 }
 
 // ---------------------------------------------------------------------------

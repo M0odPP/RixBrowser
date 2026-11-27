@@ -334,6 +334,31 @@ pub(crate) fn is_supported_animatable_css_prop(css_prop: &str) -> bool {
     )
 }
 
+/// Computes W3C Web Animations §5.5.2 / CSS Logical Properties declaration priority rank
+/// for a JS keyframe property (higher rank wins on collision):
+/// - Longhands always beat shorthands.
+/// - Physical properties always beat logical properties within the same category.
+/// - Shorthands with fewer constituent longhands beat shorthands with more.
+fn web_keyframe_prop_priority(css_prop: &str) -> u32 {
+    let Some(pk) = rix_css::PropertyIdKind::from_name(css_prop) else {
+        return 100;
+    };
+    let lhs = pk.shorthand_longhands();
+    let count = lhs.len().max(1) as u32;
+    let is_logical =
+        rix_css::is_logical_property(pk) || lhs.iter().any(|&lh| rix_css::is_logical_property(lh));
+    if count == 1 {
+        if is_logical {
+            900
+        } else {
+            1000
+        }
+    } else {
+        let base = if is_logical { 100 } else { 500 };
+        base + 100u32.saturating_sub(count.min(100))
+    }
+}
+
 /// Parses and validates a single CSS property value for a keyframe, returning
 /// `(serialized_value, compiled_declarations)` if valid (or `None` if invalid/unsupported).
 pub(crate) fn parse_keyframe_css_prop(
@@ -344,9 +369,19 @@ pub(crate) fn parse_keyframe_css_prop(
     if trimmed.is_empty() {
         return None;
     }
+    let prio = web_keyframe_prop_priority(css_prop);
+    let stamp = |mut decls: Vec<SpecifiedDeclaration>| {
+        for d in &mut decls {
+            d.order = prio;
+        }
+        decls
+    };
     if css_prop.starts_with("--") {
         let mut missing = Vec::new();
-        let decls = parse_inline_style(&format!("{css_prop}: {raw_val}"), &mut missing);
+        let decls = stamp(parse_inline_style(
+            &format!("{css_prop}: {raw_val}"),
+            &mut missing,
+        ));
         return Some((raw_val.to_string(), decls));
     }
     // Reject `!important` in keyframes per W3C Web Animations §5.5.2.
@@ -356,7 +391,10 @@ pub(crate) fn parse_keyframe_css_prop(
     // Preserve `var(...)` values cleanly (validated as token streams at computed-value time).
     if trimmed.contains("var(") {
         let mut missing = Vec::new();
-        let decls = parse_inline_style(&format!("{css_prop}: {trimmed}"), &mut missing);
+        let decls = stamp(parse_inline_style(
+            &format!("{css_prop}: {trimmed}"),
+            &mut missing,
+        ));
         return Some((trimmed.to_string(), decls));
     }
     // Reject non-animatable animation/transition properties in keyframes? Actually Web Animations
@@ -376,7 +414,7 @@ pub(crate) fn parse_keyframe_css_prop(
                             custom_name: None,
                             value: rix_css::PropertyValue::Number(v),
                             important: false,
-                            order: 0,
+                            order: prio,
                         }],
                     ));
                 }
@@ -391,7 +429,7 @@ pub(crate) fn parse_keyframe_css_prop(
                         custom_name: None,
                         value: rix_css::PropertyValue::Number(v),
                         important: false,
-                        order: 0,
+                        order: prio,
                     }],
                 ));
             }
@@ -399,7 +437,10 @@ pub(crate) fn parse_keyframe_css_prop(
     }
     // Validate via `parse_and_serialize_declaration` first so invalid values like `"invalid"` drop!
     let mut missing = Vec::new();
-    let decls = parse_inline_style(&format!("{css_prop}: {trimmed}"), &mut missing);
+    let decls = stamp(parse_inline_style(
+        &format!("{css_prop}: {trimmed}"),
+        &mut missing,
+    ));
     if let Some(ser) = rix_css::parse_and_serialize_declaration(css_prop, trimmed) {
         return Some((ser, decls));
     }

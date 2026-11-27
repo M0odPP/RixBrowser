@@ -151,7 +151,12 @@ th {
     left: 0;
 }
 html {
+    color: CanvasText;
     font-family: serif;
+}
+mark {
+    background-color: Mark;
+    color: MarkText;
 }
 body {
     margin: 8px;
@@ -228,12 +233,12 @@ ol {
     list-style-type: decimal;
 }
 a:link {
-    color: #0000ee;
+    color: LinkText;
     text-decoration: underline;
     cursor: pointer;
 }
 a:visited {
-    color: #551a8b;
+    color: VisitedText;
     text-decoration: underline;
     cursor: pointer;
 }
@@ -256,9 +261,9 @@ button, input, select, textarea {
 }
 button {
     box-sizing: border-box;
-    background-color: #e9e9ed;
+    background-color: ButtonFace;
     color: ButtonText;
-    border: 2px outset #817f84;
+    border: 2px outset ButtonBorder;
     padding: 1px 4px;
     text-align: center;
     overflow: visible;
@@ -266,8 +271,8 @@ button {
 }
 input {
     box-sizing: content-box;
-    background-color: #ffffff;
-    border: 2px inset #817f84;
+    background-color: Field;
+    border: 2px inset ButtonBorder;
     padding: 1px 2px;
     text-align: start;
     overflow: clip;
@@ -278,9 +283,9 @@ input[type="search" i] {
 }
 input[type="submit" i], input[type="button" i], input[type="reset" i] {
     box-sizing: border-box;
-    background-color: #e9e9ed;
+    background-color: ButtonFace;
     color: ButtonText;
-    border: 2px outset #817f84;
+    border: 2px outset ButtonBorder;
     padding: 1px 4px;
     text-align: center;
     white-space: pre;
@@ -309,14 +314,15 @@ input[type="range" i] {
     margin: 2px;
     padding: 0;
     border: 0;
-    background-color: #ffffff;
+    background-color: Field;
     overflow: visible;
     cursor: default;
 }
 input[type="color" i] {
     box-sizing: border-box;
-    background-color: #e9e9ed;
-    border: 2px outset #817f84;
+    background-color: ButtonFace;
+    color: ButtonText;
+    border: 2px outset ButtonBorder;
     padding: 4px;
     cursor: default;
 }
@@ -336,15 +342,15 @@ input[type="date" i], input[type="time" i], input[type="datetime-local" i], inpu
 }
 select {
     box-sizing: border-box;
-    background-color: #e9e9ed;
-    border: 2px inset #817f84;
+    background-color: ButtonFace;
+    border: 2px inset ButtonBorder;
     padding: 1px 4px;
     overflow: clip;
     white-space: nowrap;
     cursor: default;
 }
 select[multiple] {
-    background-color: #ffffff;
+    background-color: Field;
     padding: 1px 0;
     vertical-align: text-bottom;
     overflow-x: hidden;
@@ -363,8 +369,8 @@ textarea {
     box-sizing: content-box;
     font-family: monospace;
     font-size: 12px;
-    background-color: #ffffff;
-    border: 2px inset #817f84;
+    background-color: Field;
+    border: 2px inset ButtonBorder;
     padding: 2px;
     vertical-align: text-bottom;
     white-space: pre-wrap;

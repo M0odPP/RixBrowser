@@ -828,26 +828,35 @@ pub fn layout_block_box(
         }
     };
     let is_bb_h = is_bb || (is_table_cell && ctx.tree.quirks_mode == 2);
-    let eff_min_h = resolve_size_with_intrinsic(
-        &style.box_model.min_height,
-        space.available_height,
-        pb_h,
-        metrics.margin.vertical(),
-        is_bb_h,
-        &eval,
-        intr_h_fn,
-    )
-    .unwrap_or(metrics.min_height);
-    let eff_max_h = resolve_size_with_intrinsic(
-        &style.box_model.max_height,
-        space.available_height,
-        pb_h,
-        metrics.margin.vertical(),
-        is_bb_h,
-        &eval,
-        intr_h_fn,
-    )
-    .unwrap_or(metrics.max_height);
+    let ignore_cell_block_minmax = is_table_cell && !style.text.writing_mode.is_vertical();
+    let eff_min_h = if ignore_cell_block_minmax {
+        0.0
+    } else {
+        resolve_size_with_intrinsic(
+            &style.box_model.min_height,
+            space.available_height,
+            pb_h,
+            metrics.margin.vertical(),
+            is_bb_h,
+            &eval,
+            intr_h_fn,
+        )
+        .unwrap_or(metrics.min_height)
+    };
+    let eff_max_h = if ignore_cell_block_minmax {
+        f32::INFINITY
+    } else {
+        resolve_size_with_intrinsic(
+            &style.box_model.max_height,
+            space.available_height,
+            pb_h,
+            metrics.margin.vertical(),
+            is_bb_h,
+            &eval,
+            intr_h_fn,
+        )
+        .unwrap_or(metrics.max_height)
+    };
     let raw_content_h = definite_height.unwrap_or_else(|| {
         resolve_size_with_intrinsic(
             &style.box_model.height,

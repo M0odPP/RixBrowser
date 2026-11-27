@@ -895,6 +895,17 @@ pub fn parse_container_condition(raw: &str) -> ContainerCondition {
             }
         };
 
+    if ops.is_empty() && tokens.len() == 1 {
+        // CSS Containment L3 §5.2: boolean size feature context `(width)` / `(inline-size)` means `> 0`.
+        if let Some(axis) = parse_container_axis(tokens[0]) {
+            return ContainerCondition::SizeCmp {
+                axis,
+                op: ContainerCmpOp::Gt,
+                value: 0.0,
+                unit: crate::values::LengthUnit::Px,
+            };
+        }
+    }
     if ops.len() == 1 && tokens.len() == 2 {
         if let Some(axis) = parse_container_axis(tokens[0]) {
             if let Some(c) = make_cmp(axis, ops[0], tokens[1]) {
@@ -1149,7 +1160,8 @@ impl Stylesheet {
         } else {
             std::borrow::Cow::Borrowed(css)
         };
-        let rewritten = crate::properties::rewrite_dynamic_var_names(&quirks_norm);
+        let cleaned_custom = crate::properties::strip_unbalanced_custom_decls(&quirks_norm);
+        let rewritten = crate::properties::rewrite_dynamic_var_names(&cleaned_custom);
         let wrapped = wrap_top_level_scope_rules(&rewritten);
         let opts = ParserOptions {
             error_recovery: true,

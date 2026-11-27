@@ -75,22 +75,38 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
         });
     }
     if prop_kind == PropertyIdKind::BackgroundLayers
-        && (lower_val.starts_with("image-set(")
+        && (lower_val.starts_with("light-dark(")
+            || lower_val.starts_with("image-set(")
             || lower_val.starts_with("-webkit-image-set(")
             || lower_val.starts_with("src(")
             || lower_val.starts_with("image("))
     {
-        if lower_val.starts_with("image-set(") && crate::values_math::has_values4_syntax(trimmed) {
+        if lower_val.starts_with("image-set(")
+            && !lower_val.contains("light-dark(")
+            && crate::values_math::has_values4_syntax(trimmed)
+        {
             return crate::values_math::parse_image_set_resolution_specified(trimmed);
         }
-        if crate::substitution::parse_and_serialize_bg_image_fn(
+        return crate::substitution::parse_and_serialize_bg_image_fn(
             trimmed,
             &crate::values::EvalContext::default(),
         )
-        .is_some()
-        {
-            return Some(trimmed.to_string());
-        }
+        .map(|_| trimmed.to_string());
+    }
+    if matches!(
+        prop_kind,
+        PropertyIdKind::ListStyleImage
+            | PropertyIdKind::BorderImageSource
+            | PropertyIdKind::Content
+    ) && lower_val.starts_with("light-dark(")
+    {
+        return crate::substitution::resolve_light_dark_image_fn(
+            trimmed,
+            false,
+            &crate::values::EvalContext::default(),
+            false,
+        )
+        .map(|_| trimmed.to_string());
     }
     if prop_kind == PropertyIdKind::Display {
         return crate::values::DisplayMode::parse_css(trimmed)
@@ -648,6 +664,7 @@ pub fn is_color_longhand(kind: PropertyIdKind) -> bool {
             | PropertyIdKind::BorderInlineEndColor
             | PropertyIdKind::OutlineColor
             | PropertyIdKind::TextDecorationColor
+            | PropertyIdKind::ColumnRuleColor
     )
 }
 
@@ -973,14 +990,40 @@ fn parse_and_serialize_extra_css2_property(
             }
             Some(Some(norm.join(", ")))
         }
-        PropertyIdKind::ListStyleImage => {
+        PropertyIdKind::ListStyleImage | PropertyIdKind::BorderImageSource => {
             if low == "none" {
                 return Some(Some("none".to_string()));
+            }
+            if low.starts_with("light-dark(") {
+                return Some(
+                    crate::substitution::resolve_light_dark_image_fn(
+                        trimmed,
+                        false,
+                        &crate::values::EvalContext::default(),
+                        false,
+                    )
+                    .map(|_| trimmed.to_string()),
+                );
             }
             if low.starts_with("url(") && low.ends_with(')') {
                 return Some(Some(normalize_cssom_urls(trimmed)));
             }
             None
+        }
+        PropertyIdKind::CaretColor => {
+            if low == "auto" {
+                Some(Some("auto".to_string()))
+            } else {
+                Some(crate::color::parse_and_serialize_color_specified(trimmed))
+            }
+        }
+        PropertyIdKind::SvgClipRule => {
+            let ok = matches!(low.as_str(), "nonzero" | "evenodd");
+            Some(ok.then_some(low))
+        }
+        PropertyIdKind::BackgroundOrigin => {
+            let ok = matches!(low.as_str(), "border-box" | "padding-box" | "content-box");
+            Some(ok.then_some(low))
         }
         PropertyIdKind::ListStylePosition => {
             let ok = matches!(low.as_str(), "inside" | "outside");

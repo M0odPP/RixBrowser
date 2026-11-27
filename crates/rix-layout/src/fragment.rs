@@ -249,12 +249,31 @@ impl BoxMetrics {
         };
         let specified_height = resolve_h(&bm.height);
 
-        let min_width = resolve_size_value(&bm.min_width, cb_w, &eval)
-            .map_or(0.0, |v| to_content_dim(v, pb_w, is_border_box));
-        let max_width = resolve_size_value(&bm.max_width, cb_w, &eval)
-            .map_or(f32::INFINITY, |v| to_content_dim(v, pb_w, is_border_box));
-        let min_height = resolve_h(&bm.min_height).unwrap_or(0.0);
-        let max_height = resolve_h(&bm.max_height).unwrap_or(f32::INFINITY);
+        let is_table_cell = style.display == rix_css::DisplayMode::TableCell;
+        let is_vertical_wm = style.text.writing_mode.is_vertical();
+        let min_width = if is_table_cell && is_vertical_wm {
+            0.0
+        } else {
+            resolve_size_value(&bm.min_width, cb_w, &eval)
+                .map_or(0.0, |v| to_content_dim(v, pb_w, is_border_box))
+        };
+        let max_width = if is_table_cell && is_vertical_wm {
+            f32::INFINITY
+        } else {
+            resolve_size_value(&bm.max_width, cb_w, &eval)
+                .map_or(f32::INFINITY, |v| to_content_dim(v, pb_w, is_border_box))
+        };
+        // CSS 2.1 §10.7 / CSS Writing Modes 3: `min-block-size`/`max-block-size` do not apply to `table-cell`.
+        let min_height = if is_table_cell && !is_vertical_wm {
+            0.0
+        } else {
+            resolve_h(&bm.min_height).unwrap_or(0.0)
+        };
+        let max_height = if is_table_cell && !is_vertical_wm {
+            f32::INFINITY
+        } else {
+            resolve_h(&bm.max_height).unwrap_or(f32::INFINITY)
+        };
 
         Self {
             padding,
