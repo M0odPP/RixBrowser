@@ -963,6 +963,7 @@ fn classify_wpt_file(wpt_root: &Path, path: &Path, html: &str) -> ClassifiedTest
 fn collect_local_stylesheets(
     wpt_root: &Path,
     doc_path: &Path,
+    origin_base: &str,
     doc: &Document,
     media: &MediaContext,
 ) -> Vec<Arc<Stylesheet>> {
@@ -980,10 +981,26 @@ fn collect_local_stylesheets(
                 if let Some(href) = elem.get_attribute("href") {
                     let css_path = resolve_wpt_path(wpt_root, doc_path, href);
                     if let Ok(css_text) = fs::read_to_string(&css_path) {
-                        sheets.push(Stylesheet::parse_cached(
+                        let canonical =
+                            fs::canonicalize(&css_path).unwrap_or_else(|_| css_path.clone());
+                        let wpt_canon =
+                            fs::canonicalize(wpt_root).unwrap_or_else(|_| wpt_root.to_path_buf());
+                        let rel_css = canonical
+                            .strip_prefix(&wpt_canon)
+                            .or_else(|_| css_path.strip_prefix(wpt_root))
+                            .ok();
+                        let sheet_url = rel_css.map(|r| {
+                            format!(
+                                "{}/{}",
+                                origin_base.trim_end_matches('/'),
+                                r.to_string_lossy().replace('\\', "/")
+                            )
+                        });
+                        sheets.push(Stylesheet::parse_cached_with_base(
                             &css_text,
                             CascadeOrigin::Author,
                             media,
+                            sheet_url.as_deref(),
                         ));
                     }
                 }
@@ -1103,7 +1120,7 @@ fn render_wpt_reftest_rgba(
     };
     let mut doc = parse_html(html);
     let mut styles = StyleContext::new(media);
-    for sheet in collect_local_stylesheets(wpt_root, doc_path, &doc, &media) {
+    for sheet in collect_local_stylesheets(wpt_root, doc_path, "http://localhost", &doc, &media) {
         styles.add_stylesheet(sheet);
     }
     for css in extract_style_blocks(&doc) {
@@ -2075,7 +2092,10 @@ fn run_wpt_testharness_file(
         viewport_height: viewport.height,
         ..MediaContext::default()
     };
-    let ext_sheets = collect_local_stylesheets(wpt_root, path, &parsed, &media);
+    let origin_base = format!("http://localhost:{}", server.port);
+    let rel = path.strip_prefix(wpt_root).unwrap_or(path);
+    let doc_url = format!("{origin_base}/{}", rel.to_string_lossy().replace('\\', "/"));
+    let ext_sheets = collect_local_stylesheets(wpt_root, path, &origin_base, &parsed, &media);
 
     let mut ext_scripts: HashMap<String, String> = HashMap::new();
     let mut module_scan_queue: Vec<(PathBuf, String)> = Vec::new();
@@ -2122,7 +2142,6 @@ fn run_wpt_testharness_file(
             }
         }
     }
-    let origin_base = format!("http://localhost:{}", server.port);
     // Recursively preload static ES module imports (`import ... from "..."`, `export ... from "..."`)
     // from the local WPT tree so `<script type="module">` tests work offline cleanly.
     let mut visited_modules: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -2156,8 +2175,6 @@ fn run_wpt_testharness_file(
         }
     }
 
-    let rel = path.strip_prefix(wpt_root).unwrap_or(path);
-    let doc_url = format!("{origin_base}/{}", rel.to_string_lossy().replace('\\', "/"));
     let doc = Rc::new(RefCell::new(Document::new()));
     let per_file_engine = Arc::new(FetchEngine::new(server.fetch_engine.client().clone()));
     let mut rt =

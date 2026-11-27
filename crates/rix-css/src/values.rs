@@ -310,31 +310,34 @@ impl LengthUnit {
             Self::Px => value,
             Self::Rem => value * ctx.root_font_size_px,
             Self::Em => value * ctx.font_size_px,
-            Self::Ex => value * ctx.font_size_px * 0.5,
+            Self::Ex => value * ctx.ex_px.unwrap_or(ctx.font_size_px * 0.5),
             Self::Ch => value * ctx.ch_px.unwrap_or(ctx.font_size_px * 0.5),
-            Self::Rex | Self::Rch => value * ctx.root_font_size_px * 0.5,
-            Self::Cap => value * ctx.font_size_px * 0.7,
-            Self::Rcap => value * ctx.root_font_size_px * 0.7,
+            Self::Rex => value * ctx.rex_px.unwrap_or(ctx.root_font_size_px * 0.5),
+            Self::Rch => value * ctx.rch_px.unwrap_or(ctx.root_font_size_px * 0.5),
+            Self::Cap => value * ctx.cap_px.unwrap_or(ctx.font_size_px * 0.7),
+            Self::Rcap => value * ctx.rcap_px.unwrap_or(ctx.root_font_size_px * 0.7),
             Self::Ic => value * ctx.font_size_px,
             Self::Ric => value * ctx.root_font_size_px,
             Self::Lh => value * ctx.line_height_px,
             Self::Rlh => value * ctx.root_line_height_px,
-            Self::Vw
-            | Self::Vi
-            | Self::Svw
-            | Self::Svi
-            | Self::Lvw
-            | Self::Lvi
-            | Self::Dvw
-            | Self::Dvi => value * ctx.viewport_width_px * 0.01,
-            Self::Vh
-            | Self::Vb
-            | Self::Svh
-            | Self::Svb
-            | Self::Lvh
-            | Self::Lvb
-            | Self::Dvh
-            | Self::Dvb => value * ctx.viewport_height_px * 0.01,
+            Self::Vw | Self::Svw | Self::Lvw | Self::Dvw => value * ctx.viewport_width_px * 0.01,
+            Self::Vh | Self::Svh | Self::Lvh | Self::Dvh => value * ctx.viewport_height_px * 0.01,
+            Self::Vi | Self::Svi | Self::Lvi | Self::Dvi => {
+                let axis = if ctx.vertical_writing_mode {
+                    ctx.viewport_height_px
+                } else {
+                    ctx.viewport_width_px
+                };
+                value * axis * 0.01
+            }
+            Self::Vb | Self::Svb | Self::Lvb | Self::Dvb => {
+                let axis = if ctx.vertical_writing_mode {
+                    ctx.viewport_width_px
+                } else {
+                    ctx.viewport_height_px
+                };
+                value * axis * 0.01
+            }
             Self::Vmin | Self::Svmin | Self::Lvmin | Self::Dvmin => {
                 value * ctx.viewport_width_px.min(ctx.viewport_height_px) * 0.01
             }
@@ -350,6 +353,57 @@ impl LengthUnit {
 }
 
 /// Evaluation environment for resolving relative CSS units and `calc()` expressions.
+/// Resolved font metrics in CSS pixels for font-relative length units
+/// (`lh`, `rlh`, `ch`, `rch`, `ex`, `rex`, `cap`, `rcap`, CSS Values L4 §5.1.1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedFontMetrics {
+    pub normal_lh_px: f32,
+    pub ch_px: f32,
+    pub ex_px: f32,
+    pub cap_px: f32,
+}
+
+impl ResolvedFontMetrics {
+    #[must_use]
+    pub fn fallback(font_size_px: f32) -> Self {
+        Self {
+            normal_lh_px: (font_size_px * 1.2).max(0.0),
+            ch_px: font_size_px * 0.5,
+            ex_px: font_size_px * 0.5,
+            cap_px: font_size_px * 0.7,
+        }
+    }
+}
+
+/// Function signature backing [`FontMetricsResolver`].
+pub type FontMetricsFn =
+    dyn Fn(&[InternedStr], f32, bool, f32) -> ResolvedFontMetrics + Send + Sync;
+
+/// Callback plugged into [`crate::StyleContext`] by `rix-content` to query live `FontDatabase`
+/// metrics (`(families, weight, italic, font_size_px) -> ResolvedFontMetrics`) without introducing
+/// a circular crate dependency on `rix-text`.
+#[derive(Clone)]
+pub struct FontMetricsResolver(pub std::sync::Arc<FontMetricsFn>);
+
+impl FontMetricsResolver {
+    #[must_use]
+    pub fn resolve(
+        &self,
+        families: &[InternedStr],
+        weight: f32,
+        italic: bool,
+        font_size_px: f32,
+    ) -> ResolvedFontMetrics {
+        (self.0)(families, weight, italic, font_size_px)
+    }
+}
+
+impl std::fmt::Debug for FontMetricsResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FontMetricsResolver(..)")
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct EvalContext {
     pub font_size_px: f32,
@@ -361,6 +415,13 @@ pub struct EvalContext {
     pub container_width_px: f32,
     pub container_height_px: f32,
     pub ch_px: Option<f32>,
+    pub ex_px: Option<f32>,
+    pub cap_px: Option<f32>,
+    pub rch_px: Option<f32>,
+    pub rex_px: Option<f32>,
+    pub rcap_px: Option<f32>,
+    pub normal_lh_px: Option<f32>,
+    pub vertical_writing_mode: bool,
     pub sibling_index: u32,
     pub sibling_count: u32,
     pub random_node_id: u64,
@@ -378,6 +439,13 @@ impl PartialEq for EvalContext {
             && self.container_width_px == other.container_width_px
             && self.container_height_px == other.container_height_px
             && self.ch_px == other.ch_px
+            && self.ex_px == other.ex_px
+            && self.cap_px == other.cap_px
+            && self.rch_px == other.rch_px
+            && self.rex_px == other.rex_px
+            && self.rcap_px == other.rcap_px
+            && self.normal_lh_px == other.normal_lh_px
+            && self.vertical_writing_mode == other.vertical_writing_mode
             && self.sibling_index == other.sibling_index
             && self.sibling_count == other.sibling_count
     }
@@ -395,6 +463,13 @@ impl Default for EvalContext {
             container_width_px: 1280.0,
             container_height_px: 720.0,
             ch_px: None,
+            ex_px: None,
+            cap_px: None,
+            rch_px: None,
+            rex_px: None,
+            rcap_px: None,
+            normal_lh_px: None,
+            vertical_writing_mode: false,
             sibling_index: 1,
             sibling_count: 1,
             random_node_id: 0,

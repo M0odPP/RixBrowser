@@ -257,6 +257,8 @@ pub struct InheritedTextStyle {
     pub svg_dominant_baseline: crate::values::SvgDominantBaseline,
     pub font_stretch_pct: f32,
     pub font_size_adjust: Option<f32>,
+    pub font_feature_settings: Option<Vec<(InternedStr, i32)>>,
+    pub font_variation_settings: Option<Vec<(InternedStr, f32)>>,
     pub list_style_type: crate::values::ListStyleTypeMode,
     pub list_style_position: crate::values::ListStylePositionMode,
     /// Inherited CSS UI L4 `accent-color` (`None` = `auto`).
@@ -265,6 +267,8 @@ pub struct InheritedTextStyle {
     pub caret_color: Option<CssColor>,
     pub caret_color_computed: Option<Arc<crate::color::CssColorExpr>>,
     pub text_shadow: Vec<BoxShadowValue>,
+    /// Inherited CSS UI L4 `cursor: url(...) [x y]?, ...` image list preceding the fallback keyword.
+    pub cursor_urls: Vec<(InternedStr, Option<(f32, f32)>)>,
     /// Full CSS Values L4/L5 evaluation context snapshot for this element (`em`/`rem`/`lh`/`rlh`/viewport/container/sibling).
     pub eval_ctx: EvalContext,
 }
@@ -334,12 +338,15 @@ impl Default for InheritedTextStyle {
             svg_dominant_baseline: crate::values::SvgDominantBaseline::Auto,
             font_stretch_pct: 100.0,
             font_size_adjust: None,
+            font_feature_settings: None,
+            font_variation_settings: None,
             list_style_type: crate::values::ListStyleTypeMode::Disc,
             list_style_position: crate::values::ListStylePositionMode::Outside,
             accent_color: None,
             caret_color: None,
             caret_color_computed: None,
             text_shadow: Vec::new(),
+            cursor_urls: Vec::new(),
             eval_ctx: EvalContext::default(),
         }
     }
@@ -1283,6 +1290,7 @@ impl CascadeKey {
 struct CandidateDecl<'a> {
     key: CascadeKey,
     decl: &'a SpecifiedDeclaration,
+    base_url: Option<&'a str>,
 }
 
 /// Resolves an element's [`ComputedStyle`] from matched rules, inline declarations,
@@ -1360,7 +1368,9 @@ pub fn resolve_element_style_full(
 
 fn compute_line_height_px(lh: &LineHeightValue, font_size_px: f32, eval: &EvalContext) -> f32 {
     match lh {
-        LineHeightValue::Normal => (font_size_px * 1.2).max(0.0),
+        LineHeightValue::Normal => eval
+            .normal_lh_px
+            .unwrap_or_else(|| (font_size_px * 1.2).max(0.0)),
         LineHeightValue::Number(n) => (n * font_size_px).max(0.0),
         LineHeightValue::Length(lp) => lp.resolve_px(font_size_px, eval).max(0.0),
     }
@@ -1476,9 +1486,54 @@ pub fn resolve_element_style_with_custom_override(
     elem_attrs: &[(rix_dom::QualName, String)],
     override_custom_props: Option<&Arc<CustomPropertyMap>>,
 ) -> ComputedStyle {
+    resolve_element_style_with_metrics(
+        matched_rules,
+        pres_hint_decls,
+        inline_decls,
+        parent_style,
+        root_font_size_px,
+        media,
+        registered_props,
+        sibling_index,
+        sibling_count,
+        random_node_id,
+        random_doc_seed,
+        elem_attrs,
+        override_custom_props,
+        None,
+    )
+}
+
+/// Full element style cascade with optional live [`crate::values::FontMetricsResolver`]
+/// for exact font-relative units (`lh`, `rlh`, `ch`, `rch`, `ex`, `rex`, `cap`, `rcap`).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_element_style_with_metrics(
+    matched_rules: &[MatchedRule<'_>],
+    pres_hint_decls: &[SpecifiedDeclaration],
+    inline_decls: &[SpecifiedDeclaration],
+    parent_style: Option<&ComputedStyle>,
+    root_font_size_px: f32,
+    media: &MediaContext,
+    registered_props: Option<&HashMap<InternedStr, RegisteredProperty>>,
+    sibling_index: u32,
+    sibling_count: u32,
+    random_node_id: u64,
+    random_doc_seed: u64,
+    elem_attrs: &[(rix_dom::QualName, String)],
+    override_custom_props: Option<&Arc<CustomPropertyMap>>,
+    font_metrics: Option<&crate::values::FontMetricsResolver>,
+) -> ComputedStyle {
     let mut style = match parent_style {
         Some(p) => ComputedStyle::inherit_from(p),
         None => ComputedStyle::default(),
+    };
+    let resolve_fm = |families: &[InternedStr], weight: f32, fs_mode: FontStyleMode, fs: f32| {
+        let italic = !matches!(fs_mode, FontStyleMode::Normal);
+        font_metrics.map_or_else(
+            || crate::values::ResolvedFontMetrics::fallback(fs),
+            |fm| fm.resolve(families, weight, italic, fs),
+        )
     };
     let reg_count = registered_props.map_or(0, |m| m.len() as u32);
     let has_registered = reg_count > 0;
@@ -1505,11 +1560,13 @@ pub fn resolve_element_style_with_custom_override(
                 decl_order: decl.order,
             },
             decl,
+            base_url: None,
         });
     }
     for (rule_idx, mr) in matched_rules.iter().enumerate() {
         let rule = mr.rule;
         let r_order = (rule.source_order).max(rule_idx as u32);
+        let r_base = rule.base_url.as_deref();
         for decl in rule.declarations.iter() {
             candidates.push(CandidateDecl {
                 key: CascadeKey::new(
@@ -1524,6 +1581,7 @@ pub fn resolve_element_style_with_custom_override(
                     decl.order,
                 ),
                 decl,
+                base_url: r_base,
             });
         }
     }
@@ -1541,6 +1599,7 @@ pub fn resolve_element_style_with_custom_override(
                 decl.order,
             ),
             decl,
+            base_url: None,
         });
     }
 
@@ -1548,6 +1607,27 @@ pub fn resolve_element_style_with_custom_override(
         let mut ctx = media.eval_context(style.text.font_size_px, root_font_size_px);
         if let Some(p) = parent_style {
             ctx.root_line_height_px = p.text.eval_ctx.root_line_height_px;
+            ctx.ch_px = p.text.eval_ctx.ch_px;
+            ctx.ex_px = p.text.eval_ctx.ex_px;
+            ctx.cap_px = p.text.eval_ctx.cap_px;
+            ctx.rch_px = p.text.eval_ctx.rch_px;
+            ctx.rex_px = p.text.eval_ctx.rex_px;
+            ctx.rcap_px = p.text.eval_ctx.rcap_px;
+            ctx.normal_lh_px = p.text.eval_ctx.normal_lh_px;
+        } else {
+            let m = resolve_fm(
+                &style.text.font_family,
+                style.text.font_weight,
+                style.text.font_style,
+                style.text.font_size_px,
+            );
+            ctx.ch_px = Some(m.ch_px);
+            ctx.ex_px = Some(m.ex_px);
+            ctx.cap_px = Some(m.cap_px);
+            ctx.rch_px = Some(m.ch_px);
+            ctx.rex_px = Some(m.ex_px);
+            ctx.rcap_px = Some(m.cap_px);
+            ctx.normal_lh_px = Some(m.normal_lh_px);
         }
         ctx.line_height_px =
             compute_line_height_px(&style.text.line_height, style.text.font_size_px, &ctx);
@@ -1988,7 +2068,10 @@ pub fn resolve_element_style_with_custom_override(
             })
             .unwrap_or_default();
             if !expanded.is_empty() {
-                for decl in expanded {
+                for mut decl in expanded {
+                    if let Some(base) = c.base_url {
+                        crate::stylesheet::rewrite_decl_relative_urls(&mut decl, base);
+                    }
                     expanded_owned.push((c.key, decl));
                 }
             } else {
@@ -2222,20 +2305,52 @@ pub fn resolve_element_style_with_custom_override(
         per_prop.entry(*target_prop).or_default().push((*k, decl));
     }
 
-    // Pass 2a: Resolve `writing-mode`, `direction`, `font-size`, and `line-height` first so
-    // logical property mapping and `em`/`lh`/`rlh` units on the same element use computed values.
+    // Pass 2a: Resolve `writing-mode`, `direction`, `font-size`, `font-family`, `font-weight`,
+    // `font-style`, and `line-height` first so logical property mapping and font-relative units
+    // (`em`/`lh`/`rlh`/`ch`/`rch`/`ex`/`rex`/`cap`/`rcap`) on the same element use live font metrics.
     let parent_font_size = parent_style.map_or(16.0, |p| p.text.font_size_px);
-    let parent_lh = parent_style.map_or(19.2, |p| p.text.eval_ctx.line_height_px);
-    let root_lh = parent_style.map_or(19.2, |p| p.text.eval_ctx.root_line_height_px);
+    let init_root_metrics = if parent_style.is_none() {
+        Some(resolve_fm(&[], 400.0, FontStyleMode::Normal, 16.0))
+    } else {
+        None
+    };
+    let parent_lh = parent_style.map_or_else(
+        || init_root_metrics.map_or(19.2, |m| m.normal_lh_px),
+        |p| p.text.eval_ctx.line_height_px,
+    );
+    let root_lh = parent_style.map_or_else(
+        || init_root_metrics.map_or(19.2, |m| m.normal_lh_px),
+        |p| p.text.eval_ctx.root_line_height_px,
+    );
     let mut parent_eval = media.eval_context(parent_font_size, root_font_size_px);
     parent_eval.line_height_px = parent_lh;
     parent_eval.root_line_height_px = root_lh;
+    if let Some(p) = parent_style {
+        parent_eval.ch_px = p.text.eval_ctx.ch_px;
+        parent_eval.ex_px = p.text.eval_ctx.ex_px;
+        parent_eval.cap_px = p.text.eval_ctx.cap_px;
+        parent_eval.rch_px = p.text.eval_ctx.rch_px;
+        parent_eval.rex_px = p.text.eval_ctx.rex_px;
+        parent_eval.rcap_px = p.text.eval_ctx.rcap_px;
+        parent_eval.normal_lh_px = p.text.eval_ctx.normal_lh_px;
+    } else if let Some(im) = init_root_metrics {
+        parent_eval.ch_px = Some(im.ch_px);
+        parent_eval.ex_px = Some(im.ex_px);
+        parent_eval.cap_px = Some(im.cap_px);
+        parent_eval.rch_px = Some(im.ch_px);
+        parent_eval.rex_px = Some(im.ex_px);
+        parent_eval.rcap_px = Some(im.cap_px);
+        parent_eval.normal_lh_px = Some(im.normal_lh_px);
+    }
     parent_eval.sibling_index = sibling_index;
     parent_eval.sibling_count = sibling_count;
     for early_prop in [
         PropertyIdKind::WritingMode,
         PropertyIdKind::Direction,
         PropertyIdKind::FontSize,
+        PropertyIdKind::FontFamily,
+        PropertyIdKind::FontWeight,
+        PropertyIdKind::FontStyle,
     ] {
         if let Some(stack) = per_prop.get_mut(&early_prop) {
             stack.sort_by_key(|(k, _)| *k);
@@ -2256,9 +2371,66 @@ pub fn resolve_element_style_with_custom_override(
             }
         }
     }
-    let mut lh_eval = media.eval_context(style.text.font_size_px, root_font_size_px);
+    let self_metrics = match parent_style {
+        Some(p)
+            if p.text.font_size_px == style.text.font_size_px
+                && p.text.font_weight == style.text.font_weight
+                && p.text.font_style == style.text.font_style
+                && p.text.font_family == style.text.font_family
+                && p.text.eval_ctx.normal_lh_px.is_some() =>
+        {
+            crate::values::ResolvedFontMetrics {
+                normal_lh_px: p
+                    .text
+                    .eval_ctx
+                    .normal_lh_px
+                    .unwrap_or(style.text.font_size_px * 1.2),
+                ch_px: p
+                    .text
+                    .eval_ctx
+                    .ch_px
+                    .unwrap_or(style.text.font_size_px * 0.5),
+                ex_px: p
+                    .text
+                    .eval_ctx
+                    .ex_px
+                    .unwrap_or(style.text.font_size_px * 0.5),
+                cap_px: p
+                    .text
+                    .eval_ctx
+                    .cap_px
+                    .unwrap_or(style.text.font_size_px * 0.7),
+            }
+        }
+        _ => resolve_fm(
+            &style.text.font_family,
+            style.text.font_weight,
+            style.text.font_style,
+            style.text.font_size_px,
+        ),
+    };
+    let eff_lh_root_fs = if parent_style.is_none() {
+        style.text.font_size_px
+    } else {
+        root_font_size_px
+    };
+    let mut lh_eval = media.eval_context(style.text.font_size_px, eff_lh_root_fs);
+    lh_eval.vertical_writing_mode = style.text.writing_mode.is_vertical();
     lh_eval.line_height_px = parent_lh;
     lh_eval.root_line_height_px = root_lh;
+    lh_eval.ch_px = Some(self_metrics.ch_px);
+    lh_eval.ex_px = Some(self_metrics.ex_px);
+    lh_eval.cap_px = Some(self_metrics.cap_px);
+    lh_eval.normal_lh_px = Some(self_metrics.normal_lh_px);
+    if let Some(p) = parent_style {
+        lh_eval.rch_px = p.text.eval_ctx.rch_px;
+        lh_eval.rex_px = p.text.eval_ctx.rex_px;
+        lh_eval.rcap_px = p.text.eval_ctx.rcap_px;
+    } else {
+        lh_eval.rch_px = Some(self_metrics.ch_px);
+        lh_eval.rex_px = Some(self_metrics.ex_px);
+        lh_eval.rcap_px = Some(self_metrics.cap_px);
+    }
     lh_eval.sibling_index = sibling_index;
     lh_eval.sibling_count = sibling_count;
     if let Some(stack) = per_prop.get_mut(&PropertyIdKind::LineHeight) {
@@ -2322,8 +2494,22 @@ pub fn resolve_element_style_with_custom_override(
 
     // Pass 2c: Resolve `color-scheme` and `color` next so CanvasText & `currentColor` match.
     let mut eval_ctx = media.eval_context(style.text.font_size_px, eff_root_fs);
+    eval_ctx.vertical_writing_mode = style.text.writing_mode.is_vertical();
     eval_ctx.line_height_px = self_lh_px;
     eval_ctx.root_line_height_px = eff_root_lh;
+    eval_ctx.ch_px = Some(self_metrics.ch_px);
+    eval_ctx.ex_px = Some(self_metrics.ex_px);
+    eval_ctx.cap_px = Some(self_metrics.cap_px);
+    eval_ctx.normal_lh_px = Some(self_metrics.normal_lh_px);
+    if let Some(p) = parent_style {
+        eval_ctx.rch_px = p.text.eval_ctx.rch_px;
+        eval_ctx.rex_px = p.text.eval_ctx.rex_px;
+        eval_ctx.rcap_px = p.text.eval_ctx.rcap_px;
+    } else {
+        eval_ctx.rch_px = Some(self_metrics.ch_px);
+        eval_ctx.rex_px = Some(self_metrics.ex_px);
+        eval_ctx.rcap_px = Some(self_metrics.cap_px);
+    }
     eval_ctx.sibling_index = sibling_index;
     eval_ctx.sibling_count = sibling_count;
     eval_ctx.random_node_id = random_node_id;
@@ -2331,13 +2517,13 @@ pub fn resolve_element_style_with_custom_override(
     if let Some(p) = parent_style {
         if let SizeValue::Length(ref lp) = p.box_model.width {
             let w = lp.resolve_px(eval_ctx.viewport_width_px, &eval_ctx);
-            if w > 0.0 {
+            if w >= 0.0 {
                 eval_ctx.container_width_px = w;
             }
         }
         if let SizeValue::Length(ref lp) = p.box_model.height {
             let h = lp.resolve_px(eval_ctx.viewport_height_px, &eval_ctx);
-            if h > 0.0 {
+            if h >= 0.0 {
                 eval_ctx.container_height_px = h;
             }
         }
@@ -2396,6 +2582,9 @@ pub fn resolve_element_style_with_custom_override(
             PropertyIdKind::WritingMode
                 | PropertyIdKind::Direction
                 | PropertyIdKind::FontSize
+                | PropertyIdKind::FontFamily
+                | PropertyIdKind::FontWeight
+                | PropertyIdKind::FontStyle
                 | PropertyIdKind::LineHeight
                 | PropertyIdKind::Color
                 | PropertyIdKind::ColorScheme
@@ -3011,7 +3200,16 @@ pub fn apply_declaration(
         (PropertyIdKind::PointerEvents, PropertyValue::PointerEvents(v)) => {
             style.pointer_events = *v;
         }
-        (PropertyIdKind::Cursor, PropertyValue::Cursor(v)) => style.cursor = *v,
+        (PropertyIdKind::Cursor, PropertyValue::Cursor(v)) => {
+            style.cursor = *v;
+            if !style.text.cursor_urls.is_empty() {
+                Arc::make_mut(&mut style.text).cursor_urls.clear();
+            }
+        }
+        (PropertyIdKind::Cursor, PropertyValue::CursorWithUrls(urls, v)) => {
+            style.cursor = *v;
+            Arc::make_mut(&mut style.text).cursor_urls = urls.clone();
+        }
         (PropertyIdKind::ZIndex, PropertyValue::ZIndex(v)) => style.z_index = *v,
         (PropertyIdKind::ZIndex, PropertyValue::MathVal(node)) => {
             let v = node.eval_scalar(eval, None);
@@ -3291,6 +3489,44 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::FontSizeAdjust, PropertyValue::OptNumber(v)) => {
             Arc::make_mut(&mut style.text).font_size_adjust = *v;
+        }
+        (PropertyIdKind::FontFeatureSettings, PropertyValue::FontFeatureSettings(v)) => {
+            let resolved = v.as_ref().map(|list| {
+                list.iter()
+                    .map(|(tag, node)| {
+                        let n = node.eval_scalar(eval, None);
+                        let iv = if n.is_nan() {
+                            0
+                        } else if n.is_infinite() {
+                            if n.is_sign_positive() {
+                                i32::MAX
+                            } else {
+                                0
+                            }
+                        } else {
+                            (n + 0.5).floor().clamp(0.0, f64::from(i32::MAX)) as i32
+                        };
+                        (tag.clone(), iv)
+                    })
+                    .collect()
+            });
+            Arc::make_mut(&mut style.text).font_feature_settings = resolved;
+        }
+        (PropertyIdKind::FontVariationSettings, PropertyValue::FontVariationSettings(v)) => {
+            let resolved = v.as_ref().map(|list| {
+                list.iter()
+                    .map(|(tag, node)| {
+                        let n = node.eval_scalar(eval, None);
+                        let fv = if n.is_nan() {
+                            0.0
+                        } else {
+                            n.clamp(-3.4e38, 3.4e38) as f32
+                        };
+                        (tag.clone(), fv)
+                    })
+                    .collect()
+            });
+            Arc::make_mut(&mut style.text).font_variation_settings = resolved;
         }
         (PropertyIdKind::SvgFloodOpacity, PropertyValue::Number(v)) => {
             style.effects_mut().svg_flood_opacity = Some(v.clamp(0.0, 1.0));
@@ -4543,7 +4779,12 @@ fn copy_property_from_parent(
         PropertyIdKind::OverflowY => style.overflow.y = parent.overflow.y,
         PropertyIdKind::Visibility => style.visibility = parent.visibility,
         PropertyIdKind::PointerEvents => style.pointer_events = parent.pointer_events,
-        PropertyIdKind::Cursor => style.cursor = parent.cursor,
+        PropertyIdKind::Cursor => {
+            style.cursor = parent.cursor;
+            if style.text.cursor_urls != parent.text.cursor_urls {
+                Arc::make_mut(&mut style.text).cursor_urls = parent.text.cursor_urls.clone();
+            }
+        }
         PropertyIdKind::ZIndex => style.z_index = parent.z_index,
         PropertyIdKind::Opacity => style.opacity = parent.opacity,
         PropertyIdKind::Color => {
@@ -5175,6 +5416,14 @@ fn copy_property_from_parent(
         PropertyIdKind::FontSizeAdjust => {
             Arc::make_mut(&mut style.text).font_size_adjust = parent.text.font_size_adjust;
         }
+        PropertyIdKind::FontFeatureSettings => {
+            Arc::make_mut(&mut style.text).font_feature_settings =
+                parent.text.font_feature_settings.clone();
+        }
+        PropertyIdKind::FontVariationSettings => {
+            Arc::make_mut(&mut style.text).font_variation_settings =
+                parent.text.font_variation_settings.clone();
+        }
         PropertyIdKind::SvgFloodOpacity => {
             let v = parent.effects.as_ref().and_then(|e| e.svg_flood_opacity);
             if v.is_some() || style.effects.is_some() {
@@ -5508,7 +5757,12 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         PropertyIdKind::OverflowY => style.overflow.y = OverflowMode::Visible,
         PropertyIdKind::Visibility => style.visibility = init.visibility,
         PropertyIdKind::PointerEvents => style.pointer_events = init.pointer_events,
-        PropertyIdKind::Cursor => style.cursor = init.cursor,
+        PropertyIdKind::Cursor => {
+            style.cursor = init.cursor;
+            if !style.text.cursor_urls.is_empty() {
+                Arc::make_mut(&mut style.text).cursor_urls.clear();
+            }
+        }
         PropertyIdKind::ZIndex => style.z_index = ZIndexValue::Auto,
         PropertyIdKind::Opacity => style.opacity = 1.0,
         PropertyIdKind::Color => {
@@ -6130,6 +6384,12 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         }
         PropertyIdKind::FontSizeAdjust => {
             Arc::make_mut(&mut style.text).font_size_adjust = None;
+        }
+        PropertyIdKind::FontFeatureSettings => {
+            Arc::make_mut(&mut style.text).font_feature_settings = None;
+        }
+        PropertyIdKind::FontVariationSettings => {
+            Arc::make_mut(&mut style.text).font_variation_settings = None;
         }
         PropertyIdKind::SvgFloodOpacity => {
             if let Some(eff) = &mut style.effects {

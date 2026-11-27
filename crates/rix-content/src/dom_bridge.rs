@@ -178,8 +178,12 @@ pub struct HostState {
     pub font_db: Arc<FontDatabase>,
     /// Unmodified base system font database (cloned on demand when active `@font-face` rules change).
     pub base_font_db: Arc<FontDatabase>,
-    /// Cached decoded SFNT bytes for fetched `@font-face` URLs (`None` = fetch/decode failed).
+    /// Cached decoded SFNT bytes for fetched `@font-face` / `FontFace` URLs (`None` = fetch/decode failed).
     pub web_font_bytes_cache: HashMap<String, Option<Vec<u8>>>,
+    /// JS-constructed `new FontFace(...)` entries (CSS Font Loading L3 §2).
+    pub(crate) js_font_faces: Vec<JsFontFaceEntry>,
+    /// Last observed `(width, height)` per connected `<iframe>` node for `resize` event dispatch.
+    pub(crate) iframe_last_sizes: HashMap<NodeId, (f32, f32)>,
     last_font_faces_sig: u64,
     /// Fetched `@import` CSS bodies keyed by resolved URL (`None` = network error or rejected MIME).
     pub fetched_import_css: HashMap<String, Option<String>>,
@@ -279,11 +283,85 @@ pub(crate) type ScriptConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
 /// Callback invoked when a dynamic `<img src>`, `<link rel="stylesheet" href>`, or `<style>` becomes connected.
 pub(crate) type SubresourceConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
 
-/// Callback invoked when `document.fonts.load(...)` requests active `@font-face` web font loading.
-pub(crate) type FontLoadHook = Rc<dyn Fn(&mut JsVm, HeapHandle, String)>;
+/// Metadata for a JS-constructed `FontFace` object (`new FontFace(family, source)`).
+#[derive(Debug, Clone)]
+pub(crate) struct JsFontFaceEntry {
+    pub handle: HeapHandle,
+    pub loaded_promise: HeapHandle,
+    pub family: String,
+    pub source_url: Option<String>,
+    pub weight_range: (u16, u16),
+    pub italic: bool,
+    pub added: bool,
+    pub loaded: bool,
+}
+
+/// Callback invoked when `document.fonts.load(...)`, `FontFace.prototype.load()`, or
+/// `document.fonts.ready` requests web font loading.
+/// Parameters: `(vm, promise_h, specific_face_h, resolve_value_opt, wait_for_stylesheets)`.
+pub(crate) type FontLoadHook =
+    Rc<dyn Fn(&mut JsVm, HeapHandle, Option<HeapHandle>, Option<JsValue>, bool)>;
 
 /// Callback invoked when a `<details>` element's `open` attribute changes (queues `ToggleEvent`).
 pub(crate) type DetailsToggleHook = Rc<dyn Fn(&mut JsVm, NodeId, &'static str, &'static str)>;
+
+fn make_font_metrics_resolver(font_db: &Arc<FontDatabase>) -> rix_css::FontMetricsResolver {
+    let db = Arc::clone(font_db);
+    rix_css::FontMetricsResolver(Arc::new(move |families, weight, italic, font_size_px| {
+        let fs = font_size_px.max(0.0);
+        let fw = rix_text::FontWeight(weight.round().clamp(100.0, 900.0) as u16);
+        let fstyle = if italic {
+            rix_text::FontStyle::Italic
+        } else {
+            rix_text::FontStyle::Normal
+        };
+        let mut matched: Option<rix_text::FontId> = None;
+        for fam in families {
+            let desc = rix_text::FontDescriptor::new(fam.as_str())
+                .with_weight(fw)
+                .with_style(fstyle);
+            if let Some(id) = db.match_family(fam.as_str(), &desc) {
+                matched = Some(id);
+                break;
+            }
+        }
+        let font_id = matched.unwrap_or_else(|| {
+            let default_generic = if families.is_empty() {
+                "serif"
+            } else {
+                "sans-serif"
+            };
+            let fallback = rix_text::FontDescriptor::new(default_generic)
+                .with_weight(fw)
+                .with_style(fstyle);
+            db.match_family(default_generic, &fallback)
+                .or_else(|| db.match_family("sans-serif", &fallback))
+                .or_else(|| db.match_font(&fallback))
+                .unwrap_or(rix_text::FontId(0))
+        });
+        if let Some(font) = db.get_font(font_id) {
+            let normal_lh_px = {
+                let h = font.metrics.line_height_px(fs);
+                if h > 0.0 && h.is_finite() {
+                    h
+                } else {
+                    (fs * 1.2).max(0.0)
+                }
+            };
+            let ch_px = font.metrics.zero_advance_px(fs).unwrap_or(fs * 0.5);
+            let ex_px = font.metrics.x_height_px(fs).unwrap_or(fs * 0.5);
+            let cap_px = font.metrics.cap_height_px(fs).unwrap_or(fs * 0.7);
+            rix_css::ResolvedFontMetrics {
+                normal_lh_px,
+                ch_px,
+                ex_px,
+                cap_px,
+            }
+        } else {
+            rix_css::ResolvedFontMetrics::fallback(fs)
+        }
+    }))
+}
 
 /// Updates `Fragment.style` pointers in-place from `style_ctx` after a paint-only incremental
 /// restyle (`layout_dirty_count == 0`), avoiding a full layout rebuild when only compositor/paint
@@ -447,13 +525,19 @@ impl HostState {
             device_pixel_ratio: 1.0,
             dark_mode: false,
             base_font_db: Arc::clone(&font_db),
-            font_db,
+            font_db: Arc::clone(&font_db),
             web_font_bytes_cache: HashMap::new(),
+            js_font_faces: Vec::new(),
+            iframe_last_sizes: HashMap::new(),
             last_font_faces_sig: 0,
             fetched_import_css: HashMap::new(),
             link_stylesheet_css: HashMap::new(),
             layout_engine: LayoutEngine::new(),
-            style_ctx: StyleContext::new(media),
+            style_ctx: {
+                let mut sc = StyleContext::new(media);
+                sc.set_font_metrics(Some(make_font_metrics_resolver(&font_db)));
+                sc
+            },
             external_stylesheets: Vec::new(),
             cached_inline_sheet_hashes: Vec::new(),
             sheets_dirty: true,
@@ -516,6 +600,75 @@ impl HostState {
             completed_images: HashSet::new(),
             dynamic_lazy_images_scheduled: 0,
         }
+    }
+
+    /// Builds a live font-metrics resolver backed by the current `self.font_db`.
+    #[must_use]
+    pub fn font_metrics_resolver(&self) -> rix_css::FontMetricsResolver {
+        make_font_metrics_resolver(&self.font_db)
+    }
+
+    /// Returns the document base URL for `doc_id` honoring the first `<base href>` element
+    /// (WHATWG HTML §2.5.3).
+    #[must_use]
+    pub fn doc_base_url_for(&self, doc_id: NodeId) -> String {
+        let doc_url = self.doc_url_for_node(doc_id);
+        let base_href = {
+            let doc = self.document.borrow();
+            let found = doc.descendants(doc_id).find_map(|d| {
+                if let Some(NodeData::Element(el)) = doc.get(d) {
+                    if &*el.name.ns == crate::dom_interfaces::HTML_NS
+                        && el.name.local.as_str() == "base"
+                    {
+                        return el.get_attribute("href").map(ToString::to_string);
+                    }
+                }
+                None
+            });
+            found
+        };
+        if let Some(href) = base_href {
+            url::Url::parse(&doc_url)
+                .ok()
+                .and_then(|base| base.join(&href).ok())
+                .map(|u| u.to_string())
+                .unwrap_or(doc_url)
+        } else {
+            doc_url
+        }
+    }
+
+    /// Returns the main document's effective base URL (honoring `<base href>`).
+    #[must_use]
+    pub fn document_base_url(&self) -> String {
+        let root = self.document.borrow().root();
+        self.doc_base_url_for(root)
+    }
+
+    /// Returns `true` if `node` is connected to the main document OR to a live same-origin
+    /// `<iframe>` sub-document rooted in the main document.
+    #[must_use]
+    pub fn is_connected_to_live_doc(&self, node: NodeId) -> bool {
+        let doc = self.document.borrow();
+        if doc.is_connected(node) {
+            return true;
+        }
+        let mut cur = node;
+        while let Some(p) = doc.parent(cur) {
+            cur = p;
+        }
+        if !matches!(doc.get(cur), Some(NodeData::Document)) {
+            return false;
+        }
+        let main_root = doc.root();
+        doc.descendants_with_shadow_roots(main_root)
+            .into_iter()
+            .any(|n| {
+                matches!(
+                    doc.get(n),
+                    Some(NodeData::Element(el)) if el.content_document == Some(cur)
+                )
+            })
     }
 
     /// Marks document inline/CSSOM stylesheets dirty so the next style read checks for
@@ -834,6 +987,10 @@ impl HostState {
                     out.push(m);
                 }
             }
+        }
+        for ff in &self.js_font_faces {
+            out.push(JsValue::from_object(ff.handle));
+            out.push(JsValue::from_object(ff.loaded_promise));
         }
         if let Some(sel) = self.selection.selection_handle {
             out.push(JsValue::from_object(sel));
@@ -1247,8 +1404,8 @@ impl HostState {
                 == self.cached_inline_sheet_hashes[..];
         if is_pure_append {
             let prev_len = self.cached_inline_sheet_hashes.len();
-            let main_base_opt =
-                (!self.main_document_url.is_empty()).then_some(self.main_document_url.as_str());
+            let doc_base_str = self.document_base_url();
+            let main_base_opt = (!doc_base_str.is_empty()).then_some(doc_base_str.as_str());
             let mut doc = self.document.borrow_mut();
             for (css, owner_parent, sheet_base) in &maybe_sheets[prev_len..] {
                 let eff_base = sheet_base.as_deref().or(main_base_opt);
@@ -1267,7 +1424,12 @@ impl HostState {
             self.css_animations_sync_dirty = true;
             self.needs_full_layout = true;
             self.style_recalc_count += 1;
-            self.sync_active_web_fonts_from_cache();
+            if self.sync_active_web_fonts_from_cache() {
+                self.style_ctx
+                    .set_font_metrics(Some(self.font_metrics_resolver()));
+                let mut doc = self.document.borrow_mut();
+                let _ = self.style_ctx.cascade_full(&mut doc);
+            }
             return &self.style_ctx;
         }
 
@@ -1280,6 +1442,7 @@ impl HostState {
             "ensure_styles running cascade_full"
         );
         let mut ctx = StyleContext::new(media);
+        ctx.set_font_metrics(Some(self.font_metrics_resolver()));
         let anim_snap = self.style_ctx.take_animation_state();
         ctx.restore_animation_state(anim_snap);
         for (name, (syntax, inherits, init)) in &self.registered_properties {
@@ -1294,8 +1457,8 @@ impl HostState {
         for ext in &self.external_stylesheets {
             ctx.add_stylesheet(Arc::clone(ext));
         }
-        let main_base_opt =
-            (!self.main_document_url.is_empty()).then_some(self.main_document_url.as_str());
+        let doc_base_str = self.document_base_url();
+        let main_base_opt = (!doc_base_str.is_empty()).then_some(doc_base_str.as_str());
         for (css, owner_parent, sheet_base) in maybe_sheets {
             let eff_base = sheet_base.as_deref().or(main_base_opt);
             ctx.add_stylesheet(compile_author_sheet(&css, owner_parent, eff_base));
@@ -1328,26 +1491,39 @@ impl HostState {
         self.css_animations_sync_dirty = true;
         self.needs_full_layout = true;
         self.style_recalc_count += 1;
-        self.sync_active_web_fonts_from_cache();
+        if self.sync_active_web_fonts_from_cache() {
+            self.style_ctx
+                .set_font_metrics(Some(self.font_metrics_resolver()));
+            let mut doc = self.document.borrow_mut();
+            let _ = self.style_ctx.cascade_full(&mut doc);
+            self.sheets_dirty = false;
+            self.full_sheets_rebuild = false;
+        }
         &self.style_ctx
     }
 
-    /// Synchronizes layer-ordered active `@font-face` rules into `self.font_db` using
-    /// `self.base_font_db` and already-fetched `self.web_font_bytes_cache`, invalidating
-    /// layout caches whenever the effective web-font bindings change.
-    pub fn sync_active_web_fonts_from_cache(&mut self) {
+    /// Synchronizes layer-ordered active `@font-face` rules and JS `document.fonts` `FontFace`
+    /// entries into `self.font_db` using `self.base_font_db` and already-fetched
+    /// `self.web_font_bytes_cache`, invalidating style & layout caches whenever bindings change.
+    /// Returns `true` if `self.font_db` was updated.
+    pub fn sync_active_web_fonts_from_cache(&mut self) -> bool {
         let font_faces = &self.style_ctx.rule_index().font_faces;
-        if font_faces.is_empty() {
+        let has_js_faces = self.js_font_faces.iter().any(|f| f.added && f.loaded);
+        if font_faces.is_empty() && !has_js_faces {
             if self.last_font_faces_sig != 0 {
                 self.font_db = Arc::clone(&self.base_font_db);
                 self.last_font_faces_sig = 0;
+                self.style_ctx
+                    .set_font_metrics(Some(self.font_metrics_resolver()));
+                self.mark_full_sheets_rebuild();
                 self.layout_engine.clear_caches();
                 self.invalidate_layout_cache();
+                return true;
             }
-            return;
+            return false;
         }
         let mut sig: u64 = 0xcbf2_9ce4_8422_2325;
-        let base_url = url::Url::parse(&self.main_document_url).ok();
+        let base_url = url::Url::parse(&self.document_base_url()).ok();
         type ResolvedFontFaceEntry = (String, bool, (u16, u16), Option<String>, Option<Vec<u8>>);
         let mut resolved_entries: Vec<ResolvedFontFaceEntry> = Vec::new();
         for ff in font_faces {
@@ -1395,8 +1571,33 @@ impl HostState {
                 ));
             }
         }
+        for jf in &self.js_font_faces {
+            if !jf.added || !jf.loaded {
+                continue;
+            }
+            let Some(ref raw_url) = jf.source_url else {
+                continue;
+            };
+            let resolved = base_url
+                .as_ref()
+                .and_then(|b| b.join(raw_url.trim()).ok())
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| raw_url.trim().to_string());
+            if let Some(Some(sfnt)) = self.web_font_bytes_cache.get(&resolved) {
+                sig = fnv_mix(sig, jf.family.as_bytes());
+                sig = fnv_mix(sig, resolved.as_bytes());
+                sig = fnv_mix(sig, &sfnt.len().to_le_bytes());
+                resolved_entries.push((
+                    jf.family.clone(),
+                    jf.italic,
+                    jf.weight_range,
+                    None,
+                    Some(sfnt.clone()),
+                ));
+            }
+        }
         if sig == self.last_font_faces_sig {
-            return;
+            return false;
         }
         let mut db = (*self.base_font_db).clone();
         // Keep only the highest-priority (last in layer-sorted `font_faces`) winning rule per
@@ -1425,8 +1626,12 @@ impl HostState {
         }
         self.font_db = Arc::new(db);
         self.last_font_faces_sig = sig;
+        self.style_ctx
+            .set_font_metrics(Some(self.font_metrics_resolver()));
+        self.mark_full_sheets_rebuild();
         self.layout_engine.clear_caches();
         self.invalidate_layout_cache();
+        true
     }
 
     /// Recomputes incremental layout ONLY when document structure or layout-affecting styles
@@ -1717,9 +1922,7 @@ impl HostState {
         }
         drop(doc);
         let mut sub_ctx = StyleContext::new(media);
-        for sheet in self.external_stylesheets.iter() {
-            sub_ctx.add_stylesheet(Arc::clone(sheet));
-        }
+        sub_ctx.set_font_metrics(Some(self.font_metrics_resolver()));
         {
             let doc = self.document.borrow();
             for n in doc.descendants(doc_id) {
@@ -1732,6 +1935,16 @@ impl HostState {
                                 CascadeOrigin::Author,
                                 &media,
                             ));
+                        }
+                    } else if el.name.local.as_str().eq_ignore_ascii_case("link") {
+                        if let Some(css) = self.subdoc_link_css.get(&n) {
+                            if !css.trim().is_empty() {
+                                sub_ctx.add_stylesheet(Stylesheet::parse_cached(
+                                    css,
+                                    CascadeOrigin::Author,
+                                    &media,
+                                ));
+                            }
                         }
                     }
                 }
@@ -2134,6 +2347,22 @@ impl HostState {
     /// Returns layout-resolved box metrics (`content_size`, `border_size`, `margin`, `padding`,
     /// containing-block sizes, and used physical insets) for CSSOM View §7.1 `getComputedStyle`.
     pub fn resolved_layout_box_for_node(&mut self, node: NodeId) -> Option<ResolvedLayoutBox> {
+        let owner_doc = self.owner_doc_of(node);
+        let main_root = self.document.borrow().root();
+        if owner_doc != main_root {
+            let (tree, _, vp) = self.layout_subdoc(owner_doc)?;
+            let root = tree.root.as_ref()?;
+            let root_pad_rect = Rect::new(0.0, 0.0, vp.width, vp.height);
+            return find_fragment_metrics(
+                root,
+                root.content_rect.size,
+                root_pad_rect,
+                vp,
+                vp,
+                true,
+                node,
+            );
+        }
         let viewport = self.viewport;
         let tree = self.ensure_layout()?;
         let root = tree.root.as_ref()?;
@@ -2366,6 +2595,7 @@ impl HostState {
                 blocks
             };
             let mut ctx = StyleContext::new(media);
+            ctx.set_font_metrics(Some(self.font_metrics_resolver()));
             for (css, owner_parent) in css_blocks {
                 if owner_parent.is_some() && (css.contains("@scope") || css.contains("@SCOPE")) {
                     ctx.add_stylesheet(Arc::new(Stylesheet::parse_with_owner(
@@ -3804,7 +4034,7 @@ pub(crate) fn insert_node_into_parent(
         }
     }
 
-    let parent_connected = host.borrow().document.borrow().is_connected(parent);
+    let parent_connected = host.borrow().is_connected_to_live_doc(parent);
     let has_live_ranges = !host.borrow().selection.ranges.is_empty();
     let (prev_sib, next_sib, insert_idx) = {
         let _doc_rc = Rc::clone(&host.borrow().document);

@@ -2091,11 +2091,21 @@ fn interpolate_property_into(
         }
         P::FontWeight => Arc::make_mut(&mut target.text).font_weight = (f64::from(from.text.font_weight) * (1.0 - p) + f64::from(to.text.font_weight) * p).clamp(1.0, 1000.0) as f32,
         P::FontStyle => Arc::make_mut(&mut target.text).font_style = if use_from_disc { from.text.font_style } else { to.text.font_style },
-        P::LineHeight => Arc::make_mut(&mut target.text).line_height = match (&from.text.line_height, &to.text.line_height) {
-            (LineHeightValue::Length(a), LineHeightValue::Length(b)) => LineHeightValue::Length(interpolate_lp_pair(a, ef, b, et, p, eval, is_transition)),
-            (LineHeightValue::Number(a), LineHeightValue::Number(b)) => LineHeightValue::Number((f64::from(*a) * (1.0 - p) + f64::from(*b) * p).max(0.0) as f32),
-            _ => if use_from_disc { from.text.line_height.clone() } else { to.text.line_height.clone() },
-        },
+        P::LineHeight => {
+            let new_lh = match (&from.text.line_height, &to.text.line_height) {
+                (LineHeightValue::Length(a), LineHeightValue::Length(b)) => LineHeightValue::Length(interpolate_lp_pair(a, ef, b, et, p, eval, is_transition)),
+                (LineHeightValue::Number(a), LineHeightValue::Number(b)) => LineHeightValue::Number((f64::from(*a) * (1.0 - p) + f64::from(*b) * p).max(0.0) as f32),
+                _ => if use_from_disc { from.text.line_height.clone() } else { to.text.line_height.clone() },
+            };
+            let t = Arc::make_mut(&mut target.text);
+            let fs = t.font_size_px;
+            t.eval_ctx.line_height_px = match &new_lh {
+                LineHeightValue::Normal => t.eval_ctx.normal_lh_px.unwrap_or((fs * 1.2).max(0.0)),
+                LineHeightValue::Number(n) => (n * fs).max(0.0),
+                LineHeightValue::Length(lp) => lp.resolve_px(fs, &t.eval_ctx).max(0.0),
+            };
+            t.line_height = new_lh;
+        }
         P::ZIndex => target.z_index = match (from.z_index, to.z_index) {
             (ZIndexValue::Integer(a), ZIndexValue::Integer(b)) => ZIndexValue::Integer(((f64::from(a) * (1.0 - p) + f64::from(b) * p) + 0.5 + 1e-5).floor() as i32),
             _ => if use_from_disc { from.z_index } else { to.z_index },
@@ -2330,8 +2340,8 @@ fn lp_is_pure_pct(lp: &LengthPercentage) -> bool {
 #[rustfmt::skip]
 fn interpolate_lp_pair(a: &LengthPercentage, ea: &EvalContext, b: &LengthPercentage, eb: &EvalContext, p: f64, eval: &EvalContext, is_tr: bool) -> LengthPercentage {
     let same_kind = (lp_is_pure_px(a) && lp_is_pure_px(b)) || (lp_is_pure_pct(a) && lp_is_pure_pct(b));
-    if same_kind && p == 0.0 { return lp_from_math_node(math_node_from_lp(a, ea, is_tr)); }
-    if p == 1.0 { return lp_from_math_node(math_node_from_lp(b, eb, is_tr)); }
+    if p == 0.0 { return lp_from_math_node(math_node_from_lp(a, ea, is_tr)); }
+    if same_kind && p == 1.0 { return lp_from_math_node(math_node_from_lp(b, eb, is_tr)); }
     let combined = MathNode::Sum(vec![scale_math_for_interp(math_node_from_lp(a, ea, is_tr), 1.0 - p), scale_math_for_interp(math_node_from_lp(b, eb, is_tr), p)]).simplify(Some(eval), None);
     lp_from_math_node(combined)
 }

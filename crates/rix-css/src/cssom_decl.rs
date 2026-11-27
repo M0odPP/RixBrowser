@@ -70,6 +70,19 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
         return crate::color::parse_and_serialize_color_specified(trimmed);
     }
     if prop_kind == PropertyIdKind::Opacity {
+        if crate::values_math::has_values4_syntax(trimmed) {
+            let (_, v4_ser) = crate::properties::parse_values4_property(prop_kind, trimmed)?;
+            // CSS Color 4 §11: `<alpha-value>` percentages always resolve against positive `1.0`,
+            // so pure-percentage `min`/`max`/`clamp` simplify at specified-value time.
+            if trimmed.contains('%') {
+                if let Some(alpha_ser) =
+                    crate::color::parse_and_serialize_opacity_specified(trimmed)
+                {
+                    return Some(alpha_ser);
+                }
+            }
+            return Some(v4_ser);
+        }
         return crate::color::parse_and_serialize_opacity_specified(trimmed).or_else(|| {
             crate::properties::parse_values4_property(prop_kind, trimmed).map(|(_, s)| s)
         });
@@ -79,7 +92,14 @@ pub fn parse_and_serialize_declaration(name: &str, value: &str) -> Option<String
             || lower_val.starts_with("image-set(")
             || lower_val.starts_with("-webkit-image-set(")
             || lower_val.starts_with("src(")
-            || lower_val.starts_with("image("))
+            || lower_val.starts_with("image(")
+            || ((lower_val.starts_with("linear-gradient(")
+                || lower_val.starts_with("radial-gradient(")
+                || lower_val.starts_with("conic-gradient(")
+                || lower_val.starts_with("repeating-linear-gradient(")
+                || lower_val.starts_with("repeating-radial-gradient(")
+                || lower_val.starts_with("repeating-conic-gradient("))
+                && crate::values_math::has_values4_syntax(trimmed)))
     {
         if lower_val.starts_with("image-set(")
             && !lower_val.contains("light-dark(")
@@ -1222,6 +1242,45 @@ fn format_cssom_len_to_css<T: lightningcss::traits::ToCss>(val: &T) -> String {
     canonicalize_zero_lengths(&format_cssom_to_css(val))
 }
 
+fn format_cssom_border_width_with_calc<T: lightningcss::traits::ToCss>(
+    width: &T,
+    raw_hint: Option<&str>,
+) -> String {
+    let mut w = format_cssom_len_to_css(width);
+    // Preserve canonical `calc(...)` width in CSSOM specified serialization (`calc(calc(10px))` -> `calc(10px)`).
+    if let Some(raw) = raw_hint {
+        if raw.to_ascii_lowercase().contains("calc(") && !w.starts_with("calc(") {
+            if let Some(pos) = raw.to_ascii_lowercase().find("calc(") {
+                let sub = &raw[pos..];
+                let mut depth = 0usize;
+                let mut end = None;
+                for (idx, ch) in sub.char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                end = Some(idx + 1);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(e) = end {
+                    if let Some(pm) = crate::values_math::parse_math_value(
+                        &sub[..e],
+                        crate::values_math::ValueKind::Length,
+                    ) {
+                        w = pm.node.serialize_specified(pm.was_math_fn);
+                    }
+                }
+            }
+        }
+    }
+    w
+}
+
 fn format_cssom_generic_border<const P: u8>(
     b: &lightningcss::properties::border::GenericBorder<
         lightningcss::properties::border::LineStyle,
@@ -1229,7 +1288,7 @@ fn format_cssom_generic_border<const P: u8>(
     >,
     raw_hint: Option<&str>,
 ) -> String {
-    let w = format_cssom_len_to_css(&b.width);
+    let w = format_cssom_border_width_with_calc(&b.width, raw_hint);
     let st = format_cssom_to_css(&b.style);
     let col = format_cssom_color(&b.color, raw_hint);
     let mut parts = Vec::with_capacity(3);
@@ -1286,6 +1345,45 @@ pub(crate) fn serialize_cssom_property(prop: &Property<'_>, raw_input: &str) -> 
             let b = format_cssom_color(&bc.bottom, hint);
             let l = format_cssom_color(&bc.left, hint);
             Some(collapse_4_sides(&t, &r, &b, &l))
+        }
+        Property::Font(f) => {
+            let raw_out = prop.value_to_css_string(PrinterOptions::default()).ok()?;
+            if let Some(raw) = hint {
+                if raw.to_ascii_lowercase().contains("calc(") && !raw_out.contains("calc(") {
+                    if let Some(pos) = raw.to_ascii_lowercase().find("calc(") {
+                        let sub = &raw[pos..];
+                        let mut depth = 0usize;
+                        let mut end = None;
+                        for (idx, ch) in sub.char_indices() {
+                            match ch {
+                                '(' => depth += 1,
+                                ')' => {
+                                    depth = depth.saturating_sub(1);
+                                    if depth == 0 {
+                                        end = Some(idx + 1);
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(e) = end {
+                            let calc_str = &sub[..e];
+                            if let Some(pm) = crate::values_math::parse_math_value(
+                                calc_str,
+                                crate::values_math::ValueKind::LengthPercentage,
+                            ) {
+                                let fs_lit = format_cssom_to_css(&f.size);
+                                let canon_calc = pm.node.serialize_specified(pm.was_math_fn);
+                                if !fs_lit.is_empty() {
+                                    return Some(raw_out.replacen(&fs_lit, &canon_calc, 1));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None
         }
         Property::Border(b) => Some(format_cssom_generic_border(b, hint)),
         Property::BorderTop(b) => Some(format_cssom_generic_border(b, hint)),
@@ -1364,7 +1462,7 @@ fn expand_border_sides<const P: u8>(
     hint: Option<&str>,
 ) -> Vec<(String, String)> {
     let (w, s, c) = (
-        format_cssom_len_to_css(&b.width),
+        format_cssom_border_width_with_calc(&b.width, hint),
         format_cssom_to_css(&b.style),
         format_cssom_color(&b.color, hint),
     );

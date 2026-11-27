@@ -220,7 +220,7 @@ fn find_matching_paren(bytes: &[u8], open_idx: usize, allow_eof: bool) -> usize 
 }
 
 #[rustfmt::skip]
-fn split_top_level(s: &str, sep: u8) -> Vec<&str> {
+pub(crate) fn split_top_level(s: &str, sep: u8) -> Vec<&str> {
     let bytes = s.as_bytes();
     let (mut out, mut start, mut depth, mut i) = (Vec::new(), 0usize, 0usize, 0usize);
     while i < bytes.len() {
@@ -1732,20 +1732,45 @@ pub fn substitute_standard_property_l5(tokens: &[CssToken], prop: PropertyIdKind
 fn parse_gradient_fn_computed(fname: &str, args_raw: &str, dark_mode: bool, eval: &EvalContext) -> Option<String> {
     let parts = split_top_level(args_raw.trim(), b',');
     if parts.len() < 2 { return None; }
+    let fname_lower = fname.to_ascii_lowercase();
+    let is_conic = fname_lower.contains("conic");
     let mut gparts: Vec<String> = Vec::with_capacity(parts.len());
-    for gp in parts {
+    for (part_idx, gp) in parts.iter().enumerate() {
         let gt = gp.trim();
         if gt.is_empty() { return None; }
-        // Split each color-stop/prelude into top-level tokens while resolving color tokens.
+        // Split each color-stop/prelude into top-level tokens while resolving color and math tokens.
         let mut sub_tokens: Vec<String> = Vec::new();
         let mut pi = ParserInput::new(gt);
         let mut p = Parser::new(&mut pi);
         while !p.is_exhausted() {
             let st = p.position();
-            if p.next().is_err() { break; }
+            let Ok(tok) = p.next().cloned() else { break; };
+            if matches!(tok, Token::Function(_) | Token::ParenthesisBlock | Token::SquareBracketBlock) {
+                let _ = p.parse_nested_block(|nested| {
+                    while nested.next().is_ok() {}
+                    Ok::<_, cssparser::ParseError<'_, ()>>(())
+                });
+            }
             let seg = p.slice_from(st).trim();
             if let Some(c) = crate::color::parse_css_color(seg) {
                 sub_tokens.push(c.resolve(crate::color::ResolvedColor::from_rgba(ColorRgba::BLACK), dark_mode, eval).to_computed_css_string());
+            } else if seg.contains('(') && crate::values_math::has_values4_syntax(seg) {
+                let evaluated = if is_conic && part_idx > 0 {
+                    crate::values_math::parse_math_value(seg, ValueKind::Angle)
+                        .map(|pm| pm.node.serialize_computed(eval, None, ValueKind::Angle, None, None))
+                        .or_else(|| {
+                            crate::values_math::parse_math_value(seg, ValueKind::Percentage)
+                                .map(|pm| pm.node.serialize_computed(eval, None, ValueKind::Percentage, None, None))
+                        })
+                } else {
+                    crate::values_math::parse_math_value(seg, ValueKind::LengthPercentage)
+                        .map(|pm| pm.node.serialize_computed(eval, None, ValueKind::LengthPercentage, None, None))
+                        .or_else(|| {
+                            crate::values_math::parse_math_value(seg, ValueKind::Angle)
+                                .map(|pm| pm.node.serialize_computed(eval, None, ValueKind::Angle, None, None))
+                        })
+                };
+                sub_tokens.push(evaluated?);
             } else {
                 sub_tokens.push(seg.to_string());
             }
@@ -1753,7 +1778,7 @@ fn parse_gradient_fn_computed(fname: &str, args_raw: &str, dark_mode: bool, eval
         if sub_tokens.is_empty() { return None; }
         gparts.push(sub_tokens.join(" "));
     }
-    Some(format!("{}({})", fname.to_ascii_lowercase(), gparts.join(", ")))
+    Some(format!("{fname_lower}({})", gparts.join(", ")))
 }
 
 /// Validates and evaluates CSS Color 5 `light-dark(<image>, <image>)` (and nested `<image>`
@@ -1875,6 +1900,23 @@ pub fn parse_and_serialize_bg_image_fn_with_scheme(raw: &str, dark_mode: bool, e
         let mut p = Parser::new(&mut pi);
         let img = parse_bg_url_token(&mut p, dark_mode, eval, false)?;
         return p.is_exhausted().then(|| format!("image({img})"));
+    }
+    for gname in [
+        "linear-gradient",
+        "radial-gradient",
+        "conic-gradient",
+        "repeating-linear-gradient",
+        "repeating-radial-gradient",
+        "repeating-conic-gradient",
+    ] {
+        let pfx_len = gname.len() + 1;
+        if lower.len() > pfx_len
+            && lower[..gname.len()] == *gname
+            && lower.as_bytes()[gname.len()] == b'('
+            && t.ends_with(')')
+        {
+            return parse_gradient_fn_computed(gname, &t[pfx_len..t.len() - 1], dark_mode, eval);
+        }
     }
     let inner = if lower.starts_with("image-set(") && t.ends_with(')') {
         &t[10..t.len() - 1]

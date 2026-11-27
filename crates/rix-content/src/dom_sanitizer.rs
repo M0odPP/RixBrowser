@@ -346,14 +346,26 @@ pub fn install_dom_sanitizer_and_streaming(
         let wh = Rc::downgrade(host);
         let wwa = Rc::downgrade(web_apis);
         let wn = Rc::downgrade(net);
-        host.borrow_mut().font_load_hook = Some(Rc::new(move |vm, promise_h, _font_spec| {
-            let (Some(h), Some(wa), Some(n)) = (wh.upgrade(), wwa.upgrade(), wn.upgrade()) else {
-                let arr = vm.alloc_array();
-                rix_js::promise::resolve_promise(vm, promise_h, JsValue::from_object(arr));
-                return;
-            };
-            schedule_web_font_load(vm, &h, &wa, &n, promise_h);
-        }));
+        host.borrow_mut().font_load_hook = Some(Rc::new(
+            move |vm, promise_h, face_h, resolve_val, wait_for_stylesheets| {
+                let (Some(h), Some(wa), Some(n)) = (wh.upgrade(), wwa.upgrade(), wn.upgrade())
+                else {
+                    let v = resolve_val.unwrap_or_else(|| JsValue::from_object(vm.alloc_array()));
+                    rix_js::promise::resolve_promise(vm, promise_h, v);
+                    return;
+                };
+                schedule_web_font_load(
+                    vm,
+                    &h,
+                    &wa,
+                    &n,
+                    promise_h,
+                    face_h,
+                    resolve_val,
+                    wait_for_stylesheets,
+                );
+            },
+        ));
     }
     install_sanitizer_ctor(vm, host);
     install_html_helper_reflections(vm, host, events, event_loop, web_apis, net);
@@ -2510,7 +2522,11 @@ fn schedule_style_element_imports(
             let engine = Arc::clone(&net.borrow().fetch_engine);
             let tx = net.borrow().async_tx.clone();
             let doc_origin = web_apis.borrow().current_origin();
-            net.borrow_mut().pending_subresources += 1;
+            {
+                let mut nb = net.borrow_mut();
+                nb.pending_subresources += 1;
+                nb.pending_stylesheet_fetches += 1;
+            }
             rt_handle.spawn(async move {
                 let mut fetched = Vec::with_capacity(http_urls.len());
                 let mut any_error = any_immediate_error;
@@ -2583,45 +2599,86 @@ fn schedule_style_element_imports(
         });
 }
 
-fn schedule_web_font_load(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn schedule_web_font_load(
     vm: &mut JsVm,
     host: &SharedHost,
     web_apis: &SharedWebApis,
     net: &SharedNetBridge,
     promise_h: HeapHandle,
+    face_h: Option<HeapHandle>,
+    resolve_val: Option<JsValue>,
+    wait_for_stylesheets: bool,
 ) {
+    if wait_for_stylesheets && net.borrow().pending_stylesheet_fetches > 0 {
+        net.borrow_mut()
+            .pending_font_ready_promises
+            .push((promise_h, resolve_val));
+        return;
+    }
     let missing_urls: Vec<String> = {
         let mut hb = host.borrow_mut();
         let _ = hb.ensure_styles();
-        let base_url = url::Url::parse(&hb.main_document_url).ok();
+        let base_url = url::Url::parse(&hb.document_base_url()).ok();
         let mut to_fetch = Vec::new();
         let mut inline_decoded = Vec::new();
-        for ff in &hb.style_ctx.rule_index().font_faces {
-            for src in &ff.sources {
-                if let rix_css::FontFaceSource::Url { url, .. } = src {
-                    let raw = url.as_str().trim();
-                    if raw.is_empty() {
-                        continue;
-                    }
-                    let resolved = base_url
-                        .as_ref()
-                        .and_then(|b| b.join(raw).ok())
-                        .map(|u| u.to_string())
-                        .unwrap_or_else(|| raw.to_string());
-                    if hb.web_font_bytes_cache.contains_key(&resolved) {
-                        continue;
-                    }
-                    if resolved.starts_with("data:") {
-                        let decoded = crate::fetch_ws::decode_data_url(&resolved)
-                            .and_then(|(_, b)| rix_text::decode_web_font(&b).ok())
-                            .map(|(_, sfnt)| sfnt);
-                        inline_decoded.push((resolved, decoded));
-                    } else if (resolved.starts_with("http://") || resolved.starts_with("https://"))
-                        && !to_fetch.contains(&resolved)
-                    {
-                        to_fetch.push(resolved);
-                    }
-                }
+        let mut collect_raw_url = |raw: &str| {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                return;
+            }
+            let resolved = base_url
+                .as_ref()
+                .and_then(|b| b.join(raw).ok())
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| raw.to_string());
+            if hb.web_font_bytes_cache.contains_key(&resolved) {
+                return;
+            }
+            if resolved.starts_with("data:") {
+                let decoded = crate::fetch_ws::decode_data_url(&resolved)
+                    .and_then(|(_, b)| rix_text::decode_web_font(&b).ok())
+                    .map(|(_, sfnt)| sfnt);
+                inline_decoded.push((resolved, decoded));
+            } else if (resolved.starts_with("http://") || resolved.starts_with("https://"))
+                && !to_fetch.contains(&resolved)
+            {
+                to_fetch.push(resolved);
+            }
+        };
+        if let Some(fh) = face_h {
+            let urls: Vec<String> = hb
+                .js_font_faces
+                .iter()
+                .filter(|e| e.handle == fh)
+                .filter_map(|e| e.source_url.clone())
+                .collect();
+            for u in urls {
+                collect_raw_url(&u);
+            }
+        } else {
+            let css_urls: Vec<String> = hb
+                .style_ctx
+                .rule_index()
+                .font_faces
+                .iter()
+                .flat_map(|ff| ff.sources.iter())
+                .filter_map(|src| match src {
+                    rix_css::FontFaceSource::Url { url, .. } => Some(url.as_str().to_string()),
+                    rix_css::FontFaceSource::Local(_) => None,
+                })
+                .collect();
+            for u in css_urls {
+                collect_raw_url(&u);
+            }
+            let js_urls: Vec<String> = hb
+                .js_font_faces
+                .iter()
+                .filter(|e| e.added)
+                .filter_map(|e| e.source_url.clone())
+                .collect();
+            for u in js_urls {
+                collect_raw_url(&u);
             }
         }
         for (url, decoded) in inline_decoded {
@@ -2630,17 +2687,19 @@ fn schedule_web_font_load(
         to_fetch
     };
 
+    let finish_sync = |vm: &mut JsVm| {
+        finalize_loaded_font_faces(vm, host, face_h, resolve_val.is_none());
+        let val = resolve_val.unwrap_or_else(|| JsValue::from_object(vm.alloc_array()));
+        rix_js::promise::resolve_promise(vm, promise_h, val);
+    };
+
     if missing_urls.is_empty() {
-        host.borrow_mut().sync_active_web_fonts_from_cache();
-        let arr = vm.alloc_array();
-        rix_js::promise::resolve_promise(vm, promise_h, JsValue::from_object(arr));
+        finish_sync(vm);
         return;
     }
 
     let Ok(rt_handle) = tokio::runtime::Handle::try_current() else {
-        host.borrow_mut().sync_active_web_fonts_from_cache();
-        let arr = vm.alloc_array();
-        rix_js::promise::resolve_promise(vm, promise_h, JsValue::from_object(arr));
+        finish_sync(vm);
         return;
     };
 
@@ -2650,7 +2709,8 @@ fn schedule_web_font_load(
     {
         let mut nb = net.borrow_mut();
         nb.pending_subresources += 1;
-        nb.pending_font_promises.insert(promise_h, ());
+        nb.pending_font_promises
+            .insert(promise_h, (face_h, resolve_val));
     }
     rt_handle.spawn(async move {
         let mut fetched = Vec::with_capacity(missing_urls.len());
@@ -2678,8 +2738,45 @@ fn schedule_web_font_load(
                 };
             fetched.push((url, sfnt_opt));
         }
-        let _ = tx.send(AsyncNetEvent::WebFontsLoaded { promise_h, fetched });
+        let _ = tx.send(AsyncNetEvent::WebFontsLoaded {
+            promise_h,
+            face_h,
+            resolve_val,
+            fetched,
+        });
     });
+}
+
+/// Marks newly loaded JS `FontFace` entries as `"loaded"`, resolves their `.loaded` promises,
+/// and syncs `font_db` + invalidates styles if web fonts changed.
+pub(crate) fn finalize_loaded_font_faces(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    face_h: Option<HeapHandle>,
+    mark_all_added: bool,
+) {
+    let mut resolved_faces: Vec<(HeapHandle, HeapHandle)> = Vec::new();
+    {
+        let mut hb = host.borrow_mut();
+        for entry in &mut hb.js_font_faces {
+            let should_mark = match face_h {
+                Some(fh) => entry.handle == fh,
+                None => mark_all_added && entry.added,
+            };
+            if should_mark && !entry.loaded {
+                entry.loaded = true;
+                resolved_faces.push((entry.handle, entry.loaded_promise));
+            }
+        }
+        let _ = hb.ensure_styles();
+        let _ = hb.sync_active_web_fonts_from_cache();
+    }
+    let k_status = vm.heap.intern_key("status");
+    for (fh, lp) in resolved_faces {
+        let loaded_s = JsValue::from_string(vm.heap.alloc_string("loaded"));
+        let _ = vm.set_property_by_key(fh, k_status, loaded_s);
+        rix_js::promise::resolve_promise(vm, lp, JsValue::from_object(fh));
+    }
 }
 
 fn schedule_dynamic_stylesheet_load(
@@ -2689,7 +2786,17 @@ fn schedule_dynamic_stylesheet_load(
     link_nid: NodeId,
     raw_href: &str,
 ) {
-    let resolved = url::Url::parse(&host.borrow().main_document_url)
+    let base_str = {
+        let hb = host.borrow();
+        let owner_doc = hb.owner_doc_of(link_nid);
+        let b = hb.doc_base_url_for(owner_doc);
+        if b.starts_with("http://") || b.starts_with("https://") {
+            b
+        } else {
+            hb.document_base_url()
+        }
+    };
+    let resolved = url::Url::parse(&base_str)
         .ok()
         .and_then(|base| base.join(raw_href.trim()).ok())
         .map(|u| u.to_string())
@@ -2703,7 +2810,11 @@ fn schedule_dynamic_stylesheet_load(
     let engine = Arc::clone(&net.borrow().fetch_engine);
     let tx = net.borrow().async_tx.clone();
     let origin = web_apis.borrow().current_origin();
-    net.borrow_mut().pending_subresources += 1;
+    {
+        let mut nb = net.borrow_mut();
+        nb.pending_subresources += 1;
+        nb.pending_stylesheet_fetches += 1;
+    }
     rt_handle.spawn(async move {
         let req = rix_net::FetchRequest {
             url: resolved,

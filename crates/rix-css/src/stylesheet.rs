@@ -155,7 +155,10 @@ impl MediaContext {
                 Operator::And => conditions.iter().all(|c| self.matches_media_condition(c)),
                 Operator::Or => conditions.iter().any(|c| self.matches_media_condition(c)),
             },
-            MediaCondition::Unknown(_) => false,
+            MediaCondition::Unknown(_) => {
+                let raw = lightning_to_css_string(cond);
+                self.eval_unknown_media_condition(&raw).unwrap_or(false)
+            }
         }
     }
 
@@ -195,6 +198,64 @@ impl MediaContext {
                 compare_f32(s, *start_operator, actual) && compare_f32(actual, *end_operator, e)
             }
         }
+    }
+
+    fn eval_unknown_media_condition(&self, raw: &str) -> Option<bool> {
+        // Evaluate CSS Media Queries L4 features containing CSS Values L4 typed arithmetic
+        // (`width: calc(100px / 1em * 1em)`, `min-width: calc(...)`, range syntax `width >= calc(...)`)
+        // that `lightningcss` leaves as `MediaCondition::Unknown`.
+        let mut s = raw.trim();
+        while s.starts_with('(') && s.ends_with(')') && find_matching_paren(s) == Some(s.len() - 1)
+        {
+            s = s[1..s.len() - 1].trim();
+        }
+        let eval = self.eval_context(16.0, 16.0);
+        let eval_len = |expr: &str| -> Option<f32> {
+            let pm = crate::values_math::parse_math_value(
+                expr.trim(),
+                crate::values_math::ValueKind::Length,
+            )?;
+            let px = pm.node.eval_scalar(&eval, None);
+            px.is_finite().then_some(px as f32)
+        };
+        if let Some((lhs_raw, rhs_raw)) = s.split_once(':') {
+            let feat = lhs_raw.trim().to_ascii_lowercase();
+            let rhs = eval_len(rhs_raw)?;
+            return Some(match feat.as_str() {
+                "width" | "device-width" => (self.viewport_width - rhs).abs() < 0.01,
+                "min-width" | "min-device-width" => self.viewport_width + 0.01 >= rhs,
+                "max-width" | "max-device-width" => self.viewport_width <= rhs + 0.01,
+                "height" | "device-height" => (self.viewport_height - rhs).abs() < 0.01,
+                "min-height" | "min-device-height" => self.viewport_height + 0.01 >= rhs,
+                "max-height" | "max-device-height" => self.viewport_height <= rhs + 0.01,
+                _ => false,
+            });
+        }
+        for (op_str, op_kind) in [("<=", 0u8), (">=", 1u8), ("<", 2u8), (">", 3u8), ("=", 4u8)] {
+            if let Some((lhs_raw, rhs_raw)) = s.split_once(op_str) {
+                let lhs_l = lhs_raw.trim().to_ascii_lowercase();
+                let rhs_l = rhs_raw.trim().to_ascii_lowercase();
+                let (actual, expected, flipped) = match lhs_l.as_str() {
+                    "width" | "device-width" => (self.viewport_width, eval_len(rhs_raw)?, false),
+                    "height" | "device-height" => (self.viewport_height, eval_len(rhs_raw)?, false),
+                    _ => match rhs_l.as_str() {
+                        "width" | "device-width" => (self.viewport_width, eval_len(lhs_raw)?, true),
+                        "height" | "device-height" => {
+                            (self.viewport_height, eval_len(lhs_raw)?, true)
+                        }
+                        _ => return Some(false),
+                    },
+                };
+                return Some(match (op_kind, flipped) {
+                    (0, false) | (1, true) => actual <= expected + 0.01,
+                    (1, false) | (0, true) => actual + 0.01 >= expected,
+                    (2, false) | (3, true) => actual < expected,
+                    (3, false) | (2, true) => actual > expected,
+                    _ => (actual - expected).abs() < 0.01,
+                });
+            }
+        }
+        Some(false)
     }
 
     fn eval_boolean_feature(&self, name: &MediaFeatureName<'_, MediaFeatureId>) -> bool {
@@ -709,6 +770,7 @@ pub struct CounterStyleRule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedImport {
     pub url: String,
+    pub url_modifiers: Vec<String>,
     /// `None` = unlayered, `Some(None)` = anonymous `layer`, `Some(Some(segs))` = `layer(a.b)`.
     pub layer: Option<Option<Vec<InternedStr>>>,
     pub supports: Option<String>,
@@ -1205,6 +1267,7 @@ pub struct CompiledRule {
     pub scopes: Option<Arc<[CompiledScope]>>,
     pub container_queries: Option<Arc<[CompiledContainerQuery]>>,
     pub is_starting_style: bool,
+    pub base_url: Option<InternedStr>,
 }
 
 /// Compiled `@property` / `CSS.registerProperty` custom property registration
@@ -1331,58 +1394,105 @@ pub(crate) fn resolve_css_relative_url(base_url: &str, raw: &str) -> Option<Stri
     Some(norm)
 }
 
-fn rewrite_stylesheet_relative_urls(rules: &mut [CompiledRule], base_url: &str) {
-    fn rewrite_tokens(tokens: &mut [crate::properties::CssToken], base_url: &str) {
+pub(crate) fn rewrite_decl_relative_urls(decl: &mut SpecifiedDeclaration, base_url: &str) -> bool {
+    fn rewrite_tokens(tokens: &mut [crate::properties::CssToken], base_url: &str) -> bool {
+        let mut any = false;
         for tok in tokens {
             match tok {
                 crate::properties::CssToken::Url(u) => {
                     if let Some(abs) = resolve_css_relative_url(base_url, u.as_str()) {
                         *u = intern_str(&abs);
+                        any = true;
                     }
                 }
-                crate::properties::CssToken::Function { args, .. } => {
-                    rewrite_tokens(args, base_url);
+                crate::properties::CssToken::Function { name, args } => {
+                    if name.as_str().eq_ignore_ascii_case("url") {
+                        for a in args.iter_mut() {
+                            match a {
+                                crate::properties::CssToken::String(s)
+                                | crate::properties::CssToken::Url(s) => {
+                                    if let Some(abs) =
+                                        resolve_css_relative_url(base_url, s.as_str())
+                                    {
+                                        *s = intern_str(&abs);
+                                        any = true;
+                                    }
+                                    break;
+                                }
+                                crate::properties::CssToken::Space => {}
+                                _ => break,
+                            }
+                        }
+                    } else if rewrite_tokens(args, base_url) {
+                        any = true;
+                    }
                 }
                 crate::properties::CssToken::Var {
                     fallback: Some(fb), ..
                 } => {
-                    rewrite_tokens(fb, base_url);
+                    if rewrite_tokens(fb, base_url) {
+                        any = true;
+                    }
                 }
                 _ => {}
             }
         }
+        any
     }
+    // CSS Values L3 §4.5: custom properties do NOT resolve relative URLs at declaration time;
+    // relative URLs resolve against the stylesheet where the standard property consumes `var()`.
+    if decl.property == crate::properties::PropertyIdKind::Custom {
+        return false;
+    }
+    let mut changed = false;
+    match &mut decl.value {
+        PropertyValue::BackgroundLayers(layers) => {
+            for layer in layers.iter_mut() {
+                if let BackgroundImageValue::Url(u) = &mut layer.image {
+                    if let Some(abs) = resolve_css_relative_url(base_url, u.as_str()) {
+                        let interned = intern_str(&abs);
+                        *u = interned.clone();
+                        layer.image_url = Some(interned);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        PropertyValue::CursorWithUrls(imgs, _) => {
+            for (u, _) in imgs.iter_mut() {
+                if let Some(abs) = resolve_css_relative_url(base_url, u.as_str()) {
+                    *u = intern_str(&abs);
+                    changed = true;
+                }
+            }
+        }
+        PropertyValue::MaskImage(BackgroundImageValue::Url(u)) => {
+            if let Some(abs) = resolve_css_relative_url(base_url, u.as_str()) {
+                *u = intern_str(&abs);
+                changed = true;
+            }
+        }
+        PropertyValue::Unresolved(tokens) => {
+            if rewrite_tokens(tokens, base_url) {
+                changed = true;
+            }
+        }
+        _ => {}
+    }
+    changed
+}
+
+fn rewrite_stylesheet_relative_urls(rules: &mut [CompiledRule], base_url: &str) {
+    let base_interned = intern_str(base_url);
     for rule in rules {
+        if rule.base_url.is_none() {
+            rule.base_url = Some(base_interned.clone());
+        }
         let mut changed = false;
         let mut decls: Vec<SpecifiedDeclaration> = rule.declarations.iter().cloned().collect();
         for decl in &mut decls {
-            match &mut decl.value {
-                PropertyValue::BackgroundLayers(layers) => {
-                    for layer in layers.iter_mut() {
-                        if let BackgroundImageValue::Url(u) = &mut layer.image {
-                            if let Some(abs) = resolve_css_relative_url(base_url, u.as_str()) {
-                                let interned = intern_str(&abs);
-                                *u = interned.clone();
-                                layer.image_url = Some(interned);
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-                PropertyValue::MaskImage(BackgroundImageValue::Url(u)) => {
-                    if let Some(abs) = resolve_css_relative_url(base_url, u.as_str()) {
-                        *u = intern_str(&abs);
-                        changed = true;
-                    }
-                }
-                PropertyValue::Unresolved(tokens) => {
-                    let before = tokens.clone();
-                    rewrite_tokens(tokens, base_url);
-                    if *tokens != before {
-                        changed = true;
-                    }
-                }
-                _ => {}
+            if rewrite_decl_relative_urls(decl, base_url) {
+                changed = true;
             }
         }
         if changed {
@@ -1416,42 +1526,146 @@ fn parse_layer_name_segments(raw: &str) -> Option<Vec<InternedStr>> {
     (!segs.is_empty()).then_some(segs)
 }
 
+/// Parses the interior of `url(...)` inside `@import`, validating CSS Values L5 §2.4
+/// request URL modifiers (`cross-origin()`, `integrity()`, `referrer-policy()`), rejecting
+/// duplicate modifiers and modifiers on unquoted URLs, and returning `(url, canonical_modifiers)`.
+fn parse_import_url_inner(inner: &str) -> Option<(String, Vec<String>)> {
+    let t = inner.trim();
+    if t.is_empty() {
+        return Some((String::new(), Vec::new()));
+    }
+    let bytes = t.as_bytes();
+    if bytes[0] != b'"' && bytes[0] != b'\'' {
+        // Unquoted `url(...)` cannot carry request modifiers (CSS Values L5 §2.4).
+        if t.bytes().any(|b| b.is_ascii_whitespace()) {
+            return None;
+        }
+        return Some((t.to_string(), Vec::new()));
+    }
+    let q = bytes[0];
+    let mut i = 1usize;
+    let mut url_out = String::new();
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            url_out.push(bytes[i + 1] as char);
+            i += 2;
+            continue;
+        }
+        if bytes[i] == q {
+            break;
+        }
+        url_out.push(bytes[i] as char);
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    let mut rest = t[i + 1..].trim();
+    let mut cross_origin: Option<String> = None;
+    let mut integrity: Option<String> = None;
+    let mut referrer_policy: Option<String> = None;
+    while !rest.is_empty() {
+        let open = rest.find('(')?;
+        let fname = rest[..open].trim().to_ascii_lowercase();
+        let close = find_matching_paren(&rest[open..])?;
+        let arg = rest[open + 1..open + close].trim();
+        match fname.as_str() {
+            "cross-origin" => {
+                if cross_origin.is_some() {
+                    return None;
+                }
+                let a = arg.to_ascii_lowercase();
+                if !matches!(a.as_str(), "anonymous" | "use-credentials") {
+                    return None;
+                }
+                cross_origin = Some(format!("cross-origin({a})"));
+            }
+            "integrity" => {
+                if integrity.is_some() {
+                    return None;
+                }
+                if arg.len() < 2
+                    || !((arg.starts_with('"') && arg.ends_with('"'))
+                        || (arg.starts_with('\'') && arg.ends_with('\'')))
+                {
+                    return None;
+                }
+                let inner_s = &arg[1..arg.len() - 1];
+                let esc = inner_s.replace('\\', "\\\\").replace('"', "\\\"");
+                integrity = Some(format!("integrity(\"{esc}\")"));
+            }
+            "referrer-policy" => {
+                if referrer_policy.is_some() {
+                    return None;
+                }
+                let a = arg.to_ascii_lowercase();
+                if !matches!(
+                    a.as_str(),
+                    "no-referrer"
+                        | "no-referrer-when-downgrade"
+                        | "same-origin"
+                        | "origin"
+                        | "strict-origin"
+                        | "origin-when-cross-origin"
+                        | "strict-origin-when-cross-origin"
+                        | "unsafe-url"
+                ) {
+                    return None;
+                }
+                referrer_policy = Some(format!("referrer-policy({a})"));
+            }
+            _ => return None,
+        }
+        rest = rest[open + close + 1..].trim();
+    }
+    let mut mods = Vec::new();
+    if let Some(m) = cross_origin {
+        mods.push(m);
+    }
+    if let Some(m) = integrity {
+        mods.push(m);
+    }
+    if let Some(m) = referrer_policy {
+        mods.push(m);
+    }
+    Some((url_out, mods))
+}
+
 fn parse_import_prelude_stmt(stmt: &str, media_ctx: &MediaContext) -> Option<ExtractedImport> {
     let body = stmt.trim();
     if body.len() < 7 || !body[..7].eq_ignore_ascii_case("@import") {
         return None;
     }
     let after_kw = body[7..].trim();
-    let (url, mut rest) = if after_kw.len() >= 4 && after_kw[..4].eq_ignore_ascii_case("url(") {
-        let close = find_matching_paren(&after_kw[3..])?;
-        let raw_u = after_kw[4..3 + close]
-            .trim()
-            .trim_matches(|c| c == '"' || c == '\'');
-        (raw_u.to_string(), after_kw[4 + close..].trim())
-    } else if after_kw.starts_with('"') || after_kw.starts_with('\'') {
-        let q = after_kw.as_bytes()[0];
-        let bytes = after_kw.as_bytes();
-        let mut i = 1usize;
-        let mut out = String::new();
-        while i < bytes.len() {
-            if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1] as char);
-                i += 2;
-                continue;
+    let (url, url_modifiers, mut rest) =
+        if after_kw.len() >= 4 && after_kw[..4].eq_ignore_ascii_case("url(") {
+            let close = find_matching_paren(&after_kw[3..])?;
+            let (u, mods) = parse_import_url_inner(&after_kw[4..3 + close])?;
+            (u, mods, after_kw[4 + close..].trim())
+        } else if after_kw.starts_with('"') || after_kw.starts_with('\'') {
+            let q = after_kw.as_bytes()[0];
+            let bytes = after_kw.as_bytes();
+            let mut i = 1usize;
+            let mut out = String::new();
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    out.push(bytes[i + 1] as char);
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == q {
+                    break;
+                }
+                out.push(bytes[i] as char);
+                i += 1;
             }
-            if bytes[i] == q {
-                break;
+            if i >= bytes.len() {
+                return None;
             }
-            out.push(bytes[i] as char);
-            i += 1;
-        }
-        if i >= bytes.len() {
+            (out, Vec::new(), after_kw[i + 1..].trim())
+        } else {
             return None;
-        }
-        (out, after_kw[i + 1..].trim())
-    } else {
-        return None;
-    };
+        };
 
     let mut layer: Option<Option<Vec<InternedStr>>> = None;
     let mut supports: Option<String> = None;
@@ -1504,6 +1718,7 @@ fn parse_import_prelude_stmt(stmt: &str, media_ctx: &MediaContext) -> Option<Ext
     };
     Some(ExtractedImport {
         url,
+        url_modifiers,
         layer,
         supports,
         media: media_str,
@@ -2015,6 +2230,7 @@ impl<'a> StylesheetCompiler<'a> {
             return;
         }
         let rules_before = self.rules.len();
+        let font_faces_before = self.font_faces.len();
         let quirks_norm = if self.origin == CascadeOrigin::Author {
             crate::properties::preprocess_quirks_and_strict_lengths(
                 body_css,
@@ -2087,6 +2303,15 @@ impl<'a> StylesheetCompiler<'a> {
 
         if let Some(base) = base_url {
             rewrite_stylesheet_relative_urls(&mut self.rules[rules_before..], base);
+            for ff in &mut self.font_faces[font_faces_before..] {
+                for src in &mut ff.sources {
+                    if let FontFaceSource::Url { url, .. } = src {
+                        if let Some(abs) = resolve_css_relative_url(base, url.as_str()) {
+                            *url = intern_str(&abs);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2580,6 +2805,7 @@ impl<'a> StylesheetCompiler<'a> {
                 scopes: scopes.clone(),
                 container_queries: container_queries.clone(),
                 is_starting_style: self.in_starting_style,
+                base_url: None,
             });
         }
     }
@@ -3057,6 +3283,7 @@ pub enum CssomRuleKind {
     },
     Import {
         url: String,
+        url_modifiers: Vec<String>,
         /// `None` = no layer, `Some(None)` = anonymous `layer`, `Some(Some(name))` = `layer(name)`.
         layer: Option<Option<String>>,
         supports: Option<String>,
@@ -3260,12 +3487,17 @@ impl CssomRuleKind {
             Self::NestedDeclarations { declarations_text } => declarations_text.trim().to_string(),
             Self::Import {
                 url,
+                url_modifiers,
                 layer,
                 supports,
                 media,
             } => {
                 let escaped = url.replace('\\', "\\\\").replace('"', "\\\"");
-                let mut out = format!("@import url(\"{escaped}\")");
+                let mut out = if url_modifiers.is_empty() {
+                    format!("@import url(\"{escaped}\")")
+                } else {
+                    format!("@import url(\"{escaped}\" {})", url_modifiers.join(" "))
+                };
                 if let Some(layer_opt) = layer {
                     out.push_str(" layer");
                     if let Some(name) = layer_opt {
@@ -4084,6 +4316,7 @@ fn convert_lightning_rule_to_cssom(
             };
             Ok(CssomRuleKind::Import {
                 url,
+                url_modifiers: Vec::new(),
                 layer,
                 supports,
                 media,
@@ -4791,6 +5024,7 @@ pub fn parse_cssom_rules(css: &str) -> Vec<CssomRuleKind> {
             PreludeItem::Import(imp) => {
                 prelude_rules.push(CssomRuleKind::Import {
                     url: imp.url,
+                    url_modifiers: imp.url_modifiers,
                     layer: imp.layer.map(|opt| {
                         opt.map(|segs| {
                             segs.iter()
@@ -5371,14 +5605,18 @@ fn parse_cssom_import_rule(trimmed: &str) -> Option<CssomRuleKind> {
         .trim()
         .strip_suffix(';')?
         .trim();
-    let (url, mut rest) = if let Some(u) = body.strip_prefix("url(") {
-        let close = u.find(')')?;
-        let raw_u = u[..close].trim().trim_matches(|c| c == '"' || c == '\'');
-        (raw_u.to_string(), u[close + 1..].trim())
+    let (url, url_modifiers, mut rest) = if body.starts_with("url(") {
+        let close = find_matching_paren(&body[3..])?;
+        let (parsed_u, mods) = parse_import_url_inner(&body[4..3 + close])?;
+        (parsed_u, mods, body[4 + close..].trim())
     } else if body.starts_with('"') || body.starts_with('\'') {
         let q = body.as_bytes()[0] as char;
         let close = body[1..].find(q)?;
-        (body[1..1 + close].to_string(), body[close + 2..].trim())
+        (
+            body[1..1 + close].to_string(),
+            Vec::new(),
+            body[close + 2..].trim(),
+        )
     } else {
         return None;
     };
@@ -5408,11 +5646,12 @@ fn parse_cssom_import_rule(trimmed: &str) -> Option<CssomRuleKind> {
         supports = Some(inner.to_string());
         rest = rest[9 + close..].trim();
     }
-    if layer.is_none() && supports.is_none() && rest.is_empty() {
+    if url_modifiers.is_empty() && layer.is_none() && supports.is_none() && rest.is_empty() {
         return None;
     }
     Some(CssomRuleKind::Import {
         url,
+        url_modifiers,
         layer,
         supports,
         media: rest.to_string(),
