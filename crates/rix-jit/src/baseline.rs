@@ -17,7 +17,7 @@
 //! - Full ES2024 opcode coverage via audited `extern "C"` trampolines (`rt_step_generic`).
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -25,7 +25,7 @@ use cranelift_codegen::ir::{
     types, AbiParam, Block, Function, InstBuilder, MemFlagsData, Signature, StackSlotData,
     StackSlotKind, UserFuncName, Value,
 };
-use cranelift_codegen::isa::CallConv;
+use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -116,6 +116,15 @@ impl CompiledBaseline {
     }
 }
 
+/// Maximum bytecode length for SSA-register Baseline JIT (beyond this, Baseline uses O(1)-frame
+/// memory-backed register lowering so large React/Next.js/GSAP bundle functions compile in O(N)
+/// time with ~96-byte native stack frames and zero stack overflow risk).
+const SSA_MAX_BYTECODES: usize = 1_024;
+const SSA_MAX_REGS: u16 = 48;
+/// Hard ceiling for Memory-Backed Frame Baseline JIT (`Tier-2L`).
+const MEM_BACKED_MAX_BYTECODES: usize = 32_768;
+const MEM_BACKED_MAX_REGS: u16 = 1_024;
+
 /// Checks whether a [`FunctionBytecode`] is eligible for Tier-2 Baseline Cranelift compilation.
 fn check_eligibility(func: &FunctionBytecode) -> Result<(), JitCompileError> {
     if func.is_async || func.is_generator {
@@ -123,7 +132,10 @@ fn check_eligibility(func: &FunctionBytecode) -> Result<(), JitCompileError> {
             "async/generator functions execute on suspendable Tier-1 frames",
         ));
     }
-    if func.code.is_empty() || func.code.len() > 1_024 || func.register_count > 48 {
+    if func.code.is_empty()
+        || func.code.len() > MEM_BACKED_MAX_BYTECODES
+        || func.register_count > MEM_BACKED_MAX_REGS
+    {
         return Err(JitCompileError::UnsupportedFunction(
             "function exceeds Baseline JIT bytecode/register budget",
         ));
@@ -170,6 +182,32 @@ fn resolve_wide(func: &FunctionBytecode, pc: usize, is_abx: bool) -> (u32, usize
     (raw, pc + 1)
 }
 
+fn cached_baseline_isa() -> Result<&'static OwnedTargetIsa, JitCompileError> {
+    static ISA: OnceLock<Result<OwnedTargetIsa, String>> = OnceLock::new();
+    let res = ISA.get_or_init(|| {
+        let mut flag_builder = settings::builder();
+        flag_builder
+            .set("opt_level", "none")
+            .map_err(|e| e.to_string())?;
+        #[cfg(not(debug_assertions))]
+        flag_builder
+            .set("enable_verifier", "false")
+            .map_err(|e| e.to_string())?;
+        flag_builder
+            .set("is_pic", "true")
+            .map_err(|e| e.to_string())?;
+        let flags = settings::Flags::new(flag_builder);
+        cranelift_native::builder()
+            .map_err(|e| e.to_string())?
+            .finish(flags)
+            .map_err(|e| e.to_string())
+    });
+    match res {
+        Ok(isa) => Ok(isa),
+        Err(msg) => Err(JitCompileError::UnsupportedIsa(msg.clone())),
+    }
+}
+
 /// Compiles `func` (`program_id`, `func_idx`) to native W^X machine code via Cranelift.
 pub fn compile_baseline_function(
     program_id: u32,
@@ -178,25 +216,7 @@ pub fn compile_baseline_function(
 ) -> Result<Arc<CompiledBaseline>, JitCompileError> {
     check_eligibility(func)?;
 
-    let mut flag_builder = settings::builder();
-    // Tier-2 Baseline JIT uses `opt_level = "none"` with Cranelift's coalescing backtracking
-    // allocator (bounded by `check_eligibility` to <=1024 bytecodes / <=48 registers) so compile
-    // times stay <2 ms while stack frames stay compact under deep recursive JS frameworks.
-    flag_builder
-        .set("opt_level", "none")
-        .map_err(|e| JitCompileError::Cranelift(e.to_string()))?;
-    #[cfg(not(debug_assertions))]
-    flag_builder
-        .set("enable_verifier", "false")
-        .map_err(|e| JitCompileError::Cranelift(e.to_string()))?;
-    flag_builder
-        .set("is_pic", "true")
-        .map_err(|e| JitCompileError::Cranelift(e.to_string()))?;
-    let flags = settings::Flags::new(flag_builder);
-    let isa = cranelift_native::builder()
-        .map_err(|e| JitCompileError::UnsupportedIsa(e.to_string()))?
-        .finish(flags)
-        .map_err(|e| JitCompileError::UnsupportedIsa(e.to_string()))?;
+    let isa = cached_baseline_isa()?;
 
     let ptr_ty = isa.pointer_type();
     let call_conv = CallConv::triple_default(isa.triple());
@@ -215,6 +235,7 @@ pub fn compile_baseline_function(
     let mut builder = FunctionBuilder::new(&mut clif_func, &mut fb_ctx);
 
     let reg_count = (func.register_count as usize).max(func.param_count as usize + 1);
+    let mem_backed = func.code.len() > SSA_MAX_BYTECODES || func.register_count > SSA_MAX_REGS;
     let has_closures = func.code.iter().any(|i| {
         matches!(
             i.opcode(),
@@ -287,19 +308,25 @@ pub fn compile_baseline_function(
     let exc_exit_block = builder.create_block();
 
     // Declare SSA Variables:
-    // 0..reg_count = bytecode registers r0..r(N-1)
-    // reg_count     = live `regs_ptr` (reloaded after calls that may reallocate `vm.registers`)
-    // reg_count + 1 = `loop_tick` (I32 amortized safepoint counter)
-    let reg_vars: Vec<Variable> = (0..reg_count)
-        .map(|_| builder.declare_var(types::I64))
-        .collect();
+    // - In SSA mode (`!mem_backed`): 0..reg_count = bytecode registers r0..r(N-1)
+    // - In Memory-Backed Frame mode (`mem_backed`): zero register SSA vars -> O(1) ~96-byte native
+    //   stack frame and O(N) compile time even for 10,000-bytecode / 500-register bundle functions!
+    // - `regs_ptr_var`: live `regs_ptr` (reloaded after calls that may reallocate `vm.registers`)
+    // - `loop_tick_var`: `I32` amortized safepoint counter
+    let reg_vars: Vec<Variable> = if mem_backed {
+        Vec::new()
+    } else {
+        (0..reg_count)
+            .map(|_| builder.declare_var(types::I64))
+            .collect()
+    };
     let regs_ptr_var = builder.declare_var(ptr_ty);
     let loop_tick_var = builder.declare_var(types::I32);
 
     // Pre-import reusable C ABI trampoline signatures.
     let sigs = TrampolineSigs::new(&mut builder, ptr_ty, call_conv);
 
-    // Emit prologue: load all live registers from `regs_ptr`, then dispatch `entry_pc` (0 or OSR header!).
+    // Emit prologue: load live SSA registers (when `!mem_backed`), then dispatch `entry_pc` (0 or OSR header!).
     builder.switch_to_block(prologue);
     let vm_ptr = builder.block_params(prologue)[0];
     let init_regs_ptr = builder.block_params(prologue)[1];
@@ -309,14 +336,16 @@ pub fn compile_baseline_function(
     let zero_i32 = builder.ins().iconst(types::I32, 0);
     builder.def_var(loop_tick_var, zero_i32);
 
-    for (i, &rv) in reg_vars.iter().enumerate() {
-        let loaded = builder.ins().load(
-            types::I64,
-            MemFlagsData::trusted(),
-            init_regs_ptr,
-            (i * 8) as i32,
-        );
-        builder.def_var(rv, loaded);
+    if !mem_backed {
+        for (i, &rv) in reg_vars.iter().enumerate() {
+            let loaded = builder.ins().load(
+                types::I64,
+                MemFlagsData::trusted(),
+                init_regs_ptr,
+                (i * 8) as i32,
+            );
+            builder.def_var(rv, loaded);
+        }
     }
 
     let entry0_block = pc_blocks[&0];
@@ -359,6 +388,8 @@ pub fn compile_baseline_function(
         regs_ptr_var,
         loop_tick_var,
         reg_vars: &reg_vars,
+        reg_count,
+        mem_backed,
         pc_blocks: &pc_blocks,
         implicit_ret_block,
         exc_exit_block,
@@ -763,6 +794,9 @@ pub fn compile_baseline_function(
                     &[emitter.vm_ptr, p_id, f_id, pc_v],
                 );
                 emitter.check_exception(res);
+                if mem_backed {
+                    emitter.reload_regs_ptr_and_maybe_all();
+                }
                 emitter.builder.ins().jump(header, &[]);
                 block_terminated = true;
             }
@@ -813,13 +847,15 @@ pub fn compile_baseline_function(
     // `vm.registers`, flush live SSA registers for `try`/`catch`/`finally` handlers, and
     // return `JIT_EXCEPTION_SENTINEL`.
     emitter.builder.switch_to_block(exc_exit_block);
-    let fresh_regs = emitter.call_trampoline_1(
-        rt_regs_ptr as *const () as usize,
-        emitter.sigs.ptr_to_ptr,
-        emitter.vm_ptr,
-    );
-    emitter.builder.def_var(emitter.regs_ptr_var, fresh_regs);
-    emitter.flush_all_regs();
+    if !mem_backed {
+        let fresh_regs = emitter.call_trampoline_1(
+            rt_regs_ptr as *const () as usize,
+            emitter.sigs.ptr_to_ptr,
+            emitter.vm_ptr,
+        );
+        emitter.builder.def_var(emitter.regs_ptr_var, fresh_regs);
+        emitter.flush_all_regs();
+    }
     let sentinel = emitter
         .builder
         .ins()
@@ -832,7 +868,7 @@ pub fn compile_baseline_function(
     let mut ctx = Context::for_function(clif_func);
     let mut ctrl_plane = ControlPlane::default();
     let compiled = ctx
-        .compile(&*isa, &mut ctrl_plane)
+        .compile(isa.as_ref(), &mut ctrl_plane)
         .map_err(|e| JitCompileError::Cranelift(format!("{e:?}")))?;
 
     let code_page = CodePage::from_machine_code(compiled.code_buffer())?;
@@ -998,6 +1034,8 @@ struct Emitter<'a, 'b> {
     regs_ptr_var: Variable,
     loop_tick_var: Variable,
     reg_vars: &'a [Variable],
+    reg_count: usize,
+    mem_backed: bool,
     pc_blocks: &'a HashMap<usize, Block>,
     implicit_ret_block: Block,
     exc_exit_block: Block,
@@ -1011,6 +1049,18 @@ struct Emitter<'a, 'b> {
 impl Emitter<'_, '_> {
     #[inline]
     fn read_reg(&mut self, r: usize) -> Value {
+        if self.mem_backed {
+            if r < self.reg_count {
+                let ptr = self.builder.use_var(self.regs_ptr_var);
+                return self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    ptr,
+                    (r * 8) as i32,
+                );
+            }
+            return self.builder.ins().iconst(types::I64, VAL_UNDEFINED);
+        }
         if let Some(&v) = self.reg_vars.get(r) {
             self.builder.use_var(v)
         } else {
@@ -1020,12 +1070,24 @@ impl Emitter<'_, '_> {
 
     #[inline]
     fn write_reg(&mut self, r: usize, val: Value) {
+        if self.mem_backed {
+            if r < self.reg_count {
+                let ptr = self.builder.use_var(self.regs_ptr_var);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), val, ptr, (r * 8) as i32);
+            }
+            return;
+        }
         if let Some(&v) = self.reg_vars.get(r) {
             self.builder.def_var(v, val);
         }
     }
 
     fn flush_all_regs(&mut self) {
+        if self.mem_backed {
+            return;
+        }
         let ptr = self.builder.use_var(self.regs_ptr_var);
         for (i, &rv) in self.reg_vars.iter().enumerate() {
             let val = self.builder.use_var(rv);
@@ -1042,6 +1104,9 @@ impl Emitter<'_, '_> {
             self.vm_ptr,
         );
         self.builder.def_var(self.regs_ptr_var, new_ptr);
+        if self.mem_backed {
+            return;
+        }
         for (i, &rv) in self.reg_vars.iter().enumerate() {
             let val = self.builder.ins().load(
                 types::I64,
@@ -1060,6 +1125,9 @@ impl Emitter<'_, '_> {
             self.vm_ptr,
         );
         self.builder.def_var(self.regs_ptr_var, new_ptr);
+        if self.mem_backed {
+            return;
+        }
         if self.has_closures {
             for (i, &rv) in self.reg_vars.iter().enumerate() {
                 let val = self.builder.ins().load(

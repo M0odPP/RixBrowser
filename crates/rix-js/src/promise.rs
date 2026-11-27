@@ -1837,7 +1837,7 @@ fn create_generator_inner(
             this_val,
             callee,
             saved_regs,
-            call_args: args.to_vec(),
+            call_args: smallvec::SmallVec::from_slice(args),
             saved_upvalues: Vec::new(),
             resume_dst: 0,
         }

@@ -261,6 +261,86 @@ impl ResourceManager {
         let url_str = url.as_str().to_string();
         let now = now_secs();
 
+        // 1. Check unified RFC 9111 L1+L2 `HttpCache` shared with `HttpClient` and `FetchEngine`
+        //    (honoring `max-age`, `s-maxage`, `immutable`, `stale-while-revalidate`, `Expires`,
+        //    `Vary`, conditional 304 revalidation, heuristic freshness, and `no-cache`/`no-store`).
+        let empty_req_headers = HashMap::new();
+        if let Some(http_cache) = self.client.http_cache() {
+            if let Some(entry) = http_cache.get(&url_str) {
+                if entry.meta.vary_matches(&empty_req_headers) {
+                    if entry.meta.is_fresh_or_swr(now) {
+                        let sniffed = sniff_mime_type_with_name(
+                            &entry.body,
+                            &entry.meta.content_type,
+                            url.path(),
+                        );
+                        return Ok(Resource {
+                            url: url.clone(),
+                            mime_type: sniffed,
+                            data: entry.body.to_vec(),
+                            etag: entry.meta.etag.clone(),
+                            last_modified: entry.meta.last_modified.clone(),
+                            from_cache: true,
+                        });
+                    }
+                    if entry.meta.can_revalidate() {
+                        if let Ok(resp) = self
+                            .client
+                            .fetch_conditional(
+                                url,
+                                entry.meta.etag.as_deref(),
+                                entry.meta.last_modified.as_deref(),
+                            )
+                            .await
+                        {
+                            if resp.status == 304 {
+                                let _ = http_cache.update_revalidated(
+                                    &url_str,
+                                    &resp.headers,
+                                    now_secs(),
+                                );
+                                let sniffed = sniff_mime_type_with_name(
+                                    &entry.body,
+                                    &entry.meta.content_type,
+                                    url.path(),
+                                );
+                                return Ok(Resource {
+                                    url: url.clone(),
+                                    mime_type: sniffed,
+                                    data: entry.body.to_vec(),
+                                    etag: resp
+                                        .headers
+                                        .get("etag")
+                                        .cloned()
+                                        .or(entry.meta.etag.clone()),
+                                    last_modified: resp
+                                        .headers
+                                        .get("last-modified")
+                                        .cloned()
+                                        .or(entry.meta.last_modified.clone()),
+                                    from_cache: true,
+                                });
+                            }
+                            let _ = http_cache.put(&url_str, &resp);
+                            let sniffed = sniff_mime_type_with_name(
+                                &resp.body,
+                                &resp.content_type,
+                                resp.final_url.path(),
+                            );
+                            return Ok(Resource {
+                                url: resp.final_url,
+                                mime_type: sniffed,
+                                data: resp.body,
+                                etag: resp.headers.get("etag").cloned(),
+                                last_modified: resp.headers.get("last-modified").cloned(),
+                                from_cache: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         let mem_hit = {
             let guard = self.mem.read().await;
             guard.get(&url_str).cloned()
@@ -296,6 +376,9 @@ impl ResourceManager {
         }
 
         let response = self.client.fetch(url).await?;
+        if let Some(http_cache) = self.client.http_cache() {
+            let _ = http_cache.put(&url_str, &response);
+        }
         if response.status == 304 {
             return Ok(Resource {
                 url: response.final_url,

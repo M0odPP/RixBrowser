@@ -177,7 +177,7 @@ pub struct SuspendedFrame {
     pub callee: HeapHandle,
     pub saved_regs: Vec<JsValue>,
     /// Original invocation arguments preserved for lazy `arguments` materialization.
-    pub call_args: Vec<JsValue>,
+    pub call_args: smallvec::SmallVec<[JsValue; 4]>,
     /// Open upvalue cells `(relative_reg_offset, cell_handle)` detached on suspend
     /// and re-attached on resume so closures stay live across `await`/`yield`.
     pub saved_upvalues: Vec<(usize, HeapHandle)>,
@@ -1769,6 +1769,16 @@ impl GcHeap {
         }
     }
 
+    /// Zero-allocation check returning the `Copy` [`ProxyObject`] payload only when `handle`
+    /// refers to a live `ObjectKind::Proxy` (never cloning `Map`/`Set`/`Closure` payloads).
+    #[inline]
+    pub fn get_proxy(&self, handle: HeapHandle) -> Option<ProxyObject> {
+        match &self.get_object(handle)?.kind {
+            ObjectKind::Proxy(p) => Some(*p),
+            _ => None,
+        }
+    }
+
     pub fn get_object_mut(&mut self, handle: HeapHandle) -> Option<&mut JsObject> {
         let slot = self.slots.get_mut(handle.index as usize)?;
         if slot.generation != handle.generation {
@@ -2092,7 +2102,7 @@ impl GcHeap {
         } else {
             DICTIONARY_TRANSITION_LIMIT
         };
-        if tc >= limit {
+        if tc >= limit || (!is_global && !shapes.can_transition_add(cur_shape, key, attrs)) {
             let obj = self.get_object_mut(owner)?;
             obj.to_dictionary_mode(shapes);
             let rare = obj.rare_mut();

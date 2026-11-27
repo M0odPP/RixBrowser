@@ -151,6 +151,17 @@ impl Default for VisualStyle {
     }
 }
 
+impl VisualStyle {
+    /// Compares only layout-affecting visual fields (`border-style` governs used border width,
+    /// `content-visibility` skips/reveals subtree layout, and `zoom` scales box geometry).
+    #[must_use]
+    pub fn layout_eq(&self, other: &Self) -> bool {
+        self.border_style == other.border_style
+            && self.content_visibility == other.content_visibility
+            && self.zoom == other.zoom
+    }
+}
+
 /// Inherited typography and text properties shared across subtrees via `Arc`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InheritedTextStyle {
@@ -325,6 +336,11 @@ impl InheritedTextStyle {
             && self.hanging_punctuation == other.hanging_punctuation
             && self.text_fit == other.text_fit
             && self.word_space_transform == other.word_space_transform
+            && self.orphans == other.orphans
+            && self.widows == other.widows
+            && self.tab_size_num == other.tab_size_num
+            && self.tab_size_len == other.tab_size_len
+            && self.interpolate_size == other.interpolate_size
     }
 }
 
@@ -442,6 +458,46 @@ pub struct EffectsStyle {
     pub container_type: u8,
     /// CSS Containment L3 `container-name` list (empty = `none`).
     pub container_name: Vec<InternedStr>,
+}
+
+impl EffectsStyle {
+    /// Returns `true` when this `EffectsStyle` causes its element to establish a containing block
+    /// for `position: fixed` (and `position: absolute`) descendants per CSS Transforms/Filters/Containment.
+    #[must_use]
+    pub fn establishes_fixed_cb(&self) -> bool {
+        !self.transform.is_empty()
+            || self.transform_raw.is_some()
+            || self.scale != crate::values_math::ScaleSpec::None
+            || self.rotate != crate::values_math::RotateSpec::None
+            || self.translate != crate::values_math::TranslateSpec::None
+            || !self.filter.is_empty()
+            || !self.backdrop_filter.is_empty()
+            || (self.contain & (0x04 | 0x10)) != 0
+    }
+
+    #[must_use]
+    pub fn layout_is_default(&self) -> bool {
+        self.contain == 0
+            && self.container_type == 0
+            && self.container_name.is_empty()
+            && self.aspect_ratio_math.is_none()
+            && self.reading_flow == ReadingFlowMode::Normal
+            && self.reading_order == 0
+            && !self.establishes_fixed_cb()
+    }
+
+    /// Compares layout-affecting effect fields (`contain`, `container-*`, `aspect-ratio`,
+    /// `reading-flow`/`reading-order`, and whether a fixed containing block is established).
+    #[must_use]
+    pub fn layout_eq(&self, other: &Self) -> bool {
+        self.contain == other.contain
+            && self.container_type == other.container_type
+            && self.container_name == other.container_name
+            && self.aspect_ratio_math == other.aspect_ratio_math
+            && self.reading_flow == other.reading_flow
+            && self.reading_order == other.reading_order
+            && self.establishes_fixed_cb() == other.establishes_fixed_cb()
+    }
 }
 
 /// Single CSS custom property value with pre-serialized CSS text and optional
@@ -868,6 +924,7 @@ impl ComputedStyle {
             || self.clear_mode != other.clear_mode
             || self.box_sizing != other.box_sizing
             || self.overflow != other.overflow
+            || self.overlay != other.overlay
             || self.white_space_trim != other.white_space_trim
             || self.wrap_inside != other.wrap_inside
             || self.text_group_align != other.text_group_align
@@ -877,13 +934,24 @@ impl ComputedStyle {
         if !Arc::ptr_eq(&self.box_model, &other.box_model) && self.box_model != other.box_model {
             return false;
         }
+        if !Arc::ptr_eq(&self.visual, &other.visual) && !self.visual.layout_eq(&other.visual) {
+            return false;
+        }
         if !Arc::ptr_eq(&self.text, &other.text) && !self.text.layout_eq(&other.text) {
             return false;
         }
-        match (&self.flex_grid, &other.flex_grid) {
+        let fg_eq = match (&self.flex_grid, &other.flex_grid) {
             (None, None) => true,
             (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
             _ => false,
+        };
+        if !fg_eq {
+            return false;
+        }
+        match (&self.effects, &other.effects) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.layout_eq(b),
+            (Some(a), None) | (None, Some(a)) => a.layout_is_default(),
         }
     }
 
@@ -1452,9 +1520,8 @@ pub fn resolve_element_style_with_context(
     }
     // Pre-select winning custom declarations and filter out exact no-ops (e.g. Tailwind v4's
     // `*, ::before, ::after { --tw-*: 0 / initial }` re-declaring values already identical to
-    // the inherited parent map!) so unchanged elements preserve O(1) `Arc` sharing with zero
-    // HashMap or token-serialization allocations.
-    let can_skip_noop_custom = !needs_reg_seed && parent_dirty_non_inherited.is_empty();
+    // the inherited parent map!) per-property so modifying one non-inherited `@property` on a
+    // parent never disables no-op filtering for all other properties down the subtree.
     let mut active_custom: Vec<(InternedStr, &SpecifiedDeclaration)> = Vec::new();
     for (name, stack) in &raw_custom {
         if let Some(winner) = select_winning_candidate(stack) {
@@ -1464,35 +1531,63 @@ pub fn resolve_element_style_with_context(
             if matches!(winner.value, PropertyValue::Global(GlobalKeyword::Inherit)) {
                 style.uses_explicit_inherit = true;
             }
-            if can_skip_noop_custom {
+            if !needs_reg_seed {
                 let reg = registered_props.and_then(|m| m.get(name));
-                let is_noop = match &winner.value {
-                    PropertyValue::Custom(tokens)
-                        if !crate::substitution::tokens_contain_subst(tokens)
-                            && style.custom_properties.get(name).is_some_and(|cur| {
-                                tokens_match_registered_computed(cur, tokens, reg)
-                            }) =>
-                    {
-                        reg.is_none_or(|r| {
-                            let syn = r
-                                .syntax
-                                .trim()
-                                .trim_matches(|c| c == '"' || c == '\'')
-                                .trim();
-                            syn == "*" || !tokens_may_depend_on_element_context(tokens)
-                        })
+                let dirty_on_parent = parent_dirty_non_inherited.contains(name);
+                let is_noop = if dirty_on_parent {
+                    // The reset loop below will reset `name` back to `reg.initial_value`; skip
+                    // pushing `name` to `active_custom` if the declaration ALSO equals initial!
+                    match (&winner.value, reg) {
+                        (PropertyValue::Global(GlobalKeyword::Initial), Some(r))
+                            if !r.inherits && !is_registered_url_syntax(&r.syntax) =>
+                        {
+                            true
+                        }
+                        (PropertyValue::Custom(tokens), Some(r))
+                            if !r.inherits
+                                && !is_registered_url_syntax(&r.syntax)
+                                && !crate::substitution::tokens_contain_subst(tokens) =>
+                        {
+                            r.initial_value.as_ref().is_some_and(|iv| {
+                                tokens_match_registered_computed(iv, tokens, Some(r))
+                                    && !tokens_may_depend_on_element_context(tokens)
+                            })
+                        }
+                        _ => false,
                     }
-                    PropertyValue::Global(GlobalKeyword::Initial) => match reg {
-                        None => style.custom_properties.get(name).is_none(),
-                        Some(r) if !is_registered_url_syntax(&r.syntax) => match &r.initial_value {
+                } else {
+                    match &winner.value {
+                        PropertyValue::Custom(tokens)
+                            if !crate::substitution::tokens_contain_subst(tokens)
+                                && style.custom_properties.get(name).is_some_and(|cur| {
+                                    tokens_match_registered_computed(cur, tokens, reg)
+                                }) =>
+                        {
+                            reg.is_none_or(|r| {
+                                let syn = r
+                                    .syntax
+                                    .trim()
+                                    .trim_matches(|c| c == '"' || c == '\'')
+                                    .trim();
+                                syn == "*" || !tokens_may_depend_on_element_context(tokens)
+                            })
+                        }
+                        PropertyValue::Global(GlobalKeyword::Initial) => match reg {
                             None => style.custom_properties.get(name).is_none(),
-                            Some(iv) => style.custom_properties.get(name).is_some_and(|cur| {
-                                tokens_match_registered_computed(cur, iv, Some(r))
-                            }),
+                            Some(r) if !is_registered_url_syntax(&r.syntax) => {
+                                match &r.initial_value {
+                                    None => style.custom_properties.get(name).is_none(),
+                                    Some(iv) => {
+                                        style.custom_properties.get(name).is_some_and(|cur| {
+                                            tokens_match_registered_computed(cur, iv, Some(r))
+                                        })
+                                    }
+                                }
+                            }
+                            _ => false,
                         },
                         _ => false,
-                    },
-                    _ => false,
+                    }
                 };
                 if is_noop {
                     continue;
@@ -2408,7 +2503,7 @@ fn compute_registered_custom_properties(
     use crate::values_math::{parse_math_value, parse_math_value_from_parser, ValueKind};
     let mut updates: Vec<(InternedStr, Vec<CssToken>)> = Vec::new();
     let compute_one = |name: &InternedStr, reg: &RegisteredProperty, updates: &mut Vec<(InternedStr, Vec<CssToken>)>| {
-        let Some(toks) = style.custom_properties.get(name) else { return; };
+        let Some(entry) = style.custom_properties.get_entry(name) else { return; };
         let syn = reg.syntax.trim().trim_matches(|c| c == '"' || c == '\'').trim();
         let is_list = syn.ends_with('+') || syn.ends_with('#');
         let base = syn.trim_end_matches(['+', '#']).trim();
@@ -2424,8 +2519,36 @@ fn compute_registered_custom_properties(
             _ => None,
         };
         let Some(vk) = kind else { return; };
-        let raw = serialize_css_tokens(toks);
-        let trimmed = raw.trim();
+        // Zero-allocation fast path: skip values that are already single canonical computed tokens.
+        if !is_list {
+            let trimmed_toks = trim_css_tokens(&entry.tokens);
+            if trimmed_toks.len() == 1 {
+                let already_canonical = match (vk, &trimmed_toks[0]) {
+                    (ValueKind::Number, CssToken::Number(_)) => true,
+                    (ValueKind::Integer, CssToken::Number(n)) => n.fract() == 0.0,
+                    (ValueKind::Length | ValueKind::LengthPercentage, CssToken::Dimension(_, u)) => {
+                        u.as_str().eq_ignore_ascii_case("px")
+                    }
+                    (ValueKind::Percentage | ValueKind::LengthPercentage, CssToken::Percentage(_)) => {
+                        true
+                    }
+                    (ValueKind::Angle, CssToken::Dimension(_, u)) => {
+                        u.as_str().eq_ignore_ascii_case("deg")
+                    }
+                    (ValueKind::Time, CssToken::Dimension(_, u)) => {
+                        u.as_str().eq_ignore_ascii_case("s")
+                    }
+                    (ValueKind::Resolution, CssToken::Dimension(_, u)) => {
+                        u.as_str().eq_ignore_ascii_case("dppx")
+                    }
+                    _ => false,
+                };
+                if already_canonical {
+                    return;
+                }
+            }
+        }
+        let trimmed = entry.serialized.trim();
         if trimmed.is_empty() { return; }
         let mut rc = 0u32;
         let formatted = if is_list {

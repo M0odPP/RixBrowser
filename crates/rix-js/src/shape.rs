@@ -14,6 +14,10 @@ use std::collections::HashMap;
 
 /// Dynamic transition limit before an object switches to dictionary mode.
 pub const DICTIONARY_TRANSITION_LIMIT: u16 = 64;
+/// Maximum outgoing child transitions per non-root shape before new objects switch to dictionary mode.
+pub const MAX_SHAPE_FANOUT: u16 = 32;
+/// Maximum total shapes per realm to prevent unbounded hidden-class explosions on dynamic hash maps.
+pub const MAX_SHAPES: usize = 32_768;
 
 /// Compact 32-bit identifier for an immutable object Shape (Hidden Class).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -95,6 +99,7 @@ pub struct Shape {
     pub parent: Option<ShapeId>,
     pub added_key: Option<PropertyKey>,
     pub slot_count: u32,
+    pub child_transition_count: u16,
     props: HashMap<PropertyKey, ShapeSlot>,
     key_order: Vec<PropertyKey>,
 }
@@ -141,6 +146,7 @@ impl ShapeTable {
             parent: None,
             added_key: None,
             slot_count: 0,
+            child_transition_count: 0,
             props: HashMap::new(),
             key_order: Vec::new(),
         };
@@ -186,6 +192,33 @@ impl ShapeTable {
         self.get(shape_id)?.lookup(key)
     }
 
+    /// Returns `true` if transitioning `from` by adding `key` with `attrs` either reuses an
+    /// existing shape transition or stays within the per-shape fan-out and realm shape budgets.
+    #[inline]
+    #[must_use]
+    pub fn can_transition_add(
+        &self,
+        from: ShapeId,
+        key: PropertyKey,
+        attrs: PropertyAttrs,
+    ) -> bool {
+        if from.is_dictionary() {
+            return false;
+        }
+        if self.transitions.contains_key(&(from, key, attrs)) {
+            return true;
+        }
+        if self.shapes.len() >= MAX_SHAPES {
+            return false;
+        }
+        if from == ShapeId::ROOT {
+            return true;
+        }
+        self.shapes
+            .get(from.0 as usize)
+            .is_some_and(|s| s.child_transition_count < MAX_SHAPE_FANOUT)
+    }
+
     /// Transitions `from` by adding `key` with `attrs`, returning `(new_shape, slot_offset)`.
     ///
     /// If `key` already exists on `from` with matching `attrs`, returns `(from, existing_offset)`.
@@ -221,11 +254,15 @@ impl ShapeTable {
             let key_order = prev.key_order.clone();
             let slot_count = prev.slot_count;
             let new_id = ShapeId(self.shapes.len() as u32);
+            self.shapes[from.0 as usize].child_transition_count = self.shapes[from.0 as usize]
+                .child_transition_count
+                .saturating_add(1);
             self.shapes.push(Shape {
                 id: new_id,
                 parent: Some(from),
                 added_key: Some(key),
                 slot_count,
+                child_transition_count: 0,
                 props,
                 key_order,
             });
@@ -247,11 +284,15 @@ impl ShapeTable {
         let mut key_order = prev.key_order.clone();
         key_order.push(key);
         let new_id = ShapeId(self.shapes.len() as u32);
+        self.shapes[from.0 as usize].child_transition_count = self.shapes[from.0 as usize]
+            .child_transition_count
+            .saturating_add(1);
         self.shapes.push(Shape {
             id: new_id,
             parent: Some(from),
             added_key: Some(key),
             slot_count: offset + 1,
+            child_transition_count: 0,
             props,
             key_order,
         });

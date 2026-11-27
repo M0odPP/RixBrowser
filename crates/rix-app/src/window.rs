@@ -409,22 +409,26 @@ fn read_proc_self_cpu_ms() -> f64 {
 
 fn settle_active_tab(controller: &mut BrowserController) -> f32 {
     let t_settle = Instant::now();
-    let fast_deadline = t_settle + Duration::from_millis(250);
-    let io_deadline = t_settle + Duration::from_millis(1200);
+    let fast_deadline = t_settle + Duration::from_millis(180);
+    let io_deadline = t_settle + Duration::from_millis(400);
     for _ in 0..160 {
-        let Some(delay) = controller.tick_active_tab() else {
+        let Some(delay) = controller.tick_active_tab_no_sync() else {
             break;
         };
         let now = Instant::now();
         let has_io = controller
             .active_tab_doc()
             .and_then(|d| d.runtime.as_ref())
-            .is_some_and(|rt| rt.net.borrow().has_pending_io());
+            .is_some_and(|rt| rt.net.borrow().has_pending_load_io());
         let deadline = if has_io { io_deadline } else { fast_deadline };
         if now >= deadline {
             break;
         }
-        let sleep_for = delay.min(Duration::from_millis(10));
+        if !has_io && now.checked_add(delay).is_none_or(|wake| wake >= deadline) {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let sleep_for = delay.min(remaining).min(Duration::from_millis(10));
         if !sleep_for.is_zero() {
             std::thread::sleep(sleep_for);
         }

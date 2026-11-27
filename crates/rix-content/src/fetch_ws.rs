@@ -298,6 +298,17 @@ impl NetworkBridge {
                 .any(|s| s.phase != WsStreamPhase::Closed)
     }
 
+    /// Returns `true` while non-keepalive `fetch()` requests or dynamic subresources
+    /// (`<img>`/`<link>`/`<script>`) are still in flight (excluding persistent WebSockets
+    /// and fire-and-forget `keepalive` beacons per WHATWG Fetch §5.4).
+    pub fn has_pending_load_io(&self) -> bool {
+        self.pending_subresources > 0
+            || self
+                .pending_fetches
+                .values()
+                .any(|pf| pf.keepalive_bytes == 0)
+    }
+
     pub(crate) fn new(fetch_engine: Arc<FetchEngine>) -> Self {
         let (async_tx, async_rx) = mpsc::unbounded_channel();
         Self {

@@ -4578,9 +4578,56 @@ pub(crate) fn restore_revert_rule_sentinel(text: &str) -> String {
     s
 }
 
-/// Parses an HTML `style="..."` attribute into typed [`SpecifiedDeclaration`]s.
+/// Parses an HTML `style="..."` attribute into typed [`SpecifiedDeclaration`]s using a
+/// lock-free thread-local cache (zero-allocation lookup on repeated React/framework inline styles).
 #[must_use]
 pub fn parse_inline_style(
+    style_attr: &str,
+    missing: &mut Vec<MissingCssFeature>,
+) -> Vec<SpecifiedDeclaration> {
+    let trimmed = style_attr.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if trimmed.len() <= 512 {
+        let hash = fnv1a_str_hash(0xcbf2_9ce4_8422_2325, trimmed);
+        let cached = INLINE_STYLE_PARSE_CACHE.with(|cell| {
+            let map = cell.borrow();
+            map.get(&hash).and_then(|(k, decls, miss)| {
+                if k.as_ref() == trimmed {
+                    Some((decls.clone(), miss.clone()))
+                } else {
+                    None
+                }
+            })
+        });
+        if let Some((decls, miss)) = cached {
+            missing.extend(miss);
+            return decls;
+        }
+        let mut local_missing = Vec::new();
+        let decls = parse_inline_style_uncached(trimmed, &mut local_missing);
+        INLINE_STYLE_PARSE_CACHE.with(|cell| {
+            let mut map = cell.borrow_mut();
+            if map.len() >= 2_048 {
+                map.clear();
+            }
+            map.insert(
+                hash,
+                (
+                    trimmed.to_string().into_boxed_str(),
+                    decls.clone(),
+                    local_missing.clone(),
+                ),
+            );
+        });
+        missing.extend(local_missing);
+        return decls;
+    }
+    parse_inline_style_uncached(trimmed, missing)
+}
+
+fn parse_inline_style_uncached(
     style_attr: &str,
     missing: &mut Vec<MissingCssFeature>,
 ) -> Vec<SpecifiedDeclaration> {
@@ -4598,6 +4645,27 @@ pub fn parse_inline_style(
         out
     }))
     .unwrap_or_default()
+}
+
+#[inline]
+fn fnv1a_str_hash(mut h: u64, s: &str) -> u64 {
+    for &b in s.as_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+type PropParseCacheMap =
+    crate::rule_index::FastU64Map<(PropertyIdKind, Box<str>, Vec<SpecifiedDeclaration>)>;
+type InlineStyleCacheMap =
+    crate::rule_index::FastU64Map<(Box<str>, Vec<SpecifiedDeclaration>, Vec<MissingCssFeature>)>;
+
+thread_local! {
+    static PROP_PARSE_CACHE: std::cell::RefCell<PropParseCacheMap> =
+        std::cell::RefCell::new(crate::rule_index::FastU64Map::default());
+    static INLINE_STYLE_PARSE_CACHE: std::cell::RefCell<InlineStyleCacheMap> =
+        std::cell::RefCell::new(crate::rule_index::FastU64Map::default());
 }
 
 /// Re-parses a resolved `var()` token stream into one or more typed declarations.
@@ -4648,7 +4716,8 @@ pub fn parse_property_from_tokens(
 }
 
 /// Parses a substituted CSS declaration value string for `prop` directly without a lossy
-/// intermediate token round-trip (preserving wide-gamut colors, `image-set()`, and `/**/` boundaries).
+/// intermediate token round-trip (preserving wide-gamut colors, `image-set()`, and `/**/` boundaries),
+/// backed by a lock-free thread-local parse cache for repeated `var()` expansions.
 #[must_use]
 pub fn parse_property_from_str(
     prop: PropertyIdKind,
@@ -4672,6 +4741,53 @@ pub fn parse_property_from_str(
             })
             .collect();
     }
+    if trimmed.len() <= 512 {
+        let seed = (prop as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0xcbf2_9ce4_8422_2325;
+        let hash = fnv1a_str_hash(seed, trimmed);
+        let hit = PROP_PARSE_CACHE.with(|cell| {
+            let map = cell.borrow();
+            map.get(&hash).and_then(|(kp, ks, decls)| {
+                if *kp == prop && ks.as_ref() == trimmed {
+                    Some(decls.clone())
+                } else {
+                    None
+                }
+            })
+        });
+        if let Some(mut decls) = hit {
+            if important {
+                for d in &mut decls {
+                    d.important = true;
+                }
+            }
+            return decls;
+        }
+        let mut decls = parse_property_from_str_uncached(prop, trimmed, false);
+        PROP_PARSE_CACHE.with(|cell| {
+            let mut map = cell.borrow_mut();
+            if map.len() >= 4_096 {
+                map.clear();
+            }
+            map.insert(
+                hash,
+                (prop, trimmed.to_string().into_boxed_str(), decls.clone()),
+            );
+        });
+        if important {
+            for d in &mut decls {
+                d.important = true;
+            }
+        }
+        return decls;
+    }
+    parse_property_from_str_uncached(prop, trimmed, important)
+}
+
+fn parse_property_from_str_uncached(
+    prop: PropertyIdKind,
+    trimmed: &str,
+    important: bool,
+) -> Vec<SpecifiedDeclaration> {
     if matches!(prop, PropertyIdKind::SvgFill | PropertyIdKind::SvgStroke) {
         if trimmed.eq_ignore_ascii_case("none") {
             return vec![SpecifiedDeclaration {

@@ -42,6 +42,99 @@ pub use crate::wasm::{install_webassembly, SharedWasmHost, WasmHost};
 /// breaker permanently demotes that function to Tier-2 Baseline.
 pub const MAX_OPT_DEOPTS: u32 = 4;
 
+/// Maximum native `CompiledBaseline` code pages retained in a browser-scoped shared JIT cache.
+const MAX_SHARED_BASELINE_CACHE_ENTRIES: usize = 2_048;
+
+/// Browser-scoped reusable W^X native code cache shared across navigations and warm reloads
+/// within the same browser session (deterministically unmapped when the controller drops).
+pub type SharedBaselineCache = Rc<RefCell<HashMap<u64, Arc<CompiledBaseline>>>>;
+
+/// Creates an empty browser-scoped [`SharedBaselineCache`].
+#[must_use]
+pub fn new_shared_baseline_cache() -> SharedBaselineCache {
+    Rc::new(RefCell::new(HashMap::new()))
+}
+
+fn hash_baseline_func_key(program_id: u32, func_idx: u32, func: &rix_js::FunctionBytecode) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mix = |h: &mut u64, bytes: &[u8]| {
+        for &b in bytes {
+            *h ^= u64::from(b);
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    mix(&mut h, &program_id.to_le_bytes());
+    mix(&mut h, &func_idx.to_le_bytes());
+    mix(&mut h, &func.register_count.to_le_bytes());
+    mix(&mut h, &func.param_count.to_le_bytes());
+    mix(
+        &mut h,
+        &[
+            u8::from(func.is_strict),
+            u8::from(func.is_async),
+            u8::from(func.is_generator),
+        ],
+    );
+    mix(&mut h, &(func.code.len() as u64).to_le_bytes());
+    for inst in &func.code {
+        mix(&mut h, &inst.0.to_le_bytes());
+    }
+    mix(&mut h, &(func.constants.len() as u64).to_le_bytes());
+    for c in &func.constants {
+        match c {
+            rix_js::ConstantEntry::Int32(v) => {
+                mix(&mut h, &[1]);
+                mix(&mut h, &v.to_le_bytes());
+            }
+            rix_js::ConstantEntry::Number(v) => {
+                mix(&mut h, &[2]);
+                mix(&mut h, &v.to_bits().to_le_bytes());
+            }
+            rix_js::ConstantEntry::String(s) => {
+                mix(&mut h, &[3]);
+                mix(&mut h, &(s.len() as u64).to_le_bytes());
+                mix(&mut h, s.as_bytes());
+            }
+            rix_js::ConstantEntry::BigInt(s) => {
+                mix(&mut h, &[4]);
+                mix(&mut h, s.as_bytes());
+            }
+            rix_js::ConstantEntry::Function(idx) => {
+                mix(&mut h, &[5]);
+                mix(&mut h, &idx.to_le_bytes());
+            }
+            rix_js::ConstantEntry::RegExp { pattern, flags } => {
+                mix(&mut h, &[6]);
+                mix(&mut h, pattern.as_bytes());
+                mix(&mut h, &[0]);
+                mix(&mut h, flags.as_bytes());
+            }
+            rix_js::ConstantEntry::Class(bp) => {
+                mix(&mut h, &[7]);
+                mix(
+                    &mut h,
+                    &bp.constructor_idx.unwrap_or(u32::MAX).to_le_bytes(),
+                );
+                mix(&mut h, &(bp.methods.len() as u64).to_le_bytes());
+            }
+            rix_js::ConstantEntry::DirectEval(m) => {
+                mix(&mut h, &[8, m.argc, u8::from(m.is_strict)]);
+            }
+        }
+    }
+    mix(
+        &mut h,
+        &(func.exception_handlers.len() as u64).to_le_bytes(),
+    );
+    for eh in &func.exception_handlers {
+        mix(&mut h, &eh.try_start.to_le_bytes());
+        mix(&mut h, &eh.try_end.to_le_bytes());
+        mix(&mut h, &eh.handler_pc.to_le_bytes());
+        mix(&mut h, &[eh.catch_reg]);
+    }
+    h
+}
+
 /// Runtime compilation, tier-up, and execution counters for [`BaselineJit`] / [`TieredJit`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct JitStats {
@@ -59,6 +152,9 @@ pub struct JitStats {
     pub hoisted_invariant_loads: u64,
     pub hoisted_array_guards: u64,
     pub inlined_call_sites: u64,
+    pub baseline_compile_us: u64,
+    pub opt_compile_us: u64,
+    pub mem_backed_compiled: u64,
 }
 
 enum CompiledSlot {
@@ -86,6 +182,7 @@ struct FuncOptMeta {
 /// executable page via `libc::munmap`.
 pub struct BaselineJit {
     baseline_cache: RefCell<HashMap<(u32, u32), CompiledSlot>>,
+    shared_baseline_cache: Option<SharedBaselineCache>,
     opt_cache: RefCell<HashMap<(u32, u32), OptSlot>>,
     opt_meta: RefCell<HashMap<(u32, u32), FuncOptMeta>>,
     baseline_threshold: u32,
@@ -120,8 +217,21 @@ impl BaselineJit {
         osr_threshold: u32,
         opt_threshold: u32,
     ) -> Rc<Self> {
+        Self::with_tier_thresholds_and_cache(baseline_threshold, osr_threshold, opt_threshold, None)
+    }
+
+    /// Creates a JIT with custom tier thresholds and an optional browser-scoped
+    /// [`SharedBaselineCache`] that reuses finalized W^X code pages across warm reloads.
+    #[must_use]
+    pub fn with_tier_thresholds_and_cache(
+        baseline_threshold: u32,
+        osr_threshold: u32,
+        opt_threshold: u32,
+        shared_baseline_cache: Option<SharedBaselineCache>,
+    ) -> Rc<Self> {
         Rc::new(Self {
             baseline_cache: RefCell::new(HashMap::new()),
+            shared_baseline_cache,
             opt_cache: RefCell::new(HashMap::new()),
             opt_meta: RefCell::new(HashMap::new()),
             baseline_threshold,
@@ -206,9 +316,38 @@ impl BaselineJit {
         }
 
         let func = vm.function_bytecode(program_id, func_idx)?;
+        let shared_key = self
+            .shared_baseline_cache
+            .as_ref()
+            .map(|_| hash_baseline_func_key(program_id, func_idx, func));
+        if let (Some(shared), Some(skey)) = (&self.shared_baseline_cache, shared_key) {
+            if let Some(hit) = shared.borrow().get(&skey).cloned() {
+                self.baseline_cache
+                    .borrow_mut()
+                    .insert(key, CompiledSlot::Compiled(Arc::clone(&hit)));
+                return Some(hit);
+            }
+        }
+        let is_mem_backed = func.code.len() > 1_024 || func.register_count > 48;
+        let t0 = std::time::Instant::now();
         match compile_baseline_function(program_id, func_idx, func) {
             Ok(compiled) => {
-                self.stats.borrow_mut().compiled_functions += 1;
+                let elapsed_us = t0.elapsed().as_micros() as u64;
+                {
+                    let mut st = self.stats.borrow_mut();
+                    st.compiled_functions += 1;
+                    st.baseline_compile_us += elapsed_us;
+                    if is_mem_backed {
+                        st.mem_backed_compiled += 1;
+                    }
+                }
+                if let (Some(shared), Some(skey)) = (&self.shared_baseline_cache, shared_key) {
+                    let mut map = shared.borrow_mut();
+                    if map.len() >= MAX_SHARED_BASELINE_CACHE_ENTRIES {
+                        map.clear();
+                    }
+                    map.insert(skey, Arc::clone(&compiled));
+                }
                 self.baseline_cache
                     .borrow_mut()
                     .insert(key, CompiledSlot::Compiled(Arc::clone(&compiled)));
@@ -254,11 +393,14 @@ impl BaselineJit {
             .unwrap_or_default()
             .hints;
         let func = vm.function_bytecode(program_id, func_idx)?;
+        let t0 = std::time::Instant::now();
         match compile_optimizing_function(vm, program_id, func_idx, func, hints) {
             Ok(compiled) => {
+                let elapsed_us = t0.elapsed().as_micros() as u64;
                 {
                     let mut st = self.stats.borrow_mut();
                     st.opt_compiled_functions += 1;
+                    st.opt_compile_us += elapsed_us;
                     st.hoisted_shape_guards += compiled.hoisted_shape_guards as u64;
                     st.hoisted_invariant_loads += compiled.hoisted_invariant_loads as u64;
                     st.hoisted_array_guards += compiled.hoisted_array_guards as u64;
@@ -379,9 +521,23 @@ impl JitEngine for BaselineJit {
             }
         }
 
-        // Tier-2 Baseline Cranelift JIT & OSR entry.
+        // Tier-2 Baseline Cranelift JIT & OSR entry (cost-based threshold for large Tier-2L
+        // bundle functions so cold megabyte functions don't burn Cranelift compile time).
         if entry_pc == 0 {
-            if call_count < self.baseline_threshold && back_edge_count < self.osr_threshold {
+            let eff_threshold = if self.baseline_threshold > 2 {
+                if let Some(func) = vm.function_bytecode(program_id, func_idx) {
+                    if func.code.len() > 1_024 || func.register_count > 48 {
+                        self.baseline_threshold.max((func.code.len() / 8) as u32)
+                    } else {
+                        self.baseline_threshold
+                    }
+                } else {
+                    self.baseline_threshold
+                }
+            } else {
+                self.baseline_threshold
+            };
+            if call_count < eff_threshold && back_edge_count < self.osr_threshold {
                 return JitOutcome::Fallback;
             }
         } else if back_edge_count < self.osr_threshold {

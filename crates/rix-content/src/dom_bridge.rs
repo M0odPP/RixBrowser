@@ -184,6 +184,9 @@ pub struct HostState {
     last_inline_style_hash: u64,
     last_style_revs: Option<(u64, u64)>,
     last_layout_revs: Option<(u64, u64)>,
+    last_layout_structural_rev: Option<u64>,
+    needs_full_layout: bool,
+    fragment_styles_stale: bool,
     last_paint_revs: Option<(u64, u64)>,
     cached_fragment_tree: Option<FragmentTree>,
     pub style_recalc_count: u64,
@@ -245,6 +248,85 @@ pub(crate) type ScriptConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
 
 /// Callback invoked when a dynamic `<img src>` or `<link rel="stylesheet" href>` becomes connected.
 pub(crate) type SubresourceConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
+
+/// Updates `Fragment.style` pointers in-place from `style_ctx` after a paint-only incremental
+/// restyle (`layout_dirty_count == 0`), avoiding a full layout rebuild when only compositor/paint
+/// properties (`transform`, `opacity`, `color`, `background-color`, `filter`, `box-shadow`) changed.
+fn sync_fragment_styles_rec(frag: &mut Fragment, style_ctx: &StyleContext) {
+    if let Some(nid) = frag.dom_node {
+        if let Some(st) = style_ctx.style_for(nid) {
+            if !Arc::ptr_eq(&frag.style, st) {
+                frag.style = Arc::clone(st);
+            }
+        }
+    }
+    for child in Arc::make_mut(&mut frag.children).iter_mut() {
+        sync_fragment_styles_rec(child, style_ctx);
+    }
+}
+
+/// Returns `true` if changing HTML/SVG attribute `name` can affect intrinsic sizing, layout
+/// geometry, presentational hints, or replaced-element rendering outside pure CSS selectors.
+fn is_layout_or_presentational_attr(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "width"
+            | "height"
+            | "src"
+            | "srcset"
+            | "sizes"
+            | "value"
+            | "placeholder"
+            | "type"
+            | "size"
+            | "rows"
+            | "cols"
+            | "colspan"
+            | "rowspan"
+            | "hidden"
+            | "open"
+            | "dir"
+            | "align"
+            | "valign"
+            | "bgcolor"
+            | "border"
+            | "cellpadding"
+            | "cellspacing"
+            | "hspace"
+            | "vspace"
+            | "nowrap"
+            | "color"
+            | "face"
+            | "checked"
+            | "selected"
+            | "disabled"
+            | "readonly"
+            | "required"
+            | "multiple"
+            | "slot"
+            | "name"
+            | "viewbox"
+            | "preserveaspectratio"
+            | "d"
+            | "points"
+            | "transform"
+            | "x"
+            | "y"
+            | "x1"
+            | "y1"
+            | "x2"
+            | "y2"
+            | "r"
+            | "rx"
+            | "ry"
+            | "cx"
+            | "cy"
+            | "fill"
+            | "stroke"
+            | "stroke-width"
+            | "opacity"
+    )
+}
 
 /// Recursively collects `(content_width, content_height)` for every CSS Containment Level 3
 /// size query container (`container-type: size | inline-size`) in a laid-out [`FragmentTree`].
@@ -331,6 +413,9 @@ impl HostState {
             last_inline_style_hash: 0,
             last_style_revs: None,
             last_layout_revs: None,
+            last_layout_structural_rev: None,
+            needs_full_layout: true,
+            fragment_styles_stale: false,
             last_paint_revs: None,
             cached_fragment_tree: None,
             style_recalc_count: 0,
@@ -383,6 +468,7 @@ impl HostState {
     pub fn mark_sheets_dirty(&mut self) {
         self.sheets_dirty = true;
         self.last_layout_revs = None;
+        self.needs_full_layout = true;
         self.last_paint_revs = None;
     }
 
@@ -393,6 +479,7 @@ impl HostState {
         self.full_sheets_rebuild = true;
         self.last_style_revs = None;
         self.last_layout_revs = None;
+        self.needs_full_layout = true;
         self.last_paint_revs = None;
     }
 
@@ -407,6 +494,17 @@ impl HostState {
         let doc_rc = Rc::clone(&self.document);
         let mut doc = doc_rc.borrow_mut();
         doc.bump_style_revision_for(nid);
+        if is_layout_or_presentational_attr(attr_name) {
+            doc.bump_structural_revision();
+            doc.mark_node_dirty(
+                nid,
+                rix_dom::DirtyFlags::SELF_STYLE_DIRTY
+                    | rix_dom::DirtyFlags::SELF_LAYOUT_DIRTY
+                    | rix_dom::DirtyFlags::PAINT_DIRTY,
+            );
+        } else {
+            doc.mark_node_dirty(nid, rix_dom::DirtyFlags::SELF_STYLE_DIRTY);
+        }
         if attr_name.eq_ignore_ascii_case("class") {
             let old_set: Vec<&str> = old_val.unwrap_or("").split_ascii_whitespace().collect();
             let new_set: Vec<&str> = new_val.unwrap_or("").split_ascii_whitespace().collect();
@@ -497,8 +595,9 @@ impl HostState {
         let doc_rc = Rc::clone(&self.document);
         let mut doc = doc_rc.borrow_mut();
         doc.bump_style_revision_for(nid);
-        self.last_style_revs = None;
+        doc.mark_node_dirty(nid, rix_dom::DirtyFlags::SELF_STYLE_DIRTY);
         self.last_layout_revs = None;
+        self.needs_full_layout = true;
     }
 
     /// Resolves a JS wrapper's `host_tag` back to its `NodeId`.
@@ -697,12 +796,14 @@ impl HostState {
     /// (for example after async images or web fonts finish loading).
     pub fn invalidate_paint(&mut self) {
         self.last_layout_revs = None;
+        self.needs_full_layout = true;
         self.last_paint_revs = None;
     }
 
     /// Alias for [`Self::invalidate_paint`] called after dynamic subresource decode finishes.
     pub fn invalidate_layout_cache(&mut self) {
         self.last_layout_revs = None;
+        self.needs_full_layout = true;
         self.last_paint_revs = None;
         self.cached_fragment_tree = None;
     }
@@ -752,9 +853,14 @@ impl HostState {
         // Fast path: stylesheets unchanged — skip walking the entire DOM to re-hash `<style>`
         // blocks and run targeted incremental `restyle_dirty` directly!
         if !self.sheets_dirty && self.last_style_revs.is_some() {
-            {
+            let report = {
                 let mut doc = self.document.borrow_mut();
-                let _ = self.style_ctx.restyle_dirty(&mut doc);
+                self.style_ctx.restyle_dirty(&mut doc)
+            };
+            if report.layout_dirty_count > 0 {
+                self.needs_full_layout = true;
+            } else if report.paint_only_count > 0 {
+                self.fragment_styles_stale = true;
             }
             let post_revs = {
                 let doc = self.document.borrow();
@@ -850,9 +956,14 @@ impl HostState {
             && inline_hash == self.last_inline_style_hash
         {
             // Fast path: stylesheets unchanged — run targeted incremental `restyle_dirty` only!
-            {
+            let report = {
                 let mut doc = self.document.borrow_mut();
-                let _ = self.style_ctx.restyle_dirty(&mut doc);
+                self.style_ctx.restyle_dirty(&mut doc)
+            };
+            if report.layout_dirty_count > 0 {
+                self.needs_full_layout = true;
+            } else if report.paint_only_count > 0 {
+                self.fragment_styles_stale = true;
             }
             let post_revs = {
                 let doc = self.document.borrow();
@@ -919,10 +1030,19 @@ impl HostState {
             self.cached_inline_sheet_hashes = new_sheet_hashes;
             self.last_inline_style_hash = inline_hash;
             self.last_style_revs = Some(post_revs);
+            self.needs_full_layout = true;
             self.style_recalc_count += 1;
             return &self.style_ctx;
         }
 
+        tracing::debug!(
+            full_rebuild = self.full_sheets_rebuild,
+            prev_sheets = self.cached_inline_sheet_hashes.len(),
+            new_sheets = new_sheet_hashes.len(),
+            has_last_style_revs = self.last_style_revs.is_some(),
+            shadow_adopted = shadow_adopted_blocks.len(),
+            "ensure_styles running cascade_full"
+        );
         let mut ctx = StyleContext::new(media);
         let anim_snap = self.style_ctx.take_animation_state();
         ctx.restore_animation_state(anim_snap);
@@ -990,11 +1110,13 @@ impl HostState {
         self.cached_inline_sheet_hashes = new_sheet_hashes;
         self.last_inline_style_hash = inline_hash;
         self.last_style_revs = Some(post_revs);
+        self.needs_full_layout = true;
         self.style_recalc_count += 1;
         &self.style_ctx
     }
 
-    /// Recomputes incremental layout ONLY when document structure or style revision changed,
+    /// Recomputes incremental layout ONLY when document structure or layout-affecting styles
+    /// changed (skipping full layout rebuilds on paint-only or no-op style/attribute mutations),
     /// performing CSS Containment Level 3 two-pass container-query resolution when size
     /// containers (`container-type: size | inline-size`) are present.
     pub fn ensure_layout(&mut self) -> Option<&FragmentTree> {
@@ -1006,6 +1128,24 @@ impl HostState {
             return self.cached_fragment_tree.as_ref();
         }
         let _ = self.ensure_styles();
+
+        // Paint-only / no-op layout bypass: if no structural DOM mutation occurred and
+        // `restyle_dirty` reported zero layout-affecting style changes, reuse the cached
+        // `FragmentTree` geometry with zero tree walk (`cssom_geometry` reads fresh transforms
+        // from `style_ctx`, and `paint_if_dirty_with_metrics` syncs `Fragment.style` once per frame).
+        let cur_struct_rev = self.document.borrow().structural_revision();
+        if !self.needs_full_layout
+            && self.last_layout_structural_rev == Some(cur_struct_rev)
+            && self.cached_fragment_tree.is_some()
+        {
+            let post_revs = {
+                let doc = self.document.borrow();
+                (doc.revision(), doc.style_revision())
+            };
+            self.last_layout_revs = Some(post_revs);
+            return self.cached_fragment_tree.as_ref();
+        }
+
         let (mut tree, mut post_revs) = {
             let doc = self.document.borrow();
             let (tree, _metrics) = self.layout_engine.layout_only_with_scroll(
@@ -1057,6 +1197,9 @@ impl HostState {
 
         self.cached_fragment_tree = Some(tree);
         self.last_layout_revs = Some(post_revs);
+        self.last_layout_structural_rev = Some(self.document.borrow().structural_revision());
+        self.needs_full_layout = false;
+        self.fragment_styles_stale = false;
         self.layout_count += 1;
         self.cached_fragment_tree.as_ref()
     }
@@ -1577,6 +1720,7 @@ impl HostState {
                 if owner_doc == main_root {
                     self.scroll_offset = Point::new(nx, ny);
                     self.last_layout_revs = None;
+                    self.needs_full_layout = true;
                 } else {
                     self.subdoc_scroll_offsets
                         .insert(owner_doc, Point::new(nx, ny));
@@ -1617,6 +1761,7 @@ impl HostState {
         if (nx - cur.x).abs() > 1e-4 || (ny - cur.y).abs() > 1e-4 {
             self.element_scroll_offsets.insert(node, Point::new(nx, ny));
             self.last_layout_revs = None;
+            self.needs_full_layout = true;
             return true;
         }
         false
@@ -1661,6 +1806,7 @@ impl HostState {
             if doc_id == main_root {
                 self.scroll_offset = Point::new(nx, ny);
                 self.last_layout_revs = None;
+                self.needs_full_layout = true;
             } else {
                 self.subdoc_scroll_offsets
                     .insert(doc_id, Point::new(nx, ny));
@@ -1854,8 +2000,8 @@ impl HostState {
             doc.mark_node_dirty(anc, rix_dom::DirtyFlags::DESCENDANT_STYLE_DIRTY);
             cur = doc.parent(anc);
         }
-        self.last_style_revs = None;
         self.last_layout_revs = None;
+        self.needs_full_layout = true;
     }
 
     /// Returns the cached `ComputedStyle` for `node`, running dirty-checked cascade if needed
@@ -1973,6 +2119,15 @@ impl HostState {
         let t_layout = std::time::Instant::now();
         let _ = self.ensure_layout();
         let layout_ms = t_layout.elapsed().as_secs_f32() * 1000.0;
+
+        if self.fragment_styles_stale {
+            if let Some(ref mut tree) = self.cached_fragment_tree {
+                if let Some(ref mut root) = tree.root {
+                    sync_fragment_styles_rec(root, &self.style_ctx);
+                }
+            }
+            self.fragment_styles_stale = false;
+        }
 
         let post_revs = {
             let doc = self.document.borrow();
@@ -3750,15 +3905,17 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         let old_val = {
             let doc_rc = Rc::clone(&h.borrow().document);
             let mut doc = doc_rc.borrow_mut();
-            match doc.get_mut(nid) {
+            match doc.get_mut_untracked(nid) {
                 Some(NodeData::Element(e)) => e
                     .set_attribute_ns(&ns, prefix.as_deref(), &local, &val)
                     .map(|(old, _)| old),
                 _ => return Ok(JsValue::UNDEFINED),
             }
         };
-        h.borrow_mut()
-            .invalidate_attr_mutation(nid, &local, old_val.as_deref(), Some(&val));
+        if old_val.as_deref() != Some(val.as_str()) {
+            h.borrow_mut()
+                .invalidate_attr_mutation(nid, &local, old_val.as_deref(), Some(&val));
+        }
         h.borrow().emit_mutation(DomMutation::Attributes {
             target: nid,
             attribute_name: local,
@@ -3781,13 +3938,15 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         let old_val = {
             let doc_rc = Rc::clone(&h.borrow().document);
             let mut doc = doc_rc.borrow_mut();
-            match doc.get_mut(nid) {
+            match doc.get_mut_untracked(nid) {
                 Some(NodeData::Element(e)) => e.remove_attribute_ns(&ns, &local),
                 _ => None,
             }
         };
-        h.borrow_mut()
-            .invalidate_attr_mutation(nid, &local, old_val.as_deref(), None);
+        if old_val.is_some() {
+            h.borrow_mut()
+                .invalidate_attr_mutation(nid, &local, old_val.as_deref(), None);
+        }
         if old_val.is_some() {
             h.borrow().emit_mutation(DomMutation::Attributes {
                 target: nid,
@@ -7203,7 +7362,7 @@ pub(crate) fn set_element_attr(
     let (old_val, tag_lower, attr_ns, attr_local) = {
         let _doc_rc = Rc::clone(&host.borrow().document);
         let mut doc = _doc_rc.borrow_mut();
-        match doc.get_mut(nid) {
+        match doc.get_mut_untracked(nid) {
             Some(NodeData::Element(e)) => {
                 // Per WHATWG DOM §4.9 setAttribute: HTML elements in HTML documents lowercase the name.
                 let fold = is_html_doc && &*e.name.ns == crate::dom_interfaces::HTML_NS;
@@ -7219,8 +7378,10 @@ pub(crate) fn set_element_attr(
             _ => return,
         }
     };
-    host.borrow_mut()
-        .invalidate_attr_mutation(nid, &attr_local, old_val.as_deref(), Some(val));
+    if old_val.as_deref() != Some(val) {
+        host.borrow_mut()
+            .invalidate_attr_mutation(nid, &attr_local, old_val.as_deref(), Some(val));
+    }
     if matches!(tag_lower.as_str(), "body" | "frameset")
         && attr_local.starts_with("on")
         && attr_ns.is_empty()
@@ -7261,7 +7422,7 @@ pub(crate) fn remove_element_attr(vm: &mut JsVm, host: &SharedHost, nid: NodeId,
     let removed = {
         let _doc_rc = Rc::clone(&host.borrow().document);
         let mut doc = _doc_rc.borrow_mut();
-        match doc.get_mut(nid) {
+        match doc.get_mut_untracked(nid) {
             Some(NodeData::Element(e)) => {
                 let fold = is_html_doc && &*e.name.ns == crate::dom_interfaces::HTML_NS;
                 let effective_name = if fold && name.bytes().any(|b| b.is_ascii_uppercase()) {

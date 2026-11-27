@@ -535,11 +535,16 @@ fn collect_fragment_boxes_rec(
     frag: &Fragment,
     parent_mat: &[f64; 16],
     scroll_map: &HashMap<NodeId, Point>,
+    style_ctx: Option<&rix_css::StyleContext>,
     target: NodeId,
     is_root: bool,
     out: &mut Vec<FragmentBox>,
 ) {
-    let base_mat = if !is_root && frag.style.position == PositionMode::Fixed {
+    let eff_style: &rix_css::ComputedStyle = frag
+        .dom_node
+        .and_then(|nid| style_ctx.and_then(|ctx| ctx.style_for(nid)))
+        .map_or(&frag.style, |arc| arc.as_ref());
+    let base_mat = if !is_root && eff_style.position == PositionMode::Fixed {
         MAT4_ID
     } else {
         *parent_mat
@@ -552,7 +557,7 @@ fn collect_fragment_boxes_rec(
             0.0,
         ),
     );
-    if let Some(local_tf) = local_style_transform_mat4(&frag.style, frag.border_rect.size) {
+    if let Some(local_tf) = local_style_transform_mat4(eff_style, frag.border_rect.size) {
         cur_mat = mat4_mul(&cur_mat, &local_tf);
     }
     if frag.dom_node == Some(target) {
@@ -586,7 +591,7 @@ fn collect_fragment_boxes_rec(
         cur_mat
     };
     for ch in frag.children.iter() {
-        collect_fragment_boxes_rec(ch, &child_mat, scroll_map, target, false, out);
+        collect_fragment_boxes_rec(ch, &child_mat, scroll_map, style_ctx, target, false, out);
     }
 }
 
@@ -614,22 +619,39 @@ pub(crate) fn collect_boxes_for_node(host: &SharedHost, nid: NodeId) -> Vec<Frag
             .copied()
             .unwrap_or(Point::ZERO);
         let scroll_map = hb.element_scroll_offsets.clone();
-        if let Some((tree, _, _)) = hb.layout_subdoc(owner_doc) {
+        if let Some((tree, sub_styles, _)) = hb.layout_subdoc(owner_doc) {
             if let Some(root) = tree.root.as_ref() {
                 let root_mat =
                     mat4_translate(-f64::from(sub_scroll.x), -f64::from(sub_scroll.y), 0.0);
-                collect_fragment_boxes_rec(root, &root_mat, &scroll_map, nid, true, &mut out);
+                collect_fragment_boxes_rec(
+                    root,
+                    &root_mat,
+                    &scroll_map,
+                    Some(&sub_styles),
+                    nid,
+                    true,
+                    &mut out,
+                );
             }
         }
         return out;
     }
     let root_scroll = hb.scroll_offset;
     let scroll_map = hb.element_scroll_offsets.clone();
-    if let Some(tree) = hb.ensure_layout() {
+    let _ = hb.ensure_layout();
+    if let Some(tree) = hb.cached_fragment_tree() {
         if let Some(root) = tree.root.as_ref() {
             let root_mat =
                 mat4_translate(-f64::from(root_scroll.x), -f64::from(root_scroll.y), 0.0);
-            collect_fragment_boxes_rec(root, &root_mat, &scroll_map, nid, true, &mut out);
+            collect_fragment_boxes_rec(
+                root,
+                &root_mat,
+                &scroll_map,
+                Some(hb.style_context()),
+                nid,
+                true,
+                &mut out,
+            );
         }
     }
     drop(hb);

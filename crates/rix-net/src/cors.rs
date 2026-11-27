@@ -225,8 +225,9 @@ impl CachedFetchEntry {
             if directives.no_cache || directives.no_store {
                 return false;
             }
-            if let Some(max_age) = directives.max_age {
-                return now_secs.saturating_sub(self.fetched_at_secs) < max_age;
+            if let Some(max_age) = directives.max_age.or(directives.s_maxage) {
+                let swr = directives.stale_while_revalidate.unwrap_or(0);
+                return now_secs.saturating_sub(self.fetched_at_secs) < max_age.saturating_add(swr);
             }
         }
         if let Some(exp) = get_header_ci(&self.headers, "expires") {
@@ -512,11 +513,29 @@ impl FetchEngine {
         let cached = if is_cacheable_method
             && !matches!(effective_cache, FetchCache::NoStore | FetchCache::Reload)
         {
-            let guard = self.http_cache.lock().await;
-            guard
-                .get(&cache_key)
-                .filter(|e| e.vary_matches(headers))
-                .cloned()
+            let mem_hit = {
+                let guard = self.http_cache.lock().await;
+                guard
+                    .get(&cache_key)
+                    .filter(|e| e.vary_matches(headers))
+                    .cloned()
+            };
+            if mem_hit.is_some() {
+                mem_hit
+            } else if let Some(disk_cache) = self.client.http_cache() {
+                disk_cache
+                    .get(&cache_key)
+                    .filter(|e| e.meta.vary_matches(headers))
+                    .map(|e| CachedFetchEntry {
+                        status: e.meta.status,
+                        headers: e.meta.headers.clone(),
+                        body: e.body.to_vec(),
+                        req_headers: e.meta.req_headers.clone(),
+                        fetched_at_secs: e.meta.fetched_at,
+                    })
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -614,6 +633,11 @@ impl FetchEngine {
             )
             && !response_forbids_cache_store(&resp.headers)
         {
+            if resp.status == 200 {
+                if let Some(disk_cache) = self.client.http_cache() {
+                    let _ = disk_cache.put_with_req_headers(&cache_key, &resp, headers);
+                }
+            }
             self.http_cache.lock().await.insert(
                 cache_key,
                 CachedFetchEntry {

@@ -20,7 +20,7 @@
 //!   SSA registers to `vm.registers[base..]` and returns `DeoptReason::encode_deopt(resume_pc)`.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -28,7 +28,7 @@ use cranelift_codegen::ir::{
     types, AbiParam, Block, Function, InstBuilder, MemFlagsData, Signature, StackSlot,
     StackSlotData, StackSlotKind, UserFuncName, Value,
 };
-use cranelift_codegen::isa::CallConv;
+use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -96,6 +96,32 @@ impl CompiledOptimized {
     }
 }
 
+fn cached_opt_isa() -> Result<&'static OwnedTargetIsa, JitCompileError> {
+    static ISA: OnceLock<Result<OwnedTargetIsa, String>> = OnceLock::new();
+    let res = ISA.get_or_init(|| {
+        let mut flag_builder = settings::builder();
+        flag_builder
+            .set("opt_level", "speed")
+            .map_err(|e| e.to_string())?;
+        #[cfg(not(debug_assertions))]
+        flag_builder
+            .set("enable_verifier", "false")
+            .map_err(|e| e.to_string())?;
+        flag_builder
+            .set("is_pic", "true")
+            .map_err(|e| e.to_string())?;
+        let flags = settings::Flags::new(flag_builder);
+        cranelift_native::builder()
+            .map_err(|e| e.to_string())?
+            .finish(flags)
+            .map_err(|e| e.to_string())
+    });
+    match res {
+        Ok(isa) => Ok(isa),
+        Err(msg) => Err(JitCompileError::UnsupportedIsa(msg.clone())),
+    }
+}
+
 /// Compiles `(program_id, func_idx)` using Tier-3 speculative optimizations guided by live VM
 /// Inline Cache, call-site, and array elements-kind feedback.
 pub fn compile_optimizing_function(
@@ -150,22 +176,7 @@ pub fn compile_optimizing_function(
         hints,
     );
 
-    let mut flag_builder = settings::builder();
-    flag_builder
-        .set("opt_level", "speed")
-        .map_err(|e| JitCompileError::Cranelift(e.to_string()))?;
-    #[cfg(not(debug_assertions))]
-    flag_builder
-        .set("enable_verifier", "false")
-        .map_err(|e| JitCompileError::Cranelift(e.to_string()))?;
-    flag_builder
-        .set("is_pic", "true")
-        .map_err(|e| JitCompileError::Cranelift(e.to_string()))?;
-    let flags = settings::Flags::new(flag_builder);
-    let isa = cranelift_native::builder()
-        .map_err(|e| JitCompileError::UnsupportedIsa(e.to_string()))?
-        .finish(flags)
-        .map_err(|e| JitCompileError::UnsupportedIsa(e.to_string()))?;
+    let isa = cached_opt_isa()?;
 
     let ptr_ty = isa.pointer_type();
     let call_conv = CallConv::triple_default(isa.triple());
@@ -1213,7 +1224,7 @@ pub fn compile_optimizing_function(
     let mut ctx = Context::for_function(clif_func);
     let mut ctrl_plane = ControlPlane::default();
     let compiled = ctx
-        .compile(&*isa, &mut ctrl_plane)
+        .compile(isa.as_ref(), &mut ctrl_plane)
         .map_err(|e| JitCompileError::Cranelift(format!("{e:?}")))?;
 
     let code_page = CodePage::from_machine_code(compiled.code_buffer())?;

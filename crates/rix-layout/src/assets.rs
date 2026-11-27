@@ -1202,42 +1202,34 @@ pub fn select_picture_source_for_img(
     None
 }
 
-/// Parses an HTML `srcset` attribute and returns the best candidate URL (preferring 1x/2x or
-/// widest standard candidate without exceeding 2x density).
+/// Parses an HTML `srcset` attribute per WHATWG HTML §4.8.4.3.7 (preserving embedded commas
+/// inside URLs such as Cloudflare Image Resizing paths and `data:` URIs) and returns the best
+/// candidate URL (preferring 1x–2x density or closest standard width).
 #[must_use]
 pub fn parse_best_srcset_url(srcset: &str) -> Option<String> {
-    let mut best: Option<(f32, String)> = None;
-    for raw_candidate in srcset.split(',') {
-        let trimmed = raw_candidate.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let mut parts = trimmed.split_whitespace();
-        let Some(url) = parts.next() else {
-            continue;
+    let candidates = rix_dom::parse_srcset(srcset);
+    let mut best: Option<(f32, &str)> = None;
+    for cand in candidates {
+        let score = if let Some(d) = cand.density {
+            d
+        } else if let Some(w) = cand.width {
+            (w as f32) / 800.0
+        } else {
+            1.0
         };
-        let score = match parts.next() {
-            Some(desc) if desc.ends_with('x') || desc.ends_with('X') => {
-                desc[..desc.len() - 1].parse::<f32>().unwrap_or(1.0)
-            }
-            Some(desc) if desc.ends_with('w') || desc.ends_with('W') => {
-                desc[..desc.len() - 1].parse::<f32>().unwrap_or(800.0) / 800.0
-            }
-            _ => 1.0,
-        };
-        let replace = match &best {
+        let replace = match best {
             None => true,
             Some((prev, _)) => {
                 let d_cur = (score - 1.5).abs();
-                let d_prev = (*prev - 1.5).abs();
-                d_cur < d_prev || ((d_cur - d_prev).abs() < 1e-4 && score > *prev)
+                let d_prev = (prev - 1.5).abs();
+                d_cur < d_prev || ((d_cur - d_prev).abs() < 1e-4 && score > prev)
             }
         };
         if replace {
-            best = Some((score, url.to_string()));
+            best = Some((score, cand.url));
         }
     }
-    best.map(|(_, url)| url)
+    best.map(|(_, url)| url.to_string())
 }
 
 /// Parses an HTML/SVG numeric attribute like `"120"` or `"120px"`.

@@ -750,18 +750,21 @@ impl<'a> BoxTreeBuilder<'a> {
                 );
                 let raw_src = elem.get_attribute("src").unwrap_or_default().trim();
                 let srcset_pick = elem.get_attribute("srcset").and_then(parse_best_srcset_url);
+                // HTML Living Standard §4.8.4.3.5: `<picture><source>` wins first, then `<img>`'s
+                // `srcset` when present, falling back to `src`.
                 let src = if let Some(ref pic) = picture_pick {
                     pic.url.clone()
-                } else if !raw_src.is_empty() {
+                } else if let Some(ref ss) = srcset_pick {
+                    ss.clone()
+                } else {
                     raw_src.to_string()
-                } else {
-                    srcset_pick.clone().unwrap_or_default()
                 };
-                let fallback_src = if picture_pick.is_some() && !raw_src.is_empty() {
-                    Some(raw_src)
-                } else {
-                    None
-                };
+                let fallback_src =
+                    if (picture_pick.is_some() || srcset_pick.is_some()) && !raw_src.is_empty() {
+                        Some(raw_src)
+                    } else {
+                        None
+                    };
                 let (attr_w, attr_h) = if let Some(ref pic) = picture_pick {
                     if pic.attr_width.is_some() || pic.attr_height.is_some() {
                         (pic.attr_width, pic.attr_height)

@@ -31,8 +31,8 @@ use rix_css::{
 use rix_dom::{Document, NodeData};
 use rix_html::{parse_html, PreloadKind, PreloadScanner};
 use rix_layout::{
-    decode_raster_batch_parallel, extract_svg_from_document, parse_best_srcset_url, AssetRegistry,
-    DecodedRasterBytes, DecodedSvg,
+    decode_raster_batch_parallel, extract_svg_from_document, parse_best_srcset_url,
+    select_picture_source_for_img, AssetRegistry, DecodedRasterBytes, DecodedSvg,
 };
 use rix_net::{HttpClient, Resource, ResourceManager, ResourcePriority};
 use rix_text::{FontDatabase, FontFaceSet, FontStyle, UnicodeRange};
@@ -42,8 +42,8 @@ use url::Url;
 const MAX_SUBRESOURCES_PER_PAGE: usize = 160;
 /// Maximum eager `loading="lazy"` images fetched during initial navigation (above-the-fold safety).
 const MAX_INITIAL_LAZY_IMAGES: usize = 24;
-/// Byte budget for the cross-tab decoded asset LRU cache (128 MiB, mirroring Firefox SurfaceCache).
-const MAX_DECODED_ASSET_CACHE_BYTES: usize = 128 * 1024 * 1024;
+/// Byte budget for the cross-tab decoded asset LRU cache (256 MiB, mirroring Firefox SurfaceCache).
+const MAX_DECODED_ASSET_CACHE_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum entry count in the decoded asset LRU cache.
 const MAX_DECODED_ASSET_CACHE_ENTRIES: usize = 512;
 /// TTL before an origin is eligible for speculative preconnect again.
@@ -70,9 +70,17 @@ impl CachedAsset {
     }
 }
 
+#[derive(Clone)]
+struct CachedWave2Probe {
+    used_bg_urls: HashSet<String>,
+    used_font_specs: HashMap<String, Vec<(u16, bool)>>,
+    doc_chars: HashSet<char>,
+}
+
 #[derive(Default)]
 struct DecodedAssetCacheInner {
     entries: HashMap<String, (CachedAsset, usize, u64)>,
+    wave2_probes: HashMap<u64, CachedWave2Probe>,
     total_bytes: usize,
     tick: u64,
 }
@@ -156,6 +164,19 @@ impl DecodedAssetCache {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    fn get_wave2_probe(&self, key: u64) -> Option<CachedWave2Probe> {
+        self.inner.read().ok()?.wave2_probes.get(&key).cloned()
+    }
+
+    fn insert_wave2_probe(&self, key: u64, probe: CachedWave2Probe) {
+        if let Ok(mut guard) = self.inner.write() {
+            if guard.wave2_probes.len() >= 64 && !guard.wave2_probes.contains_key(&key) {
+                guard.wave2_probes.clear();
+            }
+            guard.wave2_probes.insert(key, probe);
+        }
     }
 }
 
@@ -383,7 +404,17 @@ pub fn load_page_subresources(
             ));
         }
     }
+    // Track total Wave 1 candidate slots (cached + uncached) uniformly so warm reloads never
+    // spill over into fetching extra previously-capped offscreen images.
+    let mut wave1_slots_used = wave1_queue.len();
     for (_, resolved) in &discovered.images {
+        if wave1_slots_used >= MAX_SUBRESOURCES_PER_PAGE {
+            break;
+        }
+        if !is_fetchable_url(resolved, allow_file_scheme) || !seen_wave1.insert(resolved.clone()) {
+            continue;
+        }
+        wave1_slots_used += 1;
         if let Some(hit) = asset_cache.get(resolved) {
             match hit {
                 CachedAsset::Raster(r) => {
@@ -399,16 +430,11 @@ pub fn load_page_subresources(
                 CachedAsset::WebFont(_) => {}
             }
         }
-        if wave1_queue.len() >= MAX_SUBRESOURCES_PER_PAGE {
-            break;
-        }
-        if is_fetchable_url(resolved, allow_file_scheme) && seen_wave1.insert(resolved.clone()) {
-            wave1_queue.push((
-                resolved.clone(),
-                ResourcePriority::Media,
-                SubresourceRole::Image,
-            ));
-        }
+        wave1_queue.push((
+            resolved.clone(),
+            ResourcePriority::Media,
+            SubresourceRole::Image,
+        ));
     }
 
     let t_wave1 = Instant::now();
@@ -692,92 +718,127 @@ pub fn load_page_subresources(
             .iter()
             .any(|(_, s)| !s.font_faces.is_empty() || !s.referenced_image_urls().is_empty());
     if needs_wave2_probe {
-        let mut probe_doc = discovered.doc;
-        let mut probe_styles = StyleContext::new(*media);
-        for (_, sheet) in &all_sheets_with_base {
-            probe_styles.add_stylesheet(Arc::clone(sheet));
+        let mut probe_key: u64 = 0xcbf2_9ce4_8422_2325;
+        let mix = |h: &mut u64, bytes: &[u8]| {
+            for &b in bytes {
+                *h ^= u64::from(b);
+                *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        mix(&mut probe_key, html.as_bytes());
+        mix(
+            &mut probe_key,
+            &media.viewport_width.to_bits().to_le_bytes(),
+        );
+        mix(
+            &mut probe_key,
+            &media.viewport_height.to_bits().to_le_bytes(),
+        );
+        mix(&mut probe_key, &[u8::from(media.dark_mode)]);
+        for (u, s) in &all_sheets_with_base {
+            mix(&mut probe_key, u.as_bytes());
+            mix(&mut probe_key, &(s.rules.len() as u64).to_le_bytes());
         }
-        probe_styles.cascade_full(&mut probe_doc);
-        let record_style_assets =
-            |st: &rix_css::ComputedStyle,
-             used_bg_urls: &mut HashSet<String>,
-             used_font_specs: &mut HashMap<String, Vec<(u16, bool)>>,
-             doc_chars: &mut HashSet<char>| {
-                for layer in &st.visual.background_layers {
-                    if let BackgroundImageValue::Url(u) = &layer.image {
+        if let Some(cached_probe) = asset_cache.get_wave2_probe(probe_key) {
+            used_bg_urls = cached_probe.used_bg_urls;
+            used_font_specs = cached_probe.used_font_specs;
+            doc_chars = cached_probe.doc_chars;
+        } else {
+            let mut probe_doc = discovered.doc;
+            let mut probe_styles = StyleContext::new(*media);
+            for (_, sheet) in &all_sheets_with_base {
+                probe_styles.add_stylesheet(Arc::clone(sheet));
+            }
+            probe_styles.cascade_full(&mut probe_doc);
+            let record_style_assets =
+                |st: &rix_css::ComputedStyle,
+                 used_bg_urls: &mut HashSet<String>,
+                 used_font_specs: &mut HashMap<String, Vec<(u16, bool)>>,
+                 doc_chars: &mut HashSet<char>| {
+                    for layer in &st.visual.background_layers {
+                        if let BackgroundImageValue::Url(u) = &layer.image {
+                            let trimmed = u.as_str().trim();
+                            if !trimmed.is_empty() {
+                                used_bg_urls.insert(trimmed.to_string());
+                            }
+                        }
+                    }
+                    if let BackgroundImageValue::Url(u) = &st.visual.mask_image {
                         let trimmed = u.as_str().trim();
                         if !trimmed.is_empty() {
                             used_bg_urls.insert(trimmed.to_string());
                         }
                     }
-                }
-                if let BackgroundImageValue::Url(u) = &st.visual.mask_image {
-                    let trimmed = u.as_str().trim();
-                    if !trimmed.is_empty() {
-                        used_bg_urls.insert(trimmed.to_string());
+                    if let Some(ref c) = st.box_model.content {
+                        for ch in c.as_str().chars() {
+                            doc_chars.insert(ch);
+                        }
                     }
-                }
-                if let Some(ref c) = st.box_model.content {
-                    for ch in c.as_str().chars() {
-                        doc_chars.insert(ch);
+                    let weight = st.text.font_weight.round().clamp(100.0, 900.0) as u16;
+                    let italic = !matches!(st.text.font_style, rix_css::FontStyleMode::Normal);
+                    for fam in &st.text.font_family {
+                        let lower = fam
+                            .as_str()
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_ascii_lowercase();
+                        if !lower.is_empty() {
+                            let specs = used_font_specs.entry(lower).or_default();
+                            if !specs.contains(&(weight, italic)) {
+                                specs.push((weight, italic));
+                            }
+                        }
                     }
+                };
+            for node in probe_doc.descendants(probe_doc.root()) {
+                if let Some(NodeData::Text(t)) = probe_doc.get(node) {
+                    let skip_text = probe_doc.parent(node).is_some_and(|p| {
+                        matches!(
+                            probe_doc.get(p),
+                            Some(NodeData::Element(e))
+                                if e.name.local.as_str().eq_ignore_ascii_case("script")
+                                    || e.name.local.as_str().eq_ignore_ascii_case("style")
+                        )
+                    });
+                    if !skip_text {
+                        for ch in t.chars() {
+                            doc_chars.insert(ch);
+                        }
+                    }
+                    continue;
                 }
-                let weight = st.text.font_weight.round().clamp(100.0, 900.0) as u16;
-                let italic = !matches!(st.text.font_style, rix_css::FontStyleMode::Normal);
-                for fam in &st.text.font_family {
-                    let lower = fam
-                        .as_str()
-                        .trim()
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .to_ascii_lowercase();
-                    if !lower.is_empty() {
-                        let specs = used_font_specs.entry(lower).or_default();
-                        if !specs.contains(&(weight, italic)) {
-                            specs.push((weight, italic));
+                let Some(st) = probe_styles.style_for(node) else {
+                    continue;
+                };
+                if st.display == rix_css::DisplayMode::None {
+                    continue;
+                }
+                record_style_assets(st, &mut used_bg_urls, &mut used_font_specs, &mut doc_chars);
+                for pe in [
+                    rix_css::RixPseudoElement::Before,
+                    rix_css::RixPseudoElement::After,
+                ] {
+                    if let Some(pst) = probe_styles.pseudo_style_for(node, pe) {
+                        if pst.display != rix_css::DisplayMode::None {
+                            record_style_assets(
+                                pst,
+                                &mut used_bg_urls,
+                                &mut used_font_specs,
+                                &mut doc_chars,
+                            );
                         }
                     }
                 }
-            };
-        for node in probe_doc.descendants(probe_doc.root()) {
-            if let Some(NodeData::Text(t)) = probe_doc.get(node) {
-                let skip_text = probe_doc.parent(node).is_some_and(|p| {
-                    matches!(
-                        probe_doc.get(p),
-                        Some(NodeData::Element(e))
-                            if e.name.local.as_str().eq_ignore_ascii_case("script")
-                                || e.name.local.as_str().eq_ignore_ascii_case("style")
-                    )
-                });
-                if !skip_text {
-                    for ch in t.chars() {
-                        doc_chars.insert(ch);
-                    }
-                }
-                continue;
             }
-            let Some(st) = probe_styles.style_for(node) else {
-                continue;
-            };
-            if st.display == rix_css::DisplayMode::None {
-                continue;
-            }
-            record_style_assets(st, &mut used_bg_urls, &mut used_font_specs, &mut doc_chars);
-            for pe in [
-                rix_css::RixPseudoElement::Before,
-                rix_css::RixPseudoElement::After,
-            ] {
-                if let Some(pst) = probe_styles.pseudo_style_for(node, pe) {
-                    if pst.display != rix_css::DisplayMode::None {
-                        record_style_assets(
-                            pst,
-                            &mut used_bg_urls,
-                            &mut used_font_specs,
-                            &mut doc_chars,
-                        );
-                    }
-                }
-            }
+            asset_cache.insert_wave2_probe(
+                probe_key,
+                CachedWave2Probe {
+                    used_bg_urls: used_bg_urls.clone(),
+                    used_font_specs: used_font_specs.clone(),
+                    doc_chars: doc_chars.clone(),
+                },
+            );
         }
     }
 
@@ -1170,60 +1231,24 @@ fn discover_wave1_refs(document_url: &str, html: &str, media: &MediaContext) -> 
                 }
                 lazy_img_count += 1;
             }
-            if let Some(srcset) = el.get_attribute("srcset") {
-                if let Some(best) = parse_best_srcset_url(srcset) {
-                    if let Some(resolved) = resolve_url(base_str, &best) {
-                        if !is_non_image_media_url(&resolved)
-                            && seen_img.insert((best.clone(), resolved.clone()))
-                        {
-                            images.push((best, resolved));
-                        }
-                    }
-                }
-            }
-            if let Some(src) = el.get_attribute("src").map(str::trim) {
-                if !src.is_empty() {
-                    if let Some(resolved) = resolve_url(base_str, src) {
-                        if !is_non_image_media_url(&resolved)
-                            && seen_img.insert((src.to_string(), resolved.clone()))
-                        {
-                            images.push((src.to_string(), resolved));
-                        }
-                    }
-                }
-            }
-        } else if tag.eq_ignore_ascii_case("source") {
-            // HTML §4.8.4.2: Only fetch `<picture><source>` matching `media` and a supported
-            // decoded image MIME type (skip unsupported `image/avif`/`image/jxl` so `<picture>`
-            // cleanly falls back to WebP/JPEG/PNG!).
-            let in_picture = doc.parent(node).is_some_and(|p| {
-                matches!(
-                    doc.get(p),
-                    Some(NodeData::Element(pe)) if pe.name.local.eq_str_ignore_ascii_case("picture")
-                )
-            });
-            if in_picture {
-                let media_ok = el
-                    .get_attribute("media")
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                    .is_none_or(|m| media.evaluate_media_query_str(m));
-                let type_ok = el
-                    .get_attribute("type")
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty())
-                    .is_none_or(is_supported_picture_source_mime);
-                if media_ok && type_ok {
-                    if let Some(srcset) = el.get_attribute("srcset") {
-                        if let Some(best) = parse_best_srcset_url(srcset) {
-                            if let Some(resolved) = resolve_url(base_str, &best) {
-                                if !is_non_image_media_url(&resolved)
-                                    && seen_img.insert((best.clone(), resolved.clone()))
-                                {
-                                    images.push((best, resolved));
-                                }
-                            }
-                        }
+            // HTML Living Standard §4.8.4.3.5 ("update the source set"): select the SINGLE active
+            // image candidate per `<img>` (`<picture><source>` first, then `srcset`, else `src`),
+            // matching `rix_layout::box_tree` so we never double-fetch fallback sources.
+            let chosen_raw: Option<String> = select_picture_source_for_img(&doc, node, media)
+                .map(|pic| pic.url)
+                .or_else(|| el.get_attribute("srcset").and_then(parse_best_srcset_url))
+                .or_else(|| {
+                    el.get_attribute("src")
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                });
+            if let Some(raw_pick) = chosen_raw {
+                if let Some(resolved) = resolve_url(base_str, &raw_pick) {
+                    if !is_non_image_media_url(&resolved)
+                        && seen_img.insert((raw_pick.clone(), resolved.clone()))
+                    {
+                        images.push((raw_pick, resolved));
                     }
                 }
             }
@@ -1351,12 +1376,27 @@ fn fetch_batch(
                 let sem = Arc::clone(&sem);
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire_owned().await.ok();
-                    match tokio::time::timeout(per_req_timeout, rm.load_prioritized(&url, prio))
-                        .await
+                    let t_req = Instant::now();
+                    let res = match tokio::time::timeout(
+                        per_req_timeout,
+                        rm.load_prioritized(&url, prio),
+                    )
+                    .await
                     {
                         Ok(res) => res,
                         Err(_) => Err(rix_net::NetError::Timeout(per_req_timeout)),
+                    };
+                    let req_ms = t_req.elapsed().as_secs_f32() * 1000.0;
+                    if req_ms >= 500.0 || res.is_err() {
+                        tracing::debug!(
+                            url = %url.as_str(),
+                            ms = format_args!("{req_ms:.1}"),
+                            ok = res.is_ok(),
+                            err = ?res.as_ref().err(),
+                            "slow or failed subresource"
+                        );
                     }
+                    res
                 }));
             }
             let mut out = Vec::with_capacity(handles.len());
@@ -1457,23 +1497,9 @@ fn is_valid_script_response(mime: &str, body: &str) -> bool {
 }
 
 /// Returns `true` if `mime` is an image format supported by our raster/SVG decoder pipeline.
+#[cfg(test)]
 fn is_supported_picture_source_mime(mime: &str) -> bool {
-    let lower = mime
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "image/png"
-            | "image/jpeg"
-            | "image/jpg"
-            | "image/webp"
-            | "image/gif"
-            | "image/svg+xml"
-            | "image/apng"
-    )
+    rix_layout::is_supported_image_mime(mime)
 }
 
 fn resolve_url(base_url: &str, raw: &str) -> Option<String> {
@@ -1650,7 +1676,8 @@ mod stage1_page_loader_tests {
             intrinsic_height: 1000,
             rgba: Arc::new(vec![0u8; 4_000_000]),
         });
-        for i in 0..40 {
+        let count = (MAX_DECODED_ASSET_CACHE_BYTES / 4_000_000) + 8;
+        for i in 0..count {
             cache.insert(
                 format!("https://example.com/{i}.png"),
                 CachedAsset::Raster(Arc::clone(&big)),
@@ -1658,6 +1685,8 @@ mod stage1_page_loader_tests {
         }
         assert!(cache.total_bytes() <= MAX_DECODED_ASSET_CACHE_BYTES);
         assert!(cache.get("https://example.com/0.png").is_none());
-        assert!(cache.get("https://example.com/39.png").is_some());
+        assert!(cache
+            .get(&format!("https://example.com/{}.png", count - 1))
+            .is_some());
     }
 }

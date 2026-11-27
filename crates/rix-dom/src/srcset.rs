@@ -5,56 +5,149 @@ pub struct ImageCandidate<'a> {
     pub width: Option<u32>,
 }
 
+/// Parses an HTML `srcset` attribute strictly according to WHATWG HTML §4.8.4.3.7
+/// ("Parsing a srcset attribute"), preserving embedded commas inside URLs (e.g. Cloudflare
+/// Image Resizing `/cdn-cgi/image/width=640,quality=100,format=auto/...` and `data:` URIs)
+/// and parenthesized future-extension descriptors.
 pub fn parse_srcset(srcset: &str) -> Vec<ImageCandidate<'_>> {
     let mut candidates = Vec::new();
-    let mut remaining = srcset.trim();
+    let bytes = srcset.as_bytes();
+    let len = bytes.len();
+    let mut pos = 0usize;
 
-    while !remaining.is_empty() {
-        remaining = remaining.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ',');
-        if remaining.is_empty() {
+    let is_ws = |b: u8| matches!(b, b'\t' | b'\n' | 0x0C | b'\r' | b' ');
+
+    while pos < len {
+        // Step 3: Skip leading ASCII whitespace and commas.
+        while pos < len && (is_ws(bytes[pos]) || bytes[pos] == b',') {
+            pos += 1;
+        }
+        if pos >= len {
             break;
         }
 
-        let url_end = if remaining.starts_with("data:") {
-            remaining
-                .find(|c: char| c.is_ascii_whitespace())
-                .unwrap_or(remaining.len())
-        } else {
-            remaining
-                .find(|c: char| c.is_ascii_whitespace() || c == ',')
-                .unwrap_or(remaining.len())
-        };
+        // Step 5: Collect URL up to the first ASCII whitespace (commas inside URLs are valid!).
+        let url_start = pos;
+        while pos < len && !is_ws(bytes[pos]) {
+            pos += 1;
+        }
+        let raw_url = &srcset[url_start..pos];
 
-        let url = remaining[..url_end].trim();
-        remaining = remaining[url_end..].trim_start();
+        // Step 6: If URL ends with one or more U+002C COMMA characters, strip all trailing commas
+        // and finalize this candidate immediately with no descriptors (default 1x density).
+        if raw_url.ends_with(',') {
+            let url = raw_url.trim_end_matches(',');
+            if !url.is_empty() {
+                candidates.push(ImageCandidate {
+                    url,
+                    density: Some(1.0),
+                    width: None,
+                });
+            }
+            continue;
+        }
 
-        let mut density = None;
-        let mut width = None;
+        let url = raw_url;
 
-        if !remaining.is_empty() && !remaining.starts_with(',') {
-            let desc_end = remaining.find(',').unwrap_or(remaining.len());
-            let descriptor = remaining[..desc_end].trim();
-            remaining = &remaining[desc_end..];
+        // Step 7: Skip ASCII whitespace between URL and descriptors.
+        while pos < len && is_ws(bytes[pos]) {
+            pos += 1;
+        }
 
-            for token in descriptor.split_whitespace() {
-                if let Some(d) = token.strip_suffix('x').or_else(|| token.strip_suffix('X')) {
-                    if let Ok(val) = d.parse::<f32>() {
-                        if val > 0.0 && val.is_finite() {
-                            density = Some(val);
-                        }
-                    }
-                } else if let Some(w) = token.strip_suffix('w').or_else(|| token.strip_suffix('W'))
-                {
-                    if let Ok(val) = w.parse::<u32>() {
-                        if val > 0 {
-                            width = Some(val);
-                        }
-                    }
+        // Step 8: Parse descriptor list using the WHATWG state machine (in descriptor / in parens / after descriptor).
+        let mut descriptors: Vec<&str> = Vec::new();
+        let mut paren_depth: u32 = 0;
+        let mut token_start: Option<usize> = None;
+
+        while pos < len {
+            let b = bytes[pos];
+            if paren_depth > 0 {
+                if b == b')' {
+                    paren_depth -= 1;
                 }
+                pos += 1;
+                continue;
+            }
+            if b == b',' {
+                if let Some(st) = token_start.take() {
+                    descriptors.push(&srcset[st..pos]);
+                }
+                pos += 1;
+                break;
+            }
+            if is_ws(b) {
+                if let Some(st) = token_start.take() {
+                    descriptors.push(&srcset[st..pos]);
+                }
+                pos += 1;
+                continue;
+            }
+            if token_start.is_none() {
+                token_start = Some(pos);
+            }
+            if b == b'(' {
+                paren_depth += 1;
+            }
+            pos += 1;
+        }
+        if let Some(st) = token_start {
+            descriptors.push(&srcset[st..pos]);
+        }
+
+        // Step 10: Interpret width ('w') and pixel density ('x') descriptors.
+        let mut density: Option<f32> = None;
+        let mut width: Option<u32> = None;
+        let mut error = false;
+
+        for token in descriptors {
+            if token.is_empty() {
+                continue;
+            }
+            if let Some(w_str) = token.strip_suffix('w') {
+                if width.is_some() || density.is_some() {
+                    error = true;
+                    break;
+                }
+                if let Ok(val) = w_str.parse::<u32>() {
+                    if val > 0 {
+                        width = Some(val);
+                    } else {
+                        error = true;
+                        break;
+                    }
+                } else {
+                    error = true;
+                    break;
+                }
+            } else if let Some(d_str) = token.strip_suffix('x') {
+                if width.is_some() || density.is_some() {
+                    error = true;
+                    break;
+                }
+                if let Ok(val) = d_str.parse::<f32>() {
+                    if val > 0.0 && val.is_finite() {
+                        density = Some(val);
+                    } else {
+                        error = true;
+                        break;
+                    }
+                } else {
+                    error = true;
+                    break;
+                }
+            } else if token.ends_with('h') {
+                // Future 'h' descriptor (or invalid): ignore unless conflicting.
+                if density.is_some() {
+                    error = true;
+                    break;
+                }
+            } else {
+                error = true;
+                break;
             }
         }
 
-        if density.is_some() && width.is_some() {
+        if error {
             continue;
         }
         if density.is_none() && width.is_none() {
@@ -100,4 +193,40 @@ pub fn select_image_source<'a>(src: Option<&'a str>, srcset: Option<&'a str>) ->
             Some(trimmed)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn srcset_preserves_embedded_commas_in_urls_per_whatwg() {
+        let s = "/cdn-cgi/image/width=640,quality=100,format=auto/https://images.example.com/a.webp 640w, \
+                 /cdn-cgi/image/width=1280,quality=100,format=auto/https://images.example.com/a.webp 1280w";
+        let c = parse_srcset(s);
+        assert_eq!(c.len(), 2);
+        assert_eq!(
+            c[0].url,
+            "/cdn-cgi/image/width=640,quality=100,format=auto/https://images.example.com/a.webp"
+        );
+        assert_eq!(c[0].width, Some(640));
+        assert_eq!(
+            c[1].url,
+            "/cdn-cgi/image/width=1280,quality=100,format=auto/https://images.example.com/a.webp"
+        );
+        assert_eq!(c[1].width, Some(1280));
+    }
+
+    #[test]
+    fn srcset_handles_trailing_commas_and_data_uris() {
+        let s = "a.png, b.png 2x, data:image/png;base64,iVBOR,abc 1x";
+        let c = parse_srcset(s);
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[0].url, "a.png");
+        assert_eq!(c[0].density, Some(1.0));
+        assert_eq!(c[1].url, "b.png");
+        assert_eq!(c[1].density, Some(2.0));
+        assert_eq!(c[2].url, "data:image/png;base64,iVBOR,abc");
+        assert_eq!(c[2].density, Some(1.0));
+    }
 }

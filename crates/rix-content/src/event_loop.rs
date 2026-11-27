@@ -552,6 +552,24 @@ pub fn drain_ready_tasks(loop_state: &SharedEventLoop, vm: &mut JsVm) -> u64 {
     ran
 }
 
+/// Cooperatively drains immediately ready macrotasks, due timers, and microtasks up to
+/// `max_tasks` or wall-clock `budget`, then yields cleanly back to rendering/VSync so
+/// self-reposting `MessageChannel` / `setTimeout(0)` framework schedulers never block First Paint.
+pub fn drain_ready_tasks_with_budget(
+    loop_state: &SharedEventLoop,
+    vm: &mut JsVm,
+    max_tasks: u64,
+    budget: Duration,
+) -> u64 {
+    let start = Instant::now();
+    run_microtask_checkpoint(loop_state, vm);
+    let mut ran = 0u64;
+    while ran < max_tasks && start.elapsed() < budget && step_event_loop_once(loop_state, vm) {
+        ran += 1;
+    }
+    ran
+}
+
 /// Reactive async sleep waiting for EITHER the next [`ExternalEvent`] OR the exact
 /// deadline of the earliest active timer (ZERO polling, 0% idle CPU when no timers exist!).
 pub async fn wait_for_next_event_or_timer(

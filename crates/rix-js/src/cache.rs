@@ -10,6 +10,83 @@ use crate::compiler::{compile, CompileError};
 use rix_storage::StorageEngine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+
+const MAX_MEM_BYTECODE_ENTRIES: usize = 256;
+
+#[derive(Default)]
+struct MemBytecodeCache {
+    entries: HashMap<([u8; 32], u8), (CompiledProgram, u64)>,
+    tick: u64,
+}
+
+fn mem_bytecode_cache() -> &'static RwLock<MemBytecodeCache> {
+    static CACHE: OnceLock<RwLock<MemBytecodeCache>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(MemBytecodeCache::default()))
+}
+
+fn source_type_tag(source_type: SourceType) -> u8 {
+    match source_type {
+        SourceType::Script => 0,
+        SourceType::Module => 1,
+    }
+}
+
+fn mem_cache_get(hash: [u8; 32], source_type: SourceType) -> Option<CompiledProgram> {
+    let key = (hash, source_type_tag(source_type));
+    let prog = mem_bytecode_cache()
+        .read()
+        .ok()?
+        .entries
+        .get(&key)
+        .map(|(p, _)| p.clone())?;
+    if let Ok(mut guard) = mem_bytecode_cache().write() {
+        guard.tick = guard.tick.wrapping_add(1);
+        let t = guard.tick;
+        if let Some(entry) = guard.entries.get_mut(&key) {
+            entry.1 = t;
+        }
+    }
+    Some(prog)
+}
+
+fn mem_cache_put(hash: [u8; 32], program: &CompiledProgram) {
+    let key = (hash, source_type_tag(program.source_type));
+    if let Ok(mut guard) = mem_bytecode_cache().write() {
+        if guard.entries.len() >= MAX_MEM_BYTECODE_ENTRIES && !guard.entries.contains_key(&key) {
+            if let Some(victim) = guard
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, seq))| *seq)
+                .map(|(k, _)| *k)
+            {
+                guard.entries.remove(&victim);
+            }
+        }
+        guard.tick = guard.tick.wrapping_add(1);
+        let t = guard.tick;
+        guard.entries.insert(key, (program.clone(), t));
+    }
+}
+
+/// Compiles `source` using the process-wide L1 RAM bytecode LRU cache (bypassing re-lexing and
+/// re-parsing identical ES modules and scripts across warm reloads and multiple tabs).
+pub fn compile_cached_in_memory(
+    source: &str,
+    source_type: SourceType,
+) -> Result<CompiledProgram, CompileError> {
+    if source.len() < 1_024 {
+        return compile(source, source_type);
+    }
+    let hash = BytecodeCache::source_sha256(source);
+    if let Some(cached) = mem_cache_get(hash, source_type) {
+        return Ok(cached);
+    }
+    let compiled = compile(source, source_type)?;
+    mem_cache_put(hash, &compiled);
+    Ok(compiled)
+}
 
 /// Reports whether [`BytecodeCache::compile_or_load`] skipped compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +182,26 @@ impl<'a> BytecodeCache<'a> {
             return Ok((cached, CacheStatus::Hit));
         }
         let compiled = compile(source, source_type)?;
+        let _ = self.store(source, &compiled);
+        Ok((compiled, CacheStatus::Miss))
+    }
+
+    /// L1 RAM + L2 persistent disk bytecode cache lookup used by `ContentRuntime` on warm reloads.
+    pub fn compile_or_load_with_ram(
+        &self,
+        source: &str,
+        source_type: SourceType,
+    ) -> Result<(CompiledProgram, CacheStatus), CompileError> {
+        let hash = Self::source_sha256(source);
+        if let Some(mem_hit) = mem_cache_get(hash, source_type) {
+            return Ok((mem_hit, CacheStatus::Hit));
+        }
+        if let Some(disk_hit) = self.load(source, source_type) {
+            mem_cache_put(hash, &disk_hit);
+            return Ok((disk_hit, CacheStatus::Hit));
+        }
+        let compiled = compile(source, source_type)?;
+        mem_cache_put(hash, &compiled);
         let _ = self.store(source, &compiled);
         Ok((compiled, CacheStatus::Miss))
     }
