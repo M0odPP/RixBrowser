@@ -422,7 +422,10 @@ pub fn write_tokens_to_buf(tokens: &[CssToken], buf: &mut String) {
                         l.r, l.g, l.b, d.r, d.g, d.b
                     );
                 }
-                CssColor::SystemAccent => buf.push_str("rgb(0, 96, 223)"),
+                CssColor::System(sys) => {
+                    let rgba = sys.resolve(false);
+                    let _ = write!(buf, "rgb({}, {}, {})", rgba.r, rgba.g, rgba.b);
+                }
             },
             CssToken::String(s) => {
                 buf.push('"');
@@ -430,16 +433,12 @@ pub fn write_tokens_to_buf(tokens: &[CssToken], buf: &mut String) {
                 buf.push('"');
             }
             CssToken::Url(u) => {
-                let raw = u.as_str();
-                let needs_quote = raw.is_empty()
-                    || raw.bytes().any(|b| {
-                        b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'(' | b')' | b'\\')
-                    });
-                if needs_quote {
-                    let _ = write!(buf, "url({})", crate::substitution::quote_css_string(raw));
-                } else {
-                    let _ = write!(buf, "url({raw})");
-                }
+                // CSSOM §6.7.2: serialize a URL as `url("...")`.
+                let _ = write!(
+                    buf,
+                    "url({})",
+                    crate::substitution::quote_css_string(u.as_str())
+                );
             }
             CssToken::Hash(h) => {
                 buf.push('#');
@@ -843,11 +842,17 @@ pub enum PropertyIdKind {
     // Additional standard CSS2/CSS3 properties (CSSOM serialization & shorthands)
     AlignmentBaseline,
     BackgroundAttachment,
+    BackgroundOrigin,
     BackgroundRepeat,
     BaselineShift,
     BaselineSource,
     BorderImage,
+    BorderImageSource,
+    CaretColor,
     Clip,
+    ColumnRuleColor,
+    FontSizeAdjust,
+    FontStretch,
     FontVariant,
     ListStyle,
     ListStyleImage,
@@ -856,7 +861,20 @@ pub enum PropertyIdKind {
     PageBreakAfter,
     PageBreakBefore,
     PageBreakInside,
+    PerspectiveOrigin,
+    SvgClipRule,
+    SvgDominantBaseline,
+    SvgFillOpacity,
+    SvgFloodOpacity,
+    SvgStopOpacity,
+    SvgStrokeLinecap,
+    SvgStrokeLinejoin,
+    SvgStrokeMiterlimit,
+    SvgStrokeOpacity,
+    SvgTextAnchor,
+    TextDecorationStyle,
     UnicodeBidi,
+    WillChange,
     // CSS Cascade L5 `all` shorthand
     All,
     // Custom property (`--*`)
@@ -1172,11 +1190,21 @@ impl PropertyIdKind {
             "content" => Self::Content,
             "alignment-baseline" => Self::AlignmentBaseline,
             "background-attachment" => Self::BackgroundAttachment,
+            "background-origin" => Self::BackgroundOrigin,
             "background-repeat" => Self::BackgroundRepeat,
             "baseline-shift" => Self::BaselineShift,
             "baseline-source" => Self::BaselineSource,
             "border-image" => Self::BorderImage,
+            "border-image-source" => Self::BorderImageSource,
+            "caret-color" => Self::CaretColor,
             "clip" => Self::Clip,
+            "clip-rule" => Self::SvgClipRule,
+            "column-rule-color" => Self::ColumnRuleColor,
+            "dominant-baseline" => Self::SvgDominantBaseline,
+            "fill-opacity" => Self::SvgFillOpacity,
+            "flood-opacity" => Self::SvgFloodOpacity,
+            "font-size-adjust" => Self::FontSizeAdjust,
+            "font-stretch" => Self::FontStretch,
             "font-variant" => Self::FontVariant,
             "list-style" => Self::ListStyle,
             "list-style-image" => Self::ListStyleImage,
@@ -1185,7 +1213,16 @@ impl PropertyIdKind {
             "page-break-after" => Self::PageBreakAfter,
             "page-break-before" => Self::PageBreakBefore,
             "page-break-inside" => Self::PageBreakInside,
+            "perspective-origin" => Self::PerspectiveOrigin,
+            "stop-opacity" => Self::SvgStopOpacity,
+            "stroke-linecap" => Self::SvgStrokeLinecap,
+            "stroke-linejoin" => Self::SvgStrokeLinejoin,
+            "stroke-miterlimit" => Self::SvgStrokeMiterlimit,
+            "stroke-opacity" => Self::SvgStrokeOpacity,
+            "text-anchor" => Self::SvgTextAnchor,
+            "text-decoration-style" => Self::TextDecorationStyle,
             "unicode-bidi" => Self::UnicodeBidi,
+            "will-change" => Self::WillChange,
             "all" => Self::All,
             _ => return None,
         })
@@ -1492,11 +1529,21 @@ impl PropertyIdKind {
             Self::BorderEndEndRadius => "border-end-end-radius",
             Self::AlignmentBaseline => "alignment-baseline",
             Self::BackgroundAttachment => "background-attachment",
+            Self::BackgroundOrigin => "background-origin",
             Self::BackgroundRepeat => "background-repeat",
             Self::BaselineShift => "baseline-shift",
             Self::BaselineSource => "baseline-source",
             Self::BorderImage => "border-image",
+            Self::BorderImageSource => "border-image-source",
+            Self::CaretColor => "caret-color",
             Self::Clip => "clip",
+            Self::SvgClipRule => "clip-rule",
+            Self::ColumnRuleColor => "column-rule-color",
+            Self::SvgDominantBaseline => "dominant-baseline",
+            Self::SvgFillOpacity => "fill-opacity",
+            Self::SvgFloodOpacity => "flood-opacity",
+            Self::FontSizeAdjust => "font-size-adjust",
+            Self::FontStretch => "font-stretch",
             Self::FontVariant => "font-variant",
             Self::ListStyle => "list-style",
             Self::ListStyleImage => "list-style-image",
@@ -1505,7 +1552,16 @@ impl PropertyIdKind {
             Self::PageBreakAfter => "page-break-after",
             Self::PageBreakBefore => "page-break-before",
             Self::PageBreakInside => "page-break-inside",
+            Self::PerspectiveOrigin => "perspective-origin",
+            Self::SvgStopOpacity => "stop-opacity",
+            Self::SvgStrokeLinecap => "stroke-linecap",
+            Self::SvgStrokeLinejoin => "stroke-linejoin",
+            Self::SvgStrokeMiterlimit => "stroke-miterlimit",
+            Self::SvgStrokeOpacity => "stroke-opacity",
+            Self::SvgTextAnchor => "text-anchor",
+            Self::TextDecorationStyle => "text-decoration-style",
             Self::UnicodeBidi => "unicode-bidi",
+            Self::WillChange => "will-change",
             Self::All => "all",
             Self::Custom => "--custom",
         }
@@ -1518,13 +1574,17 @@ impl PropertyIdKind {
             Self::Color
                 | Self::ColorScheme
                 | Self::AccentColor
+                | Self::CaretColor
                 | Self::SvgFill
                 | Self::SvgStroke
                 | Self::SvgFillRule
+                | Self::SvgClipRule
                 | Self::Visibility
                 | Self::PointerEvents
                 | Self::Cursor
                 | Self::FontSize
+                | Self::FontSizeAdjust
+                | Self::FontStretch
                 | Self::FontWeight
                 | Self::FontStyle
                 | Self::FontFamily
@@ -1568,6 +1628,13 @@ impl PropertyIdKind {
                 | Self::BorderSpacing
                 | Self::EmptyCells
                 | Self::ColorInterpolationFilters
+                | Self::SvgDominantBaseline
+                | Self::SvgFillOpacity
+                | Self::SvgStrokeLinecap
+                | Self::SvgStrokeLinejoin
+                | Self::SvgStrokeMiterlimit
+                | Self::SvgStrokeOpacity
+                | Self::SvgTextAnchor
                 | Self::TextShadow
                 | Self::Custom
         )
@@ -2511,6 +2578,12 @@ pub enum PropertyValue {
     Color4(Box<crate::color::CssColorExpr>),
     SvgPaint(Option<CssColor>),
     SvgFillRuleEvenOdd(bool),
+    SvgStrokeLinecap(crate::values::SvgStrokeLinecap),
+    SvgStrokeLinejoin(crate::values::SvgStrokeLinejoin),
+    SvgTextAnchor(crate::values::SvgTextAnchor),
+    SvgDominantBaseline(crate::values::SvgDominantBaseline),
+    TextDecorationStyle(crate::values::TextDecorationStyleMode),
+    OptNumber(Option<f32>),
     Size(SizeValue),
     Length(LengthPercentage),
     LengthAuto(LengthPercentageAuto),
@@ -2633,6 +2706,8 @@ pub enum PropertyValue {
     /// CSS Containment L3 `container-name`: empty = `none`, otherwise ordered custom-idents.
     ContainerName(Vec<InternedStr>),
     BackgroundImageRaw(String),
+    BackgroundAttachment(InternedStr),
+    WillChangeCreatesCb(bool),
     FontStyleObliqueMath(Box<crate::values_math::MathNode>),
     ListStyleType(ListStyleTypeMode),
     ListStylePosition(ListStylePositionMode),
@@ -2860,6 +2935,164 @@ pub fn compile_declaration_block(
     }
     for prop in &block.important_declarations {
         compile_property(prop, true, &mut order, out, missing);
+    }
+}
+
+/// Strips malformed custom property declarations (`--name: ...;`) whose value contains
+/// unbalanced `)`, `]`, or `}` delimiters before `lightningcss` parses the stylesheet.
+/// Per CSS Syntax L3 §5, a single syntactically invalid declaration must be ignored without
+/// invalidating preceding valid declarations in the same rule block (`lightningcss`'s
+/// `NestedRuleParser::parse_nested` clears all prior declarations on `Err`).
+#[must_use]
+pub(crate) fn strip_unbalanced_custom_decls(css: &str) -> std::borrow::Cow<'_, str> {
+    if !css.contains("--") {
+        return std::borrow::Cow::Borrowed(css);
+    }
+    let bytes = css.as_bytes();
+    let mut out: Option<String> = None;
+    let mut last = 0usize;
+    let mut i = 0usize;
+    let mut in_str: Option<u8> = None;
+    let mut brace_depth = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            i = if b == b'\\' {
+                (i + 2).min(bytes.len())
+            } else {
+                i + 1
+            };
+            if b == q {
+                in_str = None;
+            }
+            continue;
+        }
+        if b == b'\\' {
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_str = Some(b);
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if b == b'{' {
+            brace_depth += 1;
+            i += 1;
+            continue;
+        }
+        if b == b'}' {
+            brace_depth = brace_depth.saturating_sub(1);
+            i += 1;
+            continue;
+        }
+        // Detect start of a custom property declaration `--<ident>:` inside a `{ ... }` block.
+        if brace_depth > 0
+            && b == b'-'
+            && i + 2 < bytes.len()
+            && bytes[i + 1] == b'-'
+            && (i == 0 || matches!(bytes[i - 1], b'{' | b';' | b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            let decl_start = i;
+            let mut p = i + 2;
+            while p < bytes.len()
+                && !matches!(
+                    bytes[p],
+                    b':' | b';' | b'{' | b'}' | b' ' | b'\t' | b'\n' | b'\r'
+                )
+            {
+                p += 1;
+            }
+            while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+                p += 1;
+            }
+            if p < bytes.len() && bytes[p] == b':' {
+                let mut k = p + 1;
+                let mut stack: SmallVec<[u8; 8]> = SmallVec::new();
+                let mut unbalanced = false;
+                let mut s_str: Option<u8> = None;
+                let mut decl_end = bytes.len();
+                while k < bytes.len() {
+                    let cb = bytes[k];
+                    if let Some(q) = s_str {
+                        k = if cb == b'\\' {
+                            (k + 2).min(bytes.len())
+                        } else {
+                            k + 1
+                        };
+                        if cb == q {
+                            s_str = None;
+                        }
+                        continue;
+                    }
+                    if cb == b'\\' {
+                        k = (k + 2).min(bytes.len());
+                        continue;
+                    }
+                    if cb == b'"' || cb == b'\'' {
+                        s_str = Some(cb);
+                        k += 1;
+                        continue;
+                    }
+                    if cb == b'/' && k + 1 < bytes.len() && bytes[k + 1] == b'*' {
+                        k += 2;
+                        while k + 1 < bytes.len() && !(bytes[k] == b'*' && bytes[k + 1] == b'/') {
+                            k += 1;
+                        }
+                        k = (k + 2).min(bytes.len());
+                        continue;
+                    }
+                    if stack.is_empty() && cb == b';' {
+                        decl_end = k + 1;
+                        break;
+                    }
+                    if stack.is_empty() && cb == b'}' {
+                        decl_end = k;
+                        break;
+                    }
+                    match cb {
+                        b'(' | b'[' | b'{' => stack.push(cb),
+                        b')' | b']' | b'}' => {
+                            let expected = match cb {
+                                b')' => b'(',
+                                b']' => b'[',
+                                _ => b'{',
+                            };
+                            if stack.pop() != Some(expected) {
+                                unbalanced = true;
+                                if let Some(pos) = stack.iter().rposition(|&c| c == expected) {
+                                    stack.truncate(pos);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                if unbalanced {
+                    let buf = out.get_or_insert_with(|| String::with_capacity(css.len()));
+                    buf.push_str(&css[last..decl_start]);
+                    last = decl_end;
+                    i = decl_end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    if let Some(mut buf) = out {
+        buf.push_str(&css[last..]);
+        std::borrow::Cow::Owned(buf)
+    } else {
+        std::borrow::Cow::Borrowed(css)
     }
 }
 
@@ -3165,10 +3398,20 @@ pub fn should_use_values4_parser(prop: PropertyIdKind, raw: &str) -> bool {
         return prop == PropertyIdKind::FlexBasis;
     }
     if prop == PropertyIdKind::BackgroundLayers
-        && (lower.starts_with("image-set(")
+        && (lower.starts_with("light-dark(")
+            || lower.starts_with("image-set(")
             || lower.starts_with("-webkit-image-set(")
             || lower.starts_with("src(")
             || lower.starts_with("image("))
+    {
+        return true;
+    }
+    if matches!(
+        prop,
+        PropertyIdKind::ListStyleImage
+            | PropertyIdKind::BorderImageSource
+            | PropertyIdKind::Content
+    ) && lower.starts_with("light-dark(")
     {
         return true;
     }
@@ -3881,7 +4124,8 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
         }
         PropertyIdKind::BackgroundLayers => {
             let l = trimmed.to_ascii_lowercase();
-            if l.starts_with("image-set(")
+            if l.starts_with("light-dark(")
+                || l.starts_with("image-set(")
                 || l.starts_with("-webkit-image-set(")
                 || l.starts_with("src(")
                 || l.starts_with("image(")
@@ -3889,6 +4133,30 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
                 let _ = crate::substitution::parse_and_serialize_bg_image_fn(
                     trimmed,
                     &crate::values::EvalContext::default(),
+                )?;
+                return Some((
+                    PropertyValue::BackgroundImageRaw(trimmed.to_string()),
+                    trimmed.to_string(),
+                ));
+            }
+            return None;
+        }
+        PropertyIdKind::ListStyleImage
+        | PropertyIdKind::BorderImageSource
+        | PropertyIdKind::Content => {
+            let l = trimmed.to_ascii_lowercase();
+            if l == "none" && prop != PropertyIdKind::Content {
+                return Some((
+                    PropertyValue::BackgroundImageRaw("none".to_string()),
+                    "none".to_string(),
+                ));
+            }
+            if l.starts_with("light-dark(") {
+                let _ = crate::substitution::resolve_light_dark_image_fn(
+                    trimmed,
+                    false,
+                    &crate::values::EvalContext::default(),
+                    false,
                 )?;
                 return Some((
                     PropertyValue::BackgroundImageRaw(trimmed.to_string()),
@@ -4529,6 +4797,9 @@ fn wrap_color4_declarations(css: &str) -> std::borrow::Cow<'_, str> {
                         PropertyIdKind::Transition
                             | PropertyIdKind::Animation
                             | PropertyIdKind::BackgroundLayers
+                            | PropertyIdKind::ListStyleImage
+                            | PropertyIdKind::BorderImageSource
+                            | PropertyIdKind::Content
                             | PropertyIdKind::FontStyle
                     )
             });
@@ -6193,6 +6464,107 @@ fn compile_property(
                 imp,
             );
         }
+        Property::BackgroundOrigin(origs) => {
+            use lightningcss::properties::background::BackgroundOrigin as Bo;
+            let orig = match origs.first() {
+                Some(Bo::BorderBox) => BackgroundClipMode::BorderBox,
+                Some(Bo::ContentBox) => BackgroundClipMode::ContentBox,
+                _ => BackgroundClipMode::PaddingBox,
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BackgroundOrigin,
+                PropertyValue::BackgroundClip(orig),
+                imp,
+            );
+        }
+        Property::BackgroundAttachment(atts) => {
+            use lightningcss::properties::background::BackgroundAttachment as Ba;
+            let att = match atts.first() {
+                Some(Ba::Fixed) => "fixed",
+                Some(Ba::Local) => "local",
+                _ => "scroll",
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BackgroundAttachment,
+                PropertyValue::BackgroundAttachment(intern_str(att)),
+                imp,
+            );
+        }
+        Property::BorderImageSource(img) => {
+            let raw = match img {
+                lightningcss::values::image::Image::None => "none".to_string(),
+                other => lightningcss::traits::ToCss::to_css_string(
+                    other,
+                    lightningcss::printer::PrinterOptions::default(),
+                )
+                .unwrap_or_else(|_| "none".to_string()),
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::BorderImageSource,
+                PropertyValue::BackgroundImageRaw(raw),
+                imp,
+            );
+        }
+        Property::ListStyleImage(img) => {
+            let raw = match img {
+                lightningcss::values::image::Image::None => "none".to_string(),
+                other => lightningcss::traits::ToCss::to_css_string(
+                    other,
+                    lightningcss::printer::PrinterOptions::default(),
+                )
+                .unwrap_or_else(|_| "none".to_string()),
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::ListStyleImage,
+                PropertyValue::BackgroundImageRaw(raw),
+                imp,
+            );
+        }
+        Property::CaretColor(ca) => match ca {
+            lightningcss::properties::ui::ColorOrAuto::Auto => {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::CaretColor,
+                    PropertyValue::Color(CssColor::CurrentColor),
+                    imp,
+                );
+            }
+            lightningcss::properties::ui::ColorOrAuto::Color(c) => {
+                if let Some(v) = convert_color_prop(c) {
+                    push_decl(out, ord, PropertyIdKind::CaretColor, v, imp);
+                }
+            }
+        },
+        Property::PerspectiveOrigin(pos, _) => {
+            let x = convert_bg_horiz_pos(&pos.x);
+            let y = convert_bg_vert_pos(&pos.y);
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::PerspectiveOrigin,
+                PropertyValue::BgPosition(x, y),
+                imp,
+            );
+        }
+        Property::ClipRule(rule) => {
+            let even_odd = matches!(rule, lightningcss::values::shape::FillRule::Evenodd);
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::SvgClipRule,
+                PropertyValue::SvgFillRuleEvenOdd(even_odd),
+                imp,
+            );
+        }
         Property::BackgroundImage(imgs) => {
             let layers = imgs
                 .iter()
@@ -7626,12 +7998,30 @@ fn compile_property(
             PropertyValue::TextDecorationLine(convert_text_decoration_line(l)),
             imp,
         ),
+        Property::TextDecorationStyle(st, _) => {
+            use lightningcss::properties::text::TextDecorationStyle as LTds;
+            let mode = match st {
+                LTds::Solid => crate::values::TextDecorationStyleMode::Solid,
+                LTds::Double => crate::values::TextDecorationStyleMode::Double,
+                LTds::Dotted => crate::values::TextDecorationStyleMode::Dotted,
+                LTds::Dashed => crate::values::TextDecorationStyleMode::Dashed,
+                LTds::Wavy => crate::values::TextDecorationStyleMode::Wavy,
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::TextDecorationStyle,
+                PropertyValue::TextDecorationStyle(mode),
+                imp,
+            );
+        }
         Property::TextDecorationColor(c, _) => {
             if let Some(v) = convert_color_prop(c) {
                 push_decl(out, ord, PropertyIdKind::TextDecorationColor, v, imp);
             }
         }
         Property::TextDecoration(td, _) => {
+            use lightningcss::properties::text::TextDecorationStyle as LTds;
             push_decl(
                 out,
                 ord,
@@ -7639,8 +8029,101 @@ fn compile_property(
                 PropertyValue::TextDecorationLine(convert_text_decoration_line(&td.line)),
                 imp,
             );
+            let st_mode = match td.style {
+                LTds::Solid => crate::values::TextDecorationStyleMode::Solid,
+                LTds::Double => crate::values::TextDecorationStyleMode::Double,
+                LTds::Dotted => crate::values::TextDecorationStyleMode::Dotted,
+                LTds::Dashed => crate::values::TextDecorationStyleMode::Dashed,
+                LTds::Wavy => crate::values::TextDecorationStyleMode::Wavy,
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::TextDecorationStyle,
+                PropertyValue::TextDecorationStyle(st_mode),
+                imp,
+            );
             if let Some(c) = convert_color_prop(&td.color) {
                 push_decl(out, ord, PropertyIdKind::TextDecorationColor, c, imp);
+            }
+        }
+        Property::FontStretch(fs) => {
+            use lightningcss::properties::font::{FontStretch as LFs, FontStretchKeyword as LKw};
+            let pct = match fs {
+                LFs::Keyword(LKw::UltraCondensed) => 50.0,
+                LFs::Keyword(LKw::ExtraCondensed) => 62.5,
+                LFs::Keyword(LKw::Condensed) => 75.0,
+                LFs::Keyword(LKw::SemiCondensed) => 87.5,
+                LFs::Keyword(LKw::Normal) => 100.0,
+                LFs::Keyword(LKw::SemiExpanded) => 112.5,
+                LFs::Keyword(LKw::Expanded) => 125.0,
+                LFs::Keyword(LKw::ExtraExpanded) => 150.0,
+                LFs::Keyword(LKw::UltraExpanded) => 200.0,
+                LFs::Percentage(p) => (p.0 * 100.0).max(0.0),
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::FontStretch,
+                PropertyValue::Number(pct),
+                imp,
+            );
+        }
+        Property::FillOpacity(a) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::SvgFillOpacity,
+            PropertyValue::Number(a.0.clamp(0.0, 1.0)),
+            imp,
+        ),
+        Property::StrokeOpacity(a) => push_decl(
+            out,
+            ord,
+            PropertyIdKind::SvgStrokeOpacity,
+            PropertyValue::Number(a.0.clamp(0.0, 1.0)),
+            imp,
+        ),
+        Property::StrokeLinecap(lc) => {
+            use lightningcss::properties::svg::StrokeLinecap as LSlc;
+            let v = match lc {
+                LSlc::Butt => crate::values::SvgStrokeLinecap::Butt,
+                LSlc::Round => crate::values::SvgStrokeLinecap::Round,
+                LSlc::Square => crate::values::SvgStrokeLinecap::Square,
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::SvgStrokeLinecap,
+                PropertyValue::SvgStrokeLinecap(v),
+                imp,
+            );
+        }
+        Property::StrokeLinejoin(lj) => {
+            use lightningcss::properties::svg::StrokeLinejoin as LSlj;
+            let v = match lj {
+                LSlj::Miter => crate::values::SvgStrokeLinejoin::Miter,
+                LSlj::MiterClip => crate::values::SvgStrokeLinejoin::MiterClip,
+                LSlj::Round => crate::values::SvgStrokeLinejoin::Round,
+                LSlj::Bevel => crate::values::SvgStrokeLinejoin::Bevel,
+                LSlj::Arcs => crate::values::SvgStrokeLinejoin::Arcs,
+            };
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::SvgStrokeLinejoin,
+                PropertyValue::SvgStrokeLinejoin(v),
+                imp,
+            );
+        }
+        Property::StrokeMiterlimit(ml) => {
+            if *ml >= 1.0 && ml.is_finite() {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::SvgStrokeMiterlimit,
+                    PropertyValue::Number(*ml),
+                    imp,
+                );
             }
         }
         Property::TextTransform(tt) => push_decl(
@@ -8656,7 +9139,7 @@ fn compile_property(
                 if let Some(kind) = PropertyIdKind::from_name(&ident.as_ref().to_ascii_lowercase())
                 {
                     let tokens = convert_token_list(&custom.value);
-                    let subst_unwrapped = {
+                    let sentinel_unwrapped: Option<(&str, &str)> = {
                         let non_ws: SmallVec<[&CssToken; 2]> = tokens
                             .iter()
                             .filter(|t| !matches!(t, CssToken::Space))
@@ -8667,9 +9150,12 @@ fn compile_property(
                                 fallback: Some(fb),
                             } = non_ws[0]
                             {
-                                if name.as_str() == "--__rix_subst__" {
+                                if matches!(
+                                    name.as_str(),
+                                    "--__rix_subst__" | "--__rix_val4__" | "--__rix_color4__"
+                                ) {
                                     fb.iter().find_map(|t| match t {
-                                        CssToken::String(s) => Some(s.as_str()),
+                                        CssToken::String(s) => Some((name.as_str(), s.as_str())),
                                         _ => None,
                                     })
                                 } else {
@@ -8682,14 +9168,29 @@ fn compile_property(
                             None
                         }
                     };
-                    if let Some(raw_val) = subst_unwrapped {
-                        push_decl(
-                            out,
-                            ord,
-                            kind,
-                            PropertyValue::Unresolved(tokenize_custom_value_str(raw_val)),
-                            imp,
-                        );
+                    if let Some((sent_name, raw_val)) = sentinel_unwrapped {
+                        if sent_name == "--__rix_subst__" {
+                            push_decl(
+                                out,
+                                ord,
+                                kind,
+                                PropertyValue::Unresolved(tokenize_custom_value_str(raw_val)),
+                                imp,
+                            );
+                        } else if sent_name == "--__rix_color4__" {
+                            if let Some(mut expr) = crate::color::parse_css_color(raw_val) {
+                                expr.bind_random_property(kind.css_name());
+                                push_decl(
+                                    out,
+                                    ord,
+                                    kind,
+                                    PropertyValue::Color4(Box::new(expr)),
+                                    imp,
+                                );
+                            }
+                        } else {
+                            let _ = parse_values4_property_decls(kind, raw_val, imp, ord, out);
+                        }
                         return;
                     }
                     if is_values4_native_property(kind) {
@@ -9622,6 +10123,53 @@ pub(crate) fn compile_extra_standard_property(
             );
         }
         "content" => {
+            let unwrapped_val4: Option<String> = {
+                let non_ws_c: SmallVec<[&CssToken; 2]> = owned
+                    .iter()
+                    .filter(|t| !matches!(t, CssToken::Space))
+                    .collect();
+                if non_ws_c.len() == 1 {
+                    if let CssToken::Var {
+                        name,
+                        fallback: Some(fb),
+                    } = non_ws_c[0]
+                    {
+                        if name.as_str() == "--__rix_val4__" || name.as_str() == "--__rix_color4__"
+                        {
+                            fb.iter().find_map(|t| match t {
+                                CssToken::String(s) => Some(s.as_str().to_string()),
+                                _ => None,
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            let raw_str = unwrapped_val4.unwrap_or_else(|| serialize_css_tokens(&owned));
+            let trimmed = raw_str.trim();
+            if trimmed.to_ascii_lowercase().starts_with("light-dark(")
+                && crate::substitution::resolve_light_dark_image_fn(
+                    trimmed,
+                    false,
+                    &crate::values::EvalContext::default(),
+                    false,
+                )
+                .is_some()
+            {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::Content,
+                    PropertyValue::BackgroundImageRaw(trimmed.to_string()),
+                    imp,
+                );
+                return;
+            }
             let value = owned.iter().find_map(|t| match t {
                 CssToken::String(s) => Some(s.clone()),
                 _ => None,
@@ -9633,6 +10181,146 @@ pub(crate) fn compile_extra_standard_property(
                 PropertyValue::Content(value),
                 imp,
             );
+        }
+        "column-rule-color" => {
+            let raw_str = serialize_css_tokens(&owned);
+            if let Some(mut expr) = crate::color::parse_css_color(raw_str.trim()) {
+                expr.bind_random_property("column-rule-color");
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::ColumnRuleColor,
+                    PropertyValue::Color4(Box::new(expr)),
+                    imp,
+                );
+            }
+        }
+        "will-change" => {
+            let creates_cb = owned.iter().any(|t| {
+                matches!(
+                    t,
+                    CssToken::Ident(id) if matches!(
+                        id.as_str().to_ascii_lowercase().as_str(),
+                        "transform"
+                            | "scale"
+                            | "rotate"
+                            | "translate"
+                            | "perspective"
+                            | "filter"
+                            | "backdrop-filter"
+                            | "contain"
+                            | "clip-path"
+                            | "mask"
+                            | "mask-image"
+                            | "view-transition-name"
+                    )
+                )
+            });
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::WillChange,
+                PropertyValue::WillChangeCreatesCb(creates_cb),
+                imp,
+            );
+        }
+        "flood-opacity" | "stop-opacity" => {
+            let kind = if name == "flood-opacity" {
+                PropertyIdKind::SvgFloodOpacity
+            } else {
+                PropertyIdKind::SvgStopOpacity
+            };
+            if non_ws.len() == 1 {
+                let v = match &non_ws[0] {
+                    CssToken::Number(n) if n.is_finite() => Some(n.clamp(0.0, 1.0)),
+                    CssToken::Percentage(p) if p.is_finite() => Some((p / 100.0).clamp(0.0, 1.0)),
+                    _ => None,
+                };
+                if let Some(val) = v {
+                    push_decl(out, ord, kind, PropertyValue::Number(val), imp);
+                }
+            }
+        }
+        "font-size-adjust" => {
+            if non_ws.len() == 1 {
+                match &non_ws[0] {
+                    CssToken::Ident(id) if id.as_str().eq_ignore_ascii_case("none") => {
+                        push_decl(
+                            out,
+                            ord,
+                            PropertyIdKind::FontSizeAdjust,
+                            PropertyValue::OptNumber(None),
+                            imp,
+                        );
+                    }
+                    CssToken::Number(n) if n.is_finite() && *n >= 0.0 => {
+                        push_decl(
+                            out,
+                            ord,
+                            PropertyIdKind::FontSizeAdjust,
+                            PropertyValue::OptNumber(Some(*n)),
+                            imp,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "text-anchor" => {
+            if let [CssToken::Ident(id)] = non_ws.as_slice() {
+                let v = match id.as_str().to_ascii_lowercase().as_str() {
+                    "start" => Some(crate::values::SvgTextAnchor::Start),
+                    "middle" => Some(crate::values::SvgTextAnchor::Middle),
+                    "end" => Some(crate::values::SvgTextAnchor::End),
+                    _ => None,
+                };
+                if let Some(ta) = v {
+                    push_decl(
+                        out,
+                        ord,
+                        PropertyIdKind::SvgTextAnchor,
+                        PropertyValue::SvgTextAnchor(ta),
+                        imp,
+                    );
+                }
+            }
+        }
+        "dominant-baseline" => {
+            if let [CssToken::Ident(id)] = non_ws.as_slice() {
+                let v = match id.as_str().to_ascii_lowercase().as_str() {
+                    "auto" => Some(crate::values::SvgDominantBaseline::Auto),
+                    "ideographic" => Some(crate::values::SvgDominantBaseline::Ideographic),
+                    "alphabetic" => Some(crate::values::SvgDominantBaseline::Alphabetic),
+                    "hanging" => Some(crate::values::SvgDominantBaseline::Hanging),
+                    "mathematical" => Some(crate::values::SvgDominantBaseline::Mathematical),
+                    "central" => Some(crate::values::SvgDominantBaseline::Central),
+                    "middle" => Some(crate::values::SvgDominantBaseline::Middle),
+                    "text-bottom" => Some(crate::values::SvgDominantBaseline::TextBottom),
+                    "text-top" => Some(crate::values::SvgDominantBaseline::TextTop),
+                    _ => None,
+                };
+                if let Some(db) = v {
+                    push_decl(
+                        out,
+                        ord,
+                        PropertyIdKind::SvgDominantBaseline,
+                        PropertyValue::SvgDominantBaseline(db),
+                        imp,
+                    );
+                }
+            }
+        }
+        "list-style-image" | "border-image-source" | "background-image" => {
+            let raw_str = serialize_css_tokens(&owned);
+            let trimmed = raw_str.trim();
+            let kind = match name {
+                "list-style-image" => PropertyIdKind::ListStyleImage,
+                "border-image-source" => PropertyIdKind::BorderImageSource,
+                _ => PropertyIdKind::BackgroundLayers,
+            };
+            if let Some((val, _)) = parse_values4_property(kind, trimmed) {
+                push_decl(out, ord, kind, val, imp);
+            }
         }
         _ => missing.push(MissingCssFeature::new(MissingCssKind::Property, name)),
     }

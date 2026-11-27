@@ -921,8 +921,16 @@ pub(crate) fn build_table_grid(
 
         let (raw_fixed, raw_pct, raw_calc_px) =
             decompose_size(&cell_style.box_model.width, &cell_eval);
-        let (min_fixed, _, _) = decompose_size(&cell_style.box_model.min_width, &cell_eval);
-        let (max_fixed, _, _) = decompose_size(&cell_style.box_model.max_width, &cell_eval);
+        // CSS 2.1 §10.7 / CSS Writing Modes 3: `min-block-size`/`max-block-size` (which map to
+        // `min-width`/`max-width` in vertical writing modes) do not apply to `table-cell`.
+        let (min_fixed, max_fixed) = if cell_style.text.writing_mode.is_vertical() {
+            (None, None)
+        } else {
+            (
+                decompose_size(&cell_style.box_model.min_width, &cell_eval).0,
+                decompose_size(&cell_style.box_model.max_width, &cell_eval).0,
+            )
+        };
 
         let min_bb = min_fixed.map(|v| to_border_box_dim(v, pb_w, is_bb));
         let max_bb = max_fixed.map(|v| to_border_box_dim(v, pb_w, is_bb));

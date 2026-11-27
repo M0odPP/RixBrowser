@@ -4911,11 +4911,16 @@ fn set_decl_expanded(
                 decls.retain(|(k, _, _)| k != prop);
             } else {
                 // Shorthand kept unexpanded (`var(...)` or `background: green`): remove constituent
-                // longhands unless protected by `!important` during parsing.
+                // longhands unless protected by `!important` during parsing, and when mutated via
+                // CSSOM (`!respect_important_cascade`) move the shorthand to the end so it overrides
+                // overlapping shorthands like `border-width: var(--width)`.
                 let names: Vec<&str> = longhands.iter().map(|k| k.css_name()).collect();
                 decls.retain(|(k, _, i)| {
                     !names.contains(&k.as_str()) || (respect_important_cascade && !important && *i)
                 });
+                if !respect_important_cascade {
+                    decls.retain(|(k, _, _)| k != prop);
+                }
             }
         } else if !prop.starts_with("--") {
             // Setting a longhand when a parent shorthand currently holds a pending `var()` value
@@ -4981,6 +4986,23 @@ fn sync_inline_color_expr(host: &SharedHost, nid: NodeId, prop: &str, raw_val: &
                 })
             };
             host.borrow_mut().set_inline_color_expr(nid, kind, expr);
+        } else {
+            // Setting/removing a shorthand (`border`, `border-color`, `border-block-color`,
+            // `border-inline-color`, `outline`, `text-decoration`, `all`, etc.) must clear
+            // any previously cached longhand color expressions on its constituent longhands.
+            let longhands = kind.shorthand_longhands();
+            if longhands.len() > 1 || kind == PropertyIdKind::All {
+                let mut hb = host.borrow_mut();
+                if kind == PropertyIdKind::All {
+                    hb.clear_inline_color_exprs(nid);
+                } else {
+                    for lh in longhands {
+                        if rix_css::cssom_decl::is_color_longhand(lh) {
+                            hb.set_inline_color_expr(nid, lh, None);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -5316,6 +5338,7 @@ fn prop_needs_layout_resolution(prop: &str) -> bool {
             | "height"
             | "inline-size"
             | "block-size"
+            | "perspective-origin"
             | "margin"
             | "margin-top"
             | "margin-right"
@@ -6253,10 +6276,21 @@ pub fn format_computed_property_resolved(
             CursorKind::Default => "default",
             CursorKind::Pointer => "pointer",
             CursorKind::Text => "text",
+            CursorKind::VerticalText => "vertical-text",
             CursorKind::Move => "move",
+            CursorKind::AllScroll => "all-scroll",
             CursorKind::NotAllowed => "not-allowed",
+            CursorKind::NoDrop => "no-drop",
             CursorKind::Grab => "grab",
             CursorKind::Grabbing => "grabbing",
+            CursorKind::EResize => "e-resize",
+            CursorKind::NeResize => "ne-resize",
+            CursorKind::NwResize => "nw-resize",
+            CursorKind::NResize => "n-resize",
+            CursorKind::SeResize => "se-resize",
+            CursorKind::SwResize => "sw-resize",
+            CursorKind::SResize => "s-resize",
+            CursorKind::WResize => "w-resize",
             CursorKind::EwResize => "ew-resize",
             CursorKind::NsResize => "ns-resize",
             CursorKind::NeswResize => "nesw-resize",
@@ -6267,6 +6301,12 @@ pub fn format_computed_property_resolved(
             CursorKind::Wait => "wait",
             CursorKind::Progress => "progress",
             CursorKind::Help => "help",
+            CursorKind::ContextMenu => "context-menu",
+            CursorKind::Cell => "cell",
+            CursorKind::Alias => "alias",
+            CursorKind::Copy => "copy",
+            CursorKind::ZoomIn => "zoom-in",
+            CursorKind::ZoomOut => "zoom-out",
             CursorKind::None => "none",
         }
         .into(),
@@ -6731,10 +6771,129 @@ pub fn format_computed_property_resolved(
             TableLayoutMode::Fixed => "fixed",
         }
         .into(),
-        "content" => match &style.box_model.content {
-            Some(c) => format!("\"{}\"", c.as_str()),
-            None => "normal".into(),
+        "content" => {
+            if let Some(raw_img) = style
+                .effects
+                .as_ref()
+                .and_then(|e| e.content_image_raw.as_deref())
+            {
+                raw_img.to_string()
+            } else {
+                match &style.box_model.content {
+                    Some(c) => format!("\"{}\"", c.as_str()),
+                    None => "normal".into(),
+                }
+            }
+        }
+        "column-rule-color" => style
+            .visual
+            .column_rule_color_computed
+            .as_deref()
+            .map_or_else(
+                || format_css_color_resolved(style.visual.column_rule_color, cc_resolved, dark),
+                |e| e.resolve(cc_resolved, dark, &eval).to_computed_css_string(),
+            ),
+        "caret-color" => style.text.caret_color_computed.as_deref().map_or_else(
+            || {
+                let c = style.text.caret_color.unwrap_or(CssColor::CurrentColor);
+                format_css_color_resolved(c, cc_resolved, dark)
+            },
+            |e| e.resolve(cc_resolved, dark, &eval).to_computed_css_string(),
+        ),
+        "fill" => match style.text.svg_fill {
+            Some(Some(c)) => format_css_color_resolved(c, cc_resolved, dark),
+            Some(None) => "none".into(),
+            None => "rgb(0, 0, 0)".into(),
         },
+        "stroke" => match style.text.svg_stroke {
+            Some(Some(c)) => format_css_color_resolved(c, cc_resolved, dark),
+            Some(None) | None => "none".into(),
+        },
+        "fill-rule" => if style.text.svg_fill_rule_even_odd {
+            "evenodd"
+        } else {
+            "nonzero"
+        }
+        .into(),
+        "clip-rule" => if style.text.svg_clip_rule_even_odd {
+            "evenodd"
+        } else {
+            "nonzero"
+        }
+        .into(),
+        "fill-opacity" => format_num(style.text.svg_fill_opacity),
+        "stroke-opacity" => format_num(style.text.svg_stroke_opacity),
+        "stroke-miterlimit" => format_num(style.text.svg_stroke_miterlimit),
+        "stroke-linecap" => style.text.svg_stroke_linecap.as_css_str().into(),
+        "stroke-linejoin" => style.text.svg_stroke_linejoin.as_css_str().into(),
+        "text-anchor" => style.text.svg_text_anchor.as_css_str().into(),
+        "dominant-baseline" => style.text.svg_dominant_baseline.as_css_str().into(),
+        "font-stretch" => format!("{}%", format_num(style.text.font_stretch_pct)),
+        "font-size-adjust" => match style.text.font_size_adjust {
+            Some(n) => format_num(n),
+            None => "none".into(),
+        },
+        "flood-opacity" => format_num(
+            style
+                .effects
+                .as_ref()
+                .and_then(|e| e.svg_flood_opacity)
+                .unwrap_or(1.0),
+        ),
+        "stop-opacity" => format_num(
+            style
+                .effects
+                .as_ref()
+                .and_then(|e| e.svg_stop_opacity)
+                .unwrap_or(1.0),
+        ),
+        "text-decoration-style" => style.visual.text_decoration_style.as_css_str().into(),
+        "background-attachment" => style.visual.background_attachment.as_str().to_string(),
+        "background-clip" => match style.visual.background_clip {
+            rix_css::BackgroundClipMode::BorderBox => "border-box",
+            rix_css::BackgroundClipMode::PaddingBox => "padding-box",
+            rix_css::BackgroundClipMode::ContentBox => "content-box",
+            rix_css::BackgroundClipMode::Text => "text",
+        }
+        .into(),
+        "background-origin" => match style.visual.background_origin {
+            rix_css::BackgroundClipMode::BorderBox => "border-box",
+            rix_css::BackgroundClipMode::PaddingBox => "padding-box",
+            rix_css::BackgroundClipMode::ContentBox => "content-box",
+            rix_css::BackgroundClipMode::Text => "padding-box",
+        }
+        .into(),
+        "list-style-image" => style
+            .visual
+            .list_style_image_raw
+            .clone()
+            .unwrap_or_else(|| "none".into()),
+        "border-image-source" => style
+            .visual
+            .border_image_source_raw
+            .clone()
+            .unwrap_or_else(|| "none".into()),
+        "perspective-origin" => {
+            let (bw, bh) = layout_box.map_or((0.0, 0.0), |lb| {
+                (lb.border_size.width, lb.border_size.height)
+            });
+            let (ox, oy) = style
+                .effects
+                .as_ref()
+                .and_then(|e| e.perspective_origin.as_ref())
+                .map_or(
+                    (
+                        LengthPercentage::Percent(0.5),
+                        LengthPercentage::Percent(0.5),
+                    ),
+                    |(x, y)| (x.clone(), y.clone()),
+                );
+            format!(
+                "{} {}",
+                format_px(ox.resolve_px(bw, &eval)),
+                format_px(oy.resolve_px(bh, &eval))
+            )
+        }
         "flex-direction" => match style.flex_grid.as_ref().map(|f| f.flex_direction) {
             Some(FlexDirectionMode::RowReverse) => "row-reverse",
             Some(FlexDirectionMode::Column) => "column",
@@ -7147,8 +7306,8 @@ pub fn format_computed_property_resolved(
         }
         "background-image" => {
             if let Some(raw) = style.visual.background_image_raw.as_deref() {
-                rix_css::substitution::parse_and_serialize_bg_image_fn(raw, &eval)
-                    .unwrap_or_else(|| "none".to_string())
+                rix_css::substitution::parse_and_serialize_bg_image_fn_with_scheme(raw, dark, &eval)
+                    .unwrap_or_else(|| raw.to_string())
             } else if !style.visual.background_layers.is_empty() {
                 style
                     .visual
@@ -7177,18 +7336,40 @@ pub fn format_computed_property_resolved(
                             }
                             format!("linear-gradient({})", parts.join(", "))
                         }
-                        rix_css::BackgroundImageValue::RadialGradient { stops, .. } => {
-                            let parts: Vec<String> = stops
-                                .iter()
-                                .map(|st| {
-                                    let col = format_css_color(st.color, style.text.color, dark);
-                                    if let Some(ref pos) = st.position {
-                                        format!("{col} {}", format_lp(pos, &eval))
-                                    } else {
-                                        col
-                                    }
-                                })
-                                .collect();
+                        rix_css::BackgroundImageValue::RadialGradient {
+                            shape_circle,
+                            cx,
+                            cy,
+                            stops,
+                        } => {
+                            let mut parts: Vec<String> = Vec::with_capacity(stops.len() + 1);
+                            let is_default_pos = matches!(cx, LengthPercentage::Percent(p) if (*p - 0.5).abs() < 1e-4)
+                                && matches!(cy, LengthPercentage::Percent(p) if (*p - 0.5).abs() < 1e-4);
+                            let mut prefix = String::new();
+                            if *shape_circle {
+                                prefix.push_str("circle");
+                            }
+                            if !is_default_pos {
+                                if !prefix.is_empty() {
+                                    prefix.push(' ');
+                                }
+                                prefix.push_str(&format!(
+                                    "at {} {}",
+                                    format_lp(cx, &eval),
+                                    format_lp(cy, &eval)
+                                ));
+                            }
+                            if !prefix.is_empty() {
+                                parts.push(prefix);
+                            }
+                            for st in stops {
+                                let col = format_css_color(st.color, style.text.color, dark);
+                                if let Some(ref pos) = st.position {
+                                    parts.push(format!("{col} {}", format_lp(pos, &eval)));
+                                } else {
+                                    parts.push(col);
+                                }
+                            }
                             format!("radial-gradient({})", parts.join(", "))
                         }
                     })
@@ -8116,7 +8297,50 @@ fn install_web_animations_and_typed_om(vm: &mut JsVm, host: &SharedHost) {
                 return Ok(JsValue::null());
             };
             let ch_px = Some(h_get.borrow_mut().ch_advance_px(&style));
-            let val_str = format_computed_property_resolved(&style, &prop, None, pfg, ch_px);
+            let lower_prop = prop.to_ascii_lowercase();
+            // CSS Typed OM / CSS Color 5: `computedStyleMap()` returns the computed value (where
+            // `currentcolor`-dependent relative/mixed colors preserve `currentcolor` unresolved
+            // against `color`, unlike `getComputedStyle()` which returns the resolved value).
+            let computed_color_override = match lower_prop.as_str() {
+                "background-color" => style
+                    .visual
+                    .background_color_computed
+                    .as_deref()
+                    .filter(|e| e.contains_current_color())
+                    .map(|e| e.to_specified_css_string()),
+                "border-top-color" => style.visual.border_color_computed[0]
+                    .as_deref()
+                    .filter(|e| e.contains_current_color())
+                    .map(|e| e.to_specified_css_string()),
+                "border-right-color" => style.visual.border_color_computed[1]
+                    .as_deref()
+                    .filter(|e| e.contains_current_color())
+                    .map(|e| e.to_specified_css_string()),
+                "border-bottom-color" => style.visual.border_color_computed[2]
+                    .as_deref()
+                    .filter(|e| e.contains_current_color())
+                    .map(|e| e.to_specified_css_string()),
+                "border-left-color" => style.visual.border_color_computed[3]
+                    .as_deref()
+                    .filter(|e| e.contains_current_color())
+                    .map(|e| e.to_specified_css_string()),
+                "outline-color" => style
+                    .visual
+                    .outline_color_computed
+                    .as_deref()
+                    .filter(|e| e.contains_current_color())
+                    .map(|e| e.to_specified_css_string()),
+                "text-decoration-color" => style
+                    .visual
+                    .text_decoration_color_computed
+                    .as_deref()
+                    .filter(|e| e.contains_current_color())
+                    .map(|e| e.to_specified_css_string()),
+                _ => None,
+            };
+            let val_str = computed_color_override.unwrap_or_else(|| {
+                format_computed_property_resolved(&style, &prop, None, pfg, ch_px)
+            });
             if val_str.is_empty() {
                 return Ok(JsValue::null());
             }

@@ -2,6 +2,7 @@
 //! gamut mapper, and CSSOM serializer.
 
 use cssparser::{Parser, ParserInput, Token};
+use serde::{Deserialize, Serialize};
 
 use crate::values::{ColorRgba, EvalContext, LengthUnit};
 
@@ -556,17 +557,18 @@ const XYZ_D65_TO_LIN_REC2020: [[f64; 3]; 3] = [
     [-19765991.0 / 29648200.0, 47925759.0 / 29648200.0, 467509.0 / 29648200.0],
     [792561.0 / 44930125.0, -1921689.0 / 44930125.0, 42328811.0 / 44930125.0],
 ];
+// Exact W3C CSS Color 4 §17 Bradford D65 <-> D50 chromatic adaptation matrices.
 #[rustfmt::skip]
 const D65_TO_D50: [[f64; 3]; 3] = [
-    [1.0479298208405488, 0.022946793341019088, -0.05019222954313557],
-    [0.029627815688159344, 0.990434484573249, -0.01707382502938514],
-    [-0.009243058152591178, 0.015055144896577895, 0.7518742899580008],
+    [1.0479297925449966, 0.022946870601609527, -0.050192266289205194],
+    [0.029627808770055674, 0.99043442675388, -0.01707379906341879],
+    [-0.009243040646204521, 0.015055191490298164, 0.751874281428137],
 ];
 #[rustfmt::skip]
 const D50_TO_D65: [[f64; 3]; 3] = [
-    [0.9554734527042182, -0.023098536874261423, 0.0632593086610217],
-    [-0.028369706963208136, 1.0099954580058226, 0.021041398966943008],
-    [0.012314001688319899, -0.020507696433477912, 1.3303659366080753],
+    [0.9554734214880752, -0.023098454948764523, 0.06325924320057066],
+    [-0.028369709333863583, 1.0099953980813041, 0.021041441191917306],
+    [0.012314014864481996, -0.02050764929889898, 1.330365926242124],
 ];
 #[rustfmt::skip]
 const XYZ_D65_TO_LMS: [[f64; 3]; 3] = [
@@ -621,8 +623,8 @@ fn srgb_hue(r: f64, g: f64, b: f64, max: f64, d: f64) -> f64 {
 fn srgb_to_hsl_opt([r, g, b]: [f64; 3]) -> [Option<f64>; 3] {
     let (max, min) = (r.max(g).max(b), r.min(g).min(b));
     let (d, l) = (max - min, (max + min) * 0.5);
-    if d <= 1e-9 {
-        return [None, Some(0.0), Some(l * 100.0)];
+    if d <= 1e-6 || l.abs() <= 1e-6 || (1.0 - l).abs() <= 1e-6 {
+        return [None, Some(0.0), Some(l.clamp(0.0, 1.0) * 100.0)];
     }
     let s = if l == 0.0 || l == 1.0 {
         0.0
@@ -1052,11 +1054,21 @@ impl ChannelMath {
                     .join(" * ");
                 wrap(s)
             }
-            Self::Div(a, b) => wrap(format!(
-                "{} / {}",
-                a.serialize_inner(true),
-                b.serialize_inner(true)
-            )),
+            Self::Div(a, b) => {
+                // CSS Values L4 §10.9.3: canonicalize `expr / const_num` into `(1 / const_num) * expr`.
+                if b.is_constant() && b.dim() == Some(MathDim::Number) {
+                    let denom = b.eval(&[], &EvalContext::default(), 100.0);
+                    if denom.is_finite() && denom != 0.0 {
+                        return Self::Mul(Box::new(Self::Num(1.0 / denom)), a.clone())
+                            .serialize_inner(wrap_parens);
+                    }
+                }
+                wrap(format!(
+                    "{} / {}",
+                    a.serialize_inner(true),
+                    b.serialize_inner(true)
+                ))
+            }
             Self::Func(name, args) => {
                 let inner = args
                     .iter()
@@ -1217,6 +1229,61 @@ impl ChannelMath {
         }
     }
 
+    fn contains_channel_ident(&self) -> bool {
+        match self {
+            Self::Ident(s) => !matches!(
+                s.to_ascii_lowercase().as_str(),
+                "pi" | "e" | "infinity" | "-infinity" | "nan"
+            ),
+            Self::Add(a, b) | Self::Sub(a, b) | Self::Mul(a, b) | Self::Div(a, b) => {
+                a.contains_channel_ident() || b.contains_channel_ident()
+            }
+            Self::Func(_, args) => args.iter().any(Self::contains_channel_ident),
+            Self::Random(r) => {
+                r.fixed.as_deref().is_some_and(Self::contains_channel_ident)
+                    || r.min.contains_channel_ident()
+                    || r.max.contains_channel_ident()
+                    || r.step.as_deref().is_some_and(Self::contains_channel_ident)
+            }
+            _ => false,
+        }
+    }
+
+    fn simplify_for_computed(&self, eval: &EvalContext) -> Self {
+        if !self.contains_channel_ident() {
+            let v = self.eval(&[], eval, 100.0);
+            return match self.dim() {
+                Some(MathDim::Percent) => Self::Pct(v),
+                Some(MathDim::Angle) => Self::AngleDeg(v),
+                Some(MathDim::Length) => Self::Length(v, LengthUnit::Px),
+                _ => Self::Num(v),
+            };
+        }
+        match self {
+            Self::Add(a, b) => Self::Add(
+                Box::new(a.simplify_for_computed(eval)),
+                Box::new(b.simplify_for_computed(eval)),
+            ),
+            Self::Sub(a, b) => Self::Sub(
+                Box::new(a.simplify_for_computed(eval)),
+                Box::new(b.simplify_for_computed(eval)),
+            ),
+            Self::Mul(a, b) => Self::Mul(
+                Box::new(a.simplify_for_computed(eval)),
+                Box::new(b.simplify_for_computed(eval)),
+            ),
+            Self::Div(a, b) => Self::Div(
+                Box::new(a.simplify_for_computed(eval)),
+                Box::new(b.simplify_for_computed(eval)),
+            ),
+            Self::Func(name, args) => Self::Func(
+                name.clone(),
+                args.iter().map(|a| a.simplify_for_computed(eval)).collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
     fn bind_random_property(&mut self, prop_name: &str, counter: &mut u32) {
         match self {
             Self::Add(a, b) | Self::Sub(a, b) | Self::Mul(a, b) | Self::Div(a, b) => {
@@ -1301,7 +1368,7 @@ const fn length_unit_str(u: LengthUnit) -> &'static str {
 // System Colors & CSS Color 4/5/6 Expression AST
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SystemColor {
     AccentColor,
     AccentColorText,
@@ -1371,9 +1438,9 @@ impl SystemColor {
             (Self::AccentColorText | Self::HighlightText | Self::SelectedItemText, _) => ColorRgba::WHITE,
             (Self::ActiveText, false) => ColorRgba::rgb(255, 0, 0),
             (Self::ActiveText, true) => ColorRgba::rgb(255, 102, 102),
-            (Self::ButtonBorder, false) => ColorRgba::rgb(118, 118, 118),
+            (Self::ButtonBorder, false) => ColorRgba::rgb(129, 127, 132),
             (Self::ButtonBorder, true) => ColorRgba::rgb(133, 133, 133),
-            (Self::ButtonFace, false) => ColorRgba::rgb(239, 239, 239),
+            (Self::ButtonFace, false) => ColorRgba::rgb(233, 233, 237),
             (Self::ButtonFace, true) => ColorRgba::rgb(107, 107, 107),
             (Self::ButtonText | Self::CanvasText | Self::FieldText, false) => ColorRgba::BLACK,
             (Self::ButtonText | Self::CanvasText | Self::FieldText, true) => ColorRgba::WHITE,
@@ -1496,6 +1563,110 @@ impl CssColorExpr {
             }
             Self::ContrastColor(inner) => inner.bind_random_inner(prop_name, counter),
             _ => {}
+        }
+    }
+
+    /// Simplifies a color expression to its CSS Color 4/5 computed-value representation:
+    /// resolves `light-dark()`, system colors, and tree-counting functions (`sibling-index()`)
+    /// while preserving `currentcolor`-dependent relative/mixed expressions unresolved against `color`.
+    #[must_use]
+    pub fn simplify_for_computed(&self, dark_mode: bool, eval: &EvalContext) -> Self {
+        match self {
+            Self::LightDark(l, d) => {
+                (if dark_mode { d } else { l }).simplify_for_computed(dark_mode, eval)
+            }
+            Self::System(sys, _) => {
+                Self::Resolved(ResolvedColor::from_rgba(sys.resolve(dark_mode)))
+            }
+            Self::CurrentColor => Self::CurrentColor,
+            Self::Named(_, rgba) => Self::Resolved(ResolvedColor::from_rgba(*rgba)),
+            Self::Resolved(r) => Self::Resolved(*r),
+            Self::Relative {
+                fn_name,
+                space,
+                origin,
+                c,
+                alpha,
+            } => {
+                let simp_origin = origin.simplify_for_computed(dark_mode, eval);
+                if !simp_origin.contains_current_color() {
+                    return Self::Resolved(self.resolve(
+                        ResolvedColor::BLACK_LEGACY,
+                        dark_mode,
+                        eval,
+                    ));
+                }
+                let simp_ch = |ch: &ChannelSpec| match ch {
+                    ChannelSpec::Expr {
+                        expr,
+                        is_pct,
+                        is_calc,
+                        ..
+                    } => {
+                        let se = expr.simplify_for_computed(eval);
+                        let still_calc = *is_calc && se.contains_channel_ident();
+                        let text = if still_calc {
+                            se.serialize_specified()
+                        } else {
+                            se.serialize_const()
+                        };
+                        ChannelSpec::Expr {
+                            expr: se,
+                            specified_text: text,
+                            is_pct: *is_pct,
+                            is_calc: still_calc,
+                        }
+                    }
+                    other => other.clone(),
+                };
+                Self::Relative {
+                    fn_name,
+                    space: *space,
+                    origin: Box::new(simp_origin),
+                    c: [simp_ch(&c[0]), simp_ch(&c[1]), simp_ch(&c[2])],
+                    alpha: alpha.as_ref().map(simp_ch),
+                }
+            }
+            Self::Alpha { origin, alpha } => {
+                let simp_origin = origin.simplify_for_computed(dark_mode, eval);
+                if !simp_origin.contains_current_color() {
+                    return Self::Resolved(self.resolve(
+                        ResolvedColor::BLACK_LEGACY,
+                        dark_mode,
+                        eval,
+                    ));
+                }
+                Self::Alpha {
+                    origin: Box::new(simp_origin),
+                    alpha: alpha.clone(),
+                }
+            }
+            Self::ColorMix {
+                space,
+                hue_method,
+                items,
+            } => {
+                let simp_items: Vec<(Self, Option<MixPct>)> = items
+                    .iter()
+                    .map(|(c, p)| (c.simplify_for_computed(dark_mode, eval), p.clone()))
+                    .collect();
+                if !simp_items.iter().any(|(c, _)| c.contains_current_color()) {
+                    return Self::Resolved(self.resolve(
+                        ResolvedColor::BLACK_LEGACY,
+                        dark_mode,
+                        eval,
+                    ));
+                }
+                Self::ColorMix {
+                    space: *space,
+                    hue_method: *hue_method,
+                    items: simp_items,
+                }
+            }
+            _ if !self.contains_current_color() => {
+                Self::Resolved(self.resolve(ResolvedColor::BLACK_LEGACY, dark_mode, eval))
+            }
+            other => other.clone(),
         }
     }
 
@@ -1784,6 +1955,25 @@ fn fmt_color_mix_specified(
         return format!("color-mix({pfx}{p1}, {p2})");
     }
     let single = items.len() == 1;
+    // CSS Color 5 §2.1: for 3+ color-mix items where some have literal percentages and some omit
+    // percentages, normalize omitted entries to `max(0%, (100% - sum_specified) / count_omitted)`.
+    let multi_omitted_fill: Option<f64> = if items.len() >= 3
+        && items.iter().any(|(_, p)| p.is_none())
+        && items.iter().any(|(_, p)| p.is_some())
+        && items
+            .iter()
+            .filter_map(|(_, p)| p.as_ref())
+            .all(|m| m.literal_pct.is_some())
+    {
+        let sum_spec: f64 = items
+            .iter()
+            .filter_map(|(_, p)| p.as_ref().and_then(|m| m.literal_pct))
+            .sum();
+        let unspec = items.iter().filter(|(_, p)| p.is_none()).count();
+        Some((100.0 - sum_spec).max(0.0) / unspec as f64)
+    } else {
+        None
+    };
     let joined = items
         .iter()
         .map(|(c, p)| {
@@ -1797,7 +1987,10 @@ fn fmt_color_mix_specified(
                     );
                     format!("{cs} {ps}")
                 }
-                None => cs,
+                None => match multi_omitted_fill {
+                    Some(fill) => format!("{cs} {}%", format_css_f64(fill)),
+                    None => cs,
+                },
             }
         })
         .collect::<Vec<_>>()

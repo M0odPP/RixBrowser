@@ -100,7 +100,7 @@ pub enum CssColor {
     CurrentColor,
     Rgba(ColorRgba),
     LightDark(ColorRgba, ColorRgba),
-    SystemAccent,
+    System(crate::color::SystemColor),
 }
 
 impl Default for CssColor {
@@ -115,7 +115,7 @@ impl CssColor {
         Self::Rgba(ColorRgba::rgba(r, g, b, a))
     }
 
-    /// Resolves `currentColor` and `light-dark()` into a concrete sRGBA color.
+    /// Resolves `currentColor`, `light-dark()`, and system colors into a concrete sRGBA color.
     #[must_use]
     pub const fn resolve(self, current_color: ColorRgba, dark_mode: bool) -> ColorRgba {
         match self {
@@ -128,8 +128,63 @@ impl CssColor {
                     light
                 }
             }
-            Self::SystemAccent => ColorRgba::rgb(0, 96, 223),
+            Self::System(sys) => sys.resolve(dark_mode),
         }
+    }
+
+    /// Resolves scheme-dependent colors (`light-dark()`, system colors) at computed-value time
+    /// per CSS Color 4 §6.2 while leaving `currentColor` intact for inheritance/resolved-value use.
+    #[must_use]
+    pub const fn resolve_for_computed(self, dark_mode: bool) -> Self {
+        match self {
+            Self::CurrentColor => Self::CurrentColor,
+            Self::Rgba(c) => Self::Rgba(c),
+            Self::LightDark(light, dark) => Self::Rgba(if dark_mode { dark } else { light }),
+            Self::System(sys) => Self::Rgba(sys.resolve(dark_mode)),
+        }
+    }
+}
+
+fn convert_lightning_system_color(
+    sc: lightningcss::values::color::SystemColor,
+) -> crate::color::SystemColor {
+    use crate::color::SystemColor as R;
+    use lightningcss::values::color::SystemColor as L;
+    match sc {
+        L::AccentColor => R::AccentColor,
+        L::AccentColorText => R::AccentColorText,
+        L::ActiveText => R::ActiveText,
+        L::ButtonBorder
+        | L::ActiveBorder
+        | L::InactiveBorder
+        | L::ThreeDDarkShadow
+        | L::ThreeDHighlight
+        | L::ThreeDLightShadow
+        | L::ThreeDShadow
+        | L::WindowFrame => R::ButtonBorder,
+        L::ButtonFace | L::ButtonHighlight | L::ButtonShadow | L::ThreeDFace => R::ButtonFace,
+        L::ButtonText => R::ButtonText,
+        L::Canvas
+        | L::ActiveCaption
+        | L::AppWorkspace
+        | L::Background
+        | L::InactiveCaption
+        | L::InfoBackground
+        | L::Menu
+        | L::Scrollbar
+        | L::Window => R::Canvas,
+        L::CanvasText | L::CaptionText | L::InfoText | L::MenuText | L::WindowText => R::CanvasText,
+        L::Field => R::Field,
+        L::FieldText => R::FieldText,
+        L::GrayText | L::InactiveCaptionText => R::GrayText,
+        L::Highlight => R::Highlight,
+        L::HighlightText => R::HighlightText,
+        L::LinkText => R::LinkText,
+        L::Mark => R::Mark,
+        L::MarkText => R::MarkText,
+        L::SelectedItem => R::SelectedItem,
+        L::SelectedItemText => R::SelectedItemText,
+        L::VisitedText => R::VisitedText,
     }
 }
 
@@ -146,7 +201,9 @@ pub fn convert_color(color: &LightningCssColor) -> Option<CssColor> {
             let d = convert_color(dark)?.resolve(ColorRgba::WHITE, true);
             Some(CssColor::LightDark(l, d))
         }
-        LightningCssColor::System(_) => Some(CssColor::SystemAccent),
+        LightningCssColor::System(sys) => {
+            Some(CssColor::System(convert_lightning_system_color(*sys)))
+        }
         other => match other.to_rgb().ok()? {
             LightningCssColor::RGBA(rgba) => {
                 Some(CssColor::rgba(rgba.red, rgba.green, rgba.blue, rgba.alpha))
@@ -924,10 +981,21 @@ pub enum CursorKind {
     Default,
     Pointer,
     Text,
+    VerticalText,
     Move,
+    AllScroll,
     NotAllowed,
+    NoDrop,
     Grab,
     Grabbing,
+    EResize,
+    NeResize,
+    NwResize,
+    NResize,
+    SeResize,
+    SwResize,
+    SResize,
+    WResize,
     EwResize,
     NsResize,
     NeswResize,
@@ -938,7 +1006,133 @@ pub enum CursorKind {
     Progress,
     Crosshair,
     Help,
+    ContextMenu,
+    Cell,
+    Alias,
+    Copy,
+    ZoomIn,
+    ZoomOut,
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum TextDecorationStyleMode {
+    #[default]
+    Solid,
+    Double,
+    Dotted,
+    Dashed,
+    Wavy,
+}
+
+impl TextDecorationStyleMode {
+    #[must_use]
+    pub const fn as_css_str(self) -> &'static str {
+        match self {
+            Self::Solid => "solid",
+            Self::Double => "double",
+            Self::Dotted => "dotted",
+            Self::Dashed => "dashed",
+            Self::Wavy => "wavy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum SvgStrokeLinecap {
+    #[default]
+    Butt,
+    Round,
+    Square,
+}
+
+impl SvgStrokeLinecap {
+    #[must_use]
+    pub const fn as_css_str(self) -> &'static str {
+        match self {
+            Self::Butt => "butt",
+            Self::Round => "round",
+            Self::Square => "square",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum SvgStrokeLinejoin {
+    #[default]
+    Miter,
+    MiterClip,
+    Round,
+    Bevel,
+    Arcs,
+}
+
+impl SvgStrokeLinejoin {
+    #[must_use]
+    pub const fn as_css_str(self) -> &'static str {
+        match self {
+            Self::Miter => "miter",
+            Self::MiterClip => "miter-clip",
+            Self::Round => "round",
+            Self::Bevel => "bevel",
+            Self::Arcs => "arcs",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum SvgTextAnchor {
+    #[default]
+    Start,
+    Middle,
+    End,
+}
+
+impl SvgTextAnchor {
+    #[must_use]
+    pub const fn as_css_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Middle => "middle",
+            Self::End => "end",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum SvgDominantBaseline {
+    #[default]
+    Auto,
+    Ideographic,
+    Alphabetic,
+    Hanging,
+    Mathematical,
+    Central,
+    Middle,
+    TextBottom,
+    TextTop,
+}
+
+impl SvgDominantBaseline {
+    #[must_use]
+    pub const fn as_css_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Ideographic => "ideographic",
+            Self::Alphabetic => "alphabetic",
+            Self::Hanging => "hanging",
+            Self::Mathematical => "mathematical",
+            Self::Central => "central",
+            Self::Middle => "middle",
+            Self::TextBottom => "text-bottom",
+            Self::TextTop => "text-top",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -2090,13 +2284,22 @@ impl TimingFunction {
             Self::EaseOut => "ease-out".to_string(),
             Self::EaseInOut => "ease-in-out".to_string(),
             Self::CubicBezier(a, b, c, d) => {
-                use crate::values_math::format_math_f64;
+                let fmt = |v: f64| -> String {
+                    let f = v as f32;
+                    if f == 0.0 {
+                        "0".to_string()
+                    } else if (f - f.round()).abs() < 1e-6 {
+                        format!("{}", f.round() as i64)
+                    } else {
+                        format!("{f}")
+                    }
+                };
                 format!(
                     "cubic-bezier({}, {}, {}, {})",
-                    format_math_f64(*a),
-                    format_math_f64(*b),
-                    format_math_f64(*c),
-                    format_math_f64(*d)
+                    fmt(*a),
+                    fmt(*b),
+                    fmt(*c),
+                    fmt(*d)
                 )
             }
             Self::Steps(n, pos) => match pos {
@@ -2776,31 +2979,39 @@ pub fn convert_cursor(cursor: &Cursor<'_>) -> CursorKind {
         CursorKeyword::Auto => CursorKind::Auto,
         CursorKeyword::Default => CursorKind::Default,
         CursorKeyword::Pointer => CursorKind::Pointer,
-        CursorKeyword::Text | CursorKeyword::VerticalText => CursorKind::Text,
-        CursorKeyword::Move | CursorKeyword::AllScroll => CursorKind::Move,
-        CursorKeyword::NotAllowed | CursorKeyword::NoDrop => CursorKind::NotAllowed,
+        CursorKeyword::Text => CursorKind::Text,
+        CursorKeyword::VerticalText => CursorKind::VerticalText,
+        CursorKeyword::Move => CursorKind::Move,
+        CursorKeyword::AllScroll => CursorKind::AllScroll,
+        CursorKeyword::NotAllowed => CursorKind::NotAllowed,
+        CursorKeyword::NoDrop => CursorKind::NoDrop,
         CursorKeyword::Grab => CursorKind::Grab,
         CursorKeyword::Grabbing => CursorKind::Grabbing,
-        CursorKeyword::EwResize | CursorKeyword::EResize | CursorKeyword::WResize => {
-            CursorKind::EwResize
-        }
-        CursorKeyword::NsResize | CursorKeyword::NResize | CursorKeyword::SResize => {
-            CursorKind::NsResize
-        }
-        CursorKeyword::NeswResize | CursorKeyword::NeResize | CursorKeyword::SwResize => {
-            CursorKind::NeswResize
-        }
-        CursorKeyword::NwseResize | CursorKeyword::NwResize | CursorKeyword::SeResize => {
-            CursorKind::NwseResize
-        }
+        CursorKeyword::EResize => CursorKind::EResize,
+        CursorKeyword::NeResize => CursorKind::NeResize,
+        CursorKeyword::NwResize => CursorKind::NwResize,
+        CursorKeyword::NResize => CursorKind::NResize,
+        CursorKeyword::SeResize => CursorKind::SeResize,
+        CursorKeyword::SwResize => CursorKind::SwResize,
+        CursorKeyword::SResize => CursorKind::SResize,
+        CursorKeyword::WResize => CursorKind::WResize,
+        CursorKeyword::EwResize => CursorKind::EwResize,
+        CursorKeyword::NsResize => CursorKind::NsResize,
+        CursorKeyword::NeswResize => CursorKind::NeswResize,
+        CursorKeyword::NwseResize => CursorKind::NwseResize,
         CursorKeyword::ColResize => CursorKind::ColResize,
         CursorKeyword::RowResize => CursorKind::RowResize,
         CursorKeyword::Wait => CursorKind::Wait,
         CursorKeyword::Progress => CursorKind::Progress,
         CursorKeyword::Crosshair => CursorKind::Crosshair,
         CursorKeyword::Help => CursorKind::Help,
+        CursorKeyword::ContextMenu => CursorKind::ContextMenu,
+        CursorKeyword::Cell => CursorKind::Cell,
+        CursorKeyword::Alias => CursorKind::Alias,
+        CursorKeyword::Copy => CursorKind::Copy,
+        CursorKeyword::ZoomIn => CursorKind::ZoomIn,
+        CursorKeyword::ZoomOut => CursorKind::ZoomOut,
         CursorKeyword::None => CursorKind::None,
-        _ => CursorKind::Auto,
     }
 }
 

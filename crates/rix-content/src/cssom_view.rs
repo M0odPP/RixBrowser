@@ -295,18 +295,9 @@ pub(crate) fn is_scroll_container_style(st: &ComputedStyle) -> bool {
 }
 
 pub(crate) fn establishes_fixed_cb(st: &ComputedStyle) -> bool {
-    if let Some(fx) = st.effects.as_deref() {
-        if !fx.transform.is_empty()
-            || !matches!(fx.translate, rix_css::values_math::TranslateSpec::None)
-            || !matches!(fx.rotate, rix_css::values_math::RotateSpec::None)
-            || !matches!(fx.scale, rix_css::values_math::ScaleSpec::None)
-            || !fx.filter.is_empty()
-            || (fx.contain & (0x04 | 0x10)) != 0
-        {
-            return true;
-        }
-    }
-    false
+    st.effects
+        .as_deref()
+        .is_some_and(|fx| fx.establishes_fixed_cb())
 }
 
 fn scroll_parent_for_node(host: &SharedHost, nid: NodeId) -> Option<NodeId> {

@@ -2640,6 +2640,52 @@ pub(crate) fn sync_iframe_node(
             bind_child_frame_functions(vm, proxy_h, &pre_keys);
         }
 
+        // Fetch external `<link rel="stylesheet" href="...">` resources inside the same-origin
+        // child sub-document so `iframeWindow.getComputedStyle(...)` cascades them identically.
+        if let Some(sub_id) = child_doc_nid {
+            let link_targets: Vec<(NodeId, String)> = {
+                let doc_rc = Rc::clone(&host.borrow().document);
+                let doc = doc_rc.borrow();
+                let mut links = Vec::new();
+                for n in doc.descendants(sub_id) {
+                    if let Some(NodeData::Element(el)) = doc.get(n) {
+                        if el.name.local.as_str().eq_ignore_ascii_case("link") {
+                            let is_ss = el.get_attribute("rel").is_some_and(|r| {
+                                r.split_ascii_whitespace()
+                                    .any(|t| t.eq_ignore_ascii_case("stylesheet"))
+                            });
+                            if is_ss {
+                                if let Some(href) = el.get_attribute("href") {
+                                    let trimmed = href.trim();
+                                    if !trimmed.is_empty() {
+                                        links.push((n, trimmed.to_string()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                links
+            };
+            if !link_targets.is_empty() {
+                let base_url = Url::parse(&resolved_url).ok();
+                for (link_nid, href) in link_targets {
+                    let css_url = base_url
+                        .as_ref()
+                        .and_then(|b| b.join(&href).ok())
+                        .map(|u| u.to_string())
+                        .unwrap_or(href);
+                    if css_url.starts_with("http://") || css_url.starts_with("https://") {
+                        if let Some((css_body, _, _)) =
+                            fetch_iframe_url_sync(net, &css_url, &effective_child_origin, None)
+                        {
+                            host.borrow_mut().subdoc_link_css.insert(link_nid, css_body);
+                        }
+                    }
+                }
+            }
+        }
+
         sync_window_indexed_frames(vm, frames);
 
         // Fire async `load` event on the `<iframe>` element (supports both `.onload` and inline `onload="..."`).

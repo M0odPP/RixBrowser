@@ -46,6 +46,11 @@ pub(crate) fn install_css_animations_and_transitions(
     install_css_transition_iface(vm, wa);
     install_css_animation_iface(vm, wa);
     host.borrow_mut().set_css_animations_managed(true);
+    let h_hook = Rc::clone(host);
+    let wa_hook = Rc::clone(wa);
+    host.borrow_mut().css_anim_flush_hook = Some(Rc::new(move |vm: &mut JsVm| {
+        flush_if_styles_dirty(vm, &h_hook, &wa_hook);
+    }));
 }
 
 fn install_transition_event(vm: &mut JsVm, events: &SharedEvents, wa: &SharedWebAnimations) {
@@ -526,11 +531,20 @@ fn build_processed_keyframes_from_rule(
             .collect();
         let mut props: Vec<(String, String, String)> = Vec::new();
         for d in &decls {
+            let eff_prop = if rix_css::is_logical_property(d.property) {
+                rix_css::resolve_logical_to_physical(
+                    d.property,
+                    target_style.text.writing_mode,
+                    target_style.text.direction,
+                )
+            } else {
+                d.property
+            };
             let css_p = d
                 .custom_name
                 .as_ref()
                 .map(|c| c.as_str().to_string())
-                .unwrap_or_else(|| d.property.css_name().to_string());
+                .unwrap_or_else(|| eff_prop.css_name().to_string());
             if !is_supported_animatable_css_prop(&css_p) {
                 continue;
             }
@@ -645,6 +659,7 @@ pub(crate) fn flush_and_sync_css_animations(
             && sys.css_transition_map.is_empty()
             && sys.css_animation_map.is_empty()
         {
+            host.borrow_mut().css_animations_sync_dirty = false;
             return;
         }
     }
@@ -1077,6 +1092,7 @@ pub(crate) fn flush_and_sync_css_animations(
         }
         let _ = host.borrow_mut().ensure_styles();
     }
+    host.borrow_mut().css_animations_sync_dirty = false;
 }
 
 fn cancel_css_owned_animation(

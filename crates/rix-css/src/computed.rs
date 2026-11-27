@@ -89,6 +89,12 @@ pub struct VisualStyle {
     pub background_size: Option<BackgroundSizeValue>,
     pub background_sizes: Vec<BackgroundSizeValue>,
     pub background_clip: BackgroundClipMode,
+    pub background_origin: BackgroundClipMode,
+    pub background_attachment: InternedStr,
+    pub list_style_image_raw: Option<String>,
+    pub border_image_source_raw: Option<String>,
+    pub column_rule_color: CssColor,
+    pub column_rule_color_computed: Option<Arc<crate::color::CssColorExpr>>,
     pub background_position: (LengthPercentage, LengthPercentage),
     pub background_positions: Vec<(LengthPercentage, LengthPercentage)>,
     pub background_repeats: Vec<BackgroundRepeatPair>,
@@ -104,6 +110,7 @@ pub struct VisualStyle {
     pub outline_width: f32,
     pub outline_offset: LengthPercentage,
     pub text_decoration_line: TextDecorationLine,
+    pub text_decoration_style: crate::values::TextDecorationStyleMode,
     pub text_decoration_color: Option<CssColor>,
     pub text_decoration_color_computed: Option<Arc<crate::color::CssColorExpr>>,
     pub text_decoration_inset: crate::anim_css::TextDecorationInsetValue,
@@ -127,6 +134,12 @@ impl Default for VisualStyle {
             background_size: None,
             background_sizes: Vec::new(),
             background_clip: BackgroundClipMode::BorderBox,
+            background_origin: BackgroundClipMode::PaddingBox,
+            background_attachment: rix_core::intern_str("scroll"),
+            list_style_image_raw: None,
+            border_image_source_raw: None,
+            column_rule_color: CssColor::CurrentColor,
+            column_rule_color_computed: None,
             background_position: (
                 LengthPercentage::Percent(0.0),
                 LengthPercentage::Percent(0.0),
@@ -145,6 +158,7 @@ impl Default for VisualStyle {
             outline_width: 0.0,
             outline_offset: LengthPercentage::Zero,
             text_decoration_line: TextDecorationLine::NONE,
+            text_decoration_style: crate::values::TextDecorationStyleMode::Solid,
             text_decoration_color: None,
             text_decoration_color_computed: None,
             text_decoration_inset: crate::anim_css::TextDecorationInsetValue::Auto,
@@ -230,10 +244,24 @@ pub struct InheritedTextStyle {
     pub svg_stroke: Option<Option<CssColor>>,
     /// Inherited SVG 2 presentation `fill-rule` (`true` = `evenodd`, `false` = `nonzero`).
     pub svg_fill_rule_even_odd: bool,
+    /// Inherited SVG 2 presentation `clip-rule` (`true` = `evenodd`, `false` = `nonzero`).
+    pub svg_clip_rule_even_odd: bool,
+    pub svg_fill_opacity: f32,
+    pub svg_stroke_opacity: f32,
+    pub svg_stroke_miterlimit: f32,
+    pub svg_stroke_linecap: crate::values::SvgStrokeLinecap,
+    pub svg_stroke_linejoin: crate::values::SvgStrokeLinejoin,
+    pub svg_text_anchor: crate::values::SvgTextAnchor,
+    pub svg_dominant_baseline: crate::values::SvgDominantBaseline,
+    pub font_stretch_pct: f32,
+    pub font_size_adjust: Option<f32>,
     pub list_style_type: crate::values::ListStyleTypeMode,
     pub list_style_position: crate::values::ListStylePositionMode,
     /// Inherited CSS UI L4 `accent-color` (`None` = `auto`).
     pub accent_color: Option<CssColor>,
+    /// Inherited CSS UI L4 `caret-color` (`None` = `auto`, resolved as `currentColor`).
+    pub caret_color: Option<CssColor>,
+    pub caret_color_computed: Option<Arc<crate::color::CssColorExpr>>,
     pub text_shadow: Vec<BoxShadowValue>,
     /// Full CSS Values L4/L5 evaluation context snapshot for this element (`em`/`rem`/`lh`/`rlh`/viewport/container/sibling).
     pub eval_ctx: EvalContext,
@@ -294,9 +322,21 @@ impl Default for InheritedTextStyle {
             svg_fill: None,
             svg_stroke: None,
             svg_fill_rule_even_odd: false,
+            svg_clip_rule_even_odd: false,
+            svg_fill_opacity: 1.0,
+            svg_stroke_opacity: 1.0,
+            svg_stroke_miterlimit: 4.0,
+            svg_stroke_linecap: crate::values::SvgStrokeLinecap::Butt,
+            svg_stroke_linejoin: crate::values::SvgStrokeLinejoin::Miter,
+            svg_text_anchor: crate::values::SvgTextAnchor::Start,
+            svg_dominant_baseline: crate::values::SvgDominantBaseline::Auto,
+            font_stretch_pct: 100.0,
+            font_size_adjust: None,
             list_style_type: crate::values::ListStyleTypeMode::Disc,
             list_style_position: crate::values::ListStylePositionMode::Outside,
             accent_color: None,
+            caret_color: None,
+            caret_color_computed: None,
             text_shadow: Vec::new(),
             eval_ctx: EvalContext::default(),
         }
@@ -475,11 +515,22 @@ pub struct EffectsStyle {
     pub container_type: u8,
     /// CSS Containment L3 `container-name` list (empty = `none`).
     pub container_name: Vec<InternedStr>,
+    /// CSS Transforms L2 `perspective-origin` `(x, y)` (defaults to `50% 50%`).
+    pub perspective_origin: Option<(LengthPercentage, LengthPercentage)>,
+    /// CSS Will Change L1: `true` if `will-change` lists a property that creates a containing block
+    /// for fixed/absolute positioned descendants (`transform`, `filter`, `perspective`, `backdrop-filter`, `contain`, `clip-path`, etc.).
+    pub will_change_creates_cb: bool,
+    /// Resolved `content` image string (e.g. `light-dark(url(...), url(...))`).
+    pub content_image_raw: Option<String>,
+    /// SVG `flood-opacity` (`None` = default `1.0`).
+    pub svg_flood_opacity: Option<f32>,
+    /// SVG `stop-opacity` (`None` = default `1.0`).
+    pub svg_stop_opacity: Option<f32>,
 }
 
 impl EffectsStyle {
     /// Returns `true` when this `EffectsStyle` causes its element to establish a containing block
-    /// for `position: fixed` (and `position: absolute`) descendants per CSS Transforms/Filters/Containment.
+    /// for `position: fixed` (and `position: absolute`) descendants per CSS Transforms/Filters/Containment/Will-Change.
     #[must_use]
     pub fn establishes_fixed_cb(&self) -> bool {
         !self.transform.is_empty()
@@ -490,6 +541,7 @@ impl EffectsStyle {
             || !self.filter.is_empty()
             || !self.backdrop_filter.is_empty()
             || (self.contain & (0x04 | 0x10)) != 0
+            || self.will_change_creates_cb
     }
 
     #[must_use]
@@ -1385,6 +1437,43 @@ pub fn resolve_element_style_with_context(
     random_doc_seed: u64,
     elem_attrs: &[(rix_dom::QualName, String)],
 ) -> ComputedStyle {
+    resolve_element_style_with_custom_override(
+        matched_rules,
+        pres_hint_decls,
+        inline_decls,
+        parent_style,
+        root_font_size_px,
+        media,
+        registered_props,
+        sibling_index,
+        sibling_count,
+        random_node_id,
+        random_doc_seed,
+        elem_attrs,
+        None,
+    )
+}
+
+/// Like [`resolve_element_style_with_context`], optionally overriding Pass 1 custom properties
+/// with an animation-updated [`CustomPropertyMap`] so `var()`-dependent standard properties
+/// re-substitute against animated custom properties.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_element_style_with_custom_override(
+    matched_rules: &[MatchedRule<'_>],
+    pres_hint_decls: &[SpecifiedDeclaration],
+    inline_decls: &[SpecifiedDeclaration],
+    parent_style: Option<&ComputedStyle>,
+    root_font_size_px: f32,
+    media: &MediaContext,
+    registered_props: Option<&HashMap<InternedStr, RegisteredProperty>>,
+    sibling_index: u32,
+    sibling_count: u32,
+    random_node_id: u64,
+    random_doc_seed: u64,
+    elem_attrs: &[(rix_dom::QualName, String)],
+    override_custom_props: Option<&Arc<CustomPropertyMap>>,
+) -> ComputedStyle {
     let mut style = match parent_style {
         Some(p) => ComputedStyle::inherit_from(p),
         None => ComputedStyle::default(),
@@ -1529,12 +1618,16 @@ pub fn resolve_element_style_with_context(
         InternedStr,
         SmallVec<[(CascadeKey, &SpecifiedDeclaration); 2]>,
     > = crate::cascade::FastMap::default();
-    for c in &candidates {
-        if let (PropertyIdKind::Custom, Some(name)) = (c.decl.property, &c.decl.custom_name) {
-            raw_custom
-                .entry(name.clone())
-                .or_default()
-                .push((c.key, c.decl));
+    if let Some(ov_cp) = override_custom_props {
+        style.custom_properties = Arc::clone(ov_cp);
+    } else {
+        for c in &candidates {
+            if let (PropertyIdKind::Custom, Some(name)) = (c.decl.property, &c.decl.custom_name) {
+                raw_custom
+                    .entry(name.clone())
+                    .or_default()
+                    .push((c.key, c.decl));
+            }
         }
     }
     // Pre-select winning custom declarations and filter out exact no-ops (e.g. Tailwind v4's
@@ -1615,7 +1708,9 @@ pub fn resolve_element_style_with_context(
             active_custom.push((name.clone(), winner));
         }
     }
-    if !active_custom.is_empty() || needs_reg_seed || !parent_dirty_non_inherited.is_empty() {
+    if override_custom_props.is_none()
+        && (!active_custom.is_empty() || needs_reg_seed || !parent_dirty_non_inherited.is_empty())
+    {
         let mut custom_map = CustomPropertyMap::child_of_with_capacity(
             &style.custom_properties,
             active_custom.len() + parent_dirty_non_inherited.len(),
@@ -2273,7 +2368,7 @@ pub fn resolve_element_style_with_context(
         && style.color_scheme_dark
         && parent_style.is_none_or(|p| !p.color_scheme_dark)
     {
-        Arc::make_mut(&mut style.text).color = ColorRgba::rgb(241, 245, 249);
+        Arc::make_mut(&mut style.text).color = crate::color::SystemColor::CanvasText.resolve(true);
     }
 
     // Pass 2d: Resolve list-sizing properties (`transition-property`, `animation-name`) first
@@ -3054,11 +3149,8 @@ pub fn apply_declaration(
             let res = expr.resolve(current_resolved, effective_dark, eval);
             let vis = Arc::make_mut(&mut style.visual);
             vis.background_color = res.to_srgb_u8();
-            vis.background_color_computed = Some(Arc::new(if expr.contains_current_color() {
-                (**expr).clone()
-            } else {
-                crate::color::CssColorExpr::Resolved(res)
-            }));
+            let simplified = expr.simplify_for_computed(effective_dark, eval);
+            vis.background_color_computed = Some(Arc::new(simplified));
         }
         (PropertyIdKind::BackgroundLayers, PropertyValue::BackgroundLayers(l)) => {
             let v = Arc::make_mut(&mut style.visual);
@@ -3068,7 +3160,13 @@ pub fn apply_declaration(
         (PropertyIdKind::BackgroundLayers, PropertyValue::BackgroundImageRaw(raw)) => {
             let v = Arc::make_mut(&mut style.visual);
             v.background_layers.clear();
-            v.background_image_raw = Some(raw.clone());
+            let resolved = crate::substitution::parse_and_serialize_bg_image_fn_with_scheme(
+                raw,
+                effective_dark,
+                eval,
+            )
+            .unwrap_or_else(|| raw.clone());
+            v.background_image_raw = Some(resolved);
         }
         (PropertyIdKind::BackgroundSize, PropertyValue::BackgroundSize(sz)) => {
             let v = Arc::make_mut(&mut style.visual);
@@ -3093,6 +3191,117 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::BackgroundClip, PropertyValue::BackgroundClip(clip)) => {
             Arc::make_mut(&mut style.visual).background_clip = *clip;
+        }
+        (PropertyIdKind::BackgroundOrigin, PropertyValue::BackgroundClip(orig)) => {
+            Arc::make_mut(&mut style.visual).background_origin = *orig;
+        }
+        (PropertyIdKind::BackgroundAttachment, PropertyValue::BackgroundAttachment(att)) => {
+            Arc::make_mut(&mut style.visual).background_attachment = att.clone();
+        }
+        (PropertyIdKind::ListStyleImage, PropertyValue::BackgroundImageRaw(raw)) => {
+            let resolved = if raw.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(
+                    crate::substitution::resolve_light_dark_image_fn(
+                        raw,
+                        effective_dark,
+                        eval,
+                        false,
+                    )
+                    .unwrap_or_else(|| raw.clone()),
+                )
+            };
+            Arc::make_mut(&mut style.visual).list_style_image_raw = resolved;
+        }
+        (PropertyIdKind::BorderImageSource, PropertyValue::BackgroundImageRaw(raw)) => {
+            let resolved = if raw.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(
+                    crate::substitution::resolve_light_dark_image_fn(
+                        raw,
+                        effective_dark,
+                        eval,
+                        false,
+                    )
+                    .unwrap_or_else(|| raw.clone()),
+                )
+            };
+            Arc::make_mut(&mut style.visual).border_image_source_raw = resolved;
+        }
+        (PropertyIdKind::ColumnRuleColor, PropertyValue::Color(c)) => {
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.column_rule_color = c.resolve_for_computed(effective_dark);
+            vis.column_rule_color_computed = None;
+        }
+        (PropertyIdKind::ColumnRuleColor, PropertyValue::Color4(expr)) => {
+            let res = expr.resolve(current_resolved, effective_dark, eval);
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.column_rule_color = CssColor::Rgba(res.to_srgb_u8());
+            vis.column_rule_color_computed =
+                Some(Arc::new(expr.simplify_for_computed(effective_dark, eval)));
+        }
+        (PropertyIdKind::CaretColor, PropertyValue::Color(c)) => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.caret_color = if *c == CssColor::CurrentColor {
+                None
+            } else {
+                Some(c.resolve_for_computed(effective_dark))
+            };
+            txt.caret_color_computed = None;
+        }
+        (PropertyIdKind::CaretColor, PropertyValue::Color4(expr)) => {
+            let res = expr.resolve(current_resolved, effective_dark, eval);
+            let txt = Arc::make_mut(&mut style.text);
+            txt.caret_color = Some(CssColor::Rgba(res.to_srgb_u8()));
+            txt.caret_color_computed =
+                Some(Arc::new(expr.simplify_for_computed(effective_dark, eval)));
+        }
+        (PropertyIdKind::SvgClipRule, PropertyValue::SvgFillRuleEvenOdd(v)) => {
+            Arc::make_mut(&mut style.text).svg_clip_rule_even_odd = *v;
+        }
+        (PropertyIdKind::SvgFillOpacity, PropertyValue::Number(v)) => {
+            Arc::make_mut(&mut style.text).svg_fill_opacity = v.clamp(0.0, 1.0);
+        }
+        (PropertyIdKind::SvgStrokeOpacity, PropertyValue::Number(v)) => {
+            Arc::make_mut(&mut style.text).svg_stroke_opacity = v.clamp(0.0, 1.0);
+        }
+        (PropertyIdKind::SvgStrokeMiterlimit, PropertyValue::Number(v)) => {
+            Arc::make_mut(&mut style.text).svg_stroke_miterlimit = *v;
+        }
+        (PropertyIdKind::SvgStrokeLinecap, PropertyValue::SvgStrokeLinecap(v)) => {
+            Arc::make_mut(&mut style.text).svg_stroke_linecap = *v;
+        }
+        (PropertyIdKind::SvgStrokeLinejoin, PropertyValue::SvgStrokeLinejoin(v)) => {
+            Arc::make_mut(&mut style.text).svg_stroke_linejoin = *v;
+        }
+        (PropertyIdKind::SvgTextAnchor, PropertyValue::SvgTextAnchor(v)) => {
+            Arc::make_mut(&mut style.text).svg_text_anchor = *v;
+        }
+        (PropertyIdKind::SvgDominantBaseline, PropertyValue::SvgDominantBaseline(v)) => {
+            Arc::make_mut(&mut style.text).svg_dominant_baseline = *v;
+        }
+        (PropertyIdKind::FontStretch, PropertyValue::Number(v)) => {
+            Arc::make_mut(&mut style.text).font_stretch_pct = *v;
+        }
+        (PropertyIdKind::FontSizeAdjust, PropertyValue::OptNumber(v)) => {
+            Arc::make_mut(&mut style.text).font_size_adjust = *v;
+        }
+        (PropertyIdKind::SvgFloodOpacity, PropertyValue::Number(v)) => {
+            style.effects_mut().svg_flood_opacity = Some(v.clamp(0.0, 1.0));
+        }
+        (PropertyIdKind::SvgStopOpacity, PropertyValue::Number(v)) => {
+            style.effects_mut().svg_stop_opacity = Some(v.clamp(0.0, 1.0));
+        }
+        (PropertyIdKind::TextDecorationStyle, PropertyValue::TextDecorationStyle(v)) => {
+            Arc::make_mut(&mut style.visual).text_decoration_style = *v;
+        }
+        (PropertyIdKind::PerspectiveOrigin, PropertyValue::BgPosition(x, y)) => {
+            style.effects_mut().perspective_origin = Some((x.clone(), y.clone()));
+        }
+        (PropertyIdKind::WillChange, PropertyValue::WillChangeCreatesCb(v)) => {
+            style.effects_mut().will_change_creates_cb = *v;
         }
         (PropertyIdKind::MaskImage, PropertyValue::MaskImage(img)) => {
             Arc::make_mut(&mut style.visual).mask_image = img.clone();
@@ -3119,22 +3328,23 @@ pub fn apply_declaration(
             | PropertyIdKind::BorderLeftColor,
             PropertyValue::Color(c),
         ) => {
+            let resolved_c = c.resolve_for_computed(effective_dark);
             let vis = Arc::make_mut(&mut style.visual);
             let idx = match decl.property {
                 PropertyIdKind::BorderTopColor => {
-                    vis.border_color.top = *c;
+                    vis.border_color.top = resolved_c;
                     0
                 }
                 PropertyIdKind::BorderRightColor => {
-                    vis.border_color.right = *c;
+                    vis.border_color.right = resolved_c;
                     1
                 }
                 PropertyIdKind::BorderBottomColor => {
-                    vis.border_color.bottom = *c;
+                    vis.border_color.bottom = resolved_c;
                     2
                 }
                 _ => {
-                    vis.border_color.left = *c;
+                    vis.border_color.left = resolved_c;
                     3
                 }
             };
@@ -3149,11 +3359,7 @@ pub fn apply_declaration(
         ) => {
             let res = expr.resolve(current_resolved, effective_dark, eval);
             let c = CssColor::Rgba(res.to_srgb_u8());
-            let stored = Some(Arc::new(if expr.contains_current_color() {
-                (**expr).clone()
-            } else {
-                crate::color::CssColorExpr::Resolved(res)
-            }));
+            let stored = Some(Arc::new(expr.simplify_for_computed(effective_dark, eval)));
             let vis = Arc::make_mut(&mut style.visual);
             let idx = match decl.property {
                 PropertyIdKind::BorderTopColor => {
@@ -3189,18 +3395,15 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::OutlineColor, PropertyValue::Color(c)) => {
             let vis = Arc::make_mut(&mut style.visual);
-            vis.outline_color = *c;
+            vis.outline_color = c.resolve_for_computed(effective_dark);
             vis.outline_color_computed = None;
         }
         (PropertyIdKind::OutlineColor, PropertyValue::Color4(expr)) => {
             let res = expr.resolve(current_resolved, effective_dark, eval);
             let vis = Arc::make_mut(&mut style.visual);
             vis.outline_color = CssColor::Rgba(res.to_srgb_u8());
-            vis.outline_color_computed = Some(Arc::new(if expr.contains_current_color() {
-                (**expr).clone()
-            } else {
-                crate::color::CssColorExpr::Resolved(res)
-            }));
+            vis.outline_color_computed =
+                Some(Arc::new(expr.simplify_for_computed(effective_dark, eval)));
         }
         (PropertyIdKind::OutlineStyle, PropertyValue::LineStyle(s)) => {
             Arc::make_mut(&mut style.visual).outline_style = *s;
@@ -3219,18 +3422,15 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::TextDecorationColor, PropertyValue::Color(c)) => {
             let vis = Arc::make_mut(&mut style.visual);
-            vis.text_decoration_color = Some(*c);
+            vis.text_decoration_color = Some(c.resolve_for_computed(effective_dark));
             vis.text_decoration_color_computed = None;
         }
         (PropertyIdKind::TextDecorationColor, PropertyValue::Color4(expr)) => {
             let res = expr.resolve(current_resolved, effective_dark, eval);
             let vis = Arc::make_mut(&mut style.visual);
             vis.text_decoration_color = Some(CssColor::Rgba(res.to_srgb_u8()));
-            vis.text_decoration_color_computed = Some(Arc::new(if expr.contains_current_color() {
-                (**expr).clone()
-            } else {
-                crate::color::CssColorExpr::Resolved(res)
-            }));
+            vis.text_decoration_color_computed =
+                Some(Arc::new(expr.simplify_for_computed(effective_dark, eval)));
         }
         (PropertyIdKind::UserSelect, PropertyValue::UserSelect(u)) => {
             Arc::make_mut(&mut style.visual).user_select = *u;
@@ -3559,7 +3759,14 @@ pub fn apply_declaration(
 
         // Effects (allocated lazily)
         (PropertyIdKind::BoxShadow, PropertyValue::BoxShadow(v)) => {
-            style.effects_mut().box_shadow = v.clone();
+            style.effects_mut().box_shadow = v
+                .iter()
+                .map(|sh| {
+                    let mut c = sh.clone();
+                    c.color = c.color.resolve_for_computed(effective_dark);
+                    c
+                })
+                .collect();
         }
         (PropertyIdKind::Transform, PropertyValue::Transform(v)) => {
             let eff = style.effects_mut();
@@ -3879,7 +4086,8 @@ pub fn apply_declaration(
             Arc::make_mut(&mut style.text).color_interpolation_filters = *v;
         }
         (PropertyIdKind::SvgFill, PropertyValue::SvgPaint(v)) => {
-            Arc::make_mut(&mut style.text).svg_fill = Some(*v);
+            Arc::make_mut(&mut style.text).svg_fill =
+                Some(v.map(|c| c.resolve_for_computed(effective_dark)));
         }
         (PropertyIdKind::SvgFill, PropertyValue::Color4(expr)) => {
             let resolved = expr
@@ -3892,7 +4100,8 @@ pub fn apply_declaration(
             Arc::make_mut(&mut style.text).svg_fill = Some(Some(CssColor::Rgba(resolved)));
         }
         (PropertyIdKind::SvgStroke, PropertyValue::SvgPaint(v)) => {
-            Arc::make_mut(&mut style.text).svg_stroke = Some(*v);
+            Arc::make_mut(&mut style.text).svg_stroke =
+                Some(v.map(|c| c.resolve_for_computed(effective_dark)));
         }
         (PropertyIdKind::SvgStroke, PropertyValue::Color4(expr)) => {
             let resolved = expr
@@ -4186,6 +4395,16 @@ pub fn apply_declaration(
         }
         (PropertyIdKind::Content, PropertyValue::Content(v)) => {
             Arc::make_mut(&mut style.box_model).content = v.clone();
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).content_image_raw = None;
+            }
+        }
+        (PropertyIdKind::Content, PropertyValue::BackgroundImageRaw(raw)) => {
+            Arc::make_mut(&mut style.box_model).content = None;
+            let resolved =
+                crate::substitution::resolve_light_dark_image_fn(raw, effective_dark, eval, false)
+                    .unwrap_or_else(|| raw.clone());
+            style.effects_mut().content_image_raw = Some(resolved);
         }
         (PropertyIdKind::WritingMode, PropertyValue::WritingMode(v)) => {
             Arc::make_mut(&mut style.text).writing_mode = *v;
@@ -4320,6 +4539,11 @@ fn copy_property_from_parent(
             let vis = Arc::make_mut(&mut style.visual);
             vis.background_color = parent.visual.background_color;
             vis.background_color_computed = parent.visual.background_color_computed.clone();
+        }
+        PropertyIdKind::BackgroundLayers => {
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.background_layers = parent.visual.background_layers.clone();
+            vis.background_image_raw = parent.visual.background_image_raw.clone();
         }
         PropertyIdKind::BackgroundSize => {
             let v = Arc::make_mut(&mut style.visual);
@@ -4901,6 +5125,92 @@ fn copy_property_from_parent(
         PropertyIdKind::SvgFillRule => {
             Arc::make_mut(&mut style.text).svg_fill_rule_even_odd =
                 parent.text.svg_fill_rule_even_odd;
+        }
+        PropertyIdKind::SvgClipRule => {
+            Arc::make_mut(&mut style.text).svg_clip_rule_even_odd =
+                parent.text.svg_clip_rule_even_odd;
+        }
+        PropertyIdKind::SvgFillOpacity => {
+            Arc::make_mut(&mut style.text).svg_fill_opacity = parent.text.svg_fill_opacity;
+        }
+        PropertyIdKind::SvgStrokeOpacity => {
+            Arc::make_mut(&mut style.text).svg_stroke_opacity = parent.text.svg_stroke_opacity;
+        }
+        PropertyIdKind::SvgStrokeMiterlimit => {
+            Arc::make_mut(&mut style.text).svg_stroke_miterlimit =
+                parent.text.svg_stroke_miterlimit;
+        }
+        PropertyIdKind::SvgStrokeLinecap => {
+            Arc::make_mut(&mut style.text).svg_stroke_linecap = parent.text.svg_stroke_linecap;
+        }
+        PropertyIdKind::SvgStrokeLinejoin => {
+            Arc::make_mut(&mut style.text).svg_stroke_linejoin = parent.text.svg_stroke_linejoin;
+        }
+        PropertyIdKind::SvgTextAnchor => {
+            Arc::make_mut(&mut style.text).svg_text_anchor = parent.text.svg_text_anchor;
+        }
+        PropertyIdKind::SvgDominantBaseline => {
+            Arc::make_mut(&mut style.text).svg_dominant_baseline =
+                parent.text.svg_dominant_baseline;
+        }
+        PropertyIdKind::FontStretch => {
+            Arc::make_mut(&mut style.text).font_stretch_pct = parent.text.font_stretch_pct;
+        }
+        PropertyIdKind::FontSizeAdjust => {
+            Arc::make_mut(&mut style.text).font_size_adjust = parent.text.font_size_adjust;
+        }
+        PropertyIdKind::SvgFloodOpacity => {
+            let v = parent.effects.as_ref().and_then(|e| e.svg_flood_opacity);
+            if v.is_some() || style.effects.is_some() {
+                style.effects_mut().svg_flood_opacity = v;
+            }
+        }
+        PropertyIdKind::SvgStopOpacity => {
+            let v = parent.effects.as_ref().and_then(|e| e.svg_stop_opacity);
+            if v.is_some() || style.effects.is_some() {
+                style.effects_mut().svg_stop_opacity = v;
+            }
+        }
+        PropertyIdKind::TextDecorationStyle => {
+            Arc::make_mut(&mut style.visual).text_decoration_style =
+                parent.visual.text_decoration_style;
+        }
+        PropertyIdKind::ColumnRuleColor => {
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.column_rule_color = parent.visual.column_rule_color;
+            vis.column_rule_color_computed = parent.visual.column_rule_color_computed.clone();
+        }
+        PropertyIdKind::CaretColor => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.caret_color = parent.text.caret_color;
+            txt.caret_color_computed = parent.text.caret_color_computed.clone();
+        }
+        PropertyIdKind::BackgroundOrigin => {
+            Arc::make_mut(&mut style.visual).background_origin = parent.visual.background_origin;
+        }
+        PropertyIdKind::BackgroundAttachment => {
+            Arc::make_mut(&mut style.visual).background_attachment =
+                parent.visual.background_attachment.clone();
+        }
+        PropertyIdKind::ListStyleImage => {
+            Arc::make_mut(&mut style.visual).list_style_image_raw =
+                parent.visual.list_style_image_raw.clone();
+        }
+        PropertyIdKind::BorderImageSource => {
+            Arc::make_mut(&mut style.visual).border_image_source_raw =
+                parent.visual.border_image_source_raw.clone();
+        }
+        PropertyIdKind::PerspectiveOrigin => {
+            style.effects_mut().perspective_origin = parent
+                .effects
+                .as_ref()
+                .and_then(|e| e.perspective_origin.clone());
+        }
+        PropertyIdKind::WillChange => {
+            style.effects_mut().will_change_creates_cb = parent
+                .effects
+                .as_ref()
+                .is_some_and(|e| e.will_change_creates_cb);
         }
         PropertyIdKind::BoxShadow => {
             style.effects_mut().box_shadow = parent
@@ -5771,6 +6081,85 @@ fn reset_property_to_initial(style: &mut ComputedStyle, prop: PropertyIdKind) {
         }
         PropertyIdKind::SvgFillRule => {
             Arc::make_mut(&mut style.text).svg_fill_rule_even_odd = false;
+        }
+        PropertyIdKind::SvgClipRule => {
+            Arc::make_mut(&mut style.text).svg_clip_rule_even_odd = false;
+        }
+        PropertyIdKind::SvgFillOpacity => {
+            Arc::make_mut(&mut style.text).svg_fill_opacity = 1.0;
+        }
+        PropertyIdKind::SvgStrokeOpacity => {
+            Arc::make_mut(&mut style.text).svg_stroke_opacity = 1.0;
+        }
+        PropertyIdKind::SvgStrokeMiterlimit => {
+            Arc::make_mut(&mut style.text).svg_stroke_miterlimit = 4.0;
+        }
+        PropertyIdKind::SvgStrokeLinecap => {
+            Arc::make_mut(&mut style.text).svg_stroke_linecap =
+                crate::values::SvgStrokeLinecap::Butt;
+        }
+        PropertyIdKind::SvgStrokeLinejoin => {
+            Arc::make_mut(&mut style.text).svg_stroke_linejoin =
+                crate::values::SvgStrokeLinejoin::Miter;
+        }
+        PropertyIdKind::SvgTextAnchor => {
+            Arc::make_mut(&mut style.text).svg_text_anchor = crate::values::SvgTextAnchor::Start;
+        }
+        PropertyIdKind::SvgDominantBaseline => {
+            Arc::make_mut(&mut style.text).svg_dominant_baseline =
+                crate::values::SvgDominantBaseline::Auto;
+        }
+        PropertyIdKind::FontStretch => {
+            Arc::make_mut(&mut style.text).font_stretch_pct = 100.0;
+        }
+        PropertyIdKind::FontSizeAdjust => {
+            Arc::make_mut(&mut style.text).font_size_adjust = None;
+        }
+        PropertyIdKind::SvgFloodOpacity => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).svg_flood_opacity = None;
+            }
+        }
+        PropertyIdKind::SvgStopOpacity => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).svg_stop_opacity = None;
+            }
+        }
+        PropertyIdKind::TextDecorationStyle => {
+            Arc::make_mut(&mut style.visual).text_decoration_style =
+                crate::values::TextDecorationStyleMode::Solid;
+        }
+        PropertyIdKind::ColumnRuleColor => {
+            let vis = Arc::make_mut(&mut style.visual);
+            vis.column_rule_color = CssColor::CurrentColor;
+            vis.column_rule_color_computed = None;
+        }
+        PropertyIdKind::CaretColor => {
+            let txt = Arc::make_mut(&mut style.text);
+            txt.caret_color = None;
+            txt.caret_color_computed = None;
+        }
+        PropertyIdKind::BackgroundOrigin => {
+            Arc::make_mut(&mut style.visual).background_origin = BackgroundClipMode::PaddingBox;
+        }
+        PropertyIdKind::BackgroundAttachment => {
+            Arc::make_mut(&mut style.visual).background_attachment = rix_core::intern_str("scroll");
+        }
+        PropertyIdKind::ListStyleImage => {
+            Arc::make_mut(&mut style.visual).list_style_image_raw = None;
+        }
+        PropertyIdKind::BorderImageSource => {
+            Arc::make_mut(&mut style.visual).border_image_source_raw = None;
+        }
+        PropertyIdKind::PerspectiveOrigin => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).perspective_origin = None;
+            }
+        }
+        PropertyIdKind::WillChange => {
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).will_change_creates_cb = false;
+            }
         }
         PropertyIdKind::BoxShadow => {
             if let Some(eff) = &mut style.effects {

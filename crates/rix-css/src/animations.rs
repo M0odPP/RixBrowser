@@ -320,6 +320,7 @@ pub struct ActiveTransition {
 /// Portable animation/transition state preserved across stylesheet rebuilds.
 #[derive(Debug, Default, Clone)]
 pub struct AnimationStateSnapshot {
+    pub inline_color_exprs: HashMap<(NodeId, PropertyIdKind), Arc<CssColorExpr>>,
     pub before_change: HashMap<NodeId, Arc<ComputedStyle>>,
     pub pseudo_before_change:
         HashMap<(NodeId, crate::selector::RixPseudoElement), Arc<ComputedStyle>>,
@@ -358,6 +359,22 @@ pub fn resolve_transition_property_name(raw: &str, style: &ComputedStyle) -> Opt
     let pk = PropertyIdKind::from_name(&raw.to_ascii_lowercase())?;
     let phys = if is_logical_property(pk) { resolve_logical_to_physical(pk, style.text.writing_mode, style.text.direction) } else { pk };
     Some((phys, None))
+}
+
+#[rustfmt::skip]
+fn expand_transition_property_names(raw: &str, style: &ComputedStyle) -> Vec<(PropertyIdKind, Option<InternedStr>)> {
+    if raw.starts_with("--") { return vec![(PropertyIdKind::Custom, Some(rix_core::intern_str(raw)))]; }
+    let Some(pk) = PropertyIdKind::from_name(&raw.to_ascii_lowercase()) else { return Vec::new(); };
+    let longhands = pk.shorthand_longhands();
+    if longhands.len() > 1 {
+        longhands.into_iter().map(|lh| {
+            let phys = if is_logical_property(lh) { resolve_logical_to_physical(lh, style.text.writing_mode, style.text.direction) } else { lh };
+            (phys, None)
+        }).collect()
+    } else {
+        let phys = if is_logical_property(pk) { resolve_logical_to_physical(pk, style.text.writing_mode, style.text.direction) } else { pk };
+        vec![(phys, None)]
+    }
 }
 
 #[must_use]
@@ -826,12 +843,37 @@ struct NormalizedStop {
 
 #[rustfmt::skip]
 fn resolve_kf_decls(decls: &[SpecifiedDeclaration], style: &ComputedStyle) -> Vec<SpecifiedDeclaration> {
-    decls.iter().filter_map(|d| {
-        if matches!(d.property, PropertyIdKind::AnimationComposition | PropertyIdKind::AnimationTimingFunction) { return None; }
+    let mut out = Vec::with_capacity(decls.len());
+    for d in decls {
+        if matches!(d.property, PropertyIdKind::AnimationComposition | PropertyIdKind::AnimationTimingFunction) { continue; }
+        // Expand `var(...)` inside keyframes (including logical & physical shorthands like `inset-block: var(--x)` and `border: var(--b)`).
+        if d.property != PropertyIdKind::Custom {
+            if let PropertyValue::Unresolved(toks) = &d.value {
+                if let Some(exp) = crate::computed::resolve_var_tokens(toks, &style.custom_properties) {
+                    let s = crate::properties::serialize_css_tokens(&exp);
+                    let mut missing = Vec::new();
+                    let parsed = crate::properties::parse_inline_style(
+                        &format!("{}: {}", d.property.css_name(), s.trim()),
+                        &mut missing,
+                    );
+                    for mut pd in parsed {
+                        pd.order = d.order;
+                        if is_logical_property(pd.property) {
+                            pd.property = resolve_logical_to_physical(pd.property, style.text.writing_mode, style.text.direction);
+                        }
+                        if !is_property_not_animatable(pd.property) {
+                            out.push(pd);
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
         let mut r = d.clone();
         if is_logical_property(r.property) { r.property = resolve_logical_to_physical(r.property, style.text.writing_mode, style.text.direction); }
-        (!is_property_not_animatable(r.property)).then_some(r)
-    }).collect()
+        if !is_property_not_animatable(r.property) { out.push(r); }
+    }
+    out
 }
 
 #[rustfmt::skip]
@@ -860,7 +902,11 @@ fn build_web_keyframe_stops(kfs: &[WebAnimationKeyframe], style: &ComputedStyle)
         } else {
             kf.offset.unwrap_or_else(|| if n <= 1 { 1.0 } else { i as f32 / (n - 1) as f32 })
         };
-        NormalizedStop { offset: off.clamp(0.0, 1.0), composite: kf.composite, easing: kf.easing.clone(), declarations: resolve_kf_decls(&kf.declarations, style) }
+        let mut decls = resolve_kf_decls(&kf.declarations, style);
+        // W3C Web Animations §5.5.2 & CSS Logical Properties: prioritize longhands over shorthands,
+        // physical over logical, and shorthands with fewer constituent longhands over more (higher `order` wins).
+        decls.sort_by_key(|d| d.order);
+        NormalizedStop { offset: off.clamp(0.0, 1.0), composite: kf.composite, easing: kf.easing.clone(), declarations: decls }
     }).collect();
     stops.sort_by(|a, b| a.offset.total_cmp(&b.offset));
     stops
@@ -945,8 +991,41 @@ fn eval_keyframe_endpoint(
     let Some(decl) = decl_opt else { return underlying.clone(); };
     let mut kf = underlying.clone();
     if prop == PropertyIdKind::Custom {
-        if let (Some(cn), PropertyValue::Custom(toks)) = (cname, &decl.value) {
-            apply_custom_prop_tokens(&mut kf, cn, toks, eval, registered_props);
+        if let Some(cn) = cname {
+            match &decl.value {
+                PropertyValue::Custom(toks) => {
+                    apply_custom_prop_tokens(&mut kf, cn, toks, eval, registered_props);
+                }
+                PropertyValue::Global(kw) => {
+                    let reg = registered_props.get(cn);
+                    let reset_initial = |k: &mut ComputedStyle| {
+                        if let Some(init) = reg.and_then(|r| r.initial_value.clone()) {
+                            apply_custom_prop_tokens(k, cn, &init, eval, registered_props);
+                        } else {
+                            Arc::make_mut(&mut k.custom_properties).remove(cn);
+                        }
+                    };
+                    let copy_parent = |k: &mut ComputedStyle| {
+                        if let Some(entry) = parent.and_then(|p| p.custom_properties.get_entry(cn)) {
+                            Arc::make_mut(&mut k.custom_properties).insert_entry(cn.clone(), entry.clone());
+                        } else {
+                            Arc::make_mut(&mut k.custom_properties).remove(cn);
+                        }
+                    };
+                    match kw {
+                        crate::properties::GlobalKeyword::Initial => reset_initial(&mut kf),
+                        crate::properties::GlobalKeyword::Inherit => copy_parent(&mut kf),
+                        _ => {
+                            if reg.is_some_and(|r| !r.inherits) {
+                                reset_initial(&mut kf);
+                            } else {
+                                copy_parent(&mut kf);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
         return kf;
     }
@@ -1042,8 +1121,10 @@ fn find_matching_transition_spec(specs: &[TransitionSpec], prop: PropertyIdKind,
         let name = sp.property.as_str();
         if name.eq_ignore_ascii_case("none") { continue; }
         if name.eq_ignore_ascii_case("all") { if prop != PropertyIdKind::Custom { matched = Some(sp.clone()); } }
-        else if let Some((rp, rc)) = resolve_transition_property_name(name, style) {
-            if rp == prop && rc.as_ref() == cname { matched = Some(sp.clone()); }
+        else {
+            for (rp, rc) in expand_transition_property_names(name, style) {
+                if rp == prop && rc.as_ref() == cname { matched = Some(sp.clone()); }
+            }
         }
     }
     matched
@@ -1058,7 +1139,7 @@ fn collect_transition_candidates(before: &ComputedStyle, after: &ComputedStyle, 
         let name = sp.property.as_str();
         if name.eq_ignore_ascii_case("none") { continue; }
         if name.eq_ignore_ascii_case("all") { has_all = true; continue; }
-        if let Some((pk, cn)) = resolve_transition_property_name(name, after) {
+        for (pk, cn) in expand_transition_property_names(name, after) {
             if let Some(slot) = out.iter_mut().find(|(p, c, _)| *p == pk && *c == cn) { slot.2 = sp.clone(); }
             else { out.push((pk, cn, sp.clone())); }
         }
@@ -1078,6 +1159,8 @@ fn collect_transition_candidates(before: &ComputedStyle, after: &ComputedStyle, 
         }
         if before.display != after.display { all_p.push(P::Display); }
         if before.position != after.position { all_p.push(P::Position); }
+        if before.float_mode != after.float_mode { all_p.push(P::Float); }
+        if before.clear_mode != after.clear_mode { all_p.push(P::Clear); }
         if before.visibility != after.visibility { all_p.push(P::Visibility); }
         if before.overlay != after.overlay { all_p.push(P::Overlay); }
         if before.opacity != after.opacity { all_p.push(P::Opacity); }
@@ -1148,8 +1231,11 @@ fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind,
         P::Right => lpa_computed_differs(&a.box_model.inset.right, ea, &b.box_model.inset.right, eb),
         P::Bottom => lpa_computed_differs(&a.box_model.inset.bottom, ea, &b.box_model.inset.bottom, eb),
         P::Left => lpa_computed_differs(&a.box_model.inset.left, ea, &b.box_model.inset.left, eb),
-        P::Color => a.text.color != b.text.color || a.text.color_computed != b.text.color_computed,
-        P::BackgroundColor => a.visual.background_color != b.visual.background_color || a.visual.background_color_computed != b.visual.background_color_computed,
+        P::Color => resolved_text_color(a, ea) != resolved_text_color(b, eb),
+        P::BackgroundColor => resolved_bg_color(a, ea) != resolved_bg_color(b, eb),
+        P::Float => a.float_mode != b.float_mode,
+        P::Clear => a.clear_mode != b.clear_mode,
+        P::CaptionSide => a.text.caption_side != b.text.caption_side,
         P::Opacity => a.opacity != b.opacity, P::FontSize => a.text.font_size_px != b.text.font_size_px,
         P::FontWeight => a.text.font_weight != b.text.font_weight,
         P::LineHeight => match (&a.text.line_height, &b.text.line_height) {
@@ -1262,15 +1348,15 @@ fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind,
         P::BorderRightWidth => a.box_model.border_width.right != b.box_model.border_width.right,
         P::BorderBottomWidth => a.box_model.border_width.bottom != b.box_model.border_width.bottom,
         P::BorderLeftWidth => a.box_model.border_width.left != b.box_model.border_width.left,
-        P::BorderTopColor => a.visual.border_color.top != b.visual.border_color.top || a.visual.border_color_computed[0] != b.visual.border_color_computed[0],
-        P::BorderRightColor => a.visual.border_color.right != b.visual.border_color.right || a.visual.border_color_computed[1] != b.visual.border_color_computed[1],
-        P::BorderBottomColor => a.visual.border_color.bottom != b.visual.border_color.bottom || a.visual.border_color_computed[2] != b.visual.border_color_computed[2],
-        P::BorderLeftColor => a.visual.border_color.left != b.visual.border_color.left || a.visual.border_color_computed[3] != b.visual.border_color_computed[3],
+        P::BorderTopColor => resolved_border_color(a, 0, ea) != resolved_border_color(b, 0, eb),
+        P::BorderRightColor => resolved_border_color(a, 1, ea) != resolved_border_color(b, 1, eb),
+        P::BorderBottomColor => resolved_border_color(a, 2, ea) != resolved_border_color(b, 2, eb),
+        P::BorderLeftColor => resolved_border_color(a, 3, ea) != resolved_border_color(b, 3, eb),
         P::BorderTopLeftRadius => lp_computed_differs(&a.visual.border_radius.top_left.x, ea, &b.visual.border_radius.top_left.x, eb) || lp_computed_differs(&a.visual.border_radius.top_left.y, ea, &b.visual.border_radius.top_left.y, eb),
         P::BorderTopRightRadius => lp_computed_differs(&a.visual.border_radius.top_right.x, ea, &b.visual.border_radius.top_right.x, eb) || lp_computed_differs(&a.visual.border_radius.top_right.y, ea, &b.visual.border_radius.top_right.y, eb),
         P::BorderBottomRightRadius => lp_computed_differs(&a.visual.border_radius.bottom_right.x, ea, &b.visual.border_radius.bottom_right.x, eb) || lp_computed_differs(&a.visual.border_radius.bottom_right.y, ea, &b.visual.border_radius.bottom_right.y, eb),
         P::BorderBottomLeftRadius => lp_computed_differs(&a.visual.border_radius.bottom_left.x, ea, &b.visual.border_radius.bottom_left.x, eb) || lp_computed_differs(&a.visual.border_radius.bottom_left.y, ea, &b.visual.border_radius.bottom_left.y, eb),
-        P::OutlineColor => a.visual.outline_color != b.visual.outline_color || a.visual.outline_color_computed != b.visual.outline_color_computed,
+        P::OutlineColor => resolved_outline_color(a, ea) != resolved_outline_color(b, eb),
         P::OutlineWidth => a.visual.outline_width != b.visual.outline_width,
         P::OutlineOffset => lp_computed_differs(&a.visual.outline_offset, ea, &b.visual.outline_offset, eb),
         P::BackgroundPosition => lp_computed_differs(&a.visual.background_position.0, ea, &b.visual.background_position.0, eb) || lp_computed_differs(&a.visual.background_position.1, ea, &b.visual.background_position.1, eb),
@@ -1282,7 +1368,7 @@ fn properties_differ(a: &ComputedStyle, b: &ComputedStyle, prop: PropertyIdKind,
             else { a.box_model.vertical_align_lp != b.box_model.vertical_align_lp }
         }
         P::TextShadow => a.text.text_shadow != b.text.text_shadow,
-        P::TextDecorationColor => a.visual.text_decoration_color != b.visual.text_decoration_color || a.visual.text_decoration_color_computed != b.visual.text_decoration_color_computed,
+        P::TextDecorationColor => resolved_text_decor_color(a, ea) != resolved_text_decor_color(b, eb),
         P::TextDecorationInset => match (&a.visual.text_decoration_inset, &b.visual.text_decoration_inset) {
             (crate::anim_css::TextDecorationInsetValue::Lengths(ax, ay), crate::anim_css::TextDecorationInsetValue::Lengths(bx, by)) => {
                 lp_computed_differs(ax, ea, bx, eb) || lp_computed_differs(ay, ea, by, eb)
@@ -2049,8 +2135,33 @@ fn interpolate_property_into(
             eff.transform_raw = None;
         }
         P::Custom => if let Some(cn) = cname {
-            if let Some(toks) = interpolate_custom_property(cn, from.custom_properties.get(cn), to.custom_properties.get(cn), p, allow_discrete, eval, registered_props) {
-                Arc::make_mut(&mut target.custom_properties).insert(cn.clone(), toks);
+            let from_entry = from.custom_properties.get_entry(cn);
+            let to_entry = to.custom_properties.get_entry(cn);
+            let is_tainted = from_entry.is_some_and(|e| e.tainted_ranges.is_some())
+                || to_entry.is_some_and(|e| e.tainted_ranges.is_some());
+            if let Some(toks) = interpolate_custom_property(
+                cn,
+                from_entry.map(|e| e.tokens.as_ref()),
+                to_entry.map(|e| e.tokens.as_ref()),
+                p,
+                allow_discrete,
+                eval,
+                registered_props,
+            ) {
+                if is_tainted {
+                    let ser = crate::properties::serialize_css_tokens(&toks);
+                    let len = ser.len();
+                    let entry = crate::computed::CustomPropEntry::from_parts(
+                        toks,
+                        ser,
+                        if len > 0 { vec![(0, len)] } else { Vec::new() },
+                    );
+                    Arc::make_mut(&mut target.custom_properties).insert_entry(cn.clone(), entry);
+                } else {
+                    Arc::make_mut(&mut target.custom_properties).insert(cn.clone(), toks);
+                }
+            } else {
+                Arc::make_mut(&mut target.custom_properties).remove(cn);
             }
         },
         P::FlexBasis => {
@@ -2305,7 +2416,7 @@ fn resolved_border_color(style: &ComputedStyle, idx: usize, eval: &EvalContext) 
         CssColor::Rgba(r) => ResolvedColor::from_rgba(r),
         CssColor::CurrentColor => cur,
         CssColor::LightDark(l, _) => ResolvedColor::from_rgba(l),
-        CssColor::SystemAccent => ResolvedColor::from_rgba(ColorRgba::rgba(0, 122, 255, 255)),
+        CssColor::System(sys) => ResolvedColor::from_rgba(sys.resolve(false)),
     }
 }
 
@@ -2319,7 +2430,7 @@ fn resolved_outline_color(style: &ComputedStyle, eval: &EvalContext) -> Resolved
         CssColor::Rgba(r) => ResolvedColor::from_rgba(r),
         CssColor::CurrentColor => cur,
         CssColor::LightDark(l, _) => ResolvedColor::from_rgba(l),
-        CssColor::SystemAccent => ResolvedColor::from_rgba(ColorRgba::rgba(0, 122, 255, 255)),
+        CssColor::System(sys) => ResolvedColor::from_rgba(sys.resolve(false)),
     }
 }
 
@@ -2332,6 +2443,7 @@ fn resolved_text_decor_color(style: &ComputedStyle, eval: &EvalContext) -> Resol
     match style.visual.text_decoration_color {
         Some(CssColor::Rgba(r)) => ResolvedColor::from_rgba(r),
         Some(CssColor::LightDark(l, _)) => ResolvedColor::from_rgba(l),
+        Some(CssColor::System(sys)) => ResolvedColor::from_rgba(sys.resolve(false)),
         _ => cur,
     }
 }
@@ -2344,23 +2456,61 @@ fn resolved_to_srgb_f64(c: ResolvedColor) -> (f64, f64, f64, f64) {
 
 #[rustfmt::skip]
 fn interpolate_resolved_color(a: ResolvedColor, b: ResolvedColor, p: f64) -> ResolvedColor {
-    let ((ar, ag, ab, aa), (br, bg, bb, ba)) = (resolved_to_srgb_f64(a), resolved_to_srgb_f64(b));
     let inv = 1.0 - p;
     let safe_lerp = |x: f64, y: f64| {
         if (x - y).abs() < 1e-12 { x } else { x * inv + y * p }
     };
-    let alpha_raw = safe_lerp(aa, ba);
-    let alpha = if alpha_raw.is_nan() { 0.0 } else { alpha_raw.clamp(0.0, 1.0) };
-    let (r, g, bl) = if alpha > 1e-9 {
-        (
-            safe_lerp(ar * aa, br * ba) / alpha,
-            safe_lerp(ag * aa, bg * ba) / alpha,
-            safe_lerp(ab * aa, bb * ba) / alpha,
-        )
-    } else { (0.0, 0.0, 0.0) };
-    let clamp01 = |v: f64| if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
-    let space = if a.space == ColorSpace::SrgbLegacy && b.space == ColorSpace::SrgbLegacy { ColorSpace::SrgbLegacy } else { ColorSpace::Srgb };
-    ResolvedColor { space, c: [Some(clamp01(r)), Some(clamp01(g)), Some(clamp01(bl))], alpha: Some(alpha) }
+    if a.space == ColorSpace::SrgbLegacy && b.space == ColorSpace::SrgbLegacy {
+        let ((ar, ag, ab, aa), (br, bg, bb, ba)) = (resolved_to_srgb_f64(a), resolved_to_srgb_f64(b));
+        let alpha_raw = safe_lerp(aa, ba);
+        let alpha = if alpha_raw.is_nan() { 0.0 } else { alpha_raw.clamp(0.0, 1.0) };
+        let (r, g, bl) = if alpha > 1e-9 {
+            let snap_channel = |v: f64| {
+                let c = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
+                ((c * 255.0 + 1e-5).round().clamp(0.0, 255.0)) / 255.0
+            };
+            (
+                snap_channel(safe_lerp(ar * aa, br * ba) / alpha),
+                snap_channel(safe_lerp(ag * aa, bg * ba) / alpha),
+                snap_channel(safe_lerp(ab * aa, bb * ba) / alpha),
+            )
+        } else { (0.0, 0.0, 0.0) };
+        return ResolvedColor {
+            space: ColorSpace::SrgbLegacy,
+            c: [Some(r), Some(g), Some(bl)],
+            alpha: Some(alpha),
+        };
+    }
+    // CSS Color 4 §12.1: default interpolation space when either endpoint is non-legacy is `oklab`.
+    let ca = a.convert_to(ColorSpace::Oklab);
+    let cb = b.convert_to(ColorSpace::Oklab);
+    let (a_eff, b_eff, out_alpha) = match (ca.alpha, cb.alpha) {
+        (None, None) => (1.0, 1.0, None),
+        (Some(al), None) => (al, al, Some(al.clamp(0.0, 1.0))),
+        (None, Some(bl)) => (bl, bl, Some(bl.clamp(0.0, 1.0))),
+        (Some(al), Some(bl)) => {
+            let mix_a = safe_lerp(al, bl);
+            (al, bl, Some(if mix_a.is_nan() { 0.0 } else { mix_a.clamp(0.0, 1.0) }))
+        }
+    };
+    let a_premult = out_alpha.unwrap_or(1.0);
+    let mut out_c = [None; 3];
+    for i in 0..3 {
+        out_c[i] = match (ca.c[i], cb.c[i]) {
+            (None, None) => None,
+            (Some(v), None) | (None, Some(v)) => Some(if i == 0 { v.clamp(0.0, 1.0) } else { v }),
+            (Some(v1), Some(v2)) => {
+                let raw = if a_premult > 1e-9 {
+                    safe_lerp(v1 * a_eff, v2 * b_eff) / a_premult
+                } else {
+                    0.0
+                };
+                let val = if raw.is_nan() { 0.0 } else if i == 0 { raw.clamp(0.0, 1.0) } else { raw };
+                Some(val)
+            }
+        };
+    }
+    ResolvedColor { space: ColorSpace::Oklab, c: out_c, alpha: out_alpha }
 }
 
 #[rustfmt::skip]
@@ -2383,7 +2533,7 @@ fn resolve_css_color(c: CssColor, cur: ColorRgba) -> ResolvedColor {
         CssColor::Rgba(r) => ResolvedColor::from_rgba(r),
         CssColor::CurrentColor => ResolvedColor::from_rgba(cur),
         CssColor::LightDark(l, _) => ResolvedColor::from_rgba(l),
-        CssColor::SystemAccent => ResolvedColor::from_rgba(ColorRgba::rgba(0, 122, 255, 255)),
+        CssColor::System(sys) => ResolvedColor::from_rgba(sys.resolve(false)),
     }
 }
 

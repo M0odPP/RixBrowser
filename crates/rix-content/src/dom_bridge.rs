@@ -182,6 +182,9 @@ pub struct HostState {
     cached_inline_sheet_hashes: Vec<u64>,
     sheets_dirty: bool,
     full_sheets_rebuild: bool,
+    pub(crate) css_animations_sync_dirty: bool,
+    pub(crate) css_anim_flush_hook: Option<CssAnimFlushHook>,
+    pub(crate) subdoc_link_css: HashMap<NodeId, String>,
     last_inline_style_hash: u64,
     last_style_revs: Option<(u64, u64)>,
     last_layout_revs: Option<(u64, u64)>,
@@ -238,6 +241,9 @@ pub struct HostState {
     /// Number of dynamically connected `loading="lazy"` images scheduled in this document.
     pub dynamic_lazy_images_scheduled: usize,
 }
+
+/// Callback invoked to flush pending CSS animations/transitions before layout queries.
+pub(crate) type CssAnimFlushHook = Rc<dyn Fn(&mut JsVm)>;
 
 /// Callback invoked when an `<iframe>` element is connected into a live document.
 pub(crate) type IframeConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
@@ -416,6 +422,9 @@ impl HostState {
             cached_inline_sheet_hashes: Vec::new(),
             sheets_dirty: true,
             full_sheets_rebuild: true,
+            css_animations_sync_dirty: true,
+            css_anim_flush_hook: None,
+            subdoc_link_css: HashMap::new(),
             last_inline_style_hash: 0,
             last_style_revs: None,
             last_layout_revs: None,
@@ -839,11 +848,26 @@ impl HostState {
     /// Returns `true` when DOM or stylesheet revisions differ from the last style flush.
     #[must_use]
     pub fn styles_need_flush(&self) -> bool {
-        if self.sheets_dirty {
+        if self.sheets_dirty || self.css_animations_sync_dirty {
             return true;
         }
         let doc = self.document.borrow();
         self.last_style_revs != Some((doc.revision(), doc.style_revision()))
+    }
+
+    /// Invokes the CSS animations/transitions flush hook when styles or animations are dirty.
+    pub(crate) fn flush_css_animations_if_needed(host: &SharedHost, vm: &mut JsVm) {
+        let hook = {
+            let hb = host.borrow();
+            if hb.styles_need_flush() {
+                hb.css_anim_flush_hook.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(cb) = hook {
+            cb(vm);
+        }
     }
 
     /// Recomputes CSS cascade ONLY when document structure, style revision, or stylesheets changed.
@@ -874,6 +898,7 @@ impl HostState {
                 (doc.revision(), doc.style_revision())
             };
             self.last_style_revs = Some(post_revs);
+            self.css_animations_sync_dirty = true;
             self.style_recalc_count += 1;
             return &self.style_ctx;
         }
@@ -978,6 +1003,7 @@ impl HostState {
             };
             self.sheets_dirty = false;
             self.last_style_revs = Some(post_revs);
+            self.css_animations_sync_dirty = true;
             self.style_recalc_count += 1;
             return &self.style_ctx;
         }
@@ -1038,6 +1064,7 @@ impl HostState {
             self.cached_inline_sheet_hashes = new_sheet_hashes;
             self.last_inline_style_hash = inline_hash;
             self.last_style_revs = Some(post_revs);
+            self.css_animations_sync_dirty = true;
             self.needs_full_layout = true;
             self.style_recalc_count += 1;
             return &self.style_ctx;
@@ -1118,6 +1145,7 @@ impl HostState {
         self.cached_inline_sheet_hashes = new_sheet_hashes;
         self.last_inline_style_hash = inline_hash;
         self.last_style_revs = Some(post_revs);
+        self.css_animations_sync_dirty = true;
         self.needs_full_layout = true;
         self.style_recalc_count += 1;
         &self.style_ctx
@@ -2047,6 +2075,12 @@ impl HostState {
                             let text = doc.inner_text(n);
                             if !text.trim().is_empty() {
                                 blocks.push((text, doc.parent(n)));
+                            }
+                        } else if el.name.local.as_str().eq_ignore_ascii_case("link") {
+                            if let Some(css) = self.subdoc_link_css.get(&n) {
+                                if !css.trim().is_empty() {
+                                    blocks.push((css.clone(), None));
+                                }
                             }
                         }
                     }
@@ -4656,6 +4690,7 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
     let h = Rc::clone(host);
     define_host_method(vm, ep, "getBoundingClientRect", move |vm, t, _| {
         let nid = require_node(vm, &h, t)?;
+        HostState::flush_css_animations_if_needed(&h, vm);
         let rect = crate::cssom_geometry::transformed_bounding_rect_for_node(&h, nid);
         Ok(JsValue::from_object(alloc_dom_rect(vm, &h, rect)))
     });
@@ -4686,6 +4721,7 @@ fn install_element_prototype(vm: &mut JsVm, host: &SharedHost) {
         let h = Rc::clone(host);
         let g = vm.alloc_host_fn(prop, move |vm, t, _| {
             let nid = require_node(vm, &h, t)?;
+            HostState::flush_css_animations_if_needed(&h, vm);
             let mut hs = h.borrow_mut();
             let val = match field {
                 0 | 1 => {

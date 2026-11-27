@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rix_core::{Point, Rect, Size};
-use rix_css::values_math::{RotateSpec, ScaleSpec, TranslateSpec};
 use rix_css::{
     AlignValue, BoxSizingMode, ComputedStyle, DirectionMode, DisplayMode, LengthPercentageAuto,
     OverflowMode, PositionMode, SizeValue, WritingMode,
@@ -57,15 +56,10 @@ pub fn establishes_fixed_cb(style: &ComputedStyle, is_root: bool) -> bool {
     if is_root {
         return true;
     }
-    style.effects.as_ref().is_some_and(|e| {
-        !e.transform.is_empty()
-            || e.transform_raw.is_some()
-            || e.scale != ScaleSpec::None
-            || e.rotate != RotateSpec::None
-            || e.translate != TranslateSpec::None
-            || !e.filter.is_empty()
-            || (e.contain & (0x04 | 0x10) != 0)
-    })
+    style
+        .effects
+        .as_ref()
+        .is_some_and(|e| e.establishes_fixed_cb())
 }
 
 /// Returns `true` if a box with `style` establishes a containing block for `position: absolute`
