@@ -1709,10 +1709,17 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
                     let _ = stream.shutdown().await;
                     return;
                 }
-                if rel == "workers/modules/resources/redirect.py" {
+                if rel == "workers/modules/resources/redirect.py" || rel == "common/redirect.py" {
                     let loc = query_first("location").unwrap_or_default();
+                    let cors = if rel == "common/redirect.py"
+                        && !query_only.split('&').any(|p| p == "enable-cors" || p.starts_with("enable-cors="))
+                    {
+                        ""
+                    } else {
+                        "Access-Control-Allow-Origin: *\r\n"
+                    };
                     let head = format!(
-                        "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        "HTTP/1.1 302 Found\r\nLocation: {loc}\r\n{cors}Content-Length: 0\r\nConnection: close\r\n\r\n"
                     );
                     let _ = stream.write_all(head.as_bytes()).await;
                     let _ = stream.shutdown().await;
@@ -1917,25 +1924,39 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
                         body = sub.into_bytes();
                     }
                 }
-                // Honor WPT `pipe=trickle(d<seconds>)` delay parameter in query string.
+                let mut content_type = wpt_mime_type(&file_path).to_string();
+                let mut extra_headers = Vec::new();
+                // Honor WPT `pipe=trickle(d<seconds>)` and `pipe=header(Name,Value)` parameters.
                 for pair in query_only.split('&') {
                     if let Some(pipe_val) = pair.strip_prefix("pipe=") {
                         let dec = percent_decode_path(pipe_val);
-                        if let Some(pos) = dec.find("trickle(d") {
-                            let rest = &dec[pos + 9..];
-                            if let Some(end) = rest.find(')') {
-                                if let Ok(secs) = rest[..end].trim().parse::<f64>() {
-                                    let ms = (secs.clamp(0.0, 0.06) * 1000.0) as u64;
-                                    if ms > 0 {
-                                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        for part in dec.split('|') {
+                            let part = part.trim();
+                            if let Some(rest) = part.strip_prefix("trickle(d") {
+                                if let Some(end) = rest.find(')') {
+                                    if let Ok(secs) = rest[..end].trim().parse::<f64>() {
+                                        let ms = (secs.clamp(0.0, 0.06) * 1000.0) as u64;
+                                        if ms > 0 {
+                                            tokio::time::sleep(Duration::from_millis(ms)).await;
+                                        }
+                                    }
+                                }
+                            } else if let Some(rest) = part.strip_prefix("header(") {
+                                if let Some(inner) = rest.strip_suffix(')') {
+                                    if let Some((hk, hv)) = inner.split_once(',') {
+                                        let hk = hk.trim();
+                                        let hv = hv.trim();
+                                        if hk.eq_ignore_ascii_case("content-type") {
+                                            content_type = hv.to_string();
+                                        } else {
+                                            extra_headers.push(format!("{hk}: {hv}"));
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
-                let mut content_type = wpt_mime_type(&file_path).to_string();
-                let mut extra_headers = Vec::new();
                 let headers_sidecar = PathBuf::from(format!("{}.headers", file_path.display()));
                 if let Ok(hdr_txt) = tokio::fs::read_to_string(&headers_sidecar).await {
                     for line in hdr_txt.lines() {

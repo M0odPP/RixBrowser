@@ -300,6 +300,45 @@ impl FetchEngine {
         &self.client
     }
 
+    /// Fetches a browser-internal subresource (e.g. `@import` stylesheet or `<link>` CSS),
+    /// following up to 20 redirects and returning `(response, visited_hop_urls)` without
+    /// replacing cross-origin responses with opaque empty bodies.
+    pub async fn fetch_subresource(&self, url: &str) -> Result<(FetchResponse, Vec<String>)> {
+        let mut current_url = RixUrl::parse(url)?;
+        let mut hops = vec![current_url.as_str().to_string()];
+        let mut redirected = false;
+        let headers = HashMap::new();
+        for _ in 0..20u32 {
+            let resp = self
+                .send_single_hop(&current_url, "GET", &headers, Vec::new(), false)
+                .await?;
+            if matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
+                if let Some(loc) = get_header_ci(&resp.headers, "location") {
+                    let next_url = current_url
+                        .join(loc)
+                        .unwrap_or_else(|_| current_url.clone());
+                    hops.push(next_url.as_str().to_string());
+                    current_url = next_url;
+                    redirected = true;
+                    continue;
+                }
+            }
+            return Ok((
+                FetchResponse {
+                    url: current_url.as_str().to_string(),
+                    status: resp.status,
+                    status_text: reason_phrase(resp.status).to_string(),
+                    headers: resp.headers,
+                    body: resp.body,
+                    response_type: FetchResponseType::Basic,
+                    redirected,
+                },
+                hops,
+            ));
+        }
+        Err(NetError::TooManyRedirects(20))
+    }
+
     /// Executes a WHATWG Fetch request with full CORS preflight, header filtering,
     /// opaque `no-cors` handling, RFC 9111 HTTP caching, and instant zero-polling `AbortHandle` cancellation.
     pub async fn fetch(&self, req: FetchRequest) -> Result<FetchResponse> {

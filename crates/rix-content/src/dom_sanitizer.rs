@@ -342,6 +342,19 @@ pub fn install_dom_sanitizer_and_streaming(
             schedule_connected_subresource(&h, &ev, &el, &wa, &n, nid);
         }));
     }
+    {
+        let wh = Rc::downgrade(host);
+        let wwa = Rc::downgrade(web_apis);
+        let wn = Rc::downgrade(net);
+        host.borrow_mut().font_load_hook = Some(Rc::new(move |vm, promise_h, _font_spec| {
+            let (Some(h), Some(wa), Some(n)) = (wh.upgrade(), wwa.upgrade(), wn.upgrade()) else {
+                let arr = vm.alloc_array();
+                rix_js::promise::resolve_promise(vm, promise_h, JsValue::from_object(arr));
+                return;
+            };
+            schedule_web_font_load(vm, &h, &wa, &n, promise_h);
+        }));
+    }
     install_sanitizer_ctor(vm, host);
     install_html_helper_reflections(vm, host, events, event_loop, web_apis, net);
     install_positional_html_methods(vm, host, events, event_loop, web_apis, net);
@@ -2403,6 +2416,9 @@ fn schedule_connected_subresource(
                     } else {
                         None
                     }
+                } else if tag == "style" {
+                    let css_text = doc.inner_text(nid);
+                    Some(("style", css_text, false))
                 } else {
                     None
                 }
@@ -2424,8 +2440,246 @@ fn schedule_connected_subresource(
         Some(("link", href, _)) => {
             schedule_dynamic_stylesheet_load(host, web_apis, net, nid, &href);
         }
+        Some(("style", css_text, _)) => {
+            schedule_style_element_imports(host, events, event_loop, web_apis, net, nid, &css_text);
+        }
         _ => {}
     }
+}
+
+fn schedule_style_element_imports(
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
+    net: &SharedNetBridge,
+    style_nid: NodeId,
+    css_text: &str,
+) {
+    let (media, base_url_str, quirks_mode) = {
+        let hb = host.borrow();
+        let qm = hb.document.borrow().quirks_mode() == 2;
+        let media = rix_css::MediaContext {
+            viewport_width: hb.viewport.width,
+            viewport_height: hb.viewport.height,
+            dark_mode: hb.dark_mode,
+            quirks_mode: qm,
+            ..rix_css::MediaContext::default()
+        };
+        (media, hb.main_document_url.clone(), qm)
+    };
+    let imports = rix_css::extract_stylesheet_imports(css_text, &media);
+    let mut http_urls: Vec<String> = Vec::new();
+    let mut any_immediate_error = false;
+    let base_parsed = url::Url::parse(&base_url_str).ok();
+    for imp in imports {
+        if !imp.condition_matches {
+            continue;
+        }
+        let raw = imp.url.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        if raw.starts_with("data:") {
+            if let Some((_, bytes)) = crate::fetch_ws::decode_data_url(raw) {
+                let decoded = String::from_utf8_lossy(&bytes).into_owned();
+                host.borrow_mut()
+                    .fetched_import_css
+                    .insert(raw.to_string(), Some(decoded));
+            } else {
+                any_immediate_error = true;
+            }
+            continue;
+        }
+        let resolved = base_parsed
+            .as_ref()
+            .and_then(|b| b.join(raw).ok())
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| raw.to_string());
+        if resolved.starts_with("http://") || resolved.starts_with("https://") {
+            if !http_urls.contains(&resolved) {
+                http_urls.push(resolved);
+            }
+        } else {
+            any_immediate_error = true;
+        }
+    }
+
+    if !http_urls.is_empty() {
+        if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
+            let engine = Arc::clone(&net.borrow().fetch_engine);
+            let tx = net.borrow().async_tx.clone();
+            let doc_origin = web_apis.borrow().current_origin();
+            net.borrow_mut().pending_subresources += 1;
+            rt_handle.spawn(async move {
+                let mut fetched = Vec::with_capacity(http_urls.len());
+                let mut any_error = any_immediate_error;
+                for resolved in http_urls {
+                    let css_opt = match tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        engine.fetch_subresource(&resolved),
+                    )
+                    .await
+                    {
+                        Ok(Ok((resp, hops))) if (200..300).contains(&resp.status) => {
+                            let ct = resp
+                                .headers
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                                .map(|(_, v)| {
+                                    v.split(';')
+                                        .next()
+                                        .unwrap_or("")
+                                        .trim()
+                                        .to_ascii_lowercase()
+                                })
+                                .unwrap_or_default();
+                            // CSS Cascade L5 §3 / HTML §4.2.4 Quirks Mode MIME check:
+                            // `text/css` always applies (same- or cross-origin); in Quirks Mode a
+                            // non-`text/css` MIME is allowed ONLY when every hop in the redirect
+                            // chain is same-origin with the document (CORS-same-origin).
+                            let all_hops_same_origin = !doc_origin.is_empty()
+                                && !hops.is_empty()
+                                && hops.iter().all(|h| {
+                                    url::Url::parse(h).ok().is_some_and(|u| {
+                                        u.origin().ascii_serialization() == doc_origin
+                                    })
+                                });
+                            let mime_ok = ct == "text/css" || (quirks_mode && all_hops_same_origin);
+                            if mime_ok {
+                                Some(String::from_utf8_lossy(&resp.body).into_owned())
+                            } else {
+                                any_error = true;
+                                None
+                            }
+                        }
+                        _ => {
+                            any_error = true;
+                            None
+                        }
+                    };
+                    fetched.push((resolved, css_opt));
+                }
+                let _ = tx.send(AsyncNetEvent::StyleImportsLoaded {
+                    style_nid,
+                    fetched,
+                    any_error,
+                });
+            });
+            return;
+        }
+    }
+
+    // No async HTTP `@import`s pending: queue an HTML §4.2.6 task to dispatch `load`/`error`.
+    let h_cb = Rc::clone(host);
+    let ev_cb = Rc::clone(events);
+    let el_cb = Rc::clone(event_loop);
+    let ev_type: &'static str = if any_immediate_error { "error" } else { "load" };
+    event_loop
+        .borrow_mut()
+        .post_host_task(TaskPriority::Networking, move |vm| {
+            h_cb.borrow_mut().mark_full_sheets_rebuild();
+            dispatch_simple_element_event(vm, &h_cb, &ev_cb, &el_cb, style_nid, ev_type);
+        });
+}
+
+fn schedule_web_font_load(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    web_apis: &SharedWebApis,
+    net: &SharedNetBridge,
+    promise_h: HeapHandle,
+) {
+    let missing_urls: Vec<String> = {
+        let mut hb = host.borrow_mut();
+        let _ = hb.ensure_styles();
+        let base_url = url::Url::parse(&hb.main_document_url).ok();
+        let mut to_fetch = Vec::new();
+        let mut inline_decoded = Vec::new();
+        for ff in &hb.style_ctx.rule_index().font_faces {
+            for src in &ff.sources {
+                if let rix_css::FontFaceSource::Url { url, .. } = src {
+                    let raw = url.as_str().trim();
+                    if raw.is_empty() {
+                        continue;
+                    }
+                    let resolved = base_url
+                        .as_ref()
+                        .and_then(|b| b.join(raw).ok())
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|| raw.to_string());
+                    if hb.web_font_bytes_cache.contains_key(&resolved) {
+                        continue;
+                    }
+                    if resolved.starts_with("data:") {
+                        let decoded = crate::fetch_ws::decode_data_url(&resolved)
+                            .and_then(|(_, b)| rix_text::decode_web_font(&b).ok())
+                            .map(|(_, sfnt)| sfnt);
+                        inline_decoded.push((resolved, decoded));
+                    } else if (resolved.starts_with("http://") || resolved.starts_with("https://"))
+                        && !to_fetch.contains(&resolved)
+                    {
+                        to_fetch.push(resolved);
+                    }
+                }
+            }
+        }
+        for (url, decoded) in inline_decoded {
+            hb.web_font_bytes_cache.insert(url, decoded);
+        }
+        to_fetch
+    };
+
+    if missing_urls.is_empty() {
+        host.borrow_mut().sync_active_web_fonts_from_cache();
+        let arr = vm.alloc_array();
+        rix_js::promise::resolve_promise(vm, promise_h, JsValue::from_object(arr));
+        return;
+    }
+
+    let Ok(rt_handle) = tokio::runtime::Handle::try_current() else {
+        host.borrow_mut().sync_active_web_fonts_from_cache();
+        let arr = vm.alloc_array();
+        rix_js::promise::resolve_promise(vm, promise_h, JsValue::from_object(arr));
+        return;
+    };
+
+    let engine = Arc::clone(&net.borrow().fetch_engine);
+    let tx = net.borrow().async_tx.clone();
+    let origin = web_apis.borrow().current_origin();
+    {
+        let mut nb = net.borrow_mut();
+        nb.pending_subresources += 1;
+        nb.pending_font_promises.insert(promise_h, ());
+    }
+    rt_handle.spawn(async move {
+        let mut fetched = Vec::with_capacity(missing_urls.len());
+        for url in missing_urls {
+            let req = rix_net::FetchRequest {
+                url: url.clone(),
+                method: "GET".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+                mode: rix_net::FetchMode::NoCors,
+                credentials: rix_net::FetchCredentials::SameOrigin,
+                cache: rix_net::FetchCache::Default,
+                redirect: rix_net::FetchRedirect::Follow,
+                origin: origin.clone(),
+                abort_signal: None,
+            };
+            let sfnt_opt =
+                match tokio::time::timeout(std::time::Duration::from_secs(3), engine.fetch(req))
+                    .await
+                {
+                    Ok(Ok(resp)) if (200..300).contains(&resp.status) && !resp.body.is_empty() => {
+                        rix_text::decode_web_font(&resp.body).ok().map(|(_, s)| s)
+                    }
+                    _ => None,
+                };
+            fetched.push((url, sfnt_opt));
+        }
+        let _ = tx.send(AsyncNetEvent::WebFontsLoaded { promise_h, fetched });
+    });
 }
 
 fn schedule_dynamic_stylesheet_load(

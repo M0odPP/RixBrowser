@@ -176,6 +176,15 @@ pub struct HostState {
     pub device_pixel_ratio: f32,
     pub dark_mode: bool,
     pub font_db: Arc<FontDatabase>,
+    /// Unmodified base system font database (cloned on demand when active `@font-face` rules change).
+    pub base_font_db: Arc<FontDatabase>,
+    /// Cached decoded SFNT bytes for fetched `@font-face` URLs (`None` = fetch/decode failed).
+    pub web_font_bytes_cache: HashMap<String, Option<Vec<u8>>>,
+    last_font_faces_sig: u64,
+    /// Fetched `@import` CSS bodies keyed by resolved URL (`None` = network error or rejected MIME).
+    pub fetched_import_css: HashMap<String, Option<String>>,
+    /// Dynamically fetched `<link rel="stylesheet">` CSS keyed by `<link>` `NodeId` (`(base_url, css)`).
+    pub link_stylesheet_css: HashMap<NodeId, (String, String)>,
     pub layout_engine: LayoutEngine,
     pub(crate) style_ctx: StyleContext,
     external_stylesheets: Vec<Arc<Stylesheet>>,
@@ -206,6 +215,7 @@ pub struct HostState {
     pub open_popovers: Vec<NodeId>,
     pub css_stylesheet_proto: Option<HeapHandle>,
     pub css_rule_protos: HashMap<&'static str, HeapHandle>,
+    pub css_rule_bindings: HashMap<HeapHandle, CssRuleBinding>,
     pub subdoc_scroll_offsets: HashMap<NodeId, Point>,
     pub(crate) cssom_geometry_state: RefCell<crate::cssom_geometry::CssomGeometryState>,
     pub(crate) cssom_view_state: RefCell<crate::cssom_view::CssomViewState>,
@@ -230,6 +240,7 @@ pub struct HostState {
     pub(crate) body_attr_handler_hook: Option<BodyAttrHandlerHook>,
     pub(crate) script_connect_hook: Option<ScriptConnectHook>,
     pub(crate) subresource_connect_hook: Option<SubresourceConnectHook>,
+    pub(crate) font_load_hook: Option<FontLoadHook>,
     pub(crate) details_toggle_hook: Option<DetailsToggleHook>,
     /// True once initial page subresources (Wave 1 & 2 images/SVGs) have been registered into
     /// `layout_engine.assets` (used by `HTMLImageElement.prototype.complete` per HTML §4.8.4.3.6).
@@ -242,6 +253,13 @@ pub struct HostState {
     /// Number of dynamically connected `loading="lazy"` images scheduled in this document.
     pub dynamic_lazy_images_scheduled: usize,
 }
+
+/// Binding from a CSSOM rule JS wrapper to its backing stylesheet state, rule path, and interface name.
+pub type CssRuleBinding = (
+    crate::cssom::SharedStyleSheet,
+    Rc<RefCell<Vec<usize>>>,
+    &'static str,
+);
 
 /// Callback invoked to flush pending CSS animations/transitions before layout queries.
 pub(crate) type CssAnimFlushHook = Rc<dyn Fn(&mut JsVm)>;
@@ -258,8 +276,11 @@ pub(crate) type BodyAttrHandlerHook = Rc<dyn Fn(&mut JsVm, NodeId, &str, &str)>;
 /// Callback invoked when an executable fragment-created `<script>` element becomes connected.
 pub(crate) type ScriptConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
 
-/// Callback invoked when a dynamic `<img src>` or `<link rel="stylesheet" href>` becomes connected.
+/// Callback invoked when a dynamic `<img src>`, `<link rel="stylesheet" href>`, or `<style>` becomes connected.
 pub(crate) type SubresourceConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
+
+/// Callback invoked when `document.fonts.load(...)` requests active `@font-face` web font loading.
+pub(crate) type FontLoadHook = Rc<dyn Fn(&mut JsVm, HeapHandle, String)>;
 
 /// Callback invoked when a `<details>` element's `open` attribute changes (queues `ToggleEvent`).
 pub(crate) type DetailsToggleHook = Rc<dyn Fn(&mut JsVm, NodeId, &'static str, &'static str)>;
@@ -425,7 +446,12 @@ impl HostState {
             element_scroll_offsets: HashMap::new(),
             device_pixel_ratio: 1.0,
             dark_mode: false,
+            base_font_db: Arc::clone(&font_db),
             font_db,
+            web_font_bytes_cache: HashMap::new(),
+            last_font_faces_sig: 0,
+            fetched_import_css: HashMap::new(),
+            link_stylesheet_css: HashMap::new(),
             layout_engine: LayoutEngine::new(),
             style_ctx: StyleContext::new(media),
             external_stylesheets: Vec::new(),
@@ -456,6 +482,7 @@ impl HostState {
             open_popovers: Vec::new(),
             css_stylesheet_proto: None,
             css_rule_protos: HashMap::new(),
+            css_rule_bindings: HashMap::new(),
             subdoc_scroll_offsets: HashMap::new(),
             cssom_geometry_state: RefCell::new(crate::cssom_geometry::CssomGeometryState::default()),
             cssom_view_state: RefCell::new(crate::cssom_view::CssomViewState::default()),
@@ -482,6 +509,7 @@ impl HostState {
             body_attr_handler_hook: None,
             script_connect_hook: None,
             subresource_connect_hook: None,
+            font_load_hook: None,
             details_toggle_hook: None,
             initial_assets_loaded: false,
             pending_dynamic_images: HashSet::new(),
@@ -1010,10 +1038,10 @@ impl HostState {
         let (inline_hash, maybe_sheets, shadow_adopted_blocks) = {
             let doc = self.document.borrow();
             let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            let mut css_blocks: Vec<(String, Option<NodeId>)> = Vec::new();
-            // Collect ONLY light-DOM `<style>` elements for document-level sheets; `<style>`
-            // elements inside a `ShadowRoot` are compiled per-shadow-root by `cascade.rs` per
-            // CSS Scoping L1 (never leaked globally!), though we still hash them for invalidation.
+            let mut css_blocks: Vec<(String, Option<NodeId>, Option<String>)> = Vec::new();
+            // Collect ONLY light-DOM `<style>` and connected `<link rel="stylesheet">` elements
+            // in exact document order; `<style>` inside a `ShadowRoot` is compiled per-shadow-root
+            // by `cascade.rs` per CSS Scoping L1 (never leaked globally!), though still hashed.
             for node in doc.descendants(doc.root()) {
                 if let Some(NodeData::Element(el)) = doc.get(node) {
                     if el.name.local.as_str().eq_ignore_ascii_case("style") {
@@ -1033,7 +1061,27 @@ impl HostState {
                                     h = fnv_mix(h, &usize::from(pid).to_le_bytes());
                                 }
                             }
-                            css_blocks.push((text, owner_parent));
+                            css_blocks.push((text, owner_parent, None));
+                        }
+                    } else if el.name.local.as_str().eq_ignore_ascii_case("link") {
+                        if let Some((link_base, link_css)) = self.link_stylesheet_css.get(&node) {
+                            let is_disabled = el.has_attribute("disabled")
+                                || self
+                                    .style_element_sheets
+                                    .get(&node)
+                                    .is_some_and(|sh| sh.borrow().disabled);
+                            if !is_disabled && !link_css.trim().is_empty() {
+                                let owner_parent = doc.parent(node);
+                                h = fnv_mix(h, link_css.as_bytes());
+                                if let Some(pid) = owner_parent {
+                                    h = fnv_mix(h, &usize::from(pid).to_le_bytes());
+                                }
+                                css_blocks.push((
+                                    link_css.clone(),
+                                    owner_parent,
+                                    (!link_base.is_empty()).then(|| link_base.clone()),
+                                ));
+                            }
                         }
                     }
                 }
@@ -1053,7 +1101,7 @@ impl HostState {
             for sheet in doc.all_dynamic_stylesheets().values() {
                 if !sheet.trim().is_empty() {
                     h = fnv_mix(h, sheet.as_bytes());
-                    css_blocks.push((sheet.clone(), None));
+                    css_blocks.push((sheet.clone(), None, None));
                 }
             }
             for adopted in &self.adopted_stylesheets {
@@ -1062,12 +1110,19 @@ impl HostState {
                     let css = st.to_css_text();
                     if !css.trim().is_empty() {
                         h = fnv_mix(h, css.as_bytes());
-                        css_blocks.push((css, None));
+                        // CSS Cascade L6 §2.1: implicit `@scope` in a constructed stylesheet
+                        // adopted by a Document has the Document node itself as scoping root.
+                        css_blocks.push((css, Some(doc.root()), None));
                     }
                 }
             }
-            let mut shadow_adopted_blocks: HashMap<NodeId, Vec<String>> = HashMap::new();
+            let mut shadow_adopted_blocks: HashMap<NodeId, (Option<NodeId>, Vec<String>)> =
+                HashMap::new();
             for (&sr_id, list) in &self.shadow_dom.borrow().adopted_stylesheets {
+                let host_id = match doc.get(sr_id) {
+                    Some(NodeData::ShadowRoot { host, .. }) => Some(*host),
+                    _ => None,
+                };
                 let mut sr_css = Vec::new();
                 h = fnv_mix(h, &usize::from(sr_id).to_le_bytes());
                 for adopted in list {
@@ -1081,8 +1136,12 @@ impl HostState {
                     }
                 }
                 if !sr_css.is_empty() {
-                    shadow_adopted_blocks.insert(sr_id, sr_css);
+                    shadow_adopted_blocks.insert(sr_id, (host_id, sr_css));
                 }
+            }
+            // Mix fetched `@import` cache state into `h` so arriving async imports trigger rebuild.
+            if !self.fetched_import_css.is_empty() {
+                h = fnv_mix(h, &self.fetched_import_css.len().to_le_bytes());
             }
             (h, css_blocks, shadow_adopted_blocks)
         };
@@ -1120,15 +1179,62 @@ impl HostState {
             ..MediaContext::default()
         };
 
+        let fetched_imports = &self.fetched_import_css;
+        let compile_author_sheet = |css: &str,
+                                    owner_parent: Option<NodeId>,
+                                    base_opt: Option<&str>|
+         -> Arc<Stylesheet> {
+            let has_import = css
+                .as_bytes()
+                .windows(7)
+                .any(|w| w.eq_ignore_ascii_case(b"@import"));
+            let has_scope = owner_parent.is_some()
+                && css
+                    .as_bytes()
+                    .windows(6)
+                    .any(|w| w.eq_ignore_ascii_case(b"@scope"));
+            if has_import || has_scope {
+                Arc::new(Stylesheet::parse_with_imports(
+                    css,
+                    CascadeOrigin::Author,
+                    &media,
+                    owner_parent,
+                    base_opt,
+                    &mut |raw_url, cur_base| {
+                        let trimmed = raw_url.trim();
+                        if trimmed.starts_with("data:") {
+                            return crate::fetch_ws::decode_data_url(trimmed).map(|(_, bytes)| {
+                                (String::from_utf8_lossy(&bytes).into_owned(), None)
+                            });
+                        }
+                        let resolved = cur_base
+                            .and_then(|b| url::Url::parse(b).ok())
+                            .and_then(|b| b.join(trimmed).ok())
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|| trimmed.to_string());
+                        fetched_imports
+                            .get(&resolved)
+                            .and_then(|opt| opt.as_ref())
+                            .map(|text| (text.clone(), Some(resolved)))
+                    },
+                ))
+            } else {
+                Stylesheet::parse_cached_with_base(css, CascadeOrigin::Author, &media, base_opt)
+            }
+        };
+
         // Fast incremental path: when stylesheets were ALREADY cascaded for this viewport/theme
         // and JS only *appended* new `<style>`/dynamic sheets (typical of CSS-in-JS / React /
         // Next.js hydration on 10,000+ node DOMs), append and restyle ONLY affected elements!
         let new_sheet_hashes: Vec<u64> = maybe_sheets
             .iter()
-            .map(|(css, owner)| {
+            .map(|(css, owner, base)| {
                 let mut sh = fnv_mix(0xcbf2_9ce4_8422_2325, css.as_bytes());
                 if let Some(pid) = owner {
                     sh = fnv_mix(sh, &usize::from(*pid).to_le_bytes());
+                }
+                if let Some(b) = base {
+                    sh = fnv_mix(sh, b.as_bytes());
                 }
                 sh
             })
@@ -1141,29 +1247,19 @@ impl HostState {
                 == self.cached_inline_sheet_hashes[..];
         if is_pure_append {
             let prev_len = self.cached_inline_sheet_hashes.len();
-            let base_opt =
+            let main_base_opt =
                 (!self.main_document_url.is_empty()).then_some(self.main_document_url.as_str());
             let mut doc = self.document.borrow_mut();
-            for (css, owner_parent) in &maybe_sheets[prev_len..] {
-                let sheet = if owner_parent.is_some()
-                    && (css.contains("@scope") || css.contains("@SCOPE"))
-                {
-                    Arc::new(Stylesheet::parse_with_owner_and_base(
-                        css,
-                        CascadeOrigin::Author,
-                        &media,
-                        *owner_parent,
-                        base_opt,
-                    ))
-                } else {
-                    Stylesheet::parse_cached_with_base(css, CascadeOrigin::Author, &media, base_opt)
-                };
+            for (css, owner_parent, sheet_base) in &maybe_sheets[prev_len..] {
+                let eff_base = sheet_base.as_deref().or(main_base_opt);
+                let sheet = compile_author_sheet(css, *owner_parent, eff_base);
                 let _ = self
                     .style_ctx
                     .append_stylesheet_incremental(&mut doc, sheet);
             }
             let _ = self.style_ctx.restyle_dirty(&mut doc);
             let post_revs = (doc.revision(), doc.style_revision());
+            drop(doc);
             self.sheets_dirty = false;
             self.cached_inline_sheet_hashes = new_sheet_hashes;
             self.last_inline_style_hash = inline_hash;
@@ -1171,6 +1267,7 @@ impl HostState {
             self.css_animations_sync_dirty = true;
             self.needs_full_layout = true;
             self.style_recalc_count += 1;
+            self.sync_active_web_fonts_from_cache();
             return &self.style_ctx;
         }
 
@@ -1197,39 +1294,18 @@ impl HostState {
         for ext in &self.external_stylesheets {
             ctx.add_stylesheet(Arc::clone(ext));
         }
-        let base_opt =
+        let main_base_opt =
             (!self.main_document_url.is_empty()).then_some(self.main_document_url.as_str());
-        for (css, owner_parent) in maybe_sheets {
-            if owner_parent.is_some() && (css.contains("@scope") || css.contains("@SCOPE")) {
-                ctx.add_stylesheet(Arc::new(Stylesheet::parse_with_owner_and_base(
-                    &css,
-                    CascadeOrigin::Author,
-                    &media,
-                    owner_parent,
-                    base_opt,
-                )));
-            } else {
-                ctx.add_stylesheet(Stylesheet::parse_cached_with_base(
-                    &css,
-                    CascadeOrigin::Author,
-                    &media,
-                    base_opt,
-                ));
-            }
+        for (css, owner_parent, sheet_base) in maybe_sheets {
+            let eff_base = sheet_base.as_deref().or(main_base_opt);
+            ctx.add_stylesheet(compile_author_sheet(&css, owner_parent, eff_base));
         }
         if !shadow_adopted_blocks.is_empty() {
             let mut compiled_shadow: HashMap<NodeId, Vec<Arc<Stylesheet>>> = HashMap::new();
-            for (sr_id, blocks) in shadow_adopted_blocks {
+            for (sr_id, (host_id, blocks)) in shadow_adopted_blocks {
                 let sheets = blocks
                     .into_iter()
-                    .map(|css| {
-                        Stylesheet::parse_cached_with_base(
-                            &css,
-                            CascadeOrigin::Author,
-                            &media,
-                            base_opt,
-                        )
-                    })
+                    .map(|css| compile_author_sheet(&css, host_id, main_base_opt))
                     .collect();
                 compiled_shadow.insert(sr_id, sheets);
             }
@@ -1252,7 +1328,105 @@ impl HostState {
         self.css_animations_sync_dirty = true;
         self.needs_full_layout = true;
         self.style_recalc_count += 1;
+        self.sync_active_web_fonts_from_cache();
         &self.style_ctx
+    }
+
+    /// Synchronizes layer-ordered active `@font-face` rules into `self.font_db` using
+    /// `self.base_font_db` and already-fetched `self.web_font_bytes_cache`, invalidating
+    /// layout caches whenever the effective web-font bindings change.
+    pub fn sync_active_web_fonts_from_cache(&mut self) {
+        let font_faces = &self.style_ctx.rule_index().font_faces;
+        if font_faces.is_empty() {
+            if self.last_font_faces_sig != 0 {
+                self.font_db = Arc::clone(&self.base_font_db);
+                self.last_font_faces_sig = 0;
+                self.layout_engine.clear_caches();
+                self.invalidate_layout_cache();
+            }
+            return;
+        }
+        let mut sig: u64 = 0xcbf2_9ce4_8422_2325;
+        let base_url = url::Url::parse(&self.main_document_url).ok();
+        type ResolvedFontFaceEntry = (String, bool, (u16, u16), Option<String>, Option<Vec<u8>>);
+        let mut resolved_entries: Vec<ResolvedFontFaceEntry> = Vec::new();
+        for ff in font_faces {
+            let Some(ref fam) = ff.family else {
+                continue;
+            };
+            sig = fnv_mix(sig, fam.as_str().as_bytes());
+            sig = fnv_mix(sig, &ff.layer_id.0.to_le_bytes());
+            let mut local_match: Option<String> = None;
+            let mut bytes_match: Option<Vec<u8>> = None;
+            for src in &ff.sources {
+                match src {
+                    rix_css::FontFaceSource::Local(loc) => {
+                        if self.base_font_db.has_exact_family(loc.as_str()) {
+                            local_match = Some(loc.as_str().to_string());
+                            sig = fnv_mix(sig, loc.as_str().as_bytes());
+                            break;
+                        }
+                    }
+                    rix_css::FontFaceSource::Url { url, .. } => {
+                        let raw = url.as_str().trim();
+                        let resolved = base_url
+                            .as_ref()
+                            .and_then(|b| b.join(raw).ok())
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|| raw.to_string());
+                        if let Some(Some(sfnt)) = self.web_font_bytes_cache.get(&resolved) {
+                            bytes_match = Some(sfnt.clone());
+                            sig = fnv_mix(sig, resolved.as_bytes());
+                            sig = fnv_mix(sig, &sfnt.len().to_le_bytes());
+                            break;
+                        }
+                    }
+                }
+            }
+            if local_match.is_some() || bytes_match.is_some() {
+                let w_lo = (ff.weight_range.0.round().clamp(100.0, 900.0)) as u16;
+                let w_hi = (ff.weight_range.1.round().clamp(100.0, 900.0)) as u16;
+                resolved_entries.push((
+                    fam.as_str().to_string(),
+                    ff.italic,
+                    (w_lo, w_hi),
+                    local_match,
+                    bytes_match,
+                ));
+            }
+        }
+        if sig == self.last_font_faces_sig {
+            return;
+        }
+        let mut db = (*self.base_font_db).clone();
+        // Keep only the highest-priority (last in layer-sorted `font_faces`) winning rule per
+        // `(family_lower, italic, weight_range)` so higher layers cleanly override lower layers.
+        let mut winners: HashMap<(String, bool, u16, u16), usize> = HashMap::new();
+        for (idx, (fam, italic, (w_lo, w_hi), _, _)) in resolved_entries.iter().enumerate() {
+            winners.insert((fam.to_lowercase(), *italic, *w_lo, *w_hi), idx);
+        }
+        for (fam, _, _, _, _) in &resolved_entries {
+            db.clear_family_override(fam);
+        }
+        let mut winning_indices: Vec<usize> = winners.into_values().collect();
+        winning_indices.sort_unstable();
+        for idx in winning_indices {
+            let (ref fam, italic, wrange, ref local_m, ref bytes_m) = resolved_entries[idx];
+            if let Some(loc) = local_m {
+                let _ = db.alias_local_family_from(&self.base_font_db, fam, loc);
+            } else if let Some(sfnt) = bytes_m {
+                let style = if italic {
+                    rix_text::FontStyle::Italic
+                } else {
+                    rix_text::FontStyle::Normal
+                };
+                let _ = db.add_web_font_bytes_range(sfnt.clone(), 0, fam, wrange, style);
+            }
+        }
+        self.font_db = Arc::new(db);
+        self.last_font_faces_sig = sig;
+        self.layout_engine.clear_caches();
+        self.invalidate_layout_cache();
     }
 
     /// Recomputes incremental layout ONLY when document structure or layout-affecting styles
@@ -3478,8 +3652,28 @@ pub(crate) fn remove_node_from_parent(
     if has_live_ranges {
         crate::selection::adjust_ranges_for_remove_node(host, child, parent, old_index);
     }
+    let removed_has_stylesheet = {
+        let doc_rc = Rc::clone(&host.borrow().document);
+        let doc = doc_rc.borrow();
+        let found = doc.descendants(child).any(|nid| {
+            matches!(doc.get(nid), Some(NodeData::Element(e))
+                if e.name.local.as_str().eq_ignore_ascii_case("style")
+                    || (e.name.local.as_str().eq_ignore_ascii_case("link")
+                        && e.get_attribute("rel")
+                            .is_some_and(|r| r.split_ascii_whitespace().any(|t| t.eq_ignore_ascii_case("stylesheet")))))
+        });
+        found
+    };
     host.borrow().document.borrow_mut().remove_child(child);
-    host.borrow_mut().invalidate_dom_mutation(parent, None);
+    {
+        let mut hb = host.borrow_mut();
+        hb.invalidate_dom_mutation(parent, None);
+        if removed_has_stylesheet {
+            hb.sheets_dirty = true;
+            hb.full_sheets_rebuild = true;
+            hb.needs_full_layout = true;
+        }
+    }
     host.borrow().emit_mutation(DomMutation::ChildList {
         target: parent,
         added: Vec::new(),
@@ -3641,8 +3835,29 @@ pub(crate) fn insert_node_into_parent(
     if has_live_ranges {
         crate::selection::adjust_ranges_for_insert_nodes(host, parent, insert_idx, to_insert.len());
     }
-    host.borrow_mut()
-        .invalidate_dom_mutation(parent, to_insert.first().copied());
+    let inserted_has_stylesheet = {
+        let doc_rc = Rc::clone(&host.borrow().document);
+        let doc = doc_rc.borrow();
+        let found = to_insert.iter().any(|&n| {
+            doc.descendants(n).any(|nid| {
+                matches!(doc.get(nid), Some(NodeData::Element(e))
+                    if e.name.local.as_str().eq_ignore_ascii_case("style")
+                        || (e.name.local.as_str().eq_ignore_ascii_case("link")
+                            && e.get_attribute("rel")
+                                .is_some_and(|r| r.split_ascii_whitespace().any(|t| t.eq_ignore_ascii_case("stylesheet")))))
+            })
+        });
+        found
+    };
+    {
+        let mut hb = host.borrow_mut();
+        hb.invalidate_dom_mutation(parent, to_insert.first().copied());
+        if inserted_has_stylesheet {
+            hb.sheets_dirty = true;
+            hb.full_sheets_rebuild = true;
+            hb.needs_full_layout = true;
+        }
+    }
     host.borrow().emit_mutation(DomMutation::ChildList {
         target: parent,
         added: to_insert.clone(),
@@ -3872,6 +4087,7 @@ pub(crate) fn notify_connected_subresources(vm: &mut JsVm, host: &SharedHost, ro
                     Some(NodeData::Element(e))
                         if e.name.local.as_str().eq_ignore_ascii_case("img")
                             || e.name.local.as_str().eq_ignore_ascii_case("link")
+                            || e.name.local.as_str().eq_ignore_ascii_case("style")
                 ) {
                     out.push(id);
                 }
@@ -7971,8 +8187,47 @@ fn install_window_properties_proxy(
         }),
         Some(event_target_proto),
     ));
+    // HTML Living Standard §7.3.3.1 & WebIDL: `window` -> `Window.prototype` ->
+    // `WindowProperties` (named access proxy) -> `EventTarget.prototype` -> `Object.prototype`.
+    let window_proto = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proxy)));
+    if let Some(o) = vm.heap.get_object_mut(window_proto) {
+        o.is_prototype = true;
+    }
+    let window_ctor = vm.alloc_host_fn("Window", |vm, _, _| {
+        Err(vm.type_error("Illegal constructor"))
+    });
+    vm.mark_constructor(window_ctor);
+    let k_proto = vm.heap.intern_key("prototype");
+    let k_ctor = vm.heap.intern_key("constructor");
+    vm.heap.object_define_data(
+        window_ctor,
+        k_proto,
+        JsValue::from_object(window_proto),
+        PropertyAttrs::empty(),
+        &mut vm.shapes,
+    );
+    vm.heap.object_define_data(
+        window_proto,
+        k_ctor,
+        JsValue::from_object(window_ctor),
+        PropertyAttrs::CONFIGURABLE | PropertyAttrs::WRITABLE,
+        &mut vm.shapes,
+    );
+    let k_tag = vm.key_symbol_to_string_tag;
+    let tag_val = JsValue::from_string(vm.heap.alloc_string("Window"));
+    vm.heap.object_define_data(
+        window_proto,
+        k_tag,
+        tag_val,
+        PropertyAttrs::CONFIGURABLE,
+        &mut vm.shapes,
+    );
     let g = vm.global;
-    vm.heap.object_set_prototype(g, Some(proxy), &mut vm.shapes);
+    vm.heap
+        .object_set_prototype(g, Some(window_proto), &mut vm.shapes);
+    define_global(vm, "Window", JsValue::from_object(window_ctor));
 }
 
 fn find_window_named_elements(doc: &Document, name: &str) -> Vec<NodeId> {

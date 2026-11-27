@@ -53,6 +53,7 @@ pub struct BoxModelStyle {
     pub text_overflow: TextOverflowMode,
     pub table_layout: TableLayoutMode,
     pub content: Option<InternedStr>,
+    pub content_counter: Option<(InternedStr, InternedStr)>,
     pub column_count: Option<i32>,
 }
 
@@ -74,6 +75,7 @@ impl Default for BoxModelStyle {
             text_overflow: TextOverflowMode::Clip,
             table_layout: TableLayoutMode::Auto,
             content: None,
+            content_counter: None,
             column_count: None,
         }
     }
@@ -2876,7 +2878,9 @@ fn select_winning_candidate_from<'a>(
     while idx > 0 {
         idx -= 1;
         let (key, decl) = sorted_asc[idx];
-        let rule_id = (cascade_origin_group(key.band), key.rule_order);
+        // Include `key.band` directly so outer-document rules (band 4/6) never collide on
+        // `rule_order` with inner shadow `:host`/`::slotted`/`::part` rules (band 3/5).
+        let rule_id = (key.band, key.rule_order);
         if reverted_rules.contains(&rule_id) {
             continue;
         }
@@ -4394,13 +4398,25 @@ pub fn apply_declaration(
             Arc::make_mut(&mut style.box_model).table_layout = *v;
         }
         (PropertyIdKind::Content, PropertyValue::Content(v)) => {
-            Arc::make_mut(&mut style.box_model).content = v.clone();
+            let bm = Arc::make_mut(&mut style.box_model);
+            bm.content = v.clone();
+            bm.content_counter = None;
+            if let Some(eff) = &mut style.effects {
+                Arc::make_mut(eff).content_image_raw = None;
+            }
+        }
+        (PropertyIdKind::Content, PropertyValue::ContentCounter(cname, cstyle)) => {
+            let bm = Arc::make_mut(&mut style.box_model);
+            bm.content = None;
+            bm.content_counter = Some((cname.clone(), cstyle.clone()));
             if let Some(eff) = &mut style.effects {
                 Arc::make_mut(eff).content_image_raw = None;
             }
         }
         (PropertyIdKind::Content, PropertyValue::BackgroundImageRaw(raw)) => {
-            Arc::make_mut(&mut style.box_model).content = None;
+            let bm = Arc::make_mut(&mut style.box_model);
+            bm.content = None;
+            bm.content_counter = None;
             let resolved =
                 crate::substitution::resolve_light_dark_image_fn(raw, effective_dark, eval, false)
                     .unwrap_or_else(|| raw.clone());

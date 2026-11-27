@@ -727,7 +727,7 @@ impl<'a> BoxTreeBuilder<'a> {
         match elem.name.local.as_str() {
             "br" => Some(ReplacedKind::LineBreak),
             "hr" => Some(ReplacedKind::HorizontalRule),
-            "canvas" | "iframe" | "video" => {
+            "canvas" => {
                 let iw = elem
                     .get_attribute("width")
                     .and_then(parse_html_dimension_attr)
@@ -741,6 +741,10 @@ impl<'a> BoxTreeBuilder<'a> {
                     intrinsic_size: Size::new(iw, ih),
                 })
             }
+            "iframe" | "video" => Some(ReplacedKind::ExternalSurface {
+                surface_id: surface_id_for_node(node),
+                intrinsic_size: Size::new(300.0, 150.0),
+            }),
             "img" => {
                 // HTML Living Standard §4.8.4.2: when `<img>` is inside `<picture>`, select the
                 // first preceding `<source>` matching `media` and supported `type`, overriding
@@ -840,21 +844,12 @@ impl<'a> BoxTreeBuilder<'a> {
                             .as_deref()
                             .and_then(|s| self.assets.get_by_src(s))
                     });
+                // HTML §15.3.2 / CSS Cascade L5: HTML `width`/`height` attributes are mapped as
+                // CSS presentational hints (band 2), so the replaced intrinsic size must reflect
+                // the resource's true natural dimensions (allowing `width: revert` -> `auto` to
+                // fall back to natural size while `width: revert-layer` keeps the hint).
                 let (iw, ih) = match (decoded, attr_w, attr_h) {
-                    (Some(_), Some(w), Some(h)) => (w, h),
-                    (Some(img), Some(w), None) => {
-                        let ratio =
-                            img.intrinsic_height as f32 / (img.intrinsic_width.max(1) as f32);
-                        (w, (w * ratio).max(1.0))
-                    }
-                    (Some(img), None, Some(h)) => {
-                        let ratio =
-                            img.intrinsic_width as f32 / (img.intrinsic_height.max(1) as f32);
-                        ((h * ratio).max(1.0), h)
-                    }
-                    (Some(img), None, None) => {
-                        (img.intrinsic_width as f32, img.intrinsic_height as f32)
-                    }
+                    (Some(img), _, _) => (img.intrinsic_width as f32, img.intrinsic_height as f32),
                     (None, Some(w), Some(h)) => (w, h),
                     (None, Some(w), None) => (w, w),
                     (None, None, Some(h)) => (h, h),
