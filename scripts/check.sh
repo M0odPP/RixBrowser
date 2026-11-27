@@ -40,6 +40,8 @@ DOMAIN_RE = re.compile(
 UA_SPOOF_RE = re.compile(r'"[^"\n]*(Firefox/|Chrome/|Chromium/|Edg/|Safari/[0-9])[^"\n]*"')
 SPEC_NAMESPACE_URIS = {
     "http://www.mozilla.org/newlayout/xml/parsererror.xml",
+    # Normative WHATWG HTML §13.2.6.4.1 DOCTYPE Quirks Mode system identifier.
+    "http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd",
 }
 CANONICAL_UA_FILES = {
     "crates/rix-core/src/browser_profile.rs",
