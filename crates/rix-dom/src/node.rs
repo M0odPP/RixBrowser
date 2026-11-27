@@ -56,6 +56,7 @@ pub struct ElementData {
     pub pseudo_state: ElementState,
     pub cached_id: Option<InternedStr>,
     pub class_hashes: SmallVec<[u64; 4]>,
+    pub class_hashes_lower: SmallVec<[u64; 4]>,
     pub tag_hash: u64,
     pub custom_element_state: CustomElementState,
     pub is_value: Option<String>,
@@ -117,6 +118,7 @@ impl ElementData {
             pseudo_state,
             cached_id: None,
             class_hashes: SmallVec::new(),
+            class_hashes_lower: SmallVec::new(),
             tag_hash,
             custom_element_state: initial_ce_state,
             is_value: None,
@@ -145,15 +147,21 @@ impl ElementData {
     pub fn sync_cached_attrs(&mut self) {
         self.cached_id = self.id().filter(|id| !id.is_empty()).map(intern_str);
         let mut hashes = SmallVec::new();
+        let mut hashes_lower = SmallVec::new();
         if let Some(classes) = self.get_attribute("class") {
             for cls in classes.split_ascii_whitespace() {
                 let h = hash_ident(cls);
                 if !hashes.contains(&h) {
                     hashes.push(h);
                 }
+                let hl = hash_ident_ascii_lower(cls);
+                if !hashes_lower.contains(&hl) {
+                    hashes_lower.push(hl);
+                }
             }
         }
         self.class_hashes = hashes;
+        self.class_hashes_lower = hashes_lower;
         self.sync_intrinsic_state();
     }
 
@@ -162,7 +170,13 @@ impl ElementData {
         let is_link = matches!(local, "a" | "area") && self.has_attribute("href");
         self.pseudo_state.set(ElementState::LINK, is_link);
 
-        let is_checked = self.has_attribute("checked");
+        let is_checked = if local == "input" {
+            self.has_attribute("checked")
+        } else if local == "option" {
+            self.has_attribute("selected")
+        } else {
+            false
+        };
         self.pseudo_state.set(ElementState::CHECKED, is_checked);
 
         let is_disableable = matches!(
@@ -182,6 +196,11 @@ impl ElementData {
     #[inline]
     pub fn has_class_hash(&self, hash: u64) -> bool {
         self.class_hashes.contains(&hash)
+    }
+
+    #[inline]
+    pub fn has_class_hash_lower(&self, hash_lower: u64) -> bool {
+        self.class_hashes_lower.contains(&hash_lower)
     }
 
     pub fn new_html(local_name: &str) -> Self {

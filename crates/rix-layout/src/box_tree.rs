@@ -52,6 +52,8 @@ pub enum FormControlKind {
     Radio,
     TextArea,
     Select,
+    Meter,
+    Progress,
 }
 
 /// Replaced element payload carried on [`BoxKind::Replaced`].
@@ -884,8 +886,10 @@ impl<'a> BoxTreeBuilder<'a> {
                         (h * (vb.width / vb.height), h)
                     }
                     (w_opt, h_opt, vb_opt) => (
-                        w_opt.or_else(|| vb_opt.map(|vb| vb.width)).unwrap_or(16.0),
-                        h_opt.or_else(|| vb_opt.map(|vb| vb.height)).unwrap_or(16.0),
+                        w_opt.or_else(|| vb_opt.map(|vb| vb.width)).unwrap_or(300.0),
+                        h_opt
+                            .or_else(|| vb_opt.map(|vb| vb.height))
+                            .unwrap_or(150.0),
                     ),
                 };
                 let resolve_svg_css_paint = |opt: Option<Option<rix_css::CssColor>>| {
@@ -924,14 +928,34 @@ impl<'a> BoxTreeBuilder<'a> {
                     .to_string();
                 let (kind, size) = match input_type.as_str() {
                     "hidden" => return None,
-                    "checkbox" => (FormControlKind::Checkbox, Size::new(16.0, 16.0)),
-                    "radio" => (FormControlKind::Radio, Size::new(16.0, 16.0)),
+                    "checkbox" => (FormControlKind::Checkbox, Size::new(14.0, 14.0)),
+                    "radio" => (FormControlKind::Radio, Size::new(14.0, 14.0)),
+                    "range" => (FormControlKind::TextInput, Size::new(160.0, 20.0)),
+                    "color" => (FormControlKind::Button, Size::new(64.0, 32.0)),
+                    "file" => (FormControlKind::TextInput, Size::new(233.6, 24.0)),
+                    "date" | "time" | "datetime-local" | "month" | "week" => {
+                        (FormControlKind::TextInput, Size::new(126.3, 18.0))
+                    }
                     "submit" | "button" | "reset" => {
+                        let default_label = match input_type.as_str() {
+                            "submit" => "Submit",
+                            "reset" => "Reset",
+                            _ => "",
+                        };
+                        let eff_label = if value.is_empty() {
+                            default_label
+                        } else {
+                            value.as_str()
+                        };
                         let label_w =
-                            (value.len().max(4) as f32 * style.text.font_size_px * 0.56).max(48.0);
+                            (eff_label.len().max(2) as f32 * style.text.font_size_px * 0.54)
+                                .max(18.0);
                         (
                             FormControlKind::Button,
-                            Size::new(label_w + 14.0, (style.text.font_size_px * 1.3).max(18.0)),
+                            Size::new(
+                                label_w + 12.0,
+                                (style.text.font_size_px * 1.35 + 6.0).max(24.0),
+                            ),
                         )
                     }
                     _ => {
@@ -940,13 +964,10 @@ impl<'a> BoxTreeBuilder<'a> {
                             .and_then(|v| v.trim().parse::<f32>().ok())
                             .filter(|v| v.is_finite() && *v > 0.0)
                             .unwrap_or(20.0);
-                        (
-                            FormControlKind::TextInput,
-                            Size::new(
-                                (size_chars * style.text.font_size_px * 0.56).max(40.0),
-                                (style.text.font_size_px * 1.25).max(18.0),
-                            ),
-                        )
+                        let char_w = style.text.font_size_px * 0.645;
+                        let content_w = (size_chars * char_w).max(40.0);
+                        let content_h = (style.text.font_size_px * 1.35).max(18.0);
+                        (FormControlKind::TextInput, Size::new(content_w, content_h))
                     }
                 };
                 Some(ReplacedKind::FormControl {
@@ -965,32 +986,71 @@ impl<'a> BoxTreeBuilder<'a> {
                 let cols = elem
                     .get_attribute("cols")
                     .and_then(|v| v.parse::<f32>().ok())
-                    .unwrap_or(24.0);
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .unwrap_or(20.0);
                 let rows = elem
                     .get_attribute("rows")
                     .and_then(|v| v.parse::<f32>().ok())
-                    .unwrap_or(3.0);
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .unwrap_or(2.0);
                 Some(ReplacedKind::FormControl {
                     kind: FormControlKind::TextArea,
                     text,
                     placeholder,
                     intrinsic_size: Size::new(
-                        cols * style.text.font_size_px * 0.6,
-                        rows * style.text.font_size_px * 1.4 + 12.0,
+                        cols * style.text.font_size_px * 0.71667,
+                        rows * style.text.font_size_px * 1.41667,
                     ),
                 })
             }
             "select" => {
                 let text = self.first_option_text(node);
+                let longest = self.longest_option_len(node).max(4);
+                let is_multiple = elem.has_attribute("multiple");
+                let h = if is_multiple {
+                    let rows = elem
+                        .get_attribute("size")
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .filter(|v| v.is_finite() && *v >= 1.0)
+                        .unwrap_or(4.0);
+                    rows * (style.text.font_size_px * 1.35).max(18.0) + 6.0
+                } else {
+                    (style.text.font_size_px * 1.35 + 6.0).max(24.0)
+                };
+                let w = (longest as f32 * style.text.font_size_px * 0.56 + 28.0).max(48.0);
                 Some(ReplacedKind::FormControl {
                     kind: FormControlKind::Select,
                     text,
                     placeholder: String::new(),
-                    intrinsic_size: Size::new(140.0, (style.text.font_size_px * 1.9).max(28.0)),
+                    intrinsic_size: Size::new(w, h),
                 })
             }
+            "meter" => Some(ReplacedKind::FormControl {
+                kind: FormControlKind::Meter,
+                text: String::new(),
+                placeholder: String::new(),
+                intrinsic_size: Size::new(80.0, 16.0),
+            }),
+            "progress" => Some(ReplacedKind::FormControl {
+                kind: FormControlKind::Progress,
+                text: String::new(),
+                placeholder: String::new(),
+                intrinsic_size: Size::new(160.0, 16.0),
+            }),
             _ => None,
         }
+    }
+
+    fn longest_option_len(&self, node: NodeId) -> usize {
+        let mut best = 0usize;
+        for desc in self.doc.descendants(node) {
+            if let Some(NodeData::Element(e)) = self.doc.get(desc) {
+                if e.name.local.eq_str_ignore_ascii_case("option") {
+                    best = best.max(self.collect_plain_text(desc).chars().count());
+                }
+            }
+        }
+        best
     }
 
     fn collect_plain_text(&self, node: NodeId) -> String {

@@ -20,7 +20,8 @@ use crate::animations::{
 use crate::color::CssColorExpr;
 use crate::computed::{resolve_element_style_with_context, ComputedStyle, MatchedRule};
 use crate::properties::{
-    parse_inline_style, MissingCssFeature, PropertyIdKind, PropertyValue, SpecifiedDeclaration,
+    parse_inline_style, parse_inline_style_quirks, MissingCssFeature, PropertyIdKind,
+    PropertyValue, SpecifiedDeclaration,
 };
 use crate::rule_index::{InvalidationMap, InvalidationScope, RuleIndex};
 use crate::selector::{
@@ -1516,6 +1517,7 @@ fn cascade_subtree_par(
     let own_shadow_index = shadow_root_id
         .map(|sr_id| build_shadow_rule_index(doc, sr_id, ua_sheet, shadow_adopted, media));
 
+    let bloom_opt = (doc.quirks_mode() != 2).then_some(&*bloom);
     let (style, hit) = compute_single_element_style(
         doc,
         node,
@@ -1529,7 +1531,7 @@ fn cascade_subtree_par(
         inline_color_exprs,
         media,
         active_containers,
-        Some(bloom),
+        bloom_opt,
         caches,
         memo,
         out_missing,
@@ -1557,7 +1559,7 @@ fn cascade_subtree_par(
         shadow_host,
         rule_index,
         media,
-        Some(bloom),
+        bloom_opt,
         caches,
         memo,
         out_pseudos,
@@ -1933,6 +1935,7 @@ fn restyle_dirty_walk(
 
     let mut propagate_inherited = false;
     let mut style_changed = false;
+    let bloom_opt = (doc.quirks_mode() != 2).then_some(&*bloom);
     let current_style = if needs_self {
         let old_style_opt = styles.get(&node).cloned();
         let (new_style, hit) = compute_single_element_style(
@@ -1948,7 +1951,7 @@ fn restyle_dirty_walk(
             inline_color_exprs,
             media,
             active_containers,
-            Some(bloom),
+            bloom_opt,
             caches,
             memo,
             missing_out,
@@ -2403,7 +2406,13 @@ fn compute_single_element_style(
     };
 
     let mut inline_decls: Vec<SpecifiedDeclaration> = match inline_attr {
-        Some(attr) if !attr.trim().is_empty() => parse_inline_style(attr, missing_out),
+        Some(attr) if !attr.trim().is_empty() => {
+            if doc.quirks_mode() == 2 {
+                parse_inline_style_quirks(attr, missing_out)
+            } else {
+                parse_inline_style(attr, missing_out)
+            }
+        }
         _ => Vec::new(),
     };
     if !inline_color_exprs.is_empty() && !inline_decls.is_empty() {
@@ -2742,10 +2751,24 @@ fn has_presentational_hint_attrs(doc: &Document, node: NodeId, elem: &ElementDat
             || k.eq_ignore_ascii_case("cellspacing")
             || k.eq_ignore_ascii_case("cellpadding")
             || k.eq_ignore_ascii_case("border")
+            || k.eq_ignore_ascii_case("bordercolor")
             || k.eq_ignore_ascii_case("rules")
             || k.eq_ignore_ascii_case("frame")
             || k.eq_ignore_ascii_case("nowrap")
             || k.eq_ignore_ascii_case("color")
+            || k.eq_ignore_ascii_case("hspace")
+            || k.eq_ignore_ascii_case("vspace")
+            || k.eq_ignore_ascii_case("background")
+            || k.eq_ignore_ascii_case("marginwidth")
+            || k.eq_ignore_ascii_case("marginheight")
+            || k.eq_ignore_ascii_case("leftmargin")
+            || k.eq_ignore_ascii_case("rightmargin")
+            || k.eq_ignore_ascii_case("topmargin")
+            || k.eq_ignore_ascii_case("bottommargin")
+            || k.eq_ignore_ascii_case("text")
+            || k.eq_ignore_ascii_case("face")
+            || k.eq_ignore_ascii_case("size")
+            || k.eq_ignore_ascii_case("noshade")
     }) {
         return true;
     }
@@ -2904,6 +2927,10 @@ fn collect_presentational_hint_decls(
             css.push_str("white-space:nowrap;");
             continue;
         }
+        if attr.eq_ignore_ascii_case("noshade") && tag.eq_ignore_ascii_case("hr") {
+            css.push_str("border-style:solid;background-color:gray;");
+            continue;
+        }
         let trimmed = val.trim();
         if trimmed.is_empty() {
             continue;
@@ -2922,11 +2949,144 @@ fn collect_presentational_hint_decls(
             css.push_str("background-color:");
             css.push_str(&norm);
             css.push(';');
+        } else if attr.eq_ignore_ascii_case("bordercolor") && tag.eq_ignore_ascii_case("table") {
+            let norm = normalize_legacy_color(trimmed);
+            css.push_str("border-color:");
+            css.push_str(&norm);
+            css.push(';');
+        } else if attr.eq_ignore_ascii_case("background")
+            && (tag.eq_ignore_ascii_case("body")
+                || tag.eq_ignore_ascii_case("table")
+                || tag.eq_ignore_ascii_case("thead")
+                || tag.eq_ignore_ascii_case("tbody")
+                || tag.eq_ignore_ascii_case("tfoot")
+                || tag.eq_ignore_ascii_case("tr")
+                || tag.eq_ignore_ascii_case("td")
+                || tag.eq_ignore_ascii_case("th"))
+        {
+            let escaped = trimmed.replace('\\', "\\\\").replace('"', "\\\"");
+            css.push_str("background-image:url(\"");
+            css.push_str(&escaped);
+            css.push_str("\");");
+        } else if attr.eq_ignore_ascii_case("text") && tag.eq_ignore_ascii_case("body") {
+            let norm = normalize_legacy_color(trimmed);
+            css.push_str("color:");
+            css.push_str(&norm);
+            css.push(';');
+        } else if attr.eq_ignore_ascii_case("marginwidth") && tag.eq_ignore_ascii_case("body") {
+            if let Some(dim) = normalize_html_dimension(trimmed) {
+                css.push_str("margin-left:");
+                css.push_str(&dim);
+                css.push_str(";margin-right:");
+                css.push_str(&dim);
+                css.push(';');
+            }
+        } else if attr.eq_ignore_ascii_case("marginheight") && tag.eq_ignore_ascii_case("body") {
+            if let Some(dim) = normalize_html_dimension(trimmed) {
+                css.push_str("margin-top:");
+                css.push_str(&dim);
+                css.push_str(";margin-bottom:");
+                css.push_str(&dim);
+                css.push(';');
+            }
+        } else if attr.eq_ignore_ascii_case("leftmargin") && tag.eq_ignore_ascii_case("body") {
+            if let Some(dim) = normalize_html_dimension(trimmed) {
+                css.push_str("margin-left:");
+                css.push_str(&dim);
+                css.push(';');
+            }
+        } else if attr.eq_ignore_ascii_case("rightmargin") && tag.eq_ignore_ascii_case("body") {
+            if let Some(dim) = normalize_html_dimension(trimmed) {
+                css.push_str("margin-right:");
+                css.push_str(&dim);
+                css.push(';');
+            }
+        } else if attr.eq_ignore_ascii_case("topmargin") && tag.eq_ignore_ascii_case("body") {
+            if let Some(dim) = normalize_html_dimension(trimmed) {
+                css.push_str("margin-top:");
+                css.push_str(&dim);
+                css.push(';');
+            }
+        } else if attr.eq_ignore_ascii_case("bottommargin") && tag.eq_ignore_ascii_case("body") {
+            if let Some(dim) = normalize_html_dimension(trimmed) {
+                css.push_str("margin-bottom:");
+                css.push_str(&dim);
+                css.push(';');
+            }
         } else if attr.eq_ignore_ascii_case("color") && tag.eq_ignore_ascii_case("font") {
             let norm = normalize_legacy_color(trimmed);
             css.push_str("color:");
             css.push_str(&norm);
             css.push(';');
+        } else if attr.eq_ignore_ascii_case("color") && tag.eq_ignore_ascii_case("hr") {
+            let norm = normalize_legacy_color(trimmed);
+            css.push_str("color:");
+            css.push_str(&norm);
+            css.push_str(";border-color:");
+            css.push_str(&norm);
+            css.push_str(";border-style:solid;");
+        } else if attr.eq_ignore_ascii_case("face") && tag.eq_ignore_ascii_case("font") {
+            css.push_str("font-family:");
+            css.push_str(trimmed);
+            css.push(';');
+        } else if attr.eq_ignore_ascii_case("size") && tag.eq_ignore_ascii_case("font") {
+            if let Some(kw) = parse_html_font_size_attr(trimmed) {
+                css.push_str("font-size:");
+                css.push_str(kw);
+                css.push(';');
+            }
+        } else if attr.eq_ignore_ascii_case("size") && tag.eq_ignore_ascii_case("hr") {
+            if let Ok(n) = trimmed.parse::<f32>() {
+                if n >= 1.0 && n.is_finite() {
+                    css.push_str(&format!("height:{}px;", (n - 2.0).max(0.0)));
+                }
+            }
+        } else if attr.eq_ignore_ascii_case("border")
+            && (tag.eq_ignore_ascii_case("img")
+                || tag.eq_ignore_ascii_case("object")
+                || (tag.eq_ignore_ascii_case("input")
+                    && elem
+                        .get_attribute("type")
+                        .is_some_and(|t| t.eq_ignore_ascii_case("image"))))
+        {
+            let w = parse_html_table_border_attr(trimmed);
+            if w > 0.0 {
+                css.push_str(&format!("border-width:{w}px;border-style:solid;"));
+            } else {
+                css.push_str("border-width:0px;");
+            }
+        } else if attr.eq_ignore_ascii_case("hspace")
+            && (tag.eq_ignore_ascii_case("img")
+                || tag.eq_ignore_ascii_case("input")
+                || tag.eq_ignore_ascii_case("object")
+                || tag.eq_ignore_ascii_case("embed")
+                || tag.eq_ignore_ascii_case("iframe")
+                || tag.eq_ignore_ascii_case("table")
+                || tag.eq_ignore_ascii_case("marquee"))
+        {
+            if let Some(dim) = normalize_html_dimension(trimmed) {
+                css.push_str("margin-left:");
+                css.push_str(&dim);
+                css.push_str(";margin-right:");
+                css.push_str(&dim);
+                css.push(';');
+            }
+        } else if attr.eq_ignore_ascii_case("vspace")
+            && (tag.eq_ignore_ascii_case("img")
+                || tag.eq_ignore_ascii_case("input")
+                || tag.eq_ignore_ascii_case("object")
+                || tag.eq_ignore_ascii_case("embed")
+                || tag.eq_ignore_ascii_case("iframe")
+                || tag.eq_ignore_ascii_case("table")
+                || tag.eq_ignore_ascii_case("marquee"))
+        {
+            if let Some(dim) = normalize_html_dimension(trimmed) {
+                css.push_str("margin-top:");
+                css.push_str(&dim);
+                css.push_str(";margin-bottom:");
+                css.push_str(&dim);
+                css.push(';');
+            }
         } else if attr.eq_ignore_ascii_case("width")
             && (tag.eq_ignore_ascii_case("table")
                 || tag.eq_ignore_ascii_case("td")
@@ -2937,6 +3097,11 @@ fn collect_presentational_hint_decls(
                 || tag.eq_ignore_ascii_case("svg")
                 || tag.eq_ignore_ascii_case("canvas")
                 || tag.eq_ignore_ascii_case("iframe")
+                || tag.eq_ignore_ascii_case("video")
+                || tag.eq_ignore_ascii_case("embed")
+                || tag.eq_ignore_ascii_case("object")
+                || tag.eq_ignore_ascii_case("input")
+                || tag.eq_ignore_ascii_case("marquee")
                 || tag.eq_ignore_ascii_case("hr"))
         {
             let dim = if tag.eq_ignore_ascii_case("svg") {
@@ -2960,7 +3125,12 @@ fn collect_presentational_hint_decls(
                 || tag.eq_ignore_ascii_case("img")
                 || tag.eq_ignore_ascii_case("svg")
                 || tag.eq_ignore_ascii_case("canvas")
-                || tag.eq_ignore_ascii_case("iframe"))
+                || tag.eq_ignore_ascii_case("iframe")
+                || tag.eq_ignore_ascii_case("video")
+                || tag.eq_ignore_ascii_case("embed")
+                || tag.eq_ignore_ascii_case("object")
+                || tag.eq_ignore_ascii_case("input")
+                || tag.eq_ignore_ascii_case("marquee"))
         {
             let dim = if tag.eq_ignore_ascii_case("svg") {
                 normalize_svg_dimension(trimmed)
@@ -2974,8 +3144,34 @@ fn collect_presentational_hint_decls(
             }
         } else if attr.eq_ignore_ascii_case("align") {
             let lower = trimmed.to_ascii_lowercase();
-            if tag.eq_ignore_ascii_case("table") && lower == "center" {
-                css.push_str("margin-left:auto;margin-right:auto;");
+            if tag.eq_ignore_ascii_case("table") {
+                match lower.as_str() {
+                    "left" => css.push_str("float:left;"),
+                    "right" => css.push_str("float:right;"),
+                    "center" => css.push_str("margin-left:auto;margin-right:auto;"),
+                    _ => {}
+                }
+            } else if tag.eq_ignore_ascii_case("img")
+                || tag.eq_ignore_ascii_case("input")
+                || tag.eq_ignore_ascii_case("object")
+                || tag.eq_ignore_ascii_case("embed")
+                || tag.eq_ignore_ascii_case("iframe")
+            {
+                match lower.as_str() {
+                    "left" => css.push_str("float:left;"),
+                    "right" => css.push_str("float:right;"),
+                    "top" | "texttop" => css.push_str("vertical-align:top;"),
+                    "middle" | "absmiddle" | "center" => css.push_str("vertical-align:middle;"),
+                    "bottom" | "baseline" | "absbottom" => css.push_str("vertical-align:bottom;"),
+                    _ => {}
+                }
+            } else if tag.eq_ignore_ascii_case("hr") {
+                match lower.as_str() {
+                    "left" => css.push_str("margin-left:0;margin-right:auto;"),
+                    "right" => css.push_str("margin-left:auto;margin-right:0;"),
+                    "center" => css.push_str("margin-left:auto;margin-right:auto;"),
+                    _ => {}
+                }
             } else if matches!(lower.as_str(), "left" | "center" | "right" | "justify") {
                 css.push_str("text-align:");
                 css.push_str(&lower);
@@ -3009,6 +3205,30 @@ fn collect_presentational_hint_decls(
     } else {
         parse_inline_style(&css, missing_out)
     }
+}
+
+/// HTML5 §15.3.4 `<font size>` attribute mapping (`1`..`7` or relative `+N`/`-N` from 3).
+fn parse_html_font_size_attr(raw: &str) -> Option<&'static str> {
+    let s = raw.trim();
+    let level: i32 = if let Some(rest) = s.strip_prefix('+') {
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        3 + digits.parse::<i32>().ok()?
+    } else if let Some(rest) = s.strip_prefix('-') {
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        3 - digits.parse::<i32>().ok()?
+    } else {
+        let digits: String = s.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<i32>().ok()?
+    };
+    Some(match level.clamp(1, 7) {
+        1 => "xx-small",
+        2 => "small",
+        3 => "medium",
+        4 => "large",
+        5 => "x-large",
+        6 => "xx-large",
+        _ => "xxx-large",
+    })
 }
 
 fn normalize_legacy_color(raw: &str) -> String {

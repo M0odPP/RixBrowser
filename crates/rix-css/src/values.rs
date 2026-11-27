@@ -767,6 +767,41 @@ pub enum OverlayMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[repr(u8)]
+pub enum AppearanceMode {
+    #[default]
+    None,
+    Auto,
+    Textfield,
+    MenulistButton,
+}
+
+impl AppearanceMode {
+    #[must_use]
+    pub fn parse_css(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "auto" | "button" | "checkbox" | "listbox" | "menulist" | "meter" | "progress-bar"
+            | "push-button" | "radio" | "searchfield" | "slider-horizontal" | "square-button"
+            | "textarea" => Some(Self::Auto),
+            "textfield" => Some(Self::Textfield),
+            "menulist-button" => Some(Self::MenulistButton),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_css_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Auto => "auto",
+            Self::Textfield => "textfield",
+            Self::MenulistButton => "menulist-button",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
 pub enum ReadingFlowMode {
     #[default]
     Normal,

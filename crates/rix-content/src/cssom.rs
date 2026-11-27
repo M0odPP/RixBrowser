@@ -6615,6 +6615,13 @@ pub(crate) fn format_computed_property_resolved(
         "outline-style" => format_line_style(style.visual.outline_style).into(),
         "outline-width" => format_px(style.visual.outline_width),
         "outline-offset" => format_lp(&style.visual.outline_offset, &eval),
+        "appearance" | "-webkit-appearance" | "-moz-appearance" => {
+            style.visual.appearance.as_css_str().into()
+        }
+        "accent-color" => match style.text.accent_color {
+            None => "auto".into(),
+            Some(c) => format_css_color(c, cc, dark),
+        },
         "vertical-align" => match style.box_model.vertical_align {
             VerticalAlignMode::Baseline => "baseline".into(),
             VerticalAlignMode::Top => "top".into(),

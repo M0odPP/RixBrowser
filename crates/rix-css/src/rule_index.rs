@@ -9,7 +9,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use rix_core::InternedStr;
-use rix_dom::{hash_ident, hash_ident_ascii_lower, ElementData, ElementState};
+use rix_dom::{hash_ident_ascii_lower, ElementData, ElementState};
 use selectors::bloom::BloomFilter;
 use selectors::matching::selector_may_match;
 use selectors::parser::{AncestorHashes, Combinator, Component, Selector};
@@ -123,12 +123,12 @@ impl SelectorBuckets {
         };
 
         if let Some(ref id) = elem.cached_id {
-            let id_hash = hash_ident(id.as_str());
+            let id_hash = hash_ident_ascii_lower(id.as_str());
             if let Some(bucket) = self.by_id.get(&id_hash) {
                 push_bucket(bucket);
             }
         }
-        for &cls_hash in &elem.class_hashes {
+        for &cls_hash in &elem.class_hashes_lower {
             if let Some(bucket) = self.by_class.get(&cls_hash) {
                 push_bucket(bucket);
             }
@@ -548,8 +548,12 @@ impl RuleIndex {
             for comp in iter.by_ref() {
                 match comp {
                     Component::PseudoElement(pe) => pseudo_kind = Some(*pe),
-                    Component::ID(id) if best_id.is_none() => best_id = Some(id.hash64),
-                    Component::Class(cls) if best_class.is_none() => best_class = Some(cls.hash64),
+                    Component::ID(id) if best_id.is_none() => {
+                        best_id = Some(hash_ident_ascii_lower(id.as_str()));
+                    }
+                    Component::Class(cls) if best_class.is_none() => {
+                        best_class = Some(hash_ident_ascii_lower(cls.as_str()));
+                    }
                     Component::LocalName(ln) if best_tag.is_none() => {
                         best_tag = Some(ln.lower_name.hash64);
                     }
@@ -581,9 +585,11 @@ impl RuleIndex {
             {
                 for comp in iter.by_ref() {
                     match comp {
-                        Component::ID(id) if best_id.is_none() => best_id = Some(id.hash64),
+                        Component::ID(id) if best_id.is_none() => {
+                            best_id = Some(hash_ident_ascii_lower(id.as_str()));
+                        }
                         Component::Class(cls) if best_class.is_none() => {
-                            best_class = Some(cls.hash64);
+                            best_class = Some(hash_ident_ascii_lower(cls.as_str()));
                         }
                         Component::LocalName(ln) if best_tag.is_none() => {
                             best_tag = Some(ln.lower_name.hash64);
@@ -618,13 +624,16 @@ impl RuleIndex {
                 };
                 if !target_ids.is_empty() {
                     if let Some(ref id) = el.cached_id {
-                        if target_ids.contains(&hash_ident(id.as_str())) {
+                        if target_ids.contains(&hash_ident_ascii_lower(id.as_str())) {
                             return true;
                         }
                     }
                 }
                 if !target_classes.is_empty()
-                    && el.class_hashes.iter().any(|h| target_classes.contains(h))
+                    && el
+                        .class_hashes_lower
+                        .iter()
+                        .any(|h| target_classes.contains(h))
                 {
                     return true;
                 }
@@ -678,8 +687,12 @@ impl RuleIndex {
                 Component::Host(_) => {
                     is_host_subject = true;
                 }
-                Component::ID(id) if best_id.is_none() => best_id = Some(id.hash64),
-                Component::Class(cls) if best_class.is_none() => best_class = Some(cls.hash64),
+                Component::ID(id) if best_id.is_none() => {
+                    best_id = Some(hash_ident_ascii_lower(id.as_str()));
+                }
+                Component::Class(cls) if best_class.is_none() => {
+                    best_class = Some(hash_ident_ascii_lower(cls.as_str()));
+                }
                 Component::LocalName(ln) if best_tag.is_none() => {
                     best_tag = Some(ln.lower_name.hash64);
                 }
@@ -733,9 +746,11 @@ impl RuleIndex {
             if matches!(iter.next_sequence(), Some(Combinator::PseudoElement)) {
                 for comp in iter.by_ref() {
                     match comp {
-                        Component::ID(id) if best_id.is_none() => best_id = Some(id.hash64),
+                        Component::ID(id) if best_id.is_none() => {
+                            best_id = Some(hash_ident_ascii_lower(id.as_str()));
+                        }
                         Component::Class(cls) if best_class.is_none() => {
-                            best_class = Some(cls.hash64);
+                            best_class = Some(hash_ident_ascii_lower(cls.as_str()));
                         }
                         Component::LocalName(ln) if best_tag.is_none() => {
                             best_tag = Some(ln.lower_name.hash64);
@@ -834,8 +849,12 @@ fn extract_simple_key(
 ) {
     for comp in sel.iter() {
         match comp {
-            Component::ID(id) if best_id.is_none() => *best_id = Some(id.hash64),
-            Component::Class(cls) if best_class.is_none() => *best_class = Some(cls.hash64),
+            Component::ID(id) if best_id.is_none() => {
+                *best_id = Some(hash_ident_ascii_lower(id.as_str()));
+            }
+            Component::Class(cls) if best_class.is_none() => {
+                *best_class = Some(hash_ident_ascii_lower(cls.as_str()));
+            }
             Component::LocalName(ln) if best_tag.is_none() => {
                 *best_tag = Some(ln.lower_name.hash64);
             }
@@ -913,7 +932,7 @@ impl InvalidationMap {
     #[must_use]
     pub fn scope_for_class(&self, class_name: &str) -> InvalidationScope {
         self.class_deps
-            .get(&hash_ident(class_name))
+            .get(&hash_ident_ascii_lower(class_name))
             .copied()
             .unwrap_or(InvalidationScope::empty())
     }
@@ -931,7 +950,7 @@ impl InvalidationMap {
     #[must_use]
     pub fn scope_for_id(&self, id: &str) -> InvalidationScope {
         self.id_deps
-            .get(&hash_ident(id))
+            .get(&hash_ident_ascii_lower(id))
             .copied()
             .unwrap_or(InvalidationScope::empty())
     }
@@ -995,11 +1014,17 @@ impl InvalidationMap {
     ) -> (bool, bool) {
         match comp {
             Component::ID(id) => {
-                *self.id_deps.entry(id.hash64).or_default() |= scope;
+                *self
+                    .id_deps
+                    .entry(hash_ident_ascii_lower(id.as_str()))
+                    .or_default() |= scope;
                 (false, false)
             }
             Component::Class(cls) => {
-                *self.class_deps.entry(cls.hash64).or_default() |= scope;
+                *self
+                    .class_deps
+                    .entry(hash_ident_ascii_lower(cls.as_str()))
+                    .or_default() |= scope;
                 (false, false)
             }
             Component::AttributeInNoNamespace { local_name, .. } => {

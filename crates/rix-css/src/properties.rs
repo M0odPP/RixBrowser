@@ -34,9 +34,9 @@ use crate::values::{
     convert_track_sizing, convert_transform, convert_transform_origin, convert_transition,
     convert_user_select, convert_visibility, convert_white_space, convert_word_break,
     convert_z_index, time_to_ms, AlignValue, AnimationCompositionMode, AnimationDirectionMode,
-    AnimationFillModeKind, AnimationPlayStateMode, AnimationSpec, BackgroundClipMode,
-    BackgroundImageValue, BackgroundLayerValue, BackgroundSizeValue, BorderCollapseMode,
-    BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue,
+    AnimationFillModeKind, AnimationPlayStateMode, AnimationSpec, AppearanceMode,
+    BackgroundClipMode, BackgroundImageValue, BackgroundLayerValue, BackgroundSizeValue,
+    BorderCollapseMode, BoxShadowValue, BoxSizingMode, CaptionSideMode, ClearMode, ClipPathValue,
     ColorInterpolationFiltersMode, ContentVisibilityMode, CornerRadius, CssColor, CursorKind,
     DirectionMode, DisplayMode, EmptyCellsMode, FilterOp, FilterSpecOp, FlexDirectionMode,
     FlexWrapMode, FloatMode, FontStyleMode, GridAutoFlowMode, GridPlacementValue,
@@ -692,6 +692,8 @@ pub enum PropertyIdKind {
     WritingMode,
     TextOrientation,
     Resize,
+    Appearance,
+    AccentColor,
     CaptionSide,
     OverscrollBehaviorX,
     OverscrollBehaviorY,
@@ -817,6 +819,8 @@ impl PropertyIdKind {
             "writing-mode" => Self::WritingMode,
             "text-orientation" => Self::TextOrientation,
             "resize" => Self::Resize,
+            "appearance" | "-webkit-appearance" | "-moz-appearance" => Self::Appearance,
+            "accent-color" => Self::AccentColor,
             "caption-side" => Self::CaptionSide,
             "overscroll-behavior-x" => Self::OverscrollBehaviorX,
             "overscroll-behavior-y" => Self::OverscrollBehaviorY,
@@ -1338,6 +1342,8 @@ impl PropertyIdKind {
             Self::WritingMode => "writing-mode",
             Self::TextOrientation => "text-orientation",
             Self::Resize => "resize",
+            Self::Appearance => "appearance",
+            Self::AccentColor => "accent-color",
             Self::CaptionSide => "caption-side",
             Self::OverscrollBehaviorX => "overscroll-behavior-x",
             Self::OverscrollBehaviorY => "overscroll-behavior-y",
@@ -1426,6 +1432,7 @@ impl PropertyIdKind {
             self,
             Self::Color
                 | Self::ColorScheme
+                | Self::AccentColor
                 | Self::SvgFill
                 | Self::SvgStroke
                 | Self::SvgFillRule
@@ -1736,6 +1743,7 @@ impl PropertyIdKind {
 /// Complete list of supported CSS longhand property names exposed by `getComputedStyle(el)`
 /// (`length`, `item(i)`, `ownKeys`, `getOwnPropertyDescriptor`).
 pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
+    "accent-color",
     "align-content",
     "align-items",
     "align-self",
@@ -1751,6 +1759,7 @@ pub const COMPUTED_STYLE_LONGHANDS: &[&str] = &[
     "animation-range-start",
     "animation-timeline",
     "animation-timing-function",
+    "appearance",
     "background-color",
     "background-image",
     "background-position",
@@ -2145,6 +2154,8 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::WritingMode,
     PropertyIdKind::TextOrientation,
     PropertyIdKind::Resize,
+    PropertyIdKind::Appearance,
+    PropertyIdKind::AccentColor,
     PropertyIdKind::CaptionSide,
     PropertyIdKind::OverscrollBehaviorX,
     PropertyIdKind::OverscrollBehaviorY,
@@ -2479,6 +2490,8 @@ pub enum PropertyValue {
     WritingMode(WritingMode),
     TextOrientation(TextOrientationMode),
     Resize(ResizeMode),
+    Appearance(AppearanceMode),
+    AccentColor(Option<CssColor>),
     CaptionSide(CaptionSideMode),
     OverscrollBehavior(OverscrollBehaviorMode),
     ScrollBehavior(ScrollBehaviorMode),
@@ -4578,10 +4591,690 @@ pub(crate) fn restore_revert_rule_sentinel(text: &str) -> String {
     s
 }
 
+/// Preprocesses author CSS for Quirks Mode Living Standard §3.1 (hashless hex colors) and §3.2
+/// (unitless lengths) when `quirks_mode` is true, AND enforces CSS Values L3 §5.1 strict length
+/// validation (rejecting non-zero unitless numbers on length properties where `lightningcss`
+/// unconditionally coerces bare numbers to `px`) in both No-Quirks/Limited-Quirks mode and on
+/// excluded properties in Quirks Mode.
+#[must_use]
+pub(crate) fn preprocess_quirks_and_strict_lengths(
+    css: &str,
+    quirks_mode: bool,
+) -> std::borrow::Cow<'_, str> {
+    fn is_hashless_hex_prop(name: &str) -> bool {
+        matches!(
+            name,
+            "background-color"
+                | "border-color"
+                | "border-top-color"
+                | "border-right-color"
+                | "border-bottom-color"
+                | "border-left-color"
+                | "color"
+        )
+    }
+    fn is_quirky_len_prop(name: &str) -> bool {
+        matches!(
+            name,
+            "background-position"
+                | "border-spacing"
+                | "border-top-width"
+                | "border-right-width"
+                | "border-bottom-width"
+                | "border-left-width"
+                | "border-width"
+                | "bottom"
+                | "clip"
+                | "font-size"
+                | "height"
+                | "left"
+                | "letter-spacing"
+                | "margin-right"
+                | "margin-left"
+                | "margin-top"
+                | "margin-bottom"
+                | "margin"
+                | "max-height"
+                | "max-width"
+                | "min-height"
+                | "min-width"
+                | "padding-top"
+                | "padding-right"
+                | "padding-bottom"
+                | "padding-left"
+                | "padding"
+                | "right"
+                | "text-indent"
+                | "top"
+                | "vertical-align"
+                | "width"
+                | "word-spacing"
+        )
+    }
+    fn is_strict_non_quirky_len_prop(name: &str) -> bool {
+        matches!(
+            name,
+            "outline-width"
+                | "outline-offset"
+                | "outline"
+                | "border"
+                | "border-top"
+                | "border-right"
+                | "border-bottom"
+                | "border-left"
+                | "background"
+                | "font"
+                | "inset"
+                | "inset-block"
+                | "inset-block-start"
+                | "inset-block-end"
+                | "inset-inline"
+                | "inset-inline-start"
+                | "inset-inline-end"
+                | "margin-block"
+                | "margin-block-start"
+                | "margin-block-end"
+                | "margin-inline"
+                | "margin-inline-start"
+                | "margin-inline-end"
+                | "padding-block"
+                | "padding-block-start"
+                | "padding-block-end"
+                | "padding-inline"
+                | "padding-inline-start"
+                | "padding-inline-end"
+                | "inline-size"
+                | "block-size"
+                | "min-inline-size"
+                | "max-inline-size"
+                | "min-block-size"
+                | "max-block-size"
+                | "row-gap"
+                | "column-gap"
+                | "gap"
+                | "border-radius"
+                | "border-top-left-radius"
+                | "border-top-right-radius"
+                | "border-bottom-right-radius"
+                | "border-bottom-left-radius"
+        )
+    }
+    fn unescape_css_token(raw: &str) -> Option<String> {
+        let bytes = raw.as_bytes();
+        let mut out = String::with_capacity(raw.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' {
+                i += 1;
+                if i >= bytes.len() {
+                    return None;
+                }
+                if bytes[i].is_ascii_hexdigit() {
+                    let start = i;
+                    let mut count = 0;
+                    while i < bytes.len() && count < 6 && bytes[i].is_ascii_hexdigit() {
+                        i += 1;
+                        count += 1;
+                    }
+                    let cp = u32::from_str_radix(&raw[start..i], 16).ok()?;
+                    let ch = char::from_u32(cp)?;
+                    out.push(ch);
+                    // Consume single optional trailing whitespace per CSS Syntax §4.3.7.
+                    if i < bytes.len() {
+                        if bytes[i] == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                            i += 2;
+                        } else if matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c') {
+                            i += 1;
+                        }
+                    }
+                } else {
+                    let ch = raw[i..].chars().next()?;
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            } else {
+                let ch = raw[i..].chars().next()?;
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+        Some(out)
+    }
+    /// Exact Quirks Mode Living Standard §3.1 hashless hex color parser for a single component token.
+    fn parse_hashless_hex_token(tok: &str) -> Option<String> {
+        if tok.is_empty() || tok.contains("/*") || tok.starts_with('-') || tok.starts_with('#') {
+            return None;
+        }
+        let first = tok.as_bytes()[0];
+        if first == b'+' || first.is_ascii_digit() {
+            // `<number-token>` or `<dimension-token>`: must be a non-negative integer followed by
+            // optional hex-only ident (possibly with CSS escapes in the unit part, e.g. `12\33 `),
+            // total 1..=6 hex digits, left-padded with '0' to 6 digits!
+            // Reject CSS scientific notation (`<digits>[eE][+-]?<digit>`, e.g. `1e1`, `11e1a`),
+            // which CSS Syntax §4.3.3 tokenizes with `type_flag = "number"` (not `"integer"`).
+            let rest = tok.strip_prefix('+').unwrap_or(tok);
+            if rest.is_empty() || !rest.as_bytes()[0].is_ascii_digit() {
+                return None;
+            }
+            {
+                let rb = rest.as_bytes();
+                let mut d = 0;
+                while d < rb.len() && rb[d].is_ascii_digit() {
+                    d += 1;
+                }
+                if d < rb.len() && (rb[d] == b'e' || rb[d] == b'E') {
+                    let after_e = if d + 1 < rb.len() && (rb[d + 1] == b'+' || rb[d + 1] == b'-') {
+                        d + 2
+                    } else {
+                        d + 1
+                    };
+                    if after_e < rb.len() && rb[after_e].is_ascii_digit() {
+                        return None;
+                    }
+                }
+            }
+            let unesc = unescape_css_token(rest)?;
+            if unesc.is_empty() || unesc.len() > 6 || !unesc.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return None;
+            }
+            Some(format!("#{unesc:0>6}"))
+        } else if first == b'\\' || first.is_ascii_alphabetic() {
+            // `<ident-token>` (including escaped leading digit like `\31 23`):
+            // valid ONLY if unescaped string has length 3 or 6 and all ASCII hex digits!
+            let unesc = unescape_css_token(tok)?;
+            if (unesc.len() == 3 || unesc.len() == 6)
+                && unesc.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                Some(format!("#{unesc}"))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+    fn parse_bare_number(tok: &str) -> Option<f64> {
+        if tok.contains("/*") || tok.contains('\\') {
+            return None;
+        }
+        let s = tok
+            .strip_prefix('+')
+            .or_else(|| tok.strip_prefix('-'))
+            .unwrap_or(tok);
+        if s.is_empty() || s == "." {
+            return None;
+        }
+        let mut saw_dot = false;
+        let mut saw_digit = false;
+        for b in s.bytes() {
+            if b.is_ascii_digit() {
+                saw_digit = true;
+            } else if b == b'.' && !saw_dot {
+                saw_dot = true;
+            } else {
+                return None;
+            }
+        }
+        if !saw_digit {
+            return None;
+        }
+        tok.parse::<f64>().ok()
+    }
+    /// Splits `s` into top-level whitespace-separated tokens, keeping CSS escape sequences like
+    /// `\31 23` together as a single token and ignoring content inside `(...)`.
+    fn split_css_value_tokens(s: &str) -> Vec<&str> {
+        let bytes = s.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            let start = i;
+            let mut paren = 0usize;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if b == b'\\' && i + 1 < bytes.len() {
+                    i += 1;
+                    if bytes[i].is_ascii_hexdigit() {
+                        let mut c = 0;
+                        while i < bytes.len() && c < 6 && bytes[i].is_ascii_hexdigit() {
+                            i += 1;
+                            c += 1;
+                        }
+                        if i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                            i += 1;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if b == b'(' {
+                    paren += 1;
+                } else if b == b')' {
+                    paren = paren.saturating_sub(1);
+                } else if paren == 0 && b.is_ascii_whitespace() {
+                    break;
+                }
+                i += 1;
+            }
+            out.push(&s[start..i]);
+        }
+        out
+    }
+    fn has_malformed_numeric_escape_or_comment(tok: &str) -> bool {
+        if tok.starts_with('#') || tok.starts_with('"') || tok.starts_with('\'') {
+            return false;
+        }
+        // Reject unitless `calc(1)` / `calc(2)` on pure-length properties (CSS Values L3 §8.1.2:
+        // a calc() expression with no length/percentage unit resolves to `<number>`, not `<length>`).
+        if tok.len() >= 6 && tok[..5].eq_ignore_ascii_case("calc(") && tok.ends_with(')') {
+            let inner = &tok[5..tok.len() - 1];
+            let has_unit_or_ident = inner.bytes().any(|b| b.is_ascii_alphabetic() || b == b'%');
+            let has_digit = inner.bytes().any(|b| b.is_ascii_digit());
+            if has_digit && !has_unit_or_ident {
+                return true;
+            }
+            return false;
+        }
+        if tok.contains('(') {
+            return false;
+        }
+        // Catch comment-split signs like `+/**/1` / `-/**/1` and escaped-digit dimensions like `1\31 `
+        // or `\31 ` that lightningcss would mis-parse as valid pixel lengths.
+        if tok.contains("/*") {
+            let stripped = strip_css_comments_inline(tok);
+            if parse_bare_number(stripped.trim()).is_some() {
+                return true;
+            }
+        }
+        if tok.contains('\\') {
+            let s = tok
+                .strip_prefix('+')
+                .or_else(|| tok.strip_prefix('-'))
+                .unwrap_or(tok);
+            if s.starts_with('\\') || s.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
+                return true;
+            }
+        }
+        false
+    }
+    fn strip_css_comments_inline(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            } else {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        out
+    }
+    fn has_nonzero_bare_number_outside_parens(body: &str) -> bool {
+        split_css_value_tokens(body).into_iter().any(|t| {
+            has_malformed_numeric_escape_or_comment(t)
+                || (!t.contains('(') && parse_bare_number(t).is_some_and(|n| n != 0.0))
+        })
+    }
+    fn font_shorthand_has_unitless_size(body: &str) -> bool {
+        let toks = split_css_value_tokens(body);
+        let mut i = 0usize;
+        while i < toks.len() {
+            let low = toks[i].to_ascii_lowercase();
+            if matches!(
+                low.as_str(),
+                "normal"
+                    | "italic"
+                    | "oblique"
+                    | "small-caps"
+                    | "bold"
+                    | "bolder"
+                    | "lighter"
+                    | "ultra-condensed"
+                    | "extra-condensed"
+                    | "condensed"
+                    | "semi-condensed"
+                    | "semi-expanded"
+                    | "expanded"
+                    | "extra-expanded"
+                    | "ultra-expanded"
+            ) {
+                i += 1;
+                continue;
+            }
+            // Only the first numeric token before a size-with-unit could be a font-weight;
+            // if a bare non-zero number is immediately followed by a non-size font-family token,
+            // it sits in the `font-size` slot and is invalid!
+            if parse_bare_number(toks[i]).is_some_and(|n| n != 0.0) {
+                let next_is_size = toks.get(i + 1).is_some_and(|nt| {
+                    let nl = nt.to_ascii_lowercase();
+                    nt.as_bytes()
+                        .first()
+                        .is_some_and(|b| b.is_ascii_digit() || *b == b'.')
+                        || matches!(
+                            nl.as_str(),
+                            "xx-small"
+                                | "x-small"
+                                | "small"
+                                | "medium"
+                                | "large"
+                                | "x-large"
+                                | "xx-large"
+                                | "xxx-large"
+                                | "smaller"
+                                | "larger"
+                        )
+                });
+                if !next_is_size {
+                    return true;
+                }
+            }
+            break;
+        }
+        false
+    }
+
+    let bytes = css.as_bytes();
+    let mut out = String::with_capacity(css.len() + 16);
+    let mut changed = false;
+    let mut i = 0usize;
+    let mut in_str: Option<u8> = None;
+    let mut in_supports_cond = false;
+    let mut paren_depth = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            out.push(b as char);
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            out.push_str(&css[start..i]);
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_str = Some(b);
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if b == b'@' && css[i..].len() >= 9 && css[i..i + 9].eq_ignore_ascii_case("@supports") {
+            in_supports_cond = true;
+        }
+        if b == b'{' {
+            in_supports_cond = false;
+            out.push('{');
+            i += 1;
+            continue;
+        }
+        if b == b'(' {
+            paren_depth += 1;
+            out.push('(');
+            i += 1;
+            continue;
+        }
+        if b == b')' {
+            paren_depth = paren_depth.saturating_sub(1);
+            out.push(')');
+            i += 1;
+            continue;
+        }
+        // Scan `<prop-name> : <value>` declaration at top-level or inside `@supports (...)`.
+        let allow_decl_here = paren_depth == 0 || in_supports_cond;
+        if allow_decl_here
+            && (b.is_ascii_alphabetic() || b == b'-')
+            && (i == 0
+                || matches!(
+                    bytes[i - 1],
+                    b'{' | b';' | b'(' | b' ' | b'\t' | b'\n' | b'\r' | b'/'
+                ))
+        {
+            let name_start = i;
+            let mut k = i;
+            while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'-') {
+                k += 1;
+            }
+            let prop_raw = &css[name_start..k];
+            let mut colon = k;
+            while colon < bytes.len() && bytes[colon].is_ascii_whitespace() {
+                colon += 1;
+            }
+            if colon < bytes.len() && bytes[colon] == b':' {
+                let prop_lower = prop_raw.to_ascii_lowercase();
+                let want_hex = quirks_mode && is_hashless_hex_prop(&prop_lower);
+                let is_quirky_len = is_quirky_len_prop(&prop_lower);
+                let is_strict_other = is_strict_non_quirky_len_prop(&prop_lower);
+                if want_hex || is_quirky_len || is_strict_other {
+                    // Find end of declaration value (`;`, `}`, unmatched `)` in `@supports`, or EOF).
+                    let val_start = colon + 1;
+                    let mut v = val_start;
+                    let mut p = 0usize;
+                    let mut vs: Option<u8> = None;
+                    while v < bytes.len() {
+                        let ch = bytes[v];
+                        if let Some(q) = vs {
+                            if ch == b'\\' {
+                                v += 2;
+                                continue;
+                            }
+                            if ch == q {
+                                vs = None;
+                            }
+                            v += 1;
+                            continue;
+                        }
+                        if ch == b'"' || ch == b'\'' {
+                            vs = Some(ch);
+                        } else if ch == b'(' {
+                            p += 1;
+                        } else if ch == b')' {
+                            if p == 0 {
+                                break;
+                            }
+                            p -= 1;
+                        } else if p == 0 && (ch == b';' || ch == b'}') {
+                            break;
+                        }
+                        v += 1;
+                    }
+                    let raw_val = &css[val_start..v];
+                    let (body, imp_tail) = if let Some(bang) = raw_val.rfind('!') {
+                        (&raw_val[..bang], &raw_val[bang..])
+                    } else {
+                        (raw_val, "")
+                    };
+                    let trimmed_body = body.trim();
+                    let mut replacement: Option<String> = None;
+                    let mut invalidate = false;
+
+                    if want_hex {
+                        if prop_lower == "border-color" {
+                            let parts = split_css_value_tokens(trimmed_body);
+                            if !parts.is_empty() && parts.len() <= 4 {
+                                let mut any = false;
+                                let mut rebuilt = Vec::with_capacity(parts.len());
+                                for t in parts {
+                                    if let Some(hex) = parse_hashless_hex_token(t) {
+                                        any = true;
+                                        rebuilt.push(hex);
+                                    } else {
+                                        rebuilt.push(t.to_string());
+                                    }
+                                }
+                                if any {
+                                    replacement = Some(rebuilt.join(" "));
+                                }
+                            }
+                        } else {
+                            let parts = split_css_value_tokens(trimmed_body);
+                            if parts.len() == 1 {
+                                if let Some(hex) = parse_hashless_hex_token(parts[0]) {
+                                    replacement = Some(hex);
+                                }
+                            }
+                        }
+                    } else if prop_lower == "clip" {
+                        let low = trimmed_body.to_ascii_lowercase();
+                        if low.starts_with("rect(") && trimmed_body.ends_with(')') {
+                            let inner = &trimmed_body[5..trimmed_body.len() - 1];
+                            let sep = if inner.contains(',') { ',' } else { ' ' };
+                            let parts: Vec<&str> = if sep == ',' {
+                                inner.split(',').map(str::trim).collect()
+                            } else {
+                                split_css_value_tokens(inner)
+                            };
+                            if parts.len() == 4 {
+                                let has_bad = parts
+                                    .iter()
+                                    .any(|t| has_malformed_numeric_escape_or_comment(t));
+                                let has_nz = parts
+                                    .iter()
+                                    .any(|t| parse_bare_number(t).is_some_and(|n| n != 0.0));
+                                if has_bad {
+                                    invalidate = true;
+                                } else if has_nz {
+                                    if quirks_mode {
+                                        let fixed: Vec<String> = parts
+                                            .iter()
+                                            .map(|t| {
+                                                if parse_bare_number(t).is_some_and(|n| n != 0.0) {
+                                                    format!("{t}px")
+                                                } else {
+                                                    (*t).to_string()
+                                                }
+                                            })
+                                            .collect();
+                                        let glue = if sep == ',' { ", " } else { " " };
+                                        replacement = Some(format!("rect({})", fixed.join(glue)));
+                                    } else {
+                                        invalidate = true;
+                                    }
+                                }
+                            }
+                        }
+                    } else if is_quirky_len {
+                        let parts = split_css_value_tokens(trimmed_body);
+                        let has_bad = parts
+                            .iter()
+                            .any(|t| has_malformed_numeric_escape_or_comment(t));
+                        let has_nz = parts.iter().any(|t| {
+                            !t.contains('(') && parse_bare_number(t).is_some_and(|n| n != 0.0)
+                        });
+                        if has_bad {
+                            invalidate = true;
+                        } else if has_nz {
+                            if quirks_mode {
+                                let fixed: Vec<String> = parts
+                                    .into_iter()
+                                    .map(|t| {
+                                        if !t.contains('(')
+                                            && parse_bare_number(t).is_some_and(|n| n != 0.0)
+                                        {
+                                            format!("{t}px")
+                                        } else {
+                                            t.to_string()
+                                        }
+                                    })
+                                    .collect();
+                                replacement = Some(fixed.join(" "));
+                            } else {
+                                invalidate = true;
+                            }
+                        }
+                    } else if is_strict_other {
+                        // Excluded from Quirks §3.2 in BOTH quirks and non-quirks mode.
+                        let bad = if prop_lower == "font" {
+                            font_shorthand_has_unitless_size(trimmed_body)
+                        } else {
+                            has_nonzero_bare_number_outside_parens(trimmed_body)
+                        };
+                        if bad {
+                            invalidate = true;
+                        }
+                    }
+
+                    if invalidate {
+                        changed = true;
+                        out.push_str(&css[name_start..=colon]);
+                        out.push_str(" __rix_invalid_unitless__");
+                        i = v;
+                        continue;
+                    }
+                    if let Some(new_val) = replacement {
+                        changed = true;
+                        out.push_str(&css[name_start..=colon]);
+                        out.push(' ');
+                        out.push_str(&new_val);
+                        if !imp_tail.is_empty() {
+                            out.push(' ');
+                            out.push_str(imp_tail.trim());
+                        }
+                        i = v;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = css[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(css)
+    }
+}
+
+/// Parses an HTML `style="..."` attribute in Quirks Mode (applying Quirks Mode Living Standard
+/// §3.1 hashless hex colors and §3.2 unitless lengths before standard CSS parsing).
+#[must_use]
+pub fn parse_inline_style_quirks(
+    style_attr: &str,
+    missing: &mut Vec<MissingCssFeature>,
+) -> Vec<SpecifiedDeclaration> {
+    let normalized = preprocess_quirks_and_strict_lengths(style_attr, true);
+    parse_inline_style_raw(&normalized, missing)
+}
+
 /// Parses an HTML `style="..."` attribute into typed [`SpecifiedDeclaration`]s using a
 /// lock-free thread-local cache (zero-allocation lookup on repeated React/framework inline styles).
 #[must_use]
 pub fn parse_inline_style(
+    style_attr: &str,
+    missing: &mut Vec<MissingCssFeature>,
+) -> Vec<SpecifiedDeclaration> {
+    let normalized = preprocess_quirks_and_strict_lengths(style_attr, false);
+    parse_inline_style_raw(&normalized, missing)
+}
+
+fn parse_inline_style_raw(
     style_attr: &str,
     missing: &mut Vec<MissingCssFeature>,
 ) -> Vec<SpecifiedDeclaration> {
@@ -4788,6 +5481,49 @@ fn parse_property_from_str_uncached(
     trimmed: &str,
     important: bool,
 ) -> Vec<SpecifiedDeclaration> {
+    if prop == PropertyIdKind::Appearance {
+        if let Some(mode) = AppearanceMode::parse_css(trimmed) {
+            return vec![SpecifiedDeclaration {
+                property: prop,
+                custom_name: None,
+                value: PropertyValue::Appearance(mode),
+                important,
+                order: 0,
+            }];
+        }
+        return Vec::new();
+    }
+    if prop == PropertyIdKind::AccentColor {
+        if trimmed.eq_ignore_ascii_case("auto") {
+            return vec![SpecifiedDeclaration {
+                property: prop,
+                custom_name: None,
+                value: PropertyValue::AccentColor(None),
+                important,
+                order: 0,
+            }];
+        }
+        if let Some(expr) = crate::color::parse_css_color(trimmed) {
+            let col = if matches!(expr, crate::color::CssColorExpr::CurrentColor) {
+                CssColor::CurrentColor
+            } else {
+                let resolved = expr.resolve(
+                    crate::color::ResolvedColor::from_legacy_f64(0.0, 0.0, 0.0, 1.0),
+                    false,
+                    &crate::values::EvalContext::default(),
+                );
+                CssColor::Rgba(resolved.to_srgb_u8())
+            };
+            return vec![SpecifiedDeclaration {
+                property: prop,
+                custom_name: None,
+                value: PropertyValue::AccentColor(Some(col)),
+                important,
+                order: 0,
+            }];
+        }
+        return Vec::new();
+    }
     if matches!(prop, PropertyIdKind::SvgFill | PropertyIdKind::SvgStroke) {
         if trimmed.eq_ignore_ascii_case("none") {
             return vec![SpecifiedDeclaration {
@@ -6504,6 +7240,53 @@ fn compile_property(
                 PropertyValue::Resize(mode),
                 imp,
             );
+        }
+        Property::Appearance(app, _) => {
+            use lightningcss::properties::ui::Appearance as LA;
+            let mode = match app {
+                LA::None => Some(AppearanceMode::None),
+                LA::Auto
+                | LA::Button
+                | LA::Checkbox
+                | LA::Listbox
+                | LA::Menulist
+                | LA::Meter
+                | LA::ProgressBar
+                | LA::PushButton
+                | LA::Radio
+                | LA::Searchfield
+                | LA::SliderHorizontal
+                | LA::SquareButton
+                | LA::Textarea => Some(AppearanceMode::Auto),
+                LA::Textfield => Some(AppearanceMode::Textfield),
+                LA::MenulistButton => Some(AppearanceMode::MenulistButton),
+                LA::NonStandard(s) => AppearanceMode::parse_css(s.as_ref()),
+            };
+            if let Some(m) = mode {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::Appearance,
+                    PropertyValue::Appearance(m),
+                    imp,
+                );
+            }
+        }
+        Property::AccentColor(col) => {
+            use lightningcss::properties::ui::ColorOrAuto;
+            let val = match col {
+                ColorOrAuto::Auto => Some(None),
+                ColorOrAuto::Color(c) => convert_color(c).map(Some),
+            };
+            if let Some(v) = val {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::AccentColor,
+                    PropertyValue::AccentColor(v),
+                    imp,
+                );
+            }
         }
         Property::BorderTopLeftRadius(r, _) => push_decl(
             out,
