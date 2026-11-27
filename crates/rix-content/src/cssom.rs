@@ -194,87 +194,172 @@ pub fn install_cssom(
 fn install_document_fonts(vm: &mut JsVm, host: &SharedHost) {
     let dp = host.borrow().prototypes.document_proto;
 
+    fn extract_font_face_source_url(raw: &str) -> Option<String> {
+        let lower = raw.to_ascii_lowercase();
+        let pos = lower.find("url(")?;
+        let rest = &raw[pos + 4..];
+        let end = rest.find(')')?;
+        let inner = rest[..end]
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim();
+        (!inner.is_empty()).then(|| inner.to_string())
+    }
+
     // Global `FontFace` constructor (CSS Font Loading L3 §2).
     let ff_proto = vm.alloc_ordinary_object();
     if let Some(o) = vm.heap.get_object_mut(ff_proto) {
         o.is_prototype = true;
     }
-    define_host_method(vm, ff_proto, "load", move |vm, this_val, _| {
-        if let Some(h) = this_val.as_object() {
-            let k_status = vm.heap.intern_key("status");
-            let loaded_s = JsValue::from_string(vm.heap.alloc_string("loaded"));
-            let _ = vm.set_property_by_key(h, k_status, loaded_s);
-        }
-        let p = alloc_promise(vm);
-        resolve_promise(vm, p, this_val);
-        Ok(JsValue::from_object(p))
-    });
-    let ff_ctor = vm.alloc_host_fn("FontFace", move |vm, _, args| {
-        let family = vm.value_to_rust_string(arg(args, 0));
-        let face = vm
-            .heap
-            .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(ff_proto)));
-        let loaded_p = alloc_promise(vm);
-        resolve_promise(vm, loaded_p, JsValue::from_object(face));
-        for (k, v) in [
-            (
-                "family",
-                JsValue::from_string(vm.heap.alloc_string(&family)),
-            ),
-            (
-                "style",
-                JsValue::from_string(vm.heap.alloc_string("normal")),
-            ),
-            (
-                "weight",
-                JsValue::from_string(vm.heap.alloc_string("normal")),
-            ),
-            (
-                "stretch",
-                JsValue::from_string(vm.heap.alloc_string("normal")),
-            ),
-            (
-                "unicodeRange",
-                JsValue::from_string(vm.heap.alloc_string("U+0-10FFFF")),
-            ),
-            (
-                "variant",
-                JsValue::from_string(vm.heap.alloc_string("normal")),
-            ),
-            (
-                "display",
-                JsValue::from_string(vm.heap.alloc_string("auto")),
-            ),
-            (
-                "status",
-                JsValue::from_string(vm.heap.alloc_string("loaded")),
-            ),
-            ("loaded", JsValue::from_object(loaded_p)),
-        ] {
-            let key = vm.heap.intern_key(k);
-            vm.heap
-                .object_define_data(face, key, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
-        }
-        Ok(JsValue::from_object(face))
-    });
-    vm.mark_constructor(ff_ctor);
-    let k_proto = vm.heap.intern_key("prototype");
-    let k_ctor = vm.heap.intern_key("constructor");
-    vm.heap.object_define_data(
-        ff_ctor,
-        k_proto,
-        JsValue::from_object(ff_proto),
-        PropertyAttrs::empty(),
-        &mut vm.shapes,
-    );
-    vm.heap.object_define_data(
-        ff_proto,
-        k_ctor,
-        JsValue::from_object(ff_ctor),
-        PropertyAttrs::CONFIGURABLE | PropertyAttrs::WRITABLE,
-        &mut vm.shapes,
-    );
-    define_global(vm, "FontFace", JsValue::from_object(ff_ctor));
+    {
+        let h_load = Rc::clone(host);
+        define_host_method(vm, ff_proto, "load", move |vm, this_val, _| {
+            let p = alloc_promise(vm);
+            if let Some(face_h) = this_val.as_object() {
+                let hook = h_load.borrow().font_load_hook.clone();
+                if let Some(cb) = hook {
+                    cb(vm, p, Some(face_h), Some(this_val), false);
+                    return Ok(JsValue::from_object(p));
+                }
+                let k_status = vm.heap.intern_key("status");
+                let loaded_s = JsValue::from_string(vm.heap.alloc_string("loaded"));
+                let _ = vm.set_property_by_key(face_h, k_status, loaded_s);
+                let mut lp_to_resolve = None;
+                {
+                    let mut hb = h_load.borrow_mut();
+                    if let Some(entry) = hb.js_font_faces.iter_mut().find(|e| e.handle == face_h) {
+                        entry.loaded = true;
+                        lp_to_resolve = Some(entry.loaded_promise);
+                    }
+                    let _ = hb.sync_active_web_fonts_from_cache();
+                }
+                if let Some(lp) = lp_to_resolve {
+                    resolve_promise(vm, lp, this_val);
+                }
+            }
+            resolve_promise(vm, p, this_val);
+            Ok(JsValue::from_object(p))
+        });
+    }
+    {
+        let h_ctor = Rc::clone(host);
+        let ff_ctor = vm.alloc_host_fn("FontFace", move |vm, _, args| {
+            let raw_family = vm.value_to_rust_string(arg(args, 0));
+            let family = raw_family
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+            let raw_source = if args.len() > 1 && !arg(args, 1).is_undefined() {
+                vm.value_to_rust_string(arg(args, 1))
+            } else {
+                String::new()
+            };
+            let source_url = extract_font_face_source_url(&raw_source);
+            let face = vm
+                .heap
+                .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(ff_proto)));
+            let loaded_p = alloc_promise(vm);
+            let mut style_str = "normal".to_string();
+            let mut weight_str = "normal".to_string();
+            if let Some(desc_h) = args.get(2).and_then(|v| v.as_object()) {
+                let ks = vm.heap.intern_key("style");
+                if let Ok(v) = vm.get_property_by_key(desc_h, ks) {
+                    if !v.is_undefined() {
+                        style_str = vm.value_to_rust_string(v);
+                    }
+                }
+                let kw = vm.heap.intern_key("weight");
+                if let Ok(v) = vm.get_property_by_key(desc_h, kw) {
+                    if !v.is_undefined() {
+                        weight_str = vm.value_to_rust_string(v);
+                    }
+                }
+            }
+            let italic = style_str.trim().eq_ignore_ascii_case("italic")
+                || style_str.trim().to_ascii_lowercase().starts_with("oblique");
+            let w_val = match weight_str.trim().to_ascii_lowercase().as_str() {
+                "bold" => 700u16,
+                "normal" | "" => 400u16,
+                other => other
+                    .parse::<f32>()
+                    .map(|n| n.round().clamp(100.0, 900.0) as u16)
+                    .unwrap_or(400),
+            };
+            h_ctor
+                .borrow_mut()
+                .js_font_faces
+                .push(crate::dom_bridge::JsFontFaceEntry {
+                    handle: face,
+                    loaded_promise: loaded_p,
+                    family: family.clone(),
+                    source_url,
+                    weight_range: (w_val, w_val),
+                    italic,
+                    added: false,
+                    loaded: false,
+                });
+            for (k, v) in [
+                (
+                    "family",
+                    JsValue::from_string(vm.heap.alloc_string(&family)),
+                ),
+                (
+                    "style",
+                    JsValue::from_string(vm.heap.alloc_string(&style_str)),
+                ),
+                (
+                    "weight",
+                    JsValue::from_string(vm.heap.alloc_string(&weight_str)),
+                ),
+                (
+                    "stretch",
+                    JsValue::from_string(vm.heap.alloc_string("normal")),
+                ),
+                (
+                    "unicodeRange",
+                    JsValue::from_string(vm.heap.alloc_string("U+0-10FFFF")),
+                ),
+                (
+                    "variant",
+                    JsValue::from_string(vm.heap.alloc_string("normal")),
+                ),
+                (
+                    "display",
+                    JsValue::from_string(vm.heap.alloc_string("auto")),
+                ),
+                (
+                    "status",
+                    JsValue::from_string(vm.heap.alloc_string("unloaded")),
+                ),
+                ("loaded", JsValue::from_object(loaded_p)),
+            ] {
+                let key = vm.heap.intern_key(k);
+                vm.heap
+                    .object_define_data(face, key, v, PropertyAttrs::DEFAULT, &mut vm.shapes);
+            }
+            Ok(JsValue::from_object(face))
+        });
+        vm.mark_constructor(ff_ctor);
+        let k_proto = vm.heap.intern_key("prototype");
+        let k_ctor = vm.heap.intern_key("constructor");
+        vm.heap.object_define_data(
+            ff_ctor,
+            k_proto,
+            JsValue::from_object(ff_proto),
+            PropertyAttrs::empty(),
+            &mut vm.shapes,
+        );
+        vm.heap.object_define_data(
+            ff_proto,
+            k_ctor,
+            JsValue::from_object(ff_ctor),
+            PropertyAttrs::CONFIGURABLE | PropertyAttrs::WRITABLE,
+            &mut vm.shapes,
+        );
+        define_global(vm, "FontFace", JsValue::from_object(ff_ctor));
+    }
 
     // Per-document `FontFaceSet` (`document.fonts`, CSS Font Loading L3 §3).
     let ffs_proto = vm.alloc_ordinary_object();
@@ -285,16 +370,20 @@ fn install_document_fonts(vm: &mut JsVm, host: &SharedHost) {
     let fonts_obj = vm
         .heap
         .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(ffs_proto)));
-    let ready_p = alloc_promise(vm);
-    resolve_promise(vm, ready_p, JsValue::from_object(fonts_obj));
-    let k_ready = vm.heap.intern_key("ready");
-    vm.heap.object_define_data(
-        fonts_obj,
-        k_ready,
-        JsValue::from_object(ready_p),
-        PropertyAttrs::DEFAULT,
-        &mut vm.shapes,
-    );
+    {
+        let h_ready = Rc::clone(host);
+        let g_ready = vm.alloc_host_fn("get ready", move |vm, this_val, _| {
+            let p = alloc_promise(vm);
+            let hook = h_ready.borrow().font_load_hook.clone();
+            if let Some(cb) = hook {
+                cb(vm, p, None, Some(this_val), true);
+                return Ok(JsValue::from_object(p));
+            }
+            resolve_promise(vm, p, this_val);
+            Ok(JsValue::from_object(p))
+        });
+        define_host_accessor(vm, ffs_proto, "ready", Some(g_ready), None);
+    }
     let k_status = vm.heap.intern_key("status");
     let loaded_s = vm.heap.alloc_string("loaded".to_string());
     vm.heap.object_define_data(
@@ -314,22 +403,22 @@ fn install_document_fonts(vm: &mut JsVm, host: &SharedHost) {
     {
         let fl = Rc::clone(&fonts_list);
         let h_fl = Rc::clone(host);
-        define_host_method(vm, ffs_proto, "load", move |vm, _, args| {
-            let font_spec = if args.is_empty() || arg(args, 0).is_undefined() {
-                String::new()
-            } else {
-                vm.value_to_rust_string(arg(args, 0))
-            };
+        define_host_method(vm, ffs_proto, "load", move |vm, _, _args| {
             let p = alloc_promise(vm);
             let hook = h_fl.borrow().font_load_hook.clone();
             if let Some(cb) = hook {
-                cb(vm, p, font_spec);
+                cb(vm, p, None, None, false);
                 return Ok(JsValue::from_object(p));
             }
             {
                 let mut hb = h_fl.borrow_mut();
+                for e in &mut hb.js_font_faces {
+                    if e.added {
+                        e.loaded = true;
+                    }
+                }
                 let _ = hb.ensure_styles();
-                hb.sync_active_web_fonts_from_cache();
+                let _ = hb.sync_active_web_fonts_from_cache();
             }
             let arr = vm.alloc_array();
             for &face in fl.borrow().iter() {
@@ -342,22 +431,42 @@ fn install_document_fonts(vm: &mut JsVm, host: &SharedHost) {
     define_host_method(vm, ffs_proto, "check", move |_, _, _| Ok(JsValue::TRUE));
     {
         let fl = Rc::clone(&fonts_list);
+        let h_add = Rc::clone(host);
         define_host_method(vm, ffs_proto, "add", move |_, this_val, args| {
             let face = arg(args, 0);
             let mut list = fl.borrow_mut();
             if !list.contains(&face) {
                 list.push(face);
             }
+            if let Some(fh) = face.as_object() {
+                let mut hb = h_add.borrow_mut();
+                let mut was_loaded = false;
+                if let Some(entry) = hb.js_font_faces.iter_mut().find(|e| e.handle == fh) {
+                    entry.added = true;
+                    was_loaded = entry.loaded;
+                }
+                if was_loaded {
+                    let _ = hb.sync_active_web_fonts_from_cache();
+                }
+            }
             Ok(this_val)
         });
     }
     {
         let fl = Rc::clone(&fonts_list);
+        let h_del = Rc::clone(host);
         define_host_method(vm, ffs_proto, "delete", move |_, _, args| {
             let face = arg(args, 0);
             let mut list = fl.borrow_mut();
             if let Some(pos) = list.iter().position(|v| *v == face) {
                 list.remove(pos);
+                if let Some(fh) = face.as_object() {
+                    let mut hb = h_del.borrow_mut();
+                    if let Some(entry) = hb.js_font_faces.iter_mut().find(|e| e.handle == fh) {
+                        entry.added = false;
+                    }
+                    let _ = hb.sync_active_web_fonts_from_cache();
+                }
                 Ok(JsValue::TRUE)
             } else {
                 Ok(JsValue::FALSE)
@@ -366,8 +475,14 @@ fn install_document_fonts(vm: &mut JsVm, host: &SharedHost) {
     }
     {
         let fl = Rc::clone(&fonts_list);
+        let h_clr = Rc::clone(host);
         define_host_method(vm, ffs_proto, "clear", move |_, _, _| {
             fl.borrow_mut().clear();
+            let mut hb = h_clr.borrow_mut();
+            for entry in &mut hb.js_font_faces {
+                entry.added = false;
+            }
+            let _ = hb.sync_active_web_fonts_from_cache();
             Ok(JsValue::UNDEFINED)
         });
     }
@@ -424,6 +539,8 @@ fn install_document_fonts(vm: &mut JsVm, host: &SharedHost) {
         Err(vm.type_error("Illegal constructor: FontFaceSet"))
     });
     vm.mark_constructor(ffs_ctor);
+    let k_proto = vm.heap.intern_key("prototype");
+    let k_ctor = vm.heap.intern_key("constructor");
     vm.heap.object_define_data(
         ffs_ctor,
         k_proto,
@@ -6447,12 +6564,66 @@ pub fn format_computed_property_resolved(
                 String::new()
             }
         }
-        "border-radius" => fmt_quad(
-            "border-top-left-radius",
-            "border-top-right-radius",
-            "border-bottom-right-radius",
-            "border-bottom-left-radius",
-        ),
+        "border-radius" => {
+            let split_corner = |prop: &str| -> (String, String) {
+                let s = format_computed_property_resolved(
+                    style,
+                    prop,
+                    layout_box,
+                    parent_flex_grid,
+                    ch_px,
+                );
+                // Split into 1 or 2 top-level CSS values (ignoring spaces inside `calc(...)`).
+                let mut parts = Vec::with_capacity(2);
+                let mut depth = 0usize;
+                let mut start = 0usize;
+                for (idx, b) in s.bytes().enumerate() {
+                    match b {
+                        b'(' => depth += 1,
+                        b')' => depth = depth.saturating_sub(1),
+                        b' ' | b'\t' if depth == 0 => {
+                            let tok = s[start..idx].trim();
+                            if !tok.is_empty() {
+                                parts.push(tok.to_string());
+                            }
+                            start = idx + 1;
+                        }
+                        _ => {}
+                    }
+                }
+                let tail = s[start..].trim();
+                if !tail.is_empty() {
+                    parts.push(tail.to_string());
+                }
+                match parts.as_slice() {
+                    [a, b] => (a.clone(), b.clone()),
+                    [a] => (a.clone(), a.clone()),
+                    _ => (s.clone(), s),
+                }
+            };
+            let collapse_q = |a: &str, b: &str, c: &str, d: &str| -> String {
+                if a == b && b == c && c == d {
+                    a.to_string()
+                } else if a == c && b == d {
+                    format!("{a} {b}")
+                } else if b == d {
+                    format!("{a} {b} {c}")
+                } else {
+                    format!("{a} {b} {c} {d}")
+                }
+            };
+            let (tlx, tly) = split_corner("border-top-left-radius");
+            let (trx, try_) = split_corner("border-top-right-radius");
+            let (brx, bry) = split_corner("border-bottom-right-radius");
+            let (blx, bly) = split_corner("border-bottom-left-radius");
+            let h = collapse_q(&tlx, &trx, &brx, &blx);
+            let v = collapse_q(&tly, &try_, &bry, &bly);
+            if h == v {
+                h
+            } else {
+                format!("{h} / {v}")
+            }
+        }
         "overscroll-behavior" => fmt_pair("overscroll-behavior-x", "overscroll-behavior-y"),
         "writing-mode" => style.text.writing_mode.as_css_str().into(),
         "caption-side" => style.text.caption_side.as_css_str().into(),
@@ -6675,45 +6846,66 @@ pub fn format_computed_property_resolved(
             PointerEventsMode::BoundingBox => "bounding-box",
         }
         .into(),
-        "cursor" => match style.cursor {
-            CursorKind::Auto => "auto",
-            CursorKind::Default => "default",
-            CursorKind::Pointer => "pointer",
-            CursorKind::Text => "text",
-            CursorKind::VerticalText => "vertical-text",
-            CursorKind::Move => "move",
-            CursorKind::AllScroll => "all-scroll",
-            CursorKind::NotAllowed => "not-allowed",
-            CursorKind::NoDrop => "no-drop",
-            CursorKind::Grab => "grab",
-            CursorKind::Grabbing => "grabbing",
-            CursorKind::EResize => "e-resize",
-            CursorKind::NeResize => "ne-resize",
-            CursorKind::NwResize => "nw-resize",
-            CursorKind::NResize => "n-resize",
-            CursorKind::SeResize => "se-resize",
-            CursorKind::SwResize => "sw-resize",
-            CursorKind::SResize => "s-resize",
-            CursorKind::WResize => "w-resize",
-            CursorKind::EwResize => "ew-resize",
-            CursorKind::NsResize => "ns-resize",
-            CursorKind::NeswResize => "nesw-resize",
-            CursorKind::NwseResize => "nwse-resize",
-            CursorKind::ColResize => "col-resize",
-            CursorKind::RowResize => "row-resize",
-            CursorKind::Crosshair => "crosshair",
-            CursorKind::Wait => "wait",
-            CursorKind::Progress => "progress",
-            CursorKind::Help => "help",
-            CursorKind::ContextMenu => "context-menu",
-            CursorKind::Cell => "cell",
-            CursorKind::Alias => "alias",
-            CursorKind::Copy => "copy",
-            CursorKind::ZoomIn => "zoom-in",
-            CursorKind::ZoomOut => "zoom-out",
-            CursorKind::None => "none",
+        "cursor" => {
+            let kw = match style.cursor {
+                CursorKind::Auto => "auto",
+                CursorKind::Default => "default",
+                CursorKind::Pointer => "pointer",
+                CursorKind::Text => "text",
+                CursorKind::VerticalText => "vertical-text",
+                CursorKind::Move => "move",
+                CursorKind::AllScroll => "all-scroll",
+                CursorKind::NotAllowed => "not-allowed",
+                CursorKind::NoDrop => "no-drop",
+                CursorKind::Grab => "grab",
+                CursorKind::Grabbing => "grabbing",
+                CursorKind::EResize => "e-resize",
+                CursorKind::NeResize => "ne-resize",
+                CursorKind::NwResize => "nw-resize",
+                CursorKind::NResize => "n-resize",
+                CursorKind::SeResize => "se-resize",
+                CursorKind::SwResize => "sw-resize",
+                CursorKind::SResize => "s-resize",
+                CursorKind::WResize => "w-resize",
+                CursorKind::EwResize => "ew-resize",
+                CursorKind::NsResize => "ns-resize",
+                CursorKind::NeswResize => "nesw-resize",
+                CursorKind::NwseResize => "nwse-resize",
+                CursorKind::ColResize => "col-resize",
+                CursorKind::RowResize => "row-resize",
+                CursorKind::Crosshair => "crosshair",
+                CursorKind::Wait => "wait",
+                CursorKind::Progress => "progress",
+                CursorKind::Help => "help",
+                CursorKind::ContextMenu => "context-menu",
+                CursorKind::Cell => "cell",
+                CursorKind::Alias => "alias",
+                CursorKind::Copy => "copy",
+                CursorKind::ZoomIn => "zoom-in",
+                CursorKind::ZoomOut => "zoom-out",
+                CursorKind::None => "none",
+            };
+            if style.text.cursor_urls.is_empty() {
+                kw.into()
+            } else {
+                let mut parts: Vec<String> = style
+                    .text
+                    .cursor_urls
+                    .iter()
+                    .map(|(u, hs)| {
+                        let quoted = rix_css::substitution::quote_css_string(u.as_str());
+                        match hs {
+                            Some((x, y)) => {
+                                format!("url({quoted}) {} {}", format_num(*x), format_num(*y))
+                            }
+                            None => format!("url({quoted})"),
+                        }
+                    })
+                    .collect();
+                parts.push(kw.to_string());
+                parts.join(", ")
+            }
         }
-        .into(),
         "z-index" => match style.z_index {
             ZIndexValue::Auto => "auto".into(),
             ZIndexValue::Integer(n) => n.to_string(),
@@ -7236,6 +7428,30 @@ pub fn format_computed_property_resolved(
         "font-size-adjust" => match style.text.font_size_adjust {
             Some(n) => format_num(n),
             None => "none".into(),
+        },
+        "font-feature-settings" => match &style.text.font_feature_settings {
+            None => "normal".into(),
+            Some(list) if list.is_empty() => "normal".into(),
+            Some(list) => list
+                .iter()
+                .map(|(tag, val)| {
+                    if *val == 1 {
+                        format!("\"{}\"", tag.as_str())
+                    } else {
+                        format!("\"{}\" {val}", tag.as_str())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        },
+        "font-variation-settings" => match &style.text.font_variation_settings {
+            None => "normal".into(),
+            Some(list) if list.is_empty() => "normal".into(),
+            Some(list) => list
+                .iter()
+                .map(|(tag, val)| format!("\"{}\" {}", tag.as_str(), format_num(*val)))
+                .collect::<Vec<_>>()
+                .join(", "),
         },
         "flood-opacity" => format_num(
             style

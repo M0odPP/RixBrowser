@@ -1528,6 +1528,13 @@ impl ContentRuntime {
     /// Advances virtual clock by `delta` and drains all newly due timers and microtasks.
     pub fn advance_and_drain(&mut self, delta: Duration) -> u64 {
         self.event_loop.borrow_mut().advance_clock(delta);
+        frames::check_and_fire_iframe_resizes(
+            &mut self.vm,
+            &self.host,
+            &self.events,
+            &self.event_loop,
+            &self.frames,
+        );
         drain_ready_tasks(&self.event_loop, &mut self.vm)
     }
 
@@ -1536,6 +1543,13 @@ impl ContentRuntime {
     /// layout observations in HTML §8.1.7.3 rendering order.
     pub fn fire_vsync(&mut self, timestamp_ms: f64) -> usize {
         self.host.borrow_mut().run_focus_fixup();
+        frames::check_and_fire_iframe_resizes(
+            &mut self.vm,
+            &self.host,
+            &self.events,
+            &self.event_loop,
+            &self.frames,
+        );
         update_animations_and_send_events(
             &mut self.vm,
             &self.host,

@@ -1079,6 +1079,69 @@ fn install_html_element_reflected_attrs(vm: &mut JsVm, host: &SharedHost) {
             define_host_accessor(vm, proto, prop_name, Some(g), Some(s));
         }
     }
+
+    // HTML §4.2.4 `HTMLLinkElement.prototype.href`: reflects the `href` content attribute as a
+    // resolved URL against the node document's base URL (or `""` if absent), and updates the
+    // attribute on assignment (firing dynamic stylesheet loading if already connected).
+    let link_proto_opt = host
+        .borrow()
+        .interface_protos
+        .get("HTMLLinkElement")
+        .copied();
+    if let Some(link_p) = link_proto_opt {
+        let h_g = Rc::clone(host);
+        let g = vm.alloc_host_fn("get href", move |vm, this_val, _| {
+            let nid = require_node(vm, &h_g, this_val)?;
+            let resolved = {
+                let hb = h_g.borrow();
+                let raw = {
+                    let doc = hb.document.borrow();
+                    match doc.get(nid) {
+                        Some(NodeData::Element(el)) => {
+                            el.get_attribute("href").map(ToString::to_string)
+                        }
+                        _ => None,
+                    }
+                };
+                match raw {
+                    None => String::new(),
+                    Some(raw_href) => {
+                        let doc_id = hb.owner_doc_of(nid);
+                        let base = hb.doc_base_url_for(doc_id);
+                        url::Url::parse(&base)
+                            .ok()
+                            .and_then(|b| b.join(raw_href.trim()).ok())
+                            .map(|u| u.to_string())
+                            .unwrap_or(raw_href)
+                    }
+                }
+            };
+            Ok(JsValue::from_string(vm.heap.alloc_string(&resolved)))
+        });
+        let h_s = Rc::clone(host);
+        let s = vm.alloc_host_fn("set href", move |vm, this_val, args| {
+            let nid = require_node(vm, &h_s, this_val)?;
+            let val = vm.value_to_rust_string(arg(args, 0));
+            let is_conn = {
+                let hb = h_s.borrow();
+                {
+                    let mut doc = hb.document.borrow_mut();
+                    if let Some(NodeData::Element(el)) = doc.get_mut(nid) {
+                        el.set_attribute("href", &val);
+                    }
+                }
+                hb.is_connected_to_live_doc(nid)
+            };
+            if is_conn {
+                let hook = h_s.borrow().subresource_connect_hook.clone();
+                if let Some(cb) = hook {
+                    cb(vm, nid);
+                }
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, link_p, "href", Some(g), Some(s));
+    }
 }
 
 // ---------------------------------------------------------------------------

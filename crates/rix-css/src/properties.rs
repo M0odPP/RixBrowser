@@ -851,9 +851,11 @@ pub enum PropertyIdKind {
     CaretColor,
     Clip,
     ColumnRuleColor,
+    FontFeatureSettings,
     FontSizeAdjust,
     FontStretch,
     FontVariant,
+    FontVariationSettings,
     ListStyle,
     ListStyleImage,
     ListStylePosition,
@@ -1203,9 +1205,11 @@ impl PropertyIdKind {
             "dominant-baseline" => Self::SvgDominantBaseline,
             "fill-opacity" => Self::SvgFillOpacity,
             "flood-opacity" => Self::SvgFloodOpacity,
+            "font-feature-settings" => Self::FontFeatureSettings,
             "font-size-adjust" => Self::FontSizeAdjust,
             "font-stretch" => Self::FontStretch,
             "font-variant" => Self::FontVariant,
+            "font-variation-settings" => Self::FontVariationSettings,
             "list-style" => Self::ListStyle,
             "list-style-image" => Self::ListStyleImage,
             "list-style-position" => Self::ListStylePosition,
@@ -1542,9 +1546,11 @@ impl PropertyIdKind {
             Self::SvgDominantBaseline => "dominant-baseline",
             Self::SvgFillOpacity => "fill-opacity",
             Self::SvgFloodOpacity => "flood-opacity",
+            Self::FontFeatureSettings => "font-feature-settings",
             Self::FontSizeAdjust => "font-size-adjust",
             Self::FontStretch => "font-stretch",
             Self::FontVariant => "font-variant",
+            Self::FontVariationSettings => "font-variation-settings",
             Self::ListStyle => "list-style",
             Self::ListStyleImage => "list-style-image",
             Self::ListStylePosition => "list-style-position",
@@ -1583,8 +1589,10 @@ impl PropertyIdKind {
                 | Self::PointerEvents
                 | Self::Cursor
                 | Self::FontSize
+                | Self::FontFeatureSettings
                 | Self::FontSizeAdjust
                 | Self::FontStretch
+                | Self::FontVariationSettings
                 | Self::FontWeight
                 | Self::FontStyle
                 | Self::FontFamily
@@ -2570,6 +2578,7 @@ pub enum PropertyValue {
     Visibility(VisibilityMode),
     PointerEvents(PointerEventsMode),
     Cursor(CursorKind),
+    CursorWithUrls(Vec<(InternedStr, Option<(f32, f32)>)>, CursorKind),
     ZIndex(ZIndexValue),
     Number(f32),
     Integer(i32),
@@ -2709,6 +2718,10 @@ pub enum PropertyValue {
     BackgroundAttachment(InternedStr),
     WillChangeCreatesCb(bool),
     FontStyleObliqueMath(Box<crate::values_math::MathNode>),
+    /// CSS Fonts L3/L4 `font-feature-settings`: `None` = `normal`, `Some` = `(4-char tag, int math)`.
+    FontFeatureSettings(Option<Vec<(InternedStr, crate::values_math::MathNode)>>),
+    /// CSS Fonts L4 `font-variation-settings`: `None` = `normal`, `Some` = `(4-char tag, num math)`.
+    FontVariationSettings(Option<Vec<(InternedStr, crate::values_math::MathNode)>>),
     ListStyleType(ListStyleTypeMode),
     ListStylePosition(ListStylePositionMode),
 }
@@ -2727,6 +2740,9 @@ impl PropertyValue {
         };
         match self {
             Self::MathVal(n) => node_has(n),
+            Self::FontFeatureSettings(Some(list)) | Self::FontVariationSettings(Some(list)) => {
+                list.iter().any(|(_, n)| node_has(n))
+            }
             Self::Length(lp)
             | Self::LengthAuto(LengthPercentageAuto::Value(lp))
             | Self::Size(SizeValue::Length(lp)) => lp_has(lp),
@@ -2747,7 +2763,7 @@ impl PropertyValue {
             Self::Translate(crate::values_math::TranslateSpec::Values { x, y, z }) => {
                 node_has(x) || y.as_ref().is_some_and(node_has) || z.as_ref().is_some_and(node_has)
             }
-            Self::TransformRaw(s) => {
+            Self::TransformRaw(s) | Self::BackgroundImageRaw(s) => {
                 let l = s.to_ascii_lowercase();
                 l.contains("sibling-") || l.contains("random(")
             }
@@ -3402,7 +3418,14 @@ pub fn should_use_values4_parser(prop: PropertyIdKind, raw: &str) -> bool {
             || lower.starts_with("image-set(")
             || lower.starts_with("-webkit-image-set(")
             || lower.starts_with("src(")
-            || lower.starts_with("image("))
+            || lower.starts_with("image(")
+            || ((lower.starts_with("linear-gradient(")
+                || lower.starts_with("radial-gradient(")
+                || lower.starts_with("conic-gradient(")
+                || lower.starts_with("repeating-linear-gradient(")
+                || lower.starts_with("repeating-radial-gradient(")
+                || lower.starts_with("repeating-conic-gradient("))
+                && crate::values_math::has_values4_syntax(trimmed)))
     {
         return true;
     }
@@ -3492,7 +3515,7 @@ pub fn values4_property_kind(prop: PropertyIdKind) -> Option<(crate::values_math
         P::ZIndex | P::Order => Some((VK::Integer, false)),
         P::Orphans | P::Widows | P::ColumnCount => Some((VK::Integer, true)),
         P::FlexGrow | P::FlexShrink | P::FontWeight | P::AnimationIterationCount => Some((VK::Number, true)),
-        P::Opacity => Some((VK::NumberOrPercentage, false)),
+        P::Opacity | P::SvgFillOpacity => Some((VK::NumberOrPercentage, false)),
         P::TransitionDelay | P::AnimationDelay => Some((VK::Time, false)),
         P::TransitionDuration | P::AnimationDuration => Some((VK::Time, true)),
         _ => None,
@@ -3512,6 +3535,19 @@ pub fn supports_values4_math(prop: PropertyIdKind) -> bool {
                 | PropertyIdKind::GridTemplateColumns
                 | PropertyIdKind::LineHeight
         )
+}
+
+fn has_top_level_comma_raw(s: &str) -> bool {
+    let mut depth = 0usize;
+    for b in s.bytes() {
+        match b {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Parses a CSS Values L4/L5 declaration value for `prop`, returning `(PropertyValue, specified_css)`.
@@ -3624,10 +3660,8 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
             return Some((PropertyValue::Transitions(specs), spec));
         }
         PropertyIdKind::TransitionDuration
-            if trimmed.contains(',')
-                || (!trimmed.to_ascii_lowercase().contains("sibling-")
-                    && !trimmed.to_ascii_lowercase().contains("random(")
-                    && !trimmed.to_ascii_lowercase().contains("cq")) =>
+            if has_top_level_comma_raw(trimmed)
+                || !crate::values_math::has_values4_syntax(trimmed) =>
         {
             let (durs, spec) = crate::anim_css::parse_time_list_values4(trimmed, false, true)?;
             return Some((
@@ -3636,10 +3670,8 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
             ));
         }
         PropertyIdKind::TransitionDelay
-            if trimmed.contains(',')
-                || (!trimmed.to_ascii_lowercase().contains("sibling-")
-                    && !trimmed.to_ascii_lowercase().contains("random(")
-                    && !trimmed.to_ascii_lowercase().contains("cq")) =>
+            if has_top_level_comma_raw(trimmed)
+                || !crate::values_math::has_values4_syntax(trimmed) =>
         {
             let (durs, spec) = crate::anim_css::parse_time_list_values4(trimmed, false, false)?;
             return Some((
@@ -3656,19 +3688,15 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
             return Some((PropertyValue::NameList(names), spec));
         }
         PropertyIdKind::AnimationDuration
-            if trimmed.contains(',')
-                || (!trimmed.to_ascii_lowercase().contains("sibling-")
-                    && !trimmed.to_ascii_lowercase().contains("random(")
-                    && !trimmed.to_ascii_lowercase().contains("cq")) =>
+            if has_top_level_comma_raw(trimmed)
+                || !crate::values_math::has_values4_syntax(trimmed) =>
         {
             let (durs, spec) = crate::anim_css::parse_animation_duration_list(trimmed)?;
             return Some((PropertyValue::DurationAutoList(durs), spec));
         }
         PropertyIdKind::AnimationDelay
-            if trimmed.contains(',')
-                || (!trimmed.to_ascii_lowercase().contains("sibling-")
-                    && !trimmed.to_ascii_lowercase().contains("random(")
-                    && !trimmed.to_ascii_lowercase().contains("cq")) =>
+            if has_top_level_comma_raw(trimmed)
+                || !crate::values_math::has_values4_syntax(trimmed) =>
         {
             let (durs, spec) = crate::anim_css::parse_time_list_values4(trimmed, false, false)?;
             return Some((
@@ -4129,6 +4157,13 @@ pub fn parse_values4_property(prop: PropertyIdKind, raw: &str) -> Option<(Proper
                 || l.starts_with("-webkit-image-set(")
                 || l.starts_with("src(")
                 || l.starts_with("image(")
+                || ((l.starts_with("linear-gradient(")
+                    || l.starts_with("radial-gradient(")
+                    || l.starts_with("conic-gradient(")
+                    || l.starts_with("repeating-linear-gradient(")
+                    || l.starts_with("repeating-radial-gradient(")
+                    || l.starts_with("repeating-conic-gradient("))
+                    && crate::values_math::has_values4_syntax(trimmed))
             {
                 let _ = crate::substitution::parse_and_serialize_bg_image_fn(
                     trimmed,
@@ -5968,9 +6003,26 @@ fn parse_property_from_str_uncached(
     }
     if prop == PropertyIdKind::Background {
         let lower = trimmed.to_ascii_lowercase();
-        let fn_prefix = ["image-set(", "-webkit-image-set(", "src(", "image("]
-            .into_iter()
-            .find(|p| lower.starts_with(p));
+        let fn_prefix = [
+            "image-set(",
+            "-webkit-image-set(",
+            "src(",
+            "image(",
+            "linear-gradient(",
+            "radial-gradient(",
+            "conic-gradient(",
+            "repeating-linear-gradient(",
+            "repeating-radial-gradient(",
+            "repeating-conic-gradient(",
+        ]
+        .into_iter()
+        .find(|p| lower.starts_with(p));
+        let is_gradient_pfx = fn_prefix.is_some_and(|p| p.contains("gradient("));
+        let fn_prefix = if is_gradient_pfx && !crate::values_math::has_values4_syntax(trimmed) {
+            None
+        } else {
+            fn_prefix
+        };
         if let Some(pfx) = fn_prefix {
             let bytes = trimmed.as_bytes();
             let mut depth = 0usize;
@@ -6328,13 +6380,17 @@ fn compile_property(
             );
         }
         Property::Cursor(c) => {
-            push_decl(
-                out,
-                ord,
-                PropertyIdKind::Cursor,
-                PropertyValue::Cursor(convert_cursor(c)),
-                imp,
-            );
+            let val = if c.images.is_empty() {
+                PropertyValue::Cursor(convert_cursor(c))
+            } else {
+                let imgs = c
+                    .images
+                    .iter()
+                    .map(|img| (intern_str(img.url.url.as_ref()), img.hotspot))
+                    .collect();
+                PropertyValue::CursorWithUrls(imgs, convert_cursor(c))
+            };
+            push_decl(out, ord, PropertyIdKind::Cursor, val, imp);
         }
         Property::ZIndex(z) => {
             push_decl(
@@ -9665,6 +9721,20 @@ fn parse_values4_property_decls(
             }
             false
         }
+        PropertyIdKind::Background => {
+            let decls = parse_property_from_str(PropertyIdKind::Background, raw, imp);
+            if !decls.is_empty() {
+                for mut d in decls {
+                    let idx = *ord;
+                    *ord = ord.saturating_add(1);
+                    d.order = idx;
+                    out.push(d);
+                }
+                true
+            } else {
+                false
+            }
+        }
         _ => {
             if let Some((val, _)) = parse_values4_property(prop, raw) {
                 push_decl(out, ord, prop, val, imp);
@@ -10288,6 +10358,43 @@ pub(crate) fn compile_extra_standard_property(
                 }
             }
         }
+        "font-feature-settings" => {
+            // CSS Syntax L3 §4.3.3: bare `<integer>` tokens must have type flag `integer`
+            // (rejecting scientific notation like `1e1` / `1.1e1` which parse as `int_value: None`).
+            let has_non_int_bare_num = tokens.0.iter().any(|t| {
+                matches!(
+                    t,
+                    TokenOrValue::Token(LightningToken::Number {
+                        int_value: None,
+                        ..
+                    })
+                )
+            });
+            if !has_non_int_bare_num {
+                let raw_str = serialize_css_tokens(&owned);
+                if let Some(parsed) = parse_font_feature_settings_str(&raw_str) {
+                    push_decl(
+                        out,
+                        ord,
+                        PropertyIdKind::FontFeatureSettings,
+                        PropertyValue::FontFeatureSettings(parsed),
+                        imp,
+                    );
+                }
+            }
+        }
+        "font-variation-settings" => {
+            let raw_str = serialize_css_tokens(&owned);
+            if let Some(parsed) = parse_font_variation_settings_str(&raw_str) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::FontVariationSettings,
+                    PropertyValue::FontVariationSettings(parsed),
+                    imp,
+                );
+            }
+        }
         "font-size-adjust" => {
             if non_ws.len() == 1 {
                 match &non_ws[0] {
@@ -10371,4 +10478,101 @@ pub(crate) fn compile_extra_standard_property(
         }
         _ => missing.push(MissingCssFeature::new(MissingCssKind::Property, name)),
     }
+}
+
+/// Parses CSS Fonts L3/L4 `font-feature-settings`: `normal | <feature-tag-value>#`
+/// where `<feature-tag-value> = <opentype-tag> [ <integer [0,∞]> | on | off ]?`.
+pub(crate) fn parse_font_feature_settings_str(
+    raw: &str,
+) -> Option<Option<Vec<(InternedStr, crate::values_math::MathNode)>>> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("normal") {
+        return Some(None);
+    }
+    let parts = crate::substitution::split_top_level(trimmed, b',');
+    if parts.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        let p = part.trim();
+        if p.is_empty() {
+            return None;
+        }
+        let mut pi = cssparser::ParserInput::new(p);
+        let mut parser = cssparser::Parser::new(&mut pi);
+        let tag_str = match parser.next() {
+            Ok(cssparser::Token::QuotedString(s)) => s.as_ref().to_string(),
+            _ => return None,
+        };
+        if tag_str.len() != 4 || !tag_str.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+            return None;
+        }
+        let rest = parser.current_line()[parser.position().byte_index()..].trim();
+        let val_node = if rest.is_empty() || rest.eq_ignore_ascii_case("on") {
+            crate::values_math::MathNode::Number(1.0)
+        } else if rest.eq_ignore_ascii_case("off") {
+            crate::values_math::MathNode::Number(0.0)
+        } else if crate::values_math::has_values4_syntax(rest) {
+            // CSS Values L4 §10.9: math functions in `<integer>` context accept `<number>`
+            // and round to the nearest integer (half toward +∞) at computed-value time.
+            let pm =
+                crate::values_math::parse_math_value(rest, crate::values_math::ValueKind::Number)?;
+            pm.node
+        } else {
+            // Bare `<integer [0,∞]>`: CSS Syntax L3 §4.3.3 requires an integer token
+            // (rejecting scientific notation like `1e1` and decimals like `10.1`).
+            let mut npi = cssparser::ParserInput::new(rest);
+            let mut np = cssparser::Parser::new(&mut npi);
+            let iv = match np.next() {
+                Ok(cssparser::Token::Number {
+                    int_value: Some(v), ..
+                }) if *v >= 0 => *v,
+                _ => return None,
+            };
+            if !np.is_exhausted() {
+                return None;
+            }
+            crate::values_math::MathNode::Number(f64::from(iv))
+        };
+        out.push((intern_str(&tag_str), val_node));
+    }
+    Some(Some(out))
+}
+
+/// Parses CSS Fonts L4 `font-variation-settings`: `normal | [ <string> <number> ]#`.
+pub(crate) fn parse_font_variation_settings_str(
+    raw: &str,
+) -> Option<Option<Vec<(InternedStr, crate::values_math::MathNode)>>> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("normal") {
+        return Some(None);
+    }
+    let parts = crate::substitution::split_top_level(trimmed, b',');
+    if parts.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        let p = part.trim();
+        if p.is_empty() {
+            return None;
+        }
+        let mut pi = cssparser::ParserInput::new(p);
+        let mut parser = cssparser::Parser::new(&mut pi);
+        let tag_str = match parser.next() {
+            Ok(cssparser::Token::QuotedString(s)) => s.as_ref().to_string(),
+            _ => return None,
+        };
+        if tag_str.len() != 4 || !tag_str.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+            return None;
+        }
+        let rest = parser.current_line()[parser.position().byte_index()..].trim();
+        if rest.is_empty() {
+            return None;
+        }
+        let pm = crate::values_math::parse_math_value(rest, crate::values_math::ValueKind::Number)?;
+        out.push((intern_str(&tag_str), pm.node));
+    }
+    Some(Some(out))
 }

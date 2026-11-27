@@ -18,7 +18,7 @@ use crate::animations::{
     apply_animations_and_transitions, ActiveTransition, AnimationStateSnapshot, WebAnimationSpec,
 };
 use crate::color::CssColorExpr;
-use crate::computed::{resolve_element_style_with_context, ComputedStyle, MatchedRule};
+use crate::computed::{resolve_element_style_with_metrics, ComputedStyle, MatchedRule};
 use crate::properties::{
     parse_inline_style, parse_inline_style_quirks, MissingCssFeature, PropertyIdKind,
     PropertyValue, SpecifiedDeclaration,
@@ -261,6 +261,8 @@ pub struct StyleContext {
     random_doc_seed: u64,
     /// Laid-out `(content_width, content_height)` of CSS Containment L3 query containers.
     container_sizes: HashMap<NodeId, (f32, f32)>,
+    /// Live font metrics resolver for font-relative length units (`lh`/`rlh`/`ch`/`rch`/`ex`/`rex`/`cap`/`rcap`).
+    font_metrics: Option<crate::values::FontMetricsResolver>,
     missing_seen: HashSet<MissingCssFeature>,
     missing_features: Vec<MissingCssFeature>,
     index_dirty: bool,
@@ -307,6 +309,7 @@ impl StyleContext {
             animation_clock_ms: 0.0,
             random_doc_seed: next_random_doc_seed(),
             container_sizes: HashMap::new(),
+            font_metrics: None,
             missing_seen: HashSet::new(),
             missing_features: Vec::new(),
             index_dirty: true,
@@ -348,10 +351,17 @@ impl StyleContext {
             animation_clock_ms: 0.0,
             random_doc_seed: next_random_doc_seed(),
             container_sizes: HashMap::new(),
+            font_metrics: None,
             missing_seen: HashSet::new(),
             missing_features: Vec::new(),
             index_dirty: true,
         }
+    }
+
+    /// Installs or replaces the live font-metrics resolver used by cascade (`lh`/`rlh`/`ch`/`rch`/`ex`/`rex`/`cap`/`rcap`).
+    pub fn set_font_metrics(&mut self, resolver: Option<crate::values::FontMetricsResolver>) {
+        self.font_metrics = resolver.clone();
+        self.rule_index.font_metrics = resolver;
     }
 
     /// Extracts portable animation/transition state so it survives full stylesheet rebuilds.
@@ -709,6 +719,7 @@ impl StyleContext {
         all.extend(self.author_sheets.iter().cloned());
         let (mut index, inv) = RuleIndex::build(&all);
         index.random_doc_seed = self.random_doc_seed;
+        index.font_metrics = self.font_metrics.clone();
         for rp in &self.js_registered_properties {
             index
                 .registered_properties
@@ -819,7 +830,7 @@ impl StyleContext {
             .unwrap_or(16.0);
         let (si, sc) = element_sibling_position(doc, node);
         let pseudo_nid = (usize::from(node) as u64) ^ ((pseudo.discriminant_u64() + 1) << 48);
-        let mut pstyle = resolve_element_style_with_context(
+        let mut pstyle = resolve_element_style_with_metrics(
             &matched,
             &[],
             &[],
@@ -832,6 +843,8 @@ impl StyleContext {
             pseudo_nid,
             self.rule_index.random_doc_seed,
             &orig_elem.attributes,
+            None,
+            self.rule_index.font_metrics.as_ref(),
         );
         if matches!(
             orig_style.display,
@@ -2787,7 +2800,7 @@ fn compute_single_element_style(
     let t_res = dbg_timers
         .filter(|t| t.enabled)
         .map(|_| std::time::Instant::now());
-    let mut resolved_val = resolve_element_style_with_context(
+    let mut resolved_val = resolve_element_style_with_metrics(
         &matched_refs,
         &pres_decls,
         &inline_decls,
@@ -2800,6 +2813,8 @@ fn compute_single_element_style(
         usize::from(node) as u64,
         rule_index.random_doc_seed,
         &elem.attributes,
+        None,
+        rule_index.font_metrics.as_ref(),
     );
     if let (Some(tr), Some(dt)) = (t_res, dbg_timers) {
         dt.resolve_ns.fetch_add(
@@ -3177,7 +3192,7 @@ fn compute_starting_style_before(
         }
     }
     let (sib_idx, sib_cnt) = element_sibling_position(doc, node);
-    let resolved = resolve_element_style_with_context(
+    let resolved = resolve_element_style_with_metrics(
         &matched_refs,
         &pres_decls,
         &inline_decls,
@@ -3190,6 +3205,8 @@ fn compute_starting_style_before(
         usize::from(node) as u64,
         rule_index.random_doc_seed,
         &elem.attributes,
+        None,
+        rule_index.font_metrics.as_ref(),
     );
     Some(Arc::new(resolved))
 }
@@ -3310,7 +3327,7 @@ fn recompute_element_with_custom_override(
         }
     }
     let (sib_idx, sib_cnt) = element_sibling_position(doc, node);
-    let mut resolved = crate::computed::resolve_element_style_with_custom_override(
+    let mut resolved = resolve_element_style_with_metrics(
         &matched_refs,
         &pres_decls,
         &inline_decls,
@@ -3324,6 +3341,7 @@ fn recompute_element_with_custom_override(
         rule_index.random_doc_seed,
         &elem.attributes,
         Some(animated_custom),
+        rule_index.font_metrics.as_ref(),
     );
     if parent_style.is_some_and(|p| {
         matches!(
@@ -4191,7 +4209,7 @@ fn collect_pseudo_element_styles(
                 (1, 1)
             };
             let pseudo_nid = (usize::from(node) as u64) ^ ((pseudo.discriminant_u64() + 1) << 48);
-            let mut pstyle = resolve_element_style_with_context(
+            let mut pstyle = resolve_element_style_with_metrics(
                 &matched,
                 &[],
                 &[],
@@ -4204,6 +4222,8 @@ fn collect_pseudo_element_styles(
                 pseudo_nid,
                 rule_index.random_doc_seed,
                 elem_attrs,
+                None,
+                rule_index.font_metrics.as_ref(),
             );
             if layout_parent_flex_grid
                 && matches!(pseudo, RixPseudoElement::Before | RixPseudoElement::After)

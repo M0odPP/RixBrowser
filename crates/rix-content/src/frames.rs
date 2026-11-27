@@ -2211,6 +2211,107 @@ pub fn sync_all_iframes_in_document(
     }
 }
 
+/// Returns `true` if `nid` or any DOM ancestor has computed `display: none`.
+fn is_node_or_ancestor_display_none(host: &SharedHost, nid: NodeId) -> bool {
+    let mut chain = Vec::new();
+    {
+        let hb = host.borrow();
+        let doc = hb.document.borrow();
+        let mut cur = Some(nid);
+        while let Some(c) = cur {
+            if matches!(doc.get(c), Some(NodeData::Element(_))) {
+                chain.push(c);
+            }
+            cur = doc.parent(c);
+        }
+    }
+    for anc in chain {
+        if host
+            .borrow_mut()
+            .computed_style_for_node(anc)
+            .is_some_and(|st| st.display == rix_css::DisplayMode::None)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Detects viewport size changes on connected same-origin `<iframe>` browsing contexts
+/// and dispatches a `resize` event on each resized iframe's `contentWindow` (CSSOM View §4).
+pub(crate) fn check_and_fire_iframe_resizes(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    frames: &SharedFrames,
+) {
+    let entries: Vec<(NodeId, HeapHandle)> = {
+        let fs = frames.borrow();
+        if fs.iframes.is_empty() {
+            return;
+        }
+        fs.iframes
+            .values()
+            .filter(|r| !r.is_cross_origin)
+            .map(|r| (r.node_id, r.proxy))
+            .collect()
+    };
+    let mut resized: Vec<HeapHandle> = Vec::new();
+    for (iframe_nid, proxy_h) in entries {
+        let doc_id_opt = {
+            let hb = host.borrow();
+            let doc = hb.document.borrow();
+            if !doc.is_connected(iframe_nid) {
+                continue;
+            }
+            match doc.get(iframe_nid) {
+                Some(NodeData::Element(el)) => el.content_document,
+                _ => None,
+            }
+        };
+        let Some(doc_id) = doc_id_opt else {
+            continue;
+        };
+        let is_hidden = is_node_or_ancestor_display_none(host, iframe_nid);
+        let cur_sz = if is_hidden {
+            (0.0_f32, 0.0_f32)
+        } else {
+            let vp = host.borrow_mut().viewport_for_doc(doc_id);
+            (vp.width, vp.height)
+        };
+        let mut hb = host.borrow_mut();
+        match hb.iframe_last_sizes.get(&iframe_nid).copied() {
+            Some((ow, oh)) => {
+                if (ow - cur_sz.0).abs() > 0.5 || (oh - cur_sz.1).abs() > 0.5 {
+                    hb.iframe_last_sizes.insert(iframe_nid, cur_sz);
+                    if !is_hidden {
+                        resized.push(proxy_h);
+                    }
+                }
+            }
+            None => {
+                hb.iframe_last_sizes.insert(iframe_nid, cur_sz);
+            }
+        }
+    }
+    let ev_proto_opt = events.borrow().event_proto;
+    if let Some(ev_proto) = ev_proto_opt {
+        for proxy_h in resized {
+            fire_object_event_with_proto(
+                vm,
+                host,
+                events,
+                event_loop,
+                proxy_h,
+                "resize",
+                ev_proto,
+                &[],
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sync_iframe_node(
     vm: &mut JsVm,
@@ -2263,7 +2364,13 @@ pub(crate) fn sync_iframe_node(
 
     let resolved_url = if srcdoc_attr.is_some() {
         "about:srcdoc".to_string()
-    } else if src_attr.is_empty() || src_attr.eq_ignore_ascii_case("about:blank") {
+    } else if src_attr.is_empty()
+        || src_attr.eq_ignore_ascii_case("about:blank")
+        || src_attr
+            .trim_start()
+            .get(..11)
+            .is_some_and(|p| p.eq_ignore_ascii_case("javascript:"))
+    {
         "about:blank".to_string()
     } else if let Ok(base) = Url::parse(&parent_href) {
         base.join(&src_attr)
@@ -2684,6 +2791,16 @@ pub(crate) fn sync_iframe_node(
                     }
                 }
             }
+        }
+
+        if let Some(sub_id) = child_doc_nid {
+            let init_sz = if is_node_or_ancestor_display_none(host, node_id) {
+                (0.0_f32, 0.0_f32)
+            } else {
+                let init_vp = host.borrow_mut().viewport_for_doc(sub_id);
+                (init_vp.width, init_vp.height)
+            };
+            host.borrow_mut().iframe_last_sizes.insert(node_id, init_sz);
         }
 
         sync_window_indexed_frames(vm, frames);

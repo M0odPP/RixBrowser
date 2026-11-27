@@ -332,7 +332,10 @@ impl MathNode {
             }
             Self::Progress(_, v, s, e) => {
                 let t = CalcType::add_consistent(CalcType::add_consistent(v.calc_type()?, s.calc_type()?)?, e.calc_type()?)?;
-                Some(CalcType { dims: [0; 6], percent: 0, percent_hint: t.percent_hint, has_percent: t.percent_hint.is_some() })
+                let is_unit_single_dim = t.single_base_dim().is_some()
+                    && t.dims.iter().all(|&exp| exp == 0 || exp == 1);
+                (t.as_hinted_number().is_some() || t.is_pure_percent() || is_unit_single_dim)
+                    .then_some(CalcType { dims: [0; 6], percent: 0, percent_hint: t.percent_hint, has_percent: t.percent_hint.is_some() })
             }
             Self::CalcMix(items) => {
                 let mut acc = items.first()?.value.calc_type()?;
@@ -480,17 +483,20 @@ fn resolve_length_unit_f64(unit: LengthUnit, v: f64, ctx: &EvalContext) -> f64 {
         LengthUnit::Px => v,
         LengthUnit::Em => v * fs,
         LengthUnit::Rem => v * rfs,
-        LengthUnit::Ex => v * fs * 0.5,
+        LengthUnit::Ex => v * ctx.ex_px.map_or(fs * 0.5, f64::from),
         LengthUnit::Ch => v * ctx.ch_px.map_or(fs * 0.5, f64::from),
-        LengthUnit::Rex | LengthUnit::Rch => v * rfs * 0.5,
-        LengthUnit::Cap => v * fs * 0.7,
-        LengthUnit::Rcap => v * rfs * 0.7,
+        LengthUnit::Rex => v * ctx.rex_px.map_or(rfs * 0.5, f64::from),
+        LengthUnit::Rch => v * ctx.rch_px.map_or(rfs * 0.5, f64::from),
+        LengthUnit::Cap => v * ctx.cap_px.map_or(fs * 0.7, f64::from),
+        LengthUnit::Rcap => v * ctx.rcap_px.map_or(rfs * 0.7, f64::from),
         LengthUnit::Ic => v * fs,
         LengthUnit::Ric => v * rfs,
         LengthUnit::Lh => v * lh,
         LengthUnit::Rlh => v * rlh,
-        LengthUnit::Vw | LengthUnit::Vi | LengthUnit::Svw | LengthUnit::Svi | LengthUnit::Lvw | LengthUnit::Lvi | LengthUnit::Dvw | LengthUnit::Dvi => v * vw,
-        LengthUnit::Vh | LengthUnit::Vb | LengthUnit::Svh | LengthUnit::Svb | LengthUnit::Lvh | LengthUnit::Lvb | LengthUnit::Dvh | LengthUnit::Dvb => v * vh,
+        LengthUnit::Vw | LengthUnit::Svw | LengthUnit::Lvw | LengthUnit::Dvw => v * vw,
+        LengthUnit::Vh | LengthUnit::Svh | LengthUnit::Lvh | LengthUnit::Dvh => v * vh,
+        LengthUnit::Vi | LengthUnit::Svi | LengthUnit::Lvi | LengthUnit::Dvi => v * if ctx.vertical_writing_mode { vh } else { vw },
+        LengthUnit::Vb | LengthUnit::Svb | LengthUnit::Lvb | LengthUnit::Dvb => v * if ctx.vertical_writing_mode { vw } else { vh },
         LengthUnit::Vmin | LengthUnit::Svmin | LengthUnit::Lvmin | LengthUnit::Dvmin => v * vw.min(vh),
         LengthUnit::Vmax | LengthUnit::Svmax | LengthUnit::Lvmax | LengthUnit::Dvmax => v * vw.max(vh),
         LengthUnit::Cqw | LengthUnit::Cqi => v * cw,
@@ -604,7 +610,7 @@ fn simplify_product(raw: Vec<MathNode>) -> MathNode {
     }
     if num_dims.is_empty() && den_dims.is_empty() && rest.len() == 1 {
         if let MathNode::Sum(terms) = &rest[0] {
-            if scalar.is_finite() {
+            if scalar.is_finite() && terms.iter().all(|t| leaf_parts(t).is_some()) {
                 return simplify_sum(terms.iter().map(|t| simplify_product(vec![MathNode::Number(scalar), t.clone()])).collect());
             }
         }
@@ -1143,6 +1149,7 @@ fn serialize_simple_literal(n: &MathNode) -> Option<String> {
 #[rustfmt::skip]
 fn serialize_top_level_calc(n: &MathNode, specified: bool) -> String {
     match n {
+        MathNode::Pow(_, _) if specified => format!("calc({})", serialize_inner(n, false)),
         MathNode::Min(_) | MathNode::Max(_) | MathNode::Clamp(_, _, _) | MathNode::Round(_, _, _)
         | MathNode::Mod(_, _) | MathNode::Rem(_, _) | MathNode::Sin(_) | MathNode::Cos(_) | MathNode::Tan(_)
         | MathNode::Asin(_) | MathNode::Acos(_) | MathNode::Atan(_) | MathNode::Atan2(_, _)
@@ -1160,6 +1167,15 @@ fn serialize_leaf_calc(v: f64, unit: Option<&str>) -> String {
     if !v.is_finite() {
         let sym = format_math_f64(v);
         return match unit { Some(u) => format!("{sym} * 1{u}"), None => sym };
+    }
+    // Preserve IEEE-754 `-0` on unevaluated relative units (`-0em`, `-0cap`, `-0vh`, ...)
+    // so CSSOM round-tripping through `el.style` retains negative zero for `sign()`/`atan2()`.
+    if v == 0.0 && v.is_sign_negative() {
+        if let Some(u) = unit {
+            if !matches!(u, "px" | "%" | "deg" | "s" | "hz" | "dppx" | "fr") {
+                return format!("-0{u}");
+            }
+        }
     }
     match unit { Some(u) => format!("{}{u}", format_math_f64(v)), None => format_math_f64(v) }
 }
@@ -1197,7 +1213,15 @@ fn serialize_inner(n: &MathNode, parens: bool) -> String {
         MathNode::Product(items) => {
             let mut out = String::new();
             for (i, item) in items.iter().enumerate() {
-                if i == 0 { out.push_str(&serialize_inner(item, matches!(item, MathNode::Sum(_) | MathNode::Product(_)))); }
+                if i == 0 {
+                    if let MathNode::Number(v) = item {
+                        if *v == 0.0 && v.is_sign_negative() && items.len() > 1 {
+                            out.push_str("-0");
+                            continue;
+                        }
+                    }
+                    out.push_str(&serialize_inner(item, matches!(item, MathNode::Sum(_) | MathNode::Product(_))));
+                }
                 else if let MathNode::Invert(inner) = item { out.push_str(" / "); out.push_str(&serialize_inner(inner, matches!(**inner, MathNode::Sum(_) | MathNode::Product(_) | MathNode::Invert(_)))); }
                 else { out.push_str(" * "); out.push_str(&serialize_inner(item, matches!(item, MathNode::Sum(_) | MathNode::Product(_)))); }
             }

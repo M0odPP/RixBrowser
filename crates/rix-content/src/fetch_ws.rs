@@ -136,6 +136,8 @@ pub enum AsyncNetEvent {
     },
     WebFontsLoaded {
         promise_h: HeapHandle,
+        face_h: Option<HeapHandle>,
+        resolve_val: Option<JsValue>,
         fetched: Vec<(String, Option<Vec<u8>>)>,
     },
     XhrCompleted {
@@ -265,6 +267,7 @@ pub struct NetworkBridge {
     next_id: u64,
     pending_fetches: HashMap<u64, PendingFetch>,
     pub(crate) pending_subresources: usize,
+    pub(crate) pending_stylesheet_fetches: usize,
     keepalive_inflight_bytes: usize,
     websockets: HashMap<u64, JsWebSocketEntry>,
     ws_handle_to_id: HashMap<HeapHandle, u64>,
@@ -277,7 +280,8 @@ pub struct NetworkBridge {
     responses: HashMap<HeapHandle, ResponseEntry>,
     xhrs: Rc<RefCell<HashMap<HeapHandle, XhrState>>>,
     pending_xhrs: HashMap<HeapHandle, ()>,
-    pub(crate) pending_font_promises: HashMap<HeapHandle, ()>,
+    pub(crate) pending_font_promises: HashMap<HeapHandle, (Option<HeapHandle>, Option<JsValue>)>,
+    pub(crate) pending_font_ready_promises: Vec<(HeapHandle, Option<JsValue>)>,
     pub(crate) protos: NetPrototypes,
 }
 
@@ -329,6 +333,7 @@ impl NetworkBridge {
             next_id: 1,
             pending_fetches: HashMap::new(),
             pending_subresources: 0,
+            pending_stylesheet_fetches: 0,
             keepalive_inflight_bytes: 0,
             websockets: HashMap::new(),
             ws_handle_to_id: HashMap::new(),
@@ -342,6 +347,7 @@ impl NetworkBridge {
             xhrs: Rc::new(RefCell::new(HashMap::new())),
             pending_xhrs: HashMap::new(),
             pending_font_promises: HashMap::new(),
+            pending_font_ready_promises: Vec::new(),
             protos: NetPrototypes::default(),
         }
     }
@@ -400,8 +406,20 @@ impl NetworkBridge {
         for &xhr_h in self.pending_xhrs.keys() {
             out.push(JsValue::from_object(xhr_h));
         }
-        for &fp_h in self.pending_font_promises.keys() {
+        for (&fp_h, (face_opt, rv_opt)) in &self.pending_font_promises {
             out.push(JsValue::from_object(fp_h));
+            if let Some(fh) = face_opt {
+                out.push(JsValue::from_object(*fh));
+            }
+            if let Some(rv) = rv_opt {
+                out.push(*rv);
+            }
+        }
+        for &(rp_h, rv_opt) in &self.pending_font_ready_promises {
+            out.push(JsValue::from_object(rp_h));
+            if let Some(rv) = rv_opt {
+                out.push(rv);
+            }
         }
         for req in self.requests.values() {
             out.push(JsValue::from_object(req.headers_h));
@@ -815,29 +833,50 @@ pub fn deliver_async_net_event(
             );
         }
         AsyncNetEvent::DynamicStylesheetLoaded { link_nid, css } => {
-            {
+            let ready_to_flush: Vec<(HeapHandle, Option<JsValue>)> = {
                 let mut nb = net.borrow_mut();
                 nb.pending_subresources = nb.pending_subresources.saturating_sub(1);
-            }
+                nb.pending_stylesheet_fetches = nb.pending_stylesheet_fetches.saturating_sub(1);
+                if nb.pending_stylesheet_fetches == 0 {
+                    std::mem::take(&mut nb.pending_font_ready_promises)
+                } else {
+                    Vec::new()
+                }
+            };
             let loaded_ok = if let Some(css_text) = css {
                 let mut hb = host.borrow_mut();
+                let owner_doc = hb.owner_doc_of(link_nid);
+                let main_root = hb.document.borrow().root();
                 let base_url = {
-                    let doc = hb.document.borrow();
-                    let raw_href = match doc.get(link_nid) {
-                        Some(rix_dom::NodeData::Element(el)) => {
-                            el.get_attribute("href").unwrap_or("").trim().to_string()
+                    let raw_href = {
+                        let doc = hb.document.borrow();
+                        match doc.get(link_nid) {
+                            Some(rix_dom::NodeData::Element(el)) => {
+                                el.get_attribute("href").unwrap_or("").trim().to_string()
+                            }
+                            _ => String::new(),
                         }
-                        _ => String::new(),
+                    };
+                    let doc_base = {
+                        let b = hb.doc_base_url_for(owner_doc);
+                        if b.starts_with("http://") || b.starts_with("https://") {
+                            b
+                        } else {
+                            hb.document_base_url()
+                        }
                     };
                     if !raw_href.is_empty() {
-                        url::Url::parse(&hb.main_document_url)
+                        url::Url::parse(&doc_base)
                             .ok()
                             .and_then(|b| b.join(&raw_href).ok())
                             .map_or(raw_href, |u| u.to_string())
                     } else {
-                        hb.main_document_url.clone()
+                        doc_base
                     }
                 };
+                if owner_doc != main_root {
+                    hb.subdoc_link_css.insert(link_nid, css_text.clone());
+                }
                 hb.link_stylesheet_css
                     .insert(link_nid, (base_url, css_text));
                 hb.mark_full_sheets_rebuild();
@@ -845,6 +884,13 @@ pub fn deliver_async_net_event(
             } else {
                 false
             };
+            if !ready_to_flush.is_empty() {
+                if let Some(hook) = host.borrow().font_load_hook.clone() {
+                    for (p_h, rv) in ready_to_flush {
+                        hook(vm, p_h, None, rv, false);
+                    }
+                }
+            }
             let ev_type = if loaded_ok { "load" } else { "error" };
             crate::dom_sanitizer::dispatch_simple_element_event(
                 vm, host, events, event_loop, link_nid, ev_type,
@@ -855,10 +901,16 @@ pub fn deliver_async_net_event(
             fetched,
             any_error,
         } => {
-            {
+            let ready_to_flush: Vec<(HeapHandle, Option<JsValue>)> = {
                 let mut nb = net.borrow_mut();
                 nb.pending_subresources = nb.pending_subresources.saturating_sub(1);
-            }
+                nb.pending_stylesheet_fetches = nb.pending_stylesheet_fetches.saturating_sub(1);
+                if nb.pending_stylesheet_fetches == 0 {
+                    std::mem::take(&mut nb.pending_font_ready_promises)
+                } else {
+                    Vec::new()
+                }
+            };
             {
                 let mut hb = host.borrow_mut();
                 for (url, css_opt) in fetched {
@@ -866,12 +918,24 @@ pub fn deliver_async_net_event(
                 }
                 hb.mark_full_sheets_rebuild();
             }
+            if !ready_to_flush.is_empty() {
+                if let Some(hook) = host.borrow().font_load_hook.clone() {
+                    for (p_h, rv) in ready_to_flush {
+                        hook(vm, p_h, None, rv, false);
+                    }
+                }
+            }
             let ev_type = if any_error { "error" } else { "load" };
             crate::dom_sanitizer::dispatch_simple_element_event(
                 vm, host, events, event_loop, style_nid, ev_type,
             );
         }
-        AsyncNetEvent::WebFontsLoaded { promise_h, fetched } => {
+        AsyncNetEvent::WebFontsLoaded {
+            promise_h,
+            face_h,
+            resolve_val,
+            fetched,
+        } => {
             {
                 let mut nb = net.borrow_mut();
                 nb.pending_subresources = nb.pending_subresources.saturating_sub(1);
@@ -882,11 +946,15 @@ pub fn deliver_async_net_event(
                 for (url, bytes_opt) in fetched {
                     hb.web_font_bytes_cache.insert(url, bytes_opt);
                 }
-                let _ = hb.ensure_styles();
-                hb.sync_active_web_fonts_from_cache();
             }
-            let arr = vm.alloc_array();
-            rix_js::promise::resolve_promise(vm, promise_h, JsValue::from_object(arr));
+            crate::dom_sanitizer::finalize_loaded_font_faces(
+                vm,
+                host,
+                face_h,
+                resolve_val.is_none(),
+            );
+            let val = resolve_val.unwrap_or_else(|| JsValue::from_object(vm.alloc_array()));
+            rix_js::promise::resolve_promise(vm, promise_h, val);
         }
         AsyncNetEvent::XhrCompleted {
             xhr_h,

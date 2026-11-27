@@ -416,7 +416,19 @@ pub fn layout_block_box(
             }
         })
     };
-    let child_space = space.with_available(content_width, definite_height);
+    // WHATWG Quirks Mode §3.4 ("The percentage height calculation quirk"): in Quirks Mode,
+    // an auto-height in-flow block container propagates its remaining available height as the
+    // percentage-height basis for descendants (e.g. `html` -> `body { height: 100% }`).
+    let child_avail_h = definite_height.or_else(|| {
+        if ctx.tree.quirks_mode == 2 && !b.is_out_of_flow && !b.is_float && !is_table_cell {
+            space
+                .available_height
+                .map(|ah| (ah - metrics.margin.vertical() - pb_h).max(0.0))
+        } else {
+            None
+        }
+    });
+    let child_space = space.with_available(content_width, child_avail_h);
 
     let children_ids = ctx.tree.get(box_id).children.clone();
     let establishes_bfc = ctx.tree.get(box_id).establishes_bfc;
@@ -436,7 +448,7 @@ pub fn layout_block_box(
             let c = ctx.tree.get(cid);
             c.is_float
                 || c.is_out_of_flow
-                || matches!(&c.kind, BoxKind::Text(t) if t.chars().all(char::is_whitespace))
+                || matches!(&c.kind, BoxKind::Text(t) if t.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C)))
         }));
 
     let mut placed_children: Vec<Fragment> = Vec::with_capacity(children_ids.len());
@@ -629,7 +641,8 @@ pub fn layout_block_box(
                 continue;
             }
 
-            if matches!(&child_box.kind, BoxKind::Text(t) if t.chars().all(char::is_whitespace)) {
+            if matches!(&child_box.kind, BoxKind::Text(t) if t.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C)))
+            {
                 continue;
             }
 

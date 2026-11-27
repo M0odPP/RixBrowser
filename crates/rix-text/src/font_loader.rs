@@ -79,6 +79,8 @@ pub struct FontMetrics {
     pub line_gap: i16,
     pub cap_height: Option<i16>,
     pub x_height: Option<i16>,
+    /// Advance width of ASCII digit `'0'` (`U+0030`) in font design units (CSS Values L3 `1ch`).
+    pub zero_advance: Option<u16>,
 }
 
 impl FontMetrics {
@@ -102,6 +104,18 @@ impl FontMetrics {
         self.x_height
             .map(|height| height as f32 * self.scale(font_size))
             .filter(|height| *height > 0.0)
+    }
+
+    pub fn cap_height_px(&self, font_size: f32) -> Option<f32> {
+        self.cap_height
+            .map(|height| height as f32 * self.scale(font_size))
+            .filter(|height| *height > 0.0)
+    }
+
+    pub fn zero_advance_px(&self, font_size: f32) -> Option<f32> {
+        self.zero_advance
+            .map(|adv| adv as f32 * self.scale(font_size))
+            .filter(|adv| *adv > 0.0)
     }
 }
 
@@ -1485,6 +1499,20 @@ fn extract_metrics(
         desc = -(upem as i16 / 5);
     }
 
+    let zero_advance = {
+        let gid = swash_font.charmap().map('0');
+        if gid != 0 {
+            let adv = swash_font.glyph_metrics(&[]).advance_width(gid);
+            if adv > 0.0 && adv.is_finite() {
+                Some(adv.round().clamp(1.0, f32::from(u16::MAX)) as u16)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
     FontMetrics {
         units_per_em: upem,
         ascender: asc,
@@ -1492,6 +1520,7 @@ fn extract_metrics(
         line_gap: gap,
         cap_height: cap,
         x_height: xh,
+        zero_advance,
     }
 }
 

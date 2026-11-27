@@ -201,6 +201,8 @@ pub struct RuleIndex {
     pub counter_styles: HashMap<InternedStr, CounterStyleRule>,
     /// Layer-ordered `@font-face` rules (ascending priority; highest-priority last).
     pub font_faces: Vec<FontFaceRule>,
+    /// Live font metrics callback for `lh`/`rlh`/`ch`/`rch`/`ex`/`rex`/`cap`/`rcap` resolution.
+    pub font_metrics: Option<crate::values::FontMetricsResolver>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -256,6 +258,7 @@ impl RuleIndex {
             keyframes: HashMap::new(),
             counter_styles: HashMap::new(),
             font_faces: Vec::new(),
+            font_metrics: None,
         };
         let mut inv = InvalidationMap::default();
 
