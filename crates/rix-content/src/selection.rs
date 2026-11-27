@@ -1450,8 +1450,13 @@ fn install_range_prototypes(
                 };
                 (ctx_name, owner_doc)
             };
-            let (frag_doc, frag_roots) =
-                rix_html::parse_html_fragment_with_options(&html, ctx_name.as_ref(), false, false);
+            let doc_scripting = h.borrow().is_scripting_enabled_doc(owner_doc);
+            let (frag_doc, frag_roots) = rix_html::parse_html_fragment_with_options(
+                &html,
+                ctx_name.as_ref(),
+                doc_scripting,
+                false,
+            );
             let (frag_id, script_nodes) = {
                 let doc_rc = Rc::clone(&h.borrow().document);
                 let mut doc = doc_rc.borrow_mut();

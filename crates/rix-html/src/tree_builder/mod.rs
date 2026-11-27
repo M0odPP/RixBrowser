@@ -77,6 +77,8 @@ pub struct TreeBuilder<Handle, Sink> {
     foster_parenting: Cell<bool>,
     context_elem: RefCell<Option<Handle>>,
     current_line: Cell<u64>,
+    pause_on_custom_elements: Cell<bool>,
+    pending_ce_insert: RefCell<Option<(InsertionPoint<Handle>, Handle)>>,
 }
 
 impl<Handle, Sink> TreeBuilder<Handle, Sink>
@@ -104,6 +106,28 @@ where
             foster_parenting: Cell::new(false),
             context_elem: RefCell::new(None),
             current_line: Cell::new(1),
+            pause_on_custom_elements: Cell::new(false),
+            pending_ce_insert: RefCell::new(None),
+        }
+    }
+
+    pub fn set_pause_on_custom_elements(&self, enabled: bool) {
+        self.pause_on_custom_elements.set(enabled);
+    }
+
+    pub fn pending_custom_element_handle(&self) -> Option<Handle> {
+        self.pending_ce_insert
+            .borrow()
+            .as_ref()
+            .map(|(_, elem)| elem.clone())
+    }
+
+    pub fn finish_pending_custom_element_insert(&self, already_reparented: bool) {
+        let pending = self.pending_ce_insert.borrow_mut().take();
+        if let Some((insertion_point, elem)) = pending {
+            if !already_reparented {
+                self.insert_at(insertion_point, AppendNode(elem));
+            }
         }
     }
 
@@ -140,6 +164,8 @@ where
             foster_parenting: Cell::new(false),
             context_elem: RefCell::new(Some(context_elem)),
             current_line: Cell::new(1),
+            pause_on_custom_elements: Cell::new(false),
+            pending_ce_insert: RefCell::new(None),
         };
 
         tb.create_root(Vec::new());
@@ -216,12 +242,18 @@ where
                             .parse_error(Borrowed("Unacknowledged self-closing tag"));
                     }
                     let Some(next) = more_tokens.pop_front() else {
+                        if let Some(ce) = self.pending_custom_element_handle() {
+                            return TokenSinkResult::Script(ce);
+                        }
                         return TokenSinkResult::Continue;
                     };
                     token = next;
                 }
                 ProcessResult::DoneAckSelfClosing => {
                     let Some(next) = more_tokens.pop_front() else {
+                        if let Some(ce) = self.pending_custom_element_handle() {
+                            return TokenSinkResult::Script(ce);
+                        }
                         return TokenSinkResult::Continue;
                     };
                     token = next;
@@ -1048,6 +1080,14 @@ where
                     .iter()
                     .any(|a| a.name.expanded() == expanded_name!("", "form")));
 
+        let is_custom_candidate = self.pause_on_custom_elements.get()
+            && self.opts.scripting_enabled
+            && qname.ns == ns!(html)
+            && (qname.local.contains('-')
+                || attrs
+                    .iter()
+                    .any(|a| a.name.ns == ns!() && &*a.name.local == "is"));
+
         let elem = create_element_with_flags(&self.sink, qname, attrs, had_duplicate_attributes);
 
         if form_is_associatable {
@@ -1058,7 +1098,13 @@ where
             }
         }
 
-        self.insert_at(insertion_point, AppendNode(elem.clone()));
+        if is_custom_candidate && self.pending_ce_insert.borrow().is_none() {
+            // WHATWG HTML §13.2.6.1: pause before DOM insertion so synchronous custom element
+            // construction & attributeChangedCallback run before the element is inserted.
+            *self.pending_ce_insert.borrow_mut() = Some((insertion_point, elem.clone()));
+        } else {
+            self.insert_at(insertion_point, AppendNode(elem.clone()));
+        }
 
         if matches!(push, PushFlag::Push) {
             self.push(&elem);

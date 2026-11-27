@@ -441,7 +441,7 @@ pub fn install_fetch_and_websocket(
     install_fetch_fn(vm, web_apis, streams, &net);
     install_websocket(vm, host, events, event_loop, web_apis, &net);
     install_websocket_stream(vm, events, web_apis, streams, &net);
-    install_xml_http_request(vm, host, web_apis, &net);
+    install_xml_http_request(vm, host, events, event_loop, web_apis, &net);
     net
 }
 
@@ -872,13 +872,16 @@ pub fn deliver_async_net_event(
                             .then(|| v.trim().trim_matches('"').trim_matches('\'').to_string())
                     })
                 });
-                let (decoded, _) = rix_html::decode_html_bytes(&resp.body, http_charset.as_deref());
+                let (decoded, charset) =
+                    rix_html::decode_html_bytes(&resp.body, http_charset.as_deref());
                 if let Some(st) = xhrs.borrow_mut().get_mut(&xhr_h) {
                     st.status = resp.status;
                     st.status_text = resp.status_text;
                     st.response_url = resp.url;
                     st.response_bytes = resp.body;
                     st.response_text = decoded;
+                    st.response_charset = charset;
+                    st.cached_doc = None;
                     st.resp_headers = resp.headers;
                     st.ready_state = 4;
                 }
@@ -887,23 +890,18 @@ pub fn deliver_async_net_event(
                 if let Some(st) = xhrs.borrow_mut().get_mut(&xhr_h) {
                     st.status = 0;
                     st.status_text.clear();
+                    st.cached_doc = None;
                     st.ready_state = 4;
                 }
                 false
             };
-            let this_val = JsValue::from_object(xhr_h);
-            let handlers: [&str; 3] = if ok {
-                ["onreadystatechange", "onload", "onloadend"]
+            let ev_names: [&str; 3] = if ok {
+                ["readystatechange", "load", "loadend"]
             } else {
-                ["onreadystatechange", "onerror", "onloadend"]
+                ["readystatechange", "error", "loadend"]
             };
-            for ev_name in handlers {
-                let k = vm.heap.intern_key(ev_name);
-                if let Ok(cb) = vm.get_property_by_key(xhr_h, k) {
-                    if cb.as_object().is_some_and(|ch| vm.is_callable_handle(ch)) {
-                        let _ = vm.call_value(cb, this_val, &[]);
-                    }
-                }
+            for ev_name in ev_names {
+                crate::events::fire_object_event(vm, host, events, event_loop, xhr_h, ev_name, &[]);
             }
         }
     }
@@ -2357,7 +2355,7 @@ fn parse_fetch_cache(s: &str) -> FetchCache {
 }
 
 /// Decodes RFC 2397 `data:` URLs per WHATWG Fetch §4.5 scheme fetch.
-fn decode_data_url(url_str: &str) -> Option<(String, Vec<u8>)> {
+pub(crate) fn decode_data_url(url_str: &str) -> Option<(String, Vec<u8>)> {
     let rest = url_str.strip_prefix("data:")?;
     let (meta, payload) = rest.split_once(',')?;
     let meta_trimmed = meta.trim();
@@ -3235,9 +3233,11 @@ struct XhrState {
     status_text: String,
     response_url: String,
     response_text: String,
+    response_charset: &'static str,
     response_bytes: Vec<u8>,
     response_type: String,
     override_mime: Option<String>,
+    cached_doc: Option<rix_dom::NodeId>,
     req_headers: HashMap<String, String>,
     resp_headers: HashMap<String, String>,
 }
@@ -3253,13 +3253,133 @@ impl Default for XhrState {
             status_text: String::new(),
             response_url: String::new(),
             response_text: String::new(),
+            response_charset: "UTF-8",
             response_bytes: Vec::new(),
             response_type: String::new(),
             override_mime: None,
+            cached_doc: None,
             req_headers: HashMap::new(),
             resp_headers: HashMap::new(),
         }
     }
+}
+
+fn parse_data_url_for_xhr(url: &str) -> Option<FetchResponse> {
+    let (mime, bytes) = decode_data_url(url)?;
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), mime);
+    Some(FetchResponse {
+        status: 200,
+        status_text: "OK".to_string(),
+        url: url.to_string(),
+        headers,
+        body: bytes,
+        response_type: rix_net::FetchResponseType::Basic,
+        redirected: false,
+    })
+}
+
+fn build_xhr_response_document(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    xhrs: &Rc<RefCell<HashMap<HeapHandle, XhrState>>>,
+    h: HeapHandle,
+) -> JsValue {
+    let info = {
+        let map = xhrs.borrow();
+        let Some(st) = map.get(&h) else {
+            return JsValue::NULL;
+        };
+        if st.ready_state != 4 {
+            return JsValue::NULL;
+        }
+        if let Some(doc_id) = st.cached_doc {
+            return crate::dom_bridge::wrap_node(vm, host, doc_id);
+        }
+        let ct = st
+            .override_mime
+            .clone()
+            .or_else(|| {
+                st.resp_headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                    .map(|(_, v)| v.clone())
+            })
+            .unwrap_or_default();
+        (
+            ct,
+            st.response_text.clone(),
+            st.response_charset,
+            st.response_url.clone(),
+        )
+    };
+    let (ct, text, charset, url) = info;
+    let mime_essence = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let is_html = mime_essence == "text/html";
+    let is_xml = mime_essence == "text/xml"
+        || mime_essence == "application/xml"
+        || mime_essence.ends_with("+xml")
+        || mime_essence.is_empty();
+    if !is_html && !is_xml {
+        return JsValue::NULL;
+    }
+    let sub_id = if is_html {
+        // WHATWG XHR §4.7.1: HTML response documents have scripting disabled and no browsing context.
+        let parsed = rix_html::parse_html_with_options(&text, false, false);
+        let qm = parsed.quirks_mode();
+        let sid = {
+            let doc_rc = Rc::clone(&host.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            let sid = doc.new_node(rix_dom::NodeData::Document);
+            let pr = parsed.root();
+            for child in parsed.children(pr) {
+                let cloned = doc.clone_subtree_from(&parsed, child);
+                doc.append_child(sid, cloned);
+            }
+            sid
+        };
+        let mut meta = crate::dom_interfaces::DocumentMeta::html(&url);
+        meta.character_set = charset.to_string();
+        meta.quirks_mode = qm;
+        meta.scripting_enabled = false;
+        let mut hb = host.borrow_mut();
+        hb.doc_meta.insert(sid, meta);
+        hb.adopt_subtree(sid, sid);
+        sid
+    } else {
+        let sid = {
+            let doc_rc = Rc::clone(&host.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            let sid = doc.new_node(rix_dom::NodeData::Document);
+            if crate::dom_interfaces::parse_xml_into_document(&mut doc, sid, &text).is_err() {
+                return JsValue::NULL;
+            }
+            sid
+        };
+        let mut meta = crate::dom_interfaces::DocumentMeta::xml_document(
+            if mime_essence.is_empty() {
+                "text/xml"
+            } else {
+                &mime_essence
+            },
+            &url,
+        );
+        meta.character_set = charset.to_string();
+        meta.scripting_enabled = false;
+        let mut hb = host.borrow_mut();
+        hb.doc_meta.insert(sid, meta);
+        hb.adopt_subtree(sid, sid);
+        sid
+    };
+    if let Some(st) = xhrs.borrow_mut().get_mut(&h) {
+        st.cached_doc = Some(sub_id);
+    }
+    crate::dom_bridge::wrap_node(vm, host, sub_id)
 }
 
 fn is_valid_http_method_token(m: &str) -> bool {
@@ -3289,6 +3409,8 @@ fn is_valid_http_method_token(m: &str) -> bool {
 fn install_xml_http_request(
     vm: &mut JsVm,
     host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
     web_apis: &SharedWebApis,
     net: &SharedNetBridge,
 ) {
@@ -3467,6 +3589,9 @@ fn install_xml_http_request(
     // send(body?)
     {
         let xm = Rc::clone(&xhrs);
+        let h_send = Rc::clone(host);
+        let ev_send = Rc::clone(events);
+        let el_send = Rc::clone(event_loop);
         let wa = Rc::clone(web_apis);
         let nb = Rc::clone(net);
         define_host_method(vm, xp, "send", move |vm, this_val, args| {
@@ -3494,6 +3619,68 @@ fn install_xml_http_request(
                     st.override_mime.clone(),
                 )
             };
+            if url.starts_with("data:") {
+                let data_resp = parse_data_url_for_xhr(&url);
+                if async_flag {
+                    let tx = {
+                        let mut bridge = nb.borrow_mut();
+                        bridge.pending_xhrs.insert(h, ());
+                        bridge.async_tx.clone()
+                    };
+                    let _ = tx.send(AsyncNetEvent::XhrCompleted {
+                        xhr_h: h,
+                        override_mime,
+                        result: data_resp,
+                    });
+                    return Ok(JsValue::UNDEFINED);
+                }
+                let Some(resp) = data_resp else {
+                    return Err(create_dom_exception(
+                        vm,
+                        "NetworkError",
+                        "Invalid data: URL",
+                    ));
+                };
+                let ct = override_mime.or_else(|| {
+                    resp.headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, v)| v.clone())
+                });
+                let http_charset = ct.as_deref().and_then(|c| {
+                    c.split(';').skip(1).find_map(|p| {
+                        let (k, v) = p.trim().split_once('=')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("charset")
+                            .then(|| v.trim().trim_matches('"').trim_matches('\'').to_string())
+                    })
+                });
+                let (decoded, charset) =
+                    rix_html::decode_html_bytes(&resp.body, http_charset.as_deref());
+                if let Some(st) = xm.borrow_mut().get_mut(&h) {
+                    st.status = resp.status;
+                    st.status_text = resp.status_text;
+                    st.response_url = resp.url;
+                    st.response_bytes = resp.body;
+                    st.response_text = decoded;
+                    st.response_charset = charset;
+                    st.cached_doc = None;
+                    st.resp_headers = resp.headers;
+                    st.ready_state = 4;
+                }
+                for ev_name in ["readystatechange", "load", "loadend"] {
+                    crate::events::fire_object_event(
+                        vm,
+                        &h_send,
+                        &ev_send,
+                        &el_send,
+                        h,
+                        ev_name,
+                        &[],
+                    );
+                }
+                return Ok(JsValue::UNDEFINED);
+            }
             let origin = wa.borrow().current_origin();
             let engine = Arc::clone(&nb.borrow().fetch_engine);
             let req = FetchRequest {
@@ -3578,23 +3765,21 @@ fn install_xml_http_request(
                         .then(|| v.trim().trim_matches('"').trim_matches('\'').to_string())
                 })
             });
-            let (decoded, _) = rix_html::decode_html_bytes(&resp.body, http_charset.as_deref());
+            let (decoded, charset) =
+                rix_html::decode_html_bytes(&resp.body, http_charset.as_deref());
             if let Some(st) = xm.borrow_mut().get_mut(&h) {
                 st.status = resp.status;
                 st.status_text = resp.status_text;
                 st.response_url = resp.url;
                 st.response_bytes = resp.body;
                 st.response_text = decoded;
+                st.response_charset = charset;
+                st.cached_doc = None;
                 st.resp_headers = resp.headers;
                 st.ready_state = 4;
             }
-            for ev_name in ["onreadystatechange", "onload", "onloadend"] {
-                let k = vm.heap.intern_key(ev_name);
-                if let Ok(cb) = vm.get_property_by_key(h, k) {
-                    if cb.as_object().is_some_and(|ch| vm.is_callable_handle(ch)) {
-                        let _ = vm.call_value(cb, this_val, &[]);
-                    }
-                }
+            for ev_name in ["readystatechange", "load", "loadend"] {
+                crate::events::fire_object_event(vm, &h_send, &ev_send, &el_send, h, ev_name, &[]);
             }
             Ok(JsValue::UNDEFINED)
         });
@@ -3693,6 +3878,27 @@ fn install_xml_http_request(
     }
     {
         let xm = Rc::clone(&xhrs);
+        let h_xml = Rc::clone(host);
+        define_host_getter(vm, xp, "responseXML", move |vm, this_val, _| {
+            let h = require_xhr(vm, &xm, this_val)?;
+            let ty = xm
+                .borrow()
+                .get(&h)
+                .map(|st| st.response_type.clone())
+                .unwrap_or_default();
+            if !ty.is_empty() && ty != "document" {
+                return Err(create_dom_exception(
+                    vm,
+                    "InvalidStateError",
+                    "responseXML is only available when responseType is '' or 'document'",
+                ));
+            }
+            Ok(build_xhr_response_document(vm, &h_xml, &xm, h))
+        });
+    }
+    {
+        let xm = Rc::clone(&xhrs);
+        let h_resp = Rc::clone(host);
         define_host_getter(vm, xp, "response", move |vm, this_val, _| {
             let h = require_xhr(vm, &xm, this_val)?;
             let (ty, txt, bytes) = xm
@@ -3706,7 +3912,9 @@ fn install_xml_http_request(
                     )
                 })
                 .unwrap_or_default();
-            if ty == "arraybuffer" {
+            if ty == "document" {
+                Ok(build_xhr_response_document(vm, &h_resp, &xm, h))
+            } else if ty == "arraybuffer" {
                 Ok(JsValue::from_object(alloc_array_buffer(vm, bytes)))
             } else {
                 Ok(JsValue::from_string(vm.heap.alloc_string(&txt)))

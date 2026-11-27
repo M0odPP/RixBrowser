@@ -182,3 +182,65 @@ fn doctype_empty_system_id_triggers_quirks_mode() {
     );
     assert_eq!(limited.compat_mode(), "CSS1Compat");
 }
+
+#[test]
+fn xml_decl_and_meta_charset_prescan_and_late_head_switch() {
+    use rix_html::decode_html_bytes_with_fallback;
+
+    // 1. `<meta>` takes precedence over XML declaration per WHATWG HTML §13.2.3.2.
+    let xml_and_meta =
+        b"<?xml version=\"1.0\" encoding=\"windows-1251\"?>\n<meta charset=\"windows-1253\">\n\xe6";
+    let (dec, cs) = decode_html_bytes_with_fallback(xml_and_meta, None, None);
+    assert_eq!(cs, "windows-1253");
+    assert!(dec.contains('\u{03B6}'));
+
+    // 2. XML declaration allows control bytes <= 0x20 around `=` and `>` at byte 1025.
+    let one_around = b"<?xml version=\"1.0\" encoding\x01=\x01\"windows-1251\"?>\n\xe6";
+    let (dec2, cs2) = decode_html_bytes_with_fallback(one_around, None, None);
+    assert_eq!(cs2, "windows-1251");
+    assert!(dec2.contains('\u{0436}'));
+
+    // 3. UTF-16LE XML declaration heuristic when no BOM or HTTP charset.
+    let utf16le_xml = b"<\0?\0x\0>\0";
+    let (_, cs3) = decode_html_bytes_with_fallback(utf16le_xml, None, None);
+    assert_eq!(cs3, "UTF-16LE");
+
+    // 4. Late `<meta charset>` inside `<head>` past 1,024 bytes switches tentative encoding,
+    //    while `<meta>` after `</head>` past 1,024 bytes does NOT.
+    let mut after_1kb = b"<!DOCTYPE html><head>".to_vec();
+    after_1kb.resize(1030, b'\n');
+    after_1kb.extend_from_slice(b"<meta charset=\"windows-1251\"></head><body>\xe6</body>");
+    let (dec4, cs4) = decode_html_bytes_with_fallback(&after_1kb, None, Some("windows-1253"));
+    assert_eq!(cs4, "windows-1251");
+    assert!(dec4.contains('\u{0436}'));
+
+    let mut after_head_1kb = b"<!DOCTYPE html><head></head>".to_vec();
+    after_head_1kb.resize(1030, b'\n');
+    after_head_1kb.extend_from_slice(b"<meta charset=\"windows-1251\"><body>\xe6</body>");
+    let (dec5, cs5) = decode_html_bytes_with_fallback(&after_head_1kb, None, Some("windows-1253"));
+    assert_eq!(cs5, "windows-1253");
+    assert!(dec5.contains('\u{03B6}'));
+
+    // 5. Non-ASCII-compatible parent fallback (UTF-16LE) is never inherited by child frames.
+    let (_, cs6) = decode_html_bytes_with_fallback(b"<p>hello</p>", None, Some("UTF-16LE"));
+    assert_eq!(cs6, "UTF-8");
+}
+
+#[test]
+fn noscript_serialization_respects_scripting_flag_and_escapes_attr_lt_gt() {
+    let doc = parse_html("<div><a b=\"<>\"></a><noscript><p>&amp;</p></noscript></div>");
+    let div = doc
+        .descendants(doc.root())
+        .find(|&n| matches!(doc.get(n), Some(NodeData::Element(e)) if &*e.name.local == "div"))
+        .expect("div");
+    let with_script = doc.to_html_string_with_scripting(div, true);
+    assert_eq!(
+        with_script,
+        "<div><a b=\"&lt;&gt;\"></a><noscript><p>&amp;</p></noscript></div>"
+    );
+    let without_script = doc.to_html_string_with_scripting(div, false);
+    assert_eq!(
+        without_script,
+        "<div><a b=\"&lt;&gt;\"></a><noscript>&lt;p&gt;&amp;amp;&lt;/p&gt;</noscript></div>"
+    );
+}

@@ -168,6 +168,7 @@ pub struct HostState {
     pub static_node_lists: HashMap<HeapHandle, Vec<NodeId>>,
     pub traversals: HashMap<HeapHandle, crate::dom_interfaces::TraversalEntry>,
     pub active_parser: Option<Rc<RefCell<HtmlParserStream>>>,
+    pub active_sub_parsers: HashMap<NodeId, Rc<RefCell<HtmlParserStream>>>,
     pub ready_state: String,
     pub viewport: Size,
     pub scroll_offset: Point,
@@ -397,6 +398,7 @@ impl HostState {
             static_node_lists: HashMap::new(),
             traversals: HashMap::new(),
             active_parser: None,
+            active_sub_parsers: HashMap::new(),
             ready_state: "complete".to_string(),
             viewport,
             scroll_offset: Point::ZERO,
@@ -5258,16 +5260,100 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
         let form_id = {
             let doc_rc = Rc::clone(&h.borrow().document);
             let doc = doc_rc.borrow();
-            let mut cur = doc.parent(nid);
-            let mut found = None;
-            while let Some(p) = cur {
-                if matches!(doc.get(p), Some(NodeData::Element(e)) if &*e.name.local == "form") {
-                    found = Some(p);
-                    break;
+            fn root_of(doc: &Document, mut id: NodeId) -> NodeId {
+                while let Some(p) = doc.parent(id) {
+                    id = p;
                 }
-                cur = doc.parent(p);
+                id
             }
-            found
+            fn resolve_control_form(doc: &Document, ctrl: NodeId) -> Option<NodeId> {
+                let Some(NodeData::Element(e)) = doc.get(ctrl) else {
+                    return None;
+                };
+                if &*e.name.ns != crate::dom_interfaces::HTML_NS {
+                    return None;
+                }
+                let root = root_of(doc, ctrl);
+                // 1. Explicit `form` attribute overrides ancestor/parser owner per WHATWG HTML §4.10.18.3.
+                if let Some(form_id_attr) = e.get_attribute("form") {
+                    if form_id_attr.is_empty() {
+                        return None;
+                    }
+                    return doc.descendants(root).find(|&cand| {
+                        matches!(
+                            doc.get(cand),
+                            Some(NodeData::Element(fe))
+                                if &*fe.name.ns == crate::dom_interfaces::HTML_NS
+                                    && &*fe.name.local == "form"
+                                    && fe.get_attribute("id") == Some(form_id_attr)
+                        )
+                    });
+                }
+                // 2. Parser-assigned form owner (valid as long as both remain in the same tree).
+                if let Some(fo) = e.form_owner {
+                    if matches!(
+                        doc.get(fo),
+                        Some(NodeData::Element(fe))
+                            if &*fe.name.ns == crate::dom_interfaces::HTML_NS
+                                && &*fe.name.local == "form"
+                    ) && root_of(doc, fo) == root
+                    {
+                        return Some(fo);
+                    }
+                }
+                // 3. Nearest ancestor HTML `<form>` element.
+                let mut cur = doc.parent(ctrl);
+                while let Some(p) = cur {
+                    if matches!(
+                        doc.get(p),
+                        Some(NodeData::Element(fe))
+                            if &*fe.name.ns == crate::dom_interfaces::HTML_NS
+                                && &*fe.name.local == "form"
+                    ) {
+                        return Some(p);
+                    }
+                    cur = doc.parent(p);
+                }
+                None
+            }
+            match doc.get(nid) {
+                Some(NodeData::Element(e))
+                    if &*e.name.ns == crate::dom_interfaces::HTML_NS
+                        && &*e.name.local == "option" =>
+                {
+                    let mut cur = doc.parent(nid);
+                    let mut sel = None;
+                    while let Some(p) = cur {
+                        if matches!(
+                            doc.get(p),
+                            Some(NodeData::Element(se))
+                                if &*se.name.ns == crate::dom_interfaces::HTML_NS
+                                    && &*se.name.local == "select"
+                        ) {
+                            sel = Some(p);
+                            break;
+                        }
+                        cur = doc.parent(p);
+                    }
+                    sel.and_then(|s| resolve_control_form(&doc, s))
+                }
+                Some(NodeData::Element(e))
+                    if &*e.name.ns == crate::dom_interfaces::HTML_NS
+                        && &*e.name.local == "legend" =>
+                {
+                    doc.parent(nid)
+                        .filter(|&p| {
+                            matches!(
+                                doc.get(p),
+                                Some(NodeData::Element(fe))
+                                    if &*fe.name.ns == crate::dom_interfaces::HTML_NS
+                                        && &*fe.name.local == "fieldset"
+                            )
+                        })
+                        .and_then(|fs| resolve_control_form(&doc, fs))
+                }
+                _ => resolve_control_form(&doc, nid),
+            }
         };
         Ok(form_id.map_or(JsValue::NULL, |id| wrap_node(vm, &h, id)))
     });
@@ -5339,6 +5425,147 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
         Ok(JsValue::from_i32(idx))
     });
     define_host_accessor(vm, ep, "selectedIndex", Some(g), None);
+
+    // WHATWG HTML §4.9: HTMLTableElement, HTMLTableSectionElement, HTMLTableRowElement accessors.
+    if let Some(&table_proto) = host.borrow().interface_protos.get("HTMLTableElement") {
+        for (prop, tag) in [
+            ("caption", "caption"),
+            ("tHead", "thead"),
+            ("tFoot", "tfoot"),
+        ] {
+            let h = Rc::clone(host);
+            let g = vm.alloc_host_fn(
+                Box::leak(format!("get {prop}").into_boxed_str()),
+                move |vm, t, _| {
+                    let nid = require_node(vm, &h, t)?;
+                    let found = {
+                        let doc_rc = Rc::clone(&h.borrow().document);
+                        let doc = doc_rc.borrow();
+                        let found_id = doc.children(nid).find(|&c| {
+                            matches!(
+                                doc.get(c),
+                                Some(NodeData::Element(e))
+                                    if &*e.name.ns == crate::dom_interfaces::HTML_NS
+                                        && &*e.name.local == tag
+                            )
+                        });
+                        found_id
+                    };
+                    Ok(found.map_or(JsValue::NULL, |id| wrap_node(vm, &h, id)))
+                },
+            );
+            define_host_accessor(vm, table_proto, prop, Some(g), None);
+        }
+
+        let h = Rc::clone(host);
+        let g = vm.alloc_host_fn("get tBodies", move |vm, t, _| {
+            let nid = require_node(vm, &h, t)?;
+            let list: Vec<NodeId> = {
+                let doc_rc = Rc::clone(&h.borrow().document);
+                let doc = doc_rc.borrow();
+                doc.children(nid)
+                    .filter(|&c| {
+                        matches!(
+                            doc.get(c),
+                            Some(NodeData::Element(e))
+                                if &*e.name.ns == crate::dom_interfaces::HTML_NS
+                                    && &*e.name.local == "tbody"
+                        )
+                    })
+                    .collect()
+            };
+            Ok(wrap_node_list(vm, &h, list))
+        });
+        define_host_accessor(vm, table_proto, "tBodies", Some(g), None);
+
+        let h = Rc::clone(host);
+        let g = vm.alloc_host_fn("get rows", move |vm, t, _| {
+            let nid = require_node(vm, &h, t)?;
+            let list: Vec<NodeId> = {
+                let doc_rc = Rc::clone(&h.borrow().document);
+                let doc = doc_rc.borrow();
+                let is_html_tag = |n: NodeId, tag: &str| {
+                    matches!(
+                        doc.get(n),
+                        Some(NodeData::Element(e))
+                            if &*e.name.ns == crate::dom_interfaces::HTML_NS
+                                && &*e.name.local == tag
+                    )
+                };
+                let mut rows = Vec::new();
+                for c in doc.children(nid) {
+                    if is_html_tag(c, "thead") {
+                        rows.extend(doc.children(c).filter(|&r| is_html_tag(r, "tr")));
+                    }
+                }
+                for c in doc.children(nid) {
+                    if is_html_tag(c, "tr") {
+                        rows.push(c);
+                    } else if is_html_tag(c, "tbody") {
+                        rows.extend(doc.children(c).filter(|&r| is_html_tag(r, "tr")));
+                    }
+                }
+                for c in doc.children(nid) {
+                    if is_html_tag(c, "tfoot") {
+                        rows.extend(doc.children(c).filter(|&r| is_html_tag(r, "tr")));
+                    }
+                }
+                rows
+            };
+            Ok(wrap_node_list(vm, &h, list))
+        });
+        define_host_accessor(vm, table_proto, "rows", Some(g), None);
+    }
+
+    if let Some(&section_proto) = host
+        .borrow()
+        .interface_protos
+        .get("HTMLTableSectionElement")
+    {
+        let h = Rc::clone(host);
+        let g = vm.alloc_host_fn("get rows", move |vm, t, _| {
+            let nid = require_node(vm, &h, t)?;
+            let list: Vec<NodeId> = {
+                let doc_rc = Rc::clone(&h.borrow().document);
+                let doc = doc_rc.borrow();
+                doc.children(nid)
+                    .filter(|&c| {
+                        matches!(
+                            doc.get(c),
+                            Some(NodeData::Element(e))
+                                if &*e.name.ns == crate::dom_interfaces::HTML_NS
+                                    && &*e.name.local == "tr"
+                        )
+                    })
+                    .collect()
+            };
+            Ok(wrap_node_list(vm, &h, list))
+        });
+        define_host_accessor(vm, section_proto, "rows", Some(g), None);
+    }
+
+    if let Some(&row_proto) = host.borrow().interface_protos.get("HTMLTableRowElement") {
+        let h = Rc::clone(host);
+        let g = vm.alloc_host_fn("get cells", move |vm, t, _| {
+            let nid = require_node(vm, &h, t)?;
+            let list: Vec<NodeId> = {
+                let doc_rc = Rc::clone(&h.borrow().document);
+                let doc = doc_rc.borrow();
+                doc.children(nid)
+                    .filter(|&c| {
+                        matches!(
+                            doc.get(c),
+                            Some(NodeData::Element(e))
+                                if &*e.name.ns == crate::dom_interfaces::HTML_NS
+                                    && matches!(&*e.name.local, "td" | "th")
+                        )
+                    })
+                    .collect()
+            };
+            Ok(wrap_node_list(vm, &h, list))
+        });
+        define_host_accessor(vm, row_proto, "cells", Some(g), None);
+    }
 }
 
 fn compute_element_validity(host: &SharedHost, nid: NodeId) -> (bool, bool, bool, String) {
@@ -6671,8 +6898,14 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
         };
         {
             let mut hb = h.borrow_mut();
+            let doc_rc = Rc::clone(&hb.document);
+            let scripting = hb.is_scripting_enabled_doc(did);
+            let stream = Rc::new(RefCell::new(
+                HtmlParserStream::with_document_root_and_scripting(doc_rc, did, scripting),
+            ));
             if did == main_root {
                 hb.ready_state = "loading".to_string();
+                hb.active_parser = Some(stream);
             } else {
                 let url = hb.doc_url_for_node(did);
                 let meta = hb
@@ -6680,6 +6913,7 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
                     .entry(did)
                     .or_insert_with(|| crate::dom_interfaces::DocumentMeta::html(url));
                 meta.ready_state = "loading".to_string();
+                hb.active_sub_parsers.insert(did, stream);
             }
             hb.invalidate_dom_mutation(did, None);
         }
@@ -6695,13 +6929,68 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
     }
     fn write_to_doc_impl(vm: &mut JsVm, h: &SharedHost, did: NodeId, html: &str) {
         let main_root = h.borrow().document.borrow().root();
-        let parser_opt = if did == main_root {
+        let mut parser_opt = if did == main_root {
             h.borrow().active_parser.clone()
         } else {
-            None
+            h.borrow().active_sub_parsers.get(&did).cloned()
         };
+        if parser_opt.is_none() {
+            open_doc_impl(h, did);
+            parser_opt = if did == main_root {
+                h.borrow().active_parser.clone()
+            } else {
+                h.borrow().active_sub_parsers.get(&did).cloned()
+            };
+        }
         if let Some(parser) = parser_opt {
-            parser.borrow_mut().insert_document_write(html);
+            let saved = parser.borrow_mut().begin_document_write(html);
+            let mut next_script = parser.borrow_mut().pump_written_buffer();
+            while let Some(script_id) = next_script {
+                if did != main_root {
+                    h.borrow_mut().adopt_subtree(did, did);
+                }
+                let inline_code = {
+                    let doc_rc = Rc::clone(&h.borrow().document);
+                    let doc = doc_rc.borrow();
+                    match doc.get(script_id) {
+                        Some(NodeData::Element(e))
+                            if e.get_attribute("src").is_none()
+                                && e.get_attribute("href").is_none()
+                                && !e.has_attribute("nomodule") =>
+                        {
+                            let ty = e.get_attribute("type").unwrap_or("").trim();
+                            let is_classic = ty.is_empty()
+                                || ty.eq_ignore_ascii_case("text/javascript")
+                                || ty.eq_ignore_ascii_case("application/javascript")
+                                || ty.eq_ignore_ascii_case("text/ecmascript")
+                                || ty.eq_ignore_ascii_case("application/ecmascript");
+                            if is_classic {
+                                Some(doc.inner_text(script_id))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(code) = inline_code {
+                    if !code.trim().is_empty() {
+                        let prev = h.borrow().current_script;
+                        h.borrow_mut().current_script = Some(script_id);
+                        let _ = vm.eval_script(&code);
+                        h.borrow_mut().current_script = prev;
+                    }
+                }
+                next_script = parser.borrow_mut().pump_written_buffer();
+            }
+            parser.borrow_mut().end_document_write(saved);
+            {
+                let mut hb = h.borrow_mut();
+                if did != main_root {
+                    hb.adopt_subtree(did, did);
+                }
+                hb.invalidate_dom_mutation(did, None);
+            }
             return;
         }
         let is_loading = {
@@ -6794,14 +7083,34 @@ fn install_document_prototype(vm: &mut JsVm, host: &SharedHost) {
                 ));
             }
             let main_root = h.borrow().document.borrow().root();
+            let parser_to_finish = {
+                let mut hb = h.borrow_mut();
+                if did == main_root {
+                    hb.active_parser.take()
+                } else {
+                    hb.active_sub_parsers.remove(&did)
+                }
+            };
+            if let Some(parser) = parser_to_finish {
+                parser.borrow_mut().finish();
+                let qm = parser.borrow().quirks_mode_code();
+                let mut hb = h.borrow_mut();
+                if did != main_root {
+                    if let Some(meta) = hb.doc_meta.get_mut(&did) {
+                        meta.quirks_mode = qm;
+                    }
+                    hb.adopt_subtree(did, did);
+                }
+                hb.invalidate_dom_mutation(did, None);
+            }
             let mut hb = h.borrow_mut();
             if did == main_root {
                 if hb.ready_state == "loading" {
-                    hb.ready_state = "interactive".to_string();
+                    hb.ready_state = "complete".to_string();
                 }
             } else if let Some(meta) = hb.doc_meta.get_mut(&did) {
                 if meta.ready_state == "loading" {
-                    meta.ready_state = "interactive".to_string();
+                    meta.ready_state = "complete".to_string();
                 }
             }
             Ok(JsValue::UNDEFINED)

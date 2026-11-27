@@ -9,6 +9,7 @@ use rix_dom::node::NodeData;
 use rix_dom::tree::Document;
 use rix_dom::NodeId;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 const MAX_CHARSET_SNIFF_BYTES: usize = 1024;
@@ -68,6 +69,7 @@ impl RixHtmlParser {
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParserStreamStep {
     Script(NodeId),
+    CustomElement(NodeId),
     Done,
 }
 
@@ -95,8 +97,28 @@ impl HtmlParserStream {
     }
 
     pub fn with_document(document: Rc<RefCell<Document>>) -> Self {
-        let sink = DomTreeSink::with_document(document.clone());
-        let parser = RixHtmlParser::new_document(sink, TreeBuilderOpts::default());
+        Self::with_document_and_scripting(document, true)
+    }
+
+    pub fn with_document_and_scripting(
+        document: Rc<RefCell<Document>>,
+        scripting_enabled: bool,
+    ) -> Self {
+        let doc_root = document.borrow().root();
+        Self::with_document_root_and_scripting(document, doc_root, scripting_enabled)
+    }
+
+    pub fn with_document_root_and_scripting(
+        document: Rc<RefCell<Document>>,
+        doc_root: NodeId,
+        scripting_enabled: bool,
+    ) -> Self {
+        let sink = DomTreeSink::with_document_root(document.clone(), doc_root);
+        let opts = TreeBuilderOpts {
+            scripting_enabled,
+            ..Default::default()
+        };
+        let parser = RixHtmlParser::new_document(sink, opts);
         Self {
             parser,
             document,
@@ -106,6 +128,14 @@ impl HtmlParserStream {
             decoder: None,
             sniff_buf: Vec::new(),
             has_declarative_shadow: false,
+        }
+    }
+
+    pub fn quirks_mode_code(&self) -> u8 {
+        match self.parser.tokenizer.sink.sink.quirks_mode() {
+            html5ever::tree_builder::QuirksMode::NoQuirks => 0,
+            html5ever::tree_builder::QuirksMode::LimitedQuirks => 1,
+            html5ever::tree_builder::QuirksMode::Quirks => 2,
         }
     }
 
@@ -182,12 +212,56 @@ impl HtmlParserStream {
         }
     }
 
-    /// Inserts `document.write()` markup directly at the current tokenizer insertion point.
-    pub fn insert_document_write(&mut self, html: &str) {
-        if !html.is_empty() && !self.finished {
-            self.parser
-                .input_buffer
-                .push_front(StrTendril::from_slice(html));
+    /// Saves the current unparsed input tail after the insertion point and queues `html`
+    /// for synchronous tokenization per WHATWG HTML §13.2.4.1. Callers MUST pair this with
+    /// [`Self::end_document_write`] after pumping all written `<script>` elements.
+    pub fn begin_document_write(&mut self, html: &str) -> VecDeque<StrTendril> {
+        let mut saved = VecDeque::new();
+        if html.is_empty() || self.finished {
+            return saved;
+        }
+        while let Some(chunk) = self.parser.input_buffer.pop_front() {
+            saved.push_back(chunk);
+        }
+        self.parser
+            .input_buffer
+            .push_back(StrTendril::from_slice(html));
+        saved
+    }
+
+    /// Restores the saved unparsed input tail after a `document.write()` call completes.
+    pub fn end_document_write(&mut self, mut saved: VecDeque<StrTendril>) {
+        while let Some(chunk) = saved.pop_front() {
+            self.parser.input_buffer.push_back(chunk);
+        }
+    }
+
+    /// Inserts `document.write()` markup at the current tokenizer insertion point in FIFO order
+    /// and synchronously tokenizes it into the live DOM per WHATWG HTML §8.4.5.
+    pub fn insert_document_write(&mut self, html: &str) -> Option<NodeId> {
+        if html.is_empty() || self.finished {
+            return None;
+        }
+        let saved = self.begin_document_write(html);
+        let script = self.pump_written_buffer();
+        self.end_document_write(saved);
+        script
+    }
+
+    /// Continues tokenizing only the currently written `document.write()` slice without
+    /// consuming any outer saved tail.
+    pub fn pump_written_buffer(&mut self) -> Option<NodeId> {
+        loop {
+            match self.parser.tokenizer.feed(&self.parser.input_buffer) {
+                TokenizerResult::Script(node_id) => {
+                    if self.has_declarative_shadow {
+                        attach_declarative_shadow_roots(&mut self.document.borrow_mut());
+                    }
+                    return Some(node_id);
+                }
+                TokenizerResult::Done => return None,
+                TokenizerResult::EncodingIndicator(_) => continue,
+            }
         }
     }
 
@@ -204,6 +278,25 @@ impl HtmlParserStream {
         }
     }
 
+    pub fn set_pause_on_custom_elements(&mut self, enabled: bool) {
+        self.parser
+            .tokenizer
+            .sink
+            .set_pause_on_custom_elements(enabled);
+    }
+
+    pub fn finish_pending_custom_element_insert(&mut self) -> bool {
+        let Some(ce_id) = self.parser.tokenizer.sink.pending_custom_element_handle() else {
+            return false;
+        };
+        let already_reparented = self.document.borrow().parent(ce_id).is_some();
+        self.parser
+            .tokenizer
+            .sink
+            .finish_pending_custom_element_insert(already_reparented);
+        !already_reparented && self.document.borrow().parent(ce_id).is_some()
+    }
+
     pub fn step(&mut self) -> ParserStreamStep {
         if self.finished {
             return ParserStreamStep::Done;
@@ -211,6 +304,9 @@ impl HtmlParserStream {
         loop {
             match self.parser.tokenizer.feed(&self.parser.input_buffer) {
                 TokenizerResult::Script(node_id) => {
+                    if self.parser.tokenizer.sink.pending_custom_element_handle() == Some(node_id) {
+                        return ParserStreamStep::CustomElement(node_id);
+                    }
                     if self.has_declarative_shadow {
                         attach_declarative_shadow_roots(&mut self.document.borrow_mut());
                     }
@@ -226,6 +322,7 @@ impl HtmlParserStream {
         if self.finished {
             return;
         }
+        self.finish_pending_custom_element_insert();
         self.flush_sniff_for_stepping();
         if let Some(decoder) = self.decoder.as_mut() {
             decode_into_buffer(decoder, &[], true, &mut self.parser);
@@ -233,7 +330,10 @@ impl HtmlParserStream {
         loop {
             match self.parser.tokenizer.feed(&self.parser.input_buffer) {
                 TokenizerResult::Done => break,
-                TokenizerResult::Script(_) | TokenizerResult::EncodingIndicator(_) => continue,
+                TokenizerResult::Script(_) => {
+                    self.finish_pending_custom_element_insert();
+                }
+                TokenizerResult::EncodingIndicator(_) => continue,
             }
         }
         self.parser.tokenizer.end();
@@ -429,111 +529,233 @@ fn contains_head_boundary(bytes: &[u8]) -> bool {
     lower.contains("</head>") || lower.contains("<body") || lower.contains("</script>")
 }
 
+/// WHATWG HTML §13.2.3.2 XML declaration encoding prescan (`<?xml ... encoding="..."?>` within
+/// the first 1,024 bytes; `>` itself need not be inside the first 1,024 bytes).
+fn prescan_xml_declaration(bytes: &[u8]) -> Option<&'static Encoding> {
+    if !bytes.starts_with(b"<?xml") {
+        return None;
+    }
+    let scan = &bytes[5..bytes.len().min(MAX_CHARSET_SNIFF_BYTES)];
+    let decl = match scan.iter().position(|&b| b == b'>') {
+        Some(gt) => &scan[..gt],
+        None => scan,
+    };
+    let pos = decl.windows(8).position(|w| w == b"encoding")?;
+    let mut p = pos + 8;
+    while p < decl.len() && decl[p] <= 0x20 {
+        p += 1;
+    }
+    if p >= decl.len() || decl[p] != b'=' {
+        return None;
+    }
+    p += 1;
+    while p < decl.len() && decl[p] <= 0x20 {
+        p += 1;
+    }
+    if p >= decl.len() || (decl[p] != b'"' && decl[p] != b'\'') {
+        return None;
+    }
+    let quote = decl[p];
+    let start = p + 1;
+    let rel = decl[start..].iter().position(|&b| b == quote)?;
+    let label = &decl[start..start + rel];
+    if label.is_empty()
+        || label.first().is_some_and(|&b| b <= 0x20)
+        || label.last().is_some_and(|&b| b <= 0x20)
+    {
+        return None;
+    }
+    let enc = Encoding::for_label(label)?;
+    Some(
+        if enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE {
+            UTF_8
+        } else {
+            enc
+        },
+    )
+}
+
+fn find_ascii_ci(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
+}
+
+/// Parses HTML attributes from a `<meta ...>` tag byte slice per WHATWG HTML §13.2.3.2,
+/// properly respecting quoted attribute values so `charset=` inside `content="..."` is never
+/// confused with a standalone `charset` attribute.
+fn parse_meta_tag_attrs(tag_bytes: &[u8]) -> Vec<(String, String)> {
+    let mut attrs = Vec::new();
+    let len = tag_bytes.len();
+    let mut i = 0usize;
+    while i < len {
+        while i < len && matches!(tag_bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'/') {
+            i += 1;
+        }
+        if i >= len || tag_bytes[i] == b'>' {
+            break;
+        }
+        let name_start = i;
+        while i < len
+            && !matches!(
+                tag_bytes[i],
+                b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'=' | b'/' | b'>'
+            )
+        {
+            i += 1;
+        }
+        let name = String::from_utf8_lossy(&tag_bytes[name_start..i]).to_ascii_lowercase();
+        while i < len && matches!(tag_bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c') {
+            i += 1;
+        }
+        let value = if i < len && tag_bytes[i] == b'=' {
+            i += 1;
+            while i < len && matches!(tag_bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c') {
+                i += 1;
+            }
+            if i < len && (tag_bytes[i] == b'"' || tag_bytes[i] == b'\'') {
+                let q = tag_bytes[i];
+                i += 1;
+                let v_start = i;
+                while i < len && tag_bytes[i] != q {
+                    i += 1;
+                }
+                let v = String::from_utf8_lossy(&tag_bytes[v_start..i]).into_owned();
+                if i < len {
+                    i += 1;
+                }
+                v
+            } else {
+                let v_start = i;
+                while i < len
+                    && !matches!(tag_bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'>')
+                {
+                    i += 1;
+                }
+                String::from_utf8_lossy(&tag_bytes[v_start..i]).into_owned()
+            }
+        } else {
+            String::new()
+        };
+        if !name.is_empty() && !attrs.iter().any(|(k, _): &(String, String)| k == &name) {
+            attrs.push((name, value));
+        }
+    }
+    attrs
+}
+
 fn prescan_meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
-    let scan_len = bytes.len().min(MAX_CHARSET_SNIFF_BYTES);
-    let text = String::from_utf8_lossy(&bytes[..scan_len]);
-    let lower = text.to_ascii_lowercase();
-    let lb = lower.as_bytes();
-    let len = lb.len();
+    let len = bytes.len();
+    let limit = len.min(MAX_CHARSET_SNIFF_BYTES);
     let mut i = 0usize;
 
-    while i < len {
-        if lb[i] != b'<' {
+    while i < limit {
+        if bytes[i] != b'<' {
             i += 1;
             continue;
         }
         // WHATWG §13.2.3.2: skip HTML comments `<!-- ... -->`.
-        if lower[i..].starts_with("<!--") {
-            if let Some(rel) = lower[i + 4..].find("-->") {
+        if bytes[i..].starts_with(b"<!--") {
+            if let Some(rel) = bytes[i + 4..].windows(3).position(|w| w == b"-->") {
                 i = i + 4 + rel + 3;
                 continue;
             }
-            return None;
+            break;
+        }
+        // WHATWG §13.2.3.2: skip `<!`, `</`, `<?` up to the next `>`.
+        if i + 1 < len && matches!(bytes[i + 1], b'!' | b'/' | b'?') {
+            if let Some(gt) = bytes[i + 2..].iter().position(|&b| b == b'>') {
+                i = i + 2 + gt + 1;
+                continue;
+            }
+            break;
         }
         // Skip rawtext tags (`<script>`, `<style>`, `<title>`, `<xmp>`).
-        for raw_tag in ["<script", "<style", "<title", "<xmp"] {
-            if lower[i..].starts_with(raw_tag)
-                && lb
-                    .get(i + raw_tag.len())
-                    .is_some_and(|&b| b.is_ascii_whitespace() || b == b'>' || b == b'/')
+        let mut skipped_raw = false;
+        for (open, close) in [
+            (&b"<script"[..], &b"</script"[..]),
+            (&b"<style"[..], &b"</style"[..]),
+            (&b"<title"[..], &b"</title"[..]),
+            (&b"<xmp"[..], &b"</xmp"[..]),
+        ] {
+            if bytes[i..].len() > open.len()
+                && bytes[i..i + open.len()].eq_ignore_ascii_case(open)
+                && matches!(
+                    bytes[i + open.len()],
+                    b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'>' | b'/'
+                )
             {
-                let close = format!("</{}", &raw_tag[1..]);
-                if let Some(rel) = lower[i + raw_tag.len()..].find(&close) {
-                    i = i + raw_tag.len() + rel + close.len();
-                    if let Some(gt) = lower[i..].find('>') {
+                if let Some(rel) = find_ascii_ci(&bytes[i + open.len()..], close) {
+                    i = i + open.len() + rel + close.len();
+                    if let Some(gt) = bytes[i..].iter().position(|&b| b == b'>') {
                         i += gt + 1;
                     }
-                    continue;
+                    skipped_raw = true;
+                    break;
                 }
-                return None;
+                i = limit;
+                skipped_raw = true;
+                break;
             }
         }
-        if lower[i..].starts_with("<meta")
-            && lb
-                .get(i + 5)
-                .is_some_and(|&b| b.is_ascii_whitespace() || b == b'/')
+        if skipped_raw {
+            continue;
+        }
+        if bytes[i..].len() > 5
+            && bytes[i..i + 5].eq_ignore_ascii_case(b"<meta")
+            && matches!(bytes[i + 5], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'/')
         {
-            let rel_end = lower[i..].find('>')?;
-            let tag = &text[i..=i + rel_end];
-            let tag_lower = &lower[i..=i + rel_end];
-            if let Some(charset) = extract_attr_value(tag, tag_lower, "charset") {
+            // Advance past `<meta` honoring quoted attribute values to find closing `>`.
+            let mut j = i + 5;
+            let mut quote = 0u8;
+            while j < len {
+                let b = bytes[j];
+                if quote != 0 {
+                    if b == quote {
+                        quote = 0;
+                    }
+                } else if b == b'"' || b == b'\'' {
+                    quote = b;
+                } else if b == b'>' {
+                    break;
+                }
+                j += 1;
+            }
+            if j >= len {
+                break;
+            }
+            let attrs = parse_meta_tag_attrs(&bytes[i + 5..j]);
+            // WHATWG HTML §13.2.3.2: `charset` attribute takes precedence over `http-equiv`/`content`.
+            if let Some((_, charset)) = attrs.iter().find(|(k, _)| k == "charset") {
                 if let Some(enc) = Encoding::for_label(charset.trim().as_bytes()) {
                     return Some(enc);
                 }
             }
-            if extract_attr_value(tag, tag_lower, "http-equiv")
-                .is_some_and(|v| v.trim().eq_ignore_ascii_case("content-type"))
-            {
-                if let Some(content) = extract_attr_value(tag, tag_lower, "content") {
-                    if let Some(enc) = parse_charset_from_header(content) {
-                        return Some(enc);
+            let has_ct_http_equiv = attrs
+                .iter()
+                .find(|(k, _)| k == "http-equiv")
+                .is_some_and(|(_, v)| v.trim().eq_ignore_ascii_case("content-type"));
+            if has_ct_http_equiv {
+                if let Some((_, content)) = attrs.iter().find(|(k, _)| k == "content") {
+                    if let Some(label) = crate::tree_builder::data::extract_meta_charset(
+                        StrTendril::from_slice(content),
+                    ) {
+                        if let Some(enc) = Encoding::for_label(label.trim().as_bytes()) {
+                            return Some(enc);
+                        }
                     }
                 }
             }
-            i += rel_end + 1;
+            i = j + 1;
             continue;
         }
         i += 1;
     }
-    None
-}
-
-fn extract_attr_value<'a>(orig: &'a str, lower: &str, name: &str) -> Option<&'a str> {
-    let mut pos = 0usize;
-    while let Some(rel) = lower[pos..].find(name) {
-        let idx = pos + rel;
-        let before_ok = idx == 0 || !lower.as_bytes()[idx - 1].is_ascii_alphanumeric();
-        let after = idx + name.len();
-        if before_ok {
-            let mut cur = after;
-            let bytes = lower.as_bytes();
-            while cur < bytes.len() && bytes[cur].is_ascii_whitespace() {
-                cur += 1;
-            }
-            if cur < bytes.len() && bytes[cur] == b'=' {
-                cur += 1;
-                while cur < bytes.len() && bytes[cur].is_ascii_whitespace() {
-                    cur += 1;
-                }
-                if cur >= orig.len() {
-                    return None;
-                }
-                let quote = bytes[cur];
-                if quote == b'"' || quote == b'\'' {
-                    let start = cur + 1;
-                    let end = orig[start..].find(quote as char)?;
-                    return Some(&orig[start..start + end]);
-                } else {
-                    let end = orig[cur..]
-                        .find(|c: char| c.is_ascii_whitespace() || c == '>')
-                        .unwrap_or(orig.len() - cur);
-                    return Some(&orig[cur..cur + end]);
-                }
-            }
-        }
-        pos = after;
-    }
-    None
+    // WHATWG HTML §13.2.3.2: `<meta>` prescan takes precedence over XML declaration fallback.
+    prescan_xml_declaration(bytes)
 }
 
 /// Detects the document character encoding from BOM or `<meta charset>` / `<meta http-equiv>`
@@ -541,6 +763,12 @@ fn extract_attr_value<'a>(orig: &'a str, lower: &str, name: &str) -> Option<&'a 
 pub fn detect_html_charset(bytes: &[u8]) -> &'static str {
     if let Some((enc, _)) = Encoding::for_bom(bytes) {
         return enc.name();
+    }
+    if bytes.starts_with(b"<\0?\0x\0") {
+        return encoding_rs::UTF_16LE.name();
+    }
+    if bytes.starts_with(b"\0<\0?\0x") {
+        return encoding_rs::UTF_16BE.name();
     }
     if let Some(enc) = prescan_meta_charset(bytes) {
         // Per WHATWG HTML §13.2.3.2 step 8: UTF-16BE/UTF-16LE in `<meta>` maps to UTF-8.
@@ -552,31 +780,102 @@ pub fn detect_html_charset(bytes: &[u8]) -> &'static str {
     UTF_8.name()
 }
 
+/// Checks for a late `<meta charset>` encoding change inside `<head>` per WHATWG HTML §13.2.3.3
+/// (handles `<meta>` past the first 1,024 bytes or containing HTML character references).
+fn scan_late_head_meta_encoding(decoded: &str) -> Option<&'static Encoding> {
+    let sink = DomTreeSink::new();
+    let opts = TreeBuilderOpts {
+        scripting_enabled: true,
+        ..Default::default()
+    };
+    let parser = RixHtmlParser::new_document(sink, opts);
+    parser
+        .input_buffer
+        .push_back(StrTendril::from_slice(decoded));
+    loop {
+        match parser.tokenizer.feed(&parser.input_buffer) {
+            TokenizerResult::EncodingIndicator(raw_label) => {
+                if let Some(enc) = Encoding::for_label(raw_label.trim().as_bytes()) {
+                    return Some(
+                        if enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE {
+                            UTF_8
+                        } else {
+                            enc
+                        },
+                    );
+                }
+            }
+            TokenizerResult::Done => return None,
+            TokenizerResult::Script(_) => continue,
+        }
+    }
+}
+
 /// Decodes raw HTML response bytes per WHATWG HTML §13.2.3.3 (BOM -> HTTP `charset` ->
-/// `<meta>` prescan -> UTF-8), returning the decoded UTF-8 string and canonical encoding name.
+/// XML decl / `<meta>` prescan -> UTF-8), returning the decoded UTF-8 string and canonical encoding name.
 pub fn decode_html_bytes(bytes: &[u8], http_charset: Option<&str>) -> (String, &'static str) {
+    decode_html_bytes_with_fallback(bytes, http_charset, None)
+}
+
+/// Decodes raw HTML response bytes with an optional inherited parent-document fallback charset
+/// (WHATWG HTML §13.2.3.3 step 6 for same-origin `<iframe>` documents).
+pub fn decode_html_bytes_with_fallback(
+    bytes: &[u8],
+    http_charset: Option<&str>,
+    fallback_charset: Option<&str>,
+) -> (String, &'static str) {
     if let Some((enc, bom_len)) = Encoding::for_bom(bytes) {
         let (decoded, _) = enc.decode_without_bom_handling(&bytes[bom_len..]);
         return (decoded.into_owned(), enc.name());
     }
-    let enc = http_charset
+    if let Some(http_enc) = http_charset.and_then(|c| {
+        let trimmed = c.trim_matches(|ch: char| matches!(ch, '\t' | '\n' | '\x0c' | '\r' | ' '));
+        Encoding::for_label(trimmed.as_bytes())
+    }) {
+        let (decoded, _) = http_enc.decode_without_bom_handling(bytes);
+        return (decoded.into_owned(), http_enc.name());
+    }
+    // WHATWG HTML §13.2.3.2: UTF-16 XML declaration heuristic (when no BOM or HTTP charset).
+    if bytes.starts_with(b"<\0?\0x\0") {
+        let (decoded, _) = encoding_rs::UTF_16LE.decode_without_bom_handling(bytes);
+        return (decoded.into_owned(), encoding_rs::UTF_16LE.name());
+    }
+    if bytes.starts_with(b"\0<\0?\0x") {
+        let (decoded, _) = encoding_rs::UTF_16BE.decode_without_bom_handling(bytes);
+        return (decoded.into_owned(), encoding_rs::UTF_16BE.name());
+    }
+    if let Some(prescan_enc) = prescan_meta_charset(bytes) {
+        let mapped = if prescan_enc == encoding_rs::UTF_16LE || prescan_enc == encoding_rs::UTF_16BE
+        {
+            UTF_8
+        } else {
+            prescan_enc
+        };
+        let (decoded, _) = mapped.decode_without_bom_handling(bytes);
+        return (decoded.into_owned(), mapped.name());
+    }
+    // WHATWG HTML §13.2.3.2 step 5: only inherit ASCII-compatible encodings from parent frames
+    // (never UTF-16LE / UTF-16BE).
+    let tentative_enc = fallback_charset
         .and_then(|c| {
             let trimmed =
                 c.trim_matches(|ch: char| matches!(ch, '\t' | '\n' | '\x0c' | '\r' | ' '));
             Encoding::for_label(trimmed.as_bytes())
         })
-        .or_else(|| {
-            prescan_meta_charset(bytes).map(|e| {
-                if e == encoding_rs::UTF_16LE || e == encoding_rs::UTF_16BE {
-                    UTF_8
-                } else {
-                    e
-                }
-            })
-        })
+        .filter(|&e| e != encoding_rs::UTF_16LE && e != encoding_rs::UTF_16BE)
         .unwrap_or(UTF_8);
-    let (decoded, _) = enc.decode_without_bom_handling(bytes);
-    (decoded.into_owned(), enc.name())
+    let (decoded, _) = tentative_enc.decode_without_bom_handling(bytes);
+    let decoded_str = decoded.into_owned();
+    // WHATWG HTML §13.2.3.3: tentative encoding can switch on late `<meta>` inside `<head>`.
+    if find_ascii_ci(bytes, b"<meta").is_some() {
+        if let Some(late_enc) = scan_late_head_meta_encoding(&decoded_str) {
+            if late_enc != tentative_enc {
+                let (redecoded, _) = late_enc.decode_without_bom_handling(bytes);
+                return (redecoded.into_owned(), late_enc.name());
+            }
+        }
+    }
+    (decoded_str, tentative_enc.name())
 }
 
 pub fn parse_html(html: &str) -> Document {

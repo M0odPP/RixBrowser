@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use rix_dom::{Document, ElementData, LocalName, Namespace, NodeData, NodeId, QualName};
-use rix_html::{parse_html_fragment_with_options, parse_html_with_options};
+use rix_html::parse_html_with_options;
 use rix_js::{HeapHandle, JsException, JsObject, JsValue, JsVm, ObjectKind, PropertyAttrs};
 
 use crate::dom_bridge::{
@@ -529,14 +529,16 @@ fn install_html_parsing_and_serialization(
         let h_g = Rc::clone(host);
         let g = vm.alloc_host_fn("get outerHTML", move |vm, t, _| {
             let nid = require_node(vm, &h_g, t)?;
-            let is_xml = h_g.borrow().is_xml_doc(h_g.borrow().owner_doc_of(nid));
+            let owner_doc = h_g.borrow().owner_doc_of(nid);
+            let is_xml = h_g.borrow().is_xml_doc(owner_doc);
+            let scripting = h_g.borrow().is_scripting_enabled_doc(owner_doc);
             let res = {
                 let doc_rc = Rc::clone(&h_g.borrow().document);
                 let doc = doc_rc.borrow();
                 if is_xml {
                     xml_serialize_node(&doc, nid, true)
                 } else {
-                    Ok(doc.to_html_string(nid))
+                    Ok(doc.to_html_string_with_scripting(nid, scripting))
                 }
             };
             match res {
@@ -654,6 +656,8 @@ fn install_html_parsing_and_serialization(
                 }
             }
             let html = {
+                let owner_doc = h.borrow().owner_doc_of(nid);
+                let scripting = h.borrow().is_scripting_enabled_doc(owner_doc);
                 let doc_rc = Rc::clone(&h.borrow().document);
                 let doc = doc_rc.borrow();
                 serialize_html_children_with_shadows(
@@ -661,6 +665,7 @@ fn install_html_parsing_and_serialization(
                     nid,
                     serializable_shadow_roots,
                     &allowed_shadow_roots,
+                    scripting,
                 )
             };
             Ok(JsValue::from_string(vm.heap.alloc_string(html)))
@@ -673,13 +678,25 @@ fn serialize_inner_html_for_node(
     host: &SharedHost,
     nid: NodeId,
 ) -> Result<JsValue, JsException> {
-    let is_xml = host.borrow().is_xml_doc(host.borrow().owner_doc_of(nid));
+    let owner_doc = host.borrow().owner_doc_of(nid);
+    let is_xml = host.borrow().is_xml_doc(owner_doc);
+    let doc_scripting = host.borrow().is_scripting_enabled_doc(owner_doc);
     let res = {
         let doc_rc = Rc::clone(&host.borrow().document);
         let doc = doc_rc.borrow();
-        let container = match doc.get(nid) {
-            Some(NodeData::Element(e)) => e.template_contents.unwrap_or(nid),
-            _ => nid,
+        let (container, is_void_html, is_template) = match doc.get(nid) {
+            Some(NodeData::Element(e))
+                if &*e.name.ns == HTML_NS && HTML_VOID_ELEMENTS.contains(&&*e.name.local) =>
+            {
+                (nid, true, false)
+            }
+            Some(NodeData::Element(e))
+                if &*e.name.ns == HTML_NS && &*e.name.local == "template" =>
+            {
+                (e.template_contents.unwrap_or(nid), false, true)
+            }
+            Some(NodeData::Element(e)) => (e.template_contents.unwrap_or(nid), false, false),
+            _ => (nid, false, false),
         };
         if is_xml {
             let mut buf = String::new();
@@ -708,10 +725,14 @@ fn serialize_inner_html_for_node(
                 Some(e) => Err(e),
                 None => Ok(buf),
             }
+        } else if is_void_html {
+            // WHATWG HTML §13.3: void HTML elements always serialize with empty innerHTML.
+            Ok(String::new())
         } else {
+            let child_scripting = !is_template && doc_scripting;
             let mut buf = String::new();
             for c in doc.children(container) {
-                buf.push_str(&doc.to_html_string(c));
+                buf.push_str(&doc.to_html_string_with_scripting(c, child_scripting));
             }
             Ok(buf)
         }
@@ -720,6 +741,20 @@ fn serialize_inner_html_for_node(
         Ok(s) => Ok(JsValue::from_string(vm.heap.alloc_string(s))),
         Err(msg) => Err(create_dom_exception(vm, "InvalidStateError", &msg)),
     }
+}
+
+fn has_html_form_ancestor(doc: &Document, start: NodeId) -> bool {
+    let mut cur = Some(start);
+    while let Some(id) = cur {
+        if matches!(
+            doc.get(id),
+            Some(NodeData::Element(e)) if &*e.name.ns == HTML_NS && &*e.name.local == "form"
+        ) {
+            return true;
+        }
+        cur = doc.parent(id);
+    }
+    false
 }
 
 fn maybe_run_fragment_scripts(vm: &mut JsVm, host: &SharedHost, added: &[NodeId], is_conn: bool) {
@@ -773,7 +808,8 @@ fn set_inner_html_spec(
 ) -> Result<(), JsException> {
     let owner_doc = host.borrow().owner_doc_of(nid);
     let is_xml = host.borrow().is_xml_doc(owner_doc);
-    let (ctx_name, target_container, initial_ns) = {
+    let doc_scripting = host.borrow().is_scripting_enabled_doc(owner_doc);
+    let (ctx_name, target_container, initial_ns, has_form_ancestor) = {
         let doc_rc = Rc::clone(&host.borrow().document);
         let doc = doc_rc.borrow();
         let ctx = match doc.get(nid) {
@@ -792,12 +828,14 @@ fn set_inner_html_spec(
             }
             _ => nid,
         };
+        let is_tmpl = target != nid;
+        let has_form = !is_tmpl && has_html_form_ancestor(&doc, nid);
         let ns_decls = if is_xml {
             collect_ancestor_xml_ns_decls(&doc, nid)
         } else {
             Vec::new()
         };
-        (ctx, target, ns_decls)
+        (ctx, target, ns_decls, has_form)
     };
 
     let (frag_doc, frag_roots) = if is_xml {
@@ -810,7 +848,14 @@ fn set_inner_html_spec(
         let roots: Vec<NodeId> = tmp_doc.children(frag).collect();
         (tmp_doc, roots)
     } else {
-        parse_html_fragment_with_options(markup, ctx_name.as_ref(), false, allow_declarative_shadow)
+        let is_template_el = target_container != nid;
+        rix_html::parse_html_fragment_with_form_owner(
+            markup,
+            ctx_name.as_ref(),
+            !is_template_el && doc_scripting,
+            allow_declarative_shadow,
+            has_form_ancestor,
+        )
     };
 
     let (removed, added, is_conn) = {
@@ -921,7 +966,8 @@ fn set_outer_html_spec(
 ) -> Result<(), JsException> {
     let owner_doc = host.borrow().owner_doc_of(nid);
     let is_xml = host.borrow().is_xml_doc(owner_doc);
-    let (parent_id, ctx_name, initial_ns) = {
+    let doc_scripting = host.borrow().is_scripting_enabled_doc(owner_doc);
+    let (parent_id, ctx_name, initial_ns, has_form_ancestor) = {
         let doc_rc = Rc::clone(&host.borrow().document);
         let doc = doc_rc.borrow();
         let Some(p) = doc.parent(nid) else {
@@ -943,12 +989,13 @@ fn set_outer_html_spec(
                 LocalName::from("body"),
             )),
         };
+        let has_form = has_html_form_ancestor(&doc, p);
         let ns_decls = if is_xml {
             collect_ancestor_xml_ns_decls(&doc, p)
         } else {
             Vec::new()
         };
-        (p, ctx, ns_decls)
+        (p, ctx, ns_decls, has_form)
     };
 
     let (frag_doc, frag_roots) = if is_xml {
@@ -961,7 +1008,13 @@ fn set_outer_html_spec(
         let roots: Vec<NodeId> = tmp_doc.children(frag).collect();
         (tmp_doc, roots)
     } else {
-        parse_html_fragment_with_options(markup, ctx_name.as_ref(), false, false)
+        rix_html::parse_html_fragment_with_form_owner(
+            markup,
+            ctx_name.as_ref(),
+            doc_scripting,
+            false,
+            has_form_ancestor,
+        )
     };
 
     let (added, prev_sib, next_sib, is_conn) = {
@@ -1033,8 +1086,9 @@ fn insert_adjacent_html_spec(
 
     let owner_doc = host.borrow().owner_doc_of(nid);
     let is_xml = host.borrow().is_xml_doc(owner_doc);
+    let doc_scripting = host.borrow().is_scripting_enabled_doc(owner_doc);
 
-    let (context_node, parent_target, ctx_name, initial_ns) = {
+    let (context_node, parent_target, ctx_name, initial_ns, has_form_ancestor) = {
         let doc_rc = Rc::clone(&host.borrow().document);
         let doc = doc_rc.borrow();
         let (ctx_node, parent_target) = if pos_kind == 0 || pos_kind == 3 {
@@ -1075,12 +1129,13 @@ fn insert_adjacent_html_spec(
                 LocalName::from("body"),
             )),
         };
+        let has_form = has_html_form_ancestor(&doc, ctx_node);
         let ns_decls = if is_xml {
             collect_ancestor_xml_ns_decls(&doc, ctx_node)
         } else {
             Vec::new()
         };
-        (ctx_node, parent_target, ctx_qname, ns_decls)
+        (ctx_node, parent_target, ctx_qname, ns_decls, has_form)
     };
     let _ = context_node;
 
@@ -1094,7 +1149,13 @@ fn insert_adjacent_html_spec(
         let roots: Vec<NodeId> = tmp_doc.children(frag).collect();
         (tmp_doc, roots)
     } else {
-        parse_html_fragment_with_options(markup, ctx_name.as_ref(), false, false)
+        rix_html::parse_html_fragment_with_form_owner(
+            markup,
+            ctx_name.as_ref(),
+            doc_scripting,
+            false,
+            has_form_ancestor,
+        )
     };
 
     if frag_roots.is_empty() {
@@ -1161,6 +1222,7 @@ fn serialize_shadow_root_if_allowed(
     sr_id: NodeId,
     serializable_shadow_roots: bool,
     allowed_shadow_roots: &HashSet<NodeId>,
+    scripting: bool,
     out: &mut String,
 ) {
     if let Some(NodeData::ShadowRoot {
@@ -1191,6 +1253,7 @@ fn serialize_shadow_root_if_allowed(
                     sr_child,
                     serializable_shadow_roots,
                     allowed_shadow_roots,
+                    scripting,
                     out,
                 );
             }
@@ -1204,14 +1267,20 @@ fn serialize_html_children_with_shadows(
     container: NodeId,
     serializable_shadow_roots: bool,
     allowed_shadow_roots: &HashSet<NodeId>,
+    scripting: bool,
 ) -> String {
     let mut out = String::new();
-    let (actual_container, own_shadow) = match doc.get(container) {
-        Some(NodeData::Element(el)) if &*el.name.ns == HTML_NS && &*el.name.local == "template" => {
-            (el.template_contents.unwrap_or(container), None)
+    let (actual_container, own_shadow, child_scripting) = match doc.get(container) {
+        Some(NodeData::Element(el))
+            if &*el.name.ns == HTML_NS && HTML_VOID_ELEMENTS.contains(&&*el.name.local) =>
+        {
+            return out;
         }
-        Some(NodeData::Element(el)) => (container, el.shadow_root),
-        _ => (container, None),
+        Some(NodeData::Element(el)) if &*el.name.ns == HTML_NS && &*el.name.local == "template" => {
+            (el.template_contents.unwrap_or(container), None, false)
+        }
+        Some(NodeData::Element(el)) => (container, el.shadow_root, scripting),
+        _ => (container, None, scripting),
     };
     if let Some(sr_id) = own_shadow {
         serialize_shadow_root_if_allowed(
@@ -1219,6 +1288,7 @@ fn serialize_html_children_with_shadows(
             sr_id,
             serializable_shadow_roots,
             allowed_shadow_roots,
+            child_scripting,
             &mut out,
         );
     }
@@ -1228,6 +1298,7 @@ fn serialize_html_children_with_shadows(
             child,
             serializable_shadow_roots,
             allowed_shadow_roots,
+            child_scripting,
             &mut out,
         );
     }
@@ -1239,6 +1310,7 @@ fn serialize_html_node_with_shadows(
     node: NodeId,
     serializable_shadow_roots: bool,
     allowed_shadow_roots: &HashSet<NodeId>,
+    scripting: bool,
     out: &mut String,
 ) {
     match doc.get(node) {
@@ -1275,6 +1347,11 @@ fn serialize_html_node_with_shadows(
             if &*el.name.ns == HTML_NS && HTML_VOID_ELEMENTS.contains(&&*el.name.local) {
                 return;
             }
+            let child_scripting = if &*el.name.ns == HTML_NS && &*el.name.local == "template" {
+                false
+            } else {
+                scripting
+            };
             // Emit declarative shadow root `<template shadowrootmode="...">` if requested.
             if let Some(sr_id) = el.shadow_root {
                 serialize_shadow_root_if_allowed(
@@ -1282,6 +1359,7 @@ fn serialize_html_node_with_shadows(
                     sr_id,
                     serializable_shadow_roots,
                     allowed_shadow_roots,
+                    child_scripting,
                     out,
                 );
             }
@@ -1292,6 +1370,7 @@ fn serialize_html_node_with_shadows(
                     child,
                     serializable_shadow_roots,
                     allowed_shadow_roots,
+                    child_scripting,
                     out,
                 );
             }
@@ -1309,15 +1388,12 @@ fn serialize_html_node_with_shadows(
             out.push('>');
         }
         Some(NodeData::Text(text) | NodeData::CDataSection(text)) => {
-            let raw = doc
-                .parent(node)
-                .and_then(|p| doc.get(p))
-                .is_some_and(|p| {
-                    matches!(p, NodeData::Element(el) if &*el.name.ns == HTML_NS && matches!(
+            let raw = doc.parent(node).and_then(|p| doc.get(p)).is_some_and(|p| {
+                matches!(p, NodeData::Element(el) if &*el.name.ns == HTML_NS && (matches!(
                         &*el.name.local,
-                        "style" | "script" | "xmp" | "iframe" | "noembed" | "noframes" | "plaintext" | "noscript"
-                    ))
-                });
+                        "style" | "script" | "xmp" | "iframe" | "noembed" | "noframes" | "plaintext"
+                    ) || (scripting && &*el.name.local == "noscript")))
+            });
             if raw {
                 out.push_str(text);
             } else {
@@ -1348,6 +1424,7 @@ fn serialize_html_node_with_shadows(
                     child,
                     serializable_shadow_roots,
                     allowed_shadow_roots,
+                    scripting,
                     out,
                 );
             }
@@ -1360,8 +1437,8 @@ fn escape_html_str(value: &str, attr: bool, out: &mut String) {
         match ch {
             '&' => out.push_str("&amp;"),
             '\u{00a0}' => out.push_str("&nbsp;"),
-            '<' if !attr => out.push_str("&lt;"),
-            '>' if !attr => out.push_str("&gt;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
             '"' if attr => out.push_str("&quot;"),
             _ => out.push(ch),
         }

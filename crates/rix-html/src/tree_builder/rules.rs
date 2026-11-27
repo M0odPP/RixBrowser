@@ -121,16 +121,20 @@ where
                     Token::Tag(tag!(<html>)) => self.step(InsertionMode::InBody, token),
                     Token::Tag(tag @ tag!(<base> | <basefont> | <bgsound> | <link> | <meta>)) => {
                         self.insert_and_pop_element_for(tag.clone());
-                        if let Some(charset) = tag_attr(&tag, &local_name!("charset")) {
-                            return ProcessResult::EncodingIndicator(charset);
-                        }
-                        if tag_attr(&tag, &local_name!("http-equiv"))
-                            .is_some_and(|v| v.eq_ignore_ascii_case("content-type"))
+                        if self.mode.get() == InsertionMode::InHead
+                            && tag.name == local_name!("meta")
                         {
-                            if let Some(enc) = tag_attr(&tag, &local_name!("content"))
-                                .and_then(extract_meta_charset)
+                            if let Some(charset) = tag_attr(&tag, &local_name!("charset")) {
+                                return ProcessResult::EncodingIndicator(charset);
+                            }
+                            if tag_attr(&tag, &local_name!("http-equiv"))
+                                .is_some_and(|v| v.eq_ignore_ascii_case("content-type"))
                             {
-                                return ProcessResult::EncodingIndicator(enc);
+                                if let Some(enc) = tag_attr(&tag, &local_name!("content"))
+                                    .and_then(extract_meta_charset)
+                                {
+                                    return ProcessResult::EncodingIndicator(enc);
+                                }
                             }
                         }
                         ProcessResult::DoneAckSelfClosing
