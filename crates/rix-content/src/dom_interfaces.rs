@@ -34,6 +34,8 @@ pub struct DocumentMeta {
     pub quirks_mode: u8,
     pub default_view: Option<HeapHandle>,
     pub ready_state: String,
+    /// WHATWG HTML: true only when this document has an active browsing context with scripting enabled.
+    pub scripting_enabled: bool,
 }
 
 impl DocumentMeta {
@@ -49,6 +51,7 @@ impl DocumentMeta {
             quirks_mode: 0,
             default_view: None,
             ready_state: "complete".to_string(),
+            scripting_enabled: false,
         }
     }
 
@@ -64,6 +67,7 @@ impl DocumentMeta {
             quirks_mode: 0,
             default_view: None,
             ready_state: "complete".to_string(),
+            scripting_enabled: false,
         }
     }
 
@@ -79,6 +83,7 @@ impl DocumentMeta {
             quirks_mode: 0,
             default_view: None,
             ready_state: "complete".to_string(),
+            scripting_enabled: false,
         }
     }
 }
@@ -2410,6 +2415,14 @@ impl HostState {
     #[must_use]
     pub fn is_xml_doc(&self, doc_id: NodeId) -> bool {
         self.doc_meta.get(&doc_id).is_some_and(|m| m.is_xml)
+    }
+
+    #[must_use]
+    pub fn is_scripting_enabled_doc(&self, doc_id: NodeId) -> bool {
+        match self.doc_meta.get(&doc_id) {
+            Some(m) => m.scripting_enabled,
+            None => true,
+        }
     }
 
     #[must_use]

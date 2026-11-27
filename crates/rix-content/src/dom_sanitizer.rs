@@ -2688,7 +2688,7 @@ fn fetch_script_source_sync(
         return None;
     }
     let origin = crate::web_apis::origin_of_url(&web_apis.borrow().location_url);
-    crate::frames::fetch_iframe_url_sync(net, &resolved, &origin).map(|(body, _, _)| body)
+    crate::frames::fetch_iframe_url_sync(net, &resolved, &origin, None).map(|(body, _, _)| body)
 }
 
 fn percent_decode_utf8(input: &str) -> String {
@@ -3160,6 +3160,7 @@ fn install_one_streaming_method(
                             );
                         }
                     }
+                    ParserStreamStep::CustomElement(_) => {}
                     ParserStreamStep::Done => {
                         let svg_scripts = {
                             let mut sb = st_w.borrow_mut();

@@ -17,6 +17,7 @@ enum PiCommentAction {
 
 pub struct DomTreeSink {
     document: Rc<RefCell<Document>>,
+    doc_root: NodeId,
     quirks_mode: Cell<QuirksMode>,
     pi_actions: RefCell<VecDeque<PiCommentAction>>,
     dropped_nodes: RefCell<HashSet<NodeId>>,
@@ -30,8 +31,11 @@ impl Default for DomTreeSink {
 
 impl DomTreeSink {
     pub fn new() -> Self {
+        let document = Rc::new(RefCell::new(Document::new()));
+        let doc_root = document.borrow().root();
         Self {
-            document: Rc::new(RefCell::new(Document::new())),
+            document,
+            doc_root,
             quirks_mode: Cell::new(QuirksMode::NoQuirks),
             pi_actions: RefCell::new(VecDeque::new()),
             dropped_nodes: RefCell::new(HashSet::new()),
@@ -39,8 +43,14 @@ impl DomTreeSink {
     }
 
     pub fn with_document(document: Rc<RefCell<Document>>) -> Self {
+        let doc_root = document.borrow().root();
+        Self::with_document_root(document, doc_root)
+    }
+
+    pub fn with_document_root(document: Rc<RefCell<Document>>, doc_root: NodeId) -> Self {
         Self {
             document,
+            doc_root,
             quirks_mode: Cell::new(QuirksMode::NoQuirks),
             pi_actions: RefCell::new(VecDeque::new()),
             dropped_nodes: RefCell::new(HashSet::new()),
@@ -241,8 +251,32 @@ fn scan_pi_comment_actions(html: &str, scripting_enabled: bool) -> VecDeque<PiCo
     actions
 }
 
+fn find_template_host_in_subtree(doc: &Document, root: NodeId, frag: NodeId) -> Option<NodeId> {
+    let mut stack = vec![root];
+    let mut visited = 0usize;
+    while let Some(cur) = stack.pop() {
+        visited += 1;
+        if visited > 16_384 {
+            break;
+        }
+        if let Some(NodeData::Element(e)) = doc.get(cur) {
+            if e.template_contents == Some(frag) {
+                return Some(cur);
+            }
+            if let Some(sr) = e.shadow_root {
+                stack.push(sr);
+            }
+        }
+        for child in doc.children(cur) {
+            stack.push(child);
+        }
+    }
+    None
+}
+
 fn is_host_including_inclusive_ancestor(
     doc: &Document,
+    doc_root: NodeId,
     ancestor: NodeId,
     mut node: NodeId,
 ) -> bool {
@@ -264,12 +298,17 @@ fn is_host_including_inclusive_ancestor(
             continue;
         }
         if matches!(doc.get(node), Some(NodeData::DocumentFragment)) {
-            if let Some(tmpl_owner) = doc.descendants(doc.root()).find(|&cand| {
-                matches!(
-                    doc.get(cand),
-                    Some(NodeData::Element(e)) if e.template_contents == Some(node)
-                )
-            }) {
+            if let Some(tmpl_owner) = find_template_host_in_subtree(doc, ancestor, node)
+                .or_else(|| find_template_host_in_subtree(doc, doc_root, node))
+                .or_else(|| {
+                    let main_root = doc.root();
+                    if main_root != doc_root {
+                        find_template_host_in_subtree(doc, main_root, node)
+                    } else {
+                        None
+                    }
+                })
+            {
                 node = tmpl_owner;
                 continue;
             }
@@ -293,7 +332,7 @@ impl TreeSink for DomTreeSink {
     fn parse_error(&self, _msg: std::borrow::Cow<'static, str>) {}
 
     fn get_document(&self) -> Self::Handle {
-        self.document.borrow().root()
+        self.doc_root
     }
 
     fn set_quirks_mode(&self, mode: QuirksMode) {
@@ -303,7 +342,10 @@ impl TreeSink for DomTreeSink {
             QuirksMode::LimitedQuirks => 1,
             QuirksMode::Quirks => 2,
         };
-        self.document.borrow_mut().set_quirks_mode(code);
+        let mut doc = self.document.borrow_mut();
+        if self.doc_root == doc.root() {
+            doc.set_quirks_mode(code);
+        }
     }
 
     fn same_node(&self, x: &Self::Handle, y: &Self::Handle) -> bool {
@@ -424,7 +466,7 @@ impl TreeSink for DomTreeSink {
                 if self.dropped_nodes.borrow().contains(&node) {
                     return;
                 }
-                if is_host_including_inclusive_ancestor(&doc, node, target_parent) {
+                if is_host_including_inclusive_ancestor(&doc, self.doc_root, node, target_parent) {
                     return;
                 }
                 if parent_is_doc
@@ -477,7 +519,7 @@ impl TreeSink for DomTreeSink {
                 if self.dropped_nodes.borrow().contains(&node) {
                     return;
                 }
-                if is_host_including_inclusive_ancestor(&doc, node, parent_id) {
+                if is_host_including_inclusive_ancestor(&doc, self.doc_root, node, parent_id) {
                     return;
                 }
                 // WHATWG DOM §4.2.4 / HTML §13.2.6.1: a `Document` node cannot accept a second
@@ -533,7 +575,17 @@ impl TreeSink for DomTreeSink {
         system_id: StrTendril,
     ) {
         let mut doc = self.document.borrow_mut();
-        let root = doc.root();
+        let root = self.doc_root;
+        // WHATWG DOM §4.2.4: a Document cannot have a second DocumentType or a DocumentType
+        // following an existing Element child.
+        if doc.children(root).any(|c| {
+            matches!(
+                doc.get(c),
+                Some(NodeData::DocumentType { .. } | NodeData::Element(_))
+            )
+        }) {
+            return;
+        }
         let doctype = doc.new_node(NodeData::DocumentType {
             name: name.to_string(),
             public_id: public_id.to_string(),
@@ -567,7 +619,7 @@ impl TreeSink for DomTreeSink {
         let mut doc = self.document.borrow_mut();
         let children: Vec<NodeId> = doc.children(*node).collect();
         for child in children {
-            if !is_host_including_inclusive_ancestor(&doc, child, *new_parent) {
+            if !is_host_including_inclusive_ancestor(&doc, self.doc_root, child, *new_parent) {
                 doc.append_child(*new_parent, child);
             }
         }

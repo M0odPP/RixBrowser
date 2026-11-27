@@ -936,7 +936,11 @@ pub struct FirefoxWptResult {
     pub subtests: Vec<FirefoxWptSubtest>,
 }
 
-const FIREFOX_WPT_COLLECT_JS: &str = r#"new Promise((resolve) => {
+const FIREFOX_WPT_COLLECT_JS: &str = r##"new Promise((resolve) => {
+  if (typeof window.__rix_ff_wpt_result === "string") {
+    resolve(window.__rix_ff_wpt_result);
+    return;
+  }
   let settled = false;
   const finish = (tests, status) => {
     if (settled) return;
@@ -950,13 +954,49 @@ const FIREFOX_WPT_COLLECT_JS: &str = r#"new Promise((resolve) => {
       })),
     }));
   };
+  const readDomResults = () => {
+    const rows = document.querySelectorAll("#results tbody tr");
+    if (!rows || rows.length === 0) return null;
+    const subtests = [];
+    for (const row of rows) {
+      const cells = row.querySelectorAll("td");
+      if (cells.length >= 2) {
+        const st = (cells[0].textContent || "").trim().toUpperCase();
+        const name = (cells[1].textContent || "").trim();
+        const msg = cells.length >= 3 ? (cells[2].textContent || "").trim() : "";
+        subtests.push({ name, pass: st === "PASS", message: msg || null });
+      }
+    }
+    return subtests.length > 0 ? { harness_ok: true, subtests } : null;
+  };
+  const existing = readDomResults();
+  if (existing) {
+    settled = true;
+    resolve(JSON.stringify(existing));
+    return;
+  }
   if (typeof add_completion_callback === "function") {
     add_completion_callback(finish);
-    setTimeout(() => finish([], { status: 2 }), 6000);
-  } else {
-    finish([], { status: 1 });
   }
-})"#;
+  const poll = setInterval(() => {
+    if (typeof window.__rix_ff_wpt_result === "string") {
+      clearInterval(poll);
+      if (!settled) { settled = true; resolve(window.__rix_ff_wpt_result); }
+      return;
+    }
+    const dom = readDomResults();
+    if (dom) {
+      clearInterval(poll);
+      if (!settled) { settled = true; resolve(JSON.stringify(dom)); }
+    }
+  }, 50);
+  setTimeout(() => {
+    clearInterval(poll);
+    const dom = readDomResults();
+    if (dom && !settled) { settled = true; resolve(JSON.stringify(dom)); }
+    else finish([], { status: 2 });
+  }, 5000);
+})"##;
 
 /// Reusable headless Mozilla Firefox WebDriver BiDi session for fast multi-test WPT differential
 /// verification (`0` tests passing in Firefox while failing in RixBrowser).

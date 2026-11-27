@@ -980,10 +980,12 @@ impl Document {
         source: NodeId,
         only_clonable_shadows: bool,
     ) -> NodeId {
+        let same_doc = std::ptr::eq(source_document, self);
         fn shallow(
             source_document: &Document,
             source: NodeId,
             destination: &mut Document,
+            same_doc: bool,
         ) -> NodeId {
             let mut data = source_document
                 .get(source)
@@ -995,6 +997,9 @@ impl Document {
                     .map(|_| destination.new_node(NodeData::DocumentFragment));
                 element.shadow_root = None;
                 element.content_document = None;
+                if same_doc {
+                    element.form_owner = None;
+                }
                 element.custom_states.clear();
                 if matches!(
                     element.custom_element_state,
@@ -1007,7 +1012,15 @@ impl Document {
             }
             destination.new_node(data)
         }
-        let copy = shallow(source_document, source, self);
+        let copy = shallow(source_document, source, self, same_doc);
+        let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+        let mut nodes_with_form_owner: Vec<NodeId> = Vec::new();
+        if !same_doc {
+            id_map.insert(source, copy);
+            if matches!(self.get(copy), Some(NodeData::Element(e)) if e.form_owner.is_some()) {
+                nodes_with_form_owner.push(copy);
+            }
+        }
         let mut pending = vec![(source, copy)];
         while let Some((source, parent)) = pending.pop() {
             let (source_fragment, copy_fragment, shadow_root_info, source_content_doc) = {
@@ -1097,9 +1110,23 @@ impl Document {
                 pending.push((src_cd, copy_cd));
             }
             for child in source_document.children(source) {
-                let copy = shallow(source_document, child, self);
-                self.append_child(parent, copy);
-                pending.push((child, copy));
+                let child_copy = shallow(source_document, child, self, same_doc);
+                self.append_child(parent, child_copy);
+                if !same_doc {
+                    id_map.insert(child, child_copy);
+                    if matches!(
+                        self.get(child_copy),
+                        Some(NodeData::Element(e)) if e.form_owner.is_some()
+                    ) {
+                        nodes_with_form_owner.push(child_copy);
+                    }
+                }
+                pending.push((child, child_copy));
+            }
+        }
+        for nid in nodes_with_form_owner {
+            if let Some(NodeData::Element(elem)) = self.get_mut(nid) {
+                elem.form_owner = elem.form_owner.and_then(|old| id_map.get(&old).copied());
             }
         }
         copy
@@ -1251,12 +1278,17 @@ impl Document {
     }
 
     pub fn to_html_string(&self, node: NodeId) -> String {
+        self.to_html_string_with_scripting(node, true)
+    }
+
+    pub fn to_html_string_with_scripting(&self, node: NodeId, scripting_enabled: bool) -> String {
         let mut output = String::new();
-        let mut edges = vec![NodeEdge::Start(node)];
-        while let Some(edge) = edges.pop() {
+        let mut edges = vec![(NodeEdge::Start(node), scripting_enabled)];
+        while let Some((edge, cur_scripting)) = edges.pop() {
             match edge {
                 NodeEdge::Start(node) => {
                     let mut child_container = node;
+                    let mut child_scripting = cur_scripting;
                     match self.get(node) {
                         Some(NodeData::Element(element)) => {
                             output.push('<');
@@ -1306,15 +1338,19 @@ impl Document {
                             {
                                 continue;
                             }
-                            edges.push(NodeEdge::End(node));
+                            edges.push((NodeEdge::End(node), cur_scripting));
                             if let Some(fragment) = element.template_contents {
                                 child_container = fragment;
+                                child_scripting = false;
                             }
                         }
                         Some(NodeData::Text(text) | NodeData::CDataSection(text)) => {
-                            let raw = self.parent(node).and_then(|parent| self.get(parent)).is_some_and(|parent|
-                            matches!(parent, NodeData::Element(element) if &*element.name.ns == "http://www.w3.org/1999/xhtml" && matches!(&*element.name.local,
-                                "style" | "script" | "xmp" | "iframe" | "noembed" | "noframes" | "plaintext" | "noscript")));
+                            let raw = self.parent(node).and_then(|parent| self.get(parent)).is_some_and(|parent| {
+                                matches!(parent, NodeData::Element(element) if &*element.name.ns == "http://www.w3.org/1999/xhtml" && (
+                                    matches!(&*element.name.local, "style" | "script" | "xmp" | "iframe" | "noembed" | "noframes" | "plaintext")
+                                    || (cur_scripting && &*element.name.local == "noscript")
+                                ))
+                            });
                             if raw {
                                 output.push_str(text);
                             } else {
@@ -1346,7 +1382,12 @@ impl Document {
                         | None => {}
                     }
                     let children: Vec<_> = self.children(child_container).collect();
-                    edges.extend(children.into_iter().rev().map(NodeEdge::Start));
+                    edges.extend(
+                        children
+                            .into_iter()
+                            .rev()
+                            .map(|c| (NodeEdge::Start(c), child_scripting)),
+                    );
                 }
                 NodeEdge::End(node) => {
                     if let Some(NodeData::Element(element)) = self.get(node) {

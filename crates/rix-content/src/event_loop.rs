@@ -186,6 +186,55 @@ impl EventLoopState {
         self.virtual_offset_ms += delta.as_secs_f64() * 1000.0;
     }
 
+    /// Returns the next monotonic timer sequence watermark.
+    #[must_use]
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Pops the earliest due timer whose `seq < max_seq`, preserving later-scheduled timers.
+    fn pop_due_timer_before_seq(&mut self, max_seq: u64) -> Option<TimerEntry> {
+        let now = self.now_ms();
+        let mut skipped = Vec::new();
+        let mut found = None;
+        while let Some(top) = self.timers.peek() {
+            if self.cancelled_timers.contains(&top.id) {
+                let entry = self.timers.pop().unwrap();
+                self.cancelled_timers.remove(&entry.id);
+                self.active_timer_ids.remove(&entry.id);
+                continue;
+            }
+            if top.deadline_ms > now {
+                break;
+            }
+            let entry = self.timers.pop().unwrap();
+            if entry.seq < max_seq {
+                if let Some(interval) = entry.interval_ms {
+                    let next_seq = self.next_seq;
+                    self.next_seq = self.next_seq.wrapping_add(1);
+                    self.timers.push(TimerEntry {
+                        id: entry.id,
+                        deadline_ms: now + interval.max(NESTED_TIMER_MIN_DELAY_MS),
+                        seq: next_seq,
+                        interval_ms: Some(interval),
+                        nesting_level: entry.nesting_level.saturating_add(1),
+                        callback: entry.callback,
+                        args: entry.args.clone(),
+                    });
+                } else {
+                    self.active_timer_ids.remove(&entry.id);
+                }
+                found = Some(entry);
+                break;
+            }
+            skipped.push(entry);
+        }
+        for s in skipped {
+            self.timers.push(s);
+        }
+        found
+    }
+
     /// Registers a callback executed during every WHATWG microtask checkpoint.
     pub fn add_checkpoint_hook(&mut self, hook: MicrotaskCheckpointHook) {
         self.checkpoint_hooks.push(hook);
@@ -538,6 +587,39 @@ pub fn fire_vsync(loop_state: &SharedEventLoop, vm: &mut JsVm, timestamp_ms: f64
         run_microtask_checkpoint(loop_state, vm);
     }
     count
+}
+
+/// Drains due timers queued before `max_seq` (e.g. zero-delay tasks posted by `defer` scripts
+/// before the `DOMContentLoaded` task is queued per WHATWG HTML §13.2.7).
+pub fn drain_due_timers_before_seq(loop_state: &SharedEventLoop, vm: &mut JsVm, max_seq: u64) {
+    const MAX_PRE_DCL_TIMERS: u64 = 256;
+    run_microtask_checkpoint(loop_state, vm);
+    let mut ran = 0u64;
+    while ran < MAX_PRE_DCL_TIMERS {
+        let Some(timer) = loop_state.borrow_mut().pop_due_timer_before_seq(max_seq) else {
+            break;
+        };
+        let prev_nesting = {
+            let mut st = loop_state.borrow_mut();
+            let prev = st.current_timer_nesting;
+            st.current_timer_nesting = timer.nesting_level;
+            prev
+        };
+        let global = JsValue::from_object(vm.global);
+        if let Err(ex) = vm.call_value(JsValue::from_object(timer.callback), global, &timer.args) {
+            let hook = loop_state.borrow().on_uncaught_error.clone();
+            if let Some(hook) = hook {
+                hook(vm, ex);
+            }
+        }
+        {
+            let mut st = loop_state.borrow_mut();
+            st.current_timer_nesting = prev_nesting;
+            st.tasks_executed += 1;
+        }
+        run_microtask_checkpoint(loop_state, vm);
+        ran += 1;
+    }
 }
 
 /// Drains immediately ready macrotasks, due timers, and microtasks until quiescent

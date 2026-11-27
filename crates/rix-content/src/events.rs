@@ -1334,6 +1334,18 @@ fn install_event_constructors(vm: &mut JsVm, host: &SharedHost, events: &SharedE
     let _ = register_event_subclass_with_proto(
         vm,
         events,
+        "PageTransitionEvent",
+        ep,
+        Some(ev_ctor),
+        |vm, obj, init| {
+            let v = read_init_prop(vm, init, "persisted", JsValue::FALSE)?;
+            define_data(vm, obj, "persisted", JsValue::from_bool(vm.to_boolean(v)));
+            Ok(())
+        },
+    );
+    let _ = register_event_subclass_with_proto(
+        vm,
+        events,
         "StorageEvent",
         ep,
         Some(ev_ctor),
@@ -2683,6 +2695,134 @@ pub(crate) fn fire_object_event_with_proto(
     }
 
     let _ = dispatch_event_internal(vm, host, events, event_loop, target_key, ev_h);
+}
+
+/// Dispatches a trusted lifecycle event (`load`, `pageshow`) at `Window` with WHATWG DOM §2.9
+/// legacy target override (`event.target === document`, `event.currentTarget === window`,
+/// `event.eventPhase === AT_TARGET`) per WHATWG HTML §13.2.7.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fire_window_document_event(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    doc_root: NodeId,
+    ev_type: &str,
+    bubbles: bool,
+    cancelable: bool,
+    proto_name: &str,
+    props: &[(&str, JsValue)],
+) {
+    let proto = events
+        .borrow()
+        .event_protos
+        .get(proto_name)
+        .copied()
+        .or_else(|| events.borrow().event_proto)
+        .unwrap_or(vm.object_proto);
+    let ev_h = vm
+        .heap
+        .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(proto)));
+    let doc_val = value_for_target_key(vm, host, EventTargetKey::Node(doc_root));
+    let win_val = JsValue::from_object(vm.global);
+    let ts = events.borrow().now_ms();
+    events.borrow_mut().events.insert(
+        ev_h,
+        EventInternal {
+            event_type: ev_type.to_string(),
+            bubbles,
+            cancelable,
+            composed: false,
+            is_trusted: true,
+            initialized: true,
+            dispatch_flag: true,
+            default_prevented: false,
+            propagation_stopped: false,
+            immediate_stopped: false,
+            in_passive_listener: false,
+            event_phase: 2,
+            time_stamp: ts,
+            target: doc_val,
+            current_target: win_val,
+            composed_path: vec![win_val],
+            path_keys: vec![EventTargetKey::Window],
+            current_target_key: Some(EventTargetKey::Window),
+        },
+    );
+    define_own_is_trusted(vm, events, ev_h);
+    for &(name, val) in props {
+        let k = vm.heap.intern_key(name);
+        vm.heap
+            .object_define_data(ev_h, k, val, PropertyAttrs::DEFAULT, &mut vm.shapes);
+    }
+
+    let entry = PathEntry {
+        current: EventTargetKey::Window,
+        retargeted_target: EventTargetKey::Node(doc_root),
+        retargeted_related_target: None,
+        in_closed_shadow: false,
+    };
+
+    let has_trampoline = events
+        .borrow()
+        .idl_handler_trampolines
+        .contains_key(&(EventTargetKey::Window, ev_type.to_string()));
+    if !has_trampoline {
+        let handler_key = vm.heap.intern_key(&format!("on{ev_type}"));
+        if let Ok(handler_val) = vm.get_property_by_key(vm.global, handler_key) {
+            if let Some(h) = handler_val
+                .as_object()
+                .filter(|&fh| vm.is_callable_handle(fh))
+            {
+                if let Err(ex) = vm.call_value(
+                    JsValue::from_object(h),
+                    win_val,
+                    &[JsValue::from_object(ev_h)],
+                ) {
+                    let hook = events.borrow().on_uncaught_error.clone();
+                    if let Some(cb) = hook {
+                        cb(vm, ex);
+                    }
+                }
+            }
+        }
+    }
+
+    invoke_listeners_at(
+        vm,
+        host,
+        events,
+        event_loop,
+        ev_h,
+        ev_type,
+        entry,
+        2,
+        Some(true),
+        false,
+    );
+    if !is_propagation_stopped(events, ev_h) {
+        invoke_listeners_at(
+            vm,
+            host,
+            events,
+            event_loop,
+            ev_h,
+            ev_type,
+            entry,
+            2,
+            Some(false),
+            false,
+        );
+    }
+    if let Some(ev) = events.borrow_mut().events.get_mut(&ev_h) {
+        ev.dispatch_flag = false;
+        ev.event_phase = 0;
+        ev.current_target = JsValue::NULL;
+        ev.current_target_key = None;
+        ev.composed_path.clear();
+        ev.path_keys.clear();
+    }
+    run_microtask_checkpoint(event_loop, vm);
 }
 
 /// Dispatches a trusted cancelable `ErrorEvent` (`bubbles: false`, `cancelable: true`)

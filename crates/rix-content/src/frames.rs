@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rix_dom::{NodeData, NodeId};
-use rix_html::{decode_html_bytes, parse_html};
+// rix-html functions called via qualified `rix_html::...` paths.
 use rix_ipc::{ContentToBrowser, MessagePortId, PipelineId, SurfaceId};
 use rix_js::heap::{TypedArrayKind, TypedArrayObject};
 use rix_js::{
@@ -1414,6 +1414,7 @@ enum SubdocScript {
 /// Creates a REAL `NodeData::Document` subtree inside `host.document` for a same-origin
 /// `<iframe>` or `window.open()` browsing context, with full `Document.prototype` / `XMLDocument.prototype`,
 /// `DocumentMeta`, `ownerDocument` adoption, and ordered inline/external script extraction.
+#[allow(clippy::too_many_arguments)]
 fn build_sub_document(
     vm: &mut JsVm,
     host: &SharedHost,
@@ -1422,6 +1423,7 @@ fn build_sub_document(
     charset: &str,
     content_type: &str,
     window_proxy: HeapHandle,
+    scripts_allowed: bool,
 ) -> (HeapHandle, String, Vec<SubdocScript>) {
     let is_xml = is_xml_mime_or_url(content_type, url);
     let (sub_doc_id, title, scripts) = if is_xml {
@@ -1456,6 +1458,7 @@ fn build_sub_document(
         let mut meta = crate::dom_interfaces::DocumentMeta::xml_document(mime, url);
         meta.character_set = charset.to_string();
         meta.default_view = Some(window_proxy);
+        meta.scripting_enabled = scripts_allowed;
         {
             let mut hb = host.borrow_mut();
             hb.doc_meta.insert(sub_id, meta);
@@ -1464,7 +1467,7 @@ fn build_sub_document(
         let (title, scripts) = collect_subdoc_title_and_scripts(host, sub_id);
         (sub_id, title, scripts)
     } else {
-        let mut parsed_doc = parse_html(content);
+        let mut parsed_doc = rix_html::parse_html_with_options(content, scripts_allowed, true);
         parsed_doc.set_character_set(charset);
         let sub_id = {
             let doc_rc = Rc::clone(&host.borrow().document);
@@ -1481,6 +1484,7 @@ fn build_sub_document(
         meta.character_set = charset.to_string();
         meta.quirks_mode = parsed_doc.quirks_mode();
         meta.default_view = Some(window_proxy);
+        meta.scripting_enabled = scripts_allowed;
         {
             let mut hb = host.borrow_mut();
             hb.doc_meta.insert(sub_id, meta);
@@ -2288,22 +2292,27 @@ pub(crate) fn sync_iframe_node(
         .map(|r| r.proxy);
     let was_existing = frames.borrow().iframes.contains_key(&node_id);
     if is_same_origin {
+        let parent_charset = {
+            let hb = host.borrow();
+            let owner_doc = hb.owner_doc_of(node_id);
+            hb.doc_meta
+                .get(&owner_doc)
+                .map(|m| m.character_set.clone())
+                .unwrap_or_else(|| hb.document.borrow().character_set().to_string())
+        };
         let (html_content, child_charset, child_ct) = if let Some(ref sd) = srcdoc_attr {
             let cs = rix_html::detect_html_charset(sd.as_bytes());
             (sd.clone(), cs, "text/html".to_string())
         } else if resolved_url.starts_with("blob:") {
             if let Some(bytes) = web_apis.borrow().object_urls.get(&resolved_url) {
-                let cs = rix_html::detect_html_charset(bytes);
-                (
-                    String::from_utf8_lossy(bytes).into_owned(),
-                    cs,
-                    "text/html".to_string(),
-                )
+                let (decoded, cs) =
+                    rix_html::decode_html_bytes_with_fallback(bytes, None, Some(&parent_charset));
+                (decoded, cs, "text/html".to_string())
             } else {
                 (String::new(), "UTF-8", "text/html".to_string())
             }
         } else if resolved_url.starts_with("http://") || resolved_url.starts_with("https://") {
-            fetch_iframe_url_sync(net, &resolved_url, &parent_origin)
+            fetch_iframe_url_sync(net, &resolved_url, &parent_origin, Some(&parent_charset))
                 .unwrap_or_else(|| (String::new(), "UTF-8", "text/html".to_string()))
         } else {
             (String::new(), "UTF-8", "text/html".to_string())
@@ -2337,16 +2346,45 @@ pub(crate) fn sync_iframe_node(
                 },
             )
         };
-        let (child_doc, _title, inline_scripts) = build_sub_document(
-            vm,
-            host,
-            &resolved_url,
-            &html_content,
-            child_charset,
-            &child_ct,
-            proxy_h,
-        );
-        let child_doc_nid = host.borrow().node_for_handle(vm, child_doc);
+
+        let is_xml_child = is_xml_mime_or_url(&child_ct, &resolved_url);
+        let use_streaming_html = !is_xml_child && sandbox.scripts_allowed();
+
+        let (child_doc, child_doc_nid, pending_scripts) = if use_streaming_html {
+            let sub_id = {
+                let doc_rc = Rc::clone(&host.borrow().document);
+                let mut doc = doc_rc.borrow_mut();
+                doc.new_node(NodeData::Document)
+            };
+            let mut meta = crate::dom_interfaces::DocumentMeta::html(&resolved_url);
+            meta.character_set = child_charset.to_string();
+            meta.default_view = Some(proxy_h);
+            meta.ready_state = "loading".to_string();
+            meta.scripting_enabled = true;
+            {
+                let mut hb = host.borrow_mut();
+                hb.doc_meta.insert(sub_id, meta);
+                hb.adopt_subtree(sub_id, sub_id);
+            }
+            let wrapped = wrap_node(vm, host, sub_id)
+                .as_object()
+                .unwrap_or_else(|| vm.alloc_ordinary_object());
+            (wrapped, Some(sub_id), Vec::new())
+        } else {
+            let (cd, _title, inline_scripts) = build_sub_document(
+                vm,
+                host,
+                &resolved_url,
+                &html_content,
+                child_charset,
+                &child_ct,
+                proxy_h,
+                sandbox.scripts_allowed(),
+            );
+            let cd_nid = host.borrow().node_for_handle(vm, cd);
+            (cd, cd_nid, inline_scripts)
+        };
+
         if let Some(cd_nid) = child_doc_nid {
             host.borrow()
                 .document
@@ -2413,8 +2451,155 @@ pub(crate) fn sync_iframe_node(
             );
         }
 
-        // Execute external & inline scripts inside the same-origin child iframe's isolated global.
-        if sandbox.scripts_allowed() && !inline_scripts.is_empty() {
+        if use_streaming_html {
+            if let Some(sub_id) = child_doc_nid {
+                let pre_keys: HashSet<rix_js::PropertyKey> = vm
+                    .heap
+                    .get_object(proxy_h)
+                    .map(|o| {
+                        if let Some(rare) = &o.rare {
+                            rare.dict_props.keys().copied().collect()
+                        } else if let Some(shape) = vm.shapes.get(rix_js::ShapeId(o.shape_id)) {
+                            shape.keys().iter().copied().collect()
+                        } else {
+                            HashSet::new()
+                        }
+                    })
+                    .unwrap_or_default();
+                let doc_rc = Rc::clone(&host.borrow().document);
+                let sub_parser = Rc::new(RefCell::new(
+                    rix_html::HtmlParserStream::with_document_root_and_scripting(
+                        doc_rc, sub_id, true,
+                    ),
+                ));
+                sub_parser.borrow_mut().feed(&html_content);
+                host.borrow_mut()
+                    .active_sub_parsers
+                    .insert(sub_id, Rc::clone(&sub_parser));
+                let base_url = Url::parse(&resolved_url).ok();
+                loop {
+                    let step = sub_parser.borrow_mut().step();
+                    match step {
+                        rix_html::ParserStreamStep::Script(script_id) => {
+                            host.borrow_mut().adopt_subtree(sub_id, sub_id);
+                            let script_info = {
+                                let doc_rc = Rc::clone(&host.borrow().document);
+                                let doc = doc_rc.borrow();
+                                match doc.get(script_id) {
+                                    Some(NodeData::Element(e)) => {
+                                        let ty = e.get_attribute("type").unwrap_or("").trim();
+                                        let is_classic = ty.is_empty()
+                                            || ty.eq_ignore_ascii_case("text/javascript")
+                                            || ty.eq_ignore_ascii_case("application/javascript")
+                                            || ty.eq_ignore_ascii_case("text/ecmascript")
+                                            || ty.eq_ignore_ascii_case("application/ecmascript");
+                                        if !is_classic || e.has_attribute("nomodule") {
+                                            None
+                                        } else {
+                                            let src = if &*e.name.ns
+                                                == crate::dom_interfaces::SVG_NS
+                                            {
+                                                e.get_attribute("href")
+                                                    .or_else(|| e.get_attribute("xlink:href"))
+                                                    .map(|s| s.trim().to_string())
+                                            } else {
+                                                e.get_attribute("src").map(|s| s.trim().to_string())
+                                            };
+                                            if let Some(s) = src {
+                                                if s.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(SubdocScript::External(s))
+                                                }
+                                            } else {
+                                                let code = doc.inner_text(script_id);
+                                                if code.trim().is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(SubdocScript::Inline(code))
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => None,
+                                }
+                            };
+                            if let Some(script) = script_info {
+                                let code = match script {
+                                    SubdocScript::Inline(c) => Some(c),
+                                    SubdocScript::External(src) => {
+                                        let script_url = base_url
+                                            .as_ref()
+                                            .and_then(|b| b.join(&src).ok())
+                                            .map(|u| u.to_string())
+                                            .unwrap_or(src);
+                                        if script_url.starts_with("http://")
+                                            || script_url.starts_with("https://")
+                                        {
+                                            fetch_iframe_url_sync(
+                                                net,
+                                                &script_url,
+                                                &effective_child_origin,
+                                                None,
+                                            )
+                                            .map(|(body, _, _)| body)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                };
+                                if let Some(code) = code {
+                                    let prev_script = host.borrow().current_script;
+                                    host.borrow_mut().current_script = Some(script_id);
+                                    vm.global = proxy_h;
+                                    let _ = vm.eval_script(&code);
+                                    vm.global = saved_global;
+                                    host.borrow_mut().current_script = prev_script;
+                                    let has_ce_defs = host
+                                        .borrow()
+                                        .custom_elements_state
+                                        .borrow()
+                                        .has_any_definitions();
+                                    sub_parser
+                                        .borrow_mut()
+                                        .set_pause_on_custom_elements(has_ce_defs);
+                                }
+                            }
+                        }
+                        rix_html::ParserStreamStep::CustomElement(ce_id) => {
+                            {
+                                let mut hb = host.borrow_mut();
+                                hb.adopt_subtree(sub_id, sub_id);
+                                hb.owner_docs.insert(ce_id, sub_id);
+                            }
+                            let child_reg =
+                                crate::custom_elements::registry_for_document(host, sub_id);
+                            crate::custom_elements::set_element_registry(host, ce_id, child_reg);
+                            vm.global = proxy_h;
+                            crate::custom_elements::upgrade_subtree(vm, host, ce_id, true);
+                            vm.global = saved_global;
+                            sub_parser
+                                .borrow_mut()
+                                .finish_pending_custom_element_insert();
+                        }
+                        rix_html::ParserStreamStep::Done => break,
+                    }
+                }
+                sub_parser.borrow_mut().finish();
+                let qm = sub_parser.borrow().quirks_mode_code();
+                {
+                    let mut hb = host.borrow_mut();
+                    hb.active_sub_parsers.remove(&sub_id);
+                    if let Some(meta) = hb.doc_meta.get_mut(&sub_id) {
+                        meta.quirks_mode = qm;
+                        meta.ready_state = "complete".to_string();
+                    }
+                    hb.adopt_subtree(sub_id, sub_id);
+                }
+                bind_child_frame_functions(vm, proxy_h, &pre_keys);
+            }
+        } else if sandbox.scripts_allowed() && !pending_scripts.is_empty() {
+            // Execute external & inline scripts inside the same-origin child iframe's isolated global (XML docs).
             let pre_keys: HashSet<rix_js::PropertyKey> = vm
                 .heap
                 .get_object(proxy_h)
@@ -2429,7 +2614,7 @@ pub(crate) fn sync_iframe_node(
                 })
                 .unwrap_or_default();
             let base_url = Url::parse(&resolved_url).ok();
-            for script in inline_scripts {
+            for script in pending_scripts {
                 let code = match script {
                     SubdocScript::Inline(c) => Some(c),
                     SubdocScript::External(src) => {
@@ -2439,7 +2624,7 @@ pub(crate) fn sync_iframe_node(
                             .map(|u| u.to_string())
                             .unwrap_or(src);
                         if script_url.starts_with("http://") || script_url.starts_with("https://") {
-                            fetch_iframe_url_sync(net, &script_url, &effective_child_origin)
+                            fetch_iframe_url_sync(net, &script_url, &effective_child_origin, None)
                                 .map(|(body, _, _)| body)
                         } else {
                             None
@@ -2483,7 +2668,7 @@ pub(crate) fn sync_iframe_node(
                 let cs = rix_html::detect_html_charset(sd.as_bytes());
                 Some((sd.clone(), cs, "text/html".to_string()))
             } else if resolved_url.starts_with("http://") || resolved_url.starts_with("https://") {
-                fetch_iframe_url_sync(net, &resolved_url, &effective_child_origin)
+                fetch_iframe_url_sync(net, &resolved_url, &effective_child_origin, None)
             } else {
                 None
             }
@@ -2521,6 +2706,7 @@ pub(crate) fn sync_iframe_node(
                 child_charset,
                 &child_ct,
                 lg,
+                sandbox.scripts_allowed(),
             );
             let saved_global = vm.global;
             let top_val = frames.borrow().top_window;
@@ -2563,8 +2749,13 @@ pub(crate) fn sync_iframe_node(
                             if script_url.starts_with("http://")
                                 || script_url.starts_with("https://")
                             {
-                                fetch_iframe_url_sync(net, &script_url, &effective_child_origin)
-                                    .map(|(body, _, _)| body)
+                                fetch_iframe_url_sync(
+                                    net,
+                                    &script_url,
+                                    &effective_child_origin,
+                                    None,
+                                )
+                                .map(|(body, _, _)| body)
                             } else {
                                 None
                             }
@@ -2666,6 +2857,7 @@ pub(crate) fn fetch_iframe_url_sync(
     net: &SharedNetBridge,
     url: &str,
     origin: &str,
+    fallback_charset: Option<&str>,
 ) -> Option<(String, &'static str, String)> {
     let engine = std::sync::Arc::clone(&net.borrow().fetch_engine);
     let req = rix_net::FetchRequest {
@@ -2710,7 +2902,11 @@ pub(crate) fn fetch_iframe_url_sync(
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| "text/html".to_string());
         let http_cs = extract_content_type_charset(&r.headers);
-        let (decoded, cs) = decode_html_bytes(&r.body, http_cs.as_deref());
+        let (decoded, cs) = rix_html::decode_html_bytes_with_fallback(
+            &r.body,
+            http_cs.as_deref(),
+            fallback_charset,
+        );
         (decoded, cs, ct)
     })
 }
@@ -3872,6 +4068,7 @@ fn install_window_browsing_context(
                     "UTF-8",
                     "text/html",
                     proxy_h,
+                    true,
                 );
                 if let Some(WindowProxyKind::Auxiliary { doc, .. }) =
                     fr.borrow_mut().proxies.get_mut(&proxy_h)

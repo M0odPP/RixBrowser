@@ -488,12 +488,36 @@ const WPT_TESTHARNESS_SHIM: &str = r#"
             test(function() { fn.apply(this, rest); }, name);
         }
     }
+    let singleTest = null;
+    let explicitDonePending = false;
     function setup(fnOrProps, maybeProps) {
+        const props = (typeof fnOrProps === "object" && fnOrProps !== null) ? fnOrProps : maybeProps;
+        if (props && props.single_test && !singleTest) {
+            const title = (typeof document !== "undefined" && document && document.title) || "Single test";
+            singleTest = new TestObj(title);
+            singleTest._isAsync = true;
+            pendingAsync++;
+        }
+        if (props && props.explicit_done && !explicitDonePending) {
+            explicitDonePending = true;
+            pendingAsync++;
+        }
         if (typeof fnOrProps === "function") {
-            try { fnOrProps(); } catch (e) { harnessStatus = 1; harnessErrors.push(String(e)); }
+            try { fnOrProps(); } catch (e) {
+                if (singleTest && !singleTest._done) singleTest._fail(e);
+                else { harnessStatus = 1; harnessErrors.push(String(e)); }
+            }
         }
     }
-    function done() {}
+    function done() {
+        if (singleTest && !singleTest._done) {
+            singleTest.done();
+        }
+        if (explicitDonePending) {
+            explicitDonePending = false;
+            pendingAsync = Math.max(0, pendingAsync - 1);
+        }
+    }
     function add_start_callback(fn) { try { fn(); } catch (_) {} }
     function add_completion_callback() {}
     function add_result_callback() {}
@@ -908,7 +932,13 @@ fn classify_wpt_file(wpt_root: &Path, path: &Path, html: &str) -> ClassifiedTest
                 }
             }
             "script" => {
-                if let Some(src) = elem.get_attribute("src") {
+                let script_src = if &*elem.name.ns == "http://www.w3.org/2000/svg" {
+                    elem.get_attribute("href")
+                        .or_else(|| elem.get_attribute("xlink:href"))
+                } else {
+                    elem.get_attribute("src")
+                };
+                if let Some(src) = script_src {
                     if src.contains("testharness.js") {
                         has_testharness = true;
                     }
@@ -1810,6 +1840,25 @@ fn start_local_wpt_server(wpt_root: PathBuf) -> Result<LocalWptServer> {
                 } else {
                     root.join(rel)
                 };
+                if rel == "resources/testharnessreport.js" {
+                    let report_js = concat!(
+                        "(function(){if(typeof add_completion_callback==='function'){",
+                        "add_completion_callback(function(tests,status){",
+                        "window.__rix_ff_wpt_result=JSON.stringify({",
+                        "harness_ok:!status||status.status===0,",
+                        "subtests:(tests||[]).map(function(t){return{",
+                        "name:String(t.name||''),pass:t.status===0,",
+                        "message:t.message?String(t.message):null};})});});}})();"
+                    );
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/javascript; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        report_js.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(report_js.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
                 if file_path.is_dir() {
                     file_path = file_path.join("index.html");
                 }
@@ -1958,10 +2007,33 @@ fn substitute_wpt_templates(input: &str, port: u16) -> String {
     )
 }
 
+fn read_wpt_headers_charset(path: &Path) -> Option<String> {
+    let hdr_path = PathBuf::from(format!("{}.headers", path.display()));
+    let hdr_txt = fs::read_to_string(hdr_path).ok()?;
+    for line in hdr_txt.lines() {
+        if let Some((k, v)) = line.trim().split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-type") {
+                for part in v.split(';').skip(1) {
+                    if let Some((pk, pv)) = part.trim().split_once('=') {
+                        if pk.trim().eq_ignore_ascii_case("charset") {
+                            let val = pv.trim().trim_matches('"').trim_matches('\'');
+                            if !val.is_empty() {
+                                return Some(val.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn run_wpt_testharness_file(
     wpt_root: &Path,
     path: &Path,
     html: &str,
+    charset: &'static str,
     server: &LocalWptServer,
 ) -> ScriptRunOutcome {
     let _enter = server.rt.enter();
@@ -1994,7 +2066,13 @@ fn run_wpt_testharness_file(
             let is_module = elem
                 .get_attribute("type")
                 .is_some_and(|t| t.trim().eq_ignore_ascii_case("module"));
-            if let Some(src) = elem.get_attribute("src") {
+            let script_src = if &*elem.name.ns == "http://www.w3.org/2000/svg" {
+                elem.get_attribute("href")
+                    .or_else(|| elem.get_attribute("xlink:href"))
+            } else {
+                elem.get_attribute("src")
+            };
+            if let Some(src) = script_src {
                 if src.contains("testharnessreport.js") {
                     ext_scripts.insert(src.to_string(), String::new());
                 } else if src.contains("testharness.js") {
@@ -2082,7 +2160,8 @@ fn run_wpt_testharness_file(
         &mut rt.host.borrow_mut().layout_engine.assets,
     );
 
-    let script_errors = rt.load_document_with_external_scripts(html, &ext_scripts);
+    let script_errors =
+        rt.load_document_with_external_scripts_and_charset(html, Some(charset), &ext_scripts);
     let has_pending = |rt: &mut ContentRuntime| -> bool {
         rt.eval_script("typeof __rix_wpt_pending === 'function' ? __rix_wpt_pending() : 0")
             .ok()
@@ -2240,24 +2319,30 @@ pub fn run_official_wpt_suite(opts: &OfficialWptOptions) -> Result<OfficialWptRe
     collect_wpt_html_files(&suite_dir, &mut files)?;
     files.sort();
 
-    let mut testharness_jobs: Vec<(PathBuf, String)> = Vec::new();
+    let mut testharness_jobs: Vec<(PathBuf, String, &'static str)> = Vec::new();
     let mut reftest_jobs: Vec<(PathBuf, String, bool, PathBuf)> = Vec::new();
 
     for path in files {
-        let Ok(raw) = fs::read_to_string(&path) else {
+        let Ok(raw_bytes) = fs::read(&path) else {
             continue;
         };
         let is_js_test = path
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.ends_with(".any.js") || n.ends_with(".window.js"));
+        let (raw, decoded_charset) = if is_js_test {
+            (String::from_utf8_lossy(&raw_bytes).into_owned(), "UTF-8")
+        } else {
+            let http_cs = read_wpt_headers_charset(&path);
+            rix_html::decode_html_bytes(&raw_bytes, http_cs.as_deref())
+        };
         if is_js_test {
             if matches!(
                 opts.kind,
                 OfficialWptKind::All | OfficialWptKind::Testharness
             ) {
                 if let Some(synth_html) = synthesize_wpt_js_html(&path, &raw) {
-                    testharness_jobs.push((path, synth_html));
+                    testharness_jobs.push((path, synth_html, "UTF-8"));
                 }
             }
         } else {
@@ -2273,7 +2358,7 @@ pub fn run_official_wpt_suite(opts: &OfficialWptOptions) -> Result<OfficialWptRe
                         OfficialWptKind::All | OfficialWptKind::Testharness
                     ) =>
                 {
-                    testharness_jobs.push((path, raw));
+                    testharness_jobs.push((path, raw, decoded_charset));
                 }
                 _ => {}
             }
@@ -2303,9 +2388,9 @@ pub fn run_official_wpt_suite(opts: &OfficialWptOptions) -> Result<OfficialWptRe
         .install(|| {
             testharness_jobs
                 .par_iter()
-                .map(|(path, html)| {
+                .map(|(path, html, charset)| {
                     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_wpt_testharness_file(&wpt_root, path, html, &local_server)
+                        run_wpt_testharness_file(&wpt_root, path, html, charset, &local_server)
                     }))
                     .map_err(|payload| {
                         let msg = payload

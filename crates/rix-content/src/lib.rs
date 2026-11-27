@@ -658,7 +658,20 @@ impl ContentRuntime {
                         };
                         custom_elements::upgrade_subtree(&mut self.vm, &self.host, doc_root, false);
                         self.eval_script(&code)?;
+                        let has_ce_defs = self
+                            .host
+                            .borrow()
+                            .custom_elements_state
+                            .borrow()
+                            .has_any_definitions();
+                        parser
+                            .borrow_mut()
+                            .set_pause_on_custom_elements(has_ce_defs);
                     }
+                }
+                ParserStreamStep::CustomElement(ce_id) => {
+                    custom_elements::upgrade_subtree(&mut self.vm, &self.host, ce_id, true);
+                    parser.borrow_mut().finish_pending_custom_element_insert();
                 }
                 ParserStreamStep::Done => break,
             }
@@ -779,6 +792,15 @@ impl ContentRuntime {
         html: &str,
         external_scripts: &HashMap<String, String>,
     ) -> Vec<String> {
+        self.load_document_with_external_scripts_and_charset(html, None, external_scripts)
+    }
+
+    pub fn load_document_with_external_scripts_and_charset(
+        &mut self,
+        html: &str,
+        charset_override: Option<&str>,
+        external_scripts: &HashMap<String, String>,
+    ) -> Vec<String> {
         struct PendingScript {
             node_id: NodeId,
             url: String,
@@ -789,9 +811,10 @@ impl ContentRuntime {
         let doc_url = self.web_apis.borrow().location_url.clone();
         let doc_origin = doc_url.origin().ascii_serialization();
         let doc_rc = Rc::clone(&self.host.borrow().document);
-        doc_rc
-            .borrow_mut()
-            .set_character_set(rix_html::detect_html_charset(html.as_bytes()));
+        let detected_charset = charset_override
+            .map(str::to_string)
+            .unwrap_or_else(|| rix_html::detect_html_charset(html.as_bytes()).to_string());
+        doc_rc.borrow_mut().set_character_set(detected_charset);
         let parser = Rc::new(RefCell::new(HtmlParserStream::with_document(doc_rc)));
         parser.borrow_mut().feed(html);
         self.host.borrow_mut().active_parser = Some(Rc::clone(&parser));
@@ -849,7 +872,13 @@ impl ContentRuntime {
                         match doc.get(script_id) {
                             Some(NodeData::Element(e)) => {
                                 let ty = e.get_attribute("type").unwrap_or("").trim().to_string();
-                                let src = e.get_attribute("src").map(|s| s.trim().to_string());
+                                let src = if &*e.name.ns == crate::dom_interfaces::SVG_NS {
+                                    e.get_attribute("href")
+                                        .or_else(|| e.get_attribute("xlink:href"))
+                                        .map(|s| s.trim().to_string())
+                                } else {
+                                    e.get_attribute("src").map(|s| s.trim().to_string())
+                                };
                                 let is_defer = e.has_attribute("defer");
                                 let is_nomodule = e.has_attribute("nomodule");
                                 let text = doc.inner_text(script_id);
@@ -894,17 +923,27 @@ impl ContentRuntime {
                     }
 
                     let (script_url, code) = if let Some(ref raw_src) = src {
-                        let resolved = doc_url
-                            .join(raw_src)
-                            .map(|u| u.to_string())
-                            .unwrap_or_else(|_| raw_src.clone());
-                        let fetched = external_scripts
-                            .get(&resolved)
-                            .or_else(|| external_scripts.get(raw_src))
-                            .cloned();
-                        match fetched {
-                            Some(src_code) => (resolved, src_code),
-                            None => continue,
+                        if raw_src.starts_with("data:") {
+                            match crate::fetch_ws::decode_data_url(raw_src) {
+                                Some((_, bytes)) => (
+                                    raw_src.clone(),
+                                    String::from_utf8_lossy(&bytes).into_owned(),
+                                ),
+                                None => continue,
+                            }
+                        } else {
+                            let resolved = doc_url
+                                .join(raw_src)
+                                .map(|u| u.to_string())
+                                .unwrap_or_else(|_| raw_src.clone());
+                            let fetched = external_scripts
+                                .get(&resolved)
+                                .or_else(|| external_scripts.get(raw_src))
+                                .cloned();
+                            match fetched {
+                                Some(src_code) => (resolved, src_code),
+                                None => continue,
+                            }
                         }
                     } else {
                         inline_module_idx += 1;
@@ -995,6 +1034,15 @@ impl ContentRuntime {
                             );
                         }
                         self.host.borrow_mut().current_script = None;
+                        let has_ce_defs = self
+                            .host
+                            .borrow()
+                            .custom_elements_state
+                            .borrow()
+                            .has_any_definitions();
+                        parser
+                            .borrow_mut()
+                            .set_pause_on_custom_elements(has_ce_defs);
                         if let Err(err) = res {
                             let msg = format_eval_error(&self.vm, &err);
                             self.web_apis
@@ -1003,6 +1051,10 @@ impl ContentRuntime {
                             errors.push(msg);
                         }
                     }
+                }
+                ParserStreamStep::CustomElement(ce_id) => {
+                    custom_elements::upgrade_subtree(&mut self.vm, &self.host, ce_id, true);
+                    parser.borrow_mut().finish_pending_custom_element_insert();
                 }
                 ParserStreamStep::Done => break,
             }
@@ -1020,6 +1072,7 @@ impl ContentRuntime {
 
         // Execute deferred classic scripts (with `document.currentScript` bound per HTML §4.12.1.1)
         // and ES modules in document order before DOMContentLoaded.
+        let had_deferred = !deferred_scripts.is_empty();
         for script in deferred_scripts {
             let t_sc = std::time::Instant::now();
             let (sr0, ly0) = {
@@ -1076,6 +1129,17 @@ impl ContentRuntime {
             }
         }
 
+        if had_deferred {
+            // WHATWG HTML §13.2.7: DOMContentLoaded is queued as a task after deferred scripts run,
+            // so zero-delay tasks queued synchronously by a defer script execute before it.
+            let seq_watermark = self.event_loop.borrow().next_seq();
+            crate::event_loop::drain_due_timers_before_seq(
+                &self.event_loop,
+                &mut self.vm,
+                seq_watermark,
+            );
+        }
+
         let t_dcl = std::time::Instant::now();
         let (sr0, ly0) = {
             let h = self.host.borrow();
@@ -1083,7 +1147,7 @@ impl ContentRuntime {
         };
         self.host.borrow_mut().ready_state = "interactive".to_string();
         let doc_root = self.host.borrow().document.borrow().root();
-        let _ = self.dispatch_node_event(doc_root, "DOMContentLoaded", true, true, &[]);
+        let _ = self.dispatch_node_event(doc_root, "DOMContentLoaded", true, false, &[]);
         let dcl_ms = t_dcl.elapsed().as_secs_f32() * 1000.0;
         if dcl_ms >= 25.0 {
             let (sr1, ly1) = {
@@ -1115,15 +1179,29 @@ impl ContentRuntime {
             (h.style_recalc_count, h.layout_count)
         };
         self.host.borrow_mut().ready_state = "complete".to_string();
-        let global = self.vm.global;
-        fire_object_event(
+        crate::events::fire_window_document_event(
             &mut self.vm,
             &self.host,
             &self.events,
             &self.event_loop,
-            global,
+            doc_root,
             "load",
+            false,
+            false,
+            "Event",
             &[],
+        );
+        crate::events::fire_window_document_event(
+            &mut self.vm,
+            &self.host,
+            &self.events,
+            &self.event_loop,
+            doc_root,
+            "pageshow",
+            true,
+            true,
+            "PageTransitionEvent",
+            &[("persisted", JsValue::FALSE)],
         );
         let load_ms = t_load.elapsed().as_secs_f32() * 1000.0;
         if load_ms >= 25.0 {
