@@ -3306,6 +3306,7 @@ fn run_click_activation_behavior(
         FormReset(NodeId),
         FormSubmit(NodeId),
         PopoverTarget(NodeId, String, NodeId),
+        AnchorFragment(String),
     }
 
     let action = {
@@ -3459,19 +3460,54 @@ fn run_click_activation_behavior(
                 cur = doc.parent(c);
             }
         }
+        // HTML §4.6.3: `<a href="#...">` / `<area href="#...">` fragment navigation activation.
+        if matches!(act, ClickAction::None) {
+            let mut cur = Some(nid);
+            while let Some(c) = cur {
+                if let Some(NodeData::Element(ce)) = doc.get(c) {
+                    let tag = ce.name.local.as_str();
+                    if tag.eq_ignore_ascii_case("a") || tag.eq_ignore_ascii_case("area") {
+                        if let Some(href) = ce.get_attribute("href") {
+                            let trimmed = href.trim();
+                            if let Some(frag) = trimmed.strip_prefix('#') {
+                                act = ClickAction::AnchorFragment(frag.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+                cur = doc.parent(c);
+            }
+        }
         act
     };
 
     match action {
         ClickAction::None => {}
+        ClickAction::AnchorFragment(frag) => {
+            let hook = host.borrow().fragment_nav_hook.clone();
+            if let Some(cb) = hook {
+                cb(vm, &frag);
+            } else {
+                host.borrow_mut()
+                    .update_target_fragment((!frag.is_empty()).then_some(frag.as_str()));
+            }
+        }
         ClickAction::Checkbox(node) => {
             {
                 let mut hs = host.borrow_mut();
                 {
                     let mut doc = hs.document.borrow_mut();
                     if let Some(NodeData::Element(e)) = doc.get_mut(node) {
-                        let next = !e.pseudo_state.contains(ElementState::CHECKED);
-                        if next {
+                        let currently_checked =
+                            if e.pseudo_state.contains(ElementState::CHECKED_DIRTY) {
+                                e.pseudo_state.contains(ElementState::CHECKED)
+                            } else {
+                                e.pseudo_state.contains(ElementState::CHECKED)
+                                    || e.has_attribute("checked")
+                            };
+                        e.pseudo_state.insert(ElementState::CHECKED_DIRTY);
+                        if !currently_checked {
                             e.pseudo_state.insert(ElementState::CHECKED);
                         } else {
                             e.pseudo_state.remove(ElementState::CHECKED);
@@ -3479,7 +3515,10 @@ fn run_click_activation_behavior(
                         e.pseudo_state.remove(ElementState::INDETERMINATE);
                     }
                 }
-                hs.mark_node_style_dirty(node);
+                hs.invalidate_element_state(
+                    node,
+                    ElementState::CHECKED | ElementState::INDETERMINATE,
+                );
             }
             let _ = fire_dom_node_event(
                 vm,

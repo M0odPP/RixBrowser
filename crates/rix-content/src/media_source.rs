@@ -3528,6 +3528,112 @@ fn install_media_element_mse_hooks(
                                 fire_object_event(vm, &h_t, &ev_t, &el_t, elem_h, "error", &[]);
                             }
                         });
+                } else if !url.trim().is_empty() {
+                    let resolved = wa_s
+                        .borrow()
+                        .location_url
+                        .join(url.trim())
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|_| url.clone());
+                    let origin = wa_s.borrow().location_url.origin().ascii_serialization();
+                    let blob_bytes = if url.starts_with("blob:") {
+                        wa_s.borrow().object_urls.get(&url).cloned()
+                    } else {
+                        None
+                    };
+                    let me_opt = ms_s.borrow().media_elements.clone();
+                    if let Some(me) = me_opt {
+                        me.borrow_mut().ensure_player(nid).reset_for_source_change();
+                        crate::media_elements::sync_media_pseudo_state(
+                            &h_s,
+                            nid,
+                            Some(false),
+                            Some(false),
+                            None,
+                        );
+                        let h_t = Rc::clone(&h_s);
+                        let ev_t = Rc::clone(&ev_s);
+                        let el_t = Rc::clone(&el_s);
+                        el_s.borrow_mut()
+                            .post_host_task(TaskPriority::Networking, move |vm| {
+                                let bytes_opt = if let Some(b) = blob_bytes {
+                                    Some(b)
+                                } else if resolved.starts_with("http://")
+                                    || resolved.starts_with("https://")
+                                {
+                                    let net_opt = me.borrow().net.clone();
+                                    net_opt.and_then(|net| {
+                                        crate::media_elements::fetch_media_bytes_sync(
+                                            &net, &resolved, &origin,
+                                        )
+                                    })
+                                } else {
+                                    None
+                                };
+                                let Some(bytes) = bytes_opt else {
+                                    return;
+                                };
+                                if bytes.is_empty() {
+                                    return;
+                                }
+                                {
+                                    let mut me_b = me.borrow_mut();
+                                    let p = me_b.ensure_player(nid);
+                                    let _ = p.load_container_bytes(&bytes);
+                                    p.current_src = resolved.clone();
+                                    if p.ready_state < crate::media_elements::HAVE_ENOUGH_DATA {
+                                        p.ready_state = crate::media_elements::HAVE_ENOUGH_DATA;
+                                    }
+                                    p.network_state = crate::media_elements::NETWORK_IDLE;
+                                    if !p.duration_s.is_finite() || p.duration_s <= 0.0 {
+                                        p.duration_s = 10.0;
+                                    }
+                                    p.has_fired_loadedmetadata = true;
+                                    p.has_fired_loadeddata = true;
+                                    p.has_fired_canplay = true;
+                                    p.has_fired_canplaythrough = true;
+                                }
+                                let elem_v = wrap_node(vm, &h_t, nid);
+                                if let Some(elem_h) = elem_v.as_object() {
+                                    fire_object_event(
+                                        vm,
+                                        &h_t,
+                                        &ev_t,
+                                        &el_t,
+                                        elem_h,
+                                        "loadedmetadata",
+                                        &[],
+                                    );
+                                    fire_object_event(
+                                        vm,
+                                        &h_t,
+                                        &ev_t,
+                                        &el_t,
+                                        elem_h,
+                                        "loadeddata",
+                                        &[],
+                                    );
+                                    fire_object_event(
+                                        vm,
+                                        &h_t,
+                                        &ev_t,
+                                        &el_t,
+                                        elem_h,
+                                        "canplay",
+                                        &[],
+                                    );
+                                    fire_object_event(
+                                        vm,
+                                        &h_t,
+                                        &ev_t,
+                                        &el_t,
+                                        elem_h,
+                                        "canplaythrough",
+                                        &[],
+                                    );
+                                }
+                            });
+                    }
                 }
                 Ok(JsValue::UNDEFINED)
             },

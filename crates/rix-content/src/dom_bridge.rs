@@ -184,6 +184,7 @@ pub struct HostState {
     full_sheets_rebuild: bool,
     pub(crate) css_animations_sync_dirty: bool,
     pub(crate) css_anim_flush_hook: Option<CssAnimFlushHook>,
+    pub(crate) fragment_nav_hook: Option<FragmentNavHook>,
     pub(crate) subdoc_link_css: HashMap<NodeId, String>,
     last_inline_style_hash: u64,
     last_style_revs: Option<(u64, u64)>,
@@ -244,6 +245,9 @@ pub struct HostState {
 
 /// Callback invoked to flush pending CSS animations/transitions before layout queries.
 pub(crate) type CssAnimFlushHook = Rc<dyn Fn(&mut JsVm)>;
+
+/// Callback invoked when `<a href="#...">` activation navigates to an in-page fragment.
+pub(crate) type FragmentNavHook = Rc<dyn Fn(&mut JsVm, &str)>;
 
 /// Callback invoked when an `<iframe>` element is connected into a live document.
 pub(crate) type IframeConnectHook = Rc<dyn Fn(&mut JsVm, NodeId)>;
@@ -317,6 +321,12 @@ fn is_layout_or_presentational_attr(name: &str) -> bool {
             | "slot"
             | "name"
             | "viewbox"
+            | "headingoffset"
+            | "headingreset"
+            | "muted"
+            | "min"
+            | "max"
+            | "part"
             | "preserveaspectratio"
             | "d"
             | "points"
@@ -424,6 +434,7 @@ impl HostState {
             full_sheets_rebuild: true,
             css_animations_sync_dirty: true,
             css_anim_flush_hook: None,
+            fragment_nav_hook: None,
             subdoc_link_css: HashMap::new(),
             last_inline_style_hash: 0,
             last_style_revs: None,
@@ -577,6 +588,99 @@ impl HostState {
         let mut doc = doc_rc.borrow_mut();
         self.style_ctx.set_focused(&mut doc, target, visible);
         doc.bump_style_revision();
+    }
+
+    /// HTML Living Standard §6.6.3 Focus Fixup Rule (invoked once per rendering update before
+    /// `requestAnimationFrame` callbacks): if the currently focused element has become
+    /// non-focusable (disconnected or itself / an ancestor has computed `display: none`), clear
+    /// focus so `:focus`, `:focus-within`, and `:focus-visible` stop matching.
+    pub fn run_focus_fixup(&mut self) {
+        let Some(fid) = self.active_element else {
+            return;
+        };
+        if self.styles_need_flush() {
+            let _ = self.ensure_styles();
+        }
+        let hidden_or_disconnected = {
+            let doc = self.document.borrow();
+            if !doc.is_connected(fid) {
+                true
+            } else {
+                let mut cur = Some(fid);
+                let mut hidden = false;
+                while let Some(c) = cur {
+                    if let Some(st) = self.style_ctx.style_for(c) {
+                        if st.display == rix_css::DisplayMode::None {
+                            hidden = true;
+                            break;
+                        }
+                    }
+                    cur = if let Some(p) = doc.parent(c) {
+                        Some(p)
+                    } else if let Some(NodeData::ShadowRoot { host, .. }) = doc.get(c) {
+                        Some(*host)
+                    } else {
+                        None
+                    };
+                }
+                hidden
+            }
+        };
+        if hidden_or_disconnected {
+            self.active_element = None;
+            let doc_rc = Rc::clone(&self.document);
+            let mut doc = doc_rc.borrow_mut();
+            self.style_ctx.set_focused(&mut doc, None, false);
+            doc.bump_style_revision();
+            let _ = self.style_ctx.restyle_dirty(&mut doc);
+        }
+    }
+
+    /// HTML §7.4.6.3: updates `ElementState::TARGET` to the first element matching `fragment`
+    /// (by `id` or `<a name>`) and invalidates `:target` selector dependencies.
+    pub fn update_target_fragment(&mut self, fragment: Option<&str>) {
+        let frag = fragment.unwrap_or("");
+        let (old_targets, new_target) = {
+            let doc = self.document.borrow();
+            let mut old = Vec::new();
+            let mut found = None;
+            for nid in doc.descendants(doc.root()) {
+                if let Some(NodeData::Element(e)) = doc.get(nid) {
+                    if e.pseudo_state.contains(rix_dom::ElementState::TARGET) {
+                        old.push(nid);
+                    }
+                    if !frag.is_empty()
+                        && found.is_none()
+                        && (e.get_attribute("id") == Some(frag)
+                            || (e.name.local.as_str().eq_ignore_ascii_case("a")
+                                && e.get_attribute("name") == Some(frag)))
+                    {
+                        found = Some(nid);
+                    }
+                }
+            }
+            (old, found)
+        };
+        let mut changed_nodes = Vec::new();
+        {
+            let doc_rc = Rc::clone(&self.document);
+            let mut doc = doc_rc.borrow_mut();
+            for old_id in old_targets {
+                if Some(old_id) != new_target
+                    && doc.set_element_state(old_id, rix_dom::ElementState::TARGET, false)
+                {
+                    changed_nodes.push(old_id);
+                }
+            }
+            if let Some(nt) = new_target {
+                if doc.set_element_state(nt, rix_dom::ElementState::TARGET, true) {
+                    changed_nodes.push(nt);
+                }
+            }
+        }
+        for nid in changed_nodes {
+            self.invalidate_element_state(nid, rix_dom::ElementState::TARGET);
+        }
     }
 
     /// Invalidates CSS rules affected by a pseudo-state bit change on `nid`.
@@ -1135,11 +1239,11 @@ impl HostState {
             let mut doc = self.document.borrow_mut();
             let _ = ctx.cascade_full(&mut doc);
         }
+        self.style_ctx = ctx;
         let post_revs = {
             let doc = self.document.borrow();
             (doc.revision(), doc.style_revision())
         };
-        self.style_ctx = ctx;
         self.sheets_dirty = false;
         self.full_sheets_rebuild = false;
         self.cached_inline_sheet_hashes = new_sheet_hashes;
@@ -2775,6 +2879,80 @@ pub(crate) fn arg(args: &[JsValue], i: usize) -> JsValue {
     args.get(i).copied().unwrap_or(JsValue::UNDEFINED)
 }
 
+fn option_explicitly_selected(e: &rix_dom::ElementData) -> bool {
+    if e.pseudo_state
+        .contains(rix_dom::ElementState::CHECKED_DIRTY)
+    {
+        e.pseudo_state.contains(rix_dom::ElementState::CHECKED)
+    } else {
+        e.pseudo_state.contains(rix_dom::ElementState::CHECKED) || e.has_attribute("selected")
+    }
+}
+
+fn select_selected_options(doc: &Document, select_id: NodeId) -> Vec<NodeId> {
+    let is_multi = matches!(
+        doc.get(select_id),
+        Some(NodeData::Element(se))
+            if se.has_attribute("multiple")
+                || se
+                    .get_attribute("size")
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .is_some_and(|n| n > 1)
+    );
+    let opts: Vec<NodeId> = doc
+        .descendants(select_id)
+        .filter(|&n| {
+            n != select_id
+                && matches!(doc.get(n), Some(NodeData::Element(e)) if e.name.local.eq_str_ignore_ascii_case("option"))
+        })
+        .collect();
+    let explicit: Vec<NodeId> = opts
+        .iter()
+        .copied()
+        .filter(
+            |&n| matches!(doc.get(n), Some(NodeData::Element(e)) if option_explicitly_selected(e)),
+        )
+        .collect();
+    if !explicit.is_empty() {
+        if is_multi {
+            return explicit;
+        }
+        return vec![*explicit.last().unwrap()];
+    }
+    if is_multi {
+        return Vec::new();
+    }
+    opts.into_iter()
+        .find(|&n| {
+            let disabled = matches!(doc.get(n), Some(NodeData::Element(e)) if e.has_attribute("disabled"))
+                || doc.parent(n).is_some_and(|p| {
+                    matches!(doc.get(p), Some(NodeData::Element(pe)) if pe.name.local.eq_str_ignore_ascii_case("optgroup") && pe.has_attribute("disabled"))
+                });
+            !disabled
+        })
+        .into_iter()
+        .collect()
+}
+
+fn option_is_selected_in_doc(doc: &Document, opt_id: NodeId) -> bool {
+    let Some(NodeData::Element(e)) = doc.get(opt_id) else {
+        return false;
+    };
+    if option_explicitly_selected(e) {
+        return true;
+    }
+    let mut cur = doc.parent(opt_id);
+    while let Some(a) = cur {
+        if let Some(NodeData::Element(ae)) = doc.get(a) {
+            if ae.name.local.eq_str_ignore_ascii_case("select") {
+                return select_selected_options(doc, a).contains(&opt_id);
+            }
+        }
+        cur = doc.parent(a);
+    }
+    false
+}
+
 fn wrap_node_list(vm: &mut JsVm, host: &SharedHost, nodes: Vec<NodeId>) -> JsValue {
     let arr = vm.alloc_array();
     for nid in nodes {
@@ -3272,6 +3450,7 @@ pub(crate) fn remove_node_from_parent(
     parent: NodeId,
     child: NodeId,
 ) -> Result<(), JsException> {
+    let has_live_ranges = !host.borrow().selection.ranges.is_empty();
     let (was_connected, prev_sib, next_sib, old_index) = {
         let _doc_rc = Rc::clone(&host.borrow().document);
         let doc = _doc_rc.borrow();
@@ -3282,7 +3461,11 @@ pub(crate) fn remove_node_from_parent(
                 "The node to be removed is not a child of this node",
             ));
         }
-        let idx = doc.children(parent).position(|c| c == child).unwrap_or(0);
+        let idx = if has_live_ranges {
+            doc.children(parent).position(|c| c == child).unwrap_or(0)
+        } else {
+            0
+        };
         (
             doc.is_connected(child),
             doc.previous_sibling(child),
@@ -3292,7 +3475,9 @@ pub(crate) fn remove_node_from_parent(
     };
     crate::custom_elements::freeze_subtree_registries(host, child);
     crate::dom_collections::adjust_node_iterators_for_remove(host, child);
-    crate::selection::adjust_ranges_for_remove_node(host, child, parent, old_index);
+    if has_live_ranges {
+        crate::selection::adjust_ranges_for_remove_node(host, child, parent, old_index);
+    }
     host.borrow().document.borrow_mut().remove_child(child);
     host.borrow_mut().invalidate_dom_mutation(parent, None);
     host.borrow().emit_mutation(DomMutation::ChildList {
@@ -3426,15 +3611,20 @@ pub(crate) fn insert_node_into_parent(
     }
 
     let parent_connected = host.borrow().document.borrow().is_connected(parent);
+    let has_live_ranges = !host.borrow().selection.ranges.is_empty();
     let (prev_sib, next_sib, insert_idx) = {
         let _doc_rc = Rc::clone(&host.borrow().document);
         let mut doc = _doc_rc.borrow_mut();
-        let insert_idx = match before {
-            Some(ref_n) => doc
-                .children(parent)
-                .position(|c| c == ref_n)
-                .unwrap_or_else(|| doc.children(parent).count()),
-            None => doc.children(parent).count(),
+        let insert_idx = if has_live_ranges {
+            match before {
+                Some(ref_n) => doc
+                    .children(parent)
+                    .position(|c| c == ref_n)
+                    .unwrap_or_else(|| doc.children(parent).count()),
+                None => doc.children(parent).count(),
+            }
+        } else {
+            0
         };
         let prev = before
             .and_then(|r| doc.previous_sibling(r))
@@ -3448,7 +3638,9 @@ pub(crate) fn insert_node_into_parent(
         }
         (prev, before, insert_idx)
     };
-    crate::selection::adjust_ranges_for_insert_nodes(host, parent, insert_idx, to_insert.len());
+    if has_live_ranges {
+        crate::selection::adjust_ranges_for_insert_nodes(host, parent, insert_idx, to_insert.len());
+    }
     host.borrow_mut()
         .invalidate_dom_mutation(parent, to_insert.first().copied());
     host.borrow().emit_mutation(DomMutation::ChildList {
@@ -4884,7 +5076,7 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
     define_host_accessor(vm, template_proto, "content", Some(g), None);
 
     // Reflected boolean attributes (`open`, `hidden`, `disabled`, `required`, `readOnly`,
-    // `checked`, `multiple`, `noValidate`, `selected`).
+    // `checked`, `multiple`, `noValidate`).
     for (prop, attr) in [
         ("open", "open"),
         ("hidden", "hidden"),
@@ -4894,7 +5086,6 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
         ("checked", "checked"),
         ("multiple", "multiple"),
         ("noValidate", "novalidate"),
-        ("selected", "selected"),
     ] {
         let h1 = Rc::clone(host);
         let g =
@@ -4981,6 +5172,62 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
         define_host_accessor(vm, label_proto, "htmlFor", Some(g), Some(s));
     }
 
+    // HTML Living Standard: `HTMLElement.prototype.headingOffset` & `headingReset`.
+    {
+        let hep = host.borrow().prototypes.html_element_proto;
+        let h1 = Rc::clone(host);
+        let g_off = vm.alloc_host_fn("get headingOffset", move |vm, t, _| {
+            let nid = require_node(vm, &h1, t)?;
+            let v = h1
+                .borrow()
+                .document
+                .borrow()
+                .get(nid)
+                .and_then(|d| match d {
+                    NodeData::Element(e) => e
+                        .get_attribute("headingoffset")
+                        .and_then(|raw| raw.trim().parse::<i32>().ok())
+                        .map(|n| n.clamp(0, 8)),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            Ok(JsValue::from_number(f64::from(v)))
+        });
+        let h2 = Rc::clone(host);
+        let s_off = vm.alloc_host_fn("set headingOffset", move |vm, t, args| {
+            let nid = require_node(vm, &h2, t)?;
+            let n = vm.to_number(arg(args, 0))?;
+            let clamped = if n.is_finite() {
+                (n.trunc() as i32).clamp(0, 8)
+            } else {
+                0
+            };
+            set_element_attr(vm, &h2, nid, "headingoffset", &clamped.to_string());
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, hep, "headingOffset", Some(g_off), Some(s_off));
+
+        let h1 = Rc::clone(host);
+        let g_rst = vm.alloc_host_fn("get headingReset", move |vm, t, _| {
+            let nid = require_node(vm, &h1, t)?;
+            let present = h1.borrow().document.borrow().get(nid).is_some_and(
+                |d| matches!(d, NodeData::Element(e) if e.has_attribute("headingreset")),
+            );
+            Ok(JsValue::from_bool(present))
+        });
+        let h2 = Rc::clone(host);
+        let s_rst = vm.alloc_host_fn("set headingReset", move |vm, t, args| {
+            let nid = require_node(vm, &h2, t)?;
+            if vm.to_boolean(arg(args, 0)) {
+                set_element_attr(vm, &h2, nid, "headingreset", "");
+            } else {
+                remove_element_attr(vm, &h2, nid, "headingreset");
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, hep, "headingReset", Some(g_rst), Some(s_rst));
+    }
+
     // HTML Living Standard §4.10.5.3.13: `HTMLInputElement.prototype.list` resolves the first
     // `<datalist>` element in the same tree whose `id` matches the input's `list` attribute,
     // and `HTMLInputElement.prototype.showPicker()` provides the browser picker API.
@@ -5043,6 +5290,7 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
             let s_chk = vm.alloc_host_fn("set checked", move |vm, t, args| {
                 let nid = require_node(vm, &h2, t)?;
                 let on = vm.to_boolean(arg(args, 0));
+                let mut invalidated_nodes = vec![nid];
                 {
                     let doc_rc = Rc::clone(&h2.borrow().document);
                     let mut doc = doc_rc.borrow_mut();
@@ -5086,11 +5334,14 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
                             .collect();
                         for peer in peers {
                             if let Some(NodeData::Element(pe)) = doc.get_mut(peer) {
+                                pe.pseudo_state.insert(rix_dom::ElementState::CHECKED_DIRTY);
                                 pe.pseudo_state.remove(rix_dom::ElementState::CHECKED);
+                                invalidated_nodes.push(peer);
                             }
                         }
                     }
                     if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
+                        e.pseudo_state.insert(rix_dom::ElementState::CHECKED_DIRTY);
                         if on {
                             e.pseudo_state.insert(rix_dom::ElementState::CHECKED);
                         } else {
@@ -5098,7 +5349,12 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
                         }
                     }
                 }
-                h2.borrow_mut().mark_node_style_dirty(nid);
+                for target_id in invalidated_nodes {
+                    h2.borrow_mut().invalidate_element_state(
+                        target_id,
+                        rix_dom::ElementState::CHECKED | rix_dom::ElementState::INDETERMINATE,
+                    );
+                }
                 Ok(JsValue::UNDEFINED)
             });
             define_host_accessor(vm, input_proto, "checked", Some(g_chk), Some(s_chk));
@@ -5155,7 +5411,8 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
                         }
                     }
                 }
-                h2.borrow_mut().mark_node_style_dirty(nid);
+                h2.borrow_mut()
+                    .invalidate_element_state(nid, rix_dom::ElementState::INDETERMINATE);
                 Ok(JsValue::UNDEFINED)
             });
             define_host_accessor(vm, input_proto, "indeterminate", Some(g_ind), Some(s_ind));
@@ -5334,20 +5591,20 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
     let h = Rc::clone(host);
     let g = vm.alloc_host_fn("get validity", move |vm, t, _| {
         let nid = require_node(vm, &h, t)?;
-        let (valid, value_missing, custom_error, _msg) = compute_element_validity(&h, nid);
+        let st = compute_element_validity_full(&h, nid);
         let obj = vm.alloc_ordinary_object();
         for (k, v) in [
-            ("valid", valid),
-            ("valueMissing", value_missing),
+            ("valid", st.valid),
+            ("valueMissing", st.value_missing),
             ("typeMismatch", false),
             ("patternMismatch", false),
             ("tooLong", false),
             ("tooShort", false),
-            ("rangeUnderflow", false),
-            ("rangeOverflow", false),
+            ("rangeUnderflow", st.range_underflow),
+            ("rangeOverflow", st.range_overflow),
             ("stepMismatch", false),
             ("badInput", false),
-            ("customError", custom_error),
+            ("customError", st.custom_error),
         ] {
             let key = vm.heap.intern_key(k);
             vm.heap.object_define_data(
@@ -5579,6 +5836,86 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
     });
     define_host_accessor(vm, ep, "options", Some(g), None);
 
+    // HTML §4.10.10: `HTMLOptionElement.prototype.selected` tracks selectedness state and
+    // enforces single-select exclusivity inside a non-`multiple` `<select>`.
+    let h1 = Rc::clone(host);
+    let g = vm.alloc_host_fn("get selected", move |vm, t, _| {
+        let nid = require_node(vm, &h1, t)?;
+        let sel = {
+            let doc_rc = Rc::clone(&h1.borrow().document);
+            let doc = doc_rc.borrow();
+            option_is_selected_in_doc(&doc, nid)
+        };
+        Ok(JsValue::from_bool(sel))
+    });
+    let h2 = Rc::clone(host);
+    let s = vm.alloc_host_fn("set selected", move |vm, t, args| {
+        let nid = require_node(vm, &h2, t)?;
+        let on = vm.to_boolean(arg(args, 0));
+        let affected = {
+            let doc_rc = Rc::clone(&h2.borrow().document);
+            let mut doc = doc_rc.borrow_mut();
+            let mut changed = vec![nid];
+            if on {
+                // Find owning `<select>`; if not `multiple`, deselect all sibling `<option>`s.
+                let mut select_anc = None;
+                let mut cur = doc.parent(nid);
+                while let Some(a) = cur {
+                    if let Some(NodeData::Element(ae)) = doc.get(a) {
+                        if ae.name.local.eq_str_ignore_ascii_case("select") {
+                            select_anc = Some((a, ae.has_attribute("multiple")));
+                            break;
+                        }
+                    }
+                    cur = doc.parent(a);
+                }
+                if let Some((sel_id, is_multi)) = select_anc {
+                    if !is_multi {
+                        let others: Vec<NodeId> = doc
+                            .descendants(sel_id)
+                            .filter(|&d| {
+                                d != nid
+                                    && matches!(doc.get(d), Some(NodeData::Element(oe)) if oe.name.local.eq_str_ignore_ascii_case("option"))
+                            })
+                            .collect();
+                        for o in others {
+                            if let Some(NodeData::Element(oe)) = doc.get_mut_untracked(o) {
+                                oe.pseudo_state.insert(rix_dom::ElementState::CHECKED_DIRTY);
+                                oe.pseudo_state.remove(rix_dom::ElementState::CHECKED);
+                            }
+                            changed.push(o);
+                        }
+                    }
+                }
+            }
+            if let Some(NodeData::Element(e)) = doc.get_mut_untracked(nid) {
+                e.pseudo_state.insert(rix_dom::ElementState::CHECKED_DIRTY);
+                e.pseudo_state.set(rix_dom::ElementState::CHECKED, on);
+            }
+            changed
+        };
+        {
+            let mut hb = h2.borrow_mut();
+            for opt_id in affected {
+                hb.invalidate_element_state(opt_id, rix_dom::ElementState::CHECKED);
+            }
+        }
+        Ok(JsValue::UNDEFINED)
+    });
+    define_host_accessor(vm, ep, "selected", Some(g), Some(s));
+
+    let h = Rc::clone(host);
+    let g = vm.alloc_host_fn("get selectedOptions", move |vm, t, _| {
+        let nid = require_node(vm, &h, t)?;
+        let list: Vec<NodeId> = {
+            let doc_rc = Rc::clone(&h.borrow().document);
+            let doc = doc_rc.borrow();
+            select_selected_options(&doc, nid)
+        };
+        Ok(wrap_node_list(vm, &h, list))
+    });
+    define_host_accessor(vm, ep, "selectedOptions", Some(g), None);
+
     let h = Rc::clone(host);
     let g = vm.alloc_host_fn("get selectedIndex", move |vm, t, _| {
         let nid = require_node(vm, &h, t)?;
@@ -5591,15 +5928,11 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
                     matches!(doc.get(n), Some(NodeData::Element(e)) if &*e.name.local == "option")
                 })
                 .collect();
-            if opts.is_empty() {
-                -1
-            } else {
-                opts.iter()
-                    .position(|&n| {
-                        matches!(doc.get(n), Some(NodeData::Element(e)) if e.has_attribute("selected"))
-                    })
-                    .unwrap_or(0) as i32
-            }
+            let selected = select_selected_options(&doc, nid);
+            selected
+                .first()
+                .and_then(|first_sel| opts.iter().position(|n| n == first_sel))
+                .map_or(-1, |i| i as i32)
         };
         Ok(JsValue::from_i32(idx))
     });
@@ -5747,46 +6080,114 @@ fn install_html5_element_semantics(vm: &mut JsVm, host: &SharedHost, ep: HeapHan
     }
 }
 
-fn compute_element_validity(host: &SharedHost, nid: NodeId) -> (bool, bool, bool, String) {
+struct ElementValidityResult {
+    valid: bool,
+    value_missing: bool,
+    range_underflow: bool,
+    range_overflow: bool,
+    custom_error: bool,
+    message: String,
+}
+
+fn compute_element_validity_full(host: &SharedHost, nid: NodeId) -> ElementValidityResult {
     let custom = host
         .borrow()
         .custom_validity
         .get(&nid)
         .cloned()
         .unwrap_or_default();
-    if !custom.is_empty() {
-        return (false, false, true, custom);
-    }
+    let custom_error = !custom.is_empty();
+    let mut value_missing = false;
+    let mut range_underflow = false;
+    let mut range_overflow = false;
+    let mut message = if custom_error { custom } else { String::new() };
+
     let doc_rc = Rc::clone(&host.borrow().document);
     let doc = doc_rc.borrow();
     if let Some(NodeData::Element(e)) = doc.get(nid) {
-        if !e.has_attribute("disabled") && e.has_attribute("required") {
-            let empty = match e.name.local.as_ref() {
-                "input" => {
-                    let ty = e.get_attribute("type").unwrap_or("text");
-                    if ty.eq_ignore_ascii_case("checkbox") || ty.eq_ignore_ascii_case("radio") {
-                        !e.has_attribute("checked")
-                    } else {
-                        e.get_attribute("value").unwrap_or("").is_empty()
+        if !e.has_attribute("disabled") && !e.has_attribute("readonly") {
+            let tag = e.name.local.as_ref();
+            if e.has_attribute("required") {
+                let empty = match tag {
+                    "input" => {
+                        let ty = e.get_attribute("type").unwrap_or("text");
+                        if ty.eq_ignore_ascii_case("checkbox") || ty.eq_ignore_ascii_case("radio") {
+                            if e.pseudo_state
+                                .contains(rix_dom::ElementState::CHECKED_DIRTY)
+                            {
+                                !e.pseudo_state.contains(rix_dom::ElementState::CHECKED)
+                            } else {
+                                !e.pseudo_state.contains(rix_dom::ElementState::CHECKED)
+                                    && !e.has_attribute("checked")
+                            }
+                        } else {
+                            e.get_attribute("value").unwrap_or("").is_empty()
+                        }
+                    }
+                    "textarea" => e
+                        .get_attribute("value")
+                        .map(str::is_empty)
+                        .unwrap_or_else(|| doc.inner_text(nid).is_empty()),
+                    _ => false,
+                };
+                if empty {
+                    value_missing = true;
+                    if message.is_empty() {
+                        message = "Please fill out this field.".to_string();
                     }
                 }
-                "textarea" => e
-                    .get_attribute("value")
-                    .map(|s| s.is_empty())
-                    .unwrap_or_else(|| doc.inner_text(nid).is_empty()),
-                _ => false,
-            };
-            if empty {
-                return (
-                    false,
-                    true,
-                    false,
-                    "Please fill out this field.".to_string(),
-                );
+            }
+            if tag.eq_ignore_ascii_case("input") {
+                let ty = e
+                    .get_attribute("type")
+                    .unwrap_or("text")
+                    .trim()
+                    .to_ascii_lowercase();
+                if matches!(ty.as_str(), "number" | "range") {
+                    let val_str = e.get_attribute("value").unwrap_or("").trim();
+                    if let Ok(v) = val_str.parse::<f64>() {
+                        if let Some(mn) = e
+                            .get_attribute("min")
+                            .and_then(|s| s.trim().parse::<f64>().ok())
+                        {
+                            if v < mn {
+                                range_underflow = true;
+                                if message.is_empty() {
+                                    message =
+                                        format!("Value must be greater than or equal to {mn}.");
+                                }
+                            }
+                        }
+                        if let Some(mx) = e
+                            .get_attribute("max")
+                            .and_then(|s| s.trim().parse::<f64>().ok())
+                        {
+                            if v > mx {
+                                range_overflow = true;
+                                if message.is_empty() {
+                                    message = format!("Value must be less than or equal to {mx}.");
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-    (true, false, false, String::new())
+    let valid = !custom_error && !value_missing && !range_underflow && !range_overflow;
+    ElementValidityResult {
+        valid,
+        value_missing,
+        range_underflow,
+        range_overflow,
+        custom_error,
+        message,
+    }
+}
+
+fn compute_element_validity(host: &SharedHost, nid: NodeId) -> (bool, bool, bool, String) {
+    let st = compute_element_validity_full(host, nid);
+    (st.valid, st.value_missing, st.custom_error, st.message)
 }
 
 pub(crate) fn alloc_dom_rect(vm: &mut JsVm, host: &SharedHost, rect: Rect) -> HeapHandle {

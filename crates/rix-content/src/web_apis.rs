@@ -961,7 +961,7 @@ pub fn install_web_apis(
     install_form_data(vm, host, &web_apis);
     install_structured_clone(vm, &web_apis);
     install_abort_controller(vm, host, events, event_loop, &web_apis);
-    install_location_and_history(vm, host, &web_apis);
+    install_location_and_history(vm, host, events, event_loop, &web_apis);
     install_web_storage(vm, &web_apis);
     install_performance(vm, event_loop, &web_apis);
     install_console(vm, &web_apis);
@@ -4371,11 +4371,81 @@ fn make_webidl_interface(vm: &mut JsVm, name: &str) -> (HeapHandle, HeapHandle) 
     (ctor, proto)
 }
 
-fn install_location_and_history(vm: &mut JsVm, host: &SharedHost, web_apis: &SharedWebApis) {
+fn navigate_location_fragment(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
+    raw_frag: &str,
+) {
+    let trimmed = raw_frag.strip_prefix('#').unwrap_or(raw_frag);
+    let (old_url, new_url, changed) = {
+        let mut st = web_apis.borrow_mut();
+        let old = st.location_url.as_str().to_string();
+        let prev_frag = st.location_url.fragment().unwrap_or("").to_string();
+        if trimmed.is_empty() {
+            st.location_url.set_fragment(None);
+        } else {
+            st.location_url.set_fragment(Some(trimmed));
+        }
+        let next = st.location_url.as_str().to_string();
+        let diff = prev_frag != trimmed || old != next;
+        (old, next, diff)
+    };
+    host.borrow_mut()
+        .update_target_fragment((!trimmed.is_empty()).then_some(trimmed));
+    if changed {
+        let win_h = vm.global;
+        let h_t = Rc::clone(host);
+        let ev_t = Rc::clone(events);
+        let el_t = Rc::clone(event_loop);
+        event_loop
+            .borrow_mut()
+            .post_host_task(crate::event_loop::TaskPriority::Timer, move |vm| {
+                let old_v = JsValue::from_string(vm.heap.alloc_string(&old_url));
+                let new_v = JsValue::from_string(vm.heap.alloc_string(&new_url));
+                fire_object_event(
+                    vm,
+                    &h_t,
+                    &ev_t,
+                    &el_t,
+                    win_h,
+                    "hashchange",
+                    &[("oldURL", old_v), ("newURL", new_v)],
+                );
+            });
+    }
+}
+
+fn install_location_and_history(
+    vm: &mut JsVm,
+    host: &SharedHost,
+    events: &SharedEvents,
+    event_loop: &SharedEventLoop,
+    web_apis: &SharedWebApis,
+) {
     let (_loc_ctor, loc_proto) = make_webidl_interface(vm, "Location");
     let loc = vm
         .heap
         .alloc_object(JsObject::with_kind(ObjectKind::Ordinary, Some(loc_proto)));
+
+    {
+        let h_nav = Rc::downgrade(host);
+        let ev_nav = Rc::downgrade(events);
+        let el_nav = Rc::downgrade(event_loop);
+        let wa_nav = Rc::downgrade(web_apis);
+        host.borrow_mut().fragment_nav_hook = Some(Rc::new(move |vm: &mut JsVm, frag: &str| {
+            if let (Some(h_strong), Some(ev_strong), Some(el_strong), Some(wa_strong)) = (
+                h_nav.upgrade(),
+                ev_nav.upgrade(),
+                el_nav.upgrade(),
+                wa_nav.upgrade(),
+            ) {
+                navigate_location_fragment(vm, &h_strong, &ev_strong, &el_strong, &wa_strong, frag);
+            }
+        }));
+    }
 
     let wa = Rc::clone(web_apis);
     let h_href = Rc::clone(host);
@@ -4465,6 +4535,9 @@ fn install_location_and_history(vm: &mut JsVm, host: &SharedHost, web_apis: &Sha
     });
 
     let wa = Rc::clone(web_apis);
+    let h_hash = Rc::clone(host);
+    let ev_hash = Rc::clone(events);
+    let el_hash = Rc::clone(event_loop);
     define_host_accessor(
         vm,
         loc,
@@ -4484,13 +4557,7 @@ fn install_location_and_history(vm: &mut JsVm, host: &SharedHost, web_apis: &Sha
         },
         move |vm, _, args| {
             let raw = vm.value_to_rust_string(arg(args, 0));
-            let trimmed = raw.strip_prefix('#').unwrap_or(&raw);
-            let mut st = wa.borrow_mut();
-            if trimmed.is_empty() {
-                st.location_url.set_fragment(None);
-            } else {
-                st.location_url.set_fragment(Some(trimmed));
-            }
+            navigate_location_fragment(vm, &h_hash, &ev_hash, &el_hash, &wa, &raw);
             Ok(JsValue::UNDEFINED)
         },
     );

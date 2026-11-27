@@ -475,6 +475,7 @@ impl ContentRuntime {
             &workers,
         );
         let media_elements = Rc::new(RefCell::new(MediaElementSystem::new()));
+        media_elements.borrow_mut().net = Some(Rc::clone(&net));
         let media_source = media_source::install_media_source_with_elements(
             &mut vm,
             &host,
@@ -1534,6 +1535,7 @@ impl ContentRuntime {
     /// `update animations and send events`, rAF callbacks, and `ResizeObserver`/`IntersectionObserver`
     /// layout observations in HTML §8.1.7.3 rendering order.
     pub fn fire_vsync(&mut self, timestamp_ms: f64) -> usize {
+        self.host.borrow_mut().run_focus_fixup();
         update_animations_and_send_events(
             &mut self.vm,
             &self.host,

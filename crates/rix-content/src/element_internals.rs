@@ -107,6 +107,8 @@ fn sync_element_custom_states(host: &SharedHost, nid: NodeId) {
         }
     }
     host.borrow_mut().invalidate_style_for_node(nid);
+    host.borrow_mut()
+        .invalidate_element_state(nid, rix_dom::ElementState::CUSTOM_STATE);
 }
 
 fn install_custom_state_set_and_internals(vm: &mut JsVm, host: &SharedHost) {

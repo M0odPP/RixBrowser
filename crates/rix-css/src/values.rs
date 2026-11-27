@@ -1156,6 +1156,8 @@ pub enum LineStyle {
     Ridge,
     Inset,
     Outset,
+    /// CSS UI 3 `outline-style: auto` (only valid on `outline-style`, never `border-*-style`).
+    Auto,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]

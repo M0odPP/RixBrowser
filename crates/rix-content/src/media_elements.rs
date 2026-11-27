@@ -71,6 +71,7 @@ pub struct MediaPlayerState {
     pub loop_enabled: bool,
     pub autoplay: bool,
     pub preload: String,
+    pub current_src: String,
     pub duration_s: f64,
     pub has_fired_loadedmetadata: bool,
     pub has_fired_loadeddata: bool,
@@ -117,6 +118,7 @@ impl MediaPlayerState {
             loop_enabled: false,
             autoplay: false,
             preload: "metadata".to_string(),
+            current_src: String::new(),
             duration_s: f64::NAN,
             has_fired_loadedmetadata: false,
             has_fired_loadeddata: false,
@@ -155,6 +157,7 @@ impl MediaPlayerState {
         self.seek_target_s = None;
         self.seek_generation = self.seek_generation.wrapping_add(1);
         self.ended = false;
+        self.current_src.clear();
         self.duration_s = f64::NAN;
         self.has_fired_loadedmetadata = false;
         self.has_fired_loadeddata = false;
@@ -418,6 +421,7 @@ pub struct MediaPlaybackTelemetry {
 pub struct MediaElementSystem {
     pub players: HashMap<NodeId, MediaPlayerState>,
     pub media_error_proto: Option<HeapHandle>,
+    pub(crate) net: Option<crate::fetch_ws::SharedNetBridge>,
     yuv_renderer: Option<YuvVideoRenderer>,
 }
 
@@ -435,6 +439,7 @@ impl MediaElementSystem {
         Self {
             players: HashMap::new(),
             media_error_proto: None,
+            net: None,
             yuv_renderer: None,
         }
     }
@@ -833,6 +838,94 @@ pub fn tick_playback_with_events(
     }
 }
 
+/// Synchronizes CSS Selectors L4 media pseudo-class state bits (`:playing`, `:paused`,
+/// `:seeking`, `:muted`) onto `nid` and invalidates affected CSS rules (including `:has()`).
+pub(crate) fn sync_media_pseudo_state(
+    host: &SharedHost,
+    nid: NodeId,
+    playing: Option<bool>,
+    seeking: Option<bool>,
+    muted: Option<bool>,
+) {
+    use rix_dom::ElementState;
+    let mut changed = ElementState::empty();
+    {
+        let doc_rc = Rc::clone(&host.borrow().document);
+        let mut doc = doc_rc.borrow_mut();
+        if let Some(is_playing) = playing {
+            if doc.set_element_state(nid, ElementState::PLAYING, is_playing) {
+                changed |= ElementState::PLAYING | ElementState::PAUSED;
+            }
+            if doc.set_element_state(nid, ElementState::PAUSED, !is_playing) {
+                changed |= ElementState::PLAYING | ElementState::PAUSED;
+            }
+        }
+        if let Some(is_seeking) = seeking {
+            if doc.set_element_state(nid, ElementState::SEEKING, is_seeking) {
+                changed |= ElementState::SEEKING;
+            }
+        }
+        if let Some(is_muted) = muted {
+            let _ = doc.set_element_state(nid, ElementState::MUTED_DIRTY, true);
+            if doc.set_element_state(nid, ElementState::MUTED, is_muted) {
+                changed |= ElementState::MUTED;
+            }
+        }
+    }
+    if !changed.is_empty() {
+        host.borrow_mut().invalidate_element_state(nid, changed);
+    }
+}
+
+/// Fetches raw media bytes synchronously over `net.fetch_engine` for `HTMLMediaElement.src`.
+pub(crate) fn fetch_media_bytes_sync(
+    net: &crate::fetch_ws::SharedNetBridge,
+    url: &str,
+    origin: &str,
+) -> Option<Vec<u8>> {
+    let engine = std::sync::Arc::clone(&net.borrow().fetch_engine);
+    let req = rix_net::FetchRequest {
+        url: url.to_string(),
+        method: "GET".to_string(),
+        headers: HashMap::new(),
+        body: Vec::new(),
+        mode: rix_net::FetchMode::NoCors,
+        credentials: rix_net::FetchCredentials::SameOrigin,
+        cache: rix_net::FetchCache::Default,
+        redirect: rix_net::FetchRedirect::Follow,
+        origin: origin.to_string(),
+        abort_signal: None,
+    };
+    let res = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()
+                    .map(|rt| rt.block_on(engine.fetch(req)))
+            })
+            .join()
+            .ok()
+            .flatten()?
+        } else {
+            tokio::task::block_in_place(|| handle.block_on(engine.fetch(req)))
+        }
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?
+            .block_on(engine.fetch(req))
+    };
+    let resp = res.ok()?;
+    if (200..300).contains(&resp.status) {
+        Some(resp.body)
+    } else {
+        None
+    }
+}
+
 fn define_const_u16(vm: &mut JsVm, obj: HeapHandle, name: &str, val: u16) {
     let key = vm.heap.intern_key(name);
     vm.heap.object_define_data(
@@ -921,7 +1014,24 @@ pub fn install_media_elements_with_system(
         }
     }
 
-    // `error`, `networkState`, `seeking`, `seekable` getters
+    // `currentSrc`, `error`, `networkState`, `seeking`, `seekable` getters
+    {
+        let h_g = Rc::clone(host);
+        let me_g = Rc::clone(media_sys);
+        define_host_getter(vm, media_proto, "currentSrc", move |vm, this, _| {
+            let src = h_g
+                .borrow()
+                .node_for_value(vm, this)
+                .and_then(|nid| {
+                    me_g.borrow()
+                        .players
+                        .get(&nid)
+                        .map(|p| p.current_src.clone())
+                })
+                .unwrap_or_default();
+            Ok(JsValue::from_string(vm.heap.alloc_string(&src)))
+        });
+    }
     {
         let h_g = Rc::clone(host);
         let me_g = Rc::clone(media_sys);
@@ -1058,6 +1168,9 @@ pub fn install_media_elements_with_system(
                     defer,
                 )
             };
+            if existing_err.is_none() {
+                sync_media_pseudo_state(&h_cl, nid, Some(true), None, None);
+            }
             if let Some(target_h) = this_h {
                 if should_fire_play || should_fire_playing {
                     let h_t = Rc::clone(&h_cl);
@@ -1115,6 +1228,7 @@ pub fn install_media_elements_with_system(
                 p.has_fired_playing = false;
                 playing
             };
+            sync_media_pseudo_state(&h_cl, nid, Some(false), None, None);
             if was_playing {
                 if let Some(target_h) = this.as_object() {
                     let h_t = Rc::clone(&h_cl);
@@ -1147,6 +1261,7 @@ pub fn install_media_elements_with_system(
                 .borrow_mut()
                 .ensure_player(nid)
                 .reset_for_source_change();
+            sync_media_pseudo_state(&h_cl, nid, Some(false), Some(false), None);
             Ok(JsValue::UNDEFINED)
         });
     }
@@ -1259,6 +1374,7 @@ pub fn install_media_elements_with_system(
                 };
 
                 if should_seek_events {
+                    sync_media_pseudo_state(&h_s, nid, None, Some(true), None);
                     if let Some(target_h) = this.as_object() {
                         let h_t = Rc::clone(&h_s);
                         let ev_t = Rc::clone(&ev_s);
@@ -1285,6 +1401,7 @@ pub fn install_media_elements_with_system(
                                             p.seeking = false;
                                             p.seek_target_s = None;
                                         }
+                                        sync_media_pseudo_state(&h_t, nid, None, Some(false), None);
                                         fire_object_event(
                                             vm,
                                             &h_t,
@@ -1404,7 +1521,24 @@ pub fn install_media_elements_with_system(
                 let m = h_g
                     .borrow()
                     .node_for_value(vm, this)
-                    .and_then(|nid| me_g.borrow().players.get(&nid).map(|p| p.clock.is_muted()))
+                    .map(|nid| {
+                        let doc_attr = h_g.borrow().document.borrow().get(nid).is_some_and(|d| {
+                            matches!(
+                                d,
+                                rix_dom::NodeData::Element(e)
+                                    if !e.pseudo_state.contains(rix_dom::ElementState::MUTED_DIRTY)
+                                        && e.has_attribute("muted")
+                            )
+                        });
+                        if doc_attr {
+                            true
+                        } else {
+                            me_g.borrow()
+                                .players
+                                .get(&nid)
+                                .is_some_and(|p| p.clock.is_muted())
+                        }
+                    })
                     .unwrap_or(false);
                 Ok(JsValue::from_bool(m))
             },
@@ -1414,6 +1548,7 @@ pub fn install_media_elements_with_system(
                 };
                 let m = vm.to_boolean(arg(args, 0));
                 me_s.borrow_mut().ensure_player(nid).clock.set_muted(m);
+                sync_media_pseudo_state(&h_s, nid, None, None, Some(m));
                 Ok(JsValue::UNDEFINED)
             },
         );

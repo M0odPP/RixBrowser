@@ -46,10 +46,12 @@ pub(crate) fn install_css_animations_and_transitions(
     install_css_transition_iface(vm, wa);
     install_css_animation_iface(vm, wa);
     host.borrow_mut().set_css_animations_managed(true);
-    let h_hook = Rc::clone(host);
-    let wa_hook = Rc::clone(wa);
+    let h_hook = Rc::downgrade(host);
+    let wa_hook = Rc::downgrade(wa);
     host.borrow_mut().css_anim_flush_hook = Some(Rc::new(move |vm: &mut JsVm| {
-        flush_if_styles_dirty(vm, &h_hook, &wa_hook);
+        if let (Some(h), Some(w)) = (h_hook.upgrade(), wa_hook.upgrade()) {
+            flush_if_styles_dirty(vm, &h, &w);
+        }
     }));
 }
 
