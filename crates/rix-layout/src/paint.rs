@@ -2317,7 +2317,7 @@ fn resolve_clip_radius(r: &ClipRadius, basis: f32, closest: f32, farthest: f32) 
 fn resolve_clip_path(cp: &ClipPathValue, rect: Rect) -> Option<ClipPathShape> {
     let eval = EvalContext::default();
     match cp {
-        ClipPathValue::None => None,
+        ClipPathValue::None | ClipPathValue::Url(_) => None,
         ClipPathValue::Inset {
             top,
             right,

@@ -818,6 +818,10 @@ pub struct DomElement<'a> {
     /// In this mode the host is featureless per CSS Scoping L1 §3.2, has no siblings in the
     /// shadow tree, and `:has(...)` descends into the host's shadow root children.
     pub matching_shadow_host: bool,
+    /// Optional Document root `NodeId` exposed as a featureless virtual parent of `<html>`
+    /// while evaluating a Document-implicit `@scope` (CSS Cascade L6 §2.1) so `:scope .a`,
+    /// `& .a`, and `> html` resolve cleanly against the Document scoping root.
+    pub doc_scope_root: Option<NodeId>,
 }
 
 impl<'a> DomElement<'a> {
@@ -828,7 +832,14 @@ impl<'a> DomElement<'a> {
             node_id,
             target_pseudo: None,
             matching_shadow_host: false,
+            doc_scope_root: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_doc_scope_root(mut self, root: NodeId) -> Self {
+        self.doc_scope_root = Some(root);
+        self
     }
 
     #[must_use]
@@ -838,6 +849,7 @@ impl<'a> DomElement<'a> {
             node_id,
             target_pseudo: Some(pseudo),
             matching_shadow_host: false,
+            doc_scope_root: None,
         }
     }
 
@@ -848,6 +860,7 @@ impl<'a> DomElement<'a> {
             node_id,
             target_pseudo: None,
             matching_shadow_host: true,
+            doc_scope_root: None,
         }
     }
 
@@ -862,6 +875,7 @@ impl<'a> DomElement<'a> {
             node_id,
             target_pseudo: Some(pseudo),
             matching_shadow_host: true,
+            doc_scope_root: None,
         }
     }
 
@@ -905,7 +919,16 @@ impl<'a> Element for DomElement<'a> {
     fn parent_element(&self) -> Option<Self> {
         let parent_id = self.doc.parent(self.node_id)?;
         match self.doc.get(parent_id)? {
-            NodeData::Element(_) => Some(Self::new(self.doc, parent_id)),
+            NodeData::Element(_) => Some(Self {
+                doc: self.doc,
+                node_id: parent_id,
+                target_pseudo: None,
+                matching_shadow_host: false,
+                doc_scope_root: self.doc_scope_root,
+            }),
+            NodeData::Document if self.doc_scope_root == Some(parent_id) => {
+                Some(Self::new(self.doc, parent_id))
+            }
             _ => None,
         }
     }
@@ -2138,6 +2161,7 @@ pub fn matches_single_selector_with_scope(
             node_id: element.node_id,
             target_pseudo: None,
             matching_shadow_host: element.matching_shadow_host,
+            doc_scope_root: element.doc_scope_root,
         };
         let matcher = |pe: &RixPseudoElement| *pe == target_pseudo;
         let mut ctx = MatchingContext::new(

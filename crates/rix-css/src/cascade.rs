@@ -843,6 +843,13 @@ impl StyleContext {
         {
             pstyle.display = pstyle.display.blockify();
         }
+        if pstyle.box_model.content.is_none() {
+            if let Some((_, ref cstyle)) = pstyle.box_model.content_counter {
+                let formatted = self.rule_index.format_counter(0, cstyle.as_str());
+                Arc::make_mut(&mut pstyle.box_model).content =
+                    Some(rix_core::intern_str(&formatted));
+            }
+        }
         Some(Arc::new(pstyle))
     }
 
@@ -1465,6 +1472,10 @@ fn build_shadow_rule_index(
     shadow_adopted: &HashMap<NodeId, Vec<Arc<Stylesheet>>>,
     media: &MediaContext,
 ) -> RuleIndex {
+    let host_id = match doc.get(sr_id) {
+        Some(NodeData::ShadowRoot { host, .. }) => Some(*host),
+        _ => None,
+    };
     let mut sheets = Vec::new();
     if !ua_sheet.rules.is_empty() {
         sheets.push(Arc::clone(ua_sheet));
@@ -1474,10 +1485,15 @@ fn build_shadow_rule_index(
             if el.name.local.as_str().eq_ignore_ascii_case("style") {
                 let css = doc.inner_text(nid);
                 if !css.trim().is_empty() {
-                    sheets.push(Arc::new(Stylesheet::parse(
+                    let owner_parent = match doc.parent(nid) {
+                        Some(p) if p == sr_id => host_id,
+                        other => other,
+                    };
+                    sheets.push(Arc::new(Stylesheet::parse_with_owner(
                         &css,
                         crate::stylesheet::CascadeOrigin::Author,
                         media,
+                        owner_parent,
                     )));
                 }
             }
@@ -1932,7 +1948,21 @@ impl AnimWalkCtx<'_> {
             base_style = Arc::new(cloned);
         }
         let parent_style = doc.parent(id).and_then(|pid| styles.get(&pid)).cloned();
-        let before = self.before_change_styles.get(&id).cloned();
+        let before = self.before_change_styles.get(&id).cloned().or_else(|| {
+            if has_css_tr && self.rule_index.has_starting_style_rules() {
+                compute_starting_style_before(
+                    doc,
+                    id,
+                    parent_style.as_ref(),
+                    self.root_font_size,
+                    self.rule_index,
+                    self.inline_color_exprs,
+                    self.media,
+                )
+            } else {
+                None
+            }
+        });
         let managed_slice = self.managed_css_animations.get(&id).cloned();
         let web_slice = self.web_animations.get(&id).cloned();
         if has_web || has_managed {
@@ -2861,12 +2891,30 @@ fn match_rule_with_scopes(
             .then_some(u32::MAX);
     };
     let mut chain = SmallVec::<[NodeId; 16]>::new();
-    let mut cur = Some(node);
-    while let Some(id) = cur {
-        if matches!(doc.get(id), Some(NodeData::Element(_))) {
-            chain.push(id);
+    let mut shadow_host_idx: Option<usize> = None;
+    if dom_el.matching_shadow_host {
+        // When matching a shadow-tree stylesheet against its own shadow host element,
+        // the host is the root of the shadow tree scope (no ancestors outside the shadow tree).
+        chain.push(node);
+        shadow_host_idx = Some(0);
+    } else {
+        let mut cur = Some(node);
+        while let Some(id) = cur {
+            match doc.get(id) {
+                Some(NodeData::Element(_)) => {
+                    chain.push(id);
+                    cur = doc.parent(id);
+                }
+                Some(NodeData::ShadowRoot { host, .. }) => {
+                    shadow_host_idx = Some(chain.len());
+                    chain.push(*host);
+                    break;
+                }
+                _ => {
+                    cur = doc.parent(id);
+                }
+            }
         }
-        cur = doc.parent(id);
     }
     if chain.is_empty() {
         return None;
@@ -2874,6 +2922,7 @@ fn match_rule_with_scopes(
     eval_nested_scopes(
         doc,
         &chain,
+        shadow_host_idx,
         0,
         scopes,
         chain.len() - 1,
@@ -2890,6 +2939,7 @@ fn match_rule_with_scopes(
 fn eval_nested_scopes(
     doc: &Document,
     chain: &[NodeId],
+    shadow_host_idx: Option<usize>,
     scope_idx: usize,
     scopes: &[CompiledScope],
     max_root_idx: usize,
@@ -2901,11 +2951,75 @@ fn eval_nested_scopes(
     shadow_host: Option<selectors::OpaqueElement>,
 ) -> Option<u32> {
     let sc = &scopes[scope_idx];
+    let doc_root_id = doc.root();
+
+    // CSS Cascade L6 §2.1: implicit `@scope` in a constructed stylesheet adopted by a Document
+    // has the Document node itself as scoping root (not `<html>`). It never matches inside
+    // shadow trees, `:scope` matches no element, `> html` matches only `<html>`, and proximity
+    // is `chain.len()` (strictly closer than unscoped `u32::MAX`, farther than any element root).
+    if sc.start.is_none() && sc.implicit_root == Some(doc_root_id) {
+        if shadow_host_idx.is_some() || max_root_idx < chain.len() - 1 {
+            return None;
+        }
+        let doc_opaque = DomElement::new(doc, doc_root_id).opaque();
+        if let Some(ref end_list) = sc.end {
+            for &path_id in chain {
+                let path_el = DomElement::new(doc, path_id).with_doc_scope_root(doc_root_id);
+                if matches_selector_list_with_scope(
+                    end_list,
+                    &path_el,
+                    Some(doc_opaque),
+                    None,
+                    caches,
+                    shadow_host,
+                ) {
+                    return None;
+                }
+            }
+        }
+        return if scope_idx + 1 < scopes.len() {
+            eval_nested_scopes(
+                doc,
+                chain,
+                shadow_host_idx,
+                scope_idx + 1,
+                scopes,
+                chain.len() - 1,
+                Some(doc_opaque),
+                dom_el,
+                rule,
+                bloom,
+                caches,
+                shadow_host,
+            )
+        } else {
+            let scoped_dom_el = dom_el.with_doc_scope_root(doc_root_id);
+            matches_single_selector_with_scope(
+                &rule.selector,
+                &scoped_dom_el,
+                Some(doc_opaque),
+                None,
+                caches,
+                shadow_host,
+            )
+            .then_some(chain.len() as u32)
+        };
+    }
+
     let mut best_prox: Option<u32> = None;
+    let is_doc_outer_scope =
+        outer_scope_opaque.is_some_and(|op| op == DomElement::new(doc, doc_root_id).opaque());
 
     for r_idx in 0..=max_root_idx {
         let root_id = chain[r_idx];
-        let root_el = DomElement::new(doc, root_id);
+        let is_shadow_host_root = shadow_host_idx == Some(r_idx);
+        let root_el = if is_shadow_host_root {
+            DomElement::for_shadow_host(doc, root_id)
+        } else if is_doc_outer_scope {
+            DomElement::new(doc, root_id).with_doc_scope_root(doc_root_id)
+        } else {
+            DomElement::new(doc, root_id)
+        };
         let is_root = if let Some(ref start_list) = sc.start {
             matches_selector_list_with_scope(
                 start_list,
@@ -2918,8 +3032,7 @@ fn eval_nested_scopes(
         } else if let Some(imp) = sc.implicit_root {
             imp == root_id
         } else {
-            // Constructed / adopted stylesheet without an owner `<style>` element:
-            // CSS Cascade L6 §2.1 scopes implicitly to the document root element.
+            // Fallback for stylesheet without an explicit owner: root of current tree scope.
             r_idx == chain.len() - 1
         };
         if !is_root {
@@ -2930,8 +3043,12 @@ fn eval_nested_scopes(
         // subject `chain[0]` up to scoping root `chain[r_idx]` inclusive.
         if let Some(ref end_list) = sc.end {
             let mut excluded = false;
-            for &path_id in &chain[..=r_idx] {
-                let path_el = DomElement::new(doc, path_id);
+            for (p_idx, &path_id) in chain[..=r_idx].iter().enumerate() {
+                let path_el = if shadow_host_idx == Some(p_idx) {
+                    DomElement::for_shadow_host(doc, path_id)
+                } else {
+                    DomElement::new(doc, path_id)
+                };
                 if matches_selector_list_with_scope(
                     end_list,
                     &path_el,
@@ -2952,6 +3069,7 @@ fn eval_nested_scopes(
             eval_nested_scopes(
                 doc,
                 chain,
+                shadow_host_idx,
                 scope_idx + 1,
                 scopes,
                 r_idx,
@@ -2979,6 +3097,101 @@ fn eval_nested_scopes(
         }
     }
     best_prox
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_starting_style_before(
+    doc: &Document,
+    node: NodeId,
+    parent_style: Option<&Arc<ComputedStyle>>,
+    root_font_size: f32,
+    rule_index: &RuleIndex,
+    inline_color_exprs: &FastMap<(NodeId, PropertyIdKind), Arc<crate::color::CssColorExpr>>,
+    media: &MediaContext,
+) -> Option<Arc<ComputedStyle>> {
+    let Some(NodeData::Element(elem)) = doc.get(node) else {
+        return None;
+    };
+    let dom_el = DomElement::new(doc, node);
+    let mut caches = SelectorCaches::default();
+    let mut ss_cands = SmallVec::<[u32; 16]>::new();
+    rule_index.collect_starting_style_candidates(&mut ss_cands);
+    let mut matched_refs = SmallVec::<[MatchedRule<'_>; 16]>::new();
+    let mut matched_any_starting = false;
+    for &idx in &ss_cands {
+        let rule = &rule_index.rules[idx as usize];
+        if let Some(prox) =
+            match_rule_with_scopes(doc, node, &dom_el, rule, None, &mut caches, None)
+        {
+            matched_refs.push(MatchedRule {
+                rule,
+                scope_proximity: prox,
+                is_shadow_host_rule: false,
+            });
+            matched_any_starting = true;
+        }
+    }
+    if !matched_any_starting {
+        return None;
+    }
+    let mut normal_cands = SmallVec::<[u32; 32]>::new();
+    rule_index.collect_candidates(elem, None, &mut normal_cands);
+    for &idx in &normal_cands {
+        let rule = &rule_index.rules[idx as usize];
+        if let Some(prox) =
+            match_rule_with_scopes(doc, node, &dom_el, rule, None, &mut caches, None)
+        {
+            matched_refs.push(MatchedRule {
+                rule,
+                scope_proximity: prox,
+                is_shadow_host_rule: false,
+            });
+        }
+    }
+    let mut ignored_missing = Vec::new();
+    let pres_decls = if has_presentational_hint_attrs(doc, node, elem) {
+        collect_presentational_hint_decls(doc, node, elem, &mut ignored_missing)
+    } else {
+        Vec::new()
+    };
+    let inline_attr = elem
+        .attributes
+        .iter()
+        .find(|(q, _)| q.local.eq_str_ignore_ascii_case("style"))
+        .map(|(_, v)| v.as_str());
+    let mut inline_decls = match inline_attr {
+        Some(attr) if !attr.trim().is_empty() => {
+            if doc.quirks_mode() == 2 {
+                parse_inline_style_quirks(attr, &mut ignored_missing)
+            } else {
+                parse_inline_style(attr, &mut ignored_missing)
+            }
+        }
+        _ => Vec::new(),
+    };
+    if !inline_color_exprs.is_empty() && !inline_decls.is_empty() {
+        for decl in &mut inline_decls {
+            if let Some(expr) = inline_color_exprs.get(&(node, decl.property)) {
+                decl.value = PropertyValue::Color4(Box::new((**expr).clone()));
+            }
+        }
+    }
+    let (sib_idx, sib_cnt) = element_sibling_position(doc, node);
+    let resolved = resolve_element_style_with_context(
+        &matched_refs,
+        &pres_decls,
+        &inline_decls,
+        parent_style.map(Arc::as_ref),
+        root_font_size,
+        media,
+        Some(&rule_index.registered_properties),
+        sib_idx,
+        sib_cnt,
+        usize::from(node) as u64,
+        rule_index.random_doc_seed,
+        &elem.attributes,
+    );
+    Some(Arc::new(resolved))
 }
 
 fn owning_html_table<'a>(doc: &'a Document, node: NodeId, tag: &str) -> Option<&'a ElementData> {
@@ -4020,6 +4233,13 @@ fn collect_pseudo_element_styles(
                     pstyle.display = crate::values::DisplayMode::Block;
                 }
                 _ => {}
+            }
+            if pstyle.box_model.content.is_none() {
+                if let Some((_, ref cstyle)) = pstyle.box_model.content_counter {
+                    let formatted = rule_index.format_counter(0, cstyle.as_str());
+                    Arc::make_mut(&mut pstyle.box_model).content =
+                        Some(rix_core::intern_str(&formatted));
+                }
             }
             let style = Arc::new(pstyle);
             if !any_scoped && !needs_sib && !uses_attr && !has_host_matched {

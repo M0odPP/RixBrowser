@@ -348,7 +348,114 @@ fn compare_f32(lhs: f32, op: lightningcss::media_query::MediaFeatureComparison, 
     }
 }
 
-/// Evaluates an `@supports` condition against RixBrowser's supported properties & selectors.
+fn is_supported_font_format(raw: &str) -> bool {
+    let norm = raw
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .to_ascii_lowercase();
+    matches!(
+        norm.as_str(),
+        "opentype" | "truetype" | "woff" | "woff2" | "collection" | "embedded-opentype" | "svg"
+    )
+}
+
+fn is_supported_font_tech(raw: &str) -> bool {
+    let norm = raw.trim().to_ascii_lowercase();
+    matches!(
+        norm.as_str(),
+        "features-opentype"
+            | "features-aat"
+            | "features-graphite"
+            | "color-colrv0"
+            | "color-colrv1"
+            | "color-svg"
+            | "color-sbix"
+            | "color-cbdt"
+            | "variations"
+            | "palettes"
+            | "incremental"
+    )
+}
+
+fn is_supported_at_rule(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let Some(rest) = trimmed.strip_prefix('@') else {
+        return false;
+    };
+    let name = rest
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if name.is_empty() || name.len() != rest.trim().len() {
+        return false;
+    }
+    matches!(
+        name.as_str(),
+        "charset"
+            | "import"
+            | "namespace"
+            | "media"
+            | "supports"
+            | "layer"
+            | "scope"
+            | "container"
+            | "font-face"
+            | "keyframes"
+            | "property"
+            | "page"
+            | "counter-style"
+            | "starting-style"
+            | "position-try"
+    )
+}
+
+fn eval_supports_declaration_str(decl: &str) -> bool {
+    let trimmed = decl.trim();
+    let Some((prop, raw_val)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let prop_t = prop.trim();
+    if prop_t.is_empty()
+        || !prop_t
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return false;
+    }
+    let mut val_t = raw_val.trim();
+    if let Some((before, after)) = val_t.rsplit_once('!') {
+        if after.trim().eq_ignore_ascii_case("important") {
+            val_t = before.trim();
+        } else {
+            return false;
+        }
+    }
+    if val_t.is_empty() {
+        return false;
+    }
+    crate::cssom_decl::parse_and_serialize_declaration(prop_t, val_t).is_some()
+}
+
+fn eval_supports_function_atom(s: &str) -> Option<bool> {
+    let trimmed = s.trim();
+    let open = trimmed.find('(')?;
+    if find_matching_paren(&trimmed[open..]) != Some(trimmed.len() - 1 - open) {
+        return None;
+    }
+    let fn_name = trimmed[..open].trim().to_ascii_lowercase();
+    let inner = trimmed[open + 1..trimmed.len() - 1].trim();
+    match fn_name.as_str() {
+        "selector" => Some(crate::selector::parse_selector_list_non_forgiving(inner).is_ok()),
+        "font-format" => Some(is_supported_font_format(inner)),
+        "font-tech" => Some(is_supported_font_tech(inner)),
+        "at-rule" => Some(is_supported_at_rule(inner)),
+        _ => None,
+    }
+}
+
+/// Evaluates an `@supports` condition against RixBrowser's supported properties, selectors,
+/// font technologies/formats, and at-rules (CSS Conditional Rules L3/L4/L5).
 #[must_use]
 pub fn evaluate_supports(cond: &SupportsCondition<'_>) -> bool {
     match cond {
@@ -356,28 +463,150 @@ pub fn evaluate_supports(cond: &SupportsCondition<'_>) -> bool {
         SupportsCondition::And(list) => list.iter().all(evaluate_supports),
         SupportsCondition::Or(list) => list.iter().any(evaluate_supports),
         SupportsCondition::Declaration { property_id, value } => {
-            crate::cssom_decl::parse_and_serialize_declaration(property_id.name(), value.as_ref())
-                .is_some()
+            eval_supports_declaration_str(&format!("{}: {}", property_id.name(), value.as_ref()))
         }
         SupportsCondition::Selector(sel) => {
             crate::selector::parse_selector_list_non_forgiving(sel.as_ref()).is_ok()
         }
-        SupportsCondition::Unknown(_) => false,
+        SupportsCondition::Unknown(raw) => {
+            eval_supports_function_atom(raw.as_ref()).unwrap_or(false)
+        }
     }
 }
 
-/// Evaluates a CSS Conditional Rules L3/L4 condition string for `CSS.supports(conditionText)`.
+fn split_supports_top_level_keyword<'a>(input: &'a str, kw: &str) -> Option<Vec<&'a str>> {
+    let bytes = input.as_bytes();
+    let kw_len = kw.len();
+    let (mut parts, mut start, mut depth, mut in_str, mut i) = (Vec::new(), 0, 0usize, None, 0);
+    while i < bytes.len() {
+        if skip_css_ignored(bytes, &mut i, &mut in_str) {
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            _ if depth == 0
+                && i + kw_len <= bytes.len()
+                && bytes[i..i + kw_len].eq_ignore_ascii_case(kw.as_bytes()) =>
+            {
+                let prev_ok = i > 0 && (bytes[i - 1].is_ascii_whitespace() || bytes[i - 1] == b')');
+                let next_ok = i + kw_len < bytes.len()
+                    && (bytes[i + kw_len].is_ascii_whitespace() || bytes[i + kw_len] == b'(');
+                if prev_ok && next_ok {
+                    parts.push(input[start..i].trim());
+                    i += kw_len;
+                    start = i;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.push(input[start..].trim());
+    Some(parts)
+}
+
+fn eval_supports_expr_strict(expr: &str, allow_bare_decl: bool) -> Option<bool> {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let has_and = split_supports_top_level_keyword(trimmed, "and");
+    let has_or = split_supports_top_level_keyword(trimmed, "or");
+    if has_and.is_some() && has_or.is_some() {
+        // Mixing `and` and `or` at the same level without parentheses is invalid.
+        return None;
+    }
+    if let Some(parts) = has_and {
+        let mut all_ok = true;
+        for p in parts {
+            if !eval_supports_in_parens(p)? {
+                all_ok = false;
+            }
+        }
+        return Some(all_ok);
+    }
+    if let Some(parts) = has_or {
+        let mut any_ok = false;
+        for p in parts {
+            if eval_supports_in_parens(p)? {
+                any_ok = true;
+            }
+        }
+        return Some(any_ok);
+    }
+    if trimmed.len() >= 4
+        && trimmed[..3].eq_ignore_ascii_case("not")
+        && (trimmed.as_bytes()[3].is_ascii_whitespace() || trimmed.as_bytes()[3] == b'(')
+    {
+        let rest = trimmed[3..].trim();
+        return Some(!eval_supports_in_parens(rest)?);
+    }
+    if let Some(res) = eval_supports_in_parens(trimmed) {
+        return Some(res);
+    }
+    if allow_bare_decl && trimmed.contains(':') && !trimmed.starts_with('(') {
+        return Some(eval_supports_declaration_str(trimmed));
+    }
+    None
+}
+
+fn eval_supports_in_parens(expr: &str) -> Option<bool> {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('(') {
+        if find_matching_paren(trimmed) != Some(trimmed.len() - 1) {
+            return None;
+        }
+        let inner = trimmed[1..trimmed.len() - 1].trim();
+        if inner.is_empty() {
+            return None;
+        }
+        // Nested condition (`((display: flex))`, `(not (...))`, `((a: b) and (c: d))`, `(selector(...))`)
+        if let Some(res) = eval_supports_expr_strict(inner, false) {
+            return Some(res);
+        }
+        // Declaration inside parens (`(display: block)`, `(display: block !important)`)
+        if inner.contains(':') {
+            return Some(eval_supports_declaration_str(inner));
+        }
+        return None;
+    }
+    eval_supports_function_atom(trimmed)
+}
+
+/// Evaluates an `@import ... supports(<condition>)` condition per CSS Cascade L5 §3
+/// (accepts either a `<supports-condition>` or a bare `<declaration>`, rejecting invalid syntax
+/// like `supports()`, `supports(())`, `supports(supports(...))`).
+#[must_use]
+pub fn evaluate_import_supports_str(condition: &str) -> Option<bool> {
+    eval_supports_expr_strict(condition, true)
+}
+
+/// Evaluates a CSS Conditional Rules L3/L4/L5 condition string for `CSS.supports(conditionText)`.
 #[must_use]
 pub fn evaluate_supports_condition_str(condition: &str) -> bool {
     let trimmed = condition.trim();
     if trimmed.is_empty() {
         return false;
     }
-    // CSS.supports("(color: red)") or CSS.supports("color: red") or CSS.supports("selector(:has(*))")
+    if let Some(res) = eval_supports_expr_strict(trimmed, true) {
+        return res;
+    }
+    let lower = trimmed.to_ascii_lowercase();
     let wrapped = if trimmed.starts_with('(')
-        || trimmed.to_ascii_lowercase().starts_with("not ")
-        || trimmed.to_ascii_lowercase().starts_with("not(")
-        || trimmed.to_ascii_lowercase().starts_with("selector(")
+        || lower.starts_with("not ")
+        || lower.starts_with("not(")
+        || lower.starts_with("selector(")
+        || lower.starts_with("font-tech(")
+        || lower.starts_with("font-format(")
+        || lower.starts_with("at-rule(")
     {
         format!("@supports {trimmed} {{ a {{ color: red; }} }}")
     } else {
@@ -451,6 +680,40 @@ pub struct KeyframesRule {
     pub name: InternedStr,
     pub steps: Vec<KeyframeStep>,
     pub layer_id: LayerId,
+}
+
+/// CSS Counter Styles Level 3 `@counter-style` `system` algorithm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CounterStyleSystem {
+    Cyclic,
+    Fixed(i32),
+    Symbolic,
+    Alphabetic,
+    Numeric,
+    Additive,
+    Extends(InternedStr),
+}
+
+/// Compiled `@counter-style` rule participating in CSS Cascade Layers L5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CounterStyleRule {
+    pub name: InternedStr,
+    pub system: CounterStyleSystem,
+    pub symbols: Vec<String>,
+    pub prefix: String,
+    pub suffix: String,
+    pub layer_id: LayerId,
+}
+
+/// Parsed `@import` directive extracted from a stylesheet's leading prelude.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedImport {
+    pub url: String,
+    /// `None` = unlayered, `Some(None)` = anonymous `layer`, `Some(Some(segs))` = `layer(a.b)`.
+    pub layer: Option<Option<Vec<InternedStr>>>,
+    pub supports: Option<String>,
+    pub media: String,
+    pub condition_matches: bool,
 }
 
 /// Comparison operator for CSS Containment Level 3 `@container` size/ratio queries.
@@ -941,6 +1204,7 @@ pub struct CompiledRule {
     pub declarations: Arc<[SpecifiedDeclaration]>,
     pub scopes: Option<Arc<[CompiledScope]>>,
     pub container_queries: Option<Arc<[CompiledContainerQuery]>>,
+    pub is_starting_style: bool,
 }
 
 /// Compiled `@property` / `CSS.registerProperty` custom property registration
@@ -955,7 +1219,7 @@ pub struct RegisteredProperty {
 }
 
 /// Compiled CSS stylesheet with flattened nesting, evaluated conditions,
-/// registered `@layer` ordering, `@font-face`, `@keyframes`, `@property`, and telemetry.
+/// registered `@layer` ordering, `@font-face`, `@keyframes`, `@counter-style`, `@property`, and telemetry.
 #[derive(Debug, Clone)]
 pub struct Stylesheet {
     pub origin: CascadeOrigin,
@@ -964,6 +1228,7 @@ pub struct Stylesheet {
     pub layer_paths: Vec<Vec<LayerSeg>>,
     pub font_faces: Vec<FontFaceRule>,
     pub keyframes: Vec<KeyframesRule>,
+    pub counter_styles: Vec<CounterStyleRule>,
     pub registered_properties: Vec<RegisteredProperty>,
     pub imports: Vec<String>,
     pub missing_features: Vec<MissingCssFeature>,
@@ -1126,6 +1391,309 @@ fn rewrite_stylesheet_relative_urls(rules: &mut [CompiledRule], base_url: &str) 
     }
 }
 
+/// Leading top-level statement before normal style rules (CSS Cascade L5 §3).
+enum PreludeItem {
+    LayerStatement(Vec<Vec<InternedStr>>),
+    Import(ExtractedImport),
+}
+
+fn parse_layer_name_segments(raw: &str) -> Option<Vec<InternedStr>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let mut segs = Vec::new();
+    for part in trimmed.split('.') {
+        if part.is_empty()
+            || !part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii())
+        {
+            return None;
+        }
+        segs.push(intern_str(part));
+    }
+    (!segs.is_empty()).then_some(segs)
+}
+
+fn parse_import_prelude_stmt(stmt: &str, media_ctx: &MediaContext) -> Option<ExtractedImport> {
+    let body = stmt.trim();
+    if body.len() < 7 || !body[..7].eq_ignore_ascii_case("@import") {
+        return None;
+    }
+    let after_kw = body[7..].trim();
+    let (url, mut rest) = if after_kw.len() >= 4 && after_kw[..4].eq_ignore_ascii_case("url(") {
+        let close = find_matching_paren(&after_kw[3..])?;
+        let raw_u = after_kw[4..3 + close]
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'');
+        (raw_u.to_string(), after_kw[4 + close..].trim())
+    } else if after_kw.starts_with('"') || after_kw.starts_with('\'') {
+        let q = after_kw.as_bytes()[0];
+        let bytes = after_kw.as_bytes();
+        let mut i = 1usize;
+        let mut out = String::new();
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                break;
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+        (out, after_kw[i + 1..].trim())
+    } else {
+        return None;
+    };
+
+    let mut layer: Option<Option<Vec<InternedStr>>> = None;
+    let mut supports: Option<String> = None;
+    let mut supports_ok = true;
+
+    // CSS Cascade L5 §3: `[ layer | layer(<layer-name>) ]? [ supports(<cond>) ]? <media-query-list>?`
+    if rest.len() >= 6 && rest[..6].eq_ignore_ascii_case("layer(") {
+        let close = find_matching_paren(&rest[5..])?;
+        let inner = rest[6..5 + close].trim();
+        let segs = parse_layer_name_segments(inner)?;
+        layer = Some(Some(segs));
+        rest = rest[6 + close..].trim();
+    } else if rest.len() >= 5
+        && rest[..5].eq_ignore_ascii_case("layer")
+        && (rest.len() == 5
+            || rest.as_bytes()[5].is_ascii_whitespace()
+            || rest.as_bytes()[5] == b'(')
+    {
+        if rest.len() > 5 && rest.as_bytes()[5] == b'(' {
+            return None;
+        }
+        layer = Some(None);
+        rest = rest[5..].trim();
+    }
+
+    if rest.len() >= 9 && rest[..9].eq_ignore_ascii_case("supports(") {
+        let close = find_matching_paren(&rest[8..])?;
+        let inner = &rest[9..8 + close];
+        // Invalid syntax inside `supports(...)` invalidates the entire `@import` rule!
+        let evaluated = evaluate_import_supports_str(inner)?;
+        supports_ok = evaluated;
+        supports = Some(inner.to_string());
+        rest = rest[9 + close..].trim();
+    }
+
+    // Strict grammar check: `supports(...)` or `layer(...)` cannot follow a media query
+    // (e.g. `@import url(...) (width >= 0px) supports(display:block);` is INVALID!).
+    let media_str = rest.trim().to_string();
+    if media_str
+        .as_bytes()
+        .windows(9)
+        .any(|w| w.eq_ignore_ascii_case(b"supports("))
+    {
+        return None;
+    }
+    let media_ok = if media_str.is_empty() {
+        true
+    } else {
+        media_ctx.evaluate_media_query_str(&media_str)
+    };
+    Some(ExtractedImport {
+        url,
+        layer,
+        supports,
+        media: media_str,
+        condition_matches: supports_ok && media_ok,
+    })
+}
+
+/// Scans leading `@charset`, `@layer <names>;`, and `@import ...;` statements before normal
+/// rules, returning `(prelude_items, body_byte_offset)` so `@import` rules after `@layer`
+/// statements and with CSS Conditional L4/L5 `supports(...)` are resolved in exact order.
+fn scan_stylesheet_prelude(css: &str, media_ctx: &MediaContext) -> (Vec<PreludeItem>, usize) {
+    let bytes = css.as_bytes();
+    let mut items = Vec::new();
+    let mut i = 0usize;
+    let mut body_start = 0usize;
+    let mut saw_import = false;
+
+    loop {
+        while i < bytes.len() {
+            if bytes[i].is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            break;
+        }
+        if i >= bytes.len() || bytes[i] != b'@' {
+            break;
+        }
+        let stmt_start = i;
+        let mut j = i;
+        let mut in_str = None;
+        let mut paren_depth = 0usize;
+        let mut ended_with_semi = false;
+        while j < bytes.len() {
+            if skip_css_ignored(bytes, &mut j, &mut in_str) {
+                continue;
+            }
+            match bytes[j] {
+                b'(' | b'[' => paren_depth += 1,
+                b')' | b']' => paren_depth = paren_depth.saturating_sub(1),
+                b';' if paren_depth == 0 => {
+                    ended_with_semi = true;
+                    break;
+                }
+                b'{' if paren_depth == 0 => {
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        if !ended_with_semi {
+            break;
+        }
+        let stmt = css[stmt_start..j].trim();
+        let next_i = j + 1;
+        if stmt.len() >= 8 && stmt[..8].eq_ignore_ascii_case("@charset") {
+            i = next_i;
+            body_start = next_i;
+            continue;
+        }
+        if stmt.len() >= 6
+            && stmt[..6].eq_ignore_ascii_case("@layer")
+            && (stmt.len() == 6 || stmt.as_bytes()[6].is_ascii_whitespace())
+        {
+            let rest = stmt[6..].trim();
+            let mut names = Vec::new();
+            let mut all_valid = !rest.is_empty();
+            for part in rest.split(',') {
+                if let Some(segs) = parse_layer_name_segments(part) {
+                    names.push(segs);
+                } else {
+                    all_valid = false;
+                    break;
+                }
+            }
+            if all_valid {
+                items.push(PreludeItem::LayerStatement(names));
+                i = next_i;
+                body_start = next_i;
+                continue;
+            }
+            break;
+        }
+        if stmt.len() >= 7
+            && stmt[..7].eq_ignore_ascii_case("@import")
+            && (stmt.len() == 7
+                || stmt.as_bytes()[7].is_ascii_whitespace()
+                || stmt.as_bytes()[7] == b'"'
+                || stmt.as_bytes()[7] == b'\'')
+        {
+            saw_import = true;
+            if let Some(imp) = parse_import_prelude_stmt(stmt, media_ctx) {
+                items.push(PreludeItem::Import(imp));
+            }
+            i = next_i;
+            body_start = next_i;
+            continue;
+        }
+        break;
+    }
+
+    if !saw_import {
+        // Fast path: no `@import` in prelude — let `lightningcss` compile everything untouched.
+        return (Vec::new(), 0);
+    }
+    (items, body_start)
+}
+
+/// Extracts all syntactically valid leading `@import` rules from `css` (including those after
+/// pre-import `@layer` statements and those with CSS Conditional L4/L5 `supports(...)`).
+#[must_use]
+pub fn extract_stylesheet_imports(css: &str, media: &MediaContext) -> Vec<ExtractedImport> {
+    let (items, _) = scan_stylesheet_prelude(css, media);
+    items
+        .into_iter()
+        .filter_map(|it| match it {
+            PreludeItem::Import(imp) => Some(imp),
+            PreludeItem::LayerStatement(_) => None,
+        })
+        .collect()
+}
+
+fn decode_inline_data_css_url(raw: &str) -> Option<String> {
+    let rest = raw.trim().strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    let is_base64 = meta.split(';').any(|p| p.eq_ignore_ascii_case("base64"));
+    if is_base64 {
+        let mut clean = String::with_capacity(payload.len());
+        for b in payload.bytes() {
+            if !b.is_ascii_whitespace() {
+                clean.push(b as char);
+            }
+        }
+        let table = |c: u8| -> Option<u8> {
+            match c {
+                b'A'..=b'Z' => Some(c - b'A'),
+                b'a'..=b'z' => Some(c - b'a' + 26),
+                b'0'..=b'9' => Some(c - b'0' + 52),
+                b'+' => Some(62),
+                b'/' => Some(63),
+                _ => None,
+            }
+        };
+        let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+        let bytes = clean.as_bytes();
+        let mut idx = 0usize;
+        while idx + 3 < bytes.len() {
+            let a = table(bytes[idx])?;
+            let b = table(bytes[idx + 1])?;
+            out.push((a << 2) | (b >> 4));
+            if bytes[idx + 2] != b'=' {
+                let c = table(bytes[idx + 2])?;
+                out.push((b << 4) | (c >> 2));
+                if bytes[idx + 3] != b'=' {
+                    let d = table(bytes[idx + 3])?;
+                    out.push((c << 6) | d);
+                }
+            }
+            idx += 4;
+        }
+        return String::from_utf8(out).ok();
+    }
+    let pbytes = payload.as_bytes();
+    let mut out = Vec::with_capacity(pbytes.len());
+    let mut i = 0usize;
+    while i < pbytes.len() {
+        if pbytes[i] == b'%' && i + 2 < pbytes.len() {
+            let hi = (pbytes[i + 1] as char).to_digit(16);
+            let lo = (pbytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(pbytes[i]);
+        i += 1;
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
 impl Stylesheet {
     /// Parses and compiles a CSS stylesheet against the given origin and media environment.
     #[must_use]
@@ -1146,7 +1714,7 @@ impl Stylesheet {
     }
 
     /// Parses and compiles a CSS stylesheet with optional `@scope` owner and base URL for
-    /// resolving relative `url(...)` values per CSS Values L3 §4.5.
+    /// resolving relative `url(...)` values per CSS Values L3 §4.5 (resolving inline `data:` `@import`s).
     #[must_use]
     pub fn parse_with_owner_and_base(
         css: &str,
@@ -1155,45 +1723,32 @@ impl Stylesheet {
         owner_parent: Option<rix_dom::NodeId>,
         base_url: Option<&str>,
     ) -> Self {
-        let quirks_norm = if origin == CascadeOrigin::Author {
-            crate::properties::preprocess_quirks_and_strict_lengths(css, media.quirks_mode)
-        } else {
-            std::borrow::Cow::Borrowed(css)
-        };
-        let cleaned_custom = crate::properties::strip_unbalanced_custom_decls(&quirks_norm);
-        let rewritten = crate::properties::rewrite_dynamic_var_names(&cleaned_custom);
-        let wrapped = wrap_top_level_scope_rules(&rewritten);
-        let warnings = Arc::new(RwLock::new(Vec::new()));
-        let opts = ParserOptions {
-            error_recovery: true,
-            warnings: Some(Arc::clone(&warnings)),
-            ..ParserOptions::default()
-        };
-        let mut compiler = StylesheetCompiler::new(origin, *media, owner_parent, &wrapped);
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Ok(sheet) = StyleSheet::parse(&wrapped, opts) {
-                let has_selector_warning = warnings.read().is_ok_and(|w| {
-                    w.iter().any(|e| {
-                        matches!(e.kind, lightningcss::error::ParserError::SelectorError(_))
-                    })
-                });
-                if has_selector_warning {
-                    compiler.compile_top_level_with_selector_recovery(&sheet.rules);
-                } else {
-                    compiler.compile_rule_list(
-                        &sheet.rules,
-                        CompileNesting::TopLevel,
-                        LayerId::UNLAYERED,
-                        None,
-                    );
-                }
-            }
-        }));
-        let mut sheet = compiler.finish();
-        if let Some(base) = base_url {
-            rewrite_stylesheet_relative_urls(&mut sheet.rules, base);
-        }
-        sheet
+        Self::parse_with_imports(
+            css,
+            origin,
+            media,
+            owner_parent,
+            base_url,
+            &mut |url, _base| decode_inline_data_css_url(url).map(|text| (text, None)),
+        )
+    }
+
+    /// Parses and compiles a CSS stylesheet resolving `@import` rules recursively via `resolve_import`
+    /// while preserving CSS Cascade L5 `@layer` order, `supports(...)`, media conditions, and `@scope` owner.
+    pub fn parse_with_imports<F>(
+        css: &str,
+        origin: CascadeOrigin,
+        media: &MediaContext,
+        owner_parent: Option<rix_dom::NodeId>,
+        base_url: Option<&str>,
+        resolve_import: &mut F,
+    ) -> Self
+    where
+        F: FnMut(&str, Option<&str>) -> Option<(String, Option<String>)>,
+    {
+        let mut compiler = StylesheetCompiler::new(origin, *media, owner_parent, "");
+        compiler.compile_document_css(css, base_url, LayerId::UNLAYERED, None, resolve_import, 0);
+        compiler.finish()
     }
 
     /// Parses a stylesheet through a process-wide shared compiled cache keyed by content hash
@@ -1325,8 +1880,10 @@ struct StylesheetCompiler<'a> {
     anon_layer_counter: u32,
     scope_stack: Vec<CompiledScope>,
     container_stack: Vec<CompiledContainerQuery>,
+    in_starting_style: bool,
     font_faces: Vec<FontFaceRule>,
     keyframes: Vec<KeyframesRule>,
+    counter_styles: Vec<CounterStyleRule>,
     registered_properties: Vec<RegisteredProperty>,
     imports: Vec<String>,
     missing_seen: HashSet<MissingCssFeature>,
@@ -1356,8 +1913,10 @@ impl<'a> StylesheetCompiler<'a> {
             anon_layer_counter: 0,
             scope_stack: Vec::new(),
             container_stack: Vec::new(),
+            in_starting_style: false,
             font_faces: Vec::new(),
             keyframes: Vec::new(),
+            counter_styles: Vec::new(),
             registered_properties: Vec::new(),
             imports: Vec::new(),
             missing_seen: HashSet::new(),
@@ -1365,6 +1924,169 @@ impl<'a> StylesheetCompiler<'a> {
             next_source_order: 0,
             selector_scratch: String::with_capacity(128),
             namespaces: SelectorNamespaceMap::default(),
+        }
+    }
+
+    fn register_layer_segments(
+        &mut self,
+        prefix_layer: Option<LayerId>,
+        segs: Option<&[InternedStr]>,
+    ) -> LayerId {
+        let mut path = prefix_layer
+            .and_then(|id| self.layer_paths.get(id.0 as usize).cloned())
+            .unwrap_or_default();
+        if let Some(parts) = segs {
+            let mut last_id = LayerId::UNLAYERED;
+            for part in parts {
+                path.push(LayerSeg::Named(part.clone()));
+                last_id = self.ensure_layer_path(path.clone());
+            }
+            last_id
+        } else {
+            let aid = self.anon_layer_counter;
+            self.anon_layer_counter += 1;
+            path.push(LayerSeg::Anon(aid));
+            let id = LayerId(self.layer_paths.len() as u32);
+            let label = Self::format_layer_path(&path);
+            self.layers.push(label);
+            self.layer_paths.push(path.clone());
+            self.layer_path_map.insert(path, id);
+            id
+        }
+    }
+
+    fn compile_document_css<F>(
+        &mut self,
+        css: &str,
+        base_url: Option<&str>,
+        current_layer: LayerId,
+        prefix_layer: Option<LayerId>,
+        resolve_import: &mut F,
+        depth: usize,
+    ) where
+        F: FnMut(&str, Option<&str>) -> Option<(String, Option<String>)>,
+    {
+        if depth > 8 {
+            return;
+        }
+        let (prelude_items, body_offset) = scan_stylesheet_prelude(css, &self.media);
+        for item in prelude_items {
+            match item {
+                PreludeItem::LayerStatement(names) => {
+                    for segs in names {
+                        let _ = self.register_layer_segments(prefix_layer, Some(&segs));
+                    }
+                }
+                PreludeItem::Import(imp) => {
+                    if !imp.condition_matches {
+                        continue;
+                    }
+                    if !imp.url.is_empty() {
+                        self.imports.push(imp.url.clone());
+                    }
+                    // CSS Cascade L5 §6.4.1: `@import ... layer(A)` establishes layer `A`
+                    // at the import position even if fetching the imported resource fails!
+                    let (imp_cur_layer, imp_prefix) = match &imp.layer {
+                        Some(Some(segs)) => {
+                            let lid = self.register_layer_segments(prefix_layer, Some(segs));
+                            (lid, Some(lid))
+                        }
+                        Some(None) => {
+                            let lid = self.register_layer_segments(prefix_layer, None);
+                            (lid, Some(lid))
+                        }
+                        None => (current_layer, prefix_layer),
+                    };
+                    if let Some((imp_css, imp_base)) = resolve_import(&imp.url, base_url) {
+                        self.compile_document_css(
+                            &imp_css,
+                            imp_base.as_deref().or(base_url),
+                            imp_cur_layer,
+                            imp_prefix,
+                            resolve_import,
+                            depth + 1,
+                        );
+                    }
+                }
+            }
+        }
+        let body_css = &css[body_offset..];
+        if body_css.trim().is_empty() {
+            return;
+        }
+        let rules_before = self.rules.len();
+        let quirks_norm = if self.origin == CascadeOrigin::Author {
+            crate::properties::preprocess_quirks_and_strict_lengths(
+                body_css,
+                self.media.quirks_mode,
+            )
+        } else {
+            std::borrow::Cow::Borrowed(body_css)
+        };
+        let cleaned_custom = crate::properties::strip_unbalanced_custom_decls(&quirks_norm);
+        let rewritten = crate::properties::rewrite_dynamic_var_names(&cleaned_custom);
+        let wrapped = wrap_top_level_scope_rules(&rewritten);
+        let warnings = Arc::new(RwLock::new(Vec::new()));
+        let opts = ParserOptions {
+            error_recovery: true,
+            warnings: Some(Arc::clone(&warnings)),
+            ..ParserOptions::default()
+        };
+        // Compile into a child compiler sharing our accumulated state so `source_css` borrows `&wrapped`.
+        let mut sub = StylesheetCompiler::new(self.origin, self.media, self.owner_parent, &wrapped);
+        sub.rules = std::mem::take(&mut self.rules);
+        sub.layers = std::mem::take(&mut self.layers);
+        sub.layer_paths = std::mem::take(&mut self.layer_paths);
+        sub.layer_path_map = std::mem::take(&mut self.layer_path_map);
+        sub.anon_layer_counter = self.anon_layer_counter;
+        sub.font_faces = std::mem::take(&mut self.font_faces);
+        sub.keyframes = std::mem::take(&mut self.keyframes);
+        sub.counter_styles = std::mem::take(&mut self.counter_styles);
+        sub.registered_properties = std::mem::take(&mut self.registered_properties);
+        sub.imports = std::mem::take(&mut self.imports);
+        sub.missing_seen = std::mem::take(&mut self.missing_seen);
+        sub.missing_features = std::mem::take(&mut self.missing_features);
+        sub.next_source_order = self.next_source_order;
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Ok(sheet) = StyleSheet::parse(&wrapped, opts) {
+                let has_selector_warning = warnings.read().is_ok_and(|w| {
+                    w.iter().any(|e| {
+                        matches!(e.kind, lightningcss::error::ParserError::SelectorError(_))
+                    })
+                });
+                if has_selector_warning
+                    && current_layer == LayerId::UNLAYERED
+                    && prefix_layer.is_none()
+                {
+                    sub.compile_top_level_with_selector_recovery(&sheet.rules);
+                } else {
+                    sub.compile_rule_list(
+                        &sheet.rules,
+                        CompileNesting::TopLevel,
+                        current_layer,
+                        prefix_layer,
+                    );
+                }
+            }
+        }));
+
+        self.rules = sub.rules;
+        self.layers = sub.layers;
+        self.layer_paths = sub.layer_paths;
+        self.layer_path_map = sub.layer_path_map;
+        self.anon_layer_counter = sub.anon_layer_counter;
+        self.font_faces = sub.font_faces;
+        self.keyframes = sub.keyframes;
+        self.counter_styles = sub.counter_styles;
+        self.registered_properties = sub.registered_properties;
+        self.imports = sub.imports;
+        self.missing_seen = sub.missing_seen;
+        self.missing_features = sub.missing_features;
+        self.next_source_order = sub.next_source_order;
+
+        if let Some(base) = base_url {
+            rewrite_stylesheet_relative_urls(&mut self.rules[rules_before..], base);
         }
     }
 
@@ -1577,11 +2299,20 @@ impl<'a> StylesheetCompiler<'a> {
                 self.compile_rule_list(&cr.rules, nesting, current_layer, prefix_layer);
                 self.container_stack.pop();
             }
+            CssRule::StartingStyle(ss) => {
+                let prev = self.in_starting_style;
+                self.in_starting_style = true;
+                self.compile_rule_list(&ss.rules, nesting, current_layer, prefix_layer);
+                self.in_starting_style = prev;
+            }
             CssRule::FontFace(ff) if !in_style_nesting => {
                 self.compile_font_face(ff, current_layer);
             }
             CssRule::Keyframes(kf) if !in_style_nesting => {
                 self.compile_keyframes(kf, current_layer);
+            }
+            CssRule::CounterStyle(cs) if !in_style_nesting => {
+                self.compile_counter_style(cs, current_layer);
             }
             CssRule::Property(pr) if !in_style_nesting => {
                 self.compile_property_rule(pr, current_layer);
@@ -1607,6 +2338,7 @@ impl<'a> StylesheetCompiler<'a> {
             CssRule::Ignored
             | CssRule::FontFace(_)
             | CssRule::Keyframes(_)
+            | CssRule::CounterStyle(_)
             | CssRule::Property(_)
             | CssRule::Import(_)
             | CssRule::Namespace(_)
@@ -1629,18 +2361,41 @@ impl<'a> StylesheetCompiler<'a> {
         parent_selector: Option<&str>,
     ) -> Option<CompiledScope> {
         let ns_opt = (!self.namespaces.is_empty()).then_some(&self.namespaces);
-        let start = if let Some(ref s) = sc.scope_start {
-            let raw = lightning_to_css_string(s);
+        // Extract raw `<scope-start>` and `<scope-end>` from source CSS so `lightningcss`'s
+        // serializer never strips explicit `:scope` inside `:has(:scope .b)`.
+        let (raw_start_opt, raw_end_opt) = extract_raw_at_rule_prelude(
+            self.source_css,
+            &self.line_index,
+            sc.loc.line,
+            sc.loc.column,
+        )
+        .map(split_raw_scope_prelude_parts)
+        .unwrap_or((None, None));
+
+        let start = if sc.scope_start.is_some() {
+            let raw = raw_start_opt
+                .map(str::to_string)
+                .unwrap_or_else(|| lightning_to_css_string(sc.scope_start.as_ref().unwrap()));
             if raw.trim().is_empty() {
                 return None;
             }
             let expanded = if let Some(parent) = parent_selector {
-                replace_ampersand_in_selector(&raw, parent)
+                if selector_has_ampersand(&raw) {
+                    replace_ampersand_in_selector(&raw, parent)
+                } else {
+                    // CSS Cascade L6 §2.5 / CSS Nesting: `@scope (.b)` nested inside `.a`
+                    // has an implicit leading `&` pointing to the enclosing style selector.
+                    flatten_nested_selector(parent, &raw)
+                }
             } else {
                 raw
             };
-            let list =
-                parse_selector_list_relative(&expanded, false, ns_opt, ParseRelative::No).ok()?;
+            let start_rel = if !self.scope_stack.is_empty() || parent_selector.is_some() {
+                ParseRelative::ForScope
+            } else {
+                ParseRelative::No
+            };
+            let list = parse_selector_list_relative(&expanded, false, ns_opt, start_rel).ok()?;
             if list.slice().is_empty() || list.slice().iter().any(Selector::has_pseudo_element) {
                 return None;
             }
@@ -1648,8 +2403,10 @@ impl<'a> StylesheetCompiler<'a> {
         } else {
             None
         };
-        let end = if let Some(ref e) = sc.scope_end {
-            let raw = lightning_to_css_string(e);
+        let end = if sc.scope_end.is_some() {
+            let raw = raw_end_opt
+                .map(str::to_string)
+                .unwrap_or_else(|| lightning_to_css_string(sc.scope_end.as_ref().unwrap()));
             if raw.trim().is_empty() {
                 return None;
             }
@@ -1822,6 +2579,7 @@ impl<'a> StylesheetCompiler<'a> {
                 declarations: Arc::clone(&shared_decls),
                 scopes: scopes.clone(),
                 container_queries: container_queries.clone(),
+                is_starting_style: self.in_starting_style,
             });
         }
     }
@@ -1922,6 +2680,77 @@ impl<'a> StylesheetCompiler<'a> {
         });
     }
 
+    fn compile_counter_style(
+        &mut self,
+        cs: &lightningcss::rules::counter_style::CounterStyleRule<'_>,
+        layer_id: LayerId,
+    ) {
+        let name = intern_str(cs.name.0.as_ref());
+        let full = lightning_to_css_string(cs);
+        let body = full
+            .find('{')
+            .and_then(|s| full.rfind('}').map(|e| &full[s + 1..e]))
+            .unwrap_or("");
+        let mut system = CounterStyleSystem::Symbolic;
+        let mut symbols = Vec::new();
+        let mut prefix = String::new();
+        let mut suffix = ". ".to_string();
+        for piece in body.split(';') {
+            let Some((k, v)) = piece.split_once(':') else {
+                continue;
+            };
+            let key = k.trim().to_ascii_lowercase();
+            let val = v.trim();
+            match key.as_str() {
+                "system" => {
+                    let toks: Vec<&str> = val.split_ascii_whitespace().collect();
+                    if let Some(first) = toks.first() {
+                        match first.to_ascii_lowercase().as_str() {
+                            "cyclic" => system = CounterStyleSystem::Cyclic,
+                            "fixed" => {
+                                let start =
+                                    toks.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
+                                system = CounterStyleSystem::Fixed(start);
+                            }
+                            "symbolic" => system = CounterStyleSystem::Symbolic,
+                            "alphabetic" => system = CounterStyleSystem::Alphabetic,
+                            "numeric" => system = CounterStyleSystem::Numeric,
+                            "additive" => system = CounterStyleSystem::Additive,
+                            "extends" => {
+                                if let Some(target) = toks.get(1) {
+                                    system = CounterStyleSystem::Extends(intern_str(target));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                "symbols" => {
+                    symbols = parse_counter_symbols_list(val);
+                }
+                "prefix" => {
+                    if let Some(s) = parse_counter_symbols_list(val).into_iter().next() {
+                        prefix = s;
+                    }
+                }
+                "suffix" => {
+                    if let Some(s) = parse_counter_symbols_list(val).into_iter().next() {
+                        suffix = s;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.counter_styles.push(CounterStyleRule {
+            name,
+            system,
+            symbols,
+            prefix,
+            suffix,
+            layer_id,
+        });
+    }
+
     fn compile_property_rule(
         &mut self,
         pr: &lightningcss::rules::property::PropertyRule<'_>,
@@ -1950,11 +2779,77 @@ impl<'a> StylesheetCompiler<'a> {
             layer_paths: self.layer_paths,
             font_faces: self.font_faces,
             keyframes: self.keyframes,
+            counter_styles: self.counter_styles,
             registered_properties: self.registered_properties,
             imports: self.imports,
             missing_features: self.missing_features,
         }
     }
+}
+
+fn parse_counter_symbols_list(val: &str) -> Vec<String> {
+    let bytes = val.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let q = bytes[i];
+            i += 1;
+            let mut s = String::new();
+            while i < bytes.len() && bytes[i] != q {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    s.push(bytes[i + 1] as char);
+                    i += 2;
+                } else {
+                    s.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            out.push(s);
+        } else {
+            let start = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            out.push(val[start..i].to_string());
+        }
+    }
+    out
+}
+
+fn split_raw_scope_prelude_parts(raw_prelude: &str) -> (Option<&str>, Option<&str>) {
+    let mut rest = raw_prelude.trim();
+    let start = if rest.starts_with('(') {
+        if let Some(close) = find_matching_paren(rest) {
+            let inner = rest[1..close].trim();
+            rest = rest[close + 1..].trim();
+            Some(inner)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let end = if rest.len() >= 2 && rest[..2].eq_ignore_ascii_case("to") {
+        let after = rest[2..].trim();
+        if after.starts_with('(') {
+            find_matching_paren(after).map(|close| after[1..close].trim())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    (start, end)
 }
 
 fn join_layer_name(name: &LayerName<'_>) -> String {
@@ -2217,6 +3112,10 @@ pub enum CssomRuleKind {
         name: String,
         css_text: String,
     },
+    PositionTry {
+        name: String,
+        declarations_text: String,
+    },
     Other {
         css_text: String,
     },
@@ -2318,6 +3217,9 @@ impl CssomRuleKind {
                 declarations_text, ..
             }
             | Self::FontFace { declarations_text }
+            | Self::PositionTry {
+                declarations_text, ..
+            }
             | Self::Keyframe {
                 declarations_text, ..
             } => Some(declarations_text),
@@ -2325,7 +3227,7 @@ impl CssomRuleKind {
         }
     }
 
-    /// Returns mutable declaration text for `Style`, `NestedDeclarations`, `Page`, `FontFace`, or `Keyframe` rules.
+    /// Returns mutable declaration text for `Style`, `NestedDeclarations`, `Page`, `FontFace`, `PositionTry`, or `Keyframe` rules.
     pub fn declarations_text_mut(&mut self) -> Option<&mut String> {
         match self {
             Self::Style {
@@ -2336,6 +3238,9 @@ impl CssomRuleKind {
                 declarations_text, ..
             }
             | Self::FontFace { declarations_text }
+            | Self::PositionTry {
+                declarations_text, ..
+            }
             | Self::Keyframe {
                 declarations_text, ..
             } => Some(declarations_text),
@@ -2473,6 +3378,17 @@ impl CssomRuleKind {
                     format!("{key_text} {{ }}")
                 } else {
                     format!("{key_text} {{ {d} }}")
+                }
+            }
+            Self::PositionTry {
+                name,
+                declarations_text,
+            } => {
+                let d = declarations_text.trim();
+                if d.is_empty() {
+                    format!("@position-try {name} {{ }}")
+                } else {
+                    format!("@position-try {name} {{ {d} }}")
                 }
             }
             Self::Property { css_text, .. } | Self::Other { css_text } => css_text.clone(),
@@ -2708,6 +3624,18 @@ impl LineIndex {
     }
 }
 
+fn contains_top_only_at_rule(slice: &str) -> bool {
+    let b = slice.as_bytes();
+    b.windows(6).any(|w| w.eq_ignore_ascii_case(b"@layer"))
+        || b.windows(10).any(|w| w.eq_ignore_ascii_case(b"@keyframes"))
+        || b.windows(10).any(|w| w.eq_ignore_ascii_case(b"@font-face"))
+        || b.windows(14)
+            .any(|w| w.eq_ignore_ascii_case(b"@counter-style"))
+        || b.windows(5).any(|w| w.eq_ignore_ascii_case(b"@page"))
+        || b.windows(13)
+            .any(|w| w.eq_ignore_ascii_case(b"@position-try"))
+}
+
 /// Wraps non-nested `@scope ... { ... }` blocks in `.__rix_top_scope__ { ... }` so
 /// `lightningcss` parses bare declarations and relative selectors inside `@scope`
 /// via its `NestedRuleParser`. Zero-allocation fast path when CSS has no `@scope`.
@@ -2748,11 +3676,7 @@ fn wrap_top_level_scope_rules(css: &str) -> std::borrow::Cow<'_, str> {
                 {
                     if let Some(end) = find_at_rule_block_end(css, i) {
                         let slice = &css[i..end];
-                        let has_layer_stmt = slice
-                            .as_bytes()
-                            .windows(6)
-                            .any(|w| w.eq_ignore_ascii_case(b"@layer"));
-                        if !has_layer_stmt {
+                        if !contains_top_only_at_rule(slice) {
                             out.push_str(&css[last..i]);
                             out.push_str(".__rix_top_scope__ {");
                             out.push_str(slice);
@@ -3339,17 +4263,29 @@ fn convert_lightning_rule_to_cssom(
                 };
                 (start, end)
             };
-            Ok(CssomRuleKind::Scope {
-                start,
-                end,
-                rules: convert_lightning_rule_list_to_cssom(
-                    &sc.rules,
-                    namespaces,
-                    CssomNestingContext::InsideScopeRule,
+            let mut rules = convert_lightning_rule_list_to_cssom(
+                &sc.rules,
+                namespaces,
+                CssomNestingContext::InsideScopeRule,
+                source_css,
+                line_index,
+            );
+            if !rules
+                .iter()
+                .any(|r| matches!(r, CssomRuleKind::NestedDeclarations { .. }))
+            {
+                if let Some(recovered) = recover_scope_bare_declarations(
                     source_css,
                     line_index,
-                ),
-            })
+                    sc.loc.line,
+                    sc.loc.column,
+                ) {
+                    if !recovered.is_empty() {
+                        rules.extend(recovered);
+                    }
+                }
+            }
+            Ok(CssomRuleKind::Scope { start, end, rules })
         }
         CssRule::FontFace(ff) => {
             let full = lightning_to_css_string(ff);
@@ -3443,6 +4379,31 @@ fn convert_lightning_rule_to_cssom(
                 css_text: collapsed,
             })
         }
+        CssRule::PositionTry(pt) => {
+            let name = pt.name.as_ref().to_string();
+            if !is_valid_dashed_ident(&name) {
+                return Err(CssomParseError::SyntaxError(format!(
+                    "Invalid @position-try name '{name}'"
+                )));
+            }
+            let raw_body_owned;
+            let raw_body = if let Some(slice) =
+                extract_rule_decls_slice(source_css, line_index, pt.loc.line, pt.loc.column, false)
+            {
+                slice
+            } else {
+                raw_body_owned = lightning_to_css_string(pt);
+                raw_body_owned
+                    .find('{')
+                    .and_then(|s| raw_body_owned.rfind('}').map(|e| &raw_body_owned[s + 1..e]))
+                    .unwrap_or("")
+            };
+            let declarations_text = filter_and_serialize_position_try_decls(raw_body);
+            Ok(CssomRuleKind::PositionTry {
+                name,
+                declarations_text,
+            })
+        }
         CssRule::Ignored | CssRule::Unknown(_) => {
             Err(CssomParseError::SyntaxError("Ignored CSS rule".to_string()))
         }
@@ -3485,9 +4446,7 @@ fn serialize_page_decl_block(
                 }
             }
         }
-        if !parts.is_empty() {
-            return parts.join(" ");
-        }
+        return parts.join(" ");
     }
     serialize_lightning_decl_block_cssom(block, raw_hint)
 }
@@ -3552,6 +4511,251 @@ pub fn validate_and_serialize_page_descriptor(name: &str, value: &str) -> Option
     }
 }
 
+/// Returns `true` if `prop` is an accepted CSS Anchor Positioning Level 1 §6.2
+/// `@position-try` descriptor (inset, margin, sizing, self-alignment, `position-anchor`,
+/// `position-area`; custom properties `--*` and `all` are explicitly disallowed).
+#[must_use]
+pub fn is_allowed_position_try_property(prop: &str) -> bool {
+    let lower = prop.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "top"
+            | "right"
+            | "bottom"
+            | "left"
+            | "inset"
+            | "inset-block"
+            | "inset-block-start"
+            | "inset-block-end"
+            | "inset-inline"
+            | "inset-inline-start"
+            | "inset-inline-end"
+            | "margin"
+            | "margin-top"
+            | "margin-right"
+            | "margin-bottom"
+            | "margin-left"
+            | "margin-block"
+            | "margin-block-start"
+            | "margin-block-end"
+            | "margin-inline"
+            | "margin-inline-start"
+            | "margin-inline-end"
+            | "width"
+            | "height"
+            | "min-width"
+            | "max-width"
+            | "min-height"
+            | "max-height"
+            | "inline-size"
+            | "block-size"
+            | "min-inline-size"
+            | "max-inline-size"
+            | "min-block-size"
+            | "max-block-size"
+            | "box-sizing"
+            | "aspect-ratio"
+            | "align-self"
+            | "justify-self"
+            | "place-self"
+            | "position-anchor"
+            | "position-area"
+    )
+}
+
+fn is_valid_dashed_ident(name: &str) -> bool {
+    name.starts_with("--")
+        && name.len() > 2
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii())
+}
+
+fn restore_all_rix_sentinels(input: &str) -> String {
+    let mut cur = input.to_string();
+    for _ in 0..16 {
+        if !cur.contains("--__rix_") {
+            break;
+        }
+        let next = crate::properties::restore_revert_rule_sentinel(&cur);
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
+/// Parses and canonically serializes only CSS Anchor Positioning L1 §6.2 accepted
+/// `@position-try` declarations (disallowing `!important`, `--*`, `all`, and non-accepted properties).
+#[must_use]
+pub fn filter_and_serialize_position_try_decls(raw_body: &str) -> String {
+    let mut parts = Vec::new();
+    for piece in raw_body.split(';') {
+        let p = piece.trim();
+        if p.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = p.split_once(':') else {
+            continue;
+        };
+        let key = k.trim().to_ascii_lowercase();
+        let val_owned = restore_all_rix_sentinels(v.trim());
+        let val = val_owned.trim();
+        if val.is_empty() || !is_allowed_position_try_property(&key) {
+            continue;
+        }
+        // CSS Anchor Positioning L1 §6.2: `!important` is invalid in `@position-try`.
+        if let Some((_, after)) = val.rsplit_once('!') {
+            if after.trim().eq_ignore_ascii_case("important") {
+                continue;
+            }
+        }
+        if key == "position-anchor" || key == "position-area" {
+            parts.push(format!("{key}: {val};"));
+            continue;
+        }
+        if let Some(exp) = crate::cssom_decl::parse_and_expand_declaration(&key, val) {
+            for (lk, lv) in exp {
+                parts.push(format!("{lk}: {lv};"));
+            }
+        } else if let Some(ser) = crate::cssom_decl::parse_and_serialize_declaration(&key, val) {
+            parts.push(format!("{key}: {ser};"));
+        }
+    }
+    parts.join(" ")
+}
+
+fn recover_scope_bare_declarations(
+    source_css: &str,
+    line_index: &LineIndex,
+    line: u32,
+    col: u32,
+) -> Option<Vec<CssomRuleKind>> {
+    let start_off = line_index.byte_offset(source_css.len(), line, col);
+    let end_off = find_at_rule_block_end(source_css, start_off)?;
+    let slice = &source_css[start_off..end_off];
+    let bytes = slice.as_bytes();
+    let (mut i, mut in_str, mut paren, mut body_start) = (0usize, None, 0usize, None);
+    while i < bytes.len() {
+        if skip_css_ignored(bytes, &mut i, &mut in_str) {
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' => paren += 1,
+            b')' | b']' => paren = paren.saturating_sub(1),
+            b'{' if paren == 0 => {
+                body_start = Some(i + 1);
+                break;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let bs = body_start?;
+    let body_end = slice.len().saturating_sub(1);
+    if bs >= body_end {
+        return None;
+    }
+    let body = &slice[bs..body_end];
+    let bbytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut cur_decls = String::new();
+    let mut j = 0usize;
+    let mut in_s = None;
+    while j < bbytes.len() {
+        while j < bbytes.len() {
+            if bbytes[j].is_ascii_whitespace() {
+                j += 1;
+                continue;
+            }
+            if j + 1 < bbytes.len() && bbytes[j] == b'/' && bbytes[j + 1] == b'*' {
+                j += 2;
+                while j + 1 < bbytes.len() && !(bbytes[j] == b'*' && bbytes[j + 1] == b'/') {
+                    j += 1;
+                }
+                j = (j + 2).min(bbytes.len());
+                continue;
+            }
+            break;
+        }
+        if j >= bbytes.len() {
+            break;
+        }
+        let seg_start = j;
+        let mut pdepth = 0usize;
+        let mut found_brace = false;
+        while j < bbytes.len() {
+            if skip_css_ignored(bbytes, &mut j, &mut in_s) {
+                continue;
+            }
+            match bbytes[j] {
+                b'(' | b'[' => pdepth += 1,
+                b')' | b']' => pdepth = pdepth.saturating_sub(1),
+                b';' if pdepth == 0 => {
+                    j += 1;
+                    break;
+                }
+                b'{' if pdepth == 0 => {
+                    found_brace = true;
+                    j += 1;
+                    let mut bdepth = 1usize;
+                    while j < bbytes.len() && bdepth > 0 {
+                        if skip_css_ignored(bbytes, &mut j, &mut in_s) {
+                            continue;
+                        }
+                        match bbytes[j] {
+                            b'{' => bdepth += 1,
+                            b'}' => bdepth -= 1,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        if found_brace {
+            if !cur_decls.trim().is_empty() {
+                if let Ok(CssomRuleKind::NestedDeclarations { declarations_text }) =
+                    parse_single_cssom_rule_with_context(
+                        &cur_decls,
+                        None,
+                        CssomNestingContext::InsideScopeRule,
+                    )
+                {
+                    out.push(CssomRuleKind::NestedDeclarations { declarations_text });
+                }
+                cur_decls.clear();
+            }
+        } else {
+            let seg = body[seg_start..j].trim();
+            if !seg.is_empty() && !seg.starts_with('@') && seg.contains(':') {
+                let restored_seg = restore_all_rix_sentinels(seg);
+                cur_decls.push_str(&restored_seg);
+                if !restored_seg.ends_with(';') {
+                    cur_decls.push(';');
+                }
+                cur_decls.push(' ');
+            }
+        }
+    }
+    if !cur_decls.trim().is_empty() {
+        if let Ok(CssomRuleKind::NestedDeclarations { declarations_text }) =
+            parse_single_cssom_rule_with_context(
+                &cur_decls,
+                None,
+                CssomNestingContext::InsideScopeRule,
+            )
+        {
+            out.push(CssomRuleKind::NestedDeclarations { declarations_text });
+        }
+    }
+    Some(out)
+}
+
 /// Parses a CSS stylesheet into top-level [`CssomRuleKind`] items (error-recovering).
 #[must_use]
 pub fn parse_cssom_rules(css: &str) -> Vec<CssomRuleKind> {
@@ -3567,9 +4771,47 @@ pub fn parse_cssom_rules(css: &str) -> Vec<CssomRuleKind> {
             Err(_) => Vec::new(),
         };
     }
-    let rewritten = crate::properties::rewrite_dynamic_var_names(css);
+    let (prelude_items, body_offset) = scan_stylesheet_prelude(css, &MediaContext::default());
+    let mut prelude_rules = Vec::new();
+    for item in prelude_items {
+        match item {
+            PreludeItem::LayerStatement(names) => {
+                prelude_rules.push(CssomRuleKind::LayerStatement {
+                    names: names
+                        .into_iter()
+                        .map(|segs| {
+                            segs.iter()
+                                .map(InternedStr::as_str)
+                                .collect::<Vec<_>>()
+                                .join(".")
+                        })
+                        .collect(),
+                });
+            }
+            PreludeItem::Import(imp) => {
+                prelude_rules.push(CssomRuleKind::Import {
+                    url: imp.url,
+                    layer: imp.layer.map(|opt| {
+                        opt.map(|segs| {
+                            segs.iter()
+                                .map(InternedStr::as_str)
+                                .collect::<Vec<_>>()
+                                .join(".")
+                        })
+                    }),
+                    supports: imp.supports,
+                    media: imp.media,
+                });
+            }
+        }
+    }
+    let rest_css = &css[body_offset..];
+    if rest_css.trim().is_empty() {
+        return prelude_rules;
+    }
+    let rewritten = crate::properties::rewrite_dynamic_var_names(rest_css);
     let wrapped = wrap_top_level_scope_rules(&rewritten);
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let body_rules = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let warnings = Arc::new(RwLock::new(Vec::new()));
         let opts = ParserOptions {
             error_recovery: true,
@@ -3602,7 +4844,9 @@ pub fn parse_cssom_rules(css: &str) -> Vec<CssomRuleKind> {
             )
         }
     }))
-    .unwrap_or_default()
+    .unwrap_or_default();
+    prelude_rules.extend(body_rules);
+    prelude_rules
 }
 
 fn rule_start_byte_offset(
@@ -3942,6 +5186,27 @@ pub fn parse_single_cssom_rule_with_context(
         }
     }
 
+    // Handle `@position-try <dashed-ident> { ... }` (CSS Anchor Positioning L1 §6.2).
+    if trimmed.len() >= 13 && trimmed[..13].eq_ignore_ascii_case("@position-try") {
+        if nesting == CssomNestingContext::InsideStyleRule {
+            return Err(CssomParseError::HierarchyRequestError(
+                "@position-try is not allowed inside a nested style rule".to_string(),
+            ));
+        }
+        if let Some((prelude, body)) = split_single_style_rule(trimmed) {
+            let name = prelude[13..].trim();
+            if is_valid_dashed_ident(name) {
+                return Ok(CssomRuleKind::PositionTry {
+                    name: name.to_string(),
+                    declarations_text: filter_and_serialize_position_try_decls(body),
+                });
+            }
+        }
+        return Err(CssomParseError::SyntaxError(format!(
+            "Failed to parse CSS rule '{trimmed}'"
+        )));
+    }
+
     // Handle `@import` rules with `supports(...)` or invalid `layer(...)` fallback per CSS Cascade L5.
     if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("@import") {
         if let Some(imp_rule) = parse_cssom_import_rule(trimmed) {
@@ -3992,7 +5257,8 @@ pub fn parse_single_cssom_rule_with_context(
 
     let is_top_scope = nesting == CssomNestingContext::TopLevel
         && trimmed.len() >= 6
-        && trimmed[..6].eq_ignore_ascii_case("@scope");
+        && trimmed[..6].eq_ignore_ascii_case("@scope")
+        && !contains_top_only_at_rule(trimmed);
     let wrapped_for_parse = if nesting != CssomNestingContext::TopLevel || is_top_scope {
         Some(format!(".__rix_nest_wrap__ {{ {rewritten} }}"))
     } else {
@@ -4029,9 +5295,36 @@ pub fn parse_single_cssom_rule_with_context(
                 &li,
             );
         }
-        let parsed = StyleSheet::parse(&rewritten, opts).map_err(|e| {
-            CssomParseError::SyntaxError(format!("Failed to parse CSS rule '{trimmed}': {e}"))
-        })?;
+        let parsed = match StyleSheet::parse(&rewritten, opts) {
+            Ok(p) => p,
+            Err(e) => {
+                // CSSOM `insertRule` + CSS Syntax L3 §5.4.6: invalid declarations inside a valid
+                // `@position-try` block must be dropped by declaration error-recovery rather than
+                // throwing `SyntaxError` on the enclosing `@scope`/`@media`/`@layer` rule.
+                let has_pos_try = trimmed
+                    .as_bytes()
+                    .windows(13)
+                    .any(|w| w.eq_ignore_ascii_case(b"@position-try"));
+                let is_single_balanced_at_rule = trimmed.starts_with('@')
+                    && find_at_rule_block_end(trimmed, 0)
+                        .is_some_and(|end| trimmed[end..].trim().is_empty());
+                if has_pos_try && is_single_balanced_at_rule {
+                    let rec_opts = ParserOptions {
+                        error_recovery: true,
+                        ..ParserOptions::default()
+                    };
+                    StyleSheet::parse(&rewritten, rec_opts).map_err(|e2| {
+                        CssomParseError::SyntaxError(format!(
+                            "Failed to parse CSS rule '{trimmed}': {e2}"
+                        ))
+                    })?
+                } else {
+                    return Err(CssomParseError::SyntaxError(format!(
+                        "Failed to parse CSS rule '{trimmed}': {e}"
+                    )));
+                }
+            }
+        };
         if parsed.rules.0.len() != 1 {
             return Err(CssomParseError::SyntaxError(format!(
                 "Expected exactly 1 CSS rule, got {}",

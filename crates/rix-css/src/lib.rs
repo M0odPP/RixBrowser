@@ -63,15 +63,18 @@ pub use selector::{
     RixSelectorParser, SelectorNamespaceMap,
 };
 pub use stylesheet::{
-    evaluate_supports, evaluate_supports_condition_str, normalize_nested_selector_text,
+    evaluate_import_supports_str, evaluate_supports, evaluate_supports_condition_str,
+    extract_stylesheet_imports, filter_and_serialize_position_try_decls,
+    is_allowed_position_try_property, normalize_nested_selector_text,
     parse_and_serialize_keyframe_selector, parse_and_serialize_page_selector,
     parse_and_serialize_selector_for_context, parse_container_condition, parse_cssom_rules,
     parse_single_cssom_rule, parse_single_cssom_rule_with_context,
     parse_single_cssom_rule_with_namespaces, parse_single_keyframe_rule,
     validate_and_serialize_page_descriptor, CascadeOrigin, CompiledContainerQuery, CompiledRule,
-    CompiledScope, ContainerAxis, ContainerCmpOp, ContainerCondition, CssomNestingContext,
-    CssomParseError, CssomRuleKind, FontFaceRule, FontFaceSource, KeyframeStep, KeyframesRule,
-    LayerId, LayerSeg, MediaContext, MediaTypeKind, RegisteredProperty, Stylesheet,
+    CompiledScope, ContainerAxis, ContainerCmpOp, ContainerCondition, CounterStyleRule,
+    CounterStyleSystem, CssomNestingContext, CssomParseError, CssomRuleKind, ExtractedImport,
+    FontFaceRule, FontFaceSource, KeyframeStep, KeyframesRule, LayerId, LayerSeg, MediaContext,
+    MediaTypeKind, RegisteredProperty, Stylesheet,
 };
 pub use text_css::{
     decompose_legacy_white_space, derive_white_space_mode, HangingPunctuation, HyphenateLimitChars,

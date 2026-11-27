@@ -17,7 +17,8 @@ use smallvec::SmallVec;
 
 use crate::selector::{classify_host_selector, RixPseudoClass, RixPseudoElement, RixSelectorImpl};
 use crate::stylesheet::{
-    CompiledRule, FontFaceRule, KeyframesRule, LayerId, LayerSeg, RegisteredProperty, Stylesheet,
+    CompiledRule, CounterStyleRule, CounterStyleSystem, FontFaceRule, KeyframesRule, LayerId,
+    LayerSeg, RegisteredProperty, Stylesheet,
 };
 
 /// Zero-overhead identity hasher for pre-hashed `u64` FNV-1a keys.
@@ -159,6 +160,7 @@ pub struct RuleIndex {
     host_pseudo_by_kind: HashMap<RixPseudoElement, Vec<RuleBucketEntry>>,
     slotted_rules: Vec<RuleBucketEntry>,
     part_rules: Vec<RuleBucketEntry>,
+    starting_style_rules: Vec<RuleBucketEntry>,
     pseudo_by_kind: HashMap<RixPseudoElement, SelectorBuckets>,
     /// True when any rule is inserted into multiple selector buckets (e.g. multi-branch `:is()`/`:where()`).
     pub has_multi_bucket_rules: bool,
@@ -195,6 +197,8 @@ pub struct RuleIndex {
     pub registered_properties: HashMap<InternedStr, RegisteredProperty>,
     /// Merged `@keyframes` rules by name (layer-ordered per CSS Cascade L5).
     pub keyframes: HashMap<InternedStr, KeyframesRule>,
+    /// Merged `@counter-style` rules by name (layer-ordered per CSS Cascade L5).
+    pub counter_styles: HashMap<InternedStr, CounterStyleRule>,
     /// Layer-ordered `@font-face` rules (ascending priority; highest-priority last).
     pub font_faces: Vec<FontFaceRule>,
 }
@@ -233,6 +237,7 @@ impl RuleIndex {
             host_pseudo_by_kind: HashMap::new(),
             slotted_rules: Vec::new(),
             part_rules: Vec::new(),
+            starting_style_rules: Vec::new(),
             pseudo_by_kind: HashMap::new(),
             has_multi_bucket_rules: false,
             has_relative_selectors: false,
@@ -249,6 +254,7 @@ impl RuleIndex {
             has_container_queries: false,
             registered_properties: HashMap::new(),
             keyframes: HashMap::new(),
+            counter_styles: HashMap::new(),
             font_faces: Vec::new(),
         };
         let mut inv = InvalidationMap::default();
@@ -299,6 +305,7 @@ impl RuleIndex {
 
         let mut reg_layers: HashMap<InternedStr, u32> = HashMap::new();
         let mut kf_layers: HashMap<InternedStr, (u8, u32)> = HashMap::new();
+        let mut cs_layers: HashMap<InternedStr, (u8, u32)> = HashMap::new();
         let mut ff_ranked: Vec<((u8, u32, u32), FontFaceRule)> = Vec::new();
         let mut ff_order = 0u32;
 
@@ -337,6 +344,17 @@ impl RuleIndex {
                     index.keyframes.insert(kf.name.clone(), kf_copy);
                 }
             }
+            for cs in &sheet.counter_styles {
+                let remapped = remap_layer(sheet_idx, cs.layer_id);
+                let key_rank = (origin_rank, remapped.0);
+                let wins = cs_layers.get(&cs.name).is_none_or(|&prev| key_rank >= prev);
+                if wins {
+                    cs_layers.insert(cs.name.clone(), key_rank);
+                    let mut cs_copy = cs.clone();
+                    cs_copy.layer_id = remapped;
+                    index.counter_styles.insert(cs.name.clone(), cs_copy);
+                }
+            }
             for ff in &sheet.font_faces {
                 let remapped = remap_layer(sheet_idx, ff.layer_id);
                 let mut ff_copy = ff.clone();
@@ -355,7 +373,11 @@ impl RuleIndex {
                     rule_idx,
                     ancestor_hashes: compiled.ancestor_hashes.clone(),
                 };
-                index.insert_bucket(&compiled.selector, entry);
+                if compiled.is_starting_style {
+                    index.starting_style_rules.push(entry);
+                } else {
+                    index.insert_bucket(&compiled.selector, entry);
+                }
                 if compiled.container_queries.is_some() {
                     index.has_container_queries = true;
                     index.allows_sibling_sharing = false;
@@ -548,6 +570,20 @@ impl RuleIndex {
         }
     }
 
+    /// Returns true if any rule was declared inside `@starting-style`.
+    #[must_use]
+    pub fn has_starting_style_rules(&self) -> bool {
+        !self.starting_style_rules.is_empty()
+    }
+
+    /// Collects candidate `@starting-style` rule indices.
+    pub fn collect_starting_style_candidates(&self, out: &mut SmallVec<[u32; 16]>) {
+        out.clear();
+        for entry in &self.starting_style_rules {
+            out.push(entry.rule_idx);
+        }
+    }
+
     /// Returns true if any rule targets `pseudo`.
     #[must_use]
     pub fn has_pseudo_rules(&self, pseudo: RixPseudoElement) -> bool {
@@ -569,6 +605,81 @@ impl RuleIndex {
             .sum()
     }
 
+    /// Evaluates a CSS Counter Styles L3 counter representation (`counter(name, style)`).
+    #[must_use]
+    pub fn format_counter(&self, value: i32, style_name: &str) -> String {
+        let mut cur_name = style_name;
+        let mut depth = 0usize;
+        let resolved: Option<&CounterStyleRule> = loop {
+            if depth >= 16 {
+                break None;
+            }
+            let Some(rule) = self.counter_styles.get(&rix_core::intern_str(cur_name)) else {
+                break None;
+            };
+            if let CounterStyleSystem::Extends(ref parent) = rule.system {
+                cur_name = parent.as_str();
+                depth += 1;
+                continue;
+            }
+            break Some(rule);
+        };
+        if let Some(rule) = resolved {
+            let n = rule.symbols.len();
+            if n > 0 {
+                match rule.system {
+                    CounterStyleSystem::Cyclic => {
+                        let idx = (value - 1).rem_euclid(n as i32) as usize;
+                        return rule.symbols[idx].clone();
+                    }
+                    CounterStyleSystem::Fixed(start) => {
+                        let off = value - start;
+                        if off >= 0 && (off as usize) < n {
+                            return rule.symbols[off as usize].clone();
+                        }
+                    }
+                    CounterStyleSystem::Symbolic if value >= 1 => {
+                        let idx = ((value - 1) as usize) % n;
+                        let count = ((value - 1) as usize) / n + 1;
+                        return rule.symbols[idx].repeat(count);
+                    }
+                    CounterStyleSystem::Alphabetic if value >= 1 => {
+                        let mut v = value as usize;
+                        let mut parts = Vec::new();
+                        while v > 0 {
+                            v -= 1;
+                            parts.push(rule.symbols[v % n].as_str());
+                            v /= n;
+                        }
+                        parts.reverse();
+                        return parts.concat();
+                    }
+                    CounterStyleSystem::Numeric if value >= 0 && n >= 2 => {
+                        if value == 0 {
+                            return rule.symbols[0].clone();
+                        }
+                        let mut v = value as usize;
+                        let mut parts = Vec::new();
+                        while v > 0 {
+                            parts.push(rule.symbols[v % n].as_str());
+                            v /= n;
+                        }
+                        parts.reverse();
+                        return parts.concat();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        match cur_name.to_ascii_lowercase().as_str() {
+            "none" => String::new(),
+            "disc" => "\u{2022}".to_string(),
+            "circle" => "\u{25E6}".to_string(),
+            "square" => "\u{25AA}".to_string(),
+            _ => value.to_string(),
+        }
+    }
+
     /// Marks ONLY DOM elements potentially affected by a newly appended `sheet` as
     /// `SELF_STYLE_DIRTY` (propagating `DESCENDANT_STYLE_DIRTY` to the document root).
     /// Returns `true` if incremental marking succeeded, or `false` if a full restyle is required
@@ -579,6 +690,7 @@ impl RuleIndex {
     ) -> bool {
         if !sheet.registered_properties.is_empty()
             || !sheet.keyframes.is_empty()
+            || !sheet.counter_styles.is_empty()
             || !sheet.layers.is_empty()
             || !sheet.font_faces.is_empty()
         {
@@ -1243,6 +1355,24 @@ impl InvalidationMap {
                 let mut non_sub = false;
                 for sel in list.slice() {
                     let (r, ns) = self.record_selector_with_scope(sel, scope);
+                    rel |= r;
+                    non_sub |= ns;
+                }
+                (rel, non_sub)
+            }
+            Component::NthOf(nth_of) => {
+                // `:nth-child(An+B of S)` / `:nth-last-child(An+B of S)`: mutating any sibling
+                // matching `S` changes the index of all siblings (and their descendants for `@scope`).
+                let nth_scope = scope
+                    | InvalidationScope::EARLIER_SIBLINGS
+                    | InvalidationScope::LATER_SIBLINGS
+                    | InvalidationScope::LATER_SIBLING_DESCENDANTS
+                    | InvalidationScope::DESCENDANTS
+                    | InvalidationScope::ANCESTOR_SUBTREES;
+                let mut rel = false;
+                let mut non_sub = false;
+                for sel in nth_of.selectors() {
+                    let (r, ns) = self.record_selector_with_scope(sel, nth_scope);
                     rel |= r;
                     non_sub |= ns;
                 }

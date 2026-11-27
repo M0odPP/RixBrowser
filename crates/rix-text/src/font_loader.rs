@@ -512,6 +512,40 @@ impl FontDatabase {
         self.add_memory_font_internal(bytes, face_index, None, None, None)
     }
 
+    /// Returns `true` if `family` is literally indexed in `family_index` (no fallback substitution).
+    #[must_use]
+    pub fn has_exact_family(&self, family: &str) -> bool {
+        self.family_index
+            .get(&family.to_lowercase())
+            .is_some_and(|ids| !ids.is_empty())
+    }
+
+    /// Clears existing family-index entries for `family` so a winning `@font-face`
+    /// cascade-layer declaration takes precedence cleanly over lower-layer/system faces.
+    pub fn clear_family_override(&mut self, family: &str) {
+        self.family_index.remove(&family.to_lowercase());
+    }
+
+    /// Registers an alias from `family` to existing faces of `local_family` in `base`
+    /// (for `@font-face { src: local(...); }` per CSS Fonts L4 §4.3 — always resolves
+    /// against locally installed faces even when another `@font-face` overrides `local_family`).
+    pub fn alias_local_family_from(
+        &mut self,
+        base: &FontDatabase,
+        family: &str,
+        local_family: &str,
+    ) -> bool {
+        let local_key = local_family.to_lowercase();
+        let Some(ids) = base.family_index.get(&local_key).cloned() else {
+            return false;
+        };
+        if ids.is_empty() {
+            return false;
+        }
+        self.family_index.insert(family.to_lowercase(), ids);
+        true
+    }
+
     /// Registers decoded `@font-face` SFNT bytes with explicit CSS family, weight, and style.
     pub fn add_web_font_bytes(
         &mut self,

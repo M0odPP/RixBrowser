@@ -2264,7 +2264,6 @@ pub const ALL_RESETTABLE_LONGHANDS: &[PropertyIdKind] = &[
     PropertyIdKind::TextDecorationLine,
     PropertyIdKind::TextDecorationColor,
     PropertyIdKind::TextTransform,
-    PropertyIdKind::WhiteSpace,
     PropertyIdKind::WordBreak,
     PropertyIdKind::OverflowWrap,
     PropertyIdKind::UserSelect,
@@ -2645,6 +2644,7 @@ pub enum PropertyValue {
     EmptyCells(EmptyCellsMode),
     TableLayout(TableLayoutMode),
     Content(Option<InternedStr>),
+    ContentCounter(InternedStr, InternedStr),
     WritingMode(WritingMode),
     TextOrientation(TextOrientationMode),
     Resize(ResizeMode),
@@ -8133,13 +8133,31 @@ fn compile_property(
             PropertyValue::TextTransform(convert_text_transform(tt)),
             imp,
         ),
-        Property::WhiteSpace(ws) => push_decl(
-            out,
-            ord,
-            PropertyIdKind::WhiteSpace,
-            PropertyValue::WhiteSpace(convert_white_space(ws)),
-            imp,
-        ),
+        Property::WhiteSpace(ws) => {
+            let mode = convert_white_space(ws);
+            let (collapse, wrap) = crate::text_css::decompose_legacy_white_space(mode);
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::WhiteSpaceCollapse,
+                PropertyValue::WhiteSpaceCollapse(collapse),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::TextWrapMode,
+                PropertyValue::TextWrapMode(wrap),
+                imp,
+            );
+            push_decl(
+                out,
+                ord,
+                PropertyIdKind::WhiteSpaceTrim,
+                PropertyValue::WhiteSpaceTrim(crate::text_css::WhiteSpaceTrim::NONE),
+                imp,
+            );
+        }
         Property::WordBreak(wb) => push_decl(
             out,
             ord,
@@ -10021,9 +10039,17 @@ pub(crate) fn compile_extra_standard_property(
         }
         "pointer-events" => {
             let Some(mode) = single_ident.and_then(|s| match s.to_ascii_lowercase().as_str() {
+                "auto" => Some(PointerEventsMode::Auto),
                 "none" => Some(PointerEventsMode::None),
-                "auto" | "all" | "visiblepainted" | "visiblefill" | "visiblestroke" | "visible"
-                | "painted" | "fill" | "stroke" => Some(PointerEventsMode::Auto),
+                "visiblepainted" => Some(PointerEventsMode::VisiblePainted),
+                "visiblefill" => Some(PointerEventsMode::VisibleFill),
+                "visiblestroke" => Some(PointerEventsMode::VisibleStroke),
+                "visible" => Some(PointerEventsMode::Visible),
+                "painted" => Some(PointerEventsMode::Painted),
+                "fill" => Some(PointerEventsMode::Fill),
+                "stroke" => Some(PointerEventsMode::Stroke),
+                "all" => Some(PointerEventsMode::All),
+                "bounding-box" => Some(PointerEventsMode::BoundingBox),
                 _ => None,
             }) else {
                 return;
@@ -10166,6 +10192,27 @@ pub(crate) fn compile_extra_standard_property(
                     ord,
                     PropertyIdKind::Content,
                     PropertyValue::BackgroundImageRaw(trimmed.to_string()),
+                    imp,
+                );
+                return;
+            }
+            if let Some((cname, cstyle)) = owned.iter().find_map(|t| match t {
+                CssToken::Function { name, args } if name.eq_ignore_ascii_case("counter") => {
+                    let mut idents = args.iter().filter_map(|a| match a {
+                        CssToken::Ident(s) => Some(s.clone()),
+                        _ => None,
+                    });
+                    let cname = idents.next()?;
+                    let cstyle = idents.next().unwrap_or_else(|| intern_str("decimal"));
+                    Some((cname, cstyle))
+                }
+                _ => None,
+            }) {
+                push_decl(
+                    out,
+                    ord,
+                    PropertyIdKind::Content,
+                    PropertyValue::ContentCounter(cname, cstyle),
                     imp,
                 );
                 return;

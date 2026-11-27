@@ -971,6 +971,15 @@ pub enum PointerEventsMode {
     #[default]
     Auto,
     None,
+    VisiblePainted,
+    VisibleFill,
+    VisibleStroke,
+    Visible,
+    Painted,
+    Fill,
+    Stroke,
+    All,
+    BoundingBox,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -2157,6 +2166,7 @@ pub enum ClipRadius {
 pub enum ClipPathValue {
     #[default]
     None,
+    Url(String),
     Inset {
         top: LengthPercentage,
         right: LengthPercentage,
@@ -3501,9 +3511,8 @@ fn parse_simple_lp(token: &str) -> LengthPercentage {
 #[must_use]
 pub fn convert_clip_path(cp: &LightningClipPath<'_>) -> ClipPathValue {
     match cp {
-        LightningClipPath::None | LightningClipPath::Url(_) | LightningClipPath::Box(_) => {
-            ClipPathValue::None
-        }
+        LightningClipPath::None | LightningClipPath::Box(_) => ClipPathValue::None,
+        LightningClipPath::Url(u) => ClipPathValue::Url(u.url.as_ref().to_string()),
         LightningClipPath::Shape { shape, .. } => match shape.as_ref() {
             BasicShape::Inset(ins) => ClipPathValue::Inset {
                 top: convert_length_percentage(&ins.rect.0),
