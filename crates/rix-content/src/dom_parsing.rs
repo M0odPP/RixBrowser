@@ -954,6 +954,7 @@ fn set_inner_html_spec(
     if run_scripts {
         maybe_run_fragment_scripts(vm, host, &added, is_conn);
     }
+    crate::dom_bridge::enforce_details_exclusivity_for_inserted(vm, host, &added);
     Ok(())
 }
 
@@ -1056,6 +1057,7 @@ fn set_outer_html_spec(
     if run_scripts {
         maybe_run_fragment_scripts(vm, host, &added, is_conn);
     }
+    crate::dom_bridge::enforce_details_exclusivity_for_inserted(vm, host, &added);
     Ok(())
 }
 
@@ -1210,6 +1212,7 @@ fn insert_adjacent_html_spec(
     if run_scripts {
         maybe_run_fragment_scripts(vm, host, &added, is_conn);
     }
+    crate::dom_bridge::enforce_details_exclusivity_for_inserted(vm, host, &added);
     Ok(())
 }
 

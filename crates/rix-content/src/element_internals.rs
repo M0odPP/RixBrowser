@@ -1270,7 +1270,86 @@ fn install_html_reflecting_idl_properties(vm: &mut JsVm, host: &SharedHost) {
     ] {
         install_str(vm, hep, idl, attr);
     }
-    install_nullable_str(vm, hep, "popover", "popover");
+    // HTML Living Standard §6.11: `HTMLElement.prototype.popover` enumerated attribute
+    // (`""` / `"auto"` -> `"auto"`, `"hint"` -> `"hint"`, `"manual"` or any invalid value -> `"manual"`,
+    // missing -> `null`).
+    {
+        let h1 = Rc::clone(host);
+        let g = vm.alloc_host_fn("get popover", move |vm, t, _| {
+            let nid = require_node(vm, &h1, t)?;
+            let val = {
+                let doc_rc = Rc::clone(&h1.borrow().document);
+                let doc = doc_rc.borrow();
+                match doc.get(nid) {
+                    Some(NodeData::Element(e)) => e.get_attribute("popover").map(|raw| {
+                        if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+                            "auto"
+                        } else if raw.eq_ignore_ascii_case("hint") {
+                            "hint"
+                        } else {
+                            "manual"
+                        }
+                    }),
+                    _ => None,
+                }
+            };
+            Ok(match val {
+                Some(s) => JsValue::from_string(vm.heap.alloc_string(s)),
+                None => JsValue::NULL,
+            })
+        });
+        let h2 = Rc::clone(host);
+        let s = vm.alloc_host_fn("set popover", move |vm, t, args| {
+            let nid = require_node(vm, &h2, t)?;
+            let a = arg(args, 0);
+            let prev_state = {
+                let doc_rc = Rc::clone(&h2.borrow().document);
+                let doc = doc_rc.borrow();
+                match doc.get(nid) {
+                    Some(NodeData::Element(e)) => e.get_attribute("popover").map(|raw| {
+                        if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+                            0u8
+                        } else if raw.eq_ignore_ascii_case("hint") {
+                            2u8
+                        } else {
+                            1u8
+                        }
+                    }),
+                    _ => None,
+                }
+            };
+            let next_state = if a.is_null() {
+                remove_element_attr(vm, &h2, nid, "popover");
+                None
+            } else {
+                let v = vm.value_to_rust_string(a);
+                let st = if v.is_empty() || v.eq_ignore_ascii_case("auto") {
+                    0u8
+                } else if v.eq_ignore_ascii_case("hint") {
+                    2u8
+                } else {
+                    1u8
+                };
+                set_element_attr(vm, &h2, nid, "popover", &v);
+                Some(st)
+            };
+            if prev_state != next_state {
+                let mut hs = h2.borrow_mut();
+                if hs.open_popovers.contains(&nid) {
+                    hs.open_popovers.retain(|&p| p != nid);
+                    {
+                        let mut doc = hs.document.borrow_mut();
+                        if let Some(NodeData::Element(e)) = doc.get_mut(nid) {
+                            e.pseudo_state.remove(rix_dom::ElementState::POPOVER_OPEN);
+                        }
+                    }
+                    hs.mark_node_style_dirty(nid);
+                }
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, hep, "popover", Some(g), Some(s));
+    }
     for &(idl, attr) in &[("autofocus", "autofocus"), ("inert", "inert")] {
         install_bool(vm, hep, idl, attr);
     }
@@ -1560,6 +1639,107 @@ fn install_html_reflecting_idl_properties(vm: &mut JsVm, host: &SharedHost) {
         ] {
             install_bool(vm, p, idl, attr);
         }
+        // HTML Living Standard §6.11.2: `popoverTargetElement` IDREF reflection
+        {
+            let h1 = Rc::clone(host);
+            let g = vm.alloc_host_fn("get popoverTargetElement", move |vm, t, _| {
+                let nid = require_node(vm, &h1, t)?;
+                let target = {
+                    let doc_rc = Rc::clone(&h1.borrow().document);
+                    let doc = doc_rc.borrow();
+                    let target_id = match doc.get(nid) {
+                        Some(NodeData::Element(e)) => e
+                            .get_attribute("popovertarget")
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string),
+                        _ => None,
+                    };
+                    target_id.and_then(|tid| {
+                        let root = crate::dom_bridge::tree_scope_root(&doc, nid);
+                        doc.descendants(root).find(|&cand| {
+                            matches!(
+                                doc.get(cand),
+                                Some(NodeData::Element(te)) if te.get_attribute("id") == Some(tid.as_str())
+                            )
+                        })
+                    })
+                };
+                Ok(match target {
+                    Some(tid) => wrap_node(vm, &h1, tid),
+                    None => JsValue::NULL,
+                })
+            });
+            let h2 = Rc::clone(host);
+            let s = vm.alloc_host_fn("set popoverTargetElement", move |vm, t, args| {
+                let nid = require_node(vm, &h2, t)?;
+                let a = arg(args, 0);
+                if a.is_null() {
+                    remove_element_attr(vm, &h2, nid, "popovertarget");
+                } else {
+                    let tid_opt = h2.borrow().node_for_value(vm, a);
+                    if let Some(tid) = tid_opt {
+                        let id_str = get_attr_string(&h2, tid, "id").unwrap_or_default();
+                        set_element_attr(vm, &h2, nid, "popovertarget", &id_str);
+                    }
+                }
+                Ok(JsValue::UNDEFINED)
+            });
+            define_host_accessor(vm, p, "popoverTargetElement", Some(g), Some(s));
+        }
+    }
+
+    // `HTMLInputElement.prototype` popover target reflection
+    if let Some(p) = proto_of("HTMLInputElement") {
+        install_str(vm, p, "popoverTargetAction", "popovertargetaction");
+        let h1 = Rc::clone(host);
+        let g = vm.alloc_host_fn("get popoverTargetElement", move |vm, t, _| {
+            let nid = require_node(vm, &h1, t)?;
+            let target = {
+                let doc_rc = Rc::clone(&h1.borrow().document);
+                let doc = doc_rc.borrow();
+                let target_id = match doc.get(nid) {
+                    Some(NodeData::Element(e)) => e
+                        .get_attribute("popovertarget")
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    _ => None,
+                };
+                target_id.and_then(|tid| {
+                    let root = crate::dom_bridge::tree_scope_root(&doc, nid);
+                    doc.descendants(root).find(|&cand| {
+                        matches!(
+                            doc.get(cand),
+                            Some(NodeData::Element(te)) if te.get_attribute("id") == Some(tid.as_str())
+                        )
+                    })
+                })
+            };
+            Ok(match target {
+                Some(tid) => wrap_node(vm, &h1, tid),
+                None => JsValue::NULL,
+            })
+        });
+        let h2 = Rc::clone(host);
+        let s = vm.alloc_host_fn("set popoverTargetElement", move |vm, t, args| {
+            let nid = require_node(vm, &h2, t)?;
+            let a = arg(args, 0);
+            if a.is_null() {
+                remove_element_attr(vm, &h2, nid, "popovertarget");
+            } else {
+                let tid_opt = h2.borrow().node_for_value(vm, a);
+                if let Some(tid) = tid_opt {
+                    let id_str = get_attr_string(&h2, tid, "id").unwrap_or_default();
+                    set_element_attr(vm, &h2, nid, "popovertarget", &id_str);
+                }
+            }
+            Ok(JsValue::UNDEFINED)
+        });
+        define_host_accessor(vm, p, "popoverTargetElement", Some(g), Some(s));
+    }
+
+    // `HTMLDetailsElement.prototype.name` (HTML Living Standard §4.11.1)
+    if let Some(p) = proto_of("HTMLDetailsElement") {
+        install_str(vm, p, "name", "name");
     }
 
     // `HTMLTableCellElement.prototype`
