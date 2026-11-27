@@ -241,6 +241,43 @@ fn scan_pi_comment_actions(html: &str, scripting_enabled: bool) -> VecDeque<PiCo
     actions
 }
 
+fn is_host_including_inclusive_ancestor(
+    doc: &Document,
+    ancestor: NodeId,
+    mut node: NodeId,
+) -> bool {
+    let mut visited = 0usize;
+    loop {
+        if node == ancestor {
+            return true;
+        }
+        visited += 1;
+        if visited > 4096 {
+            return true;
+        }
+        if let Some(p) = doc.parent(node) {
+            node = p;
+            continue;
+        }
+        if let Some(NodeData::ShadowRoot { host, .. }) = doc.get(node) {
+            node = *host;
+            continue;
+        }
+        if matches!(doc.get(node), Some(NodeData::DocumentFragment)) {
+            if let Some(tmpl_owner) = doc.descendants(doc.root()).find(|&cand| {
+                matches!(
+                    doc.get(cand),
+                    Some(NodeData::Element(e)) if e.template_contents == Some(node)
+                )
+            }) {
+                node = tmpl_owner;
+                continue;
+            }
+        }
+        return false;
+    }
+}
+
 impl TreeSink for DomTreeSink {
     type Handle = NodeId;
     type Output = Document;
@@ -370,15 +407,41 @@ impl TreeSink for DomTreeSink {
 
     fn append(&self, parent: &Self::Handle, child: NodeOrText<Self::Handle>) {
         let mut doc = self.document.borrow_mut();
+        // WHATWG HTML §13.2.6.1: if the adjusted insertion location's parent is an HTML
+        // `<template>` element, redirect into its template contents fragment.
+        let target_parent = match doc.get(*parent) {
+            Some(NodeData::Element(e))
+                if &*e.name.ns == "http://www.w3.org/1999/xhtml"
+                    && &*e.name.local == "template" =>
+            {
+                e.template_contents.unwrap_or(*parent)
+            }
+            _ => *parent,
+        };
+        let parent_is_doc = matches!(doc.get(target_parent), Some(NodeData::Document));
         match child {
             NodeOrText::AppendNode(node) => {
                 if self.dropped_nodes.borrow().contains(&node) {
                     return;
                 }
-                doc.append_child(*parent, node);
+                if is_host_including_inclusive_ancestor(&doc, node, target_parent) {
+                    return;
+                }
+                if parent_is_doc
+                    && matches!(doc.get(node), Some(NodeData::Element(_)))
+                    && doc
+                        .children(target_parent)
+                        .any(|c| matches!(doc.get(c), Some(NodeData::Element(_))))
+                {
+                    return;
+                }
+                doc.append_child(target_parent, node);
             }
             NodeOrText::AppendText(text) => {
-                let last_child = doc.children(*parent).last();
+                if parent_is_doc {
+                    return;
+                }
+                let last_child = doc.children(target_parent).last();
                 if let Some(last) = last_child {
                     if let Some(NodeData::Text(existing)) = doc.get_mut(last) {
                         existing.push_str(&text);
@@ -386,21 +449,55 @@ impl TreeSink for DomTreeSink {
                     }
                 }
                 let text_node = doc.create_text(&text);
-                doc.append_child(*parent, text_node);
+                doc.append_child(target_parent, text_node);
             }
         }
     }
 
     fn append_before_sibling(&self, sibling: &Self::Handle, new_node: NodeOrText<Self::Handle>) {
         let mut doc = self.document.borrow_mut();
+        let Some(parent_id) = doc.parent(*sibling) else {
+            return;
+        };
+        // WHATWG HTML §13.2.6.1 ("appropriate place for inserting a node" step 3):
+        // if a script moved `<table>` directly under a `<template>` element, foster-parenting
+        // redirects into `<template>.content` (appended as last child).
+        if let Some(NodeData::Element(e)) = doc.get(parent_id) {
+            if &*e.name.ns == "http://www.w3.org/1999/xhtml" && &*e.name.local == "template" {
+                if let Some(frag) = e.template_contents {
+                    drop(doc);
+                    self.append(&frag, new_node);
+                    return;
+                }
+            }
+        }
+        let parent_is_doc = matches!(doc.get(parent_id), Some(NodeData::Document));
         match new_node {
             NodeOrText::AppendNode(node) => {
                 if self.dropped_nodes.borrow().contains(&node) {
                     return;
                 }
+                if is_host_including_inclusive_ancestor(&doc, node, parent_id) {
+                    return;
+                }
+                // WHATWG DOM §4.2.4 / HTML §13.2.6.1: a `Document` node cannot accept a second
+                // element child (e.g., when a script moves `<table>` directly under `Document`
+                // and subsequent tokens trigger foster parenting before `<table>`).
+                if parent_is_doc
+                    && matches!(doc.get(node), Some(NodeData::Element(_)))
+                    && doc
+                        .children(parent_id)
+                        .any(|c| matches!(doc.get(c), Some(NodeData::Element(_))))
+                {
+                    return;
+                }
                 doc.insert_before(*sibling, node);
             }
             NodeOrText::AppendText(text) => {
+                // WHATWG DOM §4.2.4: a `Text` node cannot be inserted directly under `Document`.
+                if parent_is_doc {
+                    return;
+                }
                 // Per WHATWG HTML §13.2.6.1 ("insert a character"): merge with immediately
                 // preceding Text sibling when present (critical for foster-parented text).
                 if let Some(prev) = doc.previous_sibling(*sibling) {
@@ -470,7 +567,21 @@ impl TreeSink for DomTreeSink {
         let mut doc = self.document.borrow_mut();
         let children: Vec<NodeId> = doc.children(*node).collect();
         for child in children {
-            doc.append_child(*new_parent, child);
+            if !is_host_including_inclusive_ancestor(&doc, child, *new_parent) {
+                doc.append_child(*new_parent, child);
+            }
+        }
+    }
+
+    fn associate_with_form(
+        &self,
+        target: &Self::Handle,
+        form: &Self::Handle,
+        _nodes: (&Self::Handle, Option<&Self::Handle>),
+    ) {
+        let mut doc = self.document.borrow_mut();
+        if let Some(NodeData::Element(elem)) = doc.get_mut(*target) {
+            elem.form_owner = Some(*form);
         }
     }
 

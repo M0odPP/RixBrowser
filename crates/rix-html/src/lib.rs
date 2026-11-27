@@ -3,6 +3,7 @@
 pub mod parser;
 pub mod preload;
 pub mod sink;
+pub mod tree_builder;
 
 pub use markup5ever::QualName;
 pub use parser::{
